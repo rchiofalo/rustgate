@@ -1,0 +1,11 @@
+[package]
+name = "rustgate-transport"
+description = "TLS/mTLS listener and connection management"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
