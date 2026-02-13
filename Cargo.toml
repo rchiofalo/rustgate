@@ -4,6 +4,7 @@ members = [
     "crates/rustgate-core",
     "crates/rustgate-transport",
     "crates/rustgate-server",
+    "crates/rustgate-test-utils",
 ]
 
 [workspace.package]
@@ -26,6 +27,12 @@ unused_async = "warn"
 
 [workspace.dependencies]
 tokio = { version = "1", default-features = false }
+tokio-rustls = "0.26"
+rustls = "0.23"
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+x509-parser = "0.17"
+sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 bytes = "1"
 thiserror = "2"
@@ -33,6 +40,11 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 clap = { version = "4", features = ["derive"] }
+rcgen = "0.13"
+
+# Internal crates
+rustgate-core = { path = "crates/rustgate-core" }
+rustgate-test-utils = { path = "crates/rustgate-test-utils" }
 
 [profile.release]
 lto = true

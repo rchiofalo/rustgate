@@ -9,3 +9,16 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+rustgate-core = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util", "sync", "rt"] }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rustls-pki-types = { workspace = true }
+x509-parser = { workspace = true }
+sha2 = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+rustgate-test-utils = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

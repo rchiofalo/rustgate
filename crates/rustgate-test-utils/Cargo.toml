@@ -1,0 +1,22 @@
+[package]
+name = "rustgate-test-utils"
+description = "Test utilities for rustgate - certificate generation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Don't inherit workspace lints - test utilities use expect() for setup failures
+[lints.rust]
+unsafe_code = "forbid"
+unused_results = "warn"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+unwrap_used = "deny"
+# Allow panic/expect in test utilities - setup failures should panic
+panic = "allow"
+dbg_macro = "deny"
+unused_async = "warn"
+
+[dependencies]
+rcgen = { workspace = true }
