@@ -11,7 +11,7 @@ mod listener;
 mod router;
 mod session;
 
-pub use codec::{LengthPrefixedCodec, XmlStreamCodec};
+pub use codec::{FramedCodec, LengthPrefixedCodec, LineDelimitedCodec, XmlStreamCodec};
 pub use config::TlsConfig;
 pub use extract::extract_identity;
 pub use listener::TlsListener;

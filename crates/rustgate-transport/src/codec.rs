@@ -2,10 +2,55 @@
 
 use std::io;
 
+use rustgate_core::protocol::FramingStrategy;
 use tokio_util::bytes::{Buf, BufMut, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
 const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024; // 16 MB
+
+#[derive(Debug)]
+pub enum FramedCodec {
+    LengthPrefixed(LengthPrefixedCodec),
+    XmlStream(XmlStreamCodec),
+    LineDelimited(LineDelimitedCodec),
+}
+
+impl FramedCodec {
+    pub fn from_strategy(strategy: &FramingStrategy) -> Self {
+        match strategy {
+            FramingStrategy::LengthPrefixed { header_bytes } => {
+                Self::LengthPrefixed(LengthPrefixedCodec::new(*header_bytes))
+            }
+            FramingStrategy::XmlStream => Self::XmlStream(XmlStreamCodec::new()),
+            FramingStrategy::LineDelimited => Self::LineDelimited(LineDelimitedCodec::new()),
+        }
+    }
+}
+
+impl Decoder for FramedCodec {
+    type Item = BytesMut;
+    type Error = io::Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        match self {
+            Self::LengthPrefixed(c) => c.decode(src),
+            Self::XmlStream(c) => c.decode(src),
+            Self::LineDelimited(c) => c.decode(src),
+        }
+    }
+}
+
+impl Encoder<BytesMut> for FramedCodec {
+    type Error = io::Error;
+
+    fn encode(&mut self, item: BytesMut, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        match self {
+            Self::LengthPrefixed(c) => c.encode(item, dst),
+            Self::XmlStream(c) => c.encode(item, dst),
+            Self::LineDelimited(c) => c.encode(item, dst),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct LengthPrefixedCodec {
@@ -263,6 +308,48 @@ impl Encoder<BytesMut> for XmlStreamCodec {
     fn encode(&mut self, item: BytesMut, dst: &mut BytesMut) -> Result<(), Self::Error> {
         dst.reserve(item.len());
         dst.extend_from_slice(&item);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct LineDelimitedCodec;
+
+impl LineDelimitedCodec {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Decoder for LineDelimitedCodec {
+    type Item = BytesMut;
+    type Error = io::Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        if src.len() > MAX_FRAME_SIZE {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "line too long"));
+        }
+
+        if let Some(pos) = src.iter().position(|&b| b == b'\n') {
+            let mut line = src.split_to(pos + 1);
+            line.truncate(pos);
+            if pos > 0 && line[pos - 1] == b'\r' {
+                line.truncate(pos - 1);
+            }
+            Ok(Some(line))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl Encoder<BytesMut> for LineDelimitedCodec {
+    type Error = io::Error;
+
+    fn encode(&mut self, item: BytesMut, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        dst.reserve(item.len() + 1);
+        dst.extend_from_slice(&item);
+        dst.put_u8(b'\n');
         Ok(())
     }
 }
