@@ -65,6 +65,28 @@ impl TestCa {
         }
     }
 
+    /// Issue a client certificate with no CN — for testing error paths.
+    pub fn issue_client_cert_no_cn(&self) -> TestCert {
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::NoCa;
+        params
+            .extended_key_usages
+            .push(ExtendedKeyUsagePurpose::ClientAuth);
+
+        // Empty DN — no CN
+        params.distinguished_name = DistinguishedName::new();
+
+        let key_pair = KeyPair::generate().expect("failed to generate key pair");
+        let cert = params
+            .signed_by(&key_pair, &self.cert, &self.key_pair)
+            .expect("failed to sign client cert");
+
+        TestCert {
+            cert_pem: cert.pem(),
+            key_pem: key_pair.serialize_pem(),
+        }
+    }
+
     /// Issue a client certificate with the given CN and OU fields.
     ///
     /// CN becomes the user identity, OU fields become group memberships.

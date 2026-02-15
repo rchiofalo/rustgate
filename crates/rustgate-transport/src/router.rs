@@ -2,21 +2,29 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::{mpsc, RwLock};
 
 use rustgate_core::identity::{GroupId, Identity};
 use rustgate_core::message::{Destination, RoutableMessage};
 
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Debug, Clone)]
 pub struct SessionHandle {
+    pub id: u64,
     pub identity: Arc<Identity>,
     sender: mpsc::Sender<RoutableMessage>,
 }
 
 impl SessionHandle {
     pub fn new(identity: Arc<Identity>, sender: mpsc::Sender<RoutableMessage>) -> Self {
-        Self { identity, sender }
+        Self {
+            id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
+            identity,
+            sender,
+        }
     }
 
     pub async fn send(&self, msg: RoutableMessage) -> Result<(), mpsc::error::SendError<RoutableMessage>> {
@@ -70,8 +78,15 @@ impl Router {
         }
     }
 
-    pub async fn unregister(&self, cn: &str) {
+    /// Remove a session only if its ID matches the currently registered one.
+    /// Prevents a stale session task from evicting a replacement.
+    pub async fn unregister(&self, cn: &str, session_id: u64) {
         let mut state = self.state.write().await;
+        if let Some(handle) = state.sessions.get(cn)
+            && handle.id != session_id
+        {
+            return; // A newer session owns this CN — don't touch it
+        }
         if let Some(handle) = state.sessions.remove(cn) {
             state.remove_from_groups(cn, &handle.identity.groups);
         }

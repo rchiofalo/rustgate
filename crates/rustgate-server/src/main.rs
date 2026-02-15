@@ -85,7 +85,9 @@ async fn handle_session(session: AuthenticatedSession, router: Arc<Router>) {
     tracing::info!(cn = %cn, peer = %session.peer_addr(), "connected");
 
     let (tx, rx) = mpsc::channel::<RoutableMessage>(64);
-    router.register(SessionHandle::new(Arc::clone(&identity), tx)).await;
+    let handle = SessionHandle::new(Arc::clone(&identity), tx);
+    let session_id = handle.id;
+    router.register(handle).await;
 
     let (reader, writer) = session.split();
 
@@ -102,7 +104,7 @@ async fn handle_session(session: AuthenticatedSession, router: Arc<Router>) {
         }
     }
 
-    router.unregister(&cn).await;
+    router.unregister(&cn, session_id).await;
     tracing::info!(cn = %cn, "disconnected");
 }
 

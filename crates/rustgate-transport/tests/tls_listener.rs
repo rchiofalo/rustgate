@@ -8,207 +8,205 @@ use std::io::BufReader;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-#[test]
-fn test_extract_identity_directly() {
-    let ca = TestCa::new("Test CA");
-    let client_cert = ca.issue_client_cert("alice", &["engineers", "admins"]);
-
-    let certs = parse_certs(&client_cert.cert_pem);
-    let cert_der = certs.first().expect("no cert found");
-
-    let identity = extract_identity(cert_der).expect("failed to extract identity");
-
-    assert_eq!(identity.cn, "alice", "CN should be alice");
-    assert_eq!(
-        identity.groups.len(),
-        2,
-        "should have 2 groups, got: {:?}",
-        identity.groups
-    );
-    assert!(
-        identity.is_member_of("engineers"),
-        "should be member of engineers, groups: {:?}",
-        identity.groups
-    );
-    assert!(
-        identity.is_member_of("admins"),
-        "should be member of admins, groups: {:?}",
-        identity.groups
-    );
-    assert!(!identity.fingerprint.is_empty(), "fingerprint should not be empty");
-}
+// ── helpers ──────────────────────────────────────────────────────────────
 
 fn parse_certs(pem: &str) -> Vec<CertificateDer<'static>> {
     let mut reader = BufReader::new(pem.as_bytes());
     rustls_pemfile::certs(&mut reader)
         .collect::<Result<Vec<_>, _>>()
-        .expect("failed to parse certs")
+        .expect("parse certs")
 }
 
 fn parse_key(pem: &str) -> PrivateKeyDer<'static> {
     let mut reader = BufReader::new(pem.as_bytes());
     rustls_pemfile::private_key(&mut reader)
-        .expect("failed to parse key")
-        .expect("no key found")
+        .expect("parse key")
+        .expect("no key")
 }
 
-fn build_client_config(
-    client_cert_pem: &str,
-    client_key_pem: &str,
-    server_ca_pem: &str,
-) -> rustls::ClientConfig {
-    let client_certs = parse_certs(client_cert_pem);
-    let client_key = parse_key(client_key_pem);
-
+fn build_client_config(cert_pem: &str, key_pem: &str, ca_pem: &str) -> rustls::ClientConfig {
+    let certs = parse_certs(cert_pem);
+    let key = parse_key(key_pem);
     let mut root_store = RootCertStore::empty();
-    for cert in parse_certs(server_ca_pem) {
-        root_store.add(cert).expect("failed to add CA cert");
+    for cert in parse_certs(ca_pem) {
+        root_store.add(cert).expect("add CA cert");
     }
-
     rustls::ClientConfig::builder()
         .with_root_certificates(root_store)
-        .with_client_auth_cert(client_certs, client_key)
-        .expect("invalid client cert")
+        .with_client_auth_cert(certs, key)
+        .expect("client config")
 }
 
+async fn connect(
+    addr: std::net::SocketAddr,
+    config: &rustls::ClientConfig,
+) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config.clone()));
+    let tcp = tokio::net::TcpStream::connect(addr).await.expect("tcp connect");
+    let server_name = "localhost".try_into().expect("server name");
+    connector.connect(server_name, tcp).await.expect("tls connect")
+}
+
+// ── identity extraction ──────────────────────────────────────────────────
+
+/// A client cert with no OU fields should produce an identity with zero groups.
+#[test]
+fn extract_identity_no_groups() {
+    let ca = TestCa::new("Test CA");
+    let cert = ca.issue_client_cert("solo-operator", &[]);
+    let certs = parse_certs(&cert.cert_pem);
+    let identity = extract_identity(certs.first().expect("no cert")).expect("extract");
+
+    assert_eq!(identity.cn, "solo-operator");
+    assert!(identity.groups.is_empty());
+}
+
+/// A cert with no Common Name must produce an error, not panic.
+#[test]
+fn extract_identity_no_cn_returns_error() {
+    let ca = TestCa::new("Test CA");
+    let cert = ca.issue_client_cert_no_cn();
+    let certs = parse_certs(&cert.cert_pem);
+    let result = extract_identity(certs.first().expect("no cert"));
+
+    assert!(result.is_err(), "missing CN should return Err");
+}
+
+// ── mTLS handshake ───────────────────────────────────────────────────────
+
+/// Full mTLS roundtrip: connect, exchange bytes, verify identity on server side.
 #[tokio::test]
-async fn test_mtls_identity_extraction() {
+async fn mtls_handshake_and_identity() {
     let ca = TestCa::new("Test CA");
     let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
     let client_cert = ca.issue_client_cert("alice", &["engineers", "admins"]);
 
     let tls_config = TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
-        .expect("failed to create TLS config");
-
-    let listener = TlsListener::bind("127.0.0.1:0", &tls_config)
-        .await
-        .expect("failed to bind");
-
-    let addr = listener.local_addr().expect("failed to get local addr");
+        .expect("tls config");
+    let listener = TlsListener::bind("127.0.0.1:0", &tls_config).await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
 
     let server_handle = tokio::spawn(async move {
-        let session = listener
-            .accept()
-            .await
-            .expect("accept failed");
-
+        let session = listener.accept().await.expect("accept");
         let identity = session.identity().clone();
-
         let (mut reader, mut writer) = session.split();
-        let mut buf = [0u8; 5];
-        let _ = reader.read_exact(&mut buf).await.expect("read failed");
-        assert_eq!(&buf, b"hello");
 
-        writer.write_all(b"world").await.expect("write failed");
+        let mut buf = [0u8; 5];
+        let _ = reader.read_exact(&mut buf).await.expect("read");
+        assert_eq!(&buf, b"hello");
+        writer.write_all(b"world").await.expect("write");
 
         identity
     });
 
-    let client_config = build_client_config(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem);
+    let config = build_client_config(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem);
+    let mut stream = connect(addr, &config).await;
 
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
-    let tcp_stream = tokio::net::TcpStream::connect(addr)
-        .await
-        .expect("TCP connect failed");
-
-    let server_name = "localhost".try_into().expect("invalid server name");
-    let mut tls_stream = connector
-        .connect(server_name, tcp_stream)
-        .await
-        .expect("TLS connect failed");
-
-    tls_stream
-        .write_all(b"hello")
-        .await
-        .expect("client write failed");
-
+    stream.write_all(b"hello").await.expect("client write");
     let mut buf = [0u8; 5];
-    let _ = tls_stream
-        .read_exact(&mut buf)
-        .await
-        .expect("client read failed");
+    let _ = stream.read_exact(&mut buf).await.expect("client read");
     assert_eq!(&buf, b"world");
 
-    let identity = server_handle.await.expect("server task panicked");
+    let identity = server_handle.await.expect("server task");
     assert_eq!(identity.cn, "alice");
+    assert_eq!(identity.groups.len(), 2);
     assert!(identity.is_member_of("engineers"));
     assert!(identity.is_member_of("admins"));
-    assert!(!identity.is_member_of("other"));
     assert!(!identity.fingerprint.is_empty());
 }
 
+/// Untrusted client cert (signed by a different CA) must be rejected.
 #[tokio::test]
-async fn test_mtls_rejects_untrusted_client() {
+async fn mtls_rejects_untrusted_client() {
     let server_ca = TestCa::new("Server CA");
     let rogue_ca = TestCa::new("Rogue CA");
 
     let server_cert = server_ca.issue_server_cert("localhost", &["localhost"]);
-    let rogue_client_cert = rogue_ca.issue_client_cert("mallory", &["hackers"]);
+    let rogue_cert = rogue_ca.issue_client_cert("mallory", &["hackers"]);
 
     let tls_config = TlsConfig::from_pem(
         &server_cert.cert_pem,
         &server_cert.key_pem,
         &server_ca.cert_pem,
     )
-    .expect("failed to create TLS config");
+    .expect("tls config");
 
-    let listener = TlsListener::bind("127.0.0.1:0", &tls_config)
-        .await
-        .expect("failed to bind");
-
-    let addr = listener.local_addr().expect("failed to get local addr");
+    let listener = TlsListener::bind("127.0.0.1:0", &tls_config).await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
 
     let server_handle = tokio::spawn(async move {
         tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept()).await
     });
 
-    let client_config = build_client_config(
-        &rogue_client_cert.cert_pem,
-        &rogue_client_cert.key_pem,
-        &server_ca.cert_pem,
-    );
+    let config = build_client_config(&rogue_cert.cert_pem, &rogue_cert.key_pem, &server_ca.cert_pem);
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let tcp = tokio::net::TcpStream::connect(addr).await.expect("tcp connect");
+    let server_name = "localhost".try_into().expect("server name");
+    let result = connector.connect(server_name, tcp).await;
 
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
-    let tcp_stream = tokio::net::TcpStream::connect(addr)
-        .await
-        .expect("TCP connect failed");
-
-    let server_name = "localhost".try_into().expect("invalid server name");
-    let connect_result = connector.connect(server_name, tcp_stream).await;
-
-    let connection_failed = match connect_result {
+    let failed = match result {
         Err(_) => true,
         Ok(mut stream) => {
-            if stream.write_all(b"test").await.is_err() {
+            // TLS 1.3 may defer the alert — try using the connection
+            if stream.write_all(b"x").await.is_err() {
                 true
             } else if stream.flush().await.is_err() {
                 true
             } else {
                 let mut buf = [0u8; 1];
-                let read_result = tokio::time::timeout(
+                match tokio::time::timeout(
                     std::time::Duration::from_millis(500),
                     stream.read(&mut buf),
                 )
-                .await;
-
-                match read_result {
-                    Ok(Ok(0)) => true,
-                    Ok(Err(_)) => true,
-                    Err(_) => true,
+                .await
+                {
+                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => true,
                     Ok(Ok(_)) => false,
                 }
             }
         }
     };
 
-    assert!(
-        connection_failed,
-        "expected connection to fail due to untrusted client cert"
-    );
+    assert!(failed, "untrusted client should not be able to communicate");
 
-    let server_result = server_handle.await.expect("server task panicked");
-    assert!(
-        server_result.is_err(),
-        "server should timeout waiting for next connection"
-    );
+    let server_result = server_handle.await.expect("server task");
+    assert!(server_result.is_err(), "server should timeout — no valid session");
+}
+
+/// Accept multiple clients sequentially through the same listener.
+#[tokio::test]
+async fn accept_multiple_clients_sequentially() {
+    let ca = TestCa::new("Test CA");
+    let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
+    let alice_cert = ca.issue_client_cert("alice", &["alpha"]);
+    let bob_cert = ca.issue_client_cert("bob", &["bravo"]);
+
+    let tls_config = TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
+        .expect("tls config");
+    let listener = TlsListener::bind("127.0.0.1:0", &tls_config).await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    let server_handle = tokio::spawn(async move {
+        let s1 = listener.accept().await.expect("accept alice");
+        let cn1 = s1.identity().cn.clone();
+        drop(s1);
+
+        let s2 = listener.accept().await.expect("accept bob");
+        let cn2 = s2.identity().cn.clone();
+
+        (cn1, cn2)
+    });
+
+    let alice_config = build_client_config(&alice_cert.cert_pem, &alice_cert.key_pem, &ca.cert_pem);
+    let _stream1 = connect(addr, &alice_config).await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    drop(_stream1);
+
+    let bob_config = build_client_config(&bob_cert.cert_pem, &bob_cert.key_pem, &ca.cert_pem);
+    let _stream2 = connect(addr, &bob_config).await;
+
+    let (cn1, cn2) = server_handle.await.expect("server task");
+    assert_eq!(cn1, "alice");
+    assert_eq!(cn2, "bob");
 }
