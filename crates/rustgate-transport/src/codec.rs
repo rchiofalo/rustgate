@@ -52,7 +52,7 @@ impl Encoder<BytesMut> for FramedCodec {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LengthPrefixedCodec {
     header_bytes: usize,
     pending_len: Option<usize>,
