@@ -30,16 +30,14 @@ struct State {
     groups: HashMap<GroupId, HashSet<String>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Router {
     state: RwLock<State>,
 }
 
 impl Router {
     pub fn new() -> Self {
-        Self {
-            state: RwLock::new(State::default()),
-        }
+        Self::default()
     }
 
     pub async fn register(&self, handle: SessionHandle) {
