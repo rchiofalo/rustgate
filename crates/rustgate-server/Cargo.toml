@@ -13,7 +13,9 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+rustgate-core = { workspace = true }
+rustgate-transport = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

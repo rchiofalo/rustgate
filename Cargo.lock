@@ -617,6 +617,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "rustgate-core",
+ "rustgate-transport",
  "tokio",
  "tracing",
  "tracing-subscriber",
