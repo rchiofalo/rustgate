@@ -30,6 +30,19 @@ struct State {
     groups: HashMap<GroupId, HashSet<String>>,
 }
 
+impl State {
+    fn remove_from_groups(&mut self, cn: &str, groups: &std::collections::BTreeSet<GroupId>) {
+        for group in groups {
+            if let Some(members) = self.groups.get_mut(group) {
+                let _ = members.remove(cn);
+                if members.is_empty() {
+                    let _ = self.groups.remove(group);
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Router {
     state: RwLock<State>,
@@ -42,28 +55,25 @@ impl Router {
 
     pub async fn register(&self, handle: SessionHandle) {
         let cn = handle.identity.cn.clone();
-        let identity_groups = handle.identity.groups.clone();
+        let new_groups = handle.identity.groups.clone();
 
         let mut state = self.state.write().await;
+
+        // Clean stale group entries if this CN was previously registered
+        if let Some(old) = state.sessions.remove(&cn) {
+            state.remove_from_groups(&cn, &old.identity.groups);
+        }
+
         let _ = state.sessions.insert(cn.clone(), handle);
-        for group in &identity_groups {
+        for group in &new_groups {
             let _ = state.groups.entry(group.clone()).or_default().insert(cn.clone());
         }
     }
 
     pub async fn unregister(&self, cn: &str) {
         let mut state = self.state.write().await;
-        let handle = state.sessions.remove(cn);
-
-        if let Some(handle) = handle {
-            for group in &handle.identity.groups {
-                if let Some(members) = state.groups.get_mut(group) {
-                    let _ = members.remove(cn);
-                    if members.is_empty() {
-                        let _ = state.groups.remove(group);
-                    }
-                }
-            }
+        if let Some(handle) = state.sessions.remove(cn) {
+            state.remove_from_groups(cn, &handle.identity.groups);
         }
     }
 
@@ -87,37 +97,43 @@ impl Router {
     }
 
     async fn send_to_session(&self, cn: &str, msg: RoutableMessage) {
-        let state = self.state.read().await;
-        if let Some(handle) = state.sessions.get(cn) {
+        let handle = {
+            let state = self.state.read().await;
+            state.sessions.get(cn).cloned()
+        };
+        if let Some(handle) = handle {
             let _ = handle.send(msg).await;
         }
     }
 
     async fn send_to_group(&self, group: &str, msg: &RoutableMessage) {
-        let state = self.state.read().await;
-        let members = match state.groups.get(group) {
-            Some(m) => m.clone(),
-            None => return,
+        let targets: Vec<SessionHandle> = {
+            let state = self.state.read().await;
+            let members = match state.groups.get(group) {
+                Some(m) => m,
+                None => return,
+            };
+            members.iter()
+                .filter(|cn| *cn != &msg.source.cn)
+                .filter_map(|cn| state.sessions.get(cn).cloned())
+                .collect()
         };
-        drop(state);
 
-        let state = self.state.read().await;
-        for cn in &members {
-            if cn == &msg.source.cn {
-                continue;
-            }
-            if let Some(handle) = state.sessions.get(cn) {
-                let _ = handle.send(msg.clone()).await;
-            }
+        for handle in &targets {
+            let _ = handle.send(msg.clone()).await;
         }
     }
 
     async fn send_to_all(&self, msg: &RoutableMessage) {
-        let state = self.state.read().await;
-        for (cn, handle) in state.sessions.iter() {
-            if cn == &msg.source.cn {
-                continue;
-            }
+        let targets: Vec<SessionHandle> = {
+            let state = self.state.read().await;
+            state.sessions.iter()
+                .filter(|(cn, _)| *cn != &msg.source.cn)
+                .map(|(_, handle)| handle.clone())
+                .collect()
+        };
+
+        for handle in &targets {
             let _ = handle.send(msg.clone()).await;
         }
     }

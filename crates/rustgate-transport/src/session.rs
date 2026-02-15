@@ -9,7 +9,6 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;
 
-/// An authenticated TLS session with extracted client identity.
 #[derive(Debug)]
 pub struct AuthenticatedSession {
     identity: Arc<Identity>,
@@ -18,7 +17,6 @@ pub struct AuthenticatedSession {
 }
 
 impl AuthenticatedSession {
-    /// Create a new authenticated session.
     pub(crate) fn new(
         identity: Identity,
         peer_addr: SocketAddr,
@@ -31,17 +29,18 @@ impl AuthenticatedSession {
         }
     }
 
-    /// Get the client's verified identity.
     pub fn identity(&self) -> &Identity {
         &self.identity
     }
 
-    /// Get the peer's socket address.
+    pub fn identity_arc(&self) -> Arc<Identity> {
+        Arc::clone(&self.identity)
+    }
+
     pub fn peer_addr(&self) -> SocketAddr {
         self.peer_addr
     }
 
-    /// Split the session into reader and writer halves for concurrent I/O.
     pub fn split(self) -> (SessionReader, SessionWriter) {
         let (read_half, write_half) = tokio::io::split(self.stream);
         (
@@ -85,7 +84,6 @@ impl AsyncWrite for AuthenticatedSession {
     }
 }
 
-/// Read half of an authenticated session.
 #[derive(Debug)]
 pub struct SessionReader {
     inner: tokio::io::ReadHalf<TlsStream<TcpStream>>,
@@ -93,7 +91,6 @@ pub struct SessionReader {
 }
 
 impl SessionReader {
-    /// Get the client's verified identity.
     pub fn identity(&self) -> &Identity {
         &self.identity
     }
@@ -109,7 +106,6 @@ impl AsyncRead for SessionReader {
     }
 }
 
-/// Write half of an authenticated session.
 #[derive(Debug)]
 pub struct SessionWriter {
     inner: tokio::io::WriteHalf<TlsStream<TcpStream>>,
@@ -117,7 +113,6 @@ pub struct SessionWriter {
 }
 
 impl SessionWriter {
-    /// Get the client's verified identity.
     pub fn identity(&self) -> &Identity {
         &self.identity
     }

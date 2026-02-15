@@ -1,8 +1,4 @@
-//! TLS/mTLS listener and connection management for rustgate.
-//!
-//! This crate provides mTLS-authenticated connections with identity extraction
-//! from X.509 client certificates. CN becomes the user identity, and OU fields
-//! become group memberships for authorization decisions.
+//! TLS transport, session management, and message routing for rustgate.
 
 mod codec;
 mod config;

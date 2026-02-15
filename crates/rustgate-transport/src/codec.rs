@@ -2,7 +2,7 @@
 
 use std::io;
 
-use rustgate_core::protocol::FramingStrategy;
+use rustgate_core::protocol::{FramingStrategy, HeaderSize};
 use tokio_util::bytes::{Buf, BufMut, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
@@ -18,8 +18,8 @@ pub enum FramedCodec {
 impl FramedCodec {
     pub fn from_strategy(strategy: &FramingStrategy) -> Self {
         match strategy {
-            FramingStrategy::LengthPrefixed { header_bytes } => {
-                Self::LengthPrefixed(LengthPrefixedCodec::new(*header_bytes))
+            FramingStrategy::LengthPrefixed { header_size } => {
+                Self::LengthPrefixed(LengthPrefixedCodec::new(*header_size))
             }
             FramingStrategy::XmlStream => Self::XmlStream(XmlStreamCodec::new()),
             FramingStrategy::LineDelimited => Self::LineDelimited(LineDelimitedCodec::new()),
@@ -54,7 +54,7 @@ impl Encoder<BytesMut> for FramedCodec {
 
 #[derive(Debug, Clone)]
 pub struct LengthPrefixedCodec {
-    header_bytes: usize,
+    header_size: HeaderSize,
     pending_len: Option<usize>,
 }
 
@@ -64,38 +64,38 @@ pub struct XmlStreamCodec {
 }
 
 impl LengthPrefixedCodec {
-    pub fn new(header_bytes: usize) -> Self {
-        assert!(header_bytes == 1 || header_bytes == 2 || header_bytes == 4);
+    pub fn new(header_size: HeaderSize) -> Self {
         Self {
-            header_bytes,
+            header_size,
             pending_len: None,
         }
     }
 
+    fn header_bytes(&self) -> usize {
+        self.header_size.byte_count()
+    }
+
     fn read_length(&self, src: &[u8]) -> usize {
-        match self.header_bytes {
-            1 => src[0] as usize,
-            2 => u16::from_be_bytes([src[0], src[1]]) as usize,
-            4 => u32::from_be_bytes([src[0], src[1], src[2], src[3]]) as usize,
-            _ => unreachable!(),
+        match self.header_size {
+            HeaderSize::One => src[0] as usize,
+            HeaderSize::Two => u16::from_be_bytes([src[0], src[1]]) as usize,
+            HeaderSize::Four => u32::from_be_bytes([src[0], src[1], src[2], src[3]]) as usize,
         }
     }
 
     fn write_length(&self, len: usize, dst: &mut BytesMut) {
-        match self.header_bytes {
-            1 => dst.put_u8(len as u8),
-            2 => dst.put_u16(len as u16),
-            4 => dst.put_u32(len as u32),
-            _ => unreachable!(),
+        match self.header_size {
+            HeaderSize::One => dst.put_u8(len as u8),
+            HeaderSize::Two => dst.put_u16(len as u16),
+            HeaderSize::Four => dst.put_u32(len as u32),
         }
     }
 
     fn max_payload_size(&self) -> usize {
-        let header_max = match self.header_bytes {
-            1 => u8::MAX as usize,
-            2 => u16::MAX as usize,
-            4 => u32::MAX as usize,
-            _ => unreachable!(),
+        let header_max = match self.header_size {
+            HeaderSize::One => u8::MAX as usize,
+            HeaderSize::Two => u16::MAX as usize,
+            HeaderSize::Four => u32::MAX as usize,
         };
         header_max.min(MAX_FRAME_SIZE)
     }
@@ -109,14 +109,14 @@ impl Decoder for LengthPrefixedCodec {
         let payload_len = match self.pending_len {
             Some(len) => len,
             None => {
-                if src.len() < self.header_bytes {
+                if src.len() < self.header_bytes() {
                     return Ok(None);
                 }
-                let len = self.read_length(&src[..self.header_bytes]);
+                let len = self.read_length(&src[..self.header_bytes()]);
                 if len > MAX_FRAME_SIZE {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
                 }
-                src.advance(self.header_bytes);
+                src.advance(self.header_bytes());
                 self.pending_len = Some(len);
                 len
             }
@@ -143,7 +143,7 @@ impl Encoder<BytesMut> for LengthPrefixedCodec {
                 format!("frame too large: {} > {}", item.len(), max_len),
             ));
         }
-        dst.reserve(self.header_bytes + item.len());
+        dst.reserve(self.header_bytes() + item.len());
         self.write_length(item.len(), dst);
         dst.extend_from_slice(&item);
         Ok(())

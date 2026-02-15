@@ -8,7 +8,6 @@ use std::io::BufReader;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// Test that identity extraction works correctly on a generated certificate.
 #[test]
 fn test_extract_identity_directly() {
     let ca = TestCa::new("Test CA");
@@ -74,12 +73,10 @@ fn build_client_config(
 
 #[tokio::test]
 async fn test_mtls_identity_extraction() {
-    // Create CA and issue certs
     let ca = TestCa::new("Test CA");
     let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
     let client_cert = ca.issue_client_cert("alice", &["engineers", "admins"]);
 
-    // Configure and bind TLS listener
     let tls_config = TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
         .expect("failed to create TLS config");
 
@@ -89,17 +86,14 @@ async fn test_mtls_identity_extraction() {
 
     let addr = listener.local_addr().expect("failed to get local addr");
 
-    // Spawn server task
     let server_handle = tokio::spawn(async move {
         let session = listener
             .accept()
             .await
-            .expect("listener closed")
             .expect("accept failed");
 
         let identity = session.identity().clone();
 
-        // Test bidirectional I/O
         let (mut reader, mut writer) = session.split();
         let mut buf = [0u8; 5];
         let _ = reader.read_exact(&mut buf).await.expect("read failed");
@@ -110,7 +104,6 @@ async fn test_mtls_identity_extraction() {
         identity
     });
 
-    // Connect as client
     let client_config = build_client_config(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem);
 
     let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
@@ -124,7 +117,6 @@ async fn test_mtls_identity_extraction() {
         .await
         .expect("TLS connect failed");
 
-    // Send and receive data
     tls_stream
         .write_all(b"hello")
         .await
@@ -137,7 +129,6 @@ async fn test_mtls_identity_extraction() {
         .expect("client read failed");
     assert_eq!(&buf, b"world");
 
-    // Verify identity extracted by server
     let identity = server_handle.await.expect("server task panicked");
     assert_eq!(identity.cn, "alice");
     assert!(identity.is_member_of("engineers"));
@@ -148,19 +139,16 @@ async fn test_mtls_identity_extraction() {
 
 #[tokio::test]
 async fn test_mtls_rejects_untrusted_client() {
-    // Create two separate CAs
     let server_ca = TestCa::new("Server CA");
     let rogue_ca = TestCa::new("Rogue CA");
 
-    // Server uses server_ca, client has cert from rogue_ca
     let server_cert = server_ca.issue_server_cert("localhost", &["localhost"]);
     let rogue_client_cert = rogue_ca.issue_client_cert("mallory", &["hackers"]);
 
-    // Configure listener to trust only server_ca (for client verification)
     let tls_config = TlsConfig::from_pem(
         &server_cert.cert_pem,
         &server_cert.key_pem,
-        &server_ca.cert_pem, // Server only trusts certs signed by server_ca
+        &server_ca.cert_pem,
     )
     .expect("failed to create TLS config");
 
@@ -170,18 +158,14 @@ async fn test_mtls_rejects_untrusted_client() {
 
     let addr = listener.local_addr().expect("failed to get local addr");
 
-    // Spawn server that accepts (should not get a successful connection)
     let server_handle = tokio::spawn(async move {
-        // Use a timeout to prevent hanging
         tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept()).await
     });
 
-    // Try to connect with rogue client cert
-    // Client trusts server_ca for server verification
     let client_config = build_client_config(
         &rogue_client_cert.cert_pem,
         &rogue_client_cert.key_pem,
-        &server_ca.cert_pem, // Client trusts server's CA
+        &server_ca.cert_pem,
     );
 
     let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
@@ -192,20 +176,14 @@ async fn test_mtls_rejects_untrusted_client() {
     let server_name = "localhost".try_into().expect("invalid server name");
     let connect_result = connector.connect(server_name, tcp_stream).await;
 
-    // With TLS 1.3, handshake might "succeed" from client's perspective,
-    // but the connection should be unusable. Either handshake fails OR
-    // subsequent I/O should fail.
     let connection_failed = match connect_result {
-        Err(_) => true, // Handshake failed immediately
+        Err(_) => true,
         Ok(mut stream) => {
-            // Try to use the connection - should fail
-            // Write some data
             if stream.write_all(b"test").await.is_err() {
                 true
             } else if stream.flush().await.is_err() {
                 true
             } else {
-                // Try to read - if server rejected us, read should fail or timeout
                 let mut buf = [0u8; 1];
                 let read_result = tokio::time::timeout(
                     std::time::Duration::from_millis(500),
@@ -213,13 +191,11 @@ async fn test_mtls_rejects_untrusted_client() {
                 )
                 .await;
 
-                // Connection should be rejected: either timeout (server won't respond)
-                // or error (connection reset)
                 match read_result {
-                    Ok(Ok(0)) => true,     // Connection closed
-                    Ok(Err(_)) => true,    // Read error
-                    Err(_) => true,        // Timeout (server not responding)
-                    Ok(Ok(_)) => false,    // Unexpectedly got data
+                    Ok(Ok(0)) => true,
+                    Ok(Err(_)) => true,
+                    Err(_) => true,
+                    Ok(Ok(_)) => false,
                 }
             }
         }
@@ -230,9 +206,7 @@ async fn test_mtls_rejects_untrusted_client() {
         "expected connection to fail due to untrusted client cert"
     );
 
-    // Server should have timed out waiting for more connections after the failed handshake
     let server_result = server_handle.await.expect("server task panicked");
-    // Server should have timed out since the handshake failed and no more connections came
     assert!(
         server_result.is_err(),
         "server should timeout waiting for next connection"

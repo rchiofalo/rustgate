@@ -7,9 +7,6 @@ use rustls::RootCertStore;
 use std::io::BufReader;
 use std::sync::Arc;
 
-/// TLS configuration for mTLS server.
-///
-/// Holds server certificate, key, and client CA for mutual TLS authentication.
 #[derive(Debug)]
 pub struct TlsConfig {
     server_certs: Vec<CertificateDer<'static>>,
@@ -18,7 +15,6 @@ pub struct TlsConfig {
 }
 
 impl TlsConfig {
-    /// Create TLS config from PEM-encoded strings.
     pub fn from_pem(
         server_cert_pem: &str,
         server_key_pem: &str,
@@ -35,7 +31,6 @@ impl TlsConfig {
         })
     }
 
-    /// Build rustls ServerConfig with mTLS client verification.
     pub fn build_server_config(&self) -> Result<rustls::ServerConfig> {
         let client_verifier = WebPkiClientVerifier::builder(self.client_ca_store.clone())
             .build()

@@ -18,7 +18,7 @@ rustgate-transport = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "signal", "fs", "macros"] }
 tokio-util = { workspace = true }
 bytes = { workspace = true }
-futures = "0.3"
+futures = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

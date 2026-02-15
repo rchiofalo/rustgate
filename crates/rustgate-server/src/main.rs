@@ -10,6 +10,7 @@ use tracing_subscriber::EnvFilter;
 
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
+use rustgate_core::protocol::HeaderSize;
 use rustgate_transport::{
     AuthenticatedSession, LengthPrefixedCodec, Router, SessionHandle, TlsConfig, TlsListener,
 };
@@ -59,12 +60,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         tokio::select! {
             accept_result = listener.accept() => {
                 match accept_result {
-                    Some(Ok(session)) => {
+                    Ok(session) => {
                         let router = Arc::clone(&router);
                         drop(tokio::spawn(handle_session(session, router)));
                     }
-                    Some(Err(e)) => tracing::warn!(error = %e, "accept error"),
-                    None => break,
+                    Err(e) => tracing::warn!(error = %e, "accept error"),
                 }
             }
             _ = tokio::signal::ctrl_c() => {
@@ -79,7 +79,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 }
 
 async fn handle_session(session: AuthenticatedSession, router: Arc<Router>) {
-    let identity = Arc::new(session.identity().clone());
+    let identity = session.identity_arc();
     let cn = identity.cn.clone();
 
     tracing::info!(cn = %cn, peer = %session.peer_addr(), "connected");
@@ -111,10 +111,11 @@ async fn read_loop(
     identity: &Identity,
     router: &Router,
 ) -> std::io::Result<()> {
-    let mut framed = FramedRead::new(reader, LengthPrefixedCodec::new(4));
+    let mut framed = FramedRead::new(reader, LengthPrefixedCodec::new(HeaderSize::Four));
 
     while let Some(result) = framed.next().await {
         let frame = result?;
+        // TODO: parse destination from payload instead of broadcasting everything
         router.route(build_message(identity, frame.freeze())).await;
     }
 
@@ -125,7 +126,7 @@ async fn write_loop(
     writer: rustgate_transport::SessionWriter,
     mut rx: mpsc::Receiver<RoutableMessage>,
 ) -> std::io::Result<()> {
-    let mut framed = FramedWrite::new(writer, LengthPrefixedCodec::new(4));
+    let mut framed = FramedWrite::new(writer, LengthPrefixedCodec::new(HeaderSize::Four));
 
     while let Some(msg) = rx.recv().await {
         framed.send(tokio_util::bytes::BytesMut::from(msg.payload.as_ref())).await?;

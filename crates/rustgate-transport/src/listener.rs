@@ -10,7 +10,6 @@ use tokio::net::{TcpListener, ToSocketAddrs};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, warn};
 
-/// A TLS listener that accepts mTLS connections and extracts client identities.
 pub struct TlsListener {
     tcp_listener: TcpListener,
     tls_acceptor: TlsAcceptor,
@@ -26,7 +25,6 @@ impl std::fmt::Debug for TlsListener {
 }
 
 impl TlsListener {
-    /// Bind to the given address and create a TLS listener.
     pub async fn bind<A: ToSocketAddrs>(addr: A, config: &TlsConfig) -> Result<Self> {
         let tcp_listener = TcpListener::bind(addr).await?;
         let server_config = config.build_server_config()?;
@@ -43,20 +41,16 @@ impl TlsListener {
         })
     }
 
-    /// Get the local address this listener is bound to.
     pub fn local_addr(&self) -> Result<SocketAddr> {
         self.tcp_listener
             .local_addr()
             .map_err(|e| RustgateError::Transport(format!("failed to get local address: {e}")))
     }
 
-    /// Accept a new mTLS connection.
-    ///
-    /// Performs TCP accept, TLS handshake with client certificate verification,
-    /// and extracts the client's identity from their certificate.
-    ///
-    /// Returns `None` if the listener is closed.
-    pub async fn accept(&self) -> Option<Result<AuthenticatedSession>> {
+    /// Accept a new mTLS connection. Loops internally on TCP/TLS failures,
+    /// only returning when a fully authenticated session is ready or
+    /// identity extraction fails.
+    pub async fn accept(&self) -> Result<AuthenticatedSession> {
         loop {
             let (tcp_stream, peer_addr) = match self.tcp_listener.accept().await {
                 Ok(conn) => conn,
@@ -82,7 +76,7 @@ impl TlsListener {
                 Ok(id) => id,
                 Err(e) => {
                     warn!(peer_addr = %peer_addr, error = %e, "identity extraction failed");
-                    return Some(Err(e));
+                    return Err(e);
                 }
             };
 
@@ -93,7 +87,7 @@ impl TlsListener {
                 "client authenticated"
             );
 
-            return Some(Ok(AuthenticatedSession::new(identity, peer_addr, tls_stream)));
+            return Ok(AuthenticatedSession::new(identity, peer_addr, tls_stream));
         }
     }
 

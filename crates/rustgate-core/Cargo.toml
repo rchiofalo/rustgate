@@ -10,5 +10,4 @@ workspace = true
 
 [dependencies]
 bytes = { workspace = true }
-serde = { workspace = true }
 thiserror = { workspace = true }
