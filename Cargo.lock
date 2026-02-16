@@ -704,6 +704,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustgate-cot"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "rustgate-core",
+]
+
+[[package]]
 name = "rustgate-server"
 version = "0.1.0"
 dependencies = [
