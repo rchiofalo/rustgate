@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use bytes::Bytes;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use futures::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_util::codec::{FramedRead, FramedWrite};
@@ -10,9 +10,9 @@ use tracing_subscriber::EnvFilter;
 
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
-use rustgate_core::protocol::HeaderSize;
+use rustgate_core::protocol::{FramingStrategy, HeaderSize};
 use rustgate_transport::{
-    AuthenticatedSession, LengthPrefixedCodec, Router, SessionHandle, TlsConfig, TlsListener,
+    AuthenticatedSession, FramedCodec, Router, SessionHandle, TlsConfig, TlsListener,
 };
 
 #[derive(Parser)]
@@ -29,6 +29,26 @@ struct Cli {
 
     #[arg(long)]
     ca: String,
+
+    #[arg(long, value_enum, default_value_t = Framing::Xml)]
+    framing: Framing,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Framing {
+    Xml,
+    LengthPrefixed,
+    Line,
+}
+
+impl From<Framing> for FramingStrategy {
+    fn from(f: Framing) -> Self {
+        match f {
+            Framing::Xml => FramingStrategy::XmlStream,
+            Framing::LengthPrefixed => FramingStrategy::LengthPrefixed { header_size: HeaderSize::Four },
+            Framing::Line => FramingStrategy::LineDelimited,
+        }
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -51,8 +71,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     let tls_config = TlsConfig::from_pem(&cert_pem, &key_pem, &ca_pem)?;
     let listener = TlsListener::bind(&cli.bind, &tls_config).await?;
+    let framing = FramingStrategy::from(cli.framing);
 
-    tracing::info!(addr = %listener.local_addr()?, "listening");
+    tracing::info!(addr = %listener.local_addr()?, framing = ?cli.framing, "listening");
 
     let router = Arc::new(Router::new());
 
@@ -62,7 +83,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 match accept_result {
                     Ok(session) => {
                         let router = Arc::clone(&router);
-                        drop(tokio::spawn(handle_session(session, router)));
+                        let framing = framing.clone();
+                        drop(tokio::spawn(handle_session(session, router, framing)));
                     }
                     Err(e) => tracing::warn!(error = %e, "accept error"),
                 }
@@ -78,7 +100,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn handle_session(session: AuthenticatedSession, router: Arc<Router>) {
+async fn handle_session(session: AuthenticatedSession, router: Arc<Router>, framing: FramingStrategy) {
     let identity = session.identity_arc();
     let cn = identity.cn.clone();
 
@@ -92,12 +114,12 @@ async fn handle_session(session: AuthenticatedSession, router: Arc<Router>) {
     let (reader, writer) = session.split();
 
     tokio::select! {
-        r = read_loop(reader, &identity, &router) => {
+        r = read_loop(reader, &identity, &router, &framing) => {
             if let Err(e) = r {
                 tracing::debug!(cn = %cn, error = %e, "read error");
             }
         }
-        r = write_loop(writer, rx) => {
+        r = write_loop(writer, rx, &framing) => {
             if let Err(e) = r {
                 tracing::debug!(cn = %cn, error = %e, "write error");
             }
@@ -112,8 +134,9 @@ async fn read_loop(
     reader: rustgate_transport::SessionReader,
     identity: &Identity,
     router: &Router,
+    framing: &FramingStrategy,
 ) -> std::io::Result<()> {
-    let mut framed = FramedRead::new(reader, LengthPrefixedCodec::new(HeaderSize::Four));
+    let mut framed = FramedRead::new(reader, FramedCodec::from_strategy(framing));
 
     while let Some(result) = framed.next().await {
         let frame = result?;
@@ -127,8 +150,9 @@ async fn read_loop(
 async fn write_loop(
     writer: rustgate_transport::SessionWriter,
     mut rx: mpsc::Receiver<RoutableMessage>,
+    framing: &FramingStrategy,
 ) -> std::io::Result<()> {
-    let mut framed = FramedWrite::new(writer, LengthPrefixedCodec::new(HeaderSize::Four));
+    let mut framed = FramedWrite::new(writer, FramedCodec::from_strategy(framing));
 
     while let Some(msg) = rx.recv().await {
         framed.send(tokio_util::bytes::BytesMut::from(msg.payload.as_ref())).await?;
