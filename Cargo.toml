@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/rustgate-core",
+    "crates/rustgate-cot",
     "crates/rustgate-transport",
     "crates/rustgate-server",
     "crates/rustgate-test-utils",
@@ -35,6 +36,7 @@ rustls-pki-types = "1"
 x509-parser = "0.17"
 sha2 = "0.10"
 bytes = "1"
+quick-xml = "0.37"
 thiserror = "2"
 anyhow = "1"
 futures = "0.3"
@@ -45,6 +47,7 @@ rcgen = "0.13"
 
 # Internal crates
 rustgate-core = { path = "crates/rustgate-core" }
+rustgate-cot = { path = "crates/rustgate-cot" }
 rustgate-transport = { path = "crates/rustgate-transport" }
 rustgate-test-utils = { path = "crates/rustgate-test-utils" }
 

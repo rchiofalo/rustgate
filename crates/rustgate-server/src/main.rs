@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -9,8 +10,9 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing_subscriber::EnvFilter;
 
 use rustgate_core::identity::Identity;
-use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
+use rustgate_core::message::{Destination, Metadata, RoutableMessage};
 use rustgate_core::protocol::{FramingStrategy, HeaderSize};
+use rustgate_cot::{CotDestination, CotEvent};
 use rustgate_transport::{
     AuthenticatedSession, FramedCodec, Router, SessionHandle, TlsConfig, TlsListener,
 };
@@ -140,8 +142,14 @@ async fn read_loop(
 
     while let Some(result) = framed.next().await {
         let frame = result?;
-        // TODO: parse destination from payload instead of broadcasting everything
-        router.route(build_message(identity, frame.freeze())).await;
+        let payload = frame.freeze();
+
+        let msg = match rustgate_cot::parse(&payload) {
+            Ok(cot) => build_cot_message(identity, payload, cot),
+            Err(_) => build_raw_message(identity, payload),
+        };
+
+        router.route(msg).await;
     }
 
     Ok(())
@@ -161,7 +169,31 @@ async fn write_loop(
     Ok(())
 }
 
-fn build_message(source: &Identity, payload: Bytes) -> RoutableMessage {
+fn build_cot_message(source: &Identity, payload: Bytes, cot: CotEvent) -> RoutableMessage {
+    let destination = match cot.destination {
+        CotDestination::Broadcast => Destination::Broadcast,
+        CotDestination::Group(name) => Destination::Group(name),
+        CotDestination::Callsign(cn) => Destination::Direct(Identity {
+            cn,
+            fingerprint: String::new(),
+            groups: BTreeSet::new(),
+        }),
+    };
+
+    RoutableMessage {
+        source: source.clone(),
+        destination,
+        payload,
+        metadata: Metadata {
+            received_at: SystemTime::now(),
+            source_protocol: "cot".into(),
+            message_type: cot.message_type,
+            ttl: cot.ttl,
+        },
+    }
+}
+
+fn build_raw_message(source: &Identity, payload: Bytes) -> RoutableMessage {
     RoutableMessage {
         source: source.clone(),
         destination: Destination::Broadcast,
@@ -169,7 +201,7 @@ fn build_message(source: &Identity, payload: Bytes) -> RoutableMessage {
         metadata: Metadata {
             received_at: SystemTime::now(),
             source_protocol: "tcp".into(),
-            message_type: MessageType::Other("raw".into()),
+            message_type: rustgate_core::message::MessageType::Other("raw".into()),
             ttl: None,
         },
     }
