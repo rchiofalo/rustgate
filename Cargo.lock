@@ -730,6 +730,7 @@ dependencies = [
  "clap",
  "futures",
  "rustgate-core",
+ "rustgate-cot",
  "rustgate-transport",
  "tokio",
  "tokio-util",
