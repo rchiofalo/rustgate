@@ -23,7 +23,13 @@ pub struct CotEncoder;
 
 impl MessageEncoder for CotEncoder {
     fn encode(&self, msg: &RoutableMessage) -> io::Result<Bytes> {
-        // TODO: serialize RoutableMessage to CoT XML
+        if msg.metadata.source_protocol == "cot" {
+            // Already CoT XML, pass through
+            return Ok(msg.payload.clone());
+        }
+
+        // Non-CoT payload - for now, pass through raw
+        // Future: construct CoT XML wrapper from metadata
         Ok(msg.payload.clone())
     }
 }
