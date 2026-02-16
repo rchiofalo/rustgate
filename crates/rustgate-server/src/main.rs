@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use bytes::Bytes;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use futures::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_util::codec::{FramedRead, FramedWrite};
@@ -30,16 +30,24 @@ struct Cli {
     #[arg(long)]
     ca: String,
 
-    /// Framing strategy for client connections: xml (default), length-prefixed, line
-    #[arg(long, default_value = "xml")]
-    framing: String,
+    #[arg(long, value_enum, default_value_t = Framing::Xml)]
+    framing: Framing,
 }
 
-fn parse_framing(s: &str) -> FramingStrategy {
-    match s {
-        "length-prefixed" => FramingStrategy::LengthPrefixed { header_size: HeaderSize::Four },
-        "line" => FramingStrategy::LineDelimited,
-        _ => FramingStrategy::XmlStream,
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Framing {
+    Xml,
+    LengthPrefixed,
+    Line,
+}
+
+impl From<Framing> for FramingStrategy {
+    fn from(f: Framing) -> Self {
+        match f {
+            Framing::Xml => FramingStrategy::XmlStream,
+            Framing::LengthPrefixed => FramingStrategy::LengthPrefixed { header_size: HeaderSize::Four },
+            Framing::Line => FramingStrategy::LineDelimited,
+        }
     }
 }
 
@@ -63,9 +71,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     let tls_config = TlsConfig::from_pem(&cert_pem, &key_pem, &ca_pem)?;
     let listener = TlsListener::bind(&cli.bind, &tls_config).await?;
-    let framing = parse_framing(&cli.framing);
+    let framing = FramingStrategy::from(cli.framing);
 
-    tracing::info!(addr = %listener.local_addr()?, framing = %cli.framing, "listening");
+    tracing::info!(addr = %listener.local_addr()?, framing = ?cli.framing, "listening");
 
     let router = Arc::new(Router::new());
 
