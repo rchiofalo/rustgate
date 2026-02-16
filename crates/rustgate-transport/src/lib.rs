@@ -1,5 +1,6 @@
 //! TLS transport, session management, and message routing for rustgate.
 
+mod cache;
 mod codec;
 mod config;
 mod encoder;
@@ -8,6 +9,7 @@ mod listener;
 mod router;
 mod session;
 
+pub use cache::PositionCache;
 pub use codec::{FramedCodec, LengthPrefixedCodec, LineDelimitedCodec, XmlStreamCodec};
 pub use config::TlsConfig;
 pub use encoder::{CotEncoder, MessageEncoder, RawEncoder};
