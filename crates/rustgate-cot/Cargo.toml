@@ -12,3 +12,4 @@ workspace = true
 [dependencies]
 rustgate-core = { workspace = true }
 bytes = { workspace = true }
+quick-xml = { workspace = true }
