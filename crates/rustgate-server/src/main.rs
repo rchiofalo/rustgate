@@ -14,7 +14,8 @@ use rustgate_core::message::{Destination, Metadata, RoutableMessage};
 use rustgate_core::protocol::{FramingStrategy, HeaderSize};
 use rustgate_cot::{CotDestination, CotEvent};
 use rustgate_transport::{
-    AuthenticatedSession, FramedCodec, Router, SessionHandle, TlsConfig, TlsListener,
+    AuthenticatedSession, FramedCodec, MessageEncoder, RawEncoder, Router, SessionHandle,
+    TlsConfig, TlsListener,
 };
 
 #[derive(Parser)]
@@ -114,6 +115,7 @@ async fn handle_session(session: AuthenticatedSession, router: Arc<Router>, fram
     router.register(handle).await;
 
     let (reader, writer) = session.split();
+    let encoder = RawEncoder;
 
     tokio::select! {
         r = read_loop(reader, &identity, &router, &framing) => {
@@ -121,7 +123,7 @@ async fn handle_session(session: AuthenticatedSession, router: Arc<Router>, fram
                 tracing::debug!(cn = %cn, error = %e, "read error");
             }
         }
-        r = write_loop(writer, rx, &framing) => {
+        r = write_loop(writer, rx, &framing, &encoder) => {
             if let Err(e) = r {
                 tracing::debug!(cn = %cn, error = %e, "write error");
             }
@@ -159,11 +161,13 @@ async fn write_loop(
     writer: rustgate_transport::SessionWriter,
     mut rx: mpsc::Receiver<RoutableMessage>,
     framing: &FramingStrategy,
+    encoder: &impl MessageEncoder,
 ) -> std::io::Result<()> {
     let mut framed = FramedWrite::new(writer, FramedCodec::from_strategy(framing));
 
     while let Some(msg) = rx.recv().await {
-        framed.send(tokio_util::bytes::BytesMut::from(msg.payload.as_ref())).await?;
+        let encoded = encoder.encode(&msg)?;
+        framed.send(tokio_util::bytes::BytesMut::from(encoded.as_ref())).await?;
     }
 
     Ok(())
