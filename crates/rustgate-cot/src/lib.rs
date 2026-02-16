@@ -1,4 +1,10 @@
 //! Cursor on Target (CoT) XML parser.
+//!
+//! # Security
+//!
+//! This parser uses `quick-xml`, a streaming parser that does not resolve
+//! external entities or process DTD declarations. This design prevents
+//! XXE (XML External Entity) injection attacks by default.
 
 use std::time::Duration;
 

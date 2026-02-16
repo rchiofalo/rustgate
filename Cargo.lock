@@ -751,6 +751,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "futures",
+ "quick-xml",
  "rustgate-core",
  "rustgate-test-utils",
  "rustls",
