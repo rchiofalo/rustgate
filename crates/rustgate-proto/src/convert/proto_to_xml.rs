@@ -96,8 +96,11 @@ fn build_xml(cot: &tak_proto::CotEvent) -> Result<Vec<u8>, ProtoError> {
                 write_track(&mut xml, t);
             }
 
-            // Residual xmlDetail (raw XML fragment)
-            if !d.xml_detail.is_empty() {
+            // Residual xmlDetail (raw XML fragment per the TAK protobuf spec).
+            // Validate it's well-formed before embedding — a crafted protobuf
+            // message could contain closing tags (</detail>, </event>) that
+            // would break the enclosing document structure.
+            if !d.xml_detail.is_empty() && is_safe_xml_fragment(&d.xml_detail) {
                 xml.extend_from_slice(d.xml_detail.as_bytes());
             }
         }
@@ -191,4 +194,77 @@ fn write_track(xml: &mut Vec<u8>, t: &tak_proto::Track) {
     write_attr(xml, "speed", &t.speed.to_string());
     write_attr(xml, "course", &t.course.to_string());
     xml.extend_from_slice(b"/>");
+}
+
+/// Validate that an xmlDetail string is a well-formed XML fragment
+/// that won't break the enclosing `<detail>` element.
+///
+/// Wraps the fragment in a temporary root element and attempts to parse it
+/// with quick_xml. Rejects malformed XML and structural injection attempts
+/// (e.g., `</detail></event><evil/>`).
+fn is_safe_xml_fragment(fragment: &str) -> bool {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+
+    let wrapped = format!("<_r>{fragment}</_r>");
+    let mut reader = Reader::from_reader(wrapped.as_bytes());
+    reader.config_mut().trim_text(false);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Eof) => return true,
+            Err(_) => return false,
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_xml_fragment_valid() {
+        assert!(is_safe_xml_fragment("<marti><dest callsign=\"BRAVO\"/></marti>"));
+        assert!(is_safe_xml_fragment("<remarks>test note</remarks>"));
+        assert!(is_safe_xml_fragment("<custom attr=\"val\"/>"));
+        assert!(is_safe_xml_fragment(""));
+    }
+
+    #[test]
+    fn safe_xml_fragment_rejects_structural_injection() {
+        // Closing ancestor tags would corrupt the document
+        assert!(!is_safe_xml_fragment("</detail></event><evil/>"));
+        assert!(!is_safe_xml_fragment("</detail>"));
+        assert!(!is_safe_xml_fragment("<ok/></detail>"));
+    }
+
+    #[test]
+    fn safe_xml_fragment_rejects_malformed() {
+        assert!(!is_safe_xml_fragment("<unclosed>"));
+        assert!(!is_safe_xml_fragment("<a><b></a></b>"));
+    }
+
+    #[test]
+    fn xml_detail_injection_dropped_in_output() {
+        // Build a protobuf message with malicious xmlDetail
+        let cot = tak_proto::CotEvent {
+            uid: "ATTACKER".into(),
+            r#type: "a-f-G".into(),
+            detail: Some(tak_proto::Detail {
+                xml_detail: "</detail></event><injected/>".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let xml = build_xml(&cot).expect("build_xml");
+        let xml_str = std::str::from_utf8(&xml).expect("utf8");
+
+        // The injected content should NOT appear in the output
+        assert!(!xml_str.contains("<injected"), "injection should be dropped: {xml_str}");
+        // But the document should still be well-formed
+        assert!(xml_str.contains("</detail>"));
+        assert!(xml_str.contains("</event>"));
+    }
 }

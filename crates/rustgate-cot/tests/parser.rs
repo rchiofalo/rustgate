@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use std::time::Duration;
 
 use rustgate_core::message::MessageType;

@@ -63,10 +63,10 @@ Core transport and routing are functional. The server accepts mTLS connections, 
 - ISO 8601 ↔ millis timestamp conversion (hand-rolled, no chrono dep)
 - xmlDetail residual preservation for unknown detail elements
 - TAK protocol negotiation (server advertises protobuf, client opts in or stays XML)
+- NATS integration tests with embedded nats-server (publish/subscribe, echo prevention, JetStream replay, cross-instance delivery)
 
 **What's next:**
 - Real TAK client compatibility testing (ATAK/iTAK/WinTAK)
-- Integration testing with embedded NATS
 
 ## Building
 
@@ -149,7 +149,9 @@ Options:
 cargo test
 ```
 
-127 tests covering mTLS handshake, identity extraction, broadcast/group/direct routing, session lifecycle, codec edge cases, frame size limits, NATS wire format serialization, subject sanitization, group extraction, echo prevention, CSR signing round-trips, subject DN enforcement, Basic Auth validation, response formatting, XML/JSON enrollment responses, varint encode/decode, TAK frame codec round-trips, ISO 8601 timestamp conversion, full CoT XML parsing, XML↔protobuf bidirectional conversion with detail field preservation, and TAK protocol negotiation message builders/validators. Tests use ephemeral certificates generated at runtime — no fixture files.
+140 tests covering mTLS handshake, identity extraction, broadcast/group/direct routing, session lifecycle, codec edge cases, frame size limits, NATS wire format serialization, subject sanitization, group extraction, echo prevention, CSR signing round-trips, subject DN enforcement, Basic Auth validation, response formatting, XML/JSON enrollment responses, varint encode/decode, TAK frame codec round-trips, ISO 8601 timestamp conversion, full CoT XML parsing, XML↔protobuf bidirectional conversion with detail field preservation, and TAK protocol negotiation message builders/validators. Unit tests use ephemeral certificates generated at runtime — no fixture files.
+
+NATS integration tests (`cargo test -p rustgate-nats --test integration`) spin up a real `nats-server` subprocess with JetStream. Covers publish→subscribe round-trip, dual-layer echo prevention, cross-instance delivery, JetStream SA replay with LastPerSubject dedup, replay count limits, oversized payload rejection, group preservation, zero-position filtering, and wire format fidelity. Requires `nats-server` on PATH.
 
 ## License
 

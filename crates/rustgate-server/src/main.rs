@@ -5,9 +5,13 @@ use std::time::SystemTime;
 use bytes::Bytes;
 use clap::{Parser, ValueEnum};
 use futures::{SinkExt, StreamExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing_subscriber::EnvFilter;
+
+/// Maximum concurrent TLS sessions. Prevents resource exhaustion
+/// from connection floods (even with mTLS, the TLS handshake is costly).
+const MAX_CONNECTIONS: usize = 1024;
 
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, Metadata, RoutableMessage};
@@ -136,6 +140,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     tracing::info!(addr = %listener.local_addr()?, framing = ?cli.framing, encoding = ?encoding, "listening");
 
     let router = Arc::new(Router::new());
+    let connection_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
 
     // Optionally connect to NATS for cross-instance message delivery
     #[cfg(feature = "nats")]
@@ -237,10 +242,17 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok(session) => {
+                        let permit = match Arc::clone(&connection_limit).try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                tracing::warn!(max = MAX_CONNECTIONS, "connection limit reached, rejecting");
+                                continue;
+                            }
+                        };
                         let router = Arc::clone(&router);
                         #[allow(clippy::clone_on_copy)] // Type varies by feature flag
                         let publisher = nats_publisher.clone();
-                        drop(tokio::spawn(handle_session(session, router, framing, encoding, publisher)));
+                        drop(tokio::spawn(handle_session(session, router, framing, encoding, publisher, permit)));
                     }
                     Err(e) => tracing::warn!(error = %e, "accept error"),
                 }
@@ -262,6 +274,7 @@ async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
     framing: Framing,
     encoding: Encoding,
     nats_publisher: Option<P>,
+    _permit: OwnedSemaphorePermit, // Held for session lifetime; released on drop
 ) {
     let identity = session.identity_arc();
     let cn = identity.cn.clone();

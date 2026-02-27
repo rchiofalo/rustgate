@@ -48,15 +48,18 @@ impl Credentials {
 }
 
 /// Constant-time byte comparison to prevent timing side-channels on passwords.
+///
+/// Iterates over the caller-provided input (a) without early return,
+/// preventing attackers from learning the secret's length via timing.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
+    // Flag length mismatch without early return — an early return here
+    // would let an attacker determine the secret's length via timing.
+    let len_eq = a.len() == b.len();
     let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
+    for (i, &x) in a.iter().enumerate() {
+        diff |= x ^ b.get(i).copied().unwrap_or(0);
     }
-    diff == 0
+    len_eq && diff == 0
 }
 
 #[cfg(test)]

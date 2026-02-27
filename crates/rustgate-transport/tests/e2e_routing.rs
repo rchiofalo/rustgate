@@ -1,3 +1,4 @@
+#![allow(clippy::panic, clippy::unwrap_used)]
 //! End-to-end routing tests: mTLS clients through a real server stack,
 //! plus direct router tests for group/direct delivery.
 

@@ -10,6 +10,11 @@
 //! - Inbound: protobuf -> XML (before routing)
 //! - Outbound: XML -> protobuf (after routing)
 
+// Varint decoding casts u64 -> usize. On 32-bit platforms this truncation
+// could bypass frame size checks, so we require 64-bit.
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("rustgate-proto requires a 64-bit platform (varint decoding uses usize)");
+
 pub mod codec;
 pub mod convert;
 pub mod encoder;
