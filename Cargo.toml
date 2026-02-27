@@ -5,6 +5,7 @@ members = [
     "crates/rustgate-cot",
     "crates/rustgate-enrollment",
     "crates/rustgate-nats",
+    "crates/rustgate-proto",
     "crates/rustgate-transport",
     "crates/rustgate-server",
     "crates/rustgate-test-utils",
@@ -51,6 +52,7 @@ hyper-util = { version = "0.1", features = ["tokio", "http1"] }
 http-body-util = "0.1"
 base64 = "0.22"
 async-nats = "0.38"
+prost = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 time = { version = "0.3", features = ["formatting"] }
@@ -60,6 +62,7 @@ rustgate-core = { path = "crates/rustgate-core" }
 rustgate-cot = { path = "crates/rustgate-cot" }
 rustgate-enrollment = { path = "crates/rustgate-enrollment" }
 rustgate-nats = { path = "crates/rustgate-nats" }
+rustgate-proto = { path = "crates/rustgate-proto" }
 rustgate-transport = { path = "crates/rustgate-transport" }
 rustgate-test-utils = { path = "crates/rustgate-test-utils" }
 

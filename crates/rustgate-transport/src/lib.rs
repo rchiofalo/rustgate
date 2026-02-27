@@ -11,6 +11,8 @@ mod session;
 
 pub use cache::PositionCache;
 pub use codec::{FramedCodec, LengthPrefixedCodec, LineDelimitedCodec, XmlStreamCodec};
+#[cfg(feature = "proto")]
+pub use rustgate_proto::TakFrameCodec;
 pub use config::TlsConfig;
 pub use encoder::{CotEncoder, MessageEncoder, RawEncoder};
 pub use extract::extract_identity;

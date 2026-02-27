@@ -13,6 +13,8 @@ pub enum FramedCodec {
     LengthPrefixed(LengthPrefixedCodec),
     XmlStream(XmlStreamCodec),
     LineDelimited(LineDelimitedCodec),
+    #[cfg(feature = "proto")]
+    TakProtobuf(rustgate_proto::TakFrameCodec),
 }
 
 impl FramedCodec {
@@ -23,6 +25,16 @@ impl FramedCodec {
             }
             FramingStrategy::XmlStream => Self::XmlStream(XmlStreamCodec::new()),
             FramingStrategy::LineDelimited => Self::LineDelimited(LineDelimitedCodec::new()),
+            #[cfg(feature = "proto")]
+            FramingStrategy::TakProtobuf => {
+                Self::TakProtobuf(rustgate_proto::TakFrameCodec::new())
+            }
+            #[cfg(not(feature = "proto"))]
+            FramingStrategy::TakProtobuf => {
+                // TakProtobuf variant exists in core but requires the proto feature.
+                // Panic at construction time rather than silently misbehaving.
+                unimplemented!("TakProtobuf framing requires the `proto` feature")
+            }
         }
     }
 }
@@ -36,6 +48,8 @@ impl Decoder for FramedCodec {
             Self::LengthPrefixed(c) => c.decode(src),
             Self::XmlStream(c) => c.decode(src),
             Self::LineDelimited(c) => c.decode(src),
+            #[cfg(feature = "proto")]
+            Self::TakProtobuf(c) => c.decode(src),
         }
     }
 }
@@ -48,6 +62,8 @@ impl Encoder<BytesMut> for FramedCodec {
             Self::LengthPrefixed(c) => c.encode(item, dst),
             Self::XmlStream(c) => c.encode(item, dst),
             Self::LineDelimited(c) => c.encode(item, dst),
+            #[cfg(feature = "proto")]
+            Self::TakProtobuf(c) => c.encode(item, dst),
         }
     }
 }

@@ -74,12 +74,16 @@ enum Framing {
     Xml,
     LengthPrefixed,
     Line,
+    /// TAK protobuf binary framing (0xBF + varint length). Requires --features proto.
+    TakProtobuf,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Encoding {
     Raw,
     Cot,
+    /// TAK protobuf encoding (proto <-> XML at session edge). Requires --features proto.
+    TakProtobuf,
 }
 
 impl From<Framing> for FramingStrategy {
@@ -88,6 +92,7 @@ impl From<Framing> for FramingStrategy {
             Framing::Xml => FramingStrategy::XmlStream,
             Framing::LengthPrefixed => FramingStrategy::LengthPrefixed { header_size: HeaderSize::Four },
             Framing::Line => FramingStrategy::LineDelimited,
+            Framing::TakProtobuf => FramingStrategy::TakProtobuf,
         }
     }
 }
@@ -114,6 +119,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let listener = TlsListener::bind(&cli.bind, &tls_config).await?;
     let framing = FramingStrategy::from(cli.framing);
     let encoding = cli.encoding;
+
+    #[cfg(not(feature = "proto"))]
+    if matches!(cli.framing, Framing::TakProtobuf) || matches!(encoding, Encoding::TakProtobuf) {
+        anyhow::bail!("TAK protobuf support requires --features proto");
+    }
 
     tracing::info!(addr = %listener.local_addr()?, framing = ?cli.framing, encoding = ?encoding, "listening");
 
@@ -266,6 +276,15 @@ async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
         Encoding::Cot => {
             run_session_loops(reader, writer, rx, &identity, &router, &framing, &CotEncoder, &nats_publisher).await
         }
+        #[cfg(feature = "proto")]
+        Encoding::TakProtobuf => {
+            run_session_loops(reader, writer, rx, &identity, &router, &framing, &rustgate_proto::TakProtobufEncoder, &nats_publisher).await
+        }
+        #[cfg(not(feature = "proto"))]
+        Encoding::TakProtobuf => {
+            tracing::error!("--encoding tak-protobuf requires --features proto");
+            return;
+        }
     };
 
     if let Err(e) = result {
@@ -300,11 +319,31 @@ async fn read_loop(
     framing: &FramingStrategy,
     nats_publisher: &Option<impl NatsPublish>,
 ) -> std::io::Result<()> {
+    let is_proto = matches!(framing, FramingStrategy::TakProtobuf);
     let mut framed = FramedRead::new(reader, FramedCodec::from_strategy(framing));
 
     while let Some(result) = framed.next().await {
         let frame = result?;
-        let payload = frame.freeze();
+
+        // For protobuf sessions, convert proto -> XML to get the canonical format.
+        // The RoutableMessage payload is always XML.
+        let payload = if is_proto {
+            #[cfg(feature = "proto")]
+            {
+                let xml_bytes = rustgate_proto::proto_to_xml(&frame)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                Bytes::from(xml_bytes)
+            }
+            #[cfg(not(feature = "proto"))]
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "TakProtobuf framing requires the `proto` feature",
+                ));
+            }
+        } else {
+            frame.freeze()
+        };
 
         let msg = match rustgate_cot::parse(&payload) {
             Ok(cot) => build_cot_message(identity, payload, cot),
