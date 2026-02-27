@@ -722,6 +722,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustgate-enrollment"
+version = "0.1.0"
+dependencies = [
+ "rustgate-core",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rustgate-nats"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "rustgate-core",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rustgate-server"
 version = "0.1.0"
 dependencies = [

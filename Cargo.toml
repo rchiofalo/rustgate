@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "crates/rustgate-core",
     "crates/rustgate-cot",
+    "crates/rustgate-enrollment",
+    "crates/rustgate-nats",
     "crates/rustgate-transport",
     "crates/rustgate-server",
     "crates/rustgate-test-utils",
@@ -48,6 +50,8 @@ rcgen = "0.13"
 # Internal crates
 rustgate-core = { path = "crates/rustgate-core" }
 rustgate-cot = { path = "crates/rustgate-cot" }
+rustgate-enrollment = { path = "crates/rustgate-enrollment" }
+rustgate-nats = { path = "crates/rustgate-nats" }
 rustgate-transport = { path = "crates/rustgate-transport" }
 rustgate-test-utils = { path = "crates/rustgate-test-utils" }
 
