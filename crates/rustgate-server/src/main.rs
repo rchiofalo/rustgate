@@ -111,7 +111,9 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .json()
         .init();
 
@@ -539,8 +541,16 @@ fn build_cot_message(source: &Identity, payload: Bytes, cot: CotEvent) -> Routab
         }),
     };
 
+    // Enrich source identity with the __group from CoT detail if present.
+    // TLS certs don't carry TAK team info, so the CoT payload is the
+    // authoritative source for group membership (e.g., "Cyan", "Red").
+    let mut enriched_source = source.clone();
+    if let Some(group) = cot.source_group {
+        let _ = enriched_source.groups.insert(group);
+    }
+
     RoutableMessage {
-        source: source.clone(),
+        source: enriched_source,
         destination,
         payload,
         metadata: Metadata {
