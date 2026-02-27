@@ -636,6 +636,127 @@ async fn route_direct_to_self() {
     assert_eq!(got.payload.as_ref(), b"note-to-self");
 }
 
+/// Position messages are cached and replayed to newly connecting sessions.
+/// This provides the SA (situational awareness) picture on connect.
+#[tokio::test]
+async fn position_cache_replay() {
+    let router = Router::new();
+
+    let alice = Arc::new(make_identity("alice", &["team"]));
+    let bob = Arc::new(make_identity("bob", &["team"]));
+
+    let (alice_tx, _alice_rx) = mpsc::channel::<RoutableMessage>(16);
+    let alice_handle = SessionHandle::new(alice.clone(), alice_tx);
+    router.register(alice_handle.clone()).await;
+    router.replay_positions(&alice_handle).await;
+
+    // Alice sends a position message (broadcast)
+    let position_msg = RoutableMessage {
+        source: (*alice).clone(),
+        destination: Destination::Broadcast,
+        payload: Bytes::from("<event type='a-f-G'/>"),
+        metadata: Metadata {
+            received_at: SystemTime::now(),
+            source_protocol: "cot".into(),
+            message_type: MessageType::Position,
+            ttl: None,
+        },
+    };
+    router.route(position_msg).await;
+
+    // Verify it's cached
+    assert_eq!(router.cache().len().await, 1);
+
+    // Bob connects later
+    let (bob_tx, mut bob_rx) = mpsc::channel::<RoutableMessage>(16);
+    let bob_handle = SessionHandle::new(bob.clone(), bob_tx);
+    router.register(bob_handle.clone()).await;
+    router.replay_positions(&bob_handle).await;
+
+    // Bob should receive Alice's cached position
+    let got = bob_rx.try_recv().expect("bob should receive cached position");
+    assert_eq!(got.source.cn, "alice");
+    assert_eq!(got.metadata.message_type, MessageType::Position);
+}
+
+/// Non-position messages are not cached.
+#[tokio::test]
+async fn chat_messages_not_cached() {
+    let router = Router::new();
+
+    let alice = Arc::new(make_identity("alice", &["team"]));
+    let (alice_tx, _alice_rx) = mpsc::channel::<RoutableMessage>(16);
+    router.register(SessionHandle::new(alice.clone(), alice_tx)).await;
+
+    // Alice sends a chat message
+    let chat_msg = RoutableMessage {
+        source: (*alice).clone(),
+        destination: Destination::Broadcast,
+        payload: Bytes::from("hello"),
+        metadata: Metadata {
+            received_at: SystemTime::now(),
+            source_protocol: "cot".into(),
+            message_type: MessageType::Chat,
+            ttl: None,
+        },
+    };
+    router.route(chat_msg).await;
+
+    // Chat should not be cached
+    assert!(router.cache().is_empty().await);
+}
+
+/// Multiple positions from same CN — only latest is cached.
+#[tokio::test]
+async fn position_cache_replaces_old() {
+    let router = Router::new();
+
+    let alice = Arc::new(make_identity("alice", &["team"]));
+    let (alice_tx, _alice_rx) = mpsc::channel::<RoutableMessage>(16);
+    router.register(SessionHandle::new(alice.clone(), alice_tx)).await;
+
+    // Alice sends first position
+    let pos1 = RoutableMessage {
+        source: (*alice).clone(),
+        destination: Destination::Broadcast,
+        payload: Bytes::from("pos1"),
+        metadata: Metadata {
+            received_at: SystemTime::now(),
+            source_protocol: "cot".into(),
+            message_type: MessageType::Position,
+            ttl: None,
+        },
+    };
+    router.route(pos1).await;
+
+    // Alice sends second position
+    let pos2 = RoutableMessage {
+        source: (*alice).clone(),
+        destination: Destination::Broadcast,
+        payload: Bytes::from("pos2"),
+        metadata: Metadata {
+            received_at: SystemTime::now(),
+            source_protocol: "cot".into(),
+            message_type: MessageType::Position,
+            ttl: None,
+        },
+    };
+    router.route(pos2).await;
+
+    // Only one entry (latest)
+    assert_eq!(router.cache().len().await, 1);
+
+    // Bob connects and gets the latest position
+    let bob = Arc::new(make_identity("bob", &["team"]));
+    let (bob_tx, mut bob_rx) = mpsc::channel::<RoutableMessage>(16);
+    let bob_handle = SessionHandle::new(bob.clone(), bob_tx);
+    router.register(bob_handle.clone()).await;
+    router.replay_positions(&bob_handle).await;
+
+    let got = bob_rx.try_recv().expect("bob should receive cached position");
+    assert_eq!(got.payload.as_ref(), b"pos2");
+}
+
 // ── codec: header sizes and overflow ─────────────────────────────────────
 
 /// HeaderSize::One — encode and decode a frame within the 255-byte limit.

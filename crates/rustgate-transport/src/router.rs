@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, RwLock};
 
 use rustgate_core::identity::{GroupId, Identity};
-use rustgate_core::message::{Destination, RoutableMessage};
+use rustgate_core::message::{Destination, MessageType, RoutableMessage};
+
+use crate::cache::PositionCache;
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -54,11 +56,17 @@ impl State {
 #[derive(Debug, Default)]
 pub struct Router {
     state: RwLock<State>,
+    cache: PositionCache,
 }
 
 impl Router {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Access the position cache for SA replay.
+    pub fn cache(&self) -> &PositionCache {
+        &self.cache
     }
 
     pub async fn register(&self, handle: SessionHandle) {
@@ -93,6 +101,11 @@ impl Router {
     }
 
     pub async fn route(&self, msg: RoutableMessage) {
+        // Cache position reports for SA replay to new sessions
+        if msg.metadata.message_type == MessageType::Position {
+            self.cache.store(msg.clone()).await;
+        }
+
         match msg.destination {
             Destination::Direct(ref target) => {
                 let cn = target.cn.clone();
@@ -104,6 +117,13 @@ impl Router {
             Destination::Broadcast => {
                 self.send_to_all(&msg).await;
             }
+        }
+    }
+
+    /// Replay all cached positions to a newly connected session.
+    pub async fn replay_positions(&self, handle: &SessionHandle) {
+        for msg in self.cache.get_all().await {
+            let _ = handle.send(msg).await;
         }
     }
 

@@ -127,7 +127,8 @@ async fn handle_session(
     let (tx, rx) = mpsc::channel::<RoutableMessage>(64);
     let handle = SessionHandle::new(Arc::clone(&identity), tx);
     let session_id = handle.id;
-    router.register(handle).await;
+    router.register(handle.clone()).await;
+    router.replay_positions(&handle).await;
 
     let (reader, writer) = session.split();
 
