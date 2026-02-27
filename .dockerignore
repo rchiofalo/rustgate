@@ -1,0 +1,10 @@
+target/
+.git/
+*.crt
+*.key
+*.csr
+*.srl
+*.zip
+itak-package/
+itak-package2/
+docs-site/

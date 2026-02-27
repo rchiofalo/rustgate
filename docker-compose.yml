@@ -1,0 +1,51 @@
+services:
+  nats-server:
+    image: nats:2.11-alpine
+    command: >
+      --jetstream
+      --store_dir /data
+      --http_port 8222
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # Creates the JetStream stream required for SA replay.
+  # Exits after setup; restarts are harmless (stream already exists).
+  nats-setup:
+    image: natsio/nats-box:latest
+    depends_on:
+      nats-server:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["sh", "-c", "nats -s nats://nats-server:4222 stream add TRACKS_HISTORY --subjects 'TRACKS.HISTORY.>' --retention limits --max-msgs-per-subject 1 --storage memory --max-age 24h --discard old --defaults 2>/dev/null || true"]
+
+  rustgate:
+    build: .
+    # Or pull the pre-built image instead of building locally:
+    # image: ghcr.io/rchiofalo/rustgate:latest
+    container_name: rustgate
+    depends_on:
+      nats-server:
+        condition: service_healthy
+    ports:
+      - "4433:4433"
+    volumes:
+      - ./certs:/certs:ro
+    command:
+      - --cert=/certs/server.crt
+      - --key=/certs/server.key
+      - --ca=/certs/ca.crt
+      - --nats-url=nats://nats-server:4222
+      - --framing=xml
+    restart: unless-stopped
+
+volumes:
+  nats-data:
