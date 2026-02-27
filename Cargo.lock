@@ -1423,6 +1423,7 @@ dependencies = [
  "futures",
  "rustgate-core",
  "rustgate-cot",
+ "rustgate-proto",
  "rustgate-transport",
  "serde",
  "serde_json",

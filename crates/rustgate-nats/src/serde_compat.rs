@@ -63,6 +63,14 @@ pub struct WireDetail {
     pub status: Option<WireStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sensor: Option<WireSensor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<WireGroup>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub takv: Option<WireTakv>,
+    #[serde(default, rename = "precisionlocation", skip_serializing_if = "Option::is_none")]
+    pub precision_location: Option<WirePrecisionLocation>,
+    #[serde(default, rename = "xmlDetail", skip_serializing_if = "Option::is_none")]
+    pub xml_detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +147,34 @@ pub struct WireSensor {
     pub range: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireGroup {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub role: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireTakv {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub device: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub platform: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub os: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WirePrecisionLocation {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub geopointsrc: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub altsrc: String,
+}
+
 fn is_zero_f64(v: &f64) -> bool {
     *v == 0.0
 }
@@ -181,6 +217,77 @@ impl WireEvent {
                 le: 30.0,
             },
             detail: None,
+        }
+    }
+
+    /// Build a wire event from the full CoT parser output.
+    ///
+    /// Unlike `from_cot()`, this populates the detail section with track,
+    /// contact, status, group, takv, precision location, and residual XML.
+    #[cfg(feature = "full-detail")]
+    pub fn from_full_cot(cot: &rustgate_proto::xml_full::FullCotEvent) -> Self {
+        let detail = WireDetail {
+            track: cot.track.as_ref().map(|t| WireTrack {
+                course: t.course,
+                speed: t.speed,
+                track_valid: t.speed > 0.0 || t.course > 0.0,
+            }),
+            uid: None,
+            contact: cot.contact.as_ref().map(|c| WireContact {
+                callsign: if c.callsign.is_empty() { None } else { Some(c.callsign.clone()) },
+                endpoint: if c.endpoint.is_empty() { None } else { Some(c.endpoint.clone()) },
+            }),
+            remarks: None,
+            flow_tags: None,
+            status: cot.status.as_ref().map(|s| WireStatus {
+                battery: i32::try_from(s.battery).unwrap_or(i32::MAX),
+                readiness: String::new(),
+            }),
+            sensor: None,
+            group: cot.group.as_ref().map(|g| WireGroup {
+                name: g.name.clone(),
+                role: g.role.clone(),
+            }),
+            takv: cot.takv.as_ref().map(|t| WireTakv {
+                device: t.device.clone(),
+                platform: t.platform.clone(),
+                os: t.os.clone(),
+                version: t.version.clone(),
+            }),
+            precision_location: cot.precision_location.as_ref().map(|p| WirePrecisionLocation {
+                geopointsrc: p.geopointsrc.clone(),
+                altsrc: p.altsrc.clone(),
+            }),
+            xml_detail: if cot.xml_detail.is_empty() { None } else { Some(cot.xml_detail.clone()) },
+        };
+
+        let has_any = detail.track.is_some()
+            || detail.contact.is_some()
+            || detail.status.is_some()
+            || detail.group.is_some()
+            || detail.takv.is_some()
+            || detail.precision_location.is_some()
+            || detail.xml_detail.is_some();
+
+        Self {
+            version: "2.0".to_string(),
+            uid: cot.uid.clone(),
+            event_type: cot.event_type.clone(),
+            time: cot.time.clone(),
+            start: cot.start.clone(),
+            stale: cot.stale.clone(),
+            how: cot.how.clone(),
+            access: cot.access.clone(),
+            qos: cot.qos.clone(),
+            opex: cot.opex.clone(),
+            point: WirePoint {
+                lat: cot.lat,
+                lon: cot.lon,
+                hae: cot.hae,
+                ce: cot.ce,
+                le: cot.le,
+            },
+            detail: if has_any { Some(detail) } else { None },
         }
     }
 
@@ -281,6 +388,10 @@ mod tests {
                 flow_tags: None,
                 status: None,
                 sensor: None,
+                group: None,
+                takv: None,
+                precision_location: None,
+                xml_detail: None,
             }),
         };
 
@@ -373,5 +484,138 @@ mod tests {
         let ts = format_rfc3339(SystemTime::now());
         assert!(ts.ends_with('Z'), "timestamp should be UTC: {ts}");
         assert!(ts.contains('T'), "should have date/time separator: {ts}");
+    }
+
+    #[cfg(feature = "full-detail")]
+    mod full_detail_tests {
+        use super::*;
+        use rustgate_proto::xml_full::{
+            ContactDetail, FullCotEvent, GroupDetail, PrecisionLocationDetail,
+            StatusDetail, TakvDetail, TrackDetail,
+        };
+
+        #[test]
+        fn from_full_cot_populates_all_detail_fields() {
+            let full = FullCotEvent {
+                uid: "ALPHA-1".to_string(),
+                event_type: "a-f-G-U-C".to_string(),
+                how: "m-g".to_string(),
+                time: "2026-02-27T12:00:00Z".to_string(),
+                start: "2026-02-27T12:00:00Z".to_string(),
+                stale: "2026-02-27T12:05:00Z".to_string(),
+                lat: 37.7749,
+                lon: -122.4194,
+                hae: 10.5,
+                ce: 50.0,
+                le: 30.0,
+                contact: Some(ContactDetail {
+                    callsign: "ALPHA".to_string(),
+                    endpoint: "*:-1:stcp".to_string(),
+                }),
+                group: Some(GroupDetail {
+                    name: "Cyan".to_string(),
+                    role: "Team Lead".to_string(),
+                }),
+                status: Some(StatusDetail { battery: 85 }),
+                takv: Some(TakvDetail {
+                    device: "iPhone".to_string(),
+                    platform: "iTAK".to_string(),
+                    os: "iOS 18".to_string(),
+                    version: "2.12".to_string(),
+                }),
+                track: Some(TrackDetail {
+                    speed: 10.5,
+                    course: 90.0,
+                }),
+                precision_location: Some(PrecisionLocationDetail {
+                    geopointsrc: "GPS".to_string(),
+                    altsrc: "GPS".to_string(),
+                }),
+                ..Default::default()
+            };
+
+            let wire = WireEvent::from_full_cot(&full);
+
+            assert_eq!(wire.uid, "ALPHA-1");
+            assert_eq!(wire.event_type, "a-f-G-U-C");
+            assert!((wire.point.lat - 37.7749).abs() < f64::EPSILON);
+
+            let detail = wire.detail.expect("detail populated");
+
+            let track = detail.track.expect("track");
+            assert!((track.speed - 10.5).abs() < f64::EPSILON);
+            assert!((track.course - 90.0).abs() < f64::EPSILON);
+            assert!(track.track_valid);
+
+            let contact = detail.contact.expect("contact");
+            assert_eq!(contact.callsign.as_deref(), Some("ALPHA"));
+            assert_eq!(contact.endpoint.as_deref(), Some("*:-1:stcp"));
+
+            let group = detail.group.expect("group");
+            assert_eq!(group.name, "Cyan");
+            assert_eq!(group.role, "Team Lead");
+
+            let status = detail.status.expect("status");
+            assert_eq!(status.battery, 85);
+
+            let takv = detail.takv.expect("takv");
+            assert_eq!(takv.device, "iPhone");
+            assert_eq!(takv.platform, "iTAK");
+
+            let pl = detail.precision_location.expect("precision_location");
+            assert_eq!(pl.geopointsrc, "GPS");
+        }
+
+        #[test]
+        fn from_full_cot_round_trips_through_json() {
+            let full = FullCotEvent {
+                uid: "TEST-RT".to_string(),
+                event_type: "a-f-G-U-C".to_string(),
+                time: "2026-02-27T12:00:00Z".to_string(),
+                start: "2026-02-27T12:00:00Z".to_string(),
+                stale: "2026-02-27T12:05:00Z".to_string(),
+                lat: 37.0,
+                lon: -122.0,
+                hae: 0.0,
+                ce: 50.0,
+                le: 30.0,
+                contact: Some(ContactDetail {
+                    callsign: "BRAVO".to_string(),
+                    endpoint: String::new(),
+                }),
+                group: Some(GroupDetail {
+                    name: "Red".to_string(),
+                    role: "Team Member".to_string(),
+                }),
+                xml_detail: "<marti><dest callsign=\"CHARLIE\"/></marti>".to_string(),
+                ..Default::default()
+            };
+
+            let wire = WireEvent::from_full_cot(&full);
+            let json = serde_json::to_string(&wire).expect("serialize");
+            let parsed: WireEvent = serde_json::from_str(&json).expect("deserialize");
+
+            assert_eq!(parsed.uid, "TEST-RT");
+            let detail = parsed.detail.expect("detail");
+            assert_eq!(detail.group.as_ref().expect("group").name, "Red");
+            assert_eq!(
+                detail.xml_detail.as_deref(),
+                Some("<marti><dest callsign=\"CHARLIE\"/></marti>")
+            );
+        }
+
+        #[test]
+        fn from_full_cot_no_detail_when_empty() {
+            let full = FullCotEvent {
+                uid: "MINIMAL".to_string(),
+                event_type: "a-f-G".to_string(),
+                lat: 37.0,
+                lon: -122.0,
+                ..Default::default()
+            };
+
+            let wire = WireEvent::from_full_cot(&full);
+            assert!(wire.detail.is_none());
+        }
     }
 }

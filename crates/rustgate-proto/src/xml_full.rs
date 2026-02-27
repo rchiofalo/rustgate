@@ -81,6 +81,10 @@ pub struct TrackDetail {
     pub course: f64,
 }
 
+/// Maximum bytes for residual xmlDetail to prevent unbounded memory growth
+/// from crafted input. 64 KiB is generous for legitimate CoT detail sections.
+const MAX_XML_DETAIL_BYTES: usize = 64 * 1024;
+
 /// Parse CoT XML into a [`FullCotEvent`] with all protobuf-mappable fields.
 pub fn parse_full(xml: &[u8]) -> Result<FullCotEvent, ProtoError> {
     let mut reader = Reader::from_reader(xml);
@@ -90,6 +94,7 @@ pub fn parse_full(xml: &[u8]) -> Result<FullCotEvent, ProtoError> {
     let mut buf = Vec::new();
     let mut in_detail = false;
     let mut xml_detail_buf = Vec::<u8>::new();
+    let mut xml_detail_truncated = false;
 
     loop {
         buf.clear();
@@ -103,8 +108,16 @@ pub fn parse_full(xml: &[u8]) -> Result<FullCotEvent, ProtoError> {
                 tag if in_detail => {
                     if is_known_detail(tag) {
                         parse_known_start(tag, e, &mut reader, &mut event)?;
-                    } else {
+                    } else if !xml_detail_truncated {
                         capture_unknown_start(e, &mut reader, &mut xml_detail_buf)?;
+                        if xml_detail_buf.len() > MAX_XML_DETAIL_BYTES {
+                            xml_detail_buf.truncate(MAX_XML_DETAIL_BYTES);
+                            xml_detail_truncated = true;
+                        }
+                    } else {
+                        // Over budget — skip the element entirely
+                        let mut skip_buf = Vec::new();
+                        let _ = reader.read_to_end_into(e.to_end().name(), &mut skip_buf)?;
                     }
                 }
                 _ => {}
@@ -116,8 +129,12 @@ pub fn parse_full(xml: &[u8]) -> Result<FullCotEvent, ProtoError> {
                 tag if in_detail => {
                     if is_known_detail(tag) {
                         parse_known_empty(tag, e, &mut event);
-                    } else {
+                    } else if !xml_detail_truncated {
                         capture_unknown_empty(e, &mut xml_detail_buf);
+                        if xml_detail_buf.len() > MAX_XML_DETAIL_BYTES {
+                            xml_detail_buf.truncate(MAX_XML_DETAIL_BYTES);
+                            xml_detail_truncated = true;
+                        }
                     }
                 }
                 _ => {}

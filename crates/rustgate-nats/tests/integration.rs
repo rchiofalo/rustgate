@@ -480,11 +480,14 @@ async fn oversized_payload_dropped() {
     sub_task.abort();
 }
 
-/// Verify that non-position messages are not published to NATS.
+/// Verify that non-position messages are not published to NATS (without full-detail).
 ///
 /// Uses valid CoT XML (parseable with uid + point) so the ONLY reason the
 /// publisher drops this is the MessageType::Chat check, not a parse failure.
 /// Raw NATS subscription verifies nothing was emitted.
+///
+/// With `full-detail`, all CoT types are published, so this test is skipped.
+#[cfg(not(feature = "full-detail"))]
 #[tokio::test]
 async fn non_position_messages_filtered() {
     if !require_nats_server() {
@@ -533,6 +536,66 @@ async fn non_position_messages_filtered() {
     // Nothing should appear on NATS — publisher drops non-Position messages
     let result = timeout(Duration::from_millis(500), raw_sub.next()).await;
     assert!(result.is_err(), "chat messages should not be published to NATS");
+}
+
+/// Verify that non-position messages ARE published to NATS with full-detail.
+///
+/// The full-detail feature enables publishing all CoT types (chat, shapes, etc.)
+/// using the full XML parser for richer wire events.
+#[cfg(feature = "full-detail")]
+#[tokio::test]
+async fn non_position_messages_published() {
+    if !require_nats_server() {
+        return;
+    }
+    let server = NatsTestServer::start().await;
+
+    let config = test_config(&server.url(), "full-detail-pub");
+    let adapter = NatsAdapter::connect(config).await.expect("connect");
+
+    let raw_client = async_nats::connect(&server.url()).await.expect("raw connect");
+    let mut raw_sub = raw_client.subscribe("points.>").await.expect("subscribe");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let chat_xml = Bytes::from(
+        "<event version=\"2.0\" uid=\"chat-msg-1\" type=\"b-t-f\" \
+         time=\"2026-01-01T00:00:00Z\" start=\"2026-01-01T00:00:00Z\" \
+         stale=\"2026-01-01T00:05:00Z\" how=\"h-e\">\
+         <point lat=\"37.0\" lon=\"-122.0\" hae=\"0\" ce=\"50\" le=\"30\"/>\
+         <detail><remarks>hello world</remarks></detail></event>",
+    );
+
+    let mut groups = BTreeSet::new();
+    let _ = groups.insert("Cyan".to_string());
+    let chat_msg = RoutableMessage {
+        source: Identity {
+            cn: "chatter".to_string(),
+            fingerprint: String::new(),
+            groups,
+        },
+        destination: Destination::Broadcast,
+        payload: chat_xml,
+        metadata: Metadata {
+            received_at: SystemTime::now(),
+            source_protocol: "tak".to_string(),
+            message_type: MessageType::Chat,
+            ttl: None,
+        },
+    };
+
+    adapter.publisher().publish(&chat_msg).await;
+
+    let result = timeout(Duration::from_secs(3), raw_sub.next()).await;
+    assert!(result.is_ok(), "chat messages should be published with full-detail");
+
+    let nats_msg = result.expect("result").expect("msg");
+    let wire: WireEvent = serde_json::from_slice(&nats_msg.payload).expect("valid JSON");
+    assert_eq!(wire.uid, "chat-msg-1");
+    assert_eq!(wire.event_type, "b-t-f");
+    // With full-detail, xml_detail should contain the remarks
+    let detail = wire.detail.expect("detail should be populated");
+    assert!(detail.xml_detail.is_some(), "xml_detail should contain remarks");
 }
 
 /// Verify that 0,0 position (unknown per CoT spec) is filtered by the publisher.
