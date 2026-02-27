@@ -33,7 +33,7 @@ rustgate is a lightweight alternative that handles mTLS client connections, rout
 
 **rustgate-enrollment** — Optional HTTPS enrollment server for TAK client certificate self-provisioning. Implements the Marti v2 certificate signing protocol: clients authenticate with HTTP Basic Auth, submit a PKCS#10 CSR, and receive a signed client certificate + CA cert in JSON or XML. Server-only TLS (no client cert required). Subject DN is enforced from the authenticated username to prevent impersonation. Feature-gated behind `--features enrollment`.
 
-**rustgate-proto** — Optional TAK protocol buffer translation. Bidirectional conversion between CoT XML and TAK protobuf (prost), with the `TakFrameCodec` for TAK binary framing (0xBF + varint length). Known `<detail>` children (`<contact>`, `<__group>`, `<precisionlocation>`, `<status>`, `<takv>`, `<track>`) map to typed protobuf fields; everything else roundtrips through the `xmlDetail` residual. Translation happens at session edges — XML stays canonical inside the router. Feature-gated behind `--features proto`. Requires `protoc` at build time.
+**rustgate-proto** — Optional TAK protocol buffer translation. Bidirectional conversion between CoT XML and TAK protobuf (prost), with the `TakFrameCodec` for TAK binary framing (0xBF + varint length). Known `<detail>` children (`<contact>`, `<__group>`, `<precisionlocation>`, `<status>`, `<takv>`, `<track>`) map to typed protobuf fields; everything else roundtrips through the `xmlDetail` residual. Translation happens at session edges — XML stays canonical inside the router. Includes TAK protocol negotiation: server advertises `t-x-takp-v`, client can upgrade to protobuf with a TakControl handshake, or stay XML for legacy compatibility. Feature-gated behind `--features proto`. Requires `protoc` at build time.
 
 **rustgate-server** — Binary entry point. Accepts mTLS connections, spawns per-session read/write tasks, routes all traffic through the shared `Router`. Optionally bridges to NATS when `--nats-url` is provided. Optionally runs enrollment when `--enrollment-bind` is set.
 
@@ -62,9 +62,9 @@ Core transport and routing are functional. The server accepts mTLS connections, 
 - Full CoT XML parser with typed detail field extraction
 - ISO 8601 ↔ millis timestamp conversion (hand-rolled, no chrono dep)
 - xmlDetail residual preservation for unknown detail elements
+- TAK protocol negotiation (server advertises protobuf, client opts in or stays XML)
 
 **What's next:**
-- TAK protocol negotiation (auto-detect XML vs protobuf sessions)
 - Real TAK client compatibility testing (ATAK/iTAK/WinTAK)
 - Integration testing with embedded NATS
 
@@ -122,6 +122,12 @@ rustgate --cert server.pem --key server-key.pem --ca ca.pem \
     --framing tak-protobuf --encoding tak-protobuf
 ```
 
+With TAK protocol negotiation (recommended for real TAK clients, requires `--features proto`):
+```
+rustgate --cert server.pem --key server-key.pem --ca ca.pem \
+    --framing tak-negotiate
+```
+
 Options:
 - `--bind` — Listen address (default: `0.0.0.0:4433`)
 - `--cert` — Server certificate PEM
@@ -134,7 +140,7 @@ Options:
 - `--enrollment-user` — Enrollment Basic Auth username
 - `--enrollment-password` — Enrollment Basic Auth password
 - `--ca-organization` — Organization name for issued certs (default: `rustgate`)
-- `--framing` — Wire framing: `xml`, `length-prefixed`, `line`, `tak-protobuf`
+- `--framing` — Wire framing: `xml`, `length-prefixed`, `line`, `tak-protobuf`, `tak-negotiate`
 - `--encoding` — Payload encoding: `raw`, `cot`, `tak-protobuf`
 
 ## Testing
@@ -143,7 +149,7 @@ Options:
 cargo test
 ```
 
-118 tests covering mTLS handshake, identity extraction, broadcast/group/direct routing, session lifecycle, codec edge cases, frame size limits, NATS wire format serialization, subject sanitization, group extraction, echo prevention, CSR signing round-trips, subject DN enforcement, Basic Auth validation, response formatting, XML/JSON enrollment responses, varint encode/decode, TAK frame codec round-trips, ISO 8601 timestamp conversion, full CoT XML parsing, and XML↔protobuf bidirectional conversion with detail field preservation. Tests use ephemeral certificates generated at runtime — no fixture files.
+127 tests covering mTLS handshake, identity extraction, broadcast/group/direct routing, session lifecycle, codec edge cases, frame size limits, NATS wire format serialization, subject sanitization, group extraction, echo prevention, CSR signing round-trips, subject DN enforcement, Basic Auth validation, response formatting, XML/JSON enrollment responses, varint encode/decode, TAK frame codec round-trips, ISO 8601 timestamp conversion, full CoT XML parsing, XML↔protobuf bidirectional conversion with detail field preservation, and TAK protocol negotiation message builders/validators. Tests use ephemeral certificates generated at runtime — no fixture files.
 
 ## License
 

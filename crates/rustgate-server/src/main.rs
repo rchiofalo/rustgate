@@ -76,6 +76,9 @@ enum Framing {
     Line,
     /// TAK protobuf binary framing (0xBF + varint length). Requires --features proto.
     TakProtobuf,
+    /// TAK protocol negotiation: starts XML, upgrades to protobuf if the client requests it.
+    /// This is the mode real TAK clients expect. Requires --features proto.
+    TakNegotiate,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -93,6 +96,9 @@ impl From<Framing> for FramingStrategy {
             Framing::LengthPrefixed => FramingStrategy::LengthPrefixed { header_size: HeaderSize::Four },
             Framing::Line => FramingStrategy::LineDelimited,
             Framing::TakProtobuf => FramingStrategy::TakProtobuf,
+            // TakNegotiate starts as XML; negotiation determines the actual framing.
+            // This mapping is used as the initial framing before negotiation runs.
+            Framing::TakNegotiate => FramingStrategy::XmlStream,
         }
     }
 }
@@ -117,11 +123,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     let tls_config = TlsConfig::from_pem(&cert_pem, &key_pem, &ca_pem)?;
     let listener = TlsListener::bind(&cli.bind, &tls_config).await?;
-    let framing = FramingStrategy::from(cli.framing);
+    let framing = cli.framing;
     let encoding = cli.encoding;
 
     #[cfg(not(feature = "proto"))]
-    if matches!(cli.framing, Framing::TakProtobuf) || matches!(encoding, Encoding::TakProtobuf) {
+    if matches!(cli.framing, Framing::TakProtobuf | Framing::TakNegotiate)
+        || matches!(encoding, Encoding::TakProtobuf)
+    {
         anyhow::bail!("TAK protobuf support requires --features proto");
     }
 
@@ -230,7 +238,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 match accept_result {
                     Ok(session) => {
                         let router = Arc::clone(&router);
-                        let framing = framing.clone();
                         #[allow(clippy::clone_on_copy)] // Type varies by feature flag
                         let publisher = nats_publisher.clone();
                         drop(tokio::spawn(handle_session(session, router, framing, encoding, publisher)));
@@ -252,7 +259,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
     session: AuthenticatedSession,
     router: Arc<Router>,
-    framing: FramingStrategy,
+    framing: Framing,
     encoding: Encoding,
     nats_publisher: Option<P>,
 ) {
@@ -267,18 +274,40 @@ async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
     router.register(handle.clone()).await;
     router.replay_positions(&handle).await;
 
-    let (reader, writer) = session.split();
+    #[allow(unused_mut)] // Mutable borrows needed for proto negotiation
+    let (mut reader, mut writer) = session.split();
 
-    let result = match encoding {
+    // Run protocol negotiation for TakNegotiate mode.
+    // This may upgrade both framing and encoding from XML to protobuf.
+    let (final_framing, final_encoding, read_buf) = match framing {
+        #[cfg(feature = "proto")]
+        Framing::TakNegotiate => {
+            match negotiate_tak_protocol(&mut reader, &mut writer, &cn).await {
+                Ok(result) => result,
+                Err(e) => {
+                    tracing::debug!(cn = %cn, error = %e, "negotiation failed");
+                    router.unregister(&cn, session_id).await;
+                    tracing::info!(cn = %cn, "disconnected");
+                    return;
+                }
+            }
+        }
+        _ => {
+            let fs = FramingStrategy::from(framing);
+            (fs, encoding, tokio_util::bytes::BytesMut::new())
+        }
+    };
+
+    let result = match final_encoding {
         Encoding::Raw => {
-            run_session_loops(reader, writer, rx, &identity, &router, &framing, &RawEncoder, &nats_publisher).await
+            run_session_loops(reader, writer, rx, &identity, &router, &final_framing, &RawEncoder, &nats_publisher, read_buf).await
         }
         Encoding::Cot => {
-            run_session_loops(reader, writer, rx, &identity, &router, &framing, &CotEncoder, &nats_publisher).await
+            run_session_loops(reader, writer, rx, &identity, &router, &final_framing, &CotEncoder, &nats_publisher, read_buf).await
         }
         #[cfg(feature = "proto")]
         Encoding::TakProtobuf => {
-            run_session_loops(reader, writer, rx, &identity, &router, &framing, &rustgate_proto::TakProtobufEncoder, &nats_publisher).await
+            run_session_loops(reader, writer, rx, &identity, &router, &final_framing, &rustgate_proto::TakProtobufEncoder, &nats_publisher, read_buf).await
         }
         #[cfg(not(feature = "proto"))]
         Encoding::TakProtobuf => {
@@ -295,6 +324,66 @@ async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
     tracing::info!(cn = %cn, "disconnected");
 }
 
+/// TAK protocol negotiation handshake.
+///
+/// Sends TakProtocolSupport advertisement, then peeks the first byte of the
+/// client's response. If 0xBF (protobuf magic), completes the handshake and
+/// upgrades to protobuf. Otherwise, stays XML.
+///
+/// Returns (final_framing, final_encoding, buffered_read_bytes).
+#[cfg(feature = "proto")]
+async fn negotiate_tak_protocol(
+    reader: &mut rustgate_transport::SessionReader,
+    writer: &mut rustgate_transport::SessionWriter,
+    cn: &str,
+) -> std::io::Result<(FramingStrategy, Encoding, tokio_util::bytes::BytesMut)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::bytes::BufMut;
+
+    let server_uid = format!("rustgate-{cn}");
+
+    // Step 1: Send TakProtocolSupport XML advertisement
+    let advert = rustgate_proto::build_protocol_support_xml(&server_uid);
+    writer.write_all(&advert).await?;
+    writer.flush().await?;
+
+    tracing::debug!(cn = %cn, "sent TakProtocolSupport advertisement");
+
+    // Step 2: Peek the first byte to determine if client wants protobuf
+    let mut peek = [0u8; 1];
+    let n = reader.read(&mut peek).await?;
+    if n == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "client disconnected during negotiation",
+        ));
+    }
+
+    if peek[0] == 0xBF {
+        // Client is requesting protobuf upgrade.
+        // Magic byte already consumed; read_tak_request handles varint + payload + validation.
+        rustgate_proto::read_tak_request(reader).await?;
+
+        tracing::info!(cn = %cn, "client requested protobuf upgrade");
+
+        // Step 3: Send TakResponse (0xBF-framed TakControl acknowledgement)
+        let response = rustgate_proto::build_tak_response();
+        writer.write_all(&response).await?;
+        writer.flush().await?;
+
+        tracing::info!(cn = %cn, "protobuf negotiation complete");
+
+        Ok((FramingStrategy::TakProtobuf, Encoding::TakProtobuf, tokio_util::bytes::BytesMut::new()))
+    } else {
+        // Client sent XML (legacy mode). Preserve the byte we already read.
+        tracing::info!(cn = %cn, "client staying XML (no protobuf request)");
+
+        let mut buf = tokio_util::bytes::BytesMut::with_capacity(64);
+        buf.put_u8(peek[0]);
+        Ok((FramingStrategy::XmlStream, Encoding::Cot, buf))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_session_loops(
     reader: rustgate_transport::SessionReader,
@@ -305,9 +394,10 @@ async fn run_session_loops(
     framing: &FramingStrategy,
     encoder: &impl MessageEncoder,
     nats_publisher: &Option<impl NatsPublish>,
+    read_buf: tokio_util::bytes::BytesMut,
 ) -> std::io::Result<()> {
     tokio::select! {
-        r = read_loop(reader, identity, router, framing, nats_publisher) => r,
+        r = read_loop(reader, identity, router, framing, nats_publisher, read_buf) => r,
         r = write_loop(writer, rx, framing, encoder) => r,
     }
 }
@@ -318,9 +408,18 @@ async fn read_loop(
     router: &Router,
     framing: &FramingStrategy,
     nats_publisher: &Option<impl NatsPublish>,
+    prefix: tokio_util::bytes::BytesMut,
 ) -> std::io::Result<()> {
     let is_proto = matches!(framing, FramingStrategy::TakProtobuf);
-    let mut framed = FramedRead::new(reader, FramedCodec::from_strategy(framing));
+    let codec = FramedCodec::from_strategy(framing);
+
+    // When negotiation consumed a peek byte and fell back to XML,
+    // we need to feed that byte to the codec before reading from the socket.
+    let mut framed = if prefix.is_empty() {
+        FramedRead::new(PrefixedReader::new(reader, None), codec)
+    } else {
+        FramedRead::new(PrefixedReader::new(reader, Some(prefix)), codec)
+    };
 
     while let Some(result) = framed.next().await {
         let frame = result?;
@@ -375,6 +474,45 @@ async fn write_loop(
     }
 
     Ok(())
+}
+
+/// AsyncRead wrapper that yields prefix bytes before delegating to the inner reader.
+///
+/// Used after protocol negotiation to feed the peeked byte back to the codec
+/// when the client stays in XML mode.
+struct PrefixedReader<R> {
+    inner: R,
+    prefix: Vec<u8>,
+    prefix_pos: usize,
+}
+
+impl<R> PrefixedReader<R> {
+    fn new(inner: R, prefix: Option<tokio_util::bytes::BytesMut>) -> Self {
+        let prefix = prefix.map_or_else(Vec::new, |b| b.to_vec());
+        Self {
+            inner,
+            prefix,
+            prefix_pos: 0,
+        }
+    }
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for PrefixedReader<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        // Drain prefix bytes first
+        if self.prefix_pos < self.prefix.len() {
+            let remaining = &self.prefix[self.prefix_pos..];
+            let to_copy = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..to_copy]);
+            self.prefix_pos += to_copy;
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
 }
 
 fn build_cot_message(source: &Identity, payload: Bytes, cot: CotEvent) -> RoutableMessage {

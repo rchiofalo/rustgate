@@ -17,7 +17,7 @@ use tokio_util::bytes::{Buf, BufMut, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
 /// TAK protocol magic byte marking the start of a protobuf frame.
-const MAGIC_BYTE: u8 = 0xBF;
+pub(crate) const MAGIC_BYTE: u8 = 0xBF;
 
 /// Maximum allowed frame size (16 MB, matches rustgate-transport codecs).
 const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
@@ -129,7 +129,7 @@ impl Encoder<BytesMut> for TakFrameCodec {
 /// Decode a protobuf-style varint from the buffer.
 ///
 /// Returns `(value, bytes_consumed)` or `None` if the varint is incomplete.
-fn decode_varint(buf: &[u8]) -> Option<(usize, usize)> {
+pub(crate) fn decode_varint(buf: &[u8]) -> Option<(usize, usize)> {
     let mut result: u64 = 0;
     let mut shift = 0;
     for (i, &byte) in buf.iter().enumerate().take(MAX_VARINT_BYTES) {
