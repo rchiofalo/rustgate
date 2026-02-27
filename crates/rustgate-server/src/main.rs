@@ -46,6 +46,27 @@ struct Cli {
     /// Path to NATS credentials file for JWT/NKey auth.
     #[arg(long)]
     nats_credentials: Option<String>,
+
+    /// Bind address for the enrollment HTTPS server (e.g. 0.0.0.0:8446).
+    /// Requires --features enrollment.
+    #[arg(long)]
+    enrollment_bind: Option<String>,
+
+    /// Path to the CA private key PEM file (used to sign client CSRs).
+    #[arg(long)]
+    ca_key: Option<String>,
+
+    /// Username for enrollment HTTP Basic Auth.
+    #[arg(long)]
+    enrollment_user: Option<String>,
+
+    /// Password for enrollment HTTP Basic Auth.
+    #[arg(long)]
+    enrollment_password: Option<String>,
+
+    /// Organization name for issued client certificates.
+    #[arg(long, default_value = "rustgate")]
+    ca_organization: String,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -143,6 +164,55 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         None
     };
+
+    // Optionally start the enrollment HTTPS server for client certificate provisioning
+    #[cfg(feature = "enrollment")]
+    if let Some(ref enrollment_bind) = cli.enrollment_bind {
+        let ca_key_path = cli.ca_key.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("--ca-key is required when --enrollment-bind is set")
+        })?;
+        let enrollment_user = cli.enrollment_user.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("--enrollment-user is required when --enrollment-bind is set")
+        })?;
+        let enrollment_password = cli.enrollment_password.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("--enrollment-password is required when --enrollment-bind is set")
+        })?;
+
+        let ca_key_pem = tokio::fs::read_to_string(ca_key_path).await?;
+
+        let signer = rustgate_enrollment::CsrSigner::from_pem(
+            &ca_pem,
+            &ca_key_pem,
+            &cli.ca_organization,
+        )?;
+        let credentials = rustgate_enrollment::Credentials::new(
+            enrollment_user.to_string(),
+            enrollment_password.to_string(),
+        );
+        let enrollment_server = rustgate_enrollment::EnrollmentServer::new(signer, credentials);
+
+        let bind_addr: std::net::SocketAddr = enrollment_bind.parse()
+            .map_err(|e| anyhow::anyhow!("invalid --enrollment-bind address: {e}"))?;
+
+        let enrollment_cert = cert_pem.clone();
+        let enrollment_key = key_pem.clone();
+
+        drop(tokio::spawn(async move {
+            if let Err(e) = enrollment_server
+                .run(bind_addr, &enrollment_cert, &enrollment_key)
+                .await
+            {
+                tracing::error!(error = %e, "enrollment server failed");
+            }
+        }));
+
+        tracing::info!(addr = %enrollment_bind, "enrollment server started");
+    }
+
+    #[cfg(not(feature = "enrollment"))]
+    if cli.enrollment_bind.is_some() {
+        tracing::warn!("--enrollment-bind requires --features enrollment; ignoring");
+    }
 
     loop {
         tokio::select! {

@@ -5,6 +5,13 @@
 //! certificate. Implements the Marti-compatible certificate signing flow
 //! so TAK clients can self-provision without manual `.p12` distribution.
 
-mod signing;
+pub mod auth;
+pub mod error;
+pub mod response;
+pub mod server;
+pub mod signing;
 
+pub use auth::Credentials;
+pub use error::EnrollmentError;
+pub use server::EnrollmentServer;
 pub use signing::CsrSigner;
