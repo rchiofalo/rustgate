@@ -1426,6 +1426,7 @@ dependencies = [
  "rustgate-transport",
  "serde",
  "serde_json",
+ "tempfile",
  "time",
  "tokio",
  "tracing",
@@ -1441,6 +1442,7 @@ dependencies = [
  "quick-xml",
  "rustgate-core",
  "thiserror 2.0.18",
+ "tokio",
  "tokio-util",
 ]
 

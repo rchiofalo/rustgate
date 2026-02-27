@@ -1,0 +1,703 @@
+//! Integration tests for the NATS adapter.
+//!
+//! These tests spin up a real `nats-server` subprocess (with JetStream enabled)
+//! and exercise the full publish → subscribe → route pipeline. Each test gets
+//! its own server on a random port for isolation.
+//!
+//! Requires `nats-server` on PATH. Tests are skipped (not failed) if the
+//! binary isn't available.
+
+#![allow(clippy::panic, clippy::unwrap_used)]
+
+use std::collections::BTreeSet;
+use std::net::TcpListener;
+use std::process::{Child, Command};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+use bytes::Bytes;
+use rustgate_core::identity::Identity;
+use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
+use futures::StreamExt;
+use rustgate_nats::{NatsAdapter, NatsConfig, WireEvent};
+use rustgate_transport::Router;
+use tokio::sync::mpsc;
+use tokio::time::timeout;
+
+// ── Test harness ──────────────────────────────────────────────────────────
+
+/// Manages a `nats-server` subprocess with JetStream enabled.
+struct NatsTestServer {
+    child: Child,
+    port: u16,
+    _store_dir: tempfile::TempDir,
+}
+
+impl NatsTestServer {
+    /// Start a nats-server on a random free port with JetStream.
+    async fn start() -> Self {
+        let port = free_port();
+        let store_dir = tempfile::tempdir().expect("tmpdir");
+
+        let child = Command::new("nats-server")
+            .args([
+                "--port",
+                &port.to_string(),
+                "--jetstream",
+                "--store_dir",
+                store_dir.path().to_str().expect("path"),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to start nats-server (is it on PATH?)");
+
+        // Wait for the server to accept connections
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if tokio::time::Instant::now() > deadline {
+                panic!("nats-server failed to start within 5 seconds on port {port}");
+            }
+            match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                Ok(_) => break,
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+
+        Self {
+            child,
+            port,
+            _store_dir: store_dir,
+        }
+    }
+
+    fn url(&self) -> String {
+        format!("nats://127.0.0.1:{}", self.port)
+    }
+}
+
+impl Drop for NatsTestServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Find a free TCP port by binding to :0 and reading the assigned port.
+fn free_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.local_addr().expect("addr").port()
+}
+
+/// Check if nats-server is available. Skip tests gracefully if not.
+fn require_nats_server() -> bool {
+    Command::new("nats-server")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
+}
+
+/// Build a config pointing at the test server with a unique instance ID.
+fn test_config(url: &str, instance_id: &str) -> NatsConfig {
+    NatsConfig {
+        url: url.to_string(),
+        instance_id: instance_id.to_string(),
+        ..Default::default()
+    }
+}
+
+/// Build a valid CoT XML position message.
+fn cot_position_xml(uid: &str, lat: f64, lon: f64) -> Bytes {
+    Bytes::from(format!(
+        "<event version=\"2.0\" uid=\"{uid}\" type=\"a-f-G-U-C\" \
+         time=\"2026-01-01T00:00:00Z\" start=\"2026-01-01T00:00:00Z\" \
+         stale=\"2026-01-01T00:05:00Z\" how=\"m-g\">\
+         <point lat=\"{lat}\" lon=\"{lon}\" hae=\"0\" ce=\"50\" le=\"30\"/>\
+         <detail/></event>"
+    ))
+}
+
+/// Build a RoutableMessage from CoT XML with the given identity.
+fn position_message(uid: &str, group: &str, lat: f64, lon: f64) -> RoutableMessage {
+    let mut groups = BTreeSet::new();
+    let _ = groups.insert(group.to_string());
+
+    RoutableMessage {
+        source: Identity {
+            cn: uid.to_string(),
+            fingerprint: String::new(),
+            groups,
+        },
+        destination: Destination::Broadcast,
+        payload: cot_position_xml(uid, lat, lon),
+        metadata: Metadata {
+            received_at: SystemTime::now(),
+            source_protocol: "tak".to_string(),
+            message_type: MessageType::Position,
+            ttl: None,
+        },
+    }
+}
+
+/// Register a dummy session on the router and return the receiver.
+async fn register_session(
+    router: &Router,
+    cn: &str,
+    group: &str,
+) -> mpsc::Receiver<RoutableMessage> {
+    let (tx, rx) = mpsc::channel(64);
+    let mut groups = BTreeSet::new();
+    let _ = groups.insert(group.to_string());
+    let identity = Arc::new(Identity {
+        cn: cn.to_string(),
+        fingerprint: String::new(),
+        groups,
+    });
+    let handle = rustgate_transport::SessionHandle::new(identity, tx);
+    router.register(handle).await;
+    rx
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────
+
+/// Connect to NATS and verify the adapter initializes without error.
+#[tokio::test]
+async fn connect_and_disconnect() {
+    if !require_nats_server() {
+        return;
+    }
+    let server = NatsTestServer::start().await;
+    let config = test_config(&server.url(), "test-connect");
+    let _adapter = NatsAdapter::connect(config)
+        .await
+        .expect("should connect");
+}
+
+/// Publish a position message and verify the subscriber delivers it
+/// to a locally registered session via the Router.
+#[tokio::test]
+async fn publish_subscribe_round_trip() {
+    if !require_nats_server() {
+        return;
+    }
+    let server = NatsTestServer::start().await;
+
+    // Two adapters simulating two rustgate instances
+    let config_a = test_config(&server.url(), "instance-A");
+    let config_b = test_config(&server.url(), "instance-B");
+
+    let adapter_a = NatsAdapter::connect(config_a).await.expect("connect A");
+    let adapter_b = NatsAdapter::connect(config_b).await.expect("connect B");
+
+    // Instance B subscribes and routes to a local session
+    let router_b = Arc::new(Router::new());
+    let mut rx = register_session(&router_b, "local-client", "Cyan").await;
+
+    let subscriber = adapter_b.subscriber();
+    let sub_router = Arc::clone(&router_b);
+    let sub_task = tokio::spawn(async move {
+        let _ = subscriber.run(sub_router).await;
+    });
+
+    // Give the subscriber time to connect to NATS
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Instance A publishes a position
+    let msg = position_message("track-1", "Cyan", 37.7749, -122.4194);
+    adapter_a.publisher().publish(&msg).await;
+
+    // Instance B's local session should receive the message
+    let received = timeout(Duration::from_secs(3), rx.recv())
+        .await
+        .expect("timeout waiting for message")
+        .expect("channel closed");
+
+    assert_eq!(received.source.cn, "track-1");
+    assert_eq!(received.metadata.source_protocol, "nats");
+    assert!(received.source.groups.contains("Cyan"));
+
+    sub_task.abort();
+}
+
+/// Verify that a publisher does NOT re-publish messages originating from NATS
+/// (source_protocol == "nats"), preventing infinite loops.
+///
+/// Uses a raw NATS subscription to observe the wire directly — bypasses the
+/// rustgate subscriber so only the publisher's source_protocol guard is tested.
+#[tokio::test]
+async fn echo_prevention_source_protocol() {
+    if !require_nats_server() {
+        return;
+    }
+    let server = NatsTestServer::start().await;
+
+    let config = test_config(&server.url(), "echo-proto-test");
+    let adapter = NatsAdapter::connect(config).await.expect("connect");
+
+    // Raw NATS subscription — no rustgate subscriber, no instance header filtering
+    let raw_client = async_nats::connect(&server.url()).await.expect("raw connect");
+    let mut raw_sub = raw_client.subscribe("points.>").await.expect("subscribe");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Build a message that looks like it came FROM NATS (should be dropped by publisher)
+    let mut msg = position_message("track-echo", "Cyan", 37.0, -122.0);
+    msg.metadata.source_protocol = "nats".to_string();
+
+    adapter.publisher().publish(&msg).await;
+
+    // Nothing should appear on the NATS subject — publisher should have dropped it
+    let result = timeout(Duration::from_millis(500), raw_sub.next()).await;
+    assert!(result.is_err(), "publisher should not emit nats-sourced messages to NATS");
+}
+
+/// Verify that a subscriber ignores messages published by its own instance
+/// (X-Rustgate-Instance header echo prevention).
+#[tokio::test]
+async fn echo_prevention_instance_header() {
+    if !require_nats_server() {
+        return;
+    }
+    let server = NatsTestServer::start().await;
+
+    // Same instance ID for both publisher and subscriber
+    let config = test_config(&server.url(), "same-instance");
+    let adapter = NatsAdapter::connect(config).await.expect("connect");
+
+    let router = Arc::new(Router::new());
+    let mut rx = register_session(&router, "listener", "Cyan").await;
+
+    let subscriber = adapter.subscriber();
+    let sub_router = Arc::clone(&router);
+    let sub_task = tokio::spawn(async move {
+        let _ = subscriber.run(sub_router).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Publish from the same instance — subscriber should drop it
+    let msg = position_message("track-self", "Cyan", 37.0, -122.0);
+    adapter.publisher().publish(&msg).await;
+
+    let result = timeout(Duration::from_millis(500), rx.recv()).await;
+    assert!(result.is_err(), "subscriber should ignore own instance messages");
+
+    sub_task.abort();
+}
+
+/// Verify that messages published to NATS are NOT delivered back to the same
+/// instance, but ARE delivered to a different instance.
+#[tokio::test]
+async fn cross_instance_delivery() {
+    if !require_nats_server() {
+        return;
+    }
+    let server = NatsTestServer::start().await;
+
+    let config_a = test_config(&server.url(), "cross-A");
+    let config_b = test_config(&server.url(), "cross-B");
+
+    let adapter_a = NatsAdapter::connect(config_a).await.expect("connect A");
+    let adapter_b = NatsAdapter::connect(config_b).await.expect("connect B");
+
+    // Both instances have local sessions
+    let router_a = Arc::new(Router::new());
+    let router_b = Arc::new(Router::new());
+
+    let mut rx_a = register_session(&router_a, "client-A", "Cyan").await;
+    let mut rx_b = register_session(&router_b, "client-B", "Cyan").await;
+
+    // Subscribe on both instances
+    let sub_a = adapter_a.subscriber();
+    let sub_b = adapter_b.subscriber();
+
+    let router_a_clone = Arc::clone(&router_a);
+    let router_b_clone = Arc::clone(&router_b);
+
+    let task_a = tokio::spawn(async move { let _ = sub_a.run(router_a_clone).await; });
+    let task_b = tokio::spawn(async move { let _ = sub_b.run(router_b_clone).await; });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Instance A publishes
+    let msg = position_message("track-cross", "Cyan", 38.0, -121.0);
+    adapter_a.publisher().publish(&msg).await;
+
+    // Instance B should receive it
+    let received = timeout(Duration::from_secs(3), rx_b.recv())
+        .await
+        .expect("B should receive within timeout")
+        .expect("B channel closed");
+    assert_eq!(received.source.cn, "track-cross");
+
+    // Instance A should NOT receive its own message back
+    let self_echo = timeout(Duration::from_millis(500), rx_a.recv()).await;
+    assert!(self_echo.is_err(), "A should not receive its own message");
+
+    task_a.abort();
+    task_b.abort();
+}
+
+/// Publish positions, then verify JetStream replay populates the router cache.
+#[tokio::test]
+async fn jetstream_replay() {
+    if !require_nats_server() {
+        return;
+    }
+    let server = NatsTestServer::start().await;
+
+    let config = test_config(&server.url(), "replay-publisher");
+    let adapter = NatsAdapter::connect(config).await.expect("connect");
+
+    // Create the JetStream stream that the replay consumer expects
+    let js = async_nats::jetstream::new(
+        async_nats::connect(&server.url()).await.expect("raw connect"),
+    );
+    let _ = js
+        .create_stream(async_nats::jetstream::stream::Config {
+            name: "TRACKS_HISTORY".to_string(),
+            subjects: vec!["TRACKS.HISTORY.>".to_string()],
+            max_messages_per_subject: 1,
+            ..Default::default()
+        })
+        .await
+        .expect("create stream");
+
+    // Publish 3 distinct tracks
+    for i in 0..3 {
+        let msg = position_message(
+            &format!("track-{i}"),
+            "Cyan",
+            37.0 + i as f64 * 0.01,
+            -122.0,
+        );
+        adapter.publisher().publish(&msg).await;
+    }
+
+    // Small delay for NATS to persist
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // New adapter (different instance) replays from JetStream
+    let replay_config = test_config(&server.url(), "replay-consumer");
+    let replay_adapter = NatsAdapter::connect(replay_config).await.expect("connect replay");
+
+    let router = Arc::new(Router::new());
+    let count = replay_adapter
+        .jetstream_replay()
+        .replay(Arc::clone(&router))
+        .await
+        .expect("replay");
+
+    assert_eq!(count, 3, "should replay 3 tracks");
+    assert_eq!(router.cache().len().await, 3);
+}
+
+/// Verify that publishing the same UID twice results in only the latest
+/// position being replayed from JetStream (LastPerSubject policy).
+#[tokio::test]
+async fn jetstream_replay_latest_per_subject() {
+    if !require_nats_server() {
+        return;
+    }
+    let server = NatsTestServer::start().await;
+
+    let config = test_config(&server.url(), "replay-latest-pub");
+    let adapter = NatsAdapter::connect(config).await.expect("connect");
+
+    let js = async_nats::jetstream::new(
+        async_nats::connect(&server.url()).await.expect("raw connect"),
+    );
+    let _ = js
+        .create_stream(async_nats::jetstream::stream::Config {
+            name: "TRACKS_HISTORY".to_string(),
+            subjects: vec!["TRACKS.HISTORY.>".to_string()],
+            max_messages_per_subject: 1,
+            ..Default::default()
+        })
+        .await
+        .expect("create stream");
+
+    // Publish same UID twice with different positions
+    let msg1 = position_message("track-update", "Cyan", 37.0, -122.0);
+    adapter.publisher().publish(&msg1).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let msg2 = position_message("track-update", "Cyan", 38.0, -121.0);
+    adapter.publisher().publish(&msg2).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Replay should give us exactly 1 message (the latest)
+    let replay_config = test_config(&server.url(), "replay-latest-con");
+    let replay_adapter = NatsAdapter::connect(replay_config).await.expect("connect");
+
+    let router = Arc::new(Router::new());
+    let count = replay_adapter
+        .jetstream_replay()
+        .replay(Arc::clone(&router))
+        .await
+        .expect("replay");
+
+    assert_eq!(count, 1, "should replay only latest per subject");
+}
+
+/// Verify that the subscriber drops messages exceeding max_payload_bytes.
+#[tokio::test]
+async fn oversized_payload_dropped() {
+    if !require_nats_server() {
+        return;
+    }
+    let server = NatsTestServer::start().await;
+
+    // Publisher with default config (no size limit on publish side)
+    let pub_config = test_config(&server.url(), "oversize-pub");
+    let pub_adapter = NatsAdapter::connect(pub_config).await.expect("connect pub");
+
+    // Subscriber with tiny max payload
+    let mut sub_config = test_config(&server.url(), "oversize-sub");
+    sub_config.max_payload_bytes = 10; // Very small limit
+
+    let sub_adapter = NatsAdapter::connect(sub_config).await.expect("connect sub");
+
+    let router = Arc::new(Router::new());
+    let mut rx = register_session(&router, "listener", "Cyan").await;
+
+    let subscriber = sub_adapter.subscriber();
+    let sub_router = Arc::clone(&router);
+    let sub_task = tokio::spawn(async move { let _ = subscriber.run(sub_router).await; });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Publish a normal position (its JSON payload will exceed 10 bytes)
+    let msg = position_message("track-big", "Cyan", 37.0, -122.0);
+    pub_adapter.publisher().publish(&msg).await;
+
+    // Should NOT be delivered due to payload size limit
+    let result = timeout(Duration::from_millis(500), rx.recv()).await;
+    assert!(result.is_err(), "oversized message should be dropped by subscriber");
+
+    sub_task.abort();
+}
+
+/// Verify that non-position messages are not published to NATS.
+///
+/// Uses valid CoT XML (parseable with uid + point) so the ONLY reason the
+/// publisher drops this is the MessageType::Chat check, not a parse failure.
+/// Raw NATS subscription verifies nothing was emitted.
+#[tokio::test]
+async fn non_position_messages_filtered() {
+    if !require_nats_server() {
+        return;
+    }
+    let server = NatsTestServer::start().await;
+
+    let config = test_config(&server.url(), "filter-pub");
+    let adapter = NatsAdapter::connect(config).await.expect("connect");
+
+    // Raw subscription — observe the wire directly
+    let raw_client = async_nats::connect(&server.url()).await.expect("raw connect");
+    let mut raw_sub = raw_client.subscribe("points.>").await.expect("subscribe");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Valid CoT XML that would parse successfully — the ONLY guard is MessageType
+    let chat_xml = Bytes::from(
+        "<event version=\"2.0\" uid=\"chat-msg-1\" type=\"b-t-f\" \
+         time=\"2026-01-01T00:00:00Z\" start=\"2026-01-01T00:00:00Z\" \
+         stale=\"2026-01-01T00:05:00Z\" how=\"h-e\">\
+         <point lat=\"37.0\" lon=\"-122.0\" hae=\"0\" ce=\"50\" le=\"30\"/>\
+         <detail/></event>",
+    );
+
+    let mut groups = BTreeSet::new();
+    let _ = groups.insert("Cyan".to_string());
+    let chat_msg = RoutableMessage {
+        source: Identity {
+            cn: "chatter".to_string(),
+            fingerprint: String::new(),
+            groups,
+        },
+        destination: Destination::Broadcast,
+        payload: chat_xml,
+        metadata: Metadata {
+            received_at: SystemTime::now(),
+            source_protocol: "tak".to_string(),
+            message_type: MessageType::Chat,
+            ttl: None,
+        },
+    };
+
+    adapter.publisher().publish(&chat_msg).await;
+
+    // Nothing should appear on NATS — publisher drops non-Position messages
+    let result = timeout(Duration::from_millis(500), raw_sub.next()).await;
+    assert!(result.is_err(), "chat messages should not be published to NATS");
+}
+
+/// Verify that 0,0 position (unknown per CoT spec) is filtered by the publisher.
+///
+/// Raw NATS subscription verifies nothing was emitted — bypasses the subscriber's
+/// own is_position_unknown() check so only the publisher's guard is tested.
+#[tokio::test]
+async fn zero_position_filtered() {
+    if !require_nats_server() {
+        return;
+    }
+    let server = NatsTestServer::start().await;
+
+    let config = test_config(&server.url(), "zero-pub");
+    let adapter = NatsAdapter::connect(config).await.expect("connect");
+
+    // Raw subscription — observe the wire directly
+    let raw_client = async_nats::connect(&server.url()).await.expect("raw connect");
+    let mut raw_sub = raw_client.subscribe("points.>").await.expect("subscribe");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Position at 0,0 (unknown per CoT spec)
+    let msg = position_message("track-zero", "Cyan", 0.0, 0.0);
+    adapter.publisher().publish(&msg).await;
+
+    // Nothing should appear on NATS — publisher drops 0,0 positions
+    let result = timeout(Duration::from_millis(500), raw_sub.next()).await;
+    assert!(result.is_err(), "0,0 position should not be published to NATS");
+}
+
+/// Verify group extraction from NATS subject — publisher encodes group
+/// in the subject and subscriber extracts it for the RoutableMessage.
+#[tokio::test]
+async fn group_preserved_through_nats() {
+    if !require_nats_server() {
+        return;
+    }
+    let server = NatsTestServer::start().await;
+
+    let config_a = test_config(&server.url(), "group-pub");
+    let config_b = test_config(&server.url(), "group-sub");
+
+    let adapter_a = NatsAdapter::connect(config_a).await.expect("connect A");
+    let adapter_b = NatsAdapter::connect(config_b).await.expect("connect B");
+
+    let router = Arc::new(Router::new());
+    let mut rx = register_session(&router, "listener", "Alpha").await;
+
+    let subscriber = adapter_b.subscriber();
+    let sub_router = Arc::clone(&router);
+    let sub_task = tokio::spawn(async move { let _ = subscriber.run(sub_router).await; });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Publish with group "Alpha"
+    let msg = position_message("track-alpha", "Alpha", 38.5, -121.5);
+    adapter_a.publisher().publish(&msg).await;
+
+    let received = timeout(Duration::from_secs(3), rx.recv())
+        .await
+        .expect("timeout")
+        .expect("channel closed");
+
+    assert!(
+        received.source.groups.contains("Alpha"),
+        "group should be preserved: got {:?}",
+        received.source.groups
+    );
+
+    sub_task.abort();
+}
+
+/// Verify that max_replay_count limits the number of replayed messages.
+#[tokio::test]
+async fn jetstream_replay_count_limit() {
+    if !require_nats_server() {
+        return;
+    }
+    let server = NatsTestServer::start().await;
+
+    let config = test_config(&server.url(), "limit-pub");
+    let adapter = NatsAdapter::connect(config).await.expect("connect");
+
+    let js = async_nats::jetstream::new(
+        async_nats::connect(&server.url()).await.expect("raw connect"),
+    );
+    let _ = js
+        .create_stream(async_nats::jetstream::stream::Config {
+            name: "TRACKS_HISTORY".to_string(),
+            subjects: vec!["TRACKS.HISTORY.>".to_string()],
+            max_messages_per_subject: 1,
+            ..Default::default()
+        })
+        .await
+        .expect("create stream");
+
+    // Publish 5 tracks
+    for i in 0..5 {
+        let msg = position_message(
+            &format!("track-limit-{i}"),
+            "Cyan",
+            37.0 + i as f64 * 0.01,
+            -122.0,
+        );
+        adapter.publisher().publish(&msg).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Replay with max_replay_count = 2
+    let mut replay_config = test_config(&server.url(), "limit-con");
+    replay_config.max_replay_count = 2;
+
+    let replay_adapter = NatsAdapter::connect(replay_config).await.expect("connect");
+    let router = Arc::new(Router::new());
+
+    let count = replay_adapter
+        .jetstream_replay()
+        .replay(Arc::clone(&router))
+        .await
+        .expect("replay");
+
+    assert_eq!(count, 2, "replay should stop at max_replay_count");
+    assert_eq!(router.cache().len().await, 2);
+}
+
+/// Wire format round-trip: verify WireEvent serialization/deserialization
+/// through actual NATS publish/subscribe produces valid data.
+#[tokio::test]
+async fn wire_format_fidelity() {
+    if !require_nats_server() {
+        return;
+    }
+    let server = NatsTestServer::start().await;
+
+    let config_a = test_config(&server.url(), "wire-pub");
+    let config_b = test_config(&server.url(), "wire-sub");
+
+    let adapter_a = NatsAdapter::connect(config_a).await.expect("connect A");
+    let adapter_b = NatsAdapter::connect(config_b).await.expect("connect B");
+
+    let router = Arc::new(Router::new());
+    let mut rx = register_session(&router, "listener", "Cyan").await;
+
+    let subscriber = adapter_b.subscriber();
+    let sub_router = Arc::clone(&router);
+    let sub_task = tokio::spawn(async move { let _ = subscriber.run(sub_router).await; });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let msg = position_message("track-wire", "Cyan", 51.5074, -0.1278);
+    adapter_a.publisher().publish(&msg).await;
+
+    let received = timeout(Duration::from_secs(3), rx.recv())
+        .await
+        .expect("timeout")
+        .expect("channel closed");
+
+    // The payload should be valid JSON containing the original coordinates
+    let wire: WireEvent =
+        serde_json::from_slice(&received.payload).expect("payload should be valid JSON");
+    assert_eq!(wire.uid, "track-wire");
+    assert!((wire.point.lat - 51.5074).abs() < 0.001);
+    assert!((wire.point.lon - (-0.1278)).abs() < 0.001);
+    assert_eq!(wire.event_type, "a-f-G-U-C");
+
+    sub_task.abort();
+}

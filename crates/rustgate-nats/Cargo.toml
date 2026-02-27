@@ -22,4 +22,5 @@ tokio = { workspace = true, features = ["sync", "rt", "time"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
+tempfile = "3"
