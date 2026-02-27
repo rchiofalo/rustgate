@@ -134,6 +134,49 @@ mod tests {
         assert!(restored.xml_detail.contains("BRAVO"));
     }
 
+    /// Shape detail elements survive XML → protobuf → XML round-trip via xmlDetail.
+    #[test]
+    fn round_trip_preserves_shape_xml_detail() {
+        let xml = br#"<event uid="SHAPE-1" type="u-d-r" how="h-e" time="2021-01-01T00:00:00.000Z" start="2021-01-01T00:00:00.000Z" stale="2021-01-01T00:05:00.000Z">
+            <point lat="37.0" lon="-122.0" hae="0.0" ce="50.0" le="30.0"/>
+            <detail>
+                <shape><polyline closed="true"><vertex lat="37.0" lon="-122.0" hae="0.0"/><vertex lat="37.1" lon="-122.1" hae="0.0"/></polyline></shape>
+                <strokeColor value="-65536"/>
+                <fillColor value="536870912"/>
+            </detail>
+        </event>"#;
+        let proto_bytes = xml_to_proto(xml).expect("encode");
+        let xml_back = proto_to_xml(&proto_bytes).expect("decode");
+        let restored = crate::xml_full::parse_full(&xml_back).expect("parse");
+
+        assert!(restored.xml_detail.contains("shape"));
+        assert!(restored.xml_detail.contains("polyline"));
+        assert!(restored.xml_detail.contains("vertex"));
+        assert!(restored.xml_detail.contains("strokeColor"));
+        assert!(restored.xml_detail.contains("fillColor"));
+    }
+
+    /// GeoChat detail elements survive XML → protobuf → XML round-trip via xmlDetail.
+    #[test]
+    fn round_trip_preserves_chat_xml_detail() {
+        let xml = br#"<event uid="GeoChat.A.B.1" type="b-t-f" how="h-g-i-g-o" time="2021-01-01T00:00:00.000Z" start="2021-01-01T00:00:00.000Z" stale="2021-01-01T00:05:00.000Z">
+            <point lat="37.0" lon="-122.0" hae="0.0" ce="50.0" le="30.0"/>
+            <detail>
+                <__chat chatroom="B" senderCallsign="A"><chatgrp uid0="A" uid1="B"/></__chat>
+                <remarks source="BAO.F.ATAK.A" to="B">hello world</remarks>
+            </detail>
+        </event>"#;
+        let proto_bytes = xml_to_proto(xml).expect("encode");
+        let xml_back = proto_to_xml(&proto_bytes).expect("decode");
+        let restored = crate::xml_full::parse_full(&xml_back).expect("parse");
+
+        assert!(restored.xml_detail.contains("__chat"));
+        assert!(restored.xml_detail.contains("chatgrp"));
+        assert!(restored.xml_detail.contains("senderCallsign"));
+        assert!(restored.xml_detail.contains("remarks"));
+        assert!(restored.xml_detail.contains("hello world"));
+    }
+
     #[test]
     fn round_trip_minimal_event() {
         let xml = br#"<event uid="MINIMAL" type="a-f-G"/>"#;
