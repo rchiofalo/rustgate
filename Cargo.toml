@@ -3,6 +3,9 @@ resolver = "2"
 members = [
     "crates/rustgate-core",
     "crates/rustgate-cot",
+    "crates/rustgate-enrollment",
+    "crates/rustgate-nats",
+    "crates/rustgate-proto",
     "crates/rustgate-transport",
     "crates/rustgate-server",
     "crates/rustgate-test-utils",
@@ -29,8 +32,8 @@ unused_async = "warn"
 [workspace.dependencies]
 tokio = { version = "1", default-features = false }
 tokio-util = { version = "0.7", features = ["codec"] }
-tokio-rustls = "0.26"
-rustls = "0.23"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rustls-pemfile = "2"
 rustls-pki-types = "1"
 x509-parser = "0.17"
@@ -43,11 +46,23 @@ futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 clap = { version = "4", features = ["derive"] }
-rcgen = "0.13"
+rcgen = { version = "0.13", features = ["x509-parser"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "http1"] }
+http-body-util = "0.1"
+base64 = "0.22"
+async-nats = "0.38"
+prost = "0.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+time = { version = "0.3", features = ["formatting"] }
 
 # Internal crates
 rustgate-core = { path = "crates/rustgate-core" }
 rustgate-cot = { path = "crates/rustgate-cot" }
+rustgate-enrollment = { path = "crates/rustgate-enrollment" }
+rustgate-nats = { path = "crates/rustgate-nats" }
+rustgate-proto = { path = "crates/rustgate-proto" }
 rustgate-transport = { path = "crates/rustgate-transport" }
 rustgate-test-utils = { path = "crates/rustgate-test-utils" }
 

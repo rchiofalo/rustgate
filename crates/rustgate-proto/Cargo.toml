@@ -1,0 +1,21 @@
+[package]
+name = "rustgate-proto"
+description = "TAK protocol buffer translation layer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rustgate-core = { workspace = true }
+bytes = { workspace = true }
+quick-xml = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util"] }
+tokio-util = { workspace = true }
+prost = { workspace = true }
+
+[build-dependencies]
+prost-build = "0.13"

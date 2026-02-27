@@ -1,0 +1,33 @@
+[package]
+name = "rustgate-enrollment"
+description = "Certificate enrollment endpoint for TAK client self-provisioning"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rustgate-core = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rustls-pki-types = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt", "io-util", "sync"] }
+tokio-rustls = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+base64 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+rustgate-test-utils = { workspace = true }
+x509-parser = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

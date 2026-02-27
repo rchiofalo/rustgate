@@ -1,0 +1,8 @@
+syntax = "proto3";
+package atakmap.commoncommo.protobuf.v1;
+
+message TakControl {
+    string minProtoVersion = 1;
+    string maxProtoVersion = 2;
+    string contactUid = 3;
+}

@@ -1,0 +1,26 @@
+[package]
+name = "rustgate-nats"
+description = "NATS adapter for stateless TAK termination and cross-instance message delivery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rustgate-core = { workspace = true }
+rustgate-cot = { workspace = true }
+rustgate-transport = { workspace = true }
+async-nats = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true, features = ["sync", "rt", "time"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
+tempfile = "3"

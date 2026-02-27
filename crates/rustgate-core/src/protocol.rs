@@ -7,6 +7,8 @@ pub enum FramingStrategy {
     XmlStream,
     /// Newline-delimited messages.
     LineDelimited,
+    /// TAK protobuf: 0xBF magic + varint length + protobuf payload.
+    TakProtobuf,
 }
 
 /// Valid header sizes for length-prefixed framing.
