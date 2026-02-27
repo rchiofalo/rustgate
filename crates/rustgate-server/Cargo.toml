@@ -12,10 +12,14 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+nats = ["dep:rustgate-nats"]
+
 [dependencies]
 rustgate-core = { workspace = true }
 rustgate-cot = { workspace = true }
 rustgate-transport = { workspace = true }
+rustgate-nats = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "signal", "fs", "macros"] }
 tokio-util = { workspace = true }
 bytes = { workspace = true }

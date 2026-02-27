@@ -10,6 +10,16 @@ workspace = true
 
 [dependencies]
 rustgate-core = { workspace = true }
+rustgate-cot = { workspace = true }
+rustgate-transport = { workspace = true }
+async-nats = { workspace = true }
 bytes = { workspace = true }
-tokio = { workspace = true, features = ["sync", "rt"] }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true, features = ["sync", "rt", "time"] }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

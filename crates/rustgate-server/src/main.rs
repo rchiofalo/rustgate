@@ -38,6 +38,14 @@ struct Cli {
 
     #[arg(long, value_enum, default_value_t = Encoding::Raw)]
     encoding: Encoding,
+
+    /// NATS server URL (enables NATS bridge when set). Requires --features nats.
+    #[arg(long)]
+    nats_url: Option<String>,
+
+    /// Path to NATS credentials file for JWT/NKey auth.
+    #[arg(long)]
+    nats_credentials: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -90,6 +98,52 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     let router = Arc::new(Router::new());
 
+    // Optionally connect to NATS for cross-instance message delivery
+    #[cfg(feature = "nats")]
+    let nats_publisher = if let Some(ref nats_url) = cli.nats_url {
+        let config = rustgate_nats::NatsConfig {
+            url: nats_url.clone(),
+            credentials_file: cli.nats_credentials.clone(),
+            ..Default::default()
+        };
+
+        match rustgate_nats::NatsAdapter::connect(config).await {
+            Ok(adapter) => {
+                // Run JetStream replay to populate position cache before accepting clients
+                let replay = adapter.jetstream_replay();
+                match replay.replay(Arc::clone(&router)).await {
+                    Ok(count) => tracing::info!(count, "JetStream SA replay loaded"),
+                    Err(e) => tracing::warn!(error = %e, "JetStream replay failed (continuing without history)"),
+                }
+
+                // Spawn NATS subscriber as a background task
+                let subscriber = adapter.subscriber();
+                let sub_router = Arc::clone(&router);
+                drop(tokio::spawn(async move {
+                    if let Err(e) = subscriber.run(sub_router).await {
+                        tracing::warn!(error = %e, "NATS subscriber ended with error");
+                    }
+                }));
+
+                Some(adapter.publisher())
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to connect to NATS (continuing without bridge)");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    #[cfg(not(feature = "nats"))]
+    let nats_publisher: Option<()> = {
+        if cli.nats_url.is_some() {
+            tracing::warn!("--nats-url requires --features nats; ignoring");
+        }
+        None
+    };
+
     loop {
         tokio::select! {
             accept_result = listener.accept() => {
@@ -97,7 +151,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     Ok(session) => {
                         let router = Arc::clone(&router);
                         let framing = framing.clone();
-                        drop(tokio::spawn(handle_session(session, router, framing, encoding)));
+                        #[allow(clippy::clone_on_copy)] // Type varies by feature flag
+                        let publisher = nats_publisher.clone();
+                        drop(tokio::spawn(handle_session(session, router, framing, encoding, publisher)));
                     }
                     Err(e) => tracing::warn!(error = %e, "accept error"),
                 }
@@ -113,11 +169,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn handle_session(
+async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
     session: AuthenticatedSession,
     router: Arc<Router>,
     framing: FramingStrategy,
     encoding: Encoding,
+    nats_publisher: Option<P>,
 ) {
     let identity = session.identity_arc();
     let cn = identity.cn.clone();
@@ -134,10 +191,10 @@ async fn handle_session(
 
     let result = match encoding {
         Encoding::Raw => {
-            run_session_loops(reader, writer, rx, &identity, &router, &framing, &RawEncoder).await
+            run_session_loops(reader, writer, rx, &identity, &router, &framing, &RawEncoder, &nats_publisher).await
         }
         Encoding::Cot => {
-            run_session_loops(reader, writer, rx, &identity, &router, &framing, &CotEncoder).await
+            run_session_loops(reader, writer, rx, &identity, &router, &framing, &CotEncoder, &nats_publisher).await
         }
     };
 
@@ -149,6 +206,7 @@ async fn handle_session(
     tracing::info!(cn = %cn, "disconnected");
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_session_loops(
     reader: rustgate_transport::SessionReader,
     writer: rustgate_transport::SessionWriter,
@@ -157,9 +215,10 @@ async fn run_session_loops(
     router: &Router,
     framing: &FramingStrategy,
     encoder: &impl MessageEncoder,
+    nats_publisher: &Option<impl NatsPublish>,
 ) -> std::io::Result<()> {
     tokio::select! {
-        r = read_loop(reader, identity, router, framing) => r,
+        r = read_loop(reader, identity, router, framing, nats_publisher) => r,
         r = write_loop(writer, rx, framing, encoder) => r,
     }
 }
@@ -169,6 +228,7 @@ async fn read_loop(
     identity: &Identity,
     router: &Router,
     framing: &FramingStrategy,
+    nats_publisher: &Option<impl NatsPublish>,
 ) -> std::io::Result<()> {
     let mut framed = FramedRead::new(reader, FramedCodec::from_strategy(framing));
 
@@ -181,7 +241,12 @@ async fn read_loop(
             Err(_) => build_raw_message(identity, payload),
         };
 
-        router.route(msg).await;
+        router.route(msg.clone()).await;
+
+        // Publish to NATS after local routing (fire-and-forget)
+        if let Some(publisher) = nats_publisher {
+            publisher.publish(&msg).await;
+        }
     }
 
     Ok(())
@@ -225,6 +290,24 @@ fn build_cot_message(source: &Identity, payload: Bytes, cot: CotEvent) -> Routab
             ttl: cot.ttl,
         },
     }
+}
+
+/// Trait for optional NATS publishing. Allows the server to compile with or
+/// without the `nats` feature by abstracting over the publisher type.
+trait NatsPublish: Clone {
+    fn publish(&self, msg: &RoutableMessage) -> impl std::future::Future<Output = ()> + Send;
+}
+
+#[cfg(feature = "nats")]
+impl NatsPublish for rustgate_nats::NatsPublisher {
+    async fn publish(&self, msg: &RoutableMessage) {
+        self.publish(msg).await;
+    }
+}
+
+/// No-op publisher used when NATS is not enabled.
+impl NatsPublish for () {
+    async fn publish(&self, _msg: &RoutableMessage) {}
 }
 
 fn build_raw_message(source: &Identity, payload: Bytes) -> RoutableMessage {
