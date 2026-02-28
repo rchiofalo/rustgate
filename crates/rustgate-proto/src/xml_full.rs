@@ -477,6 +477,96 @@ mod tests {
         assert!(evt.xml_detail.contains("test note"));
     }
 
+    /// Verify that unknown detail children from real iTAK/ATAK clients
+    /// are captured in xml_detail for protobuf round-trip preservation.
+    #[test]
+    fn parse_full_preserves_itak_unknown_details() {
+        let xml = br#"<event uid="ITAK-1" type="a-f-G-U-C" how="m-g" time="2021-01-01T00:00:00Z" start="2021-01-01T00:00:00Z" stale="2021-01-01T00:05:00Z">
+            <point lat="37.0" lon="-122.0" hae="0.0" ce="50.0" le="30.0"/>
+            <detail>
+                <contact callsign="ALPHA" endpoint="*:-1:stcp"/>
+                <__group name="Cyan" role="Team Member"/>
+                <uid Droid="ALPHA"/>
+                <color argb="-16711936"/>
+                <link uid="SENDER-1" type="a-f-G" relation="p-p"/>
+                <usericon iconsetpath="COT_MAPPING_2525B/a-f/a-f-G"/>
+                <_flow-tags_ TAK-Server-e5dbc="2021-01-01T00:00:00Z"/>
+            </detail>
+        </event>"#;
+
+        let evt = parse_full(xml).expect("parse");
+
+        // Known elements parsed into typed fields
+        assert_eq!(evt.contact.as_ref().unwrap().callsign, "ALPHA");
+        assert_eq!(evt.group.as_ref().unwrap().name, "Cyan");
+
+        // Unknown elements captured in xml_detail
+        assert!(evt.xml_detail.contains("uid"));
+        assert!(evt.xml_detail.contains("Droid"));
+        assert!(evt.xml_detail.contains("color"));
+        assert!(evt.xml_detail.contains("link"));
+        assert!(evt.xml_detail.contains("usericon"));
+        assert!(evt.xml_detail.contains("_flow-tags_"));
+    }
+
+    /// Verify shape drawing elements round-trip through xml_detail.
+    #[test]
+    fn parse_full_preserves_shape_details() {
+        let xml = br#"<event uid="SHAPE-1" type="u-d-r" how="h-e" time="2021-01-01T00:00:00Z" start="2021-01-01T00:00:00Z" stale="2021-01-01T00:05:00Z">
+            <point lat="37.0" lon="-122.0" hae="0.0" ce="50.0" le="30.0"/>
+            <detail>
+                <shape>
+                    <polyline closed="true">
+                        <vertex lat="37.0" lon="-122.0" hae="0.0"/>
+                        <vertex lat="37.1" lon="-122.0" hae="0.0"/>
+                        <vertex lat="37.1" lon="-122.1" hae="0.0"/>
+                        <vertex lat="37.0" lon="-122.1" hae="0.0"/>
+                    </polyline>
+                </shape>
+                <strokeColor value="-65536"/>
+                <fillColor value="536870912"/>
+                <strokeWeight value="3.0"/>
+                <labels_on value="false"/>
+            </detail>
+        </event>"#;
+
+        let evt = parse_full(xml).expect("parse");
+
+        // All shape-related elements should be in xml_detail
+        assert!(evt.xml_detail.contains("shape"));
+        assert!(evt.xml_detail.contains("polyline"));
+        assert!(evt.xml_detail.contains("vertex"));
+        assert!(evt.xml_detail.contains("strokeColor"));
+        assert!(evt.xml_detail.contains("fillColor"));
+        assert!(evt.xml_detail.contains("strokeWeight"));
+        assert!(evt.xml_detail.contains("labels_on"));
+    }
+
+    /// Verify GeoChat detail elements round-trip through xml_detail.
+    #[test]
+    fn parse_full_preserves_chat_details() {
+        let xml = br#"<event uid="GeoChat.SENDER.RECV.MSG1" type="b-t-f" how="h-g-i-g-o" time="2021-01-01T00:00:00Z" start="2021-01-01T00:00:00Z" stale="2021-01-01T00:05:00Z">
+            <point lat="37.0" lon="-122.0" hae="0.0" ce="50.0" le="30.0"/>
+            <detail>
+                <__chat parent="RootContactGroup" groupOwner="false" chatroom="RECV" id="RECV" senderCallsign="SENDER">
+                    <chatgrp uid0="SENDER" uid1="RECV" id="RECV"/>
+                </__chat>
+                <link uid="SENDER" type="a-f-G-U-C" relation="p-p"/>
+                <remarks source="BAO.F.ATAK.SENDER" to="RECV" time="2021-01-01T00:00:00Z">hello world</remarks>
+            </detail>
+        </event>"#;
+
+        let evt = parse_full(xml).expect("parse");
+
+        // Chat elements should all be in xml_detail
+        assert!(evt.xml_detail.contains("__chat"));
+        assert!(evt.xml_detail.contains("chatgrp"));
+        assert!(evt.xml_detail.contains("senderCallsign"));
+        assert!(evt.xml_detail.contains("remarks"));
+        assert!(evt.xml_detail.contains("hello world"));
+        assert!(evt.xml_detail.contains("link"));
+    }
+
     #[test]
     fn parse_full_minimal_event() {
         let xml = br#"<event uid="TEST-1" type="a-f-G"/>"#;

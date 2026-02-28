@@ -111,7 +111,9 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .json()
         .init();
 
@@ -434,6 +436,12 @@ async fn read_loop(
         FramedRead::new(PrefixedReader::new(reader, Some(prefix)), codec)
     };
 
+    // Track the session's group across messages. Position CoT carries
+    // <__group name="Cyan"/> but chat and other types don't. Once we learn
+    // the group from a position message, apply it to subsequent messages
+    // from the same session so NATS routing stays correct.
+    let mut session_group: Option<String> = None;
+
     while let Some(result) = framed.next().await {
         let frame = result?;
 
@@ -458,8 +466,13 @@ async fn read_loop(
         };
 
         let msg = match rustgate_cot::parse(&payload) {
-            Ok(cot) => build_cot_message(identity, payload, cot),
-            Err(_) => build_raw_message(identity, payload),
+            Ok(cot) => {
+                if cot.source_group.is_some() {
+                    session_group = cot.source_group.clone();
+                }
+                build_cot_message(identity, &session_group, payload, cot)
+            }
+            Err(_) => build_raw_message(identity, &session_group, payload),
         };
 
         router.route(msg.clone()).await;
@@ -528,7 +541,12 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for PrefixedReader<R>
     }
 }
 
-fn build_cot_message(source: &Identity, payload: Bytes, cot: CotEvent) -> RoutableMessage {
+fn build_cot_message(
+    source: &Identity,
+    session_group: &Option<String>,
+    payload: Bytes,
+    cot: CotEvent,
+) -> RoutableMessage {
     let destination = match cot.destination {
         CotDestination::Broadcast => Destination::Broadcast,
         CotDestination::Group(name) => Destination::Group(name),
@@ -539,8 +557,18 @@ fn build_cot_message(source: &Identity, payload: Bytes, cot: CotEvent) -> Routab
         }),
     };
 
+    // Enrich source identity with the group. Prefer the __group from this
+    // message's CoT detail, fall back to the session's cached group (learned
+    // from earlier position messages). Chat and other non-position CoT types
+    // don't carry __group, so the fallback keeps NATS routing correct.
+    let mut enriched_source = source.clone();
+    let group = cot.source_group.as_ref().or(session_group.as_ref());
+    if let Some(g) = group {
+        let _ = enriched_source.groups.insert(g.clone());
+    }
+
     RoutableMessage {
-        source: source.clone(),
+        source: enriched_source,
         destination,
         payload,
         metadata: Metadata {
@@ -570,9 +598,17 @@ impl NatsPublish for () {
     async fn publish(&self, _msg: &RoutableMessage) {}
 }
 
-fn build_raw_message(source: &Identity, payload: Bytes) -> RoutableMessage {
+fn build_raw_message(
+    source: &Identity,
+    session_group: &Option<String>,
+    payload: Bytes,
+) -> RoutableMessage {
+    let mut enriched_source = source.clone();
+    if let Some(g) = session_group {
+        let _ = enriched_source.groups.insert(g.clone());
+    }
     RoutableMessage {
-        source: source.clone(),
+        source: enriched_source,
         destination: Destination::Broadcast,
         payload,
         metadata: Metadata {

@@ -20,6 +20,8 @@ pub struct CotEvent {
     pub message_type: MessageType,
     pub position: Option<Position>,
     pub ttl: Option<Duration>,
+    /// Source group from `<__group name="..."/>` detail element (e.g., "Cyan").
+    pub source_group: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +60,7 @@ pub fn parse(xml: &[u8]) -> Result<CotEvent, ParseError> {
     let mut position = None;
     let mut dest_callsign = None;
     let mut dest_group = None;
+    let mut source_group = None;
     let mut stale_time = None;
     let mut start_time = None;
 
@@ -103,6 +106,13 @@ pub fn parse(xml: &[u8]) -> Result<CotEvent, ParseError> {
                             }
                         }
                     }
+                    b"__group" => {
+                        for attr in e.attributes().flatten() {
+                            if attr.key.as_ref() == b"name" {
+                                source_group = Some(String::from_utf8_lossy(&attr.value).into_owned());
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -130,6 +140,7 @@ pub fn parse(xml: &[u8]) -> Result<CotEvent, ParseError> {
         message_type,
         position,
         ttl,
+        source_group,
     })
 }
 
