@@ -163,9 +163,7 @@ async fn mtls_rejects_untrusted_client() {
         Err(_) => true,
         Ok(mut stream) => {
             // TLS 1.3 may defer the alert — try using the connection
-            if stream.write_all(b"x").await.is_err() {
-                true
-            } else if stream.flush().await.is_err() {
+            if stream.write_all(b"x").await.is_err() || stream.flush().await.is_err() {
                 true
             } else {
                 let mut buf = [0u8; 1];

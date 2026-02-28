@@ -412,6 +412,7 @@ fn write_event_to_buf(ev: &Event<'_>, buf: &mut Vec<u8>) {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
