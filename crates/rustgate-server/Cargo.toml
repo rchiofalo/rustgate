@@ -17,6 +17,7 @@ nats = ["dep:rustgate-nats"]
 enrollment = ["dep:rustgate-enrollment"]
 proto = ["dep:rustgate-proto", "rustgate-transport/proto"]
 full-detail = ["rustgate-nats/full-detail"]
+metrics = ["dep:prometheus", "dep:hyper", "dep:hyper-util", "dep:http-body-util"]
 
 [dependencies]
 rustgate-core = { workspace = true }
@@ -25,7 +26,11 @@ rustgate-transport = { workspace = true }
 rustgate-nats = { workspace = true, optional = true }
 rustgate-enrollment = { workspace = true, optional = true }
 rustgate-proto = { workspace = true, optional = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "sync", "signal", "fs", "macros", "time"] }
+prometheus = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "signal", "fs", "macros", "time", "net"] }
 tokio-util = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }

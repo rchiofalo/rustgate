@@ -9,6 +9,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing_subscriber::EnvFilter;
 
+#[cfg(feature = "metrics")]
+mod metrics;
+
 /// Maximum concurrent TLS sessions. Prevents resource exhaustion
 /// from connection floods (even with mTLS, the TLS handshake is costly).
 const MAX_CONNECTIONS: usize = 1024;
@@ -79,6 +82,11 @@ struct Cli {
     /// Organization name for issued client certificates.
     #[arg(long, default_value = "rustgate")]
     ca_organization: String,
+
+    /// Bind address for the Prometheus metrics HTTP server (e.g. 0.0.0.0:9090).
+    /// Requires --features metrics.
+    #[arg(long)]
+    metrics_bind: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -150,6 +158,29 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     }
 
     tracing::info!(addr = %listener.local_addr()?, framing = ?cli.framing, encoding = ?encoding, "listening");
+
+    // Register Prometheus metrics (cheap; always active when compiled in)
+    #[cfg(feature = "metrics")]
+    metrics::init().map_err(|e| anyhow::anyhow!("failed to register metrics: {e}"))?;
+
+    // Optionally start the Prometheus metrics HTTP server
+    #[cfg(feature = "metrics")]
+    if let Some(ref metrics_bind) = cli.metrics_bind {
+        let bind_addr: std::net::SocketAddr = metrics_bind
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid --metrics-bind address: {e}"))?;
+
+        drop(tokio::spawn(async move {
+            if let Err(e) = metrics::serve(bind_addr).await {
+                tracing::error!(error = %e, "metrics server failed");
+            }
+        }));
+    }
+
+    #[cfg(not(feature = "metrics"))]
+    if cli.metrics_bind.is_some() {
+        tracing::warn!("--metrics-bind requires --features metrics; ignoring");
+    }
 
     let router = Arc::new(Router::new());
     let connection_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
@@ -255,9 +286,20 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok(session) => {
+                        #[cfg(feature = "metrics")]
+                        {
+                            metrics::connections_accepted().inc();
+                            metrics::connections_active().inc();
+                        }
+
                         let permit = match Arc::clone(&connection_limit).try_acquire_owned() {
                             Ok(p) => p,
                             Err(_) => {
+                                #[cfg(feature = "metrics")]
+                                {
+                                    metrics::connections_rejected().inc();
+                                    metrics::connections_active().dec();
+                                }
                                 tracing::warn!(max = MAX_CONNECTIONS, "connection limit reached, rejecting");
                                 continue;
                             }
@@ -267,7 +309,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                         let publisher = nats_publisher.clone();
                         drop(tokio::spawn(handle_session(session, router, framing, encoding, publisher, permit)));
                     }
-                    Err(e) => tracing::warn!(error = %e, "accept error"),
+                    Err(e) => {
+                        #[cfg(feature = "metrics")]
+                        metrics::accept_errors().inc();
+                        tracing::warn!(error = %e, "accept error");
+                    }
                 }
             }
             _ = tokio::signal::ctrl_c() => {
@@ -294,6 +340,9 @@ async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
 
     tracing::info!(cn = %cn, peer = %session.peer_addr(), "connected");
 
+    #[cfg(feature = "metrics")]
+    metrics::sessions_active().inc();
+
     let (tx, rx) = mpsc::channel::<RoutableMessage>(64);
     let handle = SessionHandle::new(Arc::clone(&identity), tx);
     let session_id = handle.id;
@@ -309,10 +358,28 @@ async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
         #[cfg(feature = "proto")]
         Framing::TakNegotiate => {
             match negotiate_tak_protocol(&mut reader, &mut writer, &cn).await {
-                Ok(result) => result,
+                Ok(result) => {
+                    #[cfg(feature = "metrics")]
+                    {
+                        let label = if matches!(result.1, Encoding::TakProtobuf) {
+                            "protobuf"
+                        } else {
+                            "xml"
+                        };
+                        metrics::negotiations().with_label_values(&[label]).inc();
+                    }
+                    result
+                }
                 Err(e) => {
+                    #[cfg(feature = "metrics")]
+                    metrics::negotiations().with_label_values(&["failed"]).inc();
                     tracing::debug!(cn = %cn, error = %e, "negotiation failed");
                     router.unregister(&cn, session_id).await;
+                    #[cfg(feature = "metrics")]
+                    {
+                        metrics::sessions_active().dec();
+                        metrics::connections_active().dec();
+                    }
                     tracing::info!(cn = %cn, "disconnected");
                     return;
                 }
@@ -380,6 +447,11 @@ async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
     }
 
     router.unregister(&cn, session_id).await;
+    #[cfg(feature = "metrics")]
+    {
+        metrics::sessions_active().dec();
+        metrics::connections_active().dec();
+    }
     tracing::info!(cn = %cn, "disconnected");
 }
 
@@ -522,6 +594,9 @@ async fn read_loop(
             frame.freeze()
         };
 
+        #[cfg(feature = "metrics")]
+        metrics::messages_received().inc();
+
         let msg = match rustgate_cot::parse(&payload) {
             Ok(cot) => {
                 if cot.source_group.is_some() {
@@ -532,10 +607,24 @@ async fn read_loop(
             Err(_) => build_raw_message(identity, &session_group, payload),
         };
 
+        #[cfg(feature = "metrics")]
+        {
+            let dest_label = match msg.destination {
+                Destination::Broadcast => "broadcast",
+                Destination::Group(_) => "group",
+                Destination::Direct(_) => "direct",
+            };
+            metrics::messages_routed()
+                .with_label_values(&[dest_label])
+                .inc();
+        }
+
         router.route(msg.clone()).await;
 
         // Publish to NATS after local routing (fire-and-forget)
         if let Some(publisher) = nats_publisher {
+            #[cfg(feature = "metrics")]
+            metrics::nats_publishes().inc();
             publisher.publish(&msg).await;
         }
     }
