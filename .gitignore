@@ -1,7 +1,19 @@
 /target
 **/*.rs.bk
+
+# TLS certificates and keys
 *.pem
 *.p12
 *.key
+*.crt
+*.csr
+*.srl
+certs/
+
+# iTAK test packages
+itak-package*/
+rustgate-itak.zip
+
+# Database
 *.db
 *.db-journal
