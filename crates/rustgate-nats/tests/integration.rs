@@ -16,9 +16,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
+use futures::StreamExt;
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
-use futures::StreamExt;
 use rustgate_nats::{NatsAdapter, NatsConfig, WireEvent};
 use rustgate_transport::Router;
 use tokio::sync::mpsc;
@@ -170,9 +170,7 @@ async fn connect_and_disconnect() {
     }
     let server = NatsTestServer::start().await;
     let config = test_config(&server.url(), "test-connect");
-    let _adapter = NatsAdapter::connect(config)
-        .await
-        .expect("should connect");
+    let _adapter = NatsAdapter::connect(config).await.expect("should connect");
 }
 
 /// Publish a position message and verify the subscriber delivers it
@@ -237,7 +235,9 @@ async fn echo_prevention_source_protocol() {
     let adapter = NatsAdapter::connect(config).await.expect("connect");
 
     // Raw NATS subscription — no rustgate subscriber, no instance header filtering
-    let raw_client = async_nats::connect(&server.url()).await.expect("raw connect");
+    let raw_client = async_nats::connect(&server.url())
+        .await
+        .expect("raw connect");
     let mut raw_sub = raw_client.subscribe("points.>").await.expect("subscribe");
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -250,7 +250,10 @@ async fn echo_prevention_source_protocol() {
 
     // Nothing should appear on the NATS subject — publisher should have dropped it
     let result = timeout(Duration::from_millis(500), raw_sub.next()).await;
-    assert!(result.is_err(), "publisher should not emit nats-sourced messages to NATS");
+    assert!(
+        result.is_err(),
+        "publisher should not emit nats-sourced messages to NATS"
+    );
 }
 
 /// Verify that a subscriber ignores messages published by its own instance
@@ -282,7 +285,10 @@ async fn echo_prevention_instance_header() {
     adapter.publisher().publish(&msg).await;
 
     let result = timeout(Duration::from_millis(500), rx.recv()).await;
-    assert!(result.is_err(), "subscriber should ignore own instance messages");
+    assert!(
+        result.is_err(),
+        "subscriber should ignore own instance messages"
+    );
 
     sub_task.abort();
 }
@@ -316,8 +322,12 @@ async fn cross_instance_delivery() {
     let router_a_clone = Arc::clone(&router_a);
     let router_b_clone = Arc::clone(&router_b);
 
-    let task_a = tokio::spawn(async move { let _ = sub_a.run(router_a_clone).await; });
-    let task_b = tokio::spawn(async move { let _ = sub_b.run(router_b_clone).await; });
+    let task_a = tokio::spawn(async move {
+        let _ = sub_a.run(router_a_clone).await;
+    });
+    let task_b = tokio::spawn(async move {
+        let _ = sub_b.run(router_b_clone).await;
+    });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -353,7 +363,9 @@ async fn jetstream_replay() {
 
     // Create the JetStream stream that the replay consumer expects
     let js = async_nats::jetstream::new(
-        async_nats::connect(&server.url()).await.expect("raw connect"),
+        async_nats::connect(&server.url())
+            .await
+            .expect("raw connect"),
     );
     let _ = js
         .create_stream(async_nats::jetstream::stream::Config {
@@ -381,7 +393,9 @@ async fn jetstream_replay() {
 
     // New adapter (different instance) replays from JetStream
     let replay_config = test_config(&server.url(), "replay-consumer");
-    let replay_adapter = NatsAdapter::connect(replay_config).await.expect("connect replay");
+    let replay_adapter = NatsAdapter::connect(replay_config)
+        .await
+        .expect("connect replay");
 
     let router = Arc::new(Router::new());
     let count = replay_adapter
@@ -407,7 +421,9 @@ async fn jetstream_replay_latest_per_subject() {
     let adapter = NatsAdapter::connect(config).await.expect("connect");
 
     let js = async_nats::jetstream::new(
-        async_nats::connect(&server.url()).await.expect("raw connect"),
+        async_nats::connect(&server.url())
+            .await
+            .expect("raw connect"),
     );
     let _ = js
         .create_stream(async_nats::jetstream::stream::Config {
@@ -465,7 +481,9 @@ async fn oversized_payload_dropped() {
 
     let subscriber = sub_adapter.subscriber();
     let sub_router = Arc::clone(&router);
-    let sub_task = tokio::spawn(async move { let _ = subscriber.run(sub_router).await; });
+    let sub_task = tokio::spawn(async move {
+        let _ = subscriber.run(sub_router).await;
+    });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -475,7 +493,10 @@ async fn oversized_payload_dropped() {
 
     // Should NOT be delivered due to payload size limit
     let result = timeout(Duration::from_millis(500), rx.recv()).await;
-    assert!(result.is_err(), "oversized message should be dropped by subscriber");
+    assert!(
+        result.is_err(),
+        "oversized message should be dropped by subscriber"
+    );
 
     sub_task.abort();
 }
@@ -499,7 +520,9 @@ async fn non_position_messages_filtered() {
     let adapter = NatsAdapter::connect(config).await.expect("connect");
 
     // Raw subscription — observe the wire directly
-    let raw_client = async_nats::connect(&server.url()).await.expect("raw connect");
+    let raw_client = async_nats::connect(&server.url())
+        .await
+        .expect("raw connect");
     let mut raw_sub = raw_client.subscribe("points.>").await.expect("subscribe");
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -535,7 +558,10 @@ async fn non_position_messages_filtered() {
 
     // Nothing should appear on NATS — publisher drops non-Position messages
     let result = timeout(Duration::from_millis(500), raw_sub.next()).await;
-    assert!(result.is_err(), "chat messages should not be published to NATS");
+    assert!(
+        result.is_err(),
+        "chat messages should not be published to NATS"
+    );
 }
 
 /// Verify that non-position messages ARE published to NATS with full-detail.
@@ -553,7 +579,9 @@ async fn non_position_messages_published() {
     let config = test_config(&server.url(), "full-detail-pub");
     let adapter = NatsAdapter::connect(config).await.expect("connect");
 
-    let raw_client = async_nats::connect(&server.url()).await.expect("raw connect");
+    let raw_client = async_nats::connect(&server.url())
+        .await
+        .expect("raw connect");
     let mut raw_sub = raw_client.subscribe("points.>").await.expect("subscribe");
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -587,7 +615,10 @@ async fn non_position_messages_published() {
     adapter.publisher().publish(&chat_msg).await;
 
     let result = timeout(Duration::from_secs(3), raw_sub.next()).await;
-    assert!(result.is_ok(), "chat messages should be published with full-detail");
+    assert!(
+        result.is_ok(),
+        "chat messages should be published with full-detail"
+    );
 
     let nats_msg = result.expect("result").expect("msg");
     let wire: WireEvent = serde_json::from_slice(&nats_msg.payload).expect("valid JSON");
@@ -595,7 +626,10 @@ async fn non_position_messages_published() {
     assert_eq!(wire.event_type, "b-t-f");
     // With full-detail, xml_detail should contain the remarks
     let detail = wire.detail.expect("detail should be populated");
-    assert!(detail.xml_detail.is_some(), "xml_detail should contain remarks");
+    assert!(
+        detail.xml_detail.is_some(),
+        "xml_detail should contain remarks"
+    );
 }
 
 /// Verify that 0,0 position (unknown per CoT spec) is filtered by the publisher.
@@ -613,7 +647,9 @@ async fn zero_position_filtered() {
     let adapter = NatsAdapter::connect(config).await.expect("connect");
 
     // Raw subscription — observe the wire directly
-    let raw_client = async_nats::connect(&server.url()).await.expect("raw connect");
+    let raw_client = async_nats::connect(&server.url())
+        .await
+        .expect("raw connect");
     let mut raw_sub = raw_client.subscribe("points.>").await.expect("subscribe");
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -624,7 +660,10 @@ async fn zero_position_filtered() {
 
     // Nothing should appear on NATS — publisher drops 0,0 positions
     let result = timeout(Duration::from_millis(500), raw_sub.next()).await;
-    assert!(result.is_err(), "0,0 position should not be published to NATS");
+    assert!(
+        result.is_err(),
+        "0,0 position should not be published to NATS"
+    );
 }
 
 /// Verify group extraction from NATS subject — publisher encodes group
@@ -647,7 +686,9 @@ async fn group_preserved_through_nats() {
 
     let subscriber = adapter_b.subscriber();
     let sub_router = Arc::clone(&router);
-    let sub_task = tokio::spawn(async move { let _ = subscriber.run(sub_router).await; });
+    let sub_task = tokio::spawn(async move {
+        let _ = subscriber.run(sub_router).await;
+    });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -681,7 +722,9 @@ async fn jetstream_replay_count_limit() {
     let adapter = NatsAdapter::connect(config).await.expect("connect");
 
     let js = async_nats::jetstream::new(
-        async_nats::connect(&server.url()).await.expect("raw connect"),
+        async_nats::connect(&server.url())
+            .await
+            .expect("raw connect"),
     );
     let _ = js
         .create_stream(async_nats::jetstream::stream::Config {
@@ -742,7 +785,9 @@ async fn wire_format_fidelity() {
 
     let subscriber = adapter_b.subscriber();
     let sub_router = Arc::clone(&router);
-    let sub_task = tokio::spawn(async move { let _ = subscriber.run(sub_router).await; });
+    let sub_task = tokio::spawn(async move {
+        let _ = subscriber.run(sub_router).await;
+    });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 

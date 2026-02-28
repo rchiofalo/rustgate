@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 
 use rustgate_core::identity::{GroupId, Identity};
 use rustgate_core::message::{Destination, MessageType, RoutableMessage};
@@ -29,7 +29,10 @@ impl SessionHandle {
         }
     }
 
-    pub async fn send(&self, msg: RoutableMessage) -> Result<(), mpsc::error::SendError<RoutableMessage>> {
+    pub async fn send(
+        &self,
+        msg: RoutableMessage,
+    ) -> Result<(), mpsc::error::SendError<RoutableMessage>> {
         self.sender.send(msg).await
     }
 }
@@ -82,7 +85,11 @@ impl Router {
 
         let _ = state.sessions.insert(cn.clone(), handle);
         for group in &new_groups {
-            let _ = state.groups.entry(group.clone()).or_default().insert(cn.clone());
+            let _ = state
+                .groups
+                .entry(group.clone())
+                .or_default()
+                .insert(cn.clone());
         }
     }
 
@@ -148,7 +155,8 @@ impl Router {
                 Some(m) => m,
                 None => return,
             };
-            members.iter()
+            members
+                .iter()
                 .filter(|cn| *cn != &msg.source.cn)
                 .filter_map(|cn| state.sessions.get(cn).cloned())
                 .collect()
@@ -162,7 +170,9 @@ impl Router {
     async fn send_to_all(&self, msg: &RoutableMessage) {
         let targets: Vec<SessionHandle> = {
             let state = self.state.read().await;
-            state.sessions.iter()
+            state
+                .sessions
+                .iter()
                 .filter(|(cn, _)| *cn != &msg.source.cn)
                 .map(|(_, handle)| handle.clone())
                 .collect()

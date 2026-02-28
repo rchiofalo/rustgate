@@ -57,7 +57,11 @@ pub struct WireDetail {
     pub contact: Option<WireContact>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remarks: Option<WireRemarks>,
-    #[serde(default, rename = "_flow-tags_", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "_flow-tags_",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub flow_tags: Option<WireFlowTags>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<WireStatus>,
@@ -67,7 +71,11 @@ pub struct WireDetail {
     pub group: Option<WireGroup>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub takv: Option<WireTakv>,
-    #[serde(default, rename = "precisionlocation", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "precisionlocation",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub precision_location: Option<WirePrecisionLocation>,
     #[serde(default, rename = "xmlDetail", skip_serializing_if = "Option::is_none")]
     pub xml_detail: Option<String>,
@@ -79,7 +87,11 @@ pub struct WireTrack {
     pub course: f64,
     #[serde(default, skip_serializing_if = "is_zero_f64")]
     pub speed: f64,
-    #[serde(default, rename = "trackValid", skip_serializing_if = "std::ops::Not::not")]
+    #[serde(
+        default,
+        rename = "trackValid",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
     pub track_valid: bool,
 }
 
@@ -234,8 +246,16 @@ impl WireEvent {
             }),
             uid: None,
             contact: cot.contact.as_ref().map(|c| WireContact {
-                callsign: if c.callsign.is_empty() { None } else { Some(c.callsign.clone()) },
-                endpoint: if c.endpoint.is_empty() { None } else { Some(c.endpoint.clone()) },
+                callsign: if c.callsign.is_empty() {
+                    None
+                } else {
+                    Some(c.callsign.clone())
+                },
+                endpoint: if c.endpoint.is_empty() {
+                    None
+                } else {
+                    Some(c.endpoint.clone())
+                },
             }),
             remarks: None,
             flow_tags: None,
@@ -254,11 +274,18 @@ impl WireEvent {
                 os: t.os.clone(),
                 version: t.version.clone(),
             }),
-            precision_location: cot.precision_location.as_ref().map(|p| WirePrecisionLocation {
-                geopointsrc: p.geopointsrc.clone(),
-                altsrc: p.altsrc.clone(),
-            }),
-            xml_detail: if cot.xml_detail.is_empty() { None } else { Some(cot.xml_detail.clone()) },
+            precision_location: cot
+                .precision_location
+                .as_ref()
+                .map(|p| WirePrecisionLocation {
+                    geopointsrc: p.geopointsrc.clone(),
+                    altsrc: p.altsrc.clone(),
+                }),
+            xml_detail: if cot.xml_detail.is_empty() {
+                None
+            } else {
+                Some(cot.xml_detail.clone())
+            },
         };
 
         let has_any = detail.track.is_some()
@@ -431,7 +458,11 @@ mod tests {
         assert_eq!(event.event_type, "a-u-G-U-C");
         assert!((event.point.lat - 37.7749).abs() < f64::EPSILON);
 
-        let track = event.detail.as_ref().and_then(|d| d.track.as_ref()).expect("track");
+        let track = event
+            .detail
+            .as_ref()
+            .and_then(|d| d.track.as_ref())
+            .expect("track");
         assert!((track.speed - 12.3).abs() < f64::EPSILON);
         assert!(track.track_valid);
     }
@@ -449,7 +480,13 @@ mod tests {
             access: String::new(),
             qos: String::new(),
             opex: String::new(),
-            point: WirePoint { lat: 37.0, lon: -122.0, hae: 0.0, ce: 50.0, le: 30.0 },
+            point: WirePoint {
+                lat: 37.0,
+                lon: -122.0,
+                hae: 0.0,
+                ce: 50.0,
+                le: 30.0,
+            },
             detail: None,
         };
 
@@ -473,7 +510,13 @@ mod tests {
             access: String::new(),
             qos: String::new(),
             opex: String::new(),
-            point: WirePoint { lat: 0.0, lon: 0.0, hae: 0.0, ce: 0.0, le: 0.0 },
+            point: WirePoint {
+                lat: 0.0,
+                lon: 0.0,
+                hae: 0.0,
+                ce: 0.0,
+                le: 0.0,
+            },
             detail: None,
         };
         assert!(event.is_position_unknown());
@@ -490,8 +533,8 @@ mod tests {
     mod full_detail_tests {
         use super::*;
         use rustgate_proto::xml_full::{
-            ContactDetail, FullCotEvent, GroupDetail, PrecisionLocationDetail,
-            StatusDetail, TakvDetail, TrackDetail,
+            ContactDetail, FullCotEvent, GroupDetail, PrecisionLocationDetail, StatusDetail,
+            TakvDetail, TrackDetail,
         };
 
         #[test]

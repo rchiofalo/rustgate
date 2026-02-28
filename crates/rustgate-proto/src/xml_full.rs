@@ -5,8 +5,8 @@
 //! Uses `quick-xml` streaming parser which does not resolve external entities
 //! or process DTD declarations, preventing XXE injection.
 
-use quick_xml::events::Event;
 use quick_xml::Reader;
+use quick_xml::events::Event;
 
 use crate::error::ProtoError;
 
@@ -239,11 +239,7 @@ fn parse_known_start(
 }
 
 /// Parse a known detail child element that was an Empty event (self-closing).
-fn parse_known_empty(
-    tag: &[u8],
-    e: &quick_xml::events::BytesStart<'_>,
-    event: &mut FullCotEvent,
-) {
+fn parse_known_empty(tag: &[u8], e: &quick_xml::events::BytesStart<'_>, event: &mut FullCotEvent) {
     match tag {
         b"contact" => event.contact = Some(parse_contact(e)),
         b"__group" => event.group = Some(parse_group(e)),
@@ -364,10 +360,7 @@ fn capture_unknown_start(
 }
 
 /// Capture an unknown XML element (Empty/self-closing) as raw bytes.
-fn capture_unknown_empty(
-    e: &quick_xml::events::BytesStart<'_>,
-    xml_detail_buf: &mut Vec<u8>,
-) {
+fn capture_unknown_empty(e: &quick_xml::events::BytesStart<'_>, xml_detail_buf: &mut Vec<u8>) {
     write_opening_tag(e, xml_detail_buf);
     xml_detail_buf.extend_from_slice(b"/>");
 }

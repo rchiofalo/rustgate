@@ -6,8 +6,8 @@
 use std::io::BufReader;
 
 use rcgen::{
-    Certificate, CertificateParams, CertificateSigningRequestParams, ExtendedKeyUsagePurpose,
-    IsCa, KeyPair, KeyUsagePurpose,
+    Certificate, CertificateParams, CertificateSigningRequestParams, ExtendedKeyUsagePurpose, IsCa,
+    KeyPair, KeyUsagePurpose,
 };
 
 use crate::error::EnrollmentError;
@@ -52,7 +52,9 @@ impl CsrSigner {
         let certs: Vec<rustls_pki_types::CertificateDer<'static>> =
             rustls_pemfile::certs(&mut reader)
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| EnrollmentError::Config(format!("failed to parse CA cert PEM: {e}")))?;
+                .map_err(|e| {
+                    EnrollmentError::Config(format!("failed to parse CA cert PEM: {e}"))
+                })?;
 
         let ca_cert_der = certs
             .into_iter()
@@ -68,13 +70,10 @@ impl CsrSigner {
         // a Certificate handle. The re-signing produces different signature
         // bytes but preserves the subject DN and extensions — which is all
         // that `signed_by()` uses from the issuer.
-        let ca_params =
-            CertificateParams::from_ca_cert_der(&rustls_pki_types::CertificateDer::from(
-                ca_cert_der.as_slice(),
-            ))
-            .map_err(|e| {
-                EnrollmentError::Config(format!("failed to parse CA cert params: {e}"))
-            })?;
+        let ca_params = CertificateParams::from_ca_cert_der(
+            &rustls_pki_types::CertificateDer::from(ca_cert_der.as_slice()),
+        )
+        .map_err(|e| EnrollmentError::Config(format!("failed to parse CA cert params: {e}")))?;
 
         let ca_cert = ca_params.self_signed(&ca_key).map_err(|e| {
             EnrollmentError::Config(format!("failed to reconstruct CA certificate: {e}"))
@@ -149,9 +148,7 @@ fn ensure_pem_headers(csr: &str) -> String {
     if trimmed.starts_with("-----BEGIN") {
         return trimmed.to_string();
     }
-    format!(
-        "-----BEGIN CERTIFICATE REQUEST-----\n{trimmed}\n-----END CERTIFICATE REQUEST-----"
-    )
+    format!("-----BEGIN CERTIFICATE REQUEST-----\n{trimmed}\n-----END CERTIFICATE REQUEST-----")
 }
 
 #[cfg(test)]
@@ -180,40 +177,44 @@ mod tests {
     #[test]
     fn sign_csr_round_trip() {
         let (cert_pem, key_pem) = test_ca();
-        let signer = CsrSigner::from_pem(&cert_pem, &key_pem, "TestOrg")
-            .expect("signer");
+        let signer = CsrSigner::from_pem(&cert_pem, &key_pem, "TestOrg").expect("signer");
 
         let csr_pem = generate_csr("ignored-cn");
         let signed_der = signer.sign_csr(&csr_pem, "test-client").expect("sign");
 
         // CN comes from the authenticated username, not the CSR
-        let (_, cert) = x509_parser::parse_x509_certificate(&signed_der)
-            .expect("parse signed cert");
+        let (_, cert) =
+            x509_parser::parse_x509_certificate(&signed_der).expect("parse signed cert");
         assert_eq!(
-            cert.subject().iter_common_name().next()
+            cert.subject()
+                .iter_common_name()
+                .next()
                 .and_then(|cn| cn.as_str().ok()),
             Some("test-client")
         );
 
         // Verify it has ClientAuth EKU
-        let eku = cert.extended_key_usage().expect("EKU present").expect("parse EKU");
+        let eku = cert
+            .extended_key_usage()
+            .expect("EKU present")
+            .expect("parse EKU");
         assert!(eku.value.client_auth);
     }
 
     #[test]
     fn sign_csr_overrides_subject() {
         let (cert_pem, key_pem) = test_ca();
-        let signer = CsrSigner::from_pem(&cert_pem, &key_pem, "TestOrg")
-            .expect("signer");
+        let signer = CsrSigner::from_pem(&cert_pem, &key_pem, "TestOrg").expect("signer");
 
         // CSR claims CN=attacker, but sign_csr enforces CN=legit-user
         let csr_pem = generate_csr("attacker");
         let signed_der = signer.sign_csr(&csr_pem, "legit-user").expect("sign");
 
-        let (_, cert) = x509_parser::parse_x509_certificate(&signed_der)
-            .expect("parse");
+        let (_, cert) = x509_parser::parse_x509_certificate(&signed_der).expect("parse");
         assert_eq!(
-            cert.subject().iter_common_name().next()
+            cert.subject()
+                .iter_common_name()
+                .next()
                 .and_then(|cn| cn.as_str().ok()),
             Some("legit-user")
         );
@@ -222,8 +223,7 @@ mod tests {
     #[test]
     fn sign_csr_without_pem_headers() {
         let (cert_pem, key_pem) = test_ca();
-        let signer = CsrSigner::from_pem(&cert_pem, &key_pem, "TestOrg")
-            .expect("signer");
+        let signer = CsrSigner::from_pem(&cert_pem, &key_pem, "TestOrg").expect("signer");
 
         let csr_pem = generate_csr("raw-client");
         // Strip PEM headers to simulate TAK client behavior
@@ -234,10 +234,11 @@ mod tests {
             .join("\n");
 
         let signed_der = signer.sign_csr(&raw, "raw-client").expect("sign raw");
-        let (_, cert) = x509_parser::parse_x509_certificate(&signed_der)
-            .expect("parse");
+        let (_, cert) = x509_parser::parse_x509_certificate(&signed_der).expect("parse");
         assert_eq!(
-            cert.subject().iter_common_name().next()
+            cert.subject()
+                .iter_common_name()
+                .next()
                 .and_then(|cn| cn.as_str().ok()),
             Some("raw-client")
         );
@@ -246,8 +247,7 @@ mod tests {
     #[test]
     fn sign_csr_invalid_data() {
         let (cert_pem, key_pem) = test_ca();
-        let signer = CsrSigner::from_pem(&cert_pem, &key_pem, "TestOrg")
-            .expect("signer");
+        let signer = CsrSigner::from_pem(&cert_pem, &key_pem, "TestOrg").expect("signer");
 
         let result = signer.sign_csr("not a valid CSR", "user");
         assert!(result.is_err());
@@ -256,16 +256,17 @@ mod tests {
     #[test]
     fn sign_csr_enforces_org() {
         let (cert_pem, key_pem) = test_ca();
-        let signer = CsrSigner::from_pem(&cert_pem, &key_pem, "TestOrg")
-            .expect("signer");
+        let signer = CsrSigner::from_pem(&cert_pem, &key_pem, "TestOrg").expect("signer");
 
         // CSR has org "TestOrg" but signer enforces its own org regardless
         let csr_pem = generate_csr("org-test");
         let signed_der = signer.sign_csr(&csr_pem, "org-test").expect("sign");
 
-        let (_, cert) = x509_parser::parse_x509_certificate(&signed_der)
-            .expect("parse");
-        let org = cert.subject().iter_organization().next()
+        let (_, cert) = x509_parser::parse_x509_certificate(&signed_der).expect("parse");
+        let org = cert
+            .subject()
+            .iter_organization()
+            .next()
             .and_then(|o| o.as_str().ok());
         assert_eq!(org, Some("TestOrg"));
     }
@@ -273,11 +274,10 @@ mod tests {
     #[test]
     fn ca_cert_der_is_valid() {
         let (cert_pem, key_pem) = test_ca();
-        let signer = CsrSigner::from_pem(&cert_pem, &key_pem, "TestOrg")
-            .expect("signer");
+        let signer = CsrSigner::from_pem(&cert_pem, &key_pem, "TestOrg").expect("signer");
 
-        let (_, ca) = x509_parser::parse_x509_certificate(signer.ca_cert_der())
-            .expect("parse CA DER");
+        let (_, ca) =
+            x509_parser::parse_x509_certificate(signer.ca_cert_der()).expect("parse CA DER");
         assert!(ca.is_ca());
     }
 

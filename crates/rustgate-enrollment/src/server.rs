@@ -129,7 +129,11 @@ async fn handle_request(
             build_response(StatusCode::NO_CONTENT, "", Bytes::new())
         }
 
-        _ => build_response(StatusCode::NOT_FOUND, "text/plain", Bytes::from("not found")),
+        _ => build_response(
+            StatusCode::NOT_FOUND,
+            "text/plain",
+            Bytes::from("not found"),
+        ),
     };
 
     Ok(response)
@@ -254,19 +258,15 @@ fn build_response(status: StatusCode, content_type: &str, body: Bytes) -> Respon
     if !content_type.is_empty() {
         builder = builder.header("Content-Type", content_type);
     }
-    builder.body(Full::new(body)).unwrap_or_else(|_| {
-        Response::new(Full::new(Bytes::from("internal error")))
-    })
+    builder
+        .body(Full::new(body))
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("internal error"))))
 }
 
 fn extract_param(query: &str, key: &str) -> Option<String> {
     query.split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=')?;
-        if k == key {
-            Some(v.to_string())
-        } else {
-            None
-        }
+        if k == key { Some(v.to_string()) } else { None }
     })
 }
 

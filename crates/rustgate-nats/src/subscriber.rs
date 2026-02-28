@@ -41,7 +41,9 @@ impl NatsSubscriber {
                 continue;
             }
 
-            if self.config.max_payload_bytes > 0 && msg.payload.len() > self.config.max_payload_bytes {
+            if self.config.max_payload_bytes > 0
+                && msg.payload.len() > self.config.max_payload_bytes
+            {
                 tracing::debug!(
                     len = msg.payload.len(),
                     max = self.config.max_payload_bytes,
@@ -69,7 +71,9 @@ impl NatsSubscriber {
                 continue;
             }
 
-            router.route(wire_event.into_routable(&group, msg.payload.clone())).await;
+            router
+                .route(wire_event.into_routable(&group, msg.payload.clone()))
+                .await;
         }
 
         tracing::info!("NATS subscriber ended");

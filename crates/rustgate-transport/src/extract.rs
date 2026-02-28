@@ -36,9 +36,7 @@ fn extract_cn(cert: &X509Certificate<'_>) -> Result<String> {
                 let cn = attr
                     .attr_value()
                     .as_str()
-                    .map_err(|e| {
-                        RustgateError::Transport(format!("invalid CN encoding: {e}"))
-                    })?
+                    .map_err(|e| RustgateError::Transport(format!("invalid CN encoding: {e}")))?
                     .to_string();
                 return Ok(cn);
             }

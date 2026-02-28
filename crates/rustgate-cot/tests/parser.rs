@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use rustgate_core::message::MessageType;
-use rustgate_cot::{parse, CotDestination, ParseError};
+use rustgate_cot::{CotDestination, ParseError, parse};
 
 #[test]
 fn parse_position_event() {
@@ -79,13 +79,19 @@ fn callsign_takes_precedence_over_group() {
 #[test]
 fn missing_uid_errors() {
     let xml = br#"<event type="a-f"/>"#;
-    assert!(matches!(parse(xml), Err(ParseError::MissingAttribute("uid"))));
+    assert!(matches!(
+        parse(xml),
+        Err(ParseError::MissingAttribute("uid"))
+    ));
 }
 
 #[test]
 fn missing_type_errors() {
     let xml = br#"<event uid="test-1"/>"#;
-    assert!(matches!(parse(xml), Err(ParseError::MissingAttribute("type"))));
+    assert!(matches!(
+        parse(xml),
+        Err(ParseError::MissingAttribute("type"))
+    ));
 }
 
 #[test]
