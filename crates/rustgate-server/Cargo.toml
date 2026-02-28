@@ -16,6 +16,7 @@ workspace = true
 nats = ["dep:rustgate-nats"]
 enrollment = ["dep:rustgate-enrollment"]
 proto = ["dep:rustgate-proto", "rustgate-transport/proto"]
+full-detail = ["rustgate-nats/full-detail"]
 
 [dependencies]
 rustgate-core = { workspace = true }

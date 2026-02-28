@@ -2,7 +2,9 @@
 
 use async_nats::Client;
 use bytes::Bytes;
-use rustgate_core::message::{MessageType, RoutableMessage};
+#[cfg(not(feature = "full-detail"))]
+use rustgate_core::message::MessageType;
+use rustgate_core::message::RoutableMessage;
 
 use crate::config::NatsConfig;
 use crate::serde_compat::WireEvent;
@@ -24,31 +26,17 @@ impl NatsPublisher {
 
     /// Publish a routable message to NATS.
     ///
-    /// Only Position messages are published. Non-position messages and
-    /// NATS-originated messages are skipped (echo prevention).
+    /// With the `full-detail` feature, publishes all CoT types with full
+    /// detail fields. Without it, only position messages are published.
     pub async fn publish(&self, msg: &RoutableMessage) {
         // Echo prevention: don't re-publish messages that came from NATS
         if msg.metadata.source_protocol == "nats" {
             return;
         }
 
+        // Without full-detail, only publish position messages
+        #[cfg(not(feature = "full-detail"))]
         if msg.metadata.message_type != MessageType::Position {
-            return;
-        }
-
-        let cot = match rustgate_cot::parse(&msg.payload) {
-            Ok(cot) => cot,
-            Err(e) => {
-                tracing::debug!(error = ?e, uid = %msg.source.cn, "CoT parse failed, skipping NATS publish");
-                return;
-            }
-        };
-
-        // Filter 0,0 positions (CoT spec: position unknown)
-        if let Some(pos) = &cot.position
-            && pos.lat == 0.0
-            && pos.lon == 0.0
-        {
             return;
         }
 
@@ -65,7 +53,16 @@ impl NatsPublisher {
 
         let subject = format!("{}.{}.update", self.config.subject_prefix, group);
 
-        let wire_event = WireEvent::from_cot(&cot);
+        let wire_event = match self.build_wire_event(&msg.payload) {
+            Some(event) => event,
+            None => return,
+        };
+
+        // Filter 0,0 positions (CoT spec: position unknown)
+        if wire_event.point.lat == 0.0 && wire_event.point.lon == 0.0 {
+            return;
+        }
+
         let json = match serde_json::to_vec(&wire_event) {
             Ok(j) => j,
             Err(e) => {
@@ -103,6 +100,33 @@ impl NatsPublisher {
             }
         } else {
             tracing::debug!(uid = %wire_event.uid, "invalid UID for JetStream subject, skipping history publish");
+        }
+    }
+
+    /// Build a WireEvent from raw CoT XML payload.
+    ///
+    /// With `full-detail`, uses the full XML parser to extract all detail fields.
+    /// Without it, uses the minimal parser for position-only data.
+    fn build_wire_event(&self, payload: &[u8]) -> Option<WireEvent> {
+        #[cfg(feature = "full-detail")]
+        {
+            match rustgate_proto::xml_full::parse_full(payload) {
+                Ok(full_cot) => Some(WireEvent::from_full_cot(&full_cot)),
+                Err(e) => {
+                    tracing::debug!(error = %e, "full CoT parse failed, skipping NATS publish");
+                    None
+                }
+            }
+        }
+        #[cfg(not(feature = "full-detail"))]
+        {
+            match rustgate_cot::parse(payload) {
+                Ok(cot) => Some(WireEvent::from_cot(&cot)),
+                Err(e) => {
+                    tracing::debug!(error = ?e, "CoT parse failed, skipping NATS publish");
+                    None
+                }
+            }
         }
     }
 }
