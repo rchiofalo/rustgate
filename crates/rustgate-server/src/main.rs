@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use clap::{Parser, ValueEnum};
@@ -12,6 +12,14 @@ use tracing_subscriber::EnvFilter;
 /// Maximum concurrent TLS sessions. Prevents resource exhaustion
 /// from connection floods (even with mTLS, the TLS handshake is costly).
 const MAX_CONNECTIONS: usize = 1024;
+
+/// Maximum time to wait for a complete frame from the client.
+/// Covers both idle clients and partial-frame stalls (e.g. incomplete XML tag).
+const READ_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// Maximum time to wait for a write to complete. Drops slow consumers
+/// that can't keep up with outbound message flow.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, Metadata, RoutableMessage};
@@ -482,8 +490,17 @@ async fn read_loop(
     // from the same session so NATS routing stays correct.
     let mut session_group: Option<String> = None;
 
-    while let Some(result) = framed.next().await {
-        let frame = result?;
+    loop {
+        let frame = match tokio::time::timeout(READ_TIMEOUT, framed.next()).await {
+            Ok(Some(result)) => result?,
+            Ok(None) => break, // EOF — client closed cleanly
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "read timeout: no complete frame received",
+                ));
+            }
+        };
 
         // For protobuf sessions, convert proto -> XML to get the canonical format.
         // The RoutableMessage payload is always XML.
@@ -536,9 +553,17 @@ async fn write_loop(
 
     while let Some(msg) = rx.recv().await {
         let encoded = encoder.encode(&msg)?;
-        framed
-            .send(tokio_util::bytes::BytesMut::from(encoded.as_ref()))
-            .await?;
+        let send_fut = framed.send(tokio_util::bytes::BytesMut::from(encoded.as_ref()));
+
+        match tokio::time::timeout(WRITE_TIMEOUT, send_fut).await {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "write timeout: slow consumer",
+                ));
+            }
+        }
     }
 
     Ok(())

@@ -1,14 +1,28 @@
 //! TLS listener for accepting mTLS connections.
 
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
+use tokio_rustls::TlsAcceptor;
+use tracing::{debug, warn};
+
 use crate::config::TlsConfig;
 use crate::extract::extract_identity;
 use crate::session::AuthenticatedSession;
 use rustgate_core::error::{Result, RustgateError};
-use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::net::{TcpListener, ToSocketAddrs};
-use tokio_rustls::TlsAcceptor;
-use tracing::{debug, warn};
+
+/// TCP keepalive idle time before first probe.
+const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+
+/// Interval between TCP keepalive probes after the idle period.
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Number of failed TCP keepalive probes before dropping the connection.
+/// Note: `set_tcp_keepalive` on tokio's `TcpStream` doesn't expose retries
+/// directly; the OS default (typically 8-10) applies. We document the intent here.
+const _TCP_KEEPALIVE_RETRIES: u32 = 3;
 
 pub struct TlsListener {
     tcp_listener: TcpListener,
@@ -60,6 +74,8 @@ impl TlsListener {
                 }
             };
 
+            configure_tcp_keepalive(&tcp_stream);
+
             debug!(peer_addr = %peer_addr, "TCP connection accepted");
 
             let tls_stream = match self.tls_acceptor.accept(tcp_stream).await {
@@ -105,5 +121,20 @@ impl TlsListener {
         })?;
 
         extract_identity(client_cert)
+    }
+}
+
+/// Enable TCP keepalive on a newly accepted socket.
+///
+/// Detects half-open and dead connections at the OS level so the read loop
+/// surfaces an error instead of blocking forever.
+fn configure_tcp_keepalive(stream: &TcpStream) {
+    let sock_ref = socket2::SockRef::from(stream);
+
+    let mut keepalive = socket2::TcpKeepalive::new().with_time(TCP_KEEPALIVE_IDLE);
+    keepalive = keepalive.with_interval(TCP_KEEPALIVE_INTERVAL);
+
+    if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
+        warn!(error = %e, "failed to set TCP keepalive");
     }
 }
