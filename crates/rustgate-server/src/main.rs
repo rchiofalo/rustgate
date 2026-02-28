@@ -5,7 +5,7 @@ use std::time::SystemTime;
 use bytes::Bytes;
 use clap::{Parser, ValueEnum};
 use futures::{SinkExt, StreamExt};
-use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing_subscriber::EnvFilter;
 
@@ -97,7 +97,9 @@ impl From<Framing> for FramingStrategy {
     fn from(f: Framing) -> Self {
         match f {
             Framing::Xml => FramingStrategy::XmlStream,
-            Framing::LengthPrefixed => FramingStrategy::LengthPrefixed { header_size: HeaderSize::Four },
+            Framing::LengthPrefixed => FramingStrategy::LengthPrefixed {
+                header_size: HeaderSize::Four,
+            },
             Framing::Line => FramingStrategy::LineDelimited,
             Framing::TakProtobuf => FramingStrategy::TakProtobuf,
             // TakNegotiate starts as XML; negotiation determines the actual framing.
@@ -159,7 +161,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 let replay = adapter.jetstream_replay();
                 match replay.replay(Arc::clone(&router)).await {
                     Ok(count) => tracing::info!(count, "JetStream SA replay loaded"),
-                    Err(e) => tracing::warn!(error = %e, "JetStream replay failed (continuing without history)"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "JetStream replay failed (continuing without history)")
+                    }
                 }
 
                 // Spawn NATS subscriber as a background task
@@ -193,9 +197,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     // Optionally start the enrollment HTTPS server for client certificate provisioning
     #[cfg(feature = "enrollment")]
     if let Some(ref enrollment_bind) = cli.enrollment_bind {
-        let ca_key_path = cli.ca_key.as_deref().ok_or_else(|| {
-            anyhow::anyhow!("--ca-key is required when --enrollment-bind is set")
-        })?;
+        let ca_key_path = cli
+            .ca_key
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--ca-key is required when --enrollment-bind is set"))?;
         let enrollment_user = cli.enrollment_user.as_deref().ok_or_else(|| {
             anyhow::anyhow!("--enrollment-user is required when --enrollment-bind is set")
         })?;
@@ -205,18 +210,16 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
         let ca_key_pem = tokio::fs::read_to_string(ca_key_path).await?;
 
-        let signer = rustgate_enrollment::CsrSigner::from_pem(
-            &ca_pem,
-            &ca_key_pem,
-            &cli.ca_organization,
-        )?;
+        let signer =
+            rustgate_enrollment::CsrSigner::from_pem(&ca_pem, &ca_key_pem, &cli.ca_organization)?;
         let credentials = rustgate_enrollment::Credentials::new(
             enrollment_user.to_string(),
             enrollment_password.to_string(),
         );
         let enrollment_server = rustgate_enrollment::EnrollmentServer::new(signer, credentials);
 
-        let bind_addr: std::net::SocketAddr = enrollment_bind.parse()
+        let bind_addr: std::net::SocketAddr = enrollment_bind
+            .parse()
             .map_err(|e| anyhow::anyhow!("invalid --enrollment-bind address: {e}"))?;
 
         let enrollment_cert = cert_pem.clone();
@@ -315,14 +318,47 @@ async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
 
     let result = match final_encoding {
         Encoding::Raw => {
-            run_session_loops(reader, writer, rx, &identity, &router, &final_framing, &RawEncoder, &nats_publisher, read_buf).await
+            run_session_loops(
+                reader,
+                writer,
+                rx,
+                &identity,
+                &router,
+                &final_framing,
+                &RawEncoder,
+                &nats_publisher,
+                read_buf,
+            )
+            .await
         }
         Encoding::Cot => {
-            run_session_loops(reader, writer, rx, &identity, &router, &final_framing, &CotEncoder, &nats_publisher, read_buf).await
+            run_session_loops(
+                reader,
+                writer,
+                rx,
+                &identity,
+                &router,
+                &final_framing,
+                &CotEncoder,
+                &nats_publisher,
+                read_buf,
+            )
+            .await
         }
         #[cfg(feature = "proto")]
         Encoding::TakProtobuf => {
-            run_session_loops(reader, writer, rx, &identity, &router, &final_framing, &rustgate_proto::TakProtobufEncoder, &nats_publisher, read_buf).await
+            run_session_loops(
+                reader,
+                writer,
+                rx,
+                &identity,
+                &router,
+                &final_framing,
+                &rustgate_proto::TakProtobufEncoder,
+                &nats_publisher,
+                read_buf,
+            )
+            .await
         }
         #[cfg(not(feature = "proto"))]
         Encoding::TakProtobuf => {
@@ -388,7 +424,11 @@ async fn negotiate_tak_protocol(
 
         tracing::info!(cn = %cn, "protobuf negotiation complete");
 
-        Ok((FramingStrategy::TakProtobuf, Encoding::TakProtobuf, tokio_util::bytes::BytesMut::new()))
+        Ok((
+            FramingStrategy::TakProtobuf,
+            Encoding::TakProtobuf,
+            tokio_util::bytes::BytesMut::new(),
+        ))
     } else {
         // Client sent XML (legacy mode). Preserve the byte we already read.
         tracing::info!(cn = %cn, "client staying XML (no protobuf request)");
@@ -496,7 +536,9 @@ async fn write_loop(
 
     while let Some(msg) = rx.recv().await {
         let encoded = encoder.encode(&msg)?;
-        framed.send(tokio_util::bytes::BytesMut::from(encoded.as_ref())).await?;
+        framed
+            .send(tokio_util::bytes::BytesMut::from(encoded.as_ref()))
+            .await?;
     }
 
     Ok(())

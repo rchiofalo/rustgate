@@ -19,8 +19,8 @@ use rustgate_test_utils::certs::TestCa;
 use rustgate_transport::{
     AuthenticatedSession, LengthPrefixedCodec, Router, SessionHandle, TlsConfig, TlsListener,
 };
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::RootCertStore;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::io::BufReader;
 
 // ── helpers ──────────────────────────────────────────────────────────────
@@ -56,7 +56,10 @@ fn make_identity(cn: &str, groups: &[&str]) -> Identity {
     Identity {
         cn: cn.to_string(),
         fingerprint: format!("fake:{cn}"),
-        groups: groups.iter().map(|g| g.to_string()).collect::<BTreeSet<_>>(),
+        groups: groups
+            .iter()
+            .map(|g| g.to_string())
+            .collect::<BTreeSet<_>>(),
     }
 }
 
@@ -150,9 +153,14 @@ async fn connect_client(
 ) -> (ClientTx, ClientRx) {
     let config = build_client_config(cert_pem, key_pem, ca_pem);
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-    let tcp = tokio::net::TcpStream::connect(addr).await.expect("tcp connect");
+    let tcp = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("tcp connect");
     let server_name = "localhost".try_into().expect("server name");
-    let tls = connector.connect(server_name, tcp).await.expect("tls connect");
+    let tls = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("tls connect");
     let framed = tokio_util::codec::Framed::new(tls, LengthPrefixedCodec::new(HeaderSize::Four));
     framed.split()
 }
@@ -165,9 +173,14 @@ async fn connect_raw(
 ) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
     let config = build_client_config(cert_pem, key_pem, ca_pem);
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-    let tcp = tokio::net::TcpStream::connect(addr).await.expect("tcp connect");
+    let tcp = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("tcp connect");
     let server_name = "localhost".try_into().expect("server name");
-    connector.connect(server_name, tcp).await.expect("tls connect")
+    connector
+        .connect(server_name, tcp)
+        .await
+        .expect("tls connect")
 }
 
 /// Receive one frame with a timeout. Panics with `label` on failure.
@@ -183,9 +196,9 @@ async fn recv(rx: &mut ClientRx, label: &str) -> Vec<u8> {
 /// Assert no data frame arrives — timeout or stream-end are both acceptable.
 async fn assert_no_message(rx: &mut ClientRx, label: &str) {
     match tokio::time::timeout(std::time::Duration::from_millis(300), rx.next()).await {
-        Err(_) => {}                // Timeout — nothing arrived
-        Ok(None) => {}              // Stream closed
-        Ok(Some(Err(_))) => {}      // Read error (connection reset)
+        Err(_) => {}           // Timeout — nothing arrived
+        Ok(None) => {}         // Stream closed
+        Ok(Some(Err(_))) => {} // Read error (connection reset)
         Ok(Some(Ok(frame))) => {
             panic!("{label}: unexpected data: {:?}", &frame[..]);
         }
@@ -253,10 +266,16 @@ async fn broadcast_between_two_clients() {
 
     assert_eq!(server.router.session_count().await, 2);
 
-    alice_tx.send(tokio_util::bytes::BytesMut::from("hello bob")).await.expect("send");
+    alice_tx
+        .send(tokio_util::bytes::BytesMut::from("hello bob"))
+        .await
+        .expect("send");
     assert_eq!(recv(&mut bob_rx, "bob").await, b"hello bob");
 
-    bob_tx.send(tokio_util::bytes::BytesMut::from("hey alice")).await.expect("send");
+    bob_tx
+        .send(tokio_util::bytes::BytesMut::from("hey alice"))
+        .await
+        .expect("send");
     assert_eq!(recv(&mut alice_rx, "alice").await, b"hey alice");
 }
 
@@ -269,7 +288,10 @@ async fn no_self_echo() {
     let (mut alice_tx, mut alice_rx) = server.connect(&alice).await;
     server.wait_ready(handle).await;
 
-    alice_tx.send(tokio_util::bytes::BytesMut::from("echo?")).await.expect("send");
+    alice_tx
+        .send(tokio_util::bytes::BytesMut::from("echo?"))
+        .await
+        .expect("send");
     assert_no_message(&mut alice_rx, "alice self-echo").await;
 }
 
@@ -295,8 +317,14 @@ async fn disconnect_cleanup() {
 
     assert_eq!(server.router.session_count().await, 2);
 
-    bob_tx.send(tokio_util::bytes::BytesMut::from("still here")).await.expect("send");
-    assert_eq!(recv(&mut charlie_rx, "charlie after disconnect").await, b"still here");
+    bob_tx
+        .send(tokio_util::bytes::BytesMut::from("still here"))
+        .await
+        .expect("send");
+    assert_eq!(
+        recv(&mut charlie_rx, "charlie after disconnect").await,
+        b"still here"
+    );
 }
 
 /// Same CN reconnecting replaces the old session. The stale session's
@@ -308,9 +336,8 @@ async fn same_cn_reconnect_replaces_session() {
     let alice_cert = ca.issue_client_cert("alice", &["ops"]);
     let bob_cert = ca.issue_client_cert("bob", &["ops"]);
 
-    let tls_config =
-        TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
-            .expect("tls config");
+    let tls_config = TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
+        .expect("tls config");
     let listener = TlsListener::bind("127.0.0.1:0", &tls_config)
         .await
         .expect("bind");
@@ -333,16 +360,26 @@ async fn same_cn_reconnect_replaces_session() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     });
 
-    let (alice1_tx, mut alice1_rx) =
-        connect_client(addr, &alice_cert.cert_pem, &alice_cert.key_pem, &ca.cert_pem).await;
+    let (alice1_tx, mut alice1_rx) = connect_client(
+        addr,
+        &alice_cert.cert_pem,
+        &alice_cert.key_pem,
+        &ca.cert_pem,
+    )
+    .await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     let (mut bob_tx, _bob_rx) =
         connect_client(addr, &bob_cert.cert_pem, &bob_cert.key_pem, &ca.cert_pem).await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    let (_alice2_tx, mut alice2_rx) =
-        connect_client(addr, &alice_cert.cert_pem, &alice_cert.key_pem, &ca.cert_pem).await;
+    let (_alice2_tx, mut alice2_rx) = connect_client(
+        addr,
+        &alice_cert.cert_pem,
+        &alice_cert.key_pem,
+        &ca.cert_pem,
+    )
+    .await;
 
     accept_handle.await.expect("accept loop");
 
@@ -351,7 +388,10 @@ async fn same_cn_reconnect_replaces_session() {
     drop(alice1_tx);
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    bob_tx.send(tokio_util::bytes::BytesMut::from("who's there")).await.expect("send");
+    bob_tx
+        .send(tokio_util::bytes::BytesMut::from("who's there"))
+        .await
+        .expect("send");
     assert_eq!(recv(&mut alice2_rx, "alice2").await, b"who's there");
     assert_no_message(&mut alice1_rx, "alice1 stale").await;
 }
@@ -451,7 +491,9 @@ async fn oversized_frame_rejected() {
 
     // Write a 4-byte length header claiming 20MB
     let fake_len: u32 = 20 * 1024 * 1024;
-    raw.write_all(&fake_len.to_be_bytes()).await.expect("write header");
+    raw.write_all(&fake_len.to_be_bytes())
+        .await
+        .expect("write header");
     let _ = raw.flush().await;
 
     // Server should kill the connection — read should get EOF or error
@@ -463,8 +505,8 @@ async fn oversized_frame_rejected() {
     .await;
 
     match result {
-        Ok(Ok(0)) => {}          // EOF — server closed
-        Ok(Err(_)) => {}         // Read error — server reset
+        Ok(Ok(0)) => {}  // EOF — server closed
+        Ok(Err(_)) => {} // Read error — server reset
         Err(_) => panic!("server did not close the connection after oversized header"),
         Ok(Ok(_)) => panic!("server sent data back on an invalid frame"),
     }
@@ -492,9 +534,15 @@ async fn route_to_group() {
     let (bob_tx, mut bob_rx) = mpsc::channel::<RoutableMessage>(16);
     let (charlie_tx, mut charlie_rx) = mpsc::channel::<RoutableMessage>(16);
 
-    router.register(SessionHandle::new(alice.clone(), alice_tx)).await;
-    router.register(SessionHandle::new(bob.clone(), bob_tx)).await;
-    router.register(SessionHandle::new(charlie.clone(), charlie_tx)).await;
+    router
+        .register(SessionHandle::new(alice.clone(), alice_tx))
+        .await;
+    router
+        .register(SessionHandle::new(bob.clone(), bob_tx))
+        .await;
+    router
+        .register(SessionHandle::new(charlie.clone(), charlie_tx))
+        .await;
 
     // Alice sends to group "engineers"
     let msg = build_message(&alice, b"eng-only", Destination::Group("engineers".into()));
@@ -505,10 +553,16 @@ async fn route_to_group() {
     assert_eq!(got.payload.as_ref(), b"eng-only");
 
     // Alice is in engineers but is the sender — should not receive
-    assert!(alice_rx.try_recv().is_err(), "sender should not self-receive");
+    assert!(
+        alice_rx.try_recv().is_err(),
+        "sender should not self-receive"
+    );
 
     // Charlie is in medics — should not receive
-    assert!(charlie_rx.try_recv().is_err(), "wrong group should not receive");
+    assert!(
+        charlie_rx.try_recv().is_err(),
+        "wrong group should not receive"
+    );
 }
 
 /// Route directly to a specific CN — only the target receives it.
@@ -524,9 +578,15 @@ async fn route_direct() {
     let (bob_tx, mut bob_rx) = mpsc::channel::<RoutableMessage>(16);
     let (charlie_tx, mut charlie_rx) = mpsc::channel::<RoutableMessage>(16);
 
-    router.register(SessionHandle::new(alice.clone(), alice_tx)).await;
-    router.register(SessionHandle::new(bob.clone(), bob_tx)).await;
-    router.register(SessionHandle::new(charlie.clone(), charlie_tx)).await;
+    router
+        .register(SessionHandle::new(alice.clone(), alice_tx))
+        .await;
+    router
+        .register(SessionHandle::new(bob.clone(), bob_tx))
+        .await;
+    router
+        .register(SessionHandle::new(charlie.clone(), charlie_tx))
+        .await;
 
     // Alice sends directly to bob
     let target = (*bob).clone();
@@ -549,7 +609,9 @@ async fn route_direct_to_offline_user() {
 
     let alice = Arc::new(make_identity("alice", &["team"]));
     let (alice_tx, _alice_rx) = mpsc::channel::<RoutableMessage>(16);
-    router.register(SessionHandle::new(alice.clone(), alice_tx)).await;
+    router
+        .register(SessionHandle::new(alice.clone(), alice_tx))
+        .await;
 
     let ghost = make_identity("ghost", &["team"]);
     let msg = build_message(&alice, b"hello?", Destination::Direct(ghost));
@@ -565,7 +627,9 @@ async fn route_to_empty_group() {
 
     let alice = Arc::new(make_identity("alice", &["engineers"]));
     let (alice_tx, _alice_rx) = mpsc::channel::<RoutableMessage>(16);
-    router.register(SessionHandle::new(alice.clone(), alice_tx)).await;
+    router
+        .register(SessionHandle::new(alice.clone(), alice_tx))
+        .await;
 
     let msg = build_message(&alice, b"anyone?", Destination::Group("ghosts".into()));
 
@@ -587,14 +651,22 @@ async fn register_with_group_change() {
     let (bob_tx, mut bob_rx) = mpsc::channel::<RoutableMessage>(16);
     let (charlie_tx, mut charlie_rx) = mpsc::channel::<RoutableMessage>(16);
 
-    router.register(SessionHandle::new(alice_v1.clone(), alice_v1_tx)).await;
-    router.register(SessionHandle::new(bob.clone(), bob_tx)).await;
-    router.register(SessionHandle::new(charlie.clone(), charlie_tx)).await;
+    router
+        .register(SessionHandle::new(alice_v1.clone(), alice_v1_tx))
+        .await;
+    router
+        .register(SessionHandle::new(bob.clone(), bob_tx))
+        .await;
+    router
+        .register(SessionHandle::new(charlie.clone(), charlie_tx))
+        .await;
 
     // Alice moves from "alpha" to "bravo"
     let alice_v2 = Arc::new(make_identity("alice", &["bravo"]));
     let (alice_v2_tx, mut alice_v2_rx) = mpsc::channel::<RoutableMessage>(16);
-    router.register(SessionHandle::new(alice_v2.clone(), alice_v2_tx)).await;
+    router
+        .register(SessionHandle::new(alice_v2.clone(), alice_v2_tx))
+        .await;
 
     // Alice (now in bravo) sends to group "alpha" — she's not in alpha so
     // she won't self-filter, but she also shouldn't receive (not a member).
@@ -604,7 +676,10 @@ async fn register_with_group_change() {
 
     let got = bob_rx.try_recv().expect("bob is in alpha");
     assert_eq!(got.payload.as_ref(), b"alpha-msg");
-    assert!(alice_v2_rx.try_recv().is_err(), "alice left alpha, should not receive");
+    assert!(
+        alice_v2_rx.try_recv().is_err(),
+        "alice left alpha, should not receive"
+    );
 
     // Charlie sends to group "bravo" — alice and bob receive (both in bravo)
     let msg = build_message(&charlie, b"bravo-msg", Destination::Group("bravo".into()));
@@ -627,7 +702,9 @@ async fn route_direct_to_self() {
 
     let alice = Arc::new(make_identity("alice", &["team"]));
     let (alice_tx, mut alice_rx) = mpsc::channel::<RoutableMessage>(16);
-    router.register(SessionHandle::new(alice.clone(), alice_tx)).await;
+    router
+        .register(SessionHandle::new(alice.clone(), alice_tx))
+        .await;
 
     let target = (*alice).clone();
     let msg = build_message(&alice, b"note-to-self", Destination::Direct(target));
@@ -675,7 +752,9 @@ async fn position_cache_replay() {
     router.replay_positions(&bob_handle).await;
 
     // Bob should receive Alice's cached position
-    let got = bob_rx.try_recv().expect("bob should receive cached position");
+    let got = bob_rx
+        .try_recv()
+        .expect("bob should receive cached position");
     assert_eq!(got.source.cn, "alice");
     assert_eq!(got.metadata.message_type, MessageType::Position);
 }
@@ -687,7 +766,9 @@ async fn chat_messages_not_cached() {
 
     let alice = Arc::new(make_identity("alice", &["team"]));
     let (alice_tx, _alice_rx) = mpsc::channel::<RoutableMessage>(16);
-    router.register(SessionHandle::new(alice.clone(), alice_tx)).await;
+    router
+        .register(SessionHandle::new(alice.clone(), alice_tx))
+        .await;
 
     // Alice sends a chat message
     let chat_msg = RoutableMessage {
@@ -714,7 +795,9 @@ async fn position_cache_replaces_old() {
 
     let alice = Arc::new(make_identity("alice", &["team"]));
     let (alice_tx, _alice_rx) = mpsc::channel::<RoutableMessage>(16);
-    router.register(SessionHandle::new(alice.clone(), alice_tx)).await;
+    router
+        .register(SessionHandle::new(alice.clone(), alice_tx))
+        .await;
 
     // Alice sends first position
     let pos1 = RoutableMessage {
@@ -754,7 +837,9 @@ async fn position_cache_replaces_old() {
     router.register(bob_handle.clone()).await;
     router.replay_positions(&bob_handle).await;
 
-    let got = bob_rx.try_recv().expect("bob should receive cached position");
+    let got = bob_rx
+        .try_recv()
+        .expect("bob should receive cached position");
     assert_eq!(got.payload.as_ref(), b"pos2");
 }
 
@@ -809,7 +894,10 @@ fn codec_header_one_overflow() {
     let mut wire = tokio_util::bytes::BytesMut::new();
     let result = codec.encode(payload, &mut wire);
 
-    assert!(result.is_err(), "256 bytes should not fit in a 1-byte header");
+    assert!(
+        result.is_err(),
+        "256 bytes should not fit in a 1-byte header"
+    );
 }
 
 /// HeaderSize::Two encode must reject payloads > 65535 bytes.
@@ -822,5 +910,8 @@ fn codec_header_two_overflow() {
     let mut wire = tokio_util::bytes::BytesMut::new();
     let result = codec.encode(payload, &mut wire);
 
-    assert!(result.is_err(), "65536 bytes should not fit in a 2-byte header");
+    assert!(
+        result.is_err(),
+        "65536 bytes should not fit in a 2-byte header"
+    );
 }

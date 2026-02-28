@@ -1,9 +1,9 @@
 //! Integration tests for TLS listener with mTLS authentication.
 
 use rustgate_test_utils::certs::TestCa;
-use rustgate_transport::{extract_identity, TlsConfig, TlsListener};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustgate_transport::{TlsConfig, TlsListener, extract_identity};
 use rustls::RootCertStore;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::io::BufReader;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -42,9 +42,14 @@ async fn connect(
     config: &rustls::ClientConfig,
 ) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config.clone()));
-    let tcp = tokio::net::TcpStream::connect(addr).await.expect("tcp connect");
+    let tcp = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("tcp connect");
     let server_name = "localhost".try_into().expect("server name");
-    connector.connect(server_name, tcp).await.expect("tls connect")
+    connector
+        .connect(server_name, tcp)
+        .await
+        .expect("tls connect")
 }
 
 // ── identity extraction ──────────────────────────────────────────────────
@@ -83,7 +88,9 @@ async fn mtls_handshake_and_identity() {
 
     let tls_config = TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
         .expect("tls config");
-    let listener = TlsListener::bind("127.0.0.1:0", &tls_config).await.expect("bind");
+    let listener = TlsListener::bind("127.0.0.1:0", &tls_config)
+        .await
+        .expect("bind");
     let addr = listener.local_addr().expect("addr");
 
     let server_handle = tokio::spawn(async move {
@@ -131,16 +138,24 @@ async fn mtls_rejects_untrusted_client() {
     )
     .expect("tls config");
 
-    let listener = TlsListener::bind("127.0.0.1:0", &tls_config).await.expect("bind");
+    let listener = TlsListener::bind("127.0.0.1:0", &tls_config)
+        .await
+        .expect("bind");
     let addr = listener.local_addr().expect("addr");
 
     let server_handle = tokio::spawn(async move {
         tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept()).await
     });
 
-    let config = build_client_config(&rogue_cert.cert_pem, &rogue_cert.key_pem, &server_ca.cert_pem);
+    let config = build_client_config(
+        &rogue_cert.cert_pem,
+        &rogue_cert.key_pem,
+        &server_ca.cert_pem,
+    );
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-    let tcp = tokio::net::TcpStream::connect(addr).await.expect("tcp connect");
+    let tcp = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("tcp connect");
     let server_name = "localhost".try_into().expect("server name");
     let result = connector.connect(server_name, tcp).await;
 
@@ -148,9 +163,7 @@ async fn mtls_rejects_untrusted_client() {
         Err(_) => true,
         Ok(mut stream) => {
             // TLS 1.3 may defer the alert — try using the connection
-            if stream.write_all(b"x").await.is_err() {
-                true
-            } else if stream.flush().await.is_err() {
+            if stream.write_all(b"x").await.is_err() || stream.flush().await.is_err() {
                 true
             } else {
                 let mut buf = [0u8; 1];
@@ -170,7 +183,10 @@ async fn mtls_rejects_untrusted_client() {
     assert!(failed, "untrusted client should not be able to communicate");
 
     let server_result = server_handle.await.expect("server task");
-    assert!(server_result.is_err(), "server should timeout — no valid session");
+    assert!(
+        server_result.is_err(),
+        "server should timeout — no valid session"
+    );
 }
 
 /// Accept multiple clients sequentially through the same listener.
@@ -183,7 +199,9 @@ async fn accept_multiple_clients_sequentially() {
 
     let tls_config = TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
         .expect("tls config");
-    let listener = TlsListener::bind("127.0.0.1:0", &tls_config).await.expect("bind");
+    let listener = TlsListener::bind("127.0.0.1:0", &tls_config)
+        .await
+        .expect("bind");
     let addr = listener.local_addr().expect("addr");
 
     let server_handle = tokio::spawn(async move {

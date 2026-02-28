@@ -37,4 +37,4 @@ pub use error::ProtoError;
 pub use negotiate::{
     build_protocol_support_xml, build_tak_response, parse_tak_request, read_tak_request,
 };
-pub use xml_full::{parse_full, FullCotEvent};
+pub use xml_full::{FullCotEvent, parse_full};

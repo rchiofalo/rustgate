@@ -26,7 +26,9 @@ pub struct NatsAdapter {
 
 impl NatsAdapter {
     /// Connect to a NATS server and return an adapter ready for use.
-    pub async fn connect(config: NatsConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn connect(
+        config: NatsConfig,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let client = if let Some(ref creds) = config.credentials_file {
             async_nats::ConnectOptions::with_credentials_file(creds)
                 .await?

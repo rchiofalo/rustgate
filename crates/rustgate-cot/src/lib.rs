@@ -8,8 +8,8 @@
 
 use std::time::Duration;
 
-use quick_xml::events::Event;
 use quick_xml::Reader;
+use quick_xml::events::Event;
 use rustgate_core::message::MessageType;
 
 #[derive(Debug, Clone)]
@@ -68,54 +68,63 @@ pub fn parse(xml: &[u8]) -> Result<CotEvent, ParseError> {
     loop {
         match reader.read_event_into(&mut buf)? {
             Event::Eof => break,
-            Event::Start(e) | Event::Empty(e) => {
-                match e.name().as_ref() {
-                    b"event" => {
-                        for attr in e.attributes().flatten() {
-                            match attr.key.as_ref() {
-                                b"uid" => uid = Some(String::from_utf8_lossy(&attr.value).into_owned()),
-                                b"type" => event_type = Some(String::from_utf8_lossy(&attr.value).into_owned()),
-                                b"stale" => stale_time = Some(String::from_utf8_lossy(&attr.value).into_owned()),
-                                b"start" => start_time = Some(String::from_utf8_lossy(&attr.value).into_owned()),
-                                _ => {}
+            Event::Start(e) | Event::Empty(e) => match e.name().as_ref() {
+                b"event" => {
+                    for attr in e.attributes().flatten() {
+                        match attr.key.as_ref() {
+                            b"uid" => uid = Some(String::from_utf8_lossy(&attr.value).into_owned()),
+                            b"type" => {
+                                event_type = Some(String::from_utf8_lossy(&attr.value).into_owned())
                             }
+                            b"stale" => {
+                                stale_time = Some(String::from_utf8_lossy(&attr.value).into_owned())
+                            }
+                            b"start" => {
+                                start_time = Some(String::from_utf8_lossy(&attr.value).into_owned())
+                            }
+                            _ => {}
                         }
                     }
-                    b"point" => {
-                        let mut lat = None;
-                        let mut lon = None;
-                        let mut hae = None;
-                        for attr in e.attributes().flatten() {
-                            match attr.key.as_ref() {
-                                b"lat" => lat = Some(parse_f64(&attr.value, "lat")?),
-                                b"lon" => lon = Some(parse_f64(&attr.value, "lon")?),
-                                b"hae" => hae = Some(parse_f64(&attr.value, "hae")?),
-                                _ => {}
-                            }
-                        }
-                        if let (Some(lat), Some(lon), Some(hae)) = (lat, lon, hae) {
-                            position = Some(Position { lat, lon, hae });
-                        }
-                    }
-                    b"dest" => {
-                        for attr in e.attributes().flatten() {
-                            match attr.key.as_ref() {
-                                b"callsign" => dest_callsign = Some(String::from_utf8_lossy(&attr.value).into_owned()),
-                                b"group" => dest_group = Some(String::from_utf8_lossy(&attr.value).into_owned()),
-                                _ => {}
-                            }
-                        }
-                    }
-                    b"__group" => {
-                        for attr in e.attributes().flatten() {
-                            if attr.key.as_ref() == b"name" {
-                                source_group = Some(String::from_utf8_lossy(&attr.value).into_owned());
-                            }
-                        }
-                    }
-                    _ => {}
                 }
-            }
+                b"point" => {
+                    let mut lat = None;
+                    let mut lon = None;
+                    let mut hae = None;
+                    for attr in e.attributes().flatten() {
+                        match attr.key.as_ref() {
+                            b"lat" => lat = Some(parse_f64(&attr.value, "lat")?),
+                            b"lon" => lon = Some(parse_f64(&attr.value, "lon")?),
+                            b"hae" => hae = Some(parse_f64(&attr.value, "hae")?),
+                            _ => {}
+                        }
+                    }
+                    if let (Some(lat), Some(lon), Some(hae)) = (lat, lon, hae) {
+                        position = Some(Position { lat, lon, hae });
+                    }
+                }
+                b"dest" => {
+                    for attr in e.attributes().flatten() {
+                        match attr.key.as_ref() {
+                            b"callsign" => {
+                                dest_callsign =
+                                    Some(String::from_utf8_lossy(&attr.value).into_owned())
+                            }
+                            b"group" => {
+                                dest_group = Some(String::from_utf8_lossy(&attr.value).into_owned())
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                b"__group" => {
+                    for attr in e.attributes().flatten() {
+                        if attr.key.as_ref() == b"name" {
+                            source_group = Some(String::from_utf8_lossy(&attr.value).into_owned());
+                        }
+                    }
+                }
+                _ => {}
+            },
             _ => {}
         }
         buf.clear();
@@ -195,5 +204,8 @@ fn parse_iso8601(s: &str) -> Option<u64> {
 
 fn day_of_year(month: i64, day: i64) -> i64 {
     const DAYS: [i64; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
-    DAYS.get(month.saturating_sub(1) as usize).copied().unwrap_or(0) + day
+    DAYS.get(month.saturating_sub(1) as usize)
+        .copied()
+        .unwrap_or(0)
+        + day
 }

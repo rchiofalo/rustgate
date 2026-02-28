@@ -70,9 +70,7 @@ impl Decoder for TakFrameCodec {
                         if len > MAX_FRAME_SIZE {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
-                                format!(
-                                    "TAK frame too large: {len} bytes (max {MAX_FRAME_SIZE})"
-                                ),
+                                format!("TAK frame too large: {len} bytes (max {MAX_FRAME_SIZE})"),
                             ));
                         }
                         src.advance(1 + varint_bytes);

@@ -203,8 +203,8 @@ fn write_track(xml: &mut Vec<u8>, t: &tak_proto::Track) {
 /// with quick_xml. Rejects malformed XML and structural injection attempts
 /// (e.g., `</detail></event><evil/>`).
 fn is_safe_xml_fragment(fragment: &str) -> bool {
-    use quick_xml::events::Event;
     use quick_xml::Reader;
+    use quick_xml::events::Event;
 
     let wrapped = format!("<_r>{fragment}</_r>");
     let mut reader = Reader::from_reader(wrapped.as_bytes());
@@ -226,7 +226,9 @@ mod tests {
 
     #[test]
     fn safe_xml_fragment_valid() {
-        assert!(is_safe_xml_fragment("<marti><dest callsign=\"BRAVO\"/></marti>"));
+        assert!(is_safe_xml_fragment(
+            "<marti><dest callsign=\"BRAVO\"/></marti>"
+        ));
         assert!(is_safe_xml_fragment("<remarks>test note</remarks>"));
         assert!(is_safe_xml_fragment("<custom attr=\"val\"/>"));
         assert!(is_safe_xml_fragment(""));
@@ -262,7 +264,10 @@ mod tests {
         let xml_str = std::str::from_utf8(&xml).expect("utf8");
 
         // The injected content should NOT appear in the output
-        assert!(!xml_str.contains("<injected"), "injection should be dropped: {xml_str}");
+        assert!(
+            !xml_str.contains("<injected"),
+            "injection should be dropped: {xml_str}"
+        );
         // But the document should still be well-formed
         assert!(xml_str.contains("</detail>"));
         assert!(xml_str.contains("</event>"));

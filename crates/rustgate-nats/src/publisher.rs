@@ -48,8 +48,7 @@ impl NatsPublisher {
             .map(String::as_str)
             .unwrap_or("");
 
-        let group = sanitize_nats_token(raw_group)
-            .unwrap_or(self.config.default_group.as_str());
+        let group = sanitize_nats_token(raw_group).unwrap_or(self.config.default_group.as_str());
 
         let subject = format!("{}.{}.update", self.config.subject_prefix, group);
 
@@ -74,10 +73,7 @@ impl NatsPublisher {
         let payload = Bytes::from(json);
 
         let mut headers = async_nats::HeaderMap::new();
-        headers.insert(
-            "X-Rustgate-Instance",
-            self.config.instance_id.as_str(),
-        );
+        headers.insert("X-Rustgate-Instance", self.config.instance_id.as_str());
 
         // Publish to live subject
         if let Err(e) = self
@@ -141,7 +137,9 @@ fn sanitize_nats_token(s: &str) -> Option<&str> {
     if s.is_empty() {
         return None;
     }
-    if s.bytes().any(|b| b <= 0x20 || b >= 0x7F || matches!(b, b'.' | b'>' | b'*')) {
+    if s.bytes()
+        .any(|b| b <= 0x20 || b >= 0x7F || matches!(b, b'.' | b'>' | b'*'))
+    {
         return None;
     }
     Some(s)

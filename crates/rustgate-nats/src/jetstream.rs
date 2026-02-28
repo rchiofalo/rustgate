@@ -32,7 +32,10 @@ impl JetStreamReplay {
     ///
     /// Creates an ephemeral ordered consumer with `DeliverLastPerSubject`
     /// policy. Returns the number of positions loaded.
-    pub async fn replay(&self, router: Arc<Router>) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn replay(
+        &self,
+        router: Arc<Router>,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         let js = jetstream::new(self.client.clone());
 
         // Look up the existing stream (don't create it — stream config is external)
@@ -62,7 +65,9 @@ impl JetStreamReplay {
 
             match next {
                 Ok(Some(Ok(msg))) => {
-                    if self.config.max_payload_bytes > 0 && msg.payload.len() > self.config.max_payload_bytes {
+                    if self.config.max_payload_bytes > 0
+                        && msg.payload.len() > self.config.max_payload_bytes
+                    {
                         tracing::debug!(
                             len = msg.payload.len(),
                             max = self.config.max_payload_bytes,
@@ -95,7 +100,11 @@ impl JetStreamReplay {
                     count += 1;
 
                     if self.config.max_replay_count > 0 && count >= self.config.max_replay_count {
-                        tracing::info!(count, limit = self.config.max_replay_count, "JetStream replay hit count limit");
+                        tracing::info!(
+                            count,
+                            limit = self.config.max_replay_count,
+                            "JetStream replay hit count limit"
+                        );
                         break;
                     }
                 }
@@ -103,8 +112,8 @@ impl JetStreamReplay {
                     tracing::warn!(error = %e, "JetStream replay message error");
                     break;
                 }
-                Ok(None) => break,      // Stream ended
-                Err(_) => break,         // Timeout — done receiving
+                Ok(None) => break, // Stream ended
+                Err(_) => break,   // Timeout — done receiving
             }
         }
 

@@ -31,9 +31,7 @@ impl FramedCodec {
             FramingStrategy::XmlStream => Self::XmlStream(XmlStreamCodec::new()),
             FramingStrategy::LineDelimited => Self::LineDelimited(LineDelimitedCodec::new()),
             #[cfg(feature = "proto")]
-            FramingStrategy::TakProtobuf => {
-                Self::TakProtobuf(rustgate_proto::TakFrameCodec::new())
-            }
+            FramingStrategy::TakProtobuf => Self::TakProtobuf(rustgate_proto::TakFrameCodec::new()),
             #[cfg(not(feature = "proto"))]
             FramingStrategy::TakProtobuf => {
                 // TakProtobuf variant exists in core but requires the proto feature.
@@ -135,7 +133,10 @@ impl Decoder for LengthPrefixedCodec {
                 }
                 let len = self.read_length(&src[..self.header_bytes()]);
                 if len > MAX_FRAME_SIZE {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "frame too large",
+                    ));
                 }
                 src.advance(self.header_bytes());
                 self.pending_len = Some(len);
@@ -310,7 +311,10 @@ impl Decoder for XmlStreamCodec {
         }
 
         if src.len() > MAX_FRAME_SIZE {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "xml frame too large"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "xml frame too large",
+            ));
         }
 
         let initial_depth = self.depth;

@@ -37,7 +37,9 @@ pub fn build_protocol_support_xml(server_uid: &str) -> Vec<u8> {
     write_attr(&mut xml, "start", "2020-01-01T00:00:00.000Z");
     write_attr(&mut xml, "stale", "2020-01-01T00:05:00.000Z");
     xml.extend_from_slice(b">");
-    xml.extend_from_slice(b"<point lat=\"0.0\" lon=\"0.0\" hae=\"0.0\" ce=\"999999\" le=\"999999\"/>");
+    xml.extend_from_slice(
+        b"<point lat=\"0.0\" lon=\"0.0\" hae=\"0.0\" ce=\"999999\" le=\"999999\"/>",
+    );
     xml.extend_from_slice(b"<detail>");
     xml.extend_from_slice(b"<TakControl>");
     xml.extend_from_slice(b"<TakProtocolSupport version=\"");
@@ -109,7 +111,9 @@ pub async fn read_tak_request(reader: &mut (impl tokio::io::AsyncRead + Unpin)) 
     let payload_len;
 
     loop {
-        let n = reader.read(&mut header_buf[header_len..header_len + 1]).await?;
+        let n = reader
+            .read(&mut header_buf[header_len..header_len + 1])
+            .await?;
         if n == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -226,8 +230,7 @@ mod tests {
     fn tak_response_decodeable() {
         let response = build_tak_response();
         // Skip magic byte, decode varint to find payload
-        let (payload_len, varint_bytes) =
-            codec::decode_varint(&response[1..]).expect("varint");
+        let (payload_len, varint_bytes) = codec::decode_varint(&response[1..]).expect("varint");
         let payload_start = 1 + varint_bytes;
         let payload = &response[payload_start..payload_start + payload_len];
 

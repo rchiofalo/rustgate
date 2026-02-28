@@ -76,13 +76,13 @@ fn build_detail(full: &xml_full::FullCotEvent) -> tak_proto::Detail {
         role: g.role.clone(),
     });
 
-    let precision_location = full
-        .precision_location
-        .as_ref()
-        .map(|p| tak_proto::PrecisionLocation {
-            geopointsrc: p.geopointsrc.clone(),
-            altsrc: p.altsrc.clone(),
-        });
+    let precision_location =
+        full.precision_location
+            .as_ref()
+            .map(|p| tak_proto::PrecisionLocation {
+                geopointsrc: p.geopointsrc.clone(),
+                altsrc: p.altsrc.clone(),
+            });
 
     let status = full
         .status

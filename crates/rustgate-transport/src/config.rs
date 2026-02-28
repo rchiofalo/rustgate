@@ -1,9 +1,9 @@
 //! TLS configuration for mTLS server.
 
 use rustgate_core::error::{Result, RustgateError};
+use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
-use rustls::RootCertStore;
 use std::io::BufReader;
 use std::sync::Arc;
 
