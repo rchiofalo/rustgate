@@ -3,7 +3,9 @@ name = "rustgate-nats"
 description = "NATS adapter for stateless TAK termination and cross-instance message delivery"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [lints]
 workspace = true

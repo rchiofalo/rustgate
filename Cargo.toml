@@ -17,6 +17,8 @@ edition = "2024"
 rust-version = "1.85"
 license = "LicenseRef-Proprietary"
 repository = "https://github.com/rchiofalo/rustgate"
+keywords = ["tak", "cot", "mtls", "nats", "tactical"]
+categories = ["network-programming", "command-line-utilities"]
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

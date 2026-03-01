@@ -1,5 +1,6 @@
 [package]
 name = "rustgate-cot"
+description = "Cursor on Target (CoT) XML parsing and message extraction"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
