@@ -179,7 +179,7 @@ All flags support environment variables (CLI takes precedence):
 docker compose up
 ```
 
-The Dockerfile builds all features (including jemalloc) and runs as UID 65534 with a read-only root filesystem. Health is checked via the `/healthz` endpoint on port 9090.
+The Dockerfile builds all features (including jemalloc) and runs as UID 10001 with a read-only root filesystem. Health is checked via the `/healthz` endpoint on port 9090.
 
 ## Kubernetes
 
