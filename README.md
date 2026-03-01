@@ -199,6 +199,8 @@ The chart includes:
 
 TLS certificates must be provided as a Kubernetes Secret named by `tls.secretName` (default: `rustgate-tls`) containing `server.crt`, `server.key`, and `ca.crt`.
 
+**Helm defaults vs CLI defaults:** The Helm chart defaults to `framing: tak-negotiate` and `encoding: tak-protobuf`, optimized for production TAK client deployments. The CLI defaults to `framing: xml` and `encoding: raw` for general-purpose use and testing. Override in Helm with `--set framing=xml,encoding=raw` if needed.
+
 ## Testing
 
 ```
