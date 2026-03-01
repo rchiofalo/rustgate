@@ -433,10 +433,12 @@ mod tests {
         let mut codec = XmlStreamCodec::new();
         let mut buf = BytesMut::from("<event><detail/>");
         // Incomplete — missing </event>
-        assert!(codec
-            .decode(&mut buf)
-            .expect("decode should succeed")
-            .is_none());
+        assert!(
+            codec
+                .decode(&mut buf)
+                .expect("decode should succeed")
+                .is_none()
+        );
         // Now complete it
         buf.extend_from_slice(b"</event>");
         let frame = codec
