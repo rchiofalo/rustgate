@@ -910,7 +910,6 @@ mod tests {
         .expect("should parse");
         assert_eq!(cli.metrics_bind.as_deref(), Some("0.0.0.0:9090"));
     }
-<<<<<<< HEAD
 
     #[test]
     fn cli_env_vars_declared() {

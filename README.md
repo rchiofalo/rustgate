@@ -35,7 +35,7 @@ rustgate is a lightweight alternative that handles mTLS client connections, rout
 
 **rustgate-proto** — Optional TAK protocol buffer translation. Bidirectional conversion between CoT XML and TAK protobuf (prost), with the `TakFrameCodec` for TAK binary framing (0xBF + varint length). Known `<detail>` children (`<contact>`, `<__group>`, `<precisionlocation>`, `<status>`, `<takv>`, `<track>`) map to typed protobuf fields; everything else roundtrips through the `xmlDetail` residual. Translation happens at session edges — XML stays canonical inside the router. Includes TAK protocol negotiation: server advertises `t-x-takp-v`, client can upgrade to protobuf with a TakControl handshake, or stay XML for legacy compatibility. Feature-gated behind `--features proto`. Requires `protoc` at build time.
 
-**rustgate-server** — Binary entry point. Accepts mTLS connections, spawns per-session read/write tasks, routes all traffic through the shared `Router`. Optionally bridges to NATS when `--nats-url` is provided. Optionally runs enrollment when `--enrollment-bind` is set.
+**rustgate-server** — Binary entry point. Accepts mTLS connections, spawns per-session read/write tasks, routes all traffic through the shared `Router`. Optionally bridges to NATS when `--nats-url` is provided. Optionally runs enrollment when `--enrollment-bind` is set. Includes Prometheus metrics and health endpoints (feature-gated behind `--features metrics`), graceful shutdown with connection draining on SIGTERM, and configurable connection limits.
 
 ## Status
 
@@ -64,6 +64,15 @@ Core transport and routing are functional. The server accepts mTLS connections, 
 - xmlDetail residual preservation for unknown detail elements
 - TAK protocol negotiation (server advertises protobuf, client opts in or stays XML)
 - NATS integration tests with embedded nats-server (publish/subscribe, echo prevention, JetStream replay, cross-instance delivery)
+- Prometheus metrics: connection lifecycle, message routing, NATS bridge, protocol negotiation (feature-gated)
+- Health endpoints: `/healthz` (liveness), `/readyz` (readiness), `/metrics` (Prometheus text format)
+- Hardened HTTP metrics server: connection limit (128), per-connection timeout (15s), header read timeout (5s)
+- Graceful shutdown: SIGTERM + SIGINT handling, readiness probe goes 503, connection draining with 110s timeout
+- Environment variable configuration for all CLI flags (K8s-native)
+- Configurable max connections (`--max-connections` / `RUSTGATE_MAX_CONNECTIONS`)
+- Helm chart with Pod Security Standards (restricted), PDB, HPA, startup/liveness/readiness probes
+- Multi-stage Dockerfile with OCI labels, HEALTHCHECK, STOPSIGNAL SIGTERM
+- jemalloc allocator for production builds (avoids musl malloc contention, feature-gated)
 
 **What's next:**
 - Real TAK client compatibility testing (ATAK/iTAK/WinTAK)
@@ -89,9 +98,19 @@ With TAK protobuf support (requires `protoc`):
 cargo build --release --features proto
 ```
 
+With Prometheus metrics and health endpoints:
+```
+cargo build --release --features metrics
+```
+
+With jemalloc (recommended for Alpine/musl production builds):
+```
+cargo build --release --features jemalloc
+```
+
 All optional features:
 ```
-cargo build --release --features nats,enrollment,proto
+cargo build --release --all-features
 ```
 
 Requires Rust 1.85+ (edition 2024).
@@ -128,20 +147,57 @@ rustgate --cert server.pem --key server-key.pem --ca ca.pem \
     --framing tak-negotiate
 ```
 
-Options:
-- `--bind` — Listen address (default: `0.0.0.0:4433`)
-- `--cert` — Server certificate PEM
-- `--key` — Server private key PEM
-- `--ca` — Client CA certificate PEM (for mTLS verification)
-- `--nats-url` — NATS server URL (enables cross-instance bridge)
-- `--nats-credentials` — Path to NATS credentials file for JWT/NKey auth
-- `--enrollment-bind` — Enrollment HTTPS listen address (e.g. `0.0.0.0:8446`)
-- `--ca-key` — CA private key PEM (for signing client CSRs)
-- `--enrollment-user` — Enrollment Basic Auth username
-- `--enrollment-password` — Enrollment Basic Auth password
-- `--ca-organization` — Organization name for issued certs (default: `rustgate`)
-- `--framing` — Wire framing: `xml`, `length-prefixed`, `line`, `tak-protobuf`, `tak-negotiate`
-- `--encoding` — Payload encoding: `raw`, `cot`, `tak-protobuf`
+With metrics and health endpoints (requires `--features metrics`):
+```
+rustgate --cert server.pem --key server-key.pem --ca ca.pem \
+    --metrics-bind 0.0.0.0:9090
+```
+
+All flags support environment variables (CLI takes precedence):
+
+| Flag | Env Var | Default |
+|------|---------|---------|
+| `--bind` | `RUSTGATE_BIND` | `0.0.0.0:4433` |
+| `--cert` | `RUSTGATE_CERT` | — |
+| `--key` | `RUSTGATE_KEY` | — |
+| `--ca` | `RUSTGATE_CA` | — |
+| `--framing` | `RUSTGATE_FRAMING` | `xml` |
+| `--encoding` | `RUSTGATE_ENCODING` | `raw` |
+| `--max-connections` | `RUSTGATE_MAX_CONNECTIONS` | `1024` |
+| `--metrics-bind` | `METRICS_BIND` | — |
+| `--nats-url` | `NATS_URL` | — |
+| `--nats-credentials` | `NATS_CREDENTIALS` | — |
+| `--enrollment-bind` | `ENROLLMENT_BIND` | — |
+| `--ca-key` | `RUSTGATE_CA_KEY` | — |
+| `--enrollment-user` | `ENROLLMENT_USER` | — |
+| `--enrollment-password` | `ENROLLMENT_PASSWORD` | — |
+| `--ca-organization` | `RUSTGATE_CA_ORG` | `rustgate` |
+
+## Docker
+
+```
+docker compose up
+```
+
+The Dockerfile builds all features (including jemalloc) and runs as UID 65534 with a read-only root filesystem. Health is checked via the `/healthz` endpoint on port 9090.
+
+## Kubernetes
+
+A Helm chart is provided in `helm/`:
+
+```
+helm install rustgate helm/ --set tls.secretName=my-tls-secret
+```
+
+The chart includes:
+- Deployment with Pod Security Standards (restricted profile)
+- Startup, liveness, and readiness probes via the metrics HTTP server
+- PodDisruptionBudget (when replicas > 1 or HPA is enabled)
+- HorizontalPodAutoscaler (opt-in via `autoscaling.enabled: true`)
+- Pre-stop hook (5s sleep) for LB drain before SIGTERM
+- `terminationGracePeriodSeconds: 120` with 110s drain timeout
+
+TLS certificates must be provided as a Kubernetes Secret named by `tls.secretName` (default: `rustgate-tls`) containing `server.crt`, `server.key`, and `ca.crt`.
 
 ## Testing
 
@@ -149,7 +205,7 @@ Options:
 cargo test
 ```
 
-140 tests covering mTLS handshake, identity extraction, broadcast/group/direct routing, session lifecycle, codec edge cases, frame size limits, NATS wire format serialization, subject sanitization, group extraction, echo prevention, CSR signing round-trips, subject DN enforcement, Basic Auth validation, response formatting, XML/JSON enrollment responses, varint encode/decode, TAK frame codec round-trips, ISO 8601 timestamp conversion, full CoT XML parsing, XML↔protobuf bidirectional conversion with detail field preservation, and TAK protocol negotiation message builders/validators. Unit tests use ephemeral certificates generated at runtime — no fixture files.
+152 tests covering mTLS handshake, identity extraction, broadcast/group/direct routing, session lifecycle, codec edge cases, frame size limits, NATS wire format serialization, subject sanitization, group extraction, echo prevention, CSR signing round-trips, subject DN enforcement, Basic Auth validation, response formatting, XML/JSON enrollment responses, varint encode/decode, TAK frame codec round-trips, ISO 8601 timestamp conversion, full CoT XML parsing, XML↔protobuf bidirectional conversion with detail field preservation, and TAK protocol negotiation message builders/validators. Unit tests use ephemeral certificates generated at runtime — no fixture files.
 
 NATS integration tests (`cargo test -p rustgate-nats --test integration`) spin up a real `nats-server` subprocess with JetStream. Covers publish→subscribe round-trip, dual-layer echo prevention, cross-instance delivery, JetStream SA replay with LastPerSubject dedup, replay count limits, oversized payload rejection, group preservation, zero-position filtering, and wire format fidelity. Requires `nats-server` on PATH.
 
