@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # ── Builder stage ────────────────────────────────────────────────────────
-FROM rust:1.85-alpine AS builder
+FROM rust:1.88-alpine AS builder
 
 RUN apk add --no-cache musl-dev protobuf-dev
 
@@ -42,9 +42,9 @@ LABEL org.opencontainers.image.source="https://github.com/rchiofalo/rustgate" \
       org.opencontainers.image.licenses="LicenseRef-Proprietary"
 
 RUN apk add --no-cache ca-certificates \
-    && addgroup -g 65534 -S rustgate && adduser -u 65534 -S rustgate -G rustgate
+    && addgroup -g 10001 -S rustgate && adduser -u 10001 -S rustgate -G rustgate
 
-USER 65534
+USER 10001
 
 COPY --from=builder /src/target/release/rustgate /usr/local/bin/rustgate
 
