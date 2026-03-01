@@ -1,0 +1,22 @@
+rustgate has been deployed.
+
+{{- if .Values.metrics.enabled }}
+
+Health check:
+  kubectl exec -it deploy/{{ include "rustgate.fullname" . }} -- wget -qO- http://localhost:{{ .Values.metrics.port }}/healthz
+
+Prometheus metrics:
+  kubectl port-forward svc/{{ include "rustgate.fullname" . }} {{ .Values.metrics.port }}:{{ .Values.metrics.port }}
+  curl http://localhost:{{ .Values.metrics.port }}/metrics
+{{- end }}
+
+TAK service:
+  {{- if eq .Values.service.type "LoadBalancer" }}
+  export SERVICE_IP=$(kubectl get svc {{ include "rustgate.fullname" . }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+  echo "TAK endpoint: $SERVICE_IP:{{ .Values.service.port }}"
+  {{- else }}
+  kubectl port-forward svc/{{ include "rustgate.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+  {{- end }}
+
+TLS certificates:
+  Ensure the '{{ .Values.tls.secretName }}' Secret exists with server.crt, server.key, and ca.crt.
