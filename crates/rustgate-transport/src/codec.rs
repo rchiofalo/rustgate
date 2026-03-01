@@ -561,9 +561,7 @@ mod tests {
         let mut codec = XmlStreamCodec::new();
         let data = BytesMut::from("<event/>");
         let mut dst = BytesMut::new();
-        codec
-            .encode(data, &mut dst)
-            .expect("encode should succeed");
+        codec.encode(data, &mut dst).expect("encode should succeed");
         assert_eq!(dst, "<event/>");
     }
 
@@ -571,10 +569,12 @@ mod tests {
     fn xml_empty_buffer_returns_none() {
         let mut codec = XmlStreamCodec::new();
         let mut buf = BytesMut::new();
-        assert!(codec
-            .decode(&mut buf)
-            .expect("decode should succeed")
-            .is_none());
+        assert!(
+            codec
+                .decode(&mut buf)
+                .expect("decode should succeed")
+                .is_none()
+        );
     }
 
     // ── LineDelimitedCodec ──────────────────────────────────────────
@@ -616,10 +616,12 @@ mod tests {
     fn line_no_terminator_buffers() {
         let mut codec = LineDelimitedCodec::new();
         let mut buf = BytesMut::from("partial");
-        assert!(codec
-            .decode(&mut buf)
-            .expect("decode should succeed")
-            .is_none());
+        assert!(
+            codec
+                .decode(&mut buf)
+                .expect("decode should succeed")
+                .is_none()
+        );
         // Data remains in buffer
         assert_eq!(buf, "partial");
     }
@@ -641,9 +643,7 @@ mod tests {
         let mut codec = LineDelimitedCodec::new();
         let data = BytesMut::from("hello");
         let mut dst = BytesMut::new();
-        codec
-            .encode(data, &mut dst)
-            .expect("encode should succeed");
+        codec.encode(data, &mut dst).expect("encode should succeed");
         assert_eq!(dst, "hello\n");
     }
 
