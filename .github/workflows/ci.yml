@@ -48,17 +48,11 @@ jobs:
       - name: Test (all features)
         run: cargo test --all-features
 
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
-
-      - name: Audit dependencies for vulnerabilities
-        run: cargo audit
-
       - name: Install cargo-deny
-        run: cargo install cargo-deny@0.18.3 --locked
+        run: cargo install cargo-deny --locked
 
-      - name: Check licenses and sources
-        run: cargo deny check licenses bans sources
+      - name: Check advisories, licenses, bans, and sources
+        run: cargo deny check
 
       - name: Install Helm
         uses: azure/setup-helm@v4
