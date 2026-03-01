@@ -1,0 +1,321 @@
+//! Integration tests for the enrollment HTTPS server.
+//!
+//! Spins up a real enrollment server on localhost with ephemeral certs,
+//! then makes HTTP requests over TLS to verify endpoint behavior.
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use base64::Engine;
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::Request;
+use hyper_util::rt::TokioIo;
+use rustgate_enrollment::{Credentials, CsrSigner, EnrollmentServer};
+use rustgate_test_utils::certs::TestCa;
+use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
+
+/// Find a free TCP port by binding to port 0 and immediately releasing.
+fn free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind for port discovery");
+    listener.local_addr().expect("local_addr").port()
+}
+
+/// Build test infrastructure: CA, server cert, signer, credentials.
+struct TestEnv {
+    addr: SocketAddr,
+    server_cert_pem: String,
+    server_key_pem: String,
+    ca_cert_pem: String,
+    ca_key_pem: String,
+}
+
+impl TestEnv {
+    fn new() -> Self {
+        let ca = TestCa::new("Test Enrollment CA");
+        let server = ca.issue_server_cert("localhost", &["localhost"]);
+
+        let port = free_port();
+        let addr: SocketAddr = format!("127.0.0.1:{port}")
+            .parse()
+            .expect("parse socket addr");
+
+        Self {
+            addr,
+            server_cert_pem: server.cert_pem,
+            server_key_pem: server.key_pem,
+            ca_cert_pem: ca.cert_pem,
+            ca_key_pem: ca.key_pem,
+        }
+    }
+
+    /// Spawn the enrollment server as a background task.
+    fn spawn_server(&self) -> tokio::task::JoinHandle<()> {
+        let signer = CsrSigner::from_pem(&self.ca_cert_pem, &self.ca_key_pem, "TestOrg")
+            .expect("build signer for server");
+        let credentials = Credentials::new("admin".to_string(), "secret".to_string());
+        let server = EnrollmentServer::new(signer, credentials);
+
+        let addr = self.addr;
+        let cert_pem = self.server_cert_pem.clone();
+        let key_pem = self.server_key_pem.clone();
+
+        tokio::spawn(async move {
+            let _ = server.run(addr, &cert_pem, &key_pem).await;
+        })
+    }
+
+    /// Build a TLS connector that trusts the test CA.
+    fn tls_connector(&self) -> TlsConnector {
+        let mut root_store = rustls::RootCertStore::empty();
+        let mut reader = std::io::BufReader::new(self.ca_cert_pem.as_bytes());
+        let certs: Vec<rustls_pki_types::CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut reader)
+                .collect::<Result<Vec<_>, _>>()
+                .expect("parse CA cert");
+        for cert in certs {
+            root_store.add(cert).expect("add CA cert to root store");
+        }
+
+        let tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        TlsConnector::from(Arc::new(tls_config))
+    }
+
+    /// Send an HTTP request to the enrollment server and return the response.
+    async fn send_request(
+        &self,
+        req: Request<Full<Bytes>>,
+    ) -> hyper::Response<hyper::body::Incoming> {
+        let tcp = TcpStream::connect(self.addr).await.expect("TCP connect");
+
+        let server_name = rustls_pki_types::ServerName::try_from("localhost").expect("server name");
+        let tls = self
+            .tls_connector()
+            .connect(server_name, tcp)
+            .await
+            .expect("TLS connect");
+
+        let io = TokioIo::new(tls);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+            .await
+            .expect("HTTP handshake");
+
+        let _conn_task = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        sender.send_request(req).await.expect("send request")
+    }
+}
+
+fn encode_basic_auth(user: &str, pass: &str) -> String {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+    format!("Basic {encoded}")
+}
+
+fn generate_csr(cn: &str) -> String {
+    use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
+
+    let key = KeyPair::generate().expect("keygen");
+    let mut params = CertificateParams::default();
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, cn);
+    params.distinguished_name = dn;
+
+    let csr = params.serialize_request(&key).expect("csr");
+    csr.pem().expect("pem")
+}
+
+#[tokio::test]
+async fn sign_client_valid_csr() {
+    let env = TestEnv::new();
+    let _server = env.spawn_server();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let csr = generate_csr("test-client");
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "https://localhost:{}/Marti/api/tls/signClient/v2",
+            env.addr.port()
+        ))
+        .header("Authorization", encode_basic_auth("admin", "secret"))
+        .header("Host", "localhost")
+        .body(Full::new(Bytes::from(csr)))
+        .expect("build request");
+
+    let resp = env.send_request(req).await;
+    assert_eq!(resp.status(), 200);
+
+    let body = resp.collect().await.expect("collect body").to_bytes();
+    let json: serde_json::Value =
+        serde_json::from_slice(&body).expect("response should be valid JSON");
+    assert!(json.get("signedCert").is_some(), "missing signedCert key");
+    assert!(json.get("ca0").is_some(), "missing ca0 key");
+}
+
+#[tokio::test]
+async fn missing_auth_returns_401() {
+    let env = TestEnv::new();
+    let _server = env.spawn_server();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "https://localhost:{}/Marti/api/tls/signClient/v2",
+            env.addr.port()
+        ))
+        .header("Host", "localhost")
+        .body(Full::new(Bytes::new()))
+        .expect("build request");
+
+    let resp = env.send_request(req).await;
+    assert_eq!(resp.status(), 401);
+
+    let www_auth = resp
+        .headers()
+        .get("WWW-Authenticate")
+        .expect("should have WWW-Authenticate header");
+    assert!(
+        www_auth.to_str().expect("header to str").contains("Basic"),
+        "WWW-Authenticate should indicate Basic auth"
+    );
+}
+
+#[tokio::test]
+async fn wrong_credentials_returns_401() {
+    let env = TestEnv::new();
+    let _server = env.spawn_server();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "https://localhost:{}/Marti/api/tls/signClient/v2",
+            env.addr.port()
+        ))
+        .header("Authorization", encode_basic_auth("admin", "wrong"))
+        .header("Host", "localhost")
+        .body(Full::new(Bytes::new()))
+        .expect("build request");
+
+    let resp = env.send_request(req).await;
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn oversized_body_rejected() {
+    let env = TestEnv::new();
+    let _server = env.spawn_server();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // 70KB body exceeds the 64KB limit
+    let oversized = vec![b'A'; 70 * 1024];
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "https://localhost:{}/Marti/api/tls/signClient/v2",
+            env.addr.port()
+        ))
+        .header("Authorization", encode_basic_auth("admin", "secret"))
+        .header("Host", "localhost")
+        .body(Full::new(Bytes::from(oversized)))
+        .expect("build request");
+
+    let resp = env.send_request(req).await;
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn xml_content_negotiation() {
+    let env = TestEnv::new();
+    let _server = env.spawn_server();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let csr = generate_csr("xml-client");
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "https://localhost:{}/Marti/api/tls/signClient/v2",
+            env.addr.port()
+        ))
+        .header("Authorization", encode_basic_auth("admin", "secret"))
+        .header("Accept", "application/xml")
+        .header("Host", "localhost")
+        .body(Full::new(Bytes::from(csr)))
+        .expect("build request");
+
+    let resp = env.send_request(req).await;
+    assert_eq!(resp.status(), 200);
+
+    let content_type = resp
+        .headers()
+        .get("Content-Type")
+        .expect("should have Content-Type")
+        .to_str()
+        .expect("header to str");
+    assert!(
+        content_type.contains("application/xml"),
+        "expected XML content type, got: {content_type}"
+    );
+
+    let body = resp.collect().await.expect("collect body").to_bytes();
+    let body_str = std::str::from_utf8(&body).expect("body is UTF-8");
+    assert!(
+        body_str.contains("<enrollment>"),
+        "XML response should contain enrollment element"
+    );
+}
+
+#[tokio::test]
+async fn get_tls_config() {
+    let env = TestEnv::new();
+    let _server = env.spawn_server();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "https://localhost:{}/Marti/api/tls/config",
+            env.addr.port()
+        ))
+        .header("Host", "localhost")
+        .body(Full::new(Bytes::new()))
+        .expect("build request");
+
+    let resp = env.send_request(req).await;
+    assert_eq!(resp.status(), 200);
+
+    let body = resp.collect().await.expect("collect body").to_bytes();
+    let body_str = std::str::from_utf8(&body).expect("body is UTF-8");
+    assert!(
+        body_str.contains("certificateConfig"),
+        "should contain certificateConfig"
+    );
+    assert!(
+        body_str.contains("TestOrg"),
+        "should contain the organization name"
+    );
+}
+
+#[tokio::test]
+async fn unknown_path_returns_404() {
+    let env = TestEnv::new();
+    let _server = env.spawn_server();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("https://localhost:{}/nonexistent", env.addr.port()))
+        .header("Host", "localhost")
+        .body(Full::new(Bytes::new()))
+        .expect("build request");
+
+    let resp = env.send_request(req).await;
+    assert_eq!(resp.status(), 404);
+}
