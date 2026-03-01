@@ -105,6 +105,8 @@ impl Router {
         if let Some(handle) = state.sessions.remove(cn) {
             state.remove_from_groups(cn, &handle.identity.groups);
         }
+        drop(state);
+        self.cache.remove(cn).await;
     }
 
     pub async fn route(&self, msg: RoutableMessage) {
@@ -127,10 +129,20 @@ impl Router {
         }
     }
 
-    /// Replay all cached positions to a newly connected session.
+    /// Replay cached positions to a newly connected session.
+    /// Only replays positions from clients that share at least one group
+    /// with the connecting session to enforce group-level isolation.
     pub async fn replay_positions(&self, handle: &SessionHandle) {
         for msg in self.cache.get_all().await {
-            let _ = handle.send(msg).await;
+            let shared = msg
+                .source
+                .groups
+                .intersection(&handle.identity.groups)
+                .next()
+                .is_some();
+            if shared || handle.identity.groups.is_empty() {
+                let _ = handle.send(msg).await;
+            }
         }
     }
 
@@ -149,6 +161,15 @@ impl Router {
     }
 
     async fn send_to_group(&self, group: &str, msg: &RoutableMessage) {
+        if !msg.source.is_member_of(group) {
+            tracing::warn!(
+                sender = %msg.source.cn,
+                group = %group,
+                "rejected cross-group message: sender not a member"
+            );
+            return;
+        }
+
         let targets: Vec<SessionHandle> = {
             let state = self.state.read().await;
             let members = match state.groups.get(group) {
@@ -167,6 +188,9 @@ impl Router {
         }
     }
 
+    /// Broadcast to all connected sessions (except sender).
+    /// This is intentional for SA sharing — all authenticated clients
+    /// receive broadcasts regardless of group membership.
     async fn send_to_all(&self, msg: &RoutableMessage) {
         let targets: Vec<SessionHandle> = {
             let state = self.state.read().await;
@@ -181,5 +205,182 @@ impl Router {
         for handle in &targets {
             let _ = handle.send(msg.clone()).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use rustgate_core::identity::Identity;
+    use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
+    use std::collections::BTreeSet;
+    use std::time::SystemTime;
+
+    fn make_identity(cn: &str, groups: &[&str]) -> Arc<Identity> {
+        Arc::new(Identity {
+            cn: cn.to_string(),
+            fingerprint: format!("{cn}-fp"),
+            groups: groups
+                .iter()
+                .map(|g| g.to_string())
+                .collect::<BTreeSet<_>>(),
+        })
+    }
+
+    fn make_position(source: &Arc<Identity>, dest: Destination) -> RoutableMessage {
+        RoutableMessage {
+            source: (**source).clone(),
+            destination: dest,
+            payload: Bytes::from_static(b"<event/>"),
+            metadata: Metadata {
+                received_at: SystemTime::now(),
+                source_protocol: "cot".to_string(),
+                message_type: MessageType::Position,
+                ttl: None,
+            },
+        }
+    }
+
+    fn make_chat(source: &Arc<Identity>, dest: Destination) -> RoutableMessage {
+        RoutableMessage {
+            source: (**source).clone(),
+            destination: dest,
+            payload: Bytes::from_static(b"<chat/>"),
+            metadata: Metadata {
+                received_at: SystemTime::now(),
+                source_protocol: "cot".to_string(),
+                message_type: MessageType::Chat,
+                ttl: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn send_to_group_rejects_non_member() {
+        let router = Router::new();
+
+        let alice = make_identity("alice", &["alpha"]);
+        let bob = make_identity("bob", &["bravo"]);
+
+        let (tx_a, mut rx_a) = mpsc::channel(16);
+        let (tx_b, _rx_b) = mpsc::channel(16);
+
+        router
+            .register(SessionHandle::new(alice.clone(), tx_a))
+            .await;
+        router.register(SessionHandle::new(bob.clone(), tx_b)).await;
+
+        // Bob sends to group "alpha" — but bob is only in "bravo".
+        // The router must reject this: sender is not a member of the
+        // target group, so alice (who IS in alpha) must not receive it.
+        let msg = make_chat(&bob, Destination::Group("alpha".to_string()));
+        router.route(msg).await;
+
+        assert!(
+            rx_a.try_recv().is_err(),
+            "alice must not receive: bob is not in alpha and cannot send to it"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_to_group_allows_member() {
+        let router = Router::new();
+
+        let alice = make_identity("alice", &["alpha"]);
+        let bob = make_identity("bob", &["alpha"]);
+        let charlie = make_identity("charlie", &["bravo"]);
+
+        let (tx_a, mut rx_a) = mpsc::channel(16);
+        let (tx_b, _rx_b) = mpsc::channel(16);
+        let (tx_c, mut rx_c) = mpsc::channel(16);
+
+        router
+            .register(SessionHandle::new(alice.clone(), tx_a))
+            .await;
+        router.register(SessionHandle::new(bob.clone(), tx_b)).await;
+        router
+            .register(SessionHandle::new(charlie.clone(), tx_c))
+            .await;
+
+        // Bob sends to group "alpha" — bob IS a member
+        let msg = make_chat(&bob, Destination::Group("alpha".to_string()));
+        router.route(msg).await;
+
+        // Alice (in alpha) receives with correct payload
+        let received = rx_a.try_recv().expect("alice must receive: both in alpha");
+        assert_eq!(received.payload.as_ref(), b"<chat/>");
+        assert_eq!(received.source.cn, "bob");
+
+        // Charlie (in bravo, not alpha) must NOT receive
+        assert!(
+            rx_c.try_recv().is_err(),
+            "charlie must not receive: not in alpha"
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_positions_filters_by_group() {
+        let router = Router::new();
+
+        let alpha_user = make_identity("alpha-user", &["alpha"]);
+        let bravo_user = make_identity("bravo-user", &["bravo"]);
+
+        // Cache a position from alpha_user
+        let pos = make_position(&alpha_user, Destination::Broadcast);
+        router.cache().store(pos).await;
+
+        // bravo_user connects — should NOT receive alpha_user's position
+        let (tx, mut rx) = mpsc::channel(16);
+        let handle = SessionHandle::new(bravo_user.clone(), tx);
+        router.replay_positions(&handle).await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "bravo_user should not see alpha_user's position"
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_positions_allows_shared_group() {
+        let router = Router::new();
+
+        let alice = make_identity("alice", &["alpha", "shared"]);
+        let bob = make_identity("bob", &["bravo", "shared"]);
+
+        // Cache a position from alice
+        let pos = make_position(&alice, Destination::Broadcast);
+        router.cache().store(pos).await;
+
+        // Bob connects — shares "shared" group with alice
+        let (tx, mut rx) = mpsc::channel(16);
+        let handle = SessionHandle::new(bob.clone(), tx);
+        router.replay_positions(&handle).await;
+
+        assert!(
+            rx.try_recv().is_ok(),
+            "bob should see alice's position via shared group"
+        );
+    }
+
+    #[tokio::test]
+    async fn unregister_evicts_from_cache() {
+        let router = Router::new();
+
+        let alice = make_identity("alice", &["alpha"]);
+        let (tx, _rx) = mpsc::channel(16);
+        let handle = SessionHandle::new(alice.clone(), tx);
+        let session_id = handle.id;
+
+        router.register(handle).await;
+
+        // Cache a position
+        let pos = make_position(&alice, Destination::Broadcast);
+        router.cache().store(pos).await;
+        assert_eq!(router.cache().len().await, 1);
+
+        // Unregister should also evict from cache
+        router.unregister("alice", session_id).await;
+        assert_eq!(router.cache().len().await, 0);
     }
 }

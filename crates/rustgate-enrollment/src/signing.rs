@@ -114,6 +114,10 @@ impl CsrSigner {
 
         let mut params = csr.params;
         params.distinguished_name = dn;
+        // Strip any SANs or custom extensions from the CSR — only the
+        // server-controlled DN, validity, key usage, and EKU should survive.
+        params.subject_alt_names = Vec::new();
+        params.custom_extensions = Vec::new();
         params.not_before = time::OffsetDateTime::now_utc() - time::Duration::minutes(5);
         params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(365);
         params.is_ca = IsCa::NoCa;
@@ -279,6 +283,33 @@ mod tests {
         let (_, ca) =
             x509_parser::parse_x509_certificate(signer.ca_cert_der()).expect("parse CA DER");
         assert!(ca.is_ca());
+    }
+
+    #[test]
+    fn sign_csr_strips_subject_alt_names() {
+        let (cert_pem, key_pem) = test_ca();
+        let signer = CsrSigner::from_pem(&cert_pem, &key_pem, "TestOrg").expect("signer");
+
+        // Generate a CSR with a SAN
+        let key = rcgen::KeyPair::generate().expect("keygen");
+        let mut params = CertificateParams::default();
+        let mut dn = rcgen::DistinguishedName::new();
+        dn.push(rcgen::DnType::CommonName, "san-test");
+        params.distinguished_name = dn;
+        params.subject_alt_names = vec![rcgen::SanType::DnsName(
+            "evil.example.com".try_into().expect("dns name"),
+        )];
+        let csr = params.serialize_request(&key).expect("csr");
+        let csr_pem = csr.pem().expect("pem");
+
+        let signed_der = signer.sign_csr(&csr_pem, "san-test").expect("sign");
+        let (_, cert) = x509_parser::parse_x509_certificate(&signed_der).expect("parse");
+
+        // The SAN from the CSR should NOT be in the signed cert
+        let san = cert
+            .subject_alternative_name()
+            .expect("SAN extension parse should not error");
+        assert!(san.is_none(), "signed cert should have no SANs");
     }
 
     #[test]
