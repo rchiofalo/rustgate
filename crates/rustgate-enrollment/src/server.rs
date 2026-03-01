@@ -17,6 +17,11 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
+/// Maximum concurrent connections to the enrollment server.
+/// Bounds resource usage from connection floods against the
+/// unauthenticated TLS endpoint.
+const MAX_ENROLLMENT_CONNECTIONS: usize = 64;
+
 /// Maximum time for TLS handshake before the connection is dropped.
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -60,6 +65,7 @@ impl EnrollmentServer {
             .await
             .map_err(EnrollmentError::Io)?;
 
+        let conn_limit = Arc::new(tokio::sync::Semaphore::new(MAX_ENROLLMENT_CONNECTIONS));
         tracing::info!(addr = %bind_addr, "enrollment server listening");
 
         loop {
@@ -71,11 +77,21 @@ impl EnrollmentServer {
                 }
             };
 
+            let permit = match Arc::clone(&conn_limit).try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    tracing::warn!(peer = %peer, "enrollment connection rejected: limit reached");
+                    drop(stream);
+                    continue;
+                }
+            };
+
             let acceptor = acceptor.clone();
             let signer = Arc::clone(&self.signer);
             let credentials = Arc::clone(&self.credentials);
 
             drop(tokio::spawn(async move {
+                let _permit = permit;
                 let tls_stream = match tokio::time::timeout(
                     TLS_HANDSHAKE_TIMEOUT,
                     acceptor.accept(stream),

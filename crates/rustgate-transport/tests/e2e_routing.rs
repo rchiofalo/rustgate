@@ -668,14 +668,15 @@ async fn register_with_group_change() {
         .register(SessionHandle::new(alice_v2.clone(), alice_v2_tx))
         .await;
 
-    // Alice (now in bravo) sends to group "alpha" — she's not in alpha so
-    // she won't self-filter, but she also shouldn't receive (not a member).
-    // Bob IS in alpha → bob receives.
+    // Alice (now in bravo) sends to group "alpha" — rejected because
+    // the router enforces sender group membership.
     let msg = build_message(&alice_v2, b"alpha-msg", Destination::Group("alpha".into()));
     router.route(msg).await;
 
-    let got = bob_rx.try_recv().expect("bob is in alpha");
-    assert_eq!(got.payload.as_ref(), b"alpha-msg");
+    assert!(
+        bob_rx.try_recv().is_err(),
+        "alice is not in alpha, message should be rejected"
+    );
     assert!(
         alice_v2_rx.try_recv().is_err(),
         "alice left alpha, should not receive"
