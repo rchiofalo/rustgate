@@ -18,6 +18,7 @@ enrollment = ["dep:rustgate-enrollment"]
 proto = ["dep:rustgate-proto", "rustgate-transport/proto"]
 full-detail = ["rustgate-nats/full-detail"]
 metrics = ["dep:prometheus", "dep:hyper", "dep:hyper-util", "dep:http-body-util"]
+jemalloc = ["dep:tikv-jemallocator"]
 
 [dependencies]
 rustgate-core = { workspace = true }
@@ -30,6 +31,7 @@ prometheus = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
+tikv-jemallocator = { version = "0.6", optional = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "signal", "fs", "macros", "time", "net"] }
 tokio-util = { workspace = true }
 bytes = { workspace = true }

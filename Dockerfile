@@ -37,12 +37,22 @@ RUN cargo build --release --all-features
 # ── Runtime stage ────────────────────────────────────────────────────────
 FROM alpine:3.21
 
-RUN apk add --no-cache ca-certificates \
-    && addgroup -S rustgate && adduser -S rustgate -G rustgate
+LABEL org.opencontainers.image.source="https://github.com/rchiofalo/rustgate" \
+      org.opencontainers.image.description="Secure tactical message router with mTLS and NATS bridge" \
+      org.opencontainers.image.licenses="LicenseRef-Proprietary"
 
-USER rustgate
+RUN apk add --no-cache ca-certificates \
+    && addgroup -g 65534 -S rustgate && adduser -u 65534 -S rustgate -G rustgate
+
+USER 65534
 
 COPY --from=builder /src/target/release/rustgate /usr/local/bin/rustgate
 
-EXPOSE 4433
+EXPOSE 4433 9090
+
+STOPSIGNAL SIGTERM
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+    CMD wget --spider -q http://localhost:9090/healthz || exit 1
+
 ENTRYPOINT ["rustgate"]
