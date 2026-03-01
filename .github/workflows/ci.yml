@@ -48,6 +48,18 @@ jobs:
       - name: Test (default features)
         run: cargo test
 
+      - name: Test (nats only)
+        run: cargo test --features nats
+
+      - name: Test (enrollment only)
+        run: cargo test --features enrollment
+
+      - name: Test (proto only)
+        run: cargo test --features proto
+
+      - name: Test (metrics only)
+        run: cargo test --features metrics
+
       - name: Test (all features)
         run: cargo test --all-features
 
