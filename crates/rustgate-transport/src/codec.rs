@@ -385,3 +385,293 @@ impl Encoder<BytesMut> for LineDelimitedCodec {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── XmlStreamCodec ──────────────────────────────────────────────
+
+    #[test]
+    fn xml_basic_element() {
+        let mut codec = XmlStreamCodec::new();
+        let mut buf = BytesMut::from("<event><detail/></event>");
+        let frame = codec
+            .decode(&mut buf)
+            .expect("decode should succeed")
+            .expect("should produce a frame");
+        assert_eq!(frame, "<event><detail/></event>");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn xml_self_closing_tag() {
+        let mut codec = XmlStreamCodec::new();
+        let mut buf = BytesMut::from(r#"<point lat="0" lon="0"/>"#);
+        let frame = codec
+            .decode(&mut buf)
+            .expect("decode should succeed")
+            .expect("should produce a frame");
+        assert_eq!(frame, r#"<point lat="0" lon="0"/>"#);
+    }
+
+    #[test]
+    fn xml_nested_elements() {
+        let mut codec = XmlStreamCodec::new();
+        let xml = "<event><point/><detail><status battery=\"100\"/></detail></event>";
+        let mut buf = BytesMut::from(xml);
+        let frame = codec
+            .decode(&mut buf)
+            .expect("decode should succeed")
+            .expect("should produce a frame");
+        assert_eq!(frame, xml);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn xml_partial_frame_buffers() {
+        let mut codec = XmlStreamCodec::new();
+        let mut buf = BytesMut::from("<event><detail/>");
+        // Incomplete — missing </event>
+        assert!(codec
+            .decode(&mut buf)
+            .expect("decode should succeed")
+            .is_none());
+        // Now complete it
+        buf.extend_from_slice(b"</event>");
+        let frame = codec
+            .decode(&mut buf)
+            .expect("decode should succeed")
+            .expect("should produce a frame");
+        assert_eq!(frame, "<event><detail/></event>");
+    }
+
+    #[test]
+    fn xml_declaration_before_element() {
+        let mut codec = XmlStreamCodec::new();
+        let mut buf = BytesMut::from("<?xml version=\"1.0\"?><event/>");
+        let frame = codec
+            .decode(&mut buf)
+            .expect("decode should succeed")
+            .expect("should produce a frame");
+        // PI is consumed as part of the scan, element follows
+        assert_eq!(frame, "<?xml version=\"1.0\"?><event/>");
+    }
+
+    #[test]
+    fn xml_cdata_preserved() {
+        let mut codec = XmlStreamCodec::new();
+        let xml = "<detail><![CDATA[raw > data & more]]></detail>";
+        let mut buf = BytesMut::from(xml);
+        let frame = codec
+            .decode(&mut buf)
+            .expect("decode should succeed")
+            .expect("should produce a frame");
+        assert_eq!(frame, xml);
+    }
+
+    #[test]
+    fn xml_comment_handling() {
+        let mut codec = XmlStreamCodec::new();
+        let xml = "<!-- comment --><event/>";
+        let mut buf = BytesMut::from(xml);
+        let frame = codec
+            .decode(&mut buf)
+            .expect("decode should succeed")
+            .expect("should produce a frame");
+        assert_eq!(frame, xml);
+    }
+
+    #[test]
+    fn xml_comment_inside_element() {
+        let mut codec = XmlStreamCodec::new();
+        let xml = "<event><!-- inner --><detail/></event>";
+        let mut buf = BytesMut::from(xml);
+        let frame = codec
+            .decode(&mut buf)
+            .expect("decode should succeed")
+            .expect("should produce a frame");
+        assert_eq!(frame, xml);
+    }
+
+    #[test]
+    fn xml_max_depth_enforcement() {
+        let mut codec = XmlStreamCodec::new();
+        // Build 257 nested opening tags without any closing tags.
+        // Exceeds MAX_XML_DEPTH (256).
+        let mut xml = String::new();
+        for _ in 0..=MAX_XML_DEPTH {
+            xml.push_str("<a>");
+        }
+        let mut buf = BytesMut::from(xml.as_str());
+        let result = codec.decode(&mut buf);
+        assert!(result.is_err());
+        let err = result.expect_err("should be an error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("depth"),
+            "error should mention depth: {err}"
+        );
+    }
+
+    #[test]
+    fn xml_max_frame_size_enforcement() {
+        let mut codec = XmlStreamCodec::new();
+        // Buffer exceeding 16 MB
+        let oversized = vec![b'<'; MAX_FRAME_SIZE + 1];
+        let mut buf = BytesMut::from(oversized.as_slice());
+        let result = codec.decode(&mut buf);
+        assert!(result.is_err());
+        let err = result.expect_err("should be an error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn xml_quoted_attributes_with_angle_brackets() {
+        let mut codec = XmlStreamCodec::new();
+        // Quoted attribute containing > should not end the tag
+        let xml = r#"<event attr="val>ue"><detail/></event>"#;
+        let mut buf = BytesMut::from(xml);
+        let frame = codec
+            .decode(&mut buf)
+            .expect("decode should succeed")
+            .expect("should produce a frame");
+        assert_eq!(frame, xml);
+    }
+
+    #[test]
+    fn xml_consecutive_elements() {
+        let mut codec = XmlStreamCodec::new();
+        let mut buf = BytesMut::from("<first/><second/>");
+        let frame1 = codec
+            .decode(&mut buf)
+            .expect("decode should succeed")
+            .expect("should produce first frame");
+        assert_eq!(frame1, "<first/>");
+        let frame2 = codec
+            .decode(&mut buf)
+            .expect("decode should succeed")
+            .expect("should produce second frame");
+        assert_eq!(frame2, "<second/>");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn xml_encode_is_passthrough() {
+        let mut codec = XmlStreamCodec::new();
+        let data = BytesMut::from("<event/>");
+        let mut dst = BytesMut::new();
+        codec
+            .encode(data, &mut dst)
+            .expect("encode should succeed");
+        assert_eq!(dst, "<event/>");
+    }
+
+    #[test]
+    fn xml_empty_buffer_returns_none() {
+        let mut codec = XmlStreamCodec::new();
+        let mut buf = BytesMut::new();
+        assert!(codec
+            .decode(&mut buf)
+            .expect("decode should succeed")
+            .is_none());
+    }
+
+    // ── LineDelimitedCodec ──────────────────────────────────────────
+
+    #[test]
+    fn line_lf_terminated() {
+        let mut codec = LineDelimitedCodec::new();
+        let mut buf = BytesMut::from("hello\n");
+        let frame = codec
+            .decode(&mut buf)
+            .expect("decode should succeed")
+            .expect("should produce a frame");
+        assert_eq!(frame, "hello");
+    }
+
+    #[test]
+    fn line_crlf_terminated() {
+        let mut codec = LineDelimitedCodec::new();
+        let mut buf = BytesMut::from("hello\r\n");
+        let frame = codec
+            .decode(&mut buf)
+            .expect("decode should succeed")
+            .expect("should produce a frame");
+        assert_eq!(frame, "hello");
+    }
+
+    #[test]
+    fn line_empty_line() {
+        let mut codec = LineDelimitedCodec::new();
+        let mut buf = BytesMut::from("\n");
+        let frame = codec
+            .decode(&mut buf)
+            .expect("decode should succeed")
+            .expect("should produce a frame");
+        assert!(frame.is_empty());
+    }
+
+    #[test]
+    fn line_no_terminator_buffers() {
+        let mut codec = LineDelimitedCodec::new();
+        let mut buf = BytesMut::from("partial");
+        assert!(codec
+            .decode(&mut buf)
+            .expect("decode should succeed")
+            .is_none());
+        // Data remains in buffer
+        assert_eq!(buf, "partial");
+    }
+
+    #[test]
+    fn line_max_frame_size_enforcement() {
+        let mut codec = LineDelimitedCodec::new();
+        // Buffer exceeding 16 MB with no newline
+        let oversized = vec![b'x'; MAX_FRAME_SIZE + 1];
+        let mut buf = BytesMut::from(oversized.as_slice());
+        let result = codec.decode(&mut buf);
+        assert!(result.is_err());
+        let err = result.expect_err("should be an error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn line_encode_appends_newline() {
+        let mut codec = LineDelimitedCodec::new();
+        let data = BytesMut::from("hello");
+        let mut dst = BytesMut::new();
+        codec
+            .encode(data, &mut dst)
+            .expect("encode should succeed");
+        assert_eq!(dst, "hello\n");
+    }
+
+    #[test]
+    fn line_consecutive_lines() {
+        let mut codec = LineDelimitedCodec::new();
+        let mut buf = BytesMut::from("first\nsecond\n");
+        let frame1 = codec
+            .decode(&mut buf)
+            .expect("decode should succeed")
+            .expect("should produce first frame");
+        assert_eq!(frame1, "first");
+        let frame2 = codec
+            .decode(&mut buf)
+            .expect("decode should succeed")
+            .expect("should produce second frame");
+        assert_eq!(frame2, "second");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn line_empty_crlf() {
+        let mut codec = LineDelimitedCodec::new();
+        let mut buf = BytesMut::from("\r\n");
+        let frame = codec
+            .decode(&mut buf)
+            .expect("decode should succeed")
+            .expect("should produce a frame");
+        assert!(frame.is_empty());
+    }
+}
