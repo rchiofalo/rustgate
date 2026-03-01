@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
@@ -11,10 +12,6 @@ use tracing_subscriber::EnvFilter;
 
 #[cfg(feature = "metrics")]
 mod metrics;
-
-/// Maximum concurrent TLS sessions. Prevents resource exhaustion
-/// from connection floods (even with mTLS, the TLS handshake is costly).
-const MAX_CONNECTIONS: usize = 1024;
 
 /// Maximum time to wait for a complete frame from the client.
 /// Covers both idle clients and partial-frame stalls (e.g. incomplete XML tag).
@@ -87,6 +84,11 @@ struct Cli {
     /// Requires --features metrics.
     #[arg(long)]
     metrics_bind: Option<String>,
+
+    /// Maximum concurrent TLS sessions. Prevents resource exhaustion
+    /// from connection floods.
+    #[arg(long, default_value_t = 1024, env = "RUSTGATE_MAX_CONNECTIONS")]
+    max_connections: usize,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -159,19 +161,24 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     tracing::info!(addr = %listener.local_addr()?, framing = ?cli.framing, encoding = ?encoding, "listening");
 
+    // Readiness flag: true when accepting connections, false during shutdown.
+    // Used by the /readyz health endpoint to signal K8s readiness probes.
+    let ready = Arc::new(AtomicBool::new(true));
+
     // Register Prometheus metrics (cheap; always active when compiled in)
     #[cfg(feature = "metrics")]
     metrics::init().map_err(|e| anyhow::anyhow!("failed to register metrics: {e}"))?;
 
-    // Optionally start the Prometheus metrics HTTP server
+    // Optionally start the Prometheus metrics / health HTTP server
     #[cfg(feature = "metrics")]
     if let Some(ref metrics_bind) = cli.metrics_bind {
         let bind_addr: std::net::SocketAddr = metrics_bind
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid --metrics-bind address: {e}"))?;
 
+        let health_ready = Arc::clone(&ready);
         drop(tokio::spawn(async move {
-            if let Err(e) = metrics::serve(bind_addr).await {
+            if let Err(e) = metrics::serve(bind_addr, health_ready).await {
                 tracing::error!(error = %e, "metrics server failed");
             }
         }));
@@ -182,8 +189,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         tracing::warn!("--metrics-bind requires --features metrics; ignoring");
     }
 
+    if cli.max_connections == 0 {
+        anyhow::bail!("--max-connections must be at least 1");
+    }
+    let max_connections: u32 = cli
+        .max_connections
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("max_connections must fit in u32 (max {})", u32::MAX))?;
     let router = Arc::new(Router::new());
-    let connection_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let connection_limit = Arc::new(Semaphore::new(max_connections as usize));
 
     // Optionally connect to NATS for cross-instance message delivery
     #[cfg(feature = "nats")]
@@ -300,7 +314,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                                     metrics::connections_rejected().inc();
                                     metrics::connections_active().dec();
                                 }
-                                tracing::warn!(max = MAX_CONNECTIONS, "connection limit reached, rejecting");
+                                tracing::warn!(max = max_connections, "connection limit reached, rejecting");
                                 continue;
                             }
                         };
@@ -316,15 +330,62 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     }
                 }
             }
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("shutdown");
+            _ = shutdown_signal() => {
+                tracing::info!("shutdown signal received");
+                // Immediately mark as not-ready so the K8s readiness probe
+                // returns 503 and the load balancer stops routing traffic
+                // before we begin draining existing connections.
+                ready.store(false, Ordering::Release);
                 break;
             }
         }
     }
 
-    tracing::info!(sessions = router.session_count().await, "stopped");
+    // ── Connection draining ──────────────────────────────────────────
+
+    let active = router.session_count().await;
+    tracing::info!(sessions = active, "draining connections");
+
+    // Wait for every session to finish (each holds a semaphore permit).
+    // When all permits return to the semaphore, all sessions are done.
+    // Leave 10 s margin inside the default K8s terminationGracePeriodSeconds (120 s).
+    let drain_timeout = Duration::from_secs(110);
+    let drain = connection_limit.acquire_many(max_connections);
+
+    match tokio::time::timeout(drain_timeout, drain).await {
+        Ok(Ok(_permits)) => tracing::info!("all sessions drained"),
+        Ok(Err(_)) => tracing::warn!("semaphore closed during drain"),
+        Err(_) => {
+            tracing::warn!(
+                sessions = router.session_count().await,
+                "drain timeout reached, forcing exit"
+            );
+        }
+    }
+
     Ok(())
+}
+
+/// Wait for SIGTERM or SIGINT (Ctrl-C).
+///
+/// K8s sends SIGTERM during pod eviction; SIGINT covers local development.
+/// On non-Unix platforms only Ctrl-C is available.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
@@ -773,5 +834,76 @@ fn build_raw_message(
             message_type: rustgate_core::message::MessageType::Other("raw".into()),
             ttl: None,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_parses_defaults() {
+        let cli = Cli::try_parse_from([
+            "rustgate", "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
+        ])
+        .expect("should parse");
+        assert_eq!(cli.bind, "0.0.0.0:4433");
+        assert_eq!(cli.max_connections, 1024);
+    }
+
+    #[test]
+    fn cli_max_connections_override() {
+        let cli = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--max-connections",
+            "512",
+        ])
+        .expect("should parse");
+        assert_eq!(cli.max_connections, 512);
+    }
+
+    #[test]
+    fn cli_rejects_non_numeric_max_connections() {
+        let result = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--max-connections",
+            "abc",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_metrics_bind_optional() {
+        let cli = Cli::try_parse_from([
+            "rustgate", "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
+        ])
+        .expect("should parse");
+        assert!(cli.metrics_bind.is_none());
+
+        let cli = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--metrics-bind",
+            "0.0.0.0:9090",
+        ])
+        .expect("should parse");
+        assert_eq!(cli.metrics_bind.as_deref(), Some("0.0.0.0:9090"));
     }
 }

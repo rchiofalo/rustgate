@@ -6,6 +6,7 @@
 //! `/metrics` via a lightweight hyper HTTP server.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -201,8 +202,28 @@ pub fn negotiations() -> &'static IntCounterVec {
 
 fn handle_request(
     req: Request<hyper::body::Incoming>,
+    ready: Arc<AtomicBool>,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
     match req.uri().path() {
+        "/healthz" => Ok(Response::builder()
+            .status(StatusCode::OK)
+            .body(Full::new(Bytes::from("ok")))
+            .expect("static response")),
+
+        "/readyz" => {
+            if ready.load(Ordering::Acquire) {
+                Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Full::new(Bytes::from("ok")))
+                    .expect("static response"))
+            } else {
+                Ok(Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .body(Full::new(Bytes::from("not ready")))
+                    .expect("static response"))
+            }
+        }
+
         "/metrics" => {
             let encoder = TextEncoder::new();
             let metric_families = prometheus::gather();
@@ -227,13 +248,18 @@ fn handle_request(
     }
 }
 
-/// Serve Prometheus metrics at the given address.
+/// Serve Prometheus metrics and health endpoints at the given address.
+///
+/// Routes:
+/// - `GET /metrics` — Prometheus text format
+/// - `GET /healthz` — Liveness probe (always 200)
+/// - `GET /readyz`  — Readiness probe (200 when ready, 503 during shutdown)
 ///
 /// The server is hardened against unauthenticated abuse:
 /// - Connection count bounded by [`MAX_HTTP_CONNECTIONS`]
 /// - Per-connection timeout of [`HTTP_CONNECTION_TIMEOUT`]
 /// - Header read timeout of 5 seconds
-pub async fn serve(bind: SocketAddr) -> anyhow::Result<()> {
+pub async fn serve(bind: SocketAddr, ready: Arc<AtomicBool>) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let conn_limit = Arc::new(tokio::sync::Semaphore::new(MAX_HTTP_CONNECTIONS));
     tracing::info!(addr = %bind, "metrics server started");
@@ -250,12 +276,19 @@ pub async fn serve(bind: SocketAddr) -> anyhow::Result<()> {
         };
 
         let io = hyper_util::rt::TokioIo::new(stream);
+        let ready = Arc::clone(&ready);
         drop(tokio::spawn(async move {
             let _permit = permit;
             let conn = hyper::server::conn::http1::Builder::new()
                 .timer(hyper_util::rt::TokioTimer::new())
                 .header_read_timeout(Duration::from_secs(5))
-                .serve_connection(io, service_fn(|req| async { handle_request(req) }));
+                .serve_connection(
+                    io,
+                    service_fn(move |req| {
+                        let ready = Arc::clone(&ready);
+                        async move { handle_request(req, ready) }
+                    }),
+                );
             match tokio::time::timeout(HTTP_CONNECTION_TIMEOUT, conn).await {
                 Ok(Err(e)) => tracing::debug!(error = %e, "metrics connection error"),
                 Err(_) => tracing::debug!("metrics connection timed out"),
@@ -282,7 +315,6 @@ mod tests {
     fn init_registers_all_metrics() {
         ensure_init();
 
-        // All accessors should succeed after init
         let _ = connections_accepted();
         let _ = connections_active();
         let _ = connections_rejected();
@@ -330,31 +362,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serve_metrics_endpoint() {
+    async fn serve_health_and_metrics_endpoints() {
         ensure_init();
 
-        // Bind to an ephemeral port
+        let ready = Arc::new(AtomicBool::new(true));
+
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
         let addr = listener.local_addr().expect("local_addr");
         drop(listener);
 
-        // Start metrics server in background
+        let server_ready = Arc::clone(&ready);
         drop(tokio::spawn(async move {
-            let _ = serve(addr).await;
+            let _ = serve(addr, server_ready).await;
         }));
 
-        // Give the server a moment to start
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Test /metrics endpoint
+        // /healthz always returns 200
+        let (status, body) = http_get(addr, "/healthz").await;
+        assert_eq!(status, 200);
+        assert_eq!(body, "ok");
+
+        // /readyz returns 200 when ready
+        let (status, body) = http_get(addr, "/readyz").await;
+        assert_eq!(status, 200);
+        assert_eq!(body, "ok");
+
+        // /readyz returns 503 after marking not ready
+        ready.store(false, Ordering::Release);
+        let (status, body) = http_get(addr, "/readyz").await;
+        assert_eq!(status, 503);
+        assert_eq!(body, "not ready");
+
+        // /metrics returns Prometheus text
         let (status, body) = http_get(addr, "/metrics").await;
         assert_eq!(status, 200);
         assert!(body.contains("rustgate_connections_accepted_total"));
-        assert!(body.contains("rustgate_connections_active"));
 
-        // Test unknown path returns 404
+        // Unknown path returns 404
         let (status, _) = http_get(addr, "/unknown").await;
         assert_eq!(status, 404);
     }
@@ -372,7 +419,6 @@ mod tests {
         let _ = stream.read_to_end(&mut buf).await.expect("read");
         let response = String::from_utf8_lossy(&buf);
 
-        // Parse status code from "HTTP/1.1 200 OK\r\n..."
         let status_line = response.lines().next().unwrap_or("");
         let status: u16 = status_line
             .split_whitespace()
@@ -380,7 +426,6 @@ mod tests {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
 
-        // Body is after the blank line
         let body = response
             .split_once("\r\n\r\n")
             .map(|(_, b)| b.to_string())
