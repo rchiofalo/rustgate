@@ -10,7 +10,7 @@ spec:
   restartPolicy: Never
   securityContext:
     runAsNonRoot: true
-    runAsUser: 65534
+    runAsUser: 10001
     seccompProfile:
       type: RuntimeDefault
   containers:
