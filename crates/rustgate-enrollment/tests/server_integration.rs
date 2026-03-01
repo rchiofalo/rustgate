@@ -90,12 +90,9 @@ impl TestEnv {
         &self,
         req: Request<Full<Bytes>>,
     ) -> hyper::Response<hyper::body::Incoming> {
-        let tcp = TcpStream::connect(self.addr)
-            .await
-            .expect("TCP connect");
+        let tcp = TcpStream::connect(self.addr).await.expect("TCP connect");
 
-        let server_name =
-            rustls_pki_types::ServerName::try_from("localhost").expect("server name");
+        let server_name = rustls_pki_types::ServerName::try_from("localhost").expect("server name");
         let tls = self
             .tls_connector()
             .connect(server_name, tcp)
@@ -185,10 +182,7 @@ async fn missing_auth_returns_401() {
         .get("WWW-Authenticate")
         .expect("should have WWW-Authenticate header");
     assert!(
-        www_auth
-            .to_str()
-            .expect("header to str")
-            .contains("Basic"),
+        www_auth.to_str().expect("header to str").contains("Basic"),
         "WWW-Authenticate should indicate Basic auth"
     );
 }
@@ -317,10 +311,7 @@ async fn unknown_path_returns_404() {
 
     let req = Request::builder()
         .method("GET")
-        .uri(format!(
-            "https://localhost:{}/nonexistent",
-            env.addr.port()
-        ))
+        .uri(format!("https://localhost:{}/nonexistent", env.addr.port()))
         .header("Host", "localhost")
         .body(Full::new(Bytes::new()))
         .expect("build request");
