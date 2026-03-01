@@ -47,3 +47,30 @@ jobs:
 
       - name: Test (all features)
         run: cargo test --all-features
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Audit dependencies for vulnerabilities
+        run: cargo audit
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny@0.18.3 --locked
+
+      - name: Check licenses and sources
+        run: cargo deny check licenses bans sources
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Lint Helm chart
+        run: helm lint helm/
+
+      - name: Validate Dockerfile builds
+        uses: docker/setup-buildx-action@v3
+      - name: Docker build (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: false
