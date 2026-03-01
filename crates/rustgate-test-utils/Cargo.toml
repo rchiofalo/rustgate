@@ -3,7 +3,9 @@ name = "rustgate-test-utils"
 description = "Test utilities for rustgate - certificate generation"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 
 # Don't inherit workspace lints - test utilities use expect() for setup failures
 [lints.rust]

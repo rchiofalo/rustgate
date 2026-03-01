@@ -3,7 +3,9 @@ name = "rustgate-transport"
 description = "TLS/mTLS listener and connection management"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [lints]
 workspace = true
