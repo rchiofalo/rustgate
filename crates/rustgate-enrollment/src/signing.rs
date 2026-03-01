@@ -6,7 +6,7 @@
 use std::io::BufReader;
 
 use rcgen::{
-    CertificateSigningRequestParams, ExtendedKeyUsagePurpose, Issuer, IsCa, KeyPair,
+    CertificateSigningRequestParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose,
 };
 

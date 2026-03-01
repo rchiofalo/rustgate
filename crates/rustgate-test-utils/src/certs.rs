@@ -27,8 +27,7 @@ impl TestCa {
 
         let key_pair = KeyPair::generate().expect("failed to generate key pair");
         let key_pem = key_pair.serialize_pem();
-        let issuer = CertifiedIssuer::self_signed(params, key_pair)
-            .expect("failed to sign CA");
+        let issuer = CertifiedIssuer::self_signed(params, key_pair).expect("failed to sign CA");
 
         Self {
             cert_pem: issuer.pem(),
