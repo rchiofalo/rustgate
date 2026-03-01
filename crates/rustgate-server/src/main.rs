@@ -33,56 +33,56 @@ use rustgate_transport::{
 #[derive(Parser)]
 #[command(name = "rustgate", about = "Secure tactical message router")]
 struct Cli {
-    #[arg(short, long, default_value = "0.0.0.0:4433")]
+    #[arg(short, long, default_value = "0.0.0.0:4433", env = "RUSTGATE_BIND")]
     bind: String,
 
-    #[arg(long)]
+    #[arg(long, env = "RUSTGATE_CERT")]
     cert: String,
 
-    #[arg(long)]
+    #[arg(long, env = "RUSTGATE_KEY")]
     key: String,
 
-    #[arg(long)]
+    #[arg(long, env = "RUSTGATE_CA")]
     ca: String,
 
-    #[arg(long, value_enum, default_value_t = Framing::Xml)]
+    #[arg(long, value_enum, default_value_t = Framing::Xml, env = "RUSTGATE_FRAMING")]
     framing: Framing,
 
-    #[arg(long, value_enum, default_value_t = Encoding::Raw)]
+    #[arg(long, value_enum, default_value_t = Encoding::Raw, env = "RUSTGATE_ENCODING")]
     encoding: Encoding,
 
     /// NATS server URL (enables NATS bridge when set). Requires --features nats.
-    #[arg(long)]
+    #[arg(long, env = "NATS_URL")]
     nats_url: Option<String>,
 
     /// Path to NATS credentials file for JWT/NKey auth.
-    #[arg(long)]
+    #[arg(long, env = "NATS_CREDENTIALS")]
     nats_credentials: Option<String>,
 
     /// Bind address for the enrollment HTTPS server (e.g. 0.0.0.0:8446).
     /// Requires --features enrollment.
-    #[arg(long)]
+    #[arg(long, env = "ENROLLMENT_BIND")]
     enrollment_bind: Option<String>,
 
     /// Path to the CA private key PEM file (used to sign client CSRs).
-    #[arg(long)]
+    #[arg(long, env = "RUSTGATE_CA_KEY")]
     ca_key: Option<String>,
 
     /// Username for enrollment HTTP Basic Auth.
-    #[arg(long)]
+    #[arg(long, env = "ENROLLMENT_USER")]
     enrollment_user: Option<String>,
 
     /// Password for enrollment HTTP Basic Auth.
-    #[arg(long)]
+    #[arg(long, env = "ENROLLMENT_PASSWORD")]
     enrollment_password: Option<String>,
 
     /// Organization name for issued client certificates.
-    #[arg(long, default_value = "rustgate")]
+    #[arg(long, default_value = "rustgate", env = "RUSTGATE_CA_ORG")]
     ca_organization: String,
 
     /// Bind address for the Prometheus metrics HTTP server (e.g. 0.0.0.0:9090).
     /// Requires --features metrics.
-    #[arg(long)]
+    #[arg(long, env = "METRICS_BIND")]
     metrics_bind: Option<String>,
 
     /// Maximum concurrent TLS sessions. Prevents resource exhaustion
@@ -905,5 +905,54 @@ mod tests {
         ])
         .expect("should parse");
         assert_eq!(cli.metrics_bind.as_deref(), Some("0.0.0.0:9090"));
+    }
+
+    #[test]
+    fn cli_env_vars_declared() {
+        // Verify all expected env vars appear in clap's help output.
+        // This ensures the env = "..." attributes are wired up correctly.
+        use clap::CommandFactory;
+        let help = Cli::command().render_long_help().to_string();
+
+        let expected_env_vars = [
+            "RUSTGATE_BIND",
+            "RUSTGATE_CERT",
+            "RUSTGATE_KEY",
+            "RUSTGATE_CA",
+            "RUSTGATE_FRAMING",
+            "RUSTGATE_ENCODING",
+            "NATS_URL",
+            "NATS_CREDENTIALS",
+            "ENROLLMENT_BIND",
+            "RUSTGATE_CA_KEY",
+            "ENROLLMENT_USER",
+            "ENROLLMENT_PASSWORD",
+            "RUSTGATE_CA_ORG",
+            "METRICS_BIND",
+            "RUSTGATE_MAX_CONNECTIONS",
+        ];
+
+        for var in expected_env_vars {
+            assert!(
+                help.contains(var),
+                "expected env var {var} not found in help output"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_all_flags_have_long_option() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        for arg in cmd.get_arguments() {
+            if arg.get_id() == "help" || arg.get_id() == "version" {
+                continue;
+            }
+            assert!(
+                arg.get_long().is_some(),
+                "arg {:?} missing --long flag",
+                arg.get_id()
+            );
+        }
     }
 }
