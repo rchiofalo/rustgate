@@ -1,0 +1,78 @@
+replicaCount: 1
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  repository: ghcr.io/rchiofalo/rustgate
+  # Use a specific version tag or SHA digest for production deployments.
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+service:
+  # Use LoadBalancer for external TCP access, ClusterIP for internal-only.
+  type: ClusterIP
+  port: 4433
+
+tls:
+  secretName: rustgate-tls
+  cert: /certs/server.crt
+  key: /certs/server.key
+  ca: /certs/ca.crt
+
+framing: tak-negotiate
+encoding: tak-protobuf
+maxConnections: 1024
+
+nats:
+  enabled: true
+  url: nats://nats:4222
+  credentials: ""
+  # Name of an existing K8s Secret containing a NATS_CREDENTIALS key.
+  # When set, takes precedence over the plain-text credentials value above.
+  existingSecret: ""
+
+enrollment:
+  enabled: false
+  bind: "0.0.0.0:8446"
+  # Required when enrollment is enabled:
+  caKey: ""           # Path to CA private key PEM (RUSTGATE_CA_KEY)
+  user: ""            # HTTP Basic Auth username (ENROLLMENT_USER)
+  password: ""        # HTTP Basic Auth password (ENROLLMENT_PASSWORD)
+  caOrganization: ""  # Organization for issued certs (RUSTGATE_CA_ORG)
+  # Name of an existing K8s Secret containing ENROLLMENT_USER and
+  # ENROLLMENT_PASSWORD keys. When set, takes precedence over plain-text values.
+  existingSecret: ""
+
+metrics:
+  enabled: true
+  port: 9090
+
+networkPolicy:
+  enabled: false
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 256Mi
+  limits:
+    cpu: "2"
+    memory: 512Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+# Must be greater than drain timeout (110s) + preStop sleep (5s).
+terminationGracePeriodSeconds: 120
+
+# Spread replicas across nodes for HA. Uncomment for multi-replica deployments.
+# topologySpreadConstraints:
+#   - maxSkew: 1
+#     topologyKey: kubernetes.io/hostname
+#     whenUnsatisfiable: DoNotSchedule
+#     labelSelector:
+#       matchLabels:
+#         app.kubernetes.io/name: rustgate

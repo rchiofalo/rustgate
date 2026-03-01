@@ -1,0 +1,166 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "rustgate.fullname" . }}
+  labels:
+    {{- include "rustgate.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "rustgate.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "rustgate.selectorLabels" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: rustgate
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          ports:
+            - name: tak
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+              protocol: TCP
+            {{- end }}
+          env:
+            - name: RUSTGATE_BIND
+              value: "0.0.0.0:{{ .Values.service.port }}"
+            - name: RUSTGATE_CERT
+              value: {{ .Values.tls.cert | quote }}
+            - name: RUSTGATE_KEY
+              value: {{ .Values.tls.key | quote }}
+            - name: RUSTGATE_CA
+              value: {{ .Values.tls.ca | quote }}
+            - name: RUSTGATE_FRAMING
+              value: {{ .Values.framing | quote }}
+            - name: RUSTGATE_ENCODING
+              value: {{ .Values.encoding | quote }}
+            - name: RUSTGATE_MAX_CONNECTIONS
+              value: {{ .Values.maxConnections | quote }}
+            {{- if .Values.nats.enabled }}
+            - name: NATS_URL
+              value: {{ .Values.nats.url | quote }}
+            {{- if .Values.nats.existingSecret }}
+            - name: NATS_CREDENTIALS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.nats.existingSecret }}
+                  key: NATS_CREDENTIALS
+            {{- else if .Values.nats.credentials }}
+            - name: NATS_CREDENTIALS
+              value: {{ .Values.nats.credentials | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.metrics.enabled }}
+            - name: METRICS_BIND
+              value: "0.0.0.0:{{ .Values.metrics.port }}"
+            {{- end }}
+            {{- if .Values.enrollment.enabled }}
+            - name: ENROLLMENT_BIND
+              value: {{ .Values.enrollment.bind | quote }}
+            {{- if .Values.enrollment.caKey }}
+            - name: RUSTGATE_CA_KEY
+              value: {{ .Values.enrollment.caKey | quote }}
+            {{- end }}
+            {{- if .Values.enrollment.existingSecret }}
+            - name: ENROLLMENT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.enrollment.existingSecret }}
+                  key: ENROLLMENT_USER
+            - name: ENROLLMENT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.enrollment.existingSecret }}
+                  key: ENROLLMENT_PASSWORD
+            {{- else }}
+            {{- if .Values.enrollment.user }}
+            - name: ENROLLMENT_USER
+              value: {{ .Values.enrollment.user | quote }}
+            {{- end }}
+            {{- if .Values.enrollment.password }}
+            - name: ENROLLMENT_PASSWORD
+              value: {{ .Values.enrollment.password | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.enrollment.caOrganization }}
+            - name: RUSTGATE_CA_ORG
+              value: {{ .Values.enrollment.caOrganization | quote }}
+            {{- end }}
+            {{- end }}
+          {{- if .Values.metrics.enabled }}
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            failureThreshold: 30
+            periodSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          {{- else }}
+          startupProbe:
+            tcpSocket:
+              port: tak
+            failureThreshold: 30
+            periodSeconds: 2
+          livenessProbe:
+            tcpSocket:
+              port: tak
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: tak
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          {{- end }}
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"]
+          volumeMounts:
+            - name: tls-certs
+              mountPath: /certs
+              readOnly: true
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- if .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml .Values.topologySpreadConstraints | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: tls-certs
+          secret:
+            secretName: {{ .Values.tls.secretName }}

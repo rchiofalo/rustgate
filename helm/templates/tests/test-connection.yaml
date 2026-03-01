@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "rustgate.fullname" . }}-test-connection"
+  labels:
+    {{- include "rustgate.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: wget
+      image: busybox:1.36
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+      {{- if .Values.metrics.enabled }}
+      command: ['wget']
+      args: ['--spider', '-q', 'http://{{ include "rustgate.fullname" . }}:{{ .Values.metrics.port }}/healthz']
+      {{- else }}
+      command: ['true']
+      {{- end }}
