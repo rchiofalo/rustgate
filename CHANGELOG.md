@@ -31,7 +31,7 @@ Initial release of rustgate — a Rust-native secure tactical message router.
 - **CI pipeline** — GitHub Actions with fmt, clippy, test (default + all features), cargo-deny (licenses, advisories, bans, sources), Helm lint, Docker build validation
 - **Release pipeline** — Docker image build and push to ghcr.io on GitHub Release, cosign signing, SBOM embedding
 - **Dependency management** — Dependabot with grouped minor/patch updates and individual major version PRs; cargo-deny with advisory ignore for transitive rustls-pemfile dep
-- **169 tests** — unit tests covering mTLS, identity extraction, routing, codecs, NATS wire format, CSR signing, enrollment, protobuf conversion, metrics, and CLI configuration; NATS integration tests with embedded nats-server
+- **198 tests** — unit tests covering mTLS, identity extraction, routing, codecs (XML stream, line-delimited), NATS wire format, CSR signing, enrollment HTTP integration, protobuf conversion, metrics, and CLI configuration; NATS integration tests with embedded nats-server
 
 ### Security
 
