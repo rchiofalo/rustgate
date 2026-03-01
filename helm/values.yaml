@@ -46,6 +46,13 @@ enrollment:
 metrics:
   enabled: true
   port: 9090
+  serviceMonitor:
+    # Enable to create a Prometheus Operator ServiceMonitor resource.
+    # Requires the Prometheus Operator CRDs to be installed in the cluster.
+    enabled: false
+    interval: 30s
+    scrapeTimeout: 10s
+    additionalLabels: {}
 
 networkPolicy:
   enabled: false
