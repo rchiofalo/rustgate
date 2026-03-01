@@ -1,7 +1,7 @@
 //! X.509 certificate generation for tests.
 
 use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
+    BasicConstraints, CertificateParams, CertifiedIssuer, DistinguishedName, DnType,
     ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
 };
 use std::fmt;
@@ -10,8 +10,7 @@ use std::fmt;
 pub struct TestCa {
     pub cert_pem: String,
     pub key_pem: String,
-    cert: Certificate,
-    key_pair: KeyPair,
+    issuer: CertifiedIssuer<'static, KeyPair>,
 }
 
 impl TestCa {
@@ -27,13 +26,13 @@ impl TestCa {
         params.distinguished_name = dn;
 
         let key_pair = KeyPair::generate().expect("failed to generate key pair");
-        let cert = params.self_signed(&key_pair).expect("failed to sign CA");
+        let key_pem = key_pair.serialize_pem();
+        let issuer = CertifiedIssuer::self_signed(params, key_pair).expect("failed to sign CA");
 
         Self {
-            cert_pem: cert.pem(),
-            key_pem: key_pair.serialize_pem(),
-            cert,
-            key_pair,
+            cert_pem: issuer.pem(),
+            key_pem,
+            issuer,
         }
     }
 
@@ -56,7 +55,7 @@ impl TestCa {
 
         let key_pair = KeyPair::generate().expect("failed to generate key pair");
         let cert = params
-            .signed_by(&key_pair, &self.cert, &self.key_pair)
+            .signed_by(&key_pair, &self.issuer)
             .expect("failed to sign server cert");
 
         TestCert {
@@ -78,7 +77,7 @@ impl TestCa {
 
         let key_pair = KeyPair::generate().expect("failed to generate key pair");
         let cert = params
-            .signed_by(&key_pair, &self.cert, &self.key_pair)
+            .signed_by(&key_pair, &self.issuer)
             .expect("failed to sign client cert");
 
         TestCert {
@@ -109,7 +108,7 @@ impl TestCa {
 
         let key_pair = KeyPair::generate().expect("failed to generate key pair");
         let cert = params
-            .signed_by(&key_pair, &self.cert, &self.key_pair)
+            .signed_by(&key_pair, &self.issuer)
             .expect("failed to sign client cert");
 
         TestCert {

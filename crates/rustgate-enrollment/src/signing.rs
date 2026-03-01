@@ -6,21 +6,19 @@
 use std::io::BufReader;
 
 use rcgen::{
-    Certificate, CertificateParams, CertificateSigningRequestParams, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose,
+    CertificateSigningRequestParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+    KeyUsagePurpose,
 };
 
 use crate::error::EnrollmentError;
 
 /// Signs PKCS#10 certificate signing requests with the server CA.
 pub struct CsrSigner {
-    /// Reconstructed CA Certificate handle for use as issuer in `signed_by()`.
-    ca_cert: Certificate,
-    /// CA private key for signing.
-    ca_key: KeyPair,
+    /// CA issuer handle combining certificate params and signing key.
+    issuer: Issuer<'static, KeyPair>,
     /// Original CA certificate DER bytes for enrollment responses.
-    /// Kept separate because the reconstructed `ca_cert` may have a different
-    /// signature (re-signed during loading), but clients need the actual CA cert.
+    /// Kept separate because `Issuer` is reconstructed from the DER and
+    /// clients need the exact original CA cert bytes.
     ca_cert_der: Vec<u8>,
     /// Organization name for /tls/config responses.
     organization: String,
@@ -66,22 +64,17 @@ impl CsrSigner {
         let ca_key = KeyPair::from_pem(ca_key_pem)
             .map_err(|e| EnrollmentError::Config(format!("failed to parse CA key PEM: {e}")))?;
 
-        // Reconstruct CA params from the cert DER and re-self-sign to get
-        // a Certificate handle. The re-signing produces different signature
-        // bytes but preserves the subject DN and extensions — which is all
-        // that `signed_by()` uses from the issuer.
-        let ca_params = CertificateParams::from_ca_cert_der(
+        // Build an Issuer directly from the CA cert DER and private key.
+        // The Issuer extracts the subject DN and extensions needed for signing
+        // without re-self-signing (which was required in rcgen 0.13).
+        let issuer = Issuer::from_ca_cert_der(
             &rustls_pki_types::CertificateDer::from(ca_cert_der.as_slice()),
+            ca_key,
         )
-        .map_err(|e| EnrollmentError::Config(format!("failed to parse CA cert params: {e}")))?;
-
-        let ca_cert = ca_params.self_signed(&ca_key).map_err(|e| {
-            EnrollmentError::Config(format!("failed to reconstruct CA certificate: {e}"))
-        })?;
+        .map_err(|e| EnrollmentError::Config(format!("failed to build CA issuer: {e}")))?;
 
         Ok(Self {
-            ca_cert,
-            ca_key,
+            issuer,
             ca_cert_der,
             organization: organization.to_string(),
         })
@@ -125,7 +118,7 @@ impl CsrSigner {
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
 
         let signed = params
-            .signed_by(&csr.public_key, &self.ca_cert, &self.ca_key)
+            .signed_by(&csr.public_key, &self.issuer)
             .map_err(|e| EnrollmentError::Signing(format!("failed to sign certificate: {e}")))?;
 
         Ok(signed.der().to_vec())
@@ -292,7 +285,7 @@ mod tests {
 
         // Generate a CSR with a SAN
         let key = rcgen::KeyPair::generate().expect("keygen");
-        let mut params = CertificateParams::default();
+        let mut params = rcgen::CertificateParams::default();
         let mut dn = rcgen::DistinguishedName::new();
         dn.push(rcgen::DnType::CommonName, "san-test");
         params.distinguished_name = dn;
