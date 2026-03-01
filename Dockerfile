@@ -3,7 +3,7 @@
 # ── Builder stage ────────────────────────────────────────────────────────
 FROM rust:1.88-alpine AS builder
 
-RUN apk add --no-cache musl-dev protobuf-dev
+RUN apk add --no-cache musl-dev protobuf-dev make
 
 WORKDIR /src
 
