@@ -12,7 +12,12 @@ workspace = true
 
 [dependencies]
 rustgate-core = { workspace = true }
-tokio = { workspace = true, features = ["rt", "sync", "time", "net", "macros"] }
+rustgate-transport = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time", "net", "macros", "io-util"] }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rustls-pki-types = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
@@ -20,7 +25,9 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 time = { workspace = true }
+socket2 = "0.6"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 tempfile = { workspace = true }
+rustgate-test-utils = { workspace = true }
