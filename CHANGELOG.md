@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **CI pipeline** — split single sequential job into 6 parallel jobs (fmt, clippy, test matrix, audit, helm, docker); 12 feature combinations now run concurrently via GitHub Actions matrix strategy
+- **Branch protection** — `main` requires all 17 CI status checks to pass before merge
+
+### Added
+
+- **Audit logging** — structured event logging for connection lifecycle and federation events
+- **Marti contact API** — `/Marti/api/contacts/all` and `/Marti/api/clientEndPoints` endpoints for TAK client contact discovery
+- **Data package support** — upload, download, and keyword search for data packages via `/Marti/sync/` endpoints
+- **Directional group routing** — group-aware message filtering for federation peers
+- **Fuzz targets** — cargo-fuzz targets for XML stream codec, CoT parser, TAK frame codec, length-prefixed codec, and federation converter
+- **Criterion benchmarks** — throughput benchmarks for CoT parsing, codec encode/decode, and federation XML conversion
+- **Container security scanning** — Trivy vulnerability scanning with SARIF upload in release workflow; cargo-audit in CI
+- **Binary release artifacts** — cross-compiled static binaries for x86_64 and aarch64 linux-musl via GitHub Release
+- **701 tests** — up from 639 in v0.2.0
+
 ## [0.2.0] - 2026-03-01
 
 ### Added
@@ -46,7 +63,7 @@ Initial release of rustgate — a Rust-native secure tactical message router.
 - **jemalloc allocator** (feature-gated: `jemalloc`) — avoids musl malloc contention for Alpine/musl production builds
 - **Helm chart** — Deployment with Pod Security Standards (restricted), PDB, HPA, startup/liveness/readiness probes, pre-stop hook, configurable NATS and enrollment, TLS secret mounting
 - **Docker** — multi-stage Dockerfile with OCI labels, HEALTHCHECK, STOPSIGNAL SIGTERM, non-root UID 10001, read-only root filesystem; docker-compose for local development
-- **CI pipeline** — GitHub Actions with fmt, clippy, test (default + all features), cargo-deny (licenses, advisories, bans, sources), Helm lint, Docker build validation
+- **CI pipeline** — GitHub Actions with fmt, clippy, feature matrix testing, cargo-deny (licenses, advisories, bans, sources), Helm lint, Docker build validation
 - **Release pipeline** — Docker image build and push to ghcr.io on GitHub Release, cosign signing, SBOM embedding
 - **Dependency management** — Dependabot with grouped minor/patch updates and individual major version PRs; cargo-deny with advisory ignore for transitive rustls-pemfile dep
 - **198 tests** — unit tests covering mTLS, identity extraction, routing, codecs (XML stream, line-delimited), NATS wire format, CSR signing, enrollment HTTP integration, protobuf conversion, metrics, and CLI configuration; NATS integration tests with embedded nats-server

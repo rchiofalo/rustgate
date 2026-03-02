@@ -15,8 +15,65 @@ env:
   NATS_VERSION: "2.11.1"
 
 jobs:
-  check:
+  fmt:
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-clippy-
+
+      - name: Clippy (all features)
+        run: cargo clippy --all-features --all-targets
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            flags: ""
+          - name: nats
+            flags: "--features nats"
+          - name: enrollment
+            flags: "--features enrollment"
+          - name: proto
+            flags: "--features proto"
+          - name: metrics
+            flags: "--features metrics"
+          - name: federation
+            flags: "--features federation"
+          - name: federation-nats
+            flags: "--features federation,nats"
+          - name: federation-metrics
+            flags: "--features federation,metrics"
+          - name: proto-federation
+            flags: "--features proto,federation"
+          - name: enrollment-federation
+            flags: "--features enrollment,federation"
+          - name: nats-metrics
+            flags: "--features nats,metrics"
+          - name: all
+            flags: "--all-features"
+    name: test (${{ matrix.name }})
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -36,51 +93,25 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-test-${{ matrix.name }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-test-${{ matrix.name }}-
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+      - name: Run tests
+        run: cargo test ${{ matrix.flags }}
 
-      - name: Clippy (all features)
-        run: cargo clippy --all-features --all-targets
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Test (default features)
-        run: cargo test
-
-      - name: Test (nats only)
-        run: cargo test --features nats
-
-      - name: Test (enrollment only)
-        run: cargo test --features enrollment
-
-      - name: Test (proto only)
-        run: cargo test --features proto
-
-      - name: Test (metrics only)
-        run: cargo test --features metrics
-
-      - name: Test (federation only)
-        run: cargo test --features federation
-
-      # Feature combination tests — validate interactions between features
-      - name: Test (federation + nats)
-        run: cargo test --features federation,nats
-
-      - name: Test (federation + metrics)
-        run: cargo test --features federation,metrics
-
-      - name: Test (proto + federation)
-        run: cargo test --features proto,federation
-
-      - name: Test (enrollment + federation)
-        run: cargo test --features enrollment,federation
-
-      - name: Test (nats + metrics)
-        run: cargo test --features nats,metrics
-
-      - name: Test (all features)
-        run: cargo test --all-features
+      - name: Cache cargo registry
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-audit-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-audit-
 
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked
@@ -94,14 +125,25 @@ jobs:
       - name: Run cargo audit
         run: cargo audit
 
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
       - name: Install Helm
         uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
 
       - name: Lint Helm chart
         run: helm lint helm/
 
-      - name: Validate Dockerfile builds
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
       - name: Docker build (no push)
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:

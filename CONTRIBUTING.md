@@ -43,7 +43,18 @@ cargo test -p rustgate-nats --test integration
 
 ## Code Quality
 
-All of these checks run in CI and must pass before merging:
+CI runs as parallel jobs with a matrix strategy across all feature combinations. All checks must pass before merging to `main` (enforced via branch protection):
+
+| Job | What it checks |
+|-----|----------------|
+| `fmt` | `cargo fmt --all -- --check` |
+| `clippy` | `cargo clippy --all-features --all-targets` |
+| `test` (x12) | `cargo test` across 12 feature combos (default, nats, enrollment, proto, metrics, federation, and 6 pairwise combinations) |
+| `audit` | `cargo deny check` + `cargo audit` |
+| `helm` | `helm lint helm/` |
+| `docker` | Dockerfile build validation |
+
+Run locally before pushing:
 
 ```bash
 # Formatting (enforced)
@@ -111,6 +122,6 @@ chore: miscellaneous maintenance
 
 - Branch from `main`
 - Keep PRs focused — one logical change per PR
-- Ensure CI passes before requesting review
+- All 17 CI checks must pass before merge (branch protection enforced)
 - Update the README if the change affects user-facing behavior
 - Add or update tests for any new functionality

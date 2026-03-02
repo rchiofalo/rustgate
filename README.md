@@ -11,18 +11,18 @@ rustgate is a lightweight alternative that handles mTLS client connections, rout
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                              rustgate-server                                 │
-│                                (binary)                                      │
-├───────────────┬──────────────┬───────────────┬──────────────┬───────────────┤
-│  rustgate-    │ rustgate-nats│  rustgate-    │ rustgate-    │  rustgate-    │
-│  transport    │              │  enrollment   │ proto        │  federation   │
-│  TLS·sessions │ NATS pub/sub│ HTTPS·CSR     │ TAK protobuf │  V1·V2·gRPC  │
-│  codec·router │ JetStream·SA│ Basic Auth    │ XML↔proto    │  peer mgmt   │
-├───────────────┴──────────────┴───────────────┴──────────────┴───────────────┤
-│                              rustgate-core                                   │
-│              Identity · RoutableMessage · framing strategy                   │
-└──────────────────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                                rustgate-server                                │
+│                                    (binary)                                   │
+├───────────────┬───────────────┬───────────────┬───────────────┬───────────────┤
+│  rustgate-    │  rustgate-    │  rustgate-    │  rustgate-    │  rustgate-    │
+│  transport    │  nats         │  enrollment   │  proto        │  federation   │
+│  TLS·sessions │  NATS pub/sub │  HTTPS·CSR    │  TAK protobuf │  V1·V2·gRPC   │
+│  codec·router │  JetStream·SA │  Basic Auth   │  XML↔proto    │  peer mgmt    │
+├───────────────┴───────────────┴───────────────┴───────────────┴───────────────┤
+│                                 rustgate-core                                 │
+│                 Identity · RoutableMessage · framing strategy                 │
+└───────────────────────────────────────────────────────────────────────────────┘
 ```
 
 **rustgate-core** — Shared types: `Identity` (CN + groups + fingerprint), `RoutableMessage`, `Destination` (Broadcast / Group / Direct), framing strategies.
@@ -82,6 +82,10 @@ Core transport and routing are functional. The server accepts mTLS connections, 
 - Federation REST API for peer CRUD and certificate management
 - Federation Prometheus metrics: connections, messages, errors, heartbeats
 - NATS ↔ federation bridge with echo prevention
+- Audit logging for connection and federation events
+- Marti contact API and data package upload/download/search
+- Fuzz targets for XML codec, CoT parser, TAK frame codec, length-prefixed codec, and federation converter
+- Criterion benchmarks for CoT parsing, codec throughput, and federation conversion
 - Helm chart with Pod Security Standards (restricted), PDB, HPA, startup/liveness/readiness probes
 - Multi-stage Dockerfile with OCI labels, HEALTHCHECK, STOPSIGNAL SIGTERM
 - jemalloc allocator for production builds (avoids musl malloc contention, feature-gated)
@@ -245,7 +249,7 @@ TLS certificates must be provided as a Kubernetes Secret named by `tls.secretNam
 cargo test
 ```
 
-639 tests covering mTLS handshake, identity extraction, broadcast/group/direct routing, cross-group message rejection, position cache group scoping, session lifecycle, codec edge cases, frame size limits, XML stream codec (depth tracking, CDATA, self-closing tags, partial frames), line-delimited codec, NATS wire format serialization, subject sanitization, group extraction, echo prevention, CSR signing round-trips, CSR SAN stripping, subject DN enforcement, Basic Auth validation, response formatting, XML/JSON enrollment responses, enrollment HTTP integration (TLS handshake, content negotiation, auth rejection, body size limits), varint encode/decode, TAK frame codec round-trips, ISO 8601 timestamp conversion, full CoT XML parsing, XML↔protobuf bidirectional conversion with detail field preservation, TAK protocol negotiation message builders/validators, Prometheus metrics registration and HTTP serving, CLI environment variable configuration, federation provenance and loop detection, CoT heartbeat generation and detection, federation config and peer serialization, federate store persistence, federation V1/V2 protocol handling, gRPC FederatedChannel service, trust store certificate management, HA claim acquisition and release, connection registry, REST API endpoints, and federation metrics. Unit tests use ephemeral certificates generated at runtime — no fixture files.
+701 tests covering mTLS handshake, identity extraction, broadcast/group/direct routing, cross-group message rejection, position cache group scoping, session lifecycle, codec edge cases, frame size limits, XML stream codec (depth tracking, CDATA, self-closing tags, partial frames), line-delimited codec, NATS wire format serialization, subject sanitization, group extraction, echo prevention, CSR signing round-trips, CSR SAN stripping, subject DN enforcement, Basic Auth validation, response formatting, XML/JSON enrollment responses, enrollment HTTP integration (TLS handshake, content negotiation, auth rejection, body size limits), varint encode/decode, TAK frame codec round-trips, ISO 8601 timestamp conversion, full CoT XML parsing, XML↔protobuf bidirectional conversion with detail field preservation, TAK protocol negotiation message builders/validators, Prometheus metrics registration and HTTP serving, CLI environment variable configuration, federation provenance and loop detection, CoT heartbeat generation and detection, federation config and peer serialization, federate store persistence, federation V1/V2 protocol handling, gRPC FederatedChannel service, trust store certificate management, HA claim acquisition and release, connection registry, REST API endpoints, federation metrics, audit logging, Marti contact API, data package upload/download/search, and directional group routing. Unit tests use ephemeral certificates generated at runtime — no fixture files.
 
 NATS integration tests (`cargo test -p rustgate-nats --test integration`) spin up a real `nats-server` subprocess with JetStream. Covers publish→subscribe round-trip, dual-layer echo prevention, cross-instance delivery, JetStream SA replay with LastPerSubject dedup, replay count limits, oversized payload rejection, group preservation, zero-position filtering, and wire format fidelity. Requires `nats-server` on PATH.
 
