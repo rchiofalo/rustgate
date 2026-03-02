@@ -1,0 +1,66 @@
+name: Release Binaries
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag (e.g., v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Extract version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION=${GITHUB_REF#refs/tags/}
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install cross
+        run: cargo install cross --locked
+
+      - name: Build with cross
+        run: cross build --release --all-features --target ${{ matrix.target }}
+
+      - name: Package binary
+        run: |
+          ARCHIVE="rustgate-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz"
+          tar -czf "$ARCHIVE" -C "target/${{ matrix.target }}/release" rustgate
+          echo "ARCHIVE=$ARCHIVE" >> $GITHUB_ENV
+
+      - name: Generate SHA256 checksum
+        run: sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ steps.version.outputs.version }}" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
