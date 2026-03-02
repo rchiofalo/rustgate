@@ -48,28 +48,53 @@ pub enum RoutingMode {
 pub struct FederationConfig {
     /// Unique identifier for this federation server instance.
     pub federate_id: String,
-    /// Address to listen for inbound federation peers.
-    pub listen_addr: SocketAddr,
-    /// Federation protocol version (V1 or V2).
-    pub protocol: Protocol,
+
+    // --- V1 (legacy) listener ---
+
+    /// Whether V1 federation (length-prefixed XML over mTLS) is enabled.
+    pub v1_enabled: bool,
+    /// Address to listen for inbound V1 federation peers.
+    /// TAK Server default port: 9000. Federation Hub default: 9101.
+    pub v1_listen_addr: SocketAddr,
+
+    // --- V2 (gRPC) listener ---
+
+    /// Whether V2 federation (gRPC over mTLS) is enabled.
+    pub v2_enabled: bool,
+    /// Address to listen for inbound V2 federation peers.
+    /// TAK Server default port: 9001. Federation Hub default: 9102.
+    pub v2_listen_addr: SocketAddr,
+
     /// List of outbound peers to connect to.
     pub peers: Vec<PeerConfig>,
-    /// Interval between heartbeat messages.
+    /// Interval between V1 CoT heartbeat messages (t-x-c-t).
     pub heartbeat_interval: Duration,
     /// Timeout before considering a peer dead (no heartbeat received).
     pub heartbeat_timeout: Duration,
+    /// Interval between V2 gRPC health checks.
+    /// TAK Server default: 3s. Must be faster than `client_timeout`.
+    pub health_check_interval: Duration,
+    /// V2 gRPC client inactivity timeout.
+    /// TAK Server default: 15s. If no health check arrives within this
+    /// window, the connection is considered dead.
+    pub client_timeout: Duration,
     /// Maximum message size in bytes.
+    /// TAK Server default: 268,435,456 (256 MB).
     pub max_message_size: usize,
     /// Base delay before reconnecting to a disconnected peer.
     pub reconnect_delay: Duration,
     /// Maximum number of reconnection attempts (-1 = unlimited).
     pub max_reconnects: i32,
     /// Maximum number of federation hops before dropping a message.
+    /// TAK Server default: -1 (unlimited). We use 10 as a safer default.
     pub max_hops: u32,
     /// Default group for messages without explicit group assignment.
     pub default_group: String,
     /// Path for persistent federate store (JSON file).
     pub store_path: Option<PathBuf>,
+    /// Whether to skip TLS hostname verification for federation peers.
+    /// Useful when peers use descriptive certificate CNs instead of hostnames.
+    pub skip_hostname_verify: bool,
     /// TLS certificate file for this server.
     pub cert_file: PathBuf,
     /// TLS private key file for this server.
@@ -82,17 +107,22 @@ impl Default for FederationConfig {
     fn default() -> Self {
         Self {
             federate_id: String::from("rustgate-federation-1"),
-            listen_addr: "0.0.0.0:9001".parse().expect("valid default addr"),
-            protocol: Protocol::V2,
+            v1_enabled: true,
+            v1_listen_addr: "0.0.0.0:9000".parse().expect("valid default addr"),
+            v2_enabled: true,
+            v2_listen_addr: "0.0.0.0:9001".parse().expect("valid default addr"),
             peers: Vec::new(),
             heartbeat_interval: Duration::from_secs(30),
             heartbeat_timeout: Duration::from_secs(90),
-            max_message_size: 10 * 1024 * 1024, // 10 MB
-            reconnect_delay: Duration::from_secs(15),
+            health_check_interval: Duration::from_secs(5),
+            client_timeout: Duration::from_secs(15),
+            max_message_size: 268_435_456, // 256 MB — TAK Server default
+            reconnect_delay: Duration::from_secs(30),
             max_reconnects: -1,
             max_hops: 10,
             default_group: String::from("__ANON__"),
             store_path: None,
+            skip_hostname_verify: false,
             cert_file: PathBuf::from("server.pem"),
             key_file: PathBuf::from("server-key.pem"),
             ca_file: PathBuf::from("ca.pem"),
@@ -107,7 +137,9 @@ pub struct PeerConfig {
     pub id: String,
     /// Network address of the peer (host:port).
     pub address: String,
-    /// Groups this peer participates in.
+    /// Groups this peer participates in (bidirectional).
+    /// TAK Server has separate inbound/outbound groups; we'll add that
+    /// in a future PR. For now, a single list covers the CNAK use case.
     pub groups: Vec<String>,
     /// Whether this peer connection is enabled.
     pub enabled: bool,
@@ -118,6 +150,14 @@ pub struct PeerConfig {
     /// Routing mode for this peer.
     #[serde(default)]
     pub routing_mode: RoutingMode,
+    /// Protocol version to use for outbound connections (1 or 2).
+    /// Defaults to V2 (gRPC). V1 uses length-prefixed XML.
+    #[serde(default = "default_protocol_version")]
+    pub protocol_version: u32,
+}
+
+fn default_protocol_version() -> u32 {
+    2
 }
 
 #[cfg(test)]
@@ -144,12 +184,16 @@ mod tests {
         let cfg = FederationConfig::default();
         assert_eq!(cfg.heartbeat_interval, Duration::from_secs(30));
         assert_eq!(cfg.heartbeat_timeout, Duration::from_secs(90));
-        assert_eq!(cfg.max_message_size, 10 * 1024 * 1024);
-        assert_eq!(cfg.reconnect_delay, Duration::from_secs(15));
+        assert_eq!(cfg.health_check_interval, Duration::from_secs(5));
+        assert_eq!(cfg.client_timeout, Duration::from_secs(15));
+        assert_eq!(cfg.max_message_size, 268_435_456);
+        assert_eq!(cfg.reconnect_delay, Duration::from_secs(30));
         assert_eq!(cfg.max_reconnects, -1);
         assert_eq!(cfg.max_hops, 10);
         assert_eq!(cfg.default_group, "__ANON__");
-        assert_eq!(cfg.protocol, Protocol::V2);
+        assert!(cfg.v1_enabled);
+        assert!(cfg.v2_enabled);
+        assert!(!cfg.skip_hostname_verify);
     }
 
     #[test]
@@ -176,12 +220,14 @@ mod tests {
             is_outbound: true,
             trust_cert_cn: Some("peer-1-ca".into()),
             routing_mode: RoutingMode::Broadcast,
+            protocol_version: 1,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.id, "peer-1");
         assert_eq!(parsed.groups.len(), 2);
         assert_eq!(parsed.routing_mode, RoutingMode::Broadcast);
+        assert_eq!(parsed.protocol_version, 1);
     }
 
     #[test]
@@ -255,10 +301,12 @@ mod tests {
     }
 
     #[test]
-    fn default_config_listen_addr() {
+    fn default_config_listen_addrs() {
         let cfg = FederationConfig::default();
-        assert_eq!(cfg.listen_addr.port(), 9001);
-        assert_eq!(cfg.listen_addr.to_string(), "0.0.0.0:9001");
+        assert_eq!(cfg.v1_listen_addr.port(), 9000);
+        assert_eq!(cfg.v1_listen_addr.to_string(), "0.0.0.0:9000");
+        assert_eq!(cfg.v2_listen_addr.port(), 9001);
+        assert_eq!(cfg.v2_listen_addr.to_string(), "0.0.0.0:9001");
     }
 
     #[test]
@@ -291,6 +339,7 @@ mod tests {
             is_outbound: false,
             trust_cert_cn: None,
             routing_mode: RoutingMode::default(),
+            protocol_version: 2,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
@@ -307,6 +356,7 @@ mod tests {
             is_outbound: false,
             trust_cert_cn: None,
             routing_mode: RoutingMode::default(),
+            protocol_version: 2,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
@@ -323,6 +373,7 @@ mod tests {
             is_outbound: false,
             trust_cert_cn: None,
             routing_mode: RoutingMode::default(),
+            protocol_version: 2,
         };
         assert!(!peer.enabled);
     }
@@ -343,6 +394,7 @@ mod tests {
             is_outbound: true,
             trust_cert_cn: None,
             routing_mode: RoutingMode::default(),
+            protocol_version: 2,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
@@ -350,12 +402,41 @@ mod tests {
     }
 
     #[test]
+    fn peer_config_protocol_version_default() {
+        let json = r#"{"id":"p","address":"1.2.3.4:9001","groups":[],"enabled":true,"is_outbound":false,"trust_cert_cn":null}"#;
+        let parsed: PeerConfig = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(parsed.protocol_version, 2);
+    }
+
+    #[test]
+    fn peer_config_protocol_version_v1() {
+        let peer = PeerConfig {
+            id: "legacy-peer".into(),
+            address: "10.0.0.1:9000".into(),
+            groups: vec!["Alpha".into()],
+            enabled: true,
+            is_outbound: true,
+            trust_cert_cn: None,
+            routing_mode: RoutingMode::default(),
+            protocol_version: 1,
+        };
+        let json = serde_json::to_string(&peer).expect("serialize");
+        let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.protocol_version, 1);
+    }
+
+    #[test]
     fn federation_config_clone() {
         let cfg = FederationConfig::default();
         let cfg2 = cfg.clone();
         assert_eq!(cfg2.federate_id, cfg.federate_id);
-        assert_eq!(cfg2.listen_addr, cfg.listen_addr);
-        assert_eq!(cfg2.protocol, cfg.protocol);
+        assert_eq!(cfg2.v1_listen_addr, cfg.v1_listen_addr);
+        assert_eq!(cfg2.v2_listen_addr, cfg.v2_listen_addr);
+        assert_eq!(cfg2.v1_enabled, cfg.v1_enabled);
+        assert_eq!(cfg2.v2_enabled, cfg.v2_enabled);
         assert_eq!(cfg2.max_hops, cfg.max_hops);
+        assert_eq!(cfg2.max_message_size, cfg.max_message_size);
+        assert_eq!(cfg2.health_check_interval, cfg.health_check_interval);
+        assert_eq!(cfg2.client_timeout, cfg.client_timeout);
     }
 }

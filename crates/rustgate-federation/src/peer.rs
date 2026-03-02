@@ -226,6 +226,7 @@ mod tests {
             is_outbound: true,
             trust_cert_cn: None,
             routing_mode: RoutingMode::default(),
+            protocol_version: 2,
         }
     }
 
