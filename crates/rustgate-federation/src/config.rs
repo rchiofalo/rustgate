@@ -488,10 +488,7 @@ mod tests {
             routing_mode: RoutingMode::default(),
             protocol_version: 2,
         };
-        assert_eq!(
-            peer.effective_inbound_groups(),
-            &["Inbound1", "Inbound2"]
-        );
+        assert_eq!(peer.effective_inbound_groups(), &["Inbound1", "Inbound2"]);
         assert_eq!(peer.effective_outbound_groups(), &["Outbound1"]);
     }
 
