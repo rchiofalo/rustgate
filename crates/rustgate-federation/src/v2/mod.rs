@@ -6,6 +6,10 @@
 //! Requires the `v2` feature flag.
 
 #[cfg(feature = "v2")]
+pub mod client;
+#[cfg(feature = "v2")]
 pub mod convert;
 #[cfg(feature = "v2")]
 pub mod proto;
+#[cfg(feature = "v2")]
+pub mod server;
