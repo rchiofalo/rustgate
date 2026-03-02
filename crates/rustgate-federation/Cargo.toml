@@ -18,6 +18,8 @@ tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 rustls-pki-types = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }

@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use rustgate_core::identity::Identity;
 use rustgate_transport::extract_identity;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::RootCertStore;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
@@ -57,10 +57,8 @@ impl PeerConnector {
     ) -> anyhow::Result<Self> {
         let cert_pem =
             std::fs::read_to_string(cert).map_err(|e| anyhow::anyhow!("read cert: {e}"))?;
-        let key_pem =
-            std::fs::read_to_string(key).map_err(|e| anyhow::anyhow!("read key: {e}"))?;
-        let ca_pem =
-            std::fs::read_to_string(ca).map_err(|e| anyhow::anyhow!("read CA: {e}"))?;
+        let key_pem = std::fs::read_to_string(key).map_err(|e| anyhow::anyhow!("read key: {e}"))?;
+        let ca_pem = std::fs::read_to_string(ca).map_err(|e| anyhow::anyhow!("read CA: {e}"))?;
 
         Self::from_pem(&cert_pem, &key_pem, &ca_pem, skip_hostname_verify)
     }
@@ -102,10 +100,7 @@ impl PeerConnector {
         &self,
         addr: SocketAddr,
         server_name: &str,
-    ) -> anyhow::Result<(
-        tokio_rustls::client::TlsStream<TcpStream>,
-        Arc<Identity>,
-    )> {
+    ) -> anyhow::Result<(tokio_rustls::client::TlsStream<TcpStream>, Arc<Identity>)> {
         debug!(peer_addr = %addr, server_name = %server_name, "connecting to federation peer");
 
         let tcp = TcpStream::connect(addr)
@@ -297,9 +292,7 @@ impl rustls::client::danger::ServerCertVerifier for NoHostnameVerifier {
             // In rustls 0.23+, WebPkiServerVerifier returns the context variant
             // with details about which names are valid. Match both for
             // forward-compatibility with future rustls versions.
-            Err(rustls::Error::InvalidCertificate(
-                rustls::CertificateError::NotValidForName,
-            ))
+            Err(rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForName))
             | Err(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::NotValidForNameContext { .. },
             )) => {
@@ -353,9 +346,7 @@ mod tests {
     use rustgate_transport::{TlsConfig, TlsListener};
 
     /// Helper to start a TLS listener for testing the connector.
-    async fn start_test_server(
-        ca: &TestCa,
-    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    async fn start_test_server(ca: &TestCa) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
         let tls_config =
             TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
@@ -381,9 +372,13 @@ mod tests {
         let client_cert = ca.issue_client_cert("test-connector", &["Alpha"]);
         let (addr, server_handle) = start_test_server(&ca).await;
 
-        let connector =
-            PeerConnector::from_pem(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem, false)
-                .expect("create connector");
+        let connector = PeerConnector::from_pem(
+            &client_cert.cert_pem,
+            &client_cert.key_pem,
+            &ca.cert_pem,
+            false,
+        )
+        .expect("create connector");
 
         let (_, identity) = connector.connect(addr, "localhost").await.expect("connect");
 
@@ -501,7 +496,10 @@ mod tests {
         // Use a port that's (almost certainly) not listening
         let addr: SocketAddr = "127.0.0.1:1".parse().expect("parse addr");
         let result = connector.connect(addr, "localhost").await;
-        assert!(result.is_err(), "should fail connecting to unreachable addr");
+        assert!(
+            result.is_err(),
+            "should fail connecting to unreachable addr"
+        );
     }
 
     #[test]
@@ -521,8 +519,12 @@ mod tests {
         let ca = TestCa::new("Test CA");
         let client_cert = ca.issue_client_cert("test", &[]);
 
-        let result =
-            PeerConnector::from_pem(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem, false);
+        let result = PeerConnector::from_pem(
+            &client_cert.cert_pem,
+            &client_cert.key_pem,
+            &ca.cert_pem,
+            false,
+        );
         assert!(result.is_ok());
     }
 
@@ -531,8 +533,12 @@ mod tests {
         let ca = TestCa::new("Test CA");
         let client_cert = ca.issue_client_cert("test", &[]);
 
-        let result =
-            PeerConnector::from_pem(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem, true);
+        let result = PeerConnector::from_pem(
+            &client_cert.cert_pem,
+            &client_cert.key_pem,
+            &ca.cert_pem,
+            true,
+        );
         assert!(result.is_ok());
     }
 
@@ -541,9 +547,13 @@ mod tests {
         let ca = TestCa::new("Test CA");
         let client_cert = ca.issue_client_cert("test", &[]);
 
-        let connector =
-            PeerConnector::from_pem(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem, false)
-                .expect("create");
+        let connector = PeerConnector::from_pem(
+            &client_cert.cert_pem,
+            &client_cert.key_pem,
+            &ca.cert_pem,
+            false,
+        )
+        .expect("create");
 
         let _cloned = connector.clone();
     }
@@ -553,9 +563,13 @@ mod tests {
         let ca = TestCa::new("Test CA");
         let client_cert = ca.issue_client_cert("test", &[]);
 
-        let connector =
-            PeerConnector::from_pem(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem, false)
-                .expect("create");
+        let connector = PeerConnector::from_pem(
+            &client_cert.cert_pem,
+            &client_cert.key_pem,
+            &ca.cert_pem,
+            false,
+        )
+        .expect("create");
 
         let debug = format!("{connector:?}");
         assert!(debug.contains("PeerConnector"));
@@ -633,13 +647,22 @@ mod tests {
         .expect("create connector");
 
         // Connect 3 times with the same connector
-        let (_, id1) = connector.connect(addr, "localhost").await.expect("connect 1");
+        let (_, id1) = connector
+            .connect(addr, "localhost")
+            .await
+            .expect("connect 1");
         assert_eq!(id1.cn, "localhost");
 
-        let (_, id2) = connector.connect(addr, "localhost").await.expect("connect 2");
+        let (_, id2) = connector
+            .connect(addr, "localhost")
+            .await
+            .expect("connect 2");
         assert_eq!(id2.cn, "localhost");
 
-        let (_, id3) = connector.connect(addr, "localhost").await.expect("connect 3");
+        let (_, id3) = connector
+            .connect(addr, "localhost")
+            .await
+            .expect("connect 3");
         assert_eq!(id3.cn, "localhost");
 
         handle.abort();

@@ -1404,6 +1404,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "futures",
  "rustgate-core",
  "rustgate-test-utils",
  "rustgate-transport",
@@ -1418,6 +1419,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tracing",
 ]
 

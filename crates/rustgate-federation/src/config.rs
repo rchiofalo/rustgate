@@ -50,7 +50,6 @@ pub struct FederationConfig {
     pub federate_id: String,
 
     // --- V1 (legacy) listener ---
-
     /// Whether V1 federation (length-prefixed XML over mTLS) is enabled.
     pub v1_enabled: bool,
     /// Address to listen for inbound V1 federation peers.
@@ -58,7 +57,6 @@ pub struct FederationConfig {
     pub v1_listen_addr: SocketAddr,
 
     // --- V2 (gRPC) listener ---
-
     /// Whether V2 federation (gRPC over mTLS) is enabled.
     pub v2_enabled: bool,
     /// Address to listen for inbound V2 federation peers.
