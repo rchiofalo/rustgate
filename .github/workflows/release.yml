@@ -21,6 +21,7 @@ jobs:
       contents: read
       packages: write
       id-token: write # required for cosign keyless signing via OIDC
+      security-events: write # required for Trivy SARIF upload
 
     steps:
       - name: Checkout repository
@@ -61,3 +62,17 @@ jobs:
 
       - name: Sign image with cosign
         run: cosign sign --yes ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@18f2510ee396bbf400402947e7b4b18e3b190dc6 # v0.28.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
