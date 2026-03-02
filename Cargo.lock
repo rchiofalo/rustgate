@@ -1561,6 +1561,7 @@ dependencies = [
  "rustgate-nats",
  "rustgate-proto",
  "rustgate-transport",
+ "serde_json",
  "tikv-jemallocator",
  "tokio",
  "tokio-util",

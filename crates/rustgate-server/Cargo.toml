@@ -20,7 +20,7 @@ enrollment = ["dep:rustgate-enrollment"]
 proto = ["dep:rustgate-proto", "rustgate-transport/proto"]
 full-detail = ["rustgate-nats/full-detail"]
 metrics = ["dep:prometheus", "dep:hyper", "dep:hyper-util", "dep:http-body-util"]
-federation = ["dep:rustgate-federation"]
+federation = ["dep:rustgate-federation", "dep:serde_json"]
 jemalloc = ["dep:tikv-jemallocator"]
 
 [dependencies]
@@ -44,3 +44,4 @@ clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+serde_json = { workspace = true, optional = true }

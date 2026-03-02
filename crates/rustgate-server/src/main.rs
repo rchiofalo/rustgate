@@ -34,6 +34,13 @@ use rustgate_transport::{
     SessionHandle, TlsConfig, TlsListener,
 };
 
+/// Optional callback for forwarding messages to federation peers.
+///
+/// The closure receives `(payload, source_groups)` and spawns async work
+/// internally (fire-and-forget). Defined unconditionally so the `Option`
+/// type is available regardless of feature flags.
+type FedForwardFn = Arc<dyn Fn(Bytes, Vec<String>) + Send + Sync>;
+
 #[derive(Parser)]
 #[command(name = "rustgate", about = "Secure tactical message router")]
 struct Cli {
@@ -93,6 +100,32 @@ struct Cli {
     /// from connection floods.
     #[arg(long, default_value_t = 1024, env = "RUSTGATE_MAX_CONNECTIONS")]
     max_connections: usize,
+
+    // ── Federation flags ────────────────────────────────────────────
+    /// V1 federation listen address (enables federation when set, e.g. 0.0.0.0:9000).
+    /// Requires --features federation.
+    #[arg(long, env = "FEDERATION_V1_BIND")]
+    federation_v1_bind: Option<String>,
+
+    /// Unique federation server identity.
+    #[arg(long, default_value = "rustgate-federation-1", env = "FEDERATION_ID")]
+    federation_id: String,
+
+    /// Path to JSON file containing federation peer configurations.
+    #[arg(long, env = "FEDERATION_PEERS_FILE")]
+    federation_peers_file: Option<String>,
+
+    /// Skip TLS hostname verification for federation peers.
+    #[arg(long, default_value_t = false, env = "FEDERATION_SKIP_HOSTNAME_VERIFY")]
+    federation_skip_hostname_verify: bool,
+
+    /// Maximum federation hops before dropping a message (loop prevention).
+    #[arg(long, default_value_t = 10, env = "FEDERATION_MAX_HOPS")]
+    federation_max_hops: u32,
+
+    /// Path to persistent federate store (JSON file).
+    #[arg(long, env = "FEDERATION_STORE_PATH")]
+    federation_store_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -299,6 +332,99 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         tracing::warn!("--enrollment-bind requires --features enrollment; ignoring");
     }
 
+    // Optionally start the federation subsystem for server-to-server message exchange
+    #[cfg(feature = "federation")]
+    let (fed_forward, fed_shutdown_handle): (
+        Option<FedForwardFn>,
+        Option<Arc<tokio::sync::RwLock<rustgate_federation::manager::FederationManager>>>,
+    ) = if let Some(ref v1_bind) = cli.federation_v1_bind {
+        let bind_addr: std::net::SocketAddr = v1_bind
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid --federation-v1-bind: {e}"))?;
+
+        // Load peers from optional JSON config file
+        let peers = if let Some(ref peers_file) = cli.federation_peers_file {
+            let data = tokio::fs::read_to_string(peers_file)
+                .await
+                .map_err(|e| anyhow::anyhow!("read federation peers file: {e}"))?;
+            serde_json::from_str::<Vec<rustgate_federation::config::PeerConfig>>(&data)
+                .map_err(|e| anyhow::anyhow!("parse federation peers file: {e}"))?
+        } else {
+            Vec::new()
+        };
+
+        let config = rustgate_federation::config::FederationConfig {
+            federate_id: cli.federation_id.clone(),
+            v1_enabled: true,
+            v1_listen_addr: bind_addr,
+            v2_enabled: false,
+            peers,
+            max_hops: cli.federation_max_hops,
+            skip_hostname_verify: cli.federation_skip_hostname_verify,
+            cert_file: cli.cert.clone().into(),
+            key_file: cli.key.clone().into(),
+            ca_file: cli.ca.clone().into(),
+            store_path: cli.federation_store_path.clone().map(Into::into),
+            ..rustgate_federation::config::FederationConfig::default()
+        };
+
+        let mut manager = rustgate_federation::manager::FederationManager::new(config);
+
+        // on_inbound: route messages from federation peers to local clients
+        let router_for_fed = Arc::clone(&router);
+        let on_inbound: rustgate_federation::manager::OnInbound =
+            Arc::new(move |peer_cn, payload| {
+                let router = Arc::clone(&router_for_fed);
+                drop(tokio::spawn(async move {
+                    let identity = Identity {
+                        cn: peer_cn,
+                        fingerprint: String::new(),
+                        groups: BTreeSet::new(),
+                    };
+                    let msg = RoutableMessage {
+                        source: identity,
+                        destination: Destination::Broadcast,
+                        payload,
+                        metadata: Metadata {
+                            received_at: SystemTime::now(),
+                            source_protocol: "federation".into(),
+                            message_type: rustgate_core::message::MessageType::Other(
+                                "federation".into(),
+                            ),
+                            ttl: None,
+                        },
+                    };
+                    router.route(msg).await;
+                }));
+            });
+
+        manager.start(on_inbound).await?;
+        tracing::info!(addr = %bind_addr, id = %cli.federation_id, "federation started");
+
+        let rwlock = Arc::new(tokio::sync::RwLock::new(manager));
+        let rwlock_for_forward = Arc::clone(&rwlock);
+
+        let forward_fn: FedForwardFn = Arc::new(move |payload, groups| {
+            let inner = Arc::clone(&rwlock_for_forward);
+            drop(tokio::spawn(async move {
+                let mgr = inner.read().await;
+                let _ = mgr.forward(payload, &groups).await;
+            }));
+        });
+
+        (Some(forward_fn), Some(rwlock))
+    } else {
+        (None, None)
+    };
+
+    #[cfg(not(feature = "federation"))]
+    let fed_forward: Option<FedForwardFn> = {
+        if cli.federation_v1_bind.is_some() {
+            tracing::warn!("--federation-v1-bind requires --features federation; ignoring");
+        }
+        None
+    };
+
     loop {
         tokio::select! {
             accept_result = listener.accept() => {
@@ -325,7 +451,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                         let router = Arc::clone(&router);
                         #[allow(clippy::clone_on_copy)] // Type varies by feature flag
                         let publisher = nats_publisher.clone();
-                        drop(tokio::spawn(handle_session(session, router, framing, encoding, publisher, permit)));
+                        let fed = fed_forward.clone();
+                        drop(tokio::spawn(handle_session(session, router, framing, encoding, publisher, fed, permit)));
                     }
                     Err(e) => {
                         #[cfg(feature = "metrics")]
@@ -343,6 +470,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 break;
             }
         }
+    }
+
+    // ── Federation shutdown ──────────────────────────────────────────
+
+    #[cfg(feature = "federation")]
+    if let Some(ref rwlock) = fed_shutdown_handle {
+        let mut mgr = rwlock.write().await;
+        mgr.shutdown().await;
+        tracing::info!("federation shut down");
     }
 
     // ── Connection draining ──────────────────────────────────────────
@@ -392,12 +528,14 @@ async fn shutdown_signal() {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
     session: AuthenticatedSession,
     router: Arc<Router>,
     framing: Framing,
     encoding: Encoding,
     nats_publisher: Option<P>,
+    fed_forward: Option<FedForwardFn>,
     _permit: OwnedSemaphorePermit, // Held for session lifetime; released on drop
 ) {
     let identity = session.identity_arc();
@@ -467,6 +605,7 @@ async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
                 &final_framing,
                 &RawEncoder,
                 &nats_publisher,
+                &fed_forward,
                 read_buf,
             )
             .await
@@ -481,6 +620,7 @@ async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
                 &final_framing,
                 &CotEncoder,
                 &nats_publisher,
+                &fed_forward,
                 read_buf,
             )
             .await
@@ -496,6 +636,7 @@ async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
                 &final_framing,
                 &rustgate_proto::TakProtobufEncoder,
                 &nats_publisher,
+                &fed_forward,
                 read_buf,
             )
             .await
@@ -594,10 +735,11 @@ async fn run_session_loops(
     framing: &FramingStrategy,
     encoder: &impl MessageEncoder,
     nats_publisher: &Option<impl NatsPublish>,
+    fed_forward: &Option<FedForwardFn>,
     read_buf: tokio_util::bytes::BytesMut,
 ) -> std::io::Result<()> {
     tokio::select! {
-        r = read_loop(reader, identity, router, framing, nats_publisher, read_buf) => r,
+        r = read_loop(reader, identity, router, framing, nats_publisher, fed_forward, read_buf) => r,
         r = write_loop(writer, rx, framing, encoder) => r,
     }
 }
@@ -608,6 +750,7 @@ async fn read_loop(
     router: &Router,
     framing: &FramingStrategy,
     nats_publisher: &Option<impl NatsPublish>,
+    fed_forward: &Option<FedForwardFn>,
     prefix: tokio_util::bytes::BytesMut,
 ) -> std::io::Result<()> {
     let is_proto = matches!(framing, FramingStrategy::TakProtobuf);
@@ -691,6 +834,12 @@ async fn read_loop(
             #[cfg(feature = "metrics")]
             metrics::nats_publishes().inc();
             publisher.publish(&msg).await;
+        }
+
+        // Forward to federation peers (fire-and-forget)
+        if let Some(fwd) = fed_forward {
+            let groups: Vec<String> = msg.source.groups.iter().cloned().collect();
+            fwd(msg.payload.clone(), groups);
         }
     }
 
@@ -934,6 +1083,12 @@ mod tests {
             "RUSTGATE_CA_ORG",
             "METRICS_BIND",
             "RUSTGATE_MAX_CONNECTIONS",
+            "FEDERATION_V1_BIND",
+            "FEDERATION_ID",
+            "FEDERATION_PEERS_FILE",
+            "FEDERATION_SKIP_HOSTNAME_VERIFY",
+            "FEDERATION_MAX_HOPS",
+            "FEDERATION_STORE_PATH",
         ];
 
         for var in expected_env_vars {
@@ -958,5 +1113,58 @@ mod tests {
                 arg.get_id()
             );
         }
+    }
+
+    #[test]
+    fn cli_federation_defaults() {
+        let cli = Cli::try_parse_from([
+            "rustgate", "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
+        ])
+        .expect("should parse");
+        assert!(cli.federation_v1_bind.is_none());
+        assert_eq!(cli.federation_id, "rustgate-federation-1");
+        assert!(cli.federation_peers_file.is_none());
+        assert!(!cli.federation_skip_hostname_verify);
+        assert_eq!(cli.federation_max_hops, 10);
+        assert!(cli.federation_store_path.is_none());
+    }
+
+    #[test]
+    fn cli_federation_bind_override() {
+        let cli = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--federation-v1-bind",
+            "0.0.0.0:9000",
+            "--federation-id",
+            "my-fed-server",
+            "--federation-max-hops",
+            "5",
+        ])
+        .expect("should parse");
+        assert_eq!(cli.federation_v1_bind.as_deref(), Some("0.0.0.0:9000"));
+        assert_eq!(cli.federation_id, "my-fed-server");
+        assert_eq!(cli.federation_max_hops, 5);
+    }
+
+    #[test]
+    fn cli_federation_skip_hostname_verify() {
+        let cli = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--federation-skip-hostname-verify",
+        ])
+        .expect("should parse");
+        assert!(cli.federation_skip_hostname_verify);
     }
 }
