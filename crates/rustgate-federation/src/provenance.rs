@@ -199,4 +199,240 @@ mod tests {
         // current_hops == 1, max_hops == 1 → should drop
         assert!(m.should_drop("unknown"));
     }
+
+    #[test]
+    fn should_drop_zero_max_hops() {
+        let m = FederationMetadata::new(0);
+        // max_hops == 0, current_hops == 0 → should drop immediately
+        assert!(m.should_drop("any-server"));
+    }
+
+    #[test]
+    fn should_not_drop_at_one_below_limit() {
+        let mut m = FederationMetadata::new(3);
+        m.add_hop("s1", "S1");
+        m.add_hop("s2", "S2");
+        // current_hops == 2, max_hops == 3 → should NOT drop
+        assert!(!m.should_drop("unknown"));
+    }
+
+    #[test]
+    fn provenance_chain_preserves_order() {
+        let mut m = FederationMetadata::new(10);
+        m.add_hop("first", "First Server");
+        m.add_hop("second", "Second Server");
+        m.add_hop("third", "Third Server");
+
+        assert_eq!(m.provenance[0].server_id, "first");
+        assert_eq!(m.provenance[1].server_id, "second");
+        assert_eq!(m.provenance[2].server_id, "third");
+
+        assert_eq!(m.provenance[0].server_name, "First Server");
+        assert_eq!(m.provenance[1].server_name, "Second Server");
+        assert_eq!(m.provenance[2].server_name, "Third Server");
+    }
+
+    #[test]
+    fn should_drop_detects_loop_in_middle_of_chain() {
+        let mut m = FederationMetadata::new(10);
+        m.add_hop("s1", "S1");
+        m.add_hop("s2", "S2");
+        m.add_hop("s3", "S3");
+
+        // s2 is in the middle of the chain
+        assert!(m.should_drop("s2"));
+    }
+
+    #[test]
+    fn should_drop_first_server_in_chain() {
+        let mut m = FederationMetadata::new(10);
+        m.add_hop("origin", "Origin");
+        m.add_hop("relay", "Relay");
+
+        assert!(m.should_drop("origin"));
+    }
+
+    #[test]
+    fn should_drop_last_server_in_chain() {
+        let mut m = FederationMetadata::new(10);
+        m.add_hop("origin", "Origin");
+        m.add_hop("relay", "Relay");
+
+        assert!(m.should_drop("relay"));
+    }
+
+    #[test]
+    fn add_hop_with_empty_strings() {
+        let mut m = FederationMetadata::new(10);
+        m.add_hop("", "");
+        assert_eq!(m.current_hops, 1);
+        assert_eq!(m.provenance[0].server_id, "");
+        assert_eq!(m.provenance[0].server_name, "");
+    }
+
+    #[test]
+    fn add_hop_with_special_characters() {
+        let mut m = FederationMetadata::new(10);
+        m.add_hop(
+            "server/with-special_chars.v2",
+            "Server: Special & Chars <v2>",
+        );
+        assert_eq!(m.provenance[0].server_id, "server/with-special_chars.v2");
+        assert_eq!(m.provenance[0].server_name, "Server: Special & Chars <v2>");
+    }
+
+    #[test]
+    fn add_hop_with_unicode() {
+        let mut m = FederationMetadata::new(10);
+        m.add_hop("server-日本", "サーバー");
+        assert_eq!(m.provenance[0].server_id, "server-日本");
+        assert_eq!(m.provenance[0].server_name, "サーバー");
+    }
+
+    #[test]
+    fn deterministic_uuid_empty_input() {
+        let uuid = deterministic_uuid("");
+        // Should still produce a valid UUID format
+        let parts: Vec<&str> = uuid.split('-').collect();
+        assert_eq!(parts.len(), 5);
+        assert_eq!(parts[0].len(), 8);
+        assert_eq!(parts[4].len(), 12);
+    }
+
+    #[test]
+    fn deterministic_uuid_long_input() {
+        let long_input = "a".repeat(10_000);
+        let uuid = deterministic_uuid(&long_input);
+        let parts: Vec<&str> = uuid.split('-').collect();
+        assert_eq!(parts.len(), 5);
+        assert!(parts[2].starts_with('4'));
+    }
+
+    #[test]
+    fn deterministic_uuid_special_characters() {
+        let uuid = deterministic_uuid("hello world! @#$%^&*()");
+        let parts: Vec<&str> = uuid.split('-').collect();
+        assert_eq!(parts.len(), 5);
+        assert!(parts[2].starts_with('4'));
+    }
+
+    #[test]
+    fn deterministic_uuid_version_and_variant_bits() {
+        let uuid = deterministic_uuid("test-input");
+        let parts: Vec<&str> = uuid.split('-').collect();
+
+        // Version nibble (bits 12-15 of time_hi_and_version) should be 4
+        assert!(parts[2].starts_with('4'));
+
+        // Variant (bits 6-7 of clock_seq_hi_and_reserved) should be 10xx binary
+        // First char of parts[3] should be 8, 9, a, or b
+        let variant_char = parts[3].chars().next().expect("non-empty variant part");
+        assert!(
+            variant_char == '8'
+                || variant_char == '9'
+                || variant_char == 'a'
+                || variant_char == 'b'
+        );
+    }
+
+    #[test]
+    fn deterministic_uuid_all_lowercase_hex() {
+        let uuid = deterministic_uuid("lowercase-check");
+        // UUID should only contain lowercase hex chars and dashes
+        for ch in uuid.chars() {
+            assert!(ch.is_ascii_hexdigit() || ch == '-', "unexpected char: {ch}");
+            if ch.is_ascii_alphabetic() {
+                assert!(ch.is_ascii_lowercase(), "expected lowercase: {ch}");
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_serde_preserves_all_fields() {
+        let mut m = FederationMetadata::new(7);
+        m.add_hop("s1", "Server One");
+        m.add_hop("s2", "Server Two");
+        m.add_hop("s3", "Server Three");
+
+        let json = serde_json::to_string(&m).expect("serialize");
+        let parsed: FederationMetadata = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(parsed.current_hops, 3);
+        assert_eq!(parsed.max_hops, 7);
+        assert_eq!(parsed.provenance.len(), 3);
+        assert_eq!(parsed.provenance[0].server_id, "s1");
+        assert_eq!(parsed.provenance[0].server_name, "Server One");
+        assert_eq!(parsed.provenance[2].server_id, "s3");
+        assert_eq!(parsed.provenance[2].server_name, "Server Three");
+    }
+
+    #[test]
+    fn metadata_serde_empty_provenance() {
+        let m = FederationMetadata::new(5);
+        let json = serde_json::to_string(&m).expect("serialize");
+        let parsed: FederationMetadata = serde_json::from_str(&json).expect("deserialize");
+        assert!(parsed.provenance.is_empty());
+        assert_eq!(parsed.current_hops, 0);
+        assert_eq!(parsed.max_hops, 5);
+    }
+
+    #[test]
+    fn provenance_struct_equality() {
+        let a = FederateProvenance {
+            server_id: "s1".to_string(),
+            server_name: "Server One".to_string(),
+        };
+        let b = FederateProvenance {
+            server_id: "s1".to_string(),
+            server_name: "Server One".to_string(),
+        };
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn provenance_struct_inequality() {
+        let a = FederateProvenance {
+            server_id: "s1".to_string(),
+            server_name: "Server One".to_string(),
+        };
+        let b = FederateProvenance {
+            server_id: "s2".to_string(),
+            server_name: "Server Two".to_string(),
+        };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn provenance_clone() {
+        let original = FederateProvenance {
+            server_id: "s1".to_string(),
+            server_name: "Server One".to_string(),
+        };
+        let cloned = original.clone();
+        assert_eq!(original, cloned);
+    }
+
+    #[test]
+    fn metadata_large_hop_chain() {
+        let mut m = FederationMetadata::new(100);
+        for i in 0..50 {
+            m.add_hop(&format!("server-{i}"), &format!("Server {i}"));
+        }
+        assert_eq!(m.current_hops, 50);
+        assert_eq!(m.provenance.len(), 50);
+        assert!(!m.should_drop("server-99"));
+        assert!(m.should_drop("server-25"));
+    }
+
+    #[test]
+    fn should_drop_checks_both_loop_and_hops() {
+        let mut m = FederationMetadata::new(2);
+        m.add_hop("s1", "S1");
+        m.add_hop("s2", "S2");
+
+        // Should drop for loop (s1 is in chain)
+        assert!(m.should_drop("s1"));
+        // Should drop for hop limit (current_hops == 2 >= max_hops == 2)
+        assert!(m.should_drop("unknown"));
+    }
 }

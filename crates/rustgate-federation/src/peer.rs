@@ -335,4 +335,203 @@ mod tests {
         assert_eq!(PeerState::Connected.to_string(), "connected");
         assert_eq!(PeerState::Reconnecting.to_string(), "reconnecting");
     }
+
+    #[test]
+    fn peer_state_from_u8_valid_values() {
+        assert_eq!(PeerState::from_u8(0), PeerState::Disconnected);
+        assert_eq!(PeerState::from_u8(1), PeerState::Connecting);
+        assert_eq!(PeerState::from_u8(2), PeerState::Connected);
+        assert_eq!(PeerState::from_u8(3), PeerState::Reconnecting);
+    }
+
+    #[test]
+    fn peer_state_from_u8_invalid_defaults_to_disconnected() {
+        assert_eq!(PeerState::from_u8(4), PeerState::Disconnected);
+        assert_eq!(PeerState::from_u8(255), PeerState::Disconnected);
+    }
+
+    #[test]
+    fn peer_state_clone_and_copy() {
+        let state = PeerState::Connected;
+        let copied = state;
+        let cloned = state;
+        assert_eq!(state, copied);
+        assert_eq!(state, cloned);
+    }
+
+    #[test]
+    fn mark_connected_resets_reconnect_count() {
+        let handle = PeerHandle::new(test_config());
+        let _ = handle.increment_reconnect_count();
+        let _ = handle.increment_reconnect_count();
+        let _ = handle.increment_reconnect_count();
+        assert_eq!(handle.reconnect_count(), 3);
+
+        handle.mark_connected();
+        assert_eq!(handle.reconnect_count(), 0);
+    }
+
+    #[test]
+    fn mark_connected_records_heartbeat() {
+        let handle = PeerHandle::new(test_config());
+        assert!(handle.since_last_heartbeat().is_none());
+
+        handle.mark_connected();
+        assert!(handle.since_last_heartbeat().is_some());
+    }
+
+    #[test]
+    fn mark_disconnected_clears_connected_at() {
+        let handle = PeerHandle::new(test_config());
+        handle.mark_connected();
+        assert!(handle.connected_duration().is_some());
+
+        handle.mark_disconnected();
+        assert!(handle.connected_duration().is_none());
+    }
+
+    #[test]
+    fn error_can_be_overwritten() {
+        let handle = PeerHandle::new(test_config());
+        handle.set_error("first error");
+        assert_eq!(handle.last_error().as_deref(), Some("first error"));
+
+        handle.set_error("second error");
+        assert_eq!(handle.last_error().as_deref(), Some("second error"));
+    }
+
+    #[test]
+    fn error_with_empty_string() {
+        let handle = PeerHandle::new(test_config());
+        handle.set_error("");
+        assert_eq!(handle.last_error().as_deref(), Some(""));
+    }
+
+    #[test]
+    fn status_includes_config_fields() {
+        let handle = PeerHandle::new(test_config());
+        let status = handle.status();
+        assert_eq!(status.address, "10.0.0.1:9001");
+        assert_eq!(status.groups, vec!["Alpha"]);
+        assert!(status.enabled);
+        assert!(status.is_outbound);
+    }
+
+    #[test]
+    fn status_includes_error() {
+        let handle = PeerHandle::new(test_config());
+        handle.set_error("connection timeout");
+        let status = handle.status();
+        assert_eq!(status.last_error.as_deref(), Some("connection timeout"));
+    }
+
+    #[test]
+    fn status_no_connected_duration_when_disconnected() {
+        let handle = PeerHandle::new(test_config());
+        let status = handle.status();
+        assert!(status.connected_duration_secs.is_none());
+    }
+
+    #[test]
+    fn status_reconnect_count() {
+        let handle = PeerHandle::new(test_config());
+        let _ = handle.increment_reconnect_count();
+        let _ = handle.increment_reconnect_count();
+        let status = handle.status();
+        assert_eq!(status.reconnect_count, 2);
+    }
+
+    #[test]
+    fn peer_state_serialize_as_string() {
+        let status = PeerStatus {
+            id: "test".into(),
+            address: "1.2.3.4:9001".into(),
+            state: PeerState::Connected,
+            groups: vec![],
+            enabled: true,
+            is_outbound: true,
+            messages_sent: 0,
+            messages_recv: 0,
+            last_error: None,
+            connected_duration_secs: None,
+            reconnect_count: 0,
+        };
+        let json = serde_json::to_string(&status).expect("serialize");
+        assert!(json.contains("\"connected\""));
+    }
+
+    #[test]
+    fn peer_state_all_variants_serialize() {
+        for (state, expected) in [
+            (PeerState::Disconnected, "disconnected"),
+            (PeerState::Connecting, "connecting"),
+            (PeerState::Connected, "connected"),
+            (PeerState::Reconnecting, "reconnecting"),
+        ] {
+            let json = serde_json::to_string(&state).expect("serialize");
+            assert_eq!(json, format!("\"{expected}\""));
+        }
+    }
+
+    #[test]
+    fn set_state_all_transitions() {
+        let handle = PeerHandle::new(test_config());
+
+        // Test all valid state transitions
+        for state in [
+            PeerState::Connecting,
+            PeerState::Connected,
+            PeerState::Reconnecting,
+            PeerState::Disconnected,
+        ] {
+            handle.set_state(state);
+            assert_eq!(handle.state(), state);
+        }
+    }
+
+    #[test]
+    fn message_counters_accumulate() {
+        let handle = PeerHandle::new(test_config());
+        for _ in 0..100 {
+            handle.record_sent();
+        }
+        for _ in 0..50 {
+            handle.record_recv();
+        }
+        assert_eq!(handle.messages_sent.load(Ordering::Relaxed), 100);
+        assert_eq!(handle.messages_recv.load(Ordering::Relaxed), 50);
+    }
+
+    #[test]
+    fn new_peer_has_zero_message_counters() {
+        let handle = PeerHandle::new(test_config());
+        let status = handle.status();
+        assert_eq!(status.messages_sent, 0);
+        assert_eq!(status.messages_recv, 0);
+    }
+
+    #[test]
+    fn peer_id_matches_config() {
+        let handle = PeerHandle::new(test_config());
+        assert_eq!(handle.id, "test-peer");
+        assert_eq!(handle.config.id, "test-peer");
+    }
+
+    #[test]
+    fn new_peer_has_no_error() {
+        let handle = PeerHandle::new(test_config());
+        let status = handle.status();
+        assert!(status.last_error.is_none());
+    }
+
+    #[test]
+    fn reconnect_count_increments_sequentially() {
+        let handle = PeerHandle::new(test_config());
+        assert_eq!(handle.increment_reconnect_count(), 1);
+        assert_eq!(handle.increment_reconnect_count(), 2);
+        assert_eq!(handle.increment_reconnect_count(), 3);
+        assert_eq!(handle.increment_reconnect_count(), 4);
+        assert_eq!(handle.increment_reconnect_count(), 5);
+        assert_eq!(handle.reconnect_count(), 5);
+    }
 }

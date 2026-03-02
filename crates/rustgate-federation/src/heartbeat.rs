@@ -113,4 +113,122 @@ mod tests {
         let hb = create_heartbeat("my-server");
         assert!(is_heartbeat(&hb));
     }
+
+    #[test]
+    fn create_heartbeat_contains_timestamps() {
+        let hb = create_heartbeat("test-server");
+        let xml = std::str::from_utf8(&hb).expect("valid utf8");
+        assert!(xml.contains("time="));
+        assert!(xml.contains("start="));
+        assert!(xml.contains("stale="));
+    }
+
+    #[test]
+    fn create_heartbeat_contains_how_attribute() {
+        let hb = create_heartbeat("test-server");
+        let xml = std::str::from_utf8(&hb).expect("valid utf8");
+        assert!(xml.contains("how=\"h-g-i-g-o\""));
+    }
+
+    #[test]
+    fn create_heartbeat_contains_version() {
+        let hb = create_heartbeat("test-server");
+        let xml = std::str::from_utf8(&hb).expect("valid utf8");
+        assert!(xml.contains("version=\"2.0\""));
+    }
+
+    #[test]
+    fn create_heartbeat_point_coordinates() {
+        let hb = create_heartbeat("test-server");
+        let xml = std::str::from_utf8(&hb).expect("valid utf8");
+        assert!(xml.contains("lat=\"0.0\""));
+        assert!(xml.contains("lon=\"0.0\""));
+        assert!(xml.contains("hae=\"0.0\""));
+        assert!(xml.contains("ce=\"999999\""));
+        assert!(xml.contains("le=\"999999\""));
+    }
+
+    #[test]
+    fn create_heartbeat_custom_uid_preserved() {
+        let hb = create_heartbeat("my-custom-uid-12345");
+        let xml = std::str::from_utf8(&hb).expect("valid utf8");
+        assert!(xml.contains("uid=\"my-custom-uid-12345\""));
+    }
+
+    #[test]
+    fn create_heartbeat_uid_with_special_chars() {
+        // UIDs can contain various characters
+        let hb = create_heartbeat("server-v2.prod-01");
+        let xml = std::str::from_utf8(&hb).expect("valid utf8");
+        assert!(xml.contains("uid=\"server-v2.prod-01\""));
+    }
+
+    #[test]
+    fn is_heartbeat_with_extra_attributes_before_type() {
+        let xml = b"<event version=\"2.0\" uid=\"srv\" foo=\"bar\" type=\"t-x-c-t\" time=\"t\">";
+        assert!(is_heartbeat(xml));
+    }
+
+    #[test]
+    fn is_heartbeat_with_different_cot_type() {
+        let xml = b"<event version=\"2.0\" uid=\"s\" type=\"a-f-G-U-C-I\" time=\"t\">";
+        assert!(!is_heartbeat(xml));
+    }
+
+    #[test]
+    fn is_heartbeat_partial_match_not_detected() {
+        // "t-x-c-t" but not as a type attribute
+        let xml = b"<event version=\"2.0\" uid=\"t-x-c-t\" type=\"a-f-G\" time=\"t\">";
+        assert!(!is_heartbeat(xml));
+    }
+
+    #[test]
+    fn is_heartbeat_respects_512_byte_limit() {
+        // Put the heartbeat type attribute beyond the 512-byte search limit
+        let mut payload = vec![b' '; 510];
+        payload.extend_from_slice(b"type=\"t-x-c-t\"");
+        assert!(!is_heartbeat(&payload));
+    }
+
+    #[test]
+    fn is_heartbeat_at_512_byte_boundary() {
+        // Put the heartbeat type attribute just within the 512-byte limit
+        let prefix = vec![b'<'; 498]; // 498 bytes of padding
+        let mut payload = prefix;
+        payload.extend_from_slice(b"type=\"t-x-c-t\""); // 14 bytes, total = 512
+        assert!(is_heartbeat(&payload));
+    }
+
+    #[test]
+    fn is_heartbeat_binary_payload() {
+        let binary_data: Vec<u8> = (0..256).map(|i| i as u8).collect();
+        assert!(!is_heartbeat(&binary_data));
+    }
+
+    #[test]
+    fn is_heartbeat_very_large_payload() {
+        // Ensure large payloads don't cause issues (only first 512 bytes searched)
+        let mut payload = b"<event type=\"t-x-c-t\">".to_vec();
+        payload.extend(vec![b'x'; 100_000]);
+        assert!(is_heartbeat(&payload));
+    }
+
+    #[test]
+    fn heartbeat_type_constant() {
+        assert_eq!(HEARTBEAT_TYPE, "t-x-c-t");
+    }
+
+    #[test]
+    fn create_heartbeat_returns_bytes_type() {
+        let hb = create_heartbeat("test");
+        // Verify it's valid UTF-8 (XML should always be)
+        assert!(std::str::from_utf8(&hb).is_ok());
+    }
+
+    #[test]
+    fn create_heartbeat_ends_with_closing_tag() {
+        let hb = create_heartbeat("test");
+        let xml = std::str::from_utf8(&hb).expect("valid utf8");
+        assert!(xml.ends_with("</event>"));
+    }
 }

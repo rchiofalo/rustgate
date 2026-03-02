@@ -190,4 +190,172 @@ mod tests {
         let parsed: PeerConfig = serde_json::from_str(json).expect("deserialize");
         assert_eq!(parsed.routing_mode, RoutingMode::Matrix);
     }
+
+    #[test]
+    fn protocol_parse_error_message_contains_input() {
+        let err = "v3".parse::<Protocol>().expect_err("should fail for v3");
+        assert!(err.to_string().contains("v3"));
+    }
+
+    #[test]
+    fn protocol_parse_empty_string_fails() {
+        assert!("".parse::<Protocol>().is_err());
+    }
+
+    #[test]
+    fn protocol_parse_mixed_case() {
+        assert_eq!("V1".parse::<Protocol>().expect("parse"), Protocol::V1);
+        assert_eq!("v2".parse::<Protocol>().expect("parse"), Protocol::V2);
+    }
+
+    #[test]
+    fn protocol_equality() {
+        assert_eq!(Protocol::V1, Protocol::V1);
+        assert_eq!(Protocol::V2, Protocol::V2);
+        assert_ne!(Protocol::V1, Protocol::V2);
+    }
+
+    #[test]
+    fn protocol_clone() {
+        let p = Protocol::V1;
+        let p2 = p;
+        assert_eq!(p, p2);
+    }
+
+    #[test]
+    fn protocol_debug_format() {
+        let debug = format!("{:?}", Protocol::V1);
+        assert_eq!(debug, "V1");
+    }
+
+    #[test]
+    fn routing_mode_serde_matrix() {
+        let json = serde_json::to_string(&RoutingMode::Matrix).expect("serialize");
+        let parsed: RoutingMode = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, RoutingMode::Matrix);
+    }
+
+    #[test]
+    fn routing_mode_serde_invalid_value() {
+        let result = serde_json::from_str::<RoutingMode>("\"invalid\"");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn routing_mode_equality() {
+        assert_eq!(RoutingMode::Matrix, RoutingMode::Matrix);
+        assert_eq!(RoutingMode::Broadcast, RoutingMode::Broadcast);
+        assert_ne!(RoutingMode::Matrix, RoutingMode::Broadcast);
+    }
+
+    #[test]
+    fn default_config_federate_id() {
+        let cfg = FederationConfig::default();
+        assert_eq!(cfg.federate_id, "rustgate-federation-1");
+    }
+
+    #[test]
+    fn default_config_listen_addr() {
+        let cfg = FederationConfig::default();
+        assert_eq!(cfg.listen_addr.port(), 9001);
+        assert_eq!(cfg.listen_addr.to_string(), "0.0.0.0:9001");
+    }
+
+    #[test]
+    fn default_config_tls_paths() {
+        let cfg = FederationConfig::default();
+        assert_eq!(cfg.cert_file, PathBuf::from("server.pem"));
+        assert_eq!(cfg.key_file, PathBuf::from("server-key.pem"));
+        assert_eq!(cfg.ca_file, PathBuf::from("ca.pem"));
+    }
+
+    #[test]
+    fn default_config_no_peers() {
+        let cfg = FederationConfig::default();
+        assert!(cfg.peers.is_empty());
+    }
+
+    #[test]
+    fn default_config_no_store_path() {
+        let cfg = FederationConfig::default();
+        assert!(cfg.store_path.is_none());
+    }
+
+    #[test]
+    fn peer_config_with_no_trust_cert() {
+        let peer = PeerConfig {
+            id: "peer-1".into(),
+            address: "10.0.0.1:9001".into(),
+            groups: vec![],
+            enabled: true,
+            is_outbound: false,
+            trust_cert_cn: None,
+            routing_mode: RoutingMode::default(),
+        };
+        let json = serde_json::to_string(&peer).expect("serialize");
+        let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
+        assert!(parsed.trust_cert_cn.is_none());
+    }
+
+    #[test]
+    fn peer_config_empty_groups() {
+        let peer = PeerConfig {
+            id: "peer-1".into(),
+            address: "10.0.0.1:9001".into(),
+            groups: vec![],
+            enabled: true,
+            is_outbound: false,
+            trust_cert_cn: None,
+            routing_mode: RoutingMode::default(),
+        };
+        let json = serde_json::to_string(&peer).expect("serialize");
+        let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
+        assert!(parsed.groups.is_empty());
+    }
+
+    #[test]
+    fn peer_config_disabled() {
+        let peer = PeerConfig {
+            id: "peer-1".into(),
+            address: "10.0.0.1:9001".into(),
+            groups: vec![],
+            enabled: false,
+            is_outbound: false,
+            trust_cert_cn: None,
+            routing_mode: RoutingMode::default(),
+        };
+        assert!(!peer.enabled);
+    }
+
+    #[test]
+    fn peer_config_multiple_groups_preserved() {
+        let groups = vec![
+            "Alpha".to_string(),
+            "Bravo".to_string(),
+            "Charlie".to_string(),
+            "Delta".to_string(),
+        ];
+        let peer = PeerConfig {
+            id: "peer-1".into(),
+            address: "10.0.0.1:9001".into(),
+            groups: groups.clone(),
+            enabled: true,
+            is_outbound: true,
+            trust_cert_cn: None,
+            routing_mode: RoutingMode::default(),
+        };
+        let json = serde_json::to_string(&peer).expect("serialize");
+        let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.groups, groups);
+    }
+
+    #[test]
+    fn federation_config_clone() {
+        let cfg = FederationConfig::default();
+        let cfg2 = cfg.clone();
+        assert_eq!(cfg2.federate_id, cfg.federate_id);
+        assert_eq!(cfg2.listen_addr, cfg.listen_addr);
+        assert_eq!(cfg2.protocol, cfg.protocol);
+        assert_eq!(cfg2.max_hops, cfg.max_hops);
+    }
 }
