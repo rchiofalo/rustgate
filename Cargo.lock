@@ -1399,6 +1399,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustgate-federation"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "rustgate-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "time",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rustgate-nats"
 version = "0.1.0"
 dependencies = [
@@ -1446,6 +1462,7 @@ dependencies = [
  "rustgate-core",
  "rustgate-cot",
  "rustgate-enrollment",
+ "rustgate-federation",
  "rustgate-nats",
  "rustgate-proto",
  "rustgate-transport",
