@@ -53,6 +53,7 @@ tonic-prost-build = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+tonic = { workspace = true, features = ["router", "transport", "server"] }
 tempfile = { workspace = true }
 rustgate-test-utils = { workspace = true }
 criterion = { workspace = true }
