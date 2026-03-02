@@ -14,6 +14,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing_subscriber::EnvFilter;
 
+#[allow(dead_code)]
+mod audit;
 #[cfg(feature = "metrics")]
 mod metrics;
 
@@ -175,6 +177,7 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     tracing::info!(bind = %cli.bind, "rustgate starting");
+    audit::server_started(&cli.bind, env!("CARGO_PKG_VERSION"));
 
     tokio::runtime::Runtime::new()?.block_on(run(cli))
 }
@@ -445,6 +448,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                                     metrics::connections_active().dec();
                                 }
                                 tracing::warn!(max = max_connections, "connection limit reached, rejecting");
+                                audit::connection_rejected(session.peer_addr(), "connection limit reached");
                                 continue;
                             }
                         };
@@ -542,6 +546,7 @@ async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
     let cn = identity.cn.clone();
 
     tracing::info!(cn = %cn, peer = %session.peer_addr(), "connected");
+    audit::client_connected(&cn, session.peer_addr(), &identity.fingerprint);
 
     #[cfg(feature = "metrics")]
     metrics::sessions_active().inc();
@@ -562,27 +567,28 @@ async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
         Framing::TakNegotiate => {
             match negotiate_tak_protocol(&mut reader, &mut writer, &cn).await {
                 Ok(result) => {
+                    let protocol = if matches!(result.1, Encoding::TakProtobuf) {
+                        "protobuf"
+                    } else {
+                        "xml"
+                    };
                     #[cfg(feature = "metrics")]
-                    {
-                        let label = if matches!(result.1, Encoding::TakProtobuf) {
-                            "protobuf"
-                        } else {
-                            "xml"
-                        };
-                        metrics::negotiations().with_label_values(&[label]).inc();
-                    }
+                    metrics::negotiations().with_label_values(&[protocol]).inc();
+                    audit::negotiation_result(&cn, protocol, true);
                     result
                 }
                 Err(e) => {
                     #[cfg(feature = "metrics")]
                     metrics::negotiations().with_label_values(&["failed"]).inc();
                     tracing::debug!(cn = %cn, error = %e, "negotiation failed");
+                    audit::negotiation_result(&cn, "tak", false);
                     router.unregister(&cn, session_id).await;
                     #[cfg(feature = "metrics")]
                     {
                         metrics::sessions_active().dec();
                         metrics::connections_active().dec();
                     }
+                    audit::client_disconnected(&cn);
                     tracing::info!(cn = %cn, "disconnected");
                     return;
                 }
@@ -658,6 +664,7 @@ async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
         metrics::sessions_active().dec();
         metrics::connections_active().dec();
     }
+    audit::client_disconnected(&cn);
     tracing::info!(cn = %cn, "disconnected");
 }
 
