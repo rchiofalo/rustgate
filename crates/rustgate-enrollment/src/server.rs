@@ -29,15 +29,26 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 use crate::auth::Credentials;
+use crate::contacts::ContactsProvider;
 use crate::error::EnrollmentError;
 use crate::response;
 use crate::signing::CsrSigner;
 
 /// HTTPS enrollment server for TAK client certificate provisioning.
-#[derive(Debug)]
 pub struct EnrollmentServer {
     signer: Arc<CsrSigner>,
     credentials: Arc<Credentials>,
+    contacts_provider: Option<ContactsProvider>,
+}
+
+impl std::fmt::Debug for EnrollmentServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnrollmentServer")
+            .field("signer", &self.signer)
+            .field("credentials", &self.credentials)
+            .field("contacts_provider", &self.contacts_provider.is_some())
+            .finish()
+    }
 }
 
 impl EnrollmentServer {
@@ -45,7 +56,14 @@ impl EnrollmentServer {
         Self {
             signer: Arc::new(signer),
             credentials: Arc::new(credentials),
+            contacts_provider: None,
         }
+    }
+
+    /// Set the contacts provider for Marti API compatibility endpoints.
+    pub fn with_contacts_provider(mut self, provider: ContactsProvider) -> Self {
+        self.contacts_provider = Some(provider);
+        self
     }
 
     /// Run the enrollment HTTPS server.
@@ -89,6 +107,7 @@ impl EnrollmentServer {
             let acceptor = acceptor.clone();
             let signer = Arc::clone(&self.signer);
             let credentials = Arc::clone(&self.credentials);
+            let contacts = self.contacts_provider.clone();
 
             drop(tokio::spawn(async move {
                 let _permit = permit;
@@ -114,7 +133,8 @@ impl EnrollmentServer {
                 let service = service_fn(move |req| {
                     let signer = Arc::clone(&signer);
                     let credentials = Arc::clone(&credentials);
-                    async move { handle_request(req, &signer, &credentials).await }
+                    let contacts = contacts.clone();
+                    async move { handle_request(req, &signer, &credentials, contacts.as_ref()).await }
                 });
 
                 let conn = http1::Builder::new().serve_connection(io, service);
@@ -130,6 +150,7 @@ async fn handle_request(
     req: Request<hyper::body::Incoming>,
     signer: &CsrSigner,
     credentials: &Credentials,
+    contacts: Option<&ContactsProvider>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let path = req.uri().path();
     let method = req.method();
@@ -144,6 +165,12 @@ async fn handle_request(
         (&Method::GET, "/Marti/api/tls/profile/enrollment") => {
             build_response(StatusCode::NO_CONTENT, "", Bytes::new())
         }
+
+        (&Method::GET, "/Marti/api/version/config") => handle_version_config(),
+
+        (&Method::GET, "/Marti/api/contacts/all") => handle_contacts_all(contacts).await,
+
+        (&Method::GET, "/Marti/api/clientEndPoints") => handle_client_endpoints(contacts).await,
 
         _ => build_response(
             StatusCode::NOT_FOUND,
@@ -269,6 +296,65 @@ async fn handle_sign_client_v2(
     build_response(StatusCode::OK, content_type, Bytes::from(body))
 }
 
+fn handle_version_config() -> Response<Full<Bytes>> {
+    let version = env!("CARGO_PKG_VERSION");
+    let body = serde_json::json!({
+        "version": "3",
+        "type": "ServerConfig",
+        "data": {
+            "version": version,
+            "api": "3",
+            "hostname": "rustgate",
+        },
+        "nodeId": "rustgate"
+    });
+    build_response(
+        StatusCode::OK,
+        "application/json",
+        Bytes::from(body.to_string()),
+    )
+}
+
+async fn handle_contacts_all(contacts: Option<&ContactsProvider>) -> Response<Full<Bytes>> {
+    let contacts = match contacts {
+        Some(provider) => provider().await,
+        None => Vec::new(),
+    };
+    let body = serde_json::to_string(&contacts).unwrap_or_else(|_| "[]".to_string());
+    build_response(StatusCode::OK, "application/json", Bytes::from(body))
+}
+
+async fn handle_client_endpoints(contacts: Option<&ContactsProvider>) -> Response<Full<Bytes>> {
+    let contacts = match contacts {
+        Some(provider) => provider().await,
+        None => Vec::new(),
+    };
+
+    // clientEndPoints wraps the contact list in a Marti-compatible envelope
+    let endpoints: Vec<serde_json::Value> = contacts
+        .into_iter()
+        .map(|c| {
+            serde_json::json!({
+                "uid": c.uid,
+                "callsign": c.callsign,
+                "lastStatus": c.last_status,
+            })
+        })
+        .collect();
+
+    let body = serde_json::json!({
+        "version": "3",
+        "type": "com.bbn.marti.remote.ClientEndpoint",
+        "data": endpoints,
+        "nodeId": "rustgate"
+    });
+    build_response(
+        StatusCode::OK,
+        "application/json",
+        Bytes::from(body.to_string()),
+    )
+}
+
 fn build_response(status: StatusCode, content_type: &str, body: Bytes) -> Response<Full<Bytes>> {
     let mut builder = Response::builder().status(status);
     if !content_type.is_empty() {
@@ -316,4 +402,113 @@ fn build_server_tls_config(
         .map_err(|e| EnrollmentError::Tls(format!("invalid server certificate: {e}")))?;
 
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::contacts::ContactInfo;
+
+    fn mock_contacts_provider(contacts: Vec<ContactInfo>) -> ContactsProvider {
+        Arc::new(move || {
+            let contacts = contacts.clone();
+            Box::pin(async move { contacts })
+        })
+    }
+
+    async fn collect_body(resp: Response<Full<Bytes>>) -> Bytes {
+        http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .expect("collect body")
+            .to_bytes()
+    }
+
+    #[tokio::test]
+    async fn version_config_returns_json() {
+        let resp = handle_version_config();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = collect_body(resp).await;
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
+
+        assert_eq!(parsed["version"], "3");
+        assert_eq!(parsed["type"], "ServerConfig");
+        assert_eq!(parsed["nodeId"], "rustgate");
+        assert!(parsed["data"]["version"].as_str().is_some());
+        assert_eq!(parsed["data"]["api"], "3");
+    }
+
+    #[tokio::test]
+    async fn contacts_all_empty_without_provider() {
+        let resp = handle_contacts_all(None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = collect_body(resp).await;
+        let parsed: Vec<serde_json::Value> = serde_json::from_slice(&bytes).expect("valid JSON");
+        assert!(parsed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn contacts_all_returns_connected_clients() {
+        let provider = mock_contacts_provider(vec![
+            ContactInfo {
+                uid: "alpha-1".into(),
+                callsign: "Alpha One".into(),
+                groups: vec!["Team-A".into()],
+                last_status: "Connected".into(),
+            },
+            ContactInfo {
+                uid: "bravo-2".into(),
+                callsign: "Bravo Two".into(),
+                groups: vec!["Team-B".into()],
+                last_status: "Connected".into(),
+            },
+        ]);
+
+        let resp = handle_contacts_all(Some(&provider)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = collect_body(resp).await;
+        let parsed: Vec<serde_json::Value> = serde_json::from_slice(&bytes).expect("valid JSON");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0]["uid"], "alpha-1");
+        assert_eq!(parsed[0]["callsign"], "Alpha One");
+        assert_eq!(parsed[0]["lastStatus"], "Connected");
+        assert_eq!(parsed[1]["uid"], "bravo-2");
+    }
+
+    #[tokio::test]
+    async fn client_endpoints_empty_without_provider() {
+        let resp = handle_client_endpoints(None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = collect_body(resp).await;
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
+        assert_eq!(parsed["version"], "3");
+        assert_eq!(parsed["type"], "com.bbn.marti.remote.ClientEndpoint");
+        assert!(parsed["data"].as_array().expect("data array").is_empty());
+    }
+
+    #[tokio::test]
+    async fn client_endpoints_returns_envelope() {
+        let provider = mock_contacts_provider(vec![ContactInfo {
+            uid: "test-uid".into(),
+            callsign: "TestCall".into(),
+            groups: vec!["Alpha".into()],
+            last_status: "Connected".into(),
+        }]);
+
+        let resp = handle_client_endpoints(Some(&provider)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = collect_body(resp).await;
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
+        assert_eq!(parsed["version"], "3");
+        assert_eq!(parsed["nodeId"], "rustgate");
+
+        let data = parsed["data"].as_array().expect("data array");
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["uid"], "test-uid");
+        assert_eq!(data[0]["callsign"], "TestCall");
+    }
 }

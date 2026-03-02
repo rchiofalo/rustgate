@@ -150,6 +150,16 @@ impl Router {
         self.state.read().await.sessions.len()
     }
 
+    /// Return a snapshot of all connected client identities.
+    pub async fn connected_clients(&self) -> Vec<Arc<Identity>> {
+        let state = self.state.read().await;
+        state
+            .sessions
+            .values()
+            .map(|h| Arc::clone(&h.identity))
+            .collect()
+    }
+
     async fn send_to_session(&self, cn: &str, msg: RoutableMessage) {
         let handle = {
             let state = self.state.read().await;
@@ -382,5 +392,30 @@ mod tests {
         // Unregister should also evict from cache
         router.unregister("alice", session_id).await;
         assert_eq!(router.cache().len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn connected_clients_returns_all_sessions() {
+        let router = Router::new();
+
+        assert!(router.connected_clients().await.is_empty());
+
+        let alice = make_identity("alice", &["alpha"]);
+        let bob = make_identity("bob", &["bravo"]);
+
+        let (tx_a, _rx_a) = mpsc::channel(16);
+        let (tx_b, _rx_b) = mpsc::channel(16);
+
+        router
+            .register(SessionHandle::new(alice.clone(), tx_a))
+            .await;
+        router.register(SessionHandle::new(bob.clone(), tx_b)).await;
+
+        let clients = router.connected_clients().await;
+        assert_eq!(clients.len(), 2);
+
+        let cns: Vec<&str> = clients.iter().map(|c| c.cn.as_str()).collect();
+        assert!(cns.contains(&"alice"));
+        assert!(cns.contains(&"bob"));
     }
 }
