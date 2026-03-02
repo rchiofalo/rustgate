@@ -174,76 +174,106 @@ pub fn server_started(bind: &str, version: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-    fn test_addr() -> SocketAddr {
+    fn v4_addr() -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 12345)
     }
 
-    #[test]
-    fn client_connected_does_not_panic() {
-        // Verify audit functions don't panic when tracing isn't initialized
-        client_connected("test-cn", test_addr(), "abc123");
+    fn v6_addr() -> SocketAddr {
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 9443)
     }
 
     #[test]
-    fn client_disconnected_does_not_panic() {
-        client_disconnected("test-cn");
+    fn test_client_connected() {
+        client_connected("alpha-cn", v4_addr(), "sha256:abc123def456");
+        client_connected("", v6_addr(), "");
+        client_connected("cn/with-special.chars", v4_addr(), &"f".repeat(128));
     }
 
     #[test]
-    fn connection_rejected_does_not_panic() {
-        connection_rejected(test_addr(), "limit reached");
+    fn test_client_disconnected() {
+        client_disconnected("alpha-cn");
+        client_disconnected("");
     }
 
     #[test]
-    fn tls_accept_error_does_not_panic() {
-        tls_accept_error(test_addr(), "handshake failed");
+    fn test_connection_rejected() {
+        connection_rejected(v4_addr(), "connection limit reached");
+        connection_rejected(v6_addr(), "");
     }
 
     #[test]
-    fn negotiation_result_does_not_panic() {
-        negotiation_result("test-cn", "protobuf", true);
-        negotiation_result("test-cn", "xml", false);
+    fn test_tls_accept_error() {
+        tls_accept_error(v4_addr(), "handshake timeout");
+        tls_accept_error(v6_addr(), "certificate expired");
     }
 
     #[test]
-    fn federation_peer_connected_does_not_panic() {
-        federation_peer_connected("peer-1", "peer-cn", "inbound");
+    fn test_negotiation_success() {
+        negotiation_result("bravo-cn", "protobuf", true);
     }
 
     #[test]
-    fn federation_peer_disconnected_does_not_panic() {
-        federation_peer_disconnected("peer-1", "clean");
+    fn test_negotiation_failure() {
+        negotiation_result("bravo-cn", "xml", false);
+        negotiation_result("", "unknown", false);
+    }
+
+    mod federation {
+        use super::*;
+
+        #[test]
+        fn test_peer_connected() {
+            federation_peer_connected("peer-1", "peer-cn", "inbound");
+            federation_peer_connected("peer-2", "remote-server", "outbound");
+        }
+
+        #[test]
+        fn test_peer_disconnected() {
+            federation_peer_disconnected("peer-1", "clean shutdown");
+            federation_peer_disconnected("peer-1", "");
+        }
+
+        #[test]
+        fn test_connect_failed() {
+            federation_connect_failed("peer-1", "connection refused");
+            federation_connect_failed("peer-2", "tls: certificate verify failed");
+        }
+
+        #[test]
+        fn test_config_changed() {
+            federation_config_changed("api", "create", "peer-1");
+            federation_config_changed("admin", "delete", "peer-2");
+            federation_config_changed("api", "update", "peer-3");
+        }
+    }
+
+    mod enrollment {
+        use super::*;
+
+        #[test]
+        fn test_signed() {
+            enrollment_signed("admin", "client-uid-123");
+            enrollment_signed("user@example.com", "");
+        }
+
+        #[test]
+        fn test_sign_failed() {
+            enrollment_sign_failed("admin", "client-uid-123", "invalid CSR");
+            enrollment_sign_failed("", "", "CA not initialized");
+        }
+
+        #[test]
+        fn test_auth_failed() {
+            enrollment_auth_failed("10.0.0.1:12345");
+            enrollment_auth_failed("[::1]:443");
+        }
     }
 
     #[test]
-    fn federation_connect_failed_does_not_panic() {
-        federation_connect_failed("peer-1", "connection refused");
-    }
-
-    #[test]
-    fn enrollment_signed_does_not_panic() {
-        enrollment_signed("admin", "client-uid-123");
-    }
-
-    #[test]
-    fn enrollment_sign_failed_does_not_panic() {
-        enrollment_sign_failed("admin", "client-uid-123", "invalid CSR");
-    }
-
-    #[test]
-    fn enrollment_auth_failed_does_not_panic() {
-        enrollment_auth_failed("10.0.0.1:12345");
-    }
-
-    #[test]
-    fn federation_config_changed_does_not_panic() {
-        federation_config_changed("api", "create", "peer-1");
-    }
-
-    #[test]
-    fn server_started_does_not_panic() {
+    fn test_server_started() {
         server_started("0.0.0.0:4433", "0.1.0");
+        server_started("[::]:4433", "0.0.0");
     }
 }
