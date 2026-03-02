@@ -39,6 +39,11 @@ spec:
             - name: tak
               containerPort: {{ .Values.service.port }}
               protocol: TCP
+            {{- if .Values.federation.enabled }}
+            - name: federation
+              containerPort: 9000
+              protocol: TCP
+            {{- end }}
             {{- if .Values.metrics.enabled }}
             - name: metrics
               containerPort: {{ .Values.metrics.port }}
@@ -110,6 +115,29 @@ spec:
               value: {{ .Values.enrollment.caOrganization | quote }}
             {{- end }}
             {{- end }}
+            {{- if .Values.federation.enabled }}
+            - name: FEDERATION_V1_BIND
+              value: {{ .Values.federation.v1Bind | quote }}
+            - name: FEDERATION_ID
+              value: {{ .Values.federation.id | quote }}
+            - name: FEDERATION_MAX_HOPS
+              value: {{ .Values.federation.maxHops | quote }}
+            {{- if .Values.federation.skipHostnameVerify }}
+            - name: FEDERATION_SKIP_HOSTNAME_VERIFY
+              value: "true"
+            {{- end }}
+            {{- if .Values.federation.storePath }}
+            - name: FEDERATION_STORE_PATH
+              value: {{ .Values.federation.storePath | quote }}
+            {{- end }}
+            {{- if .Values.federation.existingSecret }}
+            - name: FEDERATION_PEERS_FILE
+              value: /etc/federation/peers.json
+            {{- else if .Values.federation.peersFile }}
+            - name: FEDERATION_PEERS_FILE
+              value: {{ .Values.federation.peersFile | quote }}
+            {{- end }}
+            {{- end }}
           {{- if .Values.metrics.enabled }}
           startupProbe:
             httpGet:
@@ -154,6 +182,11 @@ spec:
             - name: tls-certs
               mountPath: /certs
               readOnly: true
+            {{- if and .Values.federation.enabled .Values.federation.existingSecret }}
+            - name: federation-peers
+              mountPath: /etc/federation
+              readOnly: true
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       {{- if .Values.topologySpreadConstraints }}
@@ -164,3 +197,11 @@ spec:
         - name: tls-certs
           secret:
             secretName: {{ .Values.tls.secretName }}
+        {{- if and .Values.federation.enabled .Values.federation.existingSecret }}
+        - name: federation-peers
+          secret:
+            secretName: {{ .Values.federation.existingSecret }}
+            items:
+              - key: FEDERATION_PEERS_FILE
+                path: peers.json
+        {{- end }}

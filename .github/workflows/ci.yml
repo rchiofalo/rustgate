@@ -60,6 +60,9 @@ jobs:
       - name: Test (metrics only)
         run: cargo test --features metrics
 
+      - name: Test (federation only)
+        run: cargo test --features federation
+
       - name: Test (all features)
         run: cargo test --all-features
 

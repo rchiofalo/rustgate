@@ -4,6 +4,7 @@ members = [
     "crates/rustgate-core",
     "crates/rustgate-cot",
     "crates/rustgate-enrollment",
+    "crates/rustgate-federation",
     "crates/rustgate-nats",
     "crates/rustgate-proto",
     "crates/rustgate-transport",
@@ -33,6 +34,7 @@ unused_async = "warn"
 
 [workspace.dependencies]
 tokio = { version = "1", default-features = false }
+tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["codec"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
@@ -55,10 +57,17 @@ http-body-util = "0.1"
 base64 = "0.22"
 async-nats = { version = "0.46", default-features = false, features = ["jetstream", "nkeys"] }
 prost = "0.14"
+prost-build = "0.14"
+prost-types = "0.14"
+tonic = { version = "0.14", default-features = false }
+tonic-build = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 time = { version = "0.3", features = ["formatting"] }
 prometheus = { version = "0.14", default-features = false }
+tempfile = "3"
 
 # Internal crates
 rustgate-core = { path = "crates/rustgate-core" }
@@ -66,6 +75,7 @@ rustgate-cot = { path = "crates/rustgate-cot" }
 rustgate-enrollment = { path = "crates/rustgate-enrollment" }
 rustgate-nats = { path = "crates/rustgate-nats" }
 rustgate-proto = { path = "crates/rustgate-proto" }
+rustgate-federation = { path = "crates/rustgate-federation" }
 rustgate-transport = { path = "crates/rustgate-transport" }
 rustgate-test-utils = { path = "crates/rustgate-test-utils" }
 

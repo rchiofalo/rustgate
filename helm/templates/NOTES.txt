@@ -10,6 +10,18 @@ Prometheus metrics:
   curl http://localhost:{{ .Values.metrics.port }}/metrics
 {{- end }}
 
+{{- if .Values.federation.enabled }}
+
+Federation:
+  V1 listener is bound to port 9000 on the pod.
+  {{- if eq .Values.service.type "LoadBalancer" }}
+  export SERVICE_IP=$(kubectl get svc {{ include "rustgate.fullname" . }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+  echo "Federation endpoint: $SERVICE_IP:9000"
+  {{- else }}
+  kubectl port-forward svc/{{ include "rustgate.fullname" . }} 9000:9000
+  {{- end }}
+{{- end }}
+
 TAK service:
   {{- if eq .Values.service.type "LoadBalancer" }}
   export SERVICE_IP=$(kubectl get svc {{ include "rustgate.fullname" . }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}')

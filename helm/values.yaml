@@ -43,6 +43,25 @@ enrollment:
   # ENROLLMENT_PASSWORD keys. When set, takes precedence over plain-text values.
   existingSecret: ""
 
+federation:
+  enabled: false
+  # V1 federation listen address (length-prefixed XML over mTLS).
+  v1Bind: "0.0.0.0:9000"
+  # Unique federation server identity.
+  id: "rustgate-federation-1"
+  # Maximum federation hops before dropping a message (loop prevention).
+  maxHops: 10
+  # Skip TLS hostname verification for federation peers.
+  skipHostnameVerify: false
+  # Path to persistent federate store (JSON file).
+  storePath: ""
+  # Path to JSON file containing federation peer configurations.
+  # Expected format: [{"id":"peer-1","address":"10.0.0.1:9001","groups":["Alpha"],...}]
+  peersFile: ""
+  # Name of an existing K8s Secret containing a FEDERATION_PEERS_FILE key.
+  # When set, mounts the secret as a file and takes precedence over peersFile.
+  existingSecret: ""
+
 metrics:
   enabled: true
   port: 9090

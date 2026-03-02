@@ -1,0 +1,7 @@
+syntax = "proto3";
+
+package atakmap.commoncommo.protobuf.v1;
+
+message Status {
+     uint32 battery = 1;
+}

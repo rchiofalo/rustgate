@@ -1,0 +1,160 @@
+# Architecture
+
+rustgate is a Rust-native secure message router built for tactical edge deployment. It handles mTLS client connections, routes messages by group membership derived from client certificates, and federates with remote servers for cross-network situational awareness sharing.
+
+## Crate Structure
+
+```
+crates/
+  rustgate-core/          Shared types (Identity, RoutableMessage, Destination, framing)
+  rustgate-cot/           Cursor on Target XML message parsing
+  rustgate-transport/     mTLS listener, codecs, session management, message router
+  rustgate-nats/          NATS pub/sub bridge with JetStream history replay
+  rustgate-enrollment/    HTTPS certificate enrollment (Marti v2 CSR signing)
+  rustgate-proto/         TAK protobuf translation (XML <-> proto) and negotiation
+  rustgate-federation/    Server-to-server federation (V1 XML, V2 gRPC)
+  rustgate-server/        Binary entry point wiring all crates together
+  rustgate-test-utils/    Ephemeral certificate generation for tests
+```
+
+## Data Flow
+
+```
+TAK clients (ATAK/iTAK/WinTAK)
+  │
+  │ mTLS (port 4433)
+  ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                         rustgate-server                          │
+│                                                                  │
+│  ┌─────────────┐   ┌────────────┐   ┌─────────────────────┐    │
+│  │ TLS Listener│──>│   Router   │──>│  Session Write Loop  │    │
+│  │ (transport) │   │ broadcast/ │   │  (per-client sender) │    │
+│  └─────────────┘   │ group/     │   └─────────────────────┘    │
+│                     │ direct     │                               │
+│  ┌─────────────┐   │            │   ┌─────────────────────┐    │
+│  │ NATS Bridge │<->│            │<->│ Federation Manager  │    │
+│  │ (pub/sub)   │   │            │   │ (V1 XML / V2 gRPC)  │    │
+│  └─────────────┘   └────────────┘   └─────────────────────┘    │
+│                                                                  │
+│  ┌─────────────┐   ┌────────────┐   ┌─────────────────────┐    │
+│  │ Enrollment  │   │  Metrics   │   │  Position Cache     │    │
+│  │ (HTTPS CSR) │   │ Prometheus │   │  (replay on connect) │    │
+│  └─────────────┘   └────────────┘   └─────────────────────┘    │
+└──────────────────────────────────────────────────────────────────┘
+  │                     │                    │
+  │ NATS (4222)         │ HTTP (9090)        │ mTLS (9000/9001)
+  ▼                     ▼                    ▼
+Other rustgate       Prometheus/         Remote TAK
+instances            monitoring          servers (peers)
+```
+
+## Core Types
+
+### Identity
+
+Extracted from X.509 client certificates during the mTLS handshake:
+
+| Field | Source | Example |
+|-------|--------|---------|
+| `cn` | Certificate Common Name | `ALPHA-BRAVO-1` |
+| `groups` | Certificate OU fields | `{"Team-Alpha", "HQ"}` |
+| `fingerprint` | SHA-256 of DER cert | `a3b2c1...` |
+
+### RoutableMessage
+
+The internal message envelope used by the router:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `source` | `Identity` | Sender identity from their certificate |
+| `destination` | `Destination` | Broadcast, Group(name), or Direct(callsign) |
+| `payload` | `Bytes` | Raw message bytes (typically CoT XML) |
+| `metadata` | `Metadata` | Timestamp, source protocol, protocol detail |
+
+### Destination
+
+Three routing modes:
+
+- **Broadcast** — deliver to all connected sessions
+- **Group(name)** — deliver only to sessions whose certificate OU includes the group
+- **Direct(callsign)** — deliver to the session whose certificate CN matches
+
+## Feature Gates
+
+All optional features are compile-time feature gates, keeping the base binary minimal:
+
+| Feature | Crate | What It Adds |
+|---------|-------|--------------|
+| `nats` | rustgate-nats | NATS pub/sub bridge, JetStream SA replay |
+| `enrollment` | rustgate-enrollment | HTTPS certificate enrollment server |
+| `proto` | rustgate-proto | TAK protobuf translation, protocol negotiation |
+| `metrics` | prometheus, hyper | Prometheus metrics, health endpoints |
+| `federation` | rustgate-federation | Server-to-server federation (V1/V2) |
+| `jemalloc` | tikv-jemallocator | jemalloc allocator for musl builds |
+
+Build with specific features:
+```
+cargo build --release --features nats,proto,metrics,federation
+```
+
+Or all features:
+```
+cargo build --release --all-features
+```
+
+## Session Lifecycle
+
+1. Client connects over TCP to the listener port (default 4433)
+2. TLS handshake with mutual authentication (client must present a certificate)
+3. Server extracts `Identity` from the client certificate
+4. Server assigns an atomic session ID and registers a `SessionHandle` with the Router
+5. Spawns a read loop (client -> router) and write loop (router -> client)
+6. On disconnect: unregisters from Router, cleans up session resources
+7. If the same CN reconnects, the old session is evicted (new session ID wins)
+
+## Codec Pipeline
+
+Messages pass through a codec pipeline based on the configured framing mode:
+
+| Framing | Codec | Wire Format |
+|---------|-------|-------------|
+| `xml` | `XmlStreamCodec` | Raw XML stream with depth tracking |
+| `length-prefixed` | `LengthPrefixedCodec(Four)` | 4-byte big-endian length header |
+| `line` | `LineCodec` | Newline-delimited |
+| `tak-protobuf` | `TakFrameCodec` | 0xBF magic + varint length |
+| `tak-negotiate` | Negotiation then `TakFrameCodec` or `XmlStreamCodec` | Server advertises, client opts in |
+
+## Message Routing
+
+The `Router` maintains a map of session ID -> `SessionHandle` (mpsc sender). On each message:
+
+1. Parse destination from CoT XML `<event>` attributes
+2. Match destination type (broadcast/group/direct)
+3. For each candidate session, check group membership
+4. Send message bytes through the session's mpsc channel
+5. Write loop picks up bytes and writes to the TLS stream
+
+Position cache stores the latest position per (group, callsign) pair. New sessions receive cached positions on connect for immediate situational awareness.
+
+## NATS Bridge
+
+When `--nats-url` is provided, the NATS bridge:
+
+1. Subscribes to NATS subjects for messages from other rustgate instances
+2. Publishes local messages to NATS for cross-instance delivery
+3. Uses JetStream for SA history replay on new subscriber connect
+4. Two-layer echo prevention: protocol tag (`source_protocol`) + instance UUID header
+
+## Security Model
+
+- `unsafe_code = "forbid"` across all crates
+- `unwrap_used = "deny"` and `panic = "deny"` in clippy lints
+- Client certificate authentication (mTLS) — no password-based auth
+- Subject DN enforcement in enrollment (CSR subject ignored, CN set from authenticated username)
+- CSR SAN and custom extension stripping to prevent subject injection
+- 16MB maximum frame size to prevent memory exhaustion
+- Connection limits via semaphore (`--max-connections`)
+- Read-only root filesystem in Docker/K8s
+- Non-root container (UID 10001) with all capabilities dropped
+- Pod Security Standards (restricted profile) in Helm chart

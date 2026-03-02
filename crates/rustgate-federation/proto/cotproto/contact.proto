@@ -1,0 +1,8 @@
+syntax = "proto3";
+
+package atakmap.commoncommo.protobuf.v1;
+
+message Contact {
+     string endpoint = 1;
+     string callsign = 2;
+}

@@ -1,0 +1,8 @@
+syntax = "proto3";
+
+package atakmap.commoncommo.protobuf.v1;
+
+message PrecisionLocation {
+     string geopointsrc = 1;
+     string altsrc = 2;
+}

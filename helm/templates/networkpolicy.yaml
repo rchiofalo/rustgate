@@ -24,6 +24,10 @@ spec:
         - port: 8446
           protocol: TCP
         {{- end }}
+        {{- if .Values.federation.enabled }}
+        - port: 9000
+          protocol: TCP
+        {{- end }}
   egress:
     - ports:
         - port: 53
@@ -33,6 +37,13 @@ spec:
     {{- if .Values.nats.enabled }}
     - ports:
         - port: 4222
+          protocol: TCP
+    {{- end }}
+    {{- if .Values.federation.enabled }}
+    - ports:
+        - port: 9000
+          protocol: TCP
+        - port: 9001
           protocol: TCP
     {{- end }}
 {{- end }}

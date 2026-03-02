@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-03-01
+
+### Added
+
+- **Server-to-server federation** (feature-gated: `federation`) — share situational awareness between independent TAK Server networks via the standard TAK Server Federation protocol
+- **V1 federation protocol** — length-prefixed XML over mTLS for legacy server compatibility, with CoT heartbeat monitoring (30s interval, 90s timeout) and automatic reconnection with exponential backoff
+- **V2 federation protocol** — gRPC FederatedChannel service over mTLS with 5-stream handshake, group exchange, health checks (5s interval, 15s timeout), and bidirectional event streaming
+- **Provenance-based loop detection** — federation messages carry a server chain and hop counter; messages are dropped when a loop is detected or the configurable hop limit (default 10) is exceeded
+- **Federation manager** — orchestrates all inbound and outbound peer connections, protocol selection (V1/V2 per-peer), group-aware forwarding, and NATS ↔ federation bridging with echo prevention
+- **Dynamic CA trust store** — add and remove trusted CA certificates at runtime without restart; new CAs take effect on the next TLS handshake
+- **Persistent peer storage** — JSON file backend for single-pod deployments; NATS KV backend with cross-pod sync for multi-pod clusters
+- **HA mode** — distributed peer ownership via NATS KV atomic claims with 30s TTL and 10s refresh; automatic adoption of orphaned peers after pod failure with configurable delay
+- **Federation REST API** — peer CRUD, certificate management, connection status, and aggregated statistics endpoints mounted under `/api/federation/`
+- **Federation Prometheus metrics** — `federation_connections` gauge, `federation_messages_in_total` / `federation_messages_out_total` / `federation_errors_total` / `federation_heartbeats_total` counters
+- **Federation CLI flags** — `--federation-v1-bind`, `--federation-id`, `--federation-peers-file`, `--federation-skip-hostname-verify`, `--federation-max-hops`, `--federation-store-path` with corresponding `FEDERATION_*` environment variables
+- **Helm chart federation support** — `federation.enabled` toggle, peer config via Secret or values, federation port (9000) in Service and NetworkPolicy
+- **639 tests** — up from 198 in v0.1.0, adding comprehensive coverage for federation config, provenance, heartbeat, store, V1/V2 protocols, gRPC service, trust store, HA claims, REST API, and metrics
+
 ## [0.1.0] - 2026-03-01
 
 Initial release of rustgate — a Rust-native secure tactical message router.

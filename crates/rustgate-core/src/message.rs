@@ -3,6 +3,9 @@ use std::time::{Duration, SystemTime};
 
 use crate::identity::{GroupId, Identity};
 
+/// Source protocol identifier for messages originating from federation peers.
+pub const SOURCE_FEDERATION: &str = "federation";
+
 /// Every message flowing through rustgate becomes this.
 #[derive(Debug, Clone)]
 pub struct RoutableMessage {

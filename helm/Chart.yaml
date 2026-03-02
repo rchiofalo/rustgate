@@ -1,6 +1,6 @@
 apiVersion: v2
 name: rustgate
-description: Secure tactical message router with mTLS and NATS bridge
+description: Secure tactical message router with mTLS, NATS bridge, and server-to-server federation
 type: application
-version: 0.1.0
-appVersion: "0.1.0"
+version: 0.2.0
+appVersion: "0.2.0"
