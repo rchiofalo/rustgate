@@ -34,9 +34,9 @@ impl FramedCodec {
             FramingStrategy::TakProtobuf => Self::TakProtobuf(rustgate_proto::TakFrameCodec::new()),
             #[cfg(not(feature = "proto"))]
             FramingStrategy::TakProtobuf => {
-                // TakProtobuf variant exists in core but requires the proto feature.
-                // Panic at construction time rather than silently misbehaving.
-                unimplemented!("TakProtobuf framing requires the `proto` feature")
+                // Startup validation in main.rs rejects this configuration early.
+                // If we reach here, it indicates a logic error in the caller.
+                unreachable!("TakProtobuf framing requires building with --features proto")
             }
         }
     }

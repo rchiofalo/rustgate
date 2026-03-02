@@ -107,6 +107,12 @@ struct Cli {
     #[arg(long, env = "FEDERATION_V1_BIND")]
     federation_v1_bind: Option<String>,
 
+    /// V2 gRPC federation listen address (e.g. 0.0.0.0:9001).
+    /// Enables V2 gRPC inbound server when set alongside --federation-v1-bind.
+    /// Requires --features federation.
+    #[arg(long, env = "FEDERATION_V2_BIND")]
+    federation_v2_bind: Option<String>,
+
     /// Unique federation server identity.
     #[arg(long, default_value = "rustgate-federation-1", env = "FEDERATION_ID")]
     federation_id: String,
@@ -206,6 +212,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     #[cfg(feature = "metrics")]
     metrics::init().map_err(|e| anyhow::anyhow!("failed to register metrics: {e}"))?;
 
+    // Federation API handler placeholder — populated after federation manager starts.
+    #[cfg(all(feature = "metrics", feature = "federation"))]
+    let fed_api_slot: Arc<std::sync::OnceLock<metrics::FedApiHandler>> =
+        Arc::new(std::sync::OnceLock::new());
+
     // Optionally start the Prometheus metrics / health HTTP server
     #[cfg(feature = "metrics")]
     if let Some(ref metrics_bind) = cli.metrics_bind {
@@ -214,8 +225,17 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("invalid --metrics-bind address: {e}"))?;
 
         let health_ready = Arc::clone(&ready);
+        #[cfg(feature = "federation")]
+        let fed_api_for_metrics = Arc::clone(&fed_api_slot);
         drop(tokio::spawn(async move {
-            if let Err(e) = metrics::serve(bind_addr, health_ready).await {
+            if let Err(e) = metrics::serve(
+                bind_addr,
+                health_ready,
+                #[cfg(feature = "federation")]
+                fed_api_for_metrics,
+            )
+            .await
+            {
                 tracing::error!(error = %e, "metrics server failed");
             }
         }));
@@ -353,11 +373,21 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             Vec::new()
         };
 
+        let (v2_enabled, v2_listen_addr) = if let Some(ref v2_bind) = cli.federation_v2_bind {
+            let addr: std::net::SocketAddr = v2_bind
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid --federation-v2-bind: {e}"))?;
+            (true, addr)
+        } else {
+            (false, "0.0.0.0:9001".parse().expect("valid default addr"))
+        };
+
         let config = rustgate_federation::config::FederationConfig {
             federate_id: cli.federation_id.clone(),
             v1_enabled: true,
             v1_listen_addr: bind_addr,
-            v2_enabled: false,
+            v2_enabled,
+            v2_listen_addr,
             peers,
             max_hops: cli.federation_max_hops,
             skip_hostname_verify: cli.federation_skip_hostname_verify,
@@ -404,6 +434,58 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         let rwlock = Arc::new(tokio::sync::RwLock::new(manager));
         let rwlock_for_forward = Arc::clone(&rwlock);
 
+        // Wire up the federation REST API into the metrics HTTP server
+        #[cfg(feature = "metrics")]
+        {
+            use rustgate_federation::api::{ApiState, PeerStatusFn};
+            use rustgate_federation::store::file::FileStore;
+            use rustgate_federation::trust_store::TrustStore;
+
+            let store = Arc::new(std::sync::RwLock::new(FileStore::new(
+                cli.federation_store_path.clone().map(Into::into),
+            )));
+            let trust_store = Arc::new(TrustStore::new(None));
+
+            let rwlock_for_status = Arc::clone(&rwlock);
+            let status_fn: Arc<
+                dyn Fn() -> rustgate_federation::manager::FederationStatus + Send + Sync,
+            > = Arc::new(move || {
+                // Use try_read to avoid blocking; return default status if locked
+                match rwlock_for_status.try_read() {
+                    Ok(mgr) => mgr.status(),
+                    Err(_) => rustgate_federation::manager::FederationStatus {
+                        running: true,
+                        v1_server_active: false,
+                        v2_server_active: false,
+                        total_peers: 0,
+                        connected_peers: 0,
+                        peers: vec![],
+                    },
+                }
+            });
+
+            let rwlock_for_peer = Arc::clone(&rwlock);
+            let peer_status_fn: PeerStatusFn =
+                Arc::new(move |id| match rwlock_for_peer.try_read() {
+                    Ok(mgr) => mgr.peer_status(id),
+                    Err(_) => None,
+                });
+
+            let api_state = Arc::new(ApiState {
+                store,
+                trust_store,
+                status_fn,
+                peer_status_fn,
+            });
+
+            let handler: metrics::FedApiHandler = Arc::new(move |method, path, body| {
+                rustgate_federation::api::handle_request(method, path, body, &api_state)
+            });
+
+            let _ = fed_api_slot.set(handler);
+            tracing::info!("federation REST API wired into metrics server");
+        }
+
         let forward_fn: FedForwardFn = Arc::new(move |payload, groups| {
             let inner = Arc::clone(&rwlock_for_forward);
             drop(tokio::spawn(async move {
@@ -421,6 +503,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let fed_forward: Option<FedForwardFn> = {
         if cli.federation_v1_bind.is_some() {
             tracing::warn!("--federation-v1-bind requires --features federation; ignoring");
+        }
+        if cli.federation_v2_bind.is_some() {
+            tracing::warn!("--federation-v2-bind requires --features federation; ignoring");
         }
         None
     };
@@ -1084,6 +1169,7 @@ mod tests {
             "METRICS_BIND",
             "RUSTGATE_MAX_CONNECTIONS",
             "FEDERATION_V1_BIND",
+            "FEDERATION_V2_BIND",
             "FEDERATION_ID",
             "FEDERATION_PEERS_FILE",
             "FEDERATION_SKIP_HOSTNAME_VERIFY",
@@ -1122,6 +1208,7 @@ mod tests {
         ])
         .expect("should parse");
         assert!(cli.federation_v1_bind.is_none());
+        assert!(cli.federation_v2_bind.is_none());
         assert_eq!(cli.federation_id, "rustgate-federation-1");
         assert!(cli.federation_peers_file.is_none());
         assert!(!cli.federation_skip_hostname_verify);
@@ -1141,6 +1228,8 @@ mod tests {
             "ca.pem",
             "--federation-v1-bind",
             "0.0.0.0:9000",
+            "--federation-v2-bind",
+            "0.0.0.0:9001",
             "--federation-id",
             "my-fed-server",
             "--federation-max-hops",
@@ -1148,6 +1237,7 @@ mod tests {
         ])
         .expect("should parse");
         assert_eq!(cli.federation_v1_bind.as_deref(), Some("0.0.0.0:9000"));
+        assert_eq!(cli.federation_v2_bind.as_deref(), Some("0.0.0.0:9001"));
         assert_eq!(cli.federation_id, "my-fed-server");
         assert_eq!(cli.federation_max_hops, 5);
     }

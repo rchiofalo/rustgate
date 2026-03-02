@@ -16,6 +16,15 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use prometheus::{Encoder, IntCounter, IntCounterVec, IntGauge, Opts, TextEncoder};
 
+/// Type-erased federation API handler.
+///
+/// When set, the metrics server delegates requests under `/api/federation/`
+/// to this handler. Returns `None` for unrecognized paths so the caller can
+/// fall through to 404.
+#[cfg(feature = "federation")]
+pub type FedApiHandler =
+    Arc<dyn Fn(&hyper::Method, &str, &[u8]) -> Option<Response<Full<Bytes>>> + Send + Sync>;
+
 /// Maximum time for a single HTTP connection to the metrics server.
 /// Prevents slowloris attacks that hold connections open indefinitely.
 const HTTP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
@@ -259,7 +268,11 @@ fn handle_request(
 /// - Connection count bounded by [`MAX_HTTP_CONNECTIONS`]
 /// - Per-connection timeout of [`HTTP_CONNECTION_TIMEOUT`]
 /// - Header read timeout of 5 seconds
-pub async fn serve(bind: SocketAddr, ready: Arc<AtomicBool>) -> anyhow::Result<()> {
+pub async fn serve(
+    bind: SocketAddr,
+    ready: Arc<AtomicBool>,
+    #[cfg(feature = "federation")] fed_api: Arc<OnceLock<FedApiHandler>>,
+) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let conn_limit = Arc::new(tokio::sync::Semaphore::new(MAX_HTTP_CONNECTIONS));
     tracing::info!(addr = %bind, "metrics server started");
@@ -277,6 +290,8 @@ pub async fn serve(bind: SocketAddr, ready: Arc<AtomicBool>) -> anyhow::Result<(
 
         let io = hyper_util::rt::TokioIo::new(stream);
         let ready = Arc::clone(&ready);
+        #[cfg(feature = "federation")]
+        let fed_api = Arc::clone(&fed_api);
         drop(tokio::spawn(async move {
             let _permit = permit;
             let conn = hyper::server::conn::http1::Builder::new()
@@ -284,9 +299,32 @@ pub async fn serve(bind: SocketAddr, ready: Arc<AtomicBool>) -> anyhow::Result<(
                 .header_read_timeout(Duration::from_secs(5))
                 .serve_connection(
                     io,
-                    service_fn(move |req| {
+                    service_fn(move |req: Request<hyper::body::Incoming>| {
                         let ready = Arc::clone(&ready);
-                        async move { handle_request(req, ready) }
+                        #[cfg(feature = "federation")]
+                        let fed_api = Arc::clone(&fed_api);
+                        async move {
+                            // Delegate /api/federation/ paths to the federation handler
+                            #[cfg(feature = "federation")]
+                            if req.uri().path().starts_with("/api/federation/") {
+                                if let Some(handler) = fed_api.get() {
+                                    let method = req.method().clone();
+                                    let path = req.uri().path().to_string();
+                                    let body = http_body_util::BodyExt::collect(req.into_body())
+                                        .await
+                                        .map(|b| b.to_bytes())
+                                        .unwrap_or_default();
+                                    if let Some(resp) = handler(&method, &path, &body) {
+                                        return Ok(resp);
+                                    }
+                                }
+                                return Ok(Response::builder()
+                                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                                    .body(Full::new(Bytes::from("federation API not ready")))
+                                    .expect("static response"));
+                            }
+                            handle_request(req, ready)
+                        }
                     }),
                 );
             match tokio::time::timeout(HTTP_CONNECTION_TIMEOUT, conn).await {
@@ -375,7 +413,13 @@ mod tests {
 
         let server_ready = Arc::clone(&ready);
         drop(tokio::spawn(async move {
-            let _ = serve(addr, server_ready).await;
+            let _ = serve(
+                addr,
+                server_ready,
+                #[cfg(feature = "federation")]
+                Arc::new(OnceLock::new()),
+            )
+            .await;
         }));
 
         tokio::time::sleep(Duration::from_millis(50)).await;
