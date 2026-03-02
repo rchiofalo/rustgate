@@ -1,0 +1,43 @@
+[package]
+name = "rustgate-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+tokio-util = { version = "0.7", features = ["codec"] }
+rustgate-core = { path = "../crates/rustgate-core" }
+rustgate-transport = { path = "../crates/rustgate-transport" }
+rustgate-cot = { path = "../crates/rustgate-cot" }
+rustgate-proto = { path = "../crates/rustgate-proto" }
+rustgate-federation = { path = "../crates/rustgate-federation", features = ["v2"] }
+
+[[bin]]
+name = "xml_stream_codec"
+path = "fuzz_targets/xml_stream_codec.rs"
+doc = false
+
+[[bin]]
+name = "cot_parse"
+path = "fuzz_targets/cot_parse.rs"
+doc = false
+
+[[bin]]
+name = "tak_frame_codec"
+path = "fuzz_targets/tak_frame_codec.rs"
+doc = false
+
+[[bin]]
+name = "length_prefixed_codec"
+path = "fuzz_targets/length_prefixed_codec.rs"
+doc = false
+
+[[bin]]
+name = "v2_federation_convert"
+path = "fuzz_targets/v2_federation_convert.rs"
+doc = false

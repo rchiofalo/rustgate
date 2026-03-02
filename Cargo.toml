@@ -11,6 +11,7 @@ members = [
     "crates/rustgate-server",
     "crates/rustgate-test-utils",
 ]
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"
