@@ -1,6 +1,7 @@
 pub mod config;
 pub mod connector;
 pub mod heartbeat;
+pub mod manager;
 pub mod peer;
 pub mod provenance;
 pub mod store;
