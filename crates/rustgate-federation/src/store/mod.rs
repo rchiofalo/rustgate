@@ -13,8 +13,14 @@ pub struct FederateInfo {
     pub id: String,
     /// Network address (host:port).
     pub address: String,
-    /// Groups this federate participates in.
+    /// Groups this federate participates in (bidirectional fallback).
     pub groups: Vec<String>,
+    /// Groups accepted from this peer (inbound direction).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbound_groups: Option<Vec<String>>,
+    /// Groups sent to this peer (outbound direction).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound_groups: Option<Vec<String>>,
     /// Whether this federate is enabled.
     pub enabled: bool,
     /// Whether we initiate the connection (outbound) or they connect to us (inbound).
@@ -46,6 +52,8 @@ fn now() -> SystemTime {
 pub struct FederateUpdate {
     pub address: Option<String>,
     pub groups: Option<Vec<String>>,
+    pub inbound_groups: Option<Option<Vec<String>>>,
+    pub outbound_groups: Option<Option<Vec<String>>>,
     pub is_outbound: Option<bool>,
     pub trust_cert_cn: Option<Option<String>>,
 }
@@ -104,6 +112,8 @@ mod tests {
             id: id.to_string(),
             address: format!("10.0.0.1:{}", 9001),
             groups: vec!["Alpha".into()],
+            inbound_groups: None,
+            outbound_groups: None,
             enabled: true,
             is_outbound: true,
             trust_cert_cn: None,
@@ -204,9 +214,8 @@ mod tests {
     fn federate_update_debug() {
         let update = FederateUpdate {
             address: Some("new-addr".into()),
-            groups: None,
             is_outbound: Some(true),
-            trust_cert_cn: None,
+            ..Default::default()
         };
         let debug = format!("{update:?}");
         assert!(debug.contains("new-addr"));

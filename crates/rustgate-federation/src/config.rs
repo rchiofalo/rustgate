@@ -135,10 +135,17 @@ pub struct PeerConfig {
     pub id: String,
     /// Network address of the peer (host:port).
     pub address: String,
-    /// Groups this peer participates in (bidirectional).
-    /// TAK Server has separate inbound/outbound groups; we'll add that
-    /// in a future PR. For now, a single list covers the common use case.
+    /// Groups this peer participates in (bidirectional fallback).
+    /// Used when neither `inbound_groups` nor `outbound_groups` is set.
     pub groups: Vec<String>,
+    /// Groups accepted from this peer (inbound direction).
+    /// Overrides `groups` for inbound filtering when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbound_groups: Option<Vec<String>>,
+    /// Groups sent to this peer (outbound direction).
+    /// Overrides `groups` for outbound filtering when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound_groups: Option<Vec<String>>,
     /// Whether this peer connection is enabled.
     pub enabled: bool,
     /// Whether this is an outbound connection (we initiate) vs inbound (they connect to us).
@@ -152,6 +159,20 @@ pub struct PeerConfig {
     /// Defaults to V2 (gRPC). V1 uses length-prefixed XML.
     #[serde(default = "default_protocol_version")]
     pub protocol_version: u32,
+}
+
+impl PeerConfig {
+    /// Groups used for inbound filtering (accepting messages from this peer).
+    /// Returns `inbound_groups` if set, otherwise falls back to `groups`.
+    pub fn effective_inbound_groups(&self) -> &[String] {
+        self.inbound_groups.as_deref().unwrap_or(&self.groups)
+    }
+
+    /// Groups used for outbound filtering (sending messages to this peer).
+    /// Returns `outbound_groups` if set, otherwise falls back to `groups`.
+    pub fn effective_outbound_groups(&self) -> &[String] {
+        self.outbound_groups.as_deref().unwrap_or(&self.groups)
+    }
 }
 
 fn default_protocol_version() -> u32 {
@@ -214,6 +235,8 @@ mod tests {
             id: "peer-1".into(),
             address: "10.0.0.1:9001".into(),
             groups: vec!["Alpha".into(), "Bravo".into()],
+            inbound_groups: None,
+            outbound_groups: None,
             enabled: true,
             is_outbound: true,
             trust_cert_cn: Some("peer-1-ca".into()),
@@ -333,6 +356,8 @@ mod tests {
             id: "peer-1".into(),
             address: "10.0.0.1:9001".into(),
             groups: vec![],
+            inbound_groups: None,
+            outbound_groups: None,
             enabled: true,
             is_outbound: false,
             trust_cert_cn: None,
@@ -350,6 +375,8 @@ mod tests {
             id: "peer-1".into(),
             address: "10.0.0.1:9001".into(),
             groups: vec![],
+            inbound_groups: None,
+            outbound_groups: None,
             enabled: true,
             is_outbound: false,
             trust_cert_cn: None,
@@ -367,6 +394,8 @@ mod tests {
             id: "peer-1".into(),
             address: "10.0.0.1:9001".into(),
             groups: vec![],
+            inbound_groups: None,
+            outbound_groups: None,
             enabled: false,
             is_outbound: false,
             trust_cert_cn: None,
@@ -388,6 +417,8 @@ mod tests {
             id: "peer-1".into(),
             address: "10.0.0.1:9001".into(),
             groups: groups.clone(),
+            inbound_groups: None,
+            outbound_groups: None,
             enabled: true,
             is_outbound: true,
             trust_cert_cn: None,
@@ -412,6 +443,8 @@ mod tests {
             id: "legacy-peer".into(),
             address: "10.0.0.1:9000".into(),
             groups: vec!["Alpha".into()],
+            inbound_groups: None,
+            outbound_groups: None,
             enabled: true,
             is_outbound: true,
             trust_cert_cn: None,
@@ -421,6 +454,106 @@ mod tests {
         let json = serde_json::to_string(&peer).expect("serialize");
         let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.protocol_version, 1);
+    }
+
+    #[test]
+    fn effective_groups_fallback_to_groups() {
+        let peer = PeerConfig {
+            id: "p".into(),
+            address: "1.2.3.4:9001".into(),
+            groups: vec!["Alpha".into(), "Bravo".into()],
+            inbound_groups: None,
+            outbound_groups: None,
+            enabled: true,
+            is_outbound: true,
+            trust_cert_cn: None,
+            routing_mode: RoutingMode::default(),
+            protocol_version: 2,
+        };
+        assert_eq!(peer.effective_inbound_groups(), &["Alpha", "Bravo"]);
+        assert_eq!(peer.effective_outbound_groups(), &["Alpha", "Bravo"]);
+    }
+
+    #[test]
+    fn effective_groups_directional_override() {
+        let peer = PeerConfig {
+            id: "p".into(),
+            address: "1.2.3.4:9001".into(),
+            groups: vec!["Alpha".into()],
+            inbound_groups: Some(vec!["Inbound1".into(), "Inbound2".into()]),
+            outbound_groups: Some(vec!["Outbound1".into()]),
+            enabled: true,
+            is_outbound: true,
+            trust_cert_cn: None,
+            routing_mode: RoutingMode::default(),
+            protocol_version: 2,
+        };
+        assert_eq!(peer.effective_inbound_groups(), &["Inbound1", "Inbound2"]);
+        assert_eq!(peer.effective_outbound_groups(), &["Outbound1"]);
+    }
+
+    #[test]
+    fn effective_groups_partial_override() {
+        let peer = PeerConfig {
+            id: "p".into(),
+            address: "1.2.3.4:9001".into(),
+            groups: vec!["Alpha".into()],
+            inbound_groups: Some(vec!["Inbound1".into()]),
+            outbound_groups: None,
+            enabled: true,
+            is_outbound: true,
+            trust_cert_cn: None,
+            routing_mode: RoutingMode::default(),
+            protocol_version: 2,
+        };
+        assert_eq!(peer.effective_inbound_groups(), &["Inbound1"]);
+        // outbound falls back to groups
+        assert_eq!(peer.effective_outbound_groups(), &["Alpha"]);
+    }
+
+    #[test]
+    fn directional_groups_serde_round_trip() {
+        let peer = PeerConfig {
+            id: "p".into(),
+            address: "1.2.3.4:9001".into(),
+            groups: vec!["Alpha".into()],
+            inbound_groups: Some(vec!["In1".into()]),
+            outbound_groups: Some(vec!["Out1".into(), "Out2".into()]),
+            enabled: true,
+            is_outbound: true,
+            trust_cert_cn: None,
+            routing_mode: RoutingMode::default(),
+            protocol_version: 2,
+        };
+        let json = serde_json::to_string(&peer).expect("serialize");
+        assert!(json.contains("inbound_groups"));
+        assert!(json.contains("outbound_groups"));
+
+        let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.inbound_groups, Some(vec!["In1".into()]));
+        assert_eq!(
+            parsed.outbound_groups,
+            Some(vec!["Out1".into(), "Out2".into()])
+        );
+    }
+
+    #[test]
+    fn directional_groups_omitted_in_json_when_none() {
+        let peer = PeerConfig {
+            id: "p".into(),
+            address: "1.2.3.4:9001".into(),
+            groups: vec!["Alpha".into()],
+            inbound_groups: None,
+            outbound_groups: None,
+            enabled: true,
+            is_outbound: true,
+            trust_cert_cn: None,
+            routing_mode: RoutingMode::default(),
+            protocol_version: 2,
+        };
+        let json = serde_json::to_string(&peer).expect("serialize");
+        assert!(!json.contains("inbound_groups"));
+        assert!(!json.contains("outbound_groups"));
     }
 
     #[test]

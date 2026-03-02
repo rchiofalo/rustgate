@@ -121,6 +121,12 @@ impl FederateStore for FileStore {
         if let Some(groups) = update.groups {
             info.groups = groups;
         }
+        if let Some(inbound_groups) = update.inbound_groups {
+            info.inbound_groups = inbound_groups;
+        }
+        if let Some(outbound_groups) = update.outbound_groups {
+            info.outbound_groups = outbound_groups;
+        }
         if let Some(is_outbound) = update.is_outbound {
             info.is_outbound = is_outbound;
         }
@@ -176,6 +182,8 @@ mod tests {
             id: id.to_string(),
             address: format!("10.0.0.1:{}", 9001),
             groups: vec!["Alpha".into()],
+            inbound_groups: None,
+            outbound_groups: None,
             enabled: true,
             is_outbound: true,
             trust_cert_cn: None,
@@ -521,6 +529,7 @@ mod tests {
                     groups: Some(vec!["NewGroup".into()]),
                     is_outbound: Some(false),
                     trust_cert_cn: Some(Some("new-cn".into())),
+                    ..Default::default()
                 },
             )
             .expect("update");

@@ -510,6 +510,8 @@ mod tests {
             id: id.into(),
             address: "127.0.0.1:9001".into(),
             groups: vec!["Alpha".into()],
+            inbound_groups: None,
+            outbound_groups: None,
             enabled: true,
             is_outbound: true,
             trust_cert_cn: None,
