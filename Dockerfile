@@ -3,7 +3,8 @@
 # ── Builder stage ────────────────────────────────────────────────────────
 FROM rust:1.88-alpine AS builder
 
-RUN apk add --no-cache musl-dev protobuf-dev make cargo-auditable
+RUN apk add --no-cache musl-dev protobuf-dev make \
+    && cargo install cargo-auditable --locked
 
 WORKDIR /src
 
