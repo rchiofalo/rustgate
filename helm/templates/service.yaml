@@ -11,6 +11,12 @@ spec:
       port: {{ .Values.service.port }}
       targetPort: tak
       protocol: TCP
+    {{- if .Values.federation.enabled }}
+    - name: federation
+      port: 9000
+      targetPort: federation
+      protocol: TCP
+    {{- end }}
     {{- if .Values.metrics.enabled }}
     - name: metrics
       port: {{ .Values.metrics.port }}
