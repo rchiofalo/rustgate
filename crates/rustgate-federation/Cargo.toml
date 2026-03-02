@@ -55,3 +55,8 @@ tonic-prost-build = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 tempfile = { workspace = true }
 rustgate-test-utils = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "convert"
+harness = false
