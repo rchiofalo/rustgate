@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::config::FederationConfig;
@@ -54,6 +55,8 @@ pub struct FederationManager {
     config: FederationConfig,
     connector: Option<PeerConnector>,
     v1_server: Option<V1Server>,
+    #[cfg(feature = "v2")]
+    v2_server_handle: Option<JoinHandle<Result<(), tonic::transport::Error>>>,
     clients: HashMap<String, FederationClient>,
     peers: HashMap<String, Arc<PeerHandle>>,
     running: bool,
@@ -85,6 +88,8 @@ impl FederationManager {
             config,
             connector: None,
             v1_server: None,
+            #[cfg(feature = "v2")]
+            v2_server_handle: None,
             clients: HashMap::new(),
             peers: HashMap::new(),
             running: false,
@@ -138,6 +143,67 @@ impl FederationManager {
             info!(
                 addr = %self.config.v1_listen_addr,
                 "V1 federation server started"
+            );
+        }
+
+        // Start V2 gRPC inbound server if enabled
+        #[cfg(feature = "v2")]
+        if self.config.v2_enabled {
+            use tonic::transport::ServerTlsConfig;
+
+            let server_cert = tonic::transport::Identity::from_pem(&cert_pem, &key_pem);
+            let server_ca = tonic::transport::Certificate::from_pem(&ca_pem);
+
+            let tls_config = ServerTlsConfig::new()
+                .identity(server_cert)
+                .client_ca_root(server_ca);
+
+            let on_event_inbound = Arc::clone(&on_inbound);
+            let federate_id = self.config.federate_id.clone();
+            let on_event: crate::v2::server::OnEvent = Arc::new(move |event, peer_id| {
+                if event.event.is_some() {
+                    match crate::v2::convert::federated_event_to_xml(&event) {
+                        Ok(xml) => {
+                            on_event_inbound(peer_id, Bytes::from(xml));
+                        }
+                        Err(e) => {
+                            warn!(
+                                federate = %federate_id,
+                                error = %e,
+                                "failed to convert inbound V2 server event to XML"
+                            );
+                        }
+                    }
+                } else if let Some(ref contact) = event.contact {
+                    if let Some(xml) = crate::v2::convert::contact_list_entry_to_xml(contact) {
+                        on_event_inbound(peer_id, Bytes::from(xml));
+                    }
+                }
+            });
+
+            let service = crate::v2::server::FederationService::new(
+                self.config.federate_id.clone(),
+                self.config
+                    .peers
+                    .iter()
+                    .flat_map(|p| p.groups.clone())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
+                on_event,
+            );
+
+            let handle = crate::v2::server::FederationService::start(
+                self.config.v2_listen_addr,
+                tls_config,
+                service,
+                self.config.max_message_size,
+            );
+
+            self.v2_server_handle = Some(handle);
+            info!(
+                addr = %self.config.v2_listen_addr,
+                "V2 gRPC federation server started"
             );
         }
 
@@ -379,6 +445,13 @@ impl FederationManager {
             info!("V1 federation server stopped");
         }
 
+        // Shut down V2 gRPC server
+        #[cfg(feature = "v2")]
+        if let Some(handle) = self.v2_server_handle.take() {
+            handle.abort();
+            info!("V2 gRPC federation server stopped");
+        }
+
         // Shut down all outbound clients
         for (id, client) in self.clients.drain() {
             match client {
@@ -411,10 +484,15 @@ impl FederationManager {
 
     /// Get the aggregated federation status.
     pub fn status(&self) -> FederationStatus {
+        #[cfg(feature = "v2")]
+        let v2_active = self.v2_server_handle.is_some();
+        #[cfg(not(feature = "v2"))]
+        let v2_active = false;
+
         FederationStatus {
             running: self.running,
             v1_server_active: self.v1_server.is_some(),
-            v2_server_active: false, // V2 server managed externally for now
+            v2_server_active: v2_active,
             total_peers: self.peers.len(),
             connected_peers: self.connected_peer_count(),
             peers: self.all_peer_statuses(),

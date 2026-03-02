@@ -5,10 +5,12 @@
 //! event streaming, health checks, and provenance tracking.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{RwLock, mpsc};
+use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info};
@@ -151,6 +153,31 @@ impl FederationService {
             .initial_stream_window_size(Some(1024 * 1024)) // 1 MB
             .initial_connection_window_size(Some(2 * 1024 * 1024)) // 2 MB
             .max_frame_size(Some(max_message_size.min(u32::MAX as usize) as u32))
+    }
+
+    /// Start the V2 gRPC inbound server on the given address with mTLS.
+    ///
+    /// Returns a `JoinHandle` that resolves when the server shuts down.
+    /// Abort the handle to stop the server.
+    pub fn start(
+        bind: SocketAddr,
+        tls_config: tonic::transport::ServerTlsConfig,
+        service: FederationService,
+        max_message_size: usize,
+    ) -> JoinHandle<Result<(), tonic::transport::Error>> {
+        use super::proto::figpb::federated_channel_server::FederatedChannelServer;
+
+        let svc = FederatedChannelServer::new(service)
+            .max_decoding_message_size(max_message_size)
+            .max_encoding_message_size(max_message_size);
+
+        tokio::spawn(async move {
+            info!(addr = %bind, "V2 gRPC federation server starting");
+            Self::configured_server(max_message_size)
+                .tls_config(tls_config)?
+                .serve(bind, svc)
+                .await
+        })
     }
 }
 
