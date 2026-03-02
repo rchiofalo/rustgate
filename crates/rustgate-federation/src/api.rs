@@ -75,6 +75,8 @@ pub struct CreateFederateRequest {
     pub address: String,
     #[serde(default)]
     pub groups: Vec<String>,
+    pub inbound_groups: Option<Vec<String>>,
+    pub outbound_groups: Option<Vec<String>>,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
@@ -93,6 +95,8 @@ fn default_true() -> bool {
 pub struct UpdateFederateRequest {
     pub address: Option<String>,
     pub groups: Option<Vec<String>>,
+    pub inbound_groups: Option<Option<Vec<String>>>,
+    pub outbound_groups: Option<Option<Vec<String>>>,
     pub is_outbound: Option<bool>,
     pub trust_cert_cn: Option<Option<String>>,
 }
@@ -253,6 +257,8 @@ fn handle_create_federate<S: FederateStore>(
         id: req.id.clone(),
         address: req.address,
         groups: req.groups,
+        inbound_groups: req.inbound_groups,
+        outbound_groups: req.outbound_groups,
         enabled: req.enabled,
         is_outbound: req.is_outbound,
         trust_cert_cn: req.trust_cert_cn,
@@ -304,6 +310,8 @@ fn handle_update_federate<S: FederateStore>(
     let update = FederateUpdate {
         address: req.address,
         groups: req.groups,
+        inbound_groups: req.inbound_groups,
+        outbound_groups: req.outbound_groups,
         is_outbound: req.is_outbound,
         trust_cert_cn: req.trust_cert_cn,
     };
@@ -676,6 +684,8 @@ mod tests {
                         address: "10.0.0.1:9001".into(),
                         state: crate::peer::PeerState::Connected,
                         groups: vec!["Alpha".into()],
+                        inbound_groups: None,
+                        outbound_groups: None,
                         enabled: true,
                         is_outbound: true,
                         messages_sent: 10,

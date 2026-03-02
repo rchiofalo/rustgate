@@ -313,9 +313,11 @@ impl FederationManager {
                 continue;
             }
 
-            // Group-aware filtering: forward only if groups overlap
-            if !source_groups.is_empty() && !peer.config.groups.is_empty() {
-                let has_overlap = source_groups.iter().any(|g| peer.config.groups.contains(g));
+            // Group-aware filtering: forward only if source groups overlap
+            // with this peer's outbound groups (directional filtering).
+            let outbound = peer.config.effective_outbound_groups();
+            if !source_groups.is_empty() && !outbound.is_empty() {
+                let has_overlap = source_groups.iter().any(|g| outbound.contains(g));
                 if !has_overlap {
                     continue;
                 }
@@ -479,6 +481,8 @@ mod tests {
             id: id.into(),
             address: "127.0.0.1:9001".into(),
             groups,
+            inbound_groups: None,
+            outbound_groups: None,
             enabled: true,
             is_outbound: true,
             trust_cert_cn: None,
