@@ -3,8 +3,7 @@
 # ── Builder stage ────────────────────────────────────────────────────────
 FROM rust:1.88-alpine AS builder
 
-RUN apk add --no-cache musl-dev protobuf-dev make \
-    && cargo install cargo-auditable --locked
+RUN apk add --no-cache musl-dev protobuf-dev make
 
 WORKDIR /src
 
@@ -30,13 +29,13 @@ COPY crates/rustgate-proto/build.rs crates/rustgate-proto/build.rs
 COPY crates/rustgate-federation/proto crates/rustgate-federation/proto
 COPY crates/rustgate-federation/build.rs crates/rustgate-federation/build.rs
 
-RUN cargo auditable build --release --all-features 2>/dev/null || true
+RUN cargo build --release --all-features 2>/dev/null || true
 
 # Now copy real source and build for real.
 COPY . .
 # Touch all source files so cargo sees them as newer than the stubs.
 RUN find crates -name "*.rs" -exec touch {} +
-RUN cargo auditable build --release --all-features
+RUN cargo build --release --all-features
 
 # ── Runtime stage ────────────────────────────────────────────────────────
 FROM alpine:3.21
