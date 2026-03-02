@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Criterion benchmarks** — throughput benchmarks for CoT parsing, codec encode/decode, and federation XML conversion
 - **Container security scanning** — Trivy vulnerability scanning with SARIF upload in release workflow; cargo-audit in CI
 - **Binary release artifacts** — cross-compiled static binaries for x86_64 and aarch64 linux-musl via GitHub Release
-- **700 tests** — up from 639 in v0.2.0
+- **701 tests** — up from 639 in v0.2.0
 
 ## [0.2.0] - 2026-03-01
 

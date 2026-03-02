@@ -21,6 +21,7 @@ use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
 use rustgate_nats::{NatsAdapter, NatsConfig, WireEvent};
 use rustgate_transport::Router;
+use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
@@ -60,10 +61,15 @@ impl NatsTestServer {
                 panic!("nats-server failed to start within 5 seconds on port {port}");
             }
             match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
-                Ok(stream) => {
-                    // Wait until the server sends the INFO line (starts with "INFO ")
-                    let _ = stream.readable().await;
-                    break;
+                Ok(mut stream) => {
+                    // Read the first 5 bytes and verify the NATS INFO line.
+                    // A bare TCP accept isn't enough — the server may not be
+                    // protocol-ready yet, so we confirm it sends "INFO ".
+                    let mut buf = [0u8; 5];
+                    match stream.read_exact(&mut buf).await {
+                        Ok(_) if &buf == b"INFO " => break,
+                        _ => tokio::time::sleep(Duration::from_millis(50)).await,
+                    }
                 }
                 Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
             }
