@@ -643,8 +643,18 @@ mod tests {
     }
 
     #[test]
-    fn configured_server_does_not_panic() {
-        // Smoke test: building a configured server with default max_message_size
+    fn test_configured_server_default_size() {
         let _server = FederationService::configured_server(10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_configured_server_zero_size() {
+        let _server = FederationService::configured_server(0);
+    }
+
+    #[test]
+    fn test_configured_server_u32_max_clamp() {
+        // max_frame_size uses .min(u32::MAX) so very large values are clamped
+        let _server = FederationService::configured_server(usize::MAX);
     }
 }
