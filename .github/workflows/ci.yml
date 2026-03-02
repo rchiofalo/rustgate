@@ -63,6 +63,22 @@ jobs:
       - name: Test (federation only)
         run: cargo test --features federation
 
+      # Feature combination tests — validate interactions between features
+      - name: Test (federation + nats)
+        run: cargo test --features federation,nats
+
+      - name: Test (federation + metrics)
+        run: cargo test --features federation,metrics
+
+      - name: Test (proto + federation)
+        run: cargo test --features proto,federation
+
+      - name: Test (enrollment + federation)
+        run: cargo test --features enrollment,federation
+
+      - name: Test (nats + metrics)
+        run: cargo test --features nats,metrics
+
       - name: Test (all features)
         run: cargo test --all-features
 
