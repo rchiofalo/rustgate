@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
+#[cfg(feature = "v2")]
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 

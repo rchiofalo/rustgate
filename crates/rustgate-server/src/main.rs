@@ -1205,6 +1205,7 @@ mod tests {
             "ENROLLMENT_USER",
             "ENROLLMENT_PASSWORD",
             "RUSTGATE_CA_ORG",
+            "DATA_PACKAGE_DIR",
             "METRICS_BIND",
             "RUSTGATE_MAX_CONNECTIONS",
             "FEDERATION_V1_BIND",
