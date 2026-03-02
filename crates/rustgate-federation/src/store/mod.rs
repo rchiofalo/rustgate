@@ -1,4 +1,6 @@
 pub mod file;
+#[cfg(feature = "ha")]
+pub mod kv;
 
 use std::time::SystemTime;
 
@@ -59,17 +61,17 @@ pub trait FederateStore: Send + Sync {
     /// Add or replace a federate.
     fn add(&mut self, info: FederateInfo);
 
-    /// Get a federate by ID.
-    fn get(&self, id: &str) -> Option<&FederateInfo>;
+    /// Get a federate by ID (returns a clone).
+    fn get(&self, id: &str) -> Option<FederateInfo>;
 
-    /// List all federates.
-    fn list(&self) -> Vec<&FederateInfo>;
+    /// List all federates (returns clones).
+    fn list(&self) -> Vec<FederateInfo>;
 
-    /// List only enabled federates.
-    fn list_enabled(&self) -> Vec<&FederateInfo>;
+    /// List only enabled federates (returns clones).
+    fn list_enabled(&self) -> Vec<FederateInfo>;
 
-    /// List enabled outbound federates.
-    fn list_outbound(&self) -> Vec<&FederateInfo>;
+    /// List enabled outbound federates (returns clones).
+    fn list_outbound(&self) -> Vec<FederateInfo>;
 
     /// Remove a federate by ID. Returns `true` if it existed.
     fn remove(&mut self, id: &str) -> bool;

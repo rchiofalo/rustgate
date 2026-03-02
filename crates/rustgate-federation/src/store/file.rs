@@ -76,22 +76,27 @@ impl FederateStore for FileStore {
         let _ = self.federates.insert(info.id.clone(), info);
     }
 
-    fn get(&self, id: &str) -> Option<&FederateInfo> {
-        self.federates.get(id)
+    fn get(&self, id: &str) -> Option<FederateInfo> {
+        self.federates.get(id).cloned()
     }
 
-    fn list(&self) -> Vec<&FederateInfo> {
-        self.federates.values().collect()
+    fn list(&self) -> Vec<FederateInfo> {
+        self.federates.values().cloned().collect()
     }
 
-    fn list_enabled(&self) -> Vec<&FederateInfo> {
-        self.federates.values().filter(|f| f.enabled).collect()
+    fn list_enabled(&self) -> Vec<FederateInfo> {
+        self.federates
+            .values()
+            .filter(|f| f.enabled)
+            .cloned()
+            .collect()
     }
 
-    fn list_outbound(&self) -> Vec<&FederateInfo> {
+    fn list_outbound(&self) -> Vec<FederateInfo> {
         self.federates
             .values()
             .filter(|f| f.enabled && f.is_outbound)
+            .cloned()
             .collect()
     }
 
