@@ -77,7 +77,7 @@ pub struct FederationConfig {
     /// window, the connection is considered dead.
     pub client_timeout: Duration,
     /// Maximum message size in bytes.
-    /// TAK Server default: 268,435,456 (256 MB).
+    /// Standard TAK federation default: 10 MB.
     pub max_message_size: usize,
     /// Base delay before reconnecting to a disconnected peer.
     pub reconnect_delay: Duration,
@@ -114,7 +114,7 @@ impl Default for FederationConfig {
             heartbeat_timeout: Duration::from_secs(90),
             health_check_interval: Duration::from_secs(5),
             client_timeout: Duration::from_secs(15),
-            max_message_size: 268_435_456, // 256 MB — TAK Server default
+            max_message_size: 10_485_760, // 10 MB — standard TAK federation default
             reconnect_delay: Duration::from_secs(30),
             max_reconnects: -1,
             max_hops: 10,
@@ -184,7 +184,7 @@ mod tests {
         assert_eq!(cfg.heartbeat_timeout, Duration::from_secs(90));
         assert_eq!(cfg.health_check_interval, Duration::from_secs(5));
         assert_eq!(cfg.client_timeout, Duration::from_secs(15));
-        assert_eq!(cfg.max_message_size, 268_435_456);
+        assert_eq!(cfg.max_message_size, 10_485_760);
         assert_eq!(cfg.reconnect_delay, Duration::from_secs(30));
         assert_eq!(cfg.max_reconnects, -1);
         assert_eq!(cfg.max_hops, 10);

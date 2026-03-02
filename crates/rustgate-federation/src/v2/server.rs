@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{RwLock, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -133,6 +134,23 @@ impl FederationService {
             .remote_addr()
             .map(|addr| addr.to_string())
             .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    /// Create a pre-configured `tonic::transport::Server` with federation
+    /// keepalive and message size settings.
+    ///
+    /// Configures:
+    /// - HTTP/2 keepalive timeout: 20 seconds
+    /// - HTTP/2 keepalive interval: None (passive — relies on client pings)
+    /// - Max frame size and initial window sizes tuned for large CoT payloads
+    ///
+    /// The caller is responsible for binding to an address and adding TLS config.
+    pub fn configured_server(max_message_size: usize) -> tonic::transport::Server {
+        tonic::transport::Server::builder()
+            .http2_keepalive_timeout(Some(Duration::from_secs(20)))
+            .initial_stream_window_size(Some(1024 * 1024)) // 1 MB
+            .initial_connection_window_size(Some(2 * 1024 * 1024)) // 2 MB
+            .max_frame_size(Some(max_message_size.min(u32::MAX as usize) as u32))
     }
 }
 
@@ -622,5 +640,11 @@ mod tests {
             streams.insert("peer-2".into(), tx2);
         }
         assert_eq!(svc.connection_count().await, 2);
+    }
+
+    #[test]
+    fn configured_server_does_not_panic() {
+        // Smoke test: building a configured server with default max_message_size
+        let _server = FederationService::configured_server(10 * 1024 * 1024);
     }
 }

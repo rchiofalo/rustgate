@@ -551,6 +551,7 @@ mod tests {
             status_fn: Arc::new(|| FederationStatus {
                 running: true,
                 v1_server_active: true,
+                v2_server_active: false,
                 total_peers: 2,
                 connected_peers: 1,
                 peers: vec![],
@@ -663,6 +664,7 @@ mod tests {
             status_fn: Arc::new(|| FederationStatus {
                 running: true,
                 v1_server_active: true,
+                v2_server_active: false,
                 total_peers: 1,
                 connected_peers: 1,
                 peers: vec![],
@@ -953,6 +955,7 @@ mod tests {
             status_fn: Arc::new(|| FederationStatus {
                 running: false,
                 v1_server_active: false,
+                v2_server_active: false,
                 total_peers: 0,
                 connected_peers: 0,
                 peers: vec![],

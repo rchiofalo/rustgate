@@ -436,6 +436,129 @@ fn xml_escape_into(buf: &mut Vec<u8>, s: &str) {
     }
 }
 
+/// Return a string with XML-escaped attribute characters.
+fn xml_escape(s: &str) -> String {
+    let mut buf = Vec::with_capacity(s.len());
+    xml_escape_into(&mut buf, s);
+    // xml_escape_into only emits valid UTF-8 (ASCII replacements for ASCII bytes)
+    String::from_utf8(buf).expect("xml_escape_into produces valid UTF-8")
+}
+
+// ---------------------------------------------------------------------------
+// Flow tag injection
+// ---------------------------------------------------------------------------
+
+/// Inject a `<_flow-tags_>` element into a CoT XML payload for traceability.
+///
+/// The flow tag records which federation server processed the message and when.
+/// If the XML has a `</detail>` section, the tag is inserted before it.
+/// If there is no `<detail>` section but `</event>` exists, a new `<detail>`
+/// section is created containing the flow tag.
+///
+/// Returns the original bytes unchanged if neither marker is found.
+pub fn add_flow_tag(data: &[u8], source: &str) -> Vec<u8> {
+    let s = match std::str::from_utf8(data) {
+        Ok(s) => s,
+        Err(_) => return data.to_vec(),
+    };
+
+    let now = time::OffsetDateTime::now_utc();
+    let ts = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
+
+    let flow_tag = format!(
+        r#"<_flow-tags_><source name="{}" ts="{}"/></_flow-tags_>"#,
+        xml_escape(source),
+        ts,
+    );
+
+    if let Some(pos) = s.find("</detail>") {
+        // Insert flow tag before </detail>
+        let mut result = String::with_capacity(s.len() + flow_tag.len());
+        result.push_str(&s[..pos]);
+        result.push_str(&flow_tag);
+        result.push_str(&s[pos..]);
+        result.into_bytes()
+    } else if let Some(pos) = s.find("</event>") {
+        // No detail section — wrap flow tag in a new detail element
+        let mut result = String::with_capacity(s.len() + flow_tag.len() + 17);
+        result.push_str(&s[..pos]);
+        result.push_str("<detail>");
+        result.push_str(&flow_tag);
+        result.push_str("</detail>");
+        result.push_str(&s[pos..]);
+        result.into_bytes()
+    } else {
+        data.to_vec()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ContactListEntry → CoT XML
+// ---------------------------------------------------------------------------
+
+/// Convert a `ContactListEntry` into a synthetic CoT XML message.
+///
+/// Contact deletions produce a `t-x-d-d` event type; creates and updates
+/// produce `a-f-G-U-C`. Returns `None` if the contact has no UID.
+///
+/// The generated XML uses zero coordinates with maximum CE/LE to indicate
+/// unknown position, and a 5-minute stale window.
+pub fn contact_list_entry_to_xml(contact: &figpb::ContactListEntry) -> Option<Vec<u8>> {
+    if contact.uid.is_empty() {
+        return None;
+    }
+
+    let now = time::OffsetDateTime::now_utc();
+    let stale = now + time::Duration::minutes(5);
+
+    let fmt = &time::format_description::well_known::Rfc3339;
+    let now_str = now.format(fmt).unwrap_or_default();
+    let stale_str = stale.format(fmt).unwrap_or_default();
+
+    // DELETE operation → t-x-d-d; everything else → a-f-G-U-C
+    let cot_type = if contact.operation == figpb::Crud::Delete as i32 {
+        "t-x-d-d"
+    } else {
+        "a-f-G-U-C"
+    };
+
+    let mut xml = Vec::with_capacity(512);
+    xml.extend_from_slice(b"<event version=\"2.0\"");
+    write_attr(&mut xml, "uid", &contact.uid);
+    write_attr(&mut xml, "type", cot_type);
+    write_attr(&mut xml, "time", &now_str);
+    write_attr(&mut xml, "start", &now_str);
+    write_attr(&mut xml, "stale", &stale_str);
+    write_attr(&mut xml, "how", "h-e");
+    xml.extend_from_slice(b">");
+
+    // Unknown location
+    xml.extend_from_slice(
+        b"<point lat=\"0.0\" lon=\"0.0\" hae=\"0.0\" ce=\"9999999\" le=\"9999999\"/>",
+    );
+
+    xml.extend_from_slice(b"<detail>");
+
+    // <contact callsign="..." [phone="..."] [sipAddress="..."] [endpoint="..."]/>
+    xml.extend_from_slice(b"<contact");
+    write_attr(&mut xml, "callsign", &contact.callsign);
+    if !contact.phone.is_empty() {
+        write_attr(&mut xml, "phone", &contact.phone);
+    }
+    if !contact.sip.is_empty() {
+        write_attr(&mut xml, "sipAddress", &contact.sip);
+    }
+    if !contact.direct_connect.is_empty() {
+        write_attr(&mut xml, "endpoint", &contact.direct_connect);
+    }
+    xml.extend_from_slice(b"/>");
+
+    xml.extend_from_slice(b"</detail></event>");
+    Some(xml)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -907,6 +1030,12 @@ mod tests {
         assert_eq!(String::from_utf8(buf).expect("utf8"), "plain text 123");
     }
 
+    #[test]
+    fn xml_escape_string_helper() {
+        assert_eq!(xml_escape("A&B"), "A&amp;B");
+        assert_eq!(xml_escape("plain"), "plain");
+    }
+
     // --- Round-trip conversion tests ---
 
     #[test]
@@ -1000,5 +1129,152 @@ mod tests {
         assert_eq!(msg_back.source.cn, "peer-x");
         assert_eq!(msg_back.metadata.source_protocol, SOURCE_FEDERATION);
         assert_eq!(msg_back.metadata.message_type, MessageType::Position);
+    }
+
+    // --- add_flow_tag tests ---
+
+    #[test]
+    fn flow_tag_inserted_before_detail_close() {
+        let xml = b"<event><detail><contact callsign=\"A\"/></detail></event>";
+        let result = add_flow_tag(xml, "fed-server-1");
+        let s = String::from_utf8(result).expect("utf8");
+        assert!(s.contains("<_flow-tags_>"));
+        assert!(s.contains("<source name=\"fed-server-1\""));
+        assert!(s.contains("</_flow-tags_></detail>"));
+    }
+
+    #[test]
+    fn flow_tag_creates_detail_section_when_missing() {
+        let xml = b"<event><point lat=\"0\" lon=\"0\"/></event>";
+        let result = add_flow_tag(xml, "my-server");
+        let s = String::from_utf8(result).expect("utf8");
+        assert!(s.contains("<detail><_flow-tags_>"));
+        assert!(s.contains("</_flow-tags_></detail></event>"));
+    }
+
+    #[test]
+    fn flow_tag_escapes_source_name() {
+        let xml = b"<event><detail></detail></event>";
+        let result = add_flow_tag(xml, "server&<>\"name");
+        let s = String::from_utf8(result).expect("utf8");
+        assert!(s.contains("server&amp;&lt;&gt;&quot;name"));
+    }
+
+    #[test]
+    fn flow_tag_includes_timestamp() {
+        let xml = b"<event><detail></detail></event>";
+        let result = add_flow_tag(xml, "s");
+        let s = String::from_utf8(result).expect("utf8");
+        // Timestamp should be in RFC3339 format (contains 'T' and 'Z' or offset)
+        assert!(s.contains("ts=\"20"));
+    }
+
+    #[test]
+    fn flow_tag_no_change_for_invalid_xml() {
+        let data = b"not xml at all";
+        let result = add_flow_tag(data, "s");
+        assert_eq!(result, data);
+    }
+
+    // --- contact_list_entry_to_xml tests ---
+
+    #[test]
+    fn contact_entry_create_produces_position_type() {
+        let contact = figpb::ContactListEntry {
+            operation: figpb::Crud::Create as i32,
+            uid: "user-123".into(),
+            callsign: "ALPHA".into(),
+            phone: String::new(),
+            sip: String::new(),
+            direct_connect: String::new(),
+        };
+        let xml = contact_list_entry_to_xml(&contact).expect("should produce XML");
+        let s = String::from_utf8(xml).expect("utf8");
+        assert!(s.contains("type=\"a-f-G-U-C\""));
+        assert!(s.contains("uid=\"user-123\""));
+        assert!(s.contains("callsign=\"ALPHA\""));
+    }
+
+    #[test]
+    fn contact_entry_delete_produces_delete_type() {
+        let contact = figpb::ContactListEntry {
+            operation: figpb::Crud::Delete as i32,
+            uid: "user-456".into(),
+            callsign: "BRAVO".into(),
+            ..Default::default()
+        };
+        let xml = contact_list_entry_to_xml(&contact).expect("should produce XML");
+        let s = String::from_utf8(xml).expect("utf8");
+        assert!(s.contains("type=\"t-x-d-d\""));
+    }
+
+    #[test]
+    fn contact_entry_includes_optional_fields() {
+        let contact = figpb::ContactListEntry {
+            operation: figpb::Crud::Create as i32,
+            uid: "user-789".into(),
+            callsign: "CHARLIE".into(),
+            phone: "+1-555-0100".into(),
+            sip: "sip:charlie@example.com".into(),
+            direct_connect: "*:-1:stcp".into(),
+        };
+        let xml = contact_list_entry_to_xml(&contact).expect("should produce XML");
+        let s = String::from_utf8(xml).expect("utf8");
+        assert!(s.contains("phone=\"+1-555-0100\""));
+        assert!(s.contains("sipAddress=\"sip:charlie@example.com\""));
+        assert!(s.contains("endpoint=\"*:-1:stcp\""));
+    }
+
+    #[test]
+    fn contact_entry_empty_uid_returns_none() {
+        let contact = figpb::ContactListEntry {
+            uid: String::new(),
+            callsign: "DELTA".into(),
+            ..Default::default()
+        };
+        assert!(contact_list_entry_to_xml(&contact).is_none());
+    }
+
+    #[test]
+    fn contact_entry_has_zero_coordinates() {
+        let contact = figpb::ContactListEntry {
+            operation: figpb::Crud::Create as i32,
+            uid: "user-000".into(),
+            callsign: "ECHO".into(),
+            ..Default::default()
+        };
+        let xml = contact_list_entry_to_xml(&contact).expect("should produce XML");
+        let s = String::from_utf8(xml).expect("utf8");
+        assert!(s.contains("lat=\"0.0\""));
+        assert!(s.contains("lon=\"0.0\""));
+        assert!(s.contains("ce=\"9999999\""));
+        assert!(s.contains("le=\"9999999\""));
+    }
+
+    #[test]
+    fn contact_entry_how_is_h_e() {
+        let contact = figpb::ContactListEntry {
+            operation: figpb::Crud::Create as i32,
+            uid: "user-he".into(),
+            callsign: "FOXTROT".into(),
+            ..Default::default()
+        };
+        let xml = contact_list_entry_to_xml(&contact).expect("should produce XML");
+        let s = String::from_utf8(xml).expect("utf8");
+        assert!(s.contains("how=\"h-e\""));
+    }
+
+    #[test]
+    fn contact_entry_escapes_xml_special_chars() {
+        let contact = figpb::ContactListEntry {
+            operation: figpb::Crud::Create as i32,
+            uid: "user&amp".into(),
+            callsign: "A<B>C".into(),
+            ..Default::default()
+        };
+        let xml = contact_list_entry_to_xml(&contact).expect("should produce XML");
+        let s = String::from_utf8(xml).expect("utf8");
+        assert!(s.contains("uid=\"user&amp;amp\""));
+        assert!(s.contains("callsign=\"A&lt;B&gt;C\""));
     }
 }

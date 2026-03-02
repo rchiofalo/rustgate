@@ -146,6 +146,18 @@ fn should_stop(max_reconnects: i32, count: u32) -> bool {
     max_reconnects >= 0 && count >= max_reconnects as u32
 }
 
+/// Calculate post-disconnect cooldown before reconnecting.
+///
+/// TAK Server's federation cleanup can take 30–60 seconds to purge a stale
+/// federate entry. Reconnecting too quickly triggers "duplicate federate
+/// connection" rejections. The cooldown is 4× the base reconnect delay,
+/// with a minimum of 60 seconds.
+pub(crate) fn post_disconnect_cooldown(reconnect_delay: Duration) -> Duration {
+    let cooldown = reconnect_delay.saturating_mul(4);
+    let min_cooldown = Duration::from_secs(60);
+    cooldown.max(min_cooldown)
+}
+
 /// Main connection loop with automatic reconnection.
 #[allow(clippy::too_many_arguments)]
 async fn connection_loop(
@@ -242,6 +254,27 @@ async fn connection_loop(
         }
 
         peer.set_state(PeerState::Disconnected);
+
+        // Post-disconnect cooldown: wait before reconnecting to give the remote
+        // TAK Server time to purge the stale federate entry. Without this delay,
+        // rapid reconnection triggers "duplicate federate connection" rejections
+        // on the remote side. Use 4× the base reconnect delay, minimum 60s.
+        let cooldown = post_disconnect_cooldown(reconnect_delay);
+        info!(
+            peer = %peer.id,
+            cooldown = ?cooldown,
+            "post-disconnect cooldown before reconnect"
+        );
+
+        tokio::select! {
+            _ = tokio::time::sleep(cooldown) => {}
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+        }
+
         reconnect_count += 1;
     }
 }
@@ -257,7 +290,12 @@ async fn build_channel(address: &str, tls_config: ClientTlsConfig) -> anyhow::Re
         .tls_config(tls_config)
         .map_err(|e| anyhow::anyhow!("TLS config error: {e}"))?
         .connect_timeout(Duration::from_secs(30))
-        .timeout(Duration::from_secs(300));
+        .timeout(Duration::from_secs(300))
+        // gRPC keepalive: ping every 10s, timeout after 5s, allow while idle.
+        // Matches TAK Server federation protocol expectations.
+        .http2_keep_alive_interval(Duration::from_secs(10))
+        .keep_alive_timeout(Duration::from_secs(5))
+        .keep_alive_while_idle(true);
 
     let channel = endpoint
         .connect()
@@ -692,5 +730,32 @@ mod tests {
         on_event(figpb::FederatedEvent::default(), "peer-1".into());
         on_event(figpb::FederatedEvent::default(), "peer-1".into());
         assert_eq!(count.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn post_disconnect_cooldown_default() {
+        // Default reconnect_delay of 30s → 120s cooldown, but minimum is 60s
+        let cooldown = post_disconnect_cooldown(Duration::from_secs(30));
+        assert_eq!(cooldown, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn post_disconnect_cooldown_minimum_enforced() {
+        // 10s * 4 = 40s, but minimum is 60s
+        let cooldown = post_disconnect_cooldown(Duration::from_secs(10));
+        assert_eq!(cooldown, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn post_disconnect_cooldown_exact_minimum() {
+        // 15s * 4 = 60s, exactly the minimum
+        let cooldown = post_disconnect_cooldown(Duration::from_secs(15));
+        assert_eq!(cooldown, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn post_disconnect_cooldown_zero() {
+        let cooldown = post_disconnect_cooldown(Duration::ZERO);
+        assert_eq!(cooldown, Duration::from_secs(60));
     }
 }

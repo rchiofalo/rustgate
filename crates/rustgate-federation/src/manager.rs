@@ -1,6 +1,6 @@
 //! Federation manager — orchestrates all federation peer connections.
 //!
-//! The manager owns the V1 inbound server and outbound clients,
+//! The manager owns the V1 and V2 inbound servers and outbound clients,
 //! routing messages between federation peers and the local system
 //! via callbacks. It does not directly depend on the Router or NATS;
 //! integration with those systems happens at the wiring layer
@@ -25,9 +25,26 @@ use crate::v1::{V1Client, V1Server};
 /// and routing the message to local clients (e.g., via the Router).
 pub type OnInbound = Arc<dyn Fn(String, Bytes) + Send + Sync>;
 
+/// Wraps either a V1 or V2 outbound federation client.
+enum FederationClient {
+    V1(V1Client),
+    #[cfg(feature = "v2")]
+    V2(crate::v2::client::V2Client),
+}
+
+impl std::fmt::Debug for FederationClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::V1(_) => write!(f, "FederationClient::V1"),
+            #[cfg(feature = "v2")]
+            Self::V2(_) => write!(f, "FederationClient::V2"),
+        }
+    }
+}
+
 /// Orchestrates all federation peer connections.
 ///
-/// Manages the V1 inbound server and outbound clients, providing:
+/// Manages the V1/V2 inbound servers and outbound clients, providing:
 /// - Lifecycle management (start/shutdown)
 /// - Inbound message routing via callback
 /// - Outbound message forwarding with group-aware filtering
@@ -37,7 +54,7 @@ pub struct FederationManager {
     config: FederationConfig,
     connector: Option<PeerConnector>,
     v1_server: Option<V1Server>,
-    clients: HashMap<String, V1Client>,
+    clients: HashMap<String, FederationClient>,
     peers: HashMap<String, Arc<PeerHandle>>,
     running: bool,
 }
@@ -49,6 +66,8 @@ pub struct FederationStatus {
     pub running: bool,
     /// Whether the V1 inbound server is active.
     pub v1_server_active: bool,
+    /// Whether the V2 gRPC inbound server is active.
+    pub v2_server_active: bool,
     /// Total number of configured peers.
     pub total_peers: usize,
     /// Number of currently connected peers.
@@ -74,8 +93,8 @@ impl FederationManager {
 
     /// Start the federation manager.
     ///
-    /// Creates the TLS connector, starts the V1 inbound server (if enabled),
-    /// and initiates outbound connections to all configured V1 peers.
+    /// Creates the TLS connector, starts the V1/V2 inbound servers (if enabled),
+    /// and initiates outbound connections to all configured peers.
     ///
     /// The `on_inbound` callback is invoked for every non-heartbeat message
     /// received from any federation peer (both inbound and outbound connections).
@@ -92,7 +111,7 @@ impl FederationManager {
         let ca_pem = std::fs::read_to_string(&self.config.ca_file)
             .map_err(|e| anyhow::anyhow!("read CA file: {e}"))?;
 
-        // Create outbound connector
+        // Create outbound connector (used by V1 clients)
         let connector = PeerConnector::from_pem(
             &cert_pem,
             &key_pem,
@@ -122,13 +141,23 @@ impl FederationManager {
             );
         }
 
-        // Connect to all enabled outbound V1 peers
+        // Build V2 TLS config for outbound gRPC clients (if v2 feature is enabled)
+        #[cfg(feature = "v2")]
+        let v2_tls_config = {
+            use tonic::transport::ClientTlsConfig;
+
+            let ca_cert = tonic::transport::Certificate::from_pem(&ca_pem);
+            let client_identity = tonic::transport::Identity::from_pem(&cert_pem, &key_pem);
+
+            ClientTlsConfig::new()
+                .ca_certificate(ca_cert)
+                .identity(client_identity)
+        };
+
+        // Connect to all enabled outbound peers
         for peer_config in &self.config.peers {
             if !peer_config.enabled || !peer_config.is_outbound {
                 continue;
-            }
-            if peer_config.protocol_version != 1 {
-                continue; // V2 support in a future PR
             }
 
             let addr: std::net::SocketAddr = match peer_config.address.parse() {
@@ -146,27 +175,92 @@ impl FederationManager {
 
             let peer = Arc::new(PeerHandle::new(peer_config.clone()));
 
-            let client = V1Client::start(
-                Arc::clone(&peer),
-                connector.clone(),
-                addr,
-                addr.ip().to_string(),
-                self.config.federate_id.clone(),
-                self.config.heartbeat_interval,
-                self.config.heartbeat_timeout,
-                self.config.reconnect_delay,
-                self.config.max_reconnects,
-                Arc::clone(&on_inbound),
-            );
+            match peer_config.protocol_version {
+                1 => {
+                    let client = V1Client::start(
+                        Arc::clone(&peer),
+                        connector.clone(),
+                        addr,
+                        addr.ip().to_string(),
+                        self.config.federate_id.clone(),
+                        self.config.heartbeat_interval,
+                        self.config.heartbeat_timeout,
+                        self.config.reconnect_delay,
+                        self.config.max_reconnects,
+                        Arc::clone(&on_inbound),
+                    );
 
-            info!(
-                peer_id = %peer_config.id,
-                addr = %addr,
-                "started V1 federation client"
-            );
+                    info!(
+                        peer_id = %peer_config.id,
+                        addr = %addr,
+                        "started V1 federation client"
+                    );
 
-            let _ = self.peers.insert(peer_config.id.clone(), peer);
-            let _ = self.clients.insert(peer_config.id.clone(), client);
+                    let _ = self.peers.insert(peer_config.id.clone(), peer);
+                    let _ = self
+                        .clients
+                        .insert(peer_config.id.clone(), FederationClient::V1(client));
+                }
+                #[cfg(feature = "v2")]
+                2 => {
+                    let on_event_inbound = Arc::clone(&on_inbound);
+                    let federate_id = self.config.federate_id.clone();
+                    let on_event: crate::v2::client::OnEvent = Arc::new(move |event, peer_id| {
+                        // Try GeoEvent first, then fall back to ContactListEntry
+                        if event.event.is_some() {
+                            match crate::v2::convert::federated_event_to_xml(&event) {
+                                Ok(xml) => {
+                                    on_event_inbound(peer_id, Bytes::from(xml));
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        federate = %federate_id,
+                                        error = %e,
+                                        "failed to convert inbound V2 GeoEvent to XML"
+                                    );
+                                }
+                            }
+                        } else if let Some(ref contact) = event.contact {
+                            if let Some(xml) =
+                                crate::v2::convert::contact_list_entry_to_xml(contact)
+                            {
+                                on_event_inbound(peer_id, Bytes::from(xml));
+                            }
+                        }
+                    });
+
+                    let client = crate::v2::client::V2Client::start(
+                        Arc::clone(&peer),
+                        peer_config.address.clone(),
+                        v2_tls_config.clone(),
+                        self.config.federate_id.clone(),
+                        peer_config.groups.clone(),
+                        self.config.health_check_interval,
+                        self.config.reconnect_delay,
+                        self.config.max_reconnects,
+                        on_event,
+                    );
+
+                    info!(
+                        peer_id = %peer_config.id,
+                        addr = %addr,
+                        "started V2 gRPC federation client"
+                    );
+
+                    let _ = self.peers.insert(peer_config.id.clone(), peer);
+                    let _ = self
+                        .clients
+                        .insert(peer_config.id.clone(), FederationClient::V2(client));
+                }
+                other => {
+                    warn!(
+                        peer_id = %peer_config.id,
+                        protocol_version = other,
+                        "skipping peer with unsupported protocol version"
+                    );
+                    continue;
+                }
+            }
         }
 
         self.running = true;
@@ -182,14 +276,33 @@ impl FederationManager {
 
     /// Forward a message payload to all relevant connected federation peers.
     ///
-    /// Filters peers by group overlap: a peer receives the message only if
-    /// at least one of its configured groups matches one of the `source_groups`.
-    /// If either `source_groups` or the peer's groups are empty, the message
-    /// is forwarded unconditionally (broadcast behavior).
+    /// Injects a flow tag into the XML for traceability, then filters peers
+    /// by group overlap: a peer receives the message only if at least one of
+    /// its configured groups matches one of the `source_groups`. If either
+    /// `source_groups` or the peer's groups are empty, the message is
+    /// forwarded unconditionally (broadcast behavior).
+    ///
+    /// For V2 peers, the raw XML payload is converted to a FederatedEvent
+    /// before sending over gRPC.
     ///
     /// Returns the number of peers the message was successfully queued to.
     pub async fn forward(&self, payload: Bytes, source_groups: &[String]) -> usize {
         let mut sent = 0;
+
+        // Inject flow tag for traceability (identifies which federation server
+        // processed this message and when)
+        #[cfg(feature = "v2")]
+        let payload = {
+            let tagged = crate::v2::convert::add_flow_tag(&payload, &self.config.federate_id);
+            Bytes::from(tagged)
+        };
+        #[cfg(not(feature = "v2"))]
+        let payload = payload;
+
+        // Lazily convert to FederatedEvent only if there are V2 peers
+        #[cfg(feature = "v2")]
+        let mut v2_event: Option<crate::v2::proto::figpb::FederatedEvent> = None;
+
         for (id, client) in &self.clients {
             let peer = match self.peers.get(id) {
                 Some(p) => p,
@@ -208,7 +321,37 @@ impl FederationManager {
                 }
             }
 
-            match client.send(payload.clone()).await {
+            let result = match client {
+                FederationClient::V1(v1) => v1.send(payload.clone()).await,
+                #[cfg(feature = "v2")]
+                FederationClient::V2(v2) => {
+                    // Convert XML payload to FederatedEvent on first V2 peer
+                    let event = match &v2_event {
+                        Some(e) => e.clone(),
+                        None => {
+                            let metadata =
+                                crate::provenance::FederationMetadata::new(self.config.max_hops);
+                            match crate::v2::convert::xml_to_federated_event(&payload, &metadata) {
+                                Ok(e) => {
+                                    v2_event = Some(e.clone());
+                                    e
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        peer_id = %id,
+                                        error = %e,
+                                        "failed to convert XML to FederatedEvent for V2 peer"
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                    };
+                    v2.send(event).await
+                }
+            };
+
+            match result {
                 Ok(()) => {
                     sent += 1;
                 }
@@ -237,9 +380,18 @@ impl FederationManager {
         }
 
         // Shut down all outbound clients
-        for (id, mut client) in self.clients.drain() {
-            client.shutdown().await;
-            info!(peer_id = %id, "federation client stopped");
+        for (id, client) in self.clients.drain() {
+            match client {
+                FederationClient::V1(mut v1) => {
+                    v1.shutdown().await;
+                    info!(peer_id = %id, "V1 federation client stopped");
+                }
+                #[cfg(feature = "v2")]
+                FederationClient::V2(mut v2) => {
+                    v2.shutdown().await;
+                    info!(peer_id = %id, "V2 federation client stopped");
+                }
+            }
         }
 
         self.peers.clear();
@@ -262,6 +414,7 @@ impl FederationManager {
         FederationStatus {
             running: self.running,
             v1_server_active: self.v1_server.is_some(),
+            v2_server_active: false, // V2 server managed externally for now
             total_peers: self.peers.len(),
             connected_peers: self.connected_peer_count(),
             peers: self.all_peer_statuses(),
@@ -308,7 +461,7 @@ mod tests {
             heartbeat_timeout: Duration::from_secs(90),
             health_check_interval: Duration::from_secs(5),
             client_timeout: Duration::from_secs(15),
-            max_message_size: 256 * 1024 * 1024,
+            max_message_size: 10 * 1024 * 1024,
             reconnect_delay: Duration::from_secs(30),
             max_reconnects: -1,
             max_hops: 10,
@@ -526,7 +679,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_skips_disabled_peers() {
+    async fn start_skips_disabled_and_inbound_peers() {
         use rustgate_test_utils::certs::TestCa;
 
         let ca = TestCa::new("Test CA");
@@ -547,8 +700,8 @@ mod tests {
         let mut inbound_only = test_peer_config("inbound-only", vec!["Beta".into()]);
         inbound_only.is_outbound = false;
 
-        let mut v2_peer = test_peer_config("v2-peer", vec!["Gamma".into()]);
-        v2_peer.protocol_version = 2;
+        let mut bad_version = test_peer_config("bad-version", vec!["Gamma".into()]);
+        bad_version.protocol_version = 99;
 
         let config = FederationConfig {
             federate_id: "test-server".into(),
@@ -556,7 +709,7 @@ mod tests {
             peers: vec![
                 disabled,
                 inbound_only,
-                v2_peer,
+                bad_version,
                 test_peer_config("active-peer", vec!["Delta".into()]),
             ],
             cert_file: cert_path,
@@ -571,7 +724,7 @@ mod tests {
         let on_inbound: OnInbound = Arc::new(|_cn, _data| {});
 
         manager.start(on_inbound).await.expect("start");
-        // Only active-peer should be started (disabled, inbound-only, and V2 skipped)
+        // Only active-peer should be started (disabled, inbound-only, and bad version skipped)
         assert_eq!(manager.peer_count(), 1);
         assert!(manager.peer_status("active-peer").is_some());
 
@@ -631,6 +784,7 @@ mod tests {
         let status = FederationStatus {
             running: true,
             v1_server_active: true,
+            v2_server_active: false,
             total_peers: 2,
             connected_peers: 1,
             peers: vec![],
