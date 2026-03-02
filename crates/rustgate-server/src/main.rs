@@ -329,7 +329,25 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             enrollment_user.to_string(),
             enrollment_password.to_string(),
         );
-        let enrollment_server = rustgate_enrollment::EnrollmentServer::new(signer, credentials);
+        let enrollment_router = Arc::clone(&router);
+        let contacts_provider: rustgate_enrollment::ContactsProvider = Arc::new(move || {
+            let r = Arc::clone(&enrollment_router);
+            Box::pin(async move {
+                r.connected_clients()
+                    .await
+                    .into_iter()
+                    .map(|id| rustgate_enrollment::ContactInfo {
+                        uid: id.cn.clone(),
+                        callsign: id.cn.clone(),
+                        groups: id.groups.iter().cloned().collect(),
+                        last_status: "Connected".to_string(),
+                    })
+                    .collect()
+            })
+        });
+
+        let enrollment_server = rustgate_enrollment::EnrollmentServer::new(signer, credentials)
+            .with_contacts_provider(contacts_provider);
 
         let bind_addr: std::net::SocketAddr = enrollment_bind
             .parse()
