@@ -5,7 +5,7 @@ use std::time::Duration;
 /// Federation protocol version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
-    /// V1: Length-prefixed XML over mTLS (legacy CNAK-to-CNAK federation).
+    /// V1: Length-prefixed XML over mTLS (legacy federation protocol).
     V1,
     /// V2: gRPC over mTLS (standard TAK Server federation).
     V2,
@@ -137,7 +137,7 @@ pub struct PeerConfig {
     pub address: String,
     /// Groups this peer participates in (bidirectional).
     /// TAK Server has separate inbound/outbound groups; we'll add that
-    /// in a future PR. For now, a single list covers the CNAK use case.
+    /// in a future PR. For now, a single list covers the common use case.
     pub groups: Vec<String>,
     /// Whether this peer connection is enabled.
     pub enabled: bool,

@@ -112,7 +112,7 @@ Each peer in the JSON array has these fields:
 
 ### V1: Length-Prefixed XML
 
-V1 federation uses 4-byte big-endian length-prefixed CoT XML messages over mTLS. This is the same wire format used by the legacy CNAK federation service.
+V1 federation uses 4-byte big-endian length-prefixed CoT XML messages over mTLS. This is the standard wire format for legacy TAK server federation.
 
 **Wire format:**
 ```
