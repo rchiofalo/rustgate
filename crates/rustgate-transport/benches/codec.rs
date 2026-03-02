@@ -1,4 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+#![allow(unused_results)]
+
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use rustgate_core::protocol::HeaderSize;
 use rustgate_transport::{LengthPrefixedCodec, XmlStreamCodec};
 use tokio_util::bytes::BytesMut;
@@ -43,5 +45,9 @@ fn bench_length_prefixed_round_trip(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_xml_stream_decode, bench_length_prefixed_round_trip);
+criterion_group!(
+    benches,
+    bench_xml_stream_decode,
+    bench_length_prefixed_round_trip
+);
 criterion_main!(benches);

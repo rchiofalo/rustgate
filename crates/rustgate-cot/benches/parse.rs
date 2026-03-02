@@ -1,4 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+#![allow(unused_results)]
+
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 const POSITION_COT: &[u8] = br#"<event uid="ALPHA-1" type="a-f-G-U-C" time="2024-01-01T00:00:00Z" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z" how="m-g"><point lat="38.8977" lon="-77.0365" hae="0.0" ce="9999999" le="9999999"/><detail><__group name="Cyan" role="Team Member"/><contact callsign="ALPHA-1"/><status battery="85"/><track course="270.5" speed="1.2"/></detail></event>"#;
 

@@ -93,6 +93,11 @@ struct Cli {
     #[arg(long, default_value = "rustgate", env = "RUSTGATE_CA_ORG")]
     ca_organization: String,
 
+    /// Directory for data package storage. Enables the Marti sync API
+    /// endpoints when set. Requires --features enrollment.
+    #[arg(long, env = "DATA_PACKAGE_DIR")]
+    data_package_dir: Option<String>,
+
     /// Bind address for the Prometheus metrics HTTP server (e.g. 0.0.0.0:9090).
     /// Requires --features metrics.
     #[arg(long, env = "METRICS_BIND")]
@@ -346,8 +351,17 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             })
         });
 
-        let enrollment_server = rustgate_enrollment::EnrollmentServer::new(signer, credentials)
+        let mut enrollment_server = rustgate_enrollment::EnrollmentServer::new(signer, credentials)
             .with_contacts_provider(contacts_provider);
+
+        if let Some(ref pkg_dir) = cli.data_package_dir {
+            let store =
+                rustgate_enrollment::DataPackageStore::new(std::path::PathBuf::from(pkg_dir))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("data package store: {e}"))?;
+            enrollment_server = enrollment_server.with_packages(store);
+            tracing::info!(dir = %pkg_dir, "data package storage enabled");
+        }
 
         let bind_addr: std::net::SocketAddr = enrollment_bind
             .parse()

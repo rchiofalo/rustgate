@@ -30,6 +30,7 @@ const HTTP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 use crate::auth::Credentials;
 use crate::contacts::ContactsProvider;
+use crate::datapackage::DataPackageStore;
 use crate::error::EnrollmentError;
 use crate::response;
 use crate::signing::CsrSigner;
@@ -39,6 +40,7 @@ pub struct EnrollmentServer {
     signer: Arc<CsrSigner>,
     credentials: Arc<Credentials>,
     contacts_provider: Option<ContactsProvider>,
+    packages: Option<Arc<DataPackageStore>>,
 }
 
 impl std::fmt::Debug for EnrollmentServer {
@@ -47,6 +49,7 @@ impl std::fmt::Debug for EnrollmentServer {
             .field("signer", &self.signer)
             .field("credentials", &self.credentials)
             .field("contacts_provider", &self.contacts_provider.is_some())
+            .field("packages", &self.packages.is_some())
             .finish()
     }
 }
@@ -57,12 +60,19 @@ impl EnrollmentServer {
             signer: Arc::new(signer),
             credentials: Arc::new(credentials),
             contacts_provider: None,
+            packages: None,
         }
     }
 
     /// Set the contacts provider for Marti API compatibility endpoints.
     pub fn with_contacts_provider(mut self, provider: ContactsProvider) -> Self {
         self.contacts_provider = Some(provider);
+        self
+    }
+
+    /// Enable data package storage at the given store.
+    pub fn with_packages(mut self, store: DataPackageStore) -> Self {
+        self.packages = Some(Arc::new(store));
         self
     }
 
@@ -108,6 +118,7 @@ impl EnrollmentServer {
             let signer = Arc::clone(&self.signer);
             let credentials = Arc::clone(&self.credentials);
             let contacts = self.contacts_provider.clone();
+            let packages = self.packages.clone();
 
             drop(tokio::spawn(async move {
                 let _permit = permit;
@@ -134,7 +145,17 @@ impl EnrollmentServer {
                     let signer = Arc::clone(&signer);
                     let credentials = Arc::clone(&credentials);
                     let contacts = contacts.clone();
-                    async move { handle_request(req, &signer, &credentials, contacts.as_ref()).await }
+                    let packages = packages.clone();
+                    async move {
+                        handle_request(
+                            req,
+                            &signer,
+                            &credentials,
+                            contacts.as_ref(),
+                            packages.as_deref(),
+                        )
+                        .await
+                    }
                 });
 
                 let conn = http1::Builder::new().serve_connection(io, service);
@@ -151,6 +172,7 @@ async fn handle_request(
     signer: &CsrSigner,
     credentials: &Credentials,
     contacts: Option<&ContactsProvider>,
+    packages: Option<&DataPackageStore>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let path = req.uri().path();
     let method = req.method();
@@ -171,6 +193,12 @@ async fn handle_request(
         (&Method::GET, "/Marti/api/contacts/all") => handle_contacts_all(contacts).await,
 
         (&Method::GET, "/Marti/api/clientEndPoints") => handle_client_endpoints(contacts).await,
+
+        (&Method::POST, "/Marti/sync/upload") => handle_package_upload(req, packages).await,
+
+        (&Method::GET, "/Marti/sync/content") => handle_package_download(req, packages).await,
+
+        (&Method::GET, "/Marti/sync/search") => handle_package_search(req, packages).await,
 
         _ => build_response(
             StatusCode::NOT_FOUND,
@@ -353,6 +381,142 @@ async fn handle_client_endpoints(contacts: Option<&ContactsProvider>) -> Respons
         "application/json",
         Bytes::from(body.to_string()),
     )
+}
+
+async fn handle_package_upload(
+    req: Request<hyper::body::Incoming>,
+    packages: Option<&DataPackageStore>,
+) -> Response<Full<Bytes>> {
+    let Some(store) = packages else {
+        return build_response(
+            StatusCode::NOT_FOUND,
+            "text/plain",
+            Bytes::from("data package storage not configured"),
+        );
+    };
+
+    let content_type_hdr = req
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    // Read body (limit to 50 MiB + overhead for multipart headers)
+    let limited = Limited::new(req.into_body(), 52_428_800);
+    let body = match limited.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => {
+            return build_response(
+                StatusCode::BAD_REQUEST,
+                "text/plain",
+                Bytes::from("upload too large"),
+            );
+        }
+    };
+
+    // Extract file data from multipart body or use raw body
+    let (file_data, filename) =
+        if let Some(boundary) = crate::datapackage::extract_boundary(&content_type_hdr) {
+            let name = crate::datapackage::extract_multipart_filename(&body, boundary)
+                .unwrap_or_else(|| "upload.zip".to_string());
+            let data = crate::datapackage::extract_multipart_field(&body, boundary, "assetfile")
+                .unwrap_or(&body);
+            (data.to_vec(), name)
+        } else {
+            (body.to_vec(), "upload.zip".to_string())
+        };
+
+    match store.upload(&file_data, &filename, "anonymous").await {
+        Ok(meta) => {
+            let json = serde_json::json!({
+                "Hash": meta.hash,
+                "Name": meta.name,
+                "Size": meta.size,
+            });
+            build_response(
+                StatusCode::OK,
+                "application/json",
+                Bytes::from(json.to_string()),
+            )
+        }
+        Err(e) => build_response(
+            StatusCode::BAD_REQUEST,
+            "text/plain",
+            Bytes::from(format!("upload failed: {e}")),
+        ),
+    }
+}
+
+async fn handle_package_download(
+    req: Request<hyper::body::Incoming>,
+    packages: Option<&DataPackageStore>,
+) -> Response<Full<Bytes>> {
+    let Some(store) = packages else {
+        return build_response(
+            StatusCode::NOT_FOUND,
+            "text/plain",
+            Bytes::from("data package storage not configured"),
+        );
+    };
+
+    let hash = req
+        .uri()
+        .query()
+        .and_then(|q| extract_param(q, "hash"))
+        .unwrap_or_default();
+
+    if hash.is_empty() {
+        return build_response(
+            StatusCode::BAD_REQUEST,
+            "text/plain",
+            Bytes::from("missing hash parameter"),
+        );
+    }
+
+    match store.download(&hash).await {
+        Ok((_meta, data)) => build_response(
+            StatusCode::OK,
+            "application/x-zip-compressed",
+            Bytes::from(data),
+        ),
+        Err(_) => build_response(
+            StatusCode::NOT_FOUND,
+            "text/plain",
+            Bytes::from("package not found"),
+        ),
+    }
+}
+
+async fn handle_package_search(
+    req: Request<hyper::body::Incoming>,
+    packages: Option<&DataPackageStore>,
+) -> Response<Full<Bytes>> {
+    let Some(store) = packages else {
+        return build_response(
+            StatusCode::NOT_FOUND,
+            "text/plain",
+            Bytes::from("data package storage not configured"),
+        );
+    };
+
+    let keyword = req
+        .uri()
+        .query()
+        .and_then(|q| extract_param(q, "keyword"))
+        .unwrap_or_default();
+
+    match store.search(&keyword).await {
+        Ok(results) => {
+            let json = serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string());
+            build_response(StatusCode::OK, "application/json", Bytes::from(json))
+        }
+        Err(e) => build_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "text/plain",
+            Bytes::from(format!("search failed: {e}")),
+        ),
+    }
 }
 
 fn build_response(status: StatusCode, content_type: &str, body: Bytes) -> Response<Full<Bytes>> {

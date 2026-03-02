@@ -16,7 +16,8 @@ rcgen = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 rustls-pki-types = { workspace = true }
-tokio = { workspace = true, features = ["net", "rt", "io-util", "sync"] }
+tokio = { workspace = true, features = ["net", "rt", "io-util", "sync", "fs"] }
+sha2 = { workspace = true }
 tokio-rustls = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
@@ -32,6 +33,7 @@ bytes = { workspace = true }
 [dev-dependencies]
 rustgate-test-utils = { workspace = true }
 x509-parser = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }

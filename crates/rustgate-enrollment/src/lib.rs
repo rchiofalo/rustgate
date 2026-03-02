@@ -7,6 +7,7 @@
 
 pub mod auth;
 pub mod contacts;
+pub mod datapackage;
 pub mod error;
 pub mod response;
 pub mod server;
@@ -14,6 +15,7 @@ pub mod signing;
 
 pub use auth::Credentials;
 pub use contacts::{ContactInfo, ContactsProvider};
+pub use datapackage::DataPackageStore;
 pub use error::EnrollmentError;
 pub use server::EnrollmentServer;
 pub use signing::CsrSigner;
