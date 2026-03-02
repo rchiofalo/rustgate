@@ -14,3 +14,10 @@ workspace = true
 rustgate-core = { workspace = true }
 bytes = { workspace = true }
 quick-xml = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "parse"
+harness = false
