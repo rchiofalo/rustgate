@@ -14,6 +14,7 @@ workspace = true
 default = []
 v2 = ["dep:tonic", "dep:tonic-prost", "dep:tokio-stream", "dep:prost-types", "dep:prost-build", "dep:tonic-build", "dep:tonic-prost-build", "dep:rustgate-proto"]
 ha = ["dep:async-nats"]
+api = ["dep:hyper", "dep:http-body-util", "dep:prometheus"]
 
 [dependencies]
 rustgate-core = { workspace = true }
@@ -40,6 +41,9 @@ sha2 = { workspace = true }
 time = { workspace = true }
 x509-parser = { workspace = true }
 async-nats = { workspace = true, features = ["kv"], optional = true }
+hyper = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+prometheus = { workspace = true, optional = true }
 socket2 = "0.6"
 
 [build-dependencies]
