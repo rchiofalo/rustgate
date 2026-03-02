@@ -10,8 +10,13 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+v2 = ["dep:tonic", "dep:tonic-prost", "dep:prost-types", "dep:prost-build", "dep:tonic-build", "dep:tonic-prost-build", "dep:rustgate-proto"]
+
 [dependencies]
 rustgate-core = { workspace = true }
+rustgate-proto = { workspace = true, optional = true }
 rustgate-transport = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "net", "macros", "io-util"] }
 tokio-rustls = { workspace = true }
@@ -21,6 +26,10 @@ rustls-pki-types = { workspace = true }
 tokio-util = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true, optional = true }
+tonic = { workspace = true, features = ["codegen", "transport"], optional = true }
+tonic-prost = { workspace = true, optional = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -28,6 +37,11 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 time = { workspace = true }
 socket2 = "0.6"
+
+[build-dependencies]
+prost-build = { workspace = true, optional = true }
+tonic-build = { workspace = true, optional = true }
+tonic-prost-build = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

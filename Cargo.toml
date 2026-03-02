@@ -56,6 +56,12 @@ http-body-util = "0.1"
 base64 = "0.22"
 async-nats = { version = "0.46", default-features = false, features = ["jetstream", "nkeys"] }
 prost = "0.14"
+prost-build = "0.14"
+prost-types = "0.14"
+tonic = { version = "0.14", default-features = false }
+tonic-build = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 time = { version = "0.3", features = ["formatting"] }

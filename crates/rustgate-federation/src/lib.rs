@@ -6,3 +6,4 @@ pub mod peer;
 pub mod provenance;
 pub mod store;
 pub mod v1;
+pub mod v2;

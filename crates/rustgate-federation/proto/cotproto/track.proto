@@ -1,0 +1,8 @@
+syntax = "proto3";
+
+package atakmap.commoncommo.protobuf.v1;
+
+message Track {
+     double speed = 1;
+     double course = 2;
+}
