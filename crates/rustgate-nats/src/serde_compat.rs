@@ -8,12 +8,11 @@ use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
+use rustgate_core::identity::Identity;
+use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-
-use rustgate_core::identity::Identity;
-use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
 
 /// JSON wire format for a CoT event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -531,11 +530,12 @@ mod tests {
 
     #[cfg(feature = "full-detail")]
     mod full_detail_tests {
-        use super::*;
         use rustgate_proto::xml_full::{
             ContactDetail, FullCotEvent, GroupDetail, PrecisionLocationDetail, StatusDetail,
             TakvDetail, TrackDetail,
         };
+
+        use super::*;
 
         #[test]
         fn from_full_cot_populates_all_detail_fields() {

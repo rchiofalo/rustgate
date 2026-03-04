@@ -1,11 +1,12 @@
 //! Integration tests for TLS listener with mTLS authentication.
 
+use std::io::BufReader;
+use std::sync::Arc;
+
 use rustgate_test_utils::certs::TestCa;
 use rustgate_transport::{TlsConfig, TlsListener, extract_identity};
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use std::io::BufReader;
-use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // ── helpers ──────────────────────────────────────────────────────────────

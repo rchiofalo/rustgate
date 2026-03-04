@@ -1,10 +1,11 @@
 //! X.509 certificate generation for tests.
 
+use std::fmt;
+
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DistinguishedName, DnType,
     ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
 };
-use std::fmt;
 use time::{Duration as TimeDuration, OffsetDateTime};
 
 /// A certificate authority for signing test certificates.

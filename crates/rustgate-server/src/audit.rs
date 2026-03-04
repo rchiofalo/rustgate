@@ -173,8 +173,9 @@ pub fn server_started(bind: &str, version: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    use super::*;
 
     fn v4_addr() -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 12345)

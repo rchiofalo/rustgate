@@ -4,10 +4,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::sync::{RwLock, mpsc};
-
 use rustgate_core::identity::{GroupId, Identity};
 use rustgate_core::message::{Destination, MessageType, RoutableMessage};
+use tokio::sync::{RwLock, mpsc};
 
 use crate::cache::PositionCache;
 
@@ -220,12 +219,14 @@ impl Router {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::collections::BTreeSet;
+    use std::time::SystemTime;
+
     use bytes::Bytes;
     use rustgate_core::identity::Identity;
     use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
-    use std::collections::BTreeSet;
-    use std::time::SystemTime;
+
+    use super::*;
 
     fn make_identity(cn: &str, groups: &[&str]) -> Arc<Identity> {
         Arc::new(Identity {

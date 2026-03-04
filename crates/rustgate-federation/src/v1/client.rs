@@ -509,8 +509,9 @@ mod tests {
 
     #[tokio::test]
     async fn client_start_and_shutdown() {
-        use crate::config::{PeerConfig, RoutingMode};
         use rustgate_test_utils::certs::TestCa;
+
+        use crate::config::{PeerConfig, RoutingMode};
 
         let ca = TestCa::new("Test CA");
         let client_cert = ca.issue_client_cert("federation-client", &["Alpha"]);
@@ -561,8 +562,9 @@ mod tests {
 
     #[tokio::test]
     async fn client_send_fails_after_shutdown() {
-        use crate::config::{PeerConfig, RoutingMode};
         use rustgate_test_utils::certs::TestCa;
+
+        use crate::config::{PeerConfig, RoutingMode};
 
         let ca = TestCa::new("Test CA");
         let client_cert = ca.issue_client_cert("federation-client", &["Alpha"]);
@@ -614,8 +616,9 @@ mod tests {
 
     #[tokio::test]
     async fn client_peer_tracks_error_on_connection_failure() {
-        use crate::config::{PeerConfig, RoutingMode};
         use rustgate_test_utils::certs::TestCa;
+
+        use crate::config::{PeerConfig, RoutingMode};
 
         let ca = TestCa::new("Test CA");
         let client_cert = ca.issue_client_cert("federation-client", &["Alpha"]);
@@ -668,8 +671,9 @@ mod tests {
 
     #[tokio::test]
     async fn client_peer_accessor_returns_handle() {
-        use crate::config::{PeerConfig, RoutingMode};
         use rustgate_test_utils::certs::TestCa;
+
+        use crate::config::{PeerConfig, RoutingMode};
 
         let ca = TestCa::new("Test CA");
         let client_cert = ca.issue_client_cert("federation-client", &["Alpha"]);

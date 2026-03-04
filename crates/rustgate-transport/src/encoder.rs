@@ -6,11 +6,10 @@
 use std::io;
 
 use bytes::Bytes;
-use rustgate_core::message::RoutableMessage;
-
 // Re-export the trait from core so downstream crates that depend on
 // rustgate-transport continue to find it at the same path.
 pub use rustgate_core::encoder::MessageEncoder;
+use rustgate_core::message::RoutableMessage;
 
 /// Passthrough encoder that preserves the original payload bytes.
 #[derive(Debug, Default)]

@@ -501,9 +501,10 @@ async fn run_streams(
 #[cfg(test)]
 #[allow(unused_results)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
     use crate::config::{PeerConfig, RoutingMode};
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn test_peer(id: &str) -> Arc<PeerHandle> {
         Arc::new(PeerHandle::new(PeerConfig {

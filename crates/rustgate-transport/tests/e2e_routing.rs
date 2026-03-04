@@ -3,15 +3,12 @@
 //! plus direct router tests for group/direct delivery.
 
 use std::collections::BTreeSet;
+use std::io::BufReader;
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
-use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc;
-use tokio_util::codec::{FramedRead, FramedWrite};
-
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
 use rustgate_core::protocol::HeaderSize;
@@ -21,7 +18,9 @@ use rustgate_transport::{
 };
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use std::io::BufReader;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
+use tokio_util::codec::{FramedRead, FramedWrite};
 
 // ── helpers ──────────────────────────────────────────────────────────────
 

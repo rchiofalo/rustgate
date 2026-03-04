@@ -1,10 +1,11 @@
 //! Authenticated TLS session.
 
-use rustgate_core::identity::Identity;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+
+use rustgate_core::identity::Identity;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;

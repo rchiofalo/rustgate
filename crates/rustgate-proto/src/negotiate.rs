@@ -15,9 +15,8 @@ use prost::Message;
 use tokio::io::AsyncReadExt;
 use tokio_util::bytes::BufMut;
 
-use crate::codec;
 use crate::error::ProtoError;
-use crate::tak_proto;
+use crate::{codec, tak_proto};
 
 /// Protocol version we advertise and accept.
 const PROTO_VERSION: &str = "1";
