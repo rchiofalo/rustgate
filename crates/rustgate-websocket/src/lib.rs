@@ -1,10 +1,13 @@
-//! WebSocket (wss://) listener with mandatory mTLS for rustgate.
+//! WebSocket (wss://) listener and session management for rustgate.
 //!
-//! Provides [`WsListener`] for accepting WebSocket connections over TLS, and
-//! [`WsSession`] representing an authenticated client with its WebSocket stream.
+//! Provides [`WsListener`] for accepting WebSocket connections over TLS,
+//! [`WsSession`] representing an authenticated client, and [`WebSocketServer`]
+//! for managing the accept loop and session lifecycle with router integration.
 //!
 //! All connections require a valid client certificate; identity is extracted
 //! exclusively from the X.509 certificate, never from headers or query params.
+
+mod server;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -13,6 +16,7 @@ use std::time::Duration;
 use rustgate_core::error::{Result, RustgateError};
 use rustgate_core::identity::Identity;
 use rustgate_transport::{TlsConfig, extract_identity};
+pub use server::{OnFederationForward, OnNatsPublish, WebSocketServer, WsEncoding, WsServerConfig};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::WebSocketStream;

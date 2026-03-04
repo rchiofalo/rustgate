@@ -1918,8 +1918,10 @@ dependencies = [
 name = "rustgate-websocket"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "futures",
  "rustgate-core",
+ "rustgate-cot",
  "rustgate-test-utils",
  "rustgate-transport",
  "rustls",

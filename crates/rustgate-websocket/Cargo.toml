@@ -12,8 +12,11 @@ workspace = true
 
 [dependencies]
 rustgate-core = { workspace = true }
+rustgate-cot = { workspace = true }
 rustgate-transport = { workspace = true }
-tokio = { workspace = true, features = ["net", "time", "sync", "rt"] }
+bytes = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["net", "time", "sync", "rt", "macros"] }
 tokio-rustls = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tracing = { workspace = true }
@@ -27,4 +30,3 @@ tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 rustls-pki-types = { workspace = true }
-futures = { workspace = true }

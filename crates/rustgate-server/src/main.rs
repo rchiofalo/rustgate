@@ -115,6 +115,11 @@ struct Cli {
     #[arg(long, default_value_t = 1024, env = "RUSTGATE_MAX_CONNECTIONS")]
     max_connections: usize,
 
+    /// Bind address for the WebSocket (wss://) listener (e.g. 0.0.0.0:8443).
+    /// Requires --features websocket.
+    #[arg(long, env = "WEBSOCKET_BIND")]
+    websocket_bind: Option<String>,
+
     // ── Federation flags ────────────────────────────────────────────
     /// V1 federation listen address (enables federation when set, e.g. 0.0.0.0:9000).
     /// Requires --features federation.
@@ -552,6 +557,63 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         None
     };
 
+    // ── WebSocket listener ──────────────────────────────────────────
+
+    #[cfg(feature = "websocket")]
+    let ws_shutdown = if let Some(ref ws_bind) = cli.websocket_bind {
+        let addr: std::net::SocketAddr = ws_bind
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid WebSocket bind address: {e}"))?;
+        let ws_listener = rustgate_websocket::WsListener::bind(addr, &tls_config)?;
+        tracing::info!(addr = %ws_listener.local_addr()?, "WebSocket listener bound");
+
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+
+        let nats_cb: Option<rustgate_websocket::OnNatsPublish> = {
+            #[cfg(feature = "nats")]
+            {
+                nats_publisher
+                    .clone()
+                    .map(|p| -> rustgate_websocket::OnNatsPublish {
+                        Arc::new(move |msg| {
+                            let p = p.clone();
+                            drop(tokio::spawn(async move { p.publish(&msg).await }));
+                        })
+                    })
+            }
+            #[cfg(not(feature = "nats"))]
+            {
+                None
+            }
+        };
+
+        let ws_encoding = match encoding {
+            Encoding::Raw | Encoding::TakProtobuf => rustgate_websocket::WsEncoding::Raw,
+            Encoding::Cot => rustgate_websocket::WsEncoding::Cot,
+        };
+
+        let config = rustgate_websocket::WsServerConfig {
+            listener: ws_listener,
+            router: Arc::clone(&router),
+            connection_limit: Arc::clone(&connection_limit),
+            encoding: ws_encoding,
+            nats_publish: nats_cb,
+            fed_forward: fed_forward.clone(),
+            shutdown: Arc::clone(&shutdown),
+        };
+        drop(tokio::spawn(rustgate_websocket::WebSocketServer::run(
+            config,
+        )));
+        Some(shutdown)
+    } else {
+        None
+    };
+
+    #[cfg(not(feature = "websocket"))]
+    if cli.websocket_bind.is_some() {
+        tracing::warn!("--websocket-bind requires --features websocket; ignoring");
+    }
+
     loop {
         tokio::select! {
             accept_result = listener.accept() => {
@@ -607,6 +669,14 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         let mut mgr = rwlock.write().await;
         mgr.shutdown().await;
         tracing::info!("federation shut down");
+    }
+
+    // ── WebSocket shutdown ────────────────────────────────────────────
+
+    #[cfg(feature = "websocket")]
+    if let Some(ref shutdown) = ws_shutdown {
+        shutdown.notify_one();
+        tracing::info!("WebSocket server signaled to stop");
     }
 
     // ── Connection draining ──────────────────────────────────────────
