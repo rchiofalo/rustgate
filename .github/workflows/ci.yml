@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
@@ -52,8 +56,14 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - name: Cache cargo-machete binary
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: ~/.cargo/bin/cargo-machete
+          key: ${{ runner.os }}-cargo-machete-0.9
+
       - name: Install cargo-machete
-        run: cargo install cargo-machete --locked
+        run: command -v cargo-machete || cargo install cargo-machete --locked
 
       - name: Check for unused dependencies
         run: cargo machete
@@ -116,7 +126,7 @@ jobs:
           - name: nats-metrics
             flags: "--features nats,metrics"
           - name: full-detail
-            flags: "--features nats,full-detail"
+            flags: "--features full-detail"
           - name: federation-ha
             flags: "--features federation-ha,nats"
           - name: all
@@ -153,23 +163,25 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Cache cargo registry
+      - name: Cache cargo registry and tool binaries
         uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-cargo-audit-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-audit-
+            ~/.cargo/bin/cargo-deny
+            ~/.cargo/bin/cargo-audit
+          key: ${{ runner.os }}-cargo-audit-tools-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-audit-tools-
 
       - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
+        run: command -v cargo-deny || cargo install cargo-deny --locked
 
       - name: Check advisories, licenses, bans, and sources
         run: cargo deny check
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        run: command -v cargo-audit || cargo install cargo-audit --locked
 
       - name: Run cargo audit
         run: cargo audit
