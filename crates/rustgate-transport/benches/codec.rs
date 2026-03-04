@@ -1,6 +1,8 @@
 #![allow(unused_results)]
 
-use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use rustgate_core::protocol::HeaderSize;
 use rustgate_transport::{LengthPrefixedCodec, XmlStreamCodec};
 use tokio_util::bytes::BytesMut;
