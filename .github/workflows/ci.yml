@@ -22,6 +22,42 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  doc:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -Dwarnings
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-doc-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-doc-
+
+      - name: Build documentation
+        run: cargo doc --workspace --all-features --no-deps
+
+  machete:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install cargo-machete
+        run: cargo install cargo-machete --locked
+
+      - name: Check for unused dependencies
+        run: cargo machete
+
   clippy:
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
@@ -79,6 +115,10 @@ jobs:
             flags: "--features enrollment,federation"
           - name: nats-metrics
             flags: "--features nats,metrics"
+          - name: full-detail
+            flags: "--features nats,full-detail"
+          - name: federation-ha
+            flags: "--features federation-ha,nats"
           - name: all
             flags: "--all-features"
     name: test (${{ matrix.name }})
