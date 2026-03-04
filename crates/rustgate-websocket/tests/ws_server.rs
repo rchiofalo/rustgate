@@ -1,6 +1,8 @@
+#![allow(clippy::panic, clippy::unwrap_used)]
 //! Integration tests for WebSocket server session routing.
 
 use std::io::BufReader;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use futures::{SinkExt, StreamExt};
@@ -413,4 +415,82 @@ async fn ws_cot_encoding() {
 
     let received = recv_ws(&mut bob_ws, "bob receives cot-encoded msg").await;
     assert_eq!(received, cot_xml.as_slice());
+}
+
+/// NATS publish and federation forward callbacks fire for each routed message.
+#[tokio::test]
+async fn ws_nats_and_federation_callbacks_fire() {
+    let ca = TestCa::new("Test CA");
+    let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
+
+    let tls_config =
+        TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
+            .expect("tls config");
+
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("addr");
+    let listener = WsListener::bind(addr, &tls_config).expect("bind");
+    let bound_addr = listener.local_addr().expect("local addr");
+
+    let router = Arc::new(Router::new());
+    let shutdown = Arc::new(Notify::new());
+
+    let nats_count = Arc::new(AtomicUsize::new(0));
+    let fed_count = Arc::new(AtomicUsize::new(0));
+
+    let nats_counter = Arc::clone(&nats_count);
+    let nats_publish: rustgate_websocket::OnNatsPublish =
+        Arc::new(move |_msg| { let _ = nats_counter.fetch_add(1, Ordering::Relaxed); });
+
+    let fed_counter = Arc::clone(&fed_count);
+    let fed_forward: rustgate_websocket::OnFederationForward =
+        Arc::new(move |_payload, _groups| { let _ = fed_counter.fetch_add(1, Ordering::Relaxed); });
+
+    let config = WsServerConfig {
+        listener,
+        router: Arc::clone(&router),
+        connection_limit: Arc::new(Semaphore::new(64)),
+        encoding: WsEncoding::Raw,
+        nats_publish: Some(nats_publish),
+        fed_forward: Some(fed_forward),
+        shutdown: Arc::clone(&shutdown),
+    };
+
+    let _server_handle = tokio::spawn(WebSocketServer::run(config));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let alice_cert = ca.issue_client_cert("alice", &["alpha"]);
+    let bob_cert = ca.issue_client_cert("bob", &["alpha"]);
+
+    let client_tls = build_client_tls_config(&alice_cert.cert_pem, &alice_cert.key_pem, &ca.cert_pem);
+    let mut alice_ws = ws_connect(bound_addr, &client_tls).await;
+
+    let bob_tls = build_client_tls_config(&bob_cert.cert_pem, &bob_cert.key_pem, &ca.cert_pem);
+    let mut bob_ws = ws_connect(bound_addr, &bob_tls).await;
+
+    // Wait for both sessions to register
+    for _ in 0..20 {
+        if router.session_count().await >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    // Alice sends two messages
+    let msg1 = br#"<event uid="msg-1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><point lat="38.0" lon="-77.0" hae="0.0"/><detail><__group name="alpha"/></detail></event>"#;
+    let msg2 = br#"<event uid="msg-2" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><point lat="39.0" lon="-76.0" hae="0.0"/><detail><__group name="alpha"/></detail></event>"#;
+
+    alice_ws.send(Message::Binary(msg1.to_vec().into())).await.expect("send 1");
+    alice_ws.send(Message::Binary(msg2.to_vec().into())).await.expect("send 2");
+
+    // Bob receives both (confirms routing worked)
+    let _ = recv_ws(&mut bob_ws, "bob msg 1").await;
+    let _ = recv_ws(&mut bob_ws, "bob msg 2").await;
+
+    // Allow callbacks to complete
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    assert_eq!(nats_count.load(Ordering::Relaxed), 2, "NATS callback should fire for each message");
+    assert_eq!(fed_count.load(Ordering::Relaxed), 2, "federation callback should fire for each message");
+
+    shutdown.notify_one();
 }

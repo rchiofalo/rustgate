@@ -1,3 +1,4 @@
+#![allow(clippy::panic, clippy::unwrap_used)]
 //! Integration tests for WebSocket listener with mTLS authentication.
 
 use std::io::BufReader;
