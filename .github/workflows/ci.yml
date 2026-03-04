@@ -14,6 +14,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
   RUSTFLAGS: -Dwarnings
   NATS_VERSION: "2.11.1"
 
@@ -27,14 +29,10 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Cache cargo-machete binary
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
-        with:
-          path: ~/.cargo/bin/cargo-machete
-          key: ${{ runner.os }}-cargo-machete-0.9
-
       - name: Install cargo-machete
-        run: command -v cargo-machete || cargo install cargo-machete --locked
+        uses: taiki-e/install-action@205eb1d74c6feda89abb1f3a09360601953286c0 # v2.68.18
+        with:
+          tool: cargo-machete
 
       - name: Check for unused dependencies
         run: cargo machete
@@ -48,17 +46,12 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Install protobuf compiler
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Cache cargo registry and build
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-clippy-
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
 
       - name: Clippy (all features)
         run: cargo clippy --all-features --all-targets
@@ -148,7 +141,9 @@ jobs:
 
       - name: Install protobuf compiler
         if: matrix.needs_protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install nats-server
         if: matrix.needs_nats
@@ -158,14 +153,9 @@ jobs:
           nats-server --version
 
       - name: Cache cargo registry and build
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-test-${{ matrix.name }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-test-${{ matrix.name }}-
+          key: ${{ matrix.name }}
 
       - name: Run tests
         run: cargo test ${{ matrix.flags }}
@@ -176,25 +166,18 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Cache cargo registry and tool binaries
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cargo/bin/cargo-deny
-            ~/.cargo/bin/cargo-audit
-          key: ${{ runner.os }}-cargo-audit-tools-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-audit-tools-
-
       - name: Install cargo-deny
-        run: command -v cargo-deny || cargo install cargo-deny --locked
+        uses: taiki-e/install-action@205eb1d74c6feda89abb1f3a09360601953286c0 # v2.68.18
+        with:
+          tool: cargo-deny
 
       - name: Check advisories, licenses, bans, and sources
         run: cargo deny check
 
       - name: Install cargo-audit
-        run: command -v cargo-audit || cargo install cargo-audit --locked
+        uses: taiki-e/install-action@205eb1d74c6feda89abb1f3a09360601953286c0 # v2.68.18
+        with:
+          tool: cargo-audit
 
       - name: Run cargo audit
         run: cargo audit
