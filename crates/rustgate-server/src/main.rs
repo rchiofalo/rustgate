@@ -2,10 +2,13 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+#[cfg(feature = "federation")]
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
+#[cfg(feature = "federation")]
+use std::time::SystemTime;
 
 use bytes::Bytes;
 use clap::{Parser, ValueEnum};
@@ -28,9 +31,13 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 use rustgate_core::identity::Identity;
-use rustgate_core::message::{Destination, Metadata, RoutableMessage};
+#[cfg(any(feature = "metrics", feature = "federation"))]
+use rustgate_core::message::Destination;
+#[cfg(feature = "federation")]
+use rustgate_core::message::Metadata;
+use rustgate_core::message::RoutableMessage;
 use rustgate_core::protocol::{FramingStrategy, HeaderSize};
-use rustgate_cot::{CotDestination, CotEvent};
+use rustgate_cot::MessageBuilder;
 use rustgate_transport::{
     AuthenticatedSession, CotEncoder, FramedCodec, MessageEncoder, RawEncoder, Router,
     SessionHandle, TlsConfig, TlsListener,
@@ -888,11 +895,7 @@ async fn read_loop(
         FramedRead::new(PrefixedReader::new(reader, Some(prefix)), codec)
     };
 
-    // Track the session's group across messages. Position CoT carries
-    // <__group name="Cyan"/> but chat and other types don't. Once we learn
-    // the group from a position message, apply it to subsequent messages
-    // from the same session so NATS routing stays correct.
-    let mut session_group: Option<String> = None;
+    let mut msg_builder = MessageBuilder::new();
 
     loop {
         let frame = match tokio::time::timeout(READ_TIMEOUT, framed.next()).await {
@@ -929,15 +932,7 @@ async fn read_loop(
         #[cfg(feature = "metrics")]
         metrics::messages_received().inc();
 
-        let msg = match rustgate_cot::parse(&payload) {
-            Ok(cot) => {
-                if cot.source_group.is_some() {
-                    session_group = cot.source_group.clone();
-                }
-                build_cot_message(identity, &session_group, payload, cot)
-            }
-            Err(_) => build_raw_message(identity, &session_group, payload),
-        };
+        let msg = msg_builder.build(identity, payload, "tcp");
 
         #[cfg(feature = "metrics")]
         {
@@ -1035,45 +1030,6 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for PrefixedReader<R>
     }
 }
 
-fn build_cot_message(
-    source: &Identity,
-    session_group: &Option<String>,
-    payload: Bytes,
-    cot: CotEvent,
-) -> RoutableMessage {
-    let destination = match cot.destination {
-        CotDestination::Broadcast => Destination::Broadcast,
-        CotDestination::Group(name) => Destination::Group(name),
-        CotDestination::Callsign(cn) => Destination::Direct(Identity {
-            cn,
-            fingerprint: String::new(),
-            groups: BTreeSet::new(),
-        }),
-    };
-
-    // Enrich source identity with the group. Prefer the __group from this
-    // message's CoT detail, fall back to the session's cached group (learned
-    // from earlier position messages). Chat and other non-position CoT types
-    // don't carry __group, so the fallback keeps NATS routing correct.
-    let mut enriched_source = source.clone();
-    let group = cot.source_group.as_ref().or(session_group.as_ref());
-    if let Some(g) = group {
-        let _ = enriched_source.groups.insert(g.clone());
-    }
-
-    RoutableMessage {
-        source: enriched_source,
-        destination,
-        payload,
-        metadata: Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: "cot".into(),
-            message_type: cot.message_type,
-            ttl: cot.ttl,
-        },
-    }
-}
-
 /// Trait for optional NATS publishing. Allows the server to compile with or
 /// without the `nats` feature by abstracting over the publisher type.
 trait NatsPublish: Clone {
@@ -1090,28 +1046,6 @@ impl NatsPublish for rustgate_nats::NatsPublisher {
 /// No-op publisher used when NATS is not enabled.
 impl NatsPublish for () {
     async fn publish(&self, _msg: &RoutableMessage) {}
-}
-
-fn build_raw_message(
-    source: &Identity,
-    session_group: &Option<String>,
-    payload: Bytes,
-) -> RoutableMessage {
-    let mut enriched_source = source.clone();
-    if let Some(g) = session_group {
-        let _ = enriched_source.groups.insert(g.clone());
-    }
-    RoutableMessage {
-        source: enriched_source,
-        destination: Destination::Broadcast,
-        payload,
-        metadata: Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: "tcp".into(),
-            message_type: rustgate_core::message::MessageType::Other("raw".into()),
-            ttl: None,
-        },
-    }
 }
 
 #[cfg(test)]
