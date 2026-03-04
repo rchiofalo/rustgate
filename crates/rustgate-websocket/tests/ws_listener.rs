@@ -44,9 +44,7 @@ fn build_client_tls_config(cert_pem: &str, key_pem: &str, ca_pem: &str) -> rustl
 async fn ws_connect(
     addr: std::net::SocketAddr,
     tls_config: &rustls::ClientConfig,
-) -> tokio_tungstenite::WebSocketStream<
-    tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
-> {
+) -> tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
     let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config.clone()));
     let tcp = tokio::net::TcpStream::connect(addr)
         .await
@@ -74,9 +72,8 @@ async fn ws_mtls_handshake_and_identity() {
     let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
     let client_cert = ca.issue_client_cert("alice", &["engineers", "admins"]);
 
-    let tls_config =
-        TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
-            .expect("tls config");
+    let tls_config = TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
+        .expect("tls config");
 
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("addr");
     let listener = WsListener::bind(addr, &tls_config).expect("bind");
@@ -188,9 +185,8 @@ async fn ws_rejects_expired_client_cert() {
     let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
     let expired_cert = ca.issue_expired_client_cert("expired-user", &["ops"]);
 
-    let tls_config =
-        TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
-            .expect("tls config");
+    let tls_config = TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
+        .expect("tls config");
 
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("addr");
     let listener = WsListener::bind(addr, &tls_config).expect("bind");
@@ -200,11 +196,8 @@ async fn ws_rejects_expired_client_cert() {
         tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept()).await
     });
 
-    let client_tls = build_client_tls_config(
-        &expired_cert.cert_pem,
-        &expired_cert.key_pem,
-        &ca.cert_pem,
-    );
+    let client_tls =
+        build_client_tls_config(&expired_cert.cert_pem, &expired_cert.key_pem, &ca.cert_pem);
 
     let connector = tokio_rustls::TlsConnector::from(Arc::new(client_tls));
     let tcp = tokio::net::TcpStream::connect(bound_addr)
@@ -251,9 +244,8 @@ async fn ws_accept_multiple_clients() {
     let alice_cert = ca.issue_client_cert("alice", &["alpha"]);
     let bob_cert = ca.issue_client_cert("bob", &["bravo"]);
 
-    let tls_config =
-        TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
-            .expect("tls config");
+    let tls_config = TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
+        .expect("tls config");
 
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("addr");
     let listener = WsListener::bind(addr, &tls_config).expect("bind");

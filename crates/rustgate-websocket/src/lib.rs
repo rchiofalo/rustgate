@@ -10,14 +10,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rustgate_core::error::{Result, RustgateError};
+use rustgate_core::identity::Identity;
+use rustgate_transport::{TlsConfig, extract_identity};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, warn};
-
-use rustgate_core::error::{Result, RustgateError};
-use rustgate_core::identity::Identity;
-use rustgate_transport::{TlsConfig, extract_identity};
 
 /// Server-side TLS stream over TCP.
 type TlsStream = tokio_rustls::server::TlsStream<TcpStream>;
@@ -220,13 +219,13 @@ impl WsListener {
 fn extract_client_identity(tls_stream: &TlsStream) -> Result<Identity> {
     let (_, server_conn) = tls_stream.get_ref();
 
-    let certs = server_conn.peer_certificates().ok_or_else(|| {
-        RustgateError::Transport("no client certificate presented".to_string())
-    })?;
+    let certs = server_conn
+        .peer_certificates()
+        .ok_or_else(|| RustgateError::Transport("no client certificate presented".to_string()))?;
 
-    let client_cert = certs.first().ok_or_else(|| {
-        RustgateError::Transport("empty client certificate chain".to_string())
-    })?;
+    let client_cert = certs
+        .first()
+        .ok_or_else(|| RustgateError::Transport("empty client certificate chain".to_string()))?;
 
     extract_identity(client_cert)
 }
