@@ -69,78 +69,60 @@ jobs:
         include:
           - name: default
             flags: ""
-            needs_protoc: false
             needs_nats: false
           - name: nats
             flags: "--features nats"
-            needs_protoc: false
             needs_nats: true
           - name: enrollment
             flags: "--features enrollment"
-            needs_protoc: false
             needs_nats: false
           - name: proto
             flags: "--features proto"
-            needs_protoc: true
             needs_nats: false
           - name: metrics
             flags: "--features metrics"
-            needs_protoc: false
             needs_nats: false
           - name: websocket
             flags: "--features websocket"
-            needs_protoc: false
             needs_nats: false
           - name: federation
             flags: "--features federation"
-            needs_protoc: true
             needs_nats: false
           - name: websocket-nats
             flags: "--features websocket,nats"
-            needs_protoc: false
             needs_nats: true
           - name: websocket-federation
             flags: "--features websocket,federation"
-            needs_protoc: true
             needs_nats: false
           - name: federation-nats
             flags: "--features federation,nats"
-            needs_protoc: true
             needs_nats: true
           - name: federation-metrics
             flags: "--features federation,metrics"
-            needs_protoc: true
             needs_nats: false
           - name: proto-federation
             flags: "--features proto,federation"
-            needs_protoc: true
             needs_nats: false
           - name: enrollment-federation
             flags: "--features enrollment,federation"
-            needs_protoc: true
             needs_nats: false
           - name: nats-metrics
             flags: "--features nats,metrics"
-            needs_protoc: false
             needs_nats: true
           - name: full-detail
             flags: "--features full-detail"
-            needs_protoc: true
             needs_nats: true
           - name: federation-ha
             flags: "--features federation-ha,nats"
-            needs_protoc: true
             needs_nats: true
           - name: all
             flags: "--all-features"
-            needs_protoc: true
             needs_nats: true
     name: test (${{ matrix.name }})
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Install protobuf compiler
-        if: matrix.needs_protoc
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
