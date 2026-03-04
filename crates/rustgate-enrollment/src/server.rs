@@ -440,11 +440,14 @@ async fn handle_package_upload(
                 Bytes::from(json.to_string()),
             )
         }
-        Err(e) => build_response(
-            StatusCode::BAD_REQUEST,
-            "text/plain",
-            Bytes::from(format!("upload failed: {e}")),
-        ),
+        Err(e) => {
+            tracing::warn!(error = %e, "data package upload failed");
+            build_response(
+                StatusCode::BAD_REQUEST,
+                "text/plain",
+                Bytes::from("upload failed"),
+            )
+        }
     }
 }
 
@@ -511,11 +514,14 @@ async fn handle_package_search(
             let json = serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string());
             build_response(StatusCode::OK, "application/json", Bytes::from(json))
         }
-        Err(e) => build_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "text/plain",
-            Bytes::from(format!("search failed: {e}")),
-        ),
+        Err(e) => {
+            tracing::warn!(error = %e, "data package search failed");
+            build_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "text/plain",
+                Bytes::from("search failed"),
+            )
+        }
     }
 }
 

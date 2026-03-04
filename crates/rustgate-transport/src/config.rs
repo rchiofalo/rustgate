@@ -6,7 +6,7 @@ use std::sync::Arc;
 use rustgate_core::error::{Result, RustgateError};
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::server::WebPkiClientVerifier;
+use rustls::server::{NoServerSessionStorage, WebPkiClientVerifier};
 
 #[derive(Debug)]
 pub struct TlsConfig {
@@ -37,10 +37,18 @@ impl TlsConfig {
             .build()
             .map_err(|e| RustgateError::Config(format!("failed to build client verifier: {e}")))?;
 
-        let config = rustls::ServerConfig::builder()
+        let mut config = rustls::ServerConfig::builder()
             .with_client_cert_verifier(client_verifier)
             .with_single_cert(self.server_certs.clone(), self.server_key.clone_key())
             .map_err(|e| RustgateError::Config(format!("invalid server certificate: {e}")))?;
+
+        // Disable TLS session resumption. The rustls default caches 256 sessions,
+        // allowing resumed connections to skip client certificate re-validation.
+        // For an mTLS server this means a revoked or rotated client certificate
+        // could still authenticate via a cached session — the same vulnerability
+        // class as CVE-2025-23419. Disabling session storage forces a full
+        // handshake (with certificate verification) on every connection.
+        config.session_storage = Arc::new(NoServerSessionStorage {});
 
         Ok(config)
     }
