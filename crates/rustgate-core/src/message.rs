@@ -1,5 +1,6 @@
-use bytes::Bytes;
 use std::time::{Duration, SystemTime};
+
+use bytes::Bytes;
 
 use crate::identity::{GroupId, Identity};
 

@@ -10,7 +10,6 @@ use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
-
 use rustgate_core::identity::{GroupId, Identity};
 use rustgate_core::message::{
     Destination, MessageType, Metadata, RoutableMessage, SOURCE_FEDERATION,

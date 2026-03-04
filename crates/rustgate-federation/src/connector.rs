@@ -341,9 +341,10 @@ impl rustls::client::danger::ServerCertVerifier for NoHostnameVerifier {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rustgate_test_utils::certs::TestCa;
     use rustgate_transport::{TlsConfig, TlsListener};
+
+    use super::*;
 
     /// Helper to start a TLS listener for testing the connector.
     async fn start_test_server(ca: &TestCa) -> (SocketAddr, tokio::task::JoinHandle<()>) {

@@ -44,13 +44,23 @@ rustgate \
   --ca ca.pem
 ```
 
-Full setup with NATS, metrics, and protocol negotiation:
+With WebSocket listener:
+```bash
+rustgate \
+  --cert server.pem \
+  --key server-key.pem \
+  --ca ca.pem \
+  --websocket-bind 0.0.0.0:8443
+```
+
+Full setup with NATS, metrics, WebSocket, and protocol negotiation:
 ```bash
 rustgate \
   --cert server.pem \
   --key server-key.pem \
   --ca ca.pem \
   --nats-url nats://localhost:4222 \
+  --websocket-bind 0.0.0.0:8443 \
   --metrics-bind 0.0.0.0:9090 \
   --framing tak-negotiate
 ```
@@ -85,6 +95,7 @@ curl http://localhost:9090/metrics
 | Port | Service | Feature Gate |
 |------|---------|-------------|
 | 4433 | TAK client connections (mTLS) | always |
+| 8443 | WebSocket connections (wss:// mTLS) | `websocket` |
 | 8446 | Certificate enrollment (HTTPS) | `enrollment` |
 | 9000 | Federation V1 (mTLS) | `federation` |
 | 9001 | Federation V2 gRPC (mTLS) | `federation` |

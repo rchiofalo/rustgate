@@ -6,9 +6,8 @@
 
 use std::collections::HashMap;
 
-use tokio::sync::RwLock;
-
 use rustgate_core::message::RoutableMessage;
+use tokio::sync::RwLock;
 
 /// Stores the most recent position report per client CN.
 #[derive(Debug, Default)]

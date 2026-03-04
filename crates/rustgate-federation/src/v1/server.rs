@@ -241,8 +241,9 @@ async fn handle_inbound_peer(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rustgate_test_utils::certs::TestCa;
+
+    use super::*;
 
     /// Helper: build TlsConfig from test CA and server cert
     fn test_tls_config(ca: &TestCa) -> TlsConfig {

@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rustgate_core::error::{Result, RustgateError};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, warn};
@@ -11,7 +12,6 @@ use tracing::{debug, warn};
 use crate::config::TlsConfig;
 use crate::extract::extract_identity;
 use crate::session::AuthenticatedSession;
-use rustgate_core::error::{Result, RustgateError};
 
 /// TCP keepalive idle time before first probe.
 const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);

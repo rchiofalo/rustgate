@@ -7,8 +7,9 @@ rustgate is a Rust-native secure message router built for tactical edge deployme
 ```
 crates/
   rustgate-core/          Shared types (Identity, RoutableMessage, Destination, framing)
-  rustgate-cot/           Cursor on Target XML message parsing
+  rustgate-cot/           Cursor on Target XML parsing, MessageBuilder
   rustgate-transport/     mTLS listener, codecs, session management, message router
+  rustgate-websocket/     WebSocket (wss://) listener with mTLS, router integration
   rustgate-nats/          NATS pub/sub bridge with JetStream history replay
   rustgate-enrollment/    HTTPS certificate enrollment (Marti v2 CSR signing)
   rustgate-proto/         TAK protobuf translation (XML <-> proto) and negotiation
@@ -21,9 +22,9 @@ crates/
 
 ```
 TAK clients (ATAK/iTAK/WinTAK)
-  │
-  │ mTLS (port 4433)
-  ▼
+  │                        │
+  │ mTLS (port 4433)       │ wss:// mTLS (port 8443)
+  ▼                        ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │                         rustgate-server                          │
 │                                                                  │
@@ -33,14 +34,19 @@ TAK clients (ATAK/iTAK/WinTAK)
 │  └─────────────┘   │ group/     │   └─────────────────────┘    │
 │                     │ direct     │                               │
 │  ┌─────────────┐   │            │   ┌─────────────────────┐    │
-│  │ NATS Bridge │<->│            │<->│ Federation Manager  │    │
-│  │ (pub/sub)   │   │            │   │ (V1 XML / V2 gRPC)  │    │
+│  │ WS Listener │──>│            │   │ Federation Manager  │    │
+│  │ (websocket) │   │            │<->│ (V1 XML / V2 gRPC)  │    │
+│  └─────────────┘   │            │   └─────────────────────┘    │
+│                     │            │                               │
+│  ┌─────────────┐   │            │   ┌─────────────────────┐    │
+│  │ NATS Bridge │<->│            │   │  Position Cache     │    │
+│  │ (pub/sub)   │   │            │   │  (replay on connect) │    │
 │  └─────────────┘   └────────────┘   └─────────────────────┘    │
 │                                                                  │
-│  ┌─────────────┐   ┌────────────┐   ┌─────────────────────┐    │
-│  │ Enrollment  │   │  Metrics   │   │  Position Cache     │    │
-│  │ (HTTPS CSR) │   │ Prometheus │   │  (replay on connect) │    │
-│  └─────────────┘   └────────────┘   └─────────────────────┘    │
+│  ┌─────────────┐   ┌────────────┐                               │
+│  │ Enrollment  │   │  Metrics   │                               │
+│  │ (HTTPS CSR) │   │ Prometheus │                               │
+│  └─────────────┘   └────────────┘                               │
 └──────────────────────────────────────────────────────────────────┘
   │                     │                    │
   │ NATS (4222)         │ HTTP (9090)        │ mTLS (9000/9001)
@@ -86,6 +92,7 @@ All optional features are compile-time feature gates, keeping the base binary mi
 
 | Feature | Crate | What It Adds |
 |---------|-------|--------------|
+| `websocket` | rustgate-websocket | WebSocket (wss://) listener with mTLS, router integration |
 | `nats` | rustgate-nats | NATS pub/sub bridge, JetStream SA replay |
 | `enrollment` | rustgate-enrollment | HTTPS certificate enrollment server |
 | `proto` | rustgate-proto | TAK protobuf translation, protocol negotiation |
@@ -105,6 +112,8 @@ cargo build --release --all-features
 
 ## Session Lifecycle
 
+### TCP Sessions (port 4433)
+
 1. Client connects over TCP to the listener port (default 4433)
 2. TLS handshake with mutual authentication (client must present a certificate)
 3. Server extracts `Identity` from the client certificate
@@ -112,6 +121,16 @@ cargo build --release --all-features
 5. Spawns a read loop (client -> router) and write loop (router -> client)
 6. On disconnect: unregisters from Router, cleans up session resources
 7. If the same CN reconnects, the old session is evicted (new session ID wins)
+
+### WebSocket Sessions (requires `--features websocket`)
+
+1. Client connects over TCP, completes mTLS handshake (same cert requirements as TCP)
+2. WebSocket upgrade handshake over the TLS connection (10s timeout)
+3. Server extracts `Identity` from the client certificate (same as TCP)
+4. Session registers with the shared `Router` and receives cached positions
+5. Read/write loops over split WebSocket stream (Binary/Text frames, 5min read timeout, 30s write timeout)
+6. On disconnect or Close frame: unregisters from Router, releases semaphore permit
+7. WebSocket and TCP sessions are fully interoperable — same router, same groups, same position cache
 
 ## Codec Pipeline
 

@@ -338,8 +338,9 @@ pub async fn serve(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Once;
+
+    use super::*;
 
     static INIT: Once = Once::new();
 

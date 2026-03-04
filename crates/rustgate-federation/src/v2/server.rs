@@ -434,8 +434,9 @@ impl FederatedChannel for FederationService {
 #[cfg(test)]
 #[allow(unused_results)]
 mod tests {
-    use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
 
     fn noop_on_event() -> OnEvent {
         Arc::new(|_event, _peer| {})

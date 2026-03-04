@@ -525,10 +525,11 @@ impl FederationManager {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::config::{FederationConfig, PeerConfig, RoutingMode};
     use std::path::PathBuf;
     use std::time::Duration;
+
+    use super::*;
+    use crate::config::{FederationConfig, PeerConfig, RoutingMode};
 
     fn test_config() -> FederationConfig {
         FederationConfig {

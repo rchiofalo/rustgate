@@ -33,6 +33,12 @@ All rustgate configuration is done through CLI flags or environment variables. C
 | `--enrollment-password` | `ENROLLMENT_PASSWORD` | — | HTTP Basic Auth password |
 | `--ca-organization` | `RUSTGATE_CA_ORG` | `rustgate` | Organization for issued certs |
 
+### WebSocket (requires `--features websocket`)
+
+| Flag | Env Var | Default | Description |
+|------|---------|---------|-------------|
+| `--websocket-bind` | `WEBSOCKET_BIND` | — | WebSocket (wss://) listen address |
+
 ### Metrics (requires `--features metrics`)
 
 | Flag | Env Var | Default | Description |
@@ -191,6 +197,7 @@ export RUSTGATE_CA=/certs/ca.pem
 export RUSTGATE_BIND=0.0.0.0:4433
 export RUSTGATE_FRAMING=tak-negotiate
 export RUSTGATE_MAX_CONNECTIONS=2048
+export WEBSOCKET_BIND=0.0.0.0:8443
 export NATS_URL=nats://nats:4222
 export METRICS_BIND=0.0.0.0:9090
 export FEDERATION_V1_BIND=0.0.0.0:9000

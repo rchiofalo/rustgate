@@ -22,12 +22,14 @@ full-detail = ["rustgate-nats/full-detail"]
 metrics = ["dep:prometheus", "dep:hyper", "dep:hyper-util", "dep:http-body-util"]
 federation = ["dep:rustgate-federation", "rustgate-federation/v2", "rustgate-federation/api", "dep:serde_json"]
 federation-ha = ["federation", "rustgate-federation/ha"]
+websocket = ["dep:rustgate-websocket"]
 jemalloc = ["dep:tikv-jemallocator"]
 
 [dependencies]
 rustgate-core = { workspace = true }
 rustgate-cot = { workspace = true }
 rustgate-transport = { workspace = true }
+rustgate-websocket = { workspace = true, optional = true }
 rustgate-nats = { workspace = true, optional = true }
 rustgate-enrollment = { workspace = true, optional = true }
 rustgate-proto = { workspace = true, optional = true }

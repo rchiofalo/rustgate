@@ -2,11 +2,9 @@
 
 use prost::Message;
 
-use crate::error::ProtoError;
-use crate::tak_proto;
-use crate::xml_full;
-
 use super::timestamp::iso8601_to_millis;
+use crate::error::ProtoError;
+use crate::{tak_proto, xml_full};
 
 /// Convert raw CoT XML bytes to serialized TakMessage protobuf bytes.
 ///

@@ -42,6 +42,9 @@ allow = ["LicenseRef-Proprietary"]
 crate = "rustgate-transport"
 [[licenses.exceptions]]
 allow = ["LicenseRef-Proprietary"]
+crate = "rustgate-websocket"
+[[licenses.exceptions]]
+allow = ["LicenseRef-Proprietary"]
 crate = "rustgate-server"
 [[licenses.exceptions]]
 allow = ["LicenseRef-Proprietary"]

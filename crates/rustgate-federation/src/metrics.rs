@@ -204,8 +204,9 @@ pub fn snapshot() -> MetricsSnapshot {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Once;
+
+    use super::*;
 
     static INIT: Once = Once::new();
 

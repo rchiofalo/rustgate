@@ -1,10 +1,11 @@
 //! X.509 certificate parsing and identity extraction.
 
+use std::collections::BTreeSet;
+
 use rustgate_core::error::{Result, RustgateError};
 use rustgate_core::identity::Identity;
 use rustls::pki_types::CertificateDer;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
 use x509_parser::oid_registry::{OID_X509_COMMON_NAME, OID_X509_ORGANIZATIONAL_UNIT};
 use x509_parser::prelude::*;
 

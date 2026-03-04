@@ -1,10 +1,12 @@
 //! X.509 certificate generation for tests.
 
+use std::fmt;
+
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DistinguishedName, DnType,
     ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
 };
-use std::fmt;
+use time::{Duration as TimeDuration, OffsetDateTime};
 
 /// A certificate authority for signing test certificates.
 pub struct TestCa {
@@ -79,6 +81,39 @@ impl TestCa {
         let cert = params
             .signed_by(&key_pair, &self.issuer)
             .expect("failed to sign client cert");
+
+        TestCert {
+            cert_pem: cert.pem(),
+            key_pem: key_pair.serialize_pem(),
+        }
+    }
+
+    /// Issue an already-expired client certificate for testing rejection paths.
+    ///
+    /// The certificate's validity window is entirely in the past (30 days ago
+    /// to 1 day ago), so TLS handshake validation will reject it.
+    pub fn issue_expired_client_cert(&self, cn: &str, groups: &[&str]) -> TestCert {
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::NoCa;
+        params
+            .extended_key_usages
+            .push(ExtendedKeyUsagePurpose::ClientAuth);
+
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, cn);
+        if !groups.is_empty() {
+            dn.push(DnType::OrganizationalUnitName, groups.join(","));
+        }
+        params.distinguished_name = dn;
+
+        let now = OffsetDateTime::now_utc();
+        params.not_before = now - TimeDuration::days(30);
+        params.not_after = now - TimeDuration::days(1);
+
+        let key_pair = KeyPair::generate().expect("failed to generate key pair");
+        let cert = params
+            .signed_by(&key_pair, &self.issuer)
+            .expect("failed to sign expired client cert");
 
         TestCert {
             cert_pem: cert.pem(),
