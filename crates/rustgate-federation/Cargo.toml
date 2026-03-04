@@ -10,6 +10,9 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[package.metadata.cargo-machete]
+ignored = ["prost-types", "tonic-prost"]  # runtime deps for generated gRPC code (v2 feature)
+
 [features]
 default = []
 v2 = ["dep:tonic", "dep:tonic-prost", "dep:tokio-stream", "dep:prost-types", "dep:prost-build", "dep:tonic-build", "dep:tonic-prost-build", "dep:rustgate-proto"]

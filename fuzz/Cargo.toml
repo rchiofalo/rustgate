@@ -9,7 +9,6 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-bytes = "1"
 tokio-util = { version = "0.7", features = ["codec"] }
 rustgate-core = { path = "../crates/rustgate-core" }
 rustgate-transport = { path = "../crates/rustgate-transport" }

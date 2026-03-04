@@ -1,8 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
@@ -10,44 +8,60 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
   RUSTFLAGS: -Dwarnings
   NATS_VERSION: "2.11.1"
 
 jobs:
-  fmt:
+  lint:
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+      - name: Install cargo-machete
+        uses: taiki-e/install-action@205eb1d74c6feda89abb1f3a09360601953286c0 # v2.68.18
+        with:
+          tool: cargo-machete
+
+      - name: Check for unused dependencies
+        run: cargo machete
 
   clippy:
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -Dwarnings
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Install protobuf compiler
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Cache cargo registry and build
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-clippy-
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
 
       - name: Clippy (all features)
         run: cargo clippy --all-features --all-targets
 
+      - name: Build documentation
+        run: cargo doc --workspace --all-features --no-deps
+
   test:
     if: github.event.pull_request.draft == false
+    needs: [lint, clippy]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -55,56 +69,75 @@ jobs:
         include:
           - name: default
             flags: ""
+            needs_nats: false
           - name: nats
             flags: "--features nats"
+            needs_nats: true
           - name: enrollment
             flags: "--features enrollment"
+            needs_nats: false
           - name: proto
             flags: "--features proto"
+            needs_nats: false
           - name: metrics
             flags: "--features metrics"
+            needs_nats: false
           - name: websocket
             flags: "--features websocket"
+            needs_nats: false
           - name: federation
             flags: "--features federation"
+            needs_nats: false
           - name: websocket-nats
             flags: "--features websocket,nats"
+            needs_nats: true
           - name: websocket-federation
             flags: "--features websocket,federation"
+            needs_nats: false
           - name: federation-nats
             flags: "--features federation,nats"
+            needs_nats: true
           - name: federation-metrics
             flags: "--features federation,metrics"
+            needs_nats: false
           - name: proto-federation
             flags: "--features proto,federation"
+            needs_nats: false
           - name: enrollment-federation
             flags: "--features enrollment,federation"
+            needs_nats: false
           - name: nats-metrics
             flags: "--features nats,metrics"
+            needs_nats: true
+          - name: full-detail
+            flags: "--features full-detail"
+            needs_nats: true
+          - name: federation-ha
+            flags: "--features federation-ha,nats"
+            needs_nats: true
           - name: all
             flags: "--all-features"
+            needs_nats: true
     name: test (${{ matrix.name }})
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Install protobuf compiler
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install nats-server
+        if: matrix.needs_nats
         run: |
           curl -fsSL "https://github.com/nats-io/nats-server/releases/download/v${NATS_VERSION}/nats-server-v${NATS_VERSION}-linux-amd64.tar.gz" \
             | tar xzf - --strip-components=1 -C /usr/local/bin "nats-server-v${NATS_VERSION}-linux-amd64/nats-server"
           nats-server --version
 
       - name: Cache cargo registry and build
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-test-${{ matrix.name }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-test-${{ matrix.name }}-
+          key: ${{ matrix.name }}
 
       - name: Run tests
         run: cargo test ${{ matrix.flags }}
@@ -115,23 +148,18 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Cache cargo registry
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-audit-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-audit-
-
       - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
+        uses: taiki-e/install-action@205eb1d74c6feda89abb1f3a09360601953286c0 # v2.68.18
+        with:
+          tool: cargo-deny
 
       - name: Check advisories, licenses, bans, and sources
         run: cargo deny check
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        uses: taiki-e/install-action@205eb1d74c6feda89abb1f3a09360601953286c0 # v2.68.18
+        with:
+          tool: cargo-audit
 
       - name: Run cargo audit
         run: cargo audit
