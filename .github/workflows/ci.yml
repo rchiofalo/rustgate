@@ -18,43 +18,14 @@ env:
   NATS_VERSION: "2.11.1"
 
 jobs:
-  fmt:
+  lint:
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
       - name: Check formatting
         run: cargo fmt --all -- --check
-
-  doc:
-    if: github.event.pull_request.draft == false
-    runs-on: ubuntu-latest
-    env:
-      RUSTDOCFLAGS: -Dwarnings
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Install protobuf compiler
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
-      - name: Cache cargo registry and build
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-doc-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-doc-
-
-      - name: Build documentation
-        run: cargo doc --workspace --all-features --no-deps
-
-  machete:
-    if: github.event.pull_request.draft == false
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Cache cargo-machete binary
         uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
@@ -71,6 +42,8 @@ jobs:
   clippy:
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -Dwarnings
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -90,8 +63,12 @@ jobs:
       - name: Clippy (all features)
         run: cargo clippy --all-features --all-targets
 
+      - name: Build documentation
+        run: cargo doc --workspace --all-features --no-deps
+
   test:
     if: github.event.pull_request.draft == false
+    needs: [lint, clippy]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -99,46 +76,82 @@ jobs:
         include:
           - name: default
             flags: ""
+            needs_protoc: false
+            needs_nats: false
           - name: nats
             flags: "--features nats"
+            needs_protoc: false
+            needs_nats: true
           - name: enrollment
             flags: "--features enrollment"
+            needs_protoc: false
+            needs_nats: false
           - name: proto
             flags: "--features proto"
+            needs_protoc: true
+            needs_nats: false
           - name: metrics
             flags: "--features metrics"
+            needs_protoc: false
+            needs_nats: false
           - name: websocket
             flags: "--features websocket"
+            needs_protoc: false
+            needs_nats: false
           - name: federation
             flags: "--features federation"
+            needs_protoc: true
+            needs_nats: false
           - name: websocket-nats
             flags: "--features websocket,nats"
+            needs_protoc: false
+            needs_nats: true
           - name: websocket-federation
             flags: "--features websocket,federation"
+            needs_protoc: true
+            needs_nats: false
           - name: federation-nats
             flags: "--features federation,nats"
+            needs_protoc: true
+            needs_nats: true
           - name: federation-metrics
             flags: "--features federation,metrics"
+            needs_protoc: true
+            needs_nats: false
           - name: proto-federation
             flags: "--features proto,federation"
+            needs_protoc: true
+            needs_nats: false
           - name: enrollment-federation
             flags: "--features enrollment,federation"
+            needs_protoc: true
+            needs_nats: false
           - name: nats-metrics
             flags: "--features nats,metrics"
+            needs_protoc: false
+            needs_nats: true
           - name: full-detail
             flags: "--features full-detail"
+            needs_protoc: true
+            needs_nats: true
           - name: federation-ha
             flags: "--features federation-ha,nats"
+            needs_protoc: true
+            needs_nats: true
           - name: all
             flags: "--all-features"
+            needs_protoc: true
+            needs_nats: true
     name: test (${{ matrix.name }})
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Install protobuf compiler
+        if: matrix.needs_protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       - name: Install nats-server
+        if: matrix.needs_nats
         run: |
           curl -fsSL "https://github.com/nats-io/nats-server/releases/download/v${NATS_VERSION}/nats-server-v${NATS_VERSION}-linux-amd64.tar.gz" \
             | tar xzf - --strip-components=1 -C /usr/local/bin "nats-server-v${NATS_VERSION}-linux-amd64/nats-server"
