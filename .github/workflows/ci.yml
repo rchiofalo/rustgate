@@ -59,8 +59,14 @@ jobs:
             flags: "--features proto"
           - name: metrics
             flags: "--features metrics"
+          - name: websocket
+            flags: "--features websocket"
           - name: federation
             flags: "--features federation"
+          - name: websocket-nats
+            flags: "--features websocket,nats"
+          - name: websocket-federation
+            flags: "--features websocket,federation"
           - name: federation-nats
             flags: "--features federation,nats"
           - name: federation-metrics
