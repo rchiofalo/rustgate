@@ -8,6 +8,7 @@ members = [
     "crates/rustgate-nats",
     "crates/rustgate-proto",
     "crates/rustgate-transport",
+    "crates/rustgate-websocket",
     "crates/rustgate-server",
     "crates/rustgate-test-utils",
 ]
@@ -56,6 +57,8 @@ hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "http1"] }
 http-body-util = "0.1"
 base64 = "0.22"
+tokio-tungstenite = "0.26"
+socket2 = "0.6"
 async-nats = { version = "0.46", default-features = false, features = ["jetstream", "nkeys"] }
 prost = "0.14"
 prost-build = "0.14"
@@ -79,6 +82,7 @@ rustgate-nats = { path = "crates/rustgate-nats" }
 rustgate-proto = { path = "crates/rustgate-proto" }
 rustgate-federation = { path = "crates/rustgate-federation" }
 rustgate-transport = { path = "crates/rustgate-transport" }
+rustgate-websocket = { path = "crates/rustgate-websocket" }
 rustgate-test-utils = { path = "crates/rustgate-test-utils" }
 
 [profile.release]
