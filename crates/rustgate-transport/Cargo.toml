@@ -17,13 +17,11 @@ proto = ["dep:rustgate-proto"]
 rustgate-core = { workspace = true }
 rustgate-proto = { workspace = true, optional = true }
 bytes = { workspace = true }
-quick-xml = { workspace = true }
 tokio = { workspace = true, features = ["net", "io-util", "sync", "rt"] }
 tokio-util = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
-rustls-pki-types = { workspace = true }
 x509-parser = { workspace = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }
