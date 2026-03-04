@@ -16,6 +16,7 @@ COPY crates/rustgate-federation/Cargo.toml  crates/rustgate-federation/Cargo.tom
 COPY crates/rustgate-nats/Cargo.toml        crates/rustgate-nats/Cargo.toml
 COPY crates/rustgate-proto/Cargo.toml       crates/rustgate-proto/Cargo.toml
 COPY crates/rustgate-transport/Cargo.toml   crates/rustgate-transport/Cargo.toml
+COPY crates/rustgate-websocket/Cargo.toml   crates/rustgate-websocket/Cargo.toml
 COPY crates/rustgate-server/Cargo.toml      crates/rustgate-server/Cargo.toml
 COPY crates/rustgate-test-utils/Cargo.toml  crates/rustgate-test-utils/Cargo.toml
 
@@ -51,7 +52,7 @@ USER 10001
 
 COPY --from=builder /src/target/release/rustgate /usr/local/bin/rustgate
 
-EXPOSE 4433 9000 9001 9090
+EXPOSE 4433 8443 9000 9001 9090
 
 STOPSIGNAL SIGTERM
 
