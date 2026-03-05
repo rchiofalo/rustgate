@@ -7,7 +7,7 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use http_body_util::Full;
@@ -53,27 +53,34 @@ static NATS_RECEIVED: OnceLock<IntCounter> = OnceLock::new();
 
 static NEGOTIATIONS: OnceLock<IntCounterVec> = OnceLock::new();
 
-// ── No-op fallbacks ────────────────────────────────────────────────
+// ── Fallback constructors ───────────────────────────────────────────
 //
-// Unregistered metrics that absorb increments/decrements without effect.
-// Returned when an accessor is called before `init()`, preventing panics
-// during startup races or in test code that omits initialization.
+// When `init()` has not been called, accessor functions lazily create
+// an unregistered metric via `OnceLock::get_or_init()`. These helpers
+// construct the fallback without `unwrap()` or `expect()`.
 
-/// No-op counter returned when `init()` has not yet been called.
-#[allow(clippy::unwrap_used)]
-static NOOP_COUNTER: LazyLock<IntCounter> =
-    LazyLock::new(|| IntCounter::new("noop_counter", "uninitialized fallback").unwrap());
+fn fallback_counter(name: &str, help: &str) -> IntCounter {
+    match IntCounter::with_opts(Opts::new(name, help)) {
+        Ok(c) => c,
+        // Hardcoded metric names are always valid; this branch is unreachable.
+        // If prometheus is fundamentally broken, abort cleanly rather than panic.
+        Err(_) => std::process::abort(),
+    }
+}
 
-/// No-op gauge returned when `init()` has not yet been called.
-#[allow(clippy::unwrap_used)]
-static NOOP_GAUGE: LazyLock<IntGauge> =
-    LazyLock::new(|| IntGauge::new("noop_gauge", "uninitialized fallback").unwrap());
+fn fallback_gauge(name: &str, help: &str) -> IntGauge {
+    match IntGauge::with_opts(Opts::new(name, help)) {
+        Ok(g) => g,
+        Err(_) => std::process::abort(),
+    }
+}
 
-/// No-op counter vec returned when `init()` has not yet been called.
-#[allow(clippy::unwrap_used)]
-static NOOP_COUNTER_VEC: LazyLock<IntCounterVec> = LazyLock::new(|| {
-    IntCounterVec::new(Opts::new("noop_counter_vec", "uninitialized fallback"), &["label"]).unwrap()
-});
+fn fallback_counter_vec(name: &str, help: &str, labels: &[&str]) -> IntCounterVec {
+    match IntCounterVec::new(Opts::new(name, help), labels) {
+        Ok(cv) => cv,
+        Err(_) => std::process::abort(),
+    }
+}
 
 // ── Registration ────────────────────────────────────────────────────
 
@@ -177,61 +184,76 @@ pub fn init() -> prometheus::Result<()> {
 
 // ── Accessor functions ──────────────────────────────────────────────
 //
-// Each accessor returns a reference to the registered metric, or a
-// no-op fallback if `init()` has not been called.  This eliminates
-// panics from initialization-order races without adding Option
-// propagation to every call site.
+// Each accessor returns a reference to the registered metric. If
+// `init()` has not been called, `get_or_init()` lazily creates an
+// unregistered metric that absorbs increments without effect. This
+// eliminates panics from initialization-order races without adding
+// Option propagation to every call site.
 
 pub fn connections_accepted() -> &'static IntCounter {
-    CONNECTIONS_ACCEPTED.get().unwrap_or(&NOOP_COUNTER)
+    CONNECTIONS_ACCEPTED
+        .get_or_init(|| fallback_counter("rustgate_connections_accepted_total", "fallback"))
 }
 
 pub fn connections_active() -> &'static IntGauge {
-    CONNECTIONS_ACTIVE.get().unwrap_or(&NOOP_GAUGE)
+    CONNECTIONS_ACTIVE
+        .get_or_init(|| fallback_gauge("rustgate_connections_active", "fallback"))
 }
 
 pub fn connections_rejected() -> &'static IntCounter {
-    CONNECTIONS_REJECTED.get().unwrap_or(&NOOP_COUNTER)
+    CONNECTIONS_REJECTED
+        .get_or_init(|| fallback_counter("rustgate_connections_rejected_total", "fallback"))
 }
 
 pub fn accept_errors() -> &'static IntCounter {
-    ACCEPT_ERRORS.get().unwrap_or(&NOOP_COUNTER)
+    ACCEPT_ERRORS
+        .get_or_init(|| fallback_counter("rustgate_accept_errors_total", "fallback"))
 }
 
 pub fn messages_received() -> &'static IntCounter {
-    MESSAGES_RECEIVED.get().unwrap_or(&NOOP_COUNTER)
+    MESSAGES_RECEIVED
+        .get_or_init(|| fallback_counter("rustgate_messages_received_total", "fallback"))
 }
 
 pub fn messages_routed() -> &'static IntCounterVec {
-    MESSAGES_ROUTED.get().unwrap_or(&NOOP_COUNTER_VEC)
+    MESSAGES_ROUTED.get_or_init(|| {
+        fallback_counter_vec("rustgate_messages_routed_total", "fallback", &["destination"])
+    })
 }
 
 #[allow(dead_code)]
 pub fn pings_received() -> &'static IntCounter {
-    PINGS_RECEIVED.get().unwrap_or(&NOOP_COUNTER)
+    PINGS_RECEIVED
+        .get_or_init(|| fallback_counter("rustgate_pings_received_total", "fallback"))
 }
 
 pub fn sessions_active() -> &'static IntGauge {
-    SESSIONS_ACTIVE.get().unwrap_or(&NOOP_GAUGE)
+    SESSIONS_ACTIVE
+        .get_or_init(|| fallback_gauge("rustgate_sessions_active", "fallback"))
 }
 
 pub fn nats_publishes() -> &'static IntCounter {
-    NATS_PUBLISHES.get().unwrap_or(&NOOP_COUNTER)
+    NATS_PUBLISHES
+        .get_or_init(|| fallback_counter("rustgate_nats_publishes_total", "fallback"))
 }
 
 #[allow(dead_code)]
 pub fn nats_publish_errors() -> &'static IntCounter {
-    NATS_PUBLISH_ERRORS.get().unwrap_or(&NOOP_COUNTER)
+    NATS_PUBLISH_ERRORS
+        .get_or_init(|| fallback_counter("rustgate_nats_publish_errors_total", "fallback"))
 }
 
 #[allow(dead_code)]
 pub fn nats_received() -> &'static IntCounter {
-    NATS_RECEIVED.get().unwrap_or(&NOOP_COUNTER)
+    NATS_RECEIVED
+        .get_or_init(|| fallback_counter("rustgate_nats_received_total", "fallback"))
 }
 
 #[allow(dead_code)]
 pub fn negotiations() -> &'static IntCounterVec {
-    NEGOTIATIONS.get().unwrap_or(&NOOP_COUNTER_VEC)
+    NEGOTIATIONS.get_or_init(|| {
+        fallback_counter_vec("rustgate_negotiations_total", "fallback", &["result"])
+    })
 }
 
 // ── HTTP server ─────────────────────────────────────────────────────
@@ -378,18 +400,20 @@ mod tests {
     }
 
     #[test]
-    fn noop_fallbacks_do_not_panic() {
-        // Access all metrics WITHOUT calling init(). The no-op
-        // fallbacks must absorb calls without panicking.
-        let c = super::NOOP_COUNTER.clone();
+    fn fallback_constructors_do_not_panic() {
+        // Verify fallback helpers produce valid metrics without panicking.
+        let c = super::fallback_counter("test_counter", "test");
         c.inc();
+        assert_eq!(c.get(), 1);
 
-        let g = super::NOOP_GAUGE.clone();
+        let g = super::fallback_gauge("test_gauge", "test");
         g.inc();
         g.dec();
+        assert_eq!(g.get(), 0);
 
-        let cv = super::NOOP_COUNTER_VEC.with_label_values(&["test"]);
-        cv.inc();
+        let cv = super::fallback_counter_vec("test_vec", "test", &["label"]);
+        cv.with_label_values(&["x"]).inc();
+        assert_eq!(cv.with_label_values(&["x"]).get(), 1);
     }
 
     #[test]
