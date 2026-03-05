@@ -1,0 +1,200 @@
+//! FIPS 140-3 crypto provider integration tests.
+//!
+//! These tests verify that the aws-lc-rs FIPS provider installs correctly
+//! and that TLS handshakes work with the FIPS-validated backend.
+//!
+//! Only compiled when the `fips` feature is enabled. Run with:
+//! ```sh
+//! cargo test -p rustgate-transport --features fips
+//! ```
+#![cfg(feature = "fips")]
+
+use std::io::BufReader;
+use std::sync::{Arc, OnceLock};
+
+use rustgate_test_utils::certs::TestCa;
+use rustgate_transport::{TlsConfig, TlsListener, install_fips_provider};
+use rustls::RootCertStore;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+// ── setup ────────────────────────────────────────────────────────────────
+
+/// Install the FIPS provider exactly once across all tests in this binary.
+///
+/// Must be called before `TestCa::new()` to ensure aws-lc-rs is the active
+/// provider. The test-utils `ensure_crypto_provider()` will silently skip
+/// installing ring because a provider is already installed.
+static FIPS_INIT: OnceLock<()> = OnceLock::new();
+fn ensure_fips() {
+    let _ = FIPS_INIT.get_or_init(|| {
+        install_fips_provider().expect("failed to install FIPS provider");
+    });
+}
+
+// ── helpers ──────────────────────────────────────────────────────────────
+
+fn parse_certs(pem: &str) -> Vec<CertificateDer<'static>> {
+    let mut reader = BufReader::new(pem.as_bytes());
+    rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("parse certs")
+}
+
+fn parse_key(pem: &str) -> PrivateKeyDer<'static> {
+    let mut reader = BufReader::new(pem.as_bytes());
+    rustls_pemfile::private_key(&mut reader)
+        .expect("parse key")
+        .expect("no key")
+}
+
+fn build_client_config(cert_pem: &str, key_pem: &str, ca_pem: &str) -> rustls::ClientConfig {
+    let certs = parse_certs(cert_pem);
+    let key = parse_key(key_pem);
+    let mut root_store = RootCertStore::empty();
+    for cert in parse_certs(ca_pem) {
+        root_store.add(cert).expect("add CA cert");
+    }
+    rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_client_auth_cert(certs, key)
+        .expect("client config")
+}
+
+// ── FIPS provider tests ─────────────────────────────────────────────────
+
+/// After installing the FIPS provider, a second `install_fips_provider()`
+/// must return an error because `CryptoProvider::install_default` only
+/// permits one installation per process.
+#[test]
+fn fips_double_install_returns_error() {
+    ensure_fips();
+
+    let result = install_fips_provider();
+    assert!(
+        result.is_err(),
+        "second install_fips_provider() should return Err"
+    );
+}
+
+/// Full mTLS handshake using the FIPS provider. Verifies that certificate
+/// generation, TLS server setup, client connection, and bidirectional data
+/// exchange all work correctly with the aws-lc-rs backend.
+#[tokio::test]
+async fn fips_mtls_handshake() {
+    ensure_fips();
+
+    let ca = TestCa::new("FIPS Test CA");
+    let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
+    let client_cert = ca.issue_client_cert("fips-operator", &["fips-team"]);
+
+    let tls_config = TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
+        .expect("tls config with FIPS provider");
+
+    let listener = TlsListener::bind("127.0.0.1:0", &tls_config)
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    let server_handle = tokio::spawn(async move {
+        let session = listener.accept().await.expect("accept");
+        let identity = session.identity().clone();
+        let (mut reader, mut writer) = session.split();
+
+        let mut buf = [0u8; 9];
+        let _ = reader.read_exact(&mut buf).await.expect("read");
+        assert_eq!(&buf, b"fips-data");
+        writer.write_all(b"fips-resp").await.expect("write");
+
+        identity
+    });
+
+    let config = build_client_config(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem);
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let tcp = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("tcp connect");
+    let server_name = "localhost".try_into().expect("server name");
+    let mut stream = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("tls connect with FIPS provider");
+
+    stream.write_all(b"fips-data").await.expect("client write");
+    let mut buf = [0u8; 9];
+    let _ = stream.read_exact(&mut buf).await.expect("client read");
+    assert_eq!(&buf, b"fips-resp");
+
+    let identity = server_handle.await.expect("server task");
+    assert_eq!(identity.cn, "fips-operator");
+    assert!(identity.is_member_of("fips-team"));
+}
+
+/// FIPS provider works with CRL-enabled TLS config. Ensures the two
+/// features compose correctly — CRL checking under the FIPS backend.
+#[tokio::test]
+async fn fips_with_crl_rejects_revoked() {
+    ensure_fips();
+
+    let ca = TestCa::new("FIPS CRL CA");
+    let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
+    let revoked_client = ca.issue_client_cert("revoked-fips", &["team"]);
+
+    let crl_pem = ca.generate_crl(&[&revoked_client.cert_pem]);
+
+    let tls_config = TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
+        .expect("tls config")
+        .with_crls(&crl_pem)
+        .expect("load CRL");
+
+    let listener = TlsListener::bind("127.0.0.1:0", &tls_config)
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    // Server must be accepting for the TLS handshake to proceed
+    let server_handle = tokio::spawn(async move {
+        tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept()).await
+    });
+
+    // Revoked client tries to connect
+    let revoked_config = build_client_config(
+        &revoked_client.cert_pem,
+        &revoked_client.key_pem,
+        &ca.cert_pem,
+    );
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(revoked_config));
+    let tcp = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("tcp connect");
+    let server_name: rustls::pki_types::ServerName<'_> =
+        "localhost".try_into().expect("server name");
+    let result = connector.connect(server_name, tcp).await;
+
+    let revoked_failed = match result {
+        Err(_) => true,
+        Ok(mut stream) => {
+            stream.write_all(b"x").await.is_err()
+                || stream.flush().await.is_err()
+                || matches!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(500),
+                        stream.read(&mut [0u8; 1]),
+                    )
+                    .await,
+                    Ok(Ok(0)) | Ok(Err(_)) | Err(_)
+                )
+        }
+    };
+    assert!(
+        revoked_failed,
+        "revoked client should not connect under FIPS provider"
+    );
+
+    // Server should not have produced a valid session
+    let server_result = server_handle.await.expect("server task");
+    assert!(
+        server_result.is_err(),
+        "server should timeout — revoked client under FIPS + CRL"
+    );
+}
