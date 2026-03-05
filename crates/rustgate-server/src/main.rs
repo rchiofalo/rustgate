@@ -50,6 +50,24 @@ use rustgate_transport::{
 /// type is available regardless of feature flags.
 type FedForwardFn = Arc<dyn Fn(Bytes, Vec<String>) + Send + Sync>;
 
+/// Shared dependencies passed to each session handler task.
+struct SessionDeps<P: NatsPublish> {
+    router: Arc<Router>,
+    framing: Framing,
+    encoding: Encoding,
+    nats_publisher: Option<P>,
+    fed_forward: Option<FedForwardFn>,
+}
+
+/// Runtime context for a connected session's read/write loops.
+struct SessionContext<'a, P: NatsPublish> {
+    identity: &'a Identity,
+    router: &'a Router,
+    framing: &'a FramingStrategy,
+    nats_publisher: &'a Option<P>,
+    fed_forward: &'a Option<FedForwardFn>,
+}
+
 #[derive(Parser)]
 #[command(name = "rustgate", about = "Secure tactical message router")]
 struct Cli {
@@ -642,7 +660,14 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                         #[allow(clippy::clone_on_copy)] // Type varies by feature flag
                         let publisher = nats_publisher.clone();
                         let fed = fed_forward.clone();
-                        drop(tokio::spawn(handle_session(session, router, framing, encoding, publisher, fed, permit)));
+                        let deps = SessionDeps {
+                            router,
+                            framing,
+                            encoding,
+                            nats_publisher: publisher,
+                            fed_forward: fed,
+                        };
+                        drop(tokio::spawn(handle_session(session, deps, permit)));
                     }
                     Err(e) => {
                         #[cfg(feature = "metrics")]
@@ -726,14 +751,9 @@ async fn shutdown_signal() {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
     session: AuthenticatedSession,
-    router: Arc<Router>,
-    framing: Framing,
-    encoding: Encoding,
-    nats_publisher: Option<P>,
-    fed_forward: Option<FedForwardFn>,
+    deps: SessionDeps<P>,
     _permit: OwnedSemaphorePermit, // Held for session lifetime; released on drop
 ) {
     let identity = session.identity_arc();
@@ -748,15 +768,15 @@ async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
     let (tx, rx) = mpsc::channel::<RoutableMessage>(64);
     let handle = SessionHandle::new(Arc::clone(&identity), tx);
     let session_id = handle.id;
-    router.register(handle.clone()).await;
-    router.replay_positions(&handle).await;
+    deps.router.register(handle.clone()).await;
+    deps.router.replay_positions(&handle).await;
 
     #[allow(unused_mut)] // Mutable borrows needed for proto negotiation
     let (mut reader, mut writer) = session.split();
 
     // Run protocol negotiation for TakNegotiate mode.
     // This may upgrade both framing and encoding from XML to protobuf.
-    let (final_framing, final_encoding, read_buf) = match framing {
+    let (final_framing, final_encoding, read_buf) = match deps.framing {
         #[cfg(feature = "proto")]
         Framing::TakNegotiate => {
             match negotiate_tak_protocol(&mut reader, &mut writer, &cn).await {
@@ -776,7 +796,7 @@ async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
                     metrics::negotiations().with_label_values(&["failed"]).inc();
                     tracing::debug!(cn = %cn, error = %e, "negotiation failed");
                     audit::negotiation_result(&cn, "tak", false);
-                    router.unregister(&cn, session_id).await;
+                    deps.router.unregister(&cn, session_id).await;
                     #[cfg(feature = "metrics")]
                     {
                         metrics::sessions_active().dec();
@@ -789,54 +809,30 @@ async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
             }
         }
         _ => {
-            let fs = FramingStrategy::from(framing);
-            (fs, encoding, tokio_util::bytes::BytesMut::new())
+            let fs = FramingStrategy::from(deps.framing);
+            (fs, deps.encoding, tokio_util::bytes::BytesMut::new())
         }
     };
 
+    let ctx = SessionContext {
+        identity: &identity,
+        router: &deps.router,
+        framing: &final_framing,
+        nats_publisher: &deps.nats_publisher,
+        fed_forward: &deps.fed_forward,
+    };
+
     let result = match final_encoding {
-        Encoding::Raw => {
-            run_session_loops(
-                reader,
-                writer,
-                rx,
-                &identity,
-                &router,
-                &final_framing,
-                &RawEncoder,
-                &nats_publisher,
-                &fed_forward,
-                read_buf,
-            )
-            .await
-        }
-        Encoding::Cot => {
-            run_session_loops(
-                reader,
-                writer,
-                rx,
-                &identity,
-                &router,
-                &final_framing,
-                &CotEncoder,
-                &nats_publisher,
-                &fed_forward,
-                read_buf,
-            )
-            .await
-        }
+        Encoding::Raw => run_session_loops(reader, writer, rx, &ctx, &RawEncoder, read_buf).await,
+        Encoding::Cot => run_session_loops(reader, writer, rx, &ctx, &CotEncoder, read_buf).await,
         #[cfg(feature = "proto")]
         Encoding::TakProtobuf => {
             run_session_loops(
                 reader,
                 writer,
                 rx,
-                &identity,
-                &router,
-                &final_framing,
+                &ctx,
                 &rustgate_proto::TakProtobufEncoder,
-                &nats_publisher,
-                &fed_forward,
                 read_buf,
             )
             .await
@@ -852,7 +848,7 @@ async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
         tracing::debug!(cn = %cn, error = %e, "session error");
     }
 
-    router.unregister(&cn, session_id).await;
+    deps.router.unregister(&cn, session_id).await;
     #[cfg(feature = "metrics")]
     {
         metrics::sessions_active().dec();
@@ -926,22 +922,17 @@ async fn negotiate_tak_protocol(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_session_loops(
     reader: rustgate_transport::SessionReader,
     writer: rustgate_transport::SessionWriter,
     rx: mpsc::Receiver<RoutableMessage>,
-    identity: &Identity,
-    router: &Router,
-    framing: &FramingStrategy,
+    ctx: &SessionContext<'_, impl NatsPublish>,
     encoder: &impl MessageEncoder,
-    nats_publisher: &Option<impl NatsPublish>,
-    fed_forward: &Option<FedForwardFn>,
     read_buf: tokio_util::bytes::BytesMut,
 ) -> std::io::Result<()> {
     tokio::select! {
-        r = read_loop(reader, identity, router, framing, nats_publisher, fed_forward, read_buf) => r,
-        r = write_loop(writer, rx, framing, encoder) => r,
+        r = read_loop(reader, ctx.identity, ctx.router, ctx.framing, ctx.nats_publisher, ctx.fed_forward, read_buf) => r,
+        r = write_loop(writer, rx, ctx.framing, encoder) => r,
     }
 }
 

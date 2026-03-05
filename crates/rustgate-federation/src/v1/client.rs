@@ -3,6 +3,7 @@
 //! Connects to a remote federation peer over mTLS and runs read/write
 //! loops with heartbeat sending and automatic reconnection.
 
+use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,6 +27,33 @@ use crate::peer::{PeerHandle, PeerState};
 /// Arguments: (peer_id, payload_bytes)
 pub type OnMessage = Arc<dyn Fn(String, Bytes) + Send + Sync>;
 
+/// Configuration for a V1 federation outbound client.
+pub struct V1ClientConfig {
+    pub connector: PeerConnector,
+    pub addr: SocketAddr,
+    pub server_name: String,
+    pub server_uid: String,
+    pub heartbeat_interval: Duration,
+    pub heartbeat_timeout: Duration,
+    pub reconnect_delay: Duration,
+    pub max_reconnects: i32,
+    pub on_message: OnMessage,
+}
+
+impl fmt::Debug for V1ClientConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("V1ClientConfig")
+            .field("addr", &self.addr)
+            .field("server_name", &self.server_name)
+            .field("server_uid", &self.server_uid)
+            .field("heartbeat_interval", &self.heartbeat_interval)
+            .field("heartbeat_timeout", &self.heartbeat_timeout)
+            .field("reconnect_delay", &self.reconnect_delay)
+            .field("max_reconnects", &self.max_reconnects)
+            .finish_non_exhaustive()
+    }
+}
+
 /// V1 federation outbound client.
 ///
 /// Maintains a persistent connection to a remote peer with automatic
@@ -47,34 +75,14 @@ impl V1Client {
     ///
     /// The client immediately begins connecting to the remote peer
     /// and will reconnect automatically on disconnection.
-    #[allow(clippy::too_many_arguments)]
-    pub fn start(
-        peer: Arc<PeerHandle>,
-        connector: PeerConnector,
-        addr: SocketAddr,
-        server_name: String,
-        server_uid: String,
-        heartbeat_interval: Duration,
-        heartbeat_timeout: Duration,
-        reconnect_delay: Duration,
-        max_reconnects: i32,
-        on_message: OnMessage,
-    ) -> Self {
+    pub fn start(peer: Arc<PeerHandle>, config: V1ClientConfig) -> Self {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let (outbound_tx, outbound_rx) = mpsc::channel::<Bytes>(64);
 
         let peer_clone = Arc::clone(&peer);
         let task_handle = tokio::spawn(connection_loop(
             peer_clone,
-            connector,
-            addr,
-            server_name,
-            server_uid,
-            heartbeat_interval,
-            heartbeat_timeout,
-            reconnect_delay,
-            max_reconnects,
-            on_message,
+            config,
             outbound_rx,
             shutdown_rx,
         ));
@@ -119,18 +127,9 @@ impl V1Client {
 ///
 /// Keeps trying to connect to the remote peer. On disconnect, waits with
 /// exponential backoff before retrying.
-#[allow(clippy::too_many_arguments)]
 async fn connection_loop(
     peer: Arc<PeerHandle>,
-    connector: PeerConnector,
-    addr: SocketAddr,
-    server_name: String,
-    server_uid: String,
-    heartbeat_interval: Duration,
-    heartbeat_timeout: Duration,
-    reconnect_delay: Duration,
-    max_reconnects: i32,
-    on_message: OnMessage,
+    config: V1ClientConfig,
     mut outbound_rx: mpsc::Receiver<Bytes>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
@@ -147,13 +146,16 @@ async fn connection_loop(
         peer.set_state(PeerState::Connecting);
         info!(
             peer_id = %peer_id,
-            addr = %addr,
+            addr = %config.addr,
             attempt = reconnect_count + 1,
             "connecting to V1 federation peer"
         );
 
         // Attempt connection
-        let connect_result = connector.connect(addr, &server_name).await;
+        let connect_result = config
+            .connector
+            .connect(config.addr, &config.server_name)
+            .await;
         let (tls_stream, identity) = match connect_result {
             Ok(result) => result,
             Err(e) => {
@@ -165,17 +167,17 @@ async fn connection_loop(
                 peer.set_state(PeerState::Reconnecting);
                 peer.set_error(&e.to_string());
 
-                if should_stop_reconnecting(max_reconnects, reconnect_count) {
+                if should_stop_reconnecting(config.max_reconnects, reconnect_count) {
                     error!(
                         peer_id = %peer_id,
-                        max_reconnects = max_reconnects,
+                        max_reconnects = config.max_reconnects,
                         "max reconnection attempts reached, giving up"
                     );
                     peer.set_state(PeerState::Disconnected);
                     return;
                 }
 
-                let delay = backoff_delay(reconnect_delay, reconnect_count);
+                let delay = backoff_delay(config.reconnect_delay, reconnect_count);
                 reconnect_count += 1;
 
                 tokio::select! {
@@ -191,7 +193,7 @@ async fn connection_loop(
         info!(
             peer_id = %peer_id,
             peer_cn = %identity.cn,
-            addr = %addr,
+            addr = %config.addr,
             "connected to V1 federation peer"
         );
 
@@ -199,10 +201,7 @@ async fn connection_loop(
         let session_result = run_session(
             &peer,
             tls_stream,
-            &server_uid,
-            heartbeat_interval,
-            heartbeat_timeout,
-            &on_message,
+            &config,
             &mut outbound_rx,
             &mut shutdown_rx,
         )
@@ -226,17 +225,17 @@ async fn connection_loop(
 
         // Wait before reconnecting
         peer.set_state(PeerState::Reconnecting);
-        if should_stop_reconnecting(max_reconnects, reconnect_count) {
+        if should_stop_reconnecting(config.max_reconnects, reconnect_count) {
             error!(
                 peer_id = %peer_id,
-                max_reconnects = max_reconnects,
+                max_reconnects = config.max_reconnects,
                 "max reconnection attempts reached, giving up"
             );
             peer.set_state(PeerState::Disconnected);
             return;
         }
 
-        let delay = backoff_delay(reconnect_delay, reconnect_count);
+        let delay = backoff_delay(config.reconnect_delay, reconnect_count);
         reconnect_count += 1;
 
         info!(
@@ -253,14 +252,10 @@ async fn connection_loop(
 }
 
 /// Run a connected V1 session — read/write loops + heartbeat.
-#[allow(clippy::too_many_arguments)]
 async fn run_session(
     peer: &PeerHandle,
     tls_stream: tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
-    server_uid: &str,
-    heartbeat_interval: Duration,
-    heartbeat_timeout: Duration,
-    on_message: &OnMessage,
+    config: &V1ClientConfig,
     outbound_rx: &mut mpsc::Receiver<Bytes>,
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
@@ -270,7 +265,7 @@ async fn run_session(
 
     // Heartbeat tracking
     let mut last_heartbeat_received = tokio::time::Instant::now();
-    let mut heartbeat_send_interval = tokio::time::interval(heartbeat_interval);
+    let mut heartbeat_send_interval = tokio::time::interval(config.heartbeat_interval);
     let _ = heartbeat_send_interval.tick().await; // skip immediate tick
 
     let mut heartbeat_check_interval = tokio::time::interval(Duration::from_secs(5));
@@ -287,7 +282,7 @@ async fn run_session(
                             last_heartbeat_received = tokio::time::Instant::now();
                         } else {
                             peer.record_recv();
-                            on_message(peer_id.clone(), data.freeze());
+                            (config.on_message)(peer_id.clone(), data.freeze());
                         }
                     }
                     Some(Err(e)) => {
@@ -316,7 +311,7 @@ async fn run_session(
 
             // Send heartbeat at interval
             _ = heartbeat_send_interval.tick() => {
-                let hb = create_heartbeat(server_uid);
+                let hb = create_heartbeat(&config.server_uid);
                 let buf = BytesMut::from(hb.as_ref());
                 framed.send(buf).await
                     .map_err(|e| anyhow::anyhow!("heartbeat send error: {e}"))?;
@@ -325,7 +320,7 @@ async fn run_session(
 
             // Check heartbeat timeout
             _ = heartbeat_check_interval.tick() => {
-                if last_heartbeat_received.elapsed() > heartbeat_timeout {
+                if last_heartbeat_received.elapsed() > config.heartbeat_timeout {
                     return Err(anyhow::anyhow!(
                         "heartbeat timeout: no heartbeat in {:?}",
                         last_heartbeat_received.elapsed()
@@ -542,15 +537,17 @@ mod tests {
 
         let mut client = V1Client::start(
             peer,
-            connector,
-            "127.0.0.1:19999".parse().expect("addr"),
-            "localhost".into(),
-            "test-uid".into(),
-            Duration::from_secs(30),
-            Duration::from_secs(90),
-            Duration::from_secs(1),
-            0, // no reconnects — should give up quickly
-            on_msg,
+            V1ClientConfig {
+                connector,
+                addr: "127.0.0.1:19999".parse().expect("addr"),
+                server_name: "localhost".into(),
+                server_uid: "test-uid".into(),
+                heartbeat_interval: Duration::from_secs(30),
+                heartbeat_timeout: Duration::from_secs(90),
+                reconnect_delay: Duration::from_secs(1),
+                max_reconnects: 0, // no reconnects — should give up quickly
+                on_message: on_msg,
+            },
         );
 
         // Give it a moment to attempt connection and fail
@@ -595,15 +592,17 @@ mod tests {
 
         let mut client = V1Client::start(
             peer,
-            connector,
-            "127.0.0.1:19998".parse().expect("addr"),
-            "localhost".into(),
-            "test-uid".into(),
-            Duration::from_secs(30),
-            Duration::from_secs(90),
-            Duration::from_secs(1),
-            0,
-            on_msg,
+            V1ClientConfig {
+                connector,
+                addr: "127.0.0.1:19998".parse().expect("addr"),
+                server_name: "localhost".into(),
+                server_uid: "test-uid".into(),
+                heartbeat_interval: Duration::from_secs(30),
+                heartbeat_timeout: Duration::from_secs(90),
+                reconnect_delay: Duration::from_secs(1),
+                max_reconnects: 0,
+                on_message: on_msg,
+            },
         );
 
         client.shutdown().await;
@@ -649,15 +648,17 @@ mod tests {
 
         let mut client = V1Client::start(
             Arc::clone(&peer),
-            connector,
-            "127.0.0.1:19997".parse().expect("addr"),
-            "localhost".into(),
-            "test-uid".into(),
-            Duration::from_secs(30),
-            Duration::from_secs(90),
-            Duration::from_millis(100),
-            0, // no reconnects
-            on_msg,
+            V1ClientConfig {
+                connector,
+                addr: "127.0.0.1:19997".parse().expect("addr"),
+                server_name: "localhost".into(),
+                server_uid: "test-uid".into(),
+                heartbeat_interval: Duration::from_secs(30),
+                heartbeat_timeout: Duration::from_secs(90),
+                reconnect_delay: Duration::from_millis(100),
+                max_reconnects: 0, // no reconnects
+                on_message: on_msg,
+            },
         );
 
         // Wait for the connection attempt to fail and the loop to exit
@@ -704,15 +705,17 @@ mod tests {
 
         let mut client = V1Client::start(
             peer,
-            connector,
-            "127.0.0.1:19996".parse().expect("addr"),
-            "localhost".into(),
-            "test-uid".into(),
-            Duration::from_secs(30),
-            Duration::from_secs(90),
-            Duration::from_secs(1),
-            0,
-            on_msg,
+            V1ClientConfig {
+                connector,
+                addr: "127.0.0.1:19996".parse().expect("addr"),
+                server_name: "localhost".into(),
+                server_uid: "test-uid".into(),
+                heartbeat_interval: Duration::from_secs(30),
+                heartbeat_timeout: Duration::from_secs(90),
+                reconnect_delay: Duration::from_secs(1),
+                max_reconnects: 0,
+                on_message: on_msg,
+            },
         );
 
         // Verify peer accessor works
