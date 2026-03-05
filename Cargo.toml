@@ -57,7 +57,7 @@ hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "http1"] }
 http-body-util = "0.1"
 base64 = "0.22"
-tokio-tungstenite = "0.26"
+tokio-tungstenite = "0.28"
 socket2 = "0.6"
 async-nats = { version = "0.46", default-features = false, features = ["jetstream", "nkeys"] }
 prost = "0.14"
