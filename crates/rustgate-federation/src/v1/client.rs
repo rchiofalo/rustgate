@@ -152,7 +152,10 @@ async fn connection_loop(
         );
 
         // Attempt connection
-        let connect_result = config.connector.connect(config.addr, &config.server_name).await;
+        let connect_result = config
+            .connector
+            .connect(config.addr, &config.server_name)
+            .await;
         let (tls_stream, identity) = match connect_result {
             Ok(result) => result,
             Err(e) => {

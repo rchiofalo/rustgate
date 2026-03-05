@@ -823,12 +823,8 @@ async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
     };
 
     let result = match final_encoding {
-        Encoding::Raw => {
-            run_session_loops(reader, writer, rx, &ctx, &RawEncoder, read_buf).await
-        }
-        Encoding::Cot => {
-            run_session_loops(reader, writer, rx, &ctx, &CotEncoder, read_buf).await
-        }
+        Encoding::Raw => run_session_loops(reader, writer, rx, &ctx, &RawEncoder, read_buf).await,
+        Encoding::Cot => run_session_loops(reader, writer, rx, &ctx, &CotEncoder, read_buf).await,
         #[cfg(feature = "proto")]
         Encoding::TakProtobuf => {
             run_session_loops(

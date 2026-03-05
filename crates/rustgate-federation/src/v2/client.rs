@@ -231,14 +231,7 @@ async fn connection_loop(
         let client = FederatedChannelClient::new(channel);
 
         // Run the 5-stream handshake and event loop
-        let result = run_streams(
-            &peer,
-            client,
-            &config,
-            &mut outbound_rx,
-            &mut shutdown_rx,
-        )
-        .await;
+        let result = run_streams(&peer, client, &config, &mut outbound_rx, &mut shutdown_rx).await;
 
         match result {
             Ok(()) => {
