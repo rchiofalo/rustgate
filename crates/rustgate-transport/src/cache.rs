@@ -210,7 +210,10 @@ mod tests {
 
         // Position with TTL that hasn't expired yet (5 minutes)
         cache
-            .store(make_position_with_ttl("alice", Some(Duration::from_secs(300))))
+            .store(make_position_with_ttl(
+                "alice",
+                Some(Duration::from_secs(300)),
+            ))
             .await;
 
         let all = cache.get_all().await;
@@ -254,8 +257,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
         // Start sweep with a short interval for testing
-        let handle =
-            cache.start_sweep_task_with_interval(shutdown_rx, Duration::from_millis(50));
+        let handle = cache.start_sweep_task_with_interval(shutdown_rx, Duration::from_millis(50));
 
         // Wait for at least one sweep cycle
         tokio::time::sleep(Duration::from_millis(150)).await;
