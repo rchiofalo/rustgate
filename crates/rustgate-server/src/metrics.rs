@@ -196,8 +196,7 @@ pub fn connections_accepted() -> &'static IntCounter {
 }
 
 pub fn connections_active() -> &'static IntGauge {
-    CONNECTIONS_ACTIVE
-        .get_or_init(|| fallback_gauge("rustgate_connections_active", "fallback"))
+    CONNECTIONS_ACTIVE.get_or_init(|| fallback_gauge("rustgate_connections_active", "fallback"))
 }
 
 pub fn connections_rejected() -> &'static IntCounter {
@@ -206,8 +205,7 @@ pub fn connections_rejected() -> &'static IntCounter {
 }
 
 pub fn accept_errors() -> &'static IntCounter {
-    ACCEPT_ERRORS
-        .get_or_init(|| fallback_counter("rustgate_accept_errors_total", "fallback"))
+    ACCEPT_ERRORS.get_or_init(|| fallback_counter("rustgate_accept_errors_total", "fallback"))
 }
 
 pub fn messages_received() -> &'static IntCounter {
@@ -217,24 +215,25 @@ pub fn messages_received() -> &'static IntCounter {
 
 pub fn messages_routed() -> &'static IntCounterVec {
     MESSAGES_ROUTED.get_or_init(|| {
-        fallback_counter_vec("rustgate_messages_routed_total", "fallback", &["destination"])
+        fallback_counter_vec(
+            "rustgate_messages_routed_total",
+            "fallback",
+            &["destination"],
+        )
     })
 }
 
 #[allow(dead_code)]
 pub fn pings_received() -> &'static IntCounter {
-    PINGS_RECEIVED
-        .get_or_init(|| fallback_counter("rustgate_pings_received_total", "fallback"))
+    PINGS_RECEIVED.get_or_init(|| fallback_counter("rustgate_pings_received_total", "fallback"))
 }
 
 pub fn sessions_active() -> &'static IntGauge {
-    SESSIONS_ACTIVE
-        .get_or_init(|| fallback_gauge("rustgate_sessions_active", "fallback"))
+    SESSIONS_ACTIVE.get_or_init(|| fallback_gauge("rustgate_sessions_active", "fallback"))
 }
 
 pub fn nats_publishes() -> &'static IntCounter {
-    NATS_PUBLISHES
-        .get_or_init(|| fallback_counter("rustgate_nats_publishes_total", "fallback"))
+    NATS_PUBLISHES.get_or_init(|| fallback_counter("rustgate_nats_publishes_total", "fallback"))
 }
 
 #[allow(dead_code)]
@@ -245,8 +244,7 @@ pub fn nats_publish_errors() -> &'static IntCounter {
 
 #[allow(dead_code)]
 pub fn nats_received() -> &'static IntCounter {
-    NATS_RECEIVED
-        .get_or_init(|| fallback_counter("rustgate_nats_received_total", "fallback"))
+    NATS_RECEIVED.get_or_init(|| fallback_counter("rustgate_nats_received_total", "fallback"))
 }
 
 #[allow(dead_code)]
