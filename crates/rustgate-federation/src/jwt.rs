@@ -208,8 +208,8 @@ fn encode(secret: &[u8], claims: &FederationClaims) -> Result<String, JwtError> 
     let header = r#"{"alg":"HS256","typ":"JWT"}"#;
     let header_b64 = base64url_encode(header.as_bytes());
 
-    let payload_json = serde_json::to_string(claims)
-        .map_err(|e| JwtError::SerializationError(e.to_string()))?;
+    let payload_json =
+        serde_json::to_string(claims).map_err(|e| JwtError::SerializationError(e.to_string()))?;
     let payload_b64 = base64url_encode(payload_json.as_bytes());
 
     let signing_input = format!("{header_b64}.{payload_b64}");
@@ -301,8 +301,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 // ── Base64url encoding/decoding ─────────────────────────────────────
 
-const B64URL_ALPHABET: &[u8] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+const B64URL_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 fn base64url_encode(data: &[u8]) -> String {
     let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
@@ -405,8 +404,8 @@ mod tests {
 
     #[test]
     fn expired_token_rejected() {
-        let auth = JwtAuthority::new(b"secret".to_vec(), "test")
-            .with_expiry(Duration::from_secs(0));
+        let auth =
+            JwtAuthority::new(b"secret".to_vec(), "test").with_expiry(Duration::from_secs(0));
 
         let token = auth.issue("peer-1", vec![]).expect("issue");
 
