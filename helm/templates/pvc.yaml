@@ -15,3 +15,21 @@ spec:
     requests:
       storage: {{ .Values.persistence.size }}
 {{- end }}
+---
+{{- if .Values.dataPackage.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "rustgate.fullname" . }}-data-packages
+  labels:
+    {{- include "rustgate.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- if .Values.dataPackage.storageClassName }}
+  storageClassName: {{ .Values.dataPackage.storageClassName | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.dataPackage.storageSize }}
+{{- end }}

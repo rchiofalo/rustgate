@@ -11,17 +11,41 @@ spec:
       port: {{ .Values.service.port }}
       targetPort: tak
       protocol: TCP
-    {{- if .Values.federation.enabled }}
-    - name: federation
-      port: 9000
-      targetPort: federation
+    {{- if .Values.websocket.enabled }}
+    - name: websocket
+      port: {{ .Values.websocket.port }}
+      targetPort: websocket
       protocol: TCP
+    {{- end }}
+    {{- if .Values.federation.enabled }}
+    - name: federation-v1
+      port: {{ .Values.federation.v1Port }}
+      targetPort: federation-v1
+      protocol: TCP
+    {{- if .Values.federation.v2Bind }}
+    - name: federation-v2
+      port: {{ .Values.federation.v2Port }}
+      targetPort: federation-v2
+      protocol: TCP
+    {{- end }}
     {{- end }}
     {{- if .Values.metrics.enabled }}
     - name: metrics
       port: {{ .Values.metrics.port }}
       targetPort: metrics
       protocol: TCP
+    {{- end }}
+    {{- if .Values.plaintext.tcp.enabled }}
+    - name: tcp-plain
+      port: {{ .Values.plaintext.tcp.port }}
+      targetPort: tcp-plain
+      protocol: TCP
+    {{- end }}
+    {{- if .Values.plaintext.udp.enabled }}
+    - name: udp-input
+      port: {{ .Values.plaintext.udp.port }}
+      targetPort: udp-input
+      protocol: UDP
     {{- end }}
   selector:
     {{- include "rustgate.selectorLabels" . | nindent 4 }}
