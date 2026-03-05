@@ -246,15 +246,17 @@ impl FederationManager {
                 1 => {
                     let client = V1Client::start(
                         Arc::clone(&peer),
-                        connector.clone(),
-                        addr,
-                        addr.ip().to_string(),
-                        self.config.federate_id.clone(),
-                        self.config.heartbeat_interval,
-                        self.config.heartbeat_timeout,
-                        self.config.reconnect_delay,
-                        self.config.max_reconnects,
-                        Arc::clone(&on_inbound),
+                        crate::v1::client::V1ClientConfig {
+                            connector: connector.clone(),
+                            addr,
+                            server_name: addr.ip().to_string(),
+                            server_uid: self.config.federate_id.clone(),
+                            heartbeat_interval: self.config.heartbeat_interval,
+                            heartbeat_timeout: self.config.heartbeat_timeout,
+                            reconnect_delay: self.config.reconnect_delay,
+                            max_reconnects: self.config.max_reconnects,
+                            on_message: Arc::clone(&on_inbound),
+                        },
                     );
 
                     info!(
@@ -298,14 +300,16 @@ impl FederationManager {
 
                     let client = crate::v2::client::V2Client::start(
                         Arc::clone(&peer),
-                        peer_config.address.clone(),
-                        v2_tls_config.clone(),
-                        self.config.federate_id.clone(),
-                        peer_config.groups.clone(),
-                        self.config.health_check_interval,
-                        self.config.reconnect_delay,
-                        self.config.max_reconnects,
-                        on_event,
+                        crate::v2::client::V2ClientConfig {
+                            address: peer_config.address.clone(),
+                            tls_config: v2_tls_config.clone(),
+                            federate_id: self.config.federate_id.clone(),
+                            groups: peer_config.groups.clone(),
+                            health_interval: self.config.health_check_interval,
+                            reconnect_delay: self.config.reconnect_delay,
+                            max_reconnects: self.config.max_reconnects,
+                            on_event,
+                        },
                     );
 
                     info!(

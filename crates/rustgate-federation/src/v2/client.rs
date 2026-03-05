@@ -5,6 +5,7 @@
 //! concurrent streams (group exchange, event streaming, health checks)
 //! and reconnects automatically on failure.
 
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,6 +21,31 @@ use crate::provenance;
 
 /// Callback invoked when a FederatedEvent is received from the remote peer.
 pub type OnEvent = Arc<dyn Fn(figpb::FederatedEvent, String) + Send + Sync>;
+
+/// Configuration for a V2 federation gRPC client.
+pub struct V2ClientConfig {
+    pub address: String,
+    pub tls_config: ClientTlsConfig,
+    pub federate_id: String,
+    pub groups: Vec<String>,
+    pub health_interval: Duration,
+    pub reconnect_delay: Duration,
+    pub max_reconnects: i32,
+    pub on_event: OnEvent,
+}
+
+impl fmt::Debug for V2ClientConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("V2ClientConfig")
+            .field("address", &self.address)
+            .field("federate_id", &self.federate_id)
+            .field("groups", &self.groups)
+            .field("health_interval", &self.health_interval)
+            .field("reconnect_delay", &self.reconnect_delay)
+            .field("max_reconnects", &self.max_reconnects)
+            .finish_non_exhaustive()
+    }
+}
 
 /// V2 gRPC outbound federation client.
 ///
@@ -44,32 +70,14 @@ impl V2Client {
     /// 1. Establishes a gRPC channel over TLS
     /// 2. Performs the 5-stream handshake (groups, events, health)
     /// 3. Reconnects automatically on failure with exponential backoff
-    #[allow(clippy::too_many_arguments)]
-    pub fn start(
-        peer: Arc<PeerHandle>,
-        address: String,
-        tls_config: ClientTlsConfig,
-        federate_id: String,
-        groups: Vec<String>,
-        health_interval: Duration,
-        reconnect_delay: Duration,
-        max_reconnects: i32,
-        on_event: OnEvent,
-    ) -> Self {
+    pub fn start(peer: Arc<PeerHandle>, config: V2ClientConfig) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (outbound_tx, outbound_rx) = mpsc::channel::<figpb::FederatedEvent>(256);
 
         let peer_clone = Arc::clone(&peer);
         let task_handle = tokio::spawn(connection_loop(
             peer_clone,
-            address,
-            tls_config,
-            federate_id,
-            groups,
-            health_interval,
-            reconnect_delay,
-            max_reconnects,
-            on_event,
+            config,
             outbound_rx,
             shutdown_rx,
         ));
@@ -159,17 +167,9 @@ pub(crate) fn post_disconnect_cooldown(reconnect_delay: Duration) -> Duration {
 }
 
 /// Main connection loop with automatic reconnection.
-#[allow(clippy::too_many_arguments)]
 async fn connection_loop(
     peer: Arc<PeerHandle>,
-    address: String,
-    tls_config: ClientTlsConfig,
-    federate_id: String,
-    groups: Vec<String>,
-    health_interval: Duration,
-    reconnect_delay: Duration,
-    max_reconnects: i32,
-    on_event: OnEvent,
+    config: V2ClientConfig,
     mut outbound_rx: mpsc::Receiver<figpb::FederatedEvent>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
@@ -183,10 +183,10 @@ async fn connection_loop(
         }
 
         // Check reconnect limit
-        if should_stop(max_reconnects, reconnect_count) {
+        if should_stop(config.max_reconnects, reconnect_count) {
             info!(
                 peer = %peer.id,
-                max = max_reconnects,
+                max = config.max_reconnects,
                 "max reconnect attempts reached"
             );
             peer.set_state(PeerState::Disconnected);
@@ -196,7 +196,7 @@ async fn connection_loop(
         if reconnect_count > 0 {
             peer.set_state(PeerState::Reconnecting);
             let _ = peer.increment_reconnect_count();
-            let delay = backoff_delay(reconnect_delay, reconnect_count);
+            let delay = backoff_delay(config.reconnect_delay, reconnect_count);
             info!(
                 peer = %peer.id,
                 attempt = reconnect_count,
@@ -215,10 +215,10 @@ async fn connection_loop(
         }
 
         peer.set_state(PeerState::Connecting);
-        info!(peer = %peer.id, address = %address, "connecting to remote peer");
+        info!(peer = %peer.id, address = %config.address, "connecting to remote peer");
 
         // Build the gRPC channel
-        let channel = match build_channel(&address, tls_config.clone()).await {
+        let channel = match build_channel(&config.address, config.tls_config.clone()).await {
             Ok(ch) => ch,
             Err(e) => {
                 warn!(peer = %peer.id, error = %e, "failed to build gRPC channel");
@@ -234,10 +234,7 @@ async fn connection_loop(
         let result = run_streams(
             &peer,
             client,
-            &federate_id,
-            &groups,
-            health_interval,
-            &on_event,
+            &config,
             &mut outbound_rx,
             &mut shutdown_rx,
         )
@@ -259,7 +256,7 @@ async fn connection_loop(
         // TAK Server time to purge the stale federate entry. Without this delay,
         // rapid reconnection triggers "duplicate federate connection" rejections
         // on the remote side. Use 4× the base reconnect delay, minimum 60s.
-        let cooldown = post_disconnect_cooldown(reconnect_delay);
+        let cooldown = post_disconnect_cooldown(config.reconnect_delay);
         info!(
             peer = %peer.id,
             cooldown = ?cooldown,
@@ -313,18 +310,14 @@ async fn build_channel(address: &str, tls_config: ClientTlsConfig) -> anyhow::Re
 /// 3. ServerEventStream — open for sending events (client-streaming)
 /// 4. ClientEventStream — open for receiving events (server-streaming)
 /// 5. Health check loop — periodic HealthCheck RPCs
-#[allow(clippy::too_many_arguments)]
 async fn run_streams(
     peer: &Arc<PeerHandle>,
     mut client: FederatedChannelClient<Channel>,
-    federate_id: &str,
-    groups: &[String],
-    health_interval: Duration,
-    on_event: &OnEvent,
+    config: &V2ClientConfig,
     outbound_rx: &mut mpsc::Receiver<figpb::FederatedEvent>,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let sub = our_subscription(federate_id);
+    let sub = our_subscription(&config.federate_id);
 
     // --- Step 1: ServerFederateGroupsStream (receive remote groups) ---
     let mut server_groups_stream = client
@@ -360,7 +353,7 @@ async fn run_streams(
         stream_update: Some(figpb::ServerHealth {
             status: figpb::server_health::ServingStatus::Serving as i32,
         }),
-        federate_groups: groups.to_vec(),
+        federate_groups: config.groups.clone(),
         federate_provenance: Vec::new(),
         federate_hops: None,
         federate_group_hop_limits: None,
@@ -393,7 +386,7 @@ async fn run_streams(
     info!(peer = %peer.id, "V2 gRPC handshake complete, streams active");
 
     // --- Step 5: Run all streams concurrently ---
-    let mut health_ticker = tokio::time::interval(health_interval);
+    let mut health_ticker = tokio::time::interval(config.health_interval);
     // Skip the first immediate tick — do an explicit initial health check instead
     let _ = health_ticker.tick().await;
 
@@ -419,7 +412,7 @@ async fn run_streams(
                         peer.record_recv();
                         peer.record_heartbeat();
                         let pid = peer.id.to_string();
-                        on_event(event, pid);
+                        (config.on_event)(event, pid);
                     }
                     Ok(None) => {
                         info!(peer = %peer.id, "receive stream ended");
@@ -637,14 +630,16 @@ mod tests {
 
         let mut client = V2Client::start(
             peer,
-            "127.0.0.1:19999".into(),
-            tls_config,
-            "test-server".into(),
-            vec!["Alpha".into()],
-            Duration::from_secs(5),
-            Duration::from_secs(1),
-            0, // max_reconnects = 0 means immediate stop
-            noop_on_event(),
+            V2ClientConfig {
+                address: "127.0.0.1:19999".into(),
+                tls_config,
+                federate_id: "test-server".into(),
+                groups: vec!["Alpha".into()],
+                health_interval: Duration::from_secs(5),
+                reconnect_delay: Duration::from_secs(1),
+                max_reconnects: 0, // max_reconnects = 0 means immediate stop
+                on_event: noop_on_event(),
+            },
         );
 
         // Give the connection loop time to stop (max_reconnects=0)
@@ -663,14 +658,16 @@ mod tests {
 
         let mut client = V2Client::start(
             peer,
-            "127.0.0.1:19998".into(),
-            tls_config,
-            "test-server".into(),
-            vec![],
-            Duration::from_secs(5),
-            Duration::from_secs(1),
-            0,
-            noop_on_event(),
+            V2ClientConfig {
+                address: "127.0.0.1:19998".into(),
+                tls_config,
+                federate_id: "test-server".into(),
+                groups: vec![],
+                health_interval: Duration::from_secs(5),
+                reconnect_delay: Duration::from_secs(1),
+                max_reconnects: 0,
+                on_event: noop_on_event(),
+            },
         );
 
         assert_eq!(client.peer().id, "accessor-test");
@@ -686,14 +683,16 @@ mod tests {
 
         let mut client = V2Client::start(
             peer,
-            "127.0.0.1:19997".into(),
-            tls_config,
-            "test-server".into(),
-            vec![],
-            Duration::from_secs(5),
-            Duration::from_secs(1),
-            0,
-            noop_on_event(),
+            V2ClientConfig {
+                address: "127.0.0.1:19997".into(),
+                tls_config,
+                federate_id: "test-server".into(),
+                groups: vec![],
+                health_interval: Duration::from_secs(5),
+                reconnect_delay: Duration::from_secs(1),
+                max_reconnects: 0,
+                on_event: noop_on_event(),
+            },
         );
 
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -711,14 +710,16 @@ mod tests {
         // With max_reconnects=1, it should try once then stop
         let mut client = V2Client::start(
             Arc::clone(&peer),
-            "127.0.0.1:19996".into(),
-            tls_config,
-            "test-server".into(),
-            vec![],
-            Duration::from_secs(5),
-            Duration::from_millis(50), // fast reconnect for test
-            1,
-            noop_on_event(),
+            V2ClientConfig {
+                address: "127.0.0.1:19996".into(),
+                tls_config,
+                federate_id: "test-server".into(),
+                groups: vec![],
+                health_interval: Duration::from_secs(5),
+                reconnect_delay: Duration::from_millis(50), // fast reconnect for test
+                max_reconnects: 1,
+                on_event: noop_on_event(),
+            },
         );
 
         // Eventually the client will be disconnected after exhausting retries
