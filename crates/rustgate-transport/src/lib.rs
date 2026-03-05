@@ -8,6 +8,7 @@ mod extract;
 mod listener;
 mod router;
 mod session;
+mod throttle;
 
 pub use cache::PositionCache;
 pub use codec::{FramedCodec, LengthPrefixedCodec, LineDelimitedCodec, XmlStreamCodec};
@@ -19,3 +20,4 @@ pub use router::{Router, SessionHandle};
 #[cfg(feature = "proto")]
 pub use rustgate_proto::TakFrameCodec;
 pub use session::{AuthenticatedSession, SessionReader, SessionWriter};
+pub use throttle::{ClientThrottle, ThrottleConfig};

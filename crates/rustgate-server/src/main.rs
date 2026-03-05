@@ -17,6 +17,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing_subscriber::EnvFilter;
 
+mod archive;
 mod audit;
 #[cfg(feature = "metrics")]
 mod metrics;
@@ -39,7 +40,7 @@ use rustgate_core::protocol::{FramingStrategy, HeaderSize};
 use rustgate_cot::MessageBuilder;
 use rustgate_transport::{
     AuthenticatedSession, CotEncoder, FramedCodec, MessageEncoder, RawEncoder, Router,
-    SessionHandle, TlsConfig, TlsListener,
+    SessionHandle, ThrottleConfig, TlsConfig, TlsListener,
 };
 
 /// Optional callback for forwarding messages to federation peers.
@@ -56,6 +57,8 @@ struct SessionDeps<P: NatsPublish> {
     encoding: Encoding,
     nats_publisher: Option<P>,
     fed_forward: Option<FedForwardFn>,
+    throttle_config: Option<ThrottleConfig>,
+    archiver: Option<Arc<archive::CotArchiver>>,
 }
 
 /// Runtime context for a connected session's read/write loops.
@@ -65,6 +68,8 @@ struct SessionContext<'a, P: NatsPublish> {
     framing: &'a FramingStrategy,
     nats_publisher: &'a Option<P>,
     fed_forward: &'a Option<FedForwardFn>,
+    throttle: Option<rustgate_transport::ClientThrottle>,
+    archiver: &'a Option<Arc<archive::CotArchiver>>,
 }
 
 #[derive(Parser)]
@@ -168,6 +173,28 @@ struct Cli {
     /// Path to persistent federate store (JSON file).
     #[arg(long, env = "FEDERATION_STORE_PATH")]
     federation_store_path: Option<String>,
+
+    // ── QoS / rate limiting ──────────────────────────────────────────
+
+    /// Maximum sustained messages per second per connected client (0 = disabled).
+    #[arg(long, default_value_t = 0, env = "RUSTGATE_CLIENT_MSG_RATE")]
+    client_message_rate: u32,
+
+    /// Maximum burst size for per-client rate limiting.
+    #[arg(long, default_value_t = 200, env = "RUSTGATE_CLIENT_BURST")]
+    client_burst: u32,
+
+    // ── Data retention / archival ─────────────────────────────────────
+
+    /// Directory for CoT event archival (JSONL). Enables structured logging of
+    /// all received CoT events to date-stamped files.
+    #[arg(long, env = "RUSTGATE_ARCHIVE_DIR")]
+    archive_dir: Option<String>,
+
+    /// Maximum age (in hours) for uploaded data packages. Packages older than
+    /// this are eligible for cleanup. 0 = no expiration.
+    #[arg(long, default_value_t = 0, env = "RUSTGATE_PACKAGE_MAX_AGE_HOURS")]
+    package_max_age_hours: u64,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -631,6 +658,26 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         tracing::warn!("--websocket-bind requires --features websocket; ignoring");
     }
 
+    // ── Per-client rate limiting ─────────────────────────────────────
+    let throttle_config = if cli.client_message_rate > 0 {
+        tracing::info!(
+            rate = cli.client_message_rate,
+            burst = cli.client_burst,
+            "per-client rate limiting enabled"
+        );
+        Some(ThrottleConfig::new(cli.client_message_rate, cli.client_burst))
+    } else {
+        None
+    };
+
+    // ── CoT event archival ───────────────────────────────────────────
+    let archiver = if let Some(ref dir) = cli.archive_dir {
+        tracing::info!(dir = %dir, "CoT event archival enabled");
+        Some(Arc::new(archive::CotArchiver::new(dir)))
+    } else {
+        None
+    };
+
     loop {
         tokio::select! {
             accept_result = listener.accept() => {
@@ -659,12 +706,16 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                         #[allow(clippy::clone_on_copy)] // Type varies by feature flag
                         let publisher = nats_publisher.clone();
                         let fed = fed_forward.clone();
+                        let tc = throttle_config;
+                        let arch = archiver.clone();
                         let deps = SessionDeps {
                             router,
                             framing,
                             encoding,
                             nats_publisher: publisher,
                             fed_forward: fed,
+                            throttle_config: tc,
+                            archiver: arch,
                         };
                         drop(tokio::spawn(handle_session(session, deps, permit)));
                     }
@@ -813,12 +864,15 @@ async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
         }
     };
 
+    let throttle = deps.throttle_config.map(|tc| tc.build());
     let ctx = SessionContext {
         identity: &identity,
         router: &deps.router,
         framing: &final_framing,
         nats_publisher: &deps.nats_publisher,
         fed_forward: &deps.fed_forward,
+        throttle,
+        archiver: &deps.archiver,
     };
 
     let result = match final_encoding {
@@ -930,11 +984,12 @@ async fn run_session_loops(
     read_buf: tokio_util::bytes::BytesMut,
 ) -> std::io::Result<()> {
     tokio::select! {
-        r = read_loop(reader, ctx.identity, ctx.router, ctx.framing, ctx.nats_publisher, ctx.fed_forward, read_buf) => r,
+        r = read_loop(reader, ctx.identity, ctx.router, ctx.framing, ctx.nats_publisher, ctx.fed_forward, &ctx.throttle, ctx.archiver, read_buf) => r,
         r = write_loop(writer, rx, ctx.framing, encoder) => r,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn read_loop(
     reader: rustgate_transport::SessionReader,
     identity: &Identity,
@@ -942,6 +997,8 @@ async fn read_loop(
     framing: &FramingStrategy,
     nats_publisher: &Option<impl NatsPublish>,
     fed_forward: &Option<FedForwardFn>,
+    throttle: &Option<rustgate_transport::ClientThrottle>,
+    archiver: &Option<Arc<archive::CotArchiver>>,
     prefix: tokio_util::bytes::BytesMut,
 ) -> std::io::Result<()> {
     let is_proto = matches!(framing, FramingStrategy::TakProtobuf);
@@ -992,7 +1049,22 @@ async fn read_loop(
         #[cfg(feature = "metrics")]
         metrics::messages_received().inc();
 
+        // Per-client rate limiting — drop excess messages
+        if let Some(t) = throttle
+            && !t.allow()
+        {
+            tracing::debug!(cn = %identity.cn, "message dropped: rate limit exceeded");
+            #[cfg(feature = "metrics")]
+            metrics::messages_dropped().inc();
+            continue;
+        }
+
         let msg = msg_builder.build(identity, payload, "tcp");
+
+        // Archive to JSONL if enabled
+        if let Some(arch) = archiver {
+            arch.record(&msg);
+        }
 
         #[cfg(feature = "metrics")]
         {

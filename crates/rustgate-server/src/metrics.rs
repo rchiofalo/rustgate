@@ -42,6 +42,7 @@ static CONNECTIONS_REJECTED: OnceLock<IntCounter> = OnceLock::new();
 static ACCEPT_ERRORS: OnceLock<IntCounter> = OnceLock::new();
 
 static MESSAGES_RECEIVED: OnceLock<IntCounter> = OnceLock::new();
+static MESSAGES_DROPPED: OnceLock<IntCounter> = OnceLock::new();
 static MESSAGES_ROUTED: OnceLock<IntCounterVec> = OnceLock::new();
 static PINGS_RECEIVED: OnceLock<IntCounter> = OnceLock::new();
 
@@ -123,6 +124,13 @@ pub fn init() -> prometheus::Result<()> {
     ))?;
     registry.register(Box::new(messages_received.clone()))?;
     let _ = MESSAGES_RECEIVED.set(messages_received);
+
+    let messages_dropped = IntCounter::with_opts(Opts::new(
+        "rustgate_messages_dropped_total",
+        "Messages dropped due to per-client rate limiting",
+    ))?;
+    registry.register(Box::new(messages_dropped.clone()))?;
+    let _ = MESSAGES_DROPPED.set(messages_dropped);
 
     let messages_routed = IntCounterVec::new(
         Opts::new(
@@ -211,6 +219,11 @@ pub fn accept_errors() -> &'static IntCounter {
 pub fn messages_received() -> &'static IntCounter {
     MESSAGES_RECEIVED
         .get_or_init(|| fallback_counter("rustgate_messages_received_total", "fallback"))
+}
+
+pub fn messages_dropped() -> &'static IntCounter {
+    MESSAGES_DROPPED
+        .get_or_init(|| fallback_counter("rustgate_messages_dropped_total", "fallback"))
 }
 
 pub fn messages_routed() -> &'static IntCounterVec {
