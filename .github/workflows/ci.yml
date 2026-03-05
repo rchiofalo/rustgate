@@ -121,7 +121,7 @@ jobs:
 
   coverage:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
-    needs: [test]
+    needs: [lint, clippy]
     runs-on: self-hosted
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -140,7 +140,7 @@ jobs:
 
   audit:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
-    needs: [coverage]
+    needs: [test]
     runs-on: self-hosted
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -153,7 +153,6 @@ jobs:
 
   helm:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
-    needs: [coverage]
     runs-on: self-hosted
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -163,7 +162,7 @@ jobs:
 
   docker:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
-    needs: [coverage]
+    needs: [test]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
