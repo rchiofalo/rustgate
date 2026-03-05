@@ -32,8 +32,15 @@ use crate::auth::Credentials;
 use crate::contacts::ContactsProvider;
 use crate::datapackage::DataPackageStore;
 use crate::error::EnrollmentError;
+use crate::ratelimit::RateLimiter;
 use crate::response;
 use crate::signing::CsrSigner;
+
+/// Maximum CSR signing requests per IP per minute.
+const SIGN_RATE_LIMIT: usize = 10;
+
+/// Rate limit window for CSR signing.
+const SIGN_RATE_WINDOW: Duration = Duration::from_secs(60);
 
 /// HTTPS enrollment server for TAK client certificate provisioning.
 pub struct EnrollmentServer {
@@ -41,6 +48,7 @@ pub struct EnrollmentServer {
     credentials: Arc<Credentials>,
     contacts_provider: Option<ContactsProvider>,
     packages: Option<Arc<DataPackageStore>>,
+    sign_limiter: Arc<RateLimiter>,
 }
 
 impl std::fmt::Debug for EnrollmentServer {
@@ -61,6 +69,7 @@ impl EnrollmentServer {
             credentials: Arc::new(credentials),
             contacts_provider: None,
             packages: None,
+            sign_limiter: Arc::new(RateLimiter::new(SIGN_RATE_LIMIT, SIGN_RATE_WINDOW)),
         }
     }
 
@@ -119,6 +128,7 @@ impl EnrollmentServer {
             let credentials = Arc::clone(&self.credentials);
             let contacts = self.contacts_provider.clone();
             let packages = self.packages.clone();
+            let sign_limiter = Arc::clone(&self.sign_limiter);
 
             drop(tokio::spawn(async move {
                 let _permit = permit;
@@ -146,6 +156,7 @@ impl EnrollmentServer {
                     let credentials = Arc::clone(&credentials);
                     let contacts = contacts.clone();
                     let packages = packages.clone();
+                    let sign_limiter = Arc::clone(&sign_limiter);
                     async move {
                         handle_request(
                             req,
@@ -154,6 +165,7 @@ impl EnrollmentServer {
                             &credentials,
                             contacts.as_ref(),
                             packages.as_deref(),
+                            &sign_limiter,
                         )
                         .await
                     }
@@ -175,6 +187,7 @@ async fn handle_request(
     credentials: &Credentials,
     contacts: Option<&ContactsProvider>,
     packages: Option<&DataPackageStore>,
+    sign_limiter: &RateLimiter,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let path = req.uri().path();
     let method = req.method();
@@ -182,8 +195,12 @@ async fn handle_request(
     let response = match (method, path) {
         (&Method::GET, "/Marti/api/tls/config") => handle_tls_config(signer),
 
+        (&Method::POST, "/Marti/api/tls/signClient") => {
+            handle_sign_client_v1(req, peer, signer, credentials, sign_limiter).await
+        }
+
         (&Method::POST, "/Marti/api/tls/signClient/v2") => {
-            handle_sign_client_v2(req, peer, signer, credentials).await
+            handle_sign_client_v2(req, peer, signer, credentials, sign_limiter).await
         }
 
         (&Method::GET, "/Marti/api/tls/profile/enrollment") => {
@@ -196,7 +213,9 @@ async fn handle_request(
 
         (&Method::GET, "/Marti/api/clientEndPoints") => handle_client_endpoints(contacts).await,
 
-        (&Method::POST, "/Marti/sync/upload") => handle_package_upload(req, packages).await,
+        (&Method::POST, "/Marti/sync/upload") => {
+            handle_package_upload(req, credentials, packages).await
+        }
 
         (&Method::GET, "/Marti/sync/content") => handle_package_download(req, packages).await,
 
@@ -217,12 +236,144 @@ fn handle_tls_config(signer: &CsrSigner) -> Response<Full<Bytes>> {
     build_response(StatusCode::OK, "application/xml", Bytes::from(xml))
 }
 
+/// signClient v1 — returns a PKCS#12 (.p12) bundle for legacy TAK clients.
+///
+/// Same auth and CSR flow as v2, but the response is a binary PKCS#12
+/// bundle containing the signed client cert and CA cert, encrypted with
+/// the standard TAK password ("atakatak").
+async fn handle_sign_client_v1(
+    req: Request<hyper::body::Incoming>,
+    peer: SocketAddr,
+    signer: &CsrSigner,
+    credentials: &Credentials,
+    sign_limiter: &RateLimiter,
+) -> Response<Full<Bytes>> {
+    // Rate limit before doing any work
+    if !sign_limiter.check(peer.ip()) {
+        tracing::warn!(peer = %peer, "CSR signing rate limited");
+        return build_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "text/plain",
+            Bytes::from("rate limit exceeded"),
+        );
+    }
+
+    // Validate Basic Auth
+    let auth_header = req
+        .headers()
+        .get(hyper::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+
+    let Some(username) = credentials.validate(auth_header) else {
+        rustgate_core::audit::enrollment_auth_failed(&peer.to_string());
+        let mut resp = build_response(
+            StatusCode::UNAUTHORIZED,
+            "text/plain",
+            Bytes::from("unauthorized"),
+        );
+        let _ = resp.headers_mut().insert(
+            "WWW-Authenticate",
+            hyper::header::HeaderValue::from_static("Basic realm=\"rustgate-enrollment\""),
+        );
+        return resp;
+    };
+
+    let client_uid: String = req
+        .uri()
+        .query()
+        .and_then(|q| extract_param(q, "clientUID").or_else(|| extract_param(q, "clientUid")))
+        .unwrap_or_default()
+        .chars()
+        .take(128)
+        .collect();
+
+    // Read body (64KB limit)
+    let limited = Limited::new(req.into_body(), 65536);
+    let body = match limited.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => {
+            return build_response(
+                StatusCode::BAD_REQUEST,
+                "text/plain",
+                Bytes::from("CSR too large or unreadable"),
+            );
+        }
+    };
+
+    let csr_text = match std::str::from_utf8(&body) {
+        Ok(s) => s,
+        Err(_) => {
+            return build_response(
+                StatusCode::BAD_REQUEST,
+                "text/plain",
+                Bytes::from("request body is not valid UTF-8"),
+            );
+        }
+    };
+
+    let signed_der = match signer.sign_csr(csr_text, username) {
+        Ok(der) => der,
+        Err(e) => {
+            rustgate_core::audit::enrollment_sign_failed(username, &client_uid, &e.to_string());
+            tracing::warn!(
+                error = %e,
+                username = %username,
+                client_uid = %client_uid,
+                "CSR signing failed"
+            );
+            return build_response(
+                StatusCode::BAD_REQUEST,
+                "text/plain",
+                Bytes::from("failed to sign CSR"),
+            );
+        }
+    };
+
+    let p12 = match crate::pkcs12::build_p12_bundle(&signed_der, signer.ca_cert_der()) {
+        Ok(bundle) => bundle,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                username = %username,
+                client_uid = %client_uid,
+                "PKCS#12 bundle creation failed"
+            );
+            return build_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "text/plain",
+                Bytes::from("failed to create PKCS#12 bundle"),
+            );
+        }
+    };
+
+    rustgate_core::audit::enrollment_signed(username, &client_uid);
+    tracing::info!(
+        username = %username,
+        client_uid = %client_uid,
+        format = "pkcs12",
+        "signed client certificate (v1)"
+    );
+
+    build_response(StatusCode::OK, "application/x-pkcs12", Bytes::from(p12))
+}
+
 async fn handle_sign_client_v2(
     req: Request<hyper::body::Incoming>,
     peer: SocketAddr,
     signer: &CsrSigner,
     credentials: &Credentials,
+    sign_limiter: &RateLimiter,
 ) -> Response<Full<Bytes>> {
+    // Rate limit before doing any work
+    if !sign_limiter.check(peer.ip()) {
+        tracing::warn!(peer = %peer, "CSR signing rate limited");
+        return build_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "text/plain",
+            Bytes::from("rate limit exceeded"),
+        );
+    }
+
     // Validate Basic Auth
     let auth_header = req
         .headers()
@@ -391,6 +542,7 @@ async fn handle_client_endpoints(contacts: Option<&ContactsProvider>) -> Respons
 
 async fn handle_package_upload(
     req: Request<hyper::body::Incoming>,
+    credentials: &Credentials,
     packages: Option<&DataPackageStore>,
 ) -> Response<Full<Bytes>> {
     let Some(store) = packages else {
@@ -399,6 +551,25 @@ async fn handle_package_upload(
             "text/plain",
             Bytes::from("data package storage not configured"),
         );
+    };
+
+    // Require Basic Auth for uploads
+    let auth_header = req
+        .headers()
+        .get(hyper::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+
+    let Some(username) = credentials.validate(auth_header) else {
+        let mut resp = build_response(
+            StatusCode::UNAUTHORIZED,
+            "text/plain",
+            Bytes::from("unauthorized"),
+        );
+        let _ = resp.headers_mut().insert(
+            "WWW-Authenticate",
+            hyper::header::HeaderValue::from_static("Basic realm=\"rustgate-enrollment\""),
+        );
+        return resp;
     };
 
     let content_type_hdr = req
@@ -433,7 +604,7 @@ async fn handle_package_upload(
             (body.to_vec(), "upload.zip".to_string())
         };
 
-    match store.upload(&file_data, &filename, "anonymous").await {
+    match store.upload(&file_data, &filename, username).await {
         Ok(meta) => {
             let json = serde_json::json!({
                 "Hash": meta.hash,
