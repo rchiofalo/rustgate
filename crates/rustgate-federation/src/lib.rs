@@ -3,6 +3,7 @@ pub mod connector;
 #[cfg(feature = "ha")]
 pub mod ha;
 pub mod heartbeat;
+pub mod jwt;
 pub mod manager;
 pub mod peer;
 pub mod provenance;

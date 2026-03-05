@@ -99,6 +99,12 @@ pub struct FederationConfig {
     pub key_file: PathBuf,
     /// TLS CA certificate file for peer verification.
     pub ca_file: PathBuf,
+    /// Shared secret for JWT federation authentication.
+    /// When set, enables JWT token issuance and validation for federation peers.
+    /// mTLS remains required for transport security.
+    pub jwt_secret: Option<Vec<u8>>,
+    /// JWT token expiration in seconds (default: 3600).
+    pub jwt_expiry_secs: u64,
 }
 
 impl Default for FederationConfig {
@@ -124,6 +130,8 @@ impl Default for FederationConfig {
             cert_file: PathBuf::from("server.pem"),
             key_file: PathBuf::from("server-key.pem"),
             ca_file: PathBuf::from("ca.pem"),
+            jwt_secret: None,
+            jwt_expiry_secs: 3600,
         }
     }
 }
@@ -159,6 +167,11 @@ pub struct PeerConfig {
     /// Defaults to V2 (gRPC). V1 uses length-prefixed XML.
     #[serde(default = "default_protocol_version")]
     pub protocol_version: u32,
+    /// Optional JWT token for this peer's authentication.
+    /// Used as an alternative to certificate-only auth when the
+    /// federation server has JWT authentication enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt_token: Option<String>,
 }
 
 impl PeerConfig {
@@ -242,6 +255,7 @@ mod tests {
             trust_cert_cn: Some("peer-1-ca".into()),
             routing_mode: RoutingMode::Broadcast,
             protocol_version: 1,
+            jwt_token: None,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
@@ -363,6 +377,7 @@ mod tests {
             trust_cert_cn: None,
             routing_mode: RoutingMode::default(),
             protocol_version: 2,
+            jwt_token: None,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
@@ -382,6 +397,7 @@ mod tests {
             trust_cert_cn: None,
             routing_mode: RoutingMode::default(),
             protocol_version: 2,
+            jwt_token: None,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
@@ -401,6 +417,7 @@ mod tests {
             trust_cert_cn: None,
             routing_mode: RoutingMode::default(),
             protocol_version: 2,
+            jwt_token: None,
         };
         assert!(!peer.enabled);
     }
@@ -424,6 +441,7 @@ mod tests {
             trust_cert_cn: None,
             routing_mode: RoutingMode::default(),
             protocol_version: 2,
+            jwt_token: None,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
@@ -450,6 +468,7 @@ mod tests {
             trust_cert_cn: None,
             routing_mode: RoutingMode::default(),
             protocol_version: 1,
+            jwt_token: None,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
@@ -469,6 +488,7 @@ mod tests {
             trust_cert_cn: None,
             routing_mode: RoutingMode::default(),
             protocol_version: 2,
+            jwt_token: None,
         };
         assert_eq!(peer.effective_inbound_groups(), &["Alpha", "Bravo"]);
         assert_eq!(peer.effective_outbound_groups(), &["Alpha", "Bravo"]);
@@ -487,6 +507,7 @@ mod tests {
             trust_cert_cn: None,
             routing_mode: RoutingMode::default(),
             protocol_version: 2,
+            jwt_token: None,
         };
         assert_eq!(peer.effective_inbound_groups(), &["Inbound1", "Inbound2"]);
         assert_eq!(peer.effective_outbound_groups(), &["Outbound1"]);
@@ -505,6 +526,7 @@ mod tests {
             trust_cert_cn: None,
             routing_mode: RoutingMode::default(),
             protocol_version: 2,
+            jwt_token: None,
         };
         assert_eq!(peer.effective_inbound_groups(), &["Inbound1"]);
         // outbound falls back to groups
@@ -524,6 +546,7 @@ mod tests {
             trust_cert_cn: None,
             routing_mode: RoutingMode::default(),
             protocol_version: 2,
+            jwt_token: None,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         assert!(json.contains("inbound_groups"));
@@ -550,6 +573,7 @@ mod tests {
             trust_cert_cn: None,
             routing_mode: RoutingMode::default(),
             protocol_version: 2,
+            jwt_token: None,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         assert!(!json.contains("inbound_groups"));

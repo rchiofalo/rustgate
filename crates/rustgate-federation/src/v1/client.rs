@@ -534,6 +534,7 @@ mod tests {
             trust_cert_cn: None,
             routing_mode: RoutingMode::default(),
             protocol_version: 1,
+            jwt_token: None,
         };
 
         let peer = Arc::new(PeerHandle::new(peer_config));
@@ -589,6 +590,7 @@ mod tests {
             trust_cert_cn: None,
             routing_mode: RoutingMode::default(),
             protocol_version: 1,
+            jwt_token: None,
         };
 
         let peer = Arc::new(PeerHandle::new(peer_config));
@@ -645,6 +647,7 @@ mod tests {
             trust_cert_cn: None,
             routing_mode: RoutingMode::default(),
             protocol_version: 1,
+            jwt_token: None,
         };
 
         let peer = Arc::new(PeerHandle::new(peer_config));
@@ -702,6 +705,7 @@ mod tests {
             trust_cert_cn: None,
             routing_mode: RoutingMode::default(),
             protocol_version: 1,
+            jwt_token: None,
         };
 
         let peer = Arc::new(PeerHandle::new(peer_config));

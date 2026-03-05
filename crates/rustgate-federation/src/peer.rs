@@ -235,6 +235,7 @@ mod tests {
             trust_cert_cn: None,
             routing_mode: RoutingMode::default(),
             protocol_version: 2,
+            jwt_token: None,
         }
     }
 
