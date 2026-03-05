@@ -556,6 +556,8 @@ mod tests {
             cert_file: PathBuf::from("/nonexistent/cert.pem"),
             key_file: PathBuf::from("/nonexistent/key.pem"),
             ca_file: PathBuf::from("/nonexistent/ca.pem"),
+            jwt_secret: None,
+            jwt_expiry_secs: 3600,
         }
     }
 
@@ -571,6 +573,7 @@ mod tests {
             trust_cert_cn: None,
             routing_mode: RoutingMode::default(),
             protocol_version: 1,
+            jwt_token: None,
         }
     }
 

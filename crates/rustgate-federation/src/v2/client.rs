@@ -508,6 +508,7 @@ mod tests {
             trust_cert_cn: None,
             routing_mode: RoutingMode::Broadcast,
             protocol_version: 2,
+            jwt_token: None,
         }))
     }
 

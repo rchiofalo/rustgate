@@ -1,0 +1,523 @@
+//! JWT token authentication for federation connections.
+//!
+//! Provides HMAC-SHA256 signed JWT tokens as an alternative to
+//! certificate-only federation authentication. Tokens carry peer
+//! identity, group claims, and expiration.
+//!
+//! This is an opt-in layer — mTLS remains the default transport
+//! security. JWT adds per-connection authorization claims that can
+//! be rotated without re-issuing certificates.
+
+use std::collections::HashSet;
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use sha2::{Digest, Sha256};
+
+/// JWT claims for federation peer authentication.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FederationClaims {
+    /// Subject — the peer's federation ID.
+    pub sub: String,
+    /// Issuer — the server that created the token.
+    pub iss: String,
+    /// Expiration time (seconds since Unix epoch).
+    pub exp: u64,
+    /// Issued-at time (seconds since Unix epoch).
+    pub iat: u64,
+    /// Unique token identifier (for revocation).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub jti: String,
+    /// Groups the peer is authorized for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
+}
+
+/// Manages JWT issuance, validation, and revocation for federation.
+pub struct JwtAuthority {
+    /// HMAC-SHA256 signing key.
+    secret: Vec<u8>,
+    /// Issuer name stamped into tokens.
+    issuer: String,
+    /// Default token lifetime.
+    default_expiry: Duration,
+    /// Set of revoked token IDs (JTI values).
+    revoked: Mutex<HashSet<String>>,
+}
+
+impl std::fmt::Debug for JwtAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JwtAuthority")
+            .field("issuer", &self.issuer)
+            .field("default_expiry", &self.default_expiry)
+            .finish_non_exhaustive()
+    }
+}
+
+impl JwtAuthority {
+    /// Create a new JWT authority with the given signing secret.
+    pub fn new(secret: impl Into<Vec<u8>>, issuer: impl Into<String>) -> Self {
+        Self {
+            secret: secret.into(),
+            issuer: issuer.into(),
+            default_expiry: Duration::from_secs(3600),
+            revoked: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Set the default token lifetime.
+    pub fn with_expiry(mut self, expiry: Duration) -> Self {
+        self.default_expiry = expiry;
+        self
+    }
+
+    /// Issue a signed JWT for a federation peer.
+    pub fn issue(&self, peer_id: &str, groups: Vec<String>) -> Result<String, JwtError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| JwtError::ClockError)?;
+
+        let jti = generate_jti(peer_id, now.as_secs());
+
+        let claims = FederationClaims {
+            sub: peer_id.to_string(),
+            iss: self.issuer.clone(),
+            exp: now.as_secs() + self.default_expiry.as_secs(),
+            iat: now.as_secs(),
+            jti,
+            groups,
+        };
+
+        encode(&self.secret, &claims)
+    }
+
+    /// Issue a token with a custom expiration duration.
+    pub fn issue_with_expiry(
+        &self,
+        peer_id: &str,
+        groups: Vec<String>,
+        expiry: Duration,
+    ) -> Result<String, JwtError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| JwtError::ClockError)?;
+
+        let jti = generate_jti(peer_id, now.as_secs());
+
+        let claims = FederationClaims {
+            sub: peer_id.to_string(),
+            iss: self.issuer.clone(),
+            exp: now.as_secs() + expiry.as_secs(),
+            iat: now.as_secs(),
+            jti,
+            groups,
+        };
+
+        encode(&self.secret, &claims)
+    }
+
+    /// Validate a JWT token and return the claims if valid.
+    pub fn validate(&self, token: &str) -> Result<FederationClaims, JwtError> {
+        let claims = decode(&self.secret, token)?;
+
+        // Check expiration
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| JwtError::ClockError)?;
+
+        if claims.exp <= now.as_secs() {
+            return Err(JwtError::Expired);
+        }
+
+        // Check issuer
+        if claims.iss != self.issuer {
+            return Err(JwtError::InvalidIssuer);
+        }
+
+        // Check revocation
+        if !claims.jti.is_empty() {
+            let revoked = match self.revoked.lock() {
+                Ok(r) => r,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if revoked.contains(&claims.jti) {
+                return Err(JwtError::Revoked);
+            }
+        }
+
+        Ok(claims)
+    }
+
+    /// Revoke a token by its JTI (unique identifier).
+    pub fn revoke(&self, jti: &str) {
+        let mut revoked = match self.revoked.lock() {
+            Ok(r) => r,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let _ = revoked.insert(jti.to_string());
+    }
+
+    /// Number of revoked tokens tracked.
+    pub fn revoked_count(&self) -> usize {
+        match self.revoked.lock() {
+            Ok(r) => r.len(),
+            Err(poisoned) => poisoned.into_inner().len(),
+        }
+    }
+}
+
+/// JWT encoding/validation errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JwtError {
+    /// Token has expired.
+    Expired,
+    /// Token signature is invalid.
+    InvalidSignature,
+    /// Token format is malformed.
+    Malformed,
+    /// Token issuer does not match.
+    InvalidIssuer,
+    /// Token has been revoked.
+    Revoked,
+    /// System clock error.
+    ClockError,
+    /// JSON serialization/deserialization error.
+    SerializationError(String),
+}
+
+impl std::fmt::Display for JwtError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JwtError::Expired => write!(f, "token expired"),
+            JwtError::InvalidSignature => write!(f, "invalid signature"),
+            JwtError::Malformed => write!(f, "malformed token"),
+            JwtError::InvalidIssuer => write!(f, "invalid issuer"),
+            JwtError::Revoked => write!(f, "token revoked"),
+            JwtError::ClockError => write!(f, "system clock error"),
+            JwtError::SerializationError(msg) => write!(f, "serialization error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for JwtError {}
+
+// ── JWT encoding/decoding ───────────────────────────────────────────
+
+/// Encode claims into a signed JWT string.
+fn encode(secret: &[u8], claims: &FederationClaims) -> Result<String, JwtError> {
+    let header = r#"{"alg":"HS256","typ":"JWT"}"#;
+    let header_b64 = base64url_encode(header.as_bytes());
+
+    let payload_json = serde_json::to_string(claims)
+        .map_err(|e| JwtError::SerializationError(e.to_string()))?;
+    let payload_b64 = base64url_encode(payload_json.as_bytes());
+
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let signature = hmac_sha256(secret, signing_input.as_bytes());
+    let signature_b64 = base64url_encode(&signature);
+
+    Ok(format!("{signing_input}.{signature_b64}"))
+}
+
+/// Decode and verify a JWT token, returning the claims.
+fn decode(secret: &[u8], token: &str) -> Result<FederationClaims, JwtError> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(JwtError::Malformed);
+    }
+
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+    let expected_sig = hmac_sha256(secret, signing_input.as_bytes());
+    let actual_sig = base64url_decode(parts[2]).map_err(|_| JwtError::Malformed)?;
+
+    // Constant-time comparison
+    if !constant_time_eq(&expected_sig, &actual_sig) {
+        return Err(JwtError::InvalidSignature);
+    }
+
+    let payload_bytes = base64url_decode(parts[1]).map_err(|_| JwtError::Malformed)?;
+    let claims: FederationClaims = serde_json::from_slice(&payload_bytes)
+        .map_err(|e| JwtError::SerializationError(e.to_string()))?;
+
+    Ok(claims)
+}
+
+// ── HMAC-SHA256 ─────────────────────────────────────────────────────
+
+/// Compute HMAC-SHA256(key, data).
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    const BLOCK_SIZE: usize = 64;
+
+    // If key is longer than block size, hash it first
+    let key_block = if key.len() > BLOCK_SIZE {
+        let mut h = Sha256::new();
+        h.update(key);
+        let hash = h.finalize();
+        let mut block = [0u8; BLOCK_SIZE];
+        block[..32].copy_from_slice(&hash);
+        block
+    } else {
+        let mut block = [0u8; BLOCK_SIZE];
+        block[..key.len()].copy_from_slice(key);
+        block
+    };
+
+    // Inner: H((K ^ ipad) || data)
+    let mut ipad = [0x36u8; BLOCK_SIZE];
+    for (i, b) in ipad.iter_mut().enumerate() {
+        *b ^= key_block[i];
+    }
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    inner.update(data);
+    let inner_hash = inner.finalize();
+
+    // Outer: H((K ^ opad) || inner_hash)
+    let mut opad = [0x5cu8; BLOCK_SIZE];
+    for (i, b) in opad.iter_mut().enumerate() {
+        *b ^= key_block[i];
+    }
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner_hash);
+    let result = outer.finalize();
+
+    let mut output = [0u8; 32];
+    output.copy_from_slice(&result);
+    output
+}
+
+/// Constant-time byte comparison to prevent timing attacks.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+// ── Base64url encoding/decoding ─────────────────────────────────────
+
+const B64URL_ALPHABET: &[u8] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+fn base64url_encode(data: &[u8]) -> String {
+    let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
+
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+
+        result.push(B64URL_ALPHABET[((triple >> 18) & 0x3F) as usize] as char);
+        result.push(B64URL_ALPHABET[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            result.push(B64URL_ALPHABET[((triple >> 6) & 0x3F) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            result.push(B64URL_ALPHABET[(triple & 0x3F) as usize] as char);
+        }
+    }
+
+    result
+}
+
+fn base64url_decode(input: &str) -> Result<Vec<u8>, ()> {
+    let mut buf = Vec::with_capacity(input.len() * 3 / 4);
+    let bytes = input.as_bytes();
+    let chunks = bytes.chunks(4);
+
+    for chunk in chunks {
+        let mut sextet = [0u32; 4];
+        let mut pad = 0;
+
+        for (i, &b) in chunk.iter().enumerate() {
+            sextet[i] = b64url_char_to_val(b)?;
+        }
+        for s in sextet.iter_mut().skip(chunk.len()) {
+            *s = 0;
+            pad += 1;
+        }
+
+        let triple = (sextet[0] << 18) | (sextet[1] << 12) | (sextet[2] << 6) | sextet[3];
+
+        buf.push(((triple >> 16) & 0xFF) as u8);
+        if pad < 2 {
+            buf.push(((triple >> 8) & 0xFF) as u8);
+        }
+        if pad < 1 {
+            buf.push((triple & 0xFF) as u8);
+        }
+    }
+
+    Ok(buf)
+}
+
+fn b64url_char_to_val(c: u8) -> Result<u32, ()> {
+    match c {
+        b'A'..=b'Z' => Ok((c - b'A') as u32),
+        b'a'..=b'z' => Ok((c - b'a' + 26) as u32),
+        b'0'..=b'9' => Ok((c - b'0' + 52) as u32),
+        b'-' => Ok(62),
+        b'_' => Ok(63),
+        _ => Err(()),
+    }
+}
+
+/// Generate a unique token identifier from peer ID and timestamp.
+fn generate_jti(peer_id: &str, timestamp: u64) -> String {
+    let mut h = Sha256::new();
+    h.update(peer_id.as_bytes());
+    h.update(timestamp.to_le_bytes());
+    let hash = h.finalize();
+    // Use first 16 bytes as hex for a short unique ID
+    hash[..16]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_authority() -> JwtAuthority {
+        JwtAuthority::new(b"test-secret-key-for-federation".to_vec(), "rustgate-test")
+    }
+
+    #[test]
+    fn issue_and_validate() {
+        let auth = make_authority();
+        let token = auth
+            .issue("peer-1", vec!["Alpha".into()])
+            .expect("issue should succeed");
+
+        let claims = auth.validate(&token).expect("validate should succeed");
+        assert_eq!(claims.sub, "peer-1");
+        assert_eq!(claims.iss, "rustgate-test");
+        assert_eq!(claims.groups, vec!["Alpha"]);
+        assert!(!claims.jti.is_empty());
+    }
+
+    #[test]
+    fn expired_token_rejected() {
+        let auth = JwtAuthority::new(b"secret".to_vec(), "test")
+            .with_expiry(Duration::from_secs(0));
+
+        let token = auth.issue("peer-1", vec![]).expect("issue");
+
+        // Token expires immediately (exp == iat)
+        let result = auth.validate(&token);
+        assert_eq!(result, Err(JwtError::Expired));
+    }
+
+    #[test]
+    fn wrong_secret_rejected() {
+        let auth1 = JwtAuthority::new(b"secret-1".to_vec(), "test");
+        let auth2 = JwtAuthority::new(b"secret-2".to_vec(), "test");
+
+        let token = auth1.issue("peer-1", vec![]).expect("issue");
+        let result = auth2.validate(&token);
+        assert_eq!(result, Err(JwtError::InvalidSignature));
+    }
+
+    #[test]
+    fn wrong_issuer_rejected() {
+        let auth1 = JwtAuthority::new(b"secret".to_vec(), "issuer-1");
+        let auth2 = JwtAuthority::new(b"secret".to_vec(), "issuer-2");
+
+        let token = auth1.issue("peer-1", vec![]).expect("issue");
+        let result = auth2.validate(&token);
+        assert_eq!(result, Err(JwtError::InvalidIssuer));
+    }
+
+    #[test]
+    fn revoked_token_rejected() {
+        let auth = make_authority();
+        let token = auth.issue("peer-1", vec![]).expect("issue");
+
+        let claims = auth.validate(&token).expect("valid before revocation");
+        auth.revoke(&claims.jti);
+
+        let result = auth.validate(&token);
+        assert_eq!(result, Err(JwtError::Revoked));
+    }
+
+    #[test]
+    fn malformed_token_rejected() {
+        let auth = make_authority();
+        assert_eq!(auth.validate("not-a-jwt"), Err(JwtError::Malformed));
+        assert_eq!(auth.validate("a.b"), Err(JwtError::Malformed));
+        assert_eq!(auth.validate(""), Err(JwtError::Malformed));
+    }
+
+    #[test]
+    fn tampered_payload_rejected() {
+        let auth = make_authority();
+        let token = auth.issue("peer-1", vec![]).expect("issue");
+
+        // Tamper with the payload section
+        let parts: Vec<&str> = token.split('.').collect();
+        let tampered = format!("{}.dGFtcGVyZWQ.{}", parts[0], parts[2]);
+        assert_eq!(auth.validate(&tampered), Err(JwtError::InvalidSignature));
+    }
+
+    #[test]
+    fn custom_expiry() {
+        let auth = make_authority();
+        let token = auth
+            .issue_with_expiry("peer-1", vec![], Duration::from_secs(7200))
+            .expect("issue");
+
+        let claims = auth.validate(&token).expect("valid");
+        assert!(claims.exp - claims.iat >= 7200);
+    }
+
+    #[test]
+    fn revoked_count() {
+        let auth = make_authority();
+        assert_eq!(auth.revoked_count(), 0);
+        auth.revoke("jti-1");
+        auth.revoke("jti-2");
+        assert_eq!(auth.revoked_count(), 2);
+    }
+
+    #[test]
+    fn base64url_roundtrip() {
+        let data = b"Hello, Federation JWT!";
+        let encoded = base64url_encode(data);
+        let decoded = base64url_decode(&encoded).expect("decode");
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn hmac_sha256_known_vector() {
+        // RFC 4231 Test Case 2
+        let key = b"Jefe";
+        let data = b"what do ya want for nothing?";
+        let expected: [u8; 32] = [
+            0x5b, 0xdc, 0xc1, 0x46, 0xbf, 0x60, 0x75, 0x4e, 0x6a, 0x04, 0x24, 0x26, 0x08, 0x95,
+            0x75, 0xc7, 0x5a, 0x00, 0x3f, 0x08, 0x9d, 0x27, 0x39, 0x83, 0x9d, 0xec, 0x58, 0xb9,
+            0x64, 0xec, 0x38, 0x43,
+        ];
+        assert_eq!(hmac_sha256(key, data), expected);
+    }
+
+    #[test]
+    fn constant_time_eq_works() {
+        assert!(constant_time_eq(b"hello", b"hello"));
+        assert!(!constant_time_eq(b"hello", b"world"));
+        assert!(!constant_time_eq(b"hello", b"hell"));
+    }
+
+    #[test]
+    fn jwt_error_display() {
+        assert_eq!(JwtError::Expired.to_string(), "token expired");
+        assert_eq!(JwtError::InvalidSignature.to_string(), "invalid signature");
+        assert_eq!(JwtError::Revoked.to_string(), "token revoked");
+    }
+}
