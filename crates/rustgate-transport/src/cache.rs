@@ -3,16 +3,39 @@
 //! TAK clients expect to receive the current situational awareness (SA)
 //! picture on connect. This cache stores the most recent position CoT
 //! event per CN and replays them to newly connected sessions.
+//!
+//! Positions with a TTL are automatically evicted once they become stale.
+//! A background sweep task can be spawned to periodically clean up expired
+//! entries.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use rustgate_core::message::RoutableMessage;
 use tokio::sync::RwLock;
+
+/// Default sweep interval for removing expired position entries.
+const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Stores the most recent position report per client CN.
 #[derive(Debug, Default)]
 pub struct PositionCache {
     entries: RwLock<HashMap<String, RoutableMessage>>,
+}
+
+/// Check if a position message has expired based on its TTL.
+///
+/// A message is expired when `received_at + ttl < now`. Messages without
+/// a TTL never expire (they are only evicted on disconnect or replacement).
+fn is_expired(msg: &RoutableMessage) -> bool {
+    let Some(ttl) = msg.metadata.ttl else {
+        return false;
+    };
+    match msg.metadata.received_at.elapsed() {
+        Ok(elapsed) => elapsed > ttl,
+        // Clock went backwards — treat as not expired to avoid data loss.
+        Err(_) => false,
+    }
 }
 
 impl PositionCache {
@@ -28,9 +51,16 @@ impl PositionCache {
     }
 
     /// Get all cached position reports for replay to a new session.
+    ///
+    /// Expired entries (past their TTL) are excluded from the result
+    /// but not removed — the sweep task handles cleanup.
     pub async fn get_all(&self) -> Vec<RoutableMessage> {
         let entries = self.entries.read().await;
-        entries.values().cloned().collect()
+        entries
+            .values()
+            .filter(|msg| !is_expired(msg))
+            .cloned()
+            .collect()
     }
 
     /// Remove the cached position for a CN (e.g., on disconnect).
@@ -39,7 +69,17 @@ impl PositionCache {
         let _ = entries.remove(cn);
     }
 
-    /// Number of cached positions.
+    /// Remove all expired entries from the cache.
+    ///
+    /// Returns the number of entries removed.
+    pub async fn sweep(&self) -> usize {
+        let mut entries = self.entries.write().await;
+        let before = entries.len();
+        entries.retain(|_, msg| !is_expired(msg));
+        before - entries.len()
+    }
+
+    /// Number of cached positions (including expired entries not yet swept).
     pub async fn len(&self) -> usize {
         self.entries.read().await.len()
     }
@@ -47,5 +87,229 @@ impl PositionCache {
     /// Check if cache is empty.
     pub async fn is_empty(&self) -> bool {
         self.entries.read().await.is_empty()
+    }
+
+    /// Spawn a background task that periodically sweeps expired entries.
+    ///
+    /// The task runs until the provided `shutdown` signal is notified.
+    /// Uses the default sweep interval of 60 seconds.
+    pub fn start_sweep_task(
+        self: &std::sync::Arc<Self>,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
+        self.start_sweep_task_with_interval(shutdown, DEFAULT_SWEEP_INTERVAL)
+    }
+
+    /// Spawn a background task with a custom sweep interval.
+    pub fn start_sweep_task_with_interval(
+        self: &std::sync::Arc<Self>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+        interval: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let cache = std::sync::Arc::clone(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // First tick fires immediately — skip it so the first sweep
+            // happens after one full interval.
+            let _ = ticker.tick().await;
+
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let removed = cache.sweep().await;
+                        if removed > 0 {
+                            tracing::debug!(removed, "position cache sweep");
+                        }
+                    }
+                    _ = shutdown.changed() => {
+                        break;
+                    }
+                }
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime};
+
+    use bytes::Bytes;
+    use rustgate_core::identity::Identity;
+    use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
+
+    use super::*;
+
+    fn make_identity(cn: &str) -> Identity {
+        Identity {
+            cn: cn.to_string(),
+            fingerprint: format!("{cn}-fp"),
+            groups: BTreeSet::new(),
+        }
+    }
+
+    fn make_position_with_ttl(cn: &str, ttl: Option<Duration>) -> RoutableMessage {
+        RoutableMessage {
+            source: make_identity(cn),
+            destination: Destination::Broadcast,
+            payload: Bytes::from_static(b"<event/>"),
+            metadata: Metadata {
+                received_at: SystemTime::now(),
+                source_protocol: "cot".to_string(),
+                message_type: MessageType::Position,
+                ttl,
+            },
+        }
+    }
+
+    fn make_expired_position(cn: &str) -> RoutableMessage {
+        RoutableMessage {
+            source: make_identity(cn),
+            destination: Destination::Broadcast,
+            payload: Bytes::from_static(b"<event/>"),
+            metadata: Metadata {
+                // received 10 seconds ago with a 1-second TTL → expired
+                received_at: SystemTime::now() - Duration::from_secs(10),
+                source_protocol: "cot".to_string(),
+                message_type: MessageType::Position,
+                ttl: Some(Duration::from_secs(1)),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn store_and_retrieve() {
+        let cache = PositionCache::new();
+        let msg = make_position_with_ttl("alice", None);
+        cache.store(msg).await;
+
+        let all = cache.get_all().await;
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].source.cn, "alice");
+    }
+
+    #[tokio::test]
+    async fn get_all_excludes_expired() {
+        let cache = PositionCache::new();
+
+        // Fresh position
+        cache.store(make_position_with_ttl("alice", None)).await;
+        // Expired position
+        cache.store(make_expired_position("bob")).await;
+
+        let all = cache.get_all().await;
+        assert_eq!(all.len(), 1, "expired entry should be excluded");
+        assert_eq!(all[0].source.cn, "alice");
+    }
+
+    #[tokio::test]
+    async fn get_all_includes_non_expired_ttl() {
+        let cache = PositionCache::new();
+
+        // Position with TTL that hasn't expired yet (5 minutes)
+        cache
+            .store(make_position_with_ttl(
+                "alice",
+                Some(Duration::from_secs(300)),
+            ))
+            .await;
+
+        let all = cache.get_all().await;
+        assert_eq!(all.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sweep_removes_expired() {
+        let cache = PositionCache::new();
+
+        cache.store(make_position_with_ttl("alice", None)).await;
+        cache.store(make_expired_position("bob")).await;
+        cache.store(make_expired_position("charlie")).await;
+        assert_eq!(cache.len().await, 3);
+
+        let removed = cache.sweep().await;
+        assert_eq!(removed, 2, "two expired entries should be swept");
+        assert_eq!(cache.len().await, 1);
+
+        let remaining = cache.get_all().await;
+        assert_eq!(remaining[0].source.cn, "alice");
+    }
+
+    #[tokio::test]
+    async fn sweep_no_expired_returns_zero() {
+        let cache = PositionCache::new();
+        cache.store(make_position_with_ttl("alice", None)).await;
+
+        let removed = cache.sweep().await;
+        assert_eq!(removed, 0);
+    }
+
+    #[tokio::test]
+    async fn sweep_task_runs_and_cleans() {
+        let cache = Arc::new(PositionCache::new());
+
+        // Store an already-expired entry
+        cache.store(make_expired_position("stale-user")).await;
+        assert_eq!(cache.len().await, 1);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        // Start sweep with a short interval for testing
+        let handle = cache.start_sweep_task_with_interval(shutdown_rx, Duration::from_millis(50));
+
+        // Wait for at least one sweep cycle
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        assert_eq!(cache.len().await, 0, "expired entry should have been swept");
+
+        // Signal shutdown
+        let _ = shutdown_tx.send(true);
+        handle.await.expect("sweep task should complete cleanly");
+    }
+
+    #[tokio::test]
+    async fn is_expired_no_ttl_never_expires() {
+        let msg = make_position_with_ttl("alice", None);
+        assert!(!is_expired(&msg));
+    }
+
+    #[tokio::test]
+    async fn is_expired_future_ttl_not_expired() {
+        let msg = make_position_with_ttl("alice", Some(Duration::from_secs(3600)));
+        assert!(!is_expired(&msg));
+    }
+
+    #[tokio::test]
+    async fn is_expired_past_ttl_expired() {
+        let msg = make_expired_position("alice");
+        assert!(is_expired(&msg));
+    }
+
+    #[tokio::test]
+    async fn remove_still_works() {
+        let cache = PositionCache::new();
+        cache.store(make_position_with_ttl("alice", None)).await;
+        cache.store(make_position_with_ttl("bob", None)).await;
+
+        cache.remove("alice").await;
+        assert_eq!(cache.len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn store_replaces_previous_entry() {
+        let cache = PositionCache::new();
+        cache.store(make_position_with_ttl("alice", None)).await;
+        cache
+            .store(make_position_with_ttl(
+                "alice",
+                Some(Duration::from_secs(60)),
+            ))
+            .await;
+
+        assert_eq!(cache.len().await, 1);
+        let all = cache.get_all().await;
+        assert!(all[0].metadata.ttl.is_some(), "should have the newer entry");
     }
 }
