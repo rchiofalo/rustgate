@@ -70,54 +70,34 @@ jobs:
       - name: Build documentation
         run: cargo doc --workspace --all-features --no-deps
 
+  check-features:
+    if: github.event.pull_request.draft == false || github.event_name == 'push'
+    needs: [lint, clippy]
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install cargo-hack
+        run: cargo install cargo-hack --locked
+
+      - name: Check all feature combinations
+        run: cargo hack check --feature-powerset --depth 2 --exclude-features jemalloc --no-dev-deps
+
   test:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [lint, clippy]
     runs-on: self-hosted
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: default
-            flags: ""
-          - name: nats
-            flags: "--features nats"
-          - name: enrollment
-            flags: "--features enrollment"
-          - name: proto
-            flags: "--features proto"
-          - name: metrics
-            flags: "--features metrics"
-          - name: websocket
-            flags: "--features websocket"
-          - name: federation
-            flags: "--features federation"
-          - name: websocket-nats
-            flags: "--features websocket,nats"
-          - name: websocket-federation
-            flags: "--features websocket,federation"
-          - name: federation-nats
-            flags: "--features federation,nats"
-          - name: federation-metrics
-            flags: "--features federation,metrics"
-          - name: proto-federation
-            flags: "--features proto,federation"
-          - name: enrollment-federation
-            flags: "--features enrollment,federation"
-          - name: nats-metrics
-            flags: "--features nats,metrics"
-          - name: full-detail
-            flags: "--features full-detail"
-          - name: federation-ha
-            flags: "--features federation-ha,nats"
-          - name: all
-            flags: "--all-features"
-    name: test (${{ matrix.name }})
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - name: Install cargo-nextest
+        run: cargo install cargo-nextest --locked
+
       - name: Run tests
-        run: cargo test ${{ matrix.flags }}
+        run: cargo nextest run --all-features
+
+      - name: Run doc tests
+        run: cargo test --all-features --doc
 
   coverage:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
@@ -140,7 +120,7 @@ jobs:
 
   audit:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
-    needs: [test]
+    needs: [check-features, test]
     runs-on: self-hosted
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -162,7 +142,7 @@ jobs:
 
   docker:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
-    needs: [test]
+    needs: [check-features, test]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
