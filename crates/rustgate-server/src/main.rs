@@ -17,7 +17,6 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing_subscriber::EnvFilter;
 
-#[allow(dead_code)]
 mod audit;
 #[cfg(feature = "metrics")]
 mod metrics;

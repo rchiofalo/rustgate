@@ -149,6 +149,7 @@ impl EnrollmentServer {
                     async move {
                         handle_request(
                             req,
+                            peer,
                             &signer,
                             &credentials,
                             contacts.as_ref(),
@@ -169,6 +170,7 @@ impl EnrollmentServer {
 
 async fn handle_request(
     req: Request<hyper::body::Incoming>,
+    peer: SocketAddr,
     signer: &CsrSigner,
     credentials: &Credentials,
     contacts: Option<&ContactsProvider>,
@@ -181,7 +183,7 @@ async fn handle_request(
         (&Method::GET, "/Marti/api/tls/config") => handle_tls_config(signer),
 
         (&Method::POST, "/Marti/api/tls/signClient/v2") => {
-            handle_sign_client_v2(req, signer, credentials).await
+            handle_sign_client_v2(req, peer, signer, credentials).await
         }
 
         (&Method::GET, "/Marti/api/tls/profile/enrollment") => {
@@ -217,6 +219,7 @@ fn handle_tls_config(signer: &CsrSigner) -> Response<Full<Bytes>> {
 
 async fn handle_sign_client_v2(
     req: Request<hyper::body::Incoming>,
+    peer: SocketAddr,
     signer: &CsrSigner,
     credentials: &Credentials,
 ) -> Response<Full<Bytes>> {
@@ -227,6 +230,7 @@ async fn handle_sign_client_v2(
         .and_then(|v| v.to_str().ok());
 
     let Some(username) = credentials.validate(auth_header) else {
+        rustgate_core::audit::enrollment_auth_failed(&peer.to_string());
         let mut resp = build_response(
             StatusCode::UNAUTHORIZED,
             "text/plain",
@@ -288,6 +292,7 @@ async fn handle_sign_client_v2(
     let signed_der = match signer.sign_csr(csr_text, username) {
         Ok(der) => der,
         Err(e) => {
+            rustgate_core::audit::enrollment_sign_failed(username, &client_uid, &e.to_string());
             tracing::warn!(
                 error = %e,
                 username = %username,
@@ -314,6 +319,7 @@ async fn handle_sign_client_v2(
         )
     };
 
+    rustgate_core::audit::enrollment_signed(username, &client_uid);
     tracing::info!(
         username = %username,
         client_uid = %client_uid,

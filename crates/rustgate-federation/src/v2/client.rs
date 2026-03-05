@@ -221,6 +221,7 @@ async fn connection_loop(
         let channel = match build_channel(&config.address, config.tls_config.clone()).await {
             Ok(ch) => ch,
             Err(e) => {
+                rustgate_core::audit::federation_connect_failed(&peer.id, &e.to_string());
                 warn!(peer = %peer.id, error = %e, "failed to build gRPC channel");
                 peer.set_error(&e.to_string());
                 reconnect_count += 1;
@@ -235,9 +236,11 @@ async fn connection_loop(
 
         match result {
             Ok(()) => {
+                rustgate_core::audit::federation_peer_disconnected(&peer.id, "clean shutdown");
                 info!(peer = %peer.id, "streams closed gracefully");
             }
             Err(e) => {
+                rustgate_core::audit::federation_peer_disconnected(&peer.id, &e.to_string());
                 warn!(peer = %peer.id, error = %e, "streams failed");
                 peer.set_error(&e.to_string());
             }
@@ -376,6 +379,7 @@ async fn run_streams(
     // --- Connection established ---
     peer.set_state(PeerState::Connected);
     peer.mark_connected();
+    rustgate_core::audit::federation_peer_connected(&peer.id, federate_id, "outbound");
     info!(peer = %peer.id, "V2 gRPC handshake complete, streams active");
 
     // --- Step 5: Run all streams concurrently ---

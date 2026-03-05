@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod encoder;
 pub mod error;
 pub mod identity;

@@ -81,6 +81,7 @@ impl TlsListener {
             let tls_stream = match self.tls_acceptor.accept(tcp_stream).await {
                 Ok(stream) => stream,
                 Err(e) => {
+                    rustgate_core::audit::tls_accept_error(peer_addr, &e.to_string());
                     warn!(peer_addr = %peer_addr, error = %e, "TLS handshake failed");
                     continue;
                 }
