@@ -1,9 +1,6 @@
 [graph]
 targets = []
-# Exclude fips and jemalloc from dependency resolution — fips pulls in
-# aws-lc-fips-sys which has OpenSSL-licensed code and requires Go/cmake
-# to build.  These features are opt-in at compile time.
-exclude-features = ["fips", "jemalloc"]
+all-features = true
 
 [advisories]
 ignore = [
@@ -24,6 +21,16 @@ allow = [
     "Zlib",
     "CDLA-Permissive-2.0",
 ]
+
+# aws-lc-sys and aws-lc-fips-sys are licensed ISC + Apache-2.0 + OpenSSL.
+# The OpenSSL license is FSF-approved. These crates provide the crypto
+# primitives for rustls (default) and FIPS 140-3 validated builds.
+[[licenses.exceptions]]
+allow = ["OpenSSL"]
+crate = "aws-lc-sys"
+[[licenses.exceptions]]
+allow = ["OpenSSL"]
+crate = "aws-lc-fips-sys"
 
 [[licenses.exceptions]]
 allow = ["LicenseRef-Proprietary"]
