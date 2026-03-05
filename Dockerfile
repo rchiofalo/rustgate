@@ -30,13 +30,13 @@ COPY crates/rustgate-proto/build.rs crates/rustgate-proto/build.rs
 COPY crates/rustgate-federation/proto crates/rustgate-federation/proto
 COPY crates/rustgate-federation/build.rs crates/rustgate-federation/build.rs
 
-RUN cargo build --release --all-features 2>/dev/null || true
+RUN cargo build --release --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket 2>/dev/null || true
 
 # Now copy real source and build for real.
 COPY . .
 # Touch all source files so cargo sees them as newer than the stubs.
 RUN find crates -name "*.rs" -exec touch {} +
-RUN cargo build --release --all-features
+RUN cargo build --release --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket
 
 # ── Runtime stage ────────────────────────────────────────────────────────
 FROM alpine:3.23@sha256:25109184c71bdad752c8312a8623239686a9a2071e8825f20acb8f2198c3f659
