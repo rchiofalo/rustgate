@@ -1,12 +1,26 @@
 //! X.509 certificate generation for tests.
 
 use std::fmt;
+use std::sync::Once;
 
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DistinguishedName, DnType,
     ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
 };
 use time::{Duration as TimeDuration, OffsetDateTime};
+
+/// Install a crypto provider once for the test process.
+///
+/// Uses `aws-lc-rs` which is the default rustls backend and also provides
+/// FIPS 140-3 support. Idempotent via [`Once`].
+static INIT_CRYPTO: Once = Once::new();
+fn ensure_crypto_provider() {
+    INIT_CRYPTO.call_once(|| {
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        );
+    });
+}
 
 /// A certificate authority for signing test certificates.
 pub struct TestCa {
@@ -18,6 +32,7 @@ pub struct TestCa {
 impl TestCa {
     /// Create a new test CA with the given common name.
     pub fn new(cn: &str) -> Self {
+        ensure_crypto_provider();
         let mut params = CertificateParams::default();
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params.key_usages.push(KeyUsagePurpose::KeyCertSign);

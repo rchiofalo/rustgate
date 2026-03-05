@@ -22,4 +22,5 @@ unused_async = "warn"
 
 [dependencies]
 rcgen = { workspace = true }
+rustls = { workspace = true }
 time = { workspace = true }
