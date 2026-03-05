@@ -171,7 +171,11 @@ fn load_private_key(pem: &str) -> Result<KeyPair, EnrollmentError> {
         PrivateKeyDer::Sec1(sec1) => {
             PrivateKeyDer::Pkcs8(sec1_to_pkcs8(sec1.secret_sec1_der()).into())
         }
-        _ => return Err(EnrollmentError::Config("unsupported key format".to_string())),
+        _ => {
+            return Err(EnrollmentError::Config(
+                "unsupported key format".to_string(),
+            ));
+        }
     };
 
     KeyPair::try_from(&pkcs8_der)
@@ -197,7 +201,8 @@ fn pkcs1_to_pkcs8(pkcs1_der: &[u8]) -> Vec<u8> {
     // AlgorithmIdentifier: SEQUENCE { OID rsaEncryption, NULL }
     const ALGO_ID: &[u8] = &[
         0x30, 0x0d, // SEQUENCE, 13 bytes
-        0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, // OID 1.2.840.113549.1.1.1
+        0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01,
+        0x01, // OID 1.2.840.113549.1.1.1
         0x05, 0x00, // NULL
     ];
 
@@ -540,9 +545,16 @@ cyOZxZiK
                 // Should be parseable by rcgen
                 let wrapped = PrivateKeyDer::Pkcs8(pkcs8.into());
                 let key = KeyPair::try_from(&wrapped);
-                assert!(key.is_ok(), "converted PKCS#8 should be valid: {:?}", key.err());
+                assert!(
+                    key.is_ok(),
+                    "converted PKCS#8 should be valid: {:?}",
+                    key.err()
+                );
             }
-            other => panic!("expected PKCS#1 key, got {:?}", std::mem::discriminant(other)),
+            other => panic!(
+                "expected PKCS#1 key, got {:?}",
+                std::mem::discriminant(other)
+            ),
         }
     }
 
