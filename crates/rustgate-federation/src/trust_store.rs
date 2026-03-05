@@ -171,10 +171,10 @@ impl TrustStore {
         }
 
         // Persist to disk
-        if let Some(ref dir) = self.data_dir {
-            if let Err(e) = persist_cert_to_disk(dir, &cn, pem_data) {
-                warn!(cn = %cn, error = %e, "failed to persist certificate to disk");
-            }
+        if let Some(ref dir) = self.data_dir
+            && let Err(e) = persist_cert_to_disk(dir, &cn, pem_data)
+        {
+            warn!(cn = %cn, error = %e, "failed to persist certificate to disk");
         }
 
         info!(cn = %cn, "added certificate to trust store");
@@ -198,15 +198,15 @@ impl TrustStore {
             if let Some(ref dir) = self.data_dir {
                 let filename = sanitize_filename(cn);
                 let path = dir.join(format!("{filename}.pem"));
-                if path.exists() {
-                    if let Err(e) = fs::remove_file(&path) {
-                        warn!(
-                            cn = %cn,
-                            path = %path.display(),
-                            error = %e,
-                            "failed to remove certificate file"
-                        );
-                    }
+                if path.exists()
+                    && let Err(e) = fs::remove_file(&path)
+                {
+                    warn!(
+                        cn = %cn,
+                        path = %path.display(),
+                        error = %e,
+                        "failed to remove certificate file"
+                    );
                 }
             }
 

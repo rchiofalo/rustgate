@@ -296,10 +296,10 @@ pub fn routable_to_federated_event(
     }
 
     // If destination is a specific group, ensure it's in federate_groups
-    if let Destination::Group(ref group_id) = msg.destination {
-        if !event.federate_groups.contains(group_id) {
-            event.federate_groups.push(group_id.clone());
-        }
+    if let Destination::Group(ref group_id) = msg.destination
+        && !event.federate_groups.contains(group_id)
+    {
+        event.federate_groups.push(group_id.clone());
     }
 
     Ok(event)

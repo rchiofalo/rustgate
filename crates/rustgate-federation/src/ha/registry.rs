@@ -217,10 +217,10 @@ impl ConnectionRegistry {
         }
 
         for key in keys {
-            if let Ok(Some(entry)) = self.kv.entry(&key).await {
-                if let Ok(info) = serde_json::from_slice::<ConnectionInfo>(&entry.value) {
-                    connections.push(info);
-                }
+            if let Ok(Some(entry)) = self.kv.entry(&key).await
+                && let Ok(info) = serde_json::from_slice::<ConnectionInfo>(&entry.value)
+            {
+                connections.push(info);
             }
         }
 
@@ -290,10 +290,10 @@ async fn refresh_registrations(
     };
 
     for (key, info) in &snapshot {
-        if let Ok(data) = serde_json::to_vec(info) {
-            if let Err(e) = kv.put(key, data.into()).await {
-                warn!(key = %key, error = %e, "failed to refresh connection registration");
-            }
+        if let Ok(data) = serde_json::to_vec(info)
+            && let Err(e) = kv.put(key, data.into()).await
+        {
+            warn!(key = %key, error = %e, "failed to refresh connection registration");
         }
     }
 }
