@@ -339,8 +339,20 @@ mod tests {
         messages_out().inc();
 
         let snap = snapshot();
-        assert_eq!(snap.messages_in, baseline.messages_in + 1);
-        assert_eq!(snap.messages_out, baseline.messages_out + 2);
+        // Use > because parallel tests share the global counters and may
+        // increment them between our baseline and check snapshots.
+        assert!(
+            snap.messages_in > baseline.messages_in,
+            "messages_in: expected > {}, got {}",
+            baseline.messages_in,
+            snap.messages_in,
+        );
+        assert!(
+            snap.messages_out > baseline.messages_out + 1,
+            "messages_out: expected > {}, got {}",
+            baseline.messages_out + 1,
+            snap.messages_out,
+        );
     }
 
     #[test]
