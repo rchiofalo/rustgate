@@ -43,15 +43,35 @@ spec:
             - name: tak
               containerPort: {{ .Values.service.port }}
               protocol: TCP
-            {{- if .Values.federation.enabled }}
-            - name: federation
-              containerPort: 9000
+            {{- if .Values.websocket.enabled }}
+            - name: websocket
+              containerPort: {{ .Values.websocket.port }}
               protocol: TCP
+            {{- end }}
+            {{- if .Values.federation.enabled }}
+            - name: federation-v1
+              containerPort: {{ .Values.federation.v1Port }}
+              protocol: TCP
+            {{- if .Values.federation.v2Bind }}
+            - name: federation-v2
+              containerPort: {{ .Values.federation.v2Port }}
+              protocol: TCP
+            {{- end }}
             {{- end }}
             {{- if .Values.metrics.enabled }}
             - name: metrics
               containerPort: {{ .Values.metrics.port }}
               protocol: TCP
+            {{- end }}
+            {{- if .Values.plaintext.tcp.enabled }}
+            - name: tcp-plain
+              containerPort: {{ .Values.plaintext.tcp.port }}
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.plaintext.udp.enabled }}
+            - name: udp-input
+              containerPort: {{ .Values.plaintext.udp.port }}
+              protocol: UDP
             {{- end }}
           env:
             - name: RUSTGATE_BIND
@@ -119,9 +139,17 @@ spec:
               value: {{ .Values.enrollment.caOrganization | quote }}
             {{- end }}
             {{- end }}
+            {{- if .Values.websocket.enabled }}
+            - name: WEBSOCKET_BIND
+              value: {{ .Values.websocket.bind | quote }}
+            {{- end }}
             {{- if .Values.federation.enabled }}
             - name: FEDERATION_V1_BIND
               value: {{ .Values.federation.v1Bind | quote }}
+            {{- if .Values.federation.v2Bind }}
+            - name: FEDERATION_V2_BIND
+              value: {{ .Values.federation.v2Bind | quote }}
+            {{- end }}
             - name: FEDERATION_ID
               value: {{ .Values.federation.id | quote }}
             - name: FEDERATION_MAX_HOPS
@@ -144,6 +172,24 @@ spec:
             - name: FEDERATION_PEERS_FILE
               value: {{ .Values.federation.peersFile | quote }}
             {{- end }}
+            {{- end }}
+            {{- if .Values.dataPackage.enabled }}
+            - name: DATA_PACKAGE_DIR
+              value: /data/packages
+            {{- end }}
+            {{- if .Values.plaintext.tcp.enabled }}
+            - name: RUSTGATE_TCP_BIND
+              value: {{ .Values.plaintext.tcp.bind | quote }}
+            {{- end }}
+            {{- if .Values.plaintext.udp.enabled }}
+            - name: RUSTGATE_UDP_BIND
+              value: {{ .Values.plaintext.udp.bind | quote }}
+            {{- end }}
+            {{- if or .Values.plaintext.tcp.enabled .Values.plaintext.udp.enabled }}
+            - name: RUSTGATE_PLAINTEXT_CN
+              value: {{ .Values.plaintext.cn | quote }}
+            - name: RUSTGATE_PLAINTEXT_GROUP
+              value: {{ .Values.plaintext.group | quote }}
             {{- end }}
           {{- if .Values.metrics.enabled }}
           startupProbe:
@@ -198,6 +244,10 @@ spec:
             - name: federation-data
               mountPath: /data
             {{- end }}
+            {{- if .Values.dataPackage.enabled }}
+            - name: data-packages
+              mountPath: /data/packages
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       {{- if .Values.topologySpreadConstraints }}
@@ -220,4 +270,9 @@ spec:
         - name: federation-data
           persistentVolumeClaim:
             claimName: {{ include "rustgate.fullname" . }}-federation
+        {{- end }}
+        {{- if .Values.dataPackage.enabled }}
+        - name: data-packages
+          persistentVolumeClaim:
+            claimName: {{ include "rustgate.fullname" . }}-data-packages
         {{- end }}

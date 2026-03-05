@@ -16,6 +16,10 @@ spec:
     - ports:
         - port: {{ .Values.service.port }}
           protocol: TCP
+        {{- if .Values.websocket.enabled }}
+        - port: {{ .Values.websocket.port }}
+          protocol: TCP
+        {{- end }}
         {{- if .Values.metrics.enabled }}
         - port: {{ .Values.metrics.port }}
           protocol: TCP
@@ -25,8 +29,20 @@ spec:
           protocol: TCP
         {{- end }}
         {{- if .Values.federation.enabled }}
-        - port: 9000
+        - port: {{ .Values.federation.v1Port }}
           protocol: TCP
+        {{- if .Values.federation.v2Bind }}
+        - port: {{ .Values.federation.v2Port }}
+          protocol: TCP
+        {{- end }}
+        {{- end }}
+        {{- if .Values.plaintext.tcp.enabled }}
+        - port: {{ .Values.plaintext.tcp.port }}
+          protocol: TCP
+        {{- end }}
+        {{- if .Values.plaintext.udp.enabled }}
+        - port: {{ .Values.plaintext.udp.port }}
+          protocol: UDP
         {{- end }}
   egress:
     - ports:
@@ -41,9 +57,9 @@ spec:
     {{- end }}
     {{- if .Values.federation.enabled }}
     - ports:
-        - port: 9000
+        - port: {{ .Values.federation.v1Port }}
           protocol: TCP
-        - port: 9001
+        - port: {{ .Values.federation.v2Port }}
           protocol: TCP
     {{- end }}
 {{- end }}

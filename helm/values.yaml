@@ -45,10 +45,20 @@ enrollment:
   # ENROLLMENT_PASSWORD keys. When set, takes precedence over plain-text values.
   existingSecret: ""
 
+websocket:
+  # Enable WebSocket (wss://) listener for browser-based TAK clients.
+  enabled: false
+  bind: "0.0.0.0:8443"
+  port: 8443
+
 federation:
   enabled: false
   # V1 federation listen address (length-prefixed XML over mTLS).
   v1Bind: "0.0.0.0:9000"
+  v1Port: 9000
+  # V2 gRPC federation listen address. Leave empty to disable V2.
+  v2Bind: ""
+  v2Port: 9001
   # Unique federation server identity.
   id: "rustgate-federation-1"
   # Maximum federation hops before dropping a message (loop prevention).
@@ -63,6 +73,28 @@ federation:
   # Name of an existing K8s Secret containing a FEDERATION_PEERS_FILE key.
   # When set, mounts the secret as a file and takes precedence over peersFile.
   existingSecret: ""
+
+dataPackage:
+  # Enable persistent data package storage for Marti sync API.
+  # Requires enrollment to be enabled.
+  enabled: false
+  storageSize: 1Gi
+  storageClassName: ""
+
+plaintext:
+  # Plaintext TCP/UDP inputs for trusted or air-gapped networks.
+  # WARNING: Traffic is NOT encrypted. Use only behind VPN or on isolated networks.
+  tcp:
+    enabled: false
+    bind: "0.0.0.0:8087"
+    port: 8087
+  udp:
+    enabled: false
+    bind: "0.0.0.0:8087"
+    port: 8087
+  # Identity assigned to plaintext clients.
+  cn: "anonymous"
+  group: "__plaintext__"
 
 metrics:
   enabled: true
