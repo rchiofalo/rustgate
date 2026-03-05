@@ -4,22 +4,41 @@ use std::fmt;
 use std::sync::Once;
 
 use rcgen::{
-    BasicConstraints, CertificateParams, CertifiedIssuer, DistinguishedName, DnType,
-    ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
+    BasicConstraints, CertificateParams, CertificateRevocationListParams, CertifiedIssuer,
+    DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, KeyIdMethod, KeyPair,
+    KeyUsagePurpose, RevocationReason, RevokedCertParams, SerialNumber,
 };
 use time::{Duration as TimeDuration, OffsetDateTime};
 
 /// Install a crypto provider once for the test process.
 ///
-/// Uses `aws-lc-rs` which is the default rustls backend and also provides
-/// FIPS 140-3 support. Idempotent via [`Once`].
+/// Uses `ring` which is always available via the workspace rustls
+/// dependency. When FIPS mode is required, tests should call
+/// `install_fips_provider()` from `rustgate-transport` *before*
+/// creating any `TestCa` instances — the `let _ =` here silently
+/// ignores the "already installed" error so FIPS tests work
+/// correctly without conflict.
 static INIT_CRYPTO: Once = Once::new();
 fn ensure_crypto_provider() {
     INIT_CRYPTO.call_once(|| {
         let _ = rustls::crypto::CryptoProvider::install_default(
-            rustls::crypto::aws_lc_rs::default_provider(),
+            rustls::crypto::ring::default_provider(),
         );
     });
+}
+
+/// Extract the serial number from a PEM-encoded certificate.
+fn extract_serial_from_pem(pem: &str) -> SerialNumber {
+    let mut reader = std::io::BufReader::new(pem.as_bytes());
+    let cert_der = rustls_pemfile::certs(&mut reader)
+        .next()
+        .expect("no certificate in PEM")
+        .expect("failed to parse certificate PEM");
+
+    let (_, cert) =
+        x509_parser::parse_x509_certificate(cert_der.as_ref()).expect("failed to parse X.509");
+    let serial_bytes = cert.tbs_certificate.serial.to_bytes_be();
+    SerialNumber::from_slice(&serial_bytes)
 }
 
 /// A certificate authority for signing test certificates.
@@ -134,6 +153,40 @@ impl TestCa {
             cert_pem: cert.pem(),
             key_pem: key_pair.serialize_pem(),
         }
+    }
+
+    /// Generate a Certificate Revocation List (CRL) revoking the given certificates.
+    ///
+    /// Parses each PEM to extract its serial number, builds a CRL signed by
+    /// this CA, and returns the CRL in PEM format. The CRL is valid for 30 days.
+    pub fn generate_crl(&self, revoked_cert_pems: &[&str]) -> String {
+        let revoked_certs: Vec<RevokedCertParams> = revoked_cert_pems
+            .iter()
+            .map(|pem| {
+                let serial = extract_serial_from_pem(pem);
+                RevokedCertParams {
+                    serial_number: serial,
+                    revocation_time: OffsetDateTime::now_utc(),
+                    reason_code: Some(RevocationReason::KeyCompromise),
+                    invalidity_date: None,
+                }
+            })
+            .collect();
+
+        let now = OffsetDateTime::now_utc();
+        let crl_params = CertificateRevocationListParams {
+            this_update: now,
+            next_update: now + TimeDuration::days(30),
+            crl_number: SerialNumber::from(1u64),
+            issuing_distribution_point: None,
+            revoked_certs,
+            key_identifier_method: KeyIdMethod::Sha256,
+        };
+
+        let crl = crl_params
+            .signed_by(&self.issuer)
+            .expect("failed to sign CRL");
+        crl.pem().expect("failed to encode CRL as PEM")
     }
 
     /// Issue a client certificate with the given CN and OU fields.

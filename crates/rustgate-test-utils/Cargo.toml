@@ -23,4 +23,6 @@ unused_async = "warn"
 [dependencies]
 rcgen = { workspace = true }
 rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+x509-parser = { workspace = true }
 time = { workspace = true }
