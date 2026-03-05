@@ -5,7 +5,9 @@ mod codec;
 mod config;
 mod encoder;
 mod extract;
+mod filter;
 mod listener;
+mod repeater;
 mod router;
 mod session;
 
@@ -14,7 +16,9 @@ pub use codec::{FramedCodec, LengthPrefixedCodec, LineDelimitedCodec, XmlStreamC
 pub use config::TlsConfig;
 pub use encoder::{CotEncoder, MessageEncoder, RawEncoder};
 pub use extract::extract_identity;
+pub use filter::{GeoBounds, MessageFilter};
 pub use listener::TlsListener;
+pub use repeater::EmergencyRepeater;
 pub use router::{Router, SessionHandle};
 #[cfg(feature = "proto")]
 pub use rustgate_proto::TakFrameCodec;
