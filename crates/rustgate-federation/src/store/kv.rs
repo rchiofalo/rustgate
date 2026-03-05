@@ -473,16 +473,16 @@ fn flush_stats(
     };
 
     for id in pending.keys() {
-        if let Some(info) = federates_read.get(id) {
-            if let Ok(data) = serde_json::to_vec(info) {
-                let kv = kv.clone();
-                let key = id.clone();
-                drop(tokio::spawn(async move {
-                    if let Err(e) = kv.put(&key, data.into()).await {
-                        warn!(key = %key, error = %e, "failed to flush stats to KV");
-                    }
-                }));
-            }
+        if let Some(info) = federates_read.get(id)
+            && let Ok(data) = serde_json::to_vec(info)
+        {
+            let kv = kv.clone();
+            let key = id.clone();
+            drop(tokio::spawn(async move {
+                if let Err(e) = kv.put(&key, data.into()).await {
+                    warn!(key = %key, error = %e, "failed to flush stats to KV");
+                }
+            }));
         }
     }
 }

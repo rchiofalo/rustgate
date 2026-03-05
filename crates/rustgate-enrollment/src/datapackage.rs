@@ -129,12 +129,11 @@ impl DataPackageStore {
                 continue;
             };
 
-            if let Ok(meta) = self.read_meta(hash).await {
-                if meta.name.to_lowercase().contains(&keyword_lower)
-                    || meta.creator_uid.to_lowercase().contains(&keyword_lower)
-                {
-                    results.push(meta);
-                }
+            if let Ok(meta) = self.read_meta(hash).await
+                && (meta.name.to_lowercase().contains(&keyword_lower)
+                    || meta.creator_uid.to_lowercase().contains(&keyword_lower))
+            {
+                results.push(meta);
             }
         }
 

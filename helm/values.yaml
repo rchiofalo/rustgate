@@ -5,8 +5,10 @@ fullnameOverride: ""
 image:
   repository: ghcr.io/rchiofalo/rustgate
   # Use a specific version tag or SHA digest for production deployments.
-  tag: "0.1.0"
+  tag: "0.2.0"
   pullPolicy: IfNotPresent
+
+imagePullSecrets: []
 
 service:
   # Use LoadBalancer for external TCP access, ClusterIP for internal-only.
@@ -75,6 +77,19 @@ metrics:
 
 networkPolicy:
   enabled: false
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts: []
+  tls: []
+
+persistence:
+  # Enable to create a PersistentVolumeClaim for federation state.
+  enabled: false
+  storageClassName: ""
+  size: 1Gi
 
 resources:
   requests:

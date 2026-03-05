@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # ── Builder stage ────────────────────────────────────────────────────────
-FROM rust:1.88-alpine AS builder
+FROM rust:1.93-alpine@sha256:4fec02de605563c297c78a31064c8335bc004fa2b0bf406b1b99441da64e2d2d AS builder
 
 RUN apk add --no-cache musl-dev protobuf-dev make
 
@@ -39,7 +39,7 @@ RUN find crates -name "*.rs" -exec touch {} +
 RUN cargo build --release --all-features
 
 # ── Runtime stage ────────────────────────────────────────────────────────
-FROM alpine:3.21
+FROM alpine:3.21@sha256:c3f8e73fdb79deaebaa2037150150191b9dcbfba68b4a46d70103204c53f4709
 
 LABEL org.opencontainers.image.source="https://github.com/rchiofalo/rustgate" \
       org.opencontainers.image.description="Secure tactical message router with mTLS and NATS bridge" \
@@ -50,9 +50,9 @@ RUN apk add --no-cache ca-certificates \
 
 USER 10001
 
-COPY --from=builder /src/target/release/rustgate /usr/local/bin/rustgate
+COPY --from=builder --chmod=755 /src/target/release/rustgate /usr/local/bin/rustgate
 
-EXPOSE 4433 8443 9000 9001 9090
+EXPOSE 4433 8443 8446 9000 9001 9090
 
 STOPSIGNAL SIGTERM
 

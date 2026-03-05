@@ -175,10 +175,10 @@ impl FederationManager {
                             );
                         }
                     }
-                } else if let Some(ref contact) = event.contact {
-                    if let Some(xml) = crate::v2::convert::contact_list_entry_to_xml(contact) {
-                        on_event_inbound(peer_id, Bytes::from(xml));
-                    }
+                } else if let Some(ref contact) = event.contact
+                    && let Some(xml) = crate::v2::convert::contact_list_entry_to_xml(contact)
+                {
+                    on_event_inbound(peer_id, Bytes::from(xml));
                 }
             });
 
@@ -289,12 +289,11 @@ impl FederationManager {
                                     );
                                 }
                             }
-                        } else if let Some(ref contact) = event.contact {
-                            if let Some(xml) =
+                        } else if let Some(ref contact) = event.contact
+                            && let Some(xml) =
                                 crate::v2::convert::contact_list_entry_to_xml(contact)
-                            {
-                                on_event_inbound(peer_id, Bytes::from(xml));
-                            }
+                        {
+                            on_event_inbound(peer_id, Bytes::from(xml));
                         }
                     });
 

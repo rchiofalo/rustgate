@@ -1,0 +1,29 @@
+# Production values override for rustgate Helm chart.
+#
+# Usage:
+#   helm install rustgate helm/ -f helm/values-production.yaml -f my-values.yaml
+
+replicaCount: 3
+
+resources:
+  requests:
+    cpu: "1"
+    memory: 512Mi
+  limits:
+    cpu: "4"
+    memory: 2Gi
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 20
+  targetCPUUtilizationPercentage: 60
+  targetMemoryUtilizationPercentage: 70
+
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: rustgate

@@ -16,6 +16,12 @@ updates:
         update-types:
           - "minor"
           - "patch"
+      major:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - "major"
 
   - package-ecosystem: github-actions
     directory: /
@@ -33,3 +39,18 @@ updates:
         update-types:
           - "minor"
           - "patch"
+      actions-major:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - "major"
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+    commit-message:
+      prefix: "deps"

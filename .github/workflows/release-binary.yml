@@ -12,6 +12,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write # required for cosign keyless signing via OIDC
+  attestations: write # required for build provenance attestation
 
 env:
   CARGO_TERM_COLOR: always
@@ -48,6 +50,9 @@ jobs:
       - name: Install cross
         run: cargo install cross --locked
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
+
       - name: Build with cross
         run: cross build --release --all-features --target ${{ matrix.target }}
 
@@ -60,10 +65,20 @@ jobs:
       - name: Generate SHA256 checksum
         run: sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
 
+      - name: Sign binary archive with cosign
+        run: cosign sign-blob --yes --output-signature "$ARCHIVE.sig" --output-certificate "$ARCHIVE.pem" "$ARCHIVE"
+
+      - name: Attest binary provenance
+        uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2 # v2.2.3
+        with:
+          subject-path: ${{ env.ARCHIVE }}
+
       - name: Upload release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ steps.version.outputs.version }}" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
+        run: |
+          gh release upload "${{ steps.version.outputs.version }}" \
+            "$ARCHIVE" "$ARCHIVE.sha256" "$ARCHIVE.sig" "$ARCHIVE.pem" --clobber
 
   sbom:
     runs-on: ubuntu-latest

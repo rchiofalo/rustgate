@@ -1,0 +1,50 @@
+name: Nightly
+
+on:
+  schedule:
+    # Run daily at 03:00 UTC
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  security-audit:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Check advisories, licenses, bans, and sources
+        run: cargo deny check
+
+      - name: Run cargo audit
+        run: cargo audit
+
+  fuzz:
+    runs-on: self-hosted
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - cot_parse
+          - length_prefixed_codec
+          - tak_frame_codec
+          - v2_federation_convert
+          - xml_stream_codec
+    name: fuzz (${{ matrix.target }})
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install nightly toolchain
+        run: rustup toolchain install nightly --profile minimal
+
+      - name: Install cargo-fuzz
+        run: cargo +nightly install cargo-fuzz --locked
+
+      - name: Run fuzzer for 5 minutes
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=300

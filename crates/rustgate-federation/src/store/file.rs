@@ -59,10 +59,10 @@ impl FederateStore for FileStore {
         };
 
         // Create parent directory if needed
-        if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.exists()
+        {
+            std::fs::create_dir_all(parent)?;
         }
 
         let entries: Vec<&FederateInfo> = self.federates.values().collect();

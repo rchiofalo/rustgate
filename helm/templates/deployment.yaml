@@ -18,6 +18,10 @@ spec:
     spec:
       automountServiceAccountToken: false
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -126,7 +130,10 @@ spec:
             - name: FEDERATION_SKIP_HOSTNAME_VERIFY
               value: "true"
             {{- end }}
-            {{- if .Values.federation.storePath }}
+            {{- if and .Values.persistence.enabled .Values.federation.enabled }}
+            - name: FEDERATION_STORE_PATH
+              value: /data/federation-store.json
+            {{- else if .Values.federation.storePath }}
             - name: FEDERATION_STORE_PATH
               value: {{ .Values.federation.storePath | quote }}
             {{- end }}
@@ -187,6 +194,10 @@ spec:
               mountPath: /etc/federation
               readOnly: true
             {{- end }}
+            {{- if and .Values.persistence.enabled .Values.federation.enabled }}
+            - name: federation-data
+              mountPath: /data
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       {{- if .Values.topologySpreadConstraints }}
@@ -204,4 +215,9 @@ spec:
             items:
               - key: FEDERATION_PEERS_FILE
                 path: peers.json
+        {{- end }}
+        {{- if and .Values.persistence.enabled .Values.federation.enabled }}
+        - name: federation-data
+          persistentVolumeClaim:
+            claimName: {{ include "rustgate.fullname" . }}-federation
         {{- end }}
