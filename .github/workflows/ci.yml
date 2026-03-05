@@ -77,7 +77,7 @@ jobs:
         run: cargo install cargo-hack --locked
 
       - name: Check all feature combinations
-        run: cargo hack check --feature-powerset --depth 2 --exclude-features jemalloc --no-dev-deps
+        run: cargo hack check --feature-powerset --depth 2 --exclude-features jemalloc,fips --no-dev-deps
 
   test:
     if: github.event.pull_request.draft == false || github.event_name == 'push'

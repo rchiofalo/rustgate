@@ -87,6 +87,11 @@ struct Cli {
     #[arg(long, env = "RUSTGATE_CA")]
     ca: String,
 
+    /// Path to PEM-encoded Certificate Revocation List file.
+    /// Connections using revoked certificates will be rejected at the TLS handshake.
+    #[arg(long, env = "RUSTGATE_CRL")]
+    crl: Option<String>,
+
     #[arg(long, value_enum, default_value_t = Framing::Xml, env = "RUSTGATE_FRAMING")]
     framing: Framing,
 
@@ -264,6 +269,9 @@ fn main() -> anyhow::Result<()> {
         .json()
         .init();
 
+    #[cfg(feature = "fips")]
+    rustgate_transport::install_fips_provider()?;
+
     tracing::info!(bind = %cli.bind, "rustgate starting");
     audit::server_started(&cli.bind, env!("CARGO_PKG_VERSION"));
 
@@ -275,7 +283,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let key_pem = tokio::fs::read_to_string(&cli.key).await?;
     let ca_pem = tokio::fs::read_to_string(&cli.ca).await?;
 
-    let tls_config = TlsConfig::from_pem(&cert_pem, &key_pem, &ca_pem)?;
+    let mut tls_config = TlsConfig::from_pem(&cert_pem, &key_pem, &ca_pem)?;
+
+    if let Some(ref crl_path) = cli.crl {
+        let crl_pem = tokio::fs::read_to_string(crl_path).await?;
+        tls_config = tls_config.with_crls(&crl_pem)?;
+    }
+
     let listener = TlsListener::bind(&cli.bind, &tls_config).await?;
     let framing = cli.framing;
     let encoding = cli.encoding;
