@@ -102,11 +102,7 @@ impl EmergencyRepeater {
 
         events
             .values()
-            .filter(|e| {
-                now.duration_since(e.received_at)
-                    .unwrap_or_default()
-                    < self.stale_delay
-            })
+            .filter(|e| now.duration_since(e.received_at).unwrap_or_default() < self.stale_delay)
             .map(|e| e.message.clone())
             .collect()
     }
@@ -118,9 +114,7 @@ impl EmergencyRepeater {
         let now = SystemTime::now();
 
         events.retain(|_, e| {
-            now.duration_since(e.received_at)
-                .unwrap_or_default()
-                < self.stale_delay
+            now.duration_since(e.received_at).unwrap_or_default() < self.stale_delay
         });
 
         before - events.len()
@@ -308,10 +302,8 @@ mod tests {
 
     #[tokio::test]
     async fn sweep_removes_stale() {
-        let repeater = EmergencyRepeater::with_intervals(
-            Duration::from_secs(1),
-            Duration::from_millis(1),
-        );
+        let repeater =
+            EmergencyRepeater::with_intervals(Duration::from_secs(1), Duration::from_millis(1));
 
         let msg = make_alert(
             "alert-1",

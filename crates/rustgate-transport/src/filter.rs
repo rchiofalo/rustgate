@@ -86,19 +86,19 @@ impl MessageFilter {
             return self.matches_message_type(&msg.metadata.message_type);
         };
 
-        self.type_prefixes.iter().any(|prefix| cot_type.starts_with(prefix.as_str()))
+        self.type_prefixes
+            .iter()
+            .any(|prefix| cot_type.starts_with(prefix.as_str()))
     }
 
     /// Fallback type matching using the parsed MessageType enum.
     fn matches_message_type(&self, msg_type: &MessageType) -> bool {
-        self.type_prefixes.iter().any(|prefix| {
-            match msg_type {
-                MessageType::Position => prefix.starts_with("a-"),
-                MessageType::Chat => prefix.starts_with("b-t"),
-                MessageType::Alert => prefix.starts_with("b-a"),
-                MessageType::Status => prefix.starts_with("t-"),
-                _ => false,
-            }
+        self.type_prefixes.iter().any(|prefix| match msg_type {
+            MessageType::Position => prefix.starts_with("a-"),
+            MessageType::Chat => prefix.starts_with("b-t"),
+            MessageType::Alert => prefix.starts_with("b-a"),
+            MessageType::Status => prefix.starts_with("t-"),
+            _ => false,
         })
     }
 
@@ -145,7 +145,10 @@ fn extract_point(payload: &[u8]) -> Option<(f64, f64)> {
     let text = std::str::from_utf8(payload).ok()?;
 
     let point_start = text.find("<point ")?;
-    let point_end = text[point_start..].find("/>").or_else(|| text[point_start..].find('>'))? + point_start;
+    let point_end = text[point_start..]
+        .find("/>")
+        .or_else(|| text[point_start..].find('>'))?
+        + point_start;
     let point_tag = &text[point_start..point_end];
 
     let lat = extract_attr(point_tag, "lat")?;
@@ -201,7 +204,8 @@ mod tests {
     #[test]
     fn type_prefix_matches() {
         let filter = MessageFilter::new().with_type_prefixes(vec!["a-f".to_string()]);
-        let msg = make_msg(r#"<event type="a-f-G-U-C" uid="test"><point lat="0" lon="0" /></event>"#);
+        let msg =
+            make_msg(r#"<event type="a-f-G-U-C" uid="test"><point lat="0" lon="0" /></event>"#);
         assert!(filter.matches(&msg));
     }
 
@@ -214,8 +218,8 @@ mod tests {
 
     #[test]
     fn multiple_type_prefixes() {
-        let filter = MessageFilter::new()
-            .with_type_prefixes(vec!["a-f".to_string(), "b-a".to_string()]);
+        let filter =
+            MessageFilter::new().with_type_prefixes(vec!["a-f".to_string(), "b-a".to_string()]);
         let friendly = make_msg(r#"<event type="a-f-G" uid="test" />"#);
         let alert = make_msg(r#"<event type="b-a-o" uid="test" />"#);
         let hostile = make_msg(r#"<event type="a-h-G" uid="test" />"#);
