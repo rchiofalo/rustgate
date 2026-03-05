@@ -15,6 +15,7 @@ proto = ["dep:rustgate-proto"]
 
 [dependencies]
 rustgate-core = { workspace = true }
+rustgate-cot = { workspace = true }
 rustgate-proto = { workspace = true, optional = true }
 bytes = { workspace = true }
 tokio = { workspace = true, features = ["net", "io-util", "sync", "rt", "time", "macros"] }

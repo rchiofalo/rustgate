@@ -142,6 +142,29 @@ struct Cli {
     #[arg(long, env = "WEBSOCKET_BIND")]
     websocket_bind: Option<String>,
 
+    // ── Plaintext input flags ─────────────────────────────────────
+    /// Bind address for plaintext TCP input (e.g. 0.0.0.0:8087).
+    /// WARNING: connections are NOT encrypted. Use only on trusted networks.
+    #[arg(long, env = "RUSTGATE_TCP_BIND")]
+    tcp_bind: Option<String>,
+
+    /// Bind address for UDP CoT input (e.g. 0.0.0.0:8087).
+    /// WARNING: datagrams are NOT encrypted. Use only on trusted networks.
+    #[arg(long, env = "RUSTGATE_UDP_BIND")]
+    udp_bind: Option<String>,
+
+    /// Default CN for plaintext (TCP/UDP) clients.
+    #[arg(long, default_value = "anonymous", env = "RUSTGATE_PLAINTEXT_CN")]
+    plaintext_cn: String,
+
+    /// Default group for plaintext (TCP/UDP) clients.
+    #[arg(
+        long,
+        default_value = "__plaintext__",
+        env = "RUSTGATE_PLAINTEXT_GROUP"
+    )]
+    plaintext_group: String,
+
     // ── Federation flags ────────────────────────────────────────────
     /// V1 federation listen address (enables federation when set, e.g. 0.0.0.0:9000).
     /// Requires --features federation.
@@ -679,6 +702,118 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         None
     };
 
+    // ── Plaintext TCP listener (opt-in, no TLS) ──────────────────
+
+    let tcp_plaintext_shutdown = if let Some(ref tcp_bind) = cli.tcp_bind {
+        let addr: std::net::SocketAddr = tcp_bind
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid --tcp-bind address: {e}"))?;
+
+        tracing::warn!(addr = %addr, "plaintext TCP input enabled — traffic is NOT encrypted");
+
+        let identity_config = rustgate_transport::PlaintextIdentityConfig {
+            cn: cli.plaintext_cn.clone(),
+            default_group: cli.plaintext_group.clone(),
+        };
+
+        let pt_listener = rustgate_transport::PlaintextListener::bind(addr, identity_config)
+            .await
+            .map_err(|e| anyhow::anyhow!("plaintext TCP bind failed: {e}"))?;
+
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let shutdown_clone = Arc::clone(&shutdown);
+        let pt_router = Arc::clone(&router);
+        let pt_connection_limit = Arc::clone(&connection_limit);
+        let pt_framing = framing;
+        let pt_encoding = encoding;
+        #[allow(clippy::clone_on_copy)]
+        let pt_nats = nats_publisher.clone();
+        let pt_fed = fed_forward.clone();
+
+        drop(tokio::spawn(async move {
+            run_plaintext_tcp(
+                pt_listener,
+                pt_router,
+                pt_connection_limit,
+                pt_framing,
+                pt_encoding,
+                pt_nats,
+                pt_fed,
+                shutdown_clone,
+            )
+            .await;
+        }));
+
+        Some(shutdown)
+    } else {
+        None
+    };
+
+    // ── UDP input listener (opt-in, no TLS) ──────────────────────
+
+    let udp_shutdown = if let Some(ref udp_bind) = cli.udp_bind {
+        let addr: std::net::SocketAddr = udp_bind
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid --udp-bind address: {e}"))?;
+
+        tracing::warn!(addr = %addr, "UDP input enabled — datagrams are NOT encrypted");
+
+        let socket = tokio::net::UdpSocket::bind(addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("UDP bind failed: {e}"))?;
+
+        let config = rustgate_transport::UdpInputConfig {
+            cn: cli.plaintext_cn.clone(),
+            default_group: cli.plaintext_group.clone(),
+        };
+
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let shutdown_clone = Arc::clone(&shutdown);
+        let udp_router = Arc::clone(&router);
+
+        let udp_nats_cb: Option<rustgate_transport::udp::OnNatsPublish> = {
+            #[cfg(feature = "nats")]
+            {
+                nats_publisher
+                    .clone()
+                    .map(|p| -> rustgate_transport::udp::OnNatsPublish {
+                        Arc::new(move |msg| {
+                            let p = p.clone();
+                            drop(tokio::spawn(async move { p.publish(&msg).await }));
+                        })
+                    })
+            }
+            #[cfg(not(feature = "nats"))]
+            {
+                None
+            }
+        };
+
+        let udp_fed: Option<rustgate_transport::udp::OnFederationForward> = fed_forward
+            .clone()
+            .map(|fwd| -> rustgate_transport::udp::OnFederationForward {
+                Arc::new(move |payload, groups| {
+                    fwd(payload, groups);
+                })
+            });
+
+        drop(tokio::spawn(async move {
+            rustgate_transport::UdpInput::run(
+                socket,
+                udp_router,
+                config,
+                udp_nats_cb,
+                udp_fed,
+                shutdown_clone,
+            )
+            .await;
+        }));
+
+        Some(shutdown)
+    } else {
+        None
+    };
+
     loop {
         tokio::select! {
             accept_result = listener.accept() => {
@@ -753,6 +888,17 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     if let Some(ref shutdown) = ws_shutdown {
         shutdown.notify_one();
         tracing::info!("WebSocket server signaled to stop");
+    }
+
+    // ── Plaintext TCP/UDP shutdown ──────────────────────────────────
+
+    if let Some(ref shutdown) = tcp_plaintext_shutdown {
+        shutdown.notify_one();
+        tracing::info!("plaintext TCP listener signaled to stop");
+    }
+    if let Some(ref shutdown) = udp_shutdown {
+        shutdown.notify_one();
+        tracing::info!("UDP input signaled to stop");
     }
 
     // ── Connection draining ──────────────────────────────────────────
@@ -1122,6 +1268,160 @@ async fn write_loop(
     }
 
     Ok(())
+}
+
+/// Accept loop for plaintext TCP connections.
+///
+/// Mirrors the main TLS accept loop but operates on unencrypted sockets.
+/// Each connection gets a synthetic identity and participates in the same
+/// router, NATS bridge, and federation forwarding as TLS sessions.
+#[allow(clippy::too_many_arguments)]
+async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
+    listener: rustgate_transport::PlaintextListener,
+    router: Arc<Router>,
+    connection_limit: Arc<Semaphore>,
+    framing: Framing,
+    encoding: Encoding,
+    nats_publisher: Option<P>,
+    fed_forward: Option<FedForwardFn>,
+    shutdown: Arc<tokio::sync::Notify>,
+) {
+    loop {
+        tokio::select! {
+            accept_result = listener.accept() => {
+                match accept_result {
+                    Ok(session) => {
+                        let permit = match Arc::clone(&connection_limit).try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                tracing::warn!("plaintext TCP: connection limit reached, rejecting");
+                                continue;
+                            }
+                        };
+
+                        let identity = Arc::new(session.identity().clone());
+                        let cn = identity.cn.clone();
+                        let peer_addr = session.peer_addr();
+
+                        tracing::info!(cn = %cn, peer = %peer_addr, "plaintext TCP connected");
+
+                        let (tx, rx) = mpsc::channel::<RoutableMessage>(64);
+                        let handle = SessionHandle::new(Arc::clone(&identity), tx);
+                        let session_id = handle.id;
+                        router.register(handle.clone()).await;
+                        router.replay_positions(&handle).await;
+
+                        let (reader, writer) = session.into_split();
+
+                        let session_router = Arc::clone(&router);
+                        let fs = FramingStrategy::from(framing);
+                        #[allow(clippy::clone_on_copy)]
+                        let session_nats = nats_publisher.clone();
+                        let session_fed = fed_forward.clone();
+
+                        drop(tokio::spawn(async move {
+                            let _permit = permit;
+
+                            let result = run_plaintext_session_loops(
+                                reader, writer, rx, &identity, &session_router,
+                                &fs, encoding, &session_nats, &session_fed,
+                            ).await;
+
+                            if let Err(e) = result {
+                                tracing::debug!(cn = %cn, error = %e, "plaintext TCP session error");
+                            }
+
+                            session_router.unregister(&cn, session_id).await;
+                            tracing::info!(cn = %cn, "plaintext TCP disconnected");
+                        }));
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "plaintext TCP accept error");
+                    }
+                }
+            }
+            _ = shutdown.notified() => {
+                tracing::info!("plaintext TCP listener stopping");
+                break;
+            }
+        }
+    }
+}
+
+/// Read/write loops for a plaintext TCP session.
+///
+/// Uses the same codec and encoder pipeline as TLS sessions but operates
+/// on a raw `TcpStream` split.
+#[allow(clippy::too_many_arguments)]
+async fn run_plaintext_session_loops<P: NatsPublish>(
+    reader: tokio::io::ReadHalf<tokio::net::TcpStream>,
+    writer: tokio::io::WriteHalf<tokio::net::TcpStream>,
+    mut rx: mpsc::Receiver<RoutableMessage>,
+    identity: &Identity,
+    router: &Router,
+    framing: &FramingStrategy,
+    encoding: Encoding,
+    nats_publisher: &Option<P>,
+    fed_forward: &Option<FedForwardFn>,
+) -> std::io::Result<()> {
+    let codec = FramedCodec::from_strategy(framing);
+    let mut framed_read = FramedRead::new(reader, codec);
+    let mut msg_builder = MessageBuilder::new();
+
+    let write_codec = FramedCodec::from_strategy(framing);
+    let mut framed_write = FramedWrite::new(writer, write_codec);
+
+    let encoder: Box<dyn MessageEncoder + Send + Sync> = match encoding {
+        Encoding::Raw | Encoding::TakProtobuf => Box::new(RawEncoder),
+        Encoding::Cot => Box::new(CotEncoder),
+    };
+
+    tokio::select! {
+        r = async {
+            loop {
+                let frame = match tokio::time::timeout(READ_TIMEOUT, framed_read.next()).await {
+                    Ok(Some(result)) => result?,
+                    Ok(None) => break,
+                    Err(_) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "read timeout",
+                        ));
+                    }
+                };
+
+                let payload = frame.freeze();
+                let msg = msg_builder.build(identity, payload, "tcp-plaintext");
+                router.route(msg.clone()).await;
+
+                if let Some(publisher) = nats_publisher {
+                    publisher.publish(&msg).await;
+                }
+
+                if let Some(fwd) = fed_forward {
+                    let groups: Vec<String> = msg.source.groups.iter().cloned().collect();
+                    fwd(msg.payload.clone(), groups);
+                }
+            }
+            Ok(())
+        } => r,
+        r = async {
+            while let Some(msg) = rx.recv().await {
+                let encoded = encoder.encode(&msg)?;
+                let send_fut = framed_write.send(tokio_util::bytes::BytesMut::from(encoded.as_ref()));
+                match tokio::time::timeout(WRITE_TIMEOUT, send_fut).await {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "write timeout: slow consumer",
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        } => r,
+    }
 }
 
 /// AsyncRead wrapper that yields prefix bytes before delegating to the inner reader.
