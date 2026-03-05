@@ -140,9 +140,7 @@ impl TlsConfig {
 #[cfg(feature = "fips")]
 pub fn install_fips_provider() -> Result<()> {
     rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
-        .map_err(|_| {
-            RustgateError::Config("crypto provider already installed".to_string())
-        })?;
+        .map_err(|_| RustgateError::Config("crypto provider already installed".to_string()))?;
     tracing::info!("FIPS 140-3 crypto provider (aws-lc-rs) installed");
     Ok(())
 }
