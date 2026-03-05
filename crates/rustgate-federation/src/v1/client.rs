@@ -159,6 +159,7 @@ async fn connection_loop(
         let (tls_stream, identity) = match connect_result {
             Ok(result) => result,
             Err(e) => {
+                rustgate_core::audit::federation_connect_failed(&peer_id, &e.to_string());
                 warn!(
                     peer_id = %peer_id,
                     error = %e,
@@ -190,6 +191,7 @@ async fn connection_loop(
         // Connected successfully
         peer.mark_connected();
         reconnect_count = 0;
+        rustgate_core::audit::federation_peer_connected(&peer_id, &identity.cn, "outbound");
         info!(
             peer_id = %peer_id,
             peer_cn = %identity.cn,
@@ -211,9 +213,11 @@ async fn connection_loop(
 
         match session_result {
             Ok(()) => {
+                rustgate_core::audit::federation_peer_disconnected(&peer_id, "clean shutdown");
                 info!(peer_id = %peer_id, "V1 federation peer disconnected cleanly");
             }
             Err(e) => {
+                rustgate_core::audit::federation_peer_disconnected(&peer_id, &e.to_string());
                 warn!(peer_id = %peer_id, error = %e, "V1 federation peer session error");
                 peer.set_error(&e.to_string());
             }

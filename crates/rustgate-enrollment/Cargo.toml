@@ -11,6 +11,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+rustgate-core = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
