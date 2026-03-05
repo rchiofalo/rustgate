@@ -9,6 +9,8 @@ pub mod auth;
 pub mod contacts;
 pub mod datapackage;
 pub mod error;
+pub mod pkcs12;
+pub mod ratelimit;
 pub mod response;
 pub mod server;
 pub mod signing;

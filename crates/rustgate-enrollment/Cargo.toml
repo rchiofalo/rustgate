@@ -17,6 +17,7 @@ rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 rustls-pki-types = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt", "io-util", "sync", "fs"] }
+sha1 = { workspace = true }
 sha2 = { workspace = true }
 tokio-rustls = { workspace = true }
 hyper = { workspace = true }
