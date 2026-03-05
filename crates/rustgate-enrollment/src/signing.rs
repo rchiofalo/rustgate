@@ -551,7 +551,7 @@ cyOZxZiK
                     key.err()
                 );
             }
-            other => panic!(
+            other => unreachable!(
                 "expected PKCS#1 key, got {:?}",
                 std::mem::discriminant(other)
             ),
