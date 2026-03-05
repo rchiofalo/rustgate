@@ -379,7 +379,7 @@ async fn run_streams(
     // --- Connection established ---
     peer.set_state(PeerState::Connected);
     peer.mark_connected();
-    rustgate_core::audit::federation_peer_connected(&peer.id, federate_id, "outbound");
+    rustgate_core::audit::federation_peer_connected(&peer.id, &config.federate_id, "outbound");
     info!(peer = %peer.id, "V2 gRPC handshake complete, streams active");
 
     // --- Step 5: Run all streams concurrently ---

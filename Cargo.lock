@@ -1744,6 +1744,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
@@ -1766,6 +1767,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rcgen",
+ "rustgate-core",
  "rustgate-test-utils",
  "rustls",
  "rustls-pemfile",
