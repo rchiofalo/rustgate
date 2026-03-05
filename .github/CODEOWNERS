@@ -1,0 +1,23 @@
+# Default owner for everything
+* @rchiofalo
+
+# CI/CD and infrastructure
+.github/ @rchiofalo
+Dockerfile @rchiofalo
+helm/ @rchiofalo
+deny.toml @rchiofalo
+
+# Core protocol and transport
+crates/rustgate-core/ @rchiofalo
+crates/rustgate-transport/ @rchiofalo
+crates/rustgate-cot/ @rchiofalo
+
+# Federation subsystem
+crates/rustgate-federation/ @rchiofalo
+crates/rustgate-proto/ @rchiofalo
+
+# Server and integrations
+crates/rustgate-server/ @rchiofalo
+crates/rustgate-nats/ @rchiofalo
+crates/rustgate-websocket/ @rchiofalo
+crates/rustgate-enrollment/ @rchiofalo
