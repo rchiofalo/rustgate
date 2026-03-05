@@ -119,6 +119,25 @@ jobs:
       - name: Run tests
         run: cargo test ${{ matrix.flags }}
 
+  coverage:
+    if: github.event.pull_request.draft == false || github.event_name == 'push'
+    needs: [lint, clippy]
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin --locked
+
+      - name: Generate coverage report
+        run: cargo tarpaulin --all-features --out xml --output-dir coverage/
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@ea165f8d65b6db9a6b7c67862cd61e31b2b9adf2 # v4.6.2
+        with:
+          name: coverage-report
+          path: coverage/cobertura.xml
+
   audit:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [test]
