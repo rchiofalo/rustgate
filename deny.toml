@@ -65,7 +65,8 @@ deny = [
     # OpenSSL bindings — rustls is the sole TLS provider
     { crate = "openssl", use-instead = "rustls" },
     { crate = "openssl-sys", use-instead = "rustls" },
-    { crate = "openssl-probe", use-instead = "rustls" },
+    # openssl-probe is allowed: it only locates OS certificate paths for
+    # rustls-native-certs, it does not link or use OpenSSL.
 
     # native-tls dispatches to platform TLS (SChannel/SecureTransport/OpenSSL)
     { crate = "native-tls", use-instead = "rustls" },
