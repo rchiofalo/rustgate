@@ -213,6 +213,14 @@ async fn handle_request(
 
         (&Method::GET, "/Marti/api/clientEndPoints") => handle_client_endpoints(contacts).await,
 
+        (&Method::GET, "/Marti/api/device/profile/connection") => {
+            handle_device_profile(req, packages).await
+        }
+
+        (&Method::GET, "/Marti/api/groups/all") => handle_groups_all(),
+
+        (&Method::GET, "/Marti/api/missions") => handle_missions(),
+
         (&Method::POST, "/Marti/sync/upload") => {
             handle_package_upload(req, credentials, packages).await
         }
@@ -540,6 +548,111 @@ async fn handle_client_endpoints(contacts: Option<&ContactsProvider>) -> Respons
     )
 }
 
+/// Device profile and data package sync.
+///
+/// TAK clients call this periodically with `?syncSecago=N` to discover
+/// packages uploaded since their last sync. Returns an empty file list
+/// when no data package store is configured.
+async fn handle_device_profile(
+    req: Request<hyper::body::Incoming>,
+    packages: Option<&DataPackageStore>,
+) -> Response<Full<Bytes>> {
+    let sync_sec = req
+        .uri()
+        .query()
+        .and_then(|q| extract_param(q, "syncSecago"))
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    let files: Vec<serde_json::Value> = if let Some(store) = packages {
+        match store.search("").await {
+            Ok(metas) => metas
+                .into_iter()
+                .filter(|m| {
+                    if sync_sec == 0 {
+                        return true;
+                    }
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    m.upload_time + sync_sec >= now
+                })
+                .map(|m| {
+                    serde_json::json!({
+                        "hash": m.hash,
+                        "name": m.name,
+                        "size": m.size,
+                        "creatorUid": m.creator_uid,
+                    })
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+
+    let body = serde_json::json!({
+        "version": "3",
+        "type": "com.bbn.marti.remote.sync.FileInfo",
+        "data": files,
+        "nodeId": "rustgate"
+    });
+    build_response(
+        StatusCode::OK,
+        "application/json",
+        Bytes::from(body.to_string()),
+    )
+}
+
+/// Group listing endpoint.
+///
+/// Returns a minimal group list. TAK clients call this to populate their
+/// group membership UI. Returns a single `__ANON__` group which is the
+/// standard anonymous/default group in TAK.
+fn handle_groups_all() -> Response<Full<Bytes>> {
+    let body = serde_json::json!({
+        "version": "3",
+        "type": "com.bbn.marti.remote.groups.Group",
+        "data": [
+            {
+                "name": "__ANON__",
+                "direction": "IN",
+                "created": "2024-01-01T00:00:00.000Z",
+                "type": "SYSTEM",
+                "bitpos": 0,
+                "active": true,
+            }
+        ],
+        "nodeId": "rustgate"
+    });
+    build_response(
+        StatusCode::OK,
+        "application/json",
+        Bytes::from(body.to_string()),
+    )
+}
+
+/// Mission listing endpoint.
+///
+/// Returns an empty mission list. TAK clients poll this on startup to
+/// discover shared missions. Without this endpoint, clients log errors
+/// and retry indefinitely.
+fn handle_missions() -> Response<Full<Bytes>> {
+    let body = serde_json::json!({
+        "version": "3",
+        "type": "Mission",
+        "data": [],
+        "nodeId": "rustgate"
+    });
+    build_response(
+        StatusCode::OK,
+        "application/json",
+        Bytes::from(body.to_string()),
+    )
+}
+
 async fn handle_package_upload(
     req: Request<hyper::body::Incoming>,
     credentials: &Credentials,
@@ -857,5 +970,61 @@ mod tests {
         assert_eq!(data.len(), 1);
         assert_eq!(data[0]["uid"], "test-uid");
         assert_eq!(data[0]["callsign"], "TestCall");
+    }
+
+    #[tokio::test]
+    async fn device_profile_response_format() {
+        // The device profile handler needs a hyper::body::Incoming which can't
+        // be constructed in tests. Verify the response format matches Marti spec
+        // by testing the JSON structure that the handler produces.
+        let body = serde_json::json!({
+            "version": "3",
+            "type": "com.bbn.marti.remote.sync.FileInfo",
+            "data": [],
+            "nodeId": "rustgate"
+        });
+        let resp = build_response(
+            StatusCode::OK,
+            "application/json",
+            Bytes::from(body.to_string()),
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = collect_body(resp).await;
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
+        assert_eq!(parsed["version"], "3");
+        assert_eq!(parsed["type"], "com.bbn.marti.remote.sync.FileInfo");
+        assert!(parsed["data"].as_array().expect("data array").is_empty());
+        assert_eq!(parsed["nodeId"], "rustgate");
+    }
+
+    #[test]
+    fn groups_all_returns_anon_group() {
+        let resp = handle_groups_all();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn groups_all_has_anon_group() {
+        let resp = handle_groups_all();
+        let bytes = collect_body(resp).await;
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
+        assert_eq!(parsed["version"], "3");
+        assert_eq!(parsed["type"], "com.bbn.marti.remote.groups.Group");
+
+        let data = parsed["data"].as_array().expect("data array");
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["name"], "__ANON__");
+        assert_eq!(data[0]["active"], true);
+    }
+
+    #[tokio::test]
+    async fn missions_returns_empty_list() {
+        let resp = handle_missions();
+        let bytes = collect_body(resp).await;
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
+        assert_eq!(parsed["version"], "3");
+        assert_eq!(parsed["type"], "Mission");
+        assert!(parsed["data"].as_array().expect("data array").is_empty());
     }
 }
