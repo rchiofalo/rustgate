@@ -64,3 +64,38 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release upload "${{ steps.version.outputs.version }}" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
+
+  sbom:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Extract version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION=${GITHUB_REF#refs/tags/}
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Generate source SBOM
+        uses: anchore/sbom-action@17ae1740179002c89186b61233e0f892c3118b11 # v0.23.0
+        with:
+          path: .
+          artifact-name: sbom-source-${{ steps.version.outputs.version }}.spdx.json
+          output-file: sbom-source.spdx.json
+          format: spdx-json
+
+      - name: Upload SBOM to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mv sbom-source.spdx.json "sbom-source-${{ steps.version.outputs.version }}.spdx.json"
+          gh release upload "${{ steps.version.outputs.version }}" \
+            "sbom-source-${{ steps.version.outputs.version }}.spdx.json" --clobber
