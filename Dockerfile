@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # ── Builder stage ────────────────────────────────────────────────────────
-FROM rust:1.88-alpine@sha256:9dfaae478ecd298b6b5a039e1f2cc4fc040fc818a2de9aa78fa714dea036574d AS builder
+FROM rust:1.93-alpine@sha256:4fec02de605563c297c78a31064c8335bc004fa2b0bf406b1b99441da64e2d2d AS builder
 
 RUN apk add --no-cache musl-dev protobuf-dev make
 
