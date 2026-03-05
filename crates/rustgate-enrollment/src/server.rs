@@ -354,11 +354,7 @@ async fn handle_sign_client_v1(
         "signed client certificate (v1)"
     );
 
-    build_response(
-        StatusCode::OK,
-        "application/x-pkcs12",
-        Bytes::from(p12),
-    )
+    build_response(StatusCode::OK, "application/x-pkcs12", Bytes::from(p12))
 }
 
 async fn handle_sign_client_v2(

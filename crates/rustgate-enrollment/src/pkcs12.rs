@@ -65,7 +65,9 @@ pub fn build_p12_bundle(
 // ── OIDs ────────────────────────────────────────────────────────────
 
 // pkcs-7 data: 1.2.840.113549.1.7.1
-const OID_PKCS7_DATA: &[u8] = &[0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01];
+const OID_PKCS7_DATA: &[u8] = &[
+    0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01,
+];
 
 // pkcs-12 certBag: 1.2.840.113549.1.12.10.1.3
 const OID_CERT_BAG: &[u8] = &[
@@ -224,8 +226,7 @@ fn build_mac_data(auth_safe_der: &[u8], password: &[u8]) -> Result<Vec<u8>, &'st
     let salt_octet = der_wrap(0x04, &salt);
     let iter_int = der_integer(iterations);
 
-    let mut mac_inner =
-        Vec::with_capacity(digest_info.len() + salt_octet.len() + iter_int.len());
+    let mut mac_inner = Vec::with_capacity(digest_info.len() + salt_octet.len() + iter_int.len());
     mac_inner.extend_from_slice(&digest_info);
     mac_inner.extend_from_slice(&salt_octet);
     mac_inner.extend_from_slice(&iter_int);
@@ -443,8 +444,8 @@ mod tests {
         assert_eq!(
             mac,
             [
-                0xb6, 0x17, 0x31, 0x86, 0x55, 0x05, 0x72, 0x64, 0xe2, 0x8b,
-                0xc0, 0xb6, 0xfb, 0x37, 0x8c, 0x8e, 0xf1, 0x46, 0xbe, 0x00,
+                0xb6, 0x17, 0x31, 0x86, 0x55, 0x05, 0x72, 0x64, 0xe2, 0x8b, 0xc0, 0xb6, 0xfb, 0x37,
+                0x8c, 0x8e, 0xf1, 0x46, 0xbe, 0x00,
             ]
         );
     }
