@@ -12,8 +12,8 @@ use std::time::Instant;
 
 /// Per-client rate limiter using a token bucket.
 ///
-/// Create one per session. Call [`allow`] before processing each inbound
-/// message; returns `false` when the client has exceeded its rate.
+/// Create one per session. Call [`ClientThrottle::allow`] before processing
+/// each inbound message; returns `false` when the client has exceeded its rate.
 #[derive(Debug)]
 pub struct ClientThrottle {
     /// Maximum burst size (bucket capacity).

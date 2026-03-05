@@ -222,8 +222,7 @@ pub fn messages_received() -> &'static IntCounter {
 }
 
 pub fn messages_dropped() -> &'static IntCounter {
-    MESSAGES_DROPPED
-        .get_or_init(|| fallback_counter("rustgate_messages_dropped_total", "fallback"))
+    MESSAGES_DROPPED.get_or_init(|| fallback_counter("rustgate_messages_dropped_total", "fallback"))
 }
 
 pub fn messages_routed() -> &'static IntCounterVec {

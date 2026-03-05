@@ -236,7 +236,8 @@ mod tests {
 
     #[test]
     fn archiver_creates_file() {
-        let dir = std::env::temp_dir().join(format!("rustgate-archive-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("rustgate-archive-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
         let archiver = CotArchiver::new(&dir);
@@ -261,9 +262,7 @@ mod tests {
         archiver.flush();
 
         // Verify file exists and has content
-        let entries: Vec<_> = std::fs::read_dir(&dir)
-            .expect("dir should exist")
-            .collect();
+        let entries: Vec<_> = std::fs::read_dir(&dir).expect("dir should exist").collect();
         assert_eq!(entries.len(), 1, "should have one archive file");
 
         let file_path = entries[0].as_ref().expect("entry").path();

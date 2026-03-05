@@ -175,7 +175,6 @@ struct Cli {
     federation_store_path: Option<String>,
 
     // ── QoS / rate limiting ──────────────────────────────────────────
-
     /// Maximum sustained messages per second per connected client (0 = disabled).
     #[arg(long, default_value_t = 0, env = "RUSTGATE_CLIENT_MSG_RATE")]
     client_message_rate: u32,
@@ -185,7 +184,6 @@ struct Cli {
     client_burst: u32,
 
     // ── Data retention / archival ─────────────────────────────────────
-
     /// Directory for CoT event archival (JSONL). Enables structured logging of
     /// all received CoT events to date-stamped files.
     #[arg(long, env = "RUSTGATE_ARCHIVE_DIR")]
@@ -665,7 +663,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             burst = cli.client_burst,
             "per-client rate limiting enabled"
         );
-        Some(ThrottleConfig::new(cli.client_message_rate, cli.client_burst))
+        Some(ThrottleConfig::new(
+            cli.client_message_rate,
+            cli.client_burst,
+        ))
     } else {
         None
     };
