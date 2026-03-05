@@ -57,6 +57,20 @@ crate = "rustgate-test-utils"
 multiple-versions = "warn"
 wildcards = "allow"
 
+# Explicit bans — these crates must never enter the dependency tree.
+# rustgate uses rustls exclusively; pulling in OpenSSL or native-tls
+# would introduce C library dependencies, complicate FIPS validation,
+# and widen the attack surface.
+deny = [
+    # OpenSSL bindings — rustls is the sole TLS provider
+    { crate = "openssl", use-instead = "rustls" },
+    { crate = "openssl-sys", use-instead = "rustls" },
+    { crate = "openssl-probe", use-instead = "rustls" },
+
+    # native-tls dispatches to platform TLS (SChannel/SecureTransport/OpenSSL)
+    { crate = "native-tls", use-instead = "rustls" },
+]
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"

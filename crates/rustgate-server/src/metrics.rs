@@ -7,7 +7,7 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 
 use http_body_util::Full;
@@ -52,6 +52,28 @@ static NATS_PUBLISH_ERRORS: OnceLock<IntCounter> = OnceLock::new();
 static NATS_RECEIVED: OnceLock<IntCounter> = OnceLock::new();
 
 static NEGOTIATIONS: OnceLock<IntCounterVec> = OnceLock::new();
+
+// ── No-op fallbacks ────────────────────────────────────────────────
+//
+// Unregistered metrics that absorb increments/decrements without effect.
+// Returned when an accessor is called before `init()`, preventing panics
+// during startup races or in test code that omits initialization.
+
+/// No-op counter returned when `init()` has not yet been called.
+#[allow(clippy::unwrap_used)]
+static NOOP_COUNTER: LazyLock<IntCounter> =
+    LazyLock::new(|| IntCounter::new("noop_counter", "uninitialized fallback").unwrap());
+
+/// No-op gauge returned when `init()` has not yet been called.
+#[allow(clippy::unwrap_used)]
+static NOOP_GAUGE: LazyLock<IntGauge> =
+    LazyLock::new(|| IntGauge::new("noop_gauge", "uninitialized fallback").unwrap());
+
+/// No-op counter vec returned when `init()` has not yet been called.
+#[allow(clippy::unwrap_used)]
+static NOOP_COUNTER_VEC: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(Opts::new("noop_counter_vec", "uninitialized fallback"), &["label"]).unwrap()
+});
 
 // ── Registration ────────────────────────────────────────────────────
 
@@ -154,57 +176,62 @@ pub fn init() -> prometheus::Result<()> {
 }
 
 // ── Accessor functions ──────────────────────────────────────────────
+//
+// Each accessor returns a reference to the registered metric, or a
+// no-op fallback if `init()` has not been called.  This eliminates
+// panics from initialization-order races without adding Option
+// propagation to every call site.
 
 pub fn connections_accepted() -> &'static IntCounter {
-    CONNECTIONS_ACCEPTED.get().expect("metrics not initialized")
+    CONNECTIONS_ACCEPTED.get().unwrap_or(&NOOP_COUNTER)
 }
 
 pub fn connections_active() -> &'static IntGauge {
-    CONNECTIONS_ACTIVE.get().expect("metrics not initialized")
+    CONNECTIONS_ACTIVE.get().unwrap_or(&NOOP_GAUGE)
 }
 
 pub fn connections_rejected() -> &'static IntCounter {
-    CONNECTIONS_REJECTED.get().expect("metrics not initialized")
+    CONNECTIONS_REJECTED.get().unwrap_or(&NOOP_COUNTER)
 }
 
 pub fn accept_errors() -> &'static IntCounter {
-    ACCEPT_ERRORS.get().expect("metrics not initialized")
+    ACCEPT_ERRORS.get().unwrap_or(&NOOP_COUNTER)
 }
 
 pub fn messages_received() -> &'static IntCounter {
-    MESSAGES_RECEIVED.get().expect("metrics not initialized")
+    MESSAGES_RECEIVED.get().unwrap_or(&NOOP_COUNTER)
 }
 
 pub fn messages_routed() -> &'static IntCounterVec {
-    MESSAGES_ROUTED.get().expect("metrics not initialized")
+    MESSAGES_ROUTED.get().unwrap_or(&NOOP_COUNTER_VEC)
 }
 
 #[allow(dead_code)]
 pub fn pings_received() -> &'static IntCounter {
-    PINGS_RECEIVED.get().expect("metrics not initialized")
+    PINGS_RECEIVED.get().unwrap_or(&NOOP_COUNTER)
 }
 
 pub fn sessions_active() -> &'static IntGauge {
-    SESSIONS_ACTIVE.get().expect("metrics not initialized")
+    SESSIONS_ACTIVE.get().unwrap_or(&NOOP_GAUGE)
 }
 
 pub fn nats_publishes() -> &'static IntCounter {
-    NATS_PUBLISHES.get().expect("metrics not initialized")
+    NATS_PUBLISHES.get().unwrap_or(&NOOP_COUNTER)
 }
 
 #[allow(dead_code)]
 pub fn nats_publish_errors() -> &'static IntCounter {
-    NATS_PUBLISH_ERRORS.get().expect("metrics not initialized")
+    NATS_PUBLISH_ERRORS.get().unwrap_or(&NOOP_COUNTER)
 }
 
 #[allow(dead_code)]
 pub fn nats_received() -> &'static IntCounter {
-    NATS_RECEIVED.get().expect("metrics not initialized")
+    NATS_RECEIVED.get().unwrap_or(&NOOP_COUNTER)
 }
 
 #[allow(dead_code)]
 pub fn negotiations() -> &'static IntCounterVec {
-    NEGOTIATIONS.get().expect("metrics not initialized")
+    NEGOTIATIONS.get().unwrap_or(&NOOP_COUNTER_VEC)
 }
 
 // ── HTTP server ─────────────────────────────────────────────────────
@@ -348,6 +375,21 @@ mod tests {
         INIT.call_once(|| {
             init().expect("metrics init failed");
         });
+    }
+
+    #[test]
+    fn noop_fallbacks_do_not_panic() {
+        // Access all metrics WITHOUT calling init(). The no-op
+        // fallbacks must absorb calls without panicking.
+        let c = super::NOOP_COUNTER.clone();
+        c.inc();
+
+        let g = super::NOOP_GAUGE.clone();
+        g.inc();
+        g.dec();
+
+        let cv = super::NOOP_COUNTER_VEC.with_label_values(&["test"]);
+        cv.inc();
     }
 
     #[test]
