@@ -25,3 +25,9 @@ pub use router::{Router, SessionHandle};
 pub use rustgate_proto::TakFrameCodec;
 pub use session::{AuthenticatedSession, SessionReader, SessionWriter};
 pub use throttle::{ClientThrottle, ThrottleConfig};
+
+mod plaintext;
+pub mod udp;
+
+pub use plaintext::{PlaintextIdentityConfig, PlaintextListener, PlaintextSession};
+pub use udp::{UdpInput, UdpInputConfig};
