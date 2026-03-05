@@ -23,7 +23,7 @@ env:
 jobs:
   commit-lint:
     if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - name: Validate PR title follows Conventional Commits
         env:
@@ -139,7 +139,7 @@ jobs:
   docker:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [check-features, test]
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
