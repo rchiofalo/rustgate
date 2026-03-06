@@ -88,17 +88,25 @@ cargo nextest run -p rustgate-transport --features fips
 ```
 
 Tests cover:
-- FIPS provider installation and double-install error handling
+- FIPS provider installation and post-install verification
+- `is_fips_provider_active()` reports true after install
+- Provider self-reports FIPS mode via `CryptoProvider::fips()`
 - Full mTLS handshake under the FIPS provider
+- Negotiated cipher suite is FIPS-approved (AES-based)
 - CRL revocation enforcement under FIPS
 
 ## CI
 
-The CI pipeline includes a dedicated `fips` job that builds and tests with the FIPS feature flag enabled. This requires runners with Go and cmake installed.
+The CI pipeline includes a dedicated `fips` job that:
+- Runs clippy on FIPS code paths (`rustgate-transport`, `rustgate-server`)
+- Builds the full server binary with FIPS + federation features
+- Runs FIPS-specific tests
+
+This requires runners with Go and cmake installed.
 
 ## Known Limitations
 
-- **Ring is still linked**: When `fips` is enabled, aws-lc-rs is added as the crypto provider but ring remains compiled in as a workspace dependency. The FIPS provider is explicitly installed as the default, preventing ring from being used at runtime.
+- **Ring is still linked**: When `fips` is enabled, aws-lc-rs is added as the crypto provider but ring remains compiled in as a workspace dependency. The FIPS provider is installed as the process-default, and all TLS code paths (including federation) use `CryptoProvider::get_default()` to ensure the FIPS provider is used at runtime.
 - **No OCSP support**: Revocation checking is CRL-only. OCSP stapling is not supported by rustls.
 - **CRL freshness**: CRL `nextUpdate` timestamps are not validated. Operators should rotate CRL files on a regular schedule.
 - **TLS 1.2 enabled**: Both TLS 1.2 and 1.3 are available. For maximum FIPS strictness, TLS 1.3 is preferred.
