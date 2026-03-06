@@ -10,8 +10,6 @@
 #![allow(clippy::panic, clippy::unwrap_used)]
 
 use std::collections::BTreeSet;
-use std::net::TcpListener;
-use std::process::{Child, Command};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -20,95 +18,10 @@ use futures::StreamExt;
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
 use rustgate_nats::{NatsAdapter, NatsConfig, WireEvent};
+use rustgate_test_utils::require_nats;
 use rustgate_transport::Router;
-use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
-
-// ── Test harness ──────────────────────────────────────────────────────────
-
-/// Manages a `nats-server` subprocess with JetStream enabled.
-struct NatsTestServer {
-    child: Child,
-    port: u16,
-    _store_dir: tempfile::TempDir,
-}
-
-impl NatsTestServer {
-    /// Start a nats-server on a random free port with JetStream.
-    async fn start() -> Self {
-        let port = free_port();
-        let store_dir = tempfile::tempdir().expect("tmpdir");
-
-        let child = Command::new("nats-server")
-            .args([
-                "--port",
-                &port.to_string(),
-                "--jetstream",
-                "--store_dir",
-                store_dir.path().to_str().expect("path"),
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("failed to start nats-server (is it on PATH?)");
-
-        // Wait for the server to accept connections and send the NATS INFO line.
-        // A bare TCP accept isn't enough — the server may not be protocol-ready yet.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-        loop {
-            if tokio::time::Instant::now() > deadline {
-                panic!("nats-server failed to start within 15 seconds on port {port}");
-            }
-            match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
-                Ok(mut stream) => {
-                    // Read the first 5 bytes and verify the NATS INFO line.
-                    // A bare TCP accept isn't enough — the server may not be
-                    // protocol-ready yet, so we confirm it sends "INFO ".
-                    let mut buf = [0u8; 5];
-                    match stream.read_exact(&mut buf).await {
-                        Ok(_) if &buf == b"INFO " => break,
-                        _ => tokio::time::sleep(Duration::from_millis(50)).await,
-                    }
-                }
-                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
-            }
-        }
-
-        Self {
-            child,
-            port,
-            _store_dir: store_dir,
-        }
-    }
-
-    fn url(&self) -> String {
-        format!("nats://127.0.0.1:{}", self.port)
-    }
-}
-
-impl Drop for NatsTestServer {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-/// Find a free TCP port by binding to :0 and reading the assigned port.
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    listener.local_addr().expect("addr").port()
-}
-
-/// Check if nats-server is available. Skip tests gracefully if not.
-fn require_nats_server() -> bool {
-    Command::new("nats-server")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok()
-}
 
 /// Build a config pointing at the test server with a unique instance ID.
 fn test_config(url: &str, instance_id: &str) -> NatsConfig {
@@ -176,11 +89,8 @@ async fn register_session(
 /// Connect to NATS and verify the adapter initializes without error.
 #[tokio::test]
 async fn connect_and_disconnect() {
-    if !require_nats_server() {
-        return;
-    }
-    let server = NatsTestServer::start().await;
-    let config = test_config(&server.url(), "test-connect");
+    let server = require_nats!();
+    let config = test_config(server.url(), "test-connect");
     let _adapter = NatsAdapter::connect(config).await.expect("should connect");
 }
 
@@ -188,14 +98,11 @@ async fn connect_and_disconnect() {
 /// to a locally registered session via the Router.
 #[tokio::test]
 async fn publish_subscribe_round_trip() {
-    if !require_nats_server() {
-        return;
-    }
-    let server = NatsTestServer::start().await;
+    let server = require_nats!();
 
     // Two adapters simulating two rustgate instances
-    let config_a = test_config(&server.url(), "instance-A");
-    let config_b = test_config(&server.url(), "instance-B");
+    let config_a = test_config(server.url(), "instance-A");
+    let config_b = test_config(server.url(), "instance-B");
 
     let adapter_a = NatsAdapter::connect(config_a).await.expect("connect A");
     let adapter_b = NatsAdapter::connect(config_b).await.expect("connect B");
@@ -237,16 +144,13 @@ async fn publish_subscribe_round_trip() {
 /// rustgate subscriber so only the publisher's source_protocol guard is tested.
 #[tokio::test]
 async fn echo_prevention_source_protocol() {
-    if !require_nats_server() {
-        return;
-    }
-    let server = NatsTestServer::start().await;
+    let server = require_nats!();
 
-    let config = test_config(&server.url(), "echo-proto-test");
+    let config = test_config(server.url(), "echo-proto-test");
     let adapter = NatsAdapter::connect(config).await.expect("connect");
 
     // Raw NATS subscription — no rustgate subscriber, no instance header filtering
-    let raw_client = async_nats::connect(&server.url())
+    let raw_client = async_nats::connect(server.url())
         .await
         .expect("raw connect");
     let mut raw_sub = raw_client.subscribe("points.>").await.expect("subscribe");
@@ -271,13 +175,10 @@ async fn echo_prevention_source_protocol() {
 /// (X-Rustgate-Instance header echo prevention).
 #[tokio::test]
 async fn echo_prevention_instance_header() {
-    if !require_nats_server() {
-        return;
-    }
-    let server = NatsTestServer::start().await;
+    let server = require_nats!();
 
     // Same instance ID for both publisher and subscriber
-    let config = test_config(&server.url(), "same-instance");
+    let config = test_config(server.url(), "same-instance");
     let adapter = NatsAdapter::connect(config).await.expect("connect");
 
     let router = Arc::new(Router::new());
@@ -308,13 +209,10 @@ async fn echo_prevention_instance_header() {
 /// instance, but ARE delivered to a different instance.
 #[tokio::test]
 async fn cross_instance_delivery() {
-    if !require_nats_server() {
-        return;
-    }
-    let server = NatsTestServer::start().await;
+    let server = require_nats!();
 
-    let config_a = test_config(&server.url(), "cross-A");
-    let config_b = test_config(&server.url(), "cross-B");
+    let config_a = test_config(server.url(), "cross-A");
+    let config_b = test_config(server.url(), "cross-B");
 
     let adapter_a = NatsAdapter::connect(config_a).await.expect("connect A");
     let adapter_b = NatsAdapter::connect(config_b).await.expect("connect B");
@@ -364,17 +262,14 @@ async fn cross_instance_delivery() {
 /// Publish positions, then verify JetStream replay populates the router cache.
 #[tokio::test]
 async fn jetstream_replay() {
-    if !require_nats_server() {
-        return;
-    }
-    let server = NatsTestServer::start().await;
+    let server = require_nats!();
 
-    let config = test_config(&server.url(), "replay-publisher");
+    let config = test_config(server.url(), "replay-publisher");
     let adapter = NatsAdapter::connect(config).await.expect("connect");
 
     // Create the JetStream stream that the replay consumer expects
     let js = async_nats::jetstream::new(
-        async_nats::connect(&server.url())
+        async_nats::connect(server.url())
             .await
             .expect("raw connect"),
     );
@@ -403,7 +298,7 @@ async fn jetstream_replay() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // New adapter (different instance) replays from JetStream
-    let replay_config = test_config(&server.url(), "replay-consumer");
+    let replay_config = test_config(server.url(), "replay-consumer");
     let replay_adapter = NatsAdapter::connect(replay_config)
         .await
         .expect("connect replay");
@@ -423,16 +318,13 @@ async fn jetstream_replay() {
 /// position being replayed from JetStream (LastPerSubject policy).
 #[tokio::test]
 async fn jetstream_replay_latest_per_subject() {
-    if !require_nats_server() {
-        return;
-    }
-    let server = NatsTestServer::start().await;
+    let server = require_nats!();
 
-    let config = test_config(&server.url(), "replay-latest-pub");
+    let config = test_config(server.url(), "replay-latest-pub");
     let adapter = NatsAdapter::connect(config).await.expect("connect");
 
     let js = async_nats::jetstream::new(
-        async_nats::connect(&server.url())
+        async_nats::connect(server.url())
             .await
             .expect("raw connect"),
     );
@@ -456,7 +348,7 @@ async fn jetstream_replay_latest_per_subject() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Replay should give us exactly 1 message (the latest)
-    let replay_config = test_config(&server.url(), "replay-latest-con");
+    let replay_config = test_config(server.url(), "replay-latest-con");
     let replay_adapter = NatsAdapter::connect(replay_config).await.expect("connect");
 
     let router = Arc::new(Router::new());
@@ -472,17 +364,14 @@ async fn jetstream_replay_latest_per_subject() {
 /// Verify that the subscriber drops messages exceeding max_payload_bytes.
 #[tokio::test]
 async fn oversized_payload_dropped() {
-    if !require_nats_server() {
-        return;
-    }
-    let server = NatsTestServer::start().await;
+    let server = require_nats!();
 
     // Publisher with default config (no size limit on publish side)
-    let pub_config = test_config(&server.url(), "oversize-pub");
+    let pub_config = test_config(server.url(), "oversize-pub");
     let pub_adapter = NatsAdapter::connect(pub_config).await.expect("connect pub");
 
     // Subscriber with tiny max payload
-    let mut sub_config = test_config(&server.url(), "oversize-sub");
+    let mut sub_config = test_config(server.url(), "oversize-sub");
     sub_config.max_payload_bytes = 10; // Very small limit
 
     let sub_adapter = NatsAdapter::connect(sub_config).await.expect("connect sub");
@@ -522,16 +411,13 @@ async fn oversized_payload_dropped() {
 #[cfg(not(feature = "full-detail"))]
 #[tokio::test]
 async fn non_position_messages_filtered() {
-    if !require_nats_server() {
-        return;
-    }
-    let server = NatsTestServer::start().await;
+    let server = require_nats!();
 
-    let config = test_config(&server.url(), "filter-pub");
+    let config = test_config(server.url(), "filter-pub");
     let adapter = NatsAdapter::connect(config).await.expect("connect");
 
     // Raw subscription — observe the wire directly
-    let raw_client = async_nats::connect(&server.url())
+    let raw_client = async_nats::connect(server.url())
         .await
         .expect("raw connect");
     let mut raw_sub = raw_client.subscribe("points.>").await.expect("subscribe");
@@ -582,15 +468,12 @@ async fn non_position_messages_filtered() {
 #[cfg(feature = "full-detail")]
 #[tokio::test]
 async fn non_position_messages_published() {
-    if !require_nats_server() {
-        return;
-    }
-    let server = NatsTestServer::start().await;
+    let server = require_nats!();
 
-    let config = test_config(&server.url(), "full-detail-pub");
+    let config = test_config(server.url(), "full-detail-pub");
     let adapter = NatsAdapter::connect(config).await.expect("connect");
 
-    let raw_client = async_nats::connect(&server.url())
+    let raw_client = async_nats::connect(server.url())
         .await
         .expect("raw connect");
     let mut raw_sub = raw_client.subscribe("points.>").await.expect("subscribe");
@@ -649,16 +532,13 @@ async fn non_position_messages_published() {
 /// own is_position_unknown() check so only the publisher's guard is tested.
 #[tokio::test]
 async fn zero_position_filtered() {
-    if !require_nats_server() {
-        return;
-    }
-    let server = NatsTestServer::start().await;
+    let server = require_nats!();
 
-    let config = test_config(&server.url(), "zero-pub");
+    let config = test_config(server.url(), "zero-pub");
     let adapter = NatsAdapter::connect(config).await.expect("connect");
 
     // Raw subscription — observe the wire directly
-    let raw_client = async_nats::connect(&server.url())
+    let raw_client = async_nats::connect(server.url())
         .await
         .expect("raw connect");
     let mut raw_sub = raw_client.subscribe("points.>").await.expect("subscribe");
@@ -681,13 +561,10 @@ async fn zero_position_filtered() {
 /// in the subject and subscriber extracts it for the RoutableMessage.
 #[tokio::test]
 async fn group_preserved_through_nats() {
-    if !require_nats_server() {
-        return;
-    }
-    let server = NatsTestServer::start().await;
+    let server = require_nats!();
 
-    let config_a = test_config(&server.url(), "group-pub");
-    let config_b = test_config(&server.url(), "group-sub");
+    let config_a = test_config(server.url(), "group-pub");
+    let config_b = test_config(server.url(), "group-sub");
 
     let adapter_a = NatsAdapter::connect(config_a).await.expect("connect A");
     let adapter_b = NatsAdapter::connect(config_b).await.expect("connect B");
@@ -724,16 +601,13 @@ async fn group_preserved_through_nats() {
 /// Verify that max_replay_count limits the number of replayed messages.
 #[tokio::test]
 async fn jetstream_replay_count_limit() {
-    if !require_nats_server() {
-        return;
-    }
-    let server = NatsTestServer::start().await;
+    let server = require_nats!();
 
-    let config = test_config(&server.url(), "limit-pub");
+    let config = test_config(server.url(), "limit-pub");
     let adapter = NatsAdapter::connect(config).await.expect("connect");
 
     let js = async_nats::jetstream::new(
-        async_nats::connect(&server.url())
+        async_nats::connect(server.url())
             .await
             .expect("raw connect"),
     );
@@ -760,7 +634,7 @@ async fn jetstream_replay_count_limit() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Replay with max_replay_count = 2
-    let mut replay_config = test_config(&server.url(), "limit-con");
+    let mut replay_config = test_config(server.url(), "limit-con");
     replay_config.max_replay_count = 2;
 
     let replay_adapter = NatsAdapter::connect(replay_config).await.expect("connect");
@@ -780,13 +654,10 @@ async fn jetstream_replay_count_limit() {
 /// through actual NATS publish/subscribe produces valid data.
 #[tokio::test]
 async fn wire_format_fidelity() {
-    if !require_nats_server() {
-        return;
-    }
-    let server = NatsTestServer::start().await;
+    let server = require_nats!();
 
-    let config_a = test_config(&server.url(), "wire-pub");
-    let config_b = test_config(&server.url(), "wire-sub");
+    let config_a = test_config(server.url(), "wire-pub");
+    let config_b = test_config(server.url(), "wire-sub");
 
     let adapter_a = NatsAdapter::connect(config_a).await.expect("connect A");
     let adapter_b = NatsAdapter::connect(config_b).await.expect("connect B");
