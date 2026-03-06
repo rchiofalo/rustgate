@@ -119,6 +119,15 @@ pub struct FederationConfig {
     /// Seconds to wait after a circuit breaker trips before allowing a probe
     /// message (half-open state). Default: 60.
     pub circuit_breaker_timeout: Duration,
+
+    // --- High-Availability (HA) ---
+    /// Pod identifier for HA mode. When set together with `ha_nats_url`,
+    /// enables distributed peer ownership via NATS KV claims so that
+    /// only one pod manages each outbound peer in a multi-pod deployment.
+    pub pod_id: Option<String>,
+    /// NATS URL for HA coordination (claim manager + connection registry).
+    /// Requires the `ha` feature.
+    pub ha_nats_url: Option<String>,
 }
 
 impl Default for FederationConfig {
@@ -149,6 +158,8 @@ impl Default for FederationConfig {
             jwt_expiry_secs: 3600,
             circuit_breaker_threshold: 5,
             circuit_breaker_timeout: Duration::from_secs(60),
+            pod_id: None,
+            ha_nats_url: None,
         }
     }
 }
@@ -244,6 +255,8 @@ mod tests {
         assert!(cfg.v2_enabled);
         assert!(!cfg.skip_hostname_verify);
         assert!(cfg.trust_store_dir.is_none());
+        assert!(cfg.pod_id.is_none());
+        assert!(cfg.ha_nats_url.is_none());
     }
 
     #[test]
