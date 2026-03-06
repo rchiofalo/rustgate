@@ -125,10 +125,10 @@ jobs:
         run: cargo install cargo-nextest --locked
 
       - name: Clippy (FIPS)
-        run: cargo clippy -p rustgate-transport -p rustgate-server --features fips --all-targets
+        run: cargo clippy -p rustgate-transport -p rustgate-server -p rustgate-enrollment --features fips --all-targets
 
       - name: Build server with FIPS
-        run: cargo build -p rustgate-server --features fips,federation
+        run: cargo build -p rustgate-server --features fips,federation,enrollment
 
       - name: Run FIPS tests
         run: cargo nextest run -p rustgate-transport --features fips

@@ -61,6 +61,8 @@ Build with --features fips to enable FIPS 140-3 mode.
 | TLS cipher suites | ring defaults | FIPS-approved only |
 | Key exchange | X25519, ECDHE | FIPS-approved ECDHE |
 | Hash algorithms | SHA-2 family | SHA-2 family (FIPS) |
+| Certificate signing (enrollment) | rcgen + ring | rcgen + aws-lc-rs (FIPS) |
+| PKCS#12 salt generation | OS CSPRNG (via rustls provider) | FIPS CSPRNG (via aws-lc-rs) |
 
 The FIPS provider restricts cipher suites to the FIPS-approved set automatically via rustls. No manual cipher suite configuration is needed.
 
@@ -107,6 +109,7 @@ This requires runners with Go and cmake installed.
 ## Known Limitations
 
 - **Ring is still linked**: When `fips` is enabled, aws-lc-rs is added as the crypto provider but ring remains compiled in as a workspace dependency. The FIPS provider is installed as the process-default, and all TLS code paths (including federation) use `CryptoProvider::get_default()` to ensure the FIPS provider is used at runtime.
+- **SHA-1/SHA-2 for PKCS#12**: The PKCS#12 MAC uses `sha1` / `sha2` pure-Rust crates for HMAC-SHA1 and KDF operations. These are outside the FIPS boundary but only protect the P12 bundle integrity with a well-known password — they do not protect data in transit.
 - **No OCSP support**: Revocation checking is CRL-only. OCSP stapling is not supported by rustls.
 - **CRL freshness**: CRL `nextUpdate` timestamps are not validated. Operators should rotate CRL files on a regular schedule.
 - **TLS 1.2 enabled**: Both TLS 1.2 and 1.3 are available. For maximum FIPS strictness, TLS 1.3 is preferred.

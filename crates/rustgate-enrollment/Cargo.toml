@@ -10,6 +10,9 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+fips = ["rcgen/fips"]
+
 [dependencies]
 rustgate-core = { workspace = true }
 rcgen = { workspace = true }
