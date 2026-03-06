@@ -1,5 +1,6 @@
 pub mod config;
 pub mod connector;
+pub mod dedup;
 #[cfg(feature = "ha")]
 pub mod ha;
 pub mod heartbeat;

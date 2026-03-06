@@ -7,7 +7,7 @@
 //! (e.g., in `rustgate-server`).
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 #[cfg(feature = "v2")]
@@ -16,6 +16,7 @@ use tracing::{info, warn};
 
 use crate::config::FederationConfig;
 use crate::connector::PeerConnector;
+use crate::dedup::MessageDedup;
 use crate::peer::{PeerHandle, PeerStatus};
 use crate::v1::{V1Client, V1Server};
 
@@ -126,9 +127,31 @@ impl FederationManager {
         )?;
         self.connector = Some(connector.clone());
 
+        // Shared dedup cache for V1 loop detection.
+        // V1 has no provenance metadata, so we detect loops by
+        // remembering recently-seen (uid, time) pairs from CoT XML.
+        let v1_dedup: Arc<Mutex<MessageDedup>> = Arc::new(Mutex::new(MessageDedup::new()));
+
         // Start V1 inbound server if enabled
         if self.config.v1_enabled {
             let tls_config = rustgate_transport::TlsConfig::from_pem(&cert_pem, &key_pem, &ca_pem)?;
+
+            let dedup = Arc::clone(&v1_dedup);
+            let on_v1_server: crate::v1::server::OnMessage = {
+                let on_inbound = Arc::clone(&on_inbound);
+                Arc::new(move |peer_cn, data| {
+                    if let Ok(mut guard) = dedup.lock()
+                        && guard.is_duplicate(&data)
+                    {
+                        tracing::debug!(
+                            peer_cn = %peer_cn,
+                            "dropped duplicate V1 inbound server message (loop detection)"
+                        );
+                        return;
+                    }
+                    on_inbound(peer_cn, data);
+                })
+            };
 
             let server = V1Server::start(
                 self.config.v1_listen_addr,
@@ -136,7 +159,7 @@ impl FederationManager {
                 self.config.federate_id.clone(),
                 self.config.heartbeat_interval,
                 self.config.heartbeat_timeout,
-                Arc::clone(&on_inbound),
+                on_v1_server,
             )
             .await?;
 
@@ -261,6 +284,23 @@ impl FederationManager {
 
             match peer_config.protocol_version {
                 1 => {
+                    let dedup = Arc::clone(&v1_dedup);
+                    let on_v1_client: crate::v1::client::OnMessage = {
+                        let on_inbound = Arc::clone(&on_inbound);
+                        Arc::new(move |peer_id, data| {
+                            if let Ok(mut guard) = dedup.lock()
+                                && guard.is_duplicate(&data)
+                            {
+                                tracing::debug!(
+                                    peer_id = %peer_id,
+                                    "dropped duplicate V1 outbound client message (loop detection)"
+                                );
+                                return;
+                            }
+                            on_inbound(peer_id, data);
+                        })
+                    };
+
                     let client = V1Client::start(
                         Arc::clone(&peer),
                         crate::v1::client::V1ClientConfig {
@@ -272,7 +312,7 @@ impl FederationManager {
                             heartbeat_timeout: self.config.heartbeat_timeout,
                             reconnect_delay: self.config.reconnect_delay,
                             max_reconnects: self.config.max_reconnects,
-                            on_message: Arc::clone(&on_inbound),
+                            on_message: on_v1_client,
                         },
                     );
 
