@@ -94,7 +94,7 @@ curl http://localhost:9090/metrics
 
 | Port | Service | Feature Gate |
 |------|---------|-------------|
-| 4433 | TAK client connections (mTLS) | always |
+| 4433 | Client connections (mTLS) | always |
 | 8443 | WebSocket connections (wss:// mTLS) | `websocket` |
 | 8446 | Certificate enrollment (HTTPS) | `enrollment` |
 | 9000 | Federation V1 (mTLS) | `federation` |

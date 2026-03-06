@@ -12,7 +12,7 @@ crates/
   rustgate-websocket/     WebSocket (wss://) listener with mTLS, router integration
   rustgate-nats/          NATS pub/sub bridge with JetStream history replay
   rustgate-enrollment/    HTTPS certificate enrollment (Marti v2 CSR signing)
-  rustgate-proto/         TAK protobuf translation (XML <-> proto) and negotiation
+  rustgate-proto/         Protobuf translation (XML / proto) and negotiation
   rustgate-federation/    Server-to-server federation (V1 XML, V2 gRPC)
   rustgate-server/        Binary entry point wiring all crates together
   rustgate-test-utils/    Ephemeral certificate generation for tests
@@ -21,7 +21,7 @@ crates/
 ## Data Flow
 
 ```
-TAK clients (ATAK/iTAK/WinTAK)
+Clients
   │                        │
   │ mTLS (port 4433)       │ wss:// mTLS (port 8443)
   ▼                        ▼

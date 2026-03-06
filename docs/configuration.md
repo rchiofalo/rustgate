@@ -8,7 +8,7 @@ All rustgate configuration is done through CLI flags or environment variables. C
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `--bind` | `RUSTGATE_BIND` | `0.0.0.0:4433` | TAK client listen address |
+| `--bind` | `RUSTGATE_BIND` | `0.0.0.0:4433` | Client listen address |
 | `--cert` | `RUSTGATE_CERT` | — | TLS certificate file (PEM) |
 | `--key` | `RUSTGATE_KEY` | — | TLS private key file (PEM) |
 | `--ca` | `RUSTGATE_CA` | — | CA certificate file (PEM) |
@@ -63,8 +63,8 @@ All rustgate configuration is done through CLI flags or environment variables. C
 | `xml` | Raw XML stream with depth tracking | Testing, simple clients |
 | `length-prefixed` | 4-byte big-endian length header | Custom integrations |
 | `line` | Newline-delimited messages | Simple text-based clients |
-| `tak-protobuf` | TAK binary framing (0xBF + varint) | TAK clients (protobuf mode) |
-| `tak-negotiate` | Auto-negotiate (XML or protobuf) | Production TAK client deployments |
+| `tak-protobuf` | TAK binary framing (0xBF + varint) | Clients in protobuf mode |
+| `tak-negotiate` | Auto-negotiate (XML or protobuf) | Production client deployments |
 
 **Note:** `tak-protobuf` and `tak-negotiate` require `--features proto`.
 
@@ -91,7 +91,7 @@ image:
 # Service configuration
 service:
   type: ClusterIP        # or LoadBalancer
-  port: 4433             # TAK client port
+  port: 4433             # Client port
 
 # TLS certificates (K8s Secret)
 tls:
@@ -170,11 +170,11 @@ terminationGracePeriodSeconds: 120
 
 ### Helm vs CLI Defaults
 
-The Helm chart uses different defaults than the CLI for framing and encoding, optimized for production TAK client deployments:
+The Helm chart uses different defaults than the CLI for framing and encoding, optimized for production deployments:
 
 | Setting | CLI Default | Helm Default | Reason |
 |---------|------------|-------------|--------|
-| `framing` | `xml` | `tak-negotiate` | Production TAK clients expect negotiation |
+| `framing` | `xml` | `tak-negotiate` | Production clients expect negotiation |
 | `encoding` | `raw` | `tak-protobuf` | Protobuf is more efficient for production |
 
 ## Environment Variable Examples

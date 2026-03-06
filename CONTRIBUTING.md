@@ -86,11 +86,13 @@ The workspace is organized as independent crates under `crates/`:
 | Crate | Purpose |
 |-------|---------|
 | `rustgate-core` | Shared types: Identity, RoutableMessage, FramingStrategy |
-| `rustgate-transport` | mTLS listener, codec, session management, routing engine |
 | `rustgate-cot` | Cursor on Target XML parsing |
-| `rustgate-proto` | TAK protobuf translation (XML ↔ proto) |
+| `rustgate-transport` | mTLS listener, codec, CRL, FIPS provider, session management, routing engine |
+| `rustgate-websocket` | WebSocket (wss://) listener with mTLS client authentication |
 | `rustgate-nats` | NATS bridge for cross-instance messaging |
-| `rustgate-enrollment` | HTTPS certificate enrollment server |
+| `rustgate-enrollment` | HTTPS certificate enrollment server (CSR signing, PKCS#12) |
+| `rustgate-proto` | Protobuf translation (XML / proto) |
+| `rustgate-federation` | Server-to-server federation: V1 (XML), V2 (gRPC), HA, REST API |
 | `rustgate-server` | Binary entry point, wires everything together |
 | `rustgate-test-utils` | Shared test helpers (CA and cert generation) |
 
@@ -122,6 +124,6 @@ chore: miscellaneous maintenance
 
 - Branch from `main`
 - Keep PRs focused — one logical change per PR
-- All 17 CI checks must pass before merge (branch protection enforced)
+- All CI checks must pass before merge (branch protection enforced)
 - Update the README if the change affects user-facing behavior
 - Add or update tests for any new functionality

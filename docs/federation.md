@@ -1,6 +1,6 @@
 # Federation
 
-Federation enables multiple rustgate (or TAK Server) instances to share situational awareness across independent networks. Messages received from local clients are forwarded to connected federation peers, and messages from peers are delivered to local clients.
+Federation enables multiple rustgate instances to share situational awareness across independent networks. Messages received from local clients are forwarded to connected federation peers, and messages from peers are delivered to local clients.
 
 ## Overview
 
@@ -9,7 +9,7 @@ rustgate supports two federation protocol versions:
 | Protocol | Wire Format | Default Port | Use Case |
 |----------|-------------|-------------|----------|
 | V1 | 4-byte length-prefixed XML over mTLS | 9000 | Legacy server compatibility |
-| V2 | gRPC FederatedChannel over mTLS | 9001 | Standard TAK Server interop |
+| V2 | gRPC FederatedChannel over mTLS | 9001 | gRPC interop |
 
 Both protocols use mTLS for authentication. Peer identity is extracted from the certificate Common Name (CN).
 
@@ -125,7 +125,7 @@ V1 federation uses 4-byte big-endian length-prefixed CoT XML messages over mTLS.
 
 ### V2: gRPC FederatedChannel
 
-V2 federation uses the standard TAK Server FederatedChannel gRPC service over mTLS (ALPN `h2`).
+V2 federation uses the FederatedChannel gRPC service over mTLS (ALPN `h2`).
 
 **Handshake sequence:**
 1. Open TLS channel with client certificate
@@ -151,7 +151,7 @@ This prevents infinite loops in mesh federation topologies (A ↔ B ↔ C ↔ A)
 
 When NATS is enabled alongside federation:
 
-- Messages from local TAK clients are forwarded to both NATS and federation peers
+- Messages from local clients are forwarded to both NATS and federation peers
 - Messages arriving from federation peers are published to NATS for other rustgate instances
 - Messages arriving from NATS are forwarded to federation peers
 
