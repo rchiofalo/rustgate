@@ -134,8 +134,14 @@ impl FederationManager {
                 for cert_info in &extra_certs {
                     if let Some(pem_bytes) = trust_store.get_certificate_pem(&cert_info.common_name)
                     {
+                        let pem_str = std::str::from_utf8(&pem_bytes).map_err(|e| {
+                            anyhow::anyhow!(
+                                "trust store certificate '{}' contains invalid UTF-8: {e}",
+                                cert_info.common_name
+                            )
+                        })?;
                         merged.push('\n');
-                        merged.push_str(&String::from_utf8_lossy(&pem_bytes));
+                        merged.push_str(pem_str);
                     }
                 }
                 info!(
@@ -1092,7 +1098,7 @@ mod tests {
         for info in trust_store.list_certificates() {
             if let Some(pem) = trust_store.get_certificate_pem(&info.common_name) {
                 merged_ca.push('\n');
-                merged_ca.push_str(&String::from_utf8_lossy(&pem));
+                merged_ca.push_str(std::str::from_utf8(&pem).expect("PEM is valid UTF-8"));
             }
         }
 

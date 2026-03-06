@@ -243,6 +243,7 @@ mod tests {
         assert!(cfg.v1_enabled);
         assert!(cfg.v2_enabled);
         assert!(!cfg.skip_hostname_verify);
+        assert!(cfg.trust_store_dir.is_none());
     }
 
     #[test]
