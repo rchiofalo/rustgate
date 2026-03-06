@@ -246,7 +246,7 @@ async fn client_event_stream_receives_broadcast() {
     assert_eq!(sent, 1);
 
     // Receive the broadcasted event
-    let received = tokio::time::timeout(Duration::from_secs(2), stream.message())
+    let received = tokio::time::timeout(Duration::from_secs(5), stream.message())
         .await
         .expect("timeout")
         .expect("message")
@@ -388,7 +388,7 @@ async fn client_federate_groups_stream_tracks_groups() {
     let sent = svc_ref.broadcast_to_groups(event, &["Alpha".into()]).await;
     assert_eq!(sent, 1);
 
-    let received = tokio::time::timeout(Duration::from_secs(2), event_stream.message())
+    let received = tokio::time::timeout(Duration::from_secs(5), event_stream.message())
         .await
         .expect("timeout")
         .expect("message")

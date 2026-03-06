@@ -79,7 +79,7 @@ async fn crl_rejects_revoked_client() {
 
     // Server tries to accept — should fail or timeout
     let server_handle = tokio::spawn(async move {
-        tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept()).await
+        tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept()).await
     });
 
     // Client tries to connect with revoked cert
@@ -197,7 +197,7 @@ async fn crl_revokes_multiple_certs() {
     // Try revoked_a — should be rejected
     let config_a = build_client_config(&revoked_a.cert_pem, &revoked_a.key_pem, &ca.cert_pem);
     let server_handle = tokio::spawn(async move {
-        tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept()).await
+        tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept()).await
     });
 
     let result = try_connect(addr, &config_a).await;

@@ -145,7 +145,7 @@ async fn mtls_rejects_untrusted_client() {
     let addr = listener.local_addr().expect("addr");
 
     let server_handle = tokio::spawn(async move {
-        tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept()).await
+        tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept()).await
     });
 
     let config = build_client_config(

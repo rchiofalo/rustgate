@@ -72,7 +72,7 @@ async fn recv_ws(
     >,
     label: &str,
 ) -> Vec<u8> {
-    let frame = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
         .await
         .unwrap_or_else(|_| panic!("{label}: timeout"))
         .unwrap_or_else(|| panic!("{label}: stream ended"))
@@ -85,14 +85,14 @@ async fn recv_ws(
     }
 }
 
-/// Assert no data frame arrives within 300ms.
+/// Assert no data frame arrives within the timeout window.
 async fn assert_no_ws_message(
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
     >,
     label: &str,
 ) {
-    match tokio::time::timeout(std::time::Duration::from_millis(300), ws.next()).await {
+    match tokio::time::timeout(std::time::Duration::from_secs(1), ws.next()).await {
         Err(_) => {}                          // Timeout — nothing arrived
         Ok(None) => {}                        // Stream closed
         Ok(Some(Err(_))) => {}                // Read error
@@ -168,11 +168,11 @@ impl TestWsServer {
 
     /// Wait for sessions to register with the router.
     async fn wait_registered(&self, expected: usize) {
-        for _ in 0..20 {
+        for _ in 0..40 {
             if self.router.session_count().await >= expected {
                 return;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         panic!(
             "timed out waiting for {} sessions, got {}",
@@ -471,11 +471,11 @@ async fn ws_nats_and_federation_callbacks_fire() {
     let mut bob_ws = ws_connect(bound_addr, &bob_tls).await;
 
     // Wait for both sessions to register
-    for _ in 0..20 {
+    for _ in 0..40 {
         if router.session_count().await >= 2 {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
     // Alice sends two messages

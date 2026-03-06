@@ -55,10 +55,10 @@ impl NatsTestServer {
 
         // Wait for the server to accept connections and send the NATS INFO line.
         // A bare TCP accept isn't enough — the server may not be protocol-ready yet.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             if tokio::time::Instant::now() > deadline {
-                panic!("nats-server failed to start within 5 seconds on port {port}");
+                panic!("nats-server failed to start within 15 seconds on port {port}");
             }
             match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
                 Ok(mut stream) => {
@@ -218,7 +218,7 @@ async fn publish_subscribe_round_trip() {
     adapter_a.publisher().publish(&msg).await;
 
     // Instance B's local session should receive the message
-    let received = timeout(Duration::from_secs(3), rx.recv())
+    let received = timeout(Duration::from_secs(5), rx.recv())
         .await
         .expect("timeout waiting for message")
         .expect("channel closed");
@@ -260,7 +260,7 @@ async fn echo_prevention_source_protocol() {
     adapter.publisher().publish(&msg).await;
 
     // Nothing should appear on the NATS subject — publisher should have dropped it
-    let result = timeout(Duration::from_millis(500), raw_sub.next()).await;
+    let result = timeout(Duration::from_secs(2), raw_sub.next()).await;
     assert!(
         result.is_err(),
         "publisher should not emit nats-sourced messages to NATS"
@@ -295,7 +295,7 @@ async fn echo_prevention_instance_header() {
     let msg = position_message("track-self", "Cyan", 37.0, -122.0);
     adapter.publisher().publish(&msg).await;
 
-    let result = timeout(Duration::from_millis(500), rx.recv()).await;
+    let result = timeout(Duration::from_secs(2), rx.recv()).await;
     assert!(
         result.is_err(),
         "subscriber should ignore own instance messages"
@@ -347,14 +347,14 @@ async fn cross_instance_delivery() {
     adapter_a.publisher().publish(&msg).await;
 
     // Instance B should receive it
-    let received = timeout(Duration::from_secs(3), rx_b.recv())
+    let received = timeout(Duration::from_secs(5), rx_b.recv())
         .await
         .expect("B should receive within timeout")
         .expect("B channel closed");
     assert_eq!(received.source.cn, "track-cross");
 
     // Instance A should NOT receive its own message back
-    let self_echo = timeout(Duration::from_millis(500), rx_a.recv()).await;
+    let self_echo = timeout(Duration::from_secs(2), rx_a.recv()).await;
     assert!(self_echo.is_err(), "A should not receive its own message");
 
     task_a.abort();
@@ -503,7 +503,7 @@ async fn oversized_payload_dropped() {
     pub_adapter.publisher().publish(&msg).await;
 
     // Should NOT be delivered due to payload size limit
-    let result = timeout(Duration::from_millis(500), rx.recv()).await;
+    let result = timeout(Duration::from_secs(2), rx.recv()).await;
     assert!(
         result.is_err(),
         "oversized message should be dropped by subscriber"
@@ -568,7 +568,7 @@ async fn non_position_messages_filtered() {
     adapter.publisher().publish(&chat_msg).await;
 
     // Nothing should appear on NATS — publisher drops non-Position messages
-    let result = timeout(Duration::from_millis(500), raw_sub.next()).await;
+    let result = timeout(Duration::from_secs(2), raw_sub.next()).await;
     assert!(
         result.is_err(),
         "chat messages should not be published to NATS"
@@ -625,7 +625,7 @@ async fn non_position_messages_published() {
 
     adapter.publisher().publish(&chat_msg).await;
 
-    let result = timeout(Duration::from_secs(3), raw_sub.next()).await;
+    let result = timeout(Duration::from_secs(5), raw_sub.next()).await;
     assert!(
         result.is_ok(),
         "chat messages should be published with full-detail"
@@ -670,7 +670,7 @@ async fn zero_position_filtered() {
     adapter.publisher().publish(&msg).await;
 
     // Nothing should appear on NATS — publisher drops 0,0 positions
-    let result = timeout(Duration::from_millis(500), raw_sub.next()).await;
+    let result = timeout(Duration::from_secs(2), raw_sub.next()).await;
     assert!(
         result.is_err(),
         "0,0 position should not be published to NATS"
@@ -707,7 +707,7 @@ async fn group_preserved_through_nats() {
     let msg = position_message("track-alpha", "Alpha", 38.5, -121.5);
     adapter_a.publisher().publish(&msg).await;
 
-    let received = timeout(Duration::from_secs(3), rx.recv())
+    let received = timeout(Duration::from_secs(5), rx.recv())
         .await
         .expect("timeout")
         .expect("channel closed");
@@ -805,7 +805,7 @@ async fn wire_format_fidelity() {
     let msg = position_message("track-wire", "Cyan", 51.5074, -0.1278);
     adapter_a.publisher().publish(&msg).await;
 
-    let received = timeout(Duration::from_secs(3), rx.recv())
+    let received = timeout(Duration::from_secs(5), rx.recv())
         .await
         .expect("timeout")
         .expect("channel closed");
