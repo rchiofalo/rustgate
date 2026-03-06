@@ -118,35 +118,51 @@ fn message_key(payload: &[u8]) -> Option<u64> {
 /// Extract the value of an XML attribute from raw bytes.
 ///
 /// Searches for `name="value"` or `name='value'` in the first 512 bytes.
+/// If the first occurrence of `attr` is not immediately followed by a
+/// quote character, the search continues from the next position (handles
+/// cases where the attribute name appears inside another attribute's value).
+///
 /// Returns the inner value (without quotes) as a byte slice.
 fn extract_xml_attr<'a>(payload: &'a [u8], attr: &[u8]) -> Option<&'a [u8]> {
     let search_limit = payload.len().min(512);
     let haystack = &payload[..search_limit];
+    let attr_len = attr.len();
 
-    // Find the attribute name (e.g., `uid=`)
-    let attr_pos = haystack.windows(attr.len()).position(|w| w == attr)?;
-    let value_start = attr_pos + attr.len();
+    let mut offset = 0;
+    while offset + attr_len <= search_limit {
+        // Find the next occurrence of the attribute name
+        let pos = haystack[offset..].windows(attr_len).position(|w| w == attr);
+        let attr_pos = match pos {
+            Some(p) => offset + p,
+            None => return None,
+        };
 
-    if value_start >= search_limit {
-        return None;
+        let value_start = attr_pos + attr_len;
+        if value_start >= search_limit {
+            return None;
+        }
+
+        // Check that the character immediately after `attr` is a quote
+        let quote = haystack[value_start];
+        if quote != b'"' && quote != b'\'' {
+            // Not a real attribute — skip past this occurrence
+            offset = attr_pos + 1;
+            continue;
+        }
+
+        let content_start = value_start + 1;
+        if content_start >= search_limit {
+            return None;
+        }
+
+        // Find the closing quote
+        let remaining = &haystack[content_start..];
+        let end = remaining.iter().position(|&b| b == quote)?;
+
+        return Some(&payload[content_start..content_start + end]);
     }
 
-    // Determine the quote character (" or ')
-    let quote = haystack[value_start];
-    if quote != b'"' && quote != b'\'' {
-        return None;
-    }
-
-    let content_start = value_start + 1;
-    if content_start >= search_limit {
-        return None;
-    }
-
-    // Find the closing quote
-    let remaining = &haystack[content_start..];
-    let end = remaining.iter().position(|&b| b == quote)?;
-
-    Some(&payload[content_start..content_start + end])
+    None
 }
 
 #[cfg(test)]
@@ -382,5 +398,154 @@ mod tests {
             assert!(!dedup.is_duplicate(xml.as_bytes()));
         }
         assert_eq!(dedup.len(), 1000);
+    }
+
+    // ── extract_xml_attr edge cases ───────────────────────────────
+
+    #[test]
+    fn extract_skips_attr_name_inside_other_value() {
+        // `uid=` appears inside desc's value first — scanner should skip it
+        let xml = br#"<event desc="uid=fake" uid="REAL" time="T">"#;
+        let val = extract_xml_attr(xml, b"uid=").unwrap();
+        assert_eq!(val, b"REAL");
+    }
+
+    #[test]
+    fn extract_skips_time_inside_other_value() {
+        let xml = br#"<event note="time=bogus" uid="S" time="2024-01-01T00:00:00Z">"#;
+        let val = extract_xml_attr(xml, b"time=").unwrap();
+        assert_eq!(val, b"2024-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn extract_attr_order_time_before_uid() {
+        // time appears before uid in the XML
+        let xml = br#"<event time="2024-06-15T12:00:00Z" uid="CHARLIE-3" type="a-f-G">"#;
+        let uid = extract_xml_attr(xml, b"uid=").unwrap();
+        let time = extract_xml_attr(xml, b"time=").unwrap();
+        assert_eq!(uid, b"CHARLIE-3");
+        assert_eq!(time, b"2024-06-15T12:00:00Z");
+    }
+
+    #[test]
+    fn extract_attr_with_many_preceding_attributes() {
+        let xml = br#"<event version="2.0" uid="S1" type="a-f-G-U-C" time="2024-01-01T00:00:00Z" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:01:00Z" how="h-g-i-g-o">"#;
+        let uid = extract_xml_attr(xml, b"uid=").unwrap();
+        let time = extract_xml_attr(xml, b"time=").unwrap();
+        assert_eq!(uid, b"S1");
+        assert_eq!(time, b"2024-01-01T00:00:00Z");
+    }
+
+    // ── message_key with realistic CoT ────────────────────────────
+
+    #[test]
+    fn message_key_realistic_cot_event() {
+        let xml = br#"<event version="2.0" uid="ANDROID-abc123" type="a-f-G-U-C" time="2024-06-15T14:30:00.000Z" start="2024-06-15T14:30:00.000Z" stale="2024-06-15T14:31:00.000Z" how="h-g-i-g-o"><point lat="38.8977" lon="-77.0365" hae="0.0" ce="999999" le="999999"/><detail><contact callsign="Alpha-1"/><__group name="Cyan" role="Team Member"/></detail></event>"#;
+        let key = message_key(xml);
+        assert!(key.is_some());
+    }
+
+    #[test]
+    fn message_key_stable_across_attribute_order() {
+        // Same uid+time but different attribute ordering
+        let a = br#"<event uid="S1" time="T1" type="a-f-G">"#;
+        let b = br#"<event time="T1" uid="S1" type="a-f-G">"#;
+        assert_eq!(message_key(a), message_key(b));
+    }
+
+    // ── dedup with real add_flow_tag (v2 feature required) ──────
+
+    #[cfg(feature = "v2")]
+    #[test]
+    fn dedup_detects_duplicate_after_real_flow_tag() {
+        let original = br#"<event version="2.0" uid="S1" type="a-f-G" time="2024-01-01T00:00:00Z" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:01:00Z" how="h-g-i-g-o"><point lat="0.0" lon="0.0" hae="0.0" ce="999999" le="999999"/><detail/></event>"#;
+
+        // Simulate server-a adding a flow tag
+        let tagged_a = crate::v2::convert::add_flow_tag(original, "server-a");
+        // Simulate server-b adding a different flow tag to the same message
+        let tagged_b = crate::v2::convert::add_flow_tag(original, "server-b");
+
+        // The tagged payloads should be different bytes
+        assert_ne!(tagged_a, tagged_b);
+
+        // But dedup should see them as the same message
+        let mut dedup = MessageDedup::new();
+        assert!(!dedup.is_duplicate(&tagged_a));
+        assert!(dedup.is_duplicate(&tagged_b));
+    }
+
+    #[cfg(feature = "v2")]
+    #[test]
+    fn dedup_passes_original_and_catches_tagged_copy() {
+        let original = br#"<event version="2.0" uid="UNIT-TEST" type="a-f-G" time="2024-06-15T10:00:00Z" start="2024-06-15T10:00:00Z" stale="2024-06-15T10:01:00Z" how="h-g-i-g-o"><point lat="0" lon="0" hae="0" ce="9" le="9"/><detail/></event>"#;
+
+        let tagged = crate::v2::convert::add_flow_tag(original, "my-server");
+
+        let mut dedup = MessageDedup::new();
+        // Original passes through
+        assert!(!dedup.is_duplicate(original));
+        // Tagged version of the same message is caught as duplicate
+        assert!(dedup.is_duplicate(&tagged));
+    }
+
+    // ── thread safety ─────────────────────────────────────────────
+
+    #[test]
+    fn dedup_shared_across_threads() {
+        use std::sync::{Arc, Mutex};
+
+        let dedup = Arc::new(Mutex::new(MessageDedup::new()));
+        let mut handles = vec![];
+
+        // Thread 1: insert message S1
+        let d = Arc::clone(&dedup);
+        handles.push(std::thread::spawn(move || {
+            let xml = br#"<event uid="S1" time="T1">"#;
+            let mut guard = d.lock().unwrap();
+            guard.is_duplicate(xml)
+        }));
+
+        // Thread 2: insert message S2
+        let d = Arc::clone(&dedup);
+        handles.push(std::thread::spawn(move || {
+            let xml = br#"<event uid="S2" time="T2">"#;
+            let mut guard = d.lock().unwrap();
+            guard.is_duplicate(xml)
+        }));
+
+        // Both should succeed (not duplicates since they're different messages)
+        for h in handles {
+            let is_dup = h.join().unwrap();
+            assert!(!is_dup);
+        }
+
+        // Now both should be in the cache
+        let guard = dedup.lock().unwrap();
+        assert_eq!(guard.len(), 2);
+    }
+
+    #[test]
+    fn dedup_shared_mutex_detects_cross_thread_duplicate() {
+        use std::sync::{Arc, Mutex};
+
+        let dedup = Arc::new(Mutex::new(MessageDedup::new()));
+        let xml = br#"<event uid="SHARED" time="T">"#;
+
+        // First insert on main thread
+        {
+            let mut guard = dedup.lock().unwrap();
+            assert!(!guard.is_duplicate(xml));
+        }
+
+        // Second insert on spawned thread should detect duplicate
+        let d = Arc::clone(&dedup);
+        let result = std::thread::spawn(move || {
+            let mut guard = d.lock().unwrap();
+            guard.is_duplicate(xml)
+        })
+        .join()
+        .unwrap();
+
+        assert!(result);
     }
 }
