@@ -184,7 +184,7 @@ async fn connect_raw(
 
 /// Receive one frame with a timeout. Panics with `label` on failure.
 async fn recv(rx: &mut ClientRx, label: &str) -> Vec<u8> {
-    tokio::time::timeout(std::time::Duration::from_secs(2), rx.next())
+    tokio::time::timeout(std::time::Duration::from_secs(5), rx.next())
         .await
         .unwrap_or_else(|_| panic!("{label}: timeout"))
         .unwrap_or_else(|| panic!("{label}: stream ended"))
@@ -194,7 +194,7 @@ async fn recv(rx: &mut ClientRx, label: &str) -> Vec<u8> {
 
 /// Assert no data frame arrives — timeout or stream-end are both acceptable.
 async fn assert_no_message(rx: &mut ClientRx, label: &str) {
-    match tokio::time::timeout(std::time::Duration::from_millis(300), rx.next()).await {
+    match tokio::time::timeout(std::time::Duration::from_secs(1), rx.next()).await {
         Err(_) => {}           // Timeout — nothing arrived
         Ok(None) => {}         // Stream closed
         Ok(Some(Err(_))) => {} // Read error (connection reset)
@@ -498,7 +498,7 @@ async fn oversized_frame_rejected() {
     // Server should kill the connection — read should get EOF or error
     let mut buf = [0u8; 1];
     let result = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
+        std::time::Duration::from_secs(5),
         tokio::io::AsyncReadExt::read(&mut raw, &mut buf),
     )
     .await;

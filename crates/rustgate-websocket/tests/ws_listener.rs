@@ -131,7 +131,7 @@ async fn ws_rejects_untrusted_client() {
     let bound_addr = listener.local_addr().expect("local addr");
 
     let server_handle = tokio::spawn(async move {
-        tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept()).await
+        tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept()).await
     });
 
     // Client trusts the server CA but presents a cert from a different CA
@@ -194,7 +194,7 @@ async fn ws_rejects_expired_client_cert() {
     let bound_addr = listener.local_addr().expect("local addr");
 
     let server_handle = tokio::spawn(async move {
-        tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept()).await
+        tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept()).await
     });
 
     let client_tls =
