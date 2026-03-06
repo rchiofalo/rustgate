@@ -5,7 +5,7 @@ fullnameOverride: ""
 image:
   repository: ghcr.io/rchiofalo/rustgate
   # Use a specific version tag or SHA digest for production deployments.
-  tag: "0.2.0"
+  tag: "0.3.0"
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-03-05
+
 ### Changed
 
 - **CI pipeline** — 10 parallel jobs: commit-lint, lint, clippy, check-features (cargo-hack powerset), test (nextest), coverage (tarpaulin), fips, audit, helm, docker
