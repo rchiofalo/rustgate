@@ -3,4 +3,4 @@ name: rustgate
 description: Secure tactical message router with mTLS, NATS bridge, and server-to-server federation
 type: application
 version: 1.0.0
-appVersion: "0.3.0"
+appVersion: "0.4.0"

@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-03-06
+
+### Added
+
+- **Federation TrustStore integration** — dynamic CA trust for federation TLS handshakes; new CAs take effect on the next connection without restart (#191)
+- **Federation HA claim manager wiring** — distributed peer ownership via NATS KV atomic claims integrated into the federation manager (#193)
+- **Per-peer circuit breaker** — automatic backoff on repeated federation connection failures with configurable thresholds (#182)
+- **V1 loop detection** — message deduplication prevents routing loops in V1 federation protocol (#190)
+- **V2 provenance checking** — inbound and outbound provenance validation for V2 federation messages (#189)
+- **887 tests** — up from 818 in v0.3.0
+
+### Fixed
+
+- **NATS test server startup flakiness** — shared `TestNatsServer` in `rustgate-test-utils` with retry logic and fast-fail on port conflicts (#195)
+- **Release docker workflow cascading failures** — best-effort guards on post-push steps prevent attestation/Trivy failures from failing the entire job (#194)
+- **Cross-compilation FIPS builds** — install Go 1.22.12 from go.dev in `Cross.toml` (distro `golang` was 1.10.4, `aws-lc-fips-sys` requires >= 1.17.13)
+- **Nightly fuzz rustup** — fix cross-device rename error in fuzz CI (#181)
+- **Scorecard workflow** — skip on private repos where `persist-credentials: false` blocks cloning
+- **Test timeouts** — increase timeouts for coverage instrumentation overhead (#183)
+
+### Changed
+
+- **Project branding** — add project logo, OpenSSF Scorecard badge, and NIST 800-53 security posture to documentation (#180)
+
 ## [0.3.0] - 2026-03-05
 
 ### Changed
