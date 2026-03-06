@@ -40,7 +40,7 @@ impl TestNatsServer {
     /// Start a `nats-server` with JetStream on an ephemeral port.
     ///
     /// Returns `None` if the `nats-server` binary is not on `PATH`.
-    /// Retries up to [`Self::MAX_ATTEMPTS`] times with a fresh port on each
+    /// Retries up to 3 times with a fresh port on each
     /// attempt to eliminate TOCTOU port-collision failures.
     pub async fn start() -> Option<Self> {
         // Quick check: is the binary available at all?
