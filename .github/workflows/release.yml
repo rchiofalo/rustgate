@@ -85,6 +85,10 @@ jobs:
       - name: Sign image with cosign
         run: cosign sign --yes ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
 
+      # ── Post-push security & metadata steps ──────────────────────
+      # These steps are best-effort: individual failures must not cascade
+      # or fail the overall job. The image is already pushed and signed.
+
       - name: Attest build provenance
         if: github.repository_visibility == 'public'
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
@@ -94,6 +98,9 @@ jobs:
           push-to-registry: true
 
       - name: Run Trivy vulnerability scanner
+        if: ${{ !cancelled() && steps.push.conclusion == 'success' }}
+        continue-on-error: true
+        id: trivy
         uses: aquasecurity/trivy-action@97e0b3872f55f89b95b2f65b3dbab56962816478 # v0.34.2
         with:
           image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
@@ -103,11 +110,14 @@ jobs:
 
       - name: Upload Trivy scan results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@c793b717bc78562f491db7b0e93a3a178b099162 # v4.32.5
-        if: always() && hashFiles('trivy-results.sarif') != ''
+        if: ${{ !cancelled() && hashFiles('trivy-results.sarif') != '' && github.repository_visibility == 'public' }}
+        continue-on-error: true
         with:
           sarif_file: trivy-results.sarif
 
       - name: Generate container SBOM
+        if: ${{ !cancelled() && steps.push.conclusion == 'success' }}
+        continue-on-error: true
         uses: anchore/sbom-action@17ae1740179002c89186b61233e0f892c3118b11 # v0.23.0
         with:
           image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
@@ -116,7 +126,7 @@ jobs:
           format: spdx-json
 
       - name: Generate release notes
-        if: github.event_name == 'release'
+        if: ${{ github.event_name == 'release' && !cancelled() }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release edit "${{ steps.version.outputs.version }}" --generate-notes
