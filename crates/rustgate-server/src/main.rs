@@ -207,6 +207,11 @@ struct Cli {
     #[arg(long, env = "FEDERATION_STORE_PATH")]
     federation_store_path: Option<String>,
 
+    /// Directory containing additional trusted CA certificates for federation.
+    /// PEM/CRT files in this directory are merged with --ca for TLS verification.
+    #[arg(long, env = "FEDERATION_TRUST_STORE_DIR")]
+    federation_trust_store_dir: Option<String>,
+
     /// Consecutive send failures before tripping a federation peer's circuit breaker.
     #[arg(
         long,
@@ -545,6 +550,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             key_file: cli.key.clone().into(),
             ca_file: cli.ca.clone().into(),
             store_path: cli.federation_store_path.clone().map(Into::into),
+            trust_store_dir: cli.federation_trust_store_dir.clone().map(Into::into),
             circuit_breaker_threshold: cli.federation_circuit_breaker_threshold,
             circuit_breaker_timeout: std::time::Duration::from_secs(
                 cli.federation_circuit_breaker_timeout,
@@ -598,7 +604,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             let store = Arc::new(std::sync::RwLock::new(FileStore::new(
                 cli.federation_store_path.clone().map(Into::into),
             )));
-            let trust_store = Arc::new(TrustStore::new(None));
+            let trust_store = Arc::new(if let Some(ref dir) = cli.federation_trust_store_dir {
+                TrustStore::load_from_directory(std::path::Path::new(dir))?
+            } else {
+                TrustStore::new(None)
+            });
 
             let rwlock_for_status = Arc::clone(&rwlock);
             let status_fn: Arc<

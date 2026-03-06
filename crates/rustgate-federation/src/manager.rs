@@ -18,6 +18,7 @@ use crate::config::FederationConfig;
 use crate::connector::PeerConnector;
 use crate::dedup::MessageDedup;
 use crate::peer::{PeerHandle, PeerStatus};
+use crate::trust_store::TrustStore;
 use crate::v1::{V1Client, V1Server};
 
 /// Callback invoked for each non-heartbeat message received from a federation peer.
@@ -117,6 +118,43 @@ impl FederationManager {
             .map_err(|e| anyhow::anyhow!("read key file: {e}"))?;
         let ca_pem = std::fs::read_to_string(&self.config.ca_file)
             .map_err(|e| anyhow::anyhow!("read CA file: {e}"))?;
+
+        // Load trust store and merge with base CA if configured.
+        // The merged PEM contains the static base CA plus any additional
+        // CA certificates from the trust store directory. This merged PEM
+        // is used for all TLS verification (inbound and outbound, V1 and V2).
+        let ca_pem = if let Some(ref dir) = self.config.trust_store_dir {
+            let trust_store = TrustStore::load_from_directory(dir)?;
+            let extra_certs = trust_store.list_certificates();
+            if extra_certs.is_empty() {
+                info!(dir = %dir.display(), "trust store loaded (empty — using base CA only)");
+                ca_pem
+            } else {
+                let mut merged = ca_pem;
+                for cert_info in &extra_certs {
+                    if let Some(pem_bytes) = trust_store.get_certificate_pem(&cert_info.common_name)
+                    {
+                        let pem_str = std::str::from_utf8(&pem_bytes).map_err(|e| {
+                            anyhow::anyhow!(
+                                "trust store certificate '{}' contains invalid UTF-8: {e}",
+                                cert_info.common_name
+                            )
+                        })?;
+                        merged.push('\n');
+                        merged.push_str(pem_str);
+                    }
+                }
+                info!(
+                    dir = %dir.display(),
+                    base_ca = %self.config.ca_file.display(),
+                    trust_store_certs = extra_certs.len(),
+                    "merged trust store certificates with base CA"
+                );
+                merged
+            }
+        } else {
+            ca_pem
+        };
 
         // Create outbound connector (used by V1 clients)
         let connector = PeerConnector::from_pem(
@@ -637,6 +675,7 @@ mod tests {
             default_group: "__ANON__".into(),
             store_path: None,
             skip_hostname_verify: false,
+            trust_store_dir: None,
             cert_file: PathBuf::from("/nonexistent/cert.pem"),
             key_file: PathBuf::from("/nonexistent/key.pem"),
             ca_file: PathBuf::from("/nonexistent/ca.pem"),
@@ -944,6 +983,160 @@ mod tests {
         assert_eq!(manager.peer_count(), 0);
 
         manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn start_with_trust_store_dir() {
+        use rustgate_test_utils::certs::TestCa;
+
+        let ca = TestCa::new("Base CA");
+        let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cert_path = tmp.path().join("cert.pem");
+        let key_path = tmp.path().join("key.pem");
+        let ca_path = tmp.path().join("ca.pem");
+        let trust_dir = tmp.path().join("trust-store");
+        std::fs::create_dir_all(&trust_dir).expect("create trust dir");
+
+        std::fs::write(&cert_path, &server_cert.cert_pem).expect("write cert");
+        std::fs::write(&key_path, &server_cert.key_pem).expect("write key");
+        std::fs::write(&ca_path, &ca.cert_pem).expect("write ca");
+
+        // Write an additional CA to the trust store directory
+        let extra_ca = TestCa::new("Extra Federation CA");
+        std::fs::write(trust_dir.join("extra-ca.pem"), &extra_ca.cert_pem).expect("write extra ca");
+
+        let config = FederationConfig {
+            federate_id: "test-trust-store".into(),
+            v1_enabled: true,
+            v1_listen_addr: "127.0.0.1:0".parse().expect("valid addr"),
+            cert_file: cert_path,
+            key_file: key_path,
+            ca_file: ca_path,
+            trust_store_dir: Some(trust_dir),
+            ..test_config()
+        };
+
+        let mut manager = FederationManager::new(config);
+        let on_inbound: OnInbound = Arc::new(|_cn, _data| {});
+
+        // Start should succeed — trust store dir loaded and merged
+        manager
+            .start(on_inbound)
+            .await
+            .expect("start with trust store");
+        assert!(manager.is_running());
+        assert!(manager.status().v1_server_active);
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn start_with_empty_trust_store_dir() {
+        use rustgate_test_utils::certs::TestCa;
+
+        let ca = TestCa::new("Base CA");
+        let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cert_path = tmp.path().join("cert.pem");
+        let key_path = tmp.path().join("key.pem");
+        let ca_path = tmp.path().join("ca.pem");
+        let trust_dir = tmp.path().join("empty-trust-store");
+
+        std::fs::write(&cert_path, &server_cert.cert_pem).expect("write cert");
+        std::fs::write(&key_path, &server_cert.key_pem).expect("write key");
+        std::fs::write(&ca_path, &ca.cert_pem).expect("write ca");
+
+        // Empty trust store dir (will be created by TrustStore::load_from_directory)
+        let config = FederationConfig {
+            federate_id: "test-empty-trust-store".into(),
+            v1_enabled: true,
+            v1_listen_addr: "127.0.0.1:0".parse().expect("valid addr"),
+            cert_file: cert_path,
+            key_file: key_path,
+            ca_file: ca_path,
+            trust_store_dir: Some(trust_dir),
+            ..test_config()
+        };
+
+        let mut manager = FederationManager::new(config);
+        let on_inbound: OnInbound = Arc::new(|_cn, _data| {});
+
+        // Start should succeed — empty trust store just uses base CA
+        manager
+            .start(on_inbound)
+            .await
+            .expect("start with empty trust store");
+        assert!(manager.is_running());
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn trust_store_certs_used_in_tls_verification() {
+        use rustgate_test_utils::certs::TestCa;
+        use rustgate_transport::{TlsConfig, TlsListener};
+
+        // Two separate CAs — base and extra
+        let base_ca = TestCa::new("Base CA");
+        let extra_ca = TestCa::new("Extra Federation CA");
+
+        // Server cert signed by base CA
+        let server_cert = base_ca.issue_server_cert("localhost", &["localhost"]);
+        // Client cert signed by extra CA (not base CA!)
+        let client_cert = extra_ca.issue_client_cert("trust-store-client", &["Alpha"]);
+
+        // Build merged CA PEM (simulating what FederationManager does with trust store)
+        let trust_store = crate::trust_store::TrustStore::new(None);
+        let _ = trust_store
+            .add_certificate_from_pem(extra_ca.cert_pem.as_bytes())
+            .expect("add extra CA to trust store");
+
+        let mut merged_ca = base_ca.cert_pem.clone();
+        for info in trust_store.list_certificates() {
+            if let Some(pem) = trust_store.get_certificate_pem(&info.common_name) {
+                merged_ca.push('\n');
+                merged_ca.push_str(std::str::from_utf8(&pem).expect("PEM is valid UTF-8"));
+            }
+        }
+
+        // Server uses merged CA — should accept clients from both CAs
+        let tls_config =
+            TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &merged_ca)
+                .expect("tls config with merged CA");
+        let listener = TlsListener::bind("127.0.0.1:0", &tls_config)
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let handle = tokio::spawn(async move {
+            let _session = listener.accept().await.expect("accept");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        // Connect with client cert signed by extra CA — should succeed
+        let mut client_ca = base_ca.cert_pem.clone();
+        client_ca.push('\n');
+        client_ca.push_str(&extra_ca.cert_pem);
+
+        let connector = crate::connector::PeerConnector::from_pem(
+            &client_cert.cert_pem,
+            &client_cert.key_pem,
+            &client_ca,
+            false,
+        )
+        .expect("create connector");
+
+        let result = connector.connect(addr, "localhost").await;
+        assert!(
+            result.is_ok(),
+            "client cert from trust store CA should be accepted: {:?}",
+            result.err()
+        );
+
+        handle.abort();
     }
 
     #[tokio::test]
