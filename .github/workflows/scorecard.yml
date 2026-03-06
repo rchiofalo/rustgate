@@ -12,7 +12,8 @@ permissions: read-all
 jobs:
   analysis:
     name: Scorecard analysis
-    runs-on: self-hosted
+    if: github.repository_visibility == 'public'
+    runs-on: ubuntu-latest
     permissions:
       contents: read # clone the repository
       security-events: write # upload SARIF
