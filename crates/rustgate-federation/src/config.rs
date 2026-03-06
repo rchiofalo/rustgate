@@ -101,7 +101,7 @@ pub struct FederationConfig {
     pub ca_file: PathBuf,
     /// Directory containing additional trusted CA certificates for federation.
     ///
-    /// When set, PEM/CRT files in this directory are loaded into a [`TrustStore`]
+    /// When set, PEM/CRT files in this directory are loaded into a [`crate::trust_store::TrustStore`]
     /// and merged with the base `ca_file` for all TLS verification (inbound and
     /// outbound, V1 and V2). Certificates added to this directory take effect
     /// on the next server restart.
