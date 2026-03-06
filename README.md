@@ -1,10 +1,19 @@
-# rustgate
+<p align="center">
+  <img src="assets/logo.svg" alt="rustgate logo" width="600">
+</p>
 
-[![CI](https://github.com/rchiofalo/rustgate/actions/workflows/ci.yml/badge.svg)](https://github.com/rchiofalo/rustgate/actions/workflows/ci.yml)
-![Rust 1.93+](https://img.shields.io/badge/rust-1.93%2B-orange.svg)
-![License](https://img.shields.io/badge/license-Proprietary-blue.svg)
+<p align="center">
+  <a href="https://github.com/rchiofalo/rustgate/actions/workflows/ci.yml"><img src="https://github.com/rchiofalo/rustgate/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/rchiofalo/rustgate/releases/latest"><img src="https://img.shields.io/github/v/release/rchiofalo/rustgate?color=green" alt="Release"></a>
+  <a href="https://ghcr.io/rchiofalo/rustgate"><img src="https://img.shields.io/badge/docker-ghcr.io-blue?logo=docker" alt="Docker"></a>
+  <a href="https://securityscorecards.dev/viewer/?uri=github.com/rchiofalo/rustgate"><img src="https://api.securityscorecards.dev/projects/github.com/rchiofalo/rustgate/badge" alt="OpenSSF Scorecard"></a>
+  <img src="https://img.shields.io/badge/rust-1.93%2B-orange.svg?logo=rust" alt="Rust 1.93+">
+  <img src="https://img.shields.io/badge/license-Proprietary-blue.svg" alt="License">
+</p>
 
-Secure mTLS message router in Rust — group-based routing, WebSocket, server federation, NATS scaling, certificate enrollment, CRL and FIPS support. Single binary, edge-ready.
+<p align="center">
+  <em>Secure mTLS message router in Rust — group-based routing, WebSocket, server federation, NATS scaling, certificate enrollment, CRL and FIPS support. Single binary, edge-ready.</em>
+</p>
 
 ## Table of Contents
 
@@ -336,6 +345,7 @@ All tests use ephemeral certificates generated at runtime via `rustgate-test-uti
 | [Deployment](docs/deployment.md) | Binary, Docker Compose, and Kubernetes deployment |
 | [FIPS 140-3](docs/fips.md) | FIPS crypto provider setup and known limitations |
 | [Configuration](docs/configuration.md) | All CLI flags, env vars, and runtime options |
+| [Security Posture](docs/security-posture.md) | NIST 800-53 control mapping and compliance overview |
 | [Runbooks](docs/runbooks/) | Operational runbooks for federation, memory, NATS |
 | [CONTRIBUTING](CONTRIBUTING.md) | Build prerequisites, code quality, and PR guidelines |
 | [CHANGELOG](CHANGELOG.md) | Release history in Keep a Changelog format |
