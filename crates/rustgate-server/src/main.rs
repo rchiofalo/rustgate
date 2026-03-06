@@ -92,6 +92,11 @@ struct Cli {
     #[arg(long, env = "RUSTGATE_CRL")]
     crl: Option<String>,
 
+    /// Require FIPS 140-3 crypto provider. Startup fails if the FIPS provider
+    /// is not active. Build with --features fips to enable.
+    #[arg(long, default_value_t = false, env = "RUSTGATE_FIPS_REQUIRED")]
+    fips_required: bool,
+
     #[arg(long, value_enum, default_value_t = Framing::Xml, env = "RUSTGATE_FRAMING")]
     framing: Framing,
 
@@ -271,6 +276,13 @@ fn main() -> anyhow::Result<()> {
 
     #[cfg(feature = "fips")]
     rustgate_transport::install_fips_provider()?;
+
+    if cli.fips_required && !rustgate_transport::is_fips_provider_active() {
+        anyhow::bail!(
+            "--fips-required is set but FIPS crypto provider is not active. \
+             Build with --features fips to enable FIPS 140-3 mode."
+        );
+    }
 
     tracing::info!(bind = %cli.bind, "rustgate starting");
     audit::server_started(&cli.bind, env!("CARGO_PKG_VERSION"));

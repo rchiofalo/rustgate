@@ -144,3 +144,14 @@ pub fn install_fips_provider() -> Result<()> {
     tracing::info!("FIPS 140-3 crypto provider (aws-lc-rs) installed");
     Ok(())
 }
+
+/// Returns `true` if the FIPS crypto provider is the active default.
+///
+/// Checks whether a crypto provider is installed and whether it uses
+/// the `aws-lc-rs` FIPS backend. Use with `--fips-required` to fail
+/// startup when FIPS mode is expected but not active.
+pub fn is_fips_provider_active() -> bool {
+    rustls::crypto::CryptoProvider::get_default()
+        .map(|p| p.fips())
+        .unwrap_or(false)
+}

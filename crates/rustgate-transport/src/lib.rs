@@ -14,9 +14,9 @@ mod throttle;
 
 pub use cache::PositionCache;
 pub use codec::{FramedCodec, LengthPrefixedCodec, LineDelimitedCodec, XmlStreamCodec};
-pub use config::TlsConfig;
 #[cfg(feature = "fips")]
 pub use config::install_fips_provider;
+pub use config::{TlsConfig, is_fips_provider_active};
 pub use encoder::{CotEncoder, MessageEncoder, RawEncoder};
 pub use extract::extract_identity;
 pub use filter::{GeoBounds, MessageFilter};
