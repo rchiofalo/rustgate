@@ -563,6 +563,8 @@ mod tests {
                 total_peers: 2,
                 connected_peers: 1,
                 peers: vec![],
+                ha_enabled: false,
+                pod_id: None,
             }),
             peer_status_fn: Arc::new(|_id| None),
         }
@@ -676,6 +678,8 @@ mod tests {
                 total_peers: 1,
                 connected_peers: 1,
                 peers: vec![],
+                ha_enabled: false,
+                pod_id: None,
             }),
             peer_status_fn: Arc::new(|id| {
                 if id == "peer-1" {
@@ -971,6 +975,8 @@ mod tests {
                 total_peers: 0,
                 connected_peers: 0,
                 peers: vec![],
+                ha_enabled: false,
+                pod_id: None,
             }),
             peer_status_fn: Arc::new(|_| None),
         };

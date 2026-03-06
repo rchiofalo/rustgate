@@ -224,6 +224,17 @@ struct Cli {
     #[arg(long, default_value_t = 60, env = "FEDERATION_CIRCUIT_BREAKER_TIMEOUT")]
     federation_circuit_breaker_timeout: u64,
 
+    /// NATS URL for federation HA coordination (enables distributed peer ownership).
+    /// When set, only one pod manages each outbound peer in a multi-pod deployment.
+    /// Requires --features federation-ha.
+    #[arg(long, env = "FEDERATION_HA_NATS_URL")]
+    federation_ha_nats_url: Option<String>,
+
+    /// Pod identifier for federation HA mode. Defaults to --federation-id if
+    /// --federation-ha-nats-url is set.
+    #[arg(long, env = "FEDERATION_POD_ID")]
+    federation_pod_id: Option<String>,
+
     // ── QoS / rate limiting ──────────────────────────────────────────
     /// Maximum sustained messages per second per connected client (0 = disabled).
     #[arg(long, default_value_t = 0, env = "RUSTGATE_CLIENT_MSG_RATE")]
@@ -555,6 +566,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             circuit_breaker_timeout: std::time::Duration::from_secs(
                 cli.federation_circuit_breaker_timeout,
             ),
+            pod_id: cli.federation_pod_id.clone().or_else(|| {
+                cli.federation_ha_nats_url
+                    .as_ref()
+                    .map(|_| cli.federation_id.clone())
+            }),
+            ha_nats_url: cli.federation_ha_nats_url.clone(),
             ..rustgate_federation::config::FederationConfig::default()
         };
 
@@ -624,6 +641,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                         total_peers: 0,
                         connected_peers: 0,
                         peers: vec![],
+                        ha_enabled: false,
+                        pod_id: None,
                     },
                 }
             });
@@ -650,6 +669,46 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             tracing::info!("federation REST API wired into metrics server");
         }
 
+        // ── HA adoption / claim-lost handler tasks ───────────────────
+        #[cfg(feature = "federation-ha")]
+        {
+            let (adopt_rx, lost_rx) = {
+                let mut mgr = rwlock.write().await;
+                mgr.take_ha_receivers()
+            };
+
+            if let Some(mut rx) = adopt_rx {
+                let inner = Arc::clone(&rwlock);
+                drop(tokio::spawn(async move {
+                    while let Some(peer_id) = rx.recv().await {
+                        tracing::info!(peer_id = %peer_id, "adopting orphaned peer");
+                        let mut mgr = inner.write().await;
+                        if let Err(e) = mgr.adopt_peer(&peer_id).await {
+                            tracing::warn!(
+                                peer_id = %peer_id,
+                                error = %e,
+                                "failed to adopt peer"
+                            );
+                        }
+                    }
+                }));
+            }
+
+            if let Some(mut rx) = lost_rx {
+                let inner = Arc::clone(&rwlock);
+                drop(tokio::spawn(async move {
+                    while let Some(peer_id) = rx.recv().await {
+                        tracing::warn!(
+                            peer_id = %peer_id,
+                            "lost claim — disconnecting peer"
+                        );
+                        let mut mgr = inner.write().await;
+                        mgr.disconnect_peer(&peer_id).await;
+                    }
+                }));
+            }
+        }
+
         let forward_fn: FedForwardFn = Arc::new(move |payload, groups| {
             let inner = Arc::clone(&rwlock_for_forward);
             drop(tokio::spawn(async move {
@@ -673,6 +732,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         None
     };
+
+    #[cfg(not(feature = "federation-ha"))]
+    if cli.federation_ha_nats_url.is_some() {
+        tracing::warn!("--federation-ha-nats-url requires --features federation-ha; ignoring");
+    }
 
     // ── WebSocket listener ──────────────────────────────────────────
 

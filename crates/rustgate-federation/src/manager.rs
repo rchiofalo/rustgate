@@ -53,7 +53,6 @@ impl std::fmt::Debug for FederationClient {
 /// - Inbound message routing via callback
 /// - Outbound message forwarding with group-aware filtering
 /// - Peer status tracking and reporting
-#[derive(Debug)]
 pub struct FederationManager {
     config: FederationConfig,
     connector: Option<PeerConnector>,
@@ -63,6 +62,24 @@ pub struct FederationManager {
     clients: HashMap<String, FederationClient>,
     peers: HashMap<String, Arc<PeerHandle>>,
     running: bool,
+
+    // Connection materials stored during start() for reuse by adopt_peer()
+    on_inbound: Option<OnInbound>,
+    v1_dedup: Option<Arc<Mutex<MessageDedup>>>,
+    #[cfg(feature = "v2")]
+    v2_tls_config: Option<tonic::transport::ClientTlsConfig>,
+    /// Merged CA PEM used for TLS (base CA + trust store).
+    ca_pem: Option<String>,
+
+    // ── HA subsystem ─────────────────────────────────────────────────
+    #[cfg(feature = "ha")]
+    claim_manager: Option<crate::ha::claims::ClaimManager>,
+    #[cfg(feature = "ha")]
+    connection_registry: Option<crate::ha::registry::ConnectionRegistry>,
+    #[cfg(feature = "ha")]
+    ha_adopt_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+    #[cfg(feature = "ha")]
+    ha_lost_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
 }
 
 /// Aggregated status snapshot of the federation subsystem.
@@ -80,6 +97,22 @@ pub struct FederationStatus {
     pub connected_peers: usize,
     /// Per-peer status snapshots.
     pub peers: Vec<PeerStatus>,
+    /// Whether HA (distributed peer ownership) is enabled.
+    pub ha_enabled: bool,
+    /// Pod identifier (only set when HA is active).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pod_id: Option<String>,
+}
+
+impl std::fmt::Debug for FederationManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FederationManager")
+            .field("config", &self.config)
+            .field("running", &self.running)
+            .field("peers", &self.peers.len())
+            .field("clients", &self.clients.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl FederationManager {
@@ -96,6 +129,19 @@ impl FederationManager {
             clients: HashMap::new(),
             peers: HashMap::new(),
             running: false,
+            on_inbound: None,
+            v1_dedup: None,
+            #[cfg(feature = "v2")]
+            v2_tls_config: None,
+            ca_pem: None,
+            #[cfg(feature = "ha")]
+            claim_manager: None,
+            #[cfg(feature = "ha")]
+            connection_registry: None,
+            #[cfg(feature = "ha")]
+            ha_adopt_rx: None,
+            #[cfg(feature = "ha")]
+            ha_lost_rx: None,
         }
     }
 
@@ -165,10 +211,15 @@ impl FederationManager {
         )?;
         self.connector = Some(connector.clone());
 
+        // Store connection materials for reuse by adopt_peer()
+        self.on_inbound = Some(Arc::clone(&on_inbound));
+        self.ca_pem = Some(ca_pem.clone());
+
         // Shared dedup cache for V1 loop detection.
         // V1 has no provenance metadata, so we detect loops by
         // remembering recently-seen (uid, time) pairs from CoT XML.
         let v1_dedup: Arc<Mutex<MessageDedup>> = Arc::new(Mutex::new(MessageDedup::new()));
+        self.v1_dedup = Some(Arc::clone(&v1_dedup));
 
         // Start V1 inbound server if enabled
         if self.config.v1_enabled {
@@ -290,14 +341,69 @@ impl FederationManager {
             let ca_cert = tonic::transport::Certificate::from_pem(&ca_pem);
             let client_identity = tonic::transport::Identity::from_pem(&cert_pem, &key_pem);
 
-            ClientTlsConfig::new()
+            let cfg = ClientTlsConfig::new()
                 .ca_certificate(ca_cert)
-                .identity(client_identity)
+                .identity(client_identity);
+            self.v2_tls_config = Some(cfg.clone());
+            cfg
         };
+
+        // ── HA initialization ─────────────────────────────────────────
+        #[cfg(feature = "ha")]
+        if let (Some(nats_url), Some(pod_id)) = (&self.config.ha_nats_url, &self.config.pod_id) {
+            let client = async_nats::connect(nats_url)
+                .await
+                .map_err(|e| anyhow::anyhow!("HA NATS connect to {nats_url}: {e}"))?;
+            let jetstream = async_nats::jetstream::new(client);
+
+            let mut cm = crate::ha::claims::ClaimManager::new(jetstream.clone(), pod_id.clone())
+                .await
+                .map_err(|e| anyhow::anyhow!("create claim manager: {e}"))?;
+            let cr = crate::ha::registry::ConnectionRegistry::new(jetstream, pod_id.clone())
+                .await
+                .map_err(|e| anyhow::anyhow!("create connection registry: {e}"))?;
+
+            let (adopt_tx, adopt_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (lost_tx, lost_rx) = tokio::sync::mpsc::unbounded_channel();
+            cm.set_callbacks(
+                Arc::new(move |peer_id| {
+                    let _ = adopt_tx.send(peer_id);
+                }),
+                Arc::new(move |peer_id| {
+                    let _ = lost_tx.send(peer_id);
+                }),
+            );
+
+            cm.start().await;
+            cr.start().await;
+
+            info!(
+                pod_id = %pod_id,
+                nats_url = %nats_url,
+                "HA claim manager and connection registry started"
+            );
+
+            self.claim_manager = Some(cm);
+            self.connection_registry = Some(cr);
+            self.ha_adopt_rx = Some(adopt_rx);
+            self.ha_lost_rx = Some(lost_rx);
+        }
 
         // Connect to all enabled outbound peers
         for peer_config in &self.config.peers {
             if !peer_config.enabled || !peer_config.is_outbound {
+                continue;
+            }
+
+            // In HA mode, only connect to peers we can claim
+            #[cfg(feature = "ha")]
+            if let Some(ref cm) = self.claim_manager
+                && !cm.try_claim(&peer_config.id).await
+            {
+                info!(
+                    peer_id = %peer_config.id,
+                    "peer claimed by another pod, skipping"
+                );
                 continue;
             }
 
@@ -438,6 +544,20 @@ impl FederationManager {
                     );
                     continue;
                 }
+            }
+
+            // Register outbound connection in the HA registry
+            #[cfg(feature = "ha")]
+            if let Some(ref cr) = self.connection_registry
+                && let Err(e) = cr
+                    .register(&peer_config.id, crate::ha::registry::Direction::Outbound)
+                    .await
+            {
+                warn!(
+                    peer_id = %peer_config.id,
+                    error = %e,
+                    "failed to register connection in HA registry"
+                );
             }
         }
 
@@ -596,6 +716,20 @@ impl FederationManager {
         }
 
         self.peers.clear();
+
+        // Shut down HA subsystem (releases claims, unregisters connections)
+        #[cfg(feature = "ha")]
+        {
+            if let Some(ref cm) = self.claim_manager {
+                cm.stop().await;
+                info!("HA claim manager stopped");
+            }
+            if let Some(ref cr) = self.connection_registry {
+                cr.stop().await;
+                info!("HA connection registry stopped");
+            }
+        }
+
         self.running = false;
         info!("federation manager shut down");
     }
@@ -617,6 +751,11 @@ impl FederationManager {
         #[cfg(not(feature = "v2"))]
         let v2_active = false;
 
+        #[cfg(feature = "ha")]
+        let ha_enabled = self.claim_manager.is_some();
+        #[cfg(not(feature = "ha"))]
+        let ha_enabled = false;
+
         FederationStatus {
             running: self.running,
             v1_server_active: self.v1_server.is_some(),
@@ -624,6 +763,8 @@ impl FederationManager {
             total_peers: self.peers.len(),
             connected_peers: self.connected_peer_count(),
             peers: self.all_peer_statuses(),
+            ha_enabled,
+            pod_id: self.config.pod_id.clone(),
         }
     }
 
@@ -645,6 +786,283 @@ impl FederationManager {
     /// Get a reference to the federation configuration.
     pub fn config(&self) -> &FederationConfig {
         &self.config
+    }
+
+    // ── HA peer management ───────────────────────────────────────────
+
+    /// Connect a single outbound peer, creating its client and PeerHandle.
+    ///
+    /// Requires that `start()` has been called (connector, on_inbound, etc. are set).
+    /// Used by both `start()` loop (indirectly) and `adopt_peer()`.
+    #[cfg(feature = "ha")]
+    fn connect_outbound_peer(
+        &mut self,
+        peer_config: &crate::config::PeerConfig,
+    ) -> anyhow::Result<()> {
+        let connector = self
+            .connector
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("connector not initialized (call start() first)"))?
+            .clone();
+        let on_inbound = self
+            .on_inbound
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("on_inbound not set (call start() first)"))?
+            .clone();
+        let v1_dedup = self
+            .v1_dedup
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("v1_dedup not set (call start() first)"))?
+            .clone();
+
+        let addr: std::net::SocketAddr = peer_config
+            .address
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid peer address '{}': {e}", peer_config.address))?;
+
+        let peer = Arc::new(PeerHandle::with_circuit_breaker(
+            peer_config.clone(),
+            self.config.circuit_breaker_threshold,
+            self.config.circuit_breaker_timeout.as_secs(),
+        ));
+
+        match peer_config.protocol_version {
+            1 => {
+                let dedup = Arc::clone(&v1_dedup);
+                let on_v1_client: crate::v1::client::OnMessage = {
+                    let on_inbound = Arc::clone(&on_inbound);
+                    Arc::new(move |peer_id, data| {
+                        if let Ok(mut guard) = dedup.lock()
+                            && guard.is_duplicate(&data)
+                        {
+                            tracing::debug!(
+                                peer_id = %peer_id,
+                                "dropped duplicate V1 outbound client message (loop detection)"
+                            );
+                            return;
+                        }
+                        on_inbound(peer_id, data);
+                    })
+                };
+
+                let client = V1Client::start(
+                    Arc::clone(&peer),
+                    crate::v1::client::V1ClientConfig {
+                        connector,
+                        addr,
+                        server_name: addr.ip().to_string(),
+                        server_uid: self.config.federate_id.clone(),
+                        heartbeat_interval: self.config.heartbeat_interval,
+                        heartbeat_timeout: self.config.heartbeat_timeout,
+                        reconnect_delay: self.config.reconnect_delay,
+                        max_reconnects: self.config.max_reconnects,
+                        on_message: on_v1_client,
+                    },
+                );
+
+                info!(
+                    peer_id = %peer_config.id,
+                    addr = %addr,
+                    "started V1 federation client (adoption)"
+                );
+
+                let _ = self.peers.insert(peer_config.id.clone(), peer);
+                let _ = self
+                    .clients
+                    .insert(peer_config.id.clone(), FederationClient::V1(client));
+            }
+            #[cfg(feature = "v2")]
+            2 => {
+                let v2_tls = self
+                    .v2_tls_config
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("v2_tls_config not set"))?
+                    .clone();
+
+                let on_event_inbound = Arc::clone(&on_inbound);
+                let federate_id = self.config.federate_id.clone();
+                let on_event: crate::v2::client::OnEvent = Arc::new(move |event, peer_id| {
+                    let metadata = crate::v2::convert::extract_metadata(&event);
+                    if metadata.should_drop(&federate_id) {
+                        warn!(
+                            federate = %federate_id,
+                            peer = %peer_id,
+                            hops = metadata.current_hops,
+                            max_hops = metadata.max_hops,
+                            "dropped inbound V2 client event (loop or hop limit)"
+                        );
+                        return;
+                    }
+
+                    if event.event.is_some() {
+                        match crate::v2::convert::federated_event_to_xml(&event) {
+                            Ok(xml) => {
+                                on_event_inbound(peer_id, Bytes::from(xml));
+                            }
+                            Err(e) => {
+                                warn!(
+                                    federate = %federate_id,
+                                    error = %e,
+                                    "failed to convert inbound V2 GeoEvent to XML"
+                                );
+                            }
+                        }
+                    } else if let Some(ref contact) = event.contact
+                        && let Some(xml) = crate::v2::convert::contact_list_entry_to_xml(contact)
+                    {
+                        on_event_inbound(peer_id, Bytes::from(xml));
+                    }
+                });
+
+                let client = crate::v2::client::V2Client::start(
+                    Arc::clone(&peer),
+                    crate::v2::client::V2ClientConfig {
+                        address: peer_config.address.clone(),
+                        tls_config: v2_tls,
+                        federate_id: self.config.federate_id.clone(),
+                        groups: peer_config.groups.clone(),
+                        health_interval: self.config.health_check_interval,
+                        reconnect_delay: self.config.reconnect_delay,
+                        max_reconnects: self.config.max_reconnects,
+                        on_event,
+                    },
+                );
+
+                info!(
+                    peer_id = %peer_config.id,
+                    addr = %addr,
+                    "started V2 gRPC federation client (adoption)"
+                );
+
+                let _ = self.peers.insert(peer_config.id.clone(), peer);
+                let _ = self
+                    .clients
+                    .insert(peer_config.id.clone(), FederationClient::V2(client));
+            }
+            other => {
+                return Err(anyhow::anyhow!(
+                    "unsupported protocol version {other} for peer {}",
+                    peer_config.id
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Adopt an orphaned peer whose claim expired (another pod died).
+    ///
+    /// Claims the peer, waits the adoption delay (gives the remote time to clean up),
+    /// then creates a new outbound connection. Registers the connection in the
+    /// HA registry.
+    #[cfg(feature = "ha")]
+    pub async fn adopt_peer(&mut self, peer_id: &str) -> anyhow::Result<()> {
+        // Find the peer config
+        let peer_config = self
+            .config
+            .peers
+            .iter()
+            .find(|p| p.id == peer_id && p.enabled && p.is_outbound)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!("no enabled outbound peer config found for '{peer_id}'")
+            })?;
+
+        // Already connected?
+        if self.clients.contains_key(peer_id) {
+            info!(peer_id = %peer_id, "peer already connected, skipping adoption");
+            return Ok(());
+        }
+
+        // Try to claim the peer
+        let claimed = if let Some(ref cm) = self.claim_manager {
+            cm.try_claim(peer_id).await
+        } else {
+            return Err(anyhow::anyhow!("HA claim manager not initialized"));
+        };
+
+        if !claimed {
+            info!(peer_id = %peer_id, "peer claimed by another pod during adoption");
+            return Ok(());
+        }
+
+        // Wait adoption delay + jitter to let the remote clean up
+        let delay = crate::ha::claims::ClaimManager::adopt_delay()
+            + crate::ha::claims::ClaimManager::adoption_jitter();
+        info!(
+            peer_id = %peer_id,
+            delay_secs = delay.as_secs(),
+            "waiting adoption delay before connecting"
+        );
+        tokio::time::sleep(delay).await;
+
+        // Connect
+        self.connect_outbound_peer(&peer_config)?;
+
+        // Register in HA connection registry
+        if let Some(ref cr) = self.connection_registry
+            && let Err(e) = cr
+                .register(peer_id, crate::ha::registry::Direction::Outbound)
+                .await
+        {
+            warn!(peer_id = %peer_id, error = %e, "failed to register adopted connection");
+        }
+
+        info!(peer_id = %peer_id, "peer adopted successfully");
+        Ok(())
+    }
+
+    /// Disconnect a peer whose claim was lost to another pod.
+    ///
+    /// Stops the outbound client, removes the peer handle, unregisters from the
+    /// HA connection registry, and releases the claim.
+    #[cfg(feature = "ha")]
+    pub async fn disconnect_peer(&mut self, peer_id: &str) {
+        // Remove and shut down the client
+        if let Some(client) = self.clients.remove(peer_id) {
+            match client {
+                FederationClient::V1(mut v1) => {
+                    v1.shutdown().await;
+                    info!(peer_id = %peer_id, "V1 client stopped (claim lost)");
+                }
+                #[cfg(feature = "v2")]
+                FederationClient::V2(mut v2) => {
+                    v2.shutdown().await;
+                    info!(peer_id = %peer_id, "V2 client stopped (claim lost)");
+                }
+            }
+        }
+
+        let _ = self.peers.remove(peer_id);
+
+        // Unregister from connection registry
+        if let Some(ref cr) = self.connection_registry
+            && let Err(e) = cr.unregister(peer_id).await
+        {
+            warn!(peer_id = %peer_id, error = %e, "failed to unregister connection");
+        }
+
+        // Release claim
+        if let Some(ref cm) = self.claim_manager
+            && let Err(e) = cm.release(peer_id).await
+        {
+            warn!(peer_id = %peer_id, error = %e, "failed to release claim");
+        }
+    }
+
+    /// Take the HA event receivers (adoption and claim-lost channels).
+    ///
+    /// Returns `(adopt_rx, claim_lost_rx)`. Can only be called once — subsequent
+    /// calls return `(None, None)`. The caller (typically main.rs) spawns tasks
+    /// that read from these channels and call `adopt_peer()` / `disconnect_peer()`.
+    #[cfg(feature = "ha")]
+    pub fn take_ha_receivers(
+        &mut self,
+    ) -> (
+        Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+        Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+    ) {
+        (self.ha_adopt_rx.take(), self.ha_lost_rx.take())
     }
 }
 
@@ -683,6 +1101,8 @@ mod tests {
             jwt_expiry_secs: 3600,
             circuit_breaker_threshold: 5,
             circuit_breaker_timeout: Duration::from_secs(60),
+            pod_id: None,
+            ha_nats_url: None,
         }
     }
 
@@ -1157,6 +1577,8 @@ mod tests {
             total_peers: 2,
             connected_peers: 1,
             peers: vec![],
+            ha_enabled: false,
+            pod_id: None,
         };
         let json = serde_json::to_string(&status).expect("serialize");
         assert!(json.contains("\"running\":true"));
@@ -1169,5 +1591,74 @@ mod tests {
         let manager = FederationManager::new(test_config());
         let debug = format!("{manager:?}");
         assert!(debug.contains("FederationManager"));
+    }
+
+    #[test]
+    fn ha_fields_none_by_default() {
+        let config = test_config();
+        assert!(config.pod_id.is_none());
+        assert!(config.ha_nats_url.is_none());
+
+        let manager = FederationManager::new(config);
+        let status = manager.status();
+        assert!(!status.ha_enabled);
+        assert!(status.pod_id.is_none());
+    }
+
+    #[test]
+    fn ha_status_shows_pod_id_from_config() {
+        let config = FederationConfig {
+            pod_id: Some("pod-abc".into()),
+            ..test_config()
+        };
+        let manager = FederationManager::new(config);
+        let status = manager.status();
+        // HA is not enabled (no claim manager started) but pod_id is visible
+        assert!(!status.ha_enabled);
+        assert_eq!(status.pod_id.as_deref(), Some("pod-abc"));
+    }
+
+    #[test]
+    fn ha_status_serialization_omits_null_pod_id() {
+        let status = FederationStatus {
+            running: true,
+            v1_server_active: false,
+            v2_server_active: false,
+            total_peers: 0,
+            connected_peers: 0,
+            peers: vec![],
+            ha_enabled: false,
+            pod_id: None,
+        };
+        let json = serde_json::to_string(&status).expect("serialize");
+        // pod_id should be omitted when None due to skip_serializing_if
+        assert!(!json.contains("pod_id"));
+        assert!(json.contains("\"ha_enabled\":false"));
+    }
+
+    #[test]
+    fn ha_status_serialization_includes_pod_id() {
+        let status = FederationStatus {
+            running: true,
+            v1_server_active: false,
+            v2_server_active: false,
+            total_peers: 0,
+            connected_peers: 0,
+            peers: vec![],
+            ha_enabled: true,
+            pod_id: Some("my-pod".into()),
+        };
+        let json = serde_json::to_string(&status).expect("serialize");
+        assert!(json.contains("\"pod_id\":\"my-pod\""));
+        assert!(json.contains("\"ha_enabled\":true"));
+    }
+
+    #[cfg(feature = "ha")]
+    #[test]
+    fn take_ha_receivers_returns_none_without_start() {
+        let mut manager = FederationManager::new(test_config());
+        let (adopt, lost) = manager.take_ha_receivers();
+        assert!(adopt.is_none());
+        assert!(lost.is_none());
     }
 }

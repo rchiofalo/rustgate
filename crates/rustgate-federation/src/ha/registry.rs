@@ -154,7 +154,7 @@ impl ConnectionRegistry {
         };
 
         let data = serde_json::to_vec(&info).context("failed to serialize connection info")?;
-        let key = format!("{}:{}", self.pod_id, peer_id);
+        let key = format!("{}.{}", self.pod_id, peer_id);
 
         let _ = self
             .kv
@@ -177,7 +177,7 @@ impl ConnectionRegistry {
 
     /// Unregister a federation connection.
     pub async fn unregister(&self, peer_id: &str) -> Result<()> {
-        let key = format!("{}:{}", self.pod_id, peer_id);
+        let key = format!("{}.{}", self.pod_id, peer_id);
 
         let mut registered = self.registered.lock().await;
         let _ = registered.remove(&key);
