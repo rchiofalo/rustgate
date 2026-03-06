@@ -207,6 +207,18 @@ struct Cli {
     #[arg(long, env = "FEDERATION_STORE_PATH")]
     federation_store_path: Option<String>,
 
+    /// Consecutive send failures before tripping a federation peer's circuit breaker.
+    #[arg(
+        long,
+        default_value_t = 5,
+        env = "FEDERATION_CIRCUIT_BREAKER_THRESHOLD"
+    )]
+    federation_circuit_breaker_threshold: u32,
+
+    /// Seconds to wait after a circuit breaker trips before probing a federation peer.
+    #[arg(long, default_value_t = 60, env = "FEDERATION_CIRCUIT_BREAKER_TIMEOUT")]
+    federation_circuit_breaker_timeout: u64,
+
     // ── QoS / rate limiting ──────────────────────────────────────────
     /// Maximum sustained messages per second per connected client (0 = disabled).
     #[arg(long, default_value_t = 0, env = "RUSTGATE_CLIENT_MSG_RATE")]
@@ -533,6 +545,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             key_file: cli.key.clone().into(),
             ca_file: cli.ca.clone().into(),
             store_path: cli.federation_store_path.clone().map(Into::into),
+            circuit_breaker_threshold: cli.federation_circuit_breaker_threshold,
+            circuit_breaker_timeout: std::time::Duration::from_secs(
+                cli.federation_circuit_breaker_timeout,
+            ),
             ..rustgate_federation::config::FederationConfig::default()
         };
 
