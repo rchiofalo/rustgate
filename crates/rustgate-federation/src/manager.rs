@@ -162,6 +162,19 @@ impl FederationManager {
             let on_event_inbound = Arc::clone(&on_inbound);
             let federate_id = self.config.federate_id.clone();
             let on_event: crate::v2::server::OnEvent = Arc::new(move |event, peer_id| {
+                // Check provenance for loops and hop limits
+                let metadata = crate::v2::convert::extract_metadata(&event);
+                if metadata.should_drop(&federate_id) {
+                    warn!(
+                        federate = %federate_id,
+                        peer = %peer_id,
+                        hops = metadata.current_hops,
+                        max_hops = metadata.max_hops,
+                        "dropped inbound V2 server event (loop or hop limit)"
+                    );
+                    return;
+                }
+
                 if event.event.is_some() {
                     match crate::v2::convert::federated_event_to_xml(&event) {
                         Ok(xml) => {
@@ -279,6 +292,19 @@ impl FederationManager {
                     let on_event_inbound = Arc::clone(&on_inbound);
                     let federate_id = self.config.federate_id.clone();
                     let on_event: crate::v2::client::OnEvent = Arc::new(move |event, peer_id| {
+                        // Check provenance for loops and hop limits
+                        let metadata = crate::v2::convert::extract_metadata(&event);
+                        if metadata.should_drop(&federate_id) {
+                            warn!(
+                                federate = %federate_id,
+                                peer = %peer_id,
+                                hops = metadata.current_hops,
+                                max_hops = metadata.max_hops,
+                                "dropped inbound V2 client event (loop or hop limit)"
+                            );
+                            return;
+                        }
+
                         // Try GeoEvent first, then fall back to ContactListEntry
                         if event.event.is_some() {
                             match crate::v2::convert::federated_event_to_xml(&event) {
@@ -405,8 +431,9 @@ impl FederationManager {
                     let event = match &v2_event {
                         Some(e) => e.clone(),
                         None => {
-                            let metadata =
+                            let mut metadata =
                                 crate::provenance::FederationMetadata::new(self.config.max_hops);
+                            metadata.add_hop(&self.config.federate_id, &self.config.federate_id);
                             match crate::v2::convert::xml_to_federated_event(&payload, &metadata) {
                                 Ok(e) => {
                                     v2_event = Some(e.clone());
