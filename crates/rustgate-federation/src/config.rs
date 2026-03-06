@@ -99,6 +99,13 @@ pub struct FederationConfig {
     pub key_file: PathBuf,
     /// TLS CA certificate file for peer verification.
     pub ca_file: PathBuf,
+    /// Directory containing additional trusted CA certificates for federation.
+    ///
+    /// When set, PEM/CRT files in this directory are loaded into a [`TrustStore`]
+    /// and merged with the base `ca_file` for all TLS verification (inbound and
+    /// outbound, V1 and V2). Certificates added to this directory take effect
+    /// on the next server restart.
+    pub trust_store_dir: Option<PathBuf>,
     /// Shared secret for JWT federation authentication.
     /// When set, enables JWT token issuance and validation for federation peers.
     /// mTLS remains required for transport security.
@@ -134,6 +141,7 @@ impl Default for FederationConfig {
             default_group: String::from("__ANON__"),
             store_path: None,
             skip_hostname_verify: false,
+            trust_store_dir: None,
             cert_file: PathBuf::from("server.pem"),
             key_file: PathBuf::from("server-key.pem"),
             ca_file: PathBuf::from("ca.pem"),
