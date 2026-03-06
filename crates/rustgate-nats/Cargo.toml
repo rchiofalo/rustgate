@@ -29,4 +29,4 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
-tempfile = "3"
+rustgate-test-utils = { workspace = true, features = ["nats"] }
