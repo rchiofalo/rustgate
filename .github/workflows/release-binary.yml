@@ -84,6 +84,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: read # required for sbom-action artifact upload
 
     steps:
       - name: Checkout repository
