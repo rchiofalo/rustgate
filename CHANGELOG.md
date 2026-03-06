@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- **CI pipeline** — split single sequential job into 6 parallel jobs (fmt, clippy, test matrix, audit, helm, docker); 12 feature combinations now run concurrently via GitHub Actions matrix strategy
+- **CI pipeline** — 10 parallel jobs: commit-lint, lint, clippy, check-features (cargo-hack powerset), test (nextest), coverage (tarpaulin), fips, audit, helm, docker
 - **Branch protection** — `main` requires all CI status checks to pass before merge
 
 ### Added
