@@ -41,7 +41,10 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Install nightly toolchain
-        run: rustup toolchain install nightly --profile minimal
+        run: |
+          RHOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          rm -rf "$RHOME"/toolchains/nightly-* "$RHOME"/tmp
+          rustup toolchain install nightly --profile minimal
 
       - name: Install cargo-fuzz
         run: cargo +nightly install cargo-fuzz --locked
