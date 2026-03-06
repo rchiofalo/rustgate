@@ -141,7 +141,19 @@ impl TlsConfig {
 pub fn install_fips_provider() -> Result<()> {
     rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
         .map_err(|_| RustgateError::Config("crypto provider already installed".to_string()))?;
-    tracing::info!("FIPS 140-3 crypto provider (aws-lc-rs) installed");
+
+    // Verify the installed provider actually reports FIPS mode.
+    // This catches build misconfigurations where aws-lc-rs was compiled
+    // without its FIPS module.
+    if !is_fips_provider_active() {
+        return Err(RustgateError::Config(
+            "aws-lc-rs provider installed but does not report FIPS mode — \
+             check that aws-lc-fips-sys built correctly"
+                .to_string(),
+        ));
+    }
+
+    tracing::info!("FIPS 140-3 crypto provider (aws-lc-rs) installed and verified");
     Ok(())
 }
 
