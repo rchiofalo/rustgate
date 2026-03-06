@@ -9,26 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- **CI pipeline** — split single sequential job into 6 parallel jobs (fmt, clippy, test matrix, audit, helm, docker); 12 feature combinations now run concurrently via GitHub Actions matrix strategy
-- **Branch protection** — `main` requires all 17 CI status checks to pass before merge
+- **CI pipeline** — 10 parallel jobs: commit-lint, lint, clippy, check-features (cargo-hack powerset), test (nextest), coverage (tarpaulin), fips, audit, helm, docker
+- **Branch protection** — `main` requires all CI status checks to pass before merge
 
 ### Added
 
+- **CRL revocation** — PEM-encoded Certificate Revocation List support via `--crl`; revoked certificates are rejected at the TLS handshake before reaching the application layer
+- **FIPS 140-3 crypto** (feature-gated: `fips`) — aws-lc-rs crypto provider for FIPS-validated TLS, certificate signing (rcgen), and PKCS#12 salt generation; runtime enforcement via `--fips-required`
+- **TLS session resumption disabled** — forces full handshake with certificate verification on every connection, ensuring CRL checks cannot be bypassed via cached sessions
+- **Plaintext input** — TCP (`--tcp-bind`) and UDP (`--udp-bind`) listeners for trusted-network scenarios with configurable default CN and group
+- **Per-client rate limiting** — `--client-message-rate` and `--client-burst` for per-connection message throttling
+- **CoT event archival** — structured JSONL logging of all received events to date-stamped files via `--archive-dir`
+- **Data package expiration** — `--package-max-age-hours` for automatic cleanup of uploaded data packages
 - **Audit logging** — structured event logging for connection lifecycle and federation events
-- **Marti contact API** — `/Marti/api/contacts/all` and `/Marti/api/clientEndPoints` endpoints for TAK client contact discovery
+- **Marti contact API** — `/Marti/api/contacts/all` and `/Marti/api/clientEndPoints` endpoints for client contact discovery
 - **Data package support** — upload, download, and keyword search for data packages via `/Marti/sync/` endpoints
 - **Directional group routing** — group-aware message filtering for federation peers
 - **Fuzz targets** — cargo-fuzz targets for XML stream codec, CoT parser, TAK frame codec, length-prefixed codec, and federation converter
 - **Criterion benchmarks** — throughput benchmarks for CoT parsing, codec encode/decode, and federation XML conversion
 - **Container security scanning** — Trivy vulnerability scanning with SARIF upload in release workflow; cargo-audit in CI
 - **Binary release artifacts** — cross-compiled static binaries for x86_64 and aarch64 linux-musl via GitHub Release
-- **701 tests** — up from 639 in v0.2.0
+- **818 tests** — up from 639 in v0.2.0
 
 ## [0.2.0] - 2026-03-01
 
 ### Added
 
-- **Server-to-server federation** (feature-gated: `federation`) — share situational awareness between independent TAK Server networks via the standard TAK Server Federation protocol
+- **Server-to-server federation** (feature-gated: `federation`) — share situational awareness between independent server networks via the federation protocol
 - **V1 federation protocol** — length-prefixed XML over mTLS for legacy server compatibility, with CoT heartbeat monitoring (30s interval, 90s timeout) and automatic reconnection with exponential backoff
 - **V2 federation protocol** — gRPC FederatedChannel service over mTLS with 5-stream handshake, group exchange, health checks (5s interval, 15s timeout), and bidirectional event streaming
 - **Provenance-based loop detection** — federation messages carry a server chain and hop counter; messages are dropped when a loop is detected or the configurable hop limit (default 10) is exceeded

@@ -1,211 +1,229 @@
 # rustgate
 
-Rust-native secure message router with pluggable protocol support. Built for tactical edge deployment.
+[![CI](https://github.com/rchiofalo/rustgate/actions/workflows/ci.yml/badge.svg)](https://github.com/rchiofalo/rustgate/actions/workflows/ci.yml)
+![Rust 1.93+](https://img.shields.io/badge/rust-1.93%2B-orange.svg)
+![License](https://img.shields.io/badge/license-Proprietary-blue.svg)
+
+Secure mTLS message router in Rust — group-based routing, WebSocket, server federation, NATS scaling, certificate enrollment, CRL and FIPS support. Single binary, edge-ready.
+
+## Table of Contents
+
+- [Why](#why)
+- [Quick Start](#quick-start)
+- [Architecture](#architecture)
+- [Features](#features)
+- [Prerequisites](#prerequisites)
+- [Building](#building)
+- [Running](#running)
+- [Docker](#docker)
+- [Kubernetes](#kubernetes)
+- [Security](#security)
+- [Testing](#testing)
+- [Documentation](#documentation)
+- [Contributing](#contributing)
+- [License](#license)
 
 ## Why
 
-Existing tactical messaging servers are Java monoliths requiring 8GB+ RAM, multiple JVM processes, and complex module stacks. They work in garrison but fall apart at the edge where resources are constrained and reliability matters most. Federation-only alternatives exist but don't handle client connections.
+Existing messaging servers are Java monoliths requiring 8 GB+ RAM, multiple JVM processes, and complex module stacks. They work in fixed infrastructure but fall apart at the edge where resources are constrained and reliability matters most. Federation-only alternatives exist but don't handle client connections.
 
-rustgate is a lightweight alternative that handles mTLS client connections, routes messages by group membership derived from client certificates, and exposes a pluggable protocol interface for future adapters. Pure Rust, single binary, minimal footprint.
+rustgate is a lightweight alternative that handles mTLS client connections, routes messages by group membership derived from client certificates, and exposes a pluggable protocol interface. Pure Rust, single binary, minimal footprint.
+
+## Quick Start
+
+Generate test certificates and run with Docker Compose:
+
+```bash
+# Generate CA
+openssl req -x509 -newkey rsa:4096 -keyout ca-key.pem -out ca.pem \
+  -days 365 -nodes -subj "/CN=rustgate-ca"
+
+# Generate server cert
+openssl req -newkey rsa:4096 -keyout server-key.pem -out server.csr \
+  -nodes -subj "/CN=rustgate-server"
+openssl x509 -req -in server.csr -CA ca.pem -CAkey ca-key.pem \
+  -CAcreateserial -out server.pem -days 365
+
+# Place certs where Docker Compose expects them
+mkdir -p certs
+cp ca.pem certs/ca.crt && cp server.pem certs/server.crt && cp server-key.pem certs/server.key
+
+# Start
+docker compose up -d
+
+# Verify
+curl http://localhost:9090/healthz
+```
+
+For production certificate management see [docs/tls-certificates.md](docs/tls-certificates.md).
 
 ## Architecture
 
 ```
-┌───────────────────────────────────────────────────────────────────────────────┐
-│                                rustgate-server                                │
-│                                    (binary)                                   │
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                                     rustgate-server                                     │
+│                                        (binary)                                         │
 ├──────────────┬──────────────┬──────────────┬──────────────┬──────────────┬──────────────┤
 │  rustgate-   │  rustgate-   │  rustgate-   │  rustgate-   │  rustgate-   │  rustgate-   │
 │  transport   │  websocket   │  nats        │  enrollment  │  proto       │  federation  │
-│  TLS·codec   │  wss://mTLS  │  NATS pubsub │  HTTPS·CSR   │  TAK protobuf│  V1·V2·gRPC  │
-│  router      │  WS sessions │  JetStream   │  Basic Auth  │  XML↔proto   │  peer mgmt   │
+│  TLS·codec   │  wss://mTLS  │  NATS pubsub │  HTTPS·CSR   │  protobuf    │  V1·V2·gRPC  │
+│  router      │  WS sessions │  JetStream   │  Basic Auth  │  XML/proto   │  peer mgmt   │
 ├──────────────┴──────────────┴──────────────┼──────────────┴──────────────┴──────────────┤
-│                rustgate-cot                 │                rustgate-core               │
-│        CoT XML parsing · MessageBuilder     │    Identity · RoutableMessage · framing    │
-└─────────────────────────────────────────────┴────────────────────────────────────────────┘
+│                rustgate-cot                │               rustgate-core                │
+│      CoT XML parsing · MessageBuilder      │    Identity · RoutableMessage · framing    │
+└────────────────────────────────────────────┴────────────────────────────────────────────┘
 ```
 
-**rustgate-core** — Shared types: `Identity` (CN + groups + fingerprint), `RoutableMessage`, `Destination` (Broadcast / Group / Direct), framing strategies.
+| Crate | Purpose |
+|-------|---------|
+| `rustgate-core` | Shared types: Identity, RoutableMessage, Destination, framing strategies |
+| `rustgate-cot` | Cursor on Target XML parsing and message building |
+| `rustgate-transport` | mTLS listener, codec, session management, CRL, FIPS provider, routing engine |
+| `rustgate-websocket` | WebSocket (wss://) listener with mTLS client authentication |
+| `rustgate-nats` | NATS/JetStream bridge for cross-instance message delivery |
+| `rustgate-enrollment` | HTTPS certificate enrollment server (CSR signing, PKCS#12) |
+| `rustgate-proto` | Protobuf message translation (XML ↔ proto) |
+| `rustgate-federation` | Server-to-server federation: V1 (XML), V2 (gRPC), HA, REST API |
+| `rustgate-server` | Binary entry point, CLI, orchestration |
+| `rustgate-test-utils` | Test CA and certificate generation helpers |
 
-**rustgate-cot** — Cursor on Target (CoT) XML parsing and `MessageBuilder` for converting raw CoT payloads into `RoutableMessage` with destination inference, group extraction, and position detection. Shared across transport and websocket layers.
+For detailed architecture documentation see [docs/architecture.md](docs/architecture.md).
 
-**rustgate-transport** — mTLS listener with client certificate verification, X.509 identity extraction (CN → identity, OU → groups, SHA-256 → fingerprint), length-prefixed / XML stream / line-delimited codecs, and a routing engine that delivers messages by broadcast, group, or direct address. Sessions are managed with atomic IDs to prevent stale task eviction on reconnect.
+## Features
 
-**rustgate-websocket** — Optional WebSocket (wss://) listener with mTLS client authentication. `WsListener` binds a TCP socket with SO_REUSEADDR and TCP keepalive, then upgrades connections through TLS → WebSocket. `WsSession` extracts identity from the client certificate. `WebSocketServer` manages the accept loop and session lifecycle — sessions register with the `Router`, replay cached positions, and run split read/write loops with timeout enforcement and bounded channel backpressure. WebSocket and TCP clients are fully interoperable. Feature-gated behind `--features websocket`.
+### Transport & Routing
 
-**rustgate-nats** — Optional NATS bridge for stateless horizontal scaling. Publishes position updates to NATS subjects, subscribes for cross-instance delivery, and replays JetStream history on startup for situational awareness bootstrap. Two-layer echo prevention ensures messages are never re-published to their origin. Feature-gated behind `--features nats`.
+| Feature | Description |
+|---------|-------------|
+| mTLS | Mutual TLS with client certificate authentication |
+| Identity extraction | CN → callsign, OU → groups, SHA-256 → fingerprint |
+| Group routing | Broadcast, group, and direct message delivery |
+| Codecs | Length-prefixed, XML stream, and line-delimited codecs |
+| Position cache | Replay cached positions on client connect |
+| Rate limiting | Per-client message rate and burst controls |
+| Plaintext input | TCP and UDP listeners for trusted-network scenarios |
 
-**rustgate-enrollment** — Optional HTTPS enrollment server for TAK client certificate self-provisioning. Implements the Marti v2 certificate signing protocol: clients authenticate with HTTP Basic Auth, submit a PKCS#10 CSR, and receive a signed client certificate + CA cert in JSON or XML. Server-only TLS (no client cert required). Subject DN is enforced from the authenticated username to prevent impersonation. Feature-gated behind `--features enrollment`.
+### Protocols & Codecs
 
-**rustgate-proto** — Optional TAK protocol buffer translation. Bidirectional conversion between CoT XML and TAK protobuf (prost), with the `TakFrameCodec` for TAK binary framing (0xBF + varint length). Known `<detail>` children (`<contact>`, `<__group>`, `<precisionlocation>`, `<status>`, `<takv>`, `<track>`) map to typed protobuf fields; everything else roundtrips through the `xmlDetail` residual. Translation happens at session edges — XML stays canonical inside the router. Includes TAK protocol negotiation: server advertises `t-x-takp-v`, client can upgrade to protobuf with a TakControl handshake, or stay XML for legacy compatibility. Feature-gated behind `--features proto`. Requires `protoc` at build time.
+| Feature | Description |
+|---------|-------------|
+| WebSocket | wss:// listener with mTLS, interoperable with TCP clients |
+| Protobuf | Bidirectional XML ↔ protobuf translation |
+| Protocol negotiation | Automatic upgrade from XML to protobuf framing |
+| CoT archival | Structured JSONL logging of all received events |
+| Data packages | Upload, download, and search via Marti sync API |
 
-**rustgate-federation** — Optional server-to-server federation for sharing situational awareness between independent TAK Server networks. Supports V1 (length-prefixed XML over mTLS) and V2 (gRPC over mTLS with FederatedChannel service). Includes provenance-based loop detection with configurable hop limits, CoT heartbeat monitoring, automatic reconnection with exponential backoff, dynamic CA trust store for runtime certificate management, persistent peer storage (JSON file or NATS KV), HA mode with distributed claims for multi-pod deployments, REST API for peer CRUD and certificate management, and Prometheus metrics. Feature-gated behind `--features federation`. Requires `protoc` at build time.
+### Security
 
-**rustgate-server** — Binary entry point. Accepts mTLS connections, spawns per-session read/write tasks, routes all traffic through the shared `Router`. Optionally accepts WebSocket clients when `--websocket-bind` is set. Optionally bridges to NATS when `--nats-url` is provided. Optionally runs enrollment when `--enrollment-bind` is set. Optionally federates with remote servers when `--federation-v1-bind` is set. Includes Prometheus metrics and health endpoints (feature-gated behind `--features metrics`), graceful shutdown with connection draining on SIGTERM, and configurable connection limits.
+| Feature | Description |
+|---------|-------------|
+| CRL revocation | PEM-encoded CRL loaded via `--crl`, enforced at TLS handshake |
+| FIPS 140-3 | aws-lc-rs crypto provider via `--features fips` ([details](docs/fips.md)) |
+| Subject DN enforcement | Enrollment certs carry the authenticated username — prevents impersonation |
+| No unsafe code | `unsafe_code = "forbid"` workspace-wide |
+| Container hardening | Non-root UID, read-only filesystem, STOPSIGNAL SIGTERM |
 
-## Status
+### Federation & Scaling
 
-Core transport and routing are functional. The server accepts mTLS connections, extracts identity from client certificates, and routes messages between authenticated sessions.
+| Feature | Description |
+|---------|-------------|
+| Federation V1 | Length-prefixed XML over mTLS |
+| Federation V2 | gRPC over mTLS with FederatedChannel service |
+| Loop detection | Provenance-based with configurable hop limits |
+| HA mode | NATS KV distributed claims for multi-pod peer ownership |
+| NATS bridge | Publish/subscribe for stateless horizontal scaling with JetStream replay |
+| REST API | Peer CRUD and certificate management endpoints |
 
-**What works:**
-- mTLS handshake with client certificate authentication
-- Identity extraction from X.509 (CN, OU groups, SHA-256 fingerprint)
-- Broadcast, group, and direct message routing
-- Session lifecycle with reconnect handling
-- Length-prefixed codec with overflow protection (16MB max frame)
-- XML stream codec for TAK client connections
-- Cursor on Target (CoT) message parsing
-- Position cache with replay on connect
-- NATS bridge for cross-instance message delivery (feature-gated)
-- JetStream history replay for situational awareness bootstrap
-- Two-layer echo prevention (protocol tag + instance header)
-- Certificate enrollment (Marti v2 CSR signing, feature-gated)
-- Subject DN enforcement from authenticated username (anti-impersonation)
-- TLS handshake + HTTP request timeouts on enrollment server
-- Streaming body size limits (pre-read rejection, not post-buffer)
-- TAK protobuf translation (XML ↔ protobuf, feature-gated)
-- TAK binary framing codec (0xBF + varint, 16MB max frame)
-- Full CoT XML parser with typed detail field extraction
-- ISO 8601 ↔ millis timestamp conversion (hand-rolled, no chrono dep)
-- xmlDetail residual preservation for unknown detail elements
-- TAK protocol negotiation (server advertises protobuf, client opts in or stays XML)
-- NATS integration tests with embedded nats-server (publish/subscribe, echo prevention, JetStream replay, cross-instance delivery)
-- Prometheus metrics: connection lifecycle, message routing, NATS bridge, protocol negotiation (feature-gated)
-- Health endpoints: `/healthz` (liveness), `/readyz` (readiness), `/metrics` (Prometheus text format)
-- Hardened HTTP metrics server: connection limit (128), per-connection timeout (15s), header read timeout (5s)
-- Graceful shutdown: SIGTERM + SIGINT handling, readiness probe goes 503, connection draining with 110s timeout
-- Environment variable configuration for all CLI flags (K8s-native)
-- Configurable max connections (`--max-connections` / `RUSTGATE_MAX_CONNECTIONS`)
-- Server-to-server federation with V1 (length-prefixed XML) and V2 (gRPC) protocol support (feature-gated)
-- Provenance-based loop detection and configurable hop limits
-- Automatic peer reconnection with exponential backoff
-- CoT heartbeat monitoring (V1) and gRPC health checks (V2)
-- Dynamic CA trust store for runtime certificate management
-- Persistent peer storage (JSON file or NATS KV for multi-pod)
-- HA mode with NATS KV distributed claims for outbound peer ownership
-- Federation REST API for peer CRUD and certificate management
-- Federation Prometheus metrics: connections, messages, errors, heartbeats
-- NATS ↔ federation bridge with echo prevention
-- WebSocket (wss://) listener with mTLS client authentication
-- WebSocket session lifecycle with router integration (register, replay, route, unregister)
-- WebSocket read/write timeout enforcement and bounded channel backpressure
-- WebSocket + TCP client interoperability (same router, same groups)
-- Audit logging for connection and federation events
-- Marti contact API and data package upload/download/search
-- Fuzz targets for XML codec, CoT parser, TAK frame codec, length-prefixed codec, and federation converter
-- Criterion benchmarks for CoT parsing, codec throughput, and federation conversion
-- Helm chart with Pod Security Standards (restricted), PDB, HPA, startup/liveness/readiness probes
-- Multi-stage Dockerfile with OCI labels, HEALTHCHECK, STOPSIGNAL SIGTERM
-- jemalloc allocator for production builds (avoids musl malloc contention, feature-gated)
+### Operations
 
-**What's next:**
-- Real TAK client compatibility testing (ATAK/iTAK/WinTAK)
+| Feature | Description |
+|---------|-------------|
+| Prometheus metrics | Connection lifecycle, message routing, NATS, federation |
+| Health endpoints | `/healthz` (liveness), `/readyz` (readiness) |
+| Graceful shutdown | SIGTERM handling, readiness 503, connection draining |
+| Helm chart | Pod Security Standards, PDB, HPA, probes, NetworkPolicy |
+| Docker Compose | Local development stack with NATS and JetStream |
+| jemalloc | Optional allocator for musl/Alpine production builds |
+
+## Prerequisites
+
+| Dependency | Required | Notes |
+|------------|----------|-------|
+| Rust 1.93+ | Yes | Pinned in `rust-toolchain.toml` (edition 2024) |
+| Rust nightly | Yes | For `cargo +nightly fmt` (CI enforces nightly formatting) |
+| protoc | For `proto` / `federation` features | Protocol Buffers compiler |
+| Go 1.20+, cmake | For `fips` feature | Required by aws-lc-rs build system |
+| nats-server | For NATS integration tests | Install from [nats.io](https://nats.io/download/) |
+
+Optional tooling:
+
+| Tool | Purpose |
+|------|---------|
+| [cargo-nextest](https://nexte.st/) | CI test runner |
+| [cargo-hack](https://github.com/taiki-e/cargo-hack) | Feature powerset checking |
+| [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) | License and advisory auditing |
+| [cargo-machete](https://github.com/bnjbvr/cargo-machete) | Unused dependency detection |
+| Helm | Chart linting |
 
 ## Building
 
-```
+```bash
+# Default (core transport + routing)
 cargo build --release
-```
 
-With NATS bridge support:
-```
-cargo build --release --features nats
-```
+# With individual features
+cargo build --release --features nats           # NATS bridge
+cargo build --release --features enrollment     # Certificate enrollment
+cargo build --release --features proto          # Protobuf translation (needs protoc)
+cargo build --release --features federation     # Server federation (needs protoc)
+cargo build --release --features websocket      # WebSocket listener
+cargo build --release --features metrics        # Prometheus + health endpoints
+cargo build --release --features jemalloc       # jemalloc allocator (musl)
+cargo build --release --features fips           # FIPS 140-3 crypto (needs Go + cmake)
 
-With enrollment support:
-```
-cargo build --release --features enrollment
-```
-
-With TAK protobuf support (requires `protoc`):
-```
-cargo build --release --features proto
-```
-
-With Prometheus metrics and health endpoints:
-```
-cargo build --release --features metrics
-```
-
-With WebSocket support:
-```
-cargo build --release --features websocket
-```
-
-With federation support (requires `protoc`):
-```
-cargo build --release --features federation
-```
-
-With jemalloc (recommended for Alpine/musl production builds):
-```
-cargo build --release --features jemalloc
-```
-
-All optional features:
-```
+# All features
 cargo build --release --all-features
 ```
 
-Requires Rust 1.88+ (edition 2024).
+### Feature Flags
+
+| Feature | Purpose | Extra build deps |
+|---------|---------|-----------------|
+| `nats` | NATS/JetStream bridge | — |
+| `enrollment` | PKCS#12 enrollment server | — |
+| `proto` | Protobuf message support | `protoc` |
+| `federation` | Server-to-server federation | `protoc` |
+| `federation-ha` | HA federation with JWT | `protoc` |
+| `websocket` | WebSocket transport | — |
+| `metrics` | Prometheus metrics | — |
+| `full-detail` | Extended CoT parsing | — |
+| `fips` | FIPS 140-3 crypto (aws-lc-rs) | Go 1.20+, cmake |
+| `jemalloc` | jemalloc allocator | — |
 
 ## Running
 
-```
+Minimal:
+
+```bash
 rustgate --cert server.pem --key server-key.pem --ca ca.pem
 ```
 
-With NATS bridge (requires `--features nats`):
-```
-rustgate --cert server.pem --key server-key.pem --ca ca.pem \
-    --nats-url nats://nats:4222
+Full setup:
+
+```bash
+rustgate \
+  --cert server.pem --key server-key.pem --ca ca.pem \
+  --crl revoked.pem --fips-required \
+  --websocket-bind 0.0.0.0:8443 \
+  --nats-url nats://localhost:4222 \
+  --metrics-bind 0.0.0.0:9090 \
+  --federation-v1-bind 0.0.0.0:9000 \
+  --federation-v2-bind 0.0.0.0:9001 \
+  --framing tak-negotiate
 ```
 
-With enrollment (requires `--features enrollment`):
-```
-rustgate --cert server.pem --key server-key.pem --ca ca.pem \
-    --ca-key ca-key.pem \
-    --enrollment-bind 0.0.0.0:8446 \
-    --enrollment-user admin --enrollment-password changeme
-```
-
-With TAK protobuf framing (requires `--features proto`):
-```
-rustgate --cert server.pem --key server-key.pem --ca ca.pem \
-    --framing tak-protobuf --encoding tak-protobuf
-```
-
-With TAK protocol negotiation (recommended for real TAK clients, requires `--features proto`):
-```
-rustgate --cert server.pem --key server-key.pem --ca ca.pem \
-    --framing tak-negotiate
-```
-
-With WebSocket listener (requires `--features websocket`):
-```
-rustgate --cert server.pem --key server-key.pem --ca ca.pem \
-    --websocket-bind 0.0.0.0:8443
-```
-
-With metrics and health endpoints (requires `--features metrics`):
-```
-rustgate --cert server.pem --key server-key.pem --ca ca.pem \
-    --metrics-bind 0.0.0.0:9090
-```
-
-With federation (requires `--features federation`):
-```
-rustgate --cert server.pem --key server-key.pem --ca ca.pem \
-    --federation-v1-bind 0.0.0.0:9000
-```
-
-With federation and outbound peers from a JSON config file:
-```
-rustgate --cert server.pem --key server-key.pem --ca ca.pem \
-    --federation-v1-bind 0.0.0.0:9000 \
-    --federation-peers-file peers.json \
-    --federation-id my-server
-```
+<details>
+<summary>All configuration flags</summary>
 
 All flags support environment variables (CLI takes precedence):
 
@@ -215,9 +233,15 @@ All flags support environment variables (CLI takes precedence):
 | `--cert` | `RUSTGATE_CERT` | — |
 | `--key` | `RUSTGATE_KEY` | — |
 | `--ca` | `RUSTGATE_CA` | — |
+| `--crl` | `RUSTGATE_CRL` | — |
+| `--fips-required` | `RUSTGATE_FIPS_REQUIRED` | `false` |
 | `--framing` | `RUSTGATE_FRAMING` | `xml` |
 | `--encoding` | `RUSTGATE_ENCODING` | `raw` |
 | `--max-connections` | `RUSTGATE_MAX_CONNECTIONS` | `1024` |
+| `--tcp-bind` | `RUSTGATE_TCP_BIND` | — |
+| `--udp-bind` | `RUSTGATE_UDP_BIND` | — |
+| `--plaintext-cn` | `RUSTGATE_PLAINTEXT_CN` | `anonymous` |
+| `--plaintext-group` | `RUSTGATE_PLAINTEXT_GROUP` | `__plaintext__` |
 | `--metrics-bind` | `METRICS_BIND` | — |
 | `--nats-url` | `NATS_URL` | — |
 | `--nats-credentials` | `NATS_CREDENTIALS` | — |
@@ -227,51 +251,99 @@ All flags support environment variables (CLI takes precedence):
 | `--enrollment-user` | `ENROLLMENT_USER` | — |
 | `--enrollment-password` | `ENROLLMENT_PASSWORD` | — |
 | `--ca-organization` | `RUSTGATE_CA_ORG` | `rustgate` |
+| `--data-package-dir` | `DATA_PACKAGE_DIR` | — |
 | `--federation-v1-bind` | `FEDERATION_V1_BIND` | — |
+| `--federation-v2-bind` | `FEDERATION_V2_BIND` | — |
 | `--federation-id` | `FEDERATION_ID` | `rustgate-federation-1` |
 | `--federation-peers-file` | `FEDERATION_PEERS_FILE` | — |
 | `--federation-skip-hostname-verify` | `FEDERATION_SKIP_HOSTNAME_VERIFY` | `false` |
 | `--federation-max-hops` | `FEDERATION_MAX_HOPS` | `10` |
 | `--federation-store-path` | `FEDERATION_STORE_PATH` | — |
+| `--client-message-rate` | `RUSTGATE_CLIENT_MSG_RATE` | `0` (disabled) |
+| `--client-burst` | `RUSTGATE_CLIENT_BURST` | `200` |
+| `--archive-dir` | `RUSTGATE_ARCHIVE_DIR` | — |
+| `--package-max-age-hours` | `RUSTGATE_PACKAGE_MAX_AGE_HOURS` | `0` (no expiration) |
+
+</details>
 
 ## Docker
 
-```
-docker compose up
+```bash
+docker compose up -d
 ```
 
-The Dockerfile builds all features (including jemalloc) and runs as UID 10001 with a read-only root filesystem. Health is checked via the `/healthz` endpoint on port 9090.
+This starts NATS with JetStream, a one-shot stream setup container, and rustgate on port 4433 with metrics on 9090.
+
+The Dockerfile builds all features (including jemalloc) in a multi-stage Alpine build. The final image runs as UID 10001 with a read-only root filesystem. Health is checked via `/healthz` on port 9090.
+
+To build the image standalone:
+
+```bash
+docker build -t rustgate .
+```
 
 ## Kubernetes
 
 A Helm chart is provided in `helm/`:
 
-```
+```bash
 helm install rustgate helm/ --set tls.secretName=my-tls-secret
 ```
 
-The chart includes:
-- Deployment with Pod Security Standards (restricted profile)
-- Startup, liveness, and readiness probes via the metrics HTTP server
-- PodDisruptionBudget (when replicas > 1 or HPA is enabled)
-- HorizontalPodAutoscaler (opt-in via `autoscaling.enabled: true`)
-- Pre-stop hook (5s sleep) for LB drain before SIGTERM
-- `terminationGracePeriodSeconds: 120` with 110s drain timeout
-- Optional federation support (`federation.enabled: true`) with peer config via Secret or values
+The chart includes Pod Security Standards (restricted profile), startup/liveness/readiness probes, PodDisruptionBudget, HorizontalPodAutoscaler, graceful shutdown with connection draining, optional federation, and NetworkPolicy.
 
-TLS certificates must be provided as a Kubernetes Secret named by `tls.secretName` (default: `rustgate-tls`) containing `server.crt`, `server.key`, and `ca.crt`.
+For full deployment documentation see [docs/deployment.md](docs/deployment.md).
 
-**Helm defaults vs CLI defaults:** The Helm chart defaults to `framing: tak-negotiate` and `encoding: tak-protobuf`, optimized for production TAK client deployments. The CLI defaults to `framing: xml` and `encoding: raw` for general-purpose use and testing. Override in Helm with `--set framing=xml,encoding=raw` if needed.
+## Security
+
+- **mTLS everywhere** — all client and federation connections require mutual TLS with certificate verification
+- **CRL revocation** — revoked certificates are rejected at the TLS handshake via `--crl`
+- **FIPS 140-3** — optional aws-lc-rs crypto provider for FIPS-validated TLS ([details](docs/fips.md))
+- **No unsafe code** — `unsafe_code = "forbid"` enforced workspace-wide
+- **No panics** — `clippy::panic = "deny"` and `clippy::unwrap_used = "deny"` in production code
+- **Subject DN enforcement** — enrollment certificates carry the authenticated username to prevent impersonation
+- **Container hardening** — non-root UID (10001), read-only filesystem, STOPSIGNAL SIGTERM
+- **TLS session resumption disabled** — forces full handshake with CRL check on every connection
+
+For security policy and vulnerability reporting see [SECURITY.md](SECURITY.md).
 
 ## Testing
 
-```
-cargo test
+```bash
+cargo nextest run                              # All tests (default features)
+cargo nextest run --features fips              # FIPS-gated tests
+cargo nextest run -p rustgate-nats --test integration  # NATS integration (needs nats-server)
 ```
 
-722 tests covering mTLS handshake, identity extraction, broadcast/group/direct routing, cross-group message rejection, position cache group scoping, session lifecycle, codec edge cases, frame size limits, XML stream codec (depth tracking, CDATA, self-closing tags, partial frames), line-delimited codec, NATS wire format serialization, subject sanitization, group extraction, echo prevention, CSR signing round-trips, CSR SAN stripping, subject DN enforcement, Basic Auth validation, response formatting, XML/JSON enrollment responses, enrollment HTTP integration (TLS handshake, content negotiation, auth rejection, body size limits), varint encode/decode, TAK frame codec round-trips, ISO 8601 timestamp conversion, full CoT XML parsing, XML↔protobuf bidirectional conversion with detail field preservation, TAK protocol negotiation message builders/validators, Prometheus metrics registration and HTTP serving, CLI environment variable configuration, federation provenance and loop detection, CoT heartbeat generation and detection, federation config and peer serialization, federate store persistence, federation V1/V2 protocol handling, gRPC FederatedChannel service, trust store certificate management, HA claim acquisition and release, connection registry, REST API endpoints, federation metrics, audit logging, Marti contact API, data package upload/download/search, directional group routing, WebSocket mTLS handshake and identity extraction, WebSocket rejection of untrusted and expired client certificates, WebSocket session routing through the message router, WebSocket no-self-echo enforcement, WebSocket cross-group message isolation, WebSocket disconnect and close-frame session cleanup, WebSocket connection limit enforcement, WebSocket position cache replay for late joiners, WebSocket text and binary frame handling, WebSocket CotEncoder path, and WebSocket NATS/federation callback invocation. Unit tests use ephemeral certificates generated at runtime — no fixture files.
+| Crate | Test files | Covers |
+|-------|-----------|--------|
+| `rustgate-transport` | `tls_listener`, `e2e_routing`, `encoder`, `crl`, `fips` | mTLS, routing, codecs, CRL, FIPS |
+| `rustgate-cot` | `parser` | CoT XML parsing |
+| `rustgate-enrollment` | `server_integration` | PKCS#12 enrollment, CSR signing |
+| `rustgate-federation` | `v2_integration` | Federation V2 protocol |
+| `rustgate-nats` | `integration` | NATS bridge, echo prevention, JetStream replay |
+| `rustgate-websocket` | `ws_listener`, `ws_server` | WebSocket mTLS, session routing |
+| `rustgate-proto` | unit tests | XML ↔ protobuf conversion |
 
-NATS integration tests (`cargo test -p rustgate-nats --test integration`) spin up a real `nats-server` subprocess with JetStream. Covers publish→subscribe round-trip, dual-layer echo prevention, cross-instance delivery, JetStream SA replay with LastPerSubject dedup, replay count limits, oversized payload rejection, group preservation, zero-position filtering, and wire format fidelity. Requires `nats-server` on PATH.
+All tests use ephemeral certificates generated at runtime via `rustgate-test-utils` — no fixture files.
+
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [Architecture](docs/architecture.md) | System design and crate responsibilities |
+| [TLS Certificates](docs/tls-certificates.md) | Certificate requirements, generation, and management |
+| [Deployment](docs/deployment.md) | Binary, Docker Compose, and Kubernetes deployment |
+| [FIPS 140-3](docs/fips.md) | FIPS crypto provider setup and known limitations |
+| [Configuration](docs/configuration.md) | All CLI flags, env vars, and runtime options |
+| [Runbooks](docs/runbooks/) | Operational runbooks for federation, memory, NATS |
+| [CONTRIBUTING](CONTRIBUTING.md) | Build prerequisites, code quality, and PR guidelines |
+| [CHANGELOG](CHANGELOG.md) | Release history in Keep a Changelog format |
+| [SECURITY](SECURITY.md) | Security policy and vulnerability reporting |
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for prerequisites, building, testing, code quality standards, and pull request guidelines.
 
 ## License
 

@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- **Rust 1.88+** — install via [rustup](https://rustup.rs/). The pinned toolchain is defined in `rust-toolchain.toml`.
+- **Rust 1.93+** — install via [rustup](https://rustup.rs/). The pinned toolchain is defined in `rust-toolchain.toml`.
 - **protoc** — Protocol Buffers compiler, required for the `proto` feature. Install via your package manager (`apt install protobuf-compiler`, `brew install protobuf`, etc.).
 - **nats-server** — required to run NATS integration tests. Install from [nats.io](https://nats.io/download/) or via `go install github.com/nats-io/nats-server/v2@latest`.
 - **cargo-deny** — for license and advisory auditing. Install with `cargo install cargo-deny --locked`.
@@ -43,13 +43,17 @@ cargo test -p rustgate-nats --test integration
 
 ## Code Quality
 
-CI runs as parallel jobs with a matrix strategy across all feature combinations. All checks must pass before merging to `main` (enforced via branch protection):
+CI runs as parallel jobs. All checks must pass before merging to `main` (enforced via branch protection):
 
 | Job | What it checks |
 |-----|----------------|
-| `fmt` | `cargo fmt --all -- --check` |
-| `clippy` | `cargo clippy --all-features --all-targets` |
-| `test` (x12) | `cargo test` across 12 feature combos (default, nats, enrollment, proto, metrics, federation, and 6 pairwise combinations) |
+| `commit-lint` | PR title follows Conventional Commits format |
+| `lint` | `cargo +nightly fmt --check` + `cargo machete` |
+| `clippy` | `cargo clippy` with all features + `cargo doc` |
+| `check-features` | `cargo hack` feature powerset (depth 2, excludes fips/jemalloc) |
+| `test` | `cargo nextest run` with all features (except fips/jemalloc) + doc tests |
+| `coverage` | `cargo tarpaulin` code coverage |
+| `fips` | Clippy, build, and tests with `--features fips` |
 | `audit` | `cargo deny check` + `cargo audit` |
 | `helm` | `helm lint helm/` |
 | `docker` | Dockerfile build validation |
@@ -86,11 +90,13 @@ The workspace is organized as independent crates under `crates/`:
 | Crate | Purpose |
 |-------|---------|
 | `rustgate-core` | Shared types: Identity, RoutableMessage, FramingStrategy |
-| `rustgate-transport` | mTLS listener, codec, session management, routing engine |
 | `rustgate-cot` | Cursor on Target XML parsing |
-| `rustgate-proto` | TAK protobuf translation (XML ↔ proto) |
+| `rustgate-transport` | mTLS listener, codec, CRL, FIPS provider, session management, routing engine |
+| `rustgate-websocket` | WebSocket (wss://) listener with mTLS client authentication |
 | `rustgate-nats` | NATS bridge for cross-instance messaging |
-| `rustgate-enrollment` | HTTPS certificate enrollment server |
+| `rustgate-enrollment` | HTTPS certificate enrollment server (CSR signing, PKCS#12) |
+| `rustgate-proto` | Protobuf translation (XML / proto) |
+| `rustgate-federation` | Server-to-server federation: V1 (XML), V2 (gRPC), HA, REST API |
 | `rustgate-server` | Binary entry point, wires everything together |
 | `rustgate-test-utils` | Shared test helpers (CA and cert generation) |
 
@@ -122,6 +128,6 @@ chore: miscellaneous maintenance
 
 - Branch from `main`
 - Keep PRs focused — one logical change per PR
-- All 17 CI checks must pass before merge (branch protection enforced)
+- All CI checks must pass before merge (branch protection enforced)
 - Update the README if the change affects user-facing behavior
 - Add or update tests for any new functionality

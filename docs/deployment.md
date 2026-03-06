@@ -19,7 +19,7 @@ rustgate supports three deployment modes: standalone binary, Docker Compose, and
 
 ### Requirements
 
-- Rust 1.88+ (to build from source) or a pre-built release binary
+- Rust 1.93+ (to build from source) or a pre-built release binary
 - TLS certificates (server cert, private key, CA cert)
 - `protoc` (only if building with `--features proto` or `--features federation`)
 - `nats-server` (optional, for NATS bridge)
@@ -94,7 +94,7 @@ curl http://localhost:9090/metrics
 
 | Port | Service | Feature Gate |
 |------|---------|-------------|
-| 4433 | TAK client connections (mTLS) | always |
+| 4433 | Client connections (mTLS) | always |
 | 8443 | WebSocket connections (wss:// mTLS) | `websocket` |
 | 8446 | Certificate enrollment (HTTPS) | `enrollment` |
 | 9000 | Federation V1 (mTLS) | `federation` |

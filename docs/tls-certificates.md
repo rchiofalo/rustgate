@@ -15,7 +15,7 @@ The server certificate is presented to clients during the TLS handshake:
 
 ### Client Certificates
 
-Client certificates authenticate TAK clients and determine their identity and group membership:
+Client certificates authenticate connecting clients and determine their identity and group membership:
 
 - **Format:** PEM-encoded X.509
 - **Signed by:** The same CA configured with `--ca`
@@ -71,7 +71,7 @@ For production, use a proper PKI or the built-in enrollment server. Key consider
 
 ## Certificate Enrollment
 
-rustgate includes a built-in certificate enrollment server (feature-gated: `enrollment`) that implements the Marti v2 certificate signing protocol. TAK clients (ATAK, iTAK, WinTAK) can self-provision their certificates.
+rustgate includes a built-in certificate enrollment server (feature-gated: `enrollment`) that implements the Marti v2 certificate signing protocol. Compatible clients can self-provision their certificates.
 
 ### Enable Enrollment
 
