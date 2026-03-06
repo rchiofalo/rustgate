@@ -693,6 +693,8 @@ mod tests {
                         last_error: None,
                         connected_duration_secs: Some(120),
                         reconnect_count: 0,
+                        circuit_state: crate::peer::CircuitState::Closed,
+                        circuit_trips: 0,
                     })
                 } else {
                     None

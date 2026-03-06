@@ -1,8 +1,52 @@
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
 use crate::config::PeerConfig;
+
+/// Circuit breaker state for a federation peer.
+///
+/// Tracks whether a peer is healthy enough to receive messages:
+/// - `Closed` — healthy, messages flow normally.
+/// - `Open` — tripped after consecutive failures, messages are skipped.
+/// - `HalfOpen` — recovery probe: one message is allowed through to test the peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CircuitState {
+    Closed = 0,
+    Open = 1,
+    HalfOpen = 2,
+}
+
+impl CircuitState {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => CircuitState::Closed,
+            1 => CircuitState::Open,
+            2 => CircuitState::HalfOpen,
+            _ => CircuitState::Closed,
+        }
+    }
+}
+
+impl std::fmt::Display for CircuitState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CircuitState::Closed => write!(f, "closed"),
+            CircuitState::Open => write!(f, "open"),
+            CircuitState::HalfOpen => write!(f, "half_open"),
+        }
+    }
+}
+
+impl serde::Serialize for CircuitState {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
 
 /// Connection state for a federation peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,9 +104,27 @@ pub struct PeerHandle {
     connected_at: Mutex<Option<Instant>>,
     /// Number of reconnection attempts since last successful connection.
     reconnect_count: AtomicU64,
+    // ── Circuit breaker ──────────────────────────────────────────────
+    /// Current circuit breaker state.
+    circuit: AtomicU8,
+    /// Consecutive send failures (resets on success).
+    consecutive_failures: AtomicU32,
+    /// Number of consecutive failures before the circuit opens.
+    failure_threshold: u32,
+    /// Seconds to wait before transitioning Open → HalfOpen.
+    recovery_timeout_secs: u64,
+    /// When the circuit last tripped open.
+    circuit_opened_at: Mutex<Option<Instant>>,
+    /// Lifetime count of circuit-breaker trips (for observability).
+    circuit_trips: AtomicU64,
 }
 
 impl PeerHandle {
+    /// Default failure threshold when not specified.
+    const DEFAULT_FAILURE_THRESHOLD: u32 = 5;
+    /// Default recovery timeout (seconds) when not specified.
+    const DEFAULT_RECOVERY_TIMEOUT_SECS: u64 = 60;
+
     /// Create a new peer handle from configuration.
     pub fn new(config: PeerConfig) -> Self {
         let id = config.id.clone();
@@ -76,7 +138,25 @@ impl PeerHandle {
             last_error: Mutex::new(None),
             connected_at: Mutex::new(None),
             reconnect_count: AtomicU64::new(0),
+            circuit: AtomicU8::new(CircuitState::Closed as u8),
+            consecutive_failures: AtomicU32::new(0),
+            failure_threshold: Self::DEFAULT_FAILURE_THRESHOLD,
+            recovery_timeout_secs: Self::DEFAULT_RECOVERY_TIMEOUT_SECS,
+            circuit_opened_at: Mutex::new(None),
+            circuit_trips: AtomicU64::new(0),
         }
+    }
+
+    /// Create a new peer handle with explicit circuit breaker parameters.
+    pub fn with_circuit_breaker(
+        config: PeerConfig,
+        failure_threshold: u32,
+        recovery_timeout_secs: u64,
+    ) -> Self {
+        let mut handle = Self::new(config);
+        handle.failure_threshold = failure_threshold;
+        handle.recovery_timeout_secs = recovery_timeout_secs;
+        handle
     }
 
     /// Get the current connection state.
@@ -169,6 +249,84 @@ impl PeerHandle {
         let _ = self.messages_recv.fetch_add(1, Ordering::Relaxed);
     }
 
+    // ── Circuit breaker ──────────────────────────────────────────────
+
+    /// Get the current circuit breaker state, applying time-based transitions.
+    ///
+    /// If the circuit is `Open` and the recovery timeout has elapsed, it
+    /// automatically transitions to `HalfOpen` to allow a probe message.
+    pub fn circuit_state(&self) -> CircuitState {
+        let state = CircuitState::from_u8(self.circuit.load(Ordering::Acquire));
+        if state == CircuitState::Open
+            && let Ok(guard) = self.circuit_opened_at.lock()
+            && let Some(opened_at) = *guard
+            && opened_at.elapsed().as_secs() >= self.recovery_timeout_secs
+        {
+            self.circuit
+                .store(CircuitState::HalfOpen as u8, Ordering::Release);
+            return CircuitState::HalfOpen;
+        }
+        state
+    }
+
+    /// Check if the peer is available for sending (connected and circuit not open).
+    pub fn is_available(&self) -> bool {
+        self.is_connected() && self.circuit_state() != CircuitState::Open
+    }
+
+    /// Record a successful send, resetting the circuit breaker.
+    ///
+    /// If the circuit was `HalfOpen`, it transitions back to `Closed`.
+    /// Returns `true` if the circuit was recovered from `HalfOpen`.
+    pub fn record_success(&self) -> bool {
+        self.consecutive_failures.store(0, Ordering::Relaxed);
+        let prev = CircuitState::from_u8(self.circuit.load(Ordering::Acquire));
+        if prev == CircuitState::HalfOpen {
+            self.circuit
+                .store(CircuitState::Closed as u8, Ordering::Release);
+            if let Ok(mut guard) = self.circuit_opened_at.lock() {
+                *guard = None;
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Record a send failure, potentially tripping the circuit breaker.
+    ///
+    /// Returns `true` if this failure caused the circuit to open.
+    pub fn record_failure(&self) -> bool {
+        let prev_state = CircuitState::from_u8(self.circuit.load(Ordering::Acquire));
+
+        // HalfOpen probe failed — immediately reopen
+        if prev_state == CircuitState::HalfOpen {
+            self.circuit
+                .store(CircuitState::Open as u8, Ordering::Release);
+            if let Ok(mut guard) = self.circuit_opened_at.lock() {
+                *guard = Some(Instant::now());
+            }
+            let _ = self.circuit_trips.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+
+        let failures = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        if failures >= self.failure_threshold && prev_state == CircuitState::Closed {
+            self.circuit
+                .store(CircuitState::Open as u8, Ordering::Release);
+            if let Ok(mut guard) = self.circuit_opened_at.lock() {
+                *guard = Some(Instant::now());
+            }
+            let _ = self.circuit_trips.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+
+    /// Get the total number of times the circuit breaker has tripped.
+    pub fn circuit_trip_count(&self) -> u64 {
+        self.circuit_trips.load(Ordering::Relaxed)
+    }
+
     /// Get a snapshot of this peer's status for reporting.
     pub fn status(&self) -> PeerStatus {
         PeerStatus {
@@ -185,6 +343,8 @@ impl PeerHandle {
             last_error: self.last_error(),
             connected_duration_secs: self.connected_duration().map(|d| d.as_secs()),
             reconnect_count: self.reconnect_count(),
+            circuit_state: self.circuit_state(),
+            circuit_trips: self.circuit_trip_count(),
         }
     }
 }
@@ -207,6 +367,8 @@ pub struct PeerStatus {
     pub last_error: Option<String>,
     pub connected_duration_secs: Option<u64>,
     pub reconnect_count: u64,
+    pub circuit_state: CircuitState,
+    pub circuit_trips: u64,
 }
 
 impl serde::Serialize for PeerState {
@@ -467,6 +629,8 @@ mod tests {
             last_error: None,
             connected_duration_secs: None,
             reconnect_count: 0,
+            circuit_state: CircuitState::Closed,
+            circuit_trips: 0,
         };
         let json = serde_json::to_string(&status).expect("serialize");
         assert!(json.contains("\"connected\""));
@@ -545,5 +709,175 @@ mod tests {
         assert_eq!(handle.increment_reconnect_count(), 4);
         assert_eq!(handle.increment_reconnect_count(), 5);
         assert_eq!(handle.reconnect_count(), 5);
+    }
+
+    // ── Circuit breaker tests ────────────────────────────────────────
+
+    #[test]
+    fn new_peer_circuit_starts_closed() {
+        let handle = PeerHandle::new(test_config());
+        assert_eq!(handle.circuit_state(), CircuitState::Closed);
+        assert_eq!(handle.circuit_trip_count(), 0);
+    }
+
+    #[test]
+    fn circuit_stays_closed_below_threshold() {
+        let handle = PeerHandle::with_circuit_breaker(test_config(), 5, 60);
+        handle.mark_connected();
+
+        for _ in 0..4 {
+            assert!(!handle.record_failure());
+        }
+        assert_eq!(handle.circuit_state(), CircuitState::Closed);
+        assert!(handle.is_available());
+    }
+
+    #[test]
+    fn circuit_opens_at_threshold() {
+        let handle = PeerHandle::with_circuit_breaker(test_config(), 3, 60);
+        handle.mark_connected();
+
+        assert!(!handle.record_failure());
+        assert!(!handle.record_failure());
+        assert!(handle.record_failure()); // 3rd failure trips it
+        assert_eq!(handle.circuit_state(), CircuitState::Open);
+        assert!(!handle.is_available());
+        assert_eq!(handle.circuit_trip_count(), 1);
+    }
+
+    #[test]
+    fn open_circuit_transitions_to_half_open_after_timeout() {
+        let handle = PeerHandle::with_circuit_breaker(test_config(), 1, 0);
+        handle.mark_connected();
+
+        // Trip the circuit
+        assert!(handle.record_failure());
+
+        // With 0-second timeout, checking state should immediately yield HalfOpen
+        // (the auto-transition fires because elapsed >= 0 is always true)
+        assert_eq!(handle.circuit_state(), CircuitState::HalfOpen);
+        assert!(handle.is_available());
+    }
+
+    #[test]
+    fn half_open_closes_on_success() {
+        let handle = PeerHandle::with_circuit_breaker(test_config(), 1, 0);
+        handle.mark_connected();
+
+        let _ = handle.record_failure();
+        // Transition to HalfOpen
+        assert_eq!(handle.circuit_state(), CircuitState::HalfOpen);
+
+        // Success closes the circuit
+        assert!(handle.record_success());
+        assert_eq!(handle.circuit_state(), CircuitState::Closed);
+        assert!(handle.is_available());
+    }
+
+    #[test]
+    fn half_open_reopens_on_failure() {
+        let handle = PeerHandle::with_circuit_breaker(test_config(), 1, 0);
+        handle.mark_connected();
+
+        let _ = handle.record_failure();
+        // Transition to HalfOpen via timeout check
+        assert_eq!(handle.circuit_state(), CircuitState::HalfOpen);
+
+        // Failure in HalfOpen reopens the circuit (trip count goes to 2)
+        assert!(handle.record_failure());
+        assert_eq!(handle.circuit_trip_count(), 2);
+        // With 0-second timeout, circuit_state() auto-transitions Open → HalfOpen
+        // so we verify the trip count instead of observing Open directly
+        assert_eq!(handle.circuit_state(), CircuitState::HalfOpen);
+    }
+
+    #[test]
+    fn success_resets_failure_counter() {
+        let handle = PeerHandle::with_circuit_breaker(test_config(), 5, 60);
+        handle.mark_connected();
+
+        // Accumulate 4 failures (just below threshold)
+        for _ in 0..4 {
+            let _ = handle.record_failure();
+        }
+
+        // Success resets the counter
+        let _ = handle.record_success();
+
+        // 4 more failures should not trip (counter was reset)
+        for _ in 0..4 {
+            assert!(!handle.record_failure());
+        }
+        assert_eq!(handle.circuit_state(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn disconnected_peer_is_not_available() {
+        let handle = PeerHandle::new(test_config());
+        assert!(!handle.is_available());
+    }
+
+    #[test]
+    fn connected_peer_with_closed_circuit_is_available() {
+        let handle = PeerHandle::new(test_config());
+        handle.mark_connected();
+        assert!(handle.is_available());
+    }
+
+    #[test]
+    fn status_includes_circuit_breaker() {
+        let handle = PeerHandle::with_circuit_breaker(test_config(), 2, 60);
+        handle.mark_connected();
+        let _ = handle.record_failure();
+        let _ = handle.record_failure();
+
+        let status = handle.status();
+        assert_eq!(status.circuit_state, CircuitState::Open);
+        assert_eq!(status.circuit_trips, 1);
+    }
+
+    #[test]
+    fn circuit_state_display() {
+        assert_eq!(CircuitState::Closed.to_string(), "closed");
+        assert_eq!(CircuitState::Open.to_string(), "open");
+        assert_eq!(CircuitState::HalfOpen.to_string(), "half_open");
+    }
+
+    #[test]
+    fn circuit_state_from_u8_valid_values() {
+        assert_eq!(CircuitState::from_u8(0), CircuitState::Closed);
+        assert_eq!(CircuitState::from_u8(1), CircuitState::Open);
+        assert_eq!(CircuitState::from_u8(2), CircuitState::HalfOpen);
+    }
+
+    #[test]
+    fn circuit_state_from_u8_invalid_defaults_to_closed() {
+        assert_eq!(CircuitState::from_u8(3), CircuitState::Closed);
+        assert_eq!(CircuitState::from_u8(255), CircuitState::Closed);
+    }
+
+    #[test]
+    fn circuit_state_serializes_as_string() {
+        let json = serde_json::to_string(&CircuitState::Open).expect("serialize");
+        assert_eq!(json, "\"open\"");
+    }
+
+    #[test]
+    fn open_circuit_stays_open_before_timeout() {
+        let handle = PeerHandle::with_circuit_breaker(test_config(), 2, 3600);
+        handle.mark_connected();
+
+        let _ = handle.record_failure();
+        let _ = handle.record_failure();
+        // Circuit is open with 1-hour timeout — should stay Open
+        assert_eq!(handle.circuit_state(), CircuitState::Open);
+        assert!(!handle.is_available());
+    }
+
+    #[test]
+    fn with_circuit_breaker_custom_params() {
+        let handle = PeerHandle::with_circuit_breaker(test_config(), 10, 120);
+        assert_eq!(handle.failure_threshold, 10);
+        assert_eq!(handle.recovery_timeout_secs, 120);
     }
 }

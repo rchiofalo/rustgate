@@ -105,6 +105,13 @@ pub struct FederationConfig {
     pub jwt_secret: Option<Vec<u8>>,
     /// JWT token expiration in seconds (default: 3600).
     pub jwt_expiry_secs: u64,
+    /// Number of consecutive send failures before tripping the circuit breaker
+    /// for a peer. Once open, messages are skipped until the recovery timeout
+    /// elapses and a probe succeeds. Default: 5.
+    pub circuit_breaker_threshold: u32,
+    /// Seconds to wait after a circuit breaker trips before allowing a probe
+    /// message (half-open state). Default: 60.
+    pub circuit_breaker_timeout: Duration,
 }
 
 impl Default for FederationConfig {
@@ -132,6 +139,8 @@ impl Default for FederationConfig {
             ca_file: PathBuf::from("ca.pem"),
             jwt_secret: None,
             jwt_expiry_secs: 3600,
+            circuit_breaker_threshold: 5,
+            circuit_breaker_timeout: Duration::from_secs(60),
         }
     }
 }

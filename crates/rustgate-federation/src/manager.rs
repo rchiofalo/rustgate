@@ -240,7 +240,11 @@ impl FederationManager {
                 }
             };
 
-            let peer = Arc::new(PeerHandle::new(peer_config.clone()));
+            let peer = Arc::new(PeerHandle::with_circuit_breaker(
+                peer_config.clone(),
+                self.config.circuit_breaker_threshold,
+                self.config.circuit_breaker_timeout.as_secs(),
+            ));
 
             match peer_config.protocol_version {
                 1 => {
@@ -379,7 +383,7 @@ impl FederationManager {
                 None => continue,
             };
 
-            if !peer.is_connected() {
+            if !peer.is_available() {
                 continue;
             }
 
@@ -425,9 +429,22 @@ impl FederationManager {
 
             match result {
                 Ok(()) => {
+                    if peer.record_success() {
+                        info!(
+                            peer_id = %id,
+                            "circuit breaker recovered — peer is healthy again"
+                        );
+                    }
                     sent += 1;
                 }
                 Err(e) => {
+                    if peer.record_failure() {
+                        warn!(
+                            peer_id = %id,
+                            trips = peer.circuit_trip_count(),
+                            "circuit breaker tripped — skipping peer until recovery timeout"
+                        );
+                    }
                     warn!(
                         peer_id = %id,
                         error = %e,
@@ -558,6 +575,8 @@ mod tests {
             ca_file: PathBuf::from("/nonexistent/ca.pem"),
             jwt_secret: None,
             jwt_expiry_secs: 3600,
+            circuit_breaker_threshold: 5,
+            circuit_breaker_timeout: Duration::from_secs(60),
         }
     }
 
