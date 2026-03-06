@@ -69,6 +69,7 @@ jobs:
         run: cosign sign-blob --yes --output-signature "$ARCHIVE.sig" --output-certificate "$ARCHIVE.pem" "$ARCHIVE"
 
       - name: Attest binary provenance
+        if: github.repository_visibility == 'public'
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
           subject-path: ${{ env.ARCHIVE }}

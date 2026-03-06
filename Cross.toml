@@ -1,5 +1,13 @@
 [target.x86_64-unknown-linux-musl]
-pre-build = ["apt-get update && apt-get install -y protobuf-compiler cmake golang"]
+pre-build = [
+    "apt-get update && apt-get install -y protobuf-compiler cmake curl",
+    "curl -fsSL https://go.dev/dl/go1.22.12.linux-amd64.tar.gz | tar -C /usr/local -xz",
+    "ln -sf /usr/local/go/bin/go /usr/bin/go"
+]
 
 [target.aarch64-unknown-linux-musl]
-pre-build = ["apt-get update && apt-get install -y protobuf-compiler cmake golang"]
+pre-build = [
+    "apt-get update && apt-get install -y protobuf-compiler cmake curl",
+    "curl -fsSL https://go.dev/dl/go1.22.12.linux-amd64.tar.gz | tar -C /usr/local -xz",
+    "ln -sf /usr/local/go/bin/go /usr/bin/go"
+]

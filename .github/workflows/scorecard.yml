@@ -12,7 +12,7 @@ permissions: read-all
 jobs:
   analysis:
     name: Scorecard analysis
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     permissions:
       security-events: write # upload SARIF
       id-token: write # publish results
