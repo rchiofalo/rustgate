@@ -23,6 +23,7 @@ metrics = ["dep:prometheus", "dep:hyper", "dep:hyper-util", "dep:http-body-util"
 federation = ["dep:rustgate-federation", "rustgate-federation/v2", "rustgate-federation/api", "dep:serde_json"]
 federation-ha = ["federation", "rustgate-federation/ha"]
 websocket = ["dep:rustgate-websocket"]
+fips = ["rustgate-transport/fips", "rustgate-federation?/fips", "rustgate-enrollment?/fips"]
 jemalloc = ["dep:tikv-jemallocator"]
 
 [dependencies]

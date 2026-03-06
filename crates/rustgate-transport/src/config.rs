@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use rustgate_core::error::{Result, RustgateError};
 use rustls::RootCertStore;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer};
 use rustls::server::{NoServerSessionStorage, WebPkiClientVerifier};
 
 #[derive(Debug)]
@@ -13,6 +13,7 @@ pub struct TlsConfig {
     server_certs: Vec<CertificateDer<'static>>,
     server_key: PrivateKeyDer<'static>,
     client_ca_store: Arc<RootCertStore>,
+    crls: Vec<CertificateRevocationListDer<'static>>,
 }
 
 impl TlsConfig {
@@ -29,11 +30,40 @@ impl TlsConfig {
             server_certs,
             server_key,
             client_ca_store: Arc::new(client_ca_store),
+            crls: Vec::new(),
         })
     }
 
+    /// Load Certificate Revocation Lists from PEM data.
+    ///
+    /// CRLs are checked during the TLS handshake — connections using
+    /// revoked certificates will be rejected before reaching the
+    /// application layer.
+    pub fn with_crls(mut self, crl_pem: &str) -> Result<Self> {
+        let mut reader = BufReader::new(crl_pem.as_bytes());
+        let crls: Vec<CertificateRevocationListDer<'static>> = rustls_pemfile::crls(&mut reader)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| RustgateError::Config(format!("failed to parse CRL PEM: {e}")))?;
+
+        if crls.is_empty() {
+            return Err(RustgateError::Config(
+                "no CRLs found in PEM data".to_string(),
+            ));
+        }
+
+        tracing::info!(count = crls.len(), "loaded certificate revocation lists");
+        self.crls = crls;
+        Ok(self)
+    }
+
     pub fn build_server_config(&self) -> Result<rustls::ServerConfig> {
-        let client_verifier = WebPkiClientVerifier::builder(self.client_ca_store.clone())
+        let mut verifier_builder = WebPkiClientVerifier::builder(self.client_ca_store.clone());
+
+        if !self.crls.is_empty() {
+            verifier_builder = verifier_builder.with_crls(self.crls.clone());
+        }
+
+        let client_verifier = verifier_builder
             .build()
             .map_err(|e| RustgateError::Config(format!("failed to build client verifier: {e}")))?;
 
@@ -98,4 +128,42 @@ impl TlsConfig {
 
         Ok(store)
     }
+}
+
+/// Install the FIPS 140-3 validated crypto provider (aws-lc-rs).
+///
+/// Must be called once before any TLS operations. Replaces the default
+/// `ring` backend with `aws-lc-rs` in FIPS mode, restricting cipher
+/// suites and key exchange algorithms to the FIPS-approved set.
+///
+/// Returns an error if a crypto provider is already installed.
+#[cfg(feature = "fips")]
+pub fn install_fips_provider() -> Result<()> {
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .map_err(|_| RustgateError::Config("crypto provider already installed".to_string()))?;
+
+    // Verify the installed provider actually reports FIPS mode.
+    // This catches build misconfigurations where aws-lc-rs was compiled
+    // without its FIPS module.
+    if !is_fips_provider_active() {
+        return Err(RustgateError::Config(
+            "aws-lc-rs provider installed but does not report FIPS mode — \
+             check that aws-lc-fips-sys built correctly"
+                .to_string(),
+        ));
+    }
+
+    tracing::info!("FIPS 140-3 crypto provider (aws-lc-rs) installed and verified");
+    Ok(())
+}
+
+/// Returns `true` if the FIPS crypto provider is the active default.
+///
+/// Checks whether a crypto provider is installed and whether it uses
+/// the `aws-lc-rs` FIPS backend. Use with `--fips-required` to fail
+/// startup when FIPS mode is expected but not active.
+pub fn is_fips_provider_active() -> bool {
+    rustls::crypto::CryptoProvider::get_default()
+        .map(|p| p.fips())
+        .unwrap_or(false)
 }

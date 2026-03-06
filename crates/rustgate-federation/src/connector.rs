@@ -310,11 +310,13 @@ impl rustls::client::danger::ServerCertVerifier for NoHostnameVerifier {
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        let provider = rustls::crypto::CryptoProvider::get_default()
+            .ok_or_else(|| rustls::Error::General("no crypto provider installed".to_string()))?;
         rustls::crypto::verify_tls12_signature(
             message,
             cert,
             dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            &provider.signature_verification_algorithms,
         )
     }
 
@@ -324,18 +326,20 @@ impl rustls::client::danger::ServerCertVerifier for NoHostnameVerifier {
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        let provider = rustls::crypto::CryptoProvider::get_default()
+            .ok_or_else(|| rustls::Error::General("no crypto provider installed".to_string()))?;
         rustls::crypto::verify_tls13_signature(
             message,
             cert,
             dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            &provider.signature_verification_algorithms,
         )
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
+        rustls::crypto::CryptoProvider::get_default()
+            .map(|p| p.signature_verification_algorithms.supported_schemes())
+            .unwrap_or_default()
     }
 }
 

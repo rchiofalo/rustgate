@@ -12,6 +12,7 @@ workspace = true
 
 [features]
 proto = ["dep:rustgate-proto"]
+fips = ["rustls/aws_lc_rs", "rustls/fips"]
 
 [dependencies]
 rustgate-core = { workspace = true }

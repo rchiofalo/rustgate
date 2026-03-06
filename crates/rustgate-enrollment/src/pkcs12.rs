@@ -197,7 +197,7 @@ fn build_content_info(content_type_oid: &[u8], content: &[u8]) -> Vec<u8> {
 /// Uses HMAC-SHA1 as required by PKCS#12 for maximum compatibility
 /// with Java/Android TAK clients.
 fn build_mac_data(auth_safe_der: &[u8], password: &[u8]) -> Result<Vec<u8>, &'static str> {
-    let salt = generate_salt();
+    let salt = generate_salt()?;
     let iterations: u32 = 2048;
 
     // Derive MAC key using PKCS#12 KDF (ID=3 for MAC key)
@@ -234,23 +234,17 @@ fn build_mac_data(auth_safe_der: &[u8], password: &[u8]) -> Result<Vec<u8>, &'st
     Ok(der_sequence(&mac_inner))
 }
 
-/// Generate a random 8-byte salt for PKCS#12 KDF.
-fn generate_salt() -> [u8; 8] {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    // Use time-based entropy since we don't have a CSPRNG dependency.
-    // This salt only protects the P12 MAC with the well-known "atakatak"
-    // password, so cryptographic randomness isn't critical here.
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-
+/// Generate a random 8-byte salt for PKCS#12 KDF using the active
+/// crypto provider's CSPRNG.
+fn generate_salt() -> Result<[u8; 8], &'static str> {
+    let provider =
+        rustls::crypto::CryptoProvider::get_default().ok_or("no crypto provider installed")?;
     let mut salt = [0u8; 8];
-    for (i, byte) in salt.iter_mut().enumerate() {
-        *byte = (nanos >> (i * 8)) as u8;
-    }
-    salt
+    provider
+        .secure_random
+        .fill(&mut salt)
+        .map_err(|_| "CSPRNG fill failed")?;
+    Ok(salt)
 }
 
 /// PKCS#12 Key Derivation Function (RFC 7292, Appendix B).
@@ -390,8 +384,13 @@ fn hmac_sha1(key: &[u8], data: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    fn ensure_crypto_provider() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     #[test]
     fn build_p12_produces_valid_der() {
+        ensure_crypto_provider();
         // Use minimal DER-encoded self-signed cert stubs for testing.
         // Real certs would be larger but the structure is the same.
         let fake_cert = &[0x30, 0x03, 0x02, 0x01, 0x00]; // minimal SEQUENCE
