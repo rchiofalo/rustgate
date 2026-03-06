@@ -13,7 +13,7 @@ use std::io::BufReader;
 use std::sync::{Arc, OnceLock};
 
 use rustgate_test_utils::certs::TestCa;
-use rustgate_transport::{TlsConfig, TlsListener, install_fips_provider};
+use rustgate_transport::{TlsConfig, TlsListener, install_fips_provider, is_fips_provider_active};
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -77,6 +77,29 @@ fn fips_double_install_returns_error() {
     );
 }
 
+/// After installing the FIPS provider, `is_fips_provider_active()` must
+/// return `true`. This is the gatekeeper function for `--fips-required`.
+#[test]
+fn fips_provider_reports_active() {
+    ensure_fips();
+    assert!(
+        is_fips_provider_active(),
+        "is_fips_provider_active() must return true after install_fips_provider()"
+    );
+}
+
+/// Verify the installed provider self-reports as FIPS via the rustls API.
+#[test]
+fn fips_provider_reports_fips_mode() {
+    ensure_fips();
+    let provider =
+        rustls::crypto::CryptoProvider::get_default().expect("crypto provider should be installed");
+    assert!(
+        provider.fips(),
+        "CryptoProvider::fips() must return true under the FIPS feature"
+    );
+}
+
 /// Full mTLS handshake using the FIPS provider. Verifies that certificate
 /// generation, TLS server setup, client connection, and bidirectional data
 /// exchange all work correctly with the aws-lc-rs backend.
@@ -128,6 +151,56 @@ async fn fips_mtls_handshake() {
     let identity = server_handle.await.expect("server task");
     assert_eq!(identity.cn, "fips-operator");
     assert!(identity.is_member_of("fips-team"));
+}
+
+/// Verify the negotiated cipher suite is from the FIPS-approved set.
+#[tokio::test]
+async fn fips_negotiated_cipher_suite_is_approved() {
+    ensure_fips();
+
+    let ca = TestCa::new("FIPS Cipher CA");
+    let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
+    let client_cert = ca.issue_client_cert("cipher-check", &["team"]);
+
+    let tls_config = TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
+        .expect("tls config");
+
+    let listener = TlsListener::bind("127.0.0.1:0", &tls_config)
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    let server_handle = tokio::spawn(async move {
+        let _session = listener.accept().await.expect("accept");
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    });
+
+    let config = build_client_config(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem);
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let tcp = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("tcp connect");
+    let server_name = "localhost".try_into().expect("server name");
+    let stream = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("tls connect");
+
+    let (_, conn) = stream.get_ref();
+    let suite = conn
+        .negotiated_cipher_suite()
+        .expect("should have negotiated a cipher suite");
+
+    // All FIPS-approved suites use AES-GCM or AES-CCM. The suite name
+    // must contain AES (covers TLS_AES_128_GCM_SHA256,
+    // TLS_AES_256_GCM_SHA384, TLS_ECDHE_*_AES_*_GCM_SHA*).
+    let suite_name = format!("{:?}", suite.suite());
+    assert!(
+        suite_name.contains("AES"),
+        "negotiated cipher suite {suite_name} is not FIPS-approved (expected AES-based suite)"
+    );
+
+    server_handle.abort();
 }
 
 /// FIPS provider works with CRL-enabled TLS config. Ensures the two
