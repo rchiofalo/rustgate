@@ -24,11 +24,9 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
           - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
 
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
@@ -66,7 +64,7 @@ jobs:
         run: sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
 
       - name: Sign binary archive with cosign
-        run: cosign sign-blob --yes --output-signature "$ARCHIVE.sig" --output-certificate "$ARCHIVE.pem" "$ARCHIVE"
+        run: cosign sign-blob --yes --bundle "$ARCHIVE.bundle" "$ARCHIVE"
 
       - name: Attest binary provenance
         if: github.repository_visibility == 'public'
@@ -79,10 +77,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release upload "${{ steps.version.outputs.version }}" \
-            "$ARCHIVE" "$ARCHIVE.sha256" "$ARCHIVE.sig" "$ARCHIVE.pem" --clobber
+            "$ARCHIVE" "$ARCHIVE.sha256" "$ARCHIVE.bundle" --clobber
 
   sbom:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     permissions:
       contents: write
       actions: read # required for sbom-action artifact upload
@@ -90,6 +88,15 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install GitHub CLI
+        run: |
+          if ! command -v gh &> /dev/null; then
+            sudo mkdir -p /etc/apt/keyrings
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+            sudo apt-get update && sudo apt-get install -y gh
+          fi
 
       - name: Extract version
         id: version
