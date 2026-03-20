@@ -55,7 +55,9 @@ jobs:
       - name: Install Trivy
         run: |
           if ! command -v trivy &>/dev/null; then
-            curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
+            TRIVY_VERSION="0.60.0"
+            curl -sfL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" \
+              | sudo tar xz -C /usr/local/bin trivy
           fi
 
       - name: Scan container image for vulnerabilities
