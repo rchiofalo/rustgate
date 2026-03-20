@@ -8,7 +8,6 @@ on:
 
 permissions:
   contents: read
-  security-events: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,8 +15,13 @@ env:
 jobs:
   security-audit:
     runs-on: self-hosted
+    permissions:
+      contents: read
+      security-events: write # only this job needs it
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Check advisories, licenses, bans, and sources
         run: cargo deny check
@@ -39,6 +43,8 @@ jobs:
     name: fuzz (${{ matrix.target }})
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Install nightly toolchain
         run: |
