@@ -31,6 +31,54 @@ jobs:
         with:
           ignore: RUSTSEC-2025-0134
 
+      - name: Check for outdated dependencies
+        run: |
+          cargo install --locked cargo-outdated 2>/dev/null || true
+          echo "## Outdated Dependencies" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cargo outdated --root-deps-only 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  container-scan:
+    runs-on: self-hosted
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Build image for scanning
+        run: docker build -t rustgate:nightly-scan .
+
+      - name: Install Trivy
+        run: |
+          if ! command -v trivy &>/dev/null; then
+            curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
+          fi
+
+      - name: Scan container image for vulnerabilities
+        run: |
+          trivy image \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            --ignore-unfixed \
+            --format table \
+            rustgate:nightly-scan 2>&1 | tee trivy-results.txt
+
+      - name: Post scan results to job summary
+        if: always()
+        run: |
+          echo "## Container Image Scan (Trivy)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat trivy-results.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup scan image
+        if: always()
+        run: docker rmi rustgate:nightly-scan 2>/dev/null || true
+
   fuzz:
     runs-on: self-hosted
     strategy:
