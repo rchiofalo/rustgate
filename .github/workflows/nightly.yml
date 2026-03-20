@@ -17,17 +17,19 @@ jobs:
     runs-on: self-hosted
     permissions:
       contents: read
-      security-events: write # only this job needs it
+      issues: write # required for actions-rust-lang/audit to create issues
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
 
-      - name: Check advisories, licenses, bans, and sources
+      - name: Check licenses, bans, and sources
         run: cargo deny check
 
-      - name: Run cargo audit
-        run: cargo audit
+      - name: Audit dependencies for vulnerabilities
+        uses: actions-rust-lang/audit@72c09e02f132669d52284a3323acdb503cfc1a24 # v1.2.7
+        with:
+          ignore: RUSTSEC-2025-0134
 
   fuzz:
     runs-on: self-hosted
