@@ -13,7 +13,7 @@ jobs:
   analysis:
     name: Scorecard analysis
     if: github.repository_visibility == 'public' || github.event_name == 'schedule'
-    runs-on: self-hosted
+    runs-on: ubuntu-latest # publish_results requires GitHub-hosted runners
     permissions:
       contents: read # clone the repository
       security-events: write # upload SARIF
