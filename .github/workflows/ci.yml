@@ -83,7 +83,7 @@ jobs:
           persist-credentials: false
 
       - name: Install cargo-hack
-        run: cargo install cargo-hack --locked
+        run: cargo install cargo-hack --locked --force
 
       - name: Check all feature combinations
         run: cargo hack check --feature-powerset --depth 2 --exclude-features jemalloc,fips --no-dev-deps
