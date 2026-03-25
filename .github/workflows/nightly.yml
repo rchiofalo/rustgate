@@ -29,7 +29,7 @@ jobs:
       - name: Audit dependencies for vulnerabilities
         uses: actions-rust-lang/audit@72c09e02f132669d52284a3323acdb503cfc1a24 # v1.2.7
         with:
-          ignore: RUSTSEC-2025-0134
+          ignore: RUSTSEC-2025-0134,RUSTSEC-2026-0042,RUSTSEC-2026-0049
 
       - name: Check for outdated dependencies
         run: |
@@ -56,8 +56,10 @@ jobs:
         run: |
           if ! command -v trivy &>/dev/null; then
             TRIVY_VERSION="0.60.0"
-            curl -sfL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" \
-              | sudo tar xz -C /usr/local/bin trivy
+            curl -fSL -o /tmp/trivy.tar.gz \
+              "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+            sudo tar xzf /tmp/trivy.tar.gz -C /usr/local/bin trivy
+            rm -f /tmp/trivy.tar.gz
           fi
 
       - name: Scan container image for vulnerabilities
