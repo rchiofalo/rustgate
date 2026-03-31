@@ -17,10 +17,15 @@ use tokio::sync::RwLock;
 /// Default sweep interval for removing expired position entries.
 const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Default maximum number of entries in the position cache.
+const DEFAULT_MAX_ENTRIES: usize = 100_000;
+
 /// Stores the most recent position report per client CN.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct PositionCache {
     entries: RwLock<HashMap<String, RoutableMessage>>,
+    /// Maximum number of entries before oldest-entry eviction kicks in.
+    max_entries: usize,
 }
 
 /// Check if a position message has expired based on its TTL.
@@ -38,15 +43,53 @@ fn is_expired(msg: &RoutableMessage) -> bool {
     }
 }
 
+impl Default for PositionCache {
+    fn default() -> Self {
+        Self {
+            entries: RwLock::new(HashMap::new()),
+            max_entries: DEFAULT_MAX_ENTRIES,
+        }
+    }
+}
+
 impl PositionCache {
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Create a position cache with a custom maximum entry count.
+    pub fn with_max_entries(max_entries: usize) -> Self {
+        Self {
+            entries: RwLock::new(HashMap::new()),
+            max_entries,
+        }
+    }
+
     /// Store a position report, replacing any previous entry for this CN.
+    ///
+    /// If the cache is at capacity and this is a new CN, the oldest entry
+    /// (by `received_at` time) is evicted first.
     pub async fn store(&self, msg: RoutableMessage) {
         let cn = msg.source.cn.clone();
         let mut entries = self.entries.write().await;
+
+        // If this CN already exists, replacing it won't grow the cache.
+        if !entries.contains_key(&cn) && entries.len() >= self.max_entries {
+            // Evict the oldest entry by received_at time.
+            if let Some(oldest_cn) = entries
+                .iter()
+                .min_by_key(|(_, m)| m.metadata.received_at)
+                .map(|(cn, _)| cn.clone())
+            {
+                tracing::warn!(
+                    evicted_cn = %oldest_cn,
+                    size = entries.len(),
+                    max = self.max_entries,
+                    "position cache at capacity, evicting oldest entry",
+                );
+                let _ = entries.remove(&oldest_cn);
+            }
+        }
         let _ = entries.insert(cn, msg);
     }
 
@@ -311,5 +354,51 @@ mod tests {
         assert_eq!(cache.len().await, 1);
         let all = cache.get_all().await;
         assert!(all[0].metadata.ttl.is_some(), "should have the newer entry");
+    }
+
+    #[tokio::test]
+    async fn evicts_oldest_when_at_capacity() {
+        let cache = PositionCache::with_max_entries(2);
+
+        // Insert two entries — cache is now full.
+        cache.store(make_position_with_ttl("alice", None)).await;
+        // Small delay so received_at times differ.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        cache.store(make_position_with_ttl("bob", None)).await;
+        assert_eq!(cache.len().await, 2);
+
+        // Third entry should evict alice (oldest received_at).
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        cache.store(make_position_with_ttl("charlie", None)).await;
+        assert_eq!(cache.len().await, 2, "should not exceed capacity");
+
+        let all = cache.get_all().await;
+        let cns: Vec<&str> = all.iter().map(|m| m.source.cn.as_str()).collect();
+        assert!(!cns.contains(&"alice"), "alice should have been evicted");
+        assert!(cns.contains(&"bob"));
+        assert!(cns.contains(&"charlie"));
+    }
+
+    #[tokio::test]
+    async fn replace_same_cn_does_not_evict() {
+        let cache = PositionCache::with_max_entries(2);
+
+        cache.store(make_position_with_ttl("alice", None)).await;
+        cache.store(make_position_with_ttl("bob", None)).await;
+        assert_eq!(cache.len().await, 2);
+
+        // Replacing alice shouldn't trigger eviction since it's an existing key.
+        cache
+            .store(make_position_with_ttl(
+                "alice",
+                Some(Duration::from_secs(60)),
+            ))
+            .await;
+        assert_eq!(cache.len().await, 2);
+
+        let all = cache.get_all().await;
+        let cns: Vec<&str> = all.iter().map(|m| m.source.cn.as_str()).collect();
+        assert!(cns.contains(&"alice"));
+        assert!(cns.contains(&"bob"));
     }
 }
