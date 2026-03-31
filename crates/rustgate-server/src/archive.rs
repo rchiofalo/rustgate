@@ -56,7 +56,7 @@ impl CotArchiver {
 
         // Build JSONL line on the async task (cheap CPU work).
         let payload_b64 = base64_encode(&msg.payload);
-        let msg_type = escape_json(&format!("{:?}", msg.metadata.message_type));
+        let msg_type = escape_json(&msg.metadata.message_type.to_string());
         let dest = match &msg.destination {
             rustgate_core::message::Destination::Broadcast => "broadcast".to_string(),
             rustgate_core::message::Destination::Group(g) => {

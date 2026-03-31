@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::sync::Once;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateRevocationListParams, CertifiedIssuer,
@@ -18,6 +19,10 @@ use time::{Duration as TimeDuration, OffsetDateTime};
 /// creating any `TestCa` instances — the `let _ =` here silently
 /// ignores the "already installed" error so FIPS tests work
 /// correctly without conflict.
+/// Global counter for CRL serial numbers, ensuring each generated CRL
+/// receives a unique, incrementing serial number across all `TestCa` instances.
+static CRL_SERIAL: AtomicU64 = AtomicU64::new(1);
+
 static INIT_CRYPTO: Once = Once::new();
 fn ensure_crypto_provider() {
     INIT_CRYPTO.call_once(|| {
@@ -177,7 +182,7 @@ impl TestCa {
         let crl_params = CertificateRevocationListParams {
             this_update: now,
             next_update: now + TimeDuration::days(30),
-            crl_number: SerialNumber::from(1u64),
+            crl_number: SerialNumber::from(CRL_SERIAL.fetch_add(1, Ordering::Relaxed)),
             issuing_distribution_point: None,
             revoked_certs,
             key_identifier_method: KeyIdMethod::Sha256,
@@ -235,4 +240,39 @@ impl fmt::Debug for TestCa {
 pub struct TestCert {
     pub cert_pem: String,
     pub key_pem: String,
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::panic, clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn successive_crls_get_different_serial_numbers() {
+        let ca = TestCa::new("test-crl-serial-ca");
+        let client = ca.issue_client_cert("user1", &[]);
+
+        let crl1 = ca.generate_crl(&[&client.cert_pem]);
+        let crl2 = ca.generate_crl(&[&client.cert_pem]);
+
+        // The DER encoding includes the CRL number, so different serial
+        // numbers produce different DER (and thus PEM) output.
+        let crl1_der = pem_to_der(&crl1);
+        let crl2_der = pem_to_der(&crl2);
+        assert_ne!(
+            crl1_der, crl2_der,
+            "successive CRLs must differ (different serial numbers)"
+        );
+    }
+
+    /// Decode PEM-encoded CRL to DER bytes.
+    fn pem_to_der(pem: &str) -> Vec<u8> {
+        let mut reader = std::io::BufReader::new(pem.as_bytes());
+        rustls_pemfile::crls(&mut reader)
+            .next()
+            .expect("no CRL in PEM")
+            .expect("failed to parse CRL PEM")
+            .to_vec()
+    }
 }
