@@ -57,7 +57,7 @@ jobs:
         uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
 
       - name: Build with cross
-        run: cross build --release --all-features --target ${{ matrix.target }}
+        run: cross build --locked --release --all-features --target ${{ matrix.target }}
 
       - name: Package binary
         run: |

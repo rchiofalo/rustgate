@@ -48,6 +48,11 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        with:
+          cache-on-failure: true
+
       - name: Ensure nightly rustfmt is available
         run: rustup component add --toolchain nightly rustfmt
 
@@ -67,8 +72,13 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        with:
+          cache-on-failure: true
+
       - name: Clippy (all features)
-        run: cargo clippy --workspace --all-targets --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket
+        run: cargo clippy --locked --workspace --all-targets --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket
 
       - name: Build documentation
         run: cargo doc --workspace --no-deps --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket
@@ -82,11 +92,16 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        with:
+          cache-on-failure: true
+
       - name: Install cargo-hack
         run: cargo install cargo-hack --locked --force
 
       - name: Check all feature combinations
-        run: cargo hack check --feature-powerset --depth 2 --exclude-features jemalloc,fips --no-dev-deps
+        run: cargo hack check --locked --feature-powerset --depth 2 --exclude-features jemalloc,fips --no-dev-deps
 
   test:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
@@ -97,14 +112,19 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        with:
+          cache-on-failure: true
+
       - name: Install cargo-nextest
         run: cargo install cargo-nextest --locked --force
 
       - name: Run tests
-        run: cargo nextest run --workspace --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket
+        run: cargo nextest run --locked --workspace --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket
 
       - name: Run doc tests
-        run: cargo test --workspace --doc --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket
+        run: cargo test --locked --workspace --doc --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket
 
   coverage:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
@@ -115,11 +135,16 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        with:
+          cache-on-failure: true
+
       - name: Install cargo-tarpaulin
         run: cargo install cargo-tarpaulin --locked --force
 
       - name: Generate coverage report
-        run: cargo tarpaulin --engine llvm --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket --out xml --output-dir coverage/
+        run: cargo tarpaulin --locked --engine llvm --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket --out xml --output-dir coverage/
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
@@ -136,17 +161,22 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        with:
+          cache-on-failure: true
+
       - name: Install cargo-nextest
         run: cargo install cargo-nextest --locked --force
 
       - name: Clippy (FIPS)
-        run: cargo clippy -p rustgate-transport -p rustgate-server -p rustgate-enrollment --features fips --all-targets
+        run: cargo clippy --locked -p rustgate-transport -p rustgate-server -p rustgate-enrollment --features fips --all-targets
 
       - name: Build server with FIPS
-        run: cargo build -p rustgate-server --features fips,federation,enrollment
+        run: cargo build --locked -p rustgate-server --features fips,federation,enrollment
 
       - name: Run FIPS tests
-        run: cargo nextest run -p rustgate-transport --features fips
+        run: cargo nextest run --locked -p rustgate-transport --features fips
 
   audit:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
