@@ -48,7 +48,7 @@ async-nats = { workspace = true, features = ["kv"], optional = true }
 hyper = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
 prometheus = { workspace = true, optional = true }
-socket2 = "0.6"
+socket2 = { workspace = true }
 
 [build-dependencies]
 prost-build = { workspace = true, optional = true }
