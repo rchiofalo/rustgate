@@ -13,7 +13,7 @@ use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::proto::figpb;
 use super::proto::figpb::federated_channel_server::FederatedChannel;
@@ -69,11 +69,21 @@ impl FederationService {
     pub async fn broadcast(&self, event: figpb::FederatedEvent) -> usize {
         let streams = self.outbound_streams.read().await;
         let mut sent = 0;
+        let mut dropped = 0u32;
         for (peer_id, tx) in streams.iter() {
             if tx.send(event.clone()).await.is_ok() {
                 sent += 1;
                 debug!(peer = %peer_id, "broadcast event to peer");
+            } else {
+                dropped += 1;
             }
+        }
+        if dropped > 0 {
+            warn!(
+                dropped = dropped,
+                total = streams.len(),
+                "federation events dropped during broadcast: peer channel full or disconnected"
+            );
         }
         sent
     }
@@ -87,6 +97,7 @@ impl FederationService {
         let streams = self.outbound_streams.read().await;
         let peer_groups = self.peer_groups.read().await;
         let mut sent = 0;
+        let mut dropped = 0u32;
 
         for (peer_id, tx) in streams.iter() {
             let shares_group = peer_groups
@@ -95,11 +106,20 @@ impl FederationService {
 
             // If we don't track groups for this peer, send anyway (backward compat).
             // Combined with group overlap check into a single condition.
-            if (shares_group || !peer_groups.contains_key(peer_id.as_str()))
-                && tx.send(event.clone()).await.is_ok()
-            {
-                sent += 1;
+            if shares_group || !peer_groups.contains_key(peer_id.as_str()) {
+                if tx.send(event.clone()).await.is_ok() {
+                    sent += 1;
+                } else {
+                    dropped += 1;
+                }
             }
+        }
+        if dropped > 0 {
+            warn!(
+                dropped = dropped,
+                total = streams.len(),
+                "federation events dropped during group broadcast: peer channel full or disconnected"
+            );
         }
         sent
     }
@@ -367,6 +387,7 @@ impl FederatedChannel for FederationService {
         drop(tokio::spawn(async move {
             while let Some(event) = event_rx.recv().await {
                 if stream_tx.send(Ok(event)).await.is_err() {
+                    warn!(peer = %pid, "event dropped: gRPC stream closed or full, stopping forwarding");
                     break;
                 }
             }
@@ -417,7 +438,9 @@ impl FederatedChannel for FederationService {
             nested_groups: Vec::new(),
         };
 
-        let _ = tx.send(Ok(groups_msg)).await;
+        if tx.send(Ok(groups_msg)).await.is_err() {
+            warn!(peer = %peer_id, "initial groups message dropped: peer channel disconnected");
+        }
 
         // Hold the sender alive in a background task so the stream stays open.
         // The stream closes when the remote disconnects (rx is dropped by tonic).
