@@ -14,7 +14,7 @@ env:
 
 jobs:
   security-audit:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       issues: write # required for actions-rust-lang/audit to create issues
@@ -23,15 +23,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Rust PATH
-        run: |
-          for dir in "${CARGO_HOME:-$HOME/.cargo}/bin" /opt/cargo/bin /usr/local/cargo/bin; do
-            if [ -d "$dir" ]; then
-              echo "$dir" >> "$GITHUB_PATH"
-              export PATH="$dir:$PATH"
-            fi
-          done
-          cargo --version
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
 
       - name: Check licenses, bans, and sources
         run: cargo deny check
@@ -50,7 +45,7 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
   container-scan:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       issues: write
@@ -64,13 +59,11 @@ jobs:
 
       - name: Install Trivy
         run: |
-          if ! command -v trivy &>/dev/null; then
-            TRIVY_VERSION="0.69.3"
-            curl -fSL -o /tmp/trivy.tar.gz \
-              "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
-            sudo tar xzf /tmp/trivy.tar.gz -C /usr/local/bin trivy
-            rm -f /tmp/trivy.tar.gz
-          fi
+          TRIVY_VERSION="0.69.3"
+          curl -fSL -o /tmp/trivy.tar.gz \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          sudo tar xzf /tmp/trivy.tar.gz -C /usr/local/bin trivy
+          rm -f /tmp/trivy.tar.gz
 
       - name: Scan container image for vulnerabilities
         run: |
@@ -94,7 +87,7 @@ jobs:
         run: docker rmi rustgate:nightly-scan 2>/dev/null || true
 
   fuzz:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -110,21 +103,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Rust PATH
-        run: |
-          for dir in "${CARGO_HOME:-$HOME/.cargo}/bin" /opt/cargo/bin /usr/local/cargo/bin; do
-            if [ -d "$dir" ]; then
-              echo "$dir" >> "$GITHUB_PATH"
-              export PATH="$dir:$PATH"
-            fi
-          done
-          cargo --version
+      - uses: dtolnay/rust-toolchain@nightly
 
-      - name: Install nightly toolchain
-        run: |
-          RHOME="${RUSTUP_HOME:-$HOME/.rustup}"
-          rm -rf "$RHOME"/toolchains/nightly-* "$RHOME"/tmp
-          rustup toolchain install nightly --profile minimal
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       - name: Install cargo-fuzz
         run: cargo +nightly install cargo-fuzz --locked
