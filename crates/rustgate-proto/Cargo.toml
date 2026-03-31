@@ -20,4 +20,4 @@ tokio-util = { workspace = true }
 prost = { workspace = true }
 
 [build-dependencies]
-prost-build = "0.14"
+prost-build = { workspace = true }
