@@ -158,11 +158,23 @@ fn extract_point(payload: &[u8]) -> Option<(f64, f64)> {
 }
 
 /// Extract a numeric attribute value from an XML tag string.
+///
+/// Uses direct substring search followed by a `="` suffix check to
+/// avoid heap-allocating a needle string on every call.
 fn extract_attr(tag: &str, name: &str) -> Option<f64> {
-    let needle = format!("{name}=\"");
-    let start = tag.find(&needle)? + needle.len();
-    let end = tag[start..].find('"')? + start;
-    tag[start..end].parse().ok()
+    let mut search_from = 0;
+    while search_from < tag.len() {
+        let name_pos = tag[search_from..].find(name)? + search_from;
+        let eq_quote = name_pos + name.len();
+        // Verify the attribute name is followed by `="`
+        if tag[eq_quote..].starts_with("=\"") {
+            let value_start = eq_quote + 2;
+            let value_end = tag[value_start..].find('"')? + value_start;
+            return tag[value_start..value_end].parse().ok();
+        }
+        search_from = name_pos + name.len();
+    }
+    None
 }
 
 #[cfg(test)]
