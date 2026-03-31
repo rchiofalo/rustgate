@@ -62,6 +62,7 @@ tonic = { workspace = true, features = ["router", "transport", "server"] }
 tempfile = { workspace = true }
 rustgate-test-utils = { workspace = true, features = ["nats"] }
 criterion = { workspace = true }
+http-body = { workspace = true }
 
 [[bench]]
 name = "convert"

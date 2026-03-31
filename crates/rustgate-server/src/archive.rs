@@ -9,7 +9,7 @@
 
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use rustgate_core::message::RoutableMessage;
@@ -17,7 +17,7 @@ use rustgate_core::message::RoutableMessage;
 /// Writes CoT events as JSONL to date-stamped archive files.
 pub struct CotArchiver {
     dir: PathBuf,
-    inner: Mutex<ArchiverState>,
+    inner: Arc<Mutex<ArchiverState>>,
 }
 
 struct ArchiverState {
@@ -32,18 +32,19 @@ impl CotArchiver {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self {
             dir: dir.into(),
-            inner: Mutex::new(ArchiverState {
+            inner: Arc::new(Mutex::new(ArchiverState {
                 current_date: String::new(),
                 writer: None,
-            }),
+            })),
         }
     }
 
     /// Archive a single message.
     ///
-    /// Writes a JSONL line with source CN, timestamp, message type,
-    /// destination, and base64-encoded payload.
-    pub fn record(&self, msg: &RoutableMessage) {
+    /// Serialises the JSONL line on the calling task, then moves the
+    /// blocking file I/O into `spawn_blocking` so the async read loop
+    /// is never stalled by disk writes or file rotation.
+    pub async fn record(&self, msg: &RoutableMessage) {
         let now = SystemTime::now();
         let secs = now
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -53,37 +54,7 @@ impl CotArchiver {
         // Compute UTC date string (YYYY-MM-DD) without chrono
         let today = utc_date_string(secs);
 
-        let mut state = match self.inner.lock() {
-            Ok(s) => s,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-
-        // Rotate file if date changed
-        if state.current_date != today {
-            // Flush and drop previous writer
-            if let Some(ref mut w) = state.writer {
-                let _ = w.flush();
-            }
-            state.writer = None;
-            state.current_date = today.clone();
-
-            match self.open_file(&today) {
-                Ok(file) => {
-                    state.writer = Some(std::io::BufWriter::new(file));
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, dir = %self.dir.display(), "failed to open archive file");
-                    return;
-                }
-            }
-        }
-
-        let Some(ref mut writer) = state.writer else {
-            return;
-        };
-
-        // Build JSONL line manually to avoid serde dependency in server crate.
-        // Fields: ts, cn, fingerprint, type, dest, protocol, payload_b64
+        // Build JSONL line on the async task (cheap CPU work).
         let payload_b64 = base64_encode(&msg.payload);
         let msg_type = escape_json(&format!("{:?}", msg.metadata.message_type));
         let dest = match &msg.destination {
@@ -103,9 +74,13 @@ impl CotArchiver {
             escape_json(&msg.metadata.source_protocol),
         );
 
-        if let Err(e) = writer.write_all(line.as_bytes()) {
-            tracing::error!(error = %e, "failed to write archive line");
-        }
+        // Move all blocking file I/O onto the blocking thread pool.
+        let inner = Arc::clone(&self.inner);
+        let dir = self.dir.clone();
+        let _result = tokio::task::spawn_blocking(move || {
+            write_line(&inner, &dir, &today, &line);
+        })
+        .await;
     }
 
     /// Flush any buffered data to disk.
@@ -118,21 +93,59 @@ impl CotArchiver {
             let _ = w.flush();
         }
     }
-
-    fn open_file(&self, date: &str) -> std::io::Result<std::fs::File> {
-        std::fs::create_dir_all(&self.dir)?;
-        let path = self.dir.join(format!("cot-{date}.jsonl"));
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-    }
 }
 
 impl Drop for CotArchiver {
     fn drop(&mut self) {
         self.flush();
     }
+}
+
+/// Perform the blocking file rotation and write on the current thread.
+///
+/// Extracted as a free function so it can be called inside
+/// `spawn_blocking` without borrowing `self`.
+fn write_line(inner: &Mutex<ArchiverState>, dir: &std::path::Path, today: &str, line: &str) {
+    let mut state = match inner.lock() {
+        Ok(s) => s,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    // Rotate file if date changed
+    if state.current_date != today {
+        if let Some(ref mut w) = state.writer {
+            let _ = w.flush();
+        }
+        state.writer = None;
+        state.current_date = today.to_owned();
+
+        match open_file(dir, today) {
+            Ok(file) => {
+                state.writer = Some(std::io::BufWriter::new(file));
+            }
+            Err(e) => {
+                tracing::error!(error = %e, dir = %dir.display(), "failed to open archive file");
+                return;
+            }
+        }
+    }
+
+    let Some(ref mut writer) = state.writer else {
+        return;
+    };
+
+    if let Err(e) = writer.write_all(line.as_bytes()) {
+        tracing::error!(error = %e, "failed to write archive line");
+    }
+}
+
+fn open_file(dir: &std::path::Path, date: &str) -> std::io::Result<std::fs::File> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(format!("cot-{date}.jsonl"));
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
 }
 
 /// Compute UTC date string (YYYY-MM-DD) from Unix epoch seconds.
@@ -238,8 +251,8 @@ mod tests {
         assert_eq!(escape_json("hello"), "hello");
     }
 
-    #[test]
-    fn archiver_escapes_special_cn_in_dest() {
+    #[tokio::test]
+    async fn archiver_escapes_special_cn_in_dest() {
         let dir = std::env::temp_dir().join(format!(
             "rustgate-archive-escape-test-{}",
             std::process::id()
@@ -270,7 +283,7 @@ mod tests {
             },
         };
 
-        archiver.record(&msg);
+        archiver.record(&msg).await;
         archiver.flush();
 
         let entries: Vec<_> = std::fs::read_dir(&dir).expect("dir should exist").collect();
@@ -288,8 +301,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn archiver_creates_file() {
+    #[tokio::test]
+    async fn archiver_creates_file() {
         let dir =
             std::env::temp_dir().join(format!("rustgate-archive-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -312,7 +325,7 @@ mod tests {
             },
         };
 
-        archiver.record(&msg);
+        archiver.record(&msg).await;
         archiver.flush();
 
         // Verify file exists and has content

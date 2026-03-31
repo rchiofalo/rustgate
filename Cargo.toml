@@ -57,6 +57,7 @@ clap = { version = "4", features = ["derive", "env"] }
 rcgen = { version = "0.14", features = ["x509-parser"] }
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "http1"] }
+http-body = "1"
 http-body-util = "0.1"
 base64 = "0.22"
 tokio-tungstenite = "0.29"
