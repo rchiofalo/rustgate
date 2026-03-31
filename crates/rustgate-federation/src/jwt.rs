@@ -72,7 +72,7 @@ impl std::fmt::Debug for JwtAuthority {
 impl JwtAuthority {
     /// Create a new JWT authority with the given signing secret.
     ///
-    /// The secret must be at least [`MIN_SECRET_LENGTH`] bytes (32) to
+    /// The secret must be at least 32 bytes (`MIN_SECRET_LENGTH`) to
     /// provide full HMAC-SHA256 security.
     pub fn new(secret: impl Into<Vec<u8>>, issuer: impl Into<String>) -> Result<Self, JwtError> {
         let secret = secret.into();
