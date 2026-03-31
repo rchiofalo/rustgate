@@ -48,11 +48,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
-        continue-on-error: true
-        with:
-          cache-on-failure: true
 
       - name: Ensure nightly rustfmt is available
         run: rustup component add --toolchain nightly rustfmt
@@ -73,11 +68,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
-        continue-on-error: true
-        with:
-          cache-on-failure: true
 
       - name: Clippy (all features)
         run: cargo clippy --locked --workspace --all-targets --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket
@@ -94,11 +84,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
-        continue-on-error: true
-        with:
-          cache-on-failure: true
 
       - name: Install cargo-hack
         run: cargo install cargo-hack --locked --force
@@ -117,11 +102,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
-        continue-on-error: true
-        with:
-          cache-on-failure: true
 
       - name: Install cargo-nextest
         run: cargo install cargo-nextest --locked --force
@@ -141,11 +121,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
-        continue-on-error: true
-        with:
-          cache-on-failure: true
 
       - name: Install cargo-tarpaulin
         run: cargo install cargo-tarpaulin --locked --force
@@ -168,11 +143,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
-        continue-on-error: true
-        with:
-          cache-on-failure: true
 
       - name: Install cargo-nextest
         run: cargo install cargo-nextest --locked --force
