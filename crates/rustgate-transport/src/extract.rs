@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 
 use rustgate_core::error::{Result, RustgateError};
 use rustgate_core::identity::Identity;
+use rustgate_core::sanitize::sanitize_for_log;
 use rustls::pki_types::CertificateDer;
 use sha2::{Digest, Sha256};
 use x509_parser::oid_registry::{OID_X509_COMMON_NAME, OID_X509_ORGANIZATIONAL_UNIT};
@@ -19,8 +20,11 @@ pub fn extract_identity(cert_der: &CertificateDer<'_>) -> Result<Identity> {
     let (_, cert) = X509Certificate::from_der(cert_der.as_ref())
         .map_err(|e| RustgateError::Transport(format!("failed to parse X.509 certificate: {e}")))?;
 
-    let cn = extract_cn(&cert)?;
-    let groups = extract_groups(&cert);
+    let cn = sanitize_for_log(&extract_cn(&cert)?);
+    let groups = extract_groups(&cert)
+        .into_iter()
+        .map(|g| sanitize_for_log(&g))
+        .collect();
     let fingerprint = compute_fingerprint(cert_der);
 
     Ok(Identity {
