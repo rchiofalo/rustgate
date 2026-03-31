@@ -57,7 +57,7 @@ jobs:
         uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
 
       - name: Build with cross
-        run: cross build --release --all-features --target ${{ matrix.target }}
+        run: cross build --locked --release --all-features --target ${{ matrix.target }}
 
       - name: Package binary
         run: |
@@ -85,7 +85,7 @@ jobs:
             "$ARCHIVE" "$ARCHIVE.sha256" "$ARCHIVE.bundle" --clobber
 
   sbom:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     permissions:
       contents: write
       actions: read # required for sbom-action artifact upload
@@ -95,15 +95,6 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-
-      - name: Install GitHub CLI
-        run: |
-          if ! command -v gh &> /dev/null; then
-            sudo mkdir -p /etc/apt/keyrings
-            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null
-            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-            sudo apt-get update && sudo apt-get install -y gh
-          fi
 
       - name: Extract version
         id: version

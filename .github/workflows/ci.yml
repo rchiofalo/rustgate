@@ -23,7 +23,7 @@ env:
 jobs:
   commit-lint:
     if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - name: Validate PR title follows Conventional Commits
         env:
@@ -42,24 +42,27 @@ jobs:
 
   lint:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
 
-      - name: Ensure nightly rustfmt is available
-        run: rustup component add --toolchain nightly rustfmt
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
 
       - name: Check formatting
         run: cargo +nightly fmt --all -- --check
 
       - name: Check for unused dependencies
-        run: cargo machete
+        run: cargo install cargo-machete --locked && cargo machete
 
   clippy:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     env:
       RUSTDOCFLAGS: -Dwarnings
     steps:
@@ -67,8 +70,15 @@ jobs:
         with:
           persist-credentials: false
 
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       - name: Clippy (all features)
-        run: cargo clippy --workspace --all-targets --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket
+        run: cargo clippy --locked --workspace --all-targets --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket
 
       - name: Build documentation
         run: cargo doc --workspace --no-deps --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket
@@ -76,50 +86,80 @@ jobs:
   check-features:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [lint, clippy]
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
 
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       - name: Install cargo-hack
-        run: cargo install cargo-hack --locked --force
+        run: cargo install cargo-hack --locked
 
       - name: Check all feature combinations
+        # NOTE: --locked is omitted because --no-dev-deps temporarily modifies
+        # Cargo.toml files, which invalidates the lockfile.
         run: cargo hack check --feature-powerset --depth 2 --exclude-features jemalloc,fips --no-dev-deps
 
   test:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [lint, clippy]
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
 
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install nats-server
+        run: |
+          curl -fsSL https://github.com/nats-io/nats-server/releases/download/v2.10.24/nats-server-v2.10.24-linux-amd64.tar.gz -o /tmp/nats.tar.gz
+          tar xzf /tmp/nats.tar.gz -C /tmp
+          sudo mv /tmp/nats-server-v2.10.24-linux-amd64/nats-server /usr/local/bin/
+          nats-server --version
+
       - name: Install cargo-nextest
-        run: cargo install cargo-nextest --locked --force
+        run: cargo install cargo-nextest --locked
 
       - name: Run tests
-        run: cargo nextest run --workspace --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket
+        run: cargo nextest run --locked --workspace --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket
 
       - name: Run doc tests
-        run: cargo test --workspace --doc --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket
+        run: cargo test --locked --workspace --doc --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket
 
   coverage:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [lint, clippy]
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
 
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install nats-server
+        run: |
+          curl -fsSL https://github.com/nats-io/nats-server/releases/download/v2.10.24/nats-server-v2.10.24-linux-amd64.tar.gz -o /tmp/nats.tar.gz
+          tar xzf /tmp/nats.tar.gz -C /tmp
+          sudo mv /tmp/nats-server-v2.10.24-linux-amd64/nats-server /usr/local/bin/
+
       - name: Install cargo-tarpaulin
-        run: cargo install cargo-tarpaulin --locked --force
+        run: cargo install cargo-tarpaulin --locked
 
       - name: Generate coverage report
-        run: cargo tarpaulin --engine llvm --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket --out xml --output-dir coverage/
+        run: cargo tarpaulin --locked --engine llvm --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket --out xml --output-dir coverage/
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
@@ -130,46 +170,61 @@ jobs:
   fips:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [lint, clippy]
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
 
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install FIPS build dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake golang-go
+
       - name: Install cargo-nextest
-        run: cargo install cargo-nextest --locked --force
+        run: cargo install cargo-nextest --locked
 
       - name: Clippy (FIPS)
-        run: cargo clippy -p rustgate-transport -p rustgate-server -p rustgate-enrollment --features fips --all-targets
+        run: cargo clippy --locked -p rustgate-transport -p rustgate-server -p rustgate-enrollment --features fips --all-targets
 
       - name: Build server with FIPS
-        run: cargo build -p rustgate-server --features fips,federation,enrollment
+        run: cargo build --locked -p rustgate-server --features fips,federation,enrollment
 
       - name: Run FIPS tests
-        run: cargo nextest run -p rustgate-transport --features fips
+        run: cargo nextest run --locked -p rustgate-transport --features fips
 
   audit:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [check-features, test]
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
 
       - name: Check advisories, licenses, bans, and sources
         run: cargo deny check
 
       - name: Run cargo audit
-        run: cargo audit --ignore RUSTSEC-2025-0134 --ignore RUSTSEC-2026-0042 --ignore RUSTSEC-2026-0049
+        run: cargo install cargo-audit --locked && cargo audit --ignore RUSTSEC-2025-0134 --ignore RUSTSEC-2026-0042 --ignore RUSTSEC-2026-0049
 
   helm:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+
+      - name: Install Helm
+        uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 # v4.3.0
 
       - name: Lint Helm chart
         run: helm lint helm/
@@ -177,7 +232,7 @@ jobs:
   docker:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [check-features, test]
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
