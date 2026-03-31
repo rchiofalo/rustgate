@@ -218,6 +218,7 @@ pub fn nats_publishes() -> &'static IntCounter {
     NATS_PUBLISHES.get_or_init(|| fallback_counter("rustgate_nats_publishes_total", "fallback"))
 }
 
+#[allow(dead_code)] // only used when `proto` feature enables TAK negotiation
 pub fn negotiations() -> &'static IntCounterVec {
     NEGOTIATIONS.get_or_init(|| {
         fallback_counter_vec("rustgate_negotiations_total", "fallback", &["result"])
