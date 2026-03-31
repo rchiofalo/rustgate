@@ -50,6 +50,7 @@ jobs:
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        continue-on-error: true
         with:
           cache-on-failure: true
 
@@ -74,6 +75,7 @@ jobs:
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        continue-on-error: true
         with:
           cache-on-failure: true
 
@@ -94,6 +96,7 @@ jobs:
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        continue-on-error: true
         with:
           cache-on-failure: true
 
@@ -101,7 +104,9 @@ jobs:
         run: cargo install cargo-hack --locked --force
 
       - name: Check all feature combinations
-        run: cargo hack check --locked --feature-powerset --depth 2 --exclude-features jemalloc,fips --no-dev-deps
+        # NOTE: --locked is omitted because --no-dev-deps temporarily modifies
+        # Cargo.toml files, which invalidates the lockfile.
+        run: cargo hack check --feature-powerset --depth 2 --exclude-features jemalloc,fips --no-dev-deps
 
   test:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
@@ -114,6 +119,7 @@ jobs:
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        continue-on-error: true
         with:
           cache-on-failure: true
 
@@ -137,6 +143,7 @@ jobs:
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        continue-on-error: true
         with:
           cache-on-failure: true
 
@@ -163,6 +170,7 @@ jobs:
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        continue-on-error: true
         with:
           cache-on-failure: true
 
