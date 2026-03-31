@@ -98,7 +98,7 @@ jobs:
           persist-credentials: false
 
       - name: Install cargo-nextest
-        run: cargo install cargo-nextest --locked
+        run: cargo install cargo-nextest --locked --force
 
       - name: Run tests
         run: cargo nextest run --workspace --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket
@@ -116,7 +116,7 @@ jobs:
           persist-credentials: false
 
       - name: Install cargo-tarpaulin
-        run: cargo install cargo-tarpaulin --locked
+        run: cargo install cargo-tarpaulin --locked --force
 
       - name: Generate coverage report
         run: cargo tarpaulin --engine llvm --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket --out xml --output-dir coverage/
@@ -137,7 +137,7 @@ jobs:
           persist-credentials: false
 
       - name: Install cargo-nextest
-        run: cargo install cargo-nextest --locked
+        run: cargo install cargo-nextest --locked --force
 
       - name: Clippy (FIPS)
         run: cargo clippy -p rustgate-transport -p rustgate-server -p rustgate-enrollment --features fips --all-targets
