@@ -11,6 +11,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Ensure the Rust toolchain is on PATH for self-hosted runners.
+  CARGO_HOME: /opt/cargo
+  RUSTUP_HOME: /opt/rustup
 
 jobs:
   security-audit:
@@ -22,6 +25,9 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+
+      - name: Set up Rust PATH
+        run: echo "/opt/cargo/bin" >> "$GITHUB_PATH"
 
       - name: Check licenses, bans, and sources
         run: cargo deny check
@@ -99,6 +105,9 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+
+      - name: Set up Rust PATH
+        run: echo "/opt/cargo/bin" >> "$GITHUB_PATH"
 
       - name: Install nightly toolchain
         run: |
