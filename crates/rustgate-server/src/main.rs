@@ -1326,7 +1326,7 @@ async fn read_loop(
 
         // Archive to JSONL if enabled
         if let Some(arch) = archiver {
-            arch.record(&msg);
+            arch.record(&msg).await;
         }
 
         #[cfg(feature = "metrics")]

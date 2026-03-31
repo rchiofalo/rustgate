@@ -571,24 +571,33 @@ mod tests {
     }
 
     /// Extract the body bytes from a `Full<Bytes>` response.
-    /// `Full<Bytes>` is a simple wrapper; we reconstruct the data
-    /// by collecting frames from the body.
+    ///
+    /// `Full<Bytes>` yields exactly one data frame and completes
+    /// immediately, so we can poll it synchronously with a no-op
+    /// waker — no tokio runtime needed.
     fn body_string(resp: Response<Full<Bytes>>) -> String {
-        // Deconstruct the response to get the body
-        let (_, body) = resp.into_parts();
+        use std::pin::Pin;
+        use std::task::{Context, Wake};
 
-        // Full<Bytes> implements http_body::Body. We can poll it
-        // synchronously using a one-shot runtime.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("runtime");
+        use http_body::Body;
 
-        rt.block_on(async {
-            use http_body_util::BodyExt;
-            let collected = body.collect().await.expect("collect body");
-            let bytes = collected.to_bytes();
-            String::from_utf8_lossy(&bytes).to_string()
-        })
+        struct NoopWaker;
+        impl Wake for NoopWaker {
+            fn wake(self: Arc<Self>) {}
+        }
+
+        let (_, mut body) = resp.into_parts();
+        let waker = Arc::new(NoopWaker).into();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut buf = bytes::BytesMut::new();
+        while let std::task::Poll::Ready(Some(Ok(frame))) = Pin::new(&mut body).poll_frame(&mut cx)
+        {
+            if let Ok(data) = frame.into_data() {
+                buf.extend_from_slice(&data);
+            }
+        }
+        String::from_utf8_lossy(&buf).to_string()
     }
 
     // ── Routing tests ───────────────────────────────────────────
