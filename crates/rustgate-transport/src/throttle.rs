@@ -44,12 +44,17 @@ impl ClientThrottle {
     ///
     /// - `rate`: maximum sustained messages per second
     /// - `burst`: maximum burst above the steady rate (bucket capacity)
+    ///
+    /// `burst` is clamped to `u32::MAX / 100` to prevent overflow in the
+    /// ×100 fractional-token representation.
     pub fn new(rate: u32, burst: u32) -> Self {
-        let capacity = burst.max(1);
+        // Clamp to avoid overflow when multiplying by 100 for fractional tokens.
+        const MAX_CAPACITY: u32 = u32::MAX / 100;
+        let capacity = burst.clamp(1, MAX_CAPACITY);
         Self {
             capacity,
             refill_rate: f64::from(rate),
-            state: AtomicU64::new(pack(capacity * 100, 0)),
+            state: AtomicU64::new(pack(capacity.saturating_mul(100), 0)),
             epoch: Instant::now(),
         }
     }
@@ -65,11 +70,13 @@ impl ClientThrottle {
             let current = self.state.load(Ordering::Relaxed);
             let (tokens_x100, last_ms) = unpack(current);
 
-            // Refill tokens based on elapsed time
+            // Refill tokens based on elapsed time.
+            // Use u64 intermediates to prevent overflow on large refill values.
             let elapsed_ms = now_ms.saturating_sub(last_ms);
-            let refill = (self.refill_rate * f64::from(elapsed_ms) / 1000.0) as u32;
-            let max_x100 = self.capacity * 100;
-            let available = (tokens_x100 + refill * 100).min(max_x100);
+            let refill = (self.refill_rate * f64::from(elapsed_ms) / 1000.0) as u64;
+            let max_x100 = u64::from(self.capacity) * 100;
+            let available =
+                (u64::from(tokens_x100) + refill.saturating_mul(100)).min(max_x100) as u32;
 
             if available < 100 {
                 // Not enough for one token
@@ -190,5 +197,26 @@ mod tests {
         assert_eq!(throttle.available(), 5);
         let _ = throttle.allow();
         assert_eq!(throttle.available(), 4);
+    }
+
+    #[test]
+    fn large_burst_clamped_no_overflow() {
+        // burst > u32::MAX / 100 would overflow if multiplied by 100.
+        let throttle = ClientThrottle::new(100, u32::MAX);
+        // Should not panic; capacity is clamped.
+        assert!(throttle.available() > 0);
+        assert!(throttle.allow());
+    }
+
+    #[test]
+    fn large_rate_no_overflow() {
+        // Very high refill rate that would overflow u32 in refill * 100.
+        let throttle = ClientThrottle::new(u32::MAX, 10);
+        for _ in 0..10 {
+            assert!(throttle.allow());
+        }
+        // Exhaust burst, wait for refill, verify it still works.
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(throttle.allow(), "should refill without overflow");
     }
 }
