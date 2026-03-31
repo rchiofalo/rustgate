@@ -59,7 +59,7 @@ pub struct FederationManager {
     v1_server: Option<V1Server>,
     #[cfg(feature = "v2")]
     v2_server_handle: Option<JoinHandle<Result<(), tonic::transport::Error>>>,
-    clients: HashMap<String, FederationClient>,
+    clients: HashMap<String, Arc<FederationClient>>,
     peers: HashMap<String, Arc<PeerHandle>>,
     running: bool,
 
@@ -467,9 +467,10 @@ impl FederationManager {
                     );
 
                     let _ = self.peers.insert(peer_config.id.clone(), peer);
-                    let _ = self
-                        .clients
-                        .insert(peer_config.id.clone(), FederationClient::V1(client));
+                    let _ = self.clients.insert(
+                        peer_config.id.clone(),
+                        Arc::new(FederationClient::V1(client)),
+                    );
                 }
                 #[cfg(feature = "v2")]
                 2 => {
@@ -532,9 +533,10 @@ impl FederationManager {
                     );
 
                     let _ = self.peers.insert(peer_config.id.clone(), peer);
-                    let _ = self
-                        .clients
-                        .insert(peer_config.id.clone(), FederationClient::V2(client));
+                    let _ = self.clients.insert(
+                        peer_config.id.clone(),
+                        Arc::new(FederationClient::V2(client)),
+                    );
                 }
                 other => {
                     warn!(
@@ -601,12 +603,19 @@ impl FederationManager {
         #[cfg(feature = "v2")]
         let mut v2_event: Option<crate::v2::proto::figpb::FederatedEvent> = None;
 
-        for (id, client) in &self.clients {
-            let peer = match self.peers.get(id) {
-                Some(p) => p,
-                None => continue,
-            };
+        // Snapshot clients and peer handles so callers can release the outer
+        // lock before we block on per-peer channel sends.
+        let snapshot: Vec<(String, Arc<FederationClient>, Arc<PeerHandle>)> = self
+            .clients
+            .iter()
+            .filter_map(|(id, client)| {
+                self.peers
+                    .get(id)
+                    .map(|peer| (id.clone(), Arc::clone(client), Arc::clone(peer)))
+            })
+            .collect();
 
+        for (id, client, peer) in &snapshot {
             if !peer.is_available() {
                 continue;
             }
@@ -621,7 +630,7 @@ impl FederationManager {
                 }
             }
 
-            let result = match client {
+            let result = match client.as_ref() {
                 FederationClient::V1(v1) => v1.send(payload.clone()).await,
                 #[cfg(feature = "v2")]
                 FederationClient::V2(v2) => {
@@ -702,6 +711,10 @@ impl FederationManager {
 
         // Shut down all outbound clients
         for (id, client) in self.clients.drain() {
+            let Ok(client) = Arc::try_unwrap(client) else {
+                warn!(peer_id = %id, "could not unwrap federation client Arc during shutdown");
+                continue;
+            };
             match client {
                 FederationClient::V1(mut v1) => {
                     v1.shutdown().await;
@@ -867,9 +880,10 @@ impl FederationManager {
                 );
 
                 let _ = self.peers.insert(peer_config.id.clone(), peer);
-                let _ = self
-                    .clients
-                    .insert(peer_config.id.clone(), FederationClient::V1(client));
+                let _ = self.clients.insert(
+                    peer_config.id.clone(),
+                    Arc::new(FederationClient::V1(client)),
+                );
             }
             #[cfg(feature = "v2")]
             2 => {
@@ -935,9 +949,10 @@ impl FederationManager {
                 );
 
                 let _ = self.peers.insert(peer_config.id.clone(), peer);
-                let _ = self
-                    .clients
-                    .insert(peer_config.id.clone(), FederationClient::V2(client));
+                let _ = self.clients.insert(
+                    peer_config.id.clone(),
+                    Arc::new(FederationClient::V2(client)),
+                );
             }
             other => {
                 return Err(anyhow::anyhow!(
@@ -1020,15 +1035,18 @@ impl FederationManager {
     pub async fn disconnect_peer(&mut self, peer_id: &str) {
         // Remove and shut down the client
         if let Some(client) = self.clients.remove(peer_id) {
-            match client {
-                FederationClient::V1(mut v1) => {
+            match Arc::try_unwrap(client) {
+                Ok(FederationClient::V1(mut v1)) => {
                     v1.shutdown().await;
                     info!(peer_id = %peer_id, "V1 client stopped (claim lost)");
                 }
                 #[cfg(feature = "v2")]
-                FederationClient::V2(mut v2) => {
+                Ok(FederationClient::V2(mut v2)) => {
                     v2.shutdown().await;
                     info!(peer_id = %peer_id, "V2 client stopped (claim lost)");
+                }
+                Err(_) => {
+                    warn!(peer_id = %peer_id, "could not unwrap federation client Arc during disconnect");
                 }
             }
         }
@@ -1660,5 +1678,110 @@ mod tests {
         let (adopt, lost) = manager.take_ha_receivers();
         assert!(adopt.is_none());
         assert!(lost.is_none());
+    }
+
+    /// Verify that concurrent forward() calls via read locks do not deadlock
+    /// or panic when interleaved with peer mutations via write locks.
+    ///
+    /// This exercises the snapshot pattern in forward(): by collecting
+    /// Arc clones of clients/peers before iterating, forward() releases
+    /// its references to the inner HashMaps so the outer RwLock can be
+    /// dropped before the async sends complete.
+    #[tokio::test]
+    async fn forward_snapshot_handles_concurrent_peer_churn() {
+        use rustgate_test_utils::certs::TestCa;
+        use tokio::sync::RwLock;
+
+        let ca = TestCa::new("Test CA");
+        let client_cert = ca.issue_client_cert("federation-client", &["Alpha"]);
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cert_path = tmp.path().join("cert.pem");
+        let key_path = tmp.path().join("key.pem");
+        let ca_path = tmp.path().join("ca.pem");
+
+        std::fs::write(&cert_path, &client_cert.cert_pem).expect("write cert");
+        std::fs::write(&key_path, &client_cert.key_pem).expect("write key");
+        std::fs::write(&ca_path, &ca.cert_pem).expect("write ca");
+
+        // Create a manager with several peers to churn through.
+        let peers: Vec<PeerConfig> = (0..5)
+            .map(|i| test_peer_config(&format!("peer-{i}"), vec!["Alpha".into()]))
+            .collect();
+
+        let config = FederationConfig {
+            federate_id: "churn-test".into(),
+            v1_enabled: false,
+            peers,
+            cert_file: cert_path,
+            key_file: key_path,
+            ca_file: ca_path,
+            reconnect_delay: Duration::from_secs(1),
+            max_reconnects: 0,
+            ..test_config()
+        };
+
+        let mut manager = FederationManager::new(config);
+        let on_inbound: OnInbound = Arc::new(|_cn, _data| {});
+        manager.start(on_inbound).await.expect("start");
+        assert_eq!(manager.peer_count(), 5);
+
+        let manager = Arc::new(RwLock::new(manager));
+
+        // Spawn concurrent forward tasks (read locks).
+        let mut forward_handles = Vec::new();
+        for i in 0..10 {
+            let mgr = Arc::clone(&manager);
+            forward_handles.push(tokio::spawn(async move {
+                // Small stagger so forwards overlap with mutations.
+                tokio::time::sleep(Duration::from_millis(i * 5)).await;
+                let guard = mgr.read().await;
+                // Sends will fail (no remote server), but should not panic.
+                let _sent = guard
+                    .forward(Bytes::from("<event/>"), &["Alpha".into()])
+                    .await;
+            }));
+        }
+
+        // Spawn concurrent peer mutation tasks (write locks).
+        // Directly remove clients and peers from the maps to simulate churn
+        // without requiring the HA feature gate on disconnect_peer().
+        let mut mutate_handles = Vec::new();
+        for i in 0..3u64 {
+            let mgr = Arc::clone(&manager);
+            let peer_id = format!("peer-{i}");
+            mutate_handles.push(tokio::spawn(async move {
+                // Stagger so some mutations overlap with forwards.
+                tokio::time::sleep(Duration::from_millis(10 + i * 10)).await;
+                let mut guard = mgr.write().await;
+                // Simulate peer churn: remove the client and peer handle.
+                let _ = guard.clients.remove(&peer_id);
+                let _ = guard.peers.remove(&peer_id);
+            }));
+        }
+
+        // All tasks should complete without deadlock or panic.
+        for handle in forward_handles {
+            handle.await.expect("forward task should not panic");
+        }
+        for handle in mutate_handles {
+            handle.await.expect("mutation task should not panic");
+        }
+
+        // Verify peers were actually removed.
+        let guard = manager.read().await;
+        assert_eq!(
+            guard.peer_count(),
+            2,
+            "3 of 5 peers should have been disconnected"
+        );
+
+        // Forward still works after churn.
+        let _sent = guard
+            .forward(Bytes::from("<event/>"), &["Alpha".into()])
+            .await;
+
+        drop(guard);
+        manager.write().await.shutdown().await;
     }
 }
