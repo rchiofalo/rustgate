@@ -12,7 +12,13 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// Minimum secret length in bytes for HMAC-SHA256 security.
+const MIN_SECRET_LENGTH: usize = 32;
 
 /// Default maximum number of revoked JTIs tracked.
 const DEFAULT_REVOCATION_CAPACITY: usize = 10_000;
@@ -65,14 +71,24 @@ impl std::fmt::Debug for JwtAuthority {
 
 impl JwtAuthority {
     /// Create a new JWT authority with the given signing secret.
-    pub fn new(secret: impl Into<Vec<u8>>, issuer: impl Into<String>) -> Self {
-        Self {
-            secret: secret.into(),
+    ///
+    /// The secret must be at least [`MIN_SECRET_LENGTH`] bytes (32) to
+    /// provide full HMAC-SHA256 security.
+    pub fn new(secret: impl Into<Vec<u8>>, issuer: impl Into<String>) -> Result<Self, JwtError> {
+        let secret = secret.into();
+        if secret.len() < MIN_SECRET_LENGTH {
+            return Err(JwtError::SecretTooShort {
+                min: MIN_SECRET_LENGTH,
+                actual: secret.len(),
+            });
+        }
+        Ok(Self {
+            secret,
             issuer: issuer.into(),
             default_expiry: Duration::from_secs(3600),
             revoked: Mutex::new(HashMap::new()),
             revocation_capacity: DEFAULT_REVOCATION_CAPACITY,
-        }
+        })
     }
 
     /// Set the default token lifetime.
@@ -234,6 +250,13 @@ pub enum JwtError {
     ClockError,
     /// JSON serialization/deserialization error.
     SerializationError(String),
+    /// Signing secret is too short.
+    SecretTooShort {
+        /// Minimum required length in bytes.
+        min: usize,
+        /// Actual length provided.
+        actual: usize,
+    },
 }
 
 impl std::fmt::Display for JwtError {
@@ -246,6 +269,9 @@ impl std::fmt::Display for JwtError {
             JwtError::Revoked => write!(f, "token revoked"),
             JwtError::ClockError => write!(f, "system clock error"),
             JwtError::SerializationError(msg) => write!(f, "serialization error: {msg}"),
+            JwtError::SecretTooShort { min, actual } => {
+                write!(f, "secret too short: need {min} bytes, got {actual}")
+            }
         }
     }
 }
@@ -264,7 +290,10 @@ fn encode(secret: &[u8], claims: &FederationClaims) -> Result<String, JwtError> 
     let payload_b64 = base64url_encode(payload_json.as_bytes());
 
     let signing_input = format!("{header_b64}.{payload_b64}");
-    let signature = hmac_sha256(secret, signing_input.as_bytes());
+
+    let mut mac = HmacSha256::new_from_slice(secret).map_err(|_| JwtError::InvalidSignature)?;
+    mac.update(signing_input.as_bytes());
+    let signature = mac.finalize().into_bytes();
     let signature_b64 = base64url_encode(&signature);
 
     Ok(format!("{signing_input}.{signature_b64}"))
@@ -278,76 +307,19 @@ fn decode(secret: &[u8], token: &str) -> Result<FederationClaims, JwtError> {
     }
 
     let signing_input = format!("{}.{}", parts[0], parts[1]);
-    let expected_sig = hmac_sha256(secret, signing_input.as_bytes());
     let actual_sig = base64url_decode(parts[2]).map_err(|_| JwtError::Malformed)?;
 
-    // Constant-time comparison
-    if !constant_time_eq(&expected_sig, &actual_sig) {
-        return Err(JwtError::InvalidSignature);
-    }
+    let mut mac = HmacSha256::new_from_slice(secret).map_err(|_| JwtError::InvalidSignature)?;
+    mac.update(signing_input.as_bytes());
+    // Constant-time verification via the hmac crate.
+    mac.verify_slice(&actual_sig)
+        .map_err(|_| JwtError::InvalidSignature)?;
 
     let payload_bytes = base64url_decode(parts[1]).map_err(|_| JwtError::Malformed)?;
     let claims: FederationClaims = serde_json::from_slice(&payload_bytes)
         .map_err(|e| JwtError::SerializationError(e.to_string()))?;
 
     Ok(claims)
-}
-
-// ── HMAC-SHA256 ─────────────────────────────────────────────────────
-
-/// Compute HMAC-SHA256(key, data).
-fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    const BLOCK_SIZE: usize = 64;
-
-    // If key is longer than block size, hash it first
-    let key_block = if key.len() > BLOCK_SIZE {
-        let mut h = Sha256::new();
-        h.update(key);
-        let hash = h.finalize();
-        let mut block = [0u8; BLOCK_SIZE];
-        block[..32].copy_from_slice(&hash);
-        block
-    } else {
-        let mut block = [0u8; BLOCK_SIZE];
-        block[..key.len()].copy_from_slice(key);
-        block
-    };
-
-    // Inner: H((K ^ ipad) || data)
-    let mut ipad = [0x36u8; BLOCK_SIZE];
-    for (i, b) in ipad.iter_mut().enumerate() {
-        *b ^= key_block[i];
-    }
-    let mut inner = Sha256::new();
-    inner.update(ipad);
-    inner.update(data);
-    let inner_hash = inner.finalize();
-
-    // Outer: H((K ^ opad) || inner_hash)
-    let mut opad = [0x5cu8; BLOCK_SIZE];
-    for (i, b) in opad.iter_mut().enumerate() {
-        *b ^= key_block[i];
-    }
-    let mut outer = Sha256::new();
-    outer.update(opad);
-    outer.update(inner_hash);
-    let result = outer.finalize();
-
-    let mut output = [0u8; 32];
-    output.copy_from_slice(&result);
-    output
-}
-
-/// Constant-time byte comparison to prevent timing attacks.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 // ── Base64url encoding/decoding ─────────────────────────────────────
@@ -436,7 +408,11 @@ mod tests {
     use super::*;
 
     fn make_authority() -> JwtAuthority {
-        JwtAuthority::new(b"test-secret-key-for-federation".to_vec(), "rustgate-test")
+        JwtAuthority::new(
+            b"test-secret-key-for-jwt-testing!!".to_vec(),
+            "rustgate-test",
+        )
+        .expect("valid secret")
     }
 
     #[test]
@@ -455,8 +431,9 @@ mod tests {
 
     #[test]
     fn expired_token_rejected() {
-        let auth =
-            JwtAuthority::new(b"secret".to_vec(), "test").with_expiry(Duration::from_secs(0));
+        let auth = JwtAuthority::new(b"test-secret-key-for-jwt-testing!!".to_vec(), "test")
+            .expect("valid secret")
+            .with_expiry(Duration::from_secs(0));
 
         let token = auth.issue("peer-1", vec![]).expect("issue");
 
@@ -467,8 +444,10 @@ mod tests {
 
     #[test]
     fn wrong_secret_rejected() {
-        let auth1 = JwtAuthority::new(b"secret-1".to_vec(), "test");
-        let auth2 = JwtAuthority::new(b"secret-2".to_vec(), "test");
+        let auth1 = JwtAuthority::new(b"test-secret-key-for-jwt-wrong-1!!".to_vec(), "test")
+            .expect("valid secret");
+        let auth2 = JwtAuthority::new(b"test-secret-key-for-jwt-wrong-2!!".to_vec(), "test")
+            .expect("valid secret");
 
         let token = auth1.issue("peer-1", vec![]).expect("issue");
         let result = auth2.validate(&token);
@@ -477,8 +456,10 @@ mod tests {
 
     #[test]
     fn wrong_issuer_rejected() {
-        let auth1 = JwtAuthority::new(b"secret".to_vec(), "issuer-1");
-        let auth2 = JwtAuthority::new(b"secret".to_vec(), "issuer-2");
+        let auth1 = JwtAuthority::new(b"test-secret-key-for-jwt-testing!!".to_vec(), "issuer-1")
+            .expect("valid secret");
+        let auth2 = JwtAuthority::new(b"test-secret-key-for-jwt-testing!!".to_vec(), "issuer-2")
+            .expect("valid secret");
 
         let token = auth1.issue("peer-1", vec![]).expect("issue");
         let result = auth2.validate(&token);
@@ -554,7 +535,9 @@ mod tests {
 
     #[test]
     fn revocation_cache_respects_capacity() {
-        let auth = JwtAuthority::new(b"secret".to_vec(), "test").with_revocation_capacity(3);
+        let auth = JwtAuthority::new(b"test-secret-key-for-jwt-testing!!".to_vec(), "test")
+            .expect("valid secret")
+            .with_revocation_capacity(3);
 
         auth.revoke("jti-1", u64::MAX);
         auth.revoke("jti-2", u64::MAX);
@@ -576,7 +559,7 @@ mod tests {
 
     #[test]
     fn hmac_sha256_known_vector() {
-        // RFC 4231 Test Case 2
+        // RFC 4231 Test Case 2 — verify the hmac crate produces the expected output.
         let key = b"Jefe";
         let data = b"what do ya want for nothing?";
         let expected: [u8; 32] = [
@@ -584,14 +567,26 @@ mod tests {
             0x75, 0xc7, 0x5a, 0x00, 0x3f, 0x08, 0x9d, 0x27, 0x39, 0x83, 0x9d, 0xec, 0x58, 0xb9,
             0x64, 0xec, 0x38, 0x43,
         ];
-        assert_eq!(hmac_sha256(key, data), expected);
+        let mut mac = HmacSha256::new_from_slice(key).expect("valid key");
+        mac.update(data);
+        let result = mac.finalize().into_bytes();
+        assert_eq!(&result[..], &expected[..]);
     }
 
     #[test]
-    fn constant_time_eq_works() {
-        assert!(constant_time_eq(b"hello", b"hello"));
-        assert!(!constant_time_eq(b"hello", b"world"));
-        assert!(!constant_time_eq(b"hello", b"hell"));
+    fn short_secret_rejected() {
+        let result = JwtAuthority::new(b"too-short".to_vec(), "test");
+        assert_eq!(
+            result.expect_err("should fail with short secret"),
+            JwtError::SecretTooShort { min: 32, actual: 9 }
+        );
+    }
+
+    #[test]
+    fn exact_minimum_secret_accepted() {
+        let secret = vec![0xABu8; MIN_SECRET_LENGTH];
+        let auth = JwtAuthority::new(secret, "test");
+        assert!(auth.is_ok());
     }
 
     #[test]
