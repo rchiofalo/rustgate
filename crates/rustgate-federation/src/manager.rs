@@ -59,7 +59,7 @@ pub struct FederationManager {
     v1_server: Option<V1Server>,
     #[cfg(feature = "v2")]
     v2_server_handle: Option<JoinHandle<Result<(), tonic::transport::Error>>>,
-    clients: HashMap<String, FederationClient>,
+    clients: HashMap<String, Arc<FederationClient>>,
     peers: HashMap<String, Arc<PeerHandle>>,
     running: bool,
 
@@ -467,9 +467,10 @@ impl FederationManager {
                     );
 
                     let _ = self.peers.insert(peer_config.id.clone(), peer);
-                    let _ = self
-                        .clients
-                        .insert(peer_config.id.clone(), FederationClient::V1(client));
+                    let _ = self.clients.insert(
+                        peer_config.id.clone(),
+                        Arc::new(FederationClient::V1(client)),
+                    );
                 }
                 #[cfg(feature = "v2")]
                 2 => {
@@ -532,9 +533,10 @@ impl FederationManager {
                     );
 
                     let _ = self.peers.insert(peer_config.id.clone(), peer);
-                    let _ = self
-                        .clients
-                        .insert(peer_config.id.clone(), FederationClient::V2(client));
+                    let _ = self.clients.insert(
+                        peer_config.id.clone(),
+                        Arc::new(FederationClient::V2(client)),
+                    );
                 }
                 other => {
                     warn!(
@@ -601,12 +603,19 @@ impl FederationManager {
         #[cfg(feature = "v2")]
         let mut v2_event: Option<crate::v2::proto::figpb::FederatedEvent> = None;
 
-        for (id, client) in &self.clients {
-            let peer = match self.peers.get(id) {
-                Some(p) => p,
-                None => continue,
-            };
+        // Snapshot clients and peer handles so callers can release the outer
+        // lock before we block on per-peer channel sends.
+        let snapshot: Vec<(String, Arc<FederationClient>, Arc<PeerHandle>)> = self
+            .clients
+            .iter()
+            .filter_map(|(id, client)| {
+                self.peers
+                    .get(id)
+                    .map(|peer| (id.clone(), Arc::clone(client), Arc::clone(peer)))
+            })
+            .collect();
 
+        for (id, client, peer) in &snapshot {
             if !peer.is_available() {
                 continue;
             }
@@ -621,7 +630,7 @@ impl FederationManager {
                 }
             }
 
-            let result = match client {
+            let result = match client.as_ref() {
                 FederationClient::V1(v1) => v1.send(payload.clone()).await,
                 #[cfg(feature = "v2")]
                 FederationClient::V2(v2) => {
@@ -702,6 +711,10 @@ impl FederationManager {
 
         // Shut down all outbound clients
         for (id, client) in self.clients.drain() {
+            let Ok(client) = Arc::try_unwrap(client) else {
+                warn!(peer_id = %id, "could not unwrap federation client Arc during shutdown");
+                continue;
+            };
             match client {
                 FederationClient::V1(mut v1) => {
                     v1.shutdown().await;
@@ -867,9 +880,10 @@ impl FederationManager {
                 );
 
                 let _ = self.peers.insert(peer_config.id.clone(), peer);
-                let _ = self
-                    .clients
-                    .insert(peer_config.id.clone(), FederationClient::V1(client));
+                let _ = self.clients.insert(
+                    peer_config.id.clone(),
+                    Arc::new(FederationClient::V1(client)),
+                );
             }
             #[cfg(feature = "v2")]
             2 => {
@@ -935,9 +949,10 @@ impl FederationManager {
                 );
 
                 let _ = self.peers.insert(peer_config.id.clone(), peer);
-                let _ = self
-                    .clients
-                    .insert(peer_config.id.clone(), FederationClient::V2(client));
+                let _ = self.clients.insert(
+                    peer_config.id.clone(),
+                    Arc::new(FederationClient::V2(client)),
+                );
             }
             other => {
                 return Err(anyhow::anyhow!(
@@ -1020,15 +1035,18 @@ impl FederationManager {
     pub async fn disconnect_peer(&mut self, peer_id: &str) {
         // Remove and shut down the client
         if let Some(client) = self.clients.remove(peer_id) {
-            match client {
-                FederationClient::V1(mut v1) => {
+            match Arc::try_unwrap(client) {
+                Ok(FederationClient::V1(mut v1)) => {
                     v1.shutdown().await;
                     info!(peer_id = %peer_id, "V1 client stopped (claim lost)");
                 }
                 #[cfg(feature = "v2")]
-                FederationClient::V2(mut v2) => {
+                Ok(FederationClient::V2(mut v2)) => {
                     v2.shutdown().await;
                     info!(peer_id = %peer_id, "V2 client stopped (claim lost)");
+                }
+                Err(_) => {
+                    warn!(peer_id = %peer_id, "could not unwrap federation client Arc during disconnect");
                 }
             }
         }
