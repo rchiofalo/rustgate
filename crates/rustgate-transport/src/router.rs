@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rustgate_core::identity::{GroupId, Identity};
 use rustgate_core::message::{Destination, MessageType, RoutableMessage};
 use tokio::sync::{RwLock, mpsc};
+use tracing::warn;
 
 use crate::cache::PositionCache;
 
@@ -132,6 +133,8 @@ impl Router {
     /// Only replays positions from clients that share at least one group
     /// with the connecting session to enforce group-level isolation.
     pub async fn replay_positions(&self, handle: &SessionHandle) {
+        let mut dropped = 0u32;
+        let mut total = 0u32;
         for msg in self.cache.get_all().await {
             let shared = msg
                 .source
@@ -140,8 +143,19 @@ impl Router {
                 .next()
                 .is_some();
             if shared || handle.identity.groups.is_empty() {
-                let _ = handle.send(msg).await;
+                total += 1;
+                if handle.send(msg).await.is_err() {
+                    dropped += 1;
+                }
             }
+        }
+        if dropped > 0 {
+            warn!(
+                session = %handle.identity.cn,
+                dropped = dropped,
+                total = total,
+                "messages dropped during position replay: channel full or disconnected"
+            );
         }
     }
 
@@ -164,8 +178,13 @@ impl Router {
             let state = self.state.read().await;
             state.sessions.get(cn).cloned()
         };
-        if let Some(handle) = handle {
-            let _ = handle.send(msg).await;
+        if let Some(handle) = handle
+            && handle.send(msg).await.is_err()
+        {
+            warn!(
+                session = %cn,
+                "message dropped: session channel full or disconnected"
+            );
         }
     }
 
@@ -192,8 +211,19 @@ impl Router {
                 .collect()
         };
 
+        let mut dropped = 0u32;
         for handle in &targets {
-            let _ = handle.send(msg.clone()).await;
+            if handle.send(msg.clone()).await.is_err() {
+                dropped += 1;
+            }
+        }
+        if dropped > 0 {
+            warn!(
+                group = %group,
+                dropped = dropped,
+                total = targets.len(),
+                "messages dropped during group send: channel full or disconnected"
+            );
         }
     }
 
@@ -211,8 +241,18 @@ impl Router {
                 .collect()
         };
 
+        let mut dropped = 0u32;
         for handle in &targets {
-            let _ = handle.send(msg.clone()).await;
+            if handle.send(msg.clone()).await.is_err() {
+                dropped += 1;
+            }
+        }
+        if dropped > 0 {
+            warn!(
+                dropped = dropped,
+                total = targets.len(),
+                "messages dropped during broadcast: channel full or disconnected"
+            );
         }
     }
 }
