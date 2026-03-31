@@ -8,11 +8,17 @@
 //! security. JWT adds per-connection authorization claims that can
 //! be rotated without re-issuing certificates.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
+
+/// Default maximum number of revoked JTIs tracked.
+const DEFAULT_REVOCATION_CAPACITY: usize = 10_000;
+
+/// Warn when revocation cache reaches this fraction of capacity.
+const REVOCATION_WARN_THRESHOLD: f64 = 0.8;
 
 /// JWT claims for federation peer authentication.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -41,8 +47,11 @@ pub struct JwtAuthority {
     issuer: String,
     /// Default token lifetime.
     default_expiry: Duration,
-    /// Set of revoked token IDs (JTI values).
-    revoked: Mutex<HashSet<String>>,
+    /// Revoked token IDs mapped to their expiration time (Unix seconds).
+    /// Entries are auto-expired during `revoke()` when the token's `exp` has passed.
+    revoked: Mutex<HashMap<String, u64>>,
+    /// Maximum number of entries in the revocation cache.
+    revocation_capacity: usize,
 }
 
 impl std::fmt::Debug for JwtAuthority {
@@ -61,13 +70,20 @@ impl JwtAuthority {
             secret: secret.into(),
             issuer: issuer.into(),
             default_expiry: Duration::from_secs(3600),
-            revoked: Mutex::new(HashSet::new()),
+            revoked: Mutex::new(HashMap::new()),
+            revocation_capacity: DEFAULT_REVOCATION_CAPACITY,
         }
     }
 
     /// Set the default token lifetime.
     pub fn with_expiry(mut self, expiry: Duration) -> Self {
         self.default_expiry = expiry;
+        self
+    }
+
+    /// Set the maximum number of entries in the revocation cache.
+    pub fn with_revocation_capacity(mut self, capacity: usize) -> Self {
+        self.revocation_capacity = capacity;
         self
     }
 
@@ -140,7 +156,7 @@ impl JwtAuthority {
                 Ok(r) => r,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            if revoked.contains(&claims.jti) {
+            if revoked.contains_key(&claims.jti) {
                 return Err(JwtError::Revoked);
             }
         }
@@ -149,12 +165,47 @@ impl JwtAuthority {
     }
 
     /// Revoke a token by its JTI (unique identifier).
-    pub fn revoke(&self, jti: &str) {
+    ///
+    /// The `exp` parameter is the token's expiration time (Unix seconds).
+    /// Once that time passes, the entry is automatically purged during
+    /// subsequent `revoke()` calls.
+    ///
+    /// If the cache is at capacity after purging expired entries, the
+    /// oldest entry (by expiration time) is evicted.
+    pub fn revoke(&self, jti: &str, exp: u64) {
         let mut revoked = match self.revoked.lock() {
             Ok(r) => r,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let _ = revoked.insert(jti.to_string());
+
+        // Purge expired entries first.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        revoked.retain(|_, &mut entry_exp| entry_exp > now);
+
+        // Evict the oldest entry if still at capacity.
+        if revoked.len() >= self.revocation_capacity
+            && let Some(oldest_jti) = revoked
+                .iter()
+                .min_by_key(|(_, exp)| *exp)
+                .map(|(jti, _)| jti.clone())
+        {
+            let _ = revoked.remove(&oldest_jti);
+        }
+
+        let size = revoked.len() + 1;
+        let _ = revoked.insert(jti.to_string(), exp);
+
+        let threshold = (self.revocation_capacity as f64 * REVOCATION_WARN_THRESHOLD) as usize;
+        if size >= threshold {
+            tracing::warn!(
+                size,
+                capacity = self.revocation_capacity,
+                "JWT revocation cache at {:.0}% capacity",
+                (size as f64 / self.revocation_capacity as f64) * 100.0,
+            );
+        }
     }
 
     /// Number of revoked tokens tracked.
@@ -440,7 +491,7 @@ mod tests {
         let token = auth.issue("peer-1", vec![]).expect("issue");
 
         let claims = auth.validate(&token).expect("valid before revocation");
-        auth.revoke(&claims.jti);
+        auth.revoke(&claims.jti, claims.exp);
 
         let result = auth.validate(&token);
         assert_eq!(result, Err(JwtError::Revoked));
@@ -480,9 +531,39 @@ mod tests {
     fn revoked_count() {
         let auth = make_authority();
         assert_eq!(auth.revoked_count(), 0);
-        auth.revoke("jti-1");
-        auth.revoke("jti-2");
+        auth.revoke("jti-1", u64::MAX);
+        auth.revoke("jti-2", u64::MAX);
         assert_eq!(auth.revoked_count(), 2);
+    }
+
+    #[test]
+    fn expired_revocations_are_purged() {
+        let auth = make_authority();
+        // Revoke with an expiration in the past — should be purged on next revoke.
+        auth.revoke("old-jti", 1);
+        assert_eq!(auth.revoked_count(), 1);
+
+        // Inserting another entry triggers purge of expired ones.
+        auth.revoke("new-jti", u64::MAX);
+        assert_eq!(
+            auth.revoked_count(),
+            1,
+            "expired entry should have been purged"
+        );
+    }
+
+    #[test]
+    fn revocation_cache_respects_capacity() {
+        let auth = JwtAuthority::new(b"secret".to_vec(), "test").with_revocation_capacity(3);
+
+        auth.revoke("jti-1", u64::MAX);
+        auth.revoke("jti-2", u64::MAX);
+        auth.revoke("jti-3", u64::MAX);
+        assert_eq!(auth.revoked_count(), 3);
+
+        // Fourth revocation should evict the oldest.
+        auth.revoke("jti-4", u64::MAX);
+        assert_eq!(auth.revoked_count(), 3, "should not exceed capacity");
     }
 
     #[test]
