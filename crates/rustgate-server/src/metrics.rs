@@ -44,13 +44,9 @@ static ACCEPT_ERRORS: OnceLock<IntCounter> = OnceLock::new();
 static MESSAGES_RECEIVED: OnceLock<IntCounter> = OnceLock::new();
 static MESSAGES_DROPPED: OnceLock<IntCounter> = OnceLock::new();
 static MESSAGES_ROUTED: OnceLock<IntCounterVec> = OnceLock::new();
-static PINGS_RECEIVED: OnceLock<IntCounter> = OnceLock::new();
-
 static SESSIONS_ACTIVE: OnceLock<IntGauge> = OnceLock::new();
 
 static NATS_PUBLISHES: OnceLock<IntCounter> = OnceLock::new();
-static NATS_PUBLISH_ERRORS: OnceLock<IntCounter> = OnceLock::new();
-static NATS_RECEIVED: OnceLock<IntCounter> = OnceLock::new();
 
 static NEGOTIATIONS: OnceLock<IntCounterVec> = OnceLock::new();
 
@@ -142,13 +138,6 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(messages_routed.clone()))?;
     let _ = MESSAGES_ROUTED.set(messages_routed);
 
-    let pings_received = IntCounter::with_opts(Opts::new(
-        "rustgate_pings_received_total",
-        "TAK ping messages received",
-    ))?;
-    registry.register(Box::new(pings_received.clone()))?;
-    let _ = PINGS_RECEIVED.set(pings_received);
-
     let sessions_active = IntGauge::with_opts(Opts::new(
         "rustgate_sessions_active",
         "Registered sessions in the router",
@@ -162,20 +151,6 @@ pub fn init() -> prometheus::Result<()> {
     ))?;
     registry.register(Box::new(nats_publishes.clone()))?;
     let _ = NATS_PUBLISHES.set(nats_publishes);
-
-    let nats_publish_errors = IntCounter::with_opts(Opts::new(
-        "rustgate_nats_publish_errors_total",
-        "NATS publish failures",
-    ))?;
-    registry.register(Box::new(nats_publish_errors.clone()))?;
-    let _ = NATS_PUBLISH_ERRORS.set(nats_publish_errors);
-
-    let nats_received = IntCounter::with_opts(Opts::new(
-        "rustgate_nats_received_total",
-        "Messages received from NATS subscription",
-    ))?;
-    registry.register(Box::new(nats_received.clone()))?;
-    let _ = NATS_RECEIVED.set(nats_received);
 
     let negotiations = IntCounterVec::new(
         Opts::new(
@@ -235,11 +210,6 @@ pub fn messages_routed() -> &'static IntCounterVec {
     })
 }
 
-#[allow(dead_code)]
-pub fn pings_received() -> &'static IntCounter {
-    PINGS_RECEIVED.get_or_init(|| fallback_counter("rustgate_pings_received_total", "fallback"))
-}
-
 pub fn sessions_active() -> &'static IntGauge {
     SESSIONS_ACTIVE.get_or_init(|| fallback_gauge("rustgate_sessions_active", "fallback"))
 }
@@ -248,18 +218,6 @@ pub fn nats_publishes() -> &'static IntCounter {
     NATS_PUBLISHES.get_or_init(|| fallback_counter("rustgate_nats_publishes_total", "fallback"))
 }
 
-#[allow(dead_code)]
-pub fn nats_publish_errors() -> &'static IntCounter {
-    NATS_PUBLISH_ERRORS
-        .get_or_init(|| fallback_counter("rustgate_nats_publish_errors_total", "fallback"))
-}
-
-#[allow(dead_code)]
-pub fn nats_received() -> &'static IntCounter {
-    NATS_RECEIVED.get_or_init(|| fallback_counter("rustgate_nats_received_total", "fallback"))
-}
-
-#[allow(dead_code)]
 pub fn negotiations() -> &'static IntCounterVec {
     NEGOTIATIONS.get_or_init(|| {
         fallback_counter_vec("rustgate_negotiations_total", "fallback", &["result"])
@@ -436,11 +394,8 @@ mod tests {
         let _ = accept_errors();
         let _ = messages_received();
         let _ = messages_routed();
-        let _ = pings_received();
         let _ = sessions_active();
         let _ = nats_publishes();
-        let _ = nats_publish_errors();
-        let _ = nats_received();
         let _ = negotiations();
     }
 
