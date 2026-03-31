@@ -127,14 +127,24 @@ impl NatsPublisher {
     }
 }
 
+/// Maximum length in bytes for a single NATS subject token.
+///
+/// NATS does not mandate a per-token limit, but excessively long tokens
+/// waste memory and can indicate malicious input. 255 bytes is generous
+/// enough for legitimate identifiers while bounding resource usage.
+const MAX_TOKEN_LENGTH: usize = 255;
+
 /// Validate a string for safe use as a single NATS subject token.
 ///
 /// NATS subjects require printable ASCII (0x21..=0x7E) excluding the
 /// reserved characters `.` (level separator), `>` (full wildcard),
 /// and `*` (partial wildcard). Rejects control chars, space, DEL,
-/// and non-ASCII bytes.
+/// non-ASCII bytes, and tokens longer than [`MAX_TOKEN_LENGTH`] bytes.
 fn sanitize_nats_token(s: &str) -> Option<&str> {
     if s.is_empty() {
+        return None;
+    }
+    if s.len() > MAX_TOKEN_LENGTH {
         return None;
     }
     if s.bytes()
@@ -154,6 +164,18 @@ mod tests {
         assert_eq!(sanitize_nats_token("Cyan"), Some("Cyan"));
         assert_eq!(sanitize_nats_token("__ANON__"), Some("__ANON__"));
         assert_eq!(sanitize_nats_token("track-uid-123"), Some("track-uid-123"));
+    }
+
+    #[test]
+    fn sanitize_accepts_max_length_token() {
+        let token = "a".repeat(MAX_TOKEN_LENGTH);
+        assert_eq!(sanitize_nats_token(&token), Some(token.as_str()));
+    }
+
+    #[test]
+    fn sanitize_rejects_overlength_token() {
+        let token = "a".repeat(MAX_TOKEN_LENGTH + 1);
+        assert_eq!(sanitize_nats_token(&token), None);
     }
 
     #[test]

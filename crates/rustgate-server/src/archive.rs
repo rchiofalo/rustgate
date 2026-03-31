@@ -85,11 +85,15 @@ impl CotArchiver {
         // Build JSONL line manually to avoid serde dependency in server crate.
         // Fields: ts, cn, fingerprint, type, dest, protocol, payload_b64
         let payload_b64 = base64_encode(&msg.payload);
-        let msg_type = format!("{:?}", msg.metadata.message_type);
+        let msg_type = escape_json(&format!("{:?}", msg.metadata.message_type));
         let dest = match &msg.destination {
             rustgate_core::message::Destination::Broadcast => "broadcast".to_string(),
-            rustgate_core::message::Destination::Group(g) => format!("group:{g}"),
-            rustgate_core::message::Destination::Direct(d) => format!("direct:{}", d.cn),
+            rustgate_core::message::Destination::Group(g) => {
+                format!("group:{}", escape_json(g))
+            }
+            rustgate_core::message::Destination::Direct(d) => {
+                format!("direct:{}", escape_json(&d.cn))
+            }
         };
 
         let line = format!(
@@ -232,6 +236,56 @@ mod tests {
     #[test]
     fn escape_json_clean() {
         assert_eq!(escape_json("hello"), "hello");
+    }
+
+    #[test]
+    fn archiver_escapes_special_cn_in_dest() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustgate-archive-escape-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let archiver = CotArchiver::new(&dir);
+
+        let target_identity = rustgate_core::identity::Identity {
+            cn: "evil\"user\\name".to_string(),
+            fingerprint: "fp-target".to_string(),
+            groups: std::collections::BTreeSet::new(),
+        };
+
+        let msg = rustgate_core::message::RoutableMessage {
+            source: rustgate_core::identity::Identity {
+                cn: "sender".to_string(),
+                fingerprint: "fp-sender".to_string(),
+                groups: std::collections::BTreeSet::new(),
+            },
+            destination: rustgate_core::message::Destination::Direct(target_identity),
+            payload: bytes::Bytes::from_static(b"<event/>"),
+            metadata: rustgate_core::message::Metadata {
+                received_at: SystemTime::now(),
+                source_protocol: "cot".to_string(),
+                message_type: rustgate_core::message::MessageType::Position,
+                ttl: None,
+            },
+        };
+
+        archiver.record(&msg);
+        archiver.flush();
+
+        let entries: Vec<_> = std::fs::read_dir(&dir).expect("dir should exist").collect();
+        assert_eq!(entries.len(), 1);
+
+        let file_path = entries[0].as_ref().expect("entry").path();
+        let content = std::fs::read_to_string(&file_path).expect("read file");
+
+        // Verify the special chars are escaped — no raw quotes or backslashes
+        assert!(
+            content.contains(r#"direct:evil\"user\\name"#),
+            "CN with special chars should be escaped: {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
