@@ -39,7 +39,7 @@ impl std::fmt::Display for Direction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionInfo {
     /// The federation peer ID.
-    pub peer_id: String,
+    pub peer_id: rustgate_core::PeerId,
     /// The pod managing this connection.
     pub pod_id: String,
     /// Whether the connection is inbound or outbound.
@@ -147,7 +147,7 @@ impl ConnectionRegistry {
             .as_secs();
 
         let info = ConnectionInfo {
-            peer_id: peer_id.to_string(),
+            peer_id: rustgate_core::PeerId::new(peer_id),
             pod_id: self.pod_id.clone(),
             direction,
             connected_at: now,
@@ -327,7 +327,7 @@ mod tests {
     #[test]
     fn connection_info_serde_round_trip() {
         let info = ConnectionInfo {
-            peer_id: "peer-1".into(),
+            peer_id: rustgate_core::PeerId::new("peer-1"),
             pod_id: "pod-abc".into(),
             direction: Direction::Outbound,
             connected_at: 1700000000,
@@ -335,7 +335,7 @@ mod tests {
 
         let json = serde_json::to_string(&info).expect("serialize");
         let parsed: ConnectionInfo = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(parsed.peer_id, "peer-1");
+        assert_eq!(parsed.peer_id.as_str(), "peer-1");
         assert_eq!(parsed.pod_id, "pod-abc");
         assert_eq!(parsed.direction, Direction::Outbound);
         assert_eq!(parsed.connected_at, 1700000000);

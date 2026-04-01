@@ -286,7 +286,7 @@ async fn run_session(
                             last_heartbeat_received = tokio::time::Instant::now();
                         } else {
                             peer.record_recv();
-                            (config.on_message)(peer_id.clone(), data.freeze());
+                            (config.on_message)(peer_id.to_string(), data.freeze());
                         }
                     }
                     Some(Err(e)) => {

@@ -86,8 +86,8 @@ pub fn xml_to_federated_event(
             .provenance
             .iter()
             .map(|p| figpb::FederateProvenance {
-                federation_server_id: p.server_id.clone(),
-                federation_server_name: p.server_name.clone(),
+                federation_server_id: p.server_id.as_str().to_owned(),
+                federation_server_name: p.server_name.as_str().to_owned(),
             })
             .collect(),
         federate_hops: Some(figpb::FederateHops {
@@ -381,8 +381,8 @@ pub fn extract_metadata(event: &figpb::FederatedEvent) -> FederationMetadata {
         .federate_provenance
         .iter()
         .map(|p| crate::provenance::FederateProvenance {
-            server_id: p.federation_server_id.clone(),
-            server_name: p.federation_server_name.clone(),
+            server_id: rustgate_core::PeerId::new(&p.federation_server_id),
+            server_name: rustgate_core::ServerName::new(&p.federation_server_name),
         })
         .collect();
 
@@ -592,8 +592,8 @@ mod tests {
     fn sample_metadata() -> FederationMetadata {
         FederationMetadata {
             provenance: vec![crate::provenance::FederateProvenance {
-                server_id: "server-1".into(),
-                server_name: "Server One".into(),
+                server_id: rustgate_core::PeerId::new("server-1"),
+                server_name: rustgate_core::ServerName::new("Server One"),
             }],
             max_hops: 10,
             current_hops: 1,
@@ -979,8 +979,8 @@ mod tests {
         };
         let meta = extract_metadata(&event);
         assert_eq!(meta.provenance.len(), 2);
-        assert_eq!(meta.provenance[0].server_id, "s1");
-        assert_eq!(meta.provenance[1].server_id, "s2");
+        assert_eq!(meta.provenance[0].server_id.as_str(), "s1");
+        assert_eq!(meta.provenance[1].server_id.as_str(), "s2");
         assert_eq!(meta.max_hops, 5);
         assert_eq!(meta.current_hops, 2);
     }

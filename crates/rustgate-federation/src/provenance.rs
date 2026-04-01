@@ -1,12 +1,13 @@
+use rustgate_core::{PeerId, ServerName};
 use sha2::{Digest, Sha256};
 
 /// Tracks which federation server a message has passed through.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FederateProvenance {
     /// Unique identifier for the federation server (deterministic UUID).
-    pub server_id: String,
+    pub server_id: PeerId,
     /// Human-readable name of the federation server.
-    pub server_name: String,
+    pub server_name: ServerName,
 }
 
 /// Metadata attached to federated messages for loop detection and hop limiting.
@@ -39,14 +40,16 @@ impl FederationMetadata {
         if self.current_hops >= self.max_hops {
             return true;
         }
-        self.provenance.iter().any(|p| p.server_id == my_server_id)
+        self.provenance
+            .iter()
+            .any(|p| p.server_id.as_str() == my_server_id)
     }
 
     /// Record a new hop through the given server.
     pub fn add_hop(&mut self, server_id: &str, server_name: &str) {
         self.provenance.push(FederateProvenance {
-            server_id: server_id.to_string(),
-            server_name: server_name.to_string(),
+            server_id: PeerId::new(server_id),
+            server_name: ServerName::new(server_name),
         });
         self.current_hops += 1;
     }
@@ -132,8 +135,8 @@ mod tests {
         m.add_hop("s1", "Server One");
         assert_eq!(m.current_hops, 1);
         assert_eq!(m.provenance.len(), 1);
-        assert_eq!(m.provenance[0].server_id, "s1");
-        assert_eq!(m.provenance[0].server_name, "Server One");
+        assert_eq!(m.provenance[0].server_id.as_str(), "s1");
+        assert_eq!(m.provenance[0].server_name.as_str(), "Server One");
 
         m.add_hop("s2", "Server Two");
         assert_eq!(m.current_hops, 2);
@@ -182,7 +185,7 @@ mod tests {
         assert_eq!(parsed.current_hops, 2);
         assert_eq!(parsed.max_hops, 5);
         assert_eq!(parsed.provenance.len(), 2);
-        assert_eq!(parsed.provenance[0].server_id, "s1");
+        assert_eq!(parsed.provenance[0].server_id.as_str(), "s1");
     }
 
     #[test]
@@ -223,13 +226,13 @@ mod tests {
         m.add_hop("second", "Second Server");
         m.add_hop("third", "Third Server");
 
-        assert_eq!(m.provenance[0].server_id, "first");
-        assert_eq!(m.provenance[1].server_id, "second");
-        assert_eq!(m.provenance[2].server_id, "third");
+        assert_eq!(m.provenance[0].server_id.as_str(), "first");
+        assert_eq!(m.provenance[1].server_id.as_str(), "second");
+        assert_eq!(m.provenance[2].server_id.as_str(), "third");
 
-        assert_eq!(m.provenance[0].server_name, "First Server");
-        assert_eq!(m.provenance[1].server_name, "Second Server");
-        assert_eq!(m.provenance[2].server_name, "Third Server");
+        assert_eq!(m.provenance[0].server_name.as_str(), "First Server");
+        assert_eq!(m.provenance[1].server_name.as_str(), "Second Server");
+        assert_eq!(m.provenance[2].server_name.as_str(), "Third Server");
     }
 
     #[test]
@@ -266,8 +269,8 @@ mod tests {
         let mut m = FederationMetadata::new(10);
         m.add_hop("", "");
         assert_eq!(m.current_hops, 1);
-        assert_eq!(m.provenance[0].server_id, "");
-        assert_eq!(m.provenance[0].server_name, "");
+        assert_eq!(m.provenance[0].server_id.as_str(), "");
+        assert_eq!(m.provenance[0].server_name.as_str(), "");
     }
 
     #[test]
@@ -277,16 +280,22 @@ mod tests {
             "server/with-special_chars.v2",
             "Server: Special & Chars <v2>",
         );
-        assert_eq!(m.provenance[0].server_id, "server/with-special_chars.v2");
-        assert_eq!(m.provenance[0].server_name, "Server: Special & Chars <v2>");
+        assert_eq!(
+            m.provenance[0].server_id.as_str(),
+            "server/with-special_chars.v2"
+        );
+        assert_eq!(
+            m.provenance[0].server_name.as_str(),
+            "Server: Special & Chars <v2>"
+        );
     }
 
     #[test]
     fn add_hop_with_unicode() {
         let mut m = FederationMetadata::new(10);
         m.add_hop("server-日本", "サーバー");
-        assert_eq!(m.provenance[0].server_id, "server-日本");
-        assert_eq!(m.provenance[0].server_name, "サーバー");
+        assert_eq!(m.provenance[0].server_id.as_str(), "server-日本");
+        assert_eq!(m.provenance[0].server_name.as_str(), "サーバー");
     }
 
     #[test]
@@ -360,10 +369,10 @@ mod tests {
         assert_eq!(parsed.current_hops, 3);
         assert_eq!(parsed.max_hops, 7);
         assert_eq!(parsed.provenance.len(), 3);
-        assert_eq!(parsed.provenance[0].server_id, "s1");
-        assert_eq!(parsed.provenance[0].server_name, "Server One");
-        assert_eq!(parsed.provenance[2].server_id, "s3");
-        assert_eq!(parsed.provenance[2].server_name, "Server Three");
+        assert_eq!(parsed.provenance[0].server_id.as_str(), "s1");
+        assert_eq!(parsed.provenance[0].server_name.as_str(), "Server One");
+        assert_eq!(parsed.provenance[2].server_id.as_str(), "s3");
+        assert_eq!(parsed.provenance[2].server_name.as_str(), "Server Three");
     }
 
     #[test]
@@ -379,12 +388,12 @@ mod tests {
     #[test]
     fn provenance_struct_equality() {
         let a = FederateProvenance {
-            server_id: "s1".to_string(),
-            server_name: "Server One".to_string(),
+            server_id: PeerId::new("s1"),
+            server_name: ServerName::new("Server One"),
         };
         let b = FederateProvenance {
-            server_id: "s1".to_string(),
-            server_name: "Server One".to_string(),
+            server_id: PeerId::new("s1"),
+            server_name: ServerName::new("Server One"),
         };
         assert_eq!(a, b);
     }
@@ -392,12 +401,12 @@ mod tests {
     #[test]
     fn provenance_struct_inequality() {
         let a = FederateProvenance {
-            server_id: "s1".to_string(),
-            server_name: "Server One".to_string(),
+            server_id: PeerId::new("s1"),
+            server_name: ServerName::new("Server One"),
         };
         let b = FederateProvenance {
-            server_id: "s2".to_string(),
-            server_name: "Server Two".to_string(),
+            server_id: PeerId::new("s2"),
+            server_name: ServerName::new("Server Two"),
         };
         assert_ne!(a, b);
     }
@@ -405,8 +414,8 @@ mod tests {
     #[test]
     fn provenance_clone() {
         let original = FederateProvenance {
-            server_id: "s1".to_string(),
-            server_name: "Server One".to_string(),
+            server_id: PeerId::new("s1"),
+            server_name: ServerName::new("Server One"),
         };
         let cloned = original.clone();
         assert_eq!(original, cloned);
