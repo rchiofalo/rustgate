@@ -229,7 +229,9 @@ pub fn negotiations() -> &'static IntCounterVec {
 
 /// Fallback response when `Response::builder()` unexpectedly fails.
 fn internal_error_response() -> Response<Full<Bytes>> {
-    Response::new(Full::new(Bytes::from("internal server error")))
+    let mut resp = Response::new(Full::new(Bytes::from("internal server error")));
+    *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+    resp
 }
 
 fn handle_request(
@@ -514,5 +516,11 @@ mod tests {
             .unwrap_or_default();
 
         (status, body)
+    }
+
+    #[test]
+    fn internal_error_response_returns_500() {
+        let resp = internal_error_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

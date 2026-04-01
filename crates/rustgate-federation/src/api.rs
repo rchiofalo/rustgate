@@ -481,7 +481,9 @@ fn handle_status<S: FederateStore>(state: &ApiState<S>) -> Response<Full<Bytes>>
 // ── JSON response helpers ───────────────────────────────────────────
 
 fn internal_error_response() -> Response<Full<Bytes>> {
-    Response::new(Full::new(Bytes::from("internal server error")))
+    let mut resp = Response::new(Full::new(Bytes::from("internal server error")));
+    *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+    resp
 }
 
 fn json_ok<T: Serialize>(data: &T) -> Response<Full<Bytes>> {
@@ -1215,5 +1217,11 @@ mod tests {
         )
         .expect("h");
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn internal_error_response_returns_500() {
+        let resp = internal_error_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
