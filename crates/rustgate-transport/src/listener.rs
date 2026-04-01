@@ -11,7 +11,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 use crate::config::TlsConfig;
-use crate::extract::extract_identity;
+use crate::extract::{ExpectedKeyUsage, extract_identity, validate_key_usage};
 use crate::session::AuthenticatedSession;
 
 /// TCP keepalive idle time before first probe.
@@ -182,6 +182,8 @@ impl TlsListener {
         let client_cert = certs.first().ok_or_else(|| {
             RustgateError::Transport("empty client certificate chain".to_string())
         })?;
+
+        validate_key_usage(client_cert, ExpectedKeyUsage::ClientAuth)?;
 
         extract_identity(client_cert)
     }

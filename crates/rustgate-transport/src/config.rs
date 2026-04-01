@@ -8,12 +8,53 @@ use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKey
 use rustls::server::{NoServerSessionStorage, WebPkiClientVerifier};
 use rustls_pki_types::pem::PemObject;
 
+/// Minimum TLS protocol version the server will accept.
+///
+/// Controls which TLS versions are offered during the handshake. Setting
+/// `Tls13` disables TLS 1.2 entirely, which may reject older clients but
+/// provides stronger security guarantees (no CBC ciphers, mandatory PFS).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsMinVersion {
+    /// Accept TLS 1.2 and above (default).
+    Tls12,
+    /// Accept TLS 1.3 only.
+    Tls13,
+}
+
+impl TlsMinVersion {
+    /// Parse a version string into a `TlsMinVersion`.
+    ///
+    /// Accepts `"1.2"` and `"1.3"`. Returns an error for any other value.
+    pub fn from_str_version(s: &str) -> Result<Self> {
+        match s {
+            "1.2" => Ok(Self::Tls12),
+            "1.3" => Ok(Self::Tls13),
+            other => Err(RustgateError::Config(format!(
+                "unsupported TLS minimum version '{other}': expected '1.2' or '1.3'"
+            ))),
+        }
+    }
+
+    /// Return the `rustls` protocol versions matching this minimum.
+    fn protocol_versions(self) -> &'static [&'static rustls::SupportedProtocolVersion] {
+        static TLS12_AND_13: &[&rustls::SupportedProtocolVersion] =
+            &[&rustls::version::TLS12, &rustls::version::TLS13];
+        static TLS13_ONLY: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
+
+        match self {
+            Self::Tls12 => TLS12_AND_13,
+            Self::Tls13 => TLS13_ONLY,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct TlsConfig {
     server_certs: Vec<CertificateDer<'static>>,
     server_key: PrivateKeyDer<'static>,
     client_ca_store: Arc<RootCertStore>,
     crls: Vec<CertificateRevocationListDer<'static>>,
+    tls_min_version: TlsMinVersion,
 }
 
 impl TlsConfig {
@@ -31,6 +72,7 @@ impl TlsConfig {
             server_key,
             client_ca_store: Arc::new(client_ca_store),
             crls: Vec::new(),
+            tls_min_version: TlsMinVersion::Tls12,
         })
     }
 
@@ -58,6 +100,15 @@ impl TlsConfig {
         Ok(self)
     }
 
+    /// Set the minimum TLS protocol version.
+    ///
+    /// Defaults to TLS 1.2. Set to [`TlsMinVersion::Tls13`] to reject
+    /// all TLS 1.2 connections.
+    pub fn with_tls_min_version(mut self, version: TlsMinVersion) -> Self {
+        self.tls_min_version = version;
+        self
+    }
+
     pub fn build_server_config(&self) -> Result<rustls::ServerConfig> {
         let mut verifier_builder = WebPkiClientVerifier::builder(self.client_ca_store.clone());
 
@@ -69,10 +120,12 @@ impl TlsConfig {
             .build()
             .map_err(|e| RustgateError::Config(format!("failed to build client verifier: {e}")))?;
 
-        let mut config = rustls::ServerConfig::builder()
-            .with_client_cert_verifier(client_verifier)
-            .with_single_cert(self.server_certs.clone(), self.server_key.clone_key())
-            .map_err(|e| RustgateError::Config(format!("invalid server certificate: {e}")))?;
+        let mut config = rustls::ServerConfig::builder_with_protocol_versions(
+            self.tls_min_version.protocol_versions(),
+        )
+        .with_client_cert_verifier(client_verifier)
+        .with_single_cert(self.server_certs.clone(), self.server_key.clone_key())
+        .map_err(|e| RustgateError::Config(format!("invalid server certificate: {e}")))?;
 
         // Disable TLS session resumption. The rustls default caches 256 sessions,
         // allowing resumed connections to skip client certificate re-validation.
@@ -163,4 +216,35 @@ pub fn is_fips_provider_active() -> bool {
     rustls::crypto::CryptoProvider::get_default()
         .map(|p| p.fips())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::panic, clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn parse_tls_min_version_1_2() {
+        let v = TlsMinVersion::from_str_version("1.2").unwrap();
+        assert_eq!(v, TlsMinVersion::Tls12);
+    }
+
+    #[test]
+    fn parse_tls_min_version_1_3() {
+        let v = TlsMinVersion::from_str_version("1.3").unwrap();
+        assert_eq!(v, TlsMinVersion::Tls13);
+    }
+
+    #[test]
+    fn parse_tls_min_version_invalid() {
+        let result = TlsMinVersion::from_str_version("1.1");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_tls_min_version_empty() {
+        let result = TlsMinVersion::from_str_version("");
+        assert!(result.is_err());
+    }
 }

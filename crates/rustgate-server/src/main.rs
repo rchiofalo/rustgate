@@ -41,7 +41,7 @@ use rustgate_core::protocol::{FramingStrategy, HeaderSize};
 use rustgate_cot::MessageBuilder;
 use rustgate_transport::{
     AuthenticatedSession, CotEncoder, FramedCodec, MessageEncoder, RawEncoder, Router,
-    SessionHandle, ThrottleConfig, TlsConfig, TlsListener,
+    SessionHandle, ThrottleConfig, TlsConfig, TlsListener, TlsMinVersion,
 };
 
 /// Optional callback for forwarding messages to federation peers.
@@ -92,6 +92,11 @@ struct Cli {
     /// Connections using revoked certificates will be rejected at the TLS handshake.
     #[arg(long, env = "RUSTGATE_CRL")]
     crl: Option<String>,
+
+    /// Minimum TLS protocol version the server will accept.
+    /// "1.2" allows TLS 1.2 and 1.3 (default). "1.3" enforces TLS 1.3 only.
+    #[arg(long, default_value = "1.2", env = "RUSTGATE_TLS_MIN_VERSION")]
+    tls_min_version: String,
 
     /// Require FIPS 140-3 crypto provider. Startup fails if the FIPS provider
     /// is not active. Build with --features fips to enable.
@@ -337,8 +342,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         .await
         .context("reading CA certificate")?;
 
+    let tls_min_version = TlsMinVersion::from_str_version(&cli.tls_min_version)
+        .context("parsing TLS minimum version")?;
+
     let mut tls_config =
         TlsConfig::from_pem(&cert_pem, &key_pem, &ca_pem).context("building TLS config")?;
+    tls_config = tls_config.with_tls_min_version(tls_min_version);
 
     if let Some(ref crl_path) = cli.crl {
         let crl_pem = tokio::fs::read_to_string(crl_path)

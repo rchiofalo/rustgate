@@ -194,6 +194,32 @@ impl TestCa {
         crl.pem().expect("failed to encode CRL as PEM")
     }
 
+    /// Issue a certificate with only `ServerAuth` EKU and no SANs.
+    ///
+    /// Useful for testing that a server-only certificate is rejected when
+    /// presented as a client certificate during mTLS.
+    pub fn issue_server_auth_only_cert(&self, cn: &str) -> TestCert {
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::NoCa;
+        params
+            .extended_key_usages
+            .push(ExtendedKeyUsagePurpose::ServerAuth);
+
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, cn);
+        params.distinguished_name = dn;
+
+        let key_pair = KeyPair::generate().expect("failed to generate key pair");
+        let cert = params
+            .signed_by(&key_pair, &self.issuer)
+            .expect("failed to sign server-auth-only cert");
+
+        TestCert {
+            cert_pem: cert.pem(),
+            key_pem: key_pair.serialize_pem(),
+        }
+    }
+
     /// Issue a client certificate with the given CN and OU fields.
     ///
     /// CN becomes the user identity, OU fields become group memberships.

@@ -7,7 +7,9 @@ use rustgate_core::identity::Identity;
 use rustgate_core::sanitize::sanitize_for_log;
 use rustls::pki_types::CertificateDer;
 use sha2::{Digest, Sha256};
-use x509_parser::oid_registry::{OID_X509_COMMON_NAME, OID_X509_ORGANIZATIONAL_UNIT};
+use x509_parser::oid_registry::{
+    OID_X509_COMMON_NAME, OID_X509_EXT_EXTENDED_KEY_USAGE, OID_X509_ORGANIZATIONAL_UNIT,
+};
 use x509_parser::prelude::*;
 
 /// Extract identity from an X.509 certificate.
@@ -70,6 +72,61 @@ fn extract_groups(cert: &X509Certificate<'_>) -> BTreeSet<String> {
     }
 
     groups
+}
+
+/// Extended Key Usage purpose expected from a certificate.
+///
+/// Used with [`validate_key_usage`] to enforce that client-presented
+/// certificates include the correct EKU extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpectedKeyUsage {
+    /// Certificate must include `id-kp-clientAuth`.
+    ClientAuth,
+    /// Certificate must include `id-kp-serverAuth`.
+    ServerAuth,
+}
+
+/// Validate that the certificate contains the expected Extended Key Usage extension.
+///
+/// Returns `Ok(())` if the certificate has the required EKU, or an error if:
+/// - The certificate has no EKU extension at all
+/// - The EKU extension does not include the expected purpose
+///
+/// This prevents a server certificate from being used as a client certificate
+/// and vice versa, even if the CA signature is valid.
+pub fn validate_key_usage(cert_der: &CertificateDer<'_>, expected: ExpectedKeyUsage) -> Result<()> {
+    let (_, cert) = X509Certificate::from_der(cert_der.as_ref())
+        .map_err(|e| RustgateError::Transport(format!("failed to parse X.509 certificate: {e}")))?;
+
+    let extensions_map = cert.extensions_map().map_err(|e| {
+        RustgateError::Transport(format!("failed to parse certificate extensions: {e}"))
+    })?;
+
+    let eku_ext = extensions_map
+        .get(&OID_X509_EXT_EXTENDED_KEY_USAGE)
+        .ok_or_else(|| {
+            RustgateError::Transport("certificate has no Extended Key Usage extension".to_string())
+        })?;
+
+    let parsed = eku_ext.parsed_extension();
+    if let ParsedExtension::ExtendedKeyUsage(eku) = parsed {
+        let has_usage = match expected {
+            ExpectedKeyUsage::ClientAuth => eku.client_auth,
+            ExpectedKeyUsage::ServerAuth => eku.server_auth,
+        };
+
+        if has_usage {
+            Ok(())
+        } else {
+            Err(RustgateError::Transport(format!(
+                "certificate missing required Extended Key Usage: {expected:?}"
+            )))
+        }
+    } else {
+        Err(RustgateError::Transport(
+            "failed to parse Extended Key Usage extension".to_string(),
+        ))
+    }
 }
 
 fn compute_fingerprint(cert_der: &CertificateDer<'_>) -> String {
