@@ -368,4 +368,71 @@ mod tests {
             Some("test.zip".to_string())
         );
     }
+
+    #[test]
+    fn test_extract_multipart_field_basic() {
+        let body =
+            b"--boundary\r\nContent-Disposition: form-data; name=\"callsign\"\r\n\r\nALPHA-1\r\n--boundary--";
+        let result = extract_multipart_field(body, "boundary", "callsign");
+        assert_eq!(result, Some(b"ALPHA-1".as_slice()));
+    }
+
+    #[test]
+    fn test_extract_multipart_field_empty_body() {
+        let result = extract_multipart_field(b"", "boundary", "callsign");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_extract_multipart_field_missing_field() {
+        let body =
+            b"--boundary\r\nContent-Disposition: form-data; name=\"callsign\"\r\n\r\nALPHA-1\r\n--boundary--";
+        let result = extract_multipart_field(body, "boundary", "uid");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_extract_multipart_field_no_content_delimiter() {
+        // Part header with no \r\n\r\n separator before content
+        let body = b"--boundary\r\nContent-Disposition: form-data; name=\"callsign\"\r\nALPHA-1\r\n--boundary--";
+        let result = extract_multipart_field(body, "boundary", "callsign");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_extract_multipart_field_multiple_fields() {
+        let body = b"--boundary\r\n\
+            Content-Disposition: form-data; name=\"callsign\"\r\n\r\n\
+            ALPHA-1\r\n\
+            --boundary\r\n\
+            Content-Disposition: form-data; name=\"uid\"\r\n\r\n\
+            device-abc-123\r\n\
+            --boundary\r\n\
+            Content-Disposition: form-data; name=\"group\"\r\n\r\n\
+            Team Red\r\n\
+            --boundary--";
+
+        let callsign = extract_multipart_field(body, "boundary", "callsign");
+        assert_eq!(callsign, Some(b"ALPHA-1".as_slice()));
+
+        let uid = extract_multipart_field(body, "boundary", "uid");
+        assert_eq!(uid, Some(b"device-abc-123".as_slice()));
+
+        let group = extract_multipart_field(body, "boundary", "group");
+        assert_eq!(group, Some(b"Team Red".as_slice()));
+    }
+
+    #[test]
+    fn test_extract_multipart_filename_missing_quote() {
+        // filename value has opening quote but no closing quote
+        let body = b"--boundary\r\nContent-Disposition: form-data; name=\"assetfile\"; filename=\"test.zip\r\nContent-Type: application/zip\r\n\r\ndata\r\n--boundary--";
+        assert_eq!(extract_multipart_filename(body, "boundary"), None);
+    }
+
+    #[test]
+    fn test_extract_multipart_filename_no_filename() {
+        // Content-Disposition has name but no filename= attribute
+        let body = b"--boundary\r\nContent-Disposition: form-data; name=\"callsign\"\r\n\r\nALPHA-1\r\n--boundary--";
+        assert_eq!(extract_multipart_filename(body, "boundary"), None);
+    }
 }
