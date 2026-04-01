@@ -153,11 +153,23 @@ impl EnrollmentServer {
                 {
                     Ok(Ok(s)) => s,
                     Ok(Err(e)) => {
-                        tracing::debug!(peer = %peer, error = %e, "TLS handshake failed");
+                        let masked_peer = rustgate_core::masking::mask_ip(&peer.to_string());
+                        tracing::debug!(peer = %masked_peer, error = %e, "TLS handshake failed");
+                        rustgate_core::audit::tls_handshake_failed(
+                            &masked_peer,
+                            &e.to_string(),
+                            "enrollment_accept",
+                        );
                         return;
                     }
                     Err(_) => {
-                        tracing::debug!(peer = %peer, "TLS handshake timed out");
+                        let masked_peer = rustgate_core::masking::mask_ip(&peer.to_string());
+                        tracing::debug!(peer = %masked_peer, "TLS handshake timed out");
+                        rustgate_core::audit::tls_handshake_failed(
+                            &masked_peer,
+                            "timeout",
+                            "enrollment_accept",
+                        );
                         return;
                     }
                 };
@@ -271,7 +283,13 @@ async fn handle_sign_client_v1(
 ) -> Response<Full<Bytes>> {
     // Rate limit before doing any work
     if !sign_limiter.check(peer.ip()) {
-        tracing::warn!(peer = %peer, "CSR signing rate limited");
+        let masked_peer = rustgate_core::masking::mask_ip(&peer.to_string());
+        tracing::warn!(peer = %masked_peer, "CSR signing rate limited");
+        rustgate_core::audit::rate_limit_triggered(
+            &masked_peer,
+            "/Marti/api/tls/signClient",
+            SIGN_RATE_LIMIT,
+        );
         return build_response(
             StatusCode::TOO_MANY_REQUESTS,
             "text/plain",
@@ -286,7 +304,8 @@ async fn handle_sign_client_v1(
         .and_then(|v| v.to_str().ok());
 
     let Some(username) = credentials.validate(auth_header) else {
-        rustgate_core::audit::enrollment_auth_failed(&peer.to_string());
+        let masked_peer = rustgate_core::masking::mask_ip(&peer.to_string());
+        rustgate_core::audit::enrollment_auth_failed(&masked_peer);
         let mut resp = build_response(
             StatusCode::UNAUTHORIZED,
             "text/plain",
@@ -368,6 +387,7 @@ async fn handle_sign_client_v1(
     };
 
     rustgate_core::audit::enrollment_signed(username, &client_uid);
+    rustgate_core::audit::enrollment_certificate_issued(username, &client_uid, "pkcs12");
     tracing::info!(
         username = %username,
         client_uid = %client_uid,
@@ -387,7 +407,13 @@ async fn handle_sign_client_v2(
 ) -> Response<Full<Bytes>> {
     // Rate limit before doing any work
     if !sign_limiter.check(peer.ip()) {
-        tracing::warn!(peer = %peer, "CSR signing rate limited");
+        let masked_peer = rustgate_core::masking::mask_ip(&peer.to_string());
+        tracing::warn!(peer = %masked_peer, "CSR signing rate limited");
+        rustgate_core::audit::rate_limit_triggered(
+            &masked_peer,
+            "/Marti/api/tls/signClient/v2",
+            SIGN_RATE_LIMIT,
+        );
         return build_response(
             StatusCode::TOO_MANY_REQUESTS,
             "text/plain",
@@ -402,7 +428,8 @@ async fn handle_sign_client_v2(
         .and_then(|v| v.to_str().ok());
 
     let Some(username) = credentials.validate(auth_header) else {
-        rustgate_core::audit::enrollment_auth_failed(&peer.to_string());
+        let masked_peer = rustgate_core::masking::mask_ip(&peer.to_string());
+        rustgate_core::audit::enrollment_auth_failed(&masked_peer);
         let mut resp = build_response(
             StatusCode::UNAUTHORIZED,
             "text/plain",
@@ -492,6 +519,7 @@ async fn handle_sign_client_v2(
     };
 
     rustgate_core::audit::enrollment_signed(username, &client_uid);
+    rustgate_core::audit::enrollment_certificate_issued(username, &client_uid, "v2");
     tracing::info!(
         username = %username,
         client_uid = %client_uid,

@@ -51,7 +51,9 @@ impl TlsConfig {
             ));
         }
 
-        tracing::info!(count = crls.len(), "loaded certificate revocation lists");
+        let count = crls.len();
+        tracing::info!(count = count, "loaded certificate revocation lists");
+        rustgate_core::audit::crl_reload_success(count, "pem_data");
         self.crls = crls;
         Ok(self)
     }
