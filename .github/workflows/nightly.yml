@@ -93,9 +93,15 @@ jobs:
       matrix:
         target:
           - cot_parse
+          - crl_parse
+          - csr_parse
+          - jwt_parse
           - length_prefixed_codec
+          - nats_wire_event
+          - proto_roundtrip
           - tak_frame_codec
           - v2_federation_convert
+          - ws_frame
           - xml_stream_codec
     name: fuzz (${{ matrix.target }})
     steps:
