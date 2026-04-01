@@ -268,8 +268,7 @@ mod tests {
 
     /// Decode PEM-encoded CRL to DER bytes.
     fn pem_to_der(pem: &str) -> Vec<u8> {
-        let mut reader = std::io::BufReader::new(pem.as_bytes());
-        rustls_pemfile::crls(&mut reader)
+        rustls_pki_types::CertificateRevocationListDer::pem_slice_iter(pem.as_bytes())
             .next()
             .expect("no CRL in PEM")
             .expect("failed to parse CRL PEM")
