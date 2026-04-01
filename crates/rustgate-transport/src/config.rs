@@ -100,7 +100,7 @@ impl TlsConfig {
     ///
     /// After loading, each CRL is checked for freshness. If a CRL's
     /// `nextUpdate` field is in the past, a warning is logged (unless
-    /// stale CRL warnings are disabled via [`with_crl_warn_stale`]).
+    /// stale CRL warnings are disabled via [`Self::with_crl_warn_stale`]).
     pub fn with_crls(mut self, crl_pem: &str) -> Result<Self> {
         let crls: Vec<CertificateRevocationListDer<'static>> =
             CertificateRevocationListDer::pem_slice_iter(crl_pem.as_bytes())
