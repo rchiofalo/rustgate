@@ -10,7 +10,7 @@ pub mod publisher;
 pub mod serde_compat;
 pub mod subscriber;
 
-pub use config::NatsConfig;
+pub use config::{NatsConfig, NatsTlsConfig, NatsTlsConfigError};
 pub use jetstream::JetStreamReplay;
 pub use publisher::NatsPublisher;
 pub use serde_compat::WireEvent;
@@ -26,19 +26,32 @@ pub struct NatsAdapter {
 
 impl NatsAdapter {
     /// Connect to a NATS server and return an adapter ready for use.
+    ///
+    /// When TLS configuration is provided, the connection uses mTLS with
+    /// client certificate authentication. Validates TLS config before
+    /// attempting to connect.
     pub async fn connect(
         config: NatsConfig,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let client = if let Some(ref creds) = config.credentials_file {
-            async_nats::ConnectOptions::with_credentials_file(creds)
-                .await?
-                .connect(&config.url)
-                .await?
+        config.tls.validate()?;
+
+        let options = if let Some(ref creds) = config.credentials_file {
+            async_nats::ConnectOptions::with_credentials_file(creds).await?
         } else {
-            async_nats::connect(&config.url).await?
+            async_nats::ConnectOptions::new()
         };
 
-        tracing::info!(url = %config.url, instance_id = %config.instance_id, "connected to NATS");
+        let options = apply_tls_options(options, &config.tls);
+
+        let client = options.connect(&config.url).await?;
+
+        tracing::info!(
+            url = %config.url,
+            instance_id = %config.instance_id,
+            tls_required = config.tls.required,
+            tls_client_auth = config.tls.has_client_auth(),
+            "connected to NATS"
+        );
 
         Ok(Self { client, config })
     }
@@ -57,4 +70,26 @@ impl NatsAdapter {
     pub fn jetstream_replay(&self) -> JetStreamReplay {
         JetStreamReplay::new(self.client.clone(), self.config.clone())
     }
+}
+
+/// Apply TLS options to the NATS connect options based on configuration.
+///
+/// Configures client certificate authentication and CA verification when
+/// the corresponding paths are provided. Sets the `require_tls` flag to
+/// enforce TLS when configured.
+fn apply_tls_options(
+    options: async_nats::ConnectOptions,
+    tls: &config::NatsTlsConfig,
+) -> async_nats::ConnectOptions {
+    let mut options = options.require_tls(tls.required);
+
+    if let Some(ref ca_cert) = tls.ca_cert {
+        options = options.add_root_certificates(ca_cert.clone());
+    }
+
+    if let (Some(cert), Some(key)) = (&tls.client_cert, &tls.client_key) {
+        options = options.add_client_certificate(cert.clone(), key.clone());
+    }
+
+    options
 }

@@ -112,6 +112,23 @@ struct Cli {
     #[arg(long, env = "NATS_CREDENTIALS")]
     nats_credentials: Option<String>,
 
+    /// Path to PEM-encoded client certificate for NATS mTLS.
+    #[arg(long, env = "NATS_TLS_CERT")]
+    nats_tls_cert: Option<std::path::PathBuf>,
+
+    /// Path to PEM-encoded client private key for NATS mTLS.
+    #[arg(long, env = "NATS_TLS_KEY")]
+    nats_tls_key: Option<std::path::PathBuf>,
+
+    /// Path to PEM-encoded CA certificate for verifying the NATS server.
+    #[arg(long, env = "NATS_TLS_CA")]
+    nats_tls_ca: Option<std::path::PathBuf>,
+
+    /// Require TLS for NATS connections. Fails if TLS is required but
+    /// no certificates are provided.
+    #[arg(long, default_value_t = false, env = "NATS_TLS_REQUIRED")]
+    nats_tls_required: bool,
+
     /// Bind address for the enrollment HTTPS server (e.g. 0.0.0.0:8446).
     /// Requires --features enrollment.
     #[arg(long, env = "ENROLLMENT_BIND")]
@@ -413,6 +430,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         let config = rustgate_nats::NatsConfig {
             url: nats_url.clone(),
             credentials_file: cli.nats_credentials.clone(),
+            tls: rustgate_nats::NatsTlsConfig {
+                client_cert: cli.nats_tls_cert.clone(),
+                client_key: cli.nats_tls_key.clone(),
+                ca_cert: cli.nats_tls_ca.clone(),
+                required: cli.nats_tls_required,
+            },
             ..Default::default()
         };
 
@@ -1716,6 +1739,10 @@ mod tests {
             "RUSTGATE_ENCODING",
             "NATS_URL",
             "NATS_CREDENTIALS",
+            "NATS_TLS_CERT",
+            "NATS_TLS_KEY",
+            "NATS_TLS_CA",
+            "NATS_TLS_REQUIRED",
             "ENROLLMENT_BIND",
             "RUSTGATE_CA_KEY",
             "ENROLLMENT_USER",

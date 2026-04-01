@@ -1,7 +1,64 @@
 //! NATS connection configuration.
 
 use std::hash::{BuildHasher, Hasher};
+use std::path::PathBuf;
 use std::process;
+
+/// TLS configuration for mTLS connections to the NATS broker.
+#[derive(Debug, Clone, Default)]
+pub struct NatsTlsConfig {
+    /// Path to the client certificate PEM file.
+    pub client_cert: Option<PathBuf>,
+
+    /// Path to the client private key PEM file.
+    pub client_key: Option<PathBuf>,
+
+    /// Path to the CA certificate PEM file for verifying the NATS server.
+    pub ca_cert: Option<PathBuf>,
+
+    /// When true, TLS is required for the NATS connection.
+    /// If set but no certificates are provided, connection will fail.
+    pub required: bool,
+}
+
+impl NatsTlsConfig {
+    /// Returns true if client certificate and key are both configured.
+    pub fn has_client_auth(&self) -> bool {
+        self.client_cert.is_some() && self.client_key.is_some()
+    }
+
+    /// Validate that the TLS configuration is consistent.
+    ///
+    /// Returns an error if TLS is required but no certificates are provided,
+    /// or if only one of cert/key is specified without the other.
+    pub fn validate(&self) -> Result<(), NatsTlsConfigError> {
+        // If cert is provided, key must also be provided (and vice versa)
+        if self.client_cert.is_some() != self.client_key.is_some() {
+            return Err(NatsTlsConfigError::IncompleteClientAuth);
+        }
+
+        // If TLS is required, at least CA or client certs should be configured
+        if self.required && self.ca_cert.is_none() && !self.has_client_auth() {
+            return Err(NatsTlsConfigError::RequiredButNoCerts);
+        }
+
+        Ok(())
+    }
+}
+
+/// Errors from validating NATS TLS configuration.
+#[derive(Debug, thiserror::Error)]
+pub enum NatsTlsConfigError {
+    /// TLS is required but no certificates were provided.
+    #[error(
+        "NATS TLS is required but no certificates were provided (set NATS_TLS_CERT, NATS_TLS_KEY, and/or NATS_TLS_CA)"
+    )]
+    RequiredButNoCerts,
+
+    /// Only one of client cert or key was provided.
+    #[error("both NATS_TLS_CERT and NATS_TLS_KEY must be provided together")]
+    IncompleteClientAuth,
+}
 
 /// Configuration for the NATS adapter.
 #[derive(Debug, Clone)]
@@ -11,6 +68,9 @@ pub struct NatsConfig {
 
     /// Optional NATS credentials file path for JWT/NKey auth.
     pub credentials_file: Option<String>,
+
+    /// TLS/mTLS configuration for the NATS broker connection.
+    pub tls: NatsTlsConfig,
 
     /// Subject prefix for point updates (default: "points").
     pub subject_prefix: String,
@@ -43,6 +103,7 @@ impl Default for NatsConfig {
         Self {
             url: "nats://localhost:4222".to_string(),
             credentials_file: None,
+            tls: NatsTlsConfig::default(),
             subject_prefix: "points".to_string(),
             jetstream_stream: "TRACKS_HISTORY".to_string(),
             jetstream_subject_prefix: "TRACKS.HISTORY".to_string(),
@@ -68,4 +129,106 @@ fn generate_instance_id() -> String {
             .as_nanos() as u64,
     );
     format!("rustgate-{:016x}", hasher.finish())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::panic, clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn tls_config_default_validates() {
+        let config = NatsTlsConfig::default();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn tls_config_with_all_certs_validates() {
+        let config = NatsTlsConfig {
+            client_cert: Some(PathBuf::from("/tmp/cert.pem")),
+            client_key: Some(PathBuf::from("/tmp/key.pem")),
+            ca_cert: Some(PathBuf::from("/tmp/ca.pem")),
+            required: true,
+        };
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn tls_config_ca_only_validates() {
+        let config = NatsTlsConfig {
+            client_cert: None,
+            client_key: None,
+            ca_cert: Some(PathBuf::from("/tmp/ca.pem")),
+            required: true,
+        };
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn tls_config_cert_without_key_fails() {
+        let config = NatsTlsConfig {
+            client_cert: Some(PathBuf::from("/tmp/cert.pem")),
+            client_key: None,
+            ca_cert: None,
+            required: false,
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, NatsTlsConfigError::IncompleteClientAuth),
+            "expected IncompleteClientAuth, got: {err}"
+        );
+    }
+
+    #[test]
+    fn tls_config_key_without_cert_fails() {
+        let config = NatsTlsConfig {
+            client_cert: None,
+            client_key: Some(PathBuf::from("/tmp/key.pem")),
+            ca_cert: None,
+            required: false,
+        };
+        let err = config.validate().unwrap_err();
+        assert!(matches!(err, NatsTlsConfigError::IncompleteClientAuth));
+    }
+
+    #[test]
+    fn tls_config_required_without_certs_fails() {
+        let config = NatsTlsConfig {
+            client_cert: None,
+            client_key: None,
+            ca_cert: None,
+            required: true,
+        };
+        let err = config.validate().unwrap_err();
+        assert!(matches!(err, NatsTlsConfigError::RequiredButNoCerts));
+    }
+
+    #[test]
+    fn tls_config_not_required_without_certs_ok() {
+        let config = NatsTlsConfig {
+            client_cert: None,
+            client_key: None,
+            ca_cert: None,
+            required: false,
+        };
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn has_client_auth_both_present() {
+        let config = NatsTlsConfig {
+            client_cert: Some(PathBuf::from("cert.pem")),
+            client_key: Some(PathBuf::from("key.pem")),
+            ca_cert: None,
+            required: false,
+        };
+        assert!(config.has_client_auth());
+    }
+
+    #[test]
+    fn has_client_auth_none() {
+        let config = NatsTlsConfig::default();
+        assert!(!config.has_client_auth());
+    }
 }
