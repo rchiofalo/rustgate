@@ -3,7 +3,6 @@
 //! Establishes TLS client connections to remote federation peers,
 //! extracting the server's certificate identity for peer identification.
 
-use std::io::BufReader;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -13,6 +12,7 @@ use rustgate_core::identity::Identity;
 use rustgate_transport::extract_identity;
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls_pki_types::pem::PemObject;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
@@ -169,8 +169,7 @@ fn configure_tcp_keepalive(stream: &TcpStream) {
 }
 
 fn parse_certs(pem: &str) -> anyhow::Result<Vec<CertificateDer<'static>>> {
-    let mut reader = BufReader::new(pem.as_bytes());
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| anyhow::anyhow!("failed to parse certificates: {e}"))?;
 
@@ -182,16 +181,13 @@ fn parse_certs(pem: &str) -> anyhow::Result<Vec<CertificateDer<'static>>> {
 }
 
 fn parse_key(pem: &str) -> anyhow::Result<PrivateKeyDer<'static>> {
-    let mut reader = BufReader::new(pem.as_bytes());
-    rustls_pemfile::private_key(&mut reader)
-        .map_err(|e| anyhow::anyhow!("failed to parse private key: {e}"))?
-        .ok_or_else(|| anyhow::anyhow!("no private key found in PEM"))
+    PrivateKeyDer::from_pem_slice(pem.as_bytes())
+        .map_err(|e| anyhow::anyhow!("failed to parse private key: {e}"))
 }
 
 fn parse_ca_store(pem: &str) -> anyhow::Result<RootCertStore> {
     let mut store = RootCertStore::empty();
-    let mut reader = BufReader::new(pem.as_bytes());
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| anyhow::anyhow!("failed to parse CA certificates: {e}"))?;
 

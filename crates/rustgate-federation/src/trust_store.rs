@@ -9,13 +9,13 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use anyhow::{Context, Result, bail};
 use rustls::RootCertStore;
 use rustls_pki_types::CertificateDer;
+use rustls_pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
@@ -140,8 +140,7 @@ impl TrustStore {
     /// The certificate is stored in memory and optionally persisted to disk.
     /// Returns metadata about the added certificate.
     pub fn add_certificate_from_pem(&self, pem_data: &[u8]) -> Result<CertInfo> {
-        let mut reader = BufReader::new(pem_data);
-        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(pem_data)
             .collect::<std::result::Result<Vec<_>, _>>()
             .context("failed to parse PEM data")?;
 
@@ -278,8 +277,7 @@ impl TrustStore {
         let mut store = RootCertStore::empty();
 
         // Add base CA
-        let mut reader = BufReader::new(base_pem);
-        let base_certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
+        let base_certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(base_pem)
             .collect::<std::result::Result<Vec<_>, _>>()
             .context("failed to parse base CA PEM")?;
 

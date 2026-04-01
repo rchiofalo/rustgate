@@ -3,7 +3,6 @@
 //! Runs a hyper HTTP/1.1 server over tokio-rustls (server-only TLS, no client
 //! cert requirement). Routes the Marti-compatible enrollment endpoints.
 
-use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -885,10 +884,11 @@ fn build_server_tls_config(
     cert_pem: &str,
     key_pem: &str,
 ) -> Result<rustls::ServerConfig, EnrollmentError> {
+    use rustls_pki_types::pem::PemObject;
+
     // Parse server certs
-    let mut cert_reader = BufReader::new(cert_pem.as_bytes());
     let certs: Vec<rustls_pki_types::CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut cert_reader)
+        rustls_pki_types::CertificateDer::pem_slice_iter(cert_pem.as_bytes())
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| EnrollmentError::Tls(format!("failed to parse server certs: {e}")))?;
 
@@ -899,10 +899,8 @@ fn build_server_tls_config(
     }
 
     // Parse server key
-    let mut key_reader = BufReader::new(key_pem.as_bytes());
-    let key = rustls_pemfile::private_key(&mut key_reader)
-        .map_err(|e| EnrollmentError::Tls(format!("failed to parse server key: {e}")))?
-        .ok_or_else(|| EnrollmentError::Tls("no private key found in server PEM".to_string()))?;
+    let key = rustls_pki_types::PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
+        .map_err(|e| EnrollmentError::Tls(format!("failed to parse server key: {e}")))?;
 
     // Server-only TLS (no client cert requirement)
     let config = rustls::ServerConfig::builder()

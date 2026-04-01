@@ -4,10 +4,6 @@ all-features = true
 
 [advisories]
 ignore = [
-    # rustls-pemfile 2.x is marked unmaintained (RUSTSEC-2025-0134).
-    # Transitive dependency from async-nats; no action available until
-    # async-nats drops the dep. Track upstream: https://github.com/nats-io/nats.rs
-    "RUSTSEC-2025-0134",
     # aws-lc CRL distribution point scope check logic error.
     # On latest aws-lc-sys 0.39.0 — no upstream fix available yet.
     "RUSTSEC-2026-0042",

@@ -9,13 +9,13 @@
 //! ```
 #![cfg(feature = "fips")]
 
-use std::io::BufReader;
 use std::sync::{Arc, OnceLock};
 
 use rustgate_test_utils::certs::TestCa;
 use rustgate_transport::{TlsConfig, TlsListener, install_fips_provider, is_fips_provider_active};
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls_pki_types::pem::PemObject;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // ── setup ────────────────────────────────────────────────────────────────
@@ -35,17 +35,13 @@ fn ensure_fips() {
 // ── helpers ──────────────────────────────────────────────────────────────
 
 fn parse_certs(pem: &str) -> Vec<CertificateDer<'static>> {
-    let mut reader = BufReader::new(pem.as_bytes());
-    rustls_pemfile::certs(&mut reader)
+    CertificateDer::pem_slice_iter(pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .expect("parse certs")
 }
 
 fn parse_key(pem: &str) -> PrivateKeyDer<'static> {
-    let mut reader = BufReader::new(pem.as_bytes());
-    rustls_pemfile::private_key(&mut reader)
-        .expect("parse key")
-        .expect("no key")
+    PrivateKeyDer::from_pem_slice(pem.as_bytes()).expect("parse key")
 }
 
 fn build_client_config(cert_pem: &str, key_pem: &str, ca_pem: &str) -> rustls::ClientConfig {

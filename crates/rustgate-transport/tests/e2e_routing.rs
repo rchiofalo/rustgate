@@ -3,7 +3,6 @@
 //! plus direct router tests for group/direct delivery.
 
 use std::collections::BTreeSet;
-use std::io::BufReader;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -18,6 +17,7 @@ use rustgate_transport::{
 };
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls_pki_types::pem::PemObject;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio_util::codec::{FramedRead, FramedWrite};
@@ -25,17 +25,13 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 // ── helpers ──────────────────────────────────────────────────────────────
 
 fn parse_certs(pem: &str) -> Vec<CertificateDer<'static>> {
-    let mut reader = BufReader::new(pem.as_bytes());
-    rustls_pemfile::certs(&mut reader)
+    CertificateDer::pem_slice_iter(pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .expect("parse certs")
 }
 
 fn parse_key(pem: &str) -> PrivateKeyDer<'static> {
-    let mut reader = BufReader::new(pem.as_bytes());
-    rustls_pemfile::private_key(&mut reader)
-        .expect("parse key")
-        .expect("no key")
+    PrivateKeyDer::from_pem_slice(pem.as_bytes()).expect("parse key")
 }
 
 fn build_client_config(cert_pem: &str, key_pem: &str, ca_pem: &str) -> rustls::ClientConfig {

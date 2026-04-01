@@ -13,6 +13,7 @@ use hyper::Request;
 use hyper_util::rt::TokioIo;
 use rustgate_enrollment::{Credentials, CsrSigner, EnrollmentServer};
 use rustgate_test_utils::certs::TestCa;
+use rustls_pki_types::pem::PemObject;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
@@ -69,9 +70,8 @@ impl TestEnv {
     /// Build a TLS connector that trusts the test CA.
     fn tls_connector(&self) -> TlsConnector {
         let mut root_store = rustls::RootCertStore::empty();
-        let mut reader = std::io::BufReader::new(self.ca_cert_pem.as_bytes());
         let certs: Vec<rustls_pki_types::CertificateDer<'static>> =
-            rustls_pemfile::certs(&mut reader)
+            rustls_pki_types::CertificateDer::pem_slice_iter(self.ca_cert_pem.as_bytes())
                 .collect::<Result<Vec<_>, _>>()
                 .expect("parse CA cert");
         for cert in certs {
