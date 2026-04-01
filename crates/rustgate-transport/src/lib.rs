@@ -16,7 +16,7 @@ pub use cache::PositionCache;
 pub use codec::{FramedCodec, LengthPrefixedCodec, LineDelimitedCodec, XmlStreamCodec};
 #[cfg(feature = "fips")]
 pub use config::install_fips_provider;
-pub use config::{TlsConfig, TlsMinVersion, is_fips_provider_active};
+pub use config::{TlsConfig, TlsMinVersion, check_crl_freshness, is_fips_provider_active};
 pub use encoder::{CotEncoder, MessageEncoder, RawEncoder};
 pub use extract::{ExpectedKeyUsage, extract_identity, validate_key_usage};
 pub use filter::{GeoBounds, MessageFilter};

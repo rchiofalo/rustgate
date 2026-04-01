@@ -98,6 +98,11 @@ struct Cli {
     #[arg(long, default_value = "1.2", env = "RUSTGATE_TLS_MIN_VERSION")]
     tls_min_version: String,
 
+    /// Warn when loaded CRLs are stale (nextUpdate in the past).
+    /// Defaults to true. Set to false to suppress warnings for intentionally stale CRLs.
+    #[arg(long, default_value_t = true, env = "RUSTGATE_CRL_WARN_STALE")]
+    crl_warn_stale: bool,
+
     /// Require FIPS 140-3 crypto provider. Startup fails if the FIPS provider
     /// is not active. Build with --features fips to enable.
     #[arg(long, default_value_t = false, env = "RUSTGATE_FIPS_REQUIRED")]
@@ -365,6 +370,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let mut tls_config =
         TlsConfig::from_pem(&cert_pem, &key_pem, &ca_pem).context("building TLS config")?;
     tls_config = tls_config.with_tls_min_version(tls_min_version);
+
+    tls_config = tls_config.with_crl_warn_stale(cli.crl_warn_stale);
 
     if let Some(ref crl_path) = cli.crl {
         let crl_pem = tokio::fs::read_to_string(crl_path)

@@ -1,14 +1,16 @@
 //! Integration tests for Certificate Revocation List (CRL) support.
 //!
 //! Verifies that TLS handshakes reject revoked client certificates
-//! and accept non-revoked ones when CRLs are loaded.
+//! and accept non-revoked ones when CRLs are loaded, and that CRL
+//! freshness validation detects stale CRLs.
+#![allow(clippy::panic, clippy::unwrap_used)]
 
 use std::sync::Arc;
 
 use rustgate_test_utils::certs::TestCa;
 use rustgate_transport::{TlsConfig, TlsListener};
 use rustls::RootCertStore;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer};
 use rustls_pki_types::pem::PemObject;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -218,6 +220,81 @@ async fn crl_revokes_multiple_certs() {
     assert!(
         server_result.is_err(),
         "server should timeout for revoked client a"
+    );
+}
+
+// ── CRL freshness tests ────────────────────────────────────────────────
+
+/// A stale CRL (nextUpdate in the past) should be detected by the
+/// freshness check and return a non-zero stale count.
+#[test]
+fn stale_crl_detected_by_freshness_check() {
+    let ca = TestCa::new("CRL Freshness CA");
+    let client = ca.issue_client_cert("user1", &["team"]);
+
+    let expired_crl_pem = ca.generate_expired_crl(&[&client.cert_pem]);
+    let crls: Vec<rustls::pki_types::CertificateRevocationListDer<'static>> =
+        CertificateRevocationListDer::pem_slice_iter(expired_crl_pem.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .expect("parse CRL PEM");
+
+    let stale_count = rustgate_transport::check_crl_freshness(&crls);
+    assert_eq!(stale_count, 1, "expired CRL should be detected as stale");
+}
+
+/// A fresh CRL (nextUpdate in the future) should pass the freshness
+/// check with zero stale CRLs.
+#[test]
+fn fresh_crl_passes_freshness_check() {
+    let ca = TestCa::new("CRL Freshness CA");
+    let client = ca.issue_client_cert("user1", &["team"]);
+
+    let fresh_crl_pem = ca.generate_crl(&[&client.cert_pem]);
+    let crls: Vec<rustls::pki_types::CertificateRevocationListDer<'static>> =
+        CertificateRevocationListDer::pem_slice_iter(fresh_crl_pem.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .expect("parse CRL PEM");
+
+    let stale_count = rustgate_transport::check_crl_freshness(&crls);
+    assert_eq!(stale_count, 0, "fresh CRL should not be flagged as stale");
+}
+
+/// A stale CRL can still be loaded via `with_crls` — freshness check
+/// only warns, it does not reject.
+#[test]
+fn stale_crl_loads_without_error() {
+    let ca = TestCa::new("CRL Freshness CA");
+    let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
+    let client = ca.issue_client_cert("user1", &["team"]);
+
+    let expired_crl_pem = ca.generate_expired_crl(&[&client.cert_pem]);
+
+    let config = TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
+        .expect("tls config");
+
+    // with_crls should succeed even with stale CRL — it warns but does not reject
+    let result = config.with_crls(&expired_crl_pem);
+    assert!(result.is_ok(), "stale CRL should still load successfully");
+}
+
+/// When stale CRL warnings are disabled, the freshness check is skipped
+/// inside `with_crls` but the CRL still loads.
+#[test]
+fn stale_crl_warning_suppressed() {
+    let ca = TestCa::new("CRL Freshness CA");
+    let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
+    let client = ca.issue_client_cert("user1", &["team"]);
+
+    let expired_crl_pem = ca.generate_expired_crl(&[&client.cert_pem]);
+
+    let config = TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
+        .expect("tls config")
+        .with_crl_warn_stale(false);
+
+    let result = config.with_crls(&expired_crl_pem);
+    assert!(
+        result.is_ok(),
+        "stale CRL with warnings disabled should still load"
     );
 }
 

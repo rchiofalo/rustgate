@@ -220,6 +220,40 @@ impl TestCa {
         }
     }
 
+    /// Generate an already-expired CRL for testing stale CRL detection.
+    ///
+    /// The CRL's `thisUpdate` and `nextUpdate` are both in the past,
+    /// simulating a CRL that should have been refreshed.
+    pub fn generate_expired_crl(&self, revoked_cert_pems: &[&str]) -> String {
+        let revoked_certs: Vec<RevokedCertParams> = revoked_cert_pems
+            .iter()
+            .map(|pem| {
+                let serial = extract_serial_from_pem(pem);
+                RevokedCertParams {
+                    serial_number: serial,
+                    revocation_time: OffsetDateTime::now_utc() - TimeDuration::days(60),
+                    reason_code: Some(RevocationReason::KeyCompromise),
+                    invalidity_date: None,
+                }
+            })
+            .collect();
+
+        let now = OffsetDateTime::now_utc();
+        let crl_params = CertificateRevocationListParams {
+            this_update: now - TimeDuration::days(60),
+            next_update: now - TimeDuration::days(30),
+            crl_number: SerialNumber::from(CRL_SERIAL.fetch_add(1, Ordering::Relaxed)),
+            issuing_distribution_point: None,
+            revoked_certs,
+            key_identifier_method: KeyIdMethod::Sha256,
+        };
+
+        let crl = crl_params
+            .signed_by(&self.issuer)
+            .expect("failed to sign expired CRL");
+        crl.pem().expect("failed to encode expired CRL as PEM")
+    }
+
     /// Issue a client certificate with the given CN and OU fields.
     ///
     /// CN becomes the user identity, OU fields become group memberships.
