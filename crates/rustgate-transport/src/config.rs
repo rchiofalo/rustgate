@@ -7,6 +7,7 @@ use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer};
 use rustls::server::{NoServerSessionStorage, WebPkiClientVerifier};
 use rustls_pki_types::pem::PemObject;
+use x509_parser::prelude::*;
 
 /// Minimum TLS protocol version the server will accept.
 ///
@@ -55,6 +56,7 @@ pub struct TlsConfig {
     client_ca_store: Arc<RootCertStore>,
     crls: Vec<CertificateRevocationListDer<'static>>,
     tls_min_version: TlsMinVersion,
+    warn_stale_crl: bool,
 }
 
 impl TlsConfig {
@@ -73,7 +75,21 @@ impl TlsConfig {
             client_ca_store: Arc::new(client_ca_store),
             crls: Vec::new(),
             tls_min_version: TlsMinVersion::Tls12,
+            warn_stale_crl: true,
         })
+    }
+
+    /// Control whether stale CRL warnings are emitted.
+    ///
+    /// When `true` (the default), loading a CRL whose `nextUpdate` field
+    /// is in the past will produce a warning log. Set to `false` to
+    /// suppress these warnings when stale CRLs are intentional.
+    ///
+    /// Can also be controlled via the `RUSTGATE_CRL_WARN_STALE`
+    /// environment variable (set to `"false"` to disable).
+    pub fn with_crl_warn_stale(mut self, warn: bool) -> Self {
+        self.warn_stale_crl = warn;
+        self
     }
 
     /// Load Certificate Revocation Lists from PEM data.
@@ -81,6 +97,10 @@ impl TlsConfig {
     /// CRLs are checked during the TLS handshake — connections using
     /// revoked certificates will be rejected before reaching the
     /// application layer.
+    ///
+    /// After loading, each CRL is checked for freshness. If a CRL's
+    /// `nextUpdate` field is in the past, a warning is logged (unless
+    /// stale CRL warnings are disabled via [`with_crl_warn_stale`]).
     pub fn with_crls(mut self, crl_pem: &str) -> Result<Self> {
         let crls: Vec<CertificateRevocationListDer<'static>> =
             CertificateRevocationListDer::pem_slice_iter(crl_pem.as_bytes())
@@ -96,6 +116,11 @@ impl TlsConfig {
         let count = crls.len();
         tracing::info!(count = count, "loaded certificate revocation lists");
         rustgate_core::audit::crl_reload_success(count, "pem_data");
+
+        if self.warn_stale_crl {
+            let _ = check_crl_freshness(&crls);
+        }
+
         self.crls = crls;
         Ok(self)
     }
@@ -178,6 +203,56 @@ impl TlsConfig {
 
         Ok(store)
     }
+}
+
+/// Check freshness of loaded CRLs by examining the `nextUpdate` field.
+///
+/// For each CRL whose `nextUpdate` timestamp is in the past, a warning
+/// is logged. Stale CRLs are not rejected — operators may intentionally
+/// use them — but the warning helps detect misconfiguration.
+///
+/// Returns the number of stale CRLs detected.
+pub fn check_crl_freshness(crls: &[CertificateRevocationListDer<'static>]) -> usize {
+    let now = ASN1Time::now();
+    let mut stale_count: usize = 0;
+
+    for (i, crl_der) in crls.iter().enumerate() {
+        match parse_x509_crl(crl_der.as_ref()) {
+            Ok((_, crl)) => {
+                if let Some(next_update) = crl.next_update() {
+                    if next_update < now {
+                        stale_count += 1;
+                        tracing::warn!(
+                            crl_index = i,
+                            next_update = %next_update,
+                            "CRL is stale — nextUpdate is in the past; \
+                             revoked certificates may not be detected"
+                        );
+                    } else {
+                        tracing::debug!(
+                            crl_index = i,
+                            next_update = %next_update,
+                            "CRL freshness check passed"
+                        );
+                    }
+                } else {
+                    tracing::debug!(
+                        crl_index = i,
+                        "CRL has no nextUpdate field — freshness check skipped"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    crl_index = i,
+                    error = %e,
+                    "failed to parse CRL for freshness check — skipping"
+                );
+            }
+        }
+    }
+
+    stale_count
 }
 
 /// Install the FIPS 140-3 validated crypto provider (aws-lc-rs).

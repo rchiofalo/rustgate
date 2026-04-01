@@ -1,0 +1,321 @@
+================================================================================
+RUSTGATE SECURITY AUDIT - EXECUTIVE SUMMARY
+================================================================================
+
+Date: March 30, 2026
+Scope: Helm Chart, Dockerfile, docker-compose.yml, Kubernetes manifests
+Standards: Pod Security Standards (Restricted), CIS Kubernetes Benchmark v1.8,
+           NSA/CISA Kubernetes Hardening Guide v1.2
+
+================================================================================
+RISK RATING SUMMARY
+================================================================================
+
+Overall Risk Level: MEDIUM
+
+Production Readiness: NOT READY without Phase 1 remediations
+
+Compliance Status:
+  Container Image Security ........ MEDIUM - Image digest pinning needed
+  SecurityContext ................. GOOD - Meets Restricted profile
+  Network Security ................ CRITICAL - NetworkPolicy incomplete
+  Secrets Management .............. MEDIUM - Needs encryption & Secret enforcement
+  RBAC & Service Accounts ......... GOOD - Least privilege configured
+  Pod Disruption & HA ............. GOOD - PDB and topology spread present
+  Ingress Security ................ MEDIUM - TLS handling incomplete
+  Runtime Security ................ NOT CONFIGURED - Falco recommended
+
+================================================================================
+CRITICAL FINDINGS (Must fix before production)
+================================================================================
+
+1. IMAGE DIGEST PINNING (Priority: CRITICAL)
+   Issue: Container image referenced by tag only (0.3.0), not by SHA256 digest
+   Risk: Tags are mutable; enables supply chain attacks
+   Effort: 30 minutes
+   Impact: HIGH
+
+2. NETWORKPOLICY INCOMPLETE (Priority: CRITICAL)
+   Issue: NetworkPolicy disabled by default + incomplete ingress/egress rules
+   Risk: Allows pod-to-pod lateral movement, DNS exfiltration, uncontrolled egress
+   Effort: 2 hours
+   Impact: CRITICAL
+
+3. PLAINTEXT SECRETS (Priority: CRITICAL)
+   Issue: Enrollment and NATS credentials can be specified in plaintext values
+   Risk: Credentials committed to Git, visible in Helm history and pod descriptions
+   Effort: 1.5 hours
+   Impact: HIGH
+
+4. INGRESS TLS (Priority: HIGH)
+   Issue: Ingress template doesn't enforce TLS; Ingressdefaults to HTTP
+   Risk: Traffic to rustgate exposed in plaintext over cluster network
+   Effort: 2 hours
+   Impact: HIGH
+
+5. ETCD ENCRYPTION (Priority: CRITICAL)
+   Issue: Cluster-level etcd encryption not required/documented
+   Risk: Secrets stored unencrypted in etcd
+   Effort: Varies (cluster admin task)
+   Impact: CRITICAL
+
+================================================================================
+HIGH PRIORITY FINDINGS (Before scaling to production HA)
+================================================================================
+
+6. STORAGE ENCRYPTION (Priority: HIGH)
+   Issue: PVC does not specify encrypted StorageClass
+   Risk: Persistent federation data stored unencrypted
+   Effort: 1 hour
+   Impact: MEDIUM
+
+7. NATS AUTHENTICATION (Priority: HIGH)
+   Issue: docker-compose.yml NATS has no authentication
+   Risk: Unauthenticated NATS access in local dev environment
+   Effort: 2 hours
+   Impact: MEDIUM
+
+8. METRICS PORT ISOLATION (Priority: MEDIUM)
+   Issue: Metrics port (9090) exposed without authentication/isolation
+   Risk: Information disclosure through Prometheus metrics
+   Effort: 1 hour
+   Impact: MEDIUM
+
+================================================================================
+STRENGTHS (Existing Controls)
+================================================================================
+
+✓ POD SECURITYCONTEXT
+  - Runs as non-root user (10001)
+  - No privilege escalation allowed
+  - Read-only root filesystem
+  - ALL capabilities dropped
+  - Complies with Pod Security Standards (Restricted)
+
+✓ POD DISRUPTION BUDGET
+  - Configured for multi-replica deployments
+  - Ensures availability during node drains
+
+✓ TOPOLOGY SPREAD CONSTRAINTS
+  - Spreads replicas across nodes (maxSkew: 1)
+  - Prevents single-node failures
+
+✓ HEALTH CHECKS
+  - Startup, liveness, readiness probes configured
+  - Proper timeout and retry logic
+
+✓ DOCKERFILE HARDENING
+  - Base images pinned by SHA256
+  - Multi-stage build (no build tools in runtime)
+  - Non-root user created at build time
+  - Minimal dependencies
+
+✓ RESOURCE LIMITS
+  - CPU and memory requests/limits set
+  - Prevents resource starvation
+
+✓ RBAC - LEAST PRIVILEGE
+  - automountServiceAccountToken: false
+  - Service account token not needed or mounted
+  - Zero API access required
+
+✓ SECRET MOUNTING
+  - TLS certificates mounted as Kubernetes Secrets
+  - Mounted read-only
+  - User cannot access
+
+================================================================================
+ROADMAP & TIMELINE
+================================================================================
+
+PHASE 1: CRITICAL PATH (Weeks 1-2) - MUST COMPLETE
+  [ ] 1.1: Pin container image by SHA256 digest (30 min)
+  [ ] 1.2: Enable and fix NetworkPolicy (2 hrs)
+  [ ] 1.3: Remove plaintext secrets path (1 hr)
+  [ ] 1.4: Require NATS Secret (30 min)
+  [ ] 1.5: Enable cluster etcd encryption (varies)
+
+PHASE 2: HIGH PRIORITY (Weeks 2-4) - BEFORE PRODUCTION HA
+  [ ] 2.1: Configure Ingress TLS with cert-manager (2 hrs)
+  [ ] 2.2: Use encrypted StorageClass (1 hr)
+  [ ] 2.3: Add explicit ServiceAccount (30 min)
+  [ ] 2.4: Add NATS authentication (2 hrs)
+  [ ] 2.5: Restrict metrics port via NetworkPolicy (1 hr)
+
+PHASE 3: MEDIUM PRIORITY (Weeks 4-6) - ALONGSIDE PHASES 1 & 2
+  [ ] 3.1: Install Falco runtime security (3 hrs)
+  [ ] 3.2: Implement certificate auto-rotation (2 hrs)
+  [ ] 3.3: Add SBOM generation to CI/CD (1 hr)
+
+PHASE 4: LOW PRIORITY (Ongoing) - NICE-TO-HAVE
+  [ ] 4.1: Fix Dockerfile HEALTHCHECK (15 min)
+  [ ] 4.2: Pin NATS image by digest (15 min)
+  [ ] 4.3: Add AppArmor/SELinux profiles (3 hrs, optional)
+  [ ] 4.4: Add zone-aware topology spread (30 min)
+
+TOTAL EFFORT:
+  Critical: 7 hours (+ cluster admin time)
+  High: 6 hours
+  Medium: 6 hours
+  Low: 1 hour
+
+ESTIMATED TIMELINE TO PRODUCTION:
+  Phase 1 & 2: 2-3 weeks
+  Phase 3: Parallel (4-6 weeks)
+  Phase 4: Ongoing/optional
+
+================================================================================
+COMPLIANCE CHECKLIST
+================================================================================
+
+KUBERNETES POD SECURITY STANDARDS (Restricted Profile):
+  ✓ runAsNonRoot: true
+  ✓ allowPrivilegeEscalation: false
+  ✓ readOnlyRootFilesystem: true
+  ✓ Capabilities: ALL dropped
+  ✓ seccompProfile: RuntimeDefault
+  ✗ NetworkPolicy: MISSING/INCOMPLETE - FIX PHASE 1
+  ✗ Image digest pinning: MISSING - FIX PHASE 1
+
+CIS KUBERNETES BENCHMARK v1.8 KEY CONTROLS:
+  ✓ 5.1.6 - automountServiceAccountToken: false
+  ✓ 5.2.1 - Containers run as non-root
+  ✓ 5.2.2 - Read-only root filesystem
+  ✓ 5.2.4 - Image digest pinning (PARTIAL - values.yaml)
+  ✓ 1.4.12 - Resource requests and limits set
+  ✓ 1.4.6 - Health checks configured
+  ✗ 5.3.1 - NetworkPolicy enabled (INCOMPLETE)
+  ✗ 5.2.10 - Kubernetes Secrets encryption at rest (CLUSTER LEVEL)
+
+NSA/CISA KUBERNETES HARDENING GUIDE v1.2:
+  ✓ Least privilege user (10001)
+  ✓ Immutable filesystem
+  ✓ No privilege escalation
+  ✓ Network isolation (INCOMPLETE)
+  ✓ Scan container images
+  ✓ Use pod security standards
+  ✗ Encrypt secrets in transit (use service mesh) - OPTIONAL
+  ✗ Runtime security monitoring - PHASE 3
+
+HELM SECURITY BEST PRACTICES:
+  ✓ Optional imagePullSecrets support
+  ✓ Secret-first design for credentials
+  ✓ Templated all resources
+  ✗ Plaintext credentials fallback - REMOVE PHASE 1
+  ✗ Image digest pinning - FIX PHASE 1
+  ✗ NetworkPolicy disabled by default - ENABLE PHASE 1
+  ✗ Ingress TLS mandatory - FIX PHASE 2
+
+================================================================================
+DEPLOYMENT VALIDATION
+================================================================================
+
+Before deploying to production, run:
+
+  # Linting
+  $ helm lint helm/
+  $ helm template rustgate helm/ | kubeval
+
+  # Security scanning
+  $ helm template rustgate helm/ | kubesec scan
+
+  # Network policy validation
+  $ kubectl get networkpolicies
+  $ kubectl describe networkpolicy rustgate
+
+  # Image scanning
+  $ trivy image ghcr.io/rchiofalo/rustgate:0.3.0@sha256:...
+
+  # Secrets management
+  $ kubectl get secrets -o json | grep -v encryption
+
+  # Pod security standards
+  $ kubectl label namespace rustgate pod-security.kubernetes.io/enforce=restricted
+
+================================================================================
+REFERENCE DOCUMENTS
+================================================================================
+
+Detailed Findings:
+  - SECURITY_AUDIT_REPORT.md (comprehensive audit with all findings)
+
+Remediation Steps:
+  - SECURITY_REMEDIATION_ROADMAP.md (phased remediation with code examples)
+
+Standards & Sources:
+  - Kubernetes Pod Security Standards: https://kubernetes.io/docs/concepts/security/pod-security-standards/
+  - CIS Kubernetes Benchmark: https://www.cisecurity.org/benchmark/kubernetes
+  - NSA/CISA Hardening Guide: https://media.defense.gov/2022/Aug/29/.../CTR_KUBERNETES_HARDENING_GUIDANCE_1.2_20220829.PDF
+  - Helm Best Practices: https://www.sysdig.com/blog/how-to-secure-helm
+
+================================================================================
+RECOMMENDATIONS FOR STAKEHOLDERS
+================================================================================
+
+SECURITY TEAM:
+  1. Review Phase 1 findings, especially NetworkPolicy and image pinning
+  2. Enforce cluster-level etcd encryption
+  3. Set Pod Security Standards at namespace level
+  4. Implement policy as code (OPA/Kyverno) to prevent regressions
+  5. Plan Falco deployment for runtime monitoring
+
+DEVOPS/PLATFORM:
+  1. Create encrypted StorageClass
+  2. Deploy cert-manager for TLS automation
+  3. Configure RBAC for helmrelease deployments
+  4. Set up Prometheus ServiceMonitor
+  5. Document cluster-level security requirements
+
+DEVELOPMENT:
+  1. Update CI/CD to pin container digests
+  2. Add SBOM generation and scanning
+  3. Test Phase 1 changes in staging cluster
+  4. Document secret creation process for enrollment and NATS
+  5. Add security checks to pre-commit hooks
+
+OPERATIONS:
+  1. Plan cluster upgrade for etcd encryption
+  2. Create runbook for certificate rotation
+  3. Set up alerting for Pod Security violations
+  4. Monitor NetworkPolicy rejection rates
+  5. Document production deployment procedures
+
+================================================================================
+CONCLUSION
+================================================================================
+
+The rustgate Helm chart and container deployment demonstrate strong foundational
+security practices and are aligned with Kubernetes security standards and best
+practices. The architecture shows careful attention to SecurityContext, resource
+management, health checks, and availability controls.
+
+However, there are critical gaps in network security and secrets handling that
+must be addressed before production deployment. Most critically:
+
+  1. Image digest pinning (supply chain security)
+  2. NetworkPolicy enforcement (network isolation)
+  3. Secrets encryption (data protection)
+  4. TLS for external traffic (confidentiality)
+
+With completion of Phase 1 remediation (2-3 weeks), the deployment will be
+significantly hardened and production-ready for secure, authenticated message
+routing with federation and integration capabilities.
+
+Phase 2-4 enhancements (following 2-6 weeks) will provide additional defense-in-
+depth capabilities including runtime security monitoring, certificate automation,
+and enhanced resilience.
+
+Overall Assessment: STRONG FOUNDATION + CRITICAL FIXES NEEDED = READY AFTER PHASE 1
+
+Next Steps:
+  1. Review SECURITY_AUDIT_REPORT.md with security team
+  2. Create tickets for Phase 1 remediation
+  3. Begin Phase 1 implementation immediately
+  4. Schedule staging deployment for weeks 2-3
+  5. Plan production rollout for week 4+
+
+Contact: [Security/DevOps team lead]
+Created: March 30, 2026
+Version: 1.0
+
+================================================================================
