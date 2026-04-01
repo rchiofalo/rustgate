@@ -148,6 +148,13 @@ struct Cli {
     #[arg(long, default_value_t = 1024, env = "RUSTGATE_MAX_CONNECTIONS")]
     max_connections: usize,
 
+    /// Maximum number of TLS handshakes that may be in progress simultaneously.
+    /// Limits the CPU cost of concurrent cryptographic operations during
+    /// connection floods. Incoming connections that exceed this limit will
+    /// wait until a handshake slot becomes available.
+    #[arg(long, default_value_t = 100, env = "RUSTGATE_MAX_HANDSHAKES")]
+    max_concurrent_handshakes: usize,
+
     /// Bind address for the WebSocket (wss://) listener (e.g. 0.0.0.0:8443).
     /// Requires --features websocket.
     #[arg(long, env = "WEBSOCKET_BIND")]
@@ -340,9 +347,16 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         tls_config = tls_config.with_crls(&crl_pem).context("loading CRL data")?;
     }
 
-    let listener = TlsListener::bind(&cli.bind, &tls_config)
-        .await
-        .context("binding TLS listener")?;
+    if cli.max_concurrent_handshakes == 0 {
+        anyhow::bail!("--max-concurrent-handshakes must be at least 1");
+    }
+    let listener = TlsListener::bind_with_handshake_limit(
+        &cli.bind,
+        &tls_config,
+        cli.max_concurrent_handshakes,
+    )
+    .await
+    .context("binding TLS listener")?;
     let framing = cli.framing;
     let encoding = cli.encoding;
 
@@ -1642,6 +1656,24 @@ mod tests {
         .expect("should parse");
         assert_eq!(cli.bind, "0.0.0.0:4433");
         assert_eq!(cli.max_connections, 1024);
+        assert_eq!(cli.max_concurrent_handshakes, 100);
+    }
+
+    #[test]
+    fn cli_max_concurrent_handshakes_override() {
+        let cli = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--max-concurrent-handshakes",
+            "50",
+        ])
+        .expect("should parse");
+        assert_eq!(cli.max_concurrent_handshakes, 50);
     }
 
     #[test]
@@ -1724,6 +1756,7 @@ mod tests {
             "DATA_PACKAGE_DIR",
             "METRICS_BIND",
             "RUSTGATE_MAX_CONNECTIONS",
+            "RUSTGATE_MAX_HANDSHAKES",
             "FEDERATION_V1_BIND",
             "FEDERATION_V2_BIND",
             "FEDERATION_ID",

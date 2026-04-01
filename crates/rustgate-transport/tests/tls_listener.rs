@@ -225,3 +225,112 @@ async fn accept_multiple_clients_sequentially() {
     assert_eq!(cn1, "alice");
     assert_eq!(cn2, "bob");
 }
+
+// ── handshake concurrency limiting ──────────────────────────────────────
+
+/// With `max_concurrent_handshakes = 1`, a second handshake must wait until
+/// the first completes. Verify that both connections eventually succeed.
+#[tokio::test]
+async fn handshake_concurrency_limit_allows_sequential() {
+    let ca = TestCa::new("Test CA");
+    let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
+    let client_cert = ca.issue_client_cert("alice", &["alpha"]);
+
+    let tls_config = TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
+        .expect("tls config");
+    // Only 1 handshake at a time.
+    let listener = TlsListener::bind_with_handshake_limit("127.0.0.1:0", &tls_config, 1)
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    let server_handle = tokio::spawn(async move {
+        let s1 = listener.accept().await.expect("accept first");
+        let cn1 = s1.identity().cn.clone();
+        drop(s1);
+
+        let s2 = listener.accept().await.expect("accept second");
+        let cn2 = s2.identity().cn.clone();
+        (cn1, cn2)
+    });
+
+    let config = build_client_config(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem);
+
+    // First connection succeeds immediately.
+    let _stream1 = connect(addr, &config).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    drop(_stream1);
+
+    // Second connection succeeds after the first slot frees up.
+    let _stream2 = connect(addr, &config).await;
+
+    let (cn1, cn2) = server_handle.await.expect("server task");
+    assert_eq!(cn1, "alice");
+    assert_eq!(cn2, "alice");
+}
+
+/// With a handshake limit of 1, two simultaneous handshakes are serialized
+/// but both eventually complete.
+#[tokio::test]
+async fn handshake_concurrency_limit_serializes_parallel_connections() {
+    let ca = TestCa::new("Test CA");
+    let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
+    let alice = ca.issue_client_cert("alice", &["team"]);
+    let bob = ca.issue_client_cert("bob", &["team"]);
+
+    let tls_config = TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
+        .expect("tls config");
+    let listener = TlsListener::bind_with_handshake_limit("127.0.0.1:0", &tls_config, 1)
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    let server_handle = tokio::spawn(async move {
+        let mut names = Vec::new();
+        for _ in 0..2 {
+            let session = listener.accept().await.expect("accept");
+            names.push(session.identity().cn.clone());
+        }
+        names
+    });
+
+    let alice_config = build_client_config(&alice.cert_pem, &alice.key_pem, &ca.cert_pem);
+    let bob_config = build_client_config(&bob.cert_pem, &bob.key_pem, &ca.cert_pem);
+
+    // Spawn two connections concurrently; the semaphore serializes handshakes.
+    let (a, b) = tokio::join!(connect(addr, &alice_config), connect(addr, &bob_config),);
+    let _stream_a = a;
+    let _stream_b = b;
+
+    let names = server_handle.await.expect("server task");
+    assert_eq!(names.len(), 2);
+    assert!(names.contains(&"alice".to_string()));
+    assert!(names.contains(&"bob".to_string()));
+}
+
+/// Verify the default `bind` constructor still works (backwards compatibility).
+#[tokio::test]
+async fn bind_default_handshake_limit() {
+    let ca = TestCa::new("Test CA");
+    let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
+    let client_cert = ca.issue_client_cert("charlie", &[]);
+
+    let tls_config = TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
+        .expect("tls config");
+    // Use the original `bind` (no explicit limit) — should still work.
+    let listener = TlsListener::bind("127.0.0.1:0", &tls_config)
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    let server_handle = tokio::spawn(async move {
+        let session = listener.accept().await.expect("accept");
+        session.identity().cn.clone()
+    });
+
+    let config = build_client_config(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem);
+    let _stream = connect(addr, &config).await;
+
+    let cn = server_handle.await.expect("server task");
+    assert_eq!(cn, "charlie");
+}
