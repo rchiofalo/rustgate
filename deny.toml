@@ -4,6 +4,9 @@ all-features = true
 
 [advisories]
 ignore = [
+    # rustls-pemfile is unmaintained — transitive via async-nats → rustls-native-certs.
+    # Direct usage removed; waiting on upstream to drop the dependency.
+    "RUSTSEC-2025-0134",
     # rustls-webpki CRL distribution point matching logic error (GHSA-pwjx-qhcg-rvj4).
     # On latest rustls-webpki — no upstream fix available yet.
     "RUSTSEC-2026-0049",
