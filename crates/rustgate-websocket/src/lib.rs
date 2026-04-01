@@ -11,8 +11,8 @@ mod server;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
+use rustgate_core::constants::{HANDSHAKE_TIMEOUT, TCP_KEEPALIVE_IDLE, TCP_KEEPALIVE_INTERVAL};
 use rustgate_core::error::{Result, RustgateError};
 use rustgate_core::identity::Identity;
 use rustgate_transport::{TlsConfig, extract_identity};
@@ -27,15 +27,6 @@ type TlsStream = tokio_rustls::server::TlsStream<TcpStream>;
 
 /// A WebSocket stream layered on top of a TLS connection.
 pub type WsStream = WebSocketStream<TlsStream>;
-
-/// TCP keepalive idle time before first probe.
-const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
-
-/// Interval between TCP keepalive probes after the idle period.
-const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
-
-/// Maximum time allowed for the WebSocket upgrade handshake after TLS completes.
-const WS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// An authenticated WebSocket session.
 ///
@@ -192,7 +183,7 @@ impl WsListener {
             ws_config.max_message_size = Some(64 * 1024 * 1024);
 
             let ws_stream = match tokio::time::timeout(
-                WS_HANDSHAKE_TIMEOUT,
+                HANDSHAKE_TIMEOUT,
                 tokio_tungstenite::accept_async_with_config(tls_stream, Some(ws_config)),
             )
             .await

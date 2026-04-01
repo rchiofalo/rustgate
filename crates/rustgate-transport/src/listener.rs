@@ -2,8 +2,8 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
+use rustgate_core::constants::{TCP_KEEPALIVE_IDLE, TCP_KEEPALIVE_INTERVAL};
 use rustgate_core::error::{Result, RustgateError};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::sync::Semaphore;
@@ -13,12 +13,6 @@ use tracing::{debug, info, warn};
 use crate::config::TlsConfig;
 use crate::extract::{ExpectedKeyUsage, extract_identity, validate_key_usage};
 use crate::session::AuthenticatedSession;
-
-/// TCP keepalive idle time before first probe.
-const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
-
-/// Interval between TCP keepalive probes after the idle period.
-const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Number of failed TCP keepalive probes before dropping the connection.
 /// Note: `set_tcp_keepalive` on tokio's `TcpStream` doesn't expose retries

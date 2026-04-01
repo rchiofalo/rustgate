@@ -21,10 +21,11 @@ use tokio_rustls::TlsAcceptor;
 /// unauthenticated TLS endpoint.
 const MAX_ENROLLMENT_CONNECTIONS: usize = 64;
 
-/// Maximum time for TLS handshake before the connection is dropped.
-const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+use rustgate_core::constants::HANDSHAKE_TIMEOUT;
 
 /// Maximum time for an HTTP connection (from handshake complete to response sent).
+/// Higher than the default `HTTP_CONNECTION_TIMEOUT` (15s) because enrollment
+/// involves CSR signing and PKCS#12 generation which can be slow.
 const HTTP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 use crate::auth::Credentials;
@@ -146,7 +147,7 @@ impl EnrollmentServer {
             drop(tokio::spawn(async move {
                 let _permit = permit;
                 let tls_stream = match tokio::time::timeout(
-                    TLS_HANDSHAKE_TIMEOUT,
+                    HANDSHAKE_TIMEOUT,
                     acceptor.accept(stream),
                 )
                 .await

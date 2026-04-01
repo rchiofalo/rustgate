@@ -13,14 +13,12 @@
 
 use std::io;
 
+use rustgate_core::constants::MAX_FRAME_SIZE;
 use tokio_util::bytes::{Buf, BufMut, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
 /// TAK protocol magic byte marking the start of a protobuf frame.
 pub(crate) const MAGIC_BYTE: u8 = 0xBF;
-
-/// Maximum allowed frame size (16 MB, matches rustgate-transport codecs).
-const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
 /// Maximum varint bytes (5 bytes covers u32 range, sufficient for frame lengths).
 const MAX_VARINT_BYTES: usize = 5;

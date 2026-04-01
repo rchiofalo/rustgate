@@ -7,18 +7,12 @@
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
-use std::time::Duration;
 
+use rustgate_core::constants::{TCP_KEEPALIVE_IDLE, TCP_KEEPALIVE_INTERVAL};
 use rustgate_core::error::{Result, RustgateError};
 use rustgate_core::identity::Identity;
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tracing::{debug, warn};
-
-/// TCP keepalive idle time for plaintext connections.
-const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
-
-/// Interval between keepalive probes.
-const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Configuration for the anonymous identity assigned to plaintext clients.
 #[derive(Debug, Clone)]
