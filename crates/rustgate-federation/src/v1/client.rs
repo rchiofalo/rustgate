@@ -21,6 +21,7 @@ use tracing::{debug, error, info, warn};
 use crate::connector::PeerConnector;
 use crate::heartbeat::{create_heartbeat, is_heartbeat};
 use crate::peer::{PeerHandle, PeerState};
+use crate::reconnect::{backoff_delay, should_stop_reconnecting};
 
 /// Callback invoked for each non-heartbeat message received from the peer.
 ///
@@ -340,169 +341,9 @@ async fn run_session(
     }
 }
 
-/// Calculate exponential backoff delay.
-///
-/// delay = base * 2^min(count, 5), capped at 5 minutes.
-fn backoff_delay(base: Duration, count: u32) -> Duration {
-    let exponent = count.min(5);
-    let multiplier = 2u64.pow(exponent);
-    let delay = base.saturating_mul(multiplier as u32);
-    let max_delay = Duration::from_secs(300); // 5 minutes
-    delay.min(max_delay)
-}
-
-/// Check whether we should stop trying to reconnect.
-fn should_stop_reconnecting(max_reconnects: i32, count: u32) -> bool {
-    if max_reconnects < 0 {
-        return false; // unlimited
-    }
-    count >= max_reconnects as u32
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── backoff_delay ───────────────────────────────────────────────
-
-    #[test]
-    fn backoff_delay_base_case() {
-        let delay = backoff_delay(Duration::from_secs(15), 0);
-        assert_eq!(delay, Duration::from_secs(15)); // 15 * 2^0 = 15
-    }
-
-    #[test]
-    fn backoff_delay_exponential() {
-        assert_eq!(
-            backoff_delay(Duration::from_secs(15), 1),
-            Duration::from_secs(30)
-        ); // 15 * 2
-        assert_eq!(
-            backoff_delay(Duration::from_secs(15), 2),
-            Duration::from_secs(60)
-        ); // 15 * 4
-        assert_eq!(
-            backoff_delay(Duration::from_secs(15), 3),
-            Duration::from_secs(120)
-        ); // 15 * 8
-        assert_eq!(
-            backoff_delay(Duration::from_secs(15), 4),
-            Duration::from_secs(240)
-        ); // 15 * 16
-        assert_eq!(
-            backoff_delay(Duration::from_secs(15), 5),
-            Duration::from_secs(300)
-        ); // 15 * 32 = 480 → capped at 300
-    }
-
-    #[test]
-    fn backoff_delay_caps_at_five_minutes() {
-        let delay = backoff_delay(Duration::from_secs(30), 10);
-        assert_eq!(delay, Duration::from_secs(300));
-    }
-
-    #[test]
-    fn backoff_delay_caps_exponent_at_five() {
-        // Exponent is capped at 5, so count=6 gives same as count=5
-        let d5 = backoff_delay(Duration::from_secs(10), 5);
-        let d6 = backoff_delay(Duration::from_secs(10), 6);
-        assert_eq!(d5, d6);
-    }
-
-    #[test]
-    fn backoff_delay_with_one_second_base() {
-        assert_eq!(
-            backoff_delay(Duration::from_secs(1), 0),
-            Duration::from_secs(1)
-        );
-        assert_eq!(
-            backoff_delay(Duration::from_secs(1), 1),
-            Duration::from_secs(2)
-        );
-        assert_eq!(
-            backoff_delay(Duration::from_secs(1), 5),
-            Duration::from_secs(32)
-        );
-    }
-
-    #[test]
-    fn backoff_delay_with_zero_base() {
-        assert_eq!(
-            backoff_delay(Duration::from_secs(0), 0),
-            Duration::from_secs(0)
-        );
-        assert_eq!(
-            backoff_delay(Duration::from_secs(0), 5),
-            Duration::from_secs(0)
-        );
-    }
-
-    #[test]
-    fn backoff_delay_with_large_base_caps_at_five_minutes() {
-        // A large base that would exceed 5 minutes even at count=0
-        let delay = backoff_delay(Duration::from_secs(600), 0);
-        assert_eq!(delay, Duration::from_secs(300)); // capped
-    }
-
-    #[test]
-    fn backoff_delay_with_subsecond_base() {
-        let delay = backoff_delay(Duration::from_millis(500), 3);
-        // 500ms * 8 = 4000ms = 4s
-        assert_eq!(delay, Duration::from_secs(4));
-    }
-
-    #[test]
-    fn backoff_delay_all_exponents_monotonically_increase() {
-        let base = Duration::from_secs(10);
-        let mut prev = Duration::from_secs(0);
-        for i in 0..=5 {
-            let d = backoff_delay(base, i);
-            assert!(d > prev || (i == 0 && d == base), "delay should increase");
-            prev = d;
-        }
-    }
-
-    // ── should_stop_reconnecting ────────────────────────────────────
-
-    #[test]
-    fn should_stop_unlimited() {
-        assert!(!should_stop_reconnecting(-1, 0));
-        assert!(!should_stop_reconnecting(-1, 100));
-        assert!(!should_stop_reconnecting(-1, u32::MAX));
-    }
-
-    #[test]
-    fn should_stop_limited() {
-        assert!(!should_stop_reconnecting(3, 0));
-        assert!(!should_stop_reconnecting(3, 1));
-        assert!(!should_stop_reconnecting(3, 2));
-        assert!(should_stop_reconnecting(3, 3));
-        assert!(should_stop_reconnecting(3, 4));
-    }
-
-    #[test]
-    fn should_stop_zero_reconnects() {
-        assert!(should_stop_reconnecting(0, 0));
-    }
-
-    #[test]
-    fn should_stop_single_reconnect() {
-        assert!(!should_stop_reconnecting(1, 0));
-        assert!(should_stop_reconnecting(1, 1));
-    }
-
-    #[test]
-    fn should_stop_very_negative() {
-        // Any negative value means unlimited
-        assert!(!should_stop_reconnecting(-100, 0));
-        assert!(!should_stop_reconnecting(i32::MIN, u32::MAX));
-    }
-
-    #[test]
-    fn should_stop_large_limit() {
-        assert!(!should_stop_reconnecting(1_000_000, 999_999));
-        assert!(should_stop_reconnecting(1_000_000, 1_000_000));
-    }
 
     // ── V1Client lifecycle ──────────────────────────────────────────
 

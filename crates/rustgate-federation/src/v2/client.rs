@@ -18,6 +18,7 @@ use super::proto::figpb;
 use super::proto::figpb::federated_channel_client::FederatedChannelClient;
 use crate::peer::{PeerHandle, PeerState};
 use crate::provenance;
+use crate::reconnect::{backoff_delay, should_stop_reconnecting};
 
 /// Callback invoked when a FederatedEvent is received from the remote peer.
 pub type OnEvent = Arc<dyn Fn(figpb::FederatedEvent, String) + Send + Sync>;
@@ -139,21 +140,6 @@ fn our_subscription(federate_id: &str) -> figpb::Subscription {
     }
 }
 
-/// Calculate reconnection backoff delay.
-///
-/// Uses exponential backoff: base * 2^min(attempt, 5), capped at 5 minutes.
-pub(crate) fn backoff_delay(base: Duration, attempt: u32) -> Duration {
-    let exp = attempt.min(5);
-    let delay = base.saturating_mul(2u32.pow(exp));
-    let max_delay = Duration::from_secs(300);
-    delay.min(max_delay)
-}
-
-/// Check whether to stop reconnecting based on max_reconnects limit.
-fn should_stop(max_reconnects: i32, count: u32) -> bool {
-    max_reconnects >= 0 && count >= max_reconnects as u32
-}
-
 /// Calculate post-disconnect cooldown before reconnecting.
 ///
 /// TAK Server's federation cleanup can take 30–60 seconds to purge a stale
@@ -183,7 +169,7 @@ async fn connection_loop(
         }
 
         // Check reconnect limit
-        if should_stop(config.max_reconnects, reconnect_count) {
+        if should_stop_reconnecting(config.max_reconnects, reconnect_count) {
             info!(
                 peer = %peer.id,
                 max = config.max_reconnects,
@@ -523,75 +509,6 @@ mod tests {
             c.fetch_add(1, Ordering::Relaxed);
         });
         (cb, count)
-    }
-
-    #[test]
-    fn backoff_delay_base_case() {
-        let delay = backoff_delay(Duration::from_secs(15), 0);
-        assert_eq!(delay, Duration::from_secs(15));
-    }
-
-    #[test]
-    fn backoff_delay_exponential() {
-        assert_eq!(
-            backoff_delay(Duration::from_secs(15), 1),
-            Duration::from_secs(30)
-        );
-        assert_eq!(
-            backoff_delay(Duration::from_secs(15), 2),
-            Duration::from_secs(60)
-        );
-        assert_eq!(
-            backoff_delay(Duration::from_secs(15), 3),
-            Duration::from_secs(120)
-        );
-    }
-
-    #[test]
-    fn backoff_delay_caps_exponent_at_five() {
-        let delay_5 = backoff_delay(Duration::from_secs(1), 5);
-        let delay_6 = backoff_delay(Duration::from_secs(1), 6);
-        let delay_10 = backoff_delay(Duration::from_secs(1), 10);
-        assert_eq!(delay_5, delay_6);
-        assert_eq!(delay_5, delay_10);
-    }
-
-    #[test]
-    fn backoff_delay_caps_at_five_minutes() {
-        let delay = backoff_delay(Duration::from_secs(60), 5);
-        assert_eq!(delay, Duration::from_secs(300));
-    }
-
-    #[test]
-    fn backoff_delay_large_base_caps_at_five_minutes() {
-        let delay = backoff_delay(Duration::from_secs(120), 5);
-        assert_eq!(delay, Duration::from_secs(300));
-    }
-
-    #[test]
-    fn backoff_delay_zero_base() {
-        let delay = backoff_delay(Duration::ZERO, 5);
-        assert_eq!(delay, Duration::ZERO);
-    }
-
-    #[test]
-    fn should_stop_unlimited() {
-        assert!(!should_stop(-1, 0));
-        assert!(!should_stop(-1, 100));
-        assert!(!should_stop(-1, u32::MAX));
-    }
-
-    #[test]
-    fn should_stop_limited() {
-        assert!(!should_stop(3, 0));
-        assert!(!should_stop(3, 2));
-        assert!(should_stop(3, 3));
-        assert!(should_stop(3, 4));
-    }
-
-    #[test]
-    fn should_stop_zero_reconnects() {
-        assert!(should_stop(0, 0));
     }
 
     #[test]
