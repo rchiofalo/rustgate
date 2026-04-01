@@ -10,6 +10,7 @@ use std::time::Duration;
 #[cfg(feature = "federation")]
 use std::time::SystemTime;
 
+use anyhow::Context;
 use bytes::Bytes;
 use clap::{Parser, ValueEnum};
 use futures::{SinkExt, StreamExt};
@@ -319,18 +320,29 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
-    let cert_pem = tokio::fs::read_to_string(&cli.cert).await?;
-    let key_pem = tokio::fs::read_to_string(&cli.key).await?;
-    let ca_pem = tokio::fs::read_to_string(&cli.ca).await?;
+    let cert_pem = tokio::fs::read_to_string(&cli.cert)
+        .await
+        .context("reading server certificate")?;
+    let key_pem = tokio::fs::read_to_string(&cli.key)
+        .await
+        .context("reading server private key")?;
+    let ca_pem = tokio::fs::read_to_string(&cli.ca)
+        .await
+        .context("reading CA certificate")?;
 
-    let mut tls_config = TlsConfig::from_pem(&cert_pem, &key_pem, &ca_pem)?;
+    let mut tls_config =
+        TlsConfig::from_pem(&cert_pem, &key_pem, &ca_pem).context("building TLS config")?;
 
     if let Some(ref crl_path) = cli.crl {
-        let crl_pem = tokio::fs::read_to_string(crl_path).await?;
-        tls_config = tls_config.with_crls(&crl_pem)?;
+        let crl_pem = tokio::fs::read_to_string(crl_path)
+            .await
+            .context("reading CRL file")?;
+        tls_config = tls_config.with_crls(&crl_pem).context("loading CRL data")?;
     }
 
-    let listener = TlsListener::bind(&cli.bind, &tls_config).await?;
+    let listener = TlsListener::bind(&cli.bind, &tls_config)
+        .await
+        .context("binding TLS listener")?;
     let framing = cli.framing;
     let encoding = cli.encoding;
 
@@ -457,10 +469,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             anyhow::anyhow!("--enrollment-password is required when --enrollment-bind is set")
         })?;
 
-        let ca_key_pem = tokio::fs::read_to_string(ca_key_path).await?;
+        let ca_key_pem = tokio::fs::read_to_string(ca_key_path)
+            .await
+            .context("reading CA private key for enrollment")?;
 
         let signer =
-            rustgate_enrollment::CsrSigner::from_pem(&ca_pem, &ca_key_pem, &cli.ca_organization)?;
+            rustgate_enrollment::CsrSigner::from_pem(&ca_pem, &ca_key_pem, &cli.ca_organization)
+                .context("building CSR signer for enrollment")?;
         let credentials = rustgate_enrollment::Credentials::new(
             enrollment_user.to_string(),
             enrollment_password.to_string(),
@@ -579,14 +594,16 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
         // on_inbound: route messages from federation peers to local clients
         let router_for_fed = Arc::clone(&router);
-        let on_inbound: rustgate_federation::manager::OnInbound =
-            Arc::new(move |peer_cn, payload| {
+        let on_inbound: rustgate_federation::manager::OnInbound = Arc::new(
+            move |peer_cn, payload| {
                 let router = Arc::clone(&router_for_fed);
                 drop(tokio::spawn(async move {
-                    let identity = Identity {
-                        cn: peer_cn,
-                        fingerprint: String::new(),
-                        groups: BTreeSet::new(),
+                    let identity = match Identity::plaintext(peer_cn.clone(), BTreeSet::new()) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            tracing::warn!(peer_cn = %peer_cn, error = %e, "invalid federation peer identity");
+                            return;
+                        }
                     };
                     let msg = RoutableMessage {
                         source: identity,
@@ -603,9 +620,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     };
                     router.route(msg).await;
                 }));
-            });
+            },
+        );
 
-        manager.start(on_inbound).await?;
+        manager
+            .start(on_inbound)
+            .await
+            .context("starting federation manager")?;
         tracing::info!(addr = %bind_addr, id = %cli.federation_id, "federation started");
 
         let rwlock = Arc::new(tokio::sync::RwLock::new(manager));

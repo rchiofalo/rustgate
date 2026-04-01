@@ -178,11 +178,8 @@ mod tests {
 
     fn make_msg(payload: &str) -> RoutableMessage {
         RoutableMessage {
-            source: Identity {
-                cn: "test".to_string(),
-                fingerprint: "fp".to_string(),
-                groups: BTreeSet::new(),
-            },
+            source: Identity::new("test".to_string(), "fp".to_string(), BTreeSet::new())
+                .expect("valid identity"),
             destination: Destination::Broadcast,
             payload: Bytes::from(payload.to_string()),
             metadata: Metadata {

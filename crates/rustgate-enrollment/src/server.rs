@@ -98,9 +98,12 @@ impl EnrollmentServer {
         let tls_config = build_server_tls_config(cert_pem, key_pem)?;
         let acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
-        let listener = TcpListener::bind(bind_addr)
-            .await
-            .map_err(EnrollmentError::Io)?;
+        let listener = TcpListener::bind(bind_addr).await.map_err(|e| {
+            EnrollmentError::Io(std::io::Error::new(
+                e.kind(),
+                format!("failed to bind enrollment server to {bind_addr}: {e}"),
+            ))
+        })?;
 
         let conn_limit = Arc::new(tokio::sync::Semaphore::new(MAX_ENROLLMENT_CONNECTIONS));
         tracing::info!(addr = %bind_addr, "enrollment server listening");

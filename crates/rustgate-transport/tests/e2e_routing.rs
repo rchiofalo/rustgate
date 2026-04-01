@@ -52,14 +52,15 @@ fn build_client_config(cert_pem: &str, key_pem: &str, ca_pem: &str) -> rustls::C
 }
 
 fn make_identity(cn: &str, groups: &[&str]) -> Identity {
-    Identity {
-        cn: cn.to_string(),
-        fingerprint: format!("fake:{cn}"),
-        groups: groups
+    Identity::new(
+        cn.to_string(),
+        format!("fake:{cn}"),
+        groups
             .iter()
             .map(|g| g.to_string())
             .collect::<BTreeSet<_>>(),
-    }
+    )
+    .expect("valid identity")
 }
 
 fn build_message(source: &Identity, payload: &[u8], dest: Destination) -> RoutableMessage {

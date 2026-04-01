@@ -135,11 +135,9 @@ impl PlaintextListener {
             let mut groups = BTreeSet::new();
             let _ = groups.insert(self.identity_config.default_group.clone());
 
-            let identity = Identity {
-                cn,
-                fingerprint: String::new(),
-                groups,
-            };
+            let identity = Identity::plaintext(cn, groups).map_err(|e| {
+                RustgateError::Transport(format!("invalid plaintext identity for {peer_addr}: {e}"))
+            })?;
 
             return Ok(PlaintextSession {
                 identity,

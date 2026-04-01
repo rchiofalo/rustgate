@@ -268,11 +268,14 @@ impl MessageBuilder {
         let destination = match cot.destination {
             CotDestination::Broadcast => Destination::Broadcast,
             CotDestination::Group(name) => Destination::Group(name),
-            CotDestination::Callsign(cn) => Destination::Direct(Identity {
-                cn,
-                fingerprint: String::new(),
-                groups: BTreeSet::new(),
-            }),
+            CotDestination::Callsign(cn) => {
+                // Destination identities are used for routing lookup by CN only;
+                // they have no TLS session, so use the plaintext constructor.
+                match Identity::plaintext(cn, BTreeSet::new()) {
+                    Ok(id) => Destination::Direct(id),
+                    Err(_) => Destination::Broadcast,
+                }
+            }
         };
 
         let enriched_source = self.enrich_source(source, cot.source_group.as_ref());
@@ -322,16 +325,12 @@ impl MessageBuilder {
 }
 
 #[cfg(test)]
-#[allow(clippy::panic)]
+#[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
 
     fn test_identity() -> Identity {
-        Identity {
-            cn: "alice".into(),
-            fingerprint: "abc123".into(),
-            groups: BTreeSet::new(),
-        }
+        Identity::new("alice".into(), "abc123".into(), BTreeSet::new()).unwrap()
     }
 
     fn position_xml(group: Option<&str>) -> Vec<u8> {

@@ -9,6 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use rustgate_core::identity::Identity;
 use rustgate_transport::extract_identity;
 use rustls::RootCertStore;
@@ -55,10 +56,12 @@ impl PeerConnector {
         ca: &Path,
         skip_hostname_verify: bool,
     ) -> anyhow::Result<Self> {
-        let cert_pem =
-            std::fs::read_to_string(cert).map_err(|e| anyhow::anyhow!("read cert: {e}"))?;
-        let key_pem = std::fs::read_to_string(key).map_err(|e| anyhow::anyhow!("read key: {e}"))?;
-        let ca_pem = std::fs::read_to_string(ca).map_err(|e| anyhow::anyhow!("read CA: {e}"))?;
+        let cert_pem = std::fs::read_to_string(cert)
+            .with_context(|| format!("reading federation cert from {}", cert.display()))?;
+        let key_pem = std::fs::read_to_string(key)
+            .with_context(|| format!("reading federation key from {}", key.display()))?;
+        let ca_pem = std::fs::read_to_string(ca)
+            .with_context(|| format!("reading federation CA from {}", ca.display()))?;
 
         Self::from_pem(&cert_pem, &key_pem, &ca_pem, skip_hostname_verify)
     }
@@ -73,9 +76,9 @@ impl PeerConnector {
         ca_pem: &str,
         skip_hostname_verify: bool,
     ) -> anyhow::Result<Self> {
-        let certs = parse_certs(cert_pem)?;
-        let key = parse_key(key_pem)?;
-        let root_store = parse_ca_store(ca_pem)?;
+        let certs = parse_certs(cert_pem).context("loading federation client certificate")?;
+        let key = parse_key(key_pem).context("loading federation client key")?;
+        let root_store = parse_ca_store(ca_pem).context("loading federation CA store")?;
 
         let config = if skip_hostname_verify {
             build_config_no_hostname_verify(root_store, certs, key)?
@@ -122,7 +125,8 @@ impl PeerConnector {
 
         debug!(peer_addr = %addr, "TLS handshake completed");
 
-        let identity = extract_server_identity(&tls_stream)?;
+        let identity = extract_server_identity(&tls_stream)
+            .with_context(|| format!("extracting identity from peer at {addr}"))?;
 
         debug!(
             peer_addr = %addr,

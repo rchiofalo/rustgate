@@ -40,7 +40,9 @@ impl std::fmt::Debug for TlsListener {
 
 impl TlsListener {
     pub async fn bind<A: ToSocketAddrs>(addr: A, config: &TlsConfig) -> Result<Self> {
-        let tcp_listener = TcpListener::bind(addr).await?;
+        let tcp_listener = TcpListener::bind(addr)
+            .await
+            .map_err(|e| RustgateError::Transport(format!("failed to bind TLS listener: {e}")))?;
         let server_config = config.build_server_config()?;
         let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
 
