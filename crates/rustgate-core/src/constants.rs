@@ -8,12 +8,6 @@ use std::time::Duration;
 
 // ── TCP / Network ──────────────────────────────────────────────────
 
-/// TCP keepalive idle timeout before first probe.
-pub const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
-
-/// Interval between TCP keepalive probes.
-pub const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
-
 /// Read timeout for client connections (5 minutes).
 pub const READ_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 

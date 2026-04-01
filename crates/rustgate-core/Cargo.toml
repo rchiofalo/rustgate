@@ -17,6 +17,7 @@ fuzz = ["dep:arbitrary"]
 arbitrary = { workspace = true, optional = true }
 bytes = { workspace = true }
 serde = { workspace = true }
+socket2 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

@@ -3,9 +3,9 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use rustgate_core::constants::{TCP_KEEPALIVE_IDLE, TCP_KEEPALIVE_INTERVAL};
 use rustgate_core::error::{Result, TransportError};
-use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
+use rustgate_core::net::configure_tcp_keepalive;
+use tokio::net::{TcpListener, ToSocketAddrs};
 use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
@@ -13,11 +13,6 @@ use tracing::{debug, info, warn};
 use crate::config::TlsConfig;
 use crate::extract::{ExpectedKeyUsage, extract_identity, validate_key_usage};
 use crate::session::AuthenticatedSession;
-
-/// Number of failed TCP keepalive probes before dropping the connection.
-/// Note: `set_tcp_keepalive` on tokio's `TcpStream` doesn't expose retries
-/// directly; the OS default (typically 8-10) applies. We document the intent here.
-const _TCP_KEEPALIVE_RETRIES: u32 = 3;
 
 /// Default maximum number of concurrent TLS handshakes when no limit is specified.
 const DEFAULT_MAX_HANDSHAKES: usize = 100;
@@ -178,20 +173,5 @@ impl TlsListener {
         validate_key_usage(client_cert, ExpectedKeyUsage::ClientAuth)?;
 
         extract_identity(client_cert)
-    }
-}
-
-/// Enable TCP keepalive on a newly accepted socket.
-///
-/// Detects half-open and dead connections at the OS level so the read loop
-/// surfaces an error instead of blocking forever.
-fn configure_tcp_keepalive(stream: &TcpStream) {
-    let sock_ref = socket2::SockRef::from(stream);
-
-    let mut keepalive = socket2::TcpKeepalive::new().with_time(TCP_KEEPALIVE_IDLE);
-    keepalive = keepalive.with_interval(TCP_KEEPALIVE_INTERVAL);
-
-    if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
-        warn!(error = %e, "failed to set TCP keepalive");
     }
 }

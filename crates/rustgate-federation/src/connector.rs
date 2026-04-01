@@ -6,23 +6,17 @@
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::Context;
 use rustgate_core::identity::Identity;
+use rustgate_core::net::configure_tcp_keepalive;
 use rustgate_transport::extract_identity;
 use rustgate_transport::pem::{parse_ca_store, parse_certs, parse_key};
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
-use tracing::{debug, warn};
-
-/// TCP keepalive idle time before first probe.
-const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
-
-/// Interval between TCP keepalive probes after the idle period.
-const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+use tracing::debug;
 
 /// Outbound mTLS connector for establishing federation peer connections.
 ///
@@ -157,19 +151,6 @@ fn extract_server_identity(
         .ok_or_else(|| anyhow::anyhow!("empty server certificate chain"))?;
 
     extract_identity(server_cert).map_err(|e| anyhow::anyhow!("identity extraction failed: {e}"))
-}
-
-/// Enable TCP keepalive on a socket to detect dead connections.
-fn configure_tcp_keepalive(stream: &TcpStream) {
-    let sock_ref = socket2::SockRef::from(stream);
-
-    let keepalive = socket2::TcpKeepalive::new()
-        .with_time(TCP_KEEPALIVE_IDLE)
-        .with_interval(TCP_KEEPALIVE_INTERVAL);
-
-    if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
-        warn!(error = %e, "failed to set TCP keepalive on federation connection");
-    }
 }
 
 /// Build a standard ClientConfig with hostname verification enabled.
@@ -309,6 +290,8 @@ impl rustls::client::danger::ServerCertVerifier for NoHostnameVerifier {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use rustgate_test_utils::certs::TestCa;
     use rustgate_transport::{TlsConfig, TlsListener};
 
