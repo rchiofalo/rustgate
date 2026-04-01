@@ -7,6 +7,8 @@
 use std::net::SocketAddr;
 use std::time::SystemTime;
 
+use crate::PeerId;
+
 /// Emit an audit event via structured tracing.
 ///
 /// All audit events share a common shape: timestamp, event type, actor,
@@ -78,7 +80,7 @@ pub fn negotiation_result(cn: &str, protocol: &str, success: bool) {
 }
 
 /// Record a federation peer connection event.
-pub fn federation_peer_connected(peer_id: &str, peer_cn: &str, direction: &str) {
+pub fn federation_peer_connected(peer_id: &PeerId, peer_cn: &str, direction: &str) {
     audit!(
         "federation.connected",
         peer_id = %peer_id,
@@ -90,7 +92,7 @@ pub fn federation_peer_connected(peer_id: &str, peer_cn: &str, direction: &str) 
 }
 
 /// Record a federation peer disconnection event.
-pub fn federation_peer_disconnected(peer_id: &str, reason: &str) {
+pub fn federation_peer_disconnected(peer_id: &PeerId, reason: &str) {
     audit!(
         "federation.disconnected",
         peer_id = %peer_id,
@@ -100,7 +102,7 @@ pub fn federation_peer_disconnected(peer_id: &str, reason: &str) {
 }
 
 /// Record a federation connection failure.
-pub fn federation_connect_failed(peer_id: &str, error: &str) {
+pub fn federation_connect_failed(peer_id: &PeerId, error: &str) {
     audit!(
         "federation.connect_failed",
         peer_id = %peer_id,
@@ -145,7 +147,7 @@ pub fn enrollment_auth_failed(peer: &str) {
 
 /// Record a federation API configuration change.
 #[allow(dead_code)] // Wired when federation config API is added
-pub fn federation_config_changed(actor: &str, action: &str, peer_id: &str) {
+pub fn federation_config_changed(actor: &str, action: &str, peer_id: &PeerId) {
     audit!(
         "federation.config_changed",
         actor = %actor,
@@ -285,27 +287,27 @@ mod tests {
 
         #[test]
         fn test_peer_connected() {
-            federation_peer_connected("peer-1", "peer-cn", "inbound");
-            federation_peer_connected("peer-2", "remote-server", "outbound");
+            federation_peer_connected(&PeerId::new("peer-1"), "peer-cn", "inbound");
+            federation_peer_connected(&PeerId::new("peer-2"), "remote-server", "outbound");
         }
 
         #[test]
         fn test_peer_disconnected() {
-            federation_peer_disconnected("peer-1", "clean shutdown");
-            federation_peer_disconnected("peer-1", "");
+            federation_peer_disconnected(&PeerId::new("peer-1"), "clean shutdown");
+            federation_peer_disconnected(&PeerId::new("peer-1"), "");
         }
 
         #[test]
         fn test_connect_failed() {
-            federation_connect_failed("peer-1", "connection refused");
-            federation_connect_failed("peer-2", "tls: certificate verify failed");
+            federation_connect_failed(&PeerId::new("peer-1"), "connection refused");
+            federation_connect_failed(&PeerId::new("peer-2"), "tls: certificate verify failed");
         }
 
         #[test]
         fn test_config_changed() {
-            federation_config_changed("api", "create", "peer-1");
-            federation_config_changed("admin", "delete", "peer-2");
-            federation_config_changed("api", "update", "peer-3");
+            federation_config_changed("api", "create", &PeerId::new("peer-1"));
+            federation_config_changed("admin", "delete", &PeerId::new("peer-2"));
+            federation_config_changed("api", "update", &PeerId::new("peer-3"));
         }
     }
 

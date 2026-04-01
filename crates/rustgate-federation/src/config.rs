@@ -2,6 +2,8 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use rustgate_core::PeerId;
+
 /// Default V1 listen address: `0.0.0.0:9000`.
 const DEFAULT_V1_ADDR: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 9000));
 
@@ -174,7 +176,7 @@ impl Default for FederationConfig {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PeerConfig {
     /// Unique identifier for this peer.
-    pub id: String,
+    pub id: PeerId,
     /// Network address of the peer (host:port).
     pub address: String,
     /// Groups this peer participates in (bidirectional fallback).

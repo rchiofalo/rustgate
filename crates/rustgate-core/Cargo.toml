@@ -16,5 +16,9 @@ fuzz = ["dep:arbitrary"]
 [dependencies]
 arbitrary = { workspace = true, optional = true }
 bytes = { workspace = true }
+serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

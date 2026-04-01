@@ -2,6 +2,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
+use rustgate_core::PeerId;
+
 use crate::config::PeerConfig;
 
 /// Circuit breaker state for a federation peer.
@@ -87,7 +89,7 @@ impl std::fmt::Display for PeerState {
 #[derive(Debug)]
 pub struct PeerHandle {
     /// Peer identifier.
-    pub id: String,
+    pub id: PeerId,
     /// Static configuration.
     pub config: PeerConfig,
     /// Current connection state (atomic for lock-free reads).
@@ -352,7 +354,7 @@ impl PeerHandle {
 /// Serializable snapshot of a peer's current status.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PeerStatus {
-    pub id: String,
+    pub id: PeerId,
     pub address: String,
     pub state: PeerState,
     pub groups: Vec<String>,

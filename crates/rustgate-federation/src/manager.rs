@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
+use rustgate_core::PeerId;
 #[cfg(feature = "v2")]
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -67,8 +68,8 @@ pub struct FederationManager {
     v1_server: Option<V1Server>,
     #[cfg(feature = "v2")]
     v2_server_handle: Option<JoinHandle<Result<(), tonic::transport::Error>>>,
-    clients: HashMap<String, Arc<FederationClient>>,
-    peers: HashMap<String, Arc<PeerHandle>>,
+    clients: HashMap<PeerId, Arc<FederationClient>>,
+    peers: HashMap<PeerId, Arc<PeerHandle>>,
     running: bool,
 
     // Connection materials stored during start() for reuse by adopt_peer()
@@ -85,9 +86,9 @@ pub struct FederationManager {
     #[cfg(feature = "ha")]
     connection_registry: Option<crate::ha::registry::ConnectionRegistry>,
     #[cfg(feature = "ha")]
-    ha_adopt_rx: Option<tokio::sync::mpsc::Receiver<String>>,
+    ha_adopt_rx: Option<tokio::sync::mpsc::Receiver<PeerId>>,
     #[cfg(feature = "ha")]
-    ha_lost_rx: Option<tokio::sync::mpsc::Receiver<String>>,
+    ha_lost_rx: Option<tokio::sync::mpsc::Receiver<PeerId>>,
 }
 
 /// Aggregated status snapshot of the federation subsystem.
@@ -375,12 +376,12 @@ impl FederationManager {
             let (lost_tx, lost_rx) = tokio::sync::mpsc::channel(HA_CHANNEL_CAPACITY);
             cm.set_callbacks(
                 Arc::new(move |peer_id: String| {
-                    if let Err(e) = adopt_tx.try_send(peer_id) {
+                    if let Err(e) = adopt_tx.try_send(PeerId::new(peer_id)) {
                         warn!(error = %e, "HA adopt channel full, dropping event");
                     }
                 }),
                 Arc::new(move |peer_id: String| {
-                    if let Err(e) = lost_tx.try_send(peer_id) {
+                    if let Err(e) = lost_tx.try_send(PeerId::new(peer_id)) {
                         warn!(error = %e, "HA claim-lost channel full, dropping event");
                     }
                 }),
@@ -410,7 +411,7 @@ impl FederationManager {
             // In HA mode, only connect to peers we can claim
             #[cfg(feature = "ha")]
             if let Some(ref cm) = self.claim_manager
-                && !cm.try_claim(&peer_config.id).await
+                && !cm.try_claim(peer_config.id.as_str()).await
             {
                 info!(
                     peer_id = %peer_config.id,
@@ -564,7 +565,10 @@ impl FederationManager {
             #[cfg(feature = "ha")]
             if let Some(ref cr) = self.connection_registry
                 && let Err(e) = cr
-                    .register(&peer_config.id, crate::ha::registry::Direction::Outbound)
+                    .register(
+                        peer_config.id.as_str(),
+                        crate::ha::registry::Direction::Outbound,
+                    )
                     .await
             {
                 warn!(
@@ -617,7 +621,7 @@ impl FederationManager {
 
         // Snapshot clients and peer handles so callers can release the outer
         // lock before we block on per-peer channel sends.
-        let snapshot: Vec<(String, Arc<FederationClient>, Arc<PeerHandle>)> = self
+        let snapshot: Vec<(PeerId, Arc<FederationClient>, Arc<PeerHandle>)> = self
             .clients
             .iter()
             .filter_map(|(id, client)| {
@@ -983,27 +987,27 @@ impl FederationManager {
     /// then creates a new outbound connection. Registers the connection in the
     /// HA registry.
     #[cfg(feature = "ha")]
-    pub async fn adopt_peer(&mut self, peer_id: &str) -> anyhow::Result<()> {
+    pub async fn adopt_peer(&mut self, peer_id: &PeerId) -> anyhow::Result<()> {
         // Find the peer config
         let peer_config = self
             .config
             .peers
             .iter()
-            .find(|p| p.id == peer_id && p.enabled && p.is_outbound)
+            .find(|p| p.id == *peer_id && p.enabled && p.is_outbound)
             .cloned()
             .ok_or_else(|| {
                 anyhow::anyhow!("no enabled outbound peer config found for '{peer_id}'")
             })?;
 
         // Already connected?
-        if self.clients.contains_key(peer_id) {
+        if self.clients.contains_key(peer_id.as_str()) {
             info!(peer_id = %peer_id, "peer already connected, skipping adoption");
             return Ok(());
         }
 
         // Try to claim the peer
         let claimed = if let Some(ref cm) = self.claim_manager {
-            cm.try_claim(peer_id).await
+            cm.try_claim(peer_id.as_str()).await
         } else {
             return Err(anyhow::anyhow!("HA claim manager not initialized"));
         };
@@ -1029,7 +1033,7 @@ impl FederationManager {
         // Register in HA connection registry
         if let Some(ref cr) = self.connection_registry
             && let Err(e) = cr
-                .register(peer_id, crate::ha::registry::Direction::Outbound)
+                .register(peer_id.as_str(), crate::ha::registry::Direction::Outbound)
                 .await
         {
             warn!(peer_id = %peer_id, error = %e, "failed to register adopted connection");
@@ -1044,9 +1048,9 @@ impl FederationManager {
     /// Stops the outbound client, removes the peer handle, unregisters from the
     /// HA connection registry, and releases the claim.
     #[cfg(feature = "ha")]
-    pub async fn disconnect_peer(&mut self, peer_id: &str) {
+    pub async fn disconnect_peer(&mut self, peer_id: &PeerId) {
         // Remove and shut down the client
-        if let Some(client) = self.clients.remove(peer_id) {
+        if let Some(client) = self.clients.remove(peer_id.as_str()) {
             match Arc::try_unwrap(client) {
                 Ok(FederationClient::V1(mut v1)) => {
                     v1.shutdown().await;
@@ -1063,18 +1067,18 @@ impl FederationManager {
             }
         }
 
-        let _ = self.peers.remove(peer_id);
+        let _ = self.peers.remove(peer_id.as_str());
 
         // Unregister from connection registry
         if let Some(ref cr) = self.connection_registry
-            && let Err(e) = cr.unregister(peer_id).await
+            && let Err(e) = cr.unregister(peer_id.as_str()).await
         {
             warn!(peer_id = %peer_id, error = %e, "failed to unregister connection");
         }
 
         // Release claim
         if let Some(ref cm) = self.claim_manager
-            && let Err(e) = cm.release(peer_id).await
+            && let Err(e) = cm.release(peer_id.as_str()).await
         {
             warn!(peer_id = %peer_id, error = %e, "failed to release claim");
         }
@@ -1089,8 +1093,8 @@ impl FederationManager {
     pub fn take_ha_receivers(
         &mut self,
     ) -> (
-        Option<tokio::sync::mpsc::Receiver<String>>,
-        Option<tokio::sync::mpsc::Receiver<String>>,
+        Option<tokio::sync::mpsc::Receiver<PeerId>>,
+        Option<tokio::sync::mpsc::Receiver<PeerId>>,
     ) {
         (self.ha_adopt_rx.take(), self.ha_lost_rx.take())
     }
@@ -1767,8 +1771,8 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10 + i * 10)).await;
                 let mut guard = mgr.write().await;
                 // Simulate peer churn: remove the client and peer handle.
-                let _ = guard.clients.remove(&peer_id);
-                let _ = guard.peers.remove(&peer_id);
+                let _ = guard.clients.remove(peer_id.as_str());
+                let _ = guard.peers.remove(peer_id.as_str());
             }));
         }
 
