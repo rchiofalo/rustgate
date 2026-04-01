@@ -3,7 +3,9 @@
 use std::sync::Arc;
 
 use rustgate_test_utils::certs::TestCa;
-use rustgate_transport::{TlsConfig, TlsListener, extract_identity};
+use rustgate_transport::{
+    ExpectedKeyUsage, TlsConfig, TlsListener, TlsMinVersion, extract_identity, validate_key_usage,
+};
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls_pki_types::pem::PemObject;
@@ -333,4 +335,215 @@ async fn bind_default_handshake_limit() {
 
     let cn = server_handle.await.expect("server task");
     assert_eq!(cn, "charlie");
+}
+
+// ── TLS version enforcement ─────────────────────────────────────────────
+
+/// TLS 1.3-only server rejects clients that can only speak TLS 1.2.
+#[tokio::test]
+async fn tls13_only_rejects_tls12_client() {
+    let ca = TestCa::new("Test CA");
+    let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
+    let client_cert = ca.issue_client_cert("alice", &["team"]);
+
+    let tls_config = TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
+        .expect("tls config")
+        .with_tls_min_version(TlsMinVersion::Tls13);
+
+    let listener = TlsListener::bind("127.0.0.1:0", &tls_config)
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    let server_handle = tokio::spawn(async move {
+        tokio::time::timeout(std::time::Duration::from_secs(3), listener.accept()).await
+    });
+
+    // Build a client config that only supports TLS 1.2
+    let certs = parse_certs(&client_cert.cert_pem);
+    let key = parse_key(&client_cert.key_pem);
+    let mut root_store = RootCertStore::empty();
+    for cert in parse_certs(&ca.cert_pem) {
+        root_store.add(cert).expect("add CA cert");
+    }
+    let client_config =
+        rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
+            .with_root_certificates(root_store)
+            .with_client_auth_cert(certs, key)
+            .expect("client config");
+
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+    let tcp = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("tcp connect");
+    let server_name = "localhost".try_into().expect("server name");
+    let result = connector.connect(server_name, tcp).await;
+
+    assert!(
+        result.is_err(),
+        "TLS 1.2-only client should fail against TLS 1.3-only server"
+    );
+
+    // Server should time out since no valid session was established
+    let server_result = server_handle.await.expect("server task");
+    assert!(
+        server_result.is_err(),
+        "server should timeout — no valid TLS 1.3 session"
+    );
+}
+
+/// TLS 1.3-only server accepts clients that support TLS 1.3.
+#[tokio::test]
+async fn tls13_only_accepts_tls13_client() {
+    let ca = TestCa::new("Test CA");
+    let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
+    let client_cert = ca.issue_client_cert("alice", &["team"]);
+
+    let tls_config = TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
+        .expect("tls config")
+        .with_tls_min_version(TlsMinVersion::Tls13);
+
+    let listener = TlsListener::bind("127.0.0.1:0", &tls_config)
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    let server_handle = tokio::spawn(async move {
+        let session = listener.accept().await.expect("accept");
+        session.identity().cn.clone()
+    });
+
+    // Build a client config that supports TLS 1.3
+    let config = build_client_config(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem);
+    let mut stream = connect(addr, &config).await;
+    stream.write_all(b"ping").await.expect("client write");
+
+    let cn = server_handle.await.expect("server task");
+    assert_eq!(cn, "alice");
+}
+
+// ── Key usage validation ────────────────────────────────────────────────
+
+/// Client certificate with ClientAuth EKU passes validation.
+#[test]
+fn validate_key_usage_client_auth_accepted() {
+    let ca = TestCa::new("Test CA");
+    let cert = ca.issue_client_cert("alice", &["team"]);
+    let certs = parse_certs(&cert.cert_pem);
+
+    let result = validate_key_usage(
+        certs.first().expect("no cert"),
+        ExpectedKeyUsage::ClientAuth,
+    );
+    assert!(
+        result.is_ok(),
+        "ClientAuth cert should pass ClientAuth validation"
+    );
+}
+
+/// Server certificate with ServerAuth EKU passes validation.
+#[test]
+fn validate_key_usage_server_auth_accepted() {
+    let ca = TestCa::new("Test CA");
+    let cert = ca.issue_server_cert("localhost", &["localhost"]);
+    let certs = parse_certs(&cert.cert_pem);
+
+    let result = validate_key_usage(
+        certs.first().expect("no cert"),
+        ExpectedKeyUsage::ServerAuth,
+    );
+    assert!(
+        result.is_ok(),
+        "ServerAuth cert should pass ServerAuth validation"
+    );
+}
+
+/// Server-auth-only certificate is rejected when ClientAuth is expected.
+#[test]
+fn validate_key_usage_rejects_server_cert_as_client() {
+    let ca = TestCa::new("Test CA");
+    let cert = ca.issue_server_auth_only_cert("bad-client");
+    let certs = parse_certs(&cert.cert_pem);
+
+    let result = validate_key_usage(
+        certs.first().expect("no cert"),
+        ExpectedKeyUsage::ClientAuth,
+    );
+    assert!(
+        result.is_err(),
+        "ServerAuth-only cert should fail ClientAuth validation"
+    );
+}
+
+/// Client-auth-only certificate is rejected when ServerAuth is expected.
+#[test]
+fn validate_key_usage_rejects_client_cert_as_server() {
+    let ca = TestCa::new("Test CA");
+    let cert = ca.issue_client_cert("alice", &[]);
+    let certs = parse_certs(&cert.cert_pem);
+
+    let result = validate_key_usage(
+        certs.first().expect("no cert"),
+        ExpectedKeyUsage::ServerAuth,
+    );
+    assert!(
+        result.is_err(),
+        "ClientAuth-only cert should fail ServerAuth validation"
+    );
+}
+
+/// Server-auth-only certificate is rejected during mTLS handshake identity extraction.
+#[tokio::test]
+async fn mtls_rejects_server_auth_only_client_cert() {
+    let ca = TestCa::new("Test CA");
+    let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
+    // Issue a cert with ServerAuth EKU — wrong for a client
+    let bad_client_cert = ca.issue_server_auth_only_cert("bad-client");
+
+    let tls_config = TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
+        .expect("tls config");
+
+    let listener = TlsListener::bind("127.0.0.1:0", &tls_config)
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    let server_handle = tokio::spawn(async move {
+        // The server should reject — either at handshake or identity extraction
+        tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept()).await
+    });
+
+    let config = build_client_config(
+        &bad_client_cert.cert_pem,
+        &bad_client_cert.key_pem,
+        &ca.cert_pem,
+    );
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let tcp = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("tcp connect");
+    let server_name = "localhost".try_into().expect("server name");
+    // The connection may succeed at TLS level (rustls doesn't check EKU by default)
+    // but our identity extraction should reject it
+    let _client_result = connector.connect(server_name, tcp).await;
+
+    let server_result = server_handle.await.expect("server task");
+    // Server should return an error from identity extraction (key usage validation)
+    // or time out if the handshake itself was rejected.
+    let rejected = match server_result {
+        Ok(Err(e)) => {
+            let msg = format!("{e}");
+            assert!(
+                msg.contains("Extended Key Usage"),
+                "error should mention Extended Key Usage, got: {msg}"
+            );
+            true
+        }
+        Ok(Ok(_)) => false,
+        Err(_) => true, // Timeout — handshake rejected at TLS level
+    };
+    assert!(
+        rejected,
+        "server should reject server-auth-only client cert"
+    );
 }
