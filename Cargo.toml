@@ -76,6 +76,7 @@ prometheus = { version = "0.14", default-features = false }
 tikv-jemallocator = "0.6"
 tempfile = "3"
 criterion = { version = "0.8", features = ["html_reports"] }
+arbitrary = { version = "1", features = ["derive"] }
 
 # Internal crates
 rustgate-core = { path = "crates/rustgate-core" }

@@ -10,7 +10,11 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+fuzz = ["dep:arbitrary", "rustgate-core/fuzz"]
+
 [dependencies]
+arbitrary = { workspace = true, optional = true }
 rustgate-core = { workspace = true }
 bytes = { workspace = true }
 quick-xml = { workspace = true }
