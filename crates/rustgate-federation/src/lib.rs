@@ -8,6 +8,7 @@ pub mod jwt;
 pub mod manager;
 pub mod peer;
 pub mod provenance;
+mod reconnect;
 pub mod store;
 pub mod trust_store;
 pub mod v1;
