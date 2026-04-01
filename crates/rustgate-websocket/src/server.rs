@@ -14,7 +14,9 @@ use rustgate_core::encoder::MessageEncoder;
 use rustgate_core::identity::Identity;
 use rustgate_core::message::RoutableMessage;
 use rustgate_cot::MessageBuilder;
-use rustgate_transport::{CotEncoder, RawEncoder, Router, SessionHandle};
+use rustgate_transport::{
+    ClientThrottle, CotEncoder, RawEncoder, Router, SessionHandle, ThrottleConfig,
+};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
@@ -57,6 +59,7 @@ pub struct WsServerConfig {
     pub encoding: WsEncoding,
     pub nats_publish: Option<OnNatsPublish>,
     pub fed_forward: Option<OnFederationForward>,
+    pub throttle_config: Option<ThrottleConfig>,
     pub shutdown: Arc<Notify>,
 }
 
@@ -87,6 +90,7 @@ impl WebSocketServer {
             encoding,
             nats_publish,
             fed_forward,
+            throttle_config,
             shutdown,
         } = config;
 
@@ -108,9 +112,10 @@ impl WebSocketServer {
                             let router = Arc::clone(&router);
                             let nats = nats_publish.clone();
                             let fed = fed_forward.clone();
+                            let tc = throttle_config;
 
                             drop(tokio::spawn(handle_ws_session(
-                                session, router, encoding, nats, fed, permit,
+                                session, router, encoding, nats, fed, tc, permit,
                             )));
                         }
                         Err(e) => {
@@ -133,6 +138,7 @@ async fn handle_ws_session(
     encoding: WsEncoding,
     nats_publish: Option<OnNatsPublish>,
     fed_forward: Option<OnFederationForward>,
+    throttle_config: Option<ThrottleConfig>,
     _permit: OwnedSemaphorePermit,
 ) {
     let identity = session.identity_arc();
@@ -156,10 +162,12 @@ async fn handle_ws_session(
     let ws_stream = session.into_stream();
     let (ws_write, ws_read) = ws_stream.split();
 
+    let throttle = throttle_config.map(|tc| tc.build());
+
     let read_result = {
         let router = Arc::clone(&router);
         tokio::select! {
-            r = ws_read_loop(ws_read, &identity, &router, nats_publish.as_ref(), fed_forward.as_ref()) => r,
+            r = ws_read_loop(ws_read, &identity, &router, nats_publish.as_ref(), fed_forward.as_ref(), &throttle) => r,
             r = ws_write_loop(ws_write, &mut rx, encoding) => r,
         }
     };
@@ -183,6 +191,7 @@ async fn ws_read_loop(
     router: &Router,
     nats_publish: Option<&OnNatsPublish>,
     fed_forward: Option<&OnFederationForward>,
+    throttle: &Option<ClientThrottle>,
 ) -> Result<(), String> {
     let mut msg_builder = MessageBuilder::new();
 
@@ -200,6 +209,14 @@ async fn ws_read_loop(
             Message::Close(_) => return Ok(()),
             _ => continue, // Ping/Pong handled by tungstenite
         };
+
+        // Per-client rate limiting — drop excess messages
+        if let Some(t) = throttle
+            && !t.allow()
+        {
+            warn!(cn = %identity.cn, "message dropped: rate limit exceeded");
+            continue;
+        }
 
         let msg = msg_builder.build(identity, payload, "websocket");
 
