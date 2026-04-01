@@ -3,6 +3,11 @@
 # Usage:
 #   helm install rustgate helm/ -f helm/values-production.yaml -f my-values.yaml
 
+image:
+  # Pin to a SHA256 digest for immutable, reproducible deployments:
+  # digest: "sha256:abc123..."
+  digest: ""
+
 replicaCount: 3
 
 resources:
@@ -19,6 +24,9 @@ autoscaling:
   maxReplicas: 20
   targetCPUUtilizationPercentage: 60
   targetMemoryUtilizationPercentage: 70
+
+networkPolicy:
+  enabled: true
 
 topologySpreadConstraints:
   - maxSkew: 1
