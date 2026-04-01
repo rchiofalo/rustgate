@@ -37,10 +37,29 @@ impl SessionHandle {
     }
 }
 
-#[derive(Debug, Default)]
+/// Default maximum number of groups a single CN can join.
+pub const DEFAULT_MAX_GROUPS_PER_CN: usize = 128;
+
+/// Default maximum total number of groups tracked by the router.
+pub const DEFAULT_MAX_TOTAL_GROUPS: usize = 10_000;
+
+#[derive(Debug)]
 struct State {
     sessions: HashMap<String, SessionHandle>,
     groups: HashMap<GroupId, HashSet<String>>,
+    max_groups_per_cn: usize,
+    max_total_groups: usize,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            sessions: HashMap::new(),
+            groups: HashMap::new(),
+            max_groups_per_cn: DEFAULT_MAX_GROUPS_PER_CN,
+            max_total_groups: DEFAULT_MAX_TOTAL_GROUPS,
+        }
+    }
 }
 
 impl State {
@@ -56,15 +75,40 @@ impl State {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Router {
     state: RwLock<State>,
     cache: PositionCache,
 }
 
+impl Default for Router {
+    fn default() -> Self {
+        Self {
+            state: RwLock::new(State::default()),
+            cache: PositionCache::default(),
+        }
+    }
+}
+
 impl Router {
+    /// Create a new router with default group limits.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create a new router with custom group limits.
+    ///
+    /// - `max_groups_per_cn`: maximum number of groups a single CN can join
+    /// - `max_total_groups`: maximum total number of groups the router tracks
+    pub fn with_limits(max_groups_per_cn: usize, max_total_groups: usize) -> Self {
+        Self {
+            state: RwLock::new(State {
+                max_groups_per_cn,
+                max_total_groups,
+                ..State::default()
+            }),
+            cache: PositionCache::default(),
+        }
     }
 
     /// Access the position cache for SA replay.
@@ -84,12 +128,37 @@ impl Router {
         }
 
         let _ = state.sessions.insert(cn.clone(), handle);
+
+        let mut joined = 0usize;
         for group in &new_groups {
+            // Enforce per-CN group limit
+            if joined >= state.max_groups_per_cn {
+                warn!(
+                    cn = %cn,
+                    limit = state.max_groups_per_cn,
+                    requested = new_groups.len(),
+                    "group join rejected: CN exceeded max groups per CN limit"
+                );
+                break;
+            }
+
+            // Enforce total group limit (only for new groups not yet tracked)
+            if !state.groups.contains_key(group) && state.groups.len() >= state.max_total_groups {
+                warn!(
+                    cn = %cn,
+                    group = %group,
+                    limit = state.max_total_groups,
+                    "group join rejected: router exceeded max total groups limit"
+                );
+                continue;
+            }
+
             let _ = state
                 .groups
                 .entry(group.clone())
                 .or_default()
                 .insert(cn.clone());
+            joined += 1;
         }
     }
 
@@ -433,6 +502,77 @@ mod tests {
         // Unregister should also evict from cache
         router.unregister("alice", session_id).await;
         assert_eq!(router.cache().len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn register_enforces_max_groups_per_cn() {
+        let router = Router::with_limits(3, 10_000);
+
+        // Client has 5 groups but limit is 3
+        let alice = make_identity("alice", &["g1", "g2", "g3", "g4", "g5"]);
+        let (tx, _rx) = mpsc::channel(16);
+        router.register(SessionHandle::new(alice.clone(), tx)).await;
+
+        let state = router.state.read().await;
+        // Only 3 groups should have been registered (BTreeSet is sorted, so g1, g2, g3)
+        let alice_group_count = state
+            .groups
+            .values()
+            .filter(|members| members.contains("alice"))
+            .count();
+        assert_eq!(
+            alice_group_count, 3,
+            "CN should be limited to max_groups_per_cn"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_enforces_max_total_groups() {
+        // Allow each CN to join many groups, but cap total groups at 2
+        let router = Router::with_limits(128, 2);
+
+        // First client joins 2 groups — fills the total limit
+        let alice = make_identity("alice", &["g1", "g2"]);
+        let (tx_a, _rx_a) = mpsc::channel(16);
+        router
+            .register(SessionHandle::new(alice.clone(), tx_a))
+            .await;
+
+        // Second client tries to join a new group — should be rejected
+        let bob = make_identity("bob", &["g3"]);
+        let (tx_b, _rx_b) = mpsc::channel(16);
+        router.register(SessionHandle::new(bob.clone(), tx_b)).await;
+
+        let state = router.state.read().await;
+        assert_eq!(state.groups.len(), 2, "total groups should be capped at 2");
+        assert!(
+            !state.groups.contains_key("g3"),
+            "new group should be rejected when at total limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_allows_joining_existing_group_at_total_limit() {
+        // Total limit is 2, but joining an existing group should still work
+        let router = Router::with_limits(128, 2);
+
+        let alice = make_identity("alice", &["g1", "g2"]);
+        let (tx_a, _rx_a) = mpsc::channel(16);
+        router
+            .register(SessionHandle::new(alice.clone(), tx_a))
+            .await;
+
+        // Bob joins g1 (already exists) — should succeed
+        let bob = make_identity("bob", &["g1"]);
+        let (tx_b, _rx_b) = mpsc::channel(16);
+        router.register(SessionHandle::new(bob.clone(), tx_b)).await;
+
+        let state = router.state.read().await;
+        let g1_members = state.groups.get("g1").expect("g1 should exist");
+        assert!(
+            g1_members.contains("bob"),
+            "bob should be able to join existing group even at total limit"
+        );
     }
 
     #[tokio::test]

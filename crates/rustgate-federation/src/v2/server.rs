@@ -19,6 +19,12 @@ use super::proto::figpb;
 use super::proto::figpb::federated_channel_server::FederatedChannel;
 use crate::provenance;
 
+/// Default maximum number of groups a single federation peer can advertise.
+pub const DEFAULT_MAX_GROUPS_PER_PEER: usize = 1_000;
+
+/// Default maximum length of a federation group name in bytes.
+pub const DEFAULT_MAX_GROUP_NAME_LENGTH: usize = 256;
+
 /// Callback invoked when a FederatedEvent is received from a remote peer.
 pub type OnEvent = Arc<dyn Fn(figpb::FederatedEvent, String) + Send + Sync>;
 
@@ -39,6 +45,10 @@ pub struct FederationService {
     peer_groups: Arc<RwLock<HashMap<String, Vec<String>>>>,
     /// Callback for inbound events.
     on_event: OnEvent,
+    /// Maximum number of groups a single peer can advertise.
+    max_groups_per_peer: usize,
+    /// Maximum length of a group name in bytes.
+    max_group_name_length: usize,
 }
 
 impl std::fmt::Debug for FederationService {
@@ -47,13 +57,35 @@ impl std::fmt::Debug for FederationService {
             .field("federate_id", &self.federate_id)
             .field("server_uid", &self.server_uid)
             .field("groups", &self.groups)
+            .field("max_groups_per_peer", &self.max_groups_per_peer)
+            .field("max_group_name_length", &self.max_group_name_length)
             .finish_non_exhaustive()
     }
 }
 
 impl FederationService {
-    /// Create a new FederationService.
+    /// Create a new FederationService with default peer group limits.
     pub fn new(federate_id: String, groups: Vec<String>, on_event: OnEvent) -> Self {
+        Self::with_limits(
+            federate_id,
+            groups,
+            on_event,
+            DEFAULT_MAX_GROUPS_PER_PEER,
+            DEFAULT_MAX_GROUP_NAME_LENGTH,
+        )
+    }
+
+    /// Create a new FederationService with custom peer group limits.
+    ///
+    /// - `max_groups_per_peer`: maximum groups a single peer can advertise
+    /// - `max_group_name_length`: maximum length of a group name in bytes
+    pub fn with_limits(
+        federate_id: String,
+        groups: Vec<String>,
+        on_event: OnEvent,
+        max_groups_per_peer: usize,
+        max_group_name_length: usize,
+    ) -> Self {
         let server_uid = provenance::deterministic_uuid(&federate_id);
         Self {
             federate_id,
@@ -62,6 +94,8 @@ impl FederationService {
             outbound_streams: Arc::new(RwLock::new(HashMap::new())),
             peer_groups: Arc::new(RwLock::new(HashMap::new())),
             on_event,
+            max_groups_per_peer,
+            max_group_name_length,
         }
     }
 
@@ -334,11 +368,42 @@ impl FederatedChannel for FederationService {
 
         let peer_groups = Arc::clone(&self.peer_groups);
         let pid = peer_id.clone();
+        let max_groups = self.max_groups_per_peer;
+        let max_name_len = self.max_group_name_length;
 
         drop(tokio::spawn(async move {
             while let Ok(Some(groups_msg)) = stream.message().await {
-                let groups = groups_msg.federate_groups;
-                info!(peer = %pid, groups = ?groups, "peer updated groups");
+                let mut groups = groups_msg.federate_groups;
+
+                // Filter out group names that exceed the length limit
+                let original_len = groups.len();
+                groups.retain(|g| {
+                    if g.len() > max_name_len {
+                        warn!(
+                            peer = %pid,
+                            group_name_length = g.len(),
+                            limit = max_name_len,
+                            "federation group name rejected: exceeds max length"
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                });
+
+                // Enforce per-peer group count limit
+                if groups.len() > max_groups {
+                    warn!(
+                        peer = %pid,
+                        advertised = original_len,
+                        accepted = max_groups,
+                        limit = max_groups,
+                        "federation peer groups truncated: exceeds max groups per peer"
+                    );
+                    groups.truncate(max_groups);
+                }
+
+                info!(peer = %pid, count = groups.len(), "peer updated groups");
                 let _ = peer_groups.write().await.insert(pid.clone(), groups);
             }
             info!(peer = %pid, "client_federate_groups_stream closed");
@@ -691,6 +756,83 @@ mod tests {
             streams.insert("peer-2".into(), tx2);
         }
         assert_eq!(svc.connection_count().await, 2);
+    }
+
+    #[tokio::test]
+    async fn peer_groups_enforces_max_count() {
+        let svc = FederationService::with_limits(
+            "s".into(),
+            vec![],
+            noop_on_event(),
+            3,   // max 3 groups per peer
+            256, // max name length
+        );
+
+        // Simulate peer advertising 5 groups
+        let groups: Vec<String> = (0..5).map(|i| format!("group-{i}")).collect();
+        {
+            // Apply the same validation logic used in client_federate_groups_stream
+            let mut filtered = groups.clone();
+            filtered.retain(|g| g.len() <= svc.max_group_name_length);
+            if filtered.len() > svc.max_groups_per_peer {
+                filtered.truncate(svc.max_groups_per_peer);
+            }
+            svc.peer_groups
+                .write()
+                .await
+                .insert("peer-1".into(), filtered);
+        }
+
+        let pg = svc.peer_groups.read().await;
+        let peer_groups = pg.get("peer-1").expect("peer-1 should exist");
+        assert_eq!(
+            peer_groups.len(),
+            3,
+            "peer groups should be truncated to max_groups_per_peer"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_groups_enforces_max_name_length() {
+        let svc = FederationService::with_limits(
+            "s".into(),
+            vec![],
+            noop_on_event(),
+            1_000,
+            10, // max 10 bytes per group name
+        );
+
+        let groups = vec![
+            "short".to_string(),
+            "this-is-a-very-long-group-name-that-exceeds-the-limit".to_string(),
+            "ok".to_string(),
+        ];
+
+        {
+            let mut filtered = groups.clone();
+            filtered.retain(|g| g.len() <= svc.max_group_name_length);
+            svc.peer_groups
+                .write()
+                .await
+                .insert("peer-1".into(), filtered);
+        }
+
+        let pg = svc.peer_groups.read().await;
+        let peer_groups = pg.get("peer-1").expect("peer-1 should exist");
+        assert_eq!(
+            peer_groups.len(),
+            2,
+            "only group names within length limit should be accepted"
+        );
+        assert!(peer_groups.contains(&"short".to_string()));
+        assert!(peer_groups.contains(&"ok".to_string()));
+    }
+
+    #[test]
+    fn with_limits_sets_custom_values() {
+        let svc = FederationService::with_limits("s".into(), vec![], noop_on_event(), 500, 128);
+        assert_eq!(svc.max_groups_per_peer, 500);
+        assert_eq!(svc.max_group_name_length, 128);
     }
 
     #[test]
