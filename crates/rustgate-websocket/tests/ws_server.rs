@@ -1,7 +1,6 @@
 #![allow(clippy::panic, clippy::unwrap_used)]
 //! Integration tests for WebSocket server session routing.
 
-use std::io::BufReader;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -11,23 +10,20 @@ use rustgate_transport::{Router, TlsConfig};
 use rustgate_websocket::{WebSocketServer, WsEncoding, WsListener, WsServerConfig};
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls_pki_types::pem::PemObject;
 use tokio::sync::{Notify, Semaphore};
 use tokio_tungstenite::tungstenite::Message;
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
 fn parse_certs(pem: &str) -> Vec<CertificateDer<'static>> {
-    let mut reader = BufReader::new(pem.as_bytes());
-    rustls_pemfile::certs(&mut reader)
+    CertificateDer::pem_slice_iter(pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .expect("parse certs")
 }
 
 fn parse_key(pem: &str) -> PrivateKeyDer<'static> {
-    let mut reader = BufReader::new(pem.as_bytes());
-    rustls_pemfile::private_key(&mut reader)
-        .expect("parse key")
-        .expect("no key")
+    PrivateKeyDer::from_pem_slice(pem.as_bytes()).expect("parse key")
 }
 
 fn build_client_tls_config(cert_pem: &str, key_pem: &str, ca_pem: &str) -> rustls::ClientConfig {

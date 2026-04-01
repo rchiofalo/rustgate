@@ -17,7 +17,6 @@ fips = ["rcgen/fips"]
 rustgate-core = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 rustls-pki-types = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt", "io-util", "sync", "fs"] }
 sha1 = { workspace = true }

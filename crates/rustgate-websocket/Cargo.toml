@@ -28,5 +28,4 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 tokio-tungstenite = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 rustls-pki-types = { workspace = true }

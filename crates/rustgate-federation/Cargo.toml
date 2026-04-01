@@ -27,7 +27,6 @@ rustgate-transport = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "net", "macros", "io-util"] }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 rustls-pki-types = { workspace = true }
 tokio-util = { workspace = true }
 futures = { workspace = true }

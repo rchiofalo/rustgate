@@ -1,12 +1,12 @@
 //! TLS configuration for mTLS server.
 
-use std::io::BufReader;
 use std::sync::Arc;
 
 use rustgate_core::error::{Result, RustgateError};
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer};
 use rustls::server::{NoServerSessionStorage, WebPkiClientVerifier};
+use rustls_pki_types::pem::PemObject;
 
 #[derive(Debug)]
 pub struct TlsConfig {
@@ -40,10 +40,10 @@ impl TlsConfig {
     /// revoked certificates will be rejected before reaching the
     /// application layer.
     pub fn with_crls(mut self, crl_pem: &str) -> Result<Self> {
-        let mut reader = BufReader::new(crl_pem.as_bytes());
-        let crls: Vec<CertificateRevocationListDer<'static>> = rustls_pemfile::crls(&mut reader)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| RustgateError::Config(format!("failed to parse CRL PEM: {e}")))?;
+        let crls: Vec<CertificateRevocationListDer<'static>> =
+            CertificateRevocationListDer::pem_slice_iter(crl_pem.as_bytes())
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| RustgateError::Config(format!("failed to parse CRL PEM: {e}")))?;
 
         if crls.is_empty() {
             return Err(RustgateError::Config(
@@ -84,8 +84,7 @@ impl TlsConfig {
     }
 
     fn parse_certs(pem: &str) -> Result<Vec<CertificateDer<'static>>> {
-        let mut reader = BufReader::new(pem.as_bytes());
-        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(pem.as_bytes())
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| RustgateError::Config(format!("failed to parse certificates: {e}")))?;
 
@@ -99,18 +98,14 @@ impl TlsConfig {
     }
 
     fn parse_key(pem: &str) -> Result<PrivateKeyDer<'static>> {
-        let mut reader = BufReader::new(pem.as_bytes());
-
-        rustls_pemfile::private_key(&mut reader)
-            .map_err(|e| RustgateError::Config(format!("failed to parse private key: {e}")))?
-            .ok_or_else(|| RustgateError::Config("no private key found in PEM".to_string()))
+        PrivateKeyDer::from_pem_slice(pem.as_bytes())
+            .map_err(|e| RustgateError::Config(format!("failed to parse private key: {e}")))
     }
 
     fn parse_ca_store(pem: &str) -> Result<RootCertStore> {
         let mut store = RootCertStore::empty();
-        let mut reader = BufReader::new(pem.as_bytes());
 
-        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(pem.as_bytes())
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| RustgateError::Config(format!("failed to parse CA certificates: {e}")))?;
 

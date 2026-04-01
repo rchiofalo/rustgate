@@ -27,7 +27,7 @@ nats = ["dep:tempfile", "dep:tokio", "dep:async-nats"]
 [dependencies]
 rcgen = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
+rustls-pki-types = { workspace = true }
 x509-parser = { workspace = true }
 time = { workspace = true }
 

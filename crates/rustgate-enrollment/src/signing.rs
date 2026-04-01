@@ -7,13 +7,12 @@
 //! (`-----BEGIN RSA PRIVATE KEY-----`), and SEC1
 //! (`-----BEGIN EC PRIVATE KEY-----`) CA key formats.
 
-use std::io::BufReader;
-
 use rcgen::{
     CertificateSigningRequestParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose,
 };
 use rustls_pki_types::PrivateKeyDer;
+use rustls_pki_types::pem::PemObject;
 
 use crate::error::EnrollmentError;
 
@@ -41,7 +40,7 @@ impl CsrSigner {
     /// Create a signer from PEM-encoded CA certificate and private key.
     ///
     /// The CA cert PEM is parsed twice:
-    /// 1. Via `rustls_pemfile` to extract the original DER bytes (for responses).
+    /// 1. Via `rustls_pki_types::pem::PemObject` to extract the original DER bytes (for responses).
     /// 2. Via `rcgen::CertificateParams::from_ca_cert_der()` to reconstruct
     ///    signing parameters. The params are then re-self-signed with the key
     ///    to produce a `Certificate` handle that `signed_by()` requires.
@@ -51,9 +50,8 @@ impl CsrSigner {
         organization: &str,
     ) -> Result<Self, EnrollmentError> {
         // Extract original DER for enrollment responses
-        let mut reader = BufReader::new(ca_cert_pem.as_bytes());
         let certs: Vec<rustls_pki_types::CertificateDer<'static>> =
-            rustls_pemfile::certs(&mut reader)
+            rustls_pki_types::CertificateDer::pem_slice_iter(ca_cert_pem.as_bytes())
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| {
                     EnrollmentError::Config(format!("failed to parse CA cert PEM: {e}"))
@@ -154,14 +152,13 @@ fn ensure_pem_headers(csr: &str) -> String {
 
 /// Load a private key from PEM, supporting PKCS#8, PKCS#1, and SEC1 formats.
 ///
-/// `rustls_pemfile` handles all three PEM tag types, but rcgen with the
-/// `ring` backend only accepts PKCS#8 DER. For PKCS#1 (RSA) keys, we
-/// wrap the DER in a PKCS#8 envelope before handing it to rcgen.
+/// `rustls_pki_types` PEM parsing handles all three PEM tag types, but
+/// rcgen with the `ring` backend only accepts PKCS#8 DER. For PKCS#1
+/// (RSA) keys, we wrap the DER in a PKCS#8 envelope before handing it
+/// to rcgen.
 fn load_private_key(pem: &str) -> Result<KeyPair, EnrollmentError> {
-    let mut reader = BufReader::new(pem.as_bytes());
-    let key_der = rustls_pemfile::private_key(&mut reader)
-        .map_err(|e| EnrollmentError::Config(format!("failed to parse CA key PEM: {e}")))?
-        .ok_or_else(|| EnrollmentError::Config("no private key found in CA key PEM".to_string()))?;
+    let key_der = PrivateKeyDer::from_pem_slice(pem.as_bytes())
+        .map_err(|e| EnrollmentError::Config(format!("failed to parse CA key PEM: {e}")))?;
 
     let pkcs8_der = match &key_der {
         PrivateKeyDer::Pkcs8(_) => key_der,
@@ -532,10 +529,7 @@ cyOZxZiK
     #[test]
     fn pkcs1_to_pkcs8_produces_valid_der() {
         // Parse the PKCS#1 key and convert to PKCS#8
-        let mut reader = BufReader::new(RSA_CA_KEY_PKCS1.as_bytes());
-        let key_der = rustls_pemfile::private_key(&mut reader)
-            .expect("parse")
-            .expect("present");
+        let key_der = PrivateKeyDer::from_pem_slice(RSA_CA_KEY_PKCS1.as_bytes()).expect("parse");
 
         match &key_der {
             PrivateKeyDer::Pkcs1(pkcs1) => {

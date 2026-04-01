@@ -9,6 +9,7 @@ use rcgen::{
     DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, KeyIdMethod, KeyPair,
     KeyUsagePurpose, RevocationReason, RevokedCertParams, SerialNumber,
 };
+use rustls_pki_types::pem::PemObject;
 use time::{Duration as TimeDuration, OffsetDateTime};
 
 /// Install a crypto provider once for the test process.
@@ -34,8 +35,7 @@ fn ensure_crypto_provider() {
 
 /// Extract the serial number from a PEM-encoded certificate.
 fn extract_serial_from_pem(pem: &str) -> SerialNumber {
-    let mut reader = std::io::BufReader::new(pem.as_bytes());
-    let cert_der = rustls_pemfile::certs(&mut reader)
+    let cert_der = rustls_pki_types::CertificateDer::pem_slice_iter(pem.as_bytes())
         .next()
         .expect("no certificate in PEM")
         .expect("failed to parse certificate PEM");
@@ -268,8 +268,7 @@ mod tests {
 
     /// Decode PEM-encoded CRL to DER bytes.
     fn pem_to_der(pem: &str) -> Vec<u8> {
-        let mut reader = std::io::BufReader::new(pem.as_bytes());
-        rustls_pemfile::crls(&mut reader)
+        rustls_pki_types::CertificateRevocationListDer::pem_slice_iter(pem.as_bytes())
             .next()
             .expect("no CRL in PEM")
             .expect("failed to parse CRL PEM")
