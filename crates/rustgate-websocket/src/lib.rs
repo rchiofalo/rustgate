@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use rustgate_core::constants::{HANDSHAKE_TIMEOUT, TCP_KEEPALIVE_IDLE, TCP_KEEPALIVE_INTERVAL};
-use rustgate_core::error::{Result, RustgateError};
+use rustgate_core::error::{Result, TransportError};
 use rustgate_core::identity::Identity;
 use rustgate_transport::{TlsConfig, extract_identity};
 pub use server::{OnFederationForward, OnNatsPublish, WebSocketServer, WsEncoding, WsServerConfig};
@@ -101,26 +101,29 @@ impl WsListener {
             socket2::Type::STREAM,
             Some(socket2::Protocol::TCP),
         )
-        .map_err(|e| RustgateError::Transport(format!("failed to create socket: {e}")))?;
+        .map_err(|e| TransportError::Other(format!("failed to create socket: {e}")))?;
 
         socket
             .set_reuse_address(true)
-            .map_err(|e| RustgateError::Transport(format!("failed to set SO_REUSEADDR: {e}")))?;
+            .map_err(|e| TransportError::Other(format!("failed to set SO_REUSEADDR: {e}")))?;
 
         socket
             .bind(&addr.into())
-            .map_err(|e| RustgateError::Transport(format!("failed to bind {addr}: {e}")))?;
+            .map_err(|e| TransportError::Bind {
+                addr: addr.to_string(),
+                source: e,
+            })?;
 
         socket
             .listen(128)
-            .map_err(|e| RustgateError::Transport(format!("failed to listen on {addr}: {e}")))?;
+            .map_err(|e| TransportError::Other(format!("failed to listen on {addr}: {e}")))?;
 
         socket
             .set_nonblocking(true)
-            .map_err(|e| RustgateError::Transport(format!("failed to set nonblocking: {e}")))?;
+            .map_err(|e| TransportError::Other(format!("failed to set nonblocking: {e}")))?;
 
         let tcp = TcpListener::from_std(socket.into())
-            .map_err(|e| RustgateError::Transport(format!("failed to create TcpListener: {e}")))?;
+            .map_err(|e| TransportError::Other(format!("failed to create TcpListener: {e}")))?;
 
         debug!(local_addr = ?tcp.local_addr().ok(), "WebSocket listener bound");
 
@@ -131,7 +134,7 @@ impl WsListener {
     pub fn local_addr(&self) -> Result<SocketAddr> {
         self.tcp
             .local_addr()
-            .map_err(|e| RustgateError::Transport(format!("failed to get local address: {e}")))
+            .map_err(|e| TransportError::Other(format!("failed to get local address: {e}")).into())
     }
 
     /// Accept a new WebSocket connection with mTLS authentication.
@@ -216,11 +219,9 @@ fn extract_client_identity(tls_stream: &TlsStream) -> Result<Identity> {
 
     let certs = server_conn
         .peer_certificates()
-        .ok_or_else(|| RustgateError::Transport("no client certificate presented".to_string()))?;
+        .ok_or(TransportError::NoCertificate)?;
 
-    let client_cert = certs
-        .first()
-        .ok_or_else(|| RustgateError::Transport("empty client certificate chain".to_string()))?;
+    let client_cert = certs.first().ok_or(TransportError::EmptyCertChain)?;
 
     extract_identity(client_cert)
 }
