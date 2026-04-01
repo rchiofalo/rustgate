@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures::{SinkExt, StreamExt};
 use rustgate_test_utils::certs::TestCa;
-use rustgate_transport::{Router, TlsConfig};
+use rustgate_transport::{Router, ThrottleConfig, TlsConfig};
 use rustgate_websocket::{WebSocketServer, WsEncoding, WsListener, WsServerConfig};
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -110,6 +110,14 @@ struct TestWsServer {
 
 impl TestWsServer {
     async fn new(encoding: WsEncoding, max_connections: usize) -> Self {
+        Self::with_throttle(encoding, max_connections, None).await
+    }
+
+    async fn with_throttle(
+        encoding: WsEncoding,
+        max_connections: usize,
+        throttle_config: Option<ThrottleConfig>,
+    ) -> Self {
         let ca = TestCa::new("Test CA");
         let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
 
@@ -132,6 +140,7 @@ impl TestWsServer {
             encoding,
             nats_publish: None,
             fed_forward: None,
+            throttle_config,
             shutdown: Arc::clone(&shutdown),
         };
 
@@ -450,6 +459,7 @@ async fn ws_nats_and_federation_callbacks_fire() {
         encoding: WsEncoding::Raw,
         nats_publish: Some(nats_publish),
         fed_forward: Some(fed_forward),
+        throttle_config: None,
         shutdown: Arc::clone(&shutdown),
     };
 
@@ -506,4 +516,83 @@ async fn ws_nats_and_federation_callbacks_fire() {
     );
 
     shutdown.notify_one();
+}
+
+/// Messages exceeding the per-connection rate limit are dropped.
+#[tokio::test]
+async fn ws_rate_limit_drops_excess_messages() {
+    // burst=2 means only the first 2 messages pass immediately; the rest are dropped.
+    let server =
+        TestWsServer::with_throttle(WsEncoding::Raw, 64, Some(ThrottleConfig::new(1, 2))).await;
+    let alice_cert = server.issue_client("alice", &["alpha"]);
+    let bob_cert = server.issue_client("bob", &["alpha"]);
+
+    let mut alice_ws = server.connect(&alice_cert).await;
+    let mut bob_ws = server.connect(&bob_cert).await;
+    server.wait_registered(2).await;
+
+    // Send 5 messages rapidly — only first 2 should pass (burst=2)
+    for i in 0..5 {
+        let cot_xml = format!(
+            r#"<event uid="msg-{i}" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><point lat="38.0" lon="-77.0" hae="0.0"/><detail><__group name="alpha"/></detail></event>"#
+        );
+        alice_ws
+            .send(Message::Binary(cot_xml.into_bytes().into()))
+            .await
+            .expect("alice send");
+    }
+
+    // Bob should receive at most 2 messages (the burst allowance)
+    let mut received_count = 0usize;
+    for _ in 0..5 {
+        match tokio::time::timeout(std::time::Duration::from_secs(1), bob_ws.next()).await {
+            Ok(Some(Ok(Message::Binary(_) | Message::Text(_)))) => received_count += 1,
+            _ => break,
+        }
+    }
+
+    assert!(
+        received_count <= 2,
+        "expected at most 2 messages through rate limit, got {received_count}"
+    );
+    assert!(
+        received_count >= 1,
+        "expected at least 1 message through rate limit, got {received_count}"
+    );
+}
+
+/// Rate limiting is disabled when throttle config is None (msg_rate=0).
+#[tokio::test]
+async fn ws_rate_limit_disabled_when_none() {
+    let server = TestWsServer::with_throttle(WsEncoding::Raw, 64, None).await;
+    let alice_cert = server.issue_client("alice", &["alpha"]);
+    let bob_cert = server.issue_client("bob", &["alpha"]);
+
+    let mut alice_ws = server.connect(&alice_cert).await;
+    let mut bob_ws = server.connect(&bob_cert).await;
+    server.wait_registered(2).await;
+
+    // Send 10 messages — all should pass when rate limiting is disabled
+    for i in 0..10 {
+        let cot_xml = format!(
+            r#"<event uid="msg-{i}" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><point lat="38.0" lon="-77.0" hae="0.0"/><detail><__group name="alpha"/></detail></event>"#
+        );
+        alice_ws
+            .send(Message::Binary(cot_xml.into_bytes().into()))
+            .await
+            .expect("alice send");
+    }
+
+    let mut received_count = 0usize;
+    for _ in 0..10 {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), bob_ws.next()).await {
+            Ok(Some(Ok(Message::Binary(_) | Message::Text(_)))) => received_count += 1,
+            _ => break,
+        }
+    }
+
+    assert_eq!(
+        received_count, 10,
+        "all messages should pass when rate limiting is disabled"
+    );
 }

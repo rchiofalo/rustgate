@@ -765,6 +765,21 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         tracing::warn!("--federation-ha-nats-url requires --features federation-ha; ignoring");
     }
 
+    // ── Per-client rate limiting ─────────────────────────────────────
+    let throttle_config = if cli.client_message_rate > 0 {
+        tracing::info!(
+            rate = cli.client_message_rate,
+            burst = cli.client_burst,
+            "per-client rate limiting enabled"
+        );
+        Some(ThrottleConfig::new(
+            cli.client_message_rate,
+            cli.client_burst,
+        ))
+    } else {
+        None
+    };
+
     // ── WebSocket listener ──────────────────────────────────────────
 
     #[cfg(feature = "websocket")]
@@ -807,6 +822,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             encoding: ws_encoding,
             nats_publish: nats_cb,
             fed_forward: fed_forward.clone(),
+            throttle_config,
             shutdown: Arc::clone(&shutdown),
         };
         drop(tokio::spawn(rustgate_websocket::WebSocketServer::run(
@@ -821,21 +837,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     if cli.websocket_bind.is_some() {
         tracing::warn!("--websocket-bind requires --features websocket; ignoring");
     }
-
-    // ── Per-client rate limiting ─────────────────────────────────────
-    let throttle_config = if cli.client_message_rate > 0 {
-        tracing::info!(
-            rate = cli.client_message_rate,
-            burst = cli.client_burst,
-            "per-client rate limiting enabled"
-        );
-        Some(ThrottleConfig::new(
-            cli.client_message_rate,
-            cli.client_burst,
-        ))
-    } else {
-        None
-    };
 
     // ── CoT event archival ───────────────────────────────────────────
     let archiver = if let Some(ref dir) = cli.archive_dir {
