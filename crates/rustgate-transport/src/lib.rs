@@ -28,6 +28,8 @@ pub use rustgate_proto::TakFrameCodec;
 pub use session::{AuthenticatedSession, SessionReader, SessionWriter};
 pub use throttle::{ClientThrottle, ThrottleConfig};
 
+pub mod pem;
+
 mod plaintext;
 pub mod udp;
 
