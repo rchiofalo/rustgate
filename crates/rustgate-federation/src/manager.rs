@@ -29,6 +29,14 @@ use crate::v1::{V1Client, V1Server};
 /// and routing the message to local clients (e.g., via the Router).
 pub type OnInbound = Arc<dyn Fn(String, Bytes) + Send + Sync>;
 
+/// Capacity for HA peer adoption/loss event channels.
+///
+/// Bounds memory growth under rapid peer state changes while providing
+/// enough headroom for normal churn. Events that exceed capacity are
+/// dropped with a warning log.
+#[cfg(feature = "ha")]
+const HA_CHANNEL_CAPACITY: usize = 256;
+
 /// Wraps either a V1 or V2 outbound federation client.
 enum FederationClient {
     V1(V1Client),
@@ -77,9 +85,9 @@ pub struct FederationManager {
     #[cfg(feature = "ha")]
     connection_registry: Option<crate::ha::registry::ConnectionRegistry>,
     #[cfg(feature = "ha")]
-    ha_adopt_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+    ha_adopt_rx: Option<tokio::sync::mpsc::Receiver<String>>,
     #[cfg(feature = "ha")]
-    ha_lost_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+    ha_lost_rx: Option<tokio::sync::mpsc::Receiver<String>>,
 }
 
 /// Aggregated status snapshot of the federation subsystem.
@@ -363,14 +371,18 @@ impl FederationManager {
                 .await
                 .map_err(|e| anyhow::anyhow!("create connection registry: {e}"))?;
 
-            let (adopt_tx, adopt_rx) = tokio::sync::mpsc::unbounded_channel();
-            let (lost_tx, lost_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (adopt_tx, adopt_rx) = tokio::sync::mpsc::channel(HA_CHANNEL_CAPACITY);
+            let (lost_tx, lost_rx) = tokio::sync::mpsc::channel(HA_CHANNEL_CAPACITY);
             cm.set_callbacks(
-                Arc::new(move |peer_id| {
-                    let _ = adopt_tx.send(peer_id);
+                Arc::new(move |peer_id: String| {
+                    if let Err(e) = adopt_tx.try_send(peer_id) {
+                        warn!(error = %e, "HA adopt channel full, dropping event");
+                    }
                 }),
-                Arc::new(move |peer_id| {
-                    let _ = lost_tx.send(peer_id);
+                Arc::new(move |peer_id: String| {
+                    if let Err(e) = lost_tx.try_send(peer_id) {
+                        warn!(error = %e, "HA claim-lost channel full, dropping event");
+                    }
                 }),
             );
 
@@ -1077,8 +1089,8 @@ impl FederationManager {
     pub fn take_ha_receivers(
         &mut self,
     ) -> (
-        Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
-        Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+        Option<tokio::sync::mpsc::Receiver<String>>,
+        Option<tokio::sync::mpsc::Receiver<String>>,
     ) {
         (self.ha_adopt_rx.take(), self.ha_lost_rx.take())
     }
