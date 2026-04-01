@@ -1,5 +1,7 @@
 use std::time::{Duration, SystemTime};
 
+#[cfg(feature = "fuzz")]
+use arbitrary::Arbitrary;
 use bytes::Bytes;
 
 use crate::identity::{GroupId, Identity};
@@ -39,6 +41,79 @@ pub enum MessageType {
     Status,
     File,
     Other(String),
+}
+
+#[cfg(feature = "fuzz")]
+impl<'a> Arbitrary<'a> for MessageType {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        match u.int_in_range(0..=5)? {
+            0 => Ok(Self::Position),
+            1 => Ok(Self::Chat),
+            2 => Ok(Self::Alert),
+            3 => Ok(Self::Status),
+            4 => Ok(Self::File),
+            _ => {
+                let len = u.int_in_range(1..=32)?;
+                let s: String = (0..len)
+                    .map(|_| u.int_in_range(b'a'..=b'z').map(|b| b as char))
+                    .collect::<arbitrary::Result<_>>()?;
+                Ok(Self::Other(s))
+            }
+        }
+    }
+}
+
+#[cfg(feature = "fuzz")]
+impl<'a> Arbitrary<'a> for Destination {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        match u.int_in_range(0..=2)? {
+            0 => Ok(Self::Broadcast),
+            1 => {
+                let len = u.int_in_range(1..=16)?;
+                let group: String = (0..len)
+                    .map(|_| u.int_in_range(b'a'..=b'z').map(|b| b as char))
+                    .collect::<arbitrary::Result<_>>()?;
+                Ok(Self::Group(group))
+            }
+            _ => Ok(Self::Direct(u.arbitrary()?)),
+        }
+    }
+}
+
+#[cfg(feature = "fuzz")]
+impl<'a> Arbitrary<'a> for Metadata {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        let protocols = ["tcp", "udp", "websocket", "federation", "nats"];
+        let idx = u.int_in_range(0..=4)?;
+        let source_protocol = protocols[idx].to_string();
+
+        let ttl_secs: Option<u64> = u.arbitrary()?;
+        let ttl = ttl_secs.map(|s| Duration::from_secs(s % 86400));
+
+        Ok(Self {
+            received_at: SystemTime::now(),
+            source_protocol,
+            message_type: u.arbitrary()?,
+            ttl,
+        })
+    }
+}
+
+#[cfg(feature = "fuzz")]
+impl<'a> Arbitrary<'a> for RoutableMessage {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        let payload_len = u.int_in_range(0..=1024)?;
+        let payload_bytes: Vec<u8> = (0..payload_len)
+            .map(|_| u.arbitrary())
+            .collect::<arbitrary::Result<_>>()?;
+
+        Ok(Self {
+            source: u.arbitrary()?,
+            destination: u.arbitrary()?,
+            payload: Bytes::from(payload_bytes),
+            metadata: u.arbitrary()?,
+        })
+    }
 }
 
 impl std::fmt::Display for MessageType {

@@ -7,6 +7,9 @@
 
 use std::collections::BTreeSet;
 
+#[cfg(feature = "fuzz")]
+use arbitrary::Arbitrary;
+
 /// Unique group identifier.
 pub type GroupId = String;
 
@@ -109,6 +112,45 @@ fn validate_cn(cn: &str) -> Result<(), IdentityError> {
     }
 
     Ok(())
+}
+
+#[cfg(feature = "fuzz")]
+impl<'a> Arbitrary<'a> for Identity {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        // Generate a valid CN: non-empty, no control chars, max 256 chars.
+        // Use printable ASCII to avoid control characters.
+        let cn_len = u.int_in_range(1..=64)?;
+        let cn: String = (0..cn_len)
+            .map(|_| {
+                // Printable ASCII range: 0x20 (space) to 0x7E (~)
+                u.int_in_range(0x20u8..=0x7E).map(|b| b as char)
+            })
+            .collect::<arbitrary::Result<_>>()?;
+
+        // Generate a hex fingerprint like "aa:bb:cc:dd"
+        let fp_bytes: [u8; 8] = u.arbitrary()?;
+        let fingerprint: String = fp_bytes
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(":");
+
+        let num_groups: usize = u.int_in_range(0..=4)?;
+        let mut groups = BTreeSet::new();
+        for _ in 0..num_groups {
+            let glen = u.int_in_range(1..=16)?;
+            let group: String = (0..glen)
+                .map(|_| u.int_in_range(b'a'..=b'z').map(|b| b as char))
+                .collect::<arbitrary::Result<_>>()?;
+            let _ = groups.insert(group);
+        }
+
+        Ok(Self {
+            cn,
+            fingerprint,
+            groups,
+        })
+    }
 }
 
 impl std::fmt::Display for Identity {

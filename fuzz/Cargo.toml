@@ -8,11 +8,12 @@ edition = "2024"
 cargo-fuzz = true
 
 [dependencies]
-libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
 tokio-util = { version = "0.7", features = ["codec"] }
-rustgate-core = { path = "../crates/rustgate-core" }
+rustgate-core = { path = "../crates/rustgate-core", features = ["fuzz"] }
 rustgate-transport = { path = "../crates/rustgate-transport" }
-rustgate-cot = { path = "../crates/rustgate-cot" }
+rustgate-cot = { path = "../crates/rustgate-cot", features = ["fuzz"] }
 rustgate-proto = { path = "../crates/rustgate-proto" }
 rustgate-federation = { path = "../crates/rustgate-federation", features = ["v2"] }
 rustgate-nats = { path = "../crates/rustgate-nats" }
@@ -74,4 +75,14 @@ doc = false
 [[bin]]
 name = "proto_roundtrip"
 path = "fuzz_targets/proto_roundtrip.rs"
+doc = false
+
+[[bin]]
+name = "structured_routable_message"
+path = "fuzz_targets/structured_routable_message.rs"
+doc = false
+
+[[bin]]
+name = "structured_cot_event"
+path = "fuzz_targets/structured_cot_event.rs"
 doc = false

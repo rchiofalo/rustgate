@@ -9,6 +9,8 @@
 use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};
 
+#[cfg(feature = "fuzz")]
+use arbitrary::Arbitrary;
 use bytes::Bytes;
 use quick_xml::Reader;
 use quick_xml::events::Event;
@@ -28,6 +30,7 @@ pub struct CotEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "fuzz", derive(Arbitrary))]
 pub enum CotDestination {
     Broadcast,
     Callsign(String),
@@ -35,6 +38,7 @@ pub enum CotDestination {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "fuzz", derive(Arbitrary))]
 pub struct Position {
     pub lat: f64,
     pub lon: f64,
@@ -51,6 +55,34 @@ pub enum ParseError {
 impl From<quick_xml::Error> for ParseError {
     fn from(e: quick_xml::Error) -> Self {
         ParseError::Xml(e)
+    }
+}
+
+#[cfg(feature = "fuzz")]
+impl<'a> Arbitrary<'a> for CotEvent {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        let uid_len = u.int_in_range(1..=32)?;
+        let uid: String = (0..uid_len)
+            .map(|_| u.int_in_range(b'a'..=b'z').map(|b| b as char))
+            .collect::<arbitrary::Result<_>>()?;
+
+        // Generate realistic CoT event types
+        let event_types = ["a-f-G-U-C", "a-h-G", "b-t-f", "b-a-o-tbl", "t-x-c-t"];
+        let idx = u.int_in_range(0..=4)?;
+        let event_type = event_types[idx].to_string();
+
+        let ttl_secs: Option<u64> = u.arbitrary()?;
+        let ttl = ttl_secs.map(|s| Duration::from_secs(s % 86400));
+
+        Ok(Self {
+            uid,
+            event_type,
+            destination: u.arbitrary()?,
+            message_type: u.arbitrary()?,
+            position: u.arbitrary()?,
+            ttl,
+            source_group: u.arbitrary()?,
+        })
     }
 }
 
