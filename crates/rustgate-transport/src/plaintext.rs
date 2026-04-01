@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use std::net::SocketAddr;
 
 use rustgate_core::constants::{TCP_KEEPALIVE_IDLE, TCP_KEEPALIVE_INTERVAL};
-use rustgate_core::error::{Result, RustgateError};
+use rustgate_core::error::{Result, TransportError};
 use rustgate_core::identity::Identity;
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tracing::{debug, warn};
@@ -104,7 +104,7 @@ impl PlaintextListener {
     pub fn local_addr(&self) -> Result<SocketAddr> {
         self.tcp_listener
             .local_addr()
-            .map_err(|e| RustgateError::Transport(format!("failed to get local address: {e}")))
+            .map_err(|e| TransportError::Other(format!("failed to get local address: {e}")).into())
     }
 
     /// Accept a new plaintext TCP connection.
@@ -130,7 +130,7 @@ impl PlaintextListener {
             let _ = groups.insert(self.identity_config.default_group.clone());
 
             let identity = Identity::plaintext(cn, groups).map_err(|e| {
-                RustgateError::Transport(format!("invalid plaintext identity for {peer_addr}: {e}"))
+                TransportError::Other(format!("invalid plaintext identity for {peer_addr}: {e}"))
             })?;
 
             return Ok(PlaintextSession {

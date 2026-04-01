@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use rustgate_core::error::{Result, RustgateError};
+use rustgate_core::error::{Result, RustgateError, TransportError};
 use rustgate_core::identity::Identity;
 use rustgate_core::sanitize::sanitize_for_log;
 use rustls::pki_types::CertificateDer;
@@ -20,7 +20,7 @@ use x509_parser::prelude::*;
 /// - SHA-256 fingerprint → `Identity.fingerprint`
 pub fn extract_identity(cert_der: &CertificateDer<'_>) -> Result<Identity> {
     let (_, cert) = X509Certificate::from_der(cert_der.as_ref())
-        .map_err(|e| RustgateError::Transport(format!("failed to parse X.509 certificate: {e}")))?;
+        .map_err(|e| TransportError::Other(format!("failed to parse X.509 certificate: {e}")))?;
 
     let cn = sanitize_for_log(&extract_cn(&cert)?);
     let groups = extract_groups(&cert)
@@ -29,8 +29,9 @@ pub fn extract_identity(cert_der: &CertificateDer<'_>) -> Result<Identity> {
         .collect();
     let fingerprint = compute_fingerprint(cert_der);
 
-    Identity::new(cn, fingerprint, groups)
-        .map_err(|e| RustgateError::Transport(format!("invalid identity from certificate: {e}")))
+    Identity::new(cn, fingerprint, groups).map_err(|e| {
+        TransportError::Other(format!("invalid identity from certificate: {e}")).into()
+    })
 }
 
 fn extract_cn(cert: &X509Certificate<'_>) -> Result<String> {
@@ -40,16 +41,18 @@ fn extract_cn(cert: &X509Certificate<'_>) -> Result<String> {
                 let cn = attr
                     .attr_value()
                     .as_str()
-                    .map_err(|e| RustgateError::Transport(format!("invalid CN encoding: {e}")))?
+                    .map_err(|e| {
+                        RustgateError::from(TransportError::Other(format!(
+                            "invalid CN encoding: {e}"
+                        )))
+                    })?
                     .to_string();
                 return Ok(cn);
             }
         }
     }
 
-    Err(RustgateError::Transport(
-        "certificate has no Common Name (CN)".to_string(),
-    ))
+    Err(TransportError::MissingCommonName.into())
 }
 
 fn extract_groups(cert: &X509Certificate<'_>) -> BTreeSet<String> {
@@ -96,16 +99,20 @@ pub enum ExpectedKeyUsage {
 /// and vice versa, even if the CA signature is valid.
 pub fn validate_key_usage(cert_der: &CertificateDer<'_>, expected: ExpectedKeyUsage) -> Result<()> {
     let (_, cert) = X509Certificate::from_der(cert_der.as_ref())
-        .map_err(|e| RustgateError::Transport(format!("failed to parse X.509 certificate: {e}")))?;
+        .map_err(|e| TransportError::Other(format!("failed to parse X.509 certificate: {e}")))?;
 
     let extensions_map = cert.extensions_map().map_err(|e| {
-        RustgateError::Transport(format!("failed to parse certificate extensions: {e}"))
+        RustgateError::from(TransportError::Other(format!(
+            "failed to parse certificate extensions: {e}"
+        )))
     })?;
 
     let eku_ext = extensions_map
         .get(&OID_X509_EXT_EXTENDED_KEY_USAGE)
         .ok_or_else(|| {
-            RustgateError::Transport("certificate has no Extended Key Usage extension".to_string())
+            RustgateError::from(TransportError::Other(
+                "certificate has no Extended Key Usage extension".to_string(),
+            ))
         })?;
 
     let parsed = eku_ext.parsed_extension();
@@ -118,14 +125,16 @@ pub fn validate_key_usage(cert_der: &CertificateDer<'_>, expected: ExpectedKeyUs
         if has_usage {
             Ok(())
         } else {
-            Err(RustgateError::Transport(format!(
-                "certificate missing required Extended Key Usage: {expected:?}"
-            )))
+            Err(TransportError::MissingKeyUsage {
+                expected: format!("{expected:?}"),
+            }
+            .into())
         }
     } else {
-        Err(RustgateError::Transport(
-            "failed to parse Extended Key Usage extension".to_string(),
-        ))
+        Err(
+            TransportError::Other("failed to parse Extended Key Usage extension".to_string())
+                .into(),
+        )
     }
 }
 

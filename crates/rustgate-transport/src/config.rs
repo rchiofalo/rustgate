@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use rustgate_core::error::{Result, RustgateError};
+use rustgate_core::error::{ConfigError, Result, RustgateError};
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer};
 use rustls::server::{NoServerSessionStorage, WebPkiClientVerifier};
@@ -30,9 +30,10 @@ impl TlsMinVersion {
         match s {
             "1.2" => Ok(Self::Tls12),
             "1.3" => Ok(Self::Tls13),
-            other => Err(RustgateError::Config(format!(
-                "unsupported TLS minimum version '{other}': expected '1.2' or '1.3'"
-            ))),
+            other => Err(ConfigError::TlsVersion {
+                version: other.to_string(),
+            }
+            .into()),
         }
     }
 
@@ -105,12 +106,18 @@ impl TlsConfig {
         let crls: Vec<CertificateRevocationListDer<'static>> =
             CertificateRevocationListDer::pem_slice_iter(crl_pem.as_bytes())
                 .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|e| RustgateError::Config(format!("failed to parse CRL PEM: {e}")))?;
+                .map_err(|e| {
+                    RustgateError::from(ConfigError::PemParse {
+                        kind: "CRL".to_string(),
+                        reason: e.to_string(),
+                    })
+                })?;
 
         if crls.is_empty() {
-            return Err(RustgateError::Config(
-                "no CRLs found in PEM data".to_string(),
-            ));
+            return Err(ConfigError::EmptyPem {
+                kind: "CRLs".to_string(),
+            }
+            .into());
         }
 
         let count = crls.len();
@@ -141,16 +148,22 @@ impl TlsConfig {
             verifier_builder = verifier_builder.with_crls(self.crls.clone());
         }
 
-        let client_verifier = verifier_builder
-            .build()
-            .map_err(|e| RustgateError::Config(format!("failed to build client verifier: {e}")))?;
+        let client_verifier = verifier_builder.build().map_err(|e| {
+            RustgateError::from(ConfigError::Other(format!(
+                "failed to build client verifier: {e}"
+            )))
+        })?;
 
         let mut config = rustls::ServerConfig::builder_with_protocol_versions(
             self.tls_min_version.protocol_versions(),
         )
         .with_client_cert_verifier(client_verifier)
         .with_single_cert(self.server_certs.clone(), self.server_key.clone_key())
-        .map_err(|e| RustgateError::Config(format!("invalid server certificate: {e}")))?;
+        .map_err(|e| {
+            RustgateError::from(ConfigError::Other(format!(
+                "invalid server certificate: {e}"
+            )))
+        })?;
 
         // Disable TLS session resumption. The rustls default caches 256 sessions,
         // allowing resumed connections to skip client certificate re-validation.
@@ -166,20 +179,30 @@ impl TlsConfig {
     fn parse_certs(pem: &str) -> Result<Vec<CertificateDer<'static>>> {
         let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(pem.as_bytes())
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| RustgateError::Config(format!("failed to parse certificates: {e}")))?;
+            .map_err(|e| {
+                RustgateError::from(ConfigError::PemParse {
+                    kind: "certificate".to_string(),
+                    reason: e.to_string(),
+                })
+            })?;
 
         if certs.is_empty() {
-            return Err(RustgateError::Config(
-                "no certificates found in PEM".to_string(),
-            ));
+            return Err(ConfigError::EmptyPem {
+                kind: "certificates".to_string(),
+            }
+            .into());
         }
 
         Ok(certs)
     }
 
     fn parse_key(pem: &str) -> Result<PrivateKeyDer<'static>> {
-        PrivateKeyDer::from_pem_slice(pem.as_bytes())
-            .map_err(|e| RustgateError::Config(format!("failed to parse private key: {e}")))
+        PrivateKeyDer::from_pem_slice(pem.as_bytes()).map_err(|e| {
+            RustgateError::from(ConfigError::PemParse {
+                kind: "private key".to_string(),
+                reason: e.to_string(),
+            })
+        })
     }
 
     fn parse_ca_store(pem: &str) -> Result<RootCertStore> {
@@ -187,18 +210,26 @@ impl TlsConfig {
 
         let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(pem.as_bytes())
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| RustgateError::Config(format!("failed to parse CA certificates: {e}")))?;
+            .map_err(|e| {
+                RustgateError::from(ConfigError::PemParse {
+                    kind: "CA certificate".to_string(),
+                    reason: e.to_string(),
+                })
+            })?;
 
         if certs.is_empty() {
-            return Err(RustgateError::Config(
-                "no CA certificates found in PEM".to_string(),
-            ));
+            return Err(ConfigError::EmptyPem {
+                kind: "CA certificates".to_string(),
+            }
+            .into());
         }
 
         for cert in certs {
-            store
-                .add(cert)
-                .map_err(|e| RustgateError::Config(format!("failed to add CA certificate: {e}")))?;
+            store.add(cert).map_err(|e| {
+                RustgateError::from(ConfigError::Other(format!(
+                    "failed to add CA certificate: {e}"
+                )))
+            })?;
         }
 
         Ok(store)
@@ -265,17 +296,22 @@ pub fn check_crl_freshness(crls: &[CertificateRevocationListDer<'static>]) -> us
 #[cfg(feature = "fips")]
 pub fn install_fips_provider() -> Result<()> {
     rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
-        .map_err(|_| RustgateError::Config("crypto provider already installed".to_string()))?;
+        .map_err(|_| {
+            RustgateError::from(ConfigError::Other(
+                "crypto provider already installed".to_string(),
+            ))
+        })?;
 
     // Verify the installed provider actually reports FIPS mode.
     // This catches build misconfigurations where aws-lc-rs was compiled
     // without its FIPS module.
     if !is_fips_provider_active() {
-        return Err(RustgateError::Config(
+        return Err(ConfigError::Other(
             "aws-lc-rs provider installed but does not report FIPS mode — \
              check that aws-lc-fips-sys built correctly"
                 .to_string(),
-        ));
+        )
+        .into());
     }
 
     tracing::info!("FIPS 140-3 crypto provider (aws-lc-rs) installed and verified");

@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use rustgate_core::constants::{TCP_KEEPALIVE_IDLE, TCP_KEEPALIVE_INTERVAL};
-use rustgate_core::error::{Result, RustgateError};
+use rustgate_core::error::{Result, TransportError};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
@@ -64,7 +64,7 @@ impl TlsListener {
     ) -> Result<Self> {
         let tcp_listener = TcpListener::bind(addr)
             .await
-            .map_err(|e| RustgateError::Transport(format!("failed to bind TLS listener: {e}")))?;
+            .map_err(|e| TransportError::Other(format!("failed to bind TLS listener: {e}")))?;
         let server_config = config.build_server_config()?;
         let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
 
@@ -84,7 +84,7 @@ impl TlsListener {
     pub fn local_addr(&self) -> Result<SocketAddr> {
         self.tcp_listener
             .local_addr()
-            .map_err(|e| RustgateError::Transport(format!("failed to get local address: {e}")))
+            .map_err(|e| TransportError::Other(format!("failed to get local address: {e}")).into())
     }
 
     /// Accept a new mTLS connection. Loops internally on TCP/TLS failures,
@@ -116,9 +116,9 @@ impl TlsListener {
                 Ok(permit) => permit,
                 Err(_) => {
                     // Semaphore closed — listener is shutting down.
-                    return Err(RustgateError::Transport(
-                        "handshake semaphore closed".to_string(),
-                    ));
+                    return Err(
+                        TransportError::Other("handshake semaphore closed".to_string()).into(),
+                    );
                 }
             };
 
@@ -169,13 +169,11 @@ impl TlsListener {
     ) -> Result<rustgate_core::identity::Identity> {
         let (_, server_conn) = tls_stream.get_ref();
 
-        let certs = server_conn.peer_certificates().ok_or_else(|| {
-            RustgateError::Transport("no client certificate presented".to_string())
-        })?;
+        let certs = server_conn
+            .peer_certificates()
+            .ok_or(TransportError::NoCertificate)?;
 
-        let client_cert = certs.first().ok_or_else(|| {
-            RustgateError::Transport("empty client certificate chain".to_string())
-        })?;
+        let client_cert = certs.first().ok_or(TransportError::EmptyCertChain)?;
 
         validate_key_usage(client_cert, ExpectedKeyUsage::ClientAuth)?;
 
