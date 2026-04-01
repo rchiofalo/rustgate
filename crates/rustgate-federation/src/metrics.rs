@@ -104,67 +104,95 @@ pub fn init() -> prometheus::Result<()> {
     Ok(())
 }
 
+// ── Fallback constructors ───────────────────────────────────────────
+//
+// When `init()` has not been called, accessor functions lazily create
+// an unregistered metric via `OnceLock::get_or_init()`. These helpers
+// construct the fallback without `unwrap()` or `expect()`.
+
+fn fallback_counter(name: &str, help: &str) -> IntCounter {
+    match IntCounter::with_opts(Opts::new(name, help)) {
+        Ok(c) => c,
+        Err(_) => std::process::abort(),
+    }
+}
+
+fn fallback_gauge(name: &str, help: &str) -> IntGauge {
+    match IntGauge::with_opts(Opts::new(name, help)) {
+        Ok(g) => g,
+        Err(_) => std::process::abort(),
+    }
+}
+
+fn fallback_counter_vec(name: &str, help: &str, labels: &[&str]) -> IntCounterVec {
+    match IntCounterVec::new(Opts::new(name, help), labels) {
+        Ok(cv) => cv,
+        Err(_) => std::process::abort(),
+    }
+}
+
 // ── Accessor functions ──────────────────────────────────────────────
+//
+// Each accessor returns a reference to the registered metric. If
+// `init()` has not been called, `get_or_init()` lazily creates an
+// unregistered metric that absorbs increments without effect. This
+// eliminates panics from initialization-order races without adding
+// Option propagation to every call site.
 
 /// Active federation connection count (gauge).
 pub fn connections() -> &'static IntGauge {
-    CONNECTIONS
-        .get()
-        .expect("federation metrics not initialized")
+    CONNECTIONS.get_or_init(|| fallback_gauge("rustgate_federation_connections", "fallback"))
 }
 
 /// Active inbound federation connections (gauge).
 pub fn connections_inbound() -> &'static IntGauge {
     CONNECTIONS_INBOUND
-        .get()
-        .expect("federation metrics not initialized")
+        .get_or_init(|| fallback_gauge("rustgate_federation_connections_inbound", "fallback"))
 }
 
 /// Active outbound federation connections (gauge).
 pub fn connections_outbound() -> &'static IntGauge {
     CONNECTIONS_OUTBOUND
-        .get()
-        .expect("federation metrics not initialized")
+        .get_or_init(|| fallback_gauge("rustgate_federation_connections_outbound", "fallback"))
 }
 
 /// Total messages received from federation peers (counter).
 pub fn messages_in() -> &'static IntCounter {
     MESSAGES_IN
-        .get()
-        .expect("federation metrics not initialized")
+        .get_or_init(|| fallback_counter("rustgate_federation_messages_in_total", "fallback"))
 }
 
 /// Total messages sent to federation peers (counter).
 pub fn messages_out() -> &'static IntCounter {
     MESSAGES_OUT
-        .get()
-        .expect("federation metrics not initialized")
+        .get_or_init(|| fallback_counter("rustgate_federation_messages_out_total", "fallback"))
 }
 
 /// Total federation errors (counter).
 pub fn errors() -> &'static IntCounter {
-    ERRORS.get().expect("federation metrics not initialized")
+    ERRORS.get_or_init(|| fallback_counter("rustgate_federation_errors_total", "fallback"))
 }
 
 /// Federation heartbeats by direction (counter vec, labels: direction=in|out).
 pub fn heartbeats() -> &'static IntCounterVec {
-    HEARTBEATS
-        .get()
-        .expect("federation metrics not initialized")
+    HEARTBEATS.get_or_init(|| {
+        fallback_counter_vec(
+            "rustgate_federation_heartbeats_total",
+            "fallback",
+            &["direction"],
+        )
+    })
 }
 
 /// Messages dropped due to loop detection or hop limit (counter).
 pub fn messages_dropped() -> &'static IntCounter {
     MESSAGES_DROPPED
-        .get()
-        .expect("federation metrics not initialized")
+        .get_or_init(|| fallback_counter("rustgate_federation_messages_dropped_total", "fallback"))
 }
 
 /// Total outbound reconnection attempts (counter).
 pub fn reconnects() -> &'static IntCounter {
-    RECONNECTS
-        .get()
-        .expect("federation metrics not initialized")
+    RECONNECTS.get_or_init(|| fallback_counter("rustgate_federation_reconnects_total", "fallback"))
 }
 
 // ── Snapshot ────────────────────────────────────────────────────────

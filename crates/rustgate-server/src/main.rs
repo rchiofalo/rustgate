@@ -560,7 +560,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("invalid --federation-v2-bind: {e}"))?;
             (true, addr)
         } else {
-            (false, "0.0.0.0:9001".parse().expect("valid default addr"))
+            (
+                false,
+                std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                    std::net::Ipv4Addr::UNSPECIFIED,
+                    9001,
+                )),
+            )
         };
 
         let config = rustgate_federation::config::FederationConfig {
@@ -1071,11 +1077,17 @@ async fn shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
-        let mut sigterm =
-            signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = sigterm.recv() => {}
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to register SIGTERM handler, falling back to Ctrl-C only");
+                let _ = tokio::signal::ctrl_c().await;
+            }
         }
     }
 

@@ -227,6 +227,11 @@ pub fn negotiations() -> &'static IntCounterVec {
 
 // ── HTTP server ─────────────────────────────────────────────────────
 
+/// Fallback response when `Response::builder()` unexpectedly fails.
+fn internal_error_response() -> Response<Full<Bytes>> {
+    Response::new(Full::new(Bytes::from("internal server error")))
+}
+
 fn handle_request(
     req: Request<hyper::body::Incoming>,
     ready: Arc<AtomicBool>,
@@ -235,19 +240,19 @@ fn handle_request(
         "/healthz" => Ok(Response::builder()
             .status(StatusCode::OK)
             .body(Full::new(Bytes::from("ok")))
-            .expect("static response")),
+            .unwrap_or_else(|_| internal_error_response())),
 
         "/readyz" => {
             if ready.load(Ordering::Acquire) {
                 Ok(Response::builder()
                     .status(StatusCode::OK)
                     .body(Full::new(Bytes::from("ok")))
-                    .expect("static response"))
+                    .unwrap_or_else(|_| internal_error_response()))
             } else {
                 Ok(Response::builder()
                     .status(StatusCode::SERVICE_UNAVAILABLE)
                     .body(Full::new(Bytes::from("not ready")))
-                    .expect("static response"))
+                    .unwrap_or_else(|_| internal_error_response()))
             }
         }
 
@@ -259,19 +264,19 @@ fn handle_request(
                 return Ok(Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
                     .body(Full::new(Bytes::from("metrics encoding failed")))
-                    .expect("static response"));
+                    .unwrap_or_else(|_| internal_error_response()));
             }
             Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", encoder.format_type())
                 .body(Full::new(Bytes::from(buffer)))
-                .expect("static response"))
+                .unwrap_or_else(|_| internal_error_response()))
         }
 
         _ => Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Full::new(Bytes::from("not found")))
-            .expect("static response")),
+            .unwrap_or_else(|_| internal_error_response())),
     }
 }
 
@@ -339,7 +344,7 @@ pub async fn serve(
                                 return Ok(Response::builder()
                                     .status(StatusCode::SERVICE_UNAVAILABLE)
                                     .body(Full::new(Bytes::from("federation API not ready")))
-                                    .expect("static response"));
+                                    .unwrap_or_else(|_| internal_error_response()));
                             }
                             handle_request(req, ready)
                         }
