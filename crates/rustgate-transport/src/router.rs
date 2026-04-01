@@ -43,6 +43,13 @@ pub const DEFAULT_MAX_GROUPS_PER_CN: usize = 128;
 /// Default maximum total number of groups tracked by the router.
 pub const DEFAULT_MAX_TOTAL_GROUPS: usize = 10_000;
 
+/// Default initial capacity for the sessions map.
+/// Sized to avoid early rehashing under typical deployments.
+const DEFAULT_SESSION_CAPACITY: usize = 256;
+
+/// Default initial capacity for the groups map.
+const DEFAULT_GROUP_CAPACITY: usize = 64;
+
 #[derive(Debug)]
 struct State {
     sessions: HashMap<String, SessionHandle>,
@@ -54,8 +61,8 @@ struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
-            sessions: HashMap::new(),
-            groups: HashMap::new(),
+            sessions: HashMap::with_capacity(DEFAULT_SESSION_CAPACITY),
+            groups: HashMap::with_capacity(DEFAULT_GROUP_CAPACITY),
             max_groups_per_cn: DEFAULT_MAX_GROUPS_PER_CN,
             max_total_groups: DEFAULT_MAX_TOTAL_GROUPS,
         }
