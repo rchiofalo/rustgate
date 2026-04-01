@@ -191,19 +191,25 @@ pub fn extract_multipart_field<'a>(
 
     let disposition_needle = format!("name=\"{field}\"");
 
+    // Track the byte offset of each part within body_str as we iterate.
+    let mut search_start = 0;
     for part in body_str.split(&boundary_marker) {
+        // Find where this part actually starts within body_str.
+        let part_offset = body_str[search_start..]
+            .find(part)
+            .map(|i| i + search_start)?;
+        search_start = part_offset + part.len();
+
         if !part.contains(&disposition_needle) {
             continue;
         }
         // Content starts after the first blank line (\r\n\r\n)
         let content_start = part.find("\r\n\r\n").map(|i| i + 4)?;
-        let content = &part[content_start..];
+        let content = part.get(content_start..)?;
         // Trim trailing \r\n before the next boundary
         let content = content.trim_end_matches("\r\n--").trim_end_matches("\r\n");
-        let start = body_str.as_ptr() as usize;
-        let content_ptr = content.as_ptr() as usize;
-        let offset = content_ptr - start;
-        return Some(&body[offset..offset + content.len()]);
+        let offset = part_offset + content_start;
+        return body.get(offset..offset + content.len());
     }
     None
 }
@@ -216,8 +222,9 @@ pub fn extract_multipart_filename(body: &[u8], boundary: &str) -> Option<String>
     for part in body_str.split(&boundary_marker) {
         if let Some(pos) = part.find("filename=\"") {
             let start = pos + "filename=\"".len();
-            let end = part[start..].find('"')? + start;
-            return Some(part[start..end].to_string());
+            let rest = part.get(start..)?;
+            let end = rest.find('"')?;
+            return Some(rest.get(..end)?.to_string());
         }
     }
     None
