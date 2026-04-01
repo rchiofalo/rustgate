@@ -6,8 +6,9 @@ use std::time::Duration;
 
 use rustgate_core::error::{Result, RustgateError};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
+use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::TlsConfig;
 use crate::extract::extract_identity;
@@ -24,9 +25,16 @@ const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// directly; the OS default (typically 8-10) applies. We document the intent here.
 const _TCP_KEEPALIVE_RETRIES: u32 = 3;
 
+/// Default maximum number of concurrent TLS handshakes when no limit is specified.
+const DEFAULT_MAX_HANDSHAKES: usize = 100;
+
 pub struct TlsListener {
     tcp_listener: TcpListener,
     tls_acceptor: TlsAcceptor,
+    /// Semaphore that limits the number of TLS handshakes in progress.
+    /// Each handshake acquires a permit before starting and releases it
+    /// once the handshake completes (successfully or not).
+    handshake_semaphore: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for TlsListener {
@@ -34,12 +42,32 @@ impl std::fmt::Debug for TlsListener {
         f.debug_struct("TlsListener")
             .field("tcp_listener", &self.tcp_listener)
             .field("tls_acceptor", &"<TlsAcceptor>")
+            .field(
+                "max_concurrent_handshakes",
+                &self.handshake_semaphore.available_permits(),
+            )
             .finish()
     }
 }
 
 impl TlsListener {
+    /// Bind a TLS listener with the default handshake concurrency limit.
     pub async fn bind<A: ToSocketAddrs>(addr: A, config: &TlsConfig) -> Result<Self> {
+        Self::bind_with_handshake_limit(addr, config, DEFAULT_MAX_HANDSHAKES).await
+    }
+
+    /// Bind a TLS listener with a configurable handshake concurrency limit.
+    ///
+    /// `max_concurrent_handshakes` controls how many TLS handshakes may be in
+    /// progress simultaneously. Incoming TCP connections that arrive while all
+    /// handshake slots are occupied will wait until a slot becomes available.
+    /// This prevents connection-flood DoS attacks from exhausting server
+    /// resources with expensive cryptographic operations.
+    pub async fn bind_with_handshake_limit<A: ToSocketAddrs>(
+        addr: A,
+        config: &TlsConfig,
+        max_concurrent_handshakes: usize,
+    ) -> Result<Self> {
         let tcp_listener = TcpListener::bind(addr)
             .await
             .map_err(|e| RustgateError::Transport(format!("failed to bind TLS listener: {e}")))?;
@@ -48,12 +76,14 @@ impl TlsListener {
 
         debug!(
             local_addr = ?tcp_listener.local_addr().ok(),
+            max_concurrent_handshakes,
             "TLS listener bound"
         );
 
         Ok(Self {
             tcp_listener,
             tls_acceptor,
+            handshake_semaphore: Arc::new(Semaphore::new(max_concurrent_handshakes)),
         })
     }
 
@@ -66,6 +96,11 @@ impl TlsListener {
     /// Accept a new mTLS connection. Loops internally on TCP/TLS failures,
     /// only returning when a fully authenticated session is ready or
     /// identity extraction fails.
+    ///
+    /// TLS handshake concurrency is bounded by the semaphore configured at
+    /// construction time. When all handshake slots are occupied, the listener
+    /// still accepts TCP connections but waits for a free slot before
+    /// beginning the TLS handshake.
     pub async fn accept(&self) -> Result<AuthenticatedSession> {
         loop {
             let (tcp_stream, peer_addr) = match self.tcp_listener.accept().await {
@@ -80,14 +115,39 @@ impl TlsListener {
 
             debug!(peer_addr = %peer_addr, "TCP connection accepted");
 
+            // Acquire a handshake permit before starting the TLS handshake.
+            // This bounds the number of concurrent cryptographic operations
+            // to prevent resource exhaustion under connection floods.
+            let _permit = match self.handshake_semaphore.acquire().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    // Semaphore closed — listener is shutting down.
+                    return Err(RustgateError::Transport(
+                        "handshake semaphore closed".to_string(),
+                    ));
+                }
+            };
+
+            let available = self.handshake_semaphore.available_permits();
+            if available == 0 {
+                info!(
+                    peer_addr = %peer_addr,
+                    "all handshake slots occupied, new connections will wait"
+                );
+            }
+
             let tls_stream = match self.tls_acceptor.accept(tcp_stream).await {
                 Ok(stream) => stream,
                 Err(e) => {
+                    // Permit is released here when `_permit` is dropped.
                     rustgate_core::audit::tls_accept_error(peer_addr, &e.to_string());
                     warn!(peer_addr = %peer_addr, error = %e, "TLS handshake failed");
                     continue;
                 }
             };
+
+            // Permit released — handshake slot freed for the next connection.
+            drop(_permit);
 
             debug!(peer_addr = %peer_addr, "TLS handshake completed");
 
