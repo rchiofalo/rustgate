@@ -23,14 +23,7 @@ mod audit;
 #[cfg(feature = "metrics")]
 mod metrics;
 
-/// Maximum time to wait for a complete frame from the client.
-/// Covers both idle clients and partial-frame stalls (e.g. incomplete XML tag).
-const READ_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-
-/// Maximum time to wait for a write to complete. Drops slow consumers
-/// that can't keep up with outbound message flow.
-const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
-
+use rustgate_core::constants::{READ_TIMEOUT, WRITE_TIMEOUT};
 use rustgate_core::identity::Identity;
 #[cfg(any(feature = "metrics", feature = "federation"))]
 use rustgate_core::message::Destination;

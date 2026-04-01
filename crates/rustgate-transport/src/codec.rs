@@ -2,11 +2,10 @@
 
 use std::io;
 
+use rustgate_core::constants::MAX_FRAME_SIZE;
 use rustgate_core::protocol::{FramingStrategy, HeaderSize};
 use tokio_util::bytes::{Buf, BufMut, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
-
-const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024; // 16 MB
 
 /// Maximum XML nesting depth before rejecting the stream.
 /// Prevents resource exhaustion from pathological nesting (e.g., `<a><a><a>...`).

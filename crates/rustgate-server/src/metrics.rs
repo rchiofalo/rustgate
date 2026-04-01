@@ -15,6 +15,7 @@ use hyper::body::Bytes;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use prometheus::{Encoder, IntCounter, IntCounterVec, IntGauge, Opts, TextEncoder};
+use rustgate_core::constants::HTTP_CONNECTION_TIMEOUT;
 
 /// Type-erased federation API handler.
 ///
@@ -24,10 +25,6 @@ use prometheus::{Encoder, IntCounter, IntCounterVec, IntGauge, Opts, TextEncoder
 #[cfg(feature = "federation")]
 pub type FedApiHandler =
     Arc<dyn Fn(&hyper::Method, &str, &[u8]) -> Option<Response<Full<Bytes>>> + Send + Sync>;
-
-/// Maximum time for a single HTTP connection to the metrics server.
-/// Prevents slowloris attacks that hold connections open indefinitely.
-const HTTP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Maximum concurrent connections to the metrics HTTP server.
 /// Bounds memory usage from connection floods against the unauthenticated

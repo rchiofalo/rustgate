@@ -5,11 +5,11 @@
 //! same session registration, group enforcement, position cache replay.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::Bytes;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
+use rustgate_core::constants::{READ_TIMEOUT, WRITE_TIMEOUT};
 use rustgate_core::encoder::MessageEncoder;
 use rustgate_core::identity::Identity;
 use rustgate_core::message::RoutableMessage;
@@ -22,12 +22,6 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
 use crate::{WsListener, WsSession, WsStream};
-
-/// Read timeout: drop idle connections after 5 minutes of silence.
-const READ_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-
-/// Write timeout: drop slow consumers that can't accept a frame within 30 seconds.
-const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Bounded channel capacity for outbound messages per session.
 const CHANNEL_CAPACITY: usize = 64;
