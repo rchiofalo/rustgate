@@ -480,13 +480,19 @@ fn handle_status<S: FederateStore>(state: &ApiState<S>) -> Response<Full<Bytes>>
 
 // ── JSON response helpers ───────────────────────────────────────────
 
+fn internal_error_response() -> Response<Full<Bytes>> {
+    let mut resp = Response::new(Full::new(Bytes::from("internal server error")));
+    *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+    resp
+}
+
 fn json_ok<T: Serialize>(data: &T) -> Response<Full<Bytes>> {
     let body = serde_json::to_vec(&SuccessResponse { data }).unwrap_or_default();
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/json")
         .body(Full::new(Bytes::from(body)))
-        .expect("static response")
+        .unwrap_or_else(|_| internal_error_response())
 }
 
 fn json_created<T: Serialize>(data: &T) -> Response<Full<Bytes>> {
@@ -495,7 +501,7 @@ fn json_created<T: Serialize>(data: &T) -> Response<Full<Bytes>> {
         .status(StatusCode::CREATED)
         .header("content-type", "application/json")
         .body(Full::new(Bytes::from(body)))
-        .expect("static response")
+        .unwrap_or_else(|_| internal_error_response())
 }
 
 fn json_error(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
@@ -507,7 +513,7 @@ fn json_error(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
         .status(status)
         .header("content-type", "application/json")
         .body(Full::new(Bytes::from(body)))
-        .expect("static response")
+        .unwrap_or_else(|_| internal_error_response())
 }
 
 /// Simple percent-decoding for URL path segments.
@@ -1211,5 +1217,11 @@ mod tests {
         )
         .expect("h");
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn internal_error_response_returns_500() {
+        let resp = internal_error_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

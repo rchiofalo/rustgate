@@ -148,8 +148,11 @@ impl TrustStore {
             bail!("no certificates found in PEM data");
         }
 
-        // Take the first certificate
-        let der = certs.into_iter().next().expect("checked non-empty above");
+        // Take the first certificate (safe: checked non-empty above)
+        let der = certs
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("no certificates found in PEM data"))?;
 
         let cert_info = extract_cert_info(&der)?;
         let cn = cert_info.common_name.clone();

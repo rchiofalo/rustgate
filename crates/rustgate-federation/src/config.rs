@@ -1,6 +1,12 @@
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::time::Duration;
+
+/// Default V1 listen address: `0.0.0.0:9000`.
+const DEFAULT_V1_ADDR: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 9000));
+
+/// Default V2 listen address: `0.0.0.0:9001`.
+const DEFAULT_V2_ADDR: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 9001));
 
 /// Federation protocol version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,9 +141,9 @@ impl Default for FederationConfig {
         Self {
             federate_id: String::from("rustgate-federation-1"),
             v1_enabled: true,
-            v1_listen_addr: "0.0.0.0:9000".parse().expect("valid default addr"),
+            v1_listen_addr: DEFAULT_V1_ADDR,
             v2_enabled: true,
-            v2_listen_addr: "0.0.0.0:9001".parse().expect("valid default addr"),
+            v2_listen_addr: DEFAULT_V2_ADDR,
             peers: Vec::new(),
             heartbeat_interval: Duration::from_secs(30),
             heartbeat_timeout: Duration::from_secs(90),
