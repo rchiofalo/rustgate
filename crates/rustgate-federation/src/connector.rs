@@ -11,9 +11,9 @@ use std::time::Duration;
 use anyhow::Context;
 use rustgate_core::identity::Identity;
 use rustgate_transport::extract_identity;
+use rustgate_transport::pem::{parse_ca_store, parse_certs, parse_key};
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use rustls_pki_types::pem::PemObject;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
@@ -170,42 +170,6 @@ fn configure_tcp_keepalive(stream: &TcpStream) {
     if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
         warn!(error = %e, "failed to set TCP keepalive on federation connection");
     }
-}
-
-fn parse_certs(pem: &str) -> anyhow::Result<Vec<CertificateDer<'static>>> {
-    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(pem.as_bytes())
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| anyhow::anyhow!("failed to parse certificates: {e}"))?;
-
-    if certs.is_empty() {
-        anyhow::bail!("no certificates found in PEM");
-    }
-
-    Ok(certs)
-}
-
-fn parse_key(pem: &str) -> anyhow::Result<PrivateKeyDer<'static>> {
-    PrivateKeyDer::from_pem_slice(pem.as_bytes())
-        .map_err(|e| anyhow::anyhow!("failed to parse private key: {e}"))
-}
-
-fn parse_ca_store(pem: &str) -> anyhow::Result<RootCertStore> {
-    let mut store = RootCertStore::empty();
-    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(pem.as_bytes())
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| anyhow::anyhow!("failed to parse CA certificates: {e}"))?;
-
-    if certs.is_empty() {
-        anyhow::bail!("no CA certificates found in PEM");
-    }
-
-    for cert in certs {
-        store
-            .add(cert)
-            .map_err(|e| anyhow::anyhow!("failed to add CA certificate: {e}"))?;
-    }
-
-    Ok(store)
 }
 
 /// Build a standard ClientConfig with hostname verification enabled.

@@ -66,9 +66,9 @@ impl TlsConfig {
         server_key_pem: &str,
         client_ca_pem: &str,
     ) -> Result<Self> {
-        let server_certs = Self::parse_certs(server_cert_pem)?;
-        let server_key = Self::parse_key(server_key_pem)?;
-        let client_ca_store = Self::parse_ca_store(client_ca_pem)?;
+        let server_certs = crate::pem::parse_certs(server_cert_pem)?;
+        let server_key = crate::pem::parse_key(server_key_pem)?;
+        let client_ca_store = crate::pem::parse_ca_store(client_ca_pem)?;
 
         Ok(Self {
             server_certs,
@@ -174,65 +174,6 @@ impl TlsConfig {
         config.session_storage = Arc::new(NoServerSessionStorage {});
 
         Ok(config)
-    }
-
-    fn parse_certs(pem: &str) -> Result<Vec<CertificateDer<'static>>> {
-        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(pem.as_bytes())
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| {
-                RustgateError::from(ConfigError::PemParse {
-                    kind: "certificate".to_string(),
-                    reason: e.to_string(),
-                })
-            })?;
-
-        if certs.is_empty() {
-            return Err(ConfigError::EmptyPem {
-                kind: "certificates".to_string(),
-            }
-            .into());
-        }
-
-        Ok(certs)
-    }
-
-    fn parse_key(pem: &str) -> Result<PrivateKeyDer<'static>> {
-        PrivateKeyDer::from_pem_slice(pem.as_bytes()).map_err(|e| {
-            RustgateError::from(ConfigError::PemParse {
-                kind: "private key".to_string(),
-                reason: e.to_string(),
-            })
-        })
-    }
-
-    fn parse_ca_store(pem: &str) -> Result<RootCertStore> {
-        let mut store = RootCertStore::empty();
-
-        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(pem.as_bytes())
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| {
-                RustgateError::from(ConfigError::PemParse {
-                    kind: "CA certificate".to_string(),
-                    reason: e.to_string(),
-                })
-            })?;
-
-        if certs.is_empty() {
-            return Err(ConfigError::EmptyPem {
-                kind: "CA certificates".to_string(),
-            }
-            .into());
-        }
-
-        for cert in certs {
-            store.add(cert).map_err(|e| {
-                RustgateError::from(ConfigError::Other(format!(
-                    "failed to add CA certificate: {e}"
-                )))
-            })?;
-        }
-
-        Ok(store)
     }
 }
 
