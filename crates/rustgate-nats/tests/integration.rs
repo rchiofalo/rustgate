@@ -49,11 +49,7 @@ fn position_message(uid: &str, group: &str, lat: f64, lon: f64) -> RoutableMessa
     let _ = groups.insert(group.to_string());
 
     RoutableMessage {
-        source: Identity {
-            cn: uid.to_string(),
-            fingerprint: String::new(),
-            groups,
-        },
+        source: Identity::plaintext(uid.to_string(), groups).expect("valid identity"),
         destination: Destination::Broadcast,
         payload: cot_position_xml(uid, lat, lon),
         metadata: Metadata {
@@ -74,11 +70,7 @@ async fn register_session(
     let (tx, rx) = mpsc::channel(64);
     let mut groups = BTreeSet::new();
     let _ = groups.insert(group.to_string());
-    let identity = Arc::new(Identity {
-        cn: cn.to_string(),
-        fingerprint: String::new(),
-        groups,
-    });
+    let identity = Arc::new(Identity::plaintext(cn.to_string(), groups).expect("valid identity"));
     let handle = rustgate_transport::SessionHandle::new(identity, tx);
     router.register(handle).await;
     rx
@@ -436,11 +428,7 @@ async fn non_position_messages_filtered() {
     let mut groups = BTreeSet::new();
     let _ = groups.insert("Cyan".to_string());
     let chat_msg = RoutableMessage {
-        source: Identity {
-            cn: "chatter".to_string(),
-            fingerprint: String::new(),
-            groups,
-        },
+        source: Identity::plaintext("chatter".to_string(), groups).expect("valid identity"),
         destination: Destination::Broadcast,
         payload: chat_xml,
         metadata: Metadata {
@@ -491,11 +479,7 @@ async fn non_position_messages_published() {
     let mut groups = BTreeSet::new();
     let _ = groups.insert("Cyan".to_string());
     let chat_msg = RoutableMessage {
-        source: Identity {
-            cn: "chatter".to_string(),
-            fingerprint: String::new(),
-            groups,
-        },
+        source: Identity::plaintext("chatter".to_string(), groups).expect("valid identity"),
         destination: Destination::Broadcast,
         payload: chat_xml,
         metadata: Metadata {

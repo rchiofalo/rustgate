@@ -27,11 +27,8 @@ pub fn extract_identity(cert_der: &CertificateDer<'_>) -> Result<Identity> {
         .collect();
     let fingerprint = compute_fingerprint(cert_der);
 
-    Ok(Identity {
-        cn,
-        fingerprint,
-        groups,
-    })
+    Identity::new(cn, fingerprint, groups)
+        .map_err(|e| RustgateError::Transport(format!("invalid identity from certificate: {e}")))
 }
 
 fn extract_cn(cert: &X509Certificate<'_>) -> Result<String> {

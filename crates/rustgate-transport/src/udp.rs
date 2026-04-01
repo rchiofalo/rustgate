@@ -77,11 +77,13 @@ impl UdpInput {
         // membership to work).
         let mut groups = BTreeSet::new();
         let _ = groups.insert(config.default_group.clone());
-        let identity = Arc::new(Identity {
-            cn: config.cn.clone(),
-            fingerprint: String::new(),
-            groups,
-        });
+        let identity = match Identity::plaintext(config.cn.clone(), groups) {
+            Ok(id) => Arc::new(id),
+            Err(e) => {
+                tracing::error!(error = %e, "invalid UDP identity configuration");
+                return;
+            }
+        };
         let (tx, _rx) = mpsc::channel::<RoutableMessage>(1);
         let handle = SessionHandle::new(Arc::clone(&identity), tx);
         let session_id = handle.id;
@@ -108,10 +110,12 @@ impl UdpInput {
                             let dgram_cn = format!("{}-{}", config.cn, peer_addr);
                             let mut dgram_groups = BTreeSet::new();
                             let _ = dgram_groups.insert(config.default_group.clone());
-                            let dgram_identity = Identity {
-                                cn: dgram_cn,
-                                fingerprint: String::new(),
-                                groups: dgram_groups,
+                            let dgram_identity = match Identity::plaintext(dgram_cn, dgram_groups) {
+                                Ok(id) => id,
+                                Err(e) => {
+                                    tracing::warn!(error = %e, peer = %peer_addr, "invalid datagram identity");
+                                    continue;
+                                }
                             };
 
                             let msg = msg_builder.build(&dgram_identity, payload, "udp");
@@ -173,11 +177,9 @@ mod tests {
         // Register a listener in the same default group to receive routed messages
         let mut groups = BTreeSet::new();
         let _ = groups.insert("__plaintext__".to_string());
-        let listener_identity = Arc::new(Identity {
-            cn: "test-listener".to_string(),
-            fingerprint: String::new(),
-            groups,
-        });
+        let listener_identity = Arc::new(
+            Identity::plaintext("test-listener".to_string(), groups).expect("valid identity"),
+        );
         let (listener_tx, mut listener_rx) = mpsc::channel::<RoutableMessage>(16);
         let listener_handle = SessionHandle::new(listener_identity, listener_tx);
         router.register(listener_handle).await;

@@ -323,7 +323,11 @@ impl WireEvent {
     /// serialize round-trip and to preserve any unknown fields for forward
     /// compatibility. The source identity uses the UID as the CN (no mTLS
     /// identity for NATS-originated messages).
-    pub fn into_routable(self, group: &str, payload: Bytes) -> RoutableMessage {
+    pub fn into_routable(
+        self,
+        group: &str,
+        payload: Bytes,
+    ) -> Result<RoutableMessage, rustgate_core::identity::IdentityError> {
         let message_type = map_event_type(&self.event_type);
 
         let mut groups = BTreeSet::new();
@@ -331,13 +335,9 @@ impl WireEvent {
             let _ = groups.insert(group.to_string());
         }
 
-        let source = Identity {
-            cn: self.uid.clone(),
-            fingerprint: String::new(),
-            groups,
-        };
+        let source = Identity::plaintext(self.uid.clone(), groups)?;
 
-        RoutableMessage {
+        Ok(RoutableMessage {
             source,
             destination: Destination::Broadcast,
             payload,
@@ -347,7 +347,7 @@ impl WireEvent {
                 message_type,
                 ttl: None,
             },
-        }
+        })
     }
 
     /// Check if position is unknown (0,0 per CoT spec).
@@ -489,7 +489,9 @@ mod tests {
             detail: None,
         };
 
-        let msg = event.into_routable("Cyan", Bytes::from_static(b"{}"));
+        let msg = event
+            .into_routable("Cyan", Bytes::from_static(b"{}"))
+            .expect("valid identity");
         assert_eq!(msg.metadata.source_protocol, "nats");
         assert_eq!(msg.source.cn, "test-uid");
         assert!(msg.source.groups.contains("Cyan"));

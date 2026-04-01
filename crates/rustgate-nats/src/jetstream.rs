@@ -93,7 +93,13 @@ impl JetStreamReplay {
                     // default group. This is acceptable for SA bootstrap —
                     // group-aware routing applies to subsequent live messages.
                     let group = self.config.default_group.clone();
-                    let routable = wire_event.into_routable(&group, msg.payload.clone());
+                    let routable = match wire_event.into_routable(&group, msg.payload.clone()) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "invalid JetStream replay identity");
+                            continue;
+                        }
+                    };
 
                     // Store directly into cache (no sessions connected yet during replay)
                     router.cache().store(routable).await;

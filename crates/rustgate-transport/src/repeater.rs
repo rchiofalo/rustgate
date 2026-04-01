@@ -205,11 +205,8 @@ mod tests {
 
     fn make_alert(_uid: &str, payload: &str) -> RoutableMessage {
         RoutableMessage {
-            source: Identity {
-                cn: "test".to_string(),
-                fingerprint: "fp".to_string(),
-                groups: BTreeSet::new(),
-            },
+            source: Identity::new("test".to_string(), "fp".to_string(), BTreeSet::new())
+                .expect("valid identity"),
             destination: Destination::Broadcast,
             payload: Bytes::from(payload.to_string()),
             metadata: Metadata {
@@ -223,11 +220,8 @@ mod tests {
 
     fn make_position() -> RoutableMessage {
         RoutableMessage {
-            source: Identity {
-                cn: "test".to_string(),
-                fingerprint: "fp".to_string(),
-                groups: BTreeSet::new(),
-            },
+            source: Identity::new("test".to_string(), "fp".to_string(), BTreeSet::new())
+                .expect("valid identity"),
             destination: Destination::Broadcast,
             payload: Bytes::from_static(b"<event type=\"a-f-G\" uid=\"pos1\" />"),
             metadata: Metadata {

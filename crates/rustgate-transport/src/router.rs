@@ -338,14 +338,17 @@ mod tests {
     use super::*;
 
     fn make_identity(cn: &str, groups: &[&str]) -> Arc<Identity> {
-        Arc::new(Identity {
-            cn: cn.to_string(),
-            fingerprint: format!("{cn}-fp"),
-            groups: groups
-                .iter()
-                .map(|g| g.to_string())
-                .collect::<BTreeSet<_>>(),
-        })
+        Arc::new(
+            Identity::new(
+                cn.to_string(),
+                format!("{cn}-fp"),
+                groups
+                    .iter()
+                    .map(|g| g.to_string())
+                    .collect::<BTreeSet<_>>(),
+            )
+            .expect("valid identity"),
+        )
     }
 
     fn make_position(source: &Arc<Identity>, dest: Destination) -> RoutableMessage {

@@ -27,6 +27,8 @@ pub enum ConvertError {
     Xml(String),
     /// A required field was missing in the source data.
     MissingField(&'static str),
+    /// A field value is invalid.
+    InvalidField(String),
     /// Timestamp conversion failed.
     InvalidTimestamp(String),
 }
@@ -36,6 +38,7 @@ impl std::fmt::Display for ConvertError {
         match self {
             Self::Xml(msg) => write!(f, "xml parse error: {msg}"),
             Self::MissingField(field) => write!(f, "missing required field: {field}"),
+            Self::InvalidField(msg) => write!(f, "invalid field: {msg}"),
             Self::InvalidTimestamp(msg) => write!(f, "invalid timestamp: {msg}"),
         }
     }
@@ -323,11 +326,12 @@ pub fn federated_event_to_routable(
     // Build source identity from peer cert info + event groups
     let groups: BTreeSet<GroupId> = event.federate_groups.iter().cloned().collect();
 
-    let source = Identity {
-        cn: peer_cn.to_string(),
-        fingerprint: peer_fingerprint.to_string(),
-        groups,
-    };
+    let source = if peer_fingerprint.is_empty() {
+        Identity::plaintext(peer_cn.to_string(), groups)
+    } else {
+        Identity::new(peer_cn.to_string(), peer_fingerprint.to_string(), groups)
+    }
+    .map_err(|e| ConvertError::InvalidField(format!("invalid peer identity: {e}")))?;
 
     // Determine destination: if exactly one group, route to that group;
     // otherwise broadcast to all
@@ -796,11 +800,8 @@ mod tests {
         let _ = groups.insert("Bravo".to_string());
 
         let msg = RoutableMessage {
-            source: Identity {
-                cn: "test-peer".into(),
-                fingerprint: "abc123".into(),
-                groups,
-            },
+            source: Identity::new("test-peer".into(), "abc123".into(), groups)
+                .expect("valid identity"),
             destination: Destination::Broadcast,
             payload: Bytes::from_static(sample_xml()),
             metadata: Metadata {
@@ -1100,11 +1101,8 @@ mod tests {
         let source_groups: BTreeSet<GroupId> = ["Alpha".to_string()].into_iter().collect();
 
         let msg = RoutableMessage {
-            source: Identity {
-                cn: "test-server".into(),
-                fingerprint: "fp-abc".into(),
-                groups: source_groups,
-            },
+            source: Identity::new("test-server".into(), "fp-abc".into(), source_groups)
+                .expect("valid identity"),
             destination: Destination::Group("Alpha".to_string()),
             payload: Bytes::from_static(sample_xml()),
             metadata: Metadata {

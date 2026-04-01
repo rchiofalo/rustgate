@@ -261,18 +261,20 @@ mod tests {
 
         let archiver = CotArchiver::new(&dir);
 
-        let target_identity = rustgate_core::identity::Identity {
-            cn: "evil\"user\\name".to_string(),
-            fingerprint: "fp-target".to_string(),
-            groups: std::collections::BTreeSet::new(),
-        };
+        let target_identity = rustgate_core::identity::Identity::new(
+            "evil\"user\\name".to_string(),
+            "fp-target".to_string(),
+            std::collections::BTreeSet::new(),
+        )
+        .expect("valid identity");
 
         let msg = rustgate_core::message::RoutableMessage {
-            source: rustgate_core::identity::Identity {
-                cn: "sender".to_string(),
-                fingerprint: "fp-sender".to_string(),
-                groups: std::collections::BTreeSet::new(),
-            },
+            source: rustgate_core::identity::Identity::new(
+                "sender".to_string(),
+                "fp-sender".to_string(),
+                std::collections::BTreeSet::new(),
+            )
+            .expect("valid identity"),
             destination: rustgate_core::message::Destination::Direct(target_identity),
             payload: bytes::Bytes::from_static(b"<event/>"),
             metadata: rustgate_core::message::Metadata {
@@ -310,11 +312,12 @@ mod tests {
         let archiver = CotArchiver::new(&dir);
 
         let msg = rustgate_core::message::RoutableMessage {
-            source: rustgate_core::identity::Identity {
-                cn: "alice".to_string(),
-                fingerprint: "fp-123".to_string(),
-                groups: std::collections::BTreeSet::new(),
-            },
+            source: rustgate_core::identity::Identity::new(
+                "alice".to_string(),
+                "fp-123".to_string(),
+                std::collections::BTreeSet::new(),
+            )
+            .expect("valid identity"),
             destination: rustgate_core::message::Destination::Broadcast,
             payload: bytes::Bytes::from_static(b"<event/>"),
             metadata: rustgate_core::message::Metadata {

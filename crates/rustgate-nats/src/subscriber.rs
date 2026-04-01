@@ -71,9 +71,14 @@ impl NatsSubscriber {
                 continue;
             }
 
-            router
-                .route(wire_event.into_routable(&group, msg.payload.clone()))
-                .await;
+            let routable = match wire_event.into_routable(&group, msg.payload.clone()) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(error = %e, "invalid NATS message identity");
+                    continue;
+                }
+            };
+            router.route(routable).await;
         }
 
         tracing::info!("NATS subscriber ended");

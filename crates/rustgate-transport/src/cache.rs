@@ -186,11 +186,7 @@ mod tests {
     use super::*;
 
     fn make_identity(cn: &str) -> Identity {
-        Identity {
-            cn: cn.to_string(),
-            fingerprint: format!("{cn}-fp"),
-            groups: BTreeSet::new(),
-        }
+        Identity::new(cn.to_string(), format!("{cn}-fp"), BTreeSet::new()).expect("valid identity")
     }
 
     fn make_position_with_ttl(cn: &str, ttl: Option<Duration>) -> RoutableMessage {

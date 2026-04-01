@@ -10,11 +10,8 @@ use rustgate_transport::{CotEncoder, MessageEncoder, RawEncoder};
 
 fn make_message(payload: &[u8], source_protocol: &str) -> RoutableMessage {
     RoutableMessage {
-        source: Identity {
-            cn: "test-client".into(),
-            fingerprint: "aa:bb:cc".into(),
-            groups: BTreeSet::new(),
-        },
+        source: Identity::new("test-client".into(), "aa:bb:cc".into(), BTreeSet::new())
+            .expect("valid identity"),
         destination: Destination::Broadcast,
         payload: Bytes::from(payload.to_vec()),
         metadata: Metadata {
