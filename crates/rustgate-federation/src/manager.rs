@@ -234,22 +234,8 @@ impl FederationManager {
         if self.config.v1_enabled {
             let tls_config = rustgate_transport::TlsConfig::from_pem(&cert_pem, &key_pem, &ca_pem)?;
 
-            let dedup = Arc::clone(&v1_dedup);
-            let on_v1_server: crate::v1::server::OnMessage = {
-                let on_inbound = Arc::clone(&on_inbound);
-                Arc::new(move |peer_cn, data| {
-                    if let Ok(mut guard) = dedup.lock()
-                        && guard.is_duplicate(&data)
-                    {
-                        tracing::debug!(
-                            peer_cn = %peer_cn,
-                            "dropped duplicate V1 inbound server message (loop detection)"
-                        );
-                        return;
-                    }
-                    on_inbound(peer_cn, data);
-                })
-            };
+            let on_v1_server =
+                Self::create_v1_dedup_callback(&v1_dedup, &on_inbound, "inbound server");
 
             let server = V1Server::start(
                 self.config.v1_listen_addr,
@@ -280,41 +266,7 @@ impl FederationManager {
                 .identity(server_cert)
                 .client_ca_root(server_ca);
 
-            let on_event_inbound = Arc::clone(&on_inbound);
-            let federate_id = self.config.federate_id.clone();
-            let on_event: crate::v2::server::OnEvent = Arc::new(move |event, peer_id| {
-                // Check provenance for loops and hop limits
-                let metadata = crate::v2::convert::extract_metadata(&event);
-                if metadata.should_drop(&federate_id) {
-                    warn!(
-                        federate = %federate_id,
-                        peer = %peer_id,
-                        hops = metadata.current_hops,
-                        max_hops = metadata.max_hops,
-                        "dropped inbound V2 server event (loop or hop limit)"
-                    );
-                    return;
-                }
-
-                if event.event.is_some() {
-                    match crate::v2::convert::federated_event_to_xml(&event) {
-                        Ok(xml) => {
-                            on_event_inbound(peer_id, Bytes::from(xml));
-                        }
-                        Err(e) => {
-                            warn!(
-                                federate = %federate_id,
-                                error = %e,
-                                "failed to convert inbound V2 server event to XML"
-                            );
-                        }
-                    }
-                } else if let Some(ref contact) = event.contact
-                    && let Some(xml) = crate::v2::convert::contact_list_entry_to_xml(contact)
-                {
-                    on_event_inbound(peer_id, Bytes::from(xml));
-                }
-            });
+            let on_event = Self::create_v2_event_handler(&on_inbound, &self.config.federate_id);
 
             let service = crate::v2::server::FederationService::new(
                 self.config.federate_id.clone(),
@@ -441,22 +393,8 @@ impl FederationManager {
 
             match peer_config.protocol_version {
                 1 => {
-                    let dedup = Arc::clone(&v1_dedup);
-                    let on_v1_client: crate::v1::client::OnMessage = {
-                        let on_inbound = Arc::clone(&on_inbound);
-                        Arc::new(move |peer_id, data| {
-                            if let Ok(mut guard) = dedup.lock()
-                                && guard.is_duplicate(&data)
-                            {
-                                tracing::debug!(
-                                    peer_id = %peer_id,
-                                    "dropped duplicate V1 outbound client message (loop detection)"
-                                );
-                                return;
-                            }
-                            on_inbound(peer_id, data);
-                        })
-                    };
+                    let on_v1_client =
+                        Self::create_v1_dedup_callback(&v1_dedup, &on_inbound, "outbound client");
 
                     let client = V1Client::start(
                         Arc::clone(&peer),
@@ -487,43 +425,8 @@ impl FederationManager {
                 }
                 #[cfg(feature = "v2")]
                 2 => {
-                    let on_event_inbound = Arc::clone(&on_inbound);
-                    let federate_id = self.config.federate_id.clone();
-                    let on_event: crate::v2::client::OnEvent = Arc::new(move |event, peer_id| {
-                        // Check provenance for loops and hop limits
-                        let metadata = crate::v2::convert::extract_metadata(&event);
-                        if metadata.should_drop(&federate_id) {
-                            warn!(
-                                federate = %federate_id,
-                                peer = %peer_id,
-                                hops = metadata.current_hops,
-                                max_hops = metadata.max_hops,
-                                "dropped inbound V2 client event (loop or hop limit)"
-                            );
-                            return;
-                        }
-
-                        // Try GeoEvent first, then fall back to ContactListEntry
-                        if event.event.is_some() {
-                            match crate::v2::convert::federated_event_to_xml(&event) {
-                                Ok(xml) => {
-                                    on_event_inbound(peer_id, Bytes::from(xml));
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        federate = %federate_id,
-                                        error = %e,
-                                        "failed to convert inbound V2 GeoEvent to XML"
-                                    );
-                                }
-                            }
-                        } else if let Some(ref contact) = event.contact
-                            && let Some(xml) =
-                                crate::v2::convert::contact_list_entry_to_xml(contact)
-                        {
-                            on_event_inbound(peer_id, Bytes::from(xml));
-                        }
-                    });
+                    let on_event =
+                        Self::create_v2_event_handler(&on_inbound, &self.config.federate_id);
 
                     let client = crate::v2::client::V2Client::start(
                         Arc::clone(&peer),
@@ -817,6 +720,84 @@ impl FederationManager {
         &self.config
     }
 
+    // ── Helper methods for callback creation ──────────────────────────
+
+    /// Create a V1 dedup-wrapping message callback.
+    ///
+    /// Returns a callback that checks incoming messages against the shared
+    /// dedup cache before forwarding to the inbound handler. Duplicate
+    /// messages (same UID + timestamp) are silently dropped for loop detection.
+    fn create_v1_dedup_callback(
+        dedup: &Arc<Mutex<MessageDedup>>,
+        on_inbound: &OnInbound,
+        context: &str,
+    ) -> crate::v1::client::OnMessage {
+        let dedup = Arc::clone(dedup);
+        let on_inbound = Arc::clone(on_inbound);
+        let context = context.to_owned();
+        Arc::new(move |peer_id, data| {
+            if let Ok(mut guard) = dedup.lock()
+                && guard.is_duplicate(&data)
+            {
+                tracing::debug!(
+                    peer_id = %peer_id,
+                    context = %context,
+                    "dropped duplicate V1 message (loop detection)"
+                );
+                return;
+            }
+            on_inbound(peer_id, data);
+        })
+    }
+
+    /// Create a V2 event handler callback.
+    ///
+    /// Returns a callback that checks provenance metadata (loop detection and
+    /// hop limits), then converts `FederatedEvent` payloads to XML before
+    /// forwarding to the inbound handler.
+    #[cfg(feature = "v2")]
+    fn create_v2_event_handler(
+        on_inbound: &OnInbound,
+        federate_id: &str,
+    ) -> crate::v2::client::OnEvent {
+        let on_event_inbound = Arc::clone(on_inbound);
+        let federate_id = federate_id.to_owned();
+        Arc::new(move |event, peer_id| {
+            // Check provenance for loops and hop limits
+            let metadata = crate::v2::convert::extract_metadata(&event);
+            if metadata.should_drop(&federate_id) {
+                warn!(
+                    federate = %federate_id,
+                    peer = %peer_id,
+                    hops = metadata.current_hops,
+                    max_hops = metadata.max_hops,
+                    "dropped inbound V2 event (loop or hop limit)"
+                );
+                return;
+            }
+
+            // Try GeoEvent first, then fall back to ContactListEntry
+            if event.event.is_some() {
+                match crate::v2::convert::federated_event_to_xml(&event) {
+                    Ok(xml) => {
+                        on_event_inbound(peer_id, Bytes::from(xml));
+                    }
+                    Err(e) => {
+                        warn!(
+                            federate = %federate_id,
+                            error = %e,
+                            "failed to convert inbound V2 GeoEvent to XML"
+                        );
+                    }
+                }
+            } else if let Some(ref contact) = event.contact
+                && let Some(xml) = crate::v2::convert::contact_list_entry_to_xml(contact)
+            {
+                on_event_inbound(peer_id, Bytes::from(xml));
+            }
+        })
+    }
+
     // ── HA peer management ───────────────────────────────────────────
 
     /// Connect a single outbound peer, creating its client and PeerHandle.
@@ -857,22 +838,8 @@ impl FederationManager {
 
         match peer_config.protocol_version {
             1 => {
-                let dedup = Arc::clone(&v1_dedup);
-                let on_v1_client: crate::v1::client::OnMessage = {
-                    let on_inbound = Arc::clone(&on_inbound);
-                    Arc::new(move |peer_id, data| {
-                        if let Ok(mut guard) = dedup.lock()
-                            && guard.is_duplicate(&data)
-                        {
-                            tracing::debug!(
-                                peer_id = %peer_id,
-                                "dropped duplicate V1 outbound client message (loop detection)"
-                            );
-                            return;
-                        }
-                        on_inbound(peer_id, data);
-                    })
-                };
+                let on_v1_client =
+                    Self::create_v1_dedup_callback(&v1_dedup, &on_inbound, "outbound client");
 
                 let client = V1Client::start(
                     Arc::clone(&peer),
@@ -909,40 +876,7 @@ impl FederationManager {
                     .ok_or_else(|| anyhow::anyhow!("v2_tls_config not set"))?
                     .clone();
 
-                let on_event_inbound = Arc::clone(&on_inbound);
-                let federate_id = self.config.federate_id.clone();
-                let on_event: crate::v2::client::OnEvent = Arc::new(move |event, peer_id| {
-                    let metadata = crate::v2::convert::extract_metadata(&event);
-                    if metadata.should_drop(&federate_id) {
-                        warn!(
-                            federate = %federate_id,
-                            peer = %peer_id,
-                            hops = metadata.current_hops,
-                            max_hops = metadata.max_hops,
-                            "dropped inbound V2 client event (loop or hop limit)"
-                        );
-                        return;
-                    }
-
-                    if event.event.is_some() {
-                        match crate::v2::convert::federated_event_to_xml(&event) {
-                            Ok(xml) => {
-                                on_event_inbound(peer_id, Bytes::from(xml));
-                            }
-                            Err(e) => {
-                                warn!(
-                                    federate = %federate_id,
-                                    error = %e,
-                                    "failed to convert inbound V2 GeoEvent to XML"
-                                );
-                            }
-                        }
-                    } else if let Some(ref contact) = event.contact
-                        && let Some(xml) = crate::v2::convert::contact_list_entry_to_xml(contact)
-                    {
-                        on_event_inbound(peer_id, Bytes::from(xml));
-                    }
-                });
+                let on_event = Self::create_v2_event_handler(&on_inbound, &self.config.federate_id);
 
                 let client = crate::v2::client::V2Client::start(
                     Arc::clone(&peer),
