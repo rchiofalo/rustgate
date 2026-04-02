@@ -9,7 +9,8 @@ use rustgate_core::protocol::{FramingStrategy, HeaderSize};
 
 /// Validate that a CLI argument is a valid socket address (ip:port).
 fn parse_socket_addr(s: &str) -> Result<String, String> {
-    s.parse::<std::net::SocketAddr>()
+    let _ = s
+        .parse::<std::net::SocketAddr>()
         .map_err(|e| format!("invalid socket address: {e}"))?;
     Ok(s.to_string())
 }
