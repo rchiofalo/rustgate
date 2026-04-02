@@ -711,6 +711,7 @@ pub(crate) fn warn_websocket_disabled(cli: &Cli) {
 // ---------------------------------------------------------------------------
 
 /// Start the plaintext TCP listener and return its subsystem handle.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
     cli: &Cli,
     router: &Arc<Router>,
