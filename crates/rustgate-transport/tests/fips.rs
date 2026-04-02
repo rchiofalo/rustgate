@@ -12,10 +12,8 @@
 use std::sync::{Arc, OnceLock};
 
 use rustgate_test_utils::certs::TestCa;
+use rustgate_test_utils::tls::build_client_tls_config;
 use rustgate_transport::{TlsConfig, TlsListener, install_fips_provider, is_fips_provider_active};
-use rustls::RootCertStore;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls_pki_types::pem::PemObject;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // ── setup ────────────────────────────────────────────────────────────────
@@ -30,31 +28,6 @@ fn ensure_fips() {
     let _ = FIPS_INIT.get_or_init(|| {
         install_fips_provider().expect("failed to install FIPS provider");
     });
-}
-
-// ── helpers ──────────────────────────────────────────────────────────────
-
-fn parse_certs(pem: &str) -> Vec<CertificateDer<'static>> {
-    CertificateDer::pem_slice_iter(pem.as_bytes())
-        .collect::<Result<Vec<_>, _>>()
-        .expect("parse certs")
-}
-
-fn parse_key(pem: &str) -> PrivateKeyDer<'static> {
-    PrivateKeyDer::from_pem_slice(pem.as_bytes()).expect("parse key")
-}
-
-fn build_client_config(cert_pem: &str, key_pem: &str, ca_pem: &str) -> rustls::ClientConfig {
-    let certs = parse_certs(cert_pem);
-    let key = parse_key(key_pem);
-    let mut root_store = RootCertStore::empty();
-    for cert in parse_certs(ca_pem) {
-        root_store.add(cert).expect("add CA cert");
-    }
-    rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_client_auth_cert(certs, key)
-        .expect("client config")
 }
 
 // ── FIPS provider tests ─────────────────────────────────────────────────
@@ -128,7 +101,7 @@ async fn fips_mtls_handshake() {
         identity
     });
 
-    let config = build_client_config(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem);
+    let config = build_client_tls_config(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem);
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
     let tcp = tokio::net::TcpStream::connect(addr)
         .await
@@ -171,7 +144,7 @@ async fn fips_negotiated_cipher_suite_is_approved() {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     });
 
-    let config = build_client_config(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem);
+    let config = build_client_tls_config(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem);
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
     let tcp = tokio::net::TcpStream::connect(addr)
         .await
@@ -227,7 +200,7 @@ async fn fips_with_crl_rejects_revoked() {
     });
 
     // Revoked client tries to connect
-    let revoked_config = build_client_config(
+    let revoked_config = build_client_tls_config(
         &revoked_client.cert_pem,
         &revoked_client.key_pem,
         &ca.cert_pem,

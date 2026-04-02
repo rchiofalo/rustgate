@@ -7,6 +7,7 @@
 //! a managed `nats-server` subprocess for NATS integration tests.
 
 pub mod certs;
+pub mod tls;
 
 #[cfg(feature = "nats")]
 pub mod nats;

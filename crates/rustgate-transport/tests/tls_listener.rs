@@ -3,38 +3,12 @@
 use std::sync::Arc;
 
 use rustgate_test_utils::certs::TestCa;
+use rustgate_test_utils::tls::{build_client_tls_config, parse_certs, parse_key};
 use rustgate_transport::{
     ExpectedKeyUsage, TlsConfig, TlsListener, TlsMinVersion, extract_identity, validate_key_usage,
 };
 use rustls::RootCertStore;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls_pki_types::pem::PemObject;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-// ── helpers ──────────────────────────────────────────────────────────────
-
-fn parse_certs(pem: &str) -> Vec<CertificateDer<'static>> {
-    CertificateDer::pem_slice_iter(pem.as_bytes())
-        .collect::<Result<Vec<_>, _>>()
-        .expect("parse certs")
-}
-
-fn parse_key(pem: &str) -> PrivateKeyDer<'static> {
-    PrivateKeyDer::from_pem_slice(pem.as_bytes()).expect("parse key")
-}
-
-fn build_client_config(cert_pem: &str, key_pem: &str, ca_pem: &str) -> rustls::ClientConfig {
-    let certs = parse_certs(cert_pem);
-    let key = parse_key(key_pem);
-    let mut root_store = RootCertStore::empty();
-    for cert in parse_certs(ca_pem) {
-        root_store.add(cert).expect("add CA cert");
-    }
-    rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_client_auth_cert(certs, key)
-        .expect("client config")
-}
 
 async fn connect(
     addr: std::net::SocketAddr,
@@ -105,7 +79,7 @@ async fn mtls_handshake_and_identity() {
         identity
     });
 
-    let config = build_client_config(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem);
+    let config = build_client_tls_config(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem);
     let mut stream = connect(addr, &config).await;
 
     stream.write_all(b"hello").await.expect("client write");
@@ -146,7 +120,7 @@ async fn mtls_rejects_untrusted_client() {
         tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept()).await
     });
 
-    let config = build_client_config(
+    let config = build_client_tls_config(
         &rogue_cert.cert_pem,
         &rogue_cert.key_pem,
         &server_ca.cert_pem,
@@ -214,13 +188,14 @@ async fn accept_multiple_clients_sequentially() {
         (cn1, cn2)
     });
 
-    let alice_config = build_client_config(&alice_cert.cert_pem, &alice_cert.key_pem, &ca.cert_pem);
+    let alice_config =
+        build_client_tls_config(&alice_cert.cert_pem, &alice_cert.key_pem, &ca.cert_pem);
     let _stream1 = connect(addr, &alice_config).await;
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     drop(_stream1);
 
-    let bob_config = build_client_config(&bob_cert.cert_pem, &bob_cert.key_pem, &ca.cert_pem);
+    let bob_config = build_client_tls_config(&bob_cert.cert_pem, &bob_cert.key_pem, &ca.cert_pem);
     let _stream2 = connect(addr, &bob_config).await;
 
     let (cn1, cn2) = server_handle.await.expect("server task");
@@ -256,7 +231,7 @@ async fn handshake_concurrency_limit_allows_sequential() {
         (cn1, cn2)
     });
 
-    let config = build_client_config(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem);
+    let config = build_client_tls_config(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem);
 
     // First connection succeeds immediately.
     let _stream1 = connect(addr, &config).await;
@@ -296,8 +271,8 @@ async fn handshake_concurrency_limit_serializes_parallel_connections() {
         names
     });
 
-    let alice_config = build_client_config(&alice.cert_pem, &alice.key_pem, &ca.cert_pem);
-    let bob_config = build_client_config(&bob.cert_pem, &bob.key_pem, &ca.cert_pem);
+    let alice_config = build_client_tls_config(&alice.cert_pem, &alice.key_pem, &ca.cert_pem);
+    let bob_config = build_client_tls_config(&bob.cert_pem, &bob.key_pem, &ca.cert_pem);
 
     // Spawn two connections concurrently; the semaphore serializes handshakes.
     let (a, b) = tokio::join!(connect(addr, &alice_config), connect(addr, &bob_config),);
@@ -330,7 +305,7 @@ async fn bind_default_handshake_limit() {
         session.identity().cn.clone()
     });
 
-    let config = build_client_config(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem);
+    let config = build_client_tls_config(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem);
     let _stream = connect(addr, &config).await;
 
     let cn = server_handle.await.expect("server task");
@@ -414,7 +389,7 @@ async fn tls13_only_accepts_tls13_client() {
     });
 
     // Build a client config that supports TLS 1.3
-    let config = build_client_config(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem);
+    let config = build_client_tls_config(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem);
     let mut stream = connect(addr, &config).await;
     stream.write_all(b"ping").await.expect("client write");
 
@@ -513,7 +488,7 @@ async fn mtls_rejects_server_auth_only_client_cert() {
         tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept()).await
     });
 
-    let config = build_client_config(
+    let config = build_client_tls_config(
         &bad_client_cert.cert_pem,
         &bad_client_cert.key_pem,
         &ca.cert_pem,

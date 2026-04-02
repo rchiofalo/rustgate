@@ -8,36 +8,11 @@
 use std::sync::Arc;
 
 use rustgate_test_utils::certs::TestCa;
+use rustgate_test_utils::tls::build_client_tls_config;
 use rustgate_transport::{TlsConfig, TlsListener};
-use rustls::RootCertStore;
-use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer};
+use rustls::pki_types::CertificateRevocationListDer;
 use rustls_pki_types::pem::PemObject;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-// ── helpers ──────────────────────────────────────────────────────────────
-
-fn parse_certs(pem: &str) -> Vec<CertificateDer<'static>> {
-    CertificateDer::pem_slice_iter(pem.as_bytes())
-        .collect::<Result<Vec<_>, _>>()
-        .expect("parse certs")
-}
-
-fn parse_key(pem: &str) -> PrivateKeyDer<'static> {
-    PrivateKeyDer::from_pem_slice(pem.as_bytes()).expect("parse key")
-}
-
-fn build_client_config(cert_pem: &str, key_pem: &str, ca_pem: &str) -> rustls::ClientConfig {
-    let certs = parse_certs(cert_pem);
-    let key = parse_key(key_pem);
-    let mut root_store = RootCertStore::empty();
-    for cert in parse_certs(ca_pem) {
-        root_store.add(cert).expect("add CA cert");
-    }
-    rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_client_auth_cert(certs, key)
-        .expect("client config")
-}
 
 async fn try_connect(
     addr: std::net::SocketAddr,
@@ -81,7 +56,7 @@ async fn crl_rejects_revoked_client() {
     });
 
     // Client tries to connect with revoked cert
-    let config = build_client_config(
+    let config = build_client_tls_config(
         &revoked_client.cert_pem,
         &revoked_client.key_pem,
         &ca.cert_pem,
@@ -156,7 +131,7 @@ async fn crl_accepts_non_revoked_client() {
     });
 
     // good_client connects — should succeed
-    let config = build_client_config(&good_client.cert_pem, &good_client.key_pem, &ca.cert_pem);
+    let config = build_client_tls_config(&good_client.cert_pem, &good_client.key_pem, &ca.cert_pem);
     let mut stream = try_connect(addr, &config)
         .await
         .expect("TLS connect should succeed for non-revoked client");
@@ -193,7 +168,7 @@ async fn crl_revokes_multiple_certs() {
     let addr = listener.local_addr().expect("addr");
 
     // Try revoked_a — should be rejected
-    let config_a = build_client_config(&revoked_a.cert_pem, &revoked_a.key_pem, &ca.cert_pem);
+    let config_a = build_client_tls_config(&revoked_a.cert_pem, &revoked_a.key_pem, &ca.cert_pem);
     let server_handle = tokio::spawn(async move {
         tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept()).await
     });
