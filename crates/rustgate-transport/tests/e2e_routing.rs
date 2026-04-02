@@ -12,40 +12,13 @@ use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
 use rustgate_core::protocol::HeaderSize;
 use rustgate_test_utils::certs::TestCa;
+use rustgate_test_utils::tls::build_client_tls_config;
 use rustgate_transport::{
     AuthenticatedSession, LengthPrefixedCodec, Router, SessionHandle, TlsConfig, TlsListener,
 };
-use rustls::RootCertStore;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls_pki_types::pem::PemObject;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio_util::codec::{FramedRead, FramedWrite};
-
-// ── helpers ──────────────────────────────────────────────────────────────
-
-fn parse_certs(pem: &str) -> Vec<CertificateDer<'static>> {
-    CertificateDer::pem_slice_iter(pem.as_bytes())
-        .collect::<Result<Vec<_>, _>>()
-        .expect("parse certs")
-}
-
-fn parse_key(pem: &str) -> PrivateKeyDer<'static> {
-    PrivateKeyDer::from_pem_slice(pem.as_bytes()).expect("parse key")
-}
-
-fn build_client_config(cert_pem: &str, key_pem: &str, ca_pem: &str) -> rustls::ClientConfig {
-    let certs = parse_certs(cert_pem);
-    let key = parse_key(key_pem);
-    let mut root_store = RootCertStore::empty();
-    for cert in parse_certs(ca_pem) {
-        root_store.add(cert).expect("add CA cert");
-    }
-    rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_client_auth_cert(certs, key)
-        .expect("client config")
-}
 
 fn make_identity(cn: &str, groups: &[&str]) -> Identity {
     Identity::new(
@@ -147,7 +120,7 @@ async fn connect_client(
     key_pem: &str,
     ca_pem: &str,
 ) -> (ClientTx, ClientRx) {
-    let config = build_client_config(cert_pem, key_pem, ca_pem);
+    let config = build_client_tls_config(cert_pem, key_pem, ca_pem);
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
     let tcp = tokio::net::TcpStream::connect(addr)
         .await
@@ -167,7 +140,7 @@ async fn connect_raw(
     key_pem: &str,
     ca_pem: &str,
 ) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
-    let config = build_client_config(cert_pem, key_pem, ca_pem);
+    let config = build_client_tls_config(cert_pem, key_pem, ca_pem);
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
     let tcp = tokio::net::TcpStream::connect(addr)
         .await
