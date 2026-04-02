@@ -64,6 +64,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **CI workflow hardening** — minimal token permissions, credential isolation, harden-runner, dependency-review, cargo-auditable (#206, #331)
 - **CodeQL SAST** — static analysis scanning with pinned Trivy download (#214)
 - **Nightly security scanning** — auto-create issues for dependency vulnerabilities; container image scanning (#210, #212)
+- **aws-lc-rs vulnerability fix** — updated aws-lc-rs to resolve 3 HIGH severity CVEs (#208)
 - **SECURITY.md** — updated supported versions and environment variable references (#337)
 
 ## [0.4.0] - 2026-03-06
