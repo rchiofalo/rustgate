@@ -27,6 +27,22 @@ use crate::cli::{Cli, Encoding, Framing};
 use crate::metrics;
 use crate::session::{FedForwardFn, NatsPublish, PlaintextTcpConfig};
 
+/// Spawn a tokio task whose `JoinHandle` is intentionally not tracked.
+///
+/// Logs a warning if the task panics. Prefer this over bare `drop(tokio::spawn(...))`
+/// so that panics in background tasks are observable.
+pub(crate) fn spawn_background(
+    name: &'static str,
+    fut: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    let handle = tokio::spawn(fut);
+    drop(tokio::spawn(async move {
+        if let Err(e) = handle.await {
+            tracing::error!(task = name, error = %e, "background task panicked");
+        }
+    }));
+}
+
 /// Build the TLS configuration from CLI flags.
 ///
 /// Returns the `TlsConfig` along with the raw PEM strings (needed by
@@ -75,7 +91,10 @@ pub(crate) async fn bind_tls_listener(
         .context("binding TLS listener")
 }
 
-/// Validate framing/encoding feature requirements.
+/// Validate framing/encoding feature requirements at startup.
+///
+/// Rejects proto-dependent framing or encoding when the `proto` feature is not
+/// compiled in. This prevents a runtime panic in the codec layer.
 pub(crate) fn validate_framing(cli: &Cli) -> anyhow::Result<()> {
     #[cfg(not(feature = "proto"))]
     if matches!(cli.framing, Framing::TakProtobuf | Framing::TakNegotiate)
@@ -147,11 +166,11 @@ pub(crate) async fn connect_nats(
             // Spawn NATS subscriber as a background task
             let subscriber = adapter.subscriber();
             let sub_router = Arc::clone(router);
-            drop(tokio::spawn(async move {
+            spawn_background("nats-subscriber", async move {
                 if let Err(e) = subscriber.run(sub_router).await {
                     tracing::warn!(error = %e, "NATS subscriber ended with error");
                 }
-            }));
+            });
 
             Some(adapter.publisher())
         }
@@ -240,19 +259,19 @@ pub(crate) async fn start_enrollment(
 
     let bind_addr: std::net::SocketAddr = enrollment_bind
         .parse()
-        .map_err(|e| anyhow::anyhow!("invalid --enrollment-bind address: {e}"))?;
+        .context("parsing --enrollment-bind address")?;
 
     let enrollment_cert = cert_pem.to_string();
     let enrollment_key = key_pem.to_string();
 
-    drop(tokio::spawn(async move {
+    spawn_background("enrollment-server", async move {
         if let Err(e) = enrollment_server
             .run(bind_addr, &enrollment_cert, &enrollment_key)
             .await
         {
             tracing::error!(error = %e, "enrollment server failed");
         }
-    }));
+    });
 
     tracing::info!(addr = %enrollment_bind, "enrollment server started");
     Ok(())
@@ -282,12 +301,12 @@ pub(crate) fn start_metrics(
     if let Some(ref metrics_bind) = cli.metrics_bind {
         let bind_addr: std::net::SocketAddr = metrics_bind
             .parse()
-            .map_err(|e| anyhow::anyhow!("invalid --metrics-bind address: {e}"))?;
+            .context("parsing --metrics-bind address")?;
 
         let health_ready = Arc::clone(ready);
         #[cfg(feature = "federation")]
         let fed_api_for_metrics = Arc::clone(fed_api_slot);
-        drop(tokio::spawn(async move {
+        spawn_background("metrics-server", async move {
             if let Err(e) = metrics::serve(
                 bind_addr,
                 health_ready,
@@ -298,7 +317,7 @@ pub(crate) fn start_metrics(
             {
                 tracing::error!(error = %e, "metrics server failed");
             }
-        }));
+        });
     }
 
     Ok(())
@@ -316,32 +335,18 @@ pub(crate) fn warn_metrics_disabled(cli: &Cli) {
 // Federation
 // ---------------------------------------------------------------------------
 
-/// Start the federation subsystem and return the forwarding callback + shutdown handle.
+/// Build the federation configuration from CLI flags and peer config file.
 #[cfg(feature = "federation")]
-pub(crate) async fn start_federation(
+async fn build_federation_config(
     cli: &Cli,
-    router: &Arc<Router>,
-    #[cfg(feature = "metrics")] fed_api_slot: &Arc<std::sync::OnceLock<metrics::FedApiHandler>>,
-) -> anyhow::Result<(
-    Option<FedForwardFn>,
-    Option<Arc<tokio::sync::RwLock<rustgate_federation::manager::FederationManager>>>,
-)> {
-    let v1_bind = match cli.federation_v1_bind.as_ref() {
-        Some(b) => b,
-        None => return Ok((None, None)),
-    };
-
-    let bind_addr: std::net::SocketAddr = v1_bind
-        .parse()
-        .map_err(|e| anyhow::anyhow!("invalid --federation-v1-bind: {e}"))?;
-
-    // Load peers from optional JSON config file
+    bind_addr: std::net::SocketAddr,
+) -> anyhow::Result<rustgate_federation::config::FederationConfig> {
     let peers = if let Some(ref peers_file) = cli.federation_peers_file {
         let data = tokio::fs::read_to_string(peers_file)
             .await
-            .map_err(|e| anyhow::anyhow!("read federation peers file: {e}"))?;
+            .context("reading federation peers file")?;
         serde_json::from_str::<Vec<rustgate_federation::config::PeerConfig>>(&data)
-            .map_err(|e| anyhow::anyhow!("parse federation peers file: {e}"))?
+            .context("parsing federation peers file")?
     } else {
         Vec::new()
     };
@@ -349,7 +354,7 @@ pub(crate) async fn start_federation(
     let (v2_enabled, v2_listen_addr) = if let Some(ref v2_bind) = cli.federation_v2_bind {
         let addr: std::net::SocketAddr = v2_bind
             .parse()
-            .map_err(|e| anyhow::anyhow!("invalid --federation-v2-bind: {e}"))?;
+            .context("parsing --federation-v2-bind address")?;
         (true, addr)
     } else {
         (
@@ -361,7 +366,7 @@ pub(crate) async fn start_federation(
         )
     };
 
-    let config = rustgate_federation::config::FederationConfig {
+    Ok(rustgate_federation::config::FederationConfig {
         federate_id: cli.federation_id.clone(),
         v1_enabled: true,
         v1_listen_addr: bind_addr,
@@ -386,8 +391,129 @@ pub(crate) async fn start_federation(
         }),
         ha_nats_url: cli.federation_ha_nats_url.clone(),
         ..rustgate_federation::config::FederationConfig::default()
+    })
+}
+
+/// Wire the federation REST API handler into the metrics HTTP server.
+#[cfg(all(feature = "federation", feature = "metrics"))]
+fn wire_federation_api(
+    cli: &Cli,
+    rwlock: &Arc<tokio::sync::RwLock<rustgate_federation::manager::FederationManager>>,
+    fed_api_slot: &Arc<std::sync::OnceLock<metrics::FedApiHandler>>,
+) -> anyhow::Result<()> {
+    use rustgate_federation::api::{ApiState, PeerStatusFn};
+    use rustgate_federation::store::file::FileStore;
+    use rustgate_federation::trust_store::TrustStore;
+
+    let store = Arc::new(std::sync::RwLock::new(FileStore::new(
+        cli.federation_store_path.clone().map(Into::into),
+    )));
+    let trust_store = Arc::new(if let Some(ref dir) = cli.federation_trust_store_dir {
+        TrustStore::load_from_directory(std::path::Path::new(dir))?
+    } else {
+        TrustStore::new(None)
+    });
+
+    let rwlock_for_status = Arc::clone(rwlock);
+    let status_fn: Arc<dyn Fn() -> rustgate_federation::manager::FederationStatus + Send + Sync> =
+        Arc::new(move || match rwlock_for_status.try_read() {
+            Ok(mgr) => mgr.status(),
+            Err(_) => rustgate_federation::manager::FederationStatus {
+                running: true,
+                v1_server_active: false,
+                v2_server_active: false,
+                total_peers: 0,
+                connected_peers: 0,
+                peers: vec![],
+                ha_enabled: false,
+                pod_id: None,
+            },
+        });
+
+    let rwlock_for_peer = Arc::clone(rwlock);
+    let peer_status_fn: PeerStatusFn = Arc::new(move |id| match rwlock_for_peer.try_read() {
+        Ok(mgr) => mgr.peer_status(id),
+        Err(_) => None,
+    });
+
+    let api_state = Arc::new(ApiState {
+        store,
+        trust_store,
+        status_fn,
+        peer_status_fn,
+    });
+
+    let handler: metrics::FedApiHandler = Arc::new(move |method, path, body| {
+        rustgate_federation::api::handle_request(method, path, body, &api_state)
+    });
+
+    let _ = fed_api_slot.set(handler);
+    tracing::info!("federation REST API wired into metrics server");
+    Ok(())
+}
+
+/// Spawn HA adoption and claim-lost handler tasks.
+#[cfg(feature = "federation-ha")]
+async fn setup_ha_handlers(
+    rwlock: &Arc<tokio::sync::RwLock<rustgate_federation::manager::FederationManager>>,
+) {
+    let (adopt_rx, lost_rx) = {
+        let mut mgr = rwlock.write().await;
+        mgr.take_ha_receivers()
     };
 
+    if let Some(mut rx) = adopt_rx {
+        let inner = Arc::clone(rwlock);
+        spawn_background("federation-ha-adopt", async move {
+            while let Some(peer_id) = rx.recv().await {
+                tracing::info!(peer_id = %peer_id, "adopting orphaned peer");
+                let mut mgr = inner.write().await;
+                if let Err(e) = mgr.adopt_peer(&peer_id).await {
+                    tracing::warn!(
+                        peer_id = %peer_id,
+                        error = %e,
+                        "failed to adopt peer"
+                    );
+                }
+            }
+        });
+    }
+
+    if let Some(mut rx) = lost_rx {
+        let inner = Arc::clone(rwlock);
+        spawn_background("federation-ha-claim-lost", async move {
+            while let Some(peer_id) = rx.recv().await {
+                tracing::warn!(
+                    peer_id = %peer_id,
+                    "lost claim — disconnecting peer"
+                );
+                let mut mgr = inner.write().await;
+                mgr.disconnect_peer(&peer_id).await;
+            }
+        });
+    }
+}
+
+/// Start the federation subsystem and return the forwarding callback + shutdown handle.
+#[cfg(feature = "federation")]
+pub(crate) async fn start_federation(
+    cli: &Cli,
+    router: &Arc<Router>,
+    #[cfg(feature = "metrics")] fed_api_slot: &Arc<std::sync::OnceLock<metrics::FedApiHandler>>,
+) -> anyhow::Result<(
+    Option<FedForwardFn>,
+    Option<Arc<tokio::sync::RwLock<rustgate_federation::manager::FederationManager>>>,
+)> {
+    let v1_bind = match cli.federation_v1_bind.as_ref() {
+        Some(b) => b,
+        None => return Ok((None, None)),
+    };
+
+    let bind_addr: std::net::SocketAddr = v1_bind
+        .parse()
+        .context("parsing --federation-v1-bind address")?;
+
+    let config = build_federation_config(cli, bind_addr).await?;
     let mut manager = rustgate_federation::manager::FederationManager::new(config);
 
     // on_inbound: route messages from federation peers to local clients
@@ -424,105 +550,14 @@ pub(crate) async fn start_federation(
     tracing::info!(addr = %bind_addr, id = %cli.federation_id, "federation started");
 
     let rwlock = Arc::new(tokio::sync::RwLock::new(manager));
-    let rwlock_for_forward = Arc::clone(&rwlock);
 
-    // Wire up the federation REST API into the metrics HTTP server
     #[cfg(feature = "metrics")]
-    {
-        use rustgate_federation::api::{ApiState, PeerStatusFn};
-        use rustgate_federation::store::file::FileStore;
-        use rustgate_federation::trust_store::TrustStore;
+    wire_federation_api(cli, &rwlock, fed_api_slot)?;
 
-        let store = Arc::new(std::sync::RwLock::new(FileStore::new(
-            cli.federation_store_path.clone().map(Into::into),
-        )));
-        let trust_store = Arc::new(if let Some(ref dir) = cli.federation_trust_store_dir {
-            TrustStore::load_from_directory(std::path::Path::new(dir))?
-        } else {
-            TrustStore::new(None)
-        });
-
-        let rwlock_for_status = Arc::clone(&rwlock);
-        let status_fn: Arc<
-            dyn Fn() -> rustgate_federation::manager::FederationStatus + Send + Sync,
-        > = Arc::new(move || {
-            // Use try_read to avoid blocking; return default status if locked
-            match rwlock_for_status.try_read() {
-                Ok(mgr) => mgr.status(),
-                Err(_) => rustgate_federation::manager::FederationStatus {
-                    running: true,
-                    v1_server_active: false,
-                    v2_server_active: false,
-                    total_peers: 0,
-                    connected_peers: 0,
-                    peers: vec![],
-                    ha_enabled: false,
-                    pod_id: None,
-                },
-            }
-        });
-
-        let rwlock_for_peer = Arc::clone(&rwlock);
-        let peer_status_fn: PeerStatusFn = Arc::new(move |id| match rwlock_for_peer.try_read() {
-            Ok(mgr) => mgr.peer_status(id),
-            Err(_) => None,
-        });
-
-        let api_state = Arc::new(ApiState {
-            store,
-            trust_store,
-            status_fn,
-            peer_status_fn,
-        });
-
-        let handler: metrics::FedApiHandler = Arc::new(move |method, path, body| {
-            rustgate_federation::api::handle_request(method, path, body, &api_state)
-        });
-
-        let _ = fed_api_slot.set(handler);
-        tracing::info!("federation REST API wired into metrics server");
-    }
-
-    // HA adoption / claim-lost handler tasks
     #[cfg(feature = "federation-ha")]
-    {
-        let (adopt_rx, lost_rx) = {
-            let mut mgr = rwlock.write().await;
-            mgr.take_ha_receivers()
-        };
+    setup_ha_handlers(&rwlock).await;
 
-        if let Some(mut rx) = adopt_rx {
-            let inner = Arc::clone(&rwlock);
-            drop(tokio::spawn(async move {
-                while let Some(peer_id) = rx.recv().await {
-                    tracing::info!(peer_id = %peer_id, "adopting orphaned peer");
-                    let mut mgr = inner.write().await;
-                    if let Err(e) = mgr.adopt_peer(&peer_id).await {
-                        tracing::warn!(
-                            peer_id = %peer_id,
-                            error = %e,
-                            "failed to adopt peer"
-                        );
-                    }
-                }
-            }));
-        }
-
-        if let Some(mut rx) = lost_rx {
-            let inner = Arc::clone(&rwlock);
-            drop(tokio::spawn(async move {
-                while let Some(peer_id) = rx.recv().await {
-                    tracing::warn!(
-                        peer_id = %peer_id,
-                        "lost claim — disconnecting peer"
-                    );
-                    let mut mgr = inner.write().await;
-                    mgr.disconnect_peer(&peer_id).await;
-                }
-            }));
-        }
-    }
-
+    let rwlock_for_forward = Arc::clone(&rwlock);
     let forward_fn: FedForwardFn = Arc::new(move |payload, groups| {
         let inner = Arc::clone(&rwlock_for_forward);
         drop(tokio::spawn(async move {
@@ -593,7 +628,7 @@ pub(crate) fn start_websocket<P: NatsPublish + Send + Sync + 'static>(
 
     let addr: std::net::SocketAddr = ws_bind
         .parse()
-        .map_err(|e| anyhow::anyhow!("invalid WebSocket bind address: {e}"))?;
+        .context("parsing --websocket-bind address")?;
     let ws_listener = rustgate_websocket::WsListener::bind(addr, tls_config)?;
     tracing::info!(addr = %ws_listener.local_addr()?, "WebSocket listener bound");
 
@@ -633,9 +668,9 @@ pub(crate) fn start_websocket<P: NatsPublish + Send + Sync + 'static>(
         throttle_config,
         shutdown: Arc::clone(&shutdown),
     };
-    drop(tokio::spawn(rustgate_websocket::WebSocketServer::run(
-        config,
-    )));
+    spawn_background("websocket-server", async move {
+        rustgate_websocket::WebSocketServer::run(config).await;
+    });
     Ok(Some(shutdown))
 }
 
@@ -666,9 +701,7 @@ pub(crate) async fn start_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
         None => return Ok(None),
     };
 
-    let addr: std::net::SocketAddr = tcp_bind
-        .parse()
-        .map_err(|e| anyhow::anyhow!("invalid --tcp-bind address: {e}"))?;
+    let addr: std::net::SocketAddr = tcp_bind.parse().context("parsing --tcp-bind address")?;
 
     tracing::warn!(addr = %addr, "plaintext TCP input enabled — traffic is NOT encrypted");
 
@@ -679,7 +712,7 @@ pub(crate) async fn start_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
 
     let pt_listener = rustgate_transport::PlaintextListener::bind(addr, identity_config)
         .await
-        .map_err(|e| anyhow::anyhow!("plaintext TCP bind failed: {e}"))?;
+        .context("binding plaintext TCP listener")?;
 
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let shutdown_clone = Arc::clone(&shutdown);
@@ -697,9 +730,9 @@ pub(crate) async fn start_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
         shutdown: shutdown_clone,
     };
 
-    drop(tokio::spawn(async move {
+    spawn_background("plaintext-tcp", async move {
         crate::session::run_plaintext_tcp(config).await;
-    }));
+    });
 
     Ok(Some(shutdown))
 }
@@ -720,15 +753,13 @@ pub(crate) async fn start_udp<P: NatsPublish + Send + Sync + 'static>(
         None => return Ok(None),
     };
 
-    let addr: std::net::SocketAddr = udp_bind
-        .parse()
-        .map_err(|e| anyhow::anyhow!("invalid --udp-bind address: {e}"))?;
+    let addr: std::net::SocketAddr = udp_bind.parse().context("parsing --udp-bind address")?;
 
     tracing::warn!(addr = %addr, "UDP input enabled — datagrams are NOT encrypted");
 
     let socket = tokio::net::UdpSocket::bind(addr)
         .await
-        .map_err(|e| anyhow::anyhow!("UDP bind failed: {e}"))?;
+        .context("binding UDP socket")?;
 
     let config = rustgate_transport::UdpInputConfig {
         cn: cli.plaintext_cn.clone(),
@@ -767,7 +798,7 @@ pub(crate) async fn start_udp<P: NatsPublish + Send + Sync + 'static>(
                 })
             });
 
-    drop(tokio::spawn(async move {
+    spawn_background("udp-input", async move {
         rustgate_transport::UdpInput::run(
             socket,
             udp_router,
@@ -777,7 +808,7 @@ pub(crate) async fn start_udp<P: NatsPublish + Send + Sync + 'static>(
             shutdown_clone,
         )
         .await;
-    }));
+    });
 
     Ok(Some(shutdown))
 }

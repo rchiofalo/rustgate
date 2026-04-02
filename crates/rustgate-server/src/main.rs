@@ -1,3 +1,9 @@
+//! rustgate server binary — secure tactical message router.
+//!
+//! This module contains the entrypoint, async runtime orchestration, and
+//! graceful shutdown logic. Subsystem initialization is delegated to [`setup`],
+//! session handling to [`session`], and CLI parsing to [`cli`].
+
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;

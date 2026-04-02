@@ -249,6 +249,9 @@ async fn negotiate_tak_protocol(
     }
 }
 
+/// Spawn concurrent read and write loops as a `select` race.
+///
+/// Returns when either loop finishes (EOF, timeout, or error).
 async fn run_session_loops(
     reader: rustgate_transport::SessionReader,
     writer: rustgate_transport::SessionWriter,
@@ -263,6 +266,8 @@ async fn run_session_loops(
     }
 }
 
+/// Decode inbound frames, apply rate limiting, and route to local clients,
+/// NATS, federation peers, and the event archiver.
 async fn read_loop(
     reader: rustgate_transport::SessionReader,
     ctx: &SessionContext<'_, impl NatsPublish>,
@@ -273,7 +278,11 @@ async fn read_loop(
 
     // When negotiation consumed a peek byte and fell back to XML,
     // we need to feed that byte to the codec before reading from the socket.
-    let prefix_opt = if prefix.is_empty() { None } else { Some(prefix) };
+    let prefix_opt = if prefix.is_empty() {
+        None
+    } else {
+        Some(prefix)
+    };
     let mut framed = FramedRead::new(PrefixedReader::new(reader, prefix_opt), codec);
 
     let mut msg_builder = MessageBuilder::new();
@@ -361,6 +370,7 @@ async fn read_loop(
     Ok(())
 }
 
+/// Encode outbound messages and send to the client with a write timeout.
 async fn write_loop(
     writer: rustgate_transport::SessionWriter,
     mut rx: mpsc::Receiver<RoutableMessage>,
@@ -456,7 +466,7 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
                         let session_nats = nats_publisher.clone();
                         let session_fed = fed_forward.clone();
 
-                        drop(tokio::spawn(async move {
+                        crate::setup::spawn_background("plaintext-tcp-session", async move {
                             let _permit = permit;
 
                             let result = run_plaintext_session_loops(PlaintextSessionContext {
@@ -477,7 +487,7 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
 
                             session_router.unregister(&cn, session_id).await;
                             tracing::info!(cn = %cn, "plaintext TCP disconnected");
-                        }));
+                        });
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "plaintext TCP accept error");
