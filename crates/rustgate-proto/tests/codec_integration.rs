@@ -24,6 +24,20 @@ fn decode_varint(buf: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
+/// Encode a length as a protobuf-style varint and append the payload.
+/// Returns the wire frame (varint + payload) without the magic byte.
+fn encode_varint_frame(payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::new();
+    let mut v = payload.len() as u64;
+    while v >= 0x80 {
+        frame.push((v as u8) | 0x80);
+        v >>= 7;
+    }
+    frame.push(v as u8);
+    frame.extend_from_slice(payload);
+    frame
+}
+
 // ---------------------------------------------------------------------------
 // TakFrameCodec: encode/decode round-trips
 // ---------------------------------------------------------------------------
@@ -170,11 +184,10 @@ fn varint_exceeding_max_bytes_returns_error() {
 fn oversized_frame_rejected() {
     let mut codec = TakFrameCodec::new();
 
-    let too_large = MAX_FRAME_SIZE + 1;
+    // Build a frame header with an oversized length varint (no actual payload needed)
     let mut buf = BytesMut::new();
     buf.put_u8(0xBF);
-    // Encode the oversized length as a varint
-    let mut v = too_large as u64;
+    let mut v = (MAX_FRAME_SIZE + 1) as u64;
     while v >= 0x80 {
         buf.put_u8((v as u8) | 0x80);
         v >>= 7;
@@ -451,15 +464,7 @@ async fn read_tak_request_accepts_valid_frame() {
     let proto_bytes = msg.encode_to_vec();
 
     // Build the wire frame without the magic byte (read_tak_request assumes it's consumed)
-    let mut frame = Vec::new();
-    let mut v = proto_bytes.len() as u64;
-    while v >= 0x80 {
-        frame.push((v as u8) | 0x80);
-        v >>= 7;
-    }
-    frame.push(v as u8);
-    frame.extend_from_slice(&proto_bytes);
-
+    let frame = encode_varint_frame(&proto_bytes);
     let mut cursor = std::io::Cursor::new(frame);
     read_tak_request(&mut cursor).await.unwrap();
 }
@@ -474,15 +479,7 @@ async fn read_tak_request_rejects_missing_control() {
     };
     let proto_bytes = msg.encode_to_vec();
 
-    let mut frame = Vec::new();
-    let mut v = proto_bytes.len() as u64;
-    while v >= 0x80 {
-        frame.push((v as u8) | 0x80);
-        v >>= 7;
-    }
-    frame.push(v as u8);
-    frame.extend_from_slice(&proto_bytes);
-
+    let frame = encode_varint_frame(&proto_bytes);
     let mut cursor = std::io::Cursor::new(frame);
     assert!(read_tak_request(&mut cursor).await.is_err());
 }
