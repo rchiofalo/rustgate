@@ -18,13 +18,15 @@ use tempfile::TempDir;
 /// Write PEM content to a temporary file and return the path.
 fn write_pem(dir: &std::path::Path, name: &str, content: &str) -> std::path::PathBuf {
     let path = dir.join(name);
-    let mut file = std::fs::File::create(&path).unwrap();
-    file.write_all(content.as_bytes()).unwrap();
+    let mut file =
+        std::fs::File::create(&path).unwrap_or_else(|e| panic!("create {}: {e}", path.display()));
+    file.write_all(content.as_bytes())
+        .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
     path
 }
 
-/// Start the server with the given args, wait briefly, then kill it.
-/// Returns (stdout, stderr) collected during the run.
+/// Start the server with the given args, poll until it exits or the timeout
+/// elapses, then kill it. Returns (stdout, stderr) collected during the run.
 fn run_server_briefly(args: &[&str], timeout: Duration) -> (String, String) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rustgate"))
         .args(args)
@@ -33,7 +35,14 @@ fn run_server_briefly(args: &[&str], timeout: Duration) -> (String, String) {
         .spawn()
         .expect("failed to start server");
 
-    std::thread::sleep(timeout);
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if child.try_wait().expect("failed to poll child").is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
     let _ = child.kill();
     let output = child.wait_with_output().expect("failed to wait on child");
 

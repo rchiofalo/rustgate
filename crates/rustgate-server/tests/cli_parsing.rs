@@ -82,7 +82,7 @@ fn help_shows_framing_options() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("xml") || stdout.contains("Xml") || stdout.contains("xml"),
+        stdout.contains("xml") || stdout.contains("Xml") || stdout.contains("XML"),
         "help should list framing options"
     );
 }
