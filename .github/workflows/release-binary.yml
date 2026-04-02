@@ -25,13 +25,14 @@ jobs:
       attestations: write # required for build provenance attestation
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
             cc: musl-gcc
           - target: aarch64-unknown-linux-musl
-            cc: aarch64-linux-musl-gcc
-            linker: aarch64-linux-musl-gcc
+            cc: aarch64-linux-gnu-gcc
+            linker: aarch64-linux-gnu-gcc
 
     runs-on: ubuntu-latest
 
@@ -59,11 +60,9 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler musl-tools
 
-      - name: Install aarch64 musl cross-compiler
+      - name: Install aarch64 cross-compiler
         if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          curl -fsSL https://musl.cc/aarch64-linux-musl-cross.tgz | sudo tar -xz -C /opt
-          echo "/opt/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
+        run: sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Add Rust target
         run: rustup target add ${{ matrix.target }}
