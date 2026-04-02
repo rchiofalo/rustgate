@@ -1,0 +1,472 @@
+//! CLI argument parsing for the rustgate server binary.
+//!
+//! Defines the `Cli` struct (via `clap::Parser`), the `Framing` and `Encoding`
+//! enums, and the conversion from `Framing` to the transport layer's
+//! `FramingStrategy`.
+
+use clap::{Parser, ValueEnum};
+use rustgate_core::protocol::{FramingStrategy, HeaderSize};
+
+#[derive(Parser)]
+#[command(name = "rustgate", about = "Secure tactical message router")]
+pub(crate) struct Cli {
+    #[arg(short, long, default_value = "0.0.0.0:4433", env = "RUSTGATE_BIND")]
+    pub(crate) bind: String,
+
+    #[arg(long, env = "RUSTGATE_CERT")]
+    pub(crate) cert: String,
+
+    #[arg(long, env = "RUSTGATE_KEY")]
+    pub(crate) key: String,
+
+    #[arg(long, env = "RUSTGATE_CA")]
+    pub(crate) ca: String,
+
+    /// Path to PEM-encoded Certificate Revocation List file.
+    /// Connections using revoked certificates will be rejected at the TLS handshake.
+    #[arg(long, env = "RUSTGATE_CRL")]
+    pub(crate) crl: Option<String>,
+
+    /// Minimum TLS protocol version the server will accept.
+    /// "1.2" allows TLS 1.2 and 1.3 (default). "1.3" enforces TLS 1.3 only.
+    #[arg(long, default_value = "1.2", env = "RUSTGATE_TLS_MIN_VERSION")]
+    pub(crate) tls_min_version: String,
+
+    /// Warn when loaded CRLs are stale (nextUpdate in the past).
+    /// Defaults to true. Set to false to suppress warnings for intentionally stale CRLs.
+    #[arg(long, default_value_t = true, env = "RUSTGATE_CRL_WARN_STALE")]
+    pub(crate) crl_warn_stale: bool,
+
+    /// Require FIPS 140-3 crypto provider. Startup fails if the FIPS provider
+    /// is not active. Build with --features fips to enable.
+    #[arg(long, default_value_t = false, env = "RUSTGATE_FIPS_REQUIRED")]
+    pub(crate) fips_required: bool,
+
+    #[arg(long, value_enum, default_value_t = Framing::Xml, env = "RUSTGATE_FRAMING")]
+    pub(crate) framing: Framing,
+
+    #[arg(long, value_enum, default_value_t = Encoding::Raw, env = "RUSTGATE_ENCODING")]
+    pub(crate) encoding: Encoding,
+
+    /// NATS server URL (enables NATS bridge when set). Requires --features nats.
+    #[arg(long, env = "NATS_URL")]
+    pub(crate) nats_url: Option<String>,
+
+    /// Path to NATS credentials file for JWT/NKey auth.
+    #[arg(long, env = "NATS_CREDENTIALS")]
+    pub(crate) nats_credentials: Option<String>,
+
+    /// Path to PEM-encoded client certificate for NATS mTLS.
+    #[arg(long, env = "NATS_TLS_CERT")]
+    pub(crate) nats_tls_cert: Option<std::path::PathBuf>,
+
+    /// Path to PEM-encoded client private key for NATS mTLS.
+    #[arg(long, env = "NATS_TLS_KEY")]
+    pub(crate) nats_tls_key: Option<std::path::PathBuf>,
+
+    /// Path to PEM-encoded CA certificate for verifying the NATS server.
+    #[arg(long, env = "NATS_TLS_CA")]
+    pub(crate) nats_tls_ca: Option<std::path::PathBuf>,
+
+    /// Require TLS for NATS connections. Fails if TLS is required but
+    /// no certificates are provided.
+    #[arg(long, default_value_t = false, env = "NATS_TLS_REQUIRED")]
+    pub(crate) nats_tls_required: bool,
+
+    /// Bind address for the enrollment HTTPS server (e.g. 0.0.0.0:8446).
+    /// Requires --features enrollment.
+    #[arg(long, env = "ENROLLMENT_BIND")]
+    pub(crate) enrollment_bind: Option<String>,
+
+    /// Path to the CA private key PEM file (used to sign client CSRs).
+    #[arg(long, env = "RUSTGATE_CA_KEY")]
+    pub(crate) ca_key: Option<String>,
+
+    /// Username for enrollment HTTP Basic Auth.
+    #[arg(long, env = "ENROLLMENT_USER")]
+    pub(crate) enrollment_user: Option<String>,
+
+    /// Password for enrollment HTTP Basic Auth.
+    #[arg(long, env = "ENROLLMENT_PASSWORD")]
+    pub(crate) enrollment_password: Option<String>,
+
+    /// Organization name for issued client certificates.
+    #[arg(long, default_value = "rustgate", env = "RUSTGATE_CA_ORG")]
+    pub(crate) ca_organization: String,
+
+    /// Directory for data package storage. Enables the Marti sync API
+    /// endpoints when set. Requires --features enrollment.
+    #[arg(long, env = "DATA_PACKAGE_DIR")]
+    pub(crate) data_package_dir: Option<String>,
+
+    /// Bind address for the Prometheus metrics HTTP server (e.g. 0.0.0.0:9090).
+    /// Requires --features metrics.
+    #[arg(long, env = "METRICS_BIND")]
+    pub(crate) metrics_bind: Option<String>,
+
+    /// Maximum concurrent TLS sessions. Prevents resource exhaustion
+    /// from connection floods.
+    #[arg(long, default_value_t = 1024, env = "RUSTGATE_MAX_CONNECTIONS")]
+    pub(crate) max_connections: usize,
+
+    /// Maximum number of TLS handshakes that may be in progress simultaneously.
+    /// Limits the CPU cost of concurrent cryptographic operations during
+    /// connection floods. Incoming connections that exceed this limit will
+    /// wait until a handshake slot becomes available.
+    #[arg(long, default_value_t = 100, env = "RUSTGATE_MAX_HANDSHAKES")]
+    pub(crate) max_concurrent_handshakes: usize,
+
+    /// Bind address for the WebSocket (wss://) listener (e.g. 0.0.0.0:8443).
+    /// Requires --features websocket.
+    #[arg(long, env = "WEBSOCKET_BIND")]
+    pub(crate) websocket_bind: Option<String>,
+
+    // -- Plaintext input flags --
+    /// Bind address for plaintext TCP input (e.g. 0.0.0.0:8087).
+    /// WARNING: connections are NOT encrypted. Use only on trusted networks.
+    #[arg(long, env = "RUSTGATE_TCP_BIND")]
+    pub(crate) tcp_bind: Option<String>,
+
+    /// Bind address for UDP CoT input (e.g. 0.0.0.0:8087).
+    /// WARNING: datagrams are NOT encrypted. Use only on trusted networks.
+    #[arg(long, env = "RUSTGATE_UDP_BIND")]
+    pub(crate) udp_bind: Option<String>,
+
+    /// Default CN for plaintext (TCP/UDP) clients.
+    #[arg(long, default_value = "anonymous", env = "RUSTGATE_PLAINTEXT_CN")]
+    pub(crate) plaintext_cn: String,
+
+    /// Default group for plaintext (TCP/UDP) clients.
+    #[arg(
+        long,
+        default_value = "__plaintext__",
+        env = "RUSTGATE_PLAINTEXT_GROUP"
+    )]
+    pub(crate) plaintext_group: String,
+
+    // -- Federation flags --
+    /// V1 federation listen address (enables federation when set, e.g. 0.0.0.0:9000).
+    /// Requires --features federation.
+    #[arg(long, env = "FEDERATION_V1_BIND")]
+    pub(crate) federation_v1_bind: Option<String>,
+
+    /// V2 gRPC federation listen address (e.g. 0.0.0.0:9001).
+    /// Enables V2 gRPC inbound server when set alongside --federation-v1-bind.
+    /// Requires --features federation.
+    #[arg(long, env = "FEDERATION_V2_BIND")]
+    pub(crate) federation_v2_bind: Option<String>,
+
+    /// Unique federation server identity.
+    #[arg(long, default_value = "rustgate-federation-1", env = "FEDERATION_ID")]
+    pub(crate) federation_id: String,
+
+    /// Path to JSON file containing federation peer configurations.
+    #[arg(long, env = "FEDERATION_PEERS_FILE")]
+    pub(crate) federation_peers_file: Option<String>,
+
+    /// Skip TLS hostname verification for federation peers.
+    #[arg(long, default_value_t = false, env = "FEDERATION_SKIP_HOSTNAME_VERIFY")]
+    pub(crate) federation_skip_hostname_verify: bool,
+
+    /// Maximum federation hops before dropping a message (loop prevention).
+    #[arg(long, default_value_t = 10, env = "FEDERATION_MAX_HOPS")]
+    pub(crate) federation_max_hops: u32,
+
+    /// Path to persistent federate store (JSON file).
+    #[arg(long, env = "FEDERATION_STORE_PATH")]
+    pub(crate) federation_store_path: Option<String>,
+
+    /// Directory containing additional trusted CA certificates for federation.
+    /// PEM/CRT files in this directory are merged with --ca for TLS verification.
+    #[arg(long, env = "FEDERATION_TRUST_STORE_DIR")]
+    pub(crate) federation_trust_store_dir: Option<String>,
+
+    /// Consecutive send failures before tripping a federation peer's circuit breaker.
+    #[arg(
+        long,
+        default_value_t = 5,
+        env = "FEDERATION_CIRCUIT_BREAKER_THRESHOLD"
+    )]
+    pub(crate) federation_circuit_breaker_threshold: u32,
+
+    /// Seconds to wait after a circuit breaker trips before probing a federation peer.
+    #[arg(long, default_value_t = 60, env = "FEDERATION_CIRCUIT_BREAKER_TIMEOUT")]
+    pub(crate) federation_circuit_breaker_timeout: u64,
+
+    /// NATS URL for federation HA coordination (enables distributed peer ownership).
+    /// When set, only one pod manages each outbound peer in a multi-pod deployment.
+    /// Requires --features federation-ha.
+    #[arg(long, env = "FEDERATION_HA_NATS_URL")]
+    pub(crate) federation_ha_nats_url: Option<String>,
+
+    /// Pod identifier for federation HA mode. Defaults to --federation-id if
+    /// --federation-ha-nats-url is set.
+    #[arg(long, env = "FEDERATION_POD_ID")]
+    pub(crate) federation_pod_id: Option<String>,
+
+    // -- QoS / rate limiting --
+    /// Maximum sustained messages per second per connected client (0 = disabled).
+    #[arg(long, default_value_t = 0, env = "RUSTGATE_CLIENT_MSG_RATE")]
+    pub(crate) client_message_rate: u32,
+
+    /// Maximum burst size for per-client rate limiting.
+    #[arg(long, default_value_t = 200, env = "RUSTGATE_CLIENT_BURST")]
+    pub(crate) client_burst: u32,
+
+    // -- Data retention / archival --
+    /// Directory for CoT event archival (JSONL). Enables structured logging of
+    /// all received CoT events to date-stamped files.
+    #[arg(long, env = "RUSTGATE_ARCHIVE_DIR")]
+    pub(crate) archive_dir: Option<String>,
+
+    /// Maximum age (in hours) for uploaded data packages. Packages older than
+    /// this are eligible for cleanup. 0 = no expiration.
+    #[arg(long, default_value_t = 0, env = "RUSTGATE_PACKAGE_MAX_AGE_HOURS")]
+    pub(crate) package_max_age_hours: u64,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum Framing {
+    Xml,
+    LengthPrefixed,
+    Line,
+    /// TAK protobuf binary framing (0xBF + varint length). Requires --features proto.
+    TakProtobuf,
+    /// TAK protocol negotiation: starts XML, upgrades to protobuf if the client requests it.
+    /// This is the mode real TAK clients expect. Requires --features proto.
+    TakNegotiate,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum Encoding {
+    Raw,
+    Cot,
+    /// TAK protobuf encoding (proto <-> XML at session edge). Requires --features proto.
+    TakProtobuf,
+}
+
+impl From<Framing> for FramingStrategy {
+    fn from(f: Framing) -> Self {
+        match f {
+            Framing::Xml => FramingStrategy::XmlStream,
+            Framing::LengthPrefixed => FramingStrategy::LengthPrefixed {
+                header_size: HeaderSize::Four,
+            },
+            Framing::Line => FramingStrategy::LineDelimited,
+            Framing::TakProtobuf => FramingStrategy::TakProtobuf,
+            // TakNegotiate starts as XML; negotiation determines the actual framing.
+            // This mapping is used as the initial framing before negotiation runs.
+            Framing::TakNegotiate => FramingStrategy::XmlStream,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::panic, clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn cli_parses_defaults() {
+        let cli = Cli::try_parse_from([
+            "rustgate", "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
+        ])
+        .expect("should parse");
+        assert_eq!(cli.bind, "0.0.0.0:4433");
+        assert_eq!(cli.max_connections, 1024);
+        assert_eq!(cli.max_concurrent_handshakes, 100);
+    }
+
+    #[test]
+    fn cli_max_concurrent_handshakes_override() {
+        let cli = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--max-concurrent-handshakes",
+            "50",
+        ])
+        .expect("should parse");
+        assert_eq!(cli.max_concurrent_handshakes, 50);
+    }
+
+    #[test]
+    fn cli_max_connections_override() {
+        let cli = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--max-connections",
+            "512",
+        ])
+        .expect("should parse");
+        assert_eq!(cli.max_connections, 512);
+    }
+
+    #[test]
+    fn cli_rejects_non_numeric_max_connections() {
+        let result = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--max-connections",
+            "abc",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_metrics_bind_optional() {
+        let cli = Cli::try_parse_from([
+            "rustgate", "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
+        ])
+        .expect("should parse");
+        assert!(cli.metrics_bind.is_none());
+
+        let cli = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--metrics-bind",
+            "0.0.0.0:9090",
+        ])
+        .expect("should parse");
+        assert_eq!(cli.metrics_bind.as_deref(), Some("0.0.0.0:9090"));
+    }
+
+    #[test]
+    fn cli_env_vars_declared() {
+        // Verify all expected env vars appear in clap's help output.
+        // This ensures the env = "..." attributes are wired up correctly.
+        use clap::CommandFactory;
+        let help = Cli::command().render_long_help().to_string();
+
+        let expected_env_vars = [
+            "RUSTGATE_BIND",
+            "RUSTGATE_CERT",
+            "RUSTGATE_KEY",
+            "RUSTGATE_CA",
+            "RUSTGATE_FRAMING",
+            "RUSTGATE_ENCODING",
+            "NATS_URL",
+            "NATS_CREDENTIALS",
+            "NATS_TLS_CERT",
+            "NATS_TLS_KEY",
+            "NATS_TLS_CA",
+            "NATS_TLS_REQUIRED",
+            "ENROLLMENT_BIND",
+            "RUSTGATE_CA_KEY",
+            "ENROLLMENT_USER",
+            "ENROLLMENT_PASSWORD",
+            "RUSTGATE_CA_ORG",
+            "DATA_PACKAGE_DIR",
+            "METRICS_BIND",
+            "RUSTGATE_MAX_CONNECTIONS",
+            "RUSTGATE_MAX_HANDSHAKES",
+            "FEDERATION_V1_BIND",
+            "FEDERATION_V2_BIND",
+            "FEDERATION_ID",
+            "FEDERATION_PEERS_FILE",
+            "FEDERATION_SKIP_HOSTNAME_VERIFY",
+            "FEDERATION_MAX_HOPS",
+            "FEDERATION_STORE_PATH",
+        ];
+
+        for var in expected_env_vars {
+            assert!(
+                help.contains(var),
+                "expected env var {var} not found in help output"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_all_flags_have_long_option() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        for arg in cmd.get_arguments() {
+            if arg.get_id() == "help" || arg.get_id() == "version" {
+                continue;
+            }
+            assert!(
+                arg.get_long().is_some(),
+                "arg {:?} missing --long flag",
+                arg.get_id()
+            );
+        }
+    }
+
+    #[test]
+    fn cli_federation_defaults() {
+        let cli = Cli::try_parse_from([
+            "rustgate", "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
+        ])
+        .expect("should parse");
+        assert!(cli.federation_v1_bind.is_none());
+        assert!(cli.federation_v2_bind.is_none());
+        assert_eq!(cli.federation_id, "rustgate-federation-1");
+        assert!(cli.federation_peers_file.is_none());
+        assert!(!cli.federation_skip_hostname_verify);
+        assert_eq!(cli.federation_max_hops, 10);
+        assert!(cli.federation_store_path.is_none());
+    }
+
+    #[test]
+    fn cli_federation_bind_override() {
+        let cli = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--federation-v1-bind",
+            "0.0.0.0:9000",
+            "--federation-v2-bind",
+            "0.0.0.0:9001",
+            "--federation-id",
+            "my-fed-server",
+            "--federation-max-hops",
+            "5",
+        ])
+        .expect("should parse");
+        assert_eq!(cli.federation_v1_bind.as_deref(), Some("0.0.0.0:9000"));
+        assert_eq!(cli.federation_v2_bind.as_deref(), Some("0.0.0.0:9001"));
+        assert_eq!(cli.federation_id, "my-fed-server");
+        assert_eq!(cli.federation_max_hops, 5);
+    }
+
+    #[test]
+    fn cli_federation_skip_hostname_verify() {
+        let cli = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--federation-skip-hostname-verify",
+        ])
+        .expect("should parse");
+        assert!(cli.federation_skip_hostname_verify);
+    }
+}
