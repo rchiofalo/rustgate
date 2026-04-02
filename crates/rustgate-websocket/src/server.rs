@@ -129,6 +129,7 @@ impl WebSocketServer {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_ws_session(
     session: WsSession,
     router: Arc<Router>,

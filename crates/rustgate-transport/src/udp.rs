@@ -200,7 +200,16 @@ mod tests {
 
         let router_clone = Arc::clone(&router);
         let task = tokio::spawn(async move {
-            UdpInput::run(socket, router_clone, config, None, None, None, shutdown_clone).await;
+            UdpInput::run(
+                socket,
+                router_clone,
+                config,
+                None,
+                None,
+                None,
+                shutdown_clone,
+            )
+            .await;
         });
 
         // Send a CoT-like datagram
@@ -237,7 +246,16 @@ mod tests {
 
         let router_clone = Arc::clone(&router);
         let task = tokio::spawn(async move {
-            UdpInput::run(socket, router_clone, config, None, None, None, shutdown_clone).await;
+            UdpInput::run(
+                socket,
+                router_clone,
+                config,
+                None,
+                None,
+                None,
+                shutdown_clone,
+            )
+            .await;
         });
 
         // Immediate shutdown
