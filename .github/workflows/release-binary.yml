@@ -15,6 +15,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RELEASE_FEATURES: nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket
 
 jobs:
   build:
@@ -27,7 +28,10 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
+            cc: musl-gcc
           - target: aarch64-unknown-linux-musl
+            cc: aarch64-linux-musl-gcc
+            linker: aarch64-linux-musl-gcc
 
     runs-on: ubuntu-latest
 
@@ -52,17 +56,29 @@ jobs:
           fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
-      - name: Install protobuf compiler
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler musl-tools
 
-      - name: Install cross and cargo-auditable
-        run: cargo install cross cargo-auditable --locked
+      - name: Install aarch64 musl cross-compiler
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          curl -fsSL https://musl.cc/aarch64-linux-musl-cross.tgz | sudo tar -xz -C /opt
+          echo "/opt/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Install cargo-auditable
+        run: cargo install cargo-auditable --locked
 
       - name: Install cosign
         uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
 
-      - name: Build with cross (auditable)
-        run: cross auditable build --locked --release --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket --target ${{ matrix.target }}
+      - name: Build (auditable)
+        env:
+          CC_${{ matrix.target }}: ${{ matrix.cc }}
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: ${{ matrix.linker }}
+        run: cargo auditable build --locked --release --features ${{ env.RELEASE_FEATURES }} --target ${{ matrix.target }}
 
       - name: Package binary
         run: |
