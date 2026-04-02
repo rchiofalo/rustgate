@@ -339,7 +339,7 @@ async fn read_loop(
         if let Some(filter) = ctx.replay_filter
             && filter.is_replay(&payload)
         {
-            tracing::warn!(cn = %ctx.identity.cn, "message dropped: replay detected");
+            tracing::debug!(cn = %ctx.identity.cn, "message dropped: replay detected");
             #[cfg(feature = "metrics")]
             metrics::messages_replayed().inc();
             continue;
@@ -424,6 +424,7 @@ pub(crate) struct PlaintextTcpConfig<P: NatsPublish> {
     pub(crate) encoding: Encoding,
     pub(crate) nats_publisher: Option<P>,
     pub(crate) fed_forward: Option<FedForwardFn>,
+    pub(crate) replay_filter: Option<Arc<ReplayFilter>>,
     pub(crate) shutdown: Arc<tokio::sync::Notify>,
 }
 
@@ -443,6 +444,7 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
         encoding,
         nats_publisher,
         fed_forward,
+        replay_filter,
         shutdown,
     } = config;
 
@@ -478,6 +480,7 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
                         #[allow(clippy::clone_on_copy)]
                         let session_nats = nats_publisher.clone();
                         let session_fed = fed_forward.clone();
+                        let session_rf = replay_filter.clone();
 
                         crate::setup::spawn_background("plaintext-tcp-session", async move {
                             let _permit = permit;
@@ -492,6 +495,7 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
                                 encoding,
                                 nats_publisher: &session_nats,
                                 fed_forward: &session_fed,
+                                replay_filter: &session_rf,
                             }).await;
 
                             if let Err(e) = result {
@@ -526,6 +530,7 @@ struct PlaintextSessionContext<'a, P: NatsPublish> {
     encoding: Encoding,
     nats_publisher: &'a Option<P>,
     fed_forward: &'a Option<FedForwardFn>,
+    replay_filter: &'a Option<Arc<ReplayFilter>>,
 }
 
 /// Read/write loops for a plaintext TCP session.
@@ -545,6 +550,7 @@ async fn run_plaintext_session_loops<P: NatsPublish>(
         encoding,
         nats_publisher,
         fed_forward,
+        replay_filter,
     } = ctx;
     let codec = FramedCodec::from_strategy(framing);
     let mut framed_read = FramedRead::new(reader, codec);
@@ -573,6 +579,17 @@ async fn run_plaintext_session_loops<P: NatsPublish>(
                 };
 
                 let payload = frame.freeze();
+
+                // Anti-replay: drop messages with duplicate (uid, time) within the window
+                if let Some(filter) = replay_filter
+                    && filter.is_replay(&payload)
+                {
+                    tracing::debug!(cn = %identity.cn, "message dropped: replay detected");
+                    #[cfg(feature = "metrics")]
+                    metrics::messages_replayed().inc();
+                    continue;
+                }
+
                 let msg = msg_builder.build(identity, payload, "tcp-plaintext");
                 router.route(msg.clone()).await;
 

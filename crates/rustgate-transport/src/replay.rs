@@ -147,6 +147,8 @@ fn message_key(payload: &[u8]) -> Option<u64> {
 /// Extract the value of an XML attribute from raw bytes.
 ///
 /// Searches for `name="value"` or `name='value'` in the first 512 bytes.
+/// The attribute name must be preceded by whitespace (or appear at the
+/// start of the payload) to avoid matching inside other attribute values.
 fn extract_xml_attr<'a>(payload: &'a [u8], attr: &[u8]) -> Option<&'a [u8]> {
     let search_limit = payload.len().min(512);
     let haystack = &payload[..search_limit];
@@ -159,6 +161,14 @@ fn extract_xml_attr<'a>(payload: &'a [u8], attr: &[u8]) -> Option<&'a [u8]> {
             Some(p) => offset + p,
             None => return None,
         };
+
+        // Attribute must be preceded by whitespace or be at the start.
+        // This prevents matching `uid=` inside another attribute's value
+        // (e.g., `desc='contains uid="fake"'`).
+        if attr_pos > 0 && !haystack[attr_pos - 1].is_ascii_whitespace() {
+            offset = attr_pos + 1;
+            continue;
+        }
 
         let value_start = attr_pos + attr_len;
         if value_start >= search_limit {
@@ -347,5 +357,39 @@ mod tests {
         let xml = br#"<event desc="uid=fake" uid="REAL" time="T">"#;
         let val = extract_xml_attr(xml, b"uid=").unwrap();
         assert_eq!(val, b"REAL");
+    }
+
+    #[test]
+    fn extract_skips_nested_quoted_attr_in_single_quotes() {
+        // uid="nested" appears inside a single-quoted desc value — should be skipped
+        let xml = br#"<event desc='has uid="nested"' uid="REAL" time="T">"#;
+        let val = extract_xml_attr(xml, b"uid=").unwrap();
+        assert_eq!(val, b"REAL");
+    }
+
+    #[test]
+    fn extract_attr_at_start_of_payload() {
+        // Attribute at byte 0 (no preceding whitespace) should still match
+        let xml = br#"uid="VALUE" time="T""#;
+        let val = extract_xml_attr(xml, b"uid=").unwrap();
+        assert_eq!(val, b"VALUE");
+    }
+
+    #[test]
+    fn eviction_removes_expired_entries() {
+        // Use a zero-duration window so all entries expire immediately.
+        let filter = ReplayFilter::with_window(Duration::from_millis(0));
+        // Insert more than EVICT_INTERVAL unique messages to trigger a sweep.
+        for i in 0..1100 {
+            let xml = format!(r#"<event uid="E-{i}" time="T-{i}">"#);
+            let _ = filter.is_replay(xml.as_bytes());
+        }
+        // After eviction with a zero window, all entries should be expired.
+        // The map should be significantly smaller than 1100.
+        assert!(
+            filter.len() < 200,
+            "expected most entries evicted, got {}",
+            filter.len()
+        );
     }
 }

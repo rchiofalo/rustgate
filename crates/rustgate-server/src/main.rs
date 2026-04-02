@@ -150,6 +150,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         nats_publisher: &nats_publisher,
         fed_forward: &fed_forward,
         throttle_config,
+        replay_filter: &replay_filter,
     })?;
 
     #[cfg(not(feature = "websocket"))]
@@ -172,11 +173,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         encoding,
         &nats_publisher,
         &fed_forward,
+        &replay_filter,
     )
     .await?;
 
     // ── UDP input listener ──────────────────────────────────────────
-    let udp_shutdown = setup::start_udp(&cli, &router, &nats_publisher, &fed_forward).await?;
+    let udp_shutdown =
+        setup::start_udp(&cli, &router, &nats_publisher, &fed_forward, &replay_filter).await?;
 
     // ── Accept loop ─────────────────────────────────────────────────
     loop {

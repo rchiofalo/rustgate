@@ -19,7 +19,7 @@ multiple times.
    from the first 512 bytes of the CoT XML payload.
 2. These values are hashed together to form a message key.
 3. If the key was already seen within the configured window, the message
-   is dropped and a structured warning is logged.
+   is dropped and a debug-level log entry is emitted.
 4. Non-CoT payloads (where uid/time cannot be extracted) always pass
    through to avoid dropping unknown traffic.
 5. Expired entries are periodically evicted to bound memory usage.
@@ -37,7 +37,7 @@ multiple times.
    curl -s http://localhost:9090/metrics | grep replayed
    ```
 
-2. Check logs for replay warnings:
+2. Check logs for replay messages (requires debug-level logging):
    ```bash
    kubectl logs deploy/rustgate | grep "replay detected"
    ```
@@ -62,9 +62,10 @@ multiple times.
   minute), memory usage is negligible. Entries are automatically evicted
   after the window expires.
 
-- **Large deployments**: The filter is shared across all TLS and plaintext
-  TCP sessions on the same server instance. For multi-instance deployments
-  behind a load balancer, each instance maintains its own filter.
+- **Large deployments**: The filter is shared across all transport types
+  (TLS, plaintext TCP, UDP, and WebSocket sessions) on the same server
+  instance. For multi-instance deployments behind a load balancer, each
+  instance maintains its own filter.
 
 ## Disabling
 
