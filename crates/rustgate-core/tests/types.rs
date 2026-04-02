@@ -16,7 +16,7 @@ use rustgate_core::protocol::{FramingStrategy, HeaderSize};
 // ---------------------------------------------------------------------------
 
 fn make_groups(names: &[&str]) -> BTreeSet<GroupId> {
-    names.iter().map(|s| (*s).to_string()).collect()
+    names.iter().map(|s| s.to_string()).collect()
 }
 
 fn make_identity(cn: &str, fp: &str, groups: &[&str]) -> Identity {
@@ -255,10 +255,9 @@ fn routable_message_clone() {
 #[test]
 fn destination_group_name_preservation() {
     let dest = Destination::Group("team-bravo".to_string());
-    if let Destination::Group(name) = &dest {
-        assert_eq!(name, "team-bravo");
-    } else {
-        panic!("expected Group variant");
+    match &dest {
+        Destination::Group(name) => assert_eq!(name, "team-bravo"),
+        other => panic!("expected Group variant, got {other:?}"),
     }
 }
 
@@ -266,10 +265,9 @@ fn destination_group_name_preservation() {
 fn destination_direct_identity_equality() {
     let id = make_identity("alice", "fp", &["Alpha"]);
     let dest = Destination::Direct(id.clone());
-    if let Destination::Direct(inner) = &dest {
-        assert_eq!(inner, &id);
-    } else {
-        panic!("expected Direct variant");
+    match &dest {
+        Destination::Direct(inner) => assert_eq!(inner, &id),
+        other => panic!("expected Direct variant, got {other:?}"),
     }
 }
 
@@ -328,10 +326,9 @@ fn message_type_all_variants() {
 #[test]
 fn message_type_other_preserves_string() {
     let mt = MessageType::Other("my-protocol".to_string());
-    if let MessageType::Other(s) = &mt {
-        assert_eq!(s, "my-protocol");
-    } else {
-        panic!("expected Other variant");
+    match &mt {
+        MessageType::Other(s) => assert_eq!(s, "my-protocol"),
+        other => panic!("expected Other variant, got {other:?}"),
     }
 }
 
