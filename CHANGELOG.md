@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-04-01
+
+### Added
+
+- **TLS handshake concurrency limiting** — configurable semaphore to bound concurrent TLS handshakes and prevent resource exhaustion (#345)
+- **CRL freshness validation** — warn on stale CRLs whose `nextUpdate` has passed; configurable via `--crl-warn-stale` (#347)
+- **Configurable TLS version minimum** — `--tls-min-version` flag to enforce TLS 1.3-only mode; key usage validation on client certificates (#348)
+- **Per-connection WebSocket rate limiting** — reuses `--client-message-rate` and `--client-burst` config for WebSocket sessions (#346)
+- **NATS mTLS support** — client certificate authentication for NATS broker connections via `NatsTlsConfig` (#342)
+- **Sensitive data masking** — `mask_cert_serial`, `mask_ip`, `mask_credential` utilities for structured log fields (#343)
+- **Security audit events** — CRL reload, enrollment certificate issued, rate limit triggered, TLS handshake failed audit events (#343)
+- **Identity validation** — `Identity::new()` returns `Result` with validation errors for empty CN/fingerprint (#334)
+- **Structured fuzzing** — `Arbitrary` trait implementations behind `fuzz` feature flag for `RoutableMessage` and `CotEvent` (#341)
+- **Fuzz targets** — JWT parse, CSR parse, NATS wire event, WebSocket frame, CRL parse, and protobuf roundtrip fuzz targets (#344)
+- **Image digest pinning** — Helm deployment supports `image.digest` for immutable container references (#340)
+- **NetworkPolicy** — Helm template for network-level pod isolation, enabled in production values (#340)
+- **Integration tests** — 150+ new tests across core types, proto codec, server CLI/TLS, and feature gates (#359, #361, #362, #363)
+- **1100+ tests** — up from 887 in v0.4.0
+
+### Fixed
+
+- **Position cache memory exhaustion** — bounded cache size prevents unbounded growth (#316)
+- **JWT revocation cache memory exhaustion** — bounded cache with LRU eviction (#315)
+- **ClientThrottle integer overflow** — prevent token refill overflow on long-running connections (#317)
+- **Federation forward lock contention** — snapshot client list to reduce hold time during message forwarding (#318)
+- **Helm image tag** — corrected to match workspace version (#319)
+- **Workspace dependency inheritance** — enforced for socket2, prost-build, tikv-jemallocator (#320)
+- **Certificate field sanitization** — escape JSONL output and bound NATS token length (#322)
+- **Enrollment rate limiter pruning** — periodic cleanup of expired entries; URL-decode query parameters (#321)
+- **JWT HMAC implementation** — replaced custom HMAC with `hmac` crate; enforce minimum secret length (#323)
+- **Silent message drops** — added structured logging for dropped messages in router and federation (#324)
+- **Async archive I/O** — moved archive writes off the async event loop; removed `block_on` from federation tests (#325)
+- **Dead metrics code** — removed unreachable metrics paths; added `Display` impls; fixed CRL serial number formatting (#330)
+- **Group membership bounds** — limit groups per CN and federation peer to prevent resource abuse (#332)
+- **Hot-path heap allocation** — eliminated per-message allocations in routing; added HashMap capacity hints (#333)
+- **`expect()` calls** — replaced remaining `expect()` in federation and server with fallible alternatives (#339)
+- **Bounded HA channels** — federation HA peer event channels capped at 256 to prevent unbounded queue growth (#338)
+
+### Changed
+
+- **Structured error types** — `RustgateError::Transport(String)` and `Config(String)` replaced with `TransportError` and `ConfigError` sub-enums for precise error matching (#350)
+- **PeerId and ServerName newtypes** — strongly-typed identifiers replace loose `String` usage across federation, server, and audit code (#351)
+- **Centralized constants** — duplicated timeout and buffer constants extracted to `rustgate_core::constants` (#349)
+- **Shared TCP keepalive** — `configure_tcp_keepalive()` extracted to `rustgate_core::net`, replacing 4 identical implementations (#354)
+- **Shared PEM parsing** — `parse_certs`, `parse_key`, `parse_ca_store` extracted to `rustgate_transport::pem` module (#353)
+- **Reconnection utilities** — `backoff_delay` and `should_stop_reconnecting` consolidated into `rustgate_federation::reconnect` (#352)
+- **Federation module splits** — `v2/convert.rs` split into `cot_to_event`, `routable_message`, `timestamps` submodules (#358); `api.rs` split into `handlers`, `helpers`, `types` submodules (#357); callback creation extracted to helpers (#355)
+- **Enrollment module split** — `server.rs` split into `handlers/sign`, `handlers/api`, `handlers/packages`, `handlers/util` (#356)
+- **Test helper consolidation** — shared TLS helpers in `rustgate_test_utils::tls` replace duplicated code across 6 test files (#360)
+- **Safe indexing** — replaced pointer arithmetic in enrollment with safe slice indexing (#336)
+- **Dependency migration** — migrated from `rustls-pemfile` to `rustls-pki-types` PEM parsing (#335)
+
+### Security
+
+- **CI workflow hardening** — minimal token permissions, credential isolation, harden-runner, dependency-review, cargo-auditable (#206, #331)
+- **CodeQL SAST** — static analysis scanning with pinned Trivy download (#214)
+- **Nightly security scanning** — auto-create issues for dependency vulnerabilities; container image scanning (#210, #212)
+- **aws-lc-rs vulnerability fix** — updated aws-lc-rs to resolve 3 HIGH severity CVEs (#208)
+- **SECURITY.md** — updated supported versions and environment variable references (#337)
+
 ## [0.4.0] - 2026-03-06
 
 ### Added
