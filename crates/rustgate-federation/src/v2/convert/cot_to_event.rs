@@ -1,60 +1,15 @@
-//! Conversion between CoT XML, RoutableMessage, and V2 FederatedEvent types.
+//! CoT XML ↔ `FederatedEvent` (proto) conversions.
 //!
-//! Provides bidirectional conversions for the V2 gRPC federation protocol:
-//! - CoT XML ↔ `FederatedEvent` (proto)
-//! - `RoutableMessage` ↔ `FederatedEvent` (for routing through the manager)
-//!
-//! All XML parsing delegates to `rustgate-proto` for security-validated parsing.
+//! Converts between raw CoT XML bytes and the V2 gRPC `FederatedEvent`
+//! protobuf type, including flow-tag injection and contact-list entry
+//! generation.
 
-use std::collections::BTreeSet;
-use std::time::{Duration, SystemTime};
-
-use bytes::Bytes;
-use rustgate_core::identity::{GroupId, Identity};
-use rustgate_core::message::{
-    Destination, MessageType, Metadata, RoutableMessage, SOURCE_FEDERATION,
-};
-use rustgate_proto::convert::timestamp::{iso8601_to_millis, millis_to_iso8601};
 use rustgate_proto::{FullCotEvent, parse_full};
 
 use super::proto::figpb;
+use super::timestamps::{format_timestamp_millis, parse_timestamp_millis};
+use super::{ConvertError, write_attr, xml_escape};
 use crate::provenance::FederationMetadata;
-
-/// Errors that can occur during format conversion.
-#[derive(Debug)]
-pub enum ConvertError {
-    /// XML parsing failed.
-    Xml(String),
-    /// A required field was missing in the source data.
-    MissingField(&'static str),
-    /// A field value is invalid.
-    InvalidField(String),
-    /// Timestamp conversion failed.
-    InvalidTimestamp(String),
-}
-
-impl std::fmt::Display for ConvertError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Xml(msg) => write!(f, "xml parse error: {msg}"),
-            Self::MissingField(field) => write!(f, "missing required field: {field}"),
-            Self::InvalidField(msg) => write!(f, "invalid field: {msg}"),
-            Self::InvalidTimestamp(msg) => write!(f, "invalid timestamp: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for ConvertError {}
-
-impl From<rustgate_proto::ProtoError> for ConvertError {
-    fn from(e: rustgate_proto::ProtoError) -> Self {
-        match e {
-            rustgate_proto::ProtoError::MissingField(f) => Self::MissingField(f),
-            rustgate_proto::ProtoError::InvalidTimestamp(s) => Self::InvalidTimestamp(s),
-            other => Self::Xml(other.to_string()),
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // CoT XML → FederatedEvent
@@ -100,21 +55,9 @@ pub fn xml_to_federated_event(
 
 /// Build a `GeoEvent` from a fully parsed CoT XML event.
 fn full_cot_to_geo_event(full: &FullCotEvent) -> Result<figpb::GeoEvent, ConvertError> {
-    let send_time = if full.time.is_empty() {
-        0
-    } else {
-        iso8601_to_millis(&full.time)? as i64
-    };
-    let start_time = if full.start.is_empty() {
-        0
-    } else {
-        iso8601_to_millis(&full.start)? as i64
-    };
-    let stale_time = if full.stale.is_empty() {
-        0
-    } else {
-        iso8601_to_millis(&full.stale)? as i64
-    };
+    let send_time = parse_timestamp_millis(&full.time)?;
+    let start_time = parse_timestamp_millis(&full.start)?;
+    let stale_time = parse_timestamp_millis(&full.stale)?;
 
     Ok(figpb::GeoEvent {
         send_time,
@@ -191,14 +134,17 @@ pub fn federated_event_to_xml(event: &figpb::FederatedEvent) -> Result<Vec<u8>, 
     write_attr(&mut xml, "type", &geo.r#type);
 
     // Timestamps
-    if geo.send_time > 0 {
-        write_attr(&mut xml, "time", &millis_to_iso8601(geo.send_time as u64));
+    let time_str = format_timestamp_millis(geo.send_time);
+    if !time_str.is_empty() {
+        write_attr(&mut xml, "time", &time_str);
     }
-    if geo.start_time > 0 {
-        write_attr(&mut xml, "start", &millis_to_iso8601(geo.start_time as u64));
+    let start_str = format_timestamp_millis(geo.start_time);
+    if !start_str.is_empty() {
+        write_attr(&mut xml, "start", &start_str);
     }
-    if geo.stale_time > 0 {
-        write_attr(&mut xml, "stale", &millis_to_iso8601(geo.stale_time as u64));
+    let stale_str = format_timestamp_millis(geo.stale_time);
+    if !stale_str.is_empty() {
+        write_attr(&mut xml, "stale", &stale_str);
     }
 
     if !geo.access.is_empty() {
@@ -275,176 +221,6 @@ pub fn federated_event_to_xml(event: &figpb::FederatedEvent) -> Result<Vec<u8>, 
 
     xml.extend_from_slice(b"</event>");
     Ok(xml)
-}
-
-// ---------------------------------------------------------------------------
-// RoutableMessage → FederatedEvent
-// ---------------------------------------------------------------------------
-
-/// Convert a `RoutableMessage` (with XML payload) into a `FederatedEvent`.
-///
-/// The source identity's groups are merged with any groups found in the
-/// CoT XML detail section to form the `federate_groups` list.
-pub fn routable_to_federated_event(
-    msg: &RoutableMessage,
-    metadata: &FederationMetadata,
-) -> Result<figpb::FederatedEvent, ConvertError> {
-    let mut event = xml_to_federated_event(&msg.payload, metadata)?;
-
-    // Merge source identity groups into federate_groups
-    for group in &msg.source.groups {
-        if !event.federate_groups.contains(group) {
-            event.federate_groups.push(group.clone());
-        }
-    }
-
-    // If destination is a specific group, ensure it's in federate_groups
-    if let Destination::Group(ref group_id) = msg.destination
-        && !event.federate_groups.contains(group_id)
-    {
-        event.federate_groups.push(group_id.clone());
-    }
-
-    Ok(event)
-}
-
-// ---------------------------------------------------------------------------
-// FederatedEvent → RoutableMessage
-// ---------------------------------------------------------------------------
-
-/// Convert a `FederatedEvent` into a `RoutableMessage` with an XML payload.
-///
-/// Creates an identity from the peer's certificate information and determines
-/// the destination from the event's `federate_groups`.
-pub fn federated_event_to_routable(
-    event: &figpb::FederatedEvent,
-    peer_cn: &str,
-    peer_fingerprint: &str,
-) -> Result<RoutableMessage, ConvertError> {
-    let xml = federated_event_to_xml(event)?;
-
-    // Build source identity from peer cert info + event groups
-    let groups: BTreeSet<GroupId> = event.federate_groups.iter().cloned().collect();
-
-    let source = if peer_fingerprint.is_empty() {
-        Identity::plaintext(peer_cn.to_string(), groups)
-    } else {
-        Identity::new(peer_cn.to_string(), peer_fingerprint.to_string(), groups)
-    }
-    .map_err(|e| ConvertError::InvalidField(format!("invalid peer identity: {e}")))?;
-
-    // Determine destination: if exactly one group, route to that group;
-    // otherwise broadcast to all
-    let destination = if event.federate_groups.len() == 1 {
-        Destination::Group(event.federate_groups[0].clone())
-    } else {
-        Destination::Broadcast
-    };
-
-    // Infer message type from CoT type attribute
-    let message_type = event
-        .event
-        .as_ref()
-        .map(|geo| infer_message_type(&geo.r#type))
-        .unwrap_or(MessageType::Other("unknown".to_string()));
-
-    // Compute TTL from start/stale times if available
-    let ttl = event.event.as_ref().and_then(|geo| {
-        if geo.stale_time > 0 && geo.start_time > 0 && geo.stale_time > geo.start_time {
-            let diff_ms = (geo.stale_time - geo.start_time) as u64;
-            Some(Duration::from_millis(diff_ms))
-        } else {
-            None
-        }
-    });
-
-    Ok(RoutableMessage {
-        source,
-        destination,
-        payload: Bytes::from(xml),
-        metadata: Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: SOURCE_FEDERATION.to_string(),
-            message_type,
-            ttl,
-        },
-    })
-}
-
-// ---------------------------------------------------------------------------
-// FederationMetadata ↔ FederatedEvent provenance
-// ---------------------------------------------------------------------------
-
-/// Extract `FederationMetadata` from a `FederatedEvent`'s provenance fields.
-pub fn extract_metadata(event: &figpb::FederatedEvent) -> FederationMetadata {
-    let provenance = event
-        .federate_provenance
-        .iter()
-        .map(|p| crate::provenance::FederateProvenance {
-            server_id: rustgate_core::PeerId::new(&p.federation_server_id),
-            server_name: rustgate_core::ServerName::new(&p.federation_server_name),
-        })
-        .collect();
-
-    let (max_hops, current_hops) = event
-        .federate_hops
-        .as_ref()
-        .map(|h| (h.max_hops as u32, h.current_hops as u32))
-        .unwrap_or((10, 0));
-
-    FederationMetadata {
-        provenance,
-        max_hops,
-        current_hops,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Infer the message type from a CoT type string.
-fn infer_message_type(cot_type: &str) -> MessageType {
-    if cot_type.starts_with("a-") {
-        MessageType::Position
-    } else if cot_type.starts_with("b-t-f") {
-        MessageType::Chat
-    } else if cot_type.starts_with("b-a") {
-        MessageType::Alert
-    } else {
-        MessageType::Other(cot_type.to_string())
-    }
-}
-
-/// Write an XML attribute (`name="value"`) with proper escaping.
-fn write_attr(xml: &mut Vec<u8>, name: &str, value: &str) {
-    xml.push(b' ');
-    xml.extend_from_slice(name.as_bytes());
-    xml.extend_from_slice(b"=\"");
-    xml_escape_into(xml, value);
-    xml.push(b'"');
-}
-
-/// Escape special XML characters in attribute values.
-fn xml_escape_into(buf: &mut Vec<u8>, s: &str) {
-    for b in s.bytes() {
-        match b {
-            b'&' => buf.extend_from_slice(b"&amp;"),
-            b'<' => buf.extend_from_slice(b"&lt;"),
-            b'>' => buf.extend_from_slice(b"&gt;"),
-            b'"' => buf.extend_from_slice(b"&quot;"),
-            b'\'' => buf.extend_from_slice(b"&apos;"),
-            _ => buf.push(b),
-        }
-    }
-}
-
-/// Return a string with XML-escaped attribute characters.
-fn xml_escape(s: &str) -> String {
-    let mut buf = Vec::with_capacity(s.len());
-    xml_escape_into(&mut buf, s);
-    // xml_escape_into only emits valid UTF-8 (ASCII replacements for ASCII bytes)
-    String::from_utf8(buf).expect("xml_escape_into produces valid UTF-8")
 }
 
 // ---------------------------------------------------------------------------
@@ -564,7 +340,10 @@ pub fn contact_list_entry_to_xml(contact: &figpb::ContactListEntry) -> Option<Ve
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::panic, clippy::unwrap_used)]
+
     use super::*;
+    use crate::provenance::FederationMetadata;
 
     fn sample_xml() -> &'static [u8] {
         b"<event version=\"2.0\" uid=\"ALPHA-1\" type=\"a-f-G-U-C\" how=\"m-g\" \
@@ -791,251 +570,6 @@ mod tests {
         assert!(xml_str.contains("uid=\"test-uid\""));
     }
 
-    // --- routable_to_federated_event tests ---
-
-    #[test]
-    fn routable_to_event_merges_source_groups() {
-        let mut groups = BTreeSet::new();
-        let _ = groups.insert("Alpha".to_string());
-        let _ = groups.insert("Bravo".to_string());
-
-        let msg = RoutableMessage {
-            source: Identity::new("test-peer".into(), "abc123".into(), groups)
-                .expect("valid identity"),
-            destination: Destination::Broadcast,
-            payload: Bytes::from_static(sample_xml()),
-            metadata: Metadata {
-                received_at: SystemTime::now(),
-                source_protocol: SOURCE_FEDERATION.to_string(),
-                message_type: MessageType::Position,
-                ttl: None,
-            },
-        };
-
-        let event = routable_to_federated_event(&msg, &empty_metadata()).expect("conversion");
-
-        // Should contain "Cyan" from XML + "Alpha" and "Bravo" from source
-        assert!(event.federate_groups.contains(&"Cyan".to_string()));
-        assert!(event.federate_groups.contains(&"Alpha".to_string()));
-        assert!(event.federate_groups.contains(&"Bravo".to_string()));
-    }
-
-    #[test]
-    fn routable_to_event_includes_destination_group() {
-        let msg = RoutableMessage {
-            source: Identity {
-                cn: "test-peer".into(),
-                fingerprint: "abc123".into(),
-                groups: BTreeSet::new(),
-            },
-            destination: Destination::Group("Delta".to_string()),
-            payload: Bytes::from_static(sample_xml()),
-            metadata: Metadata {
-                received_at: SystemTime::now(),
-                source_protocol: SOURCE_FEDERATION.to_string(),
-                message_type: MessageType::Position,
-                ttl: None,
-            },
-        };
-
-        let event = routable_to_federated_event(&msg, &empty_metadata()).expect("conversion");
-        assert!(event.federate_groups.contains(&"Delta".to_string()));
-    }
-
-    // --- federated_event_to_routable tests ---
-
-    #[test]
-    fn event_to_routable_source_identity() {
-        let event = xml_to_federated_event(sample_xml(), &empty_metadata()).expect("conversion");
-        let msg =
-            federated_event_to_routable(&event, "peer-1", "fingerprint-abc").expect("conversion");
-        assert_eq!(msg.source.cn, "peer-1");
-        assert_eq!(msg.source.fingerprint, "fingerprint-abc");
-    }
-
-    #[test]
-    fn event_to_routable_source_protocol() {
-        let event = xml_to_federated_event(sample_xml(), &empty_metadata()).expect("conversion");
-        let msg = federated_event_to_routable(&event, "peer-1", "fp").expect("conversion");
-        assert_eq!(msg.metadata.source_protocol, SOURCE_FEDERATION);
-    }
-
-    #[test]
-    fn event_to_routable_message_type_position() {
-        let event = xml_to_federated_event(sample_xml(), &empty_metadata()).expect("conversion");
-        let msg = federated_event_to_routable(&event, "peer-1", "fp").expect("conversion");
-        assert_eq!(msg.metadata.message_type, MessageType::Position);
-    }
-
-    #[test]
-    fn event_to_routable_single_group_routes_to_group() {
-        let event = figpb::FederatedEvent {
-            event: Some(figpb::GeoEvent {
-                uid: "test".into(),
-                r#type: "a-f-G".into(),
-                ..Default::default()
-            }),
-            federate_groups: vec!["OnlyGroup".into()],
-            ..Default::default()
-        };
-        let msg = federated_event_to_routable(&event, "peer", "fp").expect("conversion");
-        assert!(
-            matches!(&msg.destination, Destination::Group(g) if g == "OnlyGroup"),
-            "expected Group(OnlyGroup) destination"
-        );
-    }
-
-    #[test]
-    fn event_to_routable_multiple_groups_broadcasts() {
-        let event = figpb::FederatedEvent {
-            event: Some(figpb::GeoEvent {
-                uid: "test".into(),
-                r#type: "a-f-G".into(),
-                ..Default::default()
-            }),
-            federate_groups: vec!["A".into(), "B".into()],
-            ..Default::default()
-        };
-        let msg = federated_event_to_routable(&event, "peer", "fp").expect("conversion");
-        assert!(matches!(msg.destination, Destination::Broadcast));
-    }
-
-    #[test]
-    fn event_to_routable_ttl_computed_from_timestamps() {
-        let event = figpb::FederatedEvent {
-            event: Some(figpb::GeoEvent {
-                uid: "test".into(),
-                r#type: "a-f-G".into(),
-                start_time: 1000000,
-                stale_time: 1300000, // 300 seconds later
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let msg = federated_event_to_routable(&event, "peer", "fp").expect("conversion");
-        let ttl = msg.metadata.ttl.expect("should have ttl");
-        assert_eq!(ttl, Duration::from_millis(300000));
-    }
-
-    #[test]
-    fn event_to_routable_no_ttl_when_no_timestamps() {
-        let event = figpb::FederatedEvent {
-            event: Some(figpb::GeoEvent {
-                uid: "test".into(),
-                r#type: "a-f-G".into(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let msg = federated_event_to_routable(&event, "peer", "fp").expect("conversion");
-        assert!(msg.metadata.ttl.is_none());
-    }
-
-    #[test]
-    fn event_to_routable_groups_in_identity() {
-        let event = figpb::FederatedEvent {
-            event: Some(figpb::GeoEvent {
-                uid: "test".into(),
-                r#type: "a-f-G".into(),
-                ..Default::default()
-            }),
-            federate_groups: vec!["X".into(), "Y".into()],
-            ..Default::default()
-        };
-        let msg = federated_event_to_routable(&event, "peer", "fp").expect("conversion");
-        assert!(msg.source.groups.contains("X"));
-        assert!(msg.source.groups.contains("Y"));
-    }
-
-    // --- extract_metadata tests ---
-
-    #[test]
-    fn extract_metadata_empty_event() {
-        let event = figpb::FederatedEvent::default();
-        let meta = extract_metadata(&event);
-        assert!(meta.provenance.is_empty());
-        assert_eq!(meta.max_hops, 10);
-        assert_eq!(meta.current_hops, 0);
-    }
-
-    #[test]
-    fn extract_metadata_with_provenance() {
-        let event = figpb::FederatedEvent {
-            federate_provenance: vec![
-                figpb::FederateProvenance {
-                    federation_server_id: "s1".into(),
-                    federation_server_name: "S One".into(),
-                },
-                figpb::FederateProvenance {
-                    federation_server_id: "s2".into(),
-                    federation_server_name: "S Two".into(),
-                },
-            ],
-            federate_hops: Some(figpb::FederateHops {
-                max_hops: 5,
-                current_hops: 2,
-            }),
-            ..Default::default()
-        };
-        let meta = extract_metadata(&event);
-        assert_eq!(meta.provenance.len(), 2);
-        assert_eq!(meta.provenance[0].server_id.as_str(), "s1");
-        assert_eq!(meta.provenance[1].server_id.as_str(), "s2");
-        assert_eq!(meta.max_hops, 5);
-        assert_eq!(meta.current_hops, 2);
-    }
-
-    // --- infer_message_type tests ---
-
-    #[test]
-    fn infer_message_type_position() {
-        assert_eq!(infer_message_type("a-f-G-U-C"), MessageType::Position);
-        assert_eq!(infer_message_type("a-h-G"), MessageType::Position);
-    }
-
-    #[test]
-    fn infer_message_type_chat() {
-        assert_eq!(infer_message_type("b-t-f"), MessageType::Chat);
-    }
-
-    #[test]
-    fn infer_message_type_alert() {
-        assert_eq!(infer_message_type("b-a-g"), MessageType::Alert);
-    }
-
-    #[test]
-    fn infer_message_type_other() {
-        assert_eq!(
-            infer_message_type("t-x-c-t"),
-            MessageType::Other("t-x-c-t".to_string())
-        );
-    }
-
-    // --- XML escaping tests ---
-
-    #[test]
-    fn xml_escape_special_characters() {
-        let mut buf = Vec::new();
-        xml_escape_into(&mut buf, "A&B<C>D\"E'F");
-        assert_eq!(
-            String::from_utf8(buf).expect("utf8"),
-            "A&amp;B&lt;C&gt;D&quot;E&apos;F"
-        );
-    }
-
-    #[test]
-    fn xml_escape_no_special_characters() {
-        let mut buf = Vec::new();
-        xml_escape_into(&mut buf, "plain text 123");
-        assert_eq!(String::from_utf8(buf).expect("utf8"), "plain text 123");
-    }
-
-    #[test]
-    fn xml_escape_string_helper() {
-        assert_eq!(xml_escape("A&B"), "A&amp;B");
-        assert_eq!(xml_escape("plain"), "plain");
-    }
-
     // --- Round-trip conversion tests ---
 
     #[test]
@@ -1094,38 +628,6 @@ mod tests {
         assert_eq!(recv_geo.screen_name, orig_geo.screen_name);
         assert_eq!(recv_geo.group_name, orig_geo.group_name);
         assert_eq!(recv_geo.battery, orig_geo.battery);
-    }
-
-    #[test]
-    fn full_round_trip_routable_to_event_to_routable() {
-        let source_groups: BTreeSet<GroupId> = ["Alpha".to_string()].into_iter().collect();
-
-        let msg = RoutableMessage {
-            source: Identity::new("test-server".into(), "fp-abc".into(), source_groups)
-                .expect("valid identity"),
-            destination: Destination::Group("Alpha".to_string()),
-            payload: Bytes::from_static(sample_xml()),
-            metadata: Metadata {
-                received_at: SystemTime::now(),
-                source_protocol: SOURCE_FEDERATION.to_string(),
-                message_type: MessageType::Position,
-                ttl: None,
-            },
-        };
-
-        let event = routable_to_federated_event(&msg, &sample_metadata()).expect("to event");
-
-        // Verify groups merged
-        assert!(event.federate_groups.contains(&"Cyan".to_string()));
-        assert!(event.federate_groups.contains(&"Alpha".to_string()));
-
-        // Convert back
-        let msg_back =
-            federated_event_to_routable(&event, "peer-x", "fp-xyz").expect("to routable");
-
-        assert_eq!(msg_back.source.cn, "peer-x");
-        assert_eq!(msg_back.metadata.source_protocol, SOURCE_FEDERATION);
-        assert_eq!(msg_back.metadata.message_type, MessageType::Position);
     }
 
     // --- add_flow_tag tests ---
