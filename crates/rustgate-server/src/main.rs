@@ -213,7 +213,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                             throttle_config: tc,
                             archiver: arch,
                         };
-                        drop(tokio::spawn(session::handle_session(session, deps, permit)));
+                        setup::spawn_background("tls-session", session::handle_session(session, deps, permit));
                     }
                     Err(e) => {
                         #[cfg(feature = "metrics")]

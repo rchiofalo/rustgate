@@ -252,7 +252,7 @@ pub(crate) async fn start_enrollment(
     if let Some(ref pkg_dir) = cli.data_package_dir {
         let store = rustgate_enrollment::DataPackageStore::new(std::path::PathBuf::from(pkg_dir))
             .await
-            .map_err(|e| anyhow::anyhow!("data package store: {e}"))?;
+            .context("initializing data package store")?;
         enrollment_server = enrollment_server.with_packages(store);
         tracing::info!(dir = %pkg_dir, "data package storage enabled");
     }
@@ -296,7 +296,7 @@ pub(crate) fn start_metrics(
     ready: &Arc<AtomicBool>,
     #[cfg(feature = "federation")] fed_api_slot: &Arc<std::sync::OnceLock<metrics::FedApiHandler>>,
 ) -> anyhow::Result<()> {
-    metrics::init().map_err(|e| anyhow::anyhow!("failed to register metrics: {e}"))?;
+    metrics::init().context("registering metrics")?;
 
     if let Some(ref metrics_bind) = cli.metrics_bind {
         let bind_addr: std::net::SocketAddr = metrics_bind
@@ -520,7 +520,7 @@ pub(crate) async fn start_federation(
     let router_for_fed = Arc::clone(router);
     let on_inbound: rustgate_federation::manager::OnInbound = Arc::new(move |peer_cn, payload| {
         let router = Arc::clone(&router_for_fed);
-        drop(tokio::spawn(async move {
+        spawn_background("federation-inbound", async move {
             let identity = match Identity::plaintext(peer_cn.clone(), BTreeSet::new()) {
                 Ok(id) => id,
                 Err(e) => {
@@ -540,7 +540,7 @@ pub(crate) async fn start_federation(
                 },
             };
             router.route(msg).await;
-        }));
+        });
     });
 
     manager
@@ -560,10 +560,10 @@ pub(crate) async fn start_federation(
     let rwlock_for_forward = Arc::clone(&rwlock);
     let forward_fn: FedForwardFn = Arc::new(move |payload, groups| {
         let inner = Arc::clone(&rwlock_for_forward);
-        drop(tokio::spawn(async move {
+        spawn_background("federation-forward", async move {
             let mgr = inner.read().await;
             let _ = mgr.forward(payload, &groups).await;
-        }));
+        });
     });
 
     Ok((Some(forward_fn), Some(rwlock)))
@@ -642,7 +642,9 @@ pub(crate) fn start_websocket<P: NatsPublish + Send + Sync + 'static>(
                 .map(|p| -> rustgate_websocket::OnNatsPublish {
                     Arc::new(move |msg| {
                         let p = p.clone();
-                        drop(tokio::spawn(async move { p.publish(&msg).await }));
+                        spawn_background("ws-nats-publish", async move {
+                            p.publish(&msg).await;
+                        });
                     })
                 })
         }
@@ -778,7 +780,9 @@ pub(crate) async fn start_udp<P: NatsPublish + Send + Sync + 'static>(
                 .map(|p| -> rustgate_transport::udp::OnNatsPublish {
                     Arc::new(move |msg| {
                         let p = p.clone();
-                        drop(tokio::spawn(async move { p.publish(&msg).await }));
+                        spawn_background("udp-nats-publish", async move {
+                            p.publish(&msg).await;
+                        });
                     })
                 })
         }
