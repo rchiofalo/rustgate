@@ -35,3 +35,15 @@ topologySpreadConstraints:
     labelSelector:
       matchLabels:
         app.kubernetes.io/name: rustgate
+
+# External Secrets Operator — uncomment and configure for production.
+# Requires ESO CRDs: https://external-secrets.io/
+# externalSecrets:
+#   enabled: true
+#   secretStoreRef:
+#     name: production-store
+#     kind: ClusterSecretStore
+#   nats:
+#     enabled: true
+#     remoteRef:
+#       key: "production/rustgate/nats-credentials"

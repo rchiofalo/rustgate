@@ -186,10 +186,7 @@ spec:
             - name: FEDERATION_STORE_PATH
               value: {{ .Values.federation.storePath | quote }}
             {{- end }}
-            {{- if and .Values.externalSecrets.enabled .Values.externalSecrets.federation.enabled }}
-            - name: FEDERATION_PEERS_FILE
-              value: /etc/federation/peers.json
-            {{- else if .Values.federation.existingSecret }}
+            {{- if (include "rustgate.federationSecretEnabled" .) }}
             - name: FEDERATION_PEERS_FILE
               value: /etc/federation/peers.json
             {{- else if .Values.federation.peersFile }}
@@ -259,7 +256,7 @@ spec:
             - name: tls-certs
               mountPath: /certs
               readOnly: true
-            {{- if and .Values.federation.enabled (or .Values.federation.existingSecret (and .Values.externalSecrets.enabled .Values.externalSecrets.federation.enabled)) }}
+            {{- if and .Values.federation.enabled (include "rustgate.federationSecretEnabled" .) }}
             - name: federation-peers
               mountPath: /etc/federation
               readOnly: true
@@ -282,7 +279,7 @@ spec:
         - name: tls-certs
           secret:
             secretName: {{ .Values.tls.secretName }}
-        {{- if and .Values.federation.enabled (or .Values.federation.existingSecret (and .Values.externalSecrets.enabled .Values.externalSecrets.federation.enabled)) }}
+        {{- if and .Values.federation.enabled (include "rustgate.federationSecretEnabled" .) }}
         - name: federation-peers
           secret:
             {{- if and .Values.externalSecrets.enabled .Values.externalSecrets.federation.enabled }}

@@ -30,5 +30,12 @@ TAK service:
   kubectl port-forward svc/{{ include "rustgate.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
   {{- end }}
 
+{{- if .Values.externalSecrets.enabled }}
+
+External Secrets:
+  ExternalSecret resources have been created. Verify sync status:
+  kubectl get externalsecrets -l app.kubernetes.io/instance={{ .Release.Name }}
+{{- end }}
+
 TLS certificates:
   Ensure the '{{ .Values.tls.secretName }}' Secret exists with server.crt, server.key, and ca.crt.

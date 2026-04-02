@@ -35,7 +35,7 @@ nats:
   # Helm release metadata and may appear in logs, version control, or CI output.
   credentials: ""
   # Name of an existing K8s Secret containing a NATS_CREDENTIALS key.
-  # When set, takes precedence over the plain-text credentials value above.
+  # Takes precedence over plaintext credentials. ExternalSecrets take precedence over this.
   existingSecret: ""
 
 enrollment:
@@ -50,7 +50,8 @@ enrollment:
   password: ""        # HTTP Basic Auth password (ENROLLMENT_PASSWORD)
   caOrganization: ""  # Organization for issued certs (RUSTGATE_CA_ORG)
   # Name of an existing K8s Secret containing ENROLLMENT_USER and
-  # ENROLLMENT_PASSWORD keys. When set, takes precedence over plain-text values.
+  # ENROLLMENT_PASSWORD keys. Takes precedence over plaintext values.
+  # ExternalSecrets take precedence over this.
   existingSecret: ""
 
 websocket:
@@ -81,7 +82,8 @@ federation:
   # Expected format: [{"id":"peer-1","address":"10.0.0.1:9001","groups":["Alpha"],...}]
   peersFile: ""
   # Name of an existing K8s Secret containing a FEDERATION_PEERS_FILE key.
-  # When set, mounts the secret as a file and takes precedence over peersFile.
+  # Mounts the secret as a file; takes precedence over peersFile.
+  # ExternalSecrets take precedence over this.
   existingSecret: ""
 
 dataPackage:
@@ -174,8 +176,8 @@ externalSecrets:
   # NATS credentials ExternalSecret.
   nats:
     enabled: false
-    # Name of the K8s Secret that will be created by the ExternalSecret.
-    # This name is automatically set as nats.existingSecret when enabled.
+    # Name of the K8s Secret that the ESO controller will create and populate.
+    # The deployment references this secret directly (not via nats.existingSecret).
     secretName: rustgate-nats-credentials
     # Remote key/path in the external secret backend.
     remoteRef:
