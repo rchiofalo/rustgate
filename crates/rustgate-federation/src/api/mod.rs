@@ -7,50 +7,60 @@
 //! ## Routes
 //!
 //! ### Connections
-//! - `GET  /api/federation/connections`      — list all active connections
-//! - `GET  /api/federation/connections/{id}`  — get specific connection
+//! - `GET  /api/federation/connections`      -- list all active connections
+//! - `GET  /api/federation/connections/{id}`  -- get specific connection
 //!
 //! ### Federates
-//! - `GET    /api/federation/federates`            — list all configured federates
-//! - `POST   /api/federation/federates`            — add new federate
-//! - `GET    /api/federation/federates/{id}`        — get federate details
-//! - `PUT    /api/federation/federates/{id}`        — update federate
-//! - `DELETE /api/federation/federates/{id}`        — remove federate
-//! - `PUT    /api/federation/federates/{id}/enable`  — enable federate
-//! - `PUT    /api/federation/federates/{id}/disable` — disable federate
-//! - `PUT    /api/federation/federates/{id}/routing-mode` — set routing mode
+//! - `GET    /api/federation/federates`            -- list all configured federates
+//! - `POST   /api/federation/federates`            -- add new federate
+//! - `GET    /api/federation/federates/{id}`        -- get federate details
+//! - `PUT    /api/federation/federates/{id}`        -- update federate
+//! - `DELETE /api/federation/federates/{id}`        -- remove federate
+//! - `PUT    /api/federation/federates/{id}/enable`  -- enable federate
+//! - `PUT    /api/federation/federates/{id}/disable` -- disable federate
+//! - `PUT    /api/federation/federates/{id}/routing-mode` -- set routing mode
 //!
 //! ### Certificates
-//! - `GET    /api/federation/certificates`      — list trusted CA certificates
-//! - `POST   /api/federation/certificates`      — upload CA certificate (PEM body)
-//! - `GET    /api/federation/certificates/{cn}` — get certificate info
-//! - `DELETE /api/federation/certificates/{cn}` — remove certificate
+//! - `GET    /api/federation/certificates`      -- list trusted CA certificates
+//! - `POST   /api/federation/certificates`      -- upload CA certificate (PEM body)
+//! - `GET    /api/federation/certificates/{cn}` -- get certificate info
+//! - `DELETE /api/federation/certificates/{cn}` -- remove certificate
 //!
 //! ### Status
-//! - `GET /api/federation/stats`  — aggregated statistics
-//! - `GET /api/federation/status` — federation manager status
+//! - `GET /api/federation/stats`  -- aggregated statistics
+//! - `GET /api/federation/status` -- federation manager status
+
+mod handlers;
+mod helpers;
+mod types;
 
 use std::sync::Arc;
 
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::{Method, Response, StatusCode};
-use serde::{Deserialize, Serialize};
 
-use crate::config::RoutingMode;
+use self::handlers::{
+    handle_add_certificate, handle_create_federate, handle_delete_certificate,
+    handle_delete_federate, handle_enable_federate, handle_get_certificate, handle_get_connection,
+    handle_get_federate, handle_list_certificates, handle_list_connections, handle_list_federates,
+    handle_set_routing_mode, handle_stats, handle_status, handle_update_federate,
+};
+use self::helpers::{json_error, percent_decode};
+pub use self::types::{CreateFederateRequest, SetRoutingModeRequest, UpdateFederateRequest};
 use crate::manager::FederationStatus;
 use crate::peer::PeerStatus;
-use crate::store::{FederateInfo, FederateStore, FederateUpdate};
+use crate::store::FederateStore;
 use crate::trust_store::TrustStore;
+
+/// Callback type for looking up a peer's status by ID.
+pub type PeerStatusFn = Arc<dyn Fn(&str) -> Option<PeerStatus> + Send + Sync>;
 
 /// Shared state provided to the API handler.
 ///
 /// The caller (e.g., `rustgate-server`) constructs this and passes it
 /// to [`handle_request`] for each incoming HTTP request that matches
 /// the `/api/federation/` prefix.
-/// Callback type for looking up a peer's status by ID.
-pub type PeerStatusFn = Arc<dyn Fn(&str) -> Option<PeerStatus> + Send + Sync>;
-
 pub struct ApiState<S: FederateStore> {
     /// The federation peer store.
     pub store: Arc<std::sync::RwLock<S>>,
@@ -67,59 +77,6 @@ impl<S: FederateStore> std::fmt::Debug for ApiState<S> {
         f.debug_struct("ApiState").finish()
     }
 }
-
-/// Request body for creating a new federate.
-#[derive(Debug, Deserialize)]
-pub struct CreateFederateRequest {
-    pub id: String,
-    pub address: String,
-    #[serde(default)]
-    pub groups: Vec<String>,
-    pub inbound_groups: Option<Vec<String>>,
-    pub outbound_groups: Option<Vec<String>>,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default)]
-    pub is_outbound: bool,
-    pub trust_cert_cn: Option<String>,
-    #[serde(default)]
-    pub routing_mode: RoutingMode,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-/// Request body for updating an existing federate.
-#[derive(Debug, Deserialize)]
-pub struct UpdateFederateRequest {
-    pub address: Option<String>,
-    pub groups: Option<Vec<String>>,
-    pub inbound_groups: Option<Option<Vec<String>>>,
-    pub outbound_groups: Option<Option<Vec<String>>>,
-    pub is_outbound: Option<bool>,
-    pub trust_cert_cn: Option<Option<String>>,
-}
-
-/// Request body for setting routing mode.
-#[derive(Debug, Deserialize)]
-pub struct SetRoutingModeRequest {
-    pub routing_mode: RoutingMode,
-}
-
-/// Standard JSON success envelope.
-#[derive(Debug, Serialize)]
-struct SuccessResponse<T: Serialize> {
-    data: T,
-}
-
-/// Standard JSON error envelope.
-#[derive(Debug, Serialize)]
-struct ErrorResponse {
-    error: String,
-}
-
-// ── HTTP handler ────────────────────────────────────────────────────
 
 /// Handle a federation API request.
 ///
@@ -211,345 +168,9 @@ fn route<S: FederateStore>(
     }
 }
 
-// ── Connection handlers ─────────────────────────────────────────────
-
-fn handle_list_connections<S: FederateStore>(state: &ApiState<S>) -> Response<Full<Bytes>> {
-    let status = (state.status_fn)();
-    json_ok(&status.peers)
-}
-
-fn handle_get_connection<S: FederateStore>(state: &ApiState<S>, id: &str) -> Response<Full<Bytes>> {
-    match (state.peer_status_fn)(id) {
-        Some(peer) => json_ok(&peer),
-        None => json_error(StatusCode::NOT_FOUND, "connection not found"),
-    }
-}
-
-// ── Federate handlers ───────────────────────────────────────────────
-
-fn handle_list_federates<S: FederateStore>(state: &ApiState<S>) -> Response<Full<Bytes>> {
-    match state.store.read() {
-        Ok(store) => json_ok(&store.list()),
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("store lock poisoned: {e}"),
-        ),
-    }
-}
-
-fn handle_create_federate<S: FederateStore>(
-    state: &ApiState<S>,
-    body: &[u8],
-) -> Response<Full<Bytes>> {
-    let req: CreateFederateRequest = match serde_json::from_slice(body) {
-        Ok(r) => r,
-        Err(e) => return json_error(StatusCode::BAD_REQUEST, &format!("invalid JSON: {e}")),
-    };
-
-    if req.id.is_empty() {
-        return json_error(StatusCode::BAD_REQUEST, "id is required");
-    }
-    if req.address.is_empty() {
-        return json_error(StatusCode::BAD_REQUEST, "address is required");
-    }
-
-    let info = FederateInfo {
-        id: req.id.clone(),
-        address: req.address,
-        groups: req.groups,
-        inbound_groups: req.inbound_groups,
-        outbound_groups: req.outbound_groups,
-        enabled: req.enabled,
-        is_outbound: req.is_outbound,
-        trust_cert_cn: req.trust_cert_cn,
-        routing_mode: req.routing_mode,
-        created_at: std::time::SystemTime::now(),
-        last_seen: None,
-        messages_sent: 0,
-        messages_recv: 0,
-    };
-
-    match state.store.write() {
-        Ok(mut store) => {
-            store.add(info.clone());
-            if let Err(e) = store.save() {
-                tracing::warn!(error = %e, "failed to persist store after add");
-            }
-            json_created(&info)
-        }
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("store lock poisoned: {e}"),
-        ),
-    }
-}
-
-fn handle_get_federate<S: FederateStore>(state: &ApiState<S>, id: &str) -> Response<Full<Bytes>> {
-    match state.store.read() {
-        Ok(store) => match store.get(id) {
-            Some(info) => json_ok(&info),
-            None => json_error(StatusCode::NOT_FOUND, "federate not found"),
-        },
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("store lock poisoned: {e}"),
-        ),
-    }
-}
-
-fn handle_update_federate<S: FederateStore>(
-    state: &ApiState<S>,
-    id: &str,
-    body: &[u8],
-) -> Response<Full<Bytes>> {
-    let req: UpdateFederateRequest = match serde_json::from_slice(body) {
-        Ok(r) => r,
-        Err(e) => return json_error(StatusCode::BAD_REQUEST, &format!("invalid JSON: {e}")),
-    };
-
-    let update = FederateUpdate {
-        address: req.address,
-        groups: req.groups,
-        inbound_groups: req.inbound_groups,
-        outbound_groups: req.outbound_groups,
-        is_outbound: req.is_outbound,
-        trust_cert_cn: req.trust_cert_cn,
-    };
-
-    match state.store.write() {
-        Ok(mut store) => match store.update(id, update) {
-            Ok(_) => {
-                if let Err(e) = store.save() {
-                    tracing::warn!(error = %e, "failed to persist store after update");
-                }
-                match store.get(id) {
-                    Some(info) => json_ok(&info),
-                    None => json_error(StatusCode::NOT_FOUND, "federate not found after update"),
-                }
-            }
-            Err(e) => json_error(StatusCode::NOT_FOUND, &format!("{e}")),
-        },
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("store lock poisoned: {e}"),
-        ),
-    }
-}
-
-fn handle_delete_federate<S: FederateStore>(
-    state: &ApiState<S>,
-    id: &str,
-) -> Response<Full<Bytes>> {
-    match state.store.write() {
-        Ok(mut store) => {
-            if store.remove(id) {
-                if let Err(e) = store.save() {
-                    tracing::warn!(error = %e, "failed to persist store after delete");
-                }
-                json_ok(&serde_json::json!({ "deleted": id }))
-            } else {
-                json_error(StatusCode::NOT_FOUND, "federate not found")
-            }
-        }
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("store lock poisoned: {e}"),
-        ),
-    }
-}
-
-fn handle_enable_federate<S: FederateStore>(
-    state: &ApiState<S>,
-    id: &str,
-    enabled: bool,
-) -> Response<Full<Bytes>> {
-    match state.store.write() {
-        Ok(mut store) => match store.set_enabled(id, enabled) {
-            Ok(()) => {
-                if let Err(e) = store.save() {
-                    tracing::warn!(error = %e, "failed to persist store after enable/disable");
-                }
-                match store.get(id) {
-                    Some(info) => json_ok(&info),
-                    None => json_error(StatusCode::NOT_FOUND, "federate not found"),
-                }
-            }
-            Err(e) => json_error(StatusCode::NOT_FOUND, &format!("{e}")),
-        },
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("store lock poisoned: {e}"),
-        ),
-    }
-}
-
-fn handle_set_routing_mode<S: FederateStore>(
-    state: &ApiState<S>,
-    id: &str,
-    body: &[u8],
-) -> Response<Full<Bytes>> {
-    let req: SetRoutingModeRequest = match serde_json::from_slice(body) {
-        Ok(r) => r,
-        Err(e) => return json_error(StatusCode::BAD_REQUEST, &format!("invalid JSON: {e}")),
-    };
-
-    match state.store.write() {
-        Ok(mut store) => match store.set_routing_mode(id, req.routing_mode) {
-            Ok(()) => {
-                if let Err(e) = store.save() {
-                    tracing::warn!(error = %e, "failed to persist store after routing mode change");
-                }
-                match store.get(id) {
-                    Some(info) => json_ok(&info),
-                    None => json_error(StatusCode::NOT_FOUND, "federate not found"),
-                }
-            }
-            Err(e) => json_error(StatusCode::NOT_FOUND, &format!("{e}")),
-        },
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("store lock poisoned: {e}"),
-        ),
-    }
-}
-
-// ── Certificate handlers ────────────────────────────────────────────
-
-fn handle_list_certificates<S: FederateStore>(state: &ApiState<S>) -> Response<Full<Bytes>> {
-    json_ok(&state.trust_store.list_certificates())
-}
-
-fn handle_add_certificate<S: FederateStore>(
-    state: &ApiState<S>,
-    body: &[u8],
-) -> Response<Full<Bytes>> {
-    if body.is_empty() {
-        return json_error(StatusCode::BAD_REQUEST, "PEM body is required");
-    }
-    match state.trust_store.add_certificate_from_pem(body) {
-        Ok(info) => json_created(&info),
-        Err(e) => json_error(StatusCode::BAD_REQUEST, &format!("{e}")),
-    }
-}
-
-fn handle_get_certificate<S: FederateStore>(
-    state: &ApiState<S>,
-    cn: &str,
-) -> Response<Full<Bytes>> {
-    match state.trust_store.get_certificate_info(cn) {
-        Some(info) => json_ok(&info),
-        None => json_error(StatusCode::NOT_FOUND, "certificate not found"),
-    }
-}
-
-fn handle_delete_certificate<S: FederateStore>(
-    state: &ApiState<S>,
-    cn: &str,
-) -> Response<Full<Bytes>> {
-    if state.trust_store.remove_certificate(cn) {
-        json_ok(&serde_json::json!({ "deleted": cn }))
-    } else {
-        json_error(StatusCode::NOT_FOUND, "certificate not found")
-    }
-}
-
-// ── Stats / Status handlers ─────────────────────────────────────────
-
-fn handle_stats<S: FederateStore>(state: &ApiState<S>) -> Response<Full<Bytes>> {
-    let status = (state.status_fn)();
-
-    let total_sent: u64 = status.peers.iter().map(|p| p.messages_sent).sum();
-    let total_recv: u64 = status.peers.iter().map(|p| p.messages_recv).sum();
-
-    let stats = serde_json::json!({
-        "total_peers": status.total_peers,
-        "connected_peers": status.connected_peers,
-        "running": status.running,
-        "messages_sent": total_sent,
-        "messages_received": total_recv,
-        "certificates": state.trust_store.count(),
-    });
-
-    json_ok(&stats)
-}
-
-fn handle_status<S: FederateStore>(state: &ApiState<S>) -> Response<Full<Bytes>> {
-    let status = (state.status_fn)();
-    json_ok(&status)
-}
-
-// ── JSON response helpers ───────────────────────────────────────────
-
-fn internal_error_response() -> Response<Full<Bytes>> {
-    let mut resp = Response::new(Full::new(Bytes::from("internal server error")));
-    *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-    resp
-}
-
-fn json_ok<T: Serialize>(data: &T) -> Response<Full<Bytes>> {
-    let body = serde_json::to_vec(&SuccessResponse { data }).unwrap_or_default();
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(body)))
-        .unwrap_or_else(|_| internal_error_response())
-}
-
-fn json_created<T: Serialize>(data: &T) -> Response<Full<Bytes>> {
-    let body = serde_json::to_vec(&SuccessResponse { data }).unwrap_or_default();
-    Response::builder()
-        .status(StatusCode::CREATED)
-        .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(body)))
-        .unwrap_or_else(|_| internal_error_response())
-}
-
-fn json_error(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
-    let body = serde_json::to_vec(&ErrorResponse {
-        error: message.to_string(),
-    })
-    .unwrap_or_default();
-    Response::builder()
-        .status(status)
-        .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(body)))
-        .unwrap_or_else(|_| internal_error_response())
-}
-
-/// Simple percent-decoding for URL path segments.
-fn percent_decode(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.bytes();
-    while let Some(b) = chars.next() {
-        if b == b'%' {
-            let hi = chars.next().unwrap_or(b'0');
-            let lo = chars.next().unwrap_or(b'0');
-            let decoded = hex_byte(hi, lo);
-            result.push(decoded as char);
-        } else if b == b'+' {
-            result.push(' ');
-        } else {
-            result.push(b as char);
-        }
-    }
-    result
-}
-
-fn hex_byte(hi: u8, lo: u8) -> u8 {
-    (hex_nibble(hi) << 4) | hex_nibble(lo)
-}
-
-fn hex_nibble(b: u8) -> u8 {
-    match b {
-        b'0'..=b'9' => b - b'0',
-        b'a'..=b'f' => b - b'a' + 10,
-        b'A'..=b'F' => b - b'A' + 10,
-        _ => 0,
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use self::helpers::{hex_byte, hex_nibble, internal_error_response, json_created, json_ok};
     use super::*;
     use crate::manager::FederationStatus;
     use crate::peer::PeerStatus;
@@ -580,7 +201,7 @@ mod tests {
     ///
     /// `Full<Bytes>` yields exactly one data frame and completes
     /// immediately, so we can poll it synchronously with a no-op
-    /// waker — no tokio runtime needed.
+    /// waker -- no tokio runtime needed.
     fn body_string(resp: Response<Full<Bytes>>) -> String {
         use std::pin::Pin;
         use std::task::{Context, Wake};
