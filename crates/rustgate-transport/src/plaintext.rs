@@ -8,9 +8,9 @@
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 
-use rustgate_core::constants::{TCP_KEEPALIVE_IDLE, TCP_KEEPALIVE_INTERVAL};
 use rustgate_core::error::{Result, TransportError};
 use rustgate_core::identity::Identity;
+use rustgate_core::net::configure_tcp_keepalive;
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tracing::{debug, warn};
 
@@ -139,17 +139,6 @@ impl PlaintextListener {
                 stream: tcp_stream,
             });
         }
-    }
-}
-
-fn configure_tcp_keepalive(stream: &TcpStream) {
-    let sock_ref = socket2::SockRef::from(stream);
-
-    let mut keepalive = socket2::TcpKeepalive::new().with_time(TCP_KEEPALIVE_IDLE);
-    keepalive = keepalive.with_interval(TCP_KEEPALIVE_INTERVAL);
-
-    if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
-        warn!(error = %e, "failed to set TCP keepalive on plaintext socket");
     }
 }
 

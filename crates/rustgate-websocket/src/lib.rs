@@ -12,9 +12,10 @@ mod server;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use rustgate_core::constants::{HANDSHAKE_TIMEOUT, TCP_KEEPALIVE_IDLE, TCP_KEEPALIVE_INTERVAL};
+use rustgate_core::constants::HANDSHAKE_TIMEOUT;
 use rustgate_core::error::{Result, TransportError};
 use rustgate_core::identity::Identity;
+use rustgate_core::net::configure_tcp_keepalive;
 use rustgate_transport::{TlsConfig, extract_identity};
 pub use server::{OnFederationForward, OnNatsPublish, WebSocketServer, WsEncoding, WsServerConfig};
 use tokio::net::{TcpListener, TcpStream};
@@ -224,17 +225,4 @@ fn extract_client_identity(tls_stream: &TlsStream) -> Result<Identity> {
     let client_cert = certs.first().ok_or(TransportError::EmptyCertChain)?;
 
     extract_identity(client_cert)
-}
-
-/// Enable TCP keepalive on a newly accepted socket.
-fn configure_tcp_keepalive(stream: &TcpStream) {
-    let sock_ref = socket2::SockRef::from(stream);
-
-    let keepalive = socket2::TcpKeepalive::new()
-        .with_time(TCP_KEEPALIVE_IDLE)
-        .with_interval(TCP_KEEPALIVE_INTERVAL);
-
-    if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
-        warn!(error = %e, "failed to set TCP keepalive");
-    }
 }

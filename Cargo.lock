@@ -1882,6 +1882,7 @@ dependencies = [
  "bytes",
  "serde",
  "serde_json",
+ "socket2",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -1950,7 +1951,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "socket2",
  "tempfile",
  "time",
  "tokio",
@@ -2055,7 +2055,6 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "sha2",
- "socket2",
  "tokio",
  "tokio-rustls",
  "tokio-util",
