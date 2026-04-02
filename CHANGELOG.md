@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **External Secrets Operator support** — optional ExternalSecret templates for NATS, enrollment, and federation secrets with configurable `secretStoreRef` and `refreshInterval` (#275)
+
 ## [0.5.0] - 2026-04-01
 
 ### Added

@@ -38,3 +38,18 @@ Selector labels
 app.kubernetes.io/name: {{ include "rustgate.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
+
+{{/*
+ExternalSecret secretStoreRef with required validation.
+*/}}
+{{- define "rustgate.externalSecretStoreRef" -}}
+name: {{ required "externalSecrets.secretStoreRef.name must be set when externalSecrets are enabled" .Values.externalSecrets.secretStoreRef.name }}
+kind: {{ .Values.externalSecrets.secretStoreRef.kind }}
+{{- end }}
+
+{{/*
+Whether federation peers are sourced from a Secret (existingSecret or ESO).
+*/}}
+{{- define "rustgate.federationSecretEnabled" -}}
+{{- or .Values.federation.existingSecret (and .Values.externalSecrets.enabled .Values.externalSecrets.federation.enabled) -}}
+{{- end }}
