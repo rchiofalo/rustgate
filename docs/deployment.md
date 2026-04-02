@@ -245,6 +245,76 @@ helm install rustgate helm/ \
   --set federation.existingSecret=federation-peers
 ```
 
+### Secret Management
+
+Credentials should never be stored as plaintext in Helm values files. rustgate supports three secret management strategies, listed from most to least recommended.
+
+#### External Secrets Operator (recommended)
+
+The [External Secrets Operator](https://external-secrets.io/) syncs secrets from external backends (AWS Secrets Manager, HashiCorp Vault, GCP Secret Manager, Azure Key Vault, etc.) into Kubernetes Secrets automatically. rustgate includes optional ExternalSecret templates for NATS, enrollment, and federation secrets.
+
+1. Install the External Secrets Operator in your cluster.
+2. Create a `SecretStore` or `ClusterSecretStore` pointing to your backend.
+3. Enable the ExternalSecret resources in your values:
+
+```yaml
+externalSecrets:
+  enabled: true
+  secretStoreRef:
+    name: my-secret-store
+    kind: ClusterSecretStore
+  refreshInterval: 1h
+  nats:
+    enabled: true
+    remoteRef:
+      key: "production/rustgate/nats-credentials"
+  enrollment:
+    enabled: true
+    remoteRefs:
+      ENROLLMENT_USER:
+        key: "production/rustgate/enrollment"
+        property: "username"
+      ENROLLMENT_PASSWORD:
+        key: "production/rustgate/enrollment"
+        property: "password"
+  federation:
+    enabled: true
+    remoteRef:
+      key: "production/rustgate/federation-peers"
+```
+
+The operator creates and refreshes Kubernetes Secrets automatically. The deployment template references these secrets without any manual `kubectl create secret` steps.
+
+#### Existing Kubernetes Secrets
+
+If you manage secrets outside of Helm (e.g., via `kubectl`, sealed-secrets, or a CI pipeline), reference them with `existingSecret`:
+
+```yaml
+nats:
+  existingSecret: my-nats-secret        # must contain NATS_CREDENTIALS key
+
+enrollment:
+  existingSecret: my-enrollment-secret   # must contain ENROLLMENT_USER and ENROLLMENT_PASSWORD keys
+
+federation:
+  existingSecret: my-federation-secret   # must contain FEDERATION_PEERS_FILE key
+```
+
+#### Plaintext values (development only)
+
+For local development and testing only, credentials can be set directly in values:
+
+```yaml
+nats:
+  credentials: "my-nats-creds"
+
+enrollment:
+  user: "admin"
+  password: "changeme"
+```
+
+**Do not use plaintext credentials in production.** Helm stores values in release metadata, which is readable by anyone with access to the Helm release secret or `helm get values`.
+
 ### Scaling
 
 Horizontal scaling with HPA:

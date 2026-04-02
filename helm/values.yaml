@@ -30,6 +30,9 @@ maxConnections: 1024
 nats:
   enabled: true
   url: nats://nats:4222
+  # WARNING: Avoid storing credentials as plaintext in values files. Use
+  # existingSecret or externalSecrets instead. Plaintext values are stored in
+  # Helm release metadata and may appear in logs, version control, or CI output.
   credentials: ""
   # Name of an existing K8s Secret containing a NATS_CREDENTIALS key.
   # When set, takes precedence over the plain-text credentials value above.
@@ -40,6 +43,9 @@ enrollment:
   bind: "0.0.0.0:8446"
   # Required when enrollment is enabled:
   caKey: ""           # Path to CA private key PEM (RUSTGATE_CA_KEY)
+  # WARNING: Avoid storing credentials as plaintext in values files. Use
+  # existingSecret or externalSecrets instead. Plaintext values are stored in
+  # Helm release metadata and may appear in logs, version control, or CI output.
   user: ""            # HTTP Basic Auth username (ENROLLMENT_USER)
   password: ""        # HTTP Basic Auth password (ENROLLMENT_PASSWORD)
   caOrganization: ""  # Organization for issued certs (RUSTGATE_CA_ORG)
@@ -69,6 +75,8 @@ federation:
   skipHostnameVerify: false
   # Path to persistent federate store (JSON file).
   storePath: ""
+  # WARNING: Avoid storing peer configurations with embedded credentials as
+  # plaintext in values files. Use existingSecret or externalSecrets instead.
   # Path to JSON file containing federation peer configurations.
   # Expected format: [{"id":"peer-1","address":"10.0.0.1:9001","groups":["Alpha"],...}]
   peersFile: ""
@@ -151,3 +159,44 @@ terminationGracePeriodSeconds: 120
 #     labelSelector:
 #       matchLabels:
 #         app.kubernetes.io/name: rustgate
+
+# External Secrets Operator integration.
+# Requires the External Secrets Operator CRDs to be installed in the cluster.
+# See: https://external-secrets.io/
+externalSecrets:
+  enabled: false
+  # SecretStore or ClusterSecretStore reference used by all ExternalSecret resources.
+  secretStoreRef:
+    name: ""
+    kind: ClusterSecretStore  # or SecretStore
+  # How often to poll the external secret backend for updates.
+  refreshInterval: 1h
+  # NATS credentials ExternalSecret.
+  nats:
+    enabled: false
+    # Name of the K8s Secret that will be created by the ExternalSecret.
+    # This name is automatically set as nats.existingSecret when enabled.
+    secretName: rustgate-nats-credentials
+    # Remote key/path in the external secret backend.
+    remoteRef:
+      key: ""           # e.g., "production/rustgate/nats-credentials"
+      property: ""      # optional property within the secret
+  # Enrollment credentials ExternalSecret.
+  enrollment:
+    enabled: false
+    secretName: rustgate-enrollment-credentials
+    # Map of remote references for each secret key.
+    remoteRefs:
+      ENROLLMENT_USER:
+        key: ""         # e.g., "production/rustgate/enrollment"
+        property: "username"
+      ENROLLMENT_PASSWORD:
+        key: ""         # e.g., "production/rustgate/enrollment"
+        property: "password"
+  # Federation peers ExternalSecret.
+  federation:
+    enabled: false
+    secretName: rustgate-federation-peers
+    remoteRef:
+      key: ""           # e.g., "production/rustgate/federation-peers"
+      property: ""      # optional property within the secret
