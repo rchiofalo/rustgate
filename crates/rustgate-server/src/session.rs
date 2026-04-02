@@ -10,7 +10,7 @@ use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use rustgate_core::constants::{READ_TIMEOUT, WRITE_TIMEOUT};
 use rustgate_core::identity::Identity;
-#[cfg(any(feature = "metrics", feature = "federation"))]
+#[cfg(feature = "metrics")]
 use rustgate_core::message::Destination;
 use rustgate_core::message::RoutableMessage;
 use rustgate_core::protocol::FramingStrategy;
