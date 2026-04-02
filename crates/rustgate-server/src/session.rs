@@ -16,8 +16,8 @@ use rustgate_core::message::RoutableMessage;
 use rustgate_core::protocol::FramingStrategy;
 use rustgate_cot::MessageBuilder;
 use rustgate_transport::{
-    AuthenticatedSession, CotEncoder, FramedCodec, MessageEncoder, RawEncoder, Router,
-    SessionHandle, ThrottleConfig,
+    AuthenticatedSession, CotEncoder, FramedCodec, MessageEncoder, RawEncoder, ReplayFilter,
+    Router, SessionHandle, ThrottleConfig,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::codec::{FramedRead, FramedWrite};
@@ -43,6 +43,7 @@ pub(crate) struct SessionDeps<P: NatsPublish> {
     pub(crate) fed_forward: Option<FedForwardFn>,
     pub(crate) throttle_config: Option<ThrottleConfig>,
     pub(crate) archiver: Option<Arc<archive::CotArchiver>>,
+    pub(crate) replay_filter: Option<Arc<ReplayFilter>>,
 }
 
 /// Runtime context for a connected session's read/write loops.
@@ -54,6 +55,7 @@ struct SessionContext<'a, P: NatsPublish> {
     fed_forward: &'a Option<FedForwardFn>,
     throttle: Option<rustgate_transport::ClientThrottle>,
     archiver: &'a Option<Arc<archive::CotArchiver>>,
+    replay_filter: &'a Option<Arc<ReplayFilter>>,
 }
 
 /// Trait for optional NATS publishing. Allows the server to compile with or
@@ -147,6 +149,7 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
         fed_forward: &deps.fed_forward,
         throttle,
         archiver: &deps.archiver,
+        replay_filter: &deps.replay_filter,
     };
 
     let result = match final_encoding {
@@ -329,6 +332,16 @@ async fn read_loop(
             tracing::debug!(cn = %ctx.identity.cn, "message dropped: rate limit exceeded");
             #[cfg(feature = "metrics")]
             metrics::messages_dropped().inc();
+            continue;
+        }
+
+        // Anti-replay: drop messages with duplicate (uid, time) within the window
+        if let Some(filter) = ctx.replay_filter
+            && filter.is_replay(&payload)
+        {
+            tracing::warn!(cn = %ctx.identity.cn, "message dropped: replay detected");
+            #[cfg(feature = "metrics")]
+            metrics::messages_replayed().inc();
             continue;
         }
 

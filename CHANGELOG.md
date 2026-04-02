@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - **External Secrets Operator support** — optional ExternalSecret templates for NATS, enrollment, and federation secrets with configurable `secretStoreRef` and `refreshInterval` (#275)
+- **Anti-replay detection** — sliding-window filter drops messages with duplicate `(uid, time)` pairs within a configurable window, preventing message replay attacks. Configurable via `--replay-window` (default 300s, 0 to disable). (#284)
 
 ## [0.5.0] - 2026-04-01
 

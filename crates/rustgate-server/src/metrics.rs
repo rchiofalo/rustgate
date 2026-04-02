@@ -40,6 +40,7 @@ static ACCEPT_ERRORS: OnceLock<IntCounter> = OnceLock::new();
 
 static MESSAGES_RECEIVED: OnceLock<IntCounter> = OnceLock::new();
 static MESSAGES_DROPPED: OnceLock<IntCounter> = OnceLock::new();
+static MESSAGES_REPLAYED: OnceLock<IntCounter> = OnceLock::new();
 static MESSAGES_ROUTED: OnceLock<IntCounterVec> = OnceLock::new();
 static SESSIONS_ACTIVE: OnceLock<IntGauge> = OnceLock::new();
 
@@ -125,6 +126,13 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(messages_dropped.clone()))?;
     let _ = MESSAGES_DROPPED.set(messages_dropped);
 
+    let messages_replayed = IntCounter::with_opts(Opts::new(
+        "rustgate_messages_replayed_total",
+        "Messages dropped due to anti-replay detection",
+    ))?;
+    registry.register(Box::new(messages_replayed.clone()))?;
+    let _ = MESSAGES_REPLAYED.set(messages_replayed);
+
     let messages_routed = IntCounterVec::new(
         Opts::new(
             "rustgate_messages_routed_total",
@@ -195,6 +203,11 @@ pub fn messages_received() -> &'static IntCounter {
 
 pub fn messages_dropped() -> &'static IntCounter {
     MESSAGES_DROPPED.get_or_init(|| fallback_counter("rustgate_messages_dropped_total", "fallback"))
+}
+
+pub fn messages_replayed() -> &'static IntCounter {
+    MESSAGES_REPLAYED
+        .get_or_init(|| fallback_counter("rustgate_messages_replayed_total", "fallback"))
 }
 
 pub fn messages_routed() -> &'static IntCounterVec {

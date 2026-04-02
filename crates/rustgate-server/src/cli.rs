@@ -234,6 +234,12 @@ pub(crate) struct Cli {
     pub(crate) federation_pod_id: Option<String>,
 
     // -- QoS / rate limiting --
+    /// Sliding-window replay detection window in seconds. Messages with the same
+    /// (uid, time) pair seen within this window are dropped as replays.
+    /// Set to 0 to disable replay detection.
+    #[arg(long, default_value_t = 300, env = "RUSTGATE_REPLAY_WINDOW")]
+    pub(crate) replay_window: u64,
+
     /// Maximum sustained messages per second per connected client (0 = disabled).
     #[arg(long, default_value_t = 0, env = "RUSTGATE_CLIENT_MSG_RATE")]
     pub(crate) client_message_rate: u32,
@@ -430,6 +436,7 @@ mod tests {
             "FEDERATION_CIRCUIT_BREAKER_TIMEOUT",
             "FEDERATION_HA_NATS_URL",
             "FEDERATION_POD_ID",
+            "RUSTGATE_REPLAY_WINDOW",
             "RUSTGATE_CLIENT_MSG_RATE",
             "RUSTGATE_CLIENT_BURST",
             "RUSTGATE_ARCHIVE_DIR",
