@@ -7,10 +7,38 @@
 use clap::{Parser, ValueEnum};
 use rustgate_core::protocol::{FramingStrategy, HeaderSize};
 
+/// Validate that a CLI argument is a valid socket address (ip:port).
+fn parse_socket_addr(s: &str) -> Result<String, String> {
+    s.parse::<std::net::SocketAddr>()
+        .map_err(|e| format!("invalid socket address: {e}"))?;
+    Ok(s.to_string())
+}
+
+/// Validate max_connections: must be 1..=u32::MAX since it backs a `Semaphore`.
+fn parse_max_connections(s: &str) -> Result<usize, String> {
+    let n: usize = s.parse().map_err(|e| format!("{e}"))?;
+    if n == 0 {
+        return Err("must be at least 1".into());
+    }
+    if n > u32::MAX as usize {
+        return Err(format!("must be at most {}", u32::MAX));
+    }
+    Ok(n)
+}
+
+/// Validate a positive usize (must be >= 1).
+fn parse_nonzero_usize(s: &str) -> Result<usize, String> {
+    let n: usize = s.parse().map_err(|e| format!("{e}"))?;
+    if n == 0 {
+        return Err("must be at least 1".into());
+    }
+    Ok(n)
+}
+
 #[derive(Parser)]
 #[command(name = "rustgate", about = "Secure tactical message router")]
 pub(crate) struct Cli {
-    #[arg(short, long, default_value = "0.0.0.0:4433", env = "RUSTGATE_BIND")]
+    #[arg(short, long, default_value = "0.0.0.0:4433", env = "RUSTGATE_BIND", value_parser = parse_socket_addr)]
     pub(crate) bind: String,
 
     #[arg(long, env = "RUSTGATE_CERT")]
@@ -75,7 +103,7 @@ pub(crate) struct Cli {
 
     /// Bind address for the enrollment HTTPS server (e.g. 0.0.0.0:8446).
     /// Requires --features enrollment.
-    #[arg(long, env = "ENROLLMENT_BIND")]
+    #[arg(long, env = "ENROLLMENT_BIND", value_parser = parse_socket_addr)]
     pub(crate) enrollment_bind: Option<String>,
 
     /// Path to the CA private key PEM file (used to sign client CSRs).
@@ -101,35 +129,35 @@ pub(crate) struct Cli {
 
     /// Bind address for the Prometheus metrics HTTP server (e.g. 0.0.0.0:9090).
     /// Requires --features metrics.
-    #[arg(long, env = "METRICS_BIND")]
+    #[arg(long, env = "METRICS_BIND", value_parser = parse_socket_addr)]
     pub(crate) metrics_bind: Option<String>,
 
     /// Maximum concurrent TLS sessions. Prevents resource exhaustion
     /// from connection floods.
-    #[arg(long, default_value_t = 1024, env = "RUSTGATE_MAX_CONNECTIONS")]
+    #[arg(long, default_value_t = 1024, env = "RUSTGATE_MAX_CONNECTIONS", value_parser = parse_max_connections)]
     pub(crate) max_connections: usize,
 
     /// Maximum number of TLS handshakes that may be in progress simultaneously.
     /// Limits the CPU cost of concurrent cryptographic operations during
     /// connection floods. Incoming connections that exceed this limit will
     /// wait until a handshake slot becomes available.
-    #[arg(long, default_value_t = 100, env = "RUSTGATE_MAX_HANDSHAKES")]
+    #[arg(long, default_value_t = 100, env = "RUSTGATE_MAX_HANDSHAKES", value_parser = parse_nonzero_usize)]
     pub(crate) max_concurrent_handshakes: usize,
 
     /// Bind address for the WebSocket (wss://) listener (e.g. 0.0.0.0:8443).
     /// Requires --features websocket.
-    #[arg(long, env = "WEBSOCKET_BIND")]
+    #[arg(long, env = "WEBSOCKET_BIND", value_parser = parse_socket_addr)]
     pub(crate) websocket_bind: Option<String>,
 
     // -- Plaintext input flags --
     /// Bind address for plaintext TCP input (e.g. 0.0.0.0:8087).
     /// WARNING: connections are NOT encrypted. Use only on trusted networks.
-    #[arg(long, env = "RUSTGATE_TCP_BIND")]
+    #[arg(long, env = "RUSTGATE_TCP_BIND", value_parser = parse_socket_addr)]
     pub(crate) tcp_bind: Option<String>,
 
     /// Bind address for UDP CoT input (e.g. 0.0.0.0:8087).
     /// WARNING: datagrams are NOT encrypted. Use only on trusted networks.
-    #[arg(long, env = "RUSTGATE_UDP_BIND")]
+    #[arg(long, env = "RUSTGATE_UDP_BIND", value_parser = parse_socket_addr)]
     pub(crate) udp_bind: Option<String>,
 
     /// Default CN for plaintext (TCP/UDP) clients.
@@ -147,13 +175,13 @@ pub(crate) struct Cli {
     // -- Federation flags --
     /// V1 federation listen address (enables federation when set, e.g. 0.0.0.0:9000).
     /// Requires --features federation.
-    #[arg(long, env = "FEDERATION_V1_BIND")]
+    #[arg(long, env = "FEDERATION_V1_BIND", value_parser = parse_socket_addr)]
     pub(crate) federation_v1_bind: Option<String>,
 
     /// V2 gRPC federation listen address (e.g. 0.0.0.0:9001).
     /// Enables V2 gRPC inbound server when set alongside --federation-v1-bind.
     /// Requires --features federation.
-    #[arg(long, env = "FEDERATION_V2_BIND")]
+    #[arg(long, env = "FEDERATION_V2_BIND", value_parser = parse_socket_addr)]
     pub(crate) federation_v2_bind: Option<String>,
 
     /// Unique federation server identity.
@@ -363,6 +391,10 @@ mod tests {
             "RUSTGATE_CERT",
             "RUSTGATE_KEY",
             "RUSTGATE_CA",
+            "RUSTGATE_CRL",
+            "RUSTGATE_TLS_MIN_VERSION",
+            "RUSTGATE_CRL_WARN_STALE",
+            "RUSTGATE_FIPS_REQUIRED",
             "RUSTGATE_FRAMING",
             "RUSTGATE_ENCODING",
             "NATS_URL",
@@ -380,6 +412,11 @@ mod tests {
             "METRICS_BIND",
             "RUSTGATE_MAX_CONNECTIONS",
             "RUSTGATE_MAX_HANDSHAKES",
+            "WEBSOCKET_BIND",
+            "RUSTGATE_TCP_BIND",
+            "RUSTGATE_UDP_BIND",
+            "RUSTGATE_PLAINTEXT_CN",
+            "RUSTGATE_PLAINTEXT_GROUP",
             "FEDERATION_V1_BIND",
             "FEDERATION_V2_BIND",
             "FEDERATION_ID",
@@ -387,6 +424,15 @@ mod tests {
             "FEDERATION_SKIP_HOSTNAME_VERIFY",
             "FEDERATION_MAX_HOPS",
             "FEDERATION_STORE_PATH",
+            "FEDERATION_TRUST_STORE_DIR",
+            "FEDERATION_CIRCUIT_BREAKER_THRESHOLD",
+            "FEDERATION_CIRCUIT_BREAKER_TIMEOUT",
+            "FEDERATION_HA_NATS_URL",
+            "FEDERATION_POD_ID",
+            "RUSTGATE_CLIENT_MSG_RATE",
+            "RUSTGATE_CLIENT_BURST",
+            "RUSTGATE_ARCHIVE_DIR",
+            "RUSTGATE_PACKAGE_MAX_AGE_HOURS",
         ];
 
         for var in expected_env_vars {

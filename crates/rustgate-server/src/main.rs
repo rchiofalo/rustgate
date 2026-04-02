@@ -85,13 +85,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     setup::warn_metrics_disabled(&cli);
 
     // ── Connection limit ────────────────────────────────────────────
-    if cli.max_connections == 0 {
-        anyhow::bail!("--max-connections must be at least 1");
-    }
-    let max_connections: u32 = cli
-        .max_connections
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("max_connections must fit in u32 (max {})", u32::MAX))?;
+    // CLI validation ensures max_connections is 1..=u32::MAX
+    let max_connections: u32 = cli.max_connections as u32;
     let router = Arc::new(Router::new());
     let connection_limit = Arc::new(Semaphore::new(max_connections as usize));
 
@@ -231,6 +226,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     }
 
     // ── Shutdown ────────────────────────────────────────────────────
+    // Stop listeners first so no new connections are accepted during drain.
 
     #[cfg(feature = "federation")]
     if let Some(ref rwlock) = fed_shutdown_handle {
@@ -240,18 +236,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     }
 
     #[cfg(feature = "websocket")]
-    if let Some(ref shutdown) = ws_shutdown {
-        shutdown.notify_one();
-        tracing::info!("WebSocket server signaled to stop");
+    if let Some(handle) = ws_shutdown {
+        setup::stop_subsystem("websocket", handle).await;
     }
 
-    if let Some(ref shutdown) = tcp_plaintext_shutdown {
-        shutdown.notify_one();
-        tracing::info!("plaintext TCP listener signaled to stop");
+    if let Some(handle) = tcp_plaintext_shutdown {
+        setup::stop_subsystem("plaintext-tcp", handle).await;
     }
-    if let Some(ref shutdown) = udp_shutdown {
-        shutdown.notify_one();
-        tracing::info!("UDP input signaled to stop");
+    if let Some(handle) = udp_shutdown {
+        setup::stop_subsystem("udp", handle).await;
     }
 
     // ── Connection draining ─────────────────────────────────────────

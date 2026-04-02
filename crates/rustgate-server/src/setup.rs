@@ -43,6 +43,27 @@ pub(crate) fn spawn_background(
     }));
 }
 
+/// Handle for a subsystem that can be gracefully stopped.
+///
+/// Unlike `spawn_background`, subsystem handles allow the caller to signal
+/// shutdown and then await the task's completion. Used for listener tasks
+/// (WebSocket, plaintext TCP, UDP) so they stop accepting before connection
+/// draining begins.
+pub(crate) struct SubsystemHandle {
+    pub(crate) shutdown: Arc<tokio::sync::Notify>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// Signal a subsystem to stop and await its completion with a timeout.
+pub(crate) async fn stop_subsystem(name: &str, handle: SubsystemHandle) {
+    handle.shutdown.notify_one();
+    match tokio::time::timeout(std::time::Duration::from_secs(5), handle.task).await {
+        Ok(Ok(())) => tracing::info!(subsystem = name, "stopped"),
+        Ok(Err(e)) => tracing::error!(subsystem = name, error = %e, "panicked during shutdown"),
+        Err(_) => tracing::warn!(subsystem = name, "did not stop within 5s timeout"),
+    }
+}
+
 /// Build the TLS configuration from CLI flags.
 ///
 /// Returns the `TlsConfig` along with the raw PEM strings (needed by
@@ -83,9 +104,7 @@ pub(crate) async fn bind_tls_listener(
     cli: &Cli,
     tls_config: &TlsConfig,
 ) -> anyhow::Result<TlsListener> {
-    if cli.max_concurrent_handshakes == 0 {
-        anyhow::bail!("--max-concurrent-handshakes must be at least 1");
-    }
+    // CLI validation ensures max_concurrent_handshakes >= 1
     TlsListener::bind_with_handshake_limit(&cli.bind, tls_config, cli.max_concurrent_handshakes)
         .await
         .context("binding TLS listener")
@@ -606,11 +625,11 @@ pub(crate) struct WebSocketSetup<'a, P: NatsPublish> {
     pub(crate) throttle_config: Option<ThrottleConfig>,
 }
 
-/// Start the WebSocket listener and return its shutdown handle.
+/// Start the WebSocket listener and return its subsystem handle.
 #[cfg(feature = "websocket")]
 pub(crate) fn start_websocket<P: NatsPublish + Send + Sync + 'static>(
     setup: WebSocketSetup<'_, P>,
-) -> anyhow::Result<Option<Arc<tokio::sync::Notify>>> {
+) -> anyhow::Result<Option<SubsystemHandle>> {
     let WebSocketSetup {
         cli,
         tls_config,
@@ -670,10 +689,10 @@ pub(crate) fn start_websocket<P: NatsPublish + Send + Sync + 'static>(
         throttle_config,
         shutdown: Arc::clone(&shutdown),
     };
-    spawn_background("websocket-server", async move {
+    let task = tokio::spawn(async move {
         rustgate_websocket::WebSocketServer::run(config).await;
     });
-    Ok(Some(shutdown))
+    Ok(Some(SubsystemHandle { shutdown, task }))
 }
 
 /// Warn when websocket is requested without the feature.
@@ -688,7 +707,7 @@ pub(crate) fn warn_websocket_disabled(cli: &Cli) {
 // Plaintext TCP
 // ---------------------------------------------------------------------------
 
-/// Start the plaintext TCP listener and return its shutdown handle.
+/// Start the plaintext TCP listener and return its subsystem handle.
 pub(crate) async fn start_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
     cli: &Cli,
     router: &Arc<Router>,
@@ -697,7 +716,7 @@ pub(crate) async fn start_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
     encoding: Encoding,
     nats_publisher: &Option<P>,
     fed_forward: &Option<FedForwardFn>,
-) -> anyhow::Result<Option<Arc<tokio::sync::Notify>>> {
+) -> anyhow::Result<Option<SubsystemHandle>> {
     let tcp_bind = match cli.tcp_bind.as_ref() {
         Some(b) => b,
         None => return Ok(None),
@@ -732,24 +751,24 @@ pub(crate) async fn start_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
         shutdown: shutdown_clone,
     };
 
-    spawn_background("plaintext-tcp", async move {
+    let task = tokio::spawn(async move {
         crate::session::run_plaintext_tcp(config).await;
     });
 
-    Ok(Some(shutdown))
+    Ok(Some(SubsystemHandle { shutdown, task }))
 }
 
 // ---------------------------------------------------------------------------
 // UDP
 // ---------------------------------------------------------------------------
 
-/// Start the UDP input listener and return its shutdown handle.
+/// Start the UDP input listener and return its subsystem handle.
 pub(crate) async fn start_udp<P: NatsPublish + Send + Sync + 'static>(
     cli: &Cli,
     router: &Arc<Router>,
     nats_publisher: &Option<P>,
     fed_forward: &Option<FedForwardFn>,
-) -> anyhow::Result<Option<Arc<tokio::sync::Notify>>> {
+) -> anyhow::Result<Option<SubsystemHandle>> {
     let udp_bind = match cli.udp_bind.as_ref() {
         Some(b) => b,
         None => return Ok(None),
@@ -802,7 +821,7 @@ pub(crate) async fn start_udp<P: NatsPublish + Send + Sync + 'static>(
                 })
             });
 
-    spawn_background("udp-input", async move {
+    let task = tokio::spawn(async move {
         rustgate_transport::UdpInput::run(
             socket,
             udp_router,
@@ -814,5 +833,5 @@ pub(crate) async fn start_udp<P: NatsPublish + Send + Sync + 'static>(
         .await;
     });
 
-    Ok(Some(shutdown))
+    Ok(Some(SubsystemHandle { shutdown, task }))
 }
