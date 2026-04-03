@@ -203,6 +203,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         &codec,
         &nats_publisher,
         &fed_forward,
+        throttle_config,
+        &archiver,
         &replay_filter,
     )
     .await?;

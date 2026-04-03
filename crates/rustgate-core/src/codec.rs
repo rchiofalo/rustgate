@@ -8,10 +8,28 @@
 //!
 //! The router is codec-agnostic — it only sees `RoutableMessage` with
 //! canonical XML payloads. Codecs handle translation at session edges.
+//!
+//! # WebSocket note
+//!
+//! The WebSocket transport (`rustgate-websocket`) handles framing via
+//! tungstenite, not `FramedCodec`. It currently uses the legacy
+//! [`MessageEncoder`](crate::encoder::MessageEncoder) trait and its own
+//! `WsEncoding` enum for outbound encoding. Migrating WebSocket to use
+//! `Codec` is tracked as a follow-up to the Phase 1 codec unification.
+//!
+//! # Legacy `Encoding` enum
+//!
+//! The `--encoding` CLI flag and its `Encoding` enum (`Raw`, `Cot`,
+//! `TakProtobuf`) are preserved for backwards compatibility. The
+//! `build_codec()` factory maps `(Framing, Encoding)` pairs to the
+//! appropriate `Codec` implementation. Note that `Encoding::Cot` and
+//! `Encoding::Raw` are functionally identical for TCP/TLS sessions since
+//! the `CotEncoder` was always a passthrough — the distinction only
+//! matters for the WebSocket path which still uses `MessageEncoder`.
 
 use std::io;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
 use crate::message::RoutableMessage;
 use crate::protocol::FramingStrategy;
@@ -41,14 +59,16 @@ pub trait Codec: Send + Sync + std::fmt::Debug {
 
     /// Transform raw framed bytes into canonical payload format (XML).
     ///
-    /// For XML-native codecs, this is a no-op passthrough. For protobuf
-    /// codecs, this converts the wire format to XML.
+    /// Accepts `BytesMut` so passthrough codecs can call `frame.freeze()`
+    /// for zero-copy conversion instead of allocating. Codecs that must
+    /// transform the payload (e.g., protobuf → XML) will allocate
+    /// regardless, so the owned buffer costs nothing extra.
     ///
     /// # Errors
     ///
     /// Returns an error if the frame cannot be decoded (e.g., malformed
     /// protobuf, invalid encoding).
-    fn decode_payload(&self, frame: &[u8]) -> io::Result<Bytes>;
+    fn decode_payload(&self, frame: BytesMut) -> io::Result<Bytes>;
 
     /// Encode a [`RoutableMessage`]'s payload into wire-format bytes.
     ///

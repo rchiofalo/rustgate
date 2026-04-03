@@ -281,7 +281,9 @@ async fn read_loop(
         };
 
         // Convert framed bytes to canonical payload format via the codec.
-        let payload = ctx.codec.decode_payload(&frame)?;
+        // Passthrough codecs use frame.freeze() for zero-copy; converting
+        // codecs (protobuf) allocate regardless so the owned buffer is free.
+        let payload = ctx.codec.decode_payload(frame)?;
 
         #[cfg(feature = "metrics")]
         metrics::messages_received().inc();
@@ -383,6 +385,8 @@ pub(crate) struct PlaintextTcpConfig<P: NatsPublish> {
     pub(crate) codec: Arc<dyn Codec>,
     pub(crate) nats_publisher: Option<P>,
     pub(crate) fed_forward: Option<FedForwardFn>,
+    pub(crate) throttle_config: Option<ThrottleConfig>,
+    pub(crate) archiver: Option<Arc<archive::CotArchiver>>,
     pub(crate) replay_filter: Option<Arc<ReplayFilter>>,
     pub(crate) shutdown: Arc<tokio::sync::Notify>,
 }
@@ -402,6 +406,8 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
         codec,
         nats_publisher,
         fed_forward,
+        throttle_config,
+        archiver,
         replay_filter,
         shutdown,
     } = config;
@@ -438,6 +444,8 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
                         #[allow(clippy::clone_on_copy)]
                         let session_nats = nats_publisher.clone();
                         let session_fed = fed_forward.clone();
+                        let session_throttle = throttle_config.map(|tc| tc.build());
+                        let session_arch = archiver.clone();
                         let session_rf = replay_filter.clone();
 
                         crate::setup::spawn_background("plaintext-tcp-session", async move {
@@ -452,6 +460,8 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
                                 codec: session_codec.as_ref(),
                                 nats_publisher: &session_nats,
                                 fed_forward: &session_fed,
+                                throttle: session_throttle,
+                                archiver: &session_arch,
                                 replay_filter: &session_rf,
                             }).await;
 
@@ -486,6 +496,8 @@ struct PlaintextSessionContext<'a, P: NatsPublish> {
     codec: &'a dyn Codec,
     nats_publisher: &'a Option<P>,
     fed_forward: &'a Option<FedForwardFn>,
+    throttle: Option<rustgate_transport::ClientThrottle>,
+    archiver: &'a Option<Arc<archive::CotArchiver>>,
     replay_filter: &'a Option<Arc<ReplayFilter>>,
 }
 
@@ -505,6 +517,8 @@ async fn run_plaintext_session_loops<P: NatsPublish>(
         codec,
         nats_publisher,
         fed_forward,
+        throttle,
+        archiver,
         replay_filter,
     } = ctx;
     let framed_codec = FramedCodec::from_strategy(&codec.framing());
@@ -528,7 +542,17 @@ async fn run_plaintext_session_loops<P: NatsPublish>(
                     }
                 };
 
-                let payload = codec.decode_payload(&frame)?;
+                let payload = codec.decode_payload(frame)?;
+
+                // Per-client rate limiting — drop excess messages
+                if let Some(t) = &throttle
+                    && !t.allow()
+                {
+                    tracing::debug!(cn = %identity.cn, "message dropped: rate limit exceeded");
+                    #[cfg(feature = "metrics")]
+                    metrics::messages_dropped().inc();
+                    continue;
+                }
 
                 // Anti-replay: drop messages with duplicate (uid, time) within the window
                 if let Some(filter) = replay_filter
@@ -541,6 +565,12 @@ async fn run_plaintext_session_loops<P: NatsPublish>(
                 }
 
                 let msg = msg_builder.build(identity, payload, "tcp-plaintext");
+
+                // Archive to JSONL if enabled
+                if let Some(arch) = archiver {
+                    arch.record(&msg).await;
+                }
+
                 router.route(msg.clone()).await;
 
                 if let Some(publisher) = nats_publisher {

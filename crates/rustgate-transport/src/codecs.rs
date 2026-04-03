@@ -6,7 +6,7 @@
 
 use std::io;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use rustgate_core::codec::Codec;
 use rustgate_core::message::RoutableMessage;
 use rustgate_core::protocol::{FramingStrategy, HeaderSize};
@@ -28,8 +28,8 @@ impl Codec for TakXmlCodec {
         FramingStrategy::XmlStream
     }
 
-    fn decode_payload(&self, frame: &[u8]) -> io::Result<Bytes> {
-        Ok(Bytes::copy_from_slice(frame))
+    fn decode_payload(&self, frame: BytesMut) -> io::Result<Bytes> {
+        Ok(frame.freeze())
     }
 
     fn encode_payload(&self, msg: &RoutableMessage) -> io::Result<Bytes> {
@@ -61,8 +61,8 @@ impl Codec for RawLineCodec {
         FramingStrategy::LineDelimited
     }
 
-    fn decode_payload(&self, frame: &[u8]) -> io::Result<Bytes> {
-        Ok(Bytes::copy_from_slice(frame))
+    fn decode_payload(&self, frame: BytesMut) -> io::Result<Bytes> {
+        Ok(frame.freeze())
     }
 
     fn encode_payload(&self, msg: &RoutableMessage) -> io::Result<Bytes> {
@@ -93,8 +93,8 @@ impl Codec for RawLengthPrefixedCodec {
         }
     }
 
-    fn decode_payload(&self, frame: &[u8]) -> io::Result<Bytes> {
-        Ok(Bytes::copy_from_slice(frame))
+    fn decode_payload(&self, frame: BytesMut) -> io::Result<Bytes> {
+        Ok(frame.freeze())
     }
 
     fn encode_payload(&self, msg: &RoutableMessage) -> io::Result<Bytes> {
@@ -142,7 +142,7 @@ mod tests {
     fn tak_xml_codec_roundtrip() {
         let codec = TakXmlCodec;
         let xml = b"<event uid=\"test\" />";
-        let decoded = codec.decode_payload(xml).unwrap();
+        let decoded = codec.decode_payload(BytesMut::from(&xml[..])).unwrap();
         assert_eq!(&decoded[..], xml);
 
         let msg = test_msg(xml);
@@ -166,7 +166,7 @@ mod tests {
     fn raw_line_codec_roundtrip() {
         let codec = RawLineCodec;
         let data = b"hello world";
-        let decoded = codec.decode_payload(data).unwrap();
+        let decoded = codec.decode_payload(BytesMut::from(&data[..])).unwrap();
         assert_eq!(&decoded[..], data);
 
         let msg = test_msg(data);
@@ -183,7 +183,7 @@ mod tests {
     fn raw_length_prefixed_codec_roundtrip() {
         let codec = RawLengthPrefixedCodec;
         let data = b"binary payload";
-        let decoded = codec.decode_payload(data).unwrap();
+        let decoded = codec.decode_payload(BytesMut::from(&data[..])).unwrap();
         assert_eq!(&decoded[..], data);
 
         let msg = test_msg(data);

@@ -7,7 +7,7 @@
 
 use std::io;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use rustgate_core::codec::Codec;
 use rustgate_core::message::RoutableMessage;
 use rustgate_core::protocol::FramingStrategy;
@@ -28,8 +28,8 @@ impl Codec for TakProtobufCodec {
         FramingStrategy::TakProtobuf
     }
 
-    fn decode_payload(&self, frame: &[u8]) -> io::Result<Bytes> {
-        let xml_bytes = crate::convert::proto_to_xml(frame)
+    fn decode_payload(&self, frame: BytesMut) -> io::Result<Bytes> {
+        let xml_bytes = crate::convert::proto_to_xml(&frame)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         Ok(Bytes::from(xml_bytes))
     }
