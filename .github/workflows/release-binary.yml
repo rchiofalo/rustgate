@@ -15,7 +15,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  RELEASE_FEATURES: nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket
+  RELEASE_FEATURES: nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket,otel
 
 jobs:
   build:
