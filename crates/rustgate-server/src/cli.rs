@@ -316,7 +316,7 @@ impl From<Framing> for FramingStrategy {
 
 /// Build a codec from the CLI `--framing` and `--encoding` flags.
 ///
-/// Maps legacy `(Framing, Encoding)` pairs to the unified [`Codec`] trait
+/// Maps legacy `(Framing, Encoding)` pairs to the unified [`Codec`](rustgate_core::codec::Codec) trait
 /// objects. `TakNegotiate` starts with XML; negotiation upgrades to protobuf
 /// inside the session handler.
 pub(crate) fn build_codec(
