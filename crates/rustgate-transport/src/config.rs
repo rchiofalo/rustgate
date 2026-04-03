@@ -191,7 +191,8 @@ impl TlsConfig {
 
     /// Get a reference to the client CA root store.
     ///
-    /// Used by consumers that need to build a [`DynamicCertVerifier`]
+    /// Used by consumers that need to build a
+    /// [`DynamicCertVerifier`](crate::DynamicCertVerifier)
     /// with the base CA store as a starting point.
     pub fn client_ca_store(&self) -> &Arc<RootCertStore> {
         &self.client_ca_store
@@ -200,7 +201,7 @@ impl TlsConfig {
     /// Get a clone of the loaded CRLs.
     ///
     /// Used by consumers that need to pass CRLs to a
-    /// [`DynamicCertVerifier`].
+    /// [`DynamicCertVerifier`](crate::DynamicCertVerifier).
     pub fn crls(&self) -> &[CertificateRevocationListDer<'static>] {
         &self.crls
     }
