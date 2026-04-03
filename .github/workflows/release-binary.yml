@@ -38,7 +38,7 @@ jobs:
           - target: x86_64-unknown-linux-musl
             cc: musl-gcc
             fips: true
-          - target: aarch64-unknown-linux-musl
+          - target: aarch64-unknown-linux-gnu
             cc: aarch64-linux-gnu-gcc
             linker: aarch64-linux-gnu-gcc
             fips: true
@@ -70,8 +70,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler musl-tools
 
       - name: Install aarch64 cross-compiler
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: sudo apt-get install -y gcc-aarch64-linux-gnu linux-libc-dev-arm64-cross
+        if: contains(matrix.target, 'aarch64')
+        run: sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Install FIPS build dependencies
         if: matrix.fips
@@ -86,11 +86,16 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
 
+      - name: Set cross-compilation env
+        if: contains(matrix.target, 'aarch64')
+        run: |
+          TARGET_UPPER=$(echo "${{ matrix.target }}" | tr '[:lower:]-' '[:upper:]_')
+          echo "CARGO_TARGET_${TARGET_UPPER}_LINKER=${{ matrix.linker }}" >> $GITHUB_ENV
+
       - name: Build (auditable)
         env:
           CC_${{ matrix.target }}: ${{ matrix.cc }}
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: ${{ matrix.linker }}
-          C_INCLUDE_PATH: ${{ matrix.fips && (matrix.target == 'aarch64-unknown-linux-musl' && '/usr/aarch64-linux-gnu/include' || '/usr/include') || '' }}
+          C_INCLUDE_PATH: ${{ matrix.fips && contains(matrix.target, 'musl') && '/usr/include:/usr/include/x86_64-linux-gnu' || '' }}
         run: |
           FEATURES="${{ env.RELEASE_FEATURES }}"
           if [ "${{ matrix.fips }}" = "true" ]; then
