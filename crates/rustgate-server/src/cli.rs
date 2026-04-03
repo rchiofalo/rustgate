@@ -314,6 +314,44 @@ impl From<Framing> for FramingStrategy {
     }
 }
 
+/// Build a codec from the CLI `--framing` and `--encoding` flags.
+///
+/// Maps legacy `(Framing, Encoding)` pairs to the unified [`Codec`] trait
+/// objects. `TakNegotiate` starts with XML; negotiation upgrades to protobuf
+/// inside the session handler.
+pub(crate) fn build_codec(
+    framing: Framing,
+    encoding: Encoding,
+) -> std::sync::Arc<dyn rustgate_core::codec::Codec> {
+    use std::sync::Arc;
+
+    match (framing, encoding) {
+        // TAK protobuf framing always uses the protobuf codec regardless
+        // of the encoding flag.
+        #[cfg(feature = "proto")]
+        (Framing::TakProtobuf, _) => Arc::new(rustgate_proto::TakProtobufCodec),
+
+        // TakNegotiate starts as XML — negotiation may upgrade to protobuf.
+        (Framing::TakNegotiate, _) => Arc::new(rustgate_transport::TakXmlCodec),
+
+        // TAK protobuf encoding with non-protobuf framing is unusual but
+        // technically valid — honor the framing.
+        #[cfg(feature = "proto")]
+        (Framing::Xml, Encoding::TakProtobuf) => Arc::new(rustgate_proto::TakProtobufCodec),
+
+        // Standard combinations: framing determines the codec, encoding is
+        // passthrough (Raw/Cot both use identity payload transform).
+        (Framing::Xml, _) => Arc::new(rustgate_transport::TakXmlCodec),
+        (Framing::Line, _) => Arc::new(rustgate_transport::RawLineCodec),
+        (Framing::LengthPrefixed, _) => Arc::new(rustgate_transport::RawLengthPrefixedCodec),
+
+        // Fallback for proto framing when proto feature is disabled
+        // (should be caught by validate_framing, but be safe).
+        #[cfg(not(feature = "proto"))]
+        (Framing::TakProtobuf, _) => Arc::new(rustgate_transport::TakXmlCodec),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::panic, clippy::unwrap_used)]

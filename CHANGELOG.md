@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Pluggable codec architecture** — unified `Codec` trait in `rustgate-core` replaces the separate `Framing`/`Encoding` dispatch. Each wire protocol (`TakXmlCodec`, `TakProtobufCodec`, `RawLineCodec`, `RawLengthPrefixedCodec`) implements a single trait covering framing strategy, payload decode/encode, and protocol detection. Session handling uses `Arc<dyn Codec>` instead of enum-matching, simplifying the read/write loops and enabling future custom codecs. Existing `--framing`/`--encoding` CLI flags are preserved via a factory function. (#184)
 - **Server certificate hot-reload** — `--cert-reload-interval` enables periodic polling of the `--cert` and `--key` files. When changes are detected (via SHA-256 digest comparison), the server certificate is atomically swapped for new TLS handshakes without restart or downtime. Audit events emitted on rotation success/failure. (#291)
 - **OpenTelemetry distributed tracing** — optional `otel` feature flag adds OTLP trace export via `--otel-endpoint`. Key spans instrumented: TLS handshake, message routing, federation forwarding, NATS publish/subscribe. Works with Jaeger, Grafana Tempo, and any OTLP-compatible backend. (#281)
 - **Dynamic TLS config refresh** — trust store certificate changes (add/remove via REST API or filesystem) take effect on the next TLS handshake without server restart. Inbound V1 uses a `DynamicCertVerifier`, outbound V1 uses a `DynamicPeerConnector` that rebuilds `ClientConfig` on generation change. (#192)
