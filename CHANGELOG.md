@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Server certificate hot-reload** — `--cert-reload-interval` enables periodic polling of the `--cert` and `--key` files. When changes are detected (via SHA-256 digest comparison), the server certificate is atomically swapped for new TLS handshakes without restart or downtime. Audit events emitted on rotation success/failure. (#291)
 - **OpenTelemetry distributed tracing** — optional `otel` feature flag adds OTLP trace export via `--otel-endpoint`. Key spans instrumented: TLS handshake, message routing, federation forwarding, NATS publish/subscribe. Works with Jaeger, Grafana Tempo, and any OTLP-compatible backend. (#281)
 - **Dynamic TLS config refresh** — trust store certificate changes (add/remove via REST API or filesystem) take effect on the next TLS handshake without server restart. Inbound V1 uses a `DynamicCertVerifier`, outbound V1 uses a `DynamicPeerConnector` that rebuilds `ClientConfig` on generation change. (#192)
 - **Circuit breaker metrics and audit events** — Prometheus counters for circuit breaker trips/recoveries and structured audit events for state transitions (#289)

@@ -19,7 +19,9 @@ use rustgate_core::identity::Identity;
 use rustgate_core::message::RoutableMessage;
 #[cfg(feature = "federation")]
 use rustgate_core::message::{Destination, Metadata};
-use rustgate_transport::{Router, ThrottleConfig, TlsConfig, TlsListener, TlsMinVersion};
+use rustgate_transport::{
+    CertReloader, Router, ThrottleConfig, TlsConfig, TlsListener, TlsMinVersion,
+};
 use tokio::sync::Semaphore;
 
 use crate::cli::{Cli, Encoding, Framing};
@@ -100,14 +102,43 @@ pub(crate) async fn build_tls_config(
 }
 
 /// Bind the TLS listener with a handshake concurrency limit.
+///
+/// When `cert_reload_interval > 0`, the server uses a [`CertReloader`] as the
+/// certificate resolver so that the TLS certificate can be rotated on disk
+/// without restarting the server. A background watcher task polls for changes.
 pub(crate) async fn bind_tls_listener(
     cli: &Cli,
     tls_config: &TlsConfig,
 ) -> anyhow::Result<TlsListener> {
-    // CLI validation ensures max_concurrent_handshakes >= 1
-    TlsListener::bind_with_handshake_limit(&cli.bind, tls_config, cli.max_concurrent_handshakes)
+    if cli.cert_reload_interval > 0 {
+        let reloader =
+            CertReloader::new(&cli.cert, &cli.key).context("initializing certificate reloader")?;
+
+        let verifier = tls_config.build_default_verifier()?;
+        let server_config = tls_config
+            .build_reloadable_server_config(verifier, reloader.clone())
+            .context("building reloadable server config")?;
+
+        let interval = std::time::Duration::from_secs(cli.cert_reload_interval);
+        reloader.spawn_watcher(interval);
+
+        tracing::info!(
+            interval_secs = cli.cert_reload_interval,
+            "certificate hot-reload enabled"
+        );
+
+        TlsListener::bind_with_server_config(
+            &cli.bind,
+            Arc::new(server_config),
+            cli.max_concurrent_handshakes,
+        )
         .await
-        .context("binding TLS listener")
+        .context("binding TLS listener with cert reloader")
+    } else {
+        TlsListener::bind_with_handshake_limit(&cli.bind, tls_config, cli.max_concurrent_handshakes)
+            .await
+            .context("binding TLS listener")
+    }
 }
 
 /// Validate framing/encoding feature requirements at startup.

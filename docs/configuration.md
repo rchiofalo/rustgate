@@ -19,6 +19,11 @@ All rustgate configuration is done through CLI flags or environment variables. C
 | `--max-connections` | `RUSTGATE_MAX_CONNECTIONS` | `1024` | Maximum concurrent connections |
 | `--max-concurrent-handshakes` | `RUSTGATE_MAX_HANDSHAKES` | `100` | Max TLS handshakes in progress |
 | `--fips-required` | `RUSTGATE_FIPS_REQUIRED` | `false` | Fail startup if FIPS provider is not active |
+| `--cert-reload-interval` | `RUSTGATE_CERT_RELOAD_INTERVAL` | `0` | Seconds between certificate file polls (0 = disabled) |
+
+### Certificate Hot-Reload
+
+When `--cert-reload-interval` is set to a value greater than 0, the server periodically polls the `--cert` and `--key` files for changes. If the file contents differ (detected via SHA-256 digest comparison), the server certificate is atomically swapped for all subsequent TLS handshakes — no restart required. Audit events are emitted on rotation success or failure.
 
 ### Certificate Revocation
 
