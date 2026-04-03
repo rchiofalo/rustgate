@@ -71,18 +71,11 @@ jobs:
 
       - name: Install aarch64 cross-compiler
         if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: sudo apt-get install -y gcc-aarch64-linux-gnu
+        run: sudo apt-get install -y gcc-aarch64-linux-gnu linux-libc-dev-arm64-cross
 
       - name: Install FIPS build dependencies
         if: matrix.fips
         run: sudo apt-get install -y cmake golang-go
-
-      - name: Set aarch64 cross-compilation env for FIPS
-        if: matrix.fips && matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          echo "GOARCH=arm64" >> $GITHUB_ENV
-          echo "GOOS=linux" >> $GITHUB_ENV
-          echo "CGO_ENABLED=1" >> $GITHUB_ENV
 
       - name: Add Rust target
         run: rustup target add ${{ matrix.target }}
@@ -97,6 +90,7 @@ jobs:
         env:
           CC_${{ matrix.target }}: ${{ matrix.cc }}
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: ${{ matrix.linker }}
+          C_INCLUDE_PATH: ${{ matrix.fips && (matrix.target == 'aarch64-unknown-linux-musl' && '/usr/aarch64-linux-gnu/include' || '/usr/include') || '' }}
         run: |
           FEATURES="${{ env.RELEASE_FEATURES }}"
           if [ "${{ matrix.fips }}" = "true" ]; then
