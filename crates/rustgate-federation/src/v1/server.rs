@@ -47,6 +47,26 @@ impl V1Server {
         on_message: OnMessage,
     ) -> anyhow::Result<Self> {
         let listener = TlsListener::bind(listen_addr, tls_config).await?;
+        Self::start_with_listener(
+            listener,
+            server_uid,
+            heartbeat_interval,
+            heartbeat_timeout,
+            on_message,
+        )
+    }
+
+    /// Start the V1 federation server with a pre-built `TlsListener`.
+    ///
+    /// Use this when you need custom TLS configuration, such as a
+    /// `DynamicCertVerifier` for runtime trust store changes.
+    pub fn start_with_listener(
+        listener: TlsListener,
+        server_uid: String,
+        heartbeat_interval: Duration,
+        heartbeat_timeout: Duration,
+        on_message: OnMessage,
+    ) -> anyhow::Result<Self> {
         let local_addr = listener.local_addr()?;
         info!(addr = %local_addr, "V1 federation server listening");
 

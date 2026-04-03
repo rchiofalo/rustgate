@@ -12,6 +12,7 @@ mod replay;
 mod router;
 mod session;
 mod throttle;
+mod verifier;
 
 pub use cache::PositionCache;
 pub use codec::{FramedCodec, LengthPrefixedCodec, LineDelimitedCodec, XmlStreamCodec};
@@ -29,6 +30,7 @@ pub use router::{Router, SessionHandle};
 pub use rustgate_proto::TakFrameCodec;
 pub use session::{AuthenticatedSession, SessionReader, SessionWriter};
 pub use throttle::{ClientThrottle, ThrottleConfig};
+pub use verifier::{DynamicCertVerifier, RootStoreProvider};
 
 pub mod pem;
 

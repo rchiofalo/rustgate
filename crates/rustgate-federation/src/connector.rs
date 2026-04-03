@@ -18,6 +18,33 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tracing::debug;
 
+/// Outbound connector that supports both static and dynamic TLS configurations.
+///
+/// When a trust store is configured, uses [`DynamicPeerConnector`] which
+/// rebuilds its `ClientConfig` when the trust store generation changes.
+/// Otherwise, uses the static [`PeerConnector`].
+#[derive(Clone, Debug)]
+pub enum OutboundConnector {
+    /// Static TLS config — root store is fixed at creation time.
+    Static(PeerConnector),
+    /// Dynamic TLS config — root store refreshes from the trust store.
+    Dynamic(DynamicPeerConnector),
+}
+
+impl OutboundConnector {
+    /// Connect to a remote federation peer over mTLS.
+    pub async fn connect(
+        &self,
+        addr: SocketAddr,
+        server_name: &str,
+    ) -> anyhow::Result<(tokio_rustls::client::TlsStream<TcpStream>, Arc<Identity>)> {
+        match self {
+            Self::Static(c) => c.connect(addr, server_name).await,
+            Self::Dynamic(c) => c.connect(addr, server_name).await,
+        }
+    }
+}
+
 /// Outbound mTLS connector for establishing federation peer connections.
 ///
 /// Manages the client-side TLS configuration and provides a `connect` method
@@ -112,6 +139,145 @@ impl PeerConnector {
             .map_err(|_| anyhow::anyhow!("invalid server name: {server_name}"))?;
 
         let connector = TlsConnector::from(Arc::clone(&self.client_config));
+        let tls_stream = connector
+            .connect(sni, tcp)
+            .await
+            .map_err(|e| anyhow::anyhow!("TLS handshake with {addr}: {e}"))?;
+
+        debug!(peer_addr = %addr, "TLS handshake completed");
+
+        let identity = extract_server_identity(&tls_stream)
+            .with_context(|| format!("extracting identity from peer at {addr}"))?;
+
+        debug!(
+            peer_addr = %addr,
+            cn = %identity.cn,
+            groups = ?identity.groups,
+            "federation peer authenticated"
+        );
+
+        Ok((tls_stream, Arc::new(identity)))
+    }
+}
+
+/// Provider that returns `(generation, RootCertStore)` for dynamic refresh.
+pub type OutboundRootStoreProvider = Arc<dyn Fn() -> (u64, RootCertStore) + Send + Sync>;
+
+/// Outbound mTLS connector with dynamic trust store refresh.
+///
+/// On each `connect` call, checks whether the trust store generation
+/// has changed. If so, rebuilds the `ClientConfig` with the fresh
+/// root store. Existing connections are not affected.
+#[derive(Clone)]
+pub struct DynamicPeerConnector {
+    provider: OutboundRootStoreProvider,
+    certs: Vec<CertificateDer<'static>>,
+    key_der: Vec<u8>,
+    skip_hostname_verify: bool,
+    cached: Arc<std::sync::Mutex<(u64, Arc<rustls::ClientConfig>)>>,
+}
+
+impl std::fmt::Debug for DynamicPeerConnector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let generation = self.cached.lock().map(|c| c.0).unwrap_or(u64::MAX);
+        f.debug_struct("DynamicPeerConnector")
+            .field("generation", &generation)
+            .field("skip_hostname_verify", &self.skip_hostname_verify)
+            .finish()
+    }
+}
+
+impl DynamicPeerConnector {
+    /// Create a new dynamic peer connector.
+    ///
+    /// `provider` is called on each `connect` to check if the root
+    /// store has changed. The connector rebuilds its `ClientConfig`
+    /// only when the generation counter advances.
+    pub fn new(
+        cert_pem: &str,
+        key_pem: &str,
+        provider: OutboundRootStoreProvider,
+        skip_hostname_verify: bool,
+    ) -> anyhow::Result<Self> {
+        let certs = parse_certs(cert_pem).context("loading federation client certificate")?;
+        let key = parse_key(key_pem).context("loading federation client key")?;
+        let key_der = key.secret_der().to_vec();
+
+        let (initial_gen, root_store) = provider();
+        let config = if skip_hostname_verify {
+            build_config_no_hostname_verify(root_store, certs.clone(), key)?
+        } else {
+            build_config_with_hostname_verify(root_store, certs.clone(), key)?
+        };
+
+        Ok(Self {
+            provider,
+            certs,
+            key_der,
+            skip_hostname_verify,
+            cached: Arc::new(std::sync::Mutex::new((initial_gen, Arc::new(config)))),
+        })
+    }
+
+    /// Get the current client config, rebuilding if generation changed.
+    fn current_config(&self) -> anyhow::Result<Arc<rustls::ClientConfig>> {
+        let (current_gen, _) = (self.provider)();
+
+        let mut cached = self
+            .cached
+            .lock()
+            .map_err(|e| anyhow::anyhow!("DynamicPeerConnector lock poisoned: {e}"))?;
+
+        if cached.0 == current_gen {
+            return Ok(Arc::clone(&cached.1));
+        }
+
+        debug!(
+            old_generation = cached.0,
+            new_generation = current_gen,
+            "trust store changed, rebuilding outbound TLS config"
+        );
+
+        let (fresh_gen, root_store) = (self.provider)();
+        let key = PrivateKeyDer::try_from(self.key_der.clone())
+            .map_err(|e| anyhow::anyhow!("re-parse private key: {e}"))?;
+
+        let config = if self.skip_hostname_verify {
+            build_config_no_hostname_verify(root_store, self.certs.clone(), key)?
+        } else {
+            build_config_with_hostname_verify(root_store, self.certs.clone(), key)?
+        };
+
+        let config = Arc::new(config);
+        *cached = (fresh_gen, Arc::clone(&config));
+        Ok(config)
+    }
+
+    /// Connect to a remote federation peer over mTLS.
+    ///
+    /// If the trust store has changed since the last connection, the
+    /// TLS configuration is rebuilt automatically before connecting.
+    pub async fn connect(
+        &self,
+        addr: SocketAddr,
+        server_name: &str,
+    ) -> anyhow::Result<(tokio_rustls::client::TlsStream<TcpStream>, Arc<Identity>)> {
+        let config = self.current_config()?;
+
+        debug!(peer_addr = %addr, server_name = %server_name, "connecting to federation peer (dynamic)");
+
+        let tcp = TcpStream::connect(addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("TCP connect to {addr}: {e}"))?;
+
+        configure_tcp_keepalive(&tcp);
+
+        let sni: ServerName<'static> = server_name
+            .to_string()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid server name: {server_name}"))?;
+
+        let connector = TlsConnector::from(config);
         let tls_stream = connector
             .connect(sni, tcp)
             .await

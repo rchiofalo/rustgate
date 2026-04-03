@@ -5,6 +5,7 @@ use std::sync::Arc;
 use rustgate_core::error::{ConfigError, Result, RustgateError};
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer};
+use rustls::server::danger::ClientCertVerifier;
 use rustls::server::{NoServerSessionStorage, WebPkiClientVerifier};
 use rustls_pki_types::pem::PemObject;
 use x509_parser::prelude::*;
@@ -154,10 +155,22 @@ impl TlsConfig {
             )))
         })?;
 
+        self.build_server_config_with_verifier(client_verifier)
+    }
+
+    /// Build a `rustls::ServerConfig` using a custom client certificate verifier.
+    ///
+    /// This is the entry point for dynamic TLS configurations where the
+    /// verifier queries a live trust store on each handshake, allowing
+    /// CA certificates to be added or removed at runtime.
+    pub fn build_server_config_with_verifier(
+        &self,
+        verifier: Arc<dyn ClientCertVerifier>,
+    ) -> Result<rustls::ServerConfig> {
         let mut config = rustls::ServerConfig::builder_with_protocol_versions(
             self.tls_min_version.protocol_versions(),
         )
-        .with_client_cert_verifier(client_verifier)
+        .with_client_cert_verifier(verifier)
         .with_single_cert(self.server_certs.clone(), self.server_key.clone_key())
         .map_err(|e| {
             RustgateError::from(ConfigError::Other(format!(
@@ -174,6 +187,22 @@ impl TlsConfig {
         config.session_storage = Arc::new(NoServerSessionStorage {});
 
         Ok(config)
+    }
+
+    /// Get a reference to the client CA root store.
+    ///
+    /// Used by consumers that need to build a [`DynamicCertVerifier`]
+    /// with the base CA store as a starting point.
+    pub fn client_ca_store(&self) -> &Arc<RootCertStore> {
+        &self.client_ca_store
+    }
+
+    /// Get a clone of the loaded CRLs.
+    ///
+    /// Used by consumers that need to pass CRLs to a
+    /// [`DynamicCertVerifier`].
+    pub fn crls(&self) -> &[CertificateRevocationListDer<'static>] {
+        &self.crls
     }
 }
 

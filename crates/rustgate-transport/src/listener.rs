@@ -57,11 +57,25 @@ impl TlsListener {
         config: &TlsConfig,
         max_concurrent_handshakes: usize,
     ) -> Result<Self> {
+        let server_config = config.build_server_config()?;
+        Self::bind_with_server_config(addr, Arc::new(server_config), max_concurrent_handshakes)
+            .await
+    }
+
+    /// Bind a TLS listener with a pre-built `ServerConfig`.
+    ///
+    /// Use this when you need custom TLS configuration, such as a
+    /// [`DynamicCertVerifier`](crate::DynamicCertVerifier) that refreshes
+    /// trusted CAs at runtime.
+    pub async fn bind_with_server_config<A: ToSocketAddrs>(
+        addr: A,
+        server_config: Arc<rustls::ServerConfig>,
+        max_concurrent_handshakes: usize,
+    ) -> Result<Self> {
         let tcp_listener = TcpListener::bind(addr)
             .await
             .map_err(|e| TransportError::Other(format!("failed to bind TLS listener: {e}")))?;
-        let server_config = config.build_server_config()?;
-        let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let tls_acceptor = TlsAcceptor::from(server_config);
 
         debug!(
             local_addr = ?tcp_listener.local_addr().ok(),
