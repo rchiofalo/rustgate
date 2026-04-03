@@ -35,10 +35,10 @@ The `--crl` flag loads a PEM-encoded Certificate Revocation List. Revoked certif
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `--tcp-bind` | `TCP_BIND` | — | Plaintext TCP listen address (enables plaintext TCP) |
-| `--udp-bind` | `UDP_BIND` | — | Plaintext UDP listen address (enables plaintext UDP) |
-| `--plaintext-cn` | `PLAINTEXT_CN` | `anonymous` | CN assigned to plaintext connections |
-| `--plaintext-group` | `PLAINTEXT_GROUP` | `__plaintext__` | Group assigned to plaintext connections |
+| `--tcp-bind` | `RUSTGATE_TCP_BIND` | — | Plaintext TCP listen address (enables plaintext TCP) |
+| `--udp-bind` | `RUSTGATE_UDP_BIND` | — | Plaintext UDP listen address (enables plaintext UDP) |
+| `--plaintext-cn` | `RUSTGATE_PLAINTEXT_CN` | `anonymous` | CN assigned to plaintext connections |
+| `--plaintext-group` | `RUSTGATE_PLAINTEXT_GROUP` | `__plaintext__` | Group assigned to plaintext connections |
 
 ### Rate Limiting
 
@@ -46,22 +46,22 @@ Per-client rate limiting uses a token bucket algorithm. When a client exceeds th
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `--client-message-rate` | `CLIENT_MESSAGE_RATE` | `0` (disabled) | Messages per second per client |
-| `--client-burst` | `CLIENT_BURST` | `200` | Maximum burst size (token bucket capacity) |
+| `--client-message-rate` | `RUSTGATE_CLIENT_MSG_RATE` | `0` (disabled) | Messages per second per client |
+| `--client-burst` | `RUSTGATE_CLIENT_BURST` | `200` | Maximum burst size (token bucket capacity) |
 
 ### Anti-Replay
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `--replay-window` | `REPLAY_WINDOW` | `300` | Replay detection window in seconds (0 to disable) |
+| `--replay-window` | `RUSTGATE_REPLAY_WINDOW` | `300` | Replay detection window in seconds (0 to disable) |
 
 ### Data Packages and Archive
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `--archive-dir` | `ARCHIVE_DIR` | — | Directory for JSONL CoT event archival |
+| `--archive-dir` | `RUSTGATE_ARCHIVE_DIR` | — | Directory for JSONL CoT event archival |
 | `--data-package-dir` | `DATA_PACKAGE_DIR` | — | Directory for client data packages |
-| `--package-max-age-hours` | `PACKAGE_MAX_AGE_HOURS` | `0` (no expiration) | Maximum age for data packages |
+| `--package-max-age-hours` | `RUSTGATE_PACKAGE_MAX_AGE_HOURS` | `0` (no expiration) | Maximum age for data packages |
 
 ### NATS (requires `--features nats`)
 
@@ -69,6 +69,10 @@ Per-client rate limiting uses a token bucket algorithm. When a client exceeds th
 |------|---------|---------|-------------|
 | `--nats-url` | `NATS_URL` | — | NATS server URL (enables NATS bridge) |
 | `--nats-credentials` | `NATS_CREDENTIALS` | — | NATS credentials file path |
+| `--nats-tls-cert` | `NATS_TLS_CERT` | — | Client certificate for NATS mTLS (PEM) |
+| `--nats-tls-key` | `NATS_TLS_KEY` | — | Client private key for NATS mTLS (PEM) |
+| `--nats-tls-ca` | `NATS_TLS_CA` | — | CA certificate for NATS server verification (PEM) |
+| `--nats-tls-required` | `NATS_TLS_REQUIRED` | `false` | Require TLS for NATS connections |
 
 ### Enrollment (requires `--features enrollment`)
 
@@ -104,8 +108,8 @@ Per-client rate limiting uses a token bucket algorithm. When a client exceeds th
 | `--federation-max-hops` | `FEDERATION_MAX_HOPS` | `10` | Max hops before message drop |
 | `--federation-store-path` | `FEDERATION_STORE_PATH` | — | Persistent peer store path |
 | `--federation-trust-store-dir` | `FEDERATION_TRUST_STORE_DIR` | — | Directory of trusted peer CA certificates |
-| `--federation-circuit-breaker-threshold` | `FEDERATION_CB_THRESHOLD` | `5` | Consecutive failures before circuit opens |
-| `--federation-circuit-breaker-timeout` | `FEDERATION_CB_TIMEOUT` | `60` | Seconds before recovery probe |
+| `--federation-circuit-breaker-threshold` | `FEDERATION_CIRCUIT_BREAKER_THRESHOLD` | `5` | Consecutive failures before circuit opens |
+| `--federation-circuit-breaker-timeout` | `FEDERATION_CIRCUIT_BREAKER_TIMEOUT` | `60` | Seconds before recovery probe |
 
 ### Federation HA (requires `--features federation-ha`)
 

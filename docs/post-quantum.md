@@ -18,17 +18,19 @@ The primary risk is **harvest-now-decrypt-later (HNDL)**: an adversary records e
 
 ### Phase 1: Hybrid Key Exchange (Target: v0.6.0)
 
-Enable **X25519Kyber768Draft00** (X25519 + ML-KEM 768) hybrid key exchange in rustls. This provides quantum resistance for key exchange while maintaining classical security as a fallback.
+Enable **X25519MLKEM768** (X25519 + ML-KEM 768) hybrid key exchange in rustls. This provides quantum resistance for key exchange while maintaining classical security as a fallback.
 
 **Requirements:**
 - rustls 0.23.22+ (already supports hybrid PQ key exchange)
+- The `aws-lc-rs` crypto backend — PQ key exchange is **not available** in the `ring` backend. rustgate already uses `aws-lc-rs` for its `fips` feature, so the build tooling (Go, cmake) is already supported.
 - No client-side changes required — clients that don't support PQ will negotiate classical X25519
 - Feature-gated behind a `post-quantum` feature flag initially
 
 **Implementation:**
-1. Add `rustls::crypto::ring::kx_group::X25519Kyber768Draft00` to the `CryptoProvider` key exchange group list
+1. Add `rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768` to the `CryptoProvider` key exchange group list
 2. Place PQ groups first in preference order so PQ-capable clients negotiate PQ
-3. Gate behind `#[cfg(feature = "post-quantum")]` to avoid increasing binary size for deployments that don't need it
+3. The `post-quantum` feature flag will depend on the `aws-lc-rs` backend (same as `fips`), since `ring` does not support PQ. Deployments that want PQ without FIPS compliance will get a separate `aws-lc-rs` dependency path.
+4. Gate behind `#[cfg(feature = "post-quantum")]` to avoid increasing binary size for deployments that don't need it
 
 ### Phase 2: PQ Certificate Authentication (Future)
 

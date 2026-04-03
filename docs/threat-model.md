@@ -53,6 +53,8 @@ rustgate is an mTLS message router that accepts connections from clients over fo
 | S4 | Attacker impersonates a federation peer | Federation uses mTLS with separate trust store (`--federation-trust-store-dir`); optional per-peer CN pinning (`trust_cert_cn`) | Mitigated |
 | S5 | Enrollment server issues cert to unauthorized user | HTTP Basic Auth on enrollment endpoint; Subject DN enforcement (CN set from authenticated username, CSR subject ignored) | Mitigated |
 
+**Note on WebSocket (port 8443):** The WebSocket listener uses the same mTLS handshake as the primary TLS path — all spoofing mitigations (S1–S5) apply identically. The WebSocket upgrade occurs over the already-authenticated TLS connection, so no additional origin header checking is needed.
+
 ### Tampering
 
 | Threat | Description | Mitigation | Status |
@@ -104,7 +106,7 @@ rustgate is an mTLS message router that accepts connections from clients over fo
 
 | Risk | Severity | Description | Recommended Action |
 |------|----------|-------------|-------------------|
-| I1 | Medium | Unauthenticated metrics endpoint | Firewall metrics port; bind to localhost or private interface |
+| I1 | Medium | Unauthenticated metrics endpoint exposes `rustgate_sessions_active`, `rustgate_connections_*`, routing stats | Firewall metrics port; bind to localhost or private interface |
 | S3 | Medium | Plaintext listeners accept unauthenticated traffic | Only enable on trusted networks; document security implications |
 | T3 | Low | NATS connection may be unencrypted | Enable NATS TLS in production (`--nats-tls-*` flags) |
 | T4/T5 | Low | On-disk config files could be tampered | Use read-only filesystem; External Secrets Operator in K8s |

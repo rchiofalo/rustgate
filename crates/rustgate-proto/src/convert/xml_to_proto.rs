@@ -39,6 +39,10 @@
 //!   lossy process: attribute ordering and whitespace may change.
 //! - **Nested attributes** within known detail elements that are not part
 //!   of the proto schema are also discarded.
+//! - The proto schema includes `caveat` and `releaseableTo` fields on
+//!   `CotEvent`. These are **reserved but currently unmapped** — they are
+//!   initialized to empty strings during conversion. If the source XML
+//!   contains corresponding attributes, they will be discarded.
 //!
 //! This behavior is by design — the protobuf schema defines a fixed set of
 //! fields, and XML attributes outside that set have no corresponding
