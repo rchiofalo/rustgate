@@ -18,7 +18,7 @@ use tokio_util::bytes::BytesMut;
 use tokio_util::codec::Framed;
 use tracing::{debug, error, info, warn};
 
-use crate::connector::PeerConnector;
+use crate::connector::OutboundConnector;
 use crate::heartbeat::{create_heartbeat, is_heartbeat};
 use crate::peer::{PeerHandle, PeerState};
 use crate::reconnect::{backoff_delay, should_stop_reconnecting};
@@ -30,7 +30,7 @@ pub type OnMessage = Arc<dyn Fn(String, Bytes) + Send + Sync>;
 
 /// Configuration for a V1 federation outbound client.
 pub struct V1ClientConfig {
-    pub connector: PeerConnector,
+    pub connector: OutboundConnector,
     pub addr: SocketAddr,
     pub server_name: String,
     pub server_uid: String,
@@ -344,6 +344,7 @@ async fn run_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connector::PeerConnector;
 
     // ── V1Client lifecycle ──────────────────────────────────────────
 
@@ -384,7 +385,7 @@ mod tests {
         let mut client = V1Client::start(
             peer,
             V1ClientConfig {
-                connector,
+                connector: OutboundConnector::Static(connector),
                 addr: "127.0.0.1:19999".parse().expect("addr"),
                 server_name: "localhost".into(),
                 server_uid: "test-uid".into(),
@@ -440,7 +441,7 @@ mod tests {
         let mut client = V1Client::start(
             peer,
             V1ClientConfig {
-                connector,
+                connector: OutboundConnector::Static(connector),
                 addr: "127.0.0.1:19998".parse().expect("addr"),
                 server_name: "localhost".into(),
                 server_uid: "test-uid".into(),
@@ -497,7 +498,7 @@ mod tests {
         let mut client = V1Client::start(
             Arc::clone(&peer),
             V1ClientConfig {
-                connector,
+                connector: OutboundConnector::Static(connector),
                 addr: "127.0.0.1:19997".parse().expect("addr"),
                 server_name: "localhost".into(),
                 server_uid: "test-uid".into(),
@@ -555,7 +556,7 @@ mod tests {
         let mut client = V1Client::start(
             peer,
             V1ClientConfig {
-                connector,
+                connector: OutboundConnector::Static(connector),
                 addr: "127.0.0.1:19996".parse().expect("addr"),
                 server_name: "localhost".into(),
                 server_uid: "test-uid".into(),

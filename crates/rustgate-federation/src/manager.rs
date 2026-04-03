@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::config::FederationConfig;
-use crate::connector::PeerConnector;
+use crate::connector::{OutboundConnector, PeerConnector};
 use crate::dedup::MessageDedup;
 use crate::peer::{PeerHandle, PeerStatus};
 use crate::trust_store::TrustStore;
@@ -64,7 +64,7 @@ impl std::fmt::Debug for FederationClient {
 /// - Peer status tracking and reporting
 pub struct FederationManager {
     config: FederationConfig,
-    connector: Option<PeerConnector>,
+    connector: Option<OutboundConnector>,
     v1_server: Option<V1Server>,
     #[cfg(feature = "v2")]
     v2_server_handle: Option<JoinHandle<Result<(), tonic::transport::Error>>>,
@@ -79,6 +79,9 @@ pub struct FederationManager {
     v2_tls_config: Option<tonic::transport::ClientTlsConfig>,
     /// Merged CA PEM used for TLS (base CA + trust store).
     ca_pem: Option<String>,
+    /// Live trust store for dynamic TLS refresh (kept alive for the
+    /// `DynamicCertVerifier` closure and the REST API).
+    trust_store: Option<Arc<TrustStore>>,
 
     // ── HA subsystem ─────────────────────────────────────────────────
     #[cfg(feature = "ha")]
@@ -143,6 +146,7 @@ impl FederationManager {
             #[cfg(feature = "v2")]
             v2_tls_config: None,
             ca_pem: None,
+            trust_store: None,
             #[cfg(feature = "ha")]
             claim_manager: None,
             #[cfg(feature = "ha")]
@@ -174,50 +178,97 @@ impl FederationManager {
         let ca_pem = std::fs::read_to_string(&self.config.ca_file)
             .map_err(|e| anyhow::anyhow!("read CA file: {e}"))?;
 
-        // Load trust store and merge with base CA if configured.
-        // The merged PEM contains the static base CA plus any additional
-        // CA certificates from the trust store directory. This merged PEM
-        // is used for all TLS verification (inbound and outbound, V1 and V2).
-        let ca_pem = if let Some(ref dir) = self.config.trust_store_dir {
-            let trust_store = TrustStore::load_from_directory(dir)?;
-            let extra_certs = trust_store.list_certificates();
-            if extra_certs.is_empty() {
-                info!(dir = %dir.display(), "trust store loaded (empty — using base CA only)");
-                ca_pem
-            } else {
-                let mut merged = ca_pem;
-                for cert_info in &extra_certs {
-                    if let Some(pem_bytes) = trust_store.get_certificate_pem(&cert_info.common_name)
-                    {
-                        let pem_str = std::str::from_utf8(&pem_bytes).map_err(|e| {
-                            anyhow::anyhow!(
-                                "trust store certificate '{}' contains invalid UTF-8: {e}",
-                                cert_info.common_name
-                            )
-                        })?;
-                        merged.push('\n');
-                        merged.push_str(pem_str);
-                    }
+        // Load trust store if configured. The trust store provides dynamic
+        // CA management — certificates can be added/removed at runtime via
+        // the REST API, and changes take effect on the next TLS handshake
+        // without restarting.
+        //
+        // The merged PEM (base CA + current trust store certs) is still
+        // built for V2/tonic which doesn't support dynamic verification,
+        // and for outbound connectors. The inbound V1 server uses a
+        // DynamicCertVerifier that queries the live trust store.
+        let trust_store: Option<Arc<TrustStore>> =
+            if let Some(ref dir) = self.config.trust_store_dir {
+                let ts = TrustStore::load_from_directory(dir)?;
+                let count = ts.count();
+                if count == 0 {
+                    info!(dir = %dir.display(), "trust store loaded (empty — using base CA only)");
+                } else {
+                    info!(
+                        dir = %dir.display(),
+                        base_ca = %self.config.ca_file.display(),
+                        trust_store_certs = count,
+                        "loaded trust store certificates"
+                    );
                 }
-                info!(
-                    dir = %dir.display(),
-                    base_ca = %self.config.ca_file.display(),
-                    trust_store_certs = extra_certs.len(),
-                    "merged trust store certificates with base CA"
-                );
-                merged
+                Some(Arc::new(ts))
+            } else {
+                None
+            };
+
+        // Build merged CA PEM for components that can't use dynamic verification
+        // (V2/tonic, initial outbound connector, adopt_peer).
+        let ca_pem = if let Some(ref ts) = trust_store {
+            let mut merged = ca_pem;
+            for cert_info in &ts.list_certificates() {
+                if let Some(pem_bytes) = ts.get_certificate_pem(&cert_info.common_name) {
+                    let pem_str = std::str::from_utf8(&pem_bytes).map_err(|e| {
+                        anyhow::anyhow!(
+                            "trust store certificate '{}' contains invalid UTF-8: {e}",
+                            cert_info.common_name
+                        )
+                    })?;
+                    merged.push('\n');
+                    merged.push_str(pem_str);
+                }
             }
+            merged
         } else {
             ca_pem
         };
 
-        // Create outbound connector (used by V1 clients)
-        let connector = PeerConnector::from_pem(
-            &cert_pem,
-            &key_pem,
-            &ca_pem,
-            self.config.skip_hostname_verify,
-        )?;
+        self.trust_store = trust_store;
+
+        // Create outbound connector (used by V1 clients).
+        // When a trust store is configured, use a DynamicPeerConnector
+        // that rebuilds its TLS config when CAs change.
+        let connector: OutboundConnector = if let Some(ref ts) = self.trust_store {
+            let ts_clone = Arc::clone(ts);
+            let base_ca = ca_pem.clone().into_bytes();
+            let provider = Arc::new(move || {
+                let current_gen = ts_clone.generation();
+                let store = ts_clone
+                    .build_root_cert_store_with_base(&base_ca)
+                    .unwrap_or_else(|e| {
+                        warn!(
+                            error = %e,
+                            "failed to build root store with base CA, \
+                             falling back to trust store CAs only — \
+                             clients signed by the base CA may be rejected"
+                        );
+                        ts_clone.build_root_cert_store()
+                    });
+                (current_gen, store)
+            });
+            let dynamic = crate::connector::DynamicPeerConnector::new(
+                &cert_pem,
+                &key_pem,
+                provider,
+                self.config.skip_hostname_verify,
+            )?;
+            info!(
+                "outbound federation using dynamic connector (trust store changes take effect on next connection)"
+            );
+            OutboundConnector::Dynamic(dynamic)
+        } else {
+            let static_connector = PeerConnector::from_pem(
+                &cert_pem,
+                &key_pem,
+                &ca_pem,
+                self.config.skip_hostname_verify,
+            )?;
+            OutboundConnector::Static(static_connector)
+        };
         self.connector = Some(connector.clone());
 
         // Store connection materials for reuse by adopt_peer()
@@ -237,15 +288,64 @@ impl FederationManager {
             let on_v1_server =
                 Self::create_v1_dedup_callback(&v1_dedup, &on_inbound, "inbound server");
 
-            let server = V1Server::start(
-                self.config.v1_listen_addr,
-                &tls_config,
-                self.config.federate_id.clone(),
-                self.config.heartbeat_interval,
-                self.config.heartbeat_timeout,
-                on_v1_server,
-            )
-            .await?;
+            // When a trust store is configured, use a DynamicCertVerifier
+            // so that CA changes take effect on the next TLS handshake
+            // without restarting the server.
+            let server = if let Some(ref ts) = self.trust_store {
+                let ts_clone = Arc::clone(ts);
+                let base_ca = ca_pem.clone().into_bytes();
+                let crls = tls_config.crls().to_vec();
+
+                let dynamic_verifier = rustgate_transport::DynamicCertVerifier::new(
+                    Box::new(move || {
+                        let current_gen = ts_clone.generation();
+                        let store = ts_clone
+                            .build_root_cert_store_with_base(&base_ca)
+                            .unwrap_or_else(|e| {
+                                warn!(
+                                    error = %e,
+                                    "failed to build root store with base CA for inbound verifier, \
+                                     falling back to trust store CAs only — \
+                                     clients signed by the base CA may be rejected"
+                                );
+                                ts_clone.build_root_cert_store()
+                            });
+                        (current_gen, store)
+                    }),
+                    crls,
+                )
+                .map_err(|e| anyhow::anyhow!("build dynamic cert verifier: {e}"))?;
+
+                let server_config =
+                    tls_config.build_server_config_with_verifier(dynamic_verifier)?;
+                let listener = rustgate_transport::TlsListener::bind_with_server_config(
+                    self.config.v1_listen_addr,
+                    Arc::new(server_config),
+                    rustgate_transport::DEFAULT_MAX_HANDSHAKES,
+                )
+                .await?;
+
+                info!(
+                    "V1 inbound using dynamic certificate verifier (trust store changes take effect on next handshake)"
+                );
+                V1Server::start_with_listener(
+                    listener,
+                    self.config.federate_id.clone(),
+                    self.config.heartbeat_interval,
+                    self.config.heartbeat_timeout,
+                    on_v1_server,
+                )?
+            } else {
+                V1Server::start(
+                    self.config.v1_listen_addr,
+                    &tls_config,
+                    self.config.federate_id.clone(),
+                    self.config.heartbeat_interval,
+                    self.config.heartbeat_timeout,
+                    on_v1_server,
+                )
+                .await?
+            };
 
             self.v1_server = Some(server);
             info!(
@@ -681,6 +781,15 @@ impl FederationManager {
     /// Get status snapshots for all peers.
     pub fn all_peer_statuses(&self) -> Vec<PeerStatus> {
         self.peers.values().map(|p| p.status()).collect()
+    }
+
+    /// Get the live trust store, if one is configured.
+    ///
+    /// The returned `Arc<TrustStore>` is the same instance used by the
+    /// `DynamicCertVerifier` — changes made via `add_certificate_from_pem`
+    /// or `remove_certificate` will take effect on the next TLS handshake.
+    pub fn trust_store(&self) -> Option<&Arc<TrustStore>> {
+        self.trust_store.as_ref()
     }
 
     /// Get the aggregated federation status.

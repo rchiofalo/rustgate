@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use rustls::RootCertStore;
@@ -50,6 +51,10 @@ struct StoredCert {
 pub struct TrustStore {
     certs: RwLock<HashMap<String, StoredCert>>,
     data_dir: Option<PathBuf>,
+    /// Monotonically increasing counter that increments on every add or remove.
+    /// Consumers can poll this to detect when the trust store contents have changed
+    /// and cached TLS configurations need rebuilding.
+    generation: AtomicU64,
 }
 
 impl std::fmt::Debug for TrustStore {
@@ -68,6 +73,7 @@ impl TrustStore {
         Self {
             certs: RwLock::new(HashMap::new()),
             data_dir,
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -171,6 +177,7 @@ impl TrustStore {
                 .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
             let _ = certs.insert(cn.clone(), stored);
         }
+        let _ = self.generation.fetch_add(1, Ordering::Release);
 
         // Persist to disk
         if let Some(ref dir) = self.data_dir
@@ -196,6 +203,7 @@ impl TrustStore {
         };
 
         if removed {
+            let _ = self.generation.fetch_add(1, Ordering::Release);
             // Remove from disk
             if let Some(ref dir) = self.data_dir {
                 let filename = sanitize_filename(cn);
@@ -242,6 +250,16 @@ impl TrustStore {
     /// Return the number of stored certificates.
     pub fn count(&self) -> usize {
         self.certs.read().map(|c| c.len()).unwrap_or(0)
+    }
+
+    /// Return the current generation counter.
+    ///
+    /// This value increments on every `add_certificate_from_pem` or
+    /// `remove_certificate` call. Consumers can compare it against a
+    /// previously observed value to detect trust store changes and
+    /// invalidate cached TLS configurations.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     /// Check if a certificate with the given common name is trusted.
