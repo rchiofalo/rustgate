@@ -623,6 +623,7 @@ pub(crate) struct WebSocketSetup<'a, P: NatsPublish> {
     pub(crate) nats_publisher: &'a Option<P>,
     pub(crate) fed_forward: &'a Option<FedForwardFn>,
     pub(crate) throttle_config: Option<ThrottleConfig>,
+    pub(crate) replay_filter: &'a Option<Arc<rustgate_transport::ReplayFilter>>,
 }
 
 /// Start the WebSocket listener and return its subsystem handle.
@@ -639,6 +640,7 @@ pub(crate) fn start_websocket<P: NatsPublish + Send + Sync + 'static>(
         nats_publisher,
         fed_forward,
         throttle_config,
+        replay_filter,
     } = setup;
     let ws_bind = match cli.websocket_bind.as_ref() {
         Some(b) => b,
@@ -687,6 +689,7 @@ pub(crate) fn start_websocket<P: NatsPublish + Send + Sync + 'static>(
         nats_publish: nats_cb,
         fed_forward: fed_forward.clone(),
         throttle_config,
+        replay_filter: replay_filter.clone(),
         shutdown: Arc::clone(&shutdown),
     };
     let task = tokio::spawn(async move {
@@ -708,6 +711,7 @@ pub(crate) fn warn_websocket_disabled(cli: &Cli) {
 // ---------------------------------------------------------------------------
 
 /// Start the plaintext TCP listener and return its subsystem handle.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
     cli: &Cli,
     router: &Arc<Router>,
@@ -716,6 +720,7 @@ pub(crate) async fn start_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
     encoding: Encoding,
     nats_publisher: &Option<P>,
     fed_forward: &Option<FedForwardFn>,
+    replay_filter: &Option<Arc<rustgate_transport::ReplayFilter>>,
 ) -> anyhow::Result<Option<SubsystemHandle>> {
     let tcp_bind = match cli.tcp_bind.as_ref() {
         Some(b) => b,
@@ -748,6 +753,7 @@ pub(crate) async fn start_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
         encoding,
         nats_publisher: pt_nats,
         fed_forward: fed_forward.clone(),
+        replay_filter: replay_filter.clone(),
         shutdown: shutdown_clone,
     };
 
@@ -768,6 +774,7 @@ pub(crate) async fn start_udp<P: NatsPublish + Send + Sync + 'static>(
     router: &Arc<Router>,
     nats_publisher: &Option<P>,
     fed_forward: &Option<FedForwardFn>,
+    replay_filter: &Option<Arc<rustgate_transport::ReplayFilter>>,
 ) -> anyhow::Result<Option<SubsystemHandle>> {
     let udp_bind = match cli.udp_bind.as_ref() {
         Some(b) => b,
@@ -821,6 +828,7 @@ pub(crate) async fn start_udp<P: NatsPublish + Send + Sync + 'static>(
                 })
             });
 
+    let udp_replay = replay_filter.clone();
     let task = tokio::spawn(async move {
         rustgate_transport::UdpInput::run(
             socket,
@@ -828,6 +836,7 @@ pub(crate) async fn start_udp<P: NatsPublish + Send + Sync + 'static>(
             config,
             udp_nats_cb,
             udp_fed,
+            udp_replay,
             shutdown_clone,
         )
         .await;

@@ -18,6 +18,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::{Notify, mpsc};
 use tracing::warn;
 
+use crate::replay::ReplayFilter;
+
 /// Maximum UDP datagram size. CoT messages are typically well under 64 KB.
 const MAX_DATAGRAM_SIZE: usize = 65_535;
 
@@ -61,6 +63,7 @@ impl UdpInput {
         config: UdpInputConfig,
         nats_publish: Option<OnNatsPublish>,
         fed_forward: Option<OnFederationForward>,
+        replay_filter: Option<Arc<ReplayFilter>>,
         shutdown: Arc<Notify>,
     ) {
         warn!(
@@ -117,6 +120,17 @@ impl UdpInput {
                                     continue;
                                 }
                             };
+
+                            // Anti-replay: drop datagrams with duplicate (uid, time)
+                            if let Some(filter) = &replay_filter
+                                && filter.is_replay(&payload)
+                            {
+                                tracing::debug!(
+                                    peer = %peer_addr,
+                                    "UDP datagram dropped: replay detected"
+                                );
+                                continue;
+                            }
 
                             let msg = msg_builder.build(&dgram_identity, payload, "udp");
                             router.route(msg.clone()).await;
@@ -186,7 +200,16 @@ mod tests {
 
         let router_clone = Arc::clone(&router);
         let task = tokio::spawn(async move {
-            UdpInput::run(socket, router_clone, config, None, None, shutdown_clone).await;
+            UdpInput::run(
+                socket,
+                router_clone,
+                config,
+                None,
+                None,
+                None,
+                shutdown_clone,
+            )
+            .await;
         });
 
         // Send a CoT-like datagram
@@ -223,7 +246,16 @@ mod tests {
 
         let router_clone = Arc::clone(&router);
         let task = tokio::spawn(async move {
-            UdpInput::run(socket, router_clone, config, None, None, shutdown_clone).await;
+            UdpInput::run(
+                socket,
+                router_clone,
+                config,
+                None,
+                None,
+                None,
+                shutdown_clone,
+            )
+            .await;
         });
 
         // Immediate shutdown

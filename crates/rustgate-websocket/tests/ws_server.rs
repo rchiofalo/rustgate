@@ -114,6 +114,7 @@ impl TestWsServer {
             nats_publish: None,
             fed_forward: None,
             throttle_config,
+            replay_filter: None,
             shutdown: Arc::clone(&shutdown),
         };
 
@@ -433,6 +434,7 @@ async fn ws_nats_and_federation_callbacks_fire() {
         nats_publish: Some(nats_publish),
         fed_forward: Some(fed_forward),
         throttle_config: None,
+        replay_filter: None,
         shutdown: Arc::clone(&shutdown),
     };
 

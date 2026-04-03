@@ -8,6 +8,7 @@ mod extract;
 mod filter;
 mod listener;
 mod repeater;
+mod replay;
 mod router;
 mod session;
 mod throttle;
@@ -22,6 +23,7 @@ pub use extract::{ExpectedKeyUsage, extract_identity, validate_key_usage};
 pub use filter::{GeoBounds, MessageFilter};
 pub use listener::TlsListener;
 pub use repeater::EmergencyRepeater;
+pub use replay::ReplayFilter;
 pub use router::{Router, SessionHandle};
 #[cfg(feature = "proto")]
 pub use rustgate_proto::TakFrameCodec;

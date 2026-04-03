@@ -129,6 +129,16 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     // ── Per-client rate limiting ────────────────────────────────────
     let throttle_config = setup::build_throttle_config(&cli);
 
+    // ── Anti-replay filter ─────────────────────────────────────────
+    let replay_filter =
+        rustgate_transport::ReplayFilter::from_secs(cli.replay_window).map(Arc::new);
+    if replay_filter.is_some() {
+        tracing::info!(
+            window_secs = cli.replay_window,
+            "anti-replay detection enabled"
+        );
+    }
+
     // ── WebSocket listener ──────────────────────────────────────────
     #[cfg(feature = "websocket")]
     let ws_shutdown = setup::start_websocket(setup::WebSocketSetup {
@@ -140,6 +150,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         nats_publisher: &nats_publisher,
         fed_forward: &fed_forward,
         throttle_config,
+        replay_filter: &replay_filter,
     })?;
 
     #[cfg(not(feature = "websocket"))]
@@ -162,11 +173,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         encoding,
         &nats_publisher,
         &fed_forward,
+        &replay_filter,
     )
     .await?;
 
     // ── UDP input listener ──────────────────────────────────────────
-    let udp_shutdown = setup::start_udp(&cli, &router, &nats_publisher, &fed_forward).await?;
+    let udp_shutdown =
+        setup::start_udp(&cli, &router, &nats_publisher, &fed_forward, &replay_filter).await?;
 
     // ── Accept loop ─────────────────────────────────────────────────
     loop {
@@ -199,6 +212,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                         let fed = fed_forward.clone();
                         let tc = throttle_config;
                         let arch = archiver.clone();
+                        let rf = replay_filter.clone();
                         let deps = SessionDeps {
                             router,
                             framing,
@@ -207,6 +221,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                             fed_forward: fed,
                             throttle_config: tc,
                             archiver: arch,
+                            replay_filter: rf,
                         };
                         setup::spawn_background("tls-session", session::handle_session(session, deps, permit));
                     }

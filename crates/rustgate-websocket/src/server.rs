@@ -15,7 +15,7 @@ use rustgate_core::identity::Identity;
 use rustgate_core::message::RoutableMessage;
 use rustgate_cot::MessageBuilder;
 use rustgate_transport::{
-    ClientThrottle, CotEncoder, RawEncoder, Router, SessionHandle, ThrottleConfig,
+    ClientThrottle, CotEncoder, RawEncoder, ReplayFilter, Router, SessionHandle, ThrottleConfig,
 };
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_tungstenite::tungstenite::Message;
@@ -54,6 +54,7 @@ pub struct WsServerConfig {
     pub nats_publish: Option<OnNatsPublish>,
     pub fed_forward: Option<OnFederationForward>,
     pub throttle_config: Option<ThrottleConfig>,
+    pub replay_filter: Option<Arc<ReplayFilter>>,
     pub shutdown: Arc<Notify>,
 }
 
@@ -85,6 +86,7 @@ impl WebSocketServer {
             nats_publish,
             fed_forward,
             throttle_config,
+            replay_filter,
             shutdown,
         } = config;
 
@@ -107,9 +109,10 @@ impl WebSocketServer {
                             let nats = nats_publish.clone();
                             let fed = fed_forward.clone();
                             let tc = throttle_config;
+                            let rf = replay_filter.clone();
 
                             drop(tokio::spawn(handle_ws_session(
-                                session, router, encoding, nats, fed, tc, permit,
+                                session, router, encoding, nats, fed, tc, rf, permit,
                             )));
                         }
                         Err(e) => {
@@ -126,6 +129,7 @@ impl WebSocketServer {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_ws_session(
     session: WsSession,
     router: Arc<Router>,
@@ -133,6 +137,7 @@ async fn handle_ws_session(
     nats_publish: Option<OnNatsPublish>,
     fed_forward: Option<OnFederationForward>,
     throttle_config: Option<ThrottleConfig>,
+    replay_filter: Option<Arc<ReplayFilter>>,
     _permit: OwnedSemaphorePermit,
 ) {
     let identity = session.identity_arc();
@@ -161,7 +166,7 @@ async fn handle_ws_session(
     let read_result = {
         let router = Arc::clone(&router);
         tokio::select! {
-            r = ws_read_loop(ws_read, &identity, &router, nats_publish.as_ref(), fed_forward.as_ref(), &throttle) => r,
+            r = ws_read_loop(ws_read, &identity, &router, nats_publish.as_ref(), fed_forward.as_ref(), &throttle, &replay_filter) => r,
             r = ws_write_loop(ws_write, &mut rx, encoding) => r,
         }
     };
@@ -186,6 +191,7 @@ async fn ws_read_loop(
     nats_publish: Option<&OnNatsPublish>,
     fed_forward: Option<&OnFederationForward>,
     throttle: &Option<ClientThrottle>,
+    replay_filter: &Option<Arc<ReplayFilter>>,
 ) -> Result<(), String> {
     let mut msg_builder = MessageBuilder::new();
 
@@ -209,6 +215,14 @@ async fn ws_read_loop(
             && !t.allow()
         {
             warn!(cn = %identity.cn, "message dropped: rate limit exceeded");
+            continue;
+        }
+
+        // Anti-replay: drop messages with duplicate (uid, time) within the window
+        if let Some(filter) = replay_filter
+            && filter.is_replay(&payload)
+        {
+            debug!(cn = %identity.cn, "message dropped: replay detected");
             continue;
         }
 
