@@ -8,22 +8,21 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
+use rustgate_core::codec::Codec;
 use rustgate_core::constants::{READ_TIMEOUT, WRITE_TIMEOUT};
 use rustgate_core::identity::Identity;
 #[cfg(feature = "metrics")]
 use rustgate_core::message::Destination;
 use rustgate_core::message::RoutableMessage;
-use rustgate_core::protocol::FramingStrategy;
 use rustgate_cot::MessageBuilder;
 use rustgate_transport::{
-    AuthenticatedSession, CotEncoder, FramedCodec, MessageEncoder, RawEncoder, ReplayFilter,
-    Router, SessionHandle, ThrottleConfig,
+    AuthenticatedSession, FramedCodec, ReplayFilter, Router, SessionHandle, ThrottleConfig,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::codec::{FramedRead, FramedWrite};
 
 use crate::archive;
-use crate::cli::{Encoding, Framing};
+use crate::cli::Framing;
 #[cfg(feature = "metrics")]
 use crate::metrics;
 
@@ -37,8 +36,10 @@ pub(crate) type FedForwardFn = Arc<dyn Fn(Bytes, Vec<String>) + Send + Sync>;
 /// Shared dependencies passed to each session handler task.
 pub(crate) struct SessionDeps<P: NatsPublish> {
     pub(crate) router: Arc<Router>,
+    /// CLI framing mode — only used to detect `TakNegotiate` for the
+    /// protocol negotiation handshake. The actual codec is in `codec`.
     pub(crate) framing: Framing,
-    pub(crate) encoding: Encoding,
+    pub(crate) codec: Arc<dyn Codec>,
     pub(crate) nats_publisher: Option<P>,
     pub(crate) fed_forward: Option<FedForwardFn>,
     pub(crate) throttle_config: Option<ThrottleConfig>,
@@ -50,7 +51,7 @@ pub(crate) struct SessionDeps<P: NatsPublish> {
 struct SessionContext<'a, P: NatsPublish> {
     identity: &'a Identity,
     router: &'a Router,
-    framing: &'a FramingStrategy,
+    codec: &'a dyn Codec,
     nats_publisher: &'a Option<P>,
     fed_forward: &'a Option<FedForwardFn>,
     throttle: Option<rustgate_transport::ClientThrottle>,
@@ -101,21 +102,24 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
     let (mut reader, mut writer) = session.split();
 
     // Run protocol negotiation for TakNegotiate mode.
-    // This may upgrade both framing and encoding from XML to protobuf.
-    let (final_framing, final_encoding, read_buf) = match deps.framing {
+    // This may upgrade the codec from XML to protobuf.
+    let (final_codec, read_buf): (Arc<dyn Codec>, _) = match deps.framing {
         #[cfg(feature = "proto")]
         Framing::TakNegotiate => {
             match negotiate_tak_protocol(&mut reader, &mut writer, &cn).await {
-                Ok(result) => {
-                    let protocol = if matches!(result.1, Encoding::TakProtobuf) {
-                        "protobuf"
-                    } else {
-                        "xml"
-                    };
+                Ok((codec, buf)) => {
+                    let protocol = codec.protocol_id();
                     #[cfg(feature = "metrics")]
-                    metrics::negotiations().with_label_values(&[protocol]).inc();
+                    {
+                        let label = if protocol == "tak-protobuf" {
+                            "protobuf"
+                        } else {
+                            "xml"
+                        };
+                        metrics::negotiations().with_label_values(&[label]).inc();
+                    }
                     crate::audit::negotiation_result(&cn, protocol, true);
-                    result
+                    (codec, buf)
                 }
                 Err(e) => {
                     #[cfg(feature = "metrics")]
@@ -134,17 +138,14 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
                 }
             }
         }
-        _ => {
-            let fs = FramingStrategy::from(deps.framing);
-            (fs, deps.encoding, tokio_util::bytes::BytesMut::new())
-        }
+        _ => (deps.codec.clone(), tokio_util::bytes::BytesMut::new()),
     };
 
     let throttle = deps.throttle_config.map(|tc| tc.build());
     let ctx = SessionContext {
         identity: &identity,
         router: &deps.router,
-        framing: &final_framing,
+        codec: final_codec.as_ref(),
         nats_publisher: &deps.nats_publisher,
         fed_forward: &deps.fed_forward,
         throttle,
@@ -152,27 +153,7 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
         replay_filter: &deps.replay_filter,
     };
 
-    let result = match final_encoding {
-        Encoding::Raw => run_session_loops(reader, writer, rx, &ctx, &RawEncoder, read_buf).await,
-        Encoding::Cot => run_session_loops(reader, writer, rx, &ctx, &CotEncoder, read_buf).await,
-        #[cfg(feature = "proto")]
-        Encoding::TakProtobuf => {
-            run_session_loops(
-                reader,
-                writer,
-                rx,
-                &ctx,
-                &rustgate_proto::TakProtobufEncoder,
-                read_buf,
-            )
-            .await
-        }
-        #[cfg(not(feature = "proto"))]
-        Encoding::TakProtobuf => {
-            tracing::error!("--encoding tak-protobuf requires --features proto");
-            return;
-        }
-    };
+    let result = run_session_loops(reader, writer, rx, &ctx, read_buf).await;
 
     if let Err(e) = result {
         tracing::debug!(cn = %cn, error = %e, "session error");
@@ -194,13 +175,13 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
 /// client's response. If 0xBF (protobuf magic), completes the handshake and
 /// upgrades to protobuf. Otherwise, stays XML.
 ///
-/// Returns (final_framing, final_encoding, buffered_read_bytes).
+/// Returns the negotiated codec and any buffered read bytes.
 #[cfg(feature = "proto")]
 async fn negotiate_tak_protocol(
     reader: &mut rustgate_transport::SessionReader,
     writer: &mut rustgate_transport::SessionWriter,
     cn: &str,
-) -> std::io::Result<(FramingStrategy, Encoding, tokio_util::bytes::BytesMut)> {
+) -> std::io::Result<(Arc<dyn Codec>, tokio_util::bytes::BytesMut)> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_util::bytes::BufMut;
 
@@ -238,8 +219,7 @@ async fn negotiate_tak_protocol(
         tracing::info!(cn = %cn, "protobuf negotiation complete");
 
         Ok((
-            FramingStrategy::TakProtobuf,
-            Encoding::TakProtobuf,
+            Arc::new(rustgate_proto::TakProtobufCodec),
             tokio_util::bytes::BytesMut::new(),
         ))
     } else {
@@ -248,7 +228,7 @@ async fn negotiate_tak_protocol(
 
         let mut buf = tokio_util::bytes::BytesMut::with_capacity(64);
         buf.put_u8(peek[0]);
-        Ok((FramingStrategy::XmlStream, Encoding::Cot, buf))
+        Ok((Arc::new(rustgate_transport::TakXmlCodec), buf))
     }
 }
 
@@ -260,12 +240,11 @@ async fn run_session_loops(
     writer: rustgate_transport::SessionWriter,
     rx: mpsc::Receiver<RoutableMessage>,
     ctx: &SessionContext<'_, impl NatsPublish>,
-    encoder: &impl MessageEncoder,
     read_buf: tokio_util::bytes::BytesMut,
 ) -> std::io::Result<()> {
     tokio::select! {
         r = read_loop(reader, ctx, read_buf) => r,
-        r = write_loop(writer, rx, ctx.framing, encoder) => r,
+        r = write_loop(writer, rx, ctx.codec) => r,
     }
 }
 
@@ -276,8 +255,7 @@ async fn read_loop(
     ctx: &SessionContext<'_, impl NatsPublish>,
     prefix: tokio_util::bytes::BytesMut,
 ) -> std::io::Result<()> {
-    let is_proto = matches!(ctx.framing, FramingStrategy::TakProtobuf);
-    let codec = FramedCodec::from_strategy(ctx.framing);
+    let framed_codec = FramedCodec::from_strategy(&ctx.codec.framing());
 
     // When negotiation consumed a peek byte and fell back to XML,
     // we need to feed that byte to the codec before reading from the socket.
@@ -286,7 +264,7 @@ async fn read_loop(
     } else {
         Some(prefix)
     };
-    let mut framed = FramedRead::new(PrefixedReader::new(reader, prefix_opt), codec);
+    let mut framed = FramedRead::new(PrefixedReader::new(reader, prefix_opt), framed_codec);
 
     let mut msg_builder = MessageBuilder::new();
 
@@ -302,25 +280,10 @@ async fn read_loop(
             }
         };
 
-        // For protobuf sessions, convert proto -> XML to get the canonical format.
-        // The RoutableMessage payload is always XML.
-        let payload = if is_proto {
-            #[cfg(feature = "proto")]
-            {
-                let xml_bytes = rustgate_proto::proto_to_xml(&frame)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                Bytes::from(xml_bytes)
-            }
-            #[cfg(not(feature = "proto"))]
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "TakProtobuf framing requires the `proto` feature",
-                ));
-            }
-        } else {
-            frame.freeze()
-        };
+        // Convert framed bytes to canonical payload format via the codec.
+        // Passthrough codecs use frame.freeze() for zero-copy; converting
+        // codecs (protobuf) allocate regardless so the owned buffer is free.
+        let payload = ctx.codec.decode_payload(frame)?;
 
         #[cfg(feature = "metrics")]
         metrics::messages_received().inc();
@@ -387,13 +350,12 @@ async fn read_loop(
 async fn write_loop(
     writer: rustgate_transport::SessionWriter,
     mut rx: mpsc::Receiver<RoutableMessage>,
-    framing: &FramingStrategy,
-    encoder: &impl MessageEncoder,
+    codec: &dyn Codec,
 ) -> std::io::Result<()> {
-    let mut framed = FramedWrite::new(writer, FramedCodec::from_strategy(framing));
+    let mut framed = FramedWrite::new(writer, FramedCodec::from_strategy(&codec.framing()));
 
     while let Some(msg) = rx.recv().await {
-        let encoded = encoder.encode(&msg)?;
+        let encoded = codec.encode_payload(&msg)?;
         let send_fut = framed.send(tokio_util::bytes::BytesMut::from(encoded.as_ref()));
 
         match tokio::time::timeout(WRITE_TIMEOUT, send_fut).await {
@@ -420,10 +382,11 @@ pub(crate) struct PlaintextTcpConfig<P: NatsPublish> {
     pub(crate) listener: rustgate_transport::PlaintextListener,
     pub(crate) router: Arc<Router>,
     pub(crate) connection_limit: Arc<Semaphore>,
-    pub(crate) framing: Framing,
-    pub(crate) encoding: Encoding,
+    pub(crate) codec: Arc<dyn Codec>,
     pub(crate) nats_publisher: Option<P>,
     pub(crate) fed_forward: Option<FedForwardFn>,
+    pub(crate) throttle_config: Option<ThrottleConfig>,
+    pub(crate) archiver: Option<Arc<archive::CotArchiver>>,
     pub(crate) replay_filter: Option<Arc<ReplayFilter>>,
     pub(crate) shutdown: Arc<tokio::sync::Notify>,
 }
@@ -440,10 +403,11 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
         listener,
         router,
         connection_limit,
-        framing,
-        encoding,
+        codec,
         nats_publisher,
         fed_forward,
+        throttle_config,
+        archiver,
         replay_filter,
         shutdown,
     } = config;
@@ -476,10 +440,12 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
                         let (reader, writer) = session.into_split();
 
                         let session_router = Arc::clone(&router);
-                        let fs = FramingStrategy::from(framing);
+                        let session_codec = Arc::clone(&codec);
                         #[allow(clippy::clone_on_copy)]
                         let session_nats = nats_publisher.clone();
                         let session_fed = fed_forward.clone();
+                        let session_throttle = throttle_config.map(|tc| tc.build());
+                        let session_arch = archiver.clone();
                         let session_rf = replay_filter.clone();
 
                         crate::setup::spawn_background("plaintext-tcp-session", async move {
@@ -491,10 +457,11 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
                                 rx,
                                 identity: &identity,
                                 router: &session_router,
-                                framing: &fs,
-                                encoding,
+                                codec: session_codec.as_ref(),
                                 nats_publisher: &session_nats,
                                 fed_forward: &session_fed,
+                                throttle: session_throttle,
+                                archiver: &session_arch,
                                 replay_filter: &session_rf,
                             }).await;
 
@@ -526,17 +493,18 @@ struct PlaintextSessionContext<'a, P: NatsPublish> {
     rx: mpsc::Receiver<RoutableMessage>,
     identity: &'a Identity,
     router: &'a Router,
-    framing: &'a FramingStrategy,
-    encoding: Encoding,
+    codec: &'a dyn Codec,
     nats_publisher: &'a Option<P>,
     fed_forward: &'a Option<FedForwardFn>,
+    throttle: Option<rustgate_transport::ClientThrottle>,
+    archiver: &'a Option<Arc<archive::CotArchiver>>,
     replay_filter: &'a Option<Arc<ReplayFilter>>,
 }
 
 /// Read/write loops for a plaintext TCP session.
 ///
-/// Uses the same codec and encoder pipeline as TLS sessions but operates
-/// on a raw `TcpStream` split.
+/// Uses the same codec pipeline as TLS sessions but operates on a raw
+/// `TcpStream` split. The codec handles both framing and payload conversion.
 async fn run_plaintext_session_loops<P: NatsPublish>(
     ctx: PlaintextSessionContext<'_, P>,
 ) -> std::io::Result<()> {
@@ -546,23 +514,19 @@ async fn run_plaintext_session_loops<P: NatsPublish>(
         mut rx,
         identity,
         router,
-        framing,
-        encoding,
+        codec,
         nats_publisher,
         fed_forward,
+        throttle,
+        archiver,
         replay_filter,
     } = ctx;
-    let codec = FramedCodec::from_strategy(framing);
-    let mut framed_read = FramedRead::new(reader, codec);
+    let framed_codec = FramedCodec::from_strategy(&codec.framing());
+    let mut framed_read = FramedRead::new(reader, framed_codec);
     let mut msg_builder = MessageBuilder::new();
 
-    let write_codec = FramedCodec::from_strategy(framing);
-    let mut framed_write = FramedWrite::new(writer, write_codec);
-
-    let encoder: Box<dyn MessageEncoder + Send + Sync> = match encoding {
-        Encoding::Raw | Encoding::TakProtobuf => Box::new(RawEncoder),
-        Encoding::Cot => Box::new(CotEncoder),
-    };
+    let write_framed_codec = FramedCodec::from_strategy(&codec.framing());
+    let mut framed_write = FramedWrite::new(writer, write_framed_codec);
 
     tokio::select! {
         r = async {
@@ -578,7 +542,17 @@ async fn run_plaintext_session_loops<P: NatsPublish>(
                     }
                 };
 
-                let payload = frame.freeze();
+                let payload = codec.decode_payload(frame)?;
+
+                // Per-client rate limiting — drop excess messages
+                if let Some(t) = &throttle
+                    && !t.allow()
+                {
+                    tracing::debug!(cn = %identity.cn, "message dropped: rate limit exceeded");
+                    #[cfg(feature = "metrics")]
+                    metrics::messages_dropped().inc();
+                    continue;
+                }
 
                 // Anti-replay: drop messages with duplicate (uid, time) within the window
                 if let Some(filter) = replay_filter
@@ -591,6 +565,12 @@ async fn run_plaintext_session_loops<P: NatsPublish>(
                 }
 
                 let msg = msg_builder.build(identity, payload, "tcp-plaintext");
+
+                // Archive to JSONL if enabled
+                if let Some(arch) = archiver {
+                    arch.record(&msg).await;
+                }
+
                 router.route(msg.clone()).await;
 
                 if let Some(publisher) = nats_publisher {
@@ -606,7 +586,7 @@ async fn run_plaintext_session_loops<P: NatsPublish>(
         } => r,
         r = async {
             while let Some(msg) = rx.recv().await {
-                let encoded = encoder.encode(&msg)?;
+                let encoded = codec.encode_payload(&msg)?;
                 let send_fut = framed_write.send(tokio_util::bytes::BytesMut::from(encoded.as_ref()));
                 match tokio::time::timeout(WRITE_TIMEOUT, send_fut).await {
                     Ok(result) => result?,

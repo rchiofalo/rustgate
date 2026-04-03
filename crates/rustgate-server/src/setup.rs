@@ -141,16 +141,30 @@ pub(crate) async fn bind_tls_listener(
     }
 }
 
-/// Validate framing/encoding feature requirements at startup.
+/// Validate framing/encoding feature requirements and consistency at startup.
 ///
 /// Rejects proto-dependent framing or encoding when the `proto` feature is not
-/// compiled in. This prevents a runtime panic in the codec layer.
+/// compiled in, and rejects ambiguous flag combinations where `--framing` and
+/// `--encoding` disagree on the wire protocol.
 pub(crate) fn validate_framing(cli: &Cli) -> anyhow::Result<()> {
     #[cfg(not(feature = "proto"))]
     if matches!(cli.framing, Framing::TakProtobuf | Framing::TakNegotiate)
         || matches!(cli.encoding, Encoding::TakProtobuf)
     {
         anyhow::bail!("TAK protobuf support requires --features proto");
+    }
+
+    // Reject ambiguous combinations where framing and encoding disagree on
+    // the wire protocol. --encoding tak-protobuf implies 0xBF+varint framing,
+    // which conflicts with non-protobuf --framing values.
+    if matches!(cli.encoding, Encoding::TakProtobuf)
+        && !matches!(cli.framing, Framing::TakProtobuf | Framing::TakNegotiate)
+    {
+        anyhow::bail!(
+            "--encoding tak-protobuf requires --framing tak-protobuf or --framing tak-negotiate; \
+             got --framing {:?}",
+            cli.framing
+        );
     }
 
     // Suppress unused-variable warning when proto is enabled
@@ -747,10 +761,11 @@ pub(crate) async fn start_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
     cli: &Cli,
     router: &Arc<Router>,
     connection_limit: &Arc<Semaphore>,
-    framing: Framing,
-    encoding: Encoding,
+    codec: &Arc<dyn rustgate_core::codec::Codec>,
     nats_publisher: &Option<P>,
     fed_forward: &Option<FedForwardFn>,
+    throttle_config: Option<ThrottleConfig>,
+    archiver: &Option<Arc<crate::archive::CotArchiver>>,
     replay_filter: &Option<Arc<rustgate_transport::ReplayFilter>>,
 ) -> anyhow::Result<Option<SubsystemHandle>> {
     let tcp_bind = match cli.tcp_bind.as_ref() {
@@ -780,10 +795,11 @@ pub(crate) async fn start_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
         listener: pt_listener,
         router: Arc::clone(router),
         connection_limit: Arc::clone(connection_limit),
-        framing,
-        encoding,
+        codec: Arc::clone(codec),
         nats_publisher: pt_nats,
         fed_forward: fed_forward.clone(),
+        throttle_config,
+        archiver: archiver.clone(),
         replay_filter: replay_filter.clone(),
         shutdown: shutdown_clone,
     };

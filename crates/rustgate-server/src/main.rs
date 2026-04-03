@@ -92,6 +92,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     setup::validate_framing(&cli)?;
 
+    let codec = cli::build_codec(framing, encoding);
+
     tracing::info!(addr = %listener.local_addr()?, framing = ?cli.framing, encoding = ?encoding, "listening");
 
     // Readiness flag for K8s health probes
@@ -198,10 +200,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         &cli,
         &router,
         &connection_limit,
-        framing,
-        encoding,
+        &codec,
         &nats_publisher,
         &fed_forward,
+        throttle_config,
+        &archiver,
         &replay_filter,
     )
     .await?;
@@ -245,7 +248,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                         let deps = SessionDeps {
                             router,
                             framing,
-                            encoding,
+                            codec: codec.clone(),
                             nats_publisher: publisher,
                             fed_forward: fed,
                             throttle_config: tc,

@@ -3,6 +3,7 @@
 mod cache;
 pub mod cert_reloader;
 mod codec;
+mod codecs;
 mod config;
 mod encoder;
 mod extract;
@@ -18,6 +19,7 @@ mod verifier;
 pub use cache::PositionCache;
 pub use cert_reloader::CertReloader;
 pub use codec::{FramedCodec, LengthPrefixedCodec, LineDelimitedCodec, XmlStreamCodec};
+pub use codecs::{RawLengthPrefixedCodec, RawLineCodec, TakXmlCodec};
 #[cfg(feature = "fips")]
 pub use config::install_fips_provider;
 pub use config::{TlsConfig, TlsMinVersion, check_crl_freshness, is_fips_provider_active};

@@ -20,6 +20,7 @@ pub mod convert;
 pub mod encoder;
 pub mod error;
 pub mod negotiate;
+pub mod proto_codec;
 pub mod xml_full;
 
 /// Generated protobuf types from TAK `.proto` schemas.
@@ -37,4 +38,5 @@ pub use error::ProtoError;
 pub use negotiate::{
     build_protocol_support_xml, build_tak_response, parse_tak_request, read_tak_request,
 };
+pub use proto_codec::TakProtobufCodec;
 pub use xml_full::{FullCotEvent, parse_full};

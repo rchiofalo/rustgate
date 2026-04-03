@@ -314,6 +314,41 @@ impl From<Framing> for FramingStrategy {
     }
 }
 
+/// Build a codec from the CLI `--framing` and `--encoding` flags.
+///
+/// Maps legacy `(Framing, Encoding)` pairs to the unified [`Codec`](rustgate_core::codec::Codec) trait
+/// objects. `TakNegotiate` starts with XML; negotiation upgrades to protobuf
+/// inside the session handler.
+pub(crate) fn build_codec(
+    framing: Framing,
+    encoding: Encoding,
+) -> std::sync::Arc<dyn rustgate_core::codec::Codec> {
+    use std::sync::Arc;
+
+    // Ambiguous combinations (e.g. --framing xml --encoding tak-protobuf)
+    // are rejected by validate_framing() before this function is called.
+    match (framing, encoding) {
+        // TAK protobuf framing always uses the protobuf codec regardless
+        // of the encoding flag.
+        #[cfg(feature = "proto")]
+        (Framing::TakProtobuf, _) => Arc::new(rustgate_proto::TakProtobufCodec),
+
+        // TakNegotiate starts as XML — negotiation may upgrade to protobuf.
+        (Framing::TakNegotiate, _) => Arc::new(rustgate_transport::TakXmlCodec),
+
+        // Standard combinations: framing determines the codec, encoding is
+        // passthrough (Raw/Cot both use identity payload transform).
+        (Framing::Xml, _) => Arc::new(rustgate_transport::TakXmlCodec),
+        (Framing::Line, _) => Arc::new(rustgate_transport::RawLineCodec),
+        (Framing::LengthPrefixed, _) => Arc::new(rustgate_transport::RawLengthPrefixedCodec),
+
+        // Fallback for proto framing when proto feature is disabled
+        // (should be caught by validate_framing, but be safe).
+        #[cfg(not(feature = "proto"))]
+        (Framing::TakProtobuf, _) => Arc::new(rustgate_transport::TakXmlCodec),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::panic, clippy::unwrap_used)]
@@ -543,5 +578,52 @@ mod tests {
         ])
         .expect("should parse");
         assert!(cli.federation_skip_hostname_verify);
+    }
+
+    // ── build_codec tests ──────────────────────────────────────────
+
+    #[test]
+    fn build_codec_xml_raw_produces_tak_xml() {
+        let codec = build_codec(Framing::Xml, Encoding::Raw);
+        assert_eq!(codec.protocol_id(), "tak-xml");
+    }
+
+    #[test]
+    fn build_codec_xml_cot_produces_tak_xml() {
+        let codec = build_codec(Framing::Xml, Encoding::Cot);
+        assert_eq!(codec.protocol_id(), "tak-xml");
+    }
+
+    #[test]
+    fn build_codec_line_produces_raw_line() {
+        let codec = build_codec(Framing::Line, Encoding::Raw);
+        assert_eq!(codec.protocol_id(), "raw-line");
+    }
+
+    #[test]
+    fn build_codec_length_prefixed_produces_raw_length_prefixed() {
+        let codec = build_codec(Framing::LengthPrefixed, Encoding::Raw);
+        assert_eq!(codec.protocol_id(), "raw-length-prefixed");
+    }
+
+    #[test]
+    fn build_codec_tak_negotiate_starts_xml() {
+        let codec = build_codec(Framing::TakNegotiate, Encoding::Raw);
+        assert_eq!(codec.protocol_id(), "tak-xml");
+    }
+
+    #[cfg(feature = "proto")]
+    #[test]
+    fn build_codec_tak_protobuf_framing_produces_protobuf() {
+        let codec = build_codec(Framing::TakProtobuf, Encoding::Raw);
+        assert_eq!(codec.protocol_id(), "tak-protobuf");
+    }
+
+    #[cfg(feature = "proto")]
+    #[test]
+    fn build_codec_tak_protobuf_framing_ignores_encoding() {
+        // Encoding flag is irrelevant when framing is TakProtobuf
+        let codec = build_codec(Framing::TakProtobuf, Encoding::Cot);
+        assert_eq!(codec.protocol_id(), "tak-protobuf");
     }
 }
