@@ -147,49 +147,63 @@ fn message_key(payload: &[u8]) -> Option<u64> {
 /// Extract the value of an XML attribute from raw bytes.
 ///
 /// Searches for `name="value"` or `name='value'` in the first 512 bytes.
-/// The attribute name must be preceded by whitespace (or appear at the
-/// start of the payload) to avoid matching inside other attribute values.
+/// Uses a forward scan with quote-state tracking to avoid matching attribute
+/// names that appear inside another attribute's quoted value.
 fn extract_xml_attr<'a>(payload: &'a [u8], attr: &[u8]) -> Option<&'a [u8]> {
     let search_limit = payload.len().min(512);
     let haystack = &payload[..search_limit];
     let attr_len = attr.len();
 
-    let mut offset = 0;
-    while offset + attr_len <= search_limit {
-        let pos = haystack[offset..].windows(attr_len).position(|w| w == attr);
-        let attr_pos = match pos {
-            Some(p) => offset + p,
-            None => return None,
-        };
+    // Track whether we are inside a quoted attribute value.
+    // When `in_quote` is Some(q), we are inside a value delimited by quote char q.
+    let mut in_quote: Option<u8> = None;
+    let mut i = 0;
 
-        // Attribute must be preceded by whitespace or be at the start.
-        // This prevents matching `uid=` inside another attribute's value
-        // (e.g., `desc='contains uid="fake"'`).
-        if attr_pos > 0 && !haystack[attr_pos - 1].is_ascii_whitespace() {
-            offset = attr_pos + 1;
+    while i < search_limit {
+        let b = haystack[i];
+
+        // If inside a quoted value, skip until closing quote.
+        if let Some(q) = in_quote {
+            if b == q {
+                in_quote = None;
+            }
+            i += 1;
             continue;
         }
 
-        let value_start = attr_pos + attr_len;
-        if value_start >= search_limit {
-            return None;
+        // Check for attribute match at this position.
+        if i + attr_len <= search_limit
+            && &haystack[i..i + attr_len] == attr
+            && (i == 0 || haystack[i - 1].is_ascii_whitespace())
+        {
+            let value_start = i + attr_len;
+            if value_start >= search_limit {
+                return None;
+            }
+
+            let quote = haystack[value_start];
+            if quote == b'"' || quote == b'\'' {
+                let content_start = value_start + 1;
+                if content_start >= search_limit {
+                    return None;
+                }
+                let remaining = &haystack[content_start..];
+                let end = remaining.iter().position(|&c| c == quote)?;
+                return Some(&payload[content_start..content_start + end]);
+            }
         }
 
-        let quote = haystack[value_start];
-        if quote != b'"' && quote != b'\'' {
-            offset = attr_pos + 1;
-            continue;
+        // Enter quoted value if we see `=` followed by a quote.
+        if b == b'=' && i + 1 < search_limit {
+            let next = haystack[i + 1];
+            if next == b'"' || next == b'\'' {
+                in_quote = Some(next);
+                i += 2; // skip past `="` or `='`
+                continue;
+            }
         }
 
-        let content_start = value_start + 1;
-        if content_start >= search_limit {
-            return None;
-        }
-
-        let remaining = &haystack[content_start..];
-        let end = remaining.iter().position(|&b| b == quote)?;
-
-        return Some(&payload[content_start..content_start + end]);
+        i += 1;
     }
 
     None
