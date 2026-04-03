@@ -1,3 +1,12 @@
+//! Federation peer handle with circuit breaker and connection state.
+//!
+//! Each configured federation peer gets a [`PeerHandle`] that tracks its
+//! connection state, circuit breaker health, and message counters. The
+//! circuit breaker pattern ([`CircuitState`]) prevents wasting resources
+//! on peers that are consistently failing — after a configurable number
+//! of consecutive failures the circuit "opens" and messages are skipped
+//! until a recovery timeout elapses.
+
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;

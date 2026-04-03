@@ -1,3 +1,9 @@
+//! Framing protocol definitions for message boundary detection.
+//!
+//! rustgate supports multiple framing strategies to interoperate with
+//! different client types. The [`FramingStrategy`] enum selects which
+//! codec is used to split a TCP byte stream into discrete messages.
+
 /// Describes how to detect message boundaries on a byte stream.
 #[derive(Debug, Clone)]
 pub enum FramingStrategy {

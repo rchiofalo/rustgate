@@ -68,6 +68,37 @@ This document maps rustgate's existing security controls to NIST SP 800-53 (Rev.
 | Vulnerability scanning | Trivy (CRITICAL/HIGH) on container image at release, SARIF uploaded to GitHub Security tab |
 | Health monitoring | `/healthz` (liveness) and `/readyz` (readiness) endpoints |
 
+### CP — Contingency Planning
+
+| Control | Implementation |
+|---------|---------------|
+| CP-2 Contingency Plan | Subsystem failures degrade gracefully — see [graceful-degradation.md](graceful-degradation.md). NATS disconnect: local routing continues. Federation peer failure: circuit breaker skips unhealthy peers. |
+| CP-9 System Backup | Position cache is ephemeral (in-memory). Federation peer state persists to `--federation-store-path` (JSON file). Operators should back up TLS certificates, CRL files, and federation peers configuration. |
+| CP-10 System Recovery | Automatic recovery for NATS (reconnect) and federation (circuit breaker half-open probe). Certificate and key issues require restart after fix. |
+
+### IR — Incident Response
+
+| Control | Implementation |
+|---------|---------------|
+| IR-4 Incident Handling | Structured JSON logs with client identity, peer addresses, and timestamps. Audit events for TLS failures, connection rejections, circuit breaker trips, and federation errors. |
+| IR-5 Incident Monitoring | Prometheus metrics for real-time alerting: `connections_rejected`, `accept_errors`, `federation_circuit_breaker_trips`. OpenTelemetry trace export for distributed investigation. |
+| IR-6 Incident Reporting | CoT archival (`--archive-dir`) produces JSONL records with full message provenance for forensic analysis. |
+
+### RA — Risk Assessment
+
+| Control | Implementation |
+|---------|---------------|
+| RA-3 Risk Assessment | STRIDE-based threat model documented in [threat-model.md](threat-model.md). Covers all four transport paths, trust boundaries, and residual risks. |
+| RA-5 Vulnerability Monitoring | `cargo-deny` (RustSec advisories), `cargo-audit`, Trivy container scanning, OpenSSF Scorecard (weekly). Dependabot alerts enabled on the repository. |
+
+### CA — Security Assessment
+
+| Control | Implementation |
+|---------|---------------|
+| CA-2 Control Assessments | CI pipeline runs 9 jobs on every push: lint, clippy, feature powerset, tests (818+), coverage, audit, Helm lint, Docker build. |
+| CA-7 Continuous Monitoring | OpenSSF Scorecard runs weekly and on push to main. Dependabot monitors dependency vulnerabilities continuously. |
+| CA-8 Penetration Testing | Fuzz testing via `cargo-fuzz` targets for CoT parsing, XML stream codec, and TAK frame codec. |
+
 ## Automated Security Checks
 
 | Check | Frequency | Tool |
@@ -83,6 +114,9 @@ This document maps rustgate's existing security controls to NIST SP 800-53 (Rev.
 
 ## Relevant Documentation
 
+- [Threat Model](threat-model.md) — STRIDE-based threat analysis
+- [Graceful Degradation](graceful-degradation.md) — Subsystem failure behavior and recovery
+- [Post-Quantum Roadmap](post-quantum.md) — PQ TLS migration plan
 - [FIPS 140-3](fips.md) — FIPS crypto provider setup and limitations
 - [TLS Certificates](tls-certificates.md) — Certificate requirements and management
 - [SECURITY.md](../SECURITY.md) — Vulnerability reporting policy

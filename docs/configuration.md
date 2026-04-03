@@ -12,9 +12,56 @@ All rustgate configuration is done through CLI flags or environment variables. C
 | `--cert` | `RUSTGATE_CERT` | — | TLS certificate file (PEM) |
 | `--key` | `RUSTGATE_KEY` | — | TLS private key file (PEM) |
 | `--ca` | `RUSTGATE_CA` | — | CA certificate file (PEM) |
+| `--crl` | `RUSTGATE_CRL` | — | PEM-encoded CRL file for certificate revocation |
+| `--tls-min-version` | `RUSTGATE_TLS_MIN_VERSION` | `1.2` | Minimum TLS version (`1.2` or `1.3`) |
 | `--framing` | `RUSTGATE_FRAMING` | `xml` | Framing mode (see below) |
 | `--encoding` | `RUSTGATE_ENCODING` | `raw` | Encoding mode (see below) |
 | `--max-connections` | `RUSTGATE_MAX_CONNECTIONS` | `1024` | Maximum concurrent connections |
+| `--max-concurrent-handshakes` | `RUSTGATE_MAX_HANDSHAKES` | `100` | Max TLS handshakes in progress |
+| `--fips-required` | `RUSTGATE_FIPS_REQUIRED` | `false` | Fail startup if FIPS provider is not active |
+
+### Certificate Revocation
+
+The `--crl` flag loads a PEM-encoded Certificate Revocation List. Revoked certificates are rejected at the TLS handshake before any application-layer processing. CRL freshness is checked at startup — stale CRLs produce a warning by default (`--crl-warn-stale`).
+
+| Flag | Env Var | Default | Description |
+|------|---------|---------|-------------|
+| `--crl` | `RUSTGATE_CRL` | — | Path to PEM-encoded CRL file |
+| `--crl-warn-stale` | `RUSTGATE_CRL_WARN_STALE` | `true` | Warn if the CRL's `nextUpdate` is in the past |
+
+### Plaintext Transport
+
+> **Security warning:** Plaintext listeners accept unauthenticated, unencrypted TCP and UDP connections. Only enable these on trusted networks (e.g., localhost, a pod sidecar, or a physically isolated segment). Messages from plaintext sources are assigned a synthetic identity.
+
+| Flag | Env Var | Default | Description |
+|------|---------|---------|-------------|
+| `--tcp-bind` | `TCP_BIND` | — | Plaintext TCP listen address (enables plaintext TCP) |
+| `--udp-bind` | `UDP_BIND` | — | Plaintext UDP listen address (enables plaintext UDP) |
+| `--plaintext-cn` | `PLAINTEXT_CN` | `anonymous` | CN assigned to plaintext connections |
+| `--plaintext-group` | `PLAINTEXT_GROUP` | `__plaintext__` | Group assigned to plaintext connections |
+
+### Rate Limiting
+
+Per-client rate limiting uses a token bucket algorithm. When a client exceeds their message rate, excess messages are dropped silently. Disabled by default (`--client-message-rate 0`).
+
+| Flag | Env Var | Default | Description |
+|------|---------|---------|-------------|
+| `--client-message-rate` | `CLIENT_MESSAGE_RATE` | `0` (disabled) | Messages per second per client |
+| `--client-burst` | `CLIENT_BURST` | `200` | Maximum burst size (token bucket capacity) |
+
+### Anti-Replay
+
+| Flag | Env Var | Default | Description |
+|------|---------|---------|-------------|
+| `--replay-window` | `REPLAY_WINDOW` | `300` | Replay detection window in seconds (0 to disable) |
+
+### Data Packages and Archive
+
+| Flag | Env Var | Default | Description |
+|------|---------|---------|-------------|
+| `--archive-dir` | `ARCHIVE_DIR` | — | Directory for JSONL CoT event archival |
+| `--data-package-dir` | `DATA_PACKAGE_DIR` | — | Directory for client data packages |
+| `--package-max-age-hours` | `PACKAGE_MAX_AGE_HOURS` | `0` (no expiration) | Maximum age for data packages |
 
 ### NATS (requires `--features nats`)
 
@@ -49,12 +96,34 @@ All rustgate configuration is done through CLI flags or environment variables. C
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `--federation-v1-bind` | `FEDERATION_V1_BIND` | — | V1 listen address (enables federation) |
+| `--federation-v1-bind` | `FEDERATION_V1_BIND` | — | V1 listen address (enables V1 federation) |
+| `--federation-v2-bind` | `FEDERATION_V2_BIND` | — | V2 gRPC listen address (enables V2 federation) |
 | `--federation-id` | `FEDERATION_ID` | `rustgate-federation-1` | Unique server identity |
 | `--federation-peers-file` | `FEDERATION_PEERS_FILE` | — | Path to peers JSON config |
 | `--federation-skip-hostname-verify` | `FEDERATION_SKIP_HOSTNAME_VERIFY` | `false` | Skip TLS hostname verification |
 | `--federation-max-hops` | `FEDERATION_MAX_HOPS` | `10` | Max hops before message drop |
 | `--federation-store-path` | `FEDERATION_STORE_PATH` | — | Persistent peer store path |
+| `--federation-trust-store-dir` | `FEDERATION_TRUST_STORE_DIR` | — | Directory of trusted peer CA certificates |
+| `--federation-circuit-breaker-threshold` | `FEDERATION_CB_THRESHOLD` | `5` | Consecutive failures before circuit opens |
+| `--federation-circuit-breaker-timeout` | `FEDERATION_CB_TIMEOUT` | `60` | Seconds before recovery probe |
+
+### Federation HA (requires `--features federation-ha`)
+
+| Flag | Env Var | Default | Description |
+|------|---------|---------|-------------|
+| `--federation-ha-nats-url` | `FEDERATION_HA_NATS_URL` | — | NATS URL for HA peer discovery |
+| `--federation-pod-id` | `FEDERATION_POD_ID` | — | Pod identifier for HA leader election |
+
+See the [Federation REST API](federation.md) documentation for the `/api/federation/` management endpoints (requires `--features metrics` for the HTTP server).
+
+### OpenTelemetry (requires `--features otel`)
+
+| Flag | Env Var | Default | Description |
+|------|---------|---------|-------------|
+| `--otel-endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` | — | OTLP gRPC endpoint (enables trace export) |
+| `--otel-service-name` | `OTEL_SERVICE_NAME` | `rustgate` | Service name reported in traces |
+
+See [Observability](observability.md) for backend setup (Jaeger, Grafana Tempo).
 
 ## Framing Modes
 

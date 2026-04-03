@@ -1,3 +1,9 @@
+//! File-backed federation peer store.
+//!
+//! Persists [`FederateInfo`] entries as a JSON array on disk. When no
+//! path is configured, the store operates in-memory only (useful for
+//! tests and ephemeral deployments).
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::SystemTime;

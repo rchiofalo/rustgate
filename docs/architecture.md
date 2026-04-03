@@ -110,6 +110,16 @@ Or all features:
 cargo build --release --all-features
 ```
 
+## Protobuf Conversion Semantics
+
+When the `proto` feature is enabled, messages can be translated between CoT XML and TAK protobuf. This conversion is **lossy by design**:
+
+- **Mapped fields** (uid, type, how, time, start, stale, point attributes, contact, group, status, takv, track, precisionlocation) are preserved in both directions.
+- **Unknown `<event>` attributes** not in the proto schema are silently discarded.
+- **Unknown `<detail>` children** are serialized into `Detail.xmlDetail` as raw XML — attribute ordering and whitespace may change.
+
+See the [`xml_to_proto` module documentation](../crates/rustgate-proto/src/convert/xml_to_proto.rs) for the complete field mapping table.
+
 ## Session Lifecycle
 
 ### TCP Sessions (port 4433)

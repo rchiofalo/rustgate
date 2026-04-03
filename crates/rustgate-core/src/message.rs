@@ -1,3 +1,9 @@
+//! Core message types used throughout the routing engine.
+//!
+//! Every message entering rustgate — whether from a TLS client, WebSocket,
+//! federation peer, or NATS subscription — is normalized into a
+//! [`RoutableMessage`] before being handed to the router.
+
 use std::time::{Duration, SystemTime};
 
 #[cfg(feature = "fuzz")]
@@ -9,37 +15,65 @@ use crate::identity::{GroupId, Identity};
 /// Source protocol identifier for messages originating from federation peers.
 pub const SOURCE_FEDERATION: &str = "federation";
 
-/// Every message flowing through rustgate becomes this.
+/// The internal message envelope for all routed messages.
+///
+/// Every inbound message is wrapped in this type before entering the router.
+/// The router inspects [`destination`](Self::destination) to determine delivery
+/// targets and uses [`source`](Self::source) for group membership checks.
 #[derive(Debug, Clone)]
 pub struct RoutableMessage {
+    /// Identity of the sender, extracted from their client certificate.
     pub source: Identity,
+    /// Where this message should be delivered.
     pub destination: Destination,
+    /// Raw message bytes (typically CoT XML or protobuf).
     pub payload: Bytes,
+    /// Contextual information about message origin and lifecycle.
     pub metadata: Metadata,
 }
 
+/// Contextual metadata attached to every routed message.
 #[derive(Debug, Clone)]
 pub struct Metadata {
+    /// When the message was received by this server.
     pub received_at: SystemTime,
+    /// Transport that originated this message (e.g., `"tcp"`, `"nats"`, `"federation"`).
     pub source_protocol: String,
+    /// Classified message type, used for routing decisions (e.g., caching positions).
     pub message_type: MessageType,
+    /// Optional time-to-live; expired messages are evicted from the position cache.
     pub ttl: Option<Duration>,
 }
 
+/// Routing destination for a message.
 #[derive(Debug, Clone)]
 pub enum Destination {
+    /// Deliver to all sessions whose certificate OU includes this group.
     Group(GroupId),
+    /// Deliver to the session whose certificate CN matches this identity.
     Direct(Identity),
+    /// Deliver to all connected sessions (except the sender).
     Broadcast,
 }
 
+/// Classified message type.
+///
+/// The router uses this to make routing decisions — for example, only
+/// [`Position`](Self::Position) messages are stored in the position cache
+/// for replay to newly connected sessions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MessageType {
+    /// Situational awareness position report (cached for replay).
     Position,
+    /// Chat / instant message.
     Chat,
+    /// Emergency or alert event.
     Alert,
+    /// Device status update.
     Status,
+    /// File transfer metadata.
     File,
+    /// Any other CoT event type not classified above.
     Other(String),
 }
 
