@@ -19,6 +19,15 @@ All rustgate configuration is done through CLI flags or environment variables. C
 | `--max-connections` | `RUSTGATE_MAX_CONNECTIONS` | `1024` | Maximum concurrent connections |
 | `--max-concurrent-handshakes` | `RUSTGATE_MAX_HANDSHAKES` | `100` | Max TLS handshakes in progress |
 | `--fips-required` | `RUSTGATE_FIPS_REQUIRED` | `false` | Fail startup if FIPS provider is not active |
+| `--cert-reload-interval` | `RUSTGATE_CERT_RELOAD_INTERVAL` | `0` | Seconds between certificate file polls (0 = disabled) |
+
+### Certificate Hot-Reload
+
+When `--cert-reload-interval` is set to a value greater than 0, the server periodically polls the `--cert` and `--key` files for changes. If the file contents differ (detected via SHA-256 digest comparison), the server certificate is atomically swapped for all subsequent TLS handshakes — no restart required. Audit events are emitted on rotation success or failure.
+
+**Scope:** Hot-reload applies only to the server certificate (`--cert` and `--key`). Client CA changes (`--ca`) are **not** reloaded by this mechanism — use the dynamic TLS refresh feature (TrustStore) for runtime CA rotation. When both are active, they complement each other: one handles server cert rotation, the other handles client CA changes.
+
+**File replacement:** For reliable rotation, replace certificate files atomically (e.g., write to a temporary file in the same directory and `mv`/rename into place). The cert and key files are read in two separate operations; if only one has been updated when the poll fires, the reload will fail with an error, emit an audit event, and self-heal on the next poll once both files are consistent.
 
 ### Certificate Revocation
 

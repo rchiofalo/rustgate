@@ -71,6 +71,13 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = false, env = "RUSTGATE_FIPS_REQUIRED")]
     pub(crate) fips_required: bool,
 
+    /// Interval in seconds to check for certificate file changes.
+    /// When set to a value > 0, the server periodically polls the --cert and
+    /// --key files and hot-reloads them on change (zero-downtime rotation).
+    /// Set to 0 (default) to disable automatic certificate rotation.
+    #[arg(long, default_value_t = 0, env = "RUSTGATE_CERT_RELOAD_INTERVAL")]
+    pub(crate) cert_reload_interval: u64,
+
     #[arg(long, value_enum, default_value_t = Framing::Xml, env = "RUSTGATE_FRAMING")]
     pub(crate) framing: Framing,
 
@@ -413,6 +420,7 @@ mod tests {
             "RUSTGATE_TLS_MIN_VERSION",
             "RUSTGATE_CRL_WARN_STALE",
             "RUSTGATE_FIPS_REQUIRED",
+            "RUSTGATE_CERT_RELOAD_INTERVAL",
             "RUSTGATE_FRAMING",
             "RUSTGATE_ENCODING",
             "NATS_URL",

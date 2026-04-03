@@ -239,6 +239,28 @@ pub fn tls_handshake_failed(peer: &str, reason: &str, stage: &str) {
     );
 }
 
+/// Record a successful server certificate rotation.
+pub fn cert_rotation_success(cert_path: &str, new_serial: &str) {
+    audit!(
+        "cert.rotated",
+        cert_path = %cert_path,
+        new_serial = %new_serial,
+        action = "rotate",
+        result = "success"
+    );
+}
+
+/// Record a failed server certificate rotation attempt.
+pub fn cert_rotation_failed(cert_path: &str, error: &str) {
+    audit!(
+        "cert.rotation_failed",
+        cert_path = %cert_path,
+        error = %error,
+        action = "rotate",
+        result = "failure"
+    );
+}
+
 /// Record server startup.
 pub fn server_started(bind: &str, version: &str) {
     let timestamp = SystemTime::now()

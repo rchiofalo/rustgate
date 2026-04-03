@@ -143,18 +143,7 @@ impl TlsConfig {
     }
 
     pub fn build_server_config(&self) -> Result<rustls::ServerConfig> {
-        let mut verifier_builder = WebPkiClientVerifier::builder(self.client_ca_store.clone());
-
-        if !self.crls.is_empty() {
-            verifier_builder = verifier_builder.with_crls(self.crls.clone());
-        }
-
-        let client_verifier = verifier_builder.build().map_err(|e| {
-            RustgateError::from(ConfigError::Other(format!(
-                "failed to build client verifier: {e}"
-            )))
-        })?;
-
+        let client_verifier = self.build_default_verifier()?;
         self.build_server_config_with_verifier(client_verifier)
     }
 
@@ -184,6 +173,48 @@ impl TlsConfig {
         // could still authenticate via a cached session — the same vulnerability
         // class as CVE-2025-23419. Disabling session storage forces a full
         // handshake (with certificate verification) on every connection.
+        config.session_storage = Arc::new(NoServerSessionStorage {});
+
+        Ok(config)
+    }
+
+    /// Build the default `WebPkiClientVerifier` from the configured CA store and CRLs.
+    ///
+    /// Use this when you need the verifier separately from the server config,
+    /// for example when combining it with a custom certificate resolver via
+    /// [`build_reloadable_server_config`](Self::build_reloadable_server_config).
+    pub fn build_default_verifier(&self) -> Result<Arc<dyn ClientCertVerifier>> {
+        let mut verifier_builder = WebPkiClientVerifier::builder(self.client_ca_store.clone());
+
+        if !self.crls.is_empty() {
+            verifier_builder = verifier_builder.with_crls(self.crls.clone());
+        }
+
+        verifier_builder.build().map_err(|e| {
+            RustgateError::from(ConfigError::Other(format!(
+                "failed to build client verifier: {e}"
+            )))
+        })
+    }
+
+    /// Build a `rustls::ServerConfig` using a custom client certificate verifier
+    /// and a dynamic certificate resolver.
+    ///
+    /// This is the entry point for server certificate hot-reload. The resolver
+    /// (typically a [`CertReloader`](crate::CertReloader)) supplies the server
+    /// certificate on each handshake, allowing zero-downtime rotation without
+    /// rebuilding the `ServerConfig`.
+    pub fn build_reloadable_server_config(
+        &self,
+        verifier: Arc<dyn ClientCertVerifier>,
+        resolver: Arc<dyn rustls::server::ResolvesServerCert>,
+    ) -> Result<rustls::ServerConfig> {
+        let mut config = rustls::ServerConfig::builder_with_protocol_versions(
+            self.tls_min_version.protocol_versions(),
+        )
+        .with_client_cert_verifier(verifier)
+        .with_cert_resolver(resolver);
+
         config.session_storage = Arc::new(NoServerSessionStorage {});
 
         Ok(config)

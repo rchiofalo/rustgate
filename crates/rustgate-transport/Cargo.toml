@@ -34,6 +34,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 futures = { workspace = true }
 bytes = { workspace = true }
 criterion = { workspace = true }
+tempfile = { workspace = true }
 
 [[bench]]
 name = "codec"

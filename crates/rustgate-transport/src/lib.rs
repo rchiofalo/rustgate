@@ -1,6 +1,7 @@
 //! TLS transport, session management, and message routing for rustgate.
 
 mod cache;
+pub mod cert_reloader;
 mod codec;
 mod config;
 mod encoder;
@@ -15,6 +16,7 @@ mod throttle;
 mod verifier;
 
 pub use cache::PositionCache;
+pub use cert_reloader::CertReloader;
 pub use codec::{FramedCodec, LengthPrefixedCodec, LineDelimitedCodec, XmlStreamCodec};
 #[cfg(feature = "fips")]
 pub use config::install_fips_provider;
