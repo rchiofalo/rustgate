@@ -171,6 +171,19 @@ jobs:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [lint, clippy]
     runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            cc: musl-gcc
+            run_tests: true
+          - target: aarch64-unknown-linux-musl
+            cc: aarch64-linux-gnu-gcc
+            linker: aarch64-linux-gnu-gcc
+            run_tests: false # cannot run aarch64 binaries on x86 runner
+
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -180,19 +193,38 @@ jobs:
         with:
           components: clippy
 
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+
       - name: Install FIPS build dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake golang-go
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake golang-go musl-tools
+
+      - name: Install aarch64 cross-compiler
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Set aarch64 cross-compilation env
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          echo "GOARCH=arm64" >> $GITHUB_ENV
+          echo "GOOS=linux" >> $GITHUB_ENV
+          echo "CGO_ENABLED=1" >> $GITHUB_ENV
 
       - name: Install cargo-nextest
         run: cargo install cargo-nextest --locked
 
       - name: Clippy (FIPS)
+        if: matrix.run_tests
         run: cargo clippy --locked -p rustgate-transport -p rustgate-server -p rustgate-enrollment --features fips --all-targets
 
       - name: Build server with FIPS
-        run: cargo build --locked -p rustgate-server --features fips,federation,enrollment
+        env:
+          CC_${{ matrix.target }}: ${{ matrix.cc }}
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: ${{ matrix.linker }}
+        run: cargo build --locked -p rustgate-server --features fips,federation,enrollment --target ${{ matrix.target }}
 
       - name: Run FIPS tests
+        if: matrix.run_tests
         run: cargo nextest run --locked -p rustgate-transport --features fips
 
   dependency-review:

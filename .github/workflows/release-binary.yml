@@ -30,9 +30,18 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             cc: musl-gcc
+            fips: false
           - target: aarch64-unknown-linux-musl
             cc: aarch64-linux-gnu-gcc
             linker: aarch64-linux-gnu-gcc
+            fips: false
+          - target: x86_64-unknown-linux-musl
+            cc: musl-gcc
+            fips: true
+          - target: aarch64-unknown-linux-musl
+            cc: aarch64-linux-gnu-gcc
+            linker: aarch64-linux-gnu-gcc
+            fips: true
 
     runs-on: ubuntu-latest
 
@@ -64,6 +73,17 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: sudo apt-get install -y gcc-aarch64-linux-gnu
 
+      - name: Install FIPS build dependencies
+        if: matrix.fips
+        run: sudo apt-get install -y cmake golang-go
+
+      - name: Set aarch64 cross-compilation env for FIPS
+        if: matrix.fips && matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          echo "GOARCH=arm64" >> $GITHUB_ENV
+          echo "GOOS=linux" >> $GITHUB_ENV
+          echo "CGO_ENABLED=1" >> $GITHUB_ENV
+
       - name: Add Rust target
         run: rustup target add ${{ matrix.target }}
 
@@ -77,11 +97,20 @@ jobs:
         env:
           CC_${{ matrix.target }}: ${{ matrix.cc }}
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: ${{ matrix.linker }}
-        run: cargo auditable build --locked --release --features ${{ env.RELEASE_FEATURES }} --target ${{ matrix.target }}
+        run: |
+          FEATURES="${{ env.RELEASE_FEATURES }}"
+          if [ "${{ matrix.fips }}" = "true" ]; then
+            FEATURES="${FEATURES},fips"
+          fi
+          cargo auditable build --locked --release --features "$FEATURES" --target ${{ matrix.target }}
 
       - name: Package binary
         run: |
-          ARCHIVE="rustgate-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz"
+          if [ "${{ matrix.fips }}" = "true" ]; then
+            ARCHIVE="rustgate-fips-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz"
+          else
+            ARCHIVE="rustgate-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz"
+          fi
           tar -czf "$ARCHIVE" -C "target/${{ matrix.target }}/release" rustgate
           echo "ARCHIVE=$ARCHIVE" >> $GITHUB_ENV
 

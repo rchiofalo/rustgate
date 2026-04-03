@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **External Secrets Operator support** — optional ExternalSecret templates for NATS, enrollment, and federation secrets with configurable `secretStoreRef` and `refreshInterval` (#275)
 - **Anti-replay detection** — sliding-window filter drops messages with duplicate `(uid, time)` pairs within a configurable window, preventing message replay attacks. Configurable via `--replay-window` (default 300s, 0 to disable). (#284)
 - **Comprehensive documentation** — configuration reference completeness (plaintext, rate limiting, CRL, archive, federation V2/HA, OTel sections), STRIDE threat model, graceful degradation policy, post-quantum TLS roadmap, expanded NIST 800-53 control mapping (CP, IR, RA, CA families), module-level docs across all source files, XML-to-protobuf field loss documentation, metrics endpoint security warning, position cache TTL semantics (#261, #256, #263, #279, #280, #290, #295, #308, #311)
+- **FIPS-enabled release binaries** — release workflow produces FIPS 140-3 binaries (aws-lc-rs) for x86_64-unknown-linux-musl and aarch64-unknown-linux-musl alongside standard binaries. CI validates FIPS cross-compilation for both targets. (#366)
 
 ## [0.5.0] - 2026-04-01
 
