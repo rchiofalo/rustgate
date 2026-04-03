@@ -226,14 +226,27 @@ fn parse_iso8601(s: &str) -> Option<u64> {
     let month: i64 = date_parts.next()?.parse().ok()?;
     let day: i64 = date_parts.next()?.parse().ok()?;
 
+    // Validate ranges to prevent overflow in epoch calculation.
+    if !(0..=9999).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+
     let time = time.split('.').next()?;
     let mut time_parts = time.split(':');
     let hour: i64 = time_parts.next()?.parse().ok()?;
     let min: i64 = time_parts.next()?.parse().ok()?;
     let sec: i64 = time_parts.next()?.parse().ok()?;
 
-    // Rough epoch calculation (not accounting for leap years properly, but good enough for TTL)
+    if !(0..=23).contains(&hour) || !(0..=59).contains(&min) || !(0..=59).contains(&sec) {
+        return None;
+    }
+
+    // Rough epoch calculation (not accounting for leap years properly, but good enough for TTL).
+    // With year bounded to 0..=9999, these operations cannot overflow i64.
     let days_since_epoch = (year - 1970) * 365 + (year - 1969) / 4 + day_of_year(month, day);
+    if days_since_epoch < 0 {
+        return None;
+    }
     Some(days_since_epoch as u64 * 86400 + hour as u64 * 3600 + min as u64 * 60 + sec as u64)
 }
 
@@ -488,5 +501,43 @@ mod tests {
         let msg = builder.build(&id, payload, "tcp");
 
         assert_eq!(msg.metadata.source_protocol, "tcp");
+    }
+
+    // ── parse_iso8601 regression tests (issue #370) ──────────────
+
+    #[test]
+    fn parse_iso8601_valid() {
+        let ts = parse_iso8601("2021-02-27T20:32:24.771Z");
+        assert!(ts.is_some());
+    }
+
+    #[test]
+    fn parse_iso8601_extreme_year_returns_none() {
+        // Previously caused integer overflow panic in debug builds.
+        assert!(parse_iso8601("25252525252525252-01-01T00:00:00Z").is_none());
+    }
+
+    #[test]
+    fn parse_iso8601_negative_year_returns_none() {
+        assert!(parse_iso8601("-9999999999-01-01T00:00:00Z").is_none());
+    }
+
+    #[test]
+    fn parse_iso8601_month_out_of_range() {
+        assert!(parse_iso8601("2021-13-01T00:00:00Z").is_none());
+        assert!(parse_iso8601("2021-00-01T00:00:00Z").is_none());
+    }
+
+    #[test]
+    fn parse_iso8601_day_out_of_range() {
+        assert!(parse_iso8601("2021-01-32T00:00:00Z").is_none());
+        assert!(parse_iso8601("2021-01-00T00:00:00Z").is_none());
+    }
+
+    #[test]
+    fn parse_iso8601_time_out_of_range() {
+        assert!(parse_iso8601("2021-01-01T24:00:00Z").is_none());
+        assert!(parse_iso8601("2021-01-01T00:60:00Z").is_none());
+        assert!(parse_iso8601("2021-01-01T00:00:60Z").is_none());
     }
 }

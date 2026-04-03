@@ -19,12 +19,34 @@ pub fn iso8601_to_millis(s: &str) -> Result<u64, ProtoError> {
     let month: u32 = parse_part(&mut date_parts, "month", s)?;
     let day: u32 = parse_part(&mut date_parts, "day", s)?;
 
+    // Validate ranges to prevent overflow in epoch calculation.
+    if !(0..=9999).contains(&year) {
+        return Err(ProtoError::InvalidTimestamp(format!(
+            "year out of range: {s}"
+        )));
+    }
+    if !(1..=12).contains(&month) {
+        return Err(ProtoError::InvalidTimestamp(format!(
+            "month out of range: {s}"
+        )));
+    }
+    if !(1..=31).contains(&day) {
+        return Err(ProtoError::InvalidTimestamp(format!(
+            "day out of range: {s}"
+        )));
+    }
+
     // Split fractional seconds
     let (time_str, frac_millis) = match time_with_frac.split_once('.') {
         Some((t, frac)) => {
-            // Parse up to 3 digits of fractional seconds
-            let padded = format!("{frac:0<3}");
-            let ms: u64 = padded[..3]
+            // Take only ASCII digits to avoid slicing into multi-byte characters.
+            let digits: String = frac
+                .chars()
+                .filter(|c| c.is_ascii_digit())
+                .take(3)
+                .collect();
+            let padded = format!("{digits:0<3}");
+            let ms: u64 = padded
                 .parse()
                 .map_err(|_| ProtoError::InvalidTimestamp(format!("bad fractional: {s}")))?;
             (t, ms)
@@ -37,7 +59,18 @@ pub fn iso8601_to_millis(s: &str) -> Result<u64, ProtoError> {
     let min: u32 = parse_part(&mut time_parts, "minute", s)?;
     let sec: u32 = parse_part(&mut time_parts, "second", s)?;
 
+    if hour > 23 || min > 59 || sec > 59 {
+        return Err(ProtoError::InvalidTimestamp(format!(
+            "time out of range: {s}"
+        )));
+    }
+
     let epoch_days = days_since_epoch(year, month, day);
+    if epoch_days < 0 {
+        return Err(ProtoError::InvalidTimestamp(format!(
+            "date before epoch: {s}"
+        )));
+    }
     let total_secs =
         epoch_days as u64 * 86400 + u64::from(hour) * 3600 + u64::from(min) * 60 + u64::from(sec);
 
@@ -159,5 +192,48 @@ mod tests {
     #[test]
     fn invalid_bad_date() {
         assert!(iso8601_to_millis("abc-02-27T20:32:24Z").is_err());
+    }
+
+    // ── regression tests for issue #370 (fuzz crashes) ───────────
+
+    #[test]
+    fn extreme_year_returns_err() {
+        // Previously caused integer overflow panic in debug builds.
+        assert!(iso8601_to_millis("25252525252525252-01-01T00:00:00Z").is_err());
+        assert!(iso8601_to_millis("99999999999999999-01-01T00:00:00Z").is_err());
+    }
+
+    #[test]
+    fn month_out_of_range() {
+        assert!(iso8601_to_millis("2021-13-01T00:00:00Z").is_err());
+        assert!(iso8601_to_millis("2021-00-01T00:00:00Z").is_err());
+    }
+
+    #[test]
+    fn day_out_of_range() {
+        assert!(iso8601_to_millis("2021-01-32T00:00:00Z").is_err());
+        assert!(iso8601_to_millis("2021-01-00T00:00:00Z").is_err());
+    }
+
+    #[test]
+    fn time_out_of_range() {
+        assert!(iso8601_to_millis("2021-01-01T24:00:00Z").is_err());
+        assert!(iso8601_to_millis("2021-01-01T00:60:00Z").is_err());
+        assert!(iso8601_to_millis("2021-01-01T00:00:60Z").is_err());
+    }
+
+    #[test]
+    fn non_ascii_fractional_seconds() {
+        // Non-ASCII bytes in fractional seconds should not panic on string slicing.
+        // The non-digit characters are filtered out, producing 0 millis.
+        let millis = iso8601_to_millis("2021-01-01T00:00:00.\u{ff}\u{fe}\u{fd}Z").expect("parse");
+        assert_eq!(millis % 1000, 0);
+    }
+
+    #[test]
+    fn empty_fractional_seconds() {
+        // Empty fraction after dot should produce 0 millis, not panic.
+        let millis = iso8601_to_millis("2021-01-01T00:00:00.Z").expect("parse");
+        assert_eq!(millis % 1000, 0);
     }
 }
