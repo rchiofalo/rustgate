@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
+use rustgate_core::codec::Codec;
 use rustgate_core::constants::{READ_TIMEOUT, WRITE_TIMEOUT};
 use rustgate_core::identity::Identity;
 #[cfg(feature = "metrics")]
@@ -16,8 +17,8 @@ use rustgate_core::message::RoutableMessage;
 use rustgate_core::protocol::FramingStrategy;
 use rustgate_cot::MessageBuilder;
 use rustgate_transport::{
-    AuthenticatedSession, CotEncoder, FramedCodec, MessageEncoder, RawEncoder, ReplayFilter,
-    Router, SessionHandle, ThrottleConfig,
+    AuthenticatedSession, CotCodec, FramedCodec, RawCodec, ReplayFilter, Router, SessionHandle,
+    ThrottleConfig,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::codec::{FramedRead, FramedWrite};
@@ -152,27 +153,18 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
         replay_filter: &deps.replay_filter,
     };
 
-    let result = match final_encoding {
-        Encoding::Raw => run_session_loops(reader, writer, rx, &ctx, &RawEncoder, read_buf).await,
-        Encoding::Cot => run_session_loops(reader, writer, rx, &ctx, &CotEncoder, read_buf).await,
+    let codec: &dyn Codec = match final_encoding {
+        Encoding::Raw => &RawCodec,
+        Encoding::Cot => &CotCodec,
         #[cfg(feature = "proto")]
-        Encoding::TakProtobuf => {
-            run_session_loops(
-                reader,
-                writer,
-                rx,
-                &ctx,
-                &rustgate_proto::TakProtobufEncoder,
-                read_buf,
-            )
-            .await
-        }
+        Encoding::TakProtobuf => &rustgate_proto::TakProtobufCodec,
         #[cfg(not(feature = "proto"))]
         Encoding::TakProtobuf => {
             tracing::error!("--encoding tak-protobuf requires --features proto");
             return;
         }
     };
+    let result = run_session_loops(reader, writer, rx, &ctx, codec, read_buf).await;
 
     if let Err(e) = result {
         tracing::debug!(cn = %cn, error = %e, "session error");
@@ -260,12 +252,12 @@ async fn run_session_loops(
     writer: rustgate_transport::SessionWriter,
     rx: mpsc::Receiver<RoutableMessage>,
     ctx: &SessionContext<'_, impl NatsPublish>,
-    encoder: &impl MessageEncoder,
+    codec: &dyn Codec,
     read_buf: tokio_util::bytes::BytesMut,
 ) -> std::io::Result<()> {
     tokio::select! {
         r = read_loop(reader, ctx, read_buf) => r,
-        r = write_loop(writer, rx, ctx.framing, encoder) => r,
+        r = write_loop(writer, rx, ctx.framing, codec) => r,
     }
 }
 
@@ -388,12 +380,12 @@ async fn write_loop(
     writer: rustgate_transport::SessionWriter,
     mut rx: mpsc::Receiver<RoutableMessage>,
     framing: &FramingStrategy,
-    encoder: &impl MessageEncoder,
+    codec: &dyn Codec,
 ) -> std::io::Result<()> {
     let mut framed = FramedWrite::new(writer, FramedCodec::from_strategy(framing));
 
     while let Some(msg) = rx.recv().await {
-        let encoded = encoder.encode(&msg)?;
+        let encoded = codec.encode_payload(&msg)?;
         let send_fut = framed.send(tokio_util::bytes::BytesMut::from(encoded.as_ref()));
 
         match tokio::time::timeout(WRITE_TIMEOUT, send_fut).await {
@@ -559,9 +551,9 @@ async fn run_plaintext_session_loops<P: NatsPublish>(
     let write_codec = FramedCodec::from_strategy(framing);
     let mut framed_write = FramedWrite::new(writer, write_codec);
 
-    let encoder: Box<dyn MessageEncoder + Send + Sync> = match encoding {
-        Encoding::Raw | Encoding::TakProtobuf => Box::new(RawEncoder),
-        Encoding::Cot => Box::new(CotEncoder),
+    let codec: Box<dyn Codec> = match encoding {
+        Encoding::Raw | Encoding::TakProtobuf => Box::new(RawCodec),
+        Encoding::Cot => Box::new(CotCodec),
     };
 
     tokio::select! {
@@ -606,7 +598,7 @@ async fn run_plaintext_session_loops<P: NatsPublish>(
         } => r,
         r = async {
             while let Some(msg) = rx.recv().await {
-                let encoded = encoder.encode(&msg)?;
+                let encoded = codec.encode_payload(&msg)?;
                 let send_fut = framed_write.send(tokio_util::bytes::BytesMut::from(encoded.as_ref()));
                 match tokio::time::timeout(WRITE_TIMEOUT, send_fut).await {
                     Ok(result) => result?,

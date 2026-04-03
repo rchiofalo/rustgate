@@ -170,12 +170,18 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     // ── WebSocket listener ──────────────────────────────────────────
     #[cfg(feature = "websocket")]
+    let ws_codec: Arc<dyn rustgate_core::codec::Codec> = match encoding {
+        cli::Encoding::Raw | cli::Encoding::TakProtobuf => Arc::new(rustgate_transport::RawCodec),
+        cli::Encoding::Cot => Arc::new(rustgate_transport::CotCodec),
+    };
+
+    #[cfg(feature = "websocket")]
     let ws_shutdown = setup::start_websocket(setup::WebSocketSetup {
         cli: &cli,
         tls_config: &tls_config,
         router: &router,
         connection_limit: &connection_limit,
-        encoding,
+        codec: ws_codec,
         nats_publisher: &nats_publisher,
         fed_forward: &fed_forward,
         throttle_config,

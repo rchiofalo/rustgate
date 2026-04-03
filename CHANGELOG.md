@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Comprehensive documentation** — configuration reference completeness (plaintext, rate limiting, CRL, archive, federation V2/HA, OTel sections), STRIDE threat model, graceful degradation policy, post-quantum TLS roadmap, expanded NIST 800-53 control mapping (CP, IR, RA, CA families), module-level docs across all source files, XML-to-protobuf field loss documentation, metrics endpoint security warning, position cache TTL semantics (#261, #256, #263, #279, #280, #290, #295, #308, #311)
 - **FIPS-enabled release binaries** — release workflow produces FIPS 140-3 binaries (aws-lc-rs) for x86_64-unknown-linux-musl and aarch64-unknown-linux-gnu alongside standard binaries. aarch64 FIPS uses gnu target because aws-lc-fips-sys is incompatible with musl cross-compilation. CI validates FIPS cross-compilation for both targets. (#366)
 
+### Changed
+
+- **Unified codec abstraction** — WebSocket, TLS, and plaintext TCP sessions now use the `Codec` trait (`rustgate-core::codec::Codec`) for message encoding and decoding. The legacy `MessageEncoder` trait and all encoder implementations (`RawEncoder`, `CotEncoder`, `TakProtobufEncoder`) have been removed in favour of `RawCodec`, `CotCodec`, and `TakProtobufCodec`. The `WsEncoding` enum has been replaced by `Arc<dyn Codec>` in `WsServerConfig`. (#391, #394)
+
 ### Security
 
 - **Quarterly advisory review** — upgraded async-nats 0.46→0.47, resolving RUSTSEC-2025-0134 (rustls-pemfile unmaintained) and RUSTSEC-2026-0049 (rustls-webpki CRL matching). RUSTSEC-2026-0042 (aws-lc-sys) was previously resolved. All advisory ignores removed from deny.toml — zero known vulnerabilities. (#239)

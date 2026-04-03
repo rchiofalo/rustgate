@@ -5,10 +5,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures::{SinkExt, StreamExt};
+use rustgate_core::codec::Codec;
 use rustgate_test_utils::certs::TestCa;
 use rustgate_test_utils::tls::build_client_tls_config;
-use rustgate_transport::{Router, ThrottleConfig, TlsConfig};
-use rustgate_websocket::{WebSocketServer, WsEncoding, WsListener, WsServerConfig};
+use rustgate_transport::{CotCodec, RawCodec, Router, ThrottleConfig, TlsConfig};
+use rustgate_websocket::{WebSocketServer, WsListener, WsServerConfig};
 use tokio::sync::{Notify, Semaphore};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -82,12 +83,12 @@ struct TestWsServer {
 }
 
 impl TestWsServer {
-    async fn new(encoding: WsEncoding, max_connections: usize) -> Self {
-        Self::with_throttle(encoding, max_connections, None).await
+    async fn new(codec: Arc<dyn Codec>, max_connections: usize) -> Self {
+        Self::with_throttle(codec, max_connections, None).await
     }
 
     async fn with_throttle(
-        encoding: WsEncoding,
+        codec: Arc<dyn Codec>,
         max_connections: usize,
         throttle_config: Option<ThrottleConfig>,
     ) -> Self {
@@ -110,7 +111,7 @@ impl TestWsServer {
             listener,
             router: Arc::clone(&router),
             connection_limit,
-            encoding,
+            codec,
             nats_publish: None,
             fed_forward: None,
             throttle_config,
@@ -173,7 +174,7 @@ impl Drop for TestWsServer {
 /// Two WebSocket clients in the same group can exchange messages through the router.
 #[tokio::test]
 async fn ws_session_routes_through_router() {
-    let server = TestWsServer::new(WsEncoding::Raw, 64).await;
+    let server = TestWsServer::new(Arc::new(RawCodec), 64).await;
     let alice_cert = server.issue_client("alice", &["alpha"]);
     let bob_cert = server.issue_client("bob", &["alpha"]);
 
@@ -195,7 +196,7 @@ async fn ws_session_routes_through_router() {
 /// Sender must not receive their own broadcast back.
 #[tokio::test]
 async fn ws_no_self_echo() {
-    let server = TestWsServer::new(WsEncoding::Raw, 64).await;
+    let server = TestWsServer::new(Arc::new(RawCodec), 64).await;
     let alice_cert = server.issue_client("alice", &["alpha"]);
 
     let mut alice_ws = server.connect(&alice_cert).await;
@@ -213,7 +214,7 @@ async fn ws_no_self_echo() {
 /// Clients in different groups must not receive each other's messages.
 #[tokio::test]
 async fn ws_cross_group_isolation() {
-    let server = TestWsServer::new(WsEncoding::Raw, 64).await;
+    let server = TestWsServer::new(Arc::new(RawCodec), 64).await;
     let alice_cert = server.issue_client("alice", &["alpha"]);
     let bob_cert = server.issue_client("bob", &["alpha"]);
     let charlie_cert = server.issue_client("charlie", &["bravo"]);
@@ -242,7 +243,7 @@ async fn ws_cross_group_isolation() {
 /// Disconnecting a WebSocket client removes the session from the router.
 #[tokio::test]
 async fn ws_disconnect_cleanup() {
-    let server = TestWsServer::new(WsEncoding::Raw, 64).await;
+    let server = TestWsServer::new(Arc::new(RawCodec), 64).await;
     let alice_cert = server.issue_client("alice", &["ops"]);
     let bob_cert = server.issue_client("bob", &["ops"]);
     let charlie_cert = server.issue_client("charlie", &["ops"]);
@@ -274,7 +275,7 @@ async fn ws_disconnect_cleanup() {
 /// Text WebSocket frames are handled alongside binary frames.
 #[tokio::test]
 async fn ws_text_frame_routes() {
-    let server = TestWsServer::new(WsEncoding::Raw, 64).await;
+    let server = TestWsServer::new(Arc::new(RawCodec), 64).await;
     let alice_cert = server.issue_client("alice", &["alpha"]);
     let bob_cert = server.issue_client("bob", &["alpha"]);
 
@@ -297,7 +298,7 @@ async fn ws_text_frame_routes() {
 /// WebSocket Close frame causes clean session teardown.
 #[tokio::test]
 async fn ws_close_frame_cleanup() {
-    let server = TestWsServer::new(WsEncoding::Raw, 64).await;
+    let server = TestWsServer::new(Arc::new(RawCodec), 64).await;
     let alice_cert = server.issue_client("alice", &["ops"]);
 
     let mut alice_ws = server.connect(&alice_cert).await;
@@ -323,7 +324,7 @@ async fn ws_close_frame_cleanup() {
 /// semaphore permits are exhausted.
 #[tokio::test]
 async fn ws_server_enforces_connection_limit() {
-    let server = TestWsServer::new(WsEncoding::Raw, 1).await;
+    let server = TestWsServer::new(Arc::new(RawCodec), 1).await;
     let user1_cert = server.issue_client("user1", &["ops"]);
     let user2_cert = server.issue_client("user2", &["ops"]);
 
@@ -351,7 +352,7 @@ async fn ws_server_enforces_connection_limit() {
 /// Late-joining client receives cached position from an earlier participant.
 #[tokio::test]
 async fn ws_position_cache_replay() {
-    let server = TestWsServer::new(WsEncoding::Raw, 64).await;
+    let server = TestWsServer::new(Arc::new(RawCodec), 64).await;
     let alice_cert = server.issue_client("alice", &["alpha"]);
     let bob_cert = server.issue_client("bob", &["alpha"]);
 
@@ -375,10 +376,10 @@ async fn ws_position_cache_replay() {
     assert_eq!(replayed, cot_position.as_slice());
 }
 
-/// CotEncoder path produces the same output for CoT-sourced messages.
+/// CotCodec path produces the same output for CoT-sourced messages.
 #[tokio::test]
 async fn ws_cot_encoding() {
-    let server = TestWsServer::new(WsEncoding::Cot, 64).await;
+    let server = TestWsServer::new(Arc::new(CotCodec), 64).await;
     let alice_cert = server.issue_client("alice", &["alpha"]);
     let bob_cert = server.issue_client("bob", &["alpha"]);
 
@@ -430,7 +431,7 @@ async fn ws_nats_and_federation_callbacks_fire() {
         listener,
         router: Arc::clone(&router),
         connection_limit: Arc::new(Semaphore::new(64)),
-        encoding: WsEncoding::Raw,
+        codec: Arc::new(RawCodec),
         nats_publish: Some(nats_publish),
         fed_forward: Some(fed_forward),
         throttle_config: None,
@@ -498,7 +499,7 @@ async fn ws_nats_and_federation_callbacks_fire() {
 async fn ws_rate_limit_drops_excess_messages() {
     // burst=2 means only the first 2 messages pass immediately; the rest are dropped.
     let server =
-        TestWsServer::with_throttle(WsEncoding::Raw, 64, Some(ThrottleConfig::new(1, 2))).await;
+        TestWsServer::with_throttle(Arc::new(RawCodec), 64, Some(ThrottleConfig::new(1, 2))).await;
     let alice_cert = server.issue_client("alice", &["alpha"]);
     let bob_cert = server.issue_client("bob", &["alpha"]);
 
@@ -539,7 +540,7 @@ async fn ws_rate_limit_drops_excess_messages() {
 /// Rate limiting is disabled when throttle config is None (msg_rate=0).
 #[tokio::test]
 async fn ws_rate_limit_disabled_when_none() {
-    let server = TestWsServer::with_throttle(WsEncoding::Raw, 64, None).await;
+    let server = TestWsServer::with_throttle(Arc::new(RawCodec), 64, None).await;
     let alice_cert = server.issue_client("alice", &["alpha"]);
     let bob_cert = server.issue_client("bob", &["alpha"]);
 

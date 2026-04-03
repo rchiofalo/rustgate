@@ -17,7 +17,7 @@ use rustgate_core::error::{Result, TransportError};
 use rustgate_core::identity::Identity;
 use rustgate_core::net::configure_tcp_keepalive;
 use rustgate_transport::{TlsConfig, extract_identity};
-pub use server::{OnFederationForward, OnNatsPublish, WebSocketServer, WsEncoding, WsServerConfig};
+pub use server::{OnFederationForward, OnNatsPublish, WebSocketServer, WsServerConfig};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::WebSocketStream;
