@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rustgate_core::identity::{GroupId, Identity};
 use rustgate_core::message::{Destination, MessageType, RoutableMessage};
 use tokio::sync::{RwLock, mpsc};
-use tracing::warn;
+use tracing::{Instrument, warn};
 
 use crate::cache::PositionCache;
 
@@ -186,6 +186,24 @@ impl Router {
     }
 
     pub async fn route(&self, msg: RoutableMessage) {
+        let destination_label = match &msg.destination {
+            Destination::Direct(target) => target.cn.as_str(),
+            Destination::Group(group) => group.as_ref(),
+            Destination::Broadcast => "broadcast",
+        };
+
+        let span = tracing::debug_span!(
+            "route",
+            source_cn = %msg.source.cn,
+            destination = %destination_label,
+        );
+
+        self.route_inner(msg).instrument(span).await;
+    }
+
+    /// Inner routing logic, separated so the caller can `.instrument()` a span
+    /// around this future without holding an `EnteredSpan` across `.await`.
+    async fn route_inner(&self, msg: RoutableMessage) {
         // Cache position reports for SA replay to new sessions
         if msg.metadata.message_type == MessageType::Position {
             self.cache.store(msg.clone()).await;

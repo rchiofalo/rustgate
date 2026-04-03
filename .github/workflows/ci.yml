@@ -78,10 +78,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       - name: Clippy (all features)
-        run: cargo clippy --locked --workspace --all-targets --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket
+        run: cargo clippy --locked --workspace --all-targets --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket,otel
 
       - name: Build documentation
-        run: cargo doc --workspace --no-deps --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket
+        run: cargo doc --workspace --no-deps --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket,otel
 
   check-features:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
@@ -103,7 +103,7 @@ jobs:
       - name: Check all feature combinations
         # NOTE: --locked is omitted because --no-dev-deps temporarily modifies
         # Cargo.toml files, which invalidates the lockfile.
-        run: cargo hack check --feature-powerset --depth 2 --exclude-features jemalloc,fips --no-dev-deps
+        run: cargo hack check --feature-powerset --depth 2 --exclude-features jemalloc,fips,otel --no-dev-deps
 
   test:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
@@ -130,10 +130,10 @@ jobs:
         run: cargo install cargo-nextest --locked
 
       - name: Run tests
-        run: cargo nextest run --locked --workspace --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket
+        run: cargo nextest run --locked --workspace --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket,otel
 
       - name: Run doc tests
-        run: cargo test --locked --workspace --doc --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket
+        run: cargo test --locked --workspace --doc --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket,otel
 
   coverage:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
@@ -159,7 +159,7 @@ jobs:
         run: cargo install cargo-tarpaulin --locked
 
       - name: Generate coverage report
-        run: cargo tarpaulin --locked --engine llvm --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket --out xml --output-dir coverage/
+        run: cargo tarpaulin --locked --engine llvm --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket,otel --out xml --output-dir coverage/
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
