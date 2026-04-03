@@ -101,6 +101,30 @@ pub fn federation_peer_disconnected(peer_id: &PeerId, reason: &str) {
     );
 }
 
+/// Record a federation circuit breaker trip.
+///
+/// `total_trips` is the cumulative lifetime trip count for this peer,
+/// not the number of trips since the last recovery.
+pub fn federation_circuit_tripped(peer_id: &PeerId, total_trips: u64) {
+    audit!(
+        "federation.circuit_tripped",
+        peer_id = %peer_id,
+        total_trips = total_trips,
+        action = "circuit_breaker",
+        result = "open"
+    );
+}
+
+/// Record a federation circuit breaker recovery.
+pub fn federation_circuit_recovered(peer_id: &PeerId) {
+    audit!(
+        "federation.circuit_recovered",
+        peer_id = %peer_id,
+        action = "circuit_breaker",
+        result = "closed"
+    );
+}
+
 /// Record a federation connection failure.
 pub fn federation_connect_failed(peer_id: &PeerId, error: &str) {
     audit!(
@@ -301,6 +325,18 @@ mod tests {
         fn test_connect_failed() {
             federation_connect_failed(&PeerId::new("peer-1"), "connection refused");
             federation_connect_failed(&PeerId::new("peer-2"), "tls: certificate verify failed");
+        }
+
+        #[test]
+        fn test_circuit_tripped() {
+            federation_circuit_tripped(&PeerId::new("peer-1"), 1);
+            federation_circuit_tripped(&PeerId::new("peer-2"), 5);
+        }
+
+        #[test]
+        fn test_circuit_recovered() {
+            federation_circuit_recovered(&PeerId::new("peer-1"));
+            federation_circuit_recovered(&PeerId::new("peer-2"));
         }
 
         #[test]

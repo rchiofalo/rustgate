@@ -206,6 +206,8 @@ mod federation_gate {
         let _ = metrics::messages_in();
         let _ = metrics::messages_out();
         let _ = metrics::errors();
+        let _ = metrics::circuit_breaker_trips();
+        let _ = metrics::circuit_breaker_recoveries();
     }
 }
 

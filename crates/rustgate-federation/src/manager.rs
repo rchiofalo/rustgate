@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use rustgate_core::PeerId;
+use rustgate_core::{PeerId, audit};
 #[cfg(feature = "v2")]
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -587,16 +587,23 @@ impl FederationManager {
                             peer_id = %id,
                             "circuit breaker recovered — peer is healthy again"
                         );
+                        #[cfg(feature = "api")]
+                        crate::metrics::circuit_breaker_recoveries().inc();
+                        audit::federation_circuit_recovered(id);
                     }
                     sent += 1;
                 }
                 Err(e) => {
                     if peer.record_failure() {
+                        let trips = peer.circuit_trip_count();
                         warn!(
                             peer_id = %id,
-                            trips = peer.circuit_trip_count(),
+                            trips = trips,
                             "circuit breaker tripped — skipping peer until recovery timeout"
                         );
+                        #[cfg(feature = "api")]
+                        crate::metrics::circuit_breaker_trips().inc();
+                        audit::federation_circuit_tripped(id, trips);
                     }
                     warn!(
                         peer_id = %id,

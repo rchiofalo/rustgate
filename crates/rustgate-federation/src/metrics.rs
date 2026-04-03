@@ -25,6 +25,9 @@ static MESSAGES_DROPPED: OnceLock<IntCounter> = OnceLock::new();
 
 static RECONNECTS: OnceLock<IntCounter> = OnceLock::new();
 
+static CIRCUIT_BREAKER_TRIPS: OnceLock<IntCounter> = OnceLock::new();
+static CIRCUIT_BREAKER_RECOVERIES: OnceLock<IntCounter> = OnceLock::new();
+
 // ── Registration ────────────────────────────────────────────────────
 
 /// Register all federation metrics with the default Prometheus registry.
@@ -100,6 +103,20 @@ pub fn init() -> prometheus::Result<()> {
     ))?;
     registry.register(Box::new(reconnects.clone()))?;
     let _ = RECONNECTS.set(reconnects);
+
+    let circuit_trips = IntCounter::with_opts(Opts::new(
+        "rustgate_federation_circuit_breaker_trips_total",
+        "Total circuit breaker trips across all federation peers",
+    ))?;
+    registry.register(Box::new(circuit_trips.clone()))?;
+    let _ = CIRCUIT_BREAKER_TRIPS.set(circuit_trips);
+
+    let circuit_recoveries = IntCounter::with_opts(Opts::new(
+        "rustgate_federation_circuit_breaker_recoveries_total",
+        "Total circuit breaker recoveries across all federation peers",
+    ))?;
+    registry.register(Box::new(circuit_recoveries.clone()))?;
+    let _ = CIRCUIT_BREAKER_RECOVERIES.set(circuit_recoveries);
 
     Ok(())
 }
@@ -195,6 +212,26 @@ pub fn reconnects() -> &'static IntCounter {
     RECONNECTS.get_or_init(|| fallback_counter("rustgate_federation_reconnects_total", "fallback"))
 }
 
+/// Total circuit breaker trips (counter).
+pub fn circuit_breaker_trips() -> &'static IntCounter {
+    CIRCUIT_BREAKER_TRIPS.get_or_init(|| {
+        fallback_counter(
+            "rustgate_federation_circuit_breaker_trips_total",
+            "fallback",
+        )
+    })
+}
+
+/// Total circuit breaker recoveries (counter).
+pub fn circuit_breaker_recoveries() -> &'static IntCounter {
+    CIRCUIT_BREAKER_RECOVERIES.get_or_init(|| {
+        fallback_counter(
+            "rustgate_federation_circuit_breaker_recoveries_total",
+            "fallback",
+        )
+    })
+}
+
 // ── Snapshot ────────────────────────────────────────────────────────
 
 /// A point-in-time snapshot of all federation metric values.
@@ -212,6 +249,8 @@ pub struct MetricsSnapshot {
     pub heartbeats_out: u64,
     pub messages_dropped: u64,
     pub reconnects: u64,
+    pub circuit_breaker_trips: u64,
+    pub circuit_breaker_recoveries: u64,
 }
 
 /// Capture a snapshot of all current federation metric values.
@@ -227,6 +266,8 @@ pub fn snapshot() -> MetricsSnapshot {
         heartbeats_out: heartbeats().with_label_values(&["out"]).get(),
         messages_dropped: messages_dropped().get(),
         reconnects: reconnects().get(),
+        circuit_breaker_trips: circuit_breaker_trips().get(),
+        circuit_breaker_recoveries: circuit_breaker_recoveries().get(),
     }
 }
 
@@ -257,6 +298,8 @@ mod tests {
         let _ = heartbeats();
         let _ = messages_dropped();
         let _ = reconnects();
+        let _ = circuit_breaker_trips();
+        let _ = circuit_breaker_recoveries();
     }
 
     #[test]
@@ -356,6 +399,24 @@ mod tests {
     }
 
     #[test]
+    fn circuit_breaker_trips_counter() {
+        ensure_init();
+
+        let before = circuit_breaker_trips().get();
+        circuit_breaker_trips().inc();
+        assert_eq!(circuit_breaker_trips().get(), before + 1);
+    }
+
+    #[test]
+    fn circuit_breaker_recoveries_counter() {
+        ensure_init();
+
+        let before = circuit_breaker_recoveries().get();
+        circuit_breaker_recoveries().inc();
+        assert_eq!(circuit_breaker_recoveries().get(), before + 1);
+    }
+
+    #[test]
     fn snapshot_captures_current_values() {
         ensure_init();
 
@@ -397,6 +458,8 @@ mod tests {
         assert!(json.contains("\"heartbeats_out\""));
         assert!(json.contains("\"messages_dropped\""));
         assert!(json.contains("\"reconnects\""));
+        assert!(json.contains("\"circuit_breaker_trips\""));
+        assert!(json.contains("\"circuit_breaker_recoveries\""));
     }
 
     #[test]
