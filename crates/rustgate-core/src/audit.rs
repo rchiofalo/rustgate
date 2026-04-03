@@ -102,11 +102,14 @@ pub fn federation_peer_disconnected(peer_id: &PeerId, reason: &str) {
 }
 
 /// Record a federation circuit breaker trip.
-pub fn federation_circuit_tripped(peer_id: &PeerId, trips: u64) {
+///
+/// `total_trips` is the cumulative lifetime trip count for this peer,
+/// not the number of trips since the last recovery.
+pub fn federation_circuit_tripped(peer_id: &PeerId, total_trips: u64) {
     audit!(
         "federation.circuit_tripped",
         peer_id = %peer_id,
-        trips = trips,
+        total_trips = total_trips,
         action = "circuit_breaker",
         result = "open"
     );
