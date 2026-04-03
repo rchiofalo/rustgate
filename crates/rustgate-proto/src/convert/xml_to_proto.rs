@@ -1,4 +1,52 @@
-//! XML CoT -> TAK protobuf conversion.
+//! XML CoT to TAK protobuf conversion.
+//!
+//! ## Field Mapping
+//!
+//! The following XML `<event>` attributes are explicitly mapped to protobuf
+//! fields in `CotEvent`:
+//!
+//! | XML attribute | Proto field | Notes |
+//! |---------------|-------------|-------|
+//! | `uid` | `uid` | |
+//! | `type` | `type` | |
+//! | `how` | `how` | |
+//! | `time` | `send_time` | ISO 8601 to milliseconds |
+//! | `start` | `start_time` | ISO 8601 to milliseconds |
+//! | `stale` | `stale_time` | ISO 8601 to milliseconds |
+//! | `access` | `access` | |
+//! | `qos` | `qos` | |
+//! | `opex` | `opex` | |
+//! | `<point>` lat/lon/hae/ce/le | corresponding proto fields | |
+//!
+//! ## Detail Mapping
+//!
+//! Known `<detail>` children are mapped to typed proto fields:
+//!
+//! - `<contact>` — `endpoint`, `callsign`
+//! - `<__group>` — `name`, `role`
+//! - `<precisionlocation>` — mapped to `PrecisionLocation`
+//! - `<status>` — `battery`
+//! - `<takv>` — `device`, `platform`, `os`, `version`
+//! - `<track>` — `speed`, `course`
+//!
+//! ## Field Loss Behavior
+//!
+//! - **Unknown `<event>` attributes** (not listed above) are **silently
+//!   discarded** during conversion. They do not appear in the protobuf
+//!   output.
+//! - **Unknown `<detail>` children** (elements not in the list above) are
+//!   serialized back to XML and preserved in `Detail.xmlDetail`. This is a
+//!   lossy process: attribute ordering and whitespace may change.
+//! - **Nested attributes** within known detail elements that are not part
+//!   of the proto schema are also discarded.
+//! - The proto schema includes `caveat` and `releaseableTo` fields on
+//!   `CotEvent`. These are **reserved but currently unmapped** — they are
+//!   initialized to empty strings during conversion. If the source XML
+//!   contains corresponding attributes, they will be discarded.
+//!
+//! This behavior is by design — the protobuf schema defines a fixed set of
+//! fields, and XML attributes outside that set have no corresponding
+//! representation.
 
 use prost::Message;
 
@@ -9,7 +57,8 @@ use crate::{tak_proto, xml_full};
 /// Convert raw CoT XML bytes to serialized TakMessage protobuf bytes.
 ///
 /// Parses the XML fully, maps all fields to protobuf types, and packages
-/// unknown detail children into `Detail.xmlDetail`.
+/// unknown detail children into `Detail.xmlDetail`. See the [module-level
+/// documentation](self) for the complete field mapping and loss behavior.
 pub fn xml_to_proto(xml: &[u8]) -> Result<Vec<u8>, ProtoError> {
     let full = xml_full::parse_full(xml)?;
     let cot_event = full_to_cot_event(&full)?;

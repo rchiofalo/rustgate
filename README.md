@@ -147,7 +147,7 @@ For detailed architecture documentation see [docs/architecture.md](docs/architec
 
 | Feature | Description |
 |---------|-------------|
-| Prometheus metrics | Connection lifecycle, message routing, NATS, federation |
+| Prometheus metrics | Connection lifecycle, message routing, NATS, federation ([unauthenticated](docs/deployment.md#ports) — firewall in hostile environments) |
 | OpenTelemetry tracing | Distributed trace export via OTLP (Jaeger, Tempo, etc.) |
 | Health endpoints | `/healthz` (liveness), `/readyz` (readiness) |
 | Graceful shutdown | SIGTERM handling, readiness 503, connection draining |

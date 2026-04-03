@@ -1,3 +1,11 @@
+//! Server-to-server federation for cross-network message routing.
+//!
+//! This crate implements both the V1 (length-prefixed XML over mTLS) and
+//! V2 (gRPC over mTLS) federation protocols. The [`manager::FederationManager`]
+//! orchestrates peer connections, heartbeats, circuit breakers, and message
+//! forwarding. Peer configuration is persisted via the [`store`] module and
+//! dynamic TLS trust is managed by [`trust_store::TrustStore`].
+
 pub mod config;
 pub mod connector;
 pub mod dedup;

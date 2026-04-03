@@ -1,3 +1,11 @@
+//! Federation peer persistence backends.
+//!
+//! The [`FederateStore`] trait abstracts peer configuration storage.
+//! Two implementations are provided: [`file::FileStore`] (JSON file on
+//! disk) and, with the `ha` feature, [`kv::KvStore`] (NATS KV for
+//! cluster-wide consistency). The store tracks each peer's address,
+//! group filters, routing mode, and message counters.
+
 pub mod file;
 #[cfg(feature = "ha")]
 pub mod kv;

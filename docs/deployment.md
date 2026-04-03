@@ -101,6 +101,8 @@ curl http://localhost:9090/metrics
 | 9001 | Federation V2 gRPC (mTLS) | `federation` |
 | 9090 | Metrics and health (HTTP) | `metrics` |
 
+> **Security note:** The metrics endpoint (port 9090) serves unauthenticated HTTP. It exposes session counts, message routing statistics, and NATS/federation status — information useful for attacker reconnaissance. In hostile or shared environments, bind the metrics port to `127.0.0.1` or a private interface and firewall it from untrusted networks. In Kubernetes, use a `NetworkPolicy` to restrict scraper access.
+
 ## Docker Compose
 
 ### Quick Start

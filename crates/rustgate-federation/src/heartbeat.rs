@@ -1,3 +1,9 @@
+//! Federation heartbeat generation and detection.
+//!
+//! Federation peers exchange periodic heartbeat messages (CoT type `t-x-c-t`)
+//! to maintain connection liveness. [`create_heartbeat`] builds the XML payload
+//! and [`is_heartbeat`] performs a fast byte-level check without full XML parsing.
+
 use bytes::Bytes;
 
 /// CoT event type for federation heartbeat messages.

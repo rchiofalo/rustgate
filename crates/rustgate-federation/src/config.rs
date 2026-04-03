@@ -1,3 +1,9 @@
+//! Federation configuration types and defaults.
+//!
+//! Defines [`FederationConfig`] (the top-level config struct) and
+//! [`PeerConfig`] (per-peer connection settings including protocol version,
+//! TLS paths, group filtering, and circuit breaker parameters).
+
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::time::Duration;

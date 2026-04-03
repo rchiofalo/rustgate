@@ -1,3 +1,10 @@
+//! Message provenance tracking for federation loop detection.
+//!
+//! Each federated message carries [`FederationMetadata`] recording the
+//! ordered list of servers it has traversed. Before forwarding, a server
+//! checks [`FederationMetadata::should_drop`] to detect loops (same server
+//! seen twice) and enforce the configurable maximum hop count.
+
 use rustgate_core::{PeerId, ServerName};
 use sha2::{Digest, Sha256};
 

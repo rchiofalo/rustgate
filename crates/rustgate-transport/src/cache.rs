@@ -1,12 +1,35 @@
 //! Latest-state cache for position reports.
 //!
-//! TAK clients expect to receive the current situational awareness (SA)
-//! picture on connect. This cache stores the most recent position CoT
-//! event per CN and replays them to newly connected sessions.
+//! Clients expect to receive the current situational awareness (SA) picture
+//! on connect. This cache stores the most recent position event per CN and
+//! replays them to newly connected sessions.
 //!
-//! Positions with a TTL are automatically evicted once they become stale.
-//! A background sweep task can be spawned to periodically clean up expired
-//! entries.
+//! ## TTL Semantics
+//!
+//! Each cached position may carry an optional TTL in its metadata:
+//!
+//! - **`ttl: None`** — the entry never expires by time. It is only evicted
+//!   when the client disconnects ([`PositionCache::remove`]), a newer
+//!   position replaces it, or the cache reaches capacity and the oldest
+//!   entry is evicted.
+//! - **`ttl: Some(duration)`** — the entry expires when
+//!   `received_at + duration < now`. A `Duration::ZERO` TTL means the entry
+//!   expires on the next check (any elapsed time > 0).
+//! - Clock-backwards edge cases (e.g., NTP corrections) are treated as
+//!   not-expired to avoid spurious eviction.
+//!
+//! ## Sweep Task
+//!
+//! [`start_sweep_task`] spawns a background `tokio` task that calls
+//! [`PositionCache::sweep`] at a fixed interval (default: **60 seconds**).
+//! The sweep removes all entries whose TTL has elapsed. Entries without a
+//! TTL are never removed by the sweep — they persist until explicitly
+//! removed or replaced.
+//!
+//! The sweep interval is independent of individual entry TTLs. An entry
+//! with a 5-second TTL will not be removed until the next sweep runs,
+//! but it will be excluded from [`PositionCache::get_all`] results
+//! immediately (the `is_expired` check runs on read).
 
 use std::collections::HashMap;
 use std::time::Duration;
