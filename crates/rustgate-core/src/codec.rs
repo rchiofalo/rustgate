@@ -4,7 +4,7 @@
 //! payload transformation (wire format ↔ canonical XML) into a single
 //! abstraction. Each protocol gets one `Codec` implementation that knows
 //! how to frame its wire format and convert payloads to/from the internal
-//! [`RoutableMessage`](crate::message::RoutableMessage) representation.
+//! [`RoutableMessage`] representation.
 //!
 //! The router is codec-agnostic — it only sees `RoutableMessage` with
 //! canonical XML payloads. Codecs handle translation at session edges.
