@@ -6,6 +6,16 @@
 //! (via SHA-256 digest comparison) and swaps the [`CertifiedKey`] when
 //! they differ. This enables zero-downtime certificate rotation without
 //! rebuilding the `ServerConfig` or `TlsAcceptor`.
+//!
+//! # File replacement strategy
+//!
+//! The cert and key files are read in two separate operations. If only one
+//! file has been updated when the poll fires, the reloader may attempt to
+//! build a `CertifiedKey` from a mismatched cert/key pair. This will fail
+//! with a parse or signing error, emit an audit failure event, and self-heal
+//! on the next poll once both files are consistent. For reliable rotation,
+//! replace certificate files atomically (e.g., write to a temporary file in
+//! the same directory and `mv`/rename into place).
 
 use std::fmt;
 use std::path::PathBuf;
@@ -28,9 +38,10 @@ use tracing::{debug, info, warn};
 pub struct CertReloader {
     cert_path: PathBuf,
     key_path: PathBuf,
-    current: RwLock<Arc<CertifiedKey>>,
-    /// SHA-256 digest of the concatenated raw cert + key file bytes.
-    file_hash: RwLock<[u8; 32]>,
+    /// The current `CertifiedKey` paired with the SHA-256 digest of the raw
+    /// cert + key file bytes that produced it. A single lock ensures both
+    /// are always in sync.
+    state: RwLock<(Arc<CertifiedKey>, [u8; 32])>,
 }
 
 impl CertReloader {
@@ -64,8 +75,7 @@ impl CertReloader {
         Ok(Arc::new(Self {
             cert_path,
             key_path,
-            current: RwLock::new(Arc::new(certified_key)),
-            file_hash: RwLock::new(hash),
+            state: RwLock::new((Arc::new(certified_key), hash)),
         }))
     }
 
@@ -91,11 +101,11 @@ impl CertReloader {
 
         // Compare against stored hash — skip rebuild if unchanged.
         {
-            let current_hash = self
-                .file_hash
+            let guard = self
+                .state
                 .read()
-                .map_err(|_| ConfigError::Other("file_hash lock poisoned".to_string()))?;
-            if *current_hash == new_hash {
+                .map_err(|_| ConfigError::Other("state lock poisoned".to_string()))?;
+            if guard.1 == new_hash {
                 debug!(
                     cert = %self.cert_path.display(),
                     "certificate files unchanged"
@@ -110,18 +120,11 @@ impl CertReloader {
         let serial = Self::extract_serial(&cert_bytes);
 
         {
-            let mut current = self
-                .current
+            let mut guard = self
+                .state
                 .write()
-                .map_err(|_| ConfigError::Other("current cert lock poisoned".to_string()))?;
-            *current = Arc::new(certified_key);
-        }
-        {
-            let mut hash = self
-                .file_hash
-                .write()
-                .map_err(|_| ConfigError::Other("file_hash lock poisoned".to_string()))?;
-            *hash = new_hash;
+                .map_err(|_| ConfigError::Other("state lock poisoned".to_string()))?;
+            *guard = (Arc::new(certified_key), new_hash);
         }
 
         info!(
@@ -136,6 +139,10 @@ impl CertReloader {
 
     /// Spawn a background task that polls the certificate files at the
     /// given interval and reloads when changes are detected.
+    ///
+    /// File I/O is offloaded to a blocking thread via
+    /// [`tokio::task::spawn_blocking`] to avoid stalling the async runtime,
+    /// particularly when certificate files reside on a network filesystem.
     pub fn spawn_watcher(self: &Arc<Self>, interval: Duration) {
         let reloader = Arc::clone(self);
         drop(tokio::spawn(async move {
@@ -145,7 +152,23 @@ impl CertReloader {
 
             loop {
                 let _ = tick.tick().await;
-                if let Err(e) = reloader.reload() {
+
+                let r = Arc::clone(&reloader);
+                let result = tokio::task::spawn_blocking(move || r.reload()).await;
+
+                let reload_result = match result {
+                    Ok(inner) => inner,
+                    Err(e) => {
+                        warn!(
+                            cert = %reloader.cert_path.display(),
+                            error = %e,
+                            "certificate reload task panicked"
+                        );
+                        continue;
+                    }
+                };
+
+                if let Err(e) = reload_result {
                     warn!(
                         cert = %reloader.cert_path.display(),
                         error = %e,
@@ -228,8 +251,8 @@ impl CertReloader {
 
 impl ResolvesServerCert for CertReloader {
     fn resolve(&self, _client_hello: rustls::server::ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        match self.current.read() {
-            Ok(guard) => Some(Arc::clone(&guard)),
+        match self.state.read() {
+            Ok(guard) => Some(Arc::clone(&guard.0)),
             Err(_) => {
                 warn!("CertReloader lock poisoned during resolve");
                 None
@@ -271,9 +294,9 @@ mod tests {
             CertReloader::new(dir.path().join("cert.pem"), dir.path().join("key.pem")).unwrap();
 
         // Verify the CertifiedKey is accessible via the internal lock
-        let guard = reloader.current.read().unwrap();
+        let guard = reloader.state.read().unwrap();
         assert!(
-            !guard.cert.is_empty(),
+            !guard.0.cert.is_empty(),
             "should have at least one certificate"
         );
     }
