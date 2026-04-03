@@ -258,6 +258,17 @@ pub(crate) struct Cli {
     /// this are eligible for cleanup. 0 = no expiration.
     #[arg(long, default_value_t = 0, env = "RUSTGATE_PACKAGE_MAX_AGE_HOURS")]
     pub(crate) package_max_age_hours: u64,
+
+    // -- Observability --
+    /// OTLP gRPC endpoint for OpenTelemetry trace export (e.g. http://localhost:4317).
+    /// Requires --features otel. When not set, OTel tracing is disabled even if
+    /// compiled with the otel feature.
+    #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
+    pub(crate) otel_endpoint: Option<String>,
+
+    /// OpenTelemetry service name reported in traces.
+    #[arg(long, default_value = "rustgate", env = "OTEL_SERVICE_NAME")]
+    pub(crate) otel_service_name: String,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -441,6 +452,8 @@ mod tests {
             "RUSTGATE_CLIENT_BURST",
             "RUSTGATE_ARCHIVE_DIR",
             "RUSTGATE_PACKAGE_MAX_AGE_HOURS",
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "OTEL_SERVICE_NAME",
         ];
 
         for var in expected_env_vars {

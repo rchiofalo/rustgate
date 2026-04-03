@@ -13,7 +13,7 @@ use bytes::Bytes;
 use rustgate_core::{PeerId, audit};
 #[cfg(feature = "v2")]
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{Instrument, info, warn};
 
 use crate::config::FederationConfig;
 use crate::connector::{OutboundConnector, PeerConnector};
@@ -606,6 +606,20 @@ impl FederationManager {
     ///
     /// Returns the number of peers the message was successfully queued to.
     pub async fn forward(&self, payload: Bytes, source_groups: &[String]) -> usize {
+        let span = tracing::debug_span!(
+            "federation_forward",
+            peer_count = self.clients.len(),
+            source_groups = ?source_groups,
+        );
+
+        self.forward_inner(payload, source_groups)
+            .instrument(span)
+            .await
+    }
+
+    /// Inner forwarding logic, separated so the caller can `.instrument()` a
+    /// span around this future without holding an `EnteredSpan` across `.await`.
+    async fn forward_inner(&self, payload: Bytes, source_groups: &[String]) -> usize {
         let mut sent = 0;
 
         // Inject flow tag for traceability (identifies which federation server

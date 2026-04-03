@@ -5,6 +5,7 @@ use bytes::Bytes;
 #[cfg(not(feature = "full-detail"))]
 use rustgate_core::message::MessageType;
 use rustgate_core::message::RoutableMessage;
+use tracing::Instrument;
 
 use crate::config::NatsConfig;
 use crate::serde_compat::WireEvent;
@@ -34,6 +35,17 @@ impl NatsPublisher {
             return;
         }
 
+        let span = tracing::debug_span!(
+            "nats_publish",
+            source_cn = %msg.source.cn,
+        );
+
+        self.publish_inner(msg).instrument(span).await;
+    }
+
+    /// Inner publish logic, separated so the caller can `.instrument()` a span
+    /// around this future without holding an `EnteredSpan` across `.await`.
+    async fn publish_inner(&self, msg: &RoutableMessage) {
         // Without full-detail, only publish position messages
         #[cfg(not(feature = "full-detail"))]
         if msg.metadata.message_type != MessageType::Position {

@@ -148,6 +148,7 @@ For detailed architecture documentation see [docs/architecture.md](docs/architec
 | Feature | Description |
 |---------|-------------|
 | Prometheus metrics | Connection lifecycle, message routing, NATS, federation |
+| OpenTelemetry tracing | Distributed trace export via OTLP (Jaeger, Tempo, etc.) |
 | Health endpoints | `/healthz` (liveness), `/readyz` (readiness) |
 | Graceful shutdown | SIGTERM handling, readiness 503, connection draining |
 | Helm chart | Pod Security Standards, PDB, HPA, probes, NetworkPolicy |
@@ -189,6 +190,7 @@ cargo build --release --features websocket      # WebSocket listener
 cargo build --release --features metrics        # Prometheus + health endpoints
 cargo build --release --features jemalloc       # jemalloc allocator (musl)
 cargo build --release --features fips           # FIPS 140-3 crypto (needs Go + cmake)
+cargo build --release --features otel           # OpenTelemetry tracing (needs protoc)
 
 # All features
 cargo build --release --all-features
@@ -207,6 +209,7 @@ cargo build --release --all-features
 | `metrics` | Prometheus metrics | — |
 | `full-detail` | Extended CoT parsing | — |
 | `fips` | FIPS 140-3 crypto (aws-lc-rs) | Go 1.20+, cmake |
+| `otel` | OpenTelemetry distributed tracing | `protoc` |
 | `jemalloc` | jemalloc allocator | — |
 
 ## Running

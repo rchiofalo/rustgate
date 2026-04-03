@@ -15,12 +15,16 @@ use std::time::Duration;
 use clap::Parser;
 use tokio::sync::Semaphore;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 mod archive;
 mod audit;
 mod cli;
 #[cfg(feature = "metrics")]
 mod metrics;
+#[cfg(feature = "otel")]
+mod otel;
 mod session;
 mod setup;
 
@@ -31,12 +35,37 @@ use session::{FedForwardFn, SessionDeps};
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .json()
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let fmt_layer = tracing_subscriber::fmt::layer().json();
+
+    #[cfg(feature = "otel")]
+    let otel_layer = if let Some(ref endpoint) = cli.otel_endpoint {
+        Some(otel::init_layer(endpoint, &cli.otel_service_name)?)
+    } else {
+        None
+    };
+
+    #[cfg(not(feature = "otel"))]
+    let otel_layer: Option<tracing_subscriber::layer::Identity> = None;
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt_layer)
+        .with(otel_layer)
         .init();
+
+    #[cfg(feature = "otel")]
+    if let Some(ref endpoint) = cli.otel_endpoint {
+        tracing::info!(endpoint = %endpoint, "OpenTelemetry trace export enabled");
+    }
+
+    #[cfg(not(feature = "otel"))]
+    if cli.otel_endpoint.is_some() {
+        tracing::warn!(
+            "--otel-endpoint provided but the otel feature is not compiled in; \
+             rebuild with --features otel to enable trace export"
+        );
+    }
 
     #[cfg(feature = "fips")]
     rustgate_transport::install_fips_provider()?;
@@ -280,6 +309,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             );
         }
     }
+
+    // Flush pending OTel spans before exit.
+    #[cfg(feature = "otel")]
+    otel::shutdown();
 
     Ok(())
 }

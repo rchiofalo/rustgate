@@ -23,6 +23,7 @@ metrics = ["dep:prometheus", "dep:hyper", "dep:hyper-util", "dep:http-body-util"
 federation = ["dep:rustgate-federation", "rustgate-federation/v2", "rustgate-federation/api", "dep:serde_json"]
 federation-ha = ["federation", "rustgate-federation/ha"]
 websocket = ["dep:rustgate-websocket"]
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
 fips = ["rustgate-transport/fips", "rustgate-federation?/fips", "rustgate-enrollment?/fips"]
 jemalloc = ["dep:tikv-jemallocator"]
 
@@ -39,6 +40,10 @@ prometheus = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
 tikv-jemallocator = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "signal", "fs", "macros", "time", "net"] }
 tokio-util = { workspace = true }

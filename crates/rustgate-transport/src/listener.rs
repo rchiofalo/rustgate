@@ -8,7 +8,7 @@ use rustgate_core::net::configure_tcp_keepalive;
 use tokio::net::{TcpListener, ToSocketAddrs};
 use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 
 use crate::config::TlsConfig;
 use crate::extract::{ExpectedKeyUsage, extract_identity, validate_key_usage};
@@ -139,7 +139,12 @@ impl TlsListener {
                 );
             }
 
-            let tls_stream = match self.tls_acceptor.accept(tcp_stream).await {
+            let tls_stream = match self
+                .tls_acceptor
+                .accept(tcp_stream)
+                .instrument(tracing::info_span!("tls_handshake", peer_addr = %peer_addr))
+                .await
+            {
                 Ok(stream) => stream,
                 Err(e) => {
                     // Permit is released here when `_permit` is dropped.

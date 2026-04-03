@@ -5,6 +5,7 @@ use std::sync::Arc;
 use async_nats::Client;
 use futures::StreamExt;
 use rustgate_transport::Router;
+use tracing::Instrument;
 
 use crate::config::NatsConfig;
 use crate::serde_compat::WireEvent;
@@ -53,32 +54,43 @@ impl NatsSubscriber {
                 continue;
             }
 
-            let group = extract_group_from_subject(
-                msg.subject.as_str(),
-                &self.config.subject_prefix,
-                &self.config.default_group,
+            let span = tracing::debug_span!(
+                "nats_recv",
+                subject = %msg.subject,
             );
 
-            let wire_event: WireEvent = match serde_json::from_slice(&msg.payload) {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::debug!(error = %e, subject = %msg.subject, "failed to parse NATS message");
+            let routable = {
+                let _guard = span.enter();
+
+                let group = extract_group_from_subject(
+                    msg.subject.as_str(),
+                    &self.config.subject_prefix,
+                    &self.config.default_group,
+                );
+
+                let wire_event: WireEvent = match serde_json::from_slice(&msg.payload) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        tracing::debug!(error = %e, subject = %msg.subject, "failed to parse NATS message");
+                        continue;
+                    }
+                };
+
+                if wire_event.is_position_unknown() {
                     continue;
                 }
-            };
 
-            if wire_event.is_position_unknown() {
-                continue;
-            }
-
-            let routable = match wire_event.into_routable(&group, msg.payload.clone()) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(error = %e, "invalid NATS message identity");
-                    continue;
+                match wire_event.into_routable(&group, msg.payload.clone()) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "invalid NATS message identity");
+                        continue;
+                    }
                 }
+                // _guard dropped here — before the .await below
             };
-            router.route(routable).await;
+
+            router.route(routable).instrument(span).await;
         }
 
         tracing::info!("NATS subscriber ended");
