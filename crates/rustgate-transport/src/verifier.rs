@@ -41,11 +41,18 @@ struct CachedVerifier {
 /// verification methods delegate to the crypto provider and do not
 /// depend on the root store.
 ///
+/// # Root hint staleness
+///
 /// `root_hint_subjects` returns the subjects computed at construction
-/// time. Hints may become slightly stale after trust store changes
-/// (a newly added CA won't appear in hints until the verifier is
-/// reconstructed), but this is cosmetic — actual certificate
-/// validation always uses the latest root store.
+/// time. After adding a new CA, that CA won't appear in the TLS
+/// `CertificateRequest` `certificate_authorities` list until the
+/// server process restarts. Some mTLS clients may not send their
+/// certificate if their issuing CA is absent from the hints.
+///
+/// Actual certificate *validation* always uses the latest root store,
+/// so a client that does send its certificate will be verified
+/// correctly regardless of hint freshness. If hint accuracy is
+/// critical, restart the server after trust store changes.
 pub struct DynamicCertVerifier {
     provider: RootStoreProvider,
     crls: Vec<CertificateRevocationListDer<'static>>,
@@ -99,7 +106,7 @@ impl DynamicCertVerifier {
 
     /// Get the current inner verifier, rebuilding if the generation changed.
     fn current_verifier(&self) -> Result<Arc<dyn ClientCertVerifier>, Error> {
-        let (current_gen, _) = (self.provider)();
+        let (current_gen, root_store) = (self.provider)();
 
         let mut cached = self
             .cached
@@ -110,20 +117,16 @@ impl DynamicCertVerifier {
             return Ok(Arc::clone(&cached.verifier));
         }
 
-        // Generation changed — rebuild
+        // Generation changed — rebuild using the store we already fetched.
         debug!(
             old_generation = cached.generation,
             new_generation = current_gen,
             "trust store changed, rebuilding client cert verifier"
         );
 
-        // Call provider again to get the actual store (we already got generation
-        // above, but the store might have changed between the two calls —
-        // acceptable since we'll catch it on the next handshake).
-        let (fresh_gen, root_store) = (self.provider)();
         match Self::build_verifier(Arc::new(root_store), &self.crls) {
             Ok(verifier) => {
-                cached.generation = fresh_gen;
+                cached.generation = current_gen;
                 cached.verifier = Arc::clone(&verifier);
                 Ok(verifier)
             }

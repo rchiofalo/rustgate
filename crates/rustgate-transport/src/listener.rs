@@ -15,7 +15,7 @@ use crate::extract::{ExpectedKeyUsage, extract_identity, validate_key_usage};
 use crate::session::AuthenticatedSession;
 
 /// Default maximum number of concurrent TLS handshakes when no limit is specified.
-const DEFAULT_MAX_HANDSHAKES: usize = 100;
+pub const DEFAULT_MAX_HANDSHAKES: usize = 100;
 
 pub struct TlsListener {
     tcp_listener: TcpListener,

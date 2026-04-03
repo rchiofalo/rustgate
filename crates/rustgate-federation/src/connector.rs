@@ -168,6 +168,20 @@ pub type OutboundRootStoreProvider = Arc<dyn Fn() -> (u64, RootCertStore) + Send
 /// On each `connect` call, checks whether the trust store generation
 /// has changed. If so, rebuilds the `ClientConfig` with the fresh
 /// root store. Existing connections are not affected.
+///
+/// # Security note
+///
+/// The private key DER bytes are retained in `key_der` so the key can
+/// be re-parsed into a `PrivateKeyDer` on each config rebuild (`rustls`
+/// consumes the key by value). This means:
+///
+/// - The key material is not zeroized on drop (plain `Vec<u8>`).
+/// - A brief duplicate exists during each rebuild (the clone passed to
+///   `PrivateKeyDer::try_from`).
+///
+/// For production deployments where key material lifetime matters,
+/// consider wrapping `key_der` in `zeroize::Zeroizing<Vec<u8>>`. This
+/// was deferred to avoid adding a new dependency for a single field.
 #[derive(Clone)]
 pub struct DynamicPeerConnector {
     provider: OutboundRootStoreProvider,
@@ -221,7 +235,7 @@ impl DynamicPeerConnector {
 
     /// Get the current client config, rebuilding if generation changed.
     fn current_config(&self) -> anyhow::Result<Arc<rustls::ClientConfig>> {
-        let (current_gen, _) = (self.provider)();
+        let (current_gen, root_store) = (self.provider)();
 
         let mut cached = self
             .cached
@@ -238,7 +252,6 @@ impl DynamicPeerConnector {
             "trust store changed, rebuilding outbound TLS config"
         );
 
-        let (fresh_gen, root_store) = (self.provider)();
         let key = PrivateKeyDer::try_from(self.key_der.clone())
             .map_err(|e| anyhow::anyhow!("re-parse private key: {e}"))?;
 
@@ -249,7 +262,7 @@ impl DynamicPeerConnector {
         };
 
         let config = Arc::new(config);
-        *cached = (fresh_gen, Arc::clone(&config));
+        *cached = (current_gen, Arc::clone(&config));
         Ok(config)
     }
 
@@ -809,5 +822,110 @@ mod tests {
         );
 
         server_handle.abort();
+    }
+
+    // ── DynamicPeerConnector tests ──────────────────────────────────
+
+    fn make_dynamic_connector(
+        ca: &TestCa,
+        generation: Arc<std::sync::atomic::AtomicU64>,
+    ) -> DynamicPeerConnector {
+        let client_cert = ca.issue_client_cert("dynamic-client", &["Alpha"]);
+        let ca_pem = ca.cert_pem.clone();
+        let provider: OutboundRootStoreProvider = Arc::new(move || {
+            let current_gen = generation.load(std::sync::atomic::Ordering::Acquire);
+            let store = parse_ca_store(&ca_pem).expect("parse ca store in provider");
+            (current_gen, store)
+        });
+        DynamicPeerConnector::new(&client_cert.cert_pem, &client_cert.key_pem, provider, false)
+            .expect("create dynamic connector")
+    }
+
+    #[test]
+    fn dynamic_connector_reuses_cached_config() {
+        let ca = TestCa::new("Dynamic CA");
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let connector = make_dynamic_connector(&ca, Arc::clone(&generation));
+
+        let c1 = connector.current_config().expect("config 1");
+        let c2 = connector.current_config().expect("config 2");
+        assert!(
+            Arc::ptr_eq(&c1, &c2),
+            "same generation should return cached config"
+        );
+    }
+
+    #[test]
+    fn dynamic_connector_rebuilds_on_generation_change() {
+        let ca = TestCa::new("Dynamic CA");
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let connector = make_dynamic_connector(&ca, Arc::clone(&generation));
+
+        let c1 = connector.current_config().expect("config 1");
+
+        // Bump generation — should trigger rebuild
+        generation.store(1, std::sync::atomic::Ordering::Release);
+
+        let c2 = connector.current_config().expect("config 2");
+        assert!(
+            !Arc::ptr_eq(&c1, &c2),
+            "new generation should rebuild config"
+        );
+    }
+
+    #[test]
+    fn dynamic_connector_debug_format() {
+        let ca = TestCa::new("Dynamic CA");
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(42));
+        let connector = make_dynamic_connector(&ca, Arc::clone(&generation));
+
+        let debug = format!("{connector:?}");
+        assert!(debug.contains("DynamicPeerConnector"));
+        assert!(debug.contains("42"));
+    }
+
+    #[test]
+    fn dynamic_connector_is_clone() {
+        let ca = TestCa::new("Dynamic CA");
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let connector = make_dynamic_connector(&ca, Arc::clone(&generation));
+
+        let _cloned = connector.clone();
+    }
+
+    #[tokio::test]
+    async fn dynamic_connector_connect_succeeds() {
+        let ca = TestCa::new("Dynamic CA");
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (addr, server_handle) = start_test_server(&ca).await;
+
+        let client_cert = ca.issue_client_cert("dynamic-client", &["Alpha"]);
+        let ca_pem = ca.cert_pem.clone();
+        let gen_clone = Arc::clone(&generation);
+        let provider: OutboundRootStoreProvider = Arc::new(move || {
+            let current_gen = gen_clone.load(std::sync::atomic::Ordering::Acquire);
+            let store = parse_ca_store(&ca_pem).expect("parse ca");
+            (current_gen, store)
+        });
+        let connector =
+            DynamicPeerConnector::new(&client_cert.cert_pem, &client_cert.key_pem, provider, false)
+                .expect("create dynamic connector");
+
+        let (_, identity) = connector.connect(addr, "localhost").await.expect("connect");
+        assert_eq!(identity.cn, "localhost");
+
+        server_handle.abort();
+    }
+
+    #[test]
+    fn outbound_connector_dynamic_variant() {
+        let ca = TestCa::new("Dynamic CA");
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let dynamic = make_dynamic_connector(&ca, Arc::clone(&generation));
+        let connector = OutboundConnector::Dynamic(dynamic);
+
+        // Verify debug output
+        let debug = format!("{connector:?}");
+        assert!(debug.contains("Dynamic"));
     }
 }

@@ -239,7 +239,15 @@ impl FederationManager {
                 let current_gen = ts_clone.generation();
                 let store = ts_clone
                     .build_root_cert_store_with_base(&base_ca)
-                    .unwrap_or_else(|_| ts_clone.build_root_cert_store());
+                    .unwrap_or_else(|e| {
+                        warn!(
+                            error = %e,
+                            "failed to build root store with base CA, \
+                             falling back to trust store CAs only — \
+                             clients signed by the base CA may be rejected"
+                        );
+                        ts_clone.build_root_cert_store()
+                    });
                 (current_gen, store)
             });
             let dynamic = crate::connector::DynamicPeerConnector::new(
@@ -293,7 +301,15 @@ impl FederationManager {
                         let current_gen = ts_clone.generation();
                         let store = ts_clone
                             .build_root_cert_store_with_base(&base_ca)
-                            .unwrap_or_else(|_| ts_clone.build_root_cert_store());
+                            .unwrap_or_else(|e| {
+                                warn!(
+                                    error = %e,
+                                    "failed to build root store with base CA for inbound verifier, \
+                                     falling back to trust store CAs only — \
+                                     clients signed by the base CA may be rejected"
+                                );
+                                ts_clone.build_root_cert_store()
+                            });
                         (current_gen, store)
                     }),
                     crls,
@@ -305,7 +321,7 @@ impl FederationManager {
                 let listener = rustgate_transport::TlsListener::bind_with_server_config(
                     self.config.v1_listen_addr,
                     Arc::new(server_config),
-                    100,
+                    rustgate_transport::DEFAULT_MAX_HANDSHAKES,
                 )
                 .await?;
 

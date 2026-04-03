@@ -22,7 +22,7 @@ pub use config::{TlsConfig, TlsMinVersion, check_crl_freshness, is_fips_provider
 pub use encoder::{CotEncoder, MessageEncoder, RawEncoder};
 pub use extract::{ExpectedKeyUsage, extract_identity, validate_key_usage};
 pub use filter::{GeoBounds, MessageFilter};
-pub use listener::TlsListener;
+pub use listener::{DEFAULT_MAX_HANDSHAKES, TlsListener};
 pub use repeater::EmergencyRepeater;
 pub use replay::ReplayFilter;
 pub use router::{Router, SessionHandle};
