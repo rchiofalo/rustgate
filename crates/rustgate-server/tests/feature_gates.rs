@@ -65,13 +65,13 @@ mod enrollment_gate {
 
 #[cfg(feature = "proto")]
 mod proto_gate {
-    use rustgate_proto::{ProtoError, TakFrameCodec, TakProtobufEncoder};
+    use rustgate_proto::{ProtoError, TakFrameCodec, TakProtobufCodec};
 
     #[test]
     fn proto_types_accessible() {
         fn _assert_send<T: Send>() {}
         _assert_send::<TakFrameCodec>();
-        _assert_send::<TakProtobufEncoder>();
+        _assert_send::<TakProtobufCodec>();
         _assert_send::<ProtoError>();
     }
 

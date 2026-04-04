@@ -2,7 +2,7 @@
 //!
 //! Combines the 0xBF+varint framing with bidirectional protobuf ↔ XML
 //! payload conversion. This unifies what was previously split across
-//! `TakFrameCodec`, `TakProtobufEncoder`, and inline `proto_to_xml` calls
+//! `TakFrameCodec` and inline `proto_to_xml` calls
 //! in the session layer.
 
 use std::io;
