@@ -85,33 +85,33 @@ pub(crate) struct Cli {
     pub(crate) encoding: Encoding,
 
     /// NATS server URL (enables NATS bridge when set). Requires --features nats.
-    #[arg(long, env = "NATS_URL")]
+    #[arg(long, env = "RUSTGATE_NATS_URL")]
     pub(crate) nats_url: Option<String>,
 
     /// Path to NATS credentials file for JWT/NKey auth.
-    #[arg(long, env = "NATS_CREDENTIALS")]
+    #[arg(long, env = "RUSTGATE_NATS_CREDENTIALS")]
     pub(crate) nats_credentials: Option<String>,
 
     /// Path to PEM-encoded client certificate for NATS mTLS.
-    #[arg(long, env = "NATS_TLS_CERT")]
+    #[arg(long, env = "RUSTGATE_NATS_TLS_CERT")]
     pub(crate) nats_tls_cert: Option<std::path::PathBuf>,
 
     /// Path to PEM-encoded client private key for NATS mTLS.
-    #[arg(long, env = "NATS_TLS_KEY")]
+    #[arg(long, env = "RUSTGATE_NATS_TLS_KEY")]
     pub(crate) nats_tls_key: Option<std::path::PathBuf>,
 
     /// Path to PEM-encoded CA certificate for verifying the NATS server.
-    #[arg(long, env = "NATS_TLS_CA")]
+    #[arg(long, env = "RUSTGATE_NATS_TLS_CA")]
     pub(crate) nats_tls_ca: Option<std::path::PathBuf>,
 
     /// Require TLS for NATS connections. Fails if TLS is required but
     /// no certificates are provided.
-    #[arg(long, default_value_t = false, env = "NATS_TLS_REQUIRED")]
+    #[arg(long, default_value_t = false, env = "RUSTGATE_NATS_TLS_REQUIRED")]
     pub(crate) nats_tls_required: bool,
 
     /// Bind address for the enrollment HTTPS server (e.g. 0.0.0.0:8446).
     /// Requires --features enrollment.
-    #[arg(long, env = "ENROLLMENT_BIND", value_parser = parse_socket_addr)]
+    #[arg(long, env = "RUSTGATE_ENROLLMENT_BIND", value_parser = parse_socket_addr)]
     pub(crate) enrollment_bind: Option<String>,
 
     /// Path to the CA private key PEM file (used to sign client CSRs).
@@ -119,11 +119,11 @@ pub(crate) struct Cli {
     pub(crate) ca_key: Option<String>,
 
     /// Username for enrollment HTTP Basic Auth.
-    #[arg(long, env = "ENROLLMENT_USER")]
+    #[arg(long, env = "RUSTGATE_ENROLLMENT_USER")]
     pub(crate) enrollment_user: Option<String>,
 
     /// Password for enrollment HTTP Basic Auth.
-    #[arg(long, env = "ENROLLMENT_PASSWORD")]
+    #[arg(long, env = "RUSTGATE_ENROLLMENT_PASSWORD")]
     pub(crate) enrollment_password: Option<String>,
 
     /// Organization name for issued client certificates.
@@ -132,12 +132,12 @@ pub(crate) struct Cli {
 
     /// Directory for data package storage. Enables the Marti sync API
     /// endpoints when set. Requires --features enrollment.
-    #[arg(long, env = "DATA_PACKAGE_DIR")]
+    #[arg(long, env = "RUSTGATE_DATA_PACKAGE_DIR")]
     pub(crate) data_package_dir: Option<String>,
 
     /// Bind address for the Prometheus metrics HTTP server (e.g. 0.0.0.0:9090).
     /// Requires --features metrics.
-    #[arg(long, env = "METRICS_BIND", value_parser = parse_socket_addr)]
+    #[arg(long, env = "RUSTGATE_METRICS_BIND", value_parser = parse_socket_addr)]
     pub(crate) metrics_bind: Option<String>,
 
     /// Maximum concurrent TLS sessions. Prevents resource exhaustion
@@ -154,7 +154,7 @@ pub(crate) struct Cli {
 
     /// Bind address for the WebSocket (wss://) listener (e.g. 0.0.0.0:8443).
     /// Requires --features websocket.
-    #[arg(long, env = "WEBSOCKET_BIND", value_parser = parse_socket_addr)]
+    #[arg(long, env = "RUSTGATE_WEBSOCKET_BIND", value_parser = parse_socket_addr)]
     pub(crate) websocket_bind: Option<String>,
 
     // -- Plaintext input flags --
@@ -183,61 +183,73 @@ pub(crate) struct Cli {
     // -- Federation flags --
     /// V1 federation listen address (enables federation when set, e.g. 0.0.0.0:9000).
     /// Requires --features federation.
-    #[arg(long, env = "FEDERATION_V1_BIND", value_parser = parse_socket_addr)]
+    #[arg(long, env = "RUSTGATE_FEDERATION_V1_BIND", value_parser = parse_socket_addr)]
     pub(crate) federation_v1_bind: Option<String>,
 
     /// V2 gRPC federation listen address (e.g. 0.0.0.0:9001).
     /// Enables V2 gRPC inbound server when set alongside --federation-v1-bind.
     /// Requires --features federation.
-    #[arg(long, env = "FEDERATION_V2_BIND", value_parser = parse_socket_addr)]
+    #[arg(long, env = "RUSTGATE_FEDERATION_V2_BIND", value_parser = parse_socket_addr)]
     pub(crate) federation_v2_bind: Option<String>,
 
     /// Unique federation server identity.
-    #[arg(long, default_value = "rustgate-federation-1", env = "FEDERATION_ID")]
+    #[arg(
+        long,
+        default_value = "rustgate-federation-1",
+        env = "RUSTGATE_FEDERATION_ID"
+    )]
     pub(crate) federation_id: String,
 
     /// Path to JSON file containing federation peer configurations.
-    #[arg(long, env = "FEDERATION_PEERS_FILE")]
+    #[arg(long, env = "RUSTGATE_FEDERATION_PEERS_FILE")]
     pub(crate) federation_peers_file: Option<String>,
 
     /// Skip TLS hostname verification for federation peers.
-    #[arg(long, default_value_t = false, env = "FEDERATION_SKIP_HOSTNAME_VERIFY")]
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "RUSTGATE_FEDERATION_SKIP_HOSTNAME_VERIFY"
+    )]
     pub(crate) federation_skip_hostname_verify: bool,
 
     /// Maximum federation hops before dropping a message (loop prevention).
-    #[arg(long, default_value_t = 10, env = "FEDERATION_MAX_HOPS")]
+    #[arg(long, default_value_t = 10, env = "RUSTGATE_FEDERATION_MAX_HOPS")]
     pub(crate) federation_max_hops: u32,
 
     /// Path to persistent federate store (JSON file).
-    #[arg(long, env = "FEDERATION_STORE_PATH")]
+    #[arg(long, env = "RUSTGATE_FEDERATION_STORE_PATH")]
     pub(crate) federation_store_path: Option<String>,
 
     /// Directory containing additional trusted CA certificates for federation.
     /// PEM/CRT files in this directory are merged with --ca for TLS verification.
-    #[arg(long, env = "FEDERATION_TRUST_STORE_DIR")]
+    #[arg(long, env = "RUSTGATE_FEDERATION_TRUST_STORE_DIR")]
     pub(crate) federation_trust_store_dir: Option<String>,
 
     /// Consecutive send failures before tripping a federation peer's circuit breaker.
     #[arg(
         long,
         default_value_t = 5,
-        env = "FEDERATION_CIRCUIT_BREAKER_THRESHOLD"
+        env = "RUSTGATE_FEDERATION_CIRCUIT_BREAKER_THRESHOLD"
     )]
     pub(crate) federation_circuit_breaker_threshold: u32,
 
     /// Seconds to wait after a circuit breaker trips before probing a federation peer.
-    #[arg(long, default_value_t = 60, env = "FEDERATION_CIRCUIT_BREAKER_TIMEOUT")]
+    #[arg(
+        long,
+        default_value_t = 60,
+        env = "RUSTGATE_FEDERATION_CIRCUIT_BREAKER_TIMEOUT"
+    )]
     pub(crate) federation_circuit_breaker_timeout: u64,
 
     /// NATS URL for federation HA coordination (enables distributed peer ownership).
     /// When set, only one pod manages each outbound peer in a multi-pod deployment.
     /// Requires --features federation-ha.
-    #[arg(long, env = "FEDERATION_HA_NATS_URL")]
+    #[arg(long, env = "RUSTGATE_FEDERATION_HA_NATS_URL")]
     pub(crate) federation_ha_nats_url: Option<String>,
 
     /// Pod identifier for federation HA mode. Defaults to --federation-id if
     /// --federation-ha-nats-url is set.
-    #[arg(long, env = "FEDERATION_POD_ID")]
+    #[arg(long, env = "RUSTGATE_FEDERATION_POD_ID")]
     pub(crate) federation_pod_id: Option<String>,
 
     // -- QoS / rate limiting --
@@ -458,38 +470,38 @@ mod tests {
             "RUSTGATE_CERT_RELOAD_INTERVAL",
             "RUSTGATE_FRAMING",
             "RUSTGATE_ENCODING",
-            "NATS_URL",
-            "NATS_CREDENTIALS",
-            "NATS_TLS_CERT",
-            "NATS_TLS_KEY",
-            "NATS_TLS_CA",
-            "NATS_TLS_REQUIRED",
-            "ENROLLMENT_BIND",
+            "RUSTGATE_NATS_URL",
+            "RUSTGATE_NATS_CREDENTIALS",
+            "RUSTGATE_NATS_TLS_CERT",
+            "RUSTGATE_NATS_TLS_KEY",
+            "RUSTGATE_NATS_TLS_CA",
+            "RUSTGATE_NATS_TLS_REQUIRED",
+            "RUSTGATE_ENROLLMENT_BIND",
             "RUSTGATE_CA_KEY",
-            "ENROLLMENT_USER",
-            "ENROLLMENT_PASSWORD",
+            "RUSTGATE_ENROLLMENT_USER",
+            "RUSTGATE_ENROLLMENT_PASSWORD",
             "RUSTGATE_CA_ORG",
-            "DATA_PACKAGE_DIR",
-            "METRICS_BIND",
+            "RUSTGATE_DATA_PACKAGE_DIR",
+            "RUSTGATE_METRICS_BIND",
             "RUSTGATE_MAX_CONNECTIONS",
             "RUSTGATE_MAX_HANDSHAKES",
-            "WEBSOCKET_BIND",
+            "RUSTGATE_WEBSOCKET_BIND",
             "RUSTGATE_TCP_BIND",
             "RUSTGATE_UDP_BIND",
             "RUSTGATE_PLAINTEXT_CN",
             "RUSTGATE_PLAINTEXT_GROUP",
-            "FEDERATION_V1_BIND",
-            "FEDERATION_V2_BIND",
-            "FEDERATION_ID",
-            "FEDERATION_PEERS_FILE",
-            "FEDERATION_SKIP_HOSTNAME_VERIFY",
-            "FEDERATION_MAX_HOPS",
-            "FEDERATION_STORE_PATH",
-            "FEDERATION_TRUST_STORE_DIR",
-            "FEDERATION_CIRCUIT_BREAKER_THRESHOLD",
-            "FEDERATION_CIRCUIT_BREAKER_TIMEOUT",
-            "FEDERATION_HA_NATS_URL",
-            "FEDERATION_POD_ID",
+            "RUSTGATE_FEDERATION_V1_BIND",
+            "RUSTGATE_FEDERATION_V2_BIND",
+            "RUSTGATE_FEDERATION_ID",
+            "RUSTGATE_FEDERATION_PEERS_FILE",
+            "RUSTGATE_FEDERATION_SKIP_HOSTNAME_VERIFY",
+            "RUSTGATE_FEDERATION_MAX_HOPS",
+            "RUSTGATE_FEDERATION_STORE_PATH",
+            "RUSTGATE_FEDERATION_TRUST_STORE_DIR",
+            "RUSTGATE_FEDERATION_CIRCUIT_BREAKER_THRESHOLD",
+            "RUSTGATE_FEDERATION_CIRCUIT_BREAKER_TIMEOUT",
+            "RUSTGATE_FEDERATION_HA_NATS_URL",
+            "RUSTGATE_FEDERATION_POD_ID",
             "RUSTGATE_REPLAY_WINDOW",
             "RUSTGATE_CLIENT_MSG_RATE",
             "RUSTGATE_CLIENT_BURST",

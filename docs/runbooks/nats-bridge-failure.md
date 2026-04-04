@@ -25,7 +25,7 @@
 
 4. Verify credentials are valid:
    ```bash
-   kubectl get secret <nats-secret> -o jsonpath='{.data.NATS_CREDENTIALS}' | base64 -d
+   kubectl get secret <nats-secret> -o jsonpath='{.data.RUSTGATE_NATS_CREDENTIALS}' | base64 -d
    ```
 
 ## Resolution

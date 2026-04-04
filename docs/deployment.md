@@ -147,8 +147,8 @@ Or use environment variables:
 rustgate:
   environment:
     RUSTGATE_FRAMING: tak-negotiate
-    METRICS_BIND: "0.0.0.0:9090"
-    FEDERATION_V1_BIND: "0.0.0.0:9000"
+    RUSTGATE_METRICS_BIND: "0.0.0.0:9090"
+    RUSTGATE_FEDERATION_V1_BIND: "0.0.0.0:9000"
 ```
 
 ### Adding Federation Peers
@@ -239,7 +239,7 @@ Provide peers via a K8s Secret:
 ```bash
 # Create the peers secret
 kubectl create secret generic federation-peers \
-  --from-file=FEDERATION_PEERS_FILE=peers.json
+  --from-file=RUSTGATE_FEDERATION_PEERS_FILE=peers.json
 
 # Reference in values
 helm install rustgate helm/ \
@@ -273,10 +273,10 @@ externalSecrets:
   enrollment:
     enabled: true
     remoteRefs:
-      ENROLLMENT_USER:
+      RUSTGATE_ENROLLMENT_USER:
         key: "production/rustgate/enrollment"
         property: "username"
-      ENROLLMENT_PASSWORD:
+      RUSTGATE_ENROLLMENT_PASSWORD:
         key: "production/rustgate/enrollment"
         property: "password"
   federation:
@@ -293,13 +293,13 @@ If you manage secrets outside of Helm (e.g., via `kubectl`, sealed-secrets, or a
 
 ```yaml
 nats:
-  existingSecret: my-nats-secret        # must contain NATS_CREDENTIALS key
+  existingSecret: my-nats-secret        # must contain RUSTGATE_NATS_CREDENTIALS key
 
 enrollment:
-  existingSecret: my-enrollment-secret   # must contain ENROLLMENT_USER and ENROLLMENT_PASSWORD keys
+  existingSecret: my-enrollment-secret   # must contain RUSTGATE_ENROLLMENT_USER and RUSTGATE_ENROLLMENT_PASSWORD keys
 
 federation:
-  existingSecret: my-federation-secret   # must contain FEDERATION_PEERS_FILE key
+  existingSecret: my-federation-secret   # must contain RUSTGATE_FEDERATION_PEERS_FILE key
 ```
 
 #### Plaintext values (development only)

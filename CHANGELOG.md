@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Standardized environment variable prefixes** — all environment variables now use the `RUSTGATE_` prefix for consistency and to avoid collisions with other services. `NATS_*` → `RUSTGATE_NATS_*`, `FEDERATION_*` → `RUSTGATE_FEDERATION_*`, `ENROLLMENT_*` → `RUSTGATE_ENROLLMENT_*`, `METRICS_BIND` → `RUSTGATE_METRICS_BIND`, `WEBSOCKET_BIND` → `RUSTGATE_WEBSOCKET_BIND`, `DATA_PACKAGE_DIR` → `RUSTGATE_DATA_PACKAGE_DIR`. `OTEL_*` vars unchanged (OpenTelemetry standard). **Breaking change** — update deployment configs, Helm values, and shell scripts. (#392)
 - **WebSocket codec migration** — WebSocket transport now uses the unified `Codec` trait (`Arc<dyn Codec>`) instead of the legacy `WsEncoding` enum and `MessageEncoder` trait. Removed `WsEncoding`, `MessageEncoder`, `RawEncoder`, `CotEncoder`, and `TakProtobufEncoder`. The `WsServerConfig.encoding` field is replaced by `WsServerConfig.codec`. (#391)
 
 ### Added
@@ -151,7 +152,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **HA mode** — distributed peer ownership via NATS KV atomic claims with 30s TTL and 10s refresh; automatic adoption of orphaned peers after pod failure with configurable delay
 - **Federation REST API** — peer CRUD, certificate management, connection status, and aggregated statistics endpoints mounted under `/api/federation/`
 - **Federation Prometheus metrics** — `federation_connections` gauge, `federation_messages_in_total` / `federation_messages_out_total` / `federation_errors_total` / `federation_heartbeats_total` counters
-- **Federation CLI flags** — `--federation-v1-bind`, `--federation-id`, `--federation-peers-file`, `--federation-skip-hostname-verify`, `--federation-max-hops`, `--federation-store-path` with corresponding `FEDERATION_*` environment variables
+- **Federation CLI flags** — `--federation-v1-bind`, `--federation-id`, `--federation-peers-file`, `--federation-skip-hostname-verify`, `--federation-max-hops`, `--federation-store-path` with corresponding `RUSTGATE_FEDERATION_*` environment variables
 - **Helm chart federation support** — `federation.enabled` toggle, peer config via Secret or values, federation port (9000) in Service and NetworkPolicy
 - **639 tests** — up from 198 in v0.1.0, adding comprehensive coverage for federation config, provenance, heartbeat, store, V1/V2 protocols, gRPC service, trust store, HA claims, REST API, and metrics
 
@@ -171,7 +172,7 @@ Initial release of rustgate — a Rust-native secure tactical message router.
 - **TAK protobuf translation** (feature-gated: `proto`) — bidirectional XML ↔ protobuf conversion via prost, TAK binary framing codec (0xBF + varint), protocol negotiation handshake (server advertises, client opts in or stays XML), xmlDetail residual preservation
 - **Prometheus metrics** (feature-gated: `metrics`) — connection lifecycle, message routing, NATS bridge, and protocol negotiation counters; `/healthz`, `/readyz`, and `/metrics` HTTP endpoints with hardened server (128 connection limit, 15s timeout)
 - **Graceful shutdown** — SIGTERM + SIGINT handling, readiness probe returns 503, connection draining with 110s timeout inside K8s terminationGracePeriodSeconds
-- **Environment variable configuration** — all CLI flags available as `RUSTGATE_*`, `NATS_*`, `ENROLLMENT_*`, and `METRICS_*` env vars (CLI takes precedence)
+- **Environment variable configuration** — all CLI flags available as `RUSTGATE_*` env vars (CLI takes precedence)
 - **Configurable connection limits** — `--max-connections` / `RUSTGATE_MAX_CONNECTIONS` with semaphore-based enforcement
 - **jemalloc allocator** (feature-gated: `jemalloc`) — avoids musl malloc contention for Alpine/musl production builds
 - **Helm chart** — Deployment with Pod Security Standards (restricted), PDB, HPA, startup/liveness/readiness probes, pre-stop hook, configurable NATS and enrollment, TLS secret mounting

@@ -93,65 +93,65 @@ spec:
             - name: RUSTGATE_MAX_CONNECTIONS
               value: {{ .Values.maxConnections | quote }}
             {{- if .Values.nats.enabled }}
-            - name: NATS_URL
+            - name: RUSTGATE_NATS_URL
               value: {{ .Values.nats.url | quote }}
             {{- if and .Values.externalSecrets.enabled .Values.externalSecrets.nats.enabled }}
-            - name: NATS_CREDENTIALS
+            - name: RUSTGATE_NATS_CREDENTIALS
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.externalSecrets.nats.secretName }}
-                  key: NATS_CREDENTIALS
+                  key: RUSTGATE_NATS_CREDENTIALS
             {{- else if .Values.nats.existingSecret }}
-            - name: NATS_CREDENTIALS
+            - name: RUSTGATE_NATS_CREDENTIALS
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.nats.existingSecret }}
-                  key: NATS_CREDENTIALS
+                  key: RUSTGATE_NATS_CREDENTIALS
             {{- else if .Values.nats.credentials }}
-            - name: NATS_CREDENTIALS
+            - name: RUSTGATE_NATS_CREDENTIALS
               value: {{ .Values.nats.credentials | quote }}
             {{- end }}
             {{- end }}
             {{- if .Values.metrics.enabled }}
-            - name: METRICS_BIND
+            - name: RUSTGATE_METRICS_BIND
               value: "0.0.0.0:{{ .Values.metrics.port }}"
             {{- end }}
             {{- if .Values.enrollment.enabled }}
-            - name: ENROLLMENT_BIND
+            - name: RUSTGATE_ENROLLMENT_BIND
               value: {{ .Values.enrollment.bind | quote }}
             {{- if .Values.enrollment.caKey }}
             - name: RUSTGATE_CA_KEY
               value: {{ .Values.enrollment.caKey | quote }}
             {{- end }}
             {{- if and .Values.externalSecrets.enabled .Values.externalSecrets.enrollment.enabled }}
-            - name: ENROLLMENT_USER
+            - name: RUSTGATE_ENROLLMENT_USER
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.externalSecrets.enrollment.secretName }}
-                  key: ENROLLMENT_USER
-            - name: ENROLLMENT_PASSWORD
+                  key: RUSTGATE_ENROLLMENT_USER
+            - name: RUSTGATE_ENROLLMENT_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.externalSecrets.enrollment.secretName }}
-                  key: ENROLLMENT_PASSWORD
+                  key: RUSTGATE_ENROLLMENT_PASSWORD
             {{- else if .Values.enrollment.existingSecret }}
-            - name: ENROLLMENT_USER
+            - name: RUSTGATE_ENROLLMENT_USER
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.enrollment.existingSecret }}
-                  key: ENROLLMENT_USER
-            - name: ENROLLMENT_PASSWORD
+                  key: RUSTGATE_ENROLLMENT_USER
+            - name: RUSTGATE_ENROLLMENT_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.enrollment.existingSecret }}
-                  key: ENROLLMENT_PASSWORD
+                  key: RUSTGATE_ENROLLMENT_PASSWORD
             {{- else }}
             {{- if .Values.enrollment.user }}
-            - name: ENROLLMENT_USER
+            - name: RUSTGATE_ENROLLMENT_USER
               value: {{ .Values.enrollment.user | quote }}
             {{- end }}
             {{- if .Values.enrollment.password }}
-            - name: ENROLLMENT_PASSWORD
+            - name: RUSTGATE_ENROLLMENT_PASSWORD
               value: {{ .Values.enrollment.password | quote }}
             {{- end }}
             {{- end }}
@@ -161,41 +161,41 @@ spec:
             {{- end }}
             {{- end }}
             {{- if .Values.websocket.enabled }}
-            - name: WEBSOCKET_BIND
+            - name: RUSTGATE_WEBSOCKET_BIND
               value: {{ .Values.websocket.bind | quote }}
             {{- end }}
             {{- if .Values.federation.enabled }}
-            - name: FEDERATION_V1_BIND
+            - name: RUSTGATE_FEDERATION_V1_BIND
               value: {{ .Values.federation.v1Bind | quote }}
             {{- if .Values.federation.v2Bind }}
-            - name: FEDERATION_V2_BIND
+            - name: RUSTGATE_FEDERATION_V2_BIND
               value: {{ .Values.federation.v2Bind | quote }}
             {{- end }}
-            - name: FEDERATION_ID
+            - name: RUSTGATE_FEDERATION_ID
               value: {{ .Values.federation.id | quote }}
-            - name: FEDERATION_MAX_HOPS
+            - name: RUSTGATE_FEDERATION_MAX_HOPS
               value: {{ .Values.federation.maxHops | quote }}
             {{- if .Values.federation.skipHostnameVerify }}
-            - name: FEDERATION_SKIP_HOSTNAME_VERIFY
+            - name: RUSTGATE_FEDERATION_SKIP_HOSTNAME_VERIFY
               value: "true"
             {{- end }}
             {{- if and .Values.persistence.enabled .Values.federation.enabled }}
-            - name: FEDERATION_STORE_PATH
+            - name: RUSTGATE_FEDERATION_STORE_PATH
               value: /data/federation-store.json
             {{- else if .Values.federation.storePath }}
-            - name: FEDERATION_STORE_PATH
+            - name: RUSTGATE_FEDERATION_STORE_PATH
               value: {{ .Values.federation.storePath | quote }}
             {{- end }}
             {{- if (include "rustgate.federationSecretEnabled" .) }}
-            - name: FEDERATION_PEERS_FILE
+            - name: RUSTGATE_FEDERATION_PEERS_FILE
               value: /etc/federation/peers.json
             {{- else if .Values.federation.peersFile }}
-            - name: FEDERATION_PEERS_FILE
+            - name: RUSTGATE_FEDERATION_PEERS_FILE
               value: {{ .Values.federation.peersFile | quote }}
             {{- end }}
             {{- end }}
             {{- if .Values.dataPackage.enabled }}
-            - name: DATA_PACKAGE_DIR
+            - name: RUSTGATE_DATA_PACKAGE_DIR
               value: /data/packages
             {{- end }}
             {{- if .Values.plaintext.tcp.enabled }}
@@ -288,7 +288,7 @@ spec:
             secretName: {{ .Values.federation.existingSecret }}
             {{- end }}
             items:
-              - key: FEDERATION_PEERS_FILE
+              - key: RUSTGATE_FEDERATION_PEERS_FILE
                 path: peers.json
         {{- end }}
         {{- if and .Values.persistence.enabled .Values.federation.enabled }}
