@@ -51,12 +51,12 @@ impl NatsTlsConfig {
 pub enum NatsTlsConfigError {
     /// TLS is required but no certificates were provided.
     #[error(
-        "NATS TLS is required but no certificates were provided (set NATS_TLS_CERT, NATS_TLS_KEY, and/or NATS_TLS_CA)"
+        "NATS TLS is required but no certificates were provided (set RUSTGATE_NATS_TLS_CERT, RUSTGATE_NATS_TLS_KEY, and/or RUSTGATE_NATS_TLS_CA)"
     )]
     RequiredButNoCerts,
 
     /// Only one of client cert or key was provided.
-    #[error("both NATS_TLS_CERT and NATS_TLS_KEY must be provided together")]
+    #[error("both RUSTGATE_NATS_TLS_CERT and RUSTGATE_NATS_TLS_KEY must be provided together")]
     IncompleteClientAuth,
 }
 

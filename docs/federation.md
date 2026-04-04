@@ -240,12 +240,12 @@ HA mode requires NATS with JetStream (for KV store).
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `--federation-v1-bind` | `FEDERATION_V1_BIND` | — | V1 listen address (enables federation) |
-| `--federation-id` | `FEDERATION_ID` | `rustgate-federation-1` | Server identity |
-| `--federation-peers-file` | `FEDERATION_PEERS_FILE` | — | Path to peers JSON file |
-| `--federation-skip-hostname-verify` | `FEDERATION_SKIP_HOSTNAME_VERIFY` | `false` | Skip TLS hostname verification |
-| `--federation-max-hops` | `FEDERATION_MAX_HOPS` | `10` | Max hops before message drop |
-| `--federation-store-path` | `FEDERATION_STORE_PATH` | — | Persistent store path |
+| `--federation-v1-bind` | `RUSTGATE_FEDERATION_V1_BIND` | — | V1 listen address (enables federation) |
+| `--federation-id` | `RUSTGATE_FEDERATION_ID` | `rustgate-federation-1` | Server identity |
+| `--federation-peers-file` | `RUSTGATE_FEDERATION_PEERS_FILE` | — | Path to peers JSON file |
+| `--federation-skip-hostname-verify` | `RUSTGATE_FEDERATION_SKIP_HOSTNAME_VERIFY` | `false` | Skip TLS hostname verification |
+| `--federation-max-hops` | `RUSTGATE_FEDERATION_MAX_HOPS` | `10` | Max hops before message drop |
+| `--federation-store-path` | `RUSTGATE_FEDERATION_STORE_PATH` | — | Persistent store path |
 
 ## Troubleshooting
 

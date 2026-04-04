@@ -69,63 +69,63 @@ Per-client rate limiting uses a token bucket algorithm. When a client exceeds th
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
 | `--archive-dir` | `RUSTGATE_ARCHIVE_DIR` | — | Directory for JSONL CoT event archival |
-| `--data-package-dir` | `DATA_PACKAGE_DIR` | — | Directory for client data packages |
+| `--data-package-dir` | `RUSTGATE_DATA_PACKAGE_DIR` | — | Directory for client data packages |
 | `--package-max-age-hours` | `RUSTGATE_PACKAGE_MAX_AGE_HOURS` | `0` (no expiration) | Maximum age for data packages |
 
 ### NATS (requires `--features nats`)
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `--nats-url` | `NATS_URL` | — | NATS server URL (enables NATS bridge) |
-| `--nats-credentials` | `NATS_CREDENTIALS` | — | NATS credentials file path |
-| `--nats-tls-cert` | `NATS_TLS_CERT` | — | Client certificate for NATS mTLS (PEM) |
-| `--nats-tls-key` | `NATS_TLS_KEY` | — | Client private key for NATS mTLS (PEM) |
-| `--nats-tls-ca` | `NATS_TLS_CA` | — | CA certificate for NATS server verification (PEM) |
-| `--nats-tls-required` | `NATS_TLS_REQUIRED` | `false` | Require TLS for NATS connections |
+| `--nats-url` | `RUSTGATE_NATS_URL` | — | NATS server URL (enables NATS bridge) |
+| `--nats-credentials` | `RUSTGATE_NATS_CREDENTIALS` | — | NATS credentials file path |
+| `--nats-tls-cert` | `RUSTGATE_NATS_TLS_CERT` | — | Client certificate for NATS mTLS (PEM) |
+| `--nats-tls-key` | `RUSTGATE_NATS_TLS_KEY` | — | Client private key for NATS mTLS (PEM) |
+| `--nats-tls-ca` | `RUSTGATE_NATS_TLS_CA` | — | CA certificate for NATS server verification (PEM) |
+| `--nats-tls-required` | `RUSTGATE_NATS_TLS_REQUIRED` | `false` | Require TLS for NATS connections |
 
 ### Enrollment (requires `--features enrollment`)
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `--enrollment-bind` | `ENROLLMENT_BIND` | — | Enrollment HTTPS listen address |
+| `--enrollment-bind` | `RUSTGATE_ENROLLMENT_BIND` | — | Enrollment HTTPS listen address |
 | `--ca-key` | `RUSTGATE_CA_KEY` | — | CA private key for signing CSRs |
-| `--enrollment-user` | `ENROLLMENT_USER` | — | HTTP Basic Auth username |
-| `--enrollment-password` | `ENROLLMENT_PASSWORD` | — | HTTP Basic Auth password |
+| `--enrollment-user` | `RUSTGATE_ENROLLMENT_USER` | — | HTTP Basic Auth username |
+| `--enrollment-password` | `RUSTGATE_ENROLLMENT_PASSWORD` | — | HTTP Basic Auth password |
 | `--ca-organization` | `RUSTGATE_CA_ORG` | `rustgate` | Organization for issued certs |
 
 ### WebSocket (requires `--features websocket`)
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `--websocket-bind` | `WEBSOCKET_BIND` | — | WebSocket (wss://) listen address |
+| `--websocket-bind` | `RUSTGATE_WEBSOCKET_BIND` | — | WebSocket (wss://) listen address |
 
 ### Metrics (requires `--features metrics`)
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `--metrics-bind` | `METRICS_BIND` | — | Metrics HTTP listen address |
+| `--metrics-bind` | `RUSTGATE_METRICS_BIND` | — | Metrics HTTP listen address |
 
 ### Federation (requires `--features federation`)
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `--federation-v1-bind` | `FEDERATION_V1_BIND` | — | V1 listen address (enables V1 federation) |
-| `--federation-v2-bind` | `FEDERATION_V2_BIND` | — | V2 gRPC listen address (enables V2 federation) |
-| `--federation-id` | `FEDERATION_ID` | `rustgate-federation-1` | Unique server identity |
-| `--federation-peers-file` | `FEDERATION_PEERS_FILE` | — | Path to peers JSON config |
-| `--federation-skip-hostname-verify` | `FEDERATION_SKIP_HOSTNAME_VERIFY` | `false` | Skip TLS hostname verification |
-| `--federation-max-hops` | `FEDERATION_MAX_HOPS` | `10` | Max hops before message drop |
-| `--federation-store-path` | `FEDERATION_STORE_PATH` | — | Persistent peer store path |
-| `--federation-trust-store-dir` | `FEDERATION_TRUST_STORE_DIR` | — | Directory of trusted peer CA certificates |
-| `--federation-circuit-breaker-threshold` | `FEDERATION_CIRCUIT_BREAKER_THRESHOLD` | `5` | Consecutive failures before circuit opens |
-| `--federation-circuit-breaker-timeout` | `FEDERATION_CIRCUIT_BREAKER_TIMEOUT` | `60` | Seconds before recovery probe |
+| `--federation-v1-bind` | `RUSTGATE_FEDERATION_V1_BIND` | — | V1 listen address (enables V1 federation) |
+| `--federation-v2-bind` | `RUSTGATE_FEDERATION_V2_BIND` | — | V2 gRPC listen address (enables V2 federation) |
+| `--federation-id` | `RUSTGATE_FEDERATION_ID` | `rustgate-federation-1` | Unique server identity |
+| `--federation-peers-file` | `RUSTGATE_FEDERATION_PEERS_FILE` | — | Path to peers JSON config |
+| `--federation-skip-hostname-verify` | `RUSTGATE_FEDERATION_SKIP_HOSTNAME_VERIFY` | `false` | Skip TLS hostname verification |
+| `--federation-max-hops` | `RUSTGATE_FEDERATION_MAX_HOPS` | `10` | Max hops before message drop |
+| `--federation-store-path` | `RUSTGATE_FEDERATION_STORE_PATH` | — | Persistent peer store path |
+| `--federation-trust-store-dir` | `RUSTGATE_FEDERATION_TRUST_STORE_DIR` | — | Directory of trusted peer CA certificates |
+| `--federation-circuit-breaker-threshold` | `RUSTGATE_FEDERATION_CIRCUIT_BREAKER_THRESHOLD` | `5` | Consecutive failures before circuit opens |
+| `--federation-circuit-breaker-timeout` | `RUSTGATE_FEDERATION_CIRCUIT_BREAKER_TIMEOUT` | `60` | Seconds before recovery probe |
 
 ### Federation HA (requires `--features federation-ha`)
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `--federation-ha-nats-url` | `FEDERATION_HA_NATS_URL` | — | NATS URL for HA peer discovery |
-| `--federation-pod-id` | `FEDERATION_POD_ID` | — | Pod identifier for HA leader election |
+| `--federation-ha-nats-url` | `RUSTGATE_FEDERATION_HA_NATS_URL` | — | NATS URL for HA peer discovery |
+| `--federation-pod-id` | `RUSTGATE_FEDERATION_POD_ID` | — | Pod identifier for HA leader election |
 
 See the [Federation REST API](federation.md) documentation for the `/api/federation/` management endpoints (requires `--features metrics` for the HTTP server).
 
@@ -192,7 +192,7 @@ nats:
   enabled: true
   url: nats://nats:4222
   credentials: ""
-  existingSecret: ""      # K8s Secret with NATS_CREDENTIALS key
+  existingSecret: ""      # K8s Secret with RUSTGATE_NATS_CREDENTIALS key
 
 # Certificate enrollment
 enrollment:
@@ -202,7 +202,7 @@ enrollment:
   user: ""
   password: ""
   caOrganization: ""
-  existingSecret: ""      # K8s Secret with ENROLLMENT_USER/PASSWORD keys
+  existingSecret: ""      # K8s Secret with RUSTGATE_ENROLLMENT_USER/PASSWORD keys
 
 # Server-to-server federation
 federation:
@@ -213,7 +213,7 @@ federation:
   skipHostnameVerify: false
   storePath: ""
   peersFile: ""
-  existingSecret: ""      # K8s Secret with FEDERATION_PEERS_FILE key
+  existingSecret: ""      # K8s Secret with RUSTGATE_FEDERATION_PEERS_FILE key
 
 # Prometheus metrics
 metrics:
@@ -279,12 +279,12 @@ export RUSTGATE_CA=/certs/ca.pem
 export RUSTGATE_BIND=0.0.0.0:4433
 export RUSTGATE_FRAMING=tak-negotiate
 export RUSTGATE_MAX_CONNECTIONS=2048
-export WEBSOCKET_BIND=0.0.0.0:8443
-export NATS_URL=nats://nats:4222
-export METRICS_BIND=0.0.0.0:9090
-export FEDERATION_V1_BIND=0.0.0.0:9000
-export FEDERATION_ID=edge-server-1
-export FEDERATION_PEERS_FILE=/etc/federation/peers.json
-export FEDERATION_MAX_HOPS=10
+export RUSTGATE_WEBSOCKET_BIND=0.0.0.0:8443
+export RUSTGATE_NATS_URL=nats://nats:4222
+export RUSTGATE_METRICS_BIND=0.0.0.0:9090
+export RUSTGATE_FEDERATION_V1_BIND=0.0.0.0:9000
+export RUSTGATE_FEDERATION_ID=edge-server-1
+export RUSTGATE_FEDERATION_PEERS_FILE=/etc/federation/peers.json
+export RUSTGATE_FEDERATION_MAX_HOPS=10
 rustgate
 ```

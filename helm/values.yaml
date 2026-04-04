@@ -34,7 +34,7 @@ nats:
   # existingSecret or externalSecrets instead. Plaintext values are stored in
   # Helm release metadata and may appear in logs, version control, or CI output.
   credentials: ""
-  # Name of an existing K8s Secret containing a NATS_CREDENTIALS key.
+  # Name of an existing K8s Secret containing a RUSTGATE_NATS_CREDENTIALS key.
   # Takes precedence over plaintext credentials. ExternalSecrets take precedence over this.
   existingSecret: ""
 
@@ -46,11 +46,11 @@ enrollment:
   # WARNING: Avoid storing credentials as plaintext in values files. Use
   # existingSecret or externalSecrets instead. Plaintext values are stored in
   # Helm release metadata and may appear in logs, version control, or CI output.
-  user: ""            # HTTP Basic Auth username (ENROLLMENT_USER)
-  password: ""        # HTTP Basic Auth password (ENROLLMENT_PASSWORD)
+  user: ""            # HTTP Basic Auth username (RUSTGATE_ENROLLMENT_USER)
+  password: ""        # HTTP Basic Auth password (RUSTGATE_ENROLLMENT_PASSWORD)
   caOrganization: ""  # Organization for issued certs (RUSTGATE_CA_ORG)
-  # Name of an existing K8s Secret containing ENROLLMENT_USER and
-  # ENROLLMENT_PASSWORD keys. Takes precedence over plaintext values.
+  # Name of an existing K8s Secret containing RUSTGATE_ENROLLMENT_USER and
+  # RUSTGATE_ENROLLMENT_PASSWORD keys. Takes precedence over plaintext values.
   # ExternalSecrets take precedence over this.
   existingSecret: ""
 
@@ -81,7 +81,7 @@ federation:
   # Path to JSON file containing federation peer configurations.
   # Expected format: [{"id":"peer-1","address":"10.0.0.1:9001","groups":["Alpha"],...}]
   peersFile: ""
-  # Name of an existing K8s Secret containing a FEDERATION_PEERS_FILE key.
+  # Name of an existing K8s Secret containing a RUSTGATE_FEDERATION_PEERS_FILE key.
   # Mounts the secret as a file; takes precedence over peersFile.
   # ExternalSecrets take precedence over this.
   existingSecret: ""
@@ -189,10 +189,10 @@ externalSecrets:
     secretName: rustgate-enrollment-credentials
     # Map of remote references for each secret key.
     remoteRefs:
-      ENROLLMENT_USER:
+      RUSTGATE_ENROLLMENT_USER:
         key: ""         # e.g., "production/rustgate/enrollment"
         property: "username"
-      ENROLLMENT_PASSWORD:
+      RUSTGATE_ENROLLMENT_PASSWORD:
         key: ""         # e.g., "production/rustgate/enrollment"
         property: "password"
   # Federation peers ExternalSecret.
