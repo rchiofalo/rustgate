@@ -167,7 +167,7 @@ The Helm chart provides a YAML interface over the environment variables. See `he
 # Container image
 image:
   repository: ghcr.io/rchiofalo/rustgate
-  tag: "0.3.0"
+  tag: "0.5.0"
   pullPolicy: IfNotPresent
 
 # Service configuration

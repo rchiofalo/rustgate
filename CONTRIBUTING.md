@@ -55,6 +55,7 @@ CI runs as parallel jobs. All checks must pass before merging to `main` (enforce
 | `coverage` | `cargo tarpaulin` code coverage |
 | `fips` | Clippy, build, and tests with `--features fips` |
 | `audit` | `cargo deny check` + `cargo audit` |
+| `dependency-review` | Dependency diff review on pull requests (fails on high-severity) |
 | `helm` | `helm lint helm/` |
 | `docker` | Dockerfile build validation |
 

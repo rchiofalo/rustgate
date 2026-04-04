@@ -79,13 +79,13 @@ For production certificate management see [docs/tls-certificates.md](docs/tls-ce
 │  router      │  WS sessions │  JetStream   │  Basic Auth  │  XML/proto   │  peer mgmt   │
 ├──────────────┴──────────────┴──────────────┼──────────────┴──────────────┴──────────────┤
 │                rustgate-cot                │               rustgate-core                │
-│      CoT XML parsing · MessageBuilder      │    Identity · RoutableMessage · framing    │
+│      CoT XML parsing · MessageBuilder      │    Codec trait · Identity · RoutableMessage│
 └────────────────────────────────────────────┴────────────────────────────────────────────┘
 ```
 
 | Crate | Purpose |
 |-------|---------|
-| `rustgate-core` | Shared types: Identity, RoutableMessage, Destination, framing strategies |
+| `rustgate-core` | Codec trait, shared types: Identity, RoutableMessage, Destination, framing strategies |
 | `rustgate-cot` | Cursor on Target XML parsing and message building |
 | `rustgate-transport` | mTLS listener, codec, session management, CRL, FIPS provider, routing engine |
 | `rustgate-websocket` | WebSocket (wss://) listener with mTLS client authentication |
@@ -246,6 +246,10 @@ All flags support environment variables (CLI takes precedence):
 | `--key` | `RUSTGATE_KEY` | — |
 | `--ca` | `RUSTGATE_CA` | — |
 | `--crl` | `RUSTGATE_CRL` | — |
+| `--crl-warn-stale` | `RUSTGATE_CRL_WARN_STALE` | `true` |
+| `--tls-min-version` | `RUSTGATE_TLS_MIN_VERSION` | `1.2` |
+| `--cert-reload-interval` | `RUSTGATE_CERT_RELOAD_INTERVAL` | `0` (disabled) |
+| `--max-concurrent-handshakes` | `RUSTGATE_MAX_HANDSHAKES` | `100` |
 | `--fips-required` | `RUSTGATE_FIPS_REQUIRED` | `false` |
 | `--framing` | `RUSTGATE_FRAMING` | `xml` |
 | `--encoding` | `RUSTGATE_ENCODING` | `raw` |
@@ -257,6 +261,10 @@ All flags support environment variables (CLI takes precedence):
 | `--metrics-bind` | `METRICS_BIND` | — |
 | `--nats-url` | `NATS_URL` | — |
 | `--nats-credentials` | `NATS_CREDENTIALS` | — |
+| `--nats-tls-cert` | `NATS_TLS_CERT` | — |
+| `--nats-tls-key` | `NATS_TLS_KEY` | — |
+| `--nats-tls-ca` | `NATS_TLS_CA` | — |
+| `--nats-tls-required` | `NATS_TLS_REQUIRED` | `false` |
 | `--websocket-bind` | `WEBSOCKET_BIND` | — |
 | `--enrollment-bind` | `ENROLLMENT_BIND` | — |
 | `--ca-key` | `RUSTGATE_CA_KEY` | — |
@@ -271,10 +279,17 @@ All flags support environment variables (CLI takes precedence):
 | `--federation-skip-hostname-verify` | `FEDERATION_SKIP_HOSTNAME_VERIFY` | `false` |
 | `--federation-max-hops` | `FEDERATION_MAX_HOPS` | `10` |
 | `--federation-store-path` | `FEDERATION_STORE_PATH` | — |
+| `--federation-trust-store-dir` | `FEDERATION_TRUST_STORE_DIR` | — |
+| `--federation-circuit-breaker-threshold` | `FEDERATION_CIRCUIT_BREAKER_THRESHOLD` | `5` |
+| `--federation-circuit-breaker-timeout` | `FEDERATION_CIRCUIT_BREAKER_TIMEOUT` | `60` |
+| `--federation-pod-id` | `FEDERATION_POD_ID` | — |
+| `--replay-window` | `RUSTGATE_REPLAY_WINDOW` | `300` |
 | `--client-message-rate` | `RUSTGATE_CLIENT_MSG_RATE` | `0` (disabled) |
 | `--client-burst` | `RUSTGATE_CLIENT_BURST` | `200` |
 | `--archive-dir` | `RUSTGATE_ARCHIVE_DIR` | — |
 | `--package-max-age-hours` | `RUSTGATE_PACKAGE_MAX_AGE_HOURS` | `0` (no expiration) |
+| `--otel-endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` | — |
+| `--otel-service-name` | `OTEL_SERVICE_NAME` | `rustgate` |
 
 </details>
 
@@ -329,13 +344,15 @@ cargo nextest run -p rustgate-nats --test integration  # NATS integration (needs
 
 | Crate | Test files | Covers |
 |-------|-----------|--------|
-| `rustgate-transport` | `tls_listener`, `e2e_routing`, `encoder`, `crl`, `fips` | mTLS, routing, codecs, CRL, FIPS |
+| `rustgate-transport` | `tls_listener`, `e2e_routing`, `encoder`, `crl`, `fips`, `cert_rotation` | mTLS, routing, codecs, CRL, FIPS, certificate hot-reload |
 | `rustgate-cot` | `parser` | CoT XML parsing |
+| `rustgate-core` | `types` | Core type invariants |
 | `rustgate-enrollment` | `server_integration` | PKCS#12 enrollment, CSR signing |
-| `rustgate-federation` | `v2_integration` | Federation V2 protocol |
+| `rustgate-federation` | `v2_integration`, `api_integration`, `ha_integration` | Federation V2 protocol, REST API, HA coordination |
 | `rustgate-nats` | `integration` | NATS bridge, echo prevention, JetStream replay |
+| `rustgate-proto` | `codec_integration` | XML ↔ protobuf conversion |
+| `rustgate-server` | `cli_parsing`, `tls_config`, `feature_gates`, `archive_integration` | CLI validation, TLS setup, feature gating, CoT archival |
 | `rustgate-websocket` | `ws_listener`, `ws_server` | WebSocket mTLS, session routing |
-| `rustgate-proto` | unit tests | XML ↔ protobuf conversion |
 
 All tests use ephemeral certificates generated at runtime via `rustgate-test-utils` — no fixture files.
 
@@ -349,6 +366,10 @@ All tests use ephemeral certificates generated at runtime via `rustgate-test-uti
 | [FIPS 140-3](docs/fips.md) | FIPS crypto provider setup and known limitations |
 | [Configuration](docs/configuration.md) | All CLI flags, env vars, and runtime options |
 | [Security Posture](docs/security-posture.md) | NIST 800-53 control mapping and compliance overview |
+| [Threat Model](docs/threat-model.md) | STRIDE methodology threats, mitigations, and residual risks |
+| [Graceful Degradation](docs/graceful-degradation.md) | Subsystem failure modes and recovery behavior |
+| [Post-Quantum Roadmap](docs/post-quantum.md) | Path to post-quantum cryptographic protection |
+| [Observability](docs/observability.md) | Structured logging, metrics, and distributed tracing |
 | [Runbooks](docs/runbooks/) | Operational runbooks for federation, memory, NATS |
 | [CONTRIBUTING](CONTRIBUTING.md) | Build prerequisites, code quality, and PR guidelines |
 | [CHANGELOG](CHANGELOG.md) | Release history in Keep a Changelog format |
