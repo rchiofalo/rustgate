@@ -99,6 +99,8 @@ jobs:
           - length_prefixed_codec
           - nats_wire_event
           - proto_roundtrip
+          - structured_cot_event
+          - structured_routable_message
           - tak_frame_codec
           - v2_federation_convert
           - ws_frame
