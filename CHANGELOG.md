@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **WebSocket codec migration** — WebSocket transport now uses the unified `Codec` trait (`Arc<dyn Codec>`) instead of the legacy `WsEncoding` enum and `MessageEncoder` trait. Removed `WsEncoding`, `MessageEncoder`, `RawEncoder`, `CotEncoder`, and `TakProtobufEncoder`. The `WsServerConfig.encoding` field is replaced by `WsServerConfig.codec`. (#391)
+
 ### Added
 
 - **Pluggable codec architecture** — unified `Codec` trait in `rustgate-core` replaces the separate `Framing`/`Encoding` dispatch. Each wire protocol (`TakXmlCodec`, `TakProtobufCodec`, `RawLineCodec`, `RawLengthPrefixedCodec`) implements a single trait covering framing strategy, payload decode/encode, and protocol detection. Session handling uses `Arc<dyn Codec>` instead of enum-matching, simplifying the read/write loops and enabling future custom codecs. Existing `--framing`/`--encoding` CLI flags are preserved via a factory function. (#184)

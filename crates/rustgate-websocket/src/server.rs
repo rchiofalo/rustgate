@@ -9,14 +9,12 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
+use rustgate_core::codec::Codec;
 use rustgate_core::constants::{READ_TIMEOUT, WRITE_TIMEOUT};
-use rustgate_core::encoder::MessageEncoder;
 use rustgate_core::identity::Identity;
 use rustgate_core::message::RoutableMessage;
 use rustgate_cot::MessageBuilder;
-use rustgate_transport::{
-    ClientThrottle, CotEncoder, RawEncoder, ReplayFilter, Router, SessionHandle, ThrottleConfig,
-};
+use rustgate_transport::{ClientThrottle, ReplayFilter, Router, SessionHandle, ThrottleConfig};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
@@ -36,21 +34,12 @@ pub type OnNatsPublish = Arc<dyn Fn(RoutableMessage) + Send + Sync>;
 /// Receives `(payload_bytes, source_groups)`.
 pub type OnFederationForward = Arc<dyn Fn(Bytes, Vec<String>) + Send + Sync>;
 
-/// Outbound encoding for WebSocket frames.
-#[derive(Debug, Clone, Copy)]
-pub enum WsEncoding {
-    /// Passthrough: send raw payload bytes.
-    Raw,
-    /// CoT XML encoding.
-    Cot,
-}
-
 /// Configuration for the WebSocket server.
 pub struct WsServerConfig {
     pub listener: WsListener,
     pub router: Arc<Router>,
     pub connection_limit: Arc<Semaphore>,
-    pub encoding: WsEncoding,
+    pub codec: Arc<dyn Codec>,
     pub nats_publish: Option<OnNatsPublish>,
     pub fed_forward: Option<OnFederationForward>,
     pub throttle_config: Option<ThrottleConfig>,
@@ -63,7 +52,7 @@ impl std::fmt::Debug for WsServerConfig {
         f.debug_struct("WsServerConfig")
             .field("listener", &self.listener)
             .field("router", &"<Router>")
-            .field("encoding", &self.encoding)
+            .field("codec", &self.codec.protocol_id())
             .finish()
     }
 }
@@ -82,7 +71,7 @@ impl WebSocketServer {
             listener,
             router,
             connection_limit,
-            encoding,
+            codec,
             nats_publish,
             fed_forward,
             throttle_config,
@@ -106,13 +95,14 @@ impl WebSocketServer {
                             };
 
                             let router = Arc::clone(&router);
+                            let session_codec = Arc::clone(&codec);
                             let nats = nats_publish.clone();
                             let fed = fed_forward.clone();
                             let tc = throttle_config;
                             let rf = replay_filter.clone();
 
                             drop(tokio::spawn(handle_ws_session(
-                                session, router, encoding, nats, fed, tc, rf, permit,
+                                session, router, session_codec, nats, fed, tc, rf, permit,
                             )));
                         }
                         Err(e) => {
@@ -133,7 +123,7 @@ impl WebSocketServer {
 async fn handle_ws_session(
     session: WsSession,
     router: Arc<Router>,
-    encoding: WsEncoding,
+    codec: Arc<dyn Codec>,
     nats_publish: Option<OnNatsPublish>,
     fed_forward: Option<OnFederationForward>,
     throttle_config: Option<ThrottleConfig>,
@@ -167,7 +157,7 @@ async fn handle_ws_session(
         let router = Arc::clone(&router);
         tokio::select! {
             r = ws_read_loop(ws_read, &identity, &router, nats_publish.as_ref(), fed_forward.as_ref(), &throttle, &replay_filter) => r,
-            r = ws_write_loop(ws_write, &mut rx, encoding) => r,
+            r = ws_write_loop(ws_write, &mut rx, &*codec) => r,
         }
     };
 
@@ -243,15 +233,10 @@ async fn ws_read_loop(
 async fn ws_write_loop(
     mut ws_write: SplitSink<WsStream, Message>,
     rx: &mut mpsc::Receiver<RoutableMessage>,
-    encoding: WsEncoding,
+    codec: &dyn Codec,
 ) -> Result<(), String> {
-    let encoder: Box<dyn MessageEncoder> = match encoding {
-        WsEncoding::Raw => Box::new(RawEncoder),
-        WsEncoding::Cot => Box::new(CotEncoder),
-    };
-
     while let Some(msg) = rx.recv().await {
-        let encoded = match encoder.encode(&msg) {
+        let encoded = match codec.encode_payload(&msg) {
             Ok(bytes) => bytes,
             Err(e) => {
                 warn!(error = %e, "failed to encode outbound message");

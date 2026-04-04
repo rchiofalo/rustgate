@@ -664,7 +664,7 @@ pub(crate) struct WebSocketSetup<'a, P: NatsPublish> {
     pub(crate) tls_config: &'a TlsConfig,
     pub(crate) router: &'a Arc<Router>,
     pub(crate) connection_limit: &'a Arc<Semaphore>,
-    pub(crate) encoding: Encoding,
+    pub(crate) codec: &'a Arc<dyn rustgate_core::codec::Codec>,
     pub(crate) nats_publisher: &'a Option<P>,
     pub(crate) fed_forward: &'a Option<FedForwardFn>,
     pub(crate) throttle_config: Option<ThrottleConfig>,
@@ -681,7 +681,7 @@ pub(crate) fn start_websocket<P: NatsPublish + Send + Sync + 'static>(
         tls_config,
         router,
         connection_limit,
-        encoding,
+        codec,
         nats_publisher,
         fed_forward,
         throttle_config,
@@ -721,16 +721,11 @@ pub(crate) fn start_websocket<P: NatsPublish + Send + Sync + 'static>(
         }
     };
 
-    let ws_encoding = match encoding {
-        Encoding::Raw | Encoding::TakProtobuf => rustgate_websocket::WsEncoding::Raw,
-        Encoding::Cot => rustgate_websocket::WsEncoding::Cot,
-    };
-
     let config = rustgate_websocket::WsServerConfig {
         listener: ws_listener,
         router: Arc::clone(router),
         connection_limit: Arc::clone(connection_limit),
-        encoding: ws_encoding,
+        codec: Arc::clone(codec),
         nats_publish: nats_cb,
         fed_forward: fed_forward.clone(),
         throttle_config,

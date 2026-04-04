@@ -9,23 +9,19 @@
 //! The router is codec-agnostic — it only sees `RoutableMessage` with
 //! canonical XML payloads. Codecs handle translation at session edges.
 //!
-//! # WebSocket note
+//! # WebSocket
 //!
 //! The WebSocket transport (`rustgate-websocket`) handles framing via
-//! tungstenite, not `FramedCodec`. It currently uses the legacy
-//! [`MessageEncoder`](crate::encoder::MessageEncoder) trait and its own
-//! `WsEncoding` enum for outbound encoding. Migrating WebSocket to use
-//! `Codec` is tracked as a follow-up to the Phase 1 codec unification.
+//! tungstenite, not `FramedCodec`. It uses the `Codec` trait for outbound
+//! encoding and inbound decoding, just like TLS/TCP sessions.
 //!
 //! # Legacy `Encoding` enum
 //!
 //! The `--encoding` CLI flag and its `Encoding` enum (`Raw`, `Cot`,
 //! `TakProtobuf`) are preserved for backwards compatibility. The
 //! `build_codec()` factory maps `(Framing, Encoding)` pairs to the
-//! appropriate `Codec` implementation. Note that `Encoding::Cot` and
-//! `Encoding::Raw` are functionally identical for TCP/TLS sessions since
-//! the `CotEncoder` was always a passthrough — the distinction only
-//! matters for the WebSocket path which still uses `MessageEncoder`.
+//! appropriate `Codec` implementation. `Encoding::Cot` and `Encoding::Raw`
+//! are functionally identical since both use passthrough codecs.
 
 use std::io;
 

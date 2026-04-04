@@ -177,7 +177,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         tls_config: &tls_config,
         router: &router,
         connection_limit: &connection_limit,
-        encoding,
+        codec: &codec,
         nats_publisher: &nats_publisher,
         fed_forward: &fed_forward,
         throttle_config,
