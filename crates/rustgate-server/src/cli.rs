@@ -157,6 +157,18 @@ pub(crate) struct Cli {
     #[arg(long, env = "RUSTGATE_WEBSOCKET_BIND", value_parser = parse_socket_addr)]
     pub(crate) websocket_bind: Option<String>,
 
+    /// Maximum WebSocket frames per second per connection (0 = unlimited).
+    #[arg(long, default_value_t = 0, env = "RUSTGATE_WS_MAX_FRAMES_PER_SEC")]
+    pub(crate) ws_max_frames_per_sec: u32,
+
+    /// Maximum WebSocket bytes per second per connection (0 = unlimited).
+    #[arg(long, default_value_t = 0, env = "RUSTGATE_WS_MAX_BYTES_PER_SEC")]
+    pub(crate) ws_max_bytes_per_sec: u64,
+
+    /// Consecutive WebSocket rate limit violations before disconnecting client.
+    #[arg(long, default_value_t = 10, env = "RUSTGATE_WS_MAX_VIOLATIONS")]
+    pub(crate) ws_max_violations: u32,
+
     // -- Plaintext input flags --
     /// Bind address for plaintext TCP input (e.g. 0.0.0.0:8087).
     /// WARNING: connections are NOT encrypted. Use only on trusted networks.
@@ -510,6 +522,9 @@ mod tests {
             "RUSTGATE_MAX_CONNECTIONS",
             "RUSTGATE_MAX_HANDSHAKES",
             "RUSTGATE_WEBSOCKET_BIND",
+            "RUSTGATE_WS_MAX_FRAMES_PER_SEC",
+            "RUSTGATE_WS_MAX_BYTES_PER_SEC",
+            "RUSTGATE_WS_MAX_VIOLATIONS",
             "RUSTGATE_TCP_BIND",
             "RUSTGATE_UDP_BIND",
             "RUSTGATE_PLAINTEXT_CN",
