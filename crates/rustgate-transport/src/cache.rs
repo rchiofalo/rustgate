@@ -21,13 +21,13 @@
 //! ## Sweep Task
 //!
 //! [`start_sweep_task`] spawns a background `tokio` task that calls
-//! [`PositionCache::sweep`] at a fixed interval (default: **60 seconds**).
+//! [`PositionCache::sweep`] at a fixed interval (default: **15 seconds**).
 //! The sweep removes all entries whose TTL has elapsed. Entries without a
 //! TTL are never removed by the sweep — they persist until explicitly
 //! removed or replaced.
 //!
 //! The sweep interval is independent of individual entry TTLs. An entry
-//! with a 5-second TTL will not be removed until the next sweep runs,
+//! with a 5-second TTL will not be removed until the next 15-second sweep runs,
 //! but it will be excluded from [`PositionCache::get_all`] results
 //! immediately (the `is_expired` check runs on read).
 
@@ -38,7 +38,7 @@ use rustgate_core::message::RoutableMessage;
 use tokio::sync::RwLock;
 
 /// Default sweep interval for removing expired position entries.
-const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Default maximum number of entries in the position cache.
 const DEFAULT_MAX_ENTRIES: usize = 100_000;
@@ -158,7 +158,7 @@ impl PositionCache {
     /// Spawn a background task that periodically sweeps expired entries.
     ///
     /// The task runs until the provided `shutdown` signal is notified.
-    /// Uses the default sweep interval of 60 seconds.
+    /// Uses the default sweep interval of 15 seconds.
     pub fn start_sweep_task(
         self: &std::sync::Arc<Self>,
         shutdown: tokio::sync::watch::Receiver<bool>,
