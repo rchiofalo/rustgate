@@ -242,6 +242,10 @@ pub(crate) async fn connect_nats(
             ca_cert: cli.nats_tls_ca.clone(),
             required: cli.nats_tls_required,
         },
+        checkpoint_path: cli
+            .nats_checkpoint_path
+            .as_ref()
+            .map(std::path::PathBuf::from),
         ..Default::default()
     };
 

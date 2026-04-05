@@ -109,6 +109,12 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = false, env = "RUSTGATE_NATS_TLS_REQUIRED")]
     pub(crate) nats_tls_required: bool,
 
+    /// Path to JetStream replay checkpoint file. When set, the server
+    /// persists the last replayed sequence number and resumes from it
+    /// on restart instead of replaying the entire history stream.
+    #[arg(long, env = "RUSTGATE_NATS_CHECKPOINT_PATH")]
+    pub(crate) nats_checkpoint_path: Option<String>,
+
     /// Bind address for the enrollment HTTPS server (e.g. 0.0.0.0:8446).
     /// Requires --features enrollment.
     #[arg(long, env = "RUSTGATE_ENROLLMENT_BIND", value_parser = parse_socket_addr)]
@@ -490,6 +496,7 @@ mod tests {
             "RUSTGATE_NATS_TLS_KEY",
             "RUSTGATE_NATS_TLS_CA",
             "RUSTGATE_NATS_TLS_REQUIRED",
+            "RUSTGATE_NATS_CHECKPOINT_PATH",
             "RUSTGATE_ENROLLMENT_BIND",
             "RUSTGATE_CA_KEY",
             "RUSTGATE_ENROLLMENT_USER",
