@@ -9,8 +9,10 @@
 
 mod server;
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use rustgate_core::constants::HANDSHAKE_TIMEOUT;
 use rustgate_core::error::{Result, TransportError};
@@ -71,15 +73,35 @@ impl std::fmt::Debug for WsSession {
     }
 }
 
+/// Maximum connection attempts per IP within the rate limit window.
+const CONN_RATE_LIMIT: usize = 10;
+
+/// Sliding window duration for connection rate limiting.
+const CONN_RATE_WINDOW: Duration = Duration::from_secs(10);
+
+/// Number of tracked IPs that triggers an inline sweep of stale entries.
+const CONN_RATE_SWEEP_THRESHOLD: usize = 512;
+
 /// WebSocket listener with mandatory mTLS.
 ///
 /// Mirrors [`TlsListener`](rustgate_transport::TlsListener) but adds the
 /// WebSocket upgrade handshake after TLS completes. The accept loop handles
 /// TCP, TLS, identity extraction, and WS upgrade — callers receive a fully
 /// authenticated [`WsSession`] ready for message exchange.
+///
+/// Includes per-IP connection rate limiting to mitigate slow-handshake DoS
+/// attacks where an adversary repeatedly initiates and abandons TLS handshakes.
 pub struct WsListener {
     tcp: TcpListener,
     tls: TlsAcceptor,
+    conn_rate: Mutex<ConnRateState>,
+}
+
+/// Per-IP connection attempt tracking for DoS mitigation.
+#[derive(Debug)]
+struct ConnRateState {
+    map: HashMap<IpAddr, VecDeque<Instant>>,
+    last_sweep: Instant,
 }
 
 impl std::fmt::Debug for WsListener {
@@ -87,6 +109,7 @@ impl std::fmt::Debug for WsListener {
         f.debug_struct("WsListener")
             .field("tcp", &self.tcp)
             .field("tls", &"<TlsAcceptor>")
+            .field("conn_rate", &"<ConnRateState>")
             .finish()
     }
 }
@@ -128,7 +151,14 @@ impl WsListener {
 
         debug!(local_addr = ?tcp.local_addr().ok(), "WebSocket listener bound");
 
-        Ok(Self { tcp, tls })
+        Ok(Self {
+            tcp,
+            tls,
+            conn_rate: Mutex::new(ConnRateState {
+                map: HashMap::new(),
+                last_sweep: Instant::now(),
+            }),
+        })
     }
 
     /// Returns the local address this listener is bound to.
@@ -143,6 +173,47 @@ impl WsListener {
     /// Loops internally on TCP, TLS, and WebSocket handshake failures.
     /// Returns only when a fully authenticated session is ready, or
     /// when identity extraction fails (which is a configuration error).
+    /// Check whether `ip` has exceeded the connection rate limit.
+    ///
+    /// Returns `true` if the IP is rate-limited, `false` otherwise.
+    /// Records the attempt timestamp on success.
+    fn is_conn_rate_limited(&self, ip: IpAddr) -> bool {
+        let now = Instant::now();
+        let cutoff = now - CONN_RATE_WINDOW;
+
+        let mut state = match self.conn_rate.lock() {
+            Ok(s) => s,
+            Err(e) => e.into_inner(),
+        };
+
+        // Periodic sweep of stale IPs to bound memory.
+        if state.map.len() > CONN_RATE_SWEEP_THRESHOLD
+            || now.duration_since(state.last_sweep) >= CONN_RATE_WINDOW
+        {
+            state.map.retain(|_, timestamps| {
+                while timestamps.front().is_some_and(|t| *t <= cutoff) {
+                    let _ = timestamps.pop_front();
+                }
+                !timestamps.is_empty()
+            });
+            state.last_sweep = now;
+        }
+
+        let timestamps = state.map.entry(ip).or_default();
+
+        // Prune expired entries for this IP.
+        while timestamps.front().is_some_and(|t| *t <= cutoff) {
+            let _ = timestamps.pop_front();
+        }
+
+        if timestamps.len() >= CONN_RATE_LIMIT {
+            return true;
+        }
+
+        timestamps.push_back(now);
+        false
+    }
+
     pub async fn accept(&self) -> Result<WsSession> {
         loop {
             let (tcp_stream, peer_addr) = match self.tcp.accept().await {
@@ -152,6 +223,16 @@ impl WsListener {
                     continue;
                 }
             };
+
+            // Per-IP connection rate limiting to mitigate slow-handshake DoS.
+            if self.is_conn_rate_limited(peer_addr.ip()) {
+                warn!(
+                    peer_addr = %peer_addr,
+                    "connection rejected: rate limit exceeded for IP"
+                );
+                drop(tcp_stream);
+                continue;
+            }
 
             configure_tcp_keepalive(&tcp_stream);
             debug!(peer_addr = %peer_addr, "TCP connection accepted");

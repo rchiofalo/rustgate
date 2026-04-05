@@ -109,16 +109,8 @@ impl EnrollmentServer {
         let conn_limit = Arc::new(tokio::sync::Semaphore::new(MAX_ENROLLMENT_CONNECTIONS));
         tracing::info!(addr = %bind_addr, "enrollment server listening");
 
-        // Periodically prune expired rate-limiter entries to prevent
-        // unbounded memory growth from departed client IPs.
-        let prune_limiter = Arc::clone(&self.sign_limiter);
-        drop(tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(300));
-            loop {
-                let _ = interval.tick().await;
-                prune_limiter.prune();
-            }
-        }));
+        // No separate prune task needed — the sliding-window rate limiter
+        // lazily cleans stale entries on each check() call.
 
         loop {
             let (stream, peer) = match listener.accept().await {
