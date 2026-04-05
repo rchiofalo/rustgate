@@ -20,6 +20,7 @@ use crate::config::FederationConfig;
 use crate::connector::{OutboundConnector, PeerConnector};
 use crate::dedup::MessageDedup;
 use crate::peer::{PeerHandle, PeerStatus};
+use crate::replay_buffer::ReplayBuffer;
 use crate::trust_store::TrustStore;
 use crate::v1::{V1Client, V1Server};
 
@@ -42,6 +43,9 @@ pub type OnInbound = Arc<dyn Fn(String, Bytes) + Send + Sync>;
 /// dropped with a warning log.
 #[cfg(feature = "ha")]
 const HA_CHANNEL_CAPACITY: usize = 256;
+
+/// Type alias for the shared replay buffers map.
+type SharedReplayBuffers = Arc<Mutex<HashMap<PeerId, ReplayBuffer>>>;
 
 /// Wraps either a V1 or V2 outbound federation client.
 enum FederationClient {
@@ -87,6 +91,8 @@ pub struct FederationManager {
     /// Live trust store for dynamic TLS refresh (kept alive for the
     /// `DynamicCertVerifier` closure and the REST API).
     trust_store: Option<Arc<TrustStore>>,
+    /// Per-peer replay buffers for reconnection catch-up.
+    replay_buffers: SharedReplayBuffers,
 
     // ── HA subsystem ─────────────────────────────────────────────────
     #[cfg(feature = "ha")]
@@ -152,6 +158,7 @@ impl FederationManager {
             v2_tls_config: None,
             ca_pem: None,
             trust_store: None,
+            replay_buffers: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(feature = "ha")]
             claim_manager: None,
             #[cfg(feature = "ha")]
@@ -522,6 +529,7 @@ impl FederationManager {
                 1 => {
                     let on_v1_client =
                         Self::create_v1_dedup_callback(&v1_dedup, &on_inbound, "outbound client");
+                    let replay_drain = Self::create_v1_replay_drain(&self.replay_buffers);
 
                     let client = V1Client::start(
                         Arc::clone(&peer),
@@ -535,6 +543,7 @@ impl FederationManager {
                             reconnect_delay: self.config.reconnect_delay,
                             max_reconnects: self.config.max_reconnects,
                             on_message: on_v1_client,
+                            replay_drain: Some(replay_drain),
                         },
                     );
 
@@ -554,6 +563,7 @@ impl FederationManager {
                 2 => {
                     let on_event =
                         Self::create_v2_event_handler(&on_inbound, &self.config.federate_id);
+                    let replay_drain = Self::create_v2_replay_drain(&self.replay_buffers);
 
                     let client = crate::v2::client::V2Client::start(
                         Arc::clone(&peer),
@@ -566,6 +576,8 @@ impl FederationManager {
                             reconnect_delay: self.config.reconnect_delay,
                             max_reconnects: self.config.max_reconnects,
                             on_event,
+                            replay_drain: Some(replay_drain),
+                            max_hops: self.config.max_hops,
                         },
                     );
 
@@ -663,6 +675,9 @@ impl FederationManager {
         #[cfg(feature = "v2")]
         let mut v2_event: Option<crate::v2::proto::figpb::FederatedEvent> = None;
 
+        // Buffer the message for replay on reconnection
+        self.buffer_for_replay(&payload, source_groups);
+
         // Snapshot clients and peer handles so callers can release the outer
         // lock before we block on per-peer channel sends.
         let snapshot: Vec<(PeerId, Arc<FederationClient>, Arc<PeerHandle>)> = self
@@ -757,6 +772,93 @@ impl FederationManager {
         sent
     }
 
+    /// Store a message in the replay buffer for all configured peers.
+    ///
+    /// Called during forwarding so that messages are available for replay
+    /// when a peer reconnects after a disconnection.
+    fn buffer_for_replay(&self, payload: &Bytes, groups: &[String]) {
+        if self.config.replay_buffer_capacity == 0 {
+            return;
+        }
+        if let Ok(mut buffers) = self.replay_buffers.lock() {
+            for peer_id in self.peers.keys() {
+                let buffer = buffers
+                    .entry(peer_id.clone())
+                    .or_insert_with(|| ReplayBuffer::new(self.config.replay_buffer_capacity));
+                let _ = buffer.push(payload.clone(), groups.to_vec());
+            }
+        }
+    }
+
+    /// Get buffered messages for a peer since a given sequence number.
+    ///
+    /// Returns all messages if `since_seq` is 0 (full replay).
+    /// Returns an empty vec if the peer has no replay buffer or if
+    /// the buffer lock cannot be acquired.
+    pub fn replay_messages(
+        &self,
+        peer_id: &str,
+        since_seq: u64,
+    ) -> Vec<crate::replay_buffer::BufferedMessage> {
+        if let Ok(buffers) = self.replay_buffers.lock() {
+            buffers
+                .get(peer_id)
+                .map(|buf| buf.messages_since(since_seq))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Get all buffered messages for a peer, deduplicated by payload.
+    ///
+    /// Used during reconnection replay to avoid resending identical
+    /// messages. Returns an empty vec if the peer has no buffer.
+    pub fn replay_messages_deduped(
+        &self,
+        peer_id: &str,
+    ) -> Vec<crate::replay_buffer::BufferedMessage> {
+        if let Ok(buffers) = self.replay_buffers.lock() {
+            buffers
+                .get(peer_id)
+                .map(|buf| buf.all_messages_deduped())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Remove the replay buffer for a specific peer.
+    ///
+    /// Called when a peer is permanently disconnected or removed from
+    /// configuration. Frees the memory used by its buffered messages.
+    pub fn remove_replay_buffer(&self, peer_id: &str) {
+        if let Ok(mut buffers) = self.replay_buffers.lock()
+            && buffers.remove(peer_id).is_some()
+        {
+            info!(peer_id = %peer_id, "removed replay buffer for peer");
+        }
+    }
+
+    /// Clear the replay buffer for a specific peer after successful replay.
+    ///
+    /// Called after all buffered messages have been resent on reconnection
+    /// so the same messages are not replayed again on the next reconnect.
+    pub fn clear_replay_buffer(&self, peer_id: &str) {
+        if let Ok(mut buffers) = self.replay_buffers.lock()
+            && let Some(buf) = buffers.get_mut(peer_id)
+        {
+            buf.clear();
+        }
+    }
+
+    /// Get a shared handle to the replay buffers map.
+    ///
+    /// Used to create replay drain callbacks for outbound clients.
+    pub fn shared_replay_buffers(&self) -> SharedReplayBuffers {
+        Arc::clone(&self.replay_buffers)
+    }
+
     /// Gracefully shut down the federation manager and all connections.
     pub async fn shutdown(&mut self) {
         if !self.running {
@@ -796,6 +898,15 @@ impl FederationManager {
         }
 
         self.peers.clear();
+
+        // Clear all replay buffers
+        if let Ok(mut buffers) = self.replay_buffers.lock() {
+            let count = buffers.len();
+            buffers.clear();
+            if count > 0 {
+                info!(count, "cleared all replay buffers during shutdown");
+            }
+        }
 
         // Shut down HA subsystem (releases claims, unregisters connections)
         #[cfg(feature = "ha")]
@@ -877,7 +988,45 @@ impl FederationManager {
         &self.config
     }
 
-    // ── Helper methods for callback creation ──────────────────────────
+    // ── Helper methods for replay and callback creation ────────────────
+
+    /// Create a replay drain closure for a V1 client.
+    ///
+    /// The returned closure, when called with a peer ID, returns all
+    /// deduped buffered messages for that peer and clears its buffer.
+    fn create_v1_replay_drain(buffers: &SharedReplayBuffers) -> crate::v1::client::ReplayDrain {
+        let buffers = Arc::clone(buffers);
+        Arc::new(move |peer_id: &str| {
+            if let Ok(mut guard) = buffers.lock()
+                && let Some(buf) = guard.get_mut(peer_id)
+            {
+                let messages = buf.all_messages_deduped();
+                buf.clear();
+                return messages;
+            }
+            Vec::new()
+        })
+    }
+
+    /// Create a replay drain closure for a V2 client.
+    ///
+    /// Same as the V1 drain — returns deduped buffered messages and
+    /// clears the buffer. The V2 client handles XML-to-FederatedEvent
+    /// conversion during replay.
+    #[cfg(feature = "v2")]
+    fn create_v2_replay_drain(buffers: &SharedReplayBuffers) -> crate::v2::client::V2ReplayDrain {
+        let buffers = Arc::clone(buffers);
+        Arc::new(move |peer_id: &str| {
+            if let Ok(mut guard) = buffers.lock()
+                && let Some(buf) = guard.get_mut(peer_id)
+            {
+                let messages = buf.all_messages_deduped();
+                buf.clear();
+                return messages;
+            }
+            Vec::new()
+        })
+    }
 
     /// Create a V1 dedup-wrapping message callback.
     ///
@@ -997,6 +1146,7 @@ impl FederationManager {
             1 => {
                 let on_v1_client =
                     Self::create_v1_dedup_callback(&v1_dedup, &on_inbound, "outbound client");
+                let replay_drain = Self::create_v1_replay_drain(&self.replay_buffers);
 
                 let client = V1Client::start(
                     Arc::clone(&peer),
@@ -1010,6 +1160,7 @@ impl FederationManager {
                         reconnect_delay: self.config.reconnect_delay,
                         max_reconnects: self.config.max_reconnects,
                         on_message: on_v1_client,
+                        replay_drain: Some(replay_drain),
                     },
                 );
 
@@ -1034,6 +1185,7 @@ impl FederationManager {
                     .clone();
 
                 let on_event = Self::create_v2_event_handler(&on_inbound, &self.config.federate_id);
+                let replay_drain = Self::create_v2_replay_drain(&self.replay_buffers);
 
                 let client = crate::v2::client::V2Client::start(
                     Arc::clone(&peer),
@@ -1046,6 +1198,8 @@ impl FederationManager {
                         reconnect_delay: self.config.reconnect_delay,
                         max_reconnects: self.config.max_reconnects,
                         on_event,
+                        replay_drain: Some(replay_drain),
+                        max_hops: self.config.max_hops,
                     },
                 );
 
@@ -1160,6 +1314,9 @@ impl FederationManager {
 
         let _ = self.peers.remove(peer_id.as_str());
 
+        // Clean up the replay buffer for this peer
+        self.remove_replay_buffer(peer_id.as_str());
+
         // Unregister from connection registry
         if let Some(ref cr) = self.connection_registry
             && let Err(e) = cr.unregister(peer_id.as_str()).await
@@ -1226,6 +1383,7 @@ mod tests {
             jwt_expiry_secs: 3600,
             circuit_breaker_threshold: 5,
             circuit_breaker_timeout: Duration::from_secs(60),
+            replay_buffer_capacity: 1000,
             pod_id: None,
             ha_nats_url: None,
         }
@@ -1893,5 +2051,174 @@ mod tests {
 
         drop(guard);
         manager.write().await.shutdown().await;
+    }
+
+    // ── Replay buffer tests ─────────────────────────────────────────
+
+    #[test]
+    fn buffer_for_replay_populates_per_peer() {
+        let mut config = test_config();
+        config.replay_buffer_capacity = 100;
+        let mut manager = FederationManager::new(config);
+
+        // Manually add peers so buffer_for_replay has targets
+        let peer1 = Arc::new(PeerHandle::new(test_peer_config(
+            "peer-1",
+            vec!["Alpha".into()],
+        )));
+        let peer2 = Arc::new(PeerHandle::new(test_peer_config(
+            "peer-2",
+            vec!["Beta".into()],
+        )));
+        let _ = manager.peers.insert("peer-1".into(), peer1);
+        let _ = manager.peers.insert("peer-2".into(), peer2);
+
+        manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()]);
+        manager.buffer_for_replay(&Bytes::from("msg2"), &["Beta".into()]);
+
+        let msgs1 = manager.replay_messages("peer-1", 0);
+        assert_eq!(msgs1.len(), 2);
+
+        let msgs2 = manager.replay_messages("peer-2", 0);
+        assert_eq!(msgs2.len(), 2);
+    }
+
+    #[test]
+    fn buffer_for_replay_skipped_when_capacity_zero() {
+        let mut config = test_config();
+        config.replay_buffer_capacity = 0;
+        let mut manager = FederationManager::new(config);
+
+        let peer = Arc::new(PeerHandle::new(test_peer_config(
+            "peer-1",
+            vec!["Alpha".into()],
+        )));
+        let _ = manager.peers.insert("peer-1".into(), peer);
+
+        manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()]);
+
+        let msgs = manager.replay_messages("peer-1", 0);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn remove_replay_buffer_cleans_up() {
+        let mut config = test_config();
+        config.replay_buffer_capacity = 100;
+        let mut manager = FederationManager::new(config);
+
+        let peer = Arc::new(PeerHandle::new(test_peer_config(
+            "peer-1",
+            vec!["Alpha".into()],
+        )));
+        let _ = manager.peers.insert("peer-1".into(), peer);
+
+        manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()]);
+        assert_eq!(manager.replay_messages("peer-1", 0).len(), 1);
+
+        manager.remove_replay_buffer("peer-1");
+        assert!(manager.replay_messages("peer-1", 0).is_empty());
+    }
+
+    #[test]
+    fn clear_replay_buffer_empties_but_keeps_entry() {
+        let mut config = test_config();
+        config.replay_buffer_capacity = 100;
+        let mut manager = FederationManager::new(config);
+
+        let peer = Arc::new(PeerHandle::new(test_peer_config(
+            "peer-1",
+            vec!["Alpha".into()],
+        )));
+        let _ = manager.peers.insert("peer-1".into(), peer);
+
+        manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()]);
+        manager.buffer_for_replay(&Bytes::from("msg2"), &["Alpha".into()]);
+        assert_eq!(manager.replay_messages("peer-1", 0).len(), 2);
+
+        manager.clear_replay_buffer("peer-1");
+        assert!(manager.replay_messages("peer-1", 0).is_empty());
+
+        // Buffer entry still exists — new messages can be buffered
+        manager.buffer_for_replay(&Bytes::from("msg3"), &["Alpha".into()]);
+        assert_eq!(manager.replay_messages("peer-1", 0).len(), 1);
+    }
+
+    #[test]
+    fn replay_messages_deduped_removes_duplicates() {
+        let mut config = test_config();
+        config.replay_buffer_capacity = 100;
+        let mut manager = FederationManager::new(config);
+
+        let peer = Arc::new(PeerHandle::new(test_peer_config(
+            "peer-1",
+            vec!["Alpha".into()],
+        )));
+        let _ = manager.peers.insert("peer-1".into(), peer);
+
+        manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()]);
+        manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()]); // duplicate
+        manager.buffer_for_replay(&Bytes::from("msg2"), &["Beta".into()]);
+
+        let deduped = manager.replay_messages_deduped("peer-1");
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped[0].payload, Bytes::from("msg1"));
+        assert_eq!(deduped[1].payload, Bytes::from("msg2"));
+    }
+
+    #[test]
+    fn v1_replay_drain_returns_and_clears() {
+        let mut config = test_config();
+        config.replay_buffer_capacity = 100;
+        let manager = FederationManager::new(config);
+
+        // Manually populate the buffer
+        {
+            let mut buffers = manager.replay_buffers.lock().expect("lock");
+            let buf = buffers
+                .entry("peer-1".into())
+                .or_insert_with(|| ReplayBuffer::new(100));
+            let _ = buf.push(Bytes::from("msg-a"), vec!["Alpha".into()]);
+            let _ = buf.push(Bytes::from("msg-b"), vec!["Beta".into()]);
+        }
+
+        let drain = FederationManager::create_v1_replay_drain(&manager.replay_buffers);
+
+        // First drain returns all messages
+        let messages = drain("peer-1");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].payload, Bytes::from("msg-a"));
+        assert_eq!(messages[1].payload, Bytes::from("msg-b"));
+
+        // Second drain returns empty (buffer was cleared)
+        let messages = drain("peer-1");
+        assert!(messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_clears_all_replay_buffers() {
+        let mut config = test_config();
+        config.replay_buffer_capacity = 100;
+        let mut manager = FederationManager::new(config);
+
+        // Manually populate replay buffers
+        {
+            let mut buffers = manager.replay_buffers.lock().expect("lock");
+            let buf1 = buffers
+                .entry("peer-1".into())
+                .or_insert_with(|| ReplayBuffer::new(100));
+            let _ = buf1.push(Bytes::from("msg1"), vec![]);
+
+            let buf2 = buffers
+                .entry("peer-2".into())
+                .or_insert_with(|| ReplayBuffer::new(100));
+            let _ = buf2.push(Bytes::from("msg2"), vec![]);
+        }
+
+        manager.running = true; // simulate running state
+        manager.shutdown().await;
+
+        let buffers = manager.replay_buffers.lock().expect("lock");
+        assert!(buffers.is_empty());
     }
 }

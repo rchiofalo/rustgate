@@ -133,6 +133,10 @@ pub struct FederationConfig {
     /// Seconds to wait after a circuit breaker trips before allowing a probe
     /// message (half-open state). Default: 60.
     pub circuit_breaker_timeout: Duration,
+    /// Maximum messages retained per peer in the replay buffer.
+    /// On reconnection, buffered messages are replayed before resuming live stream.
+    /// Set to 0 to disable replay buffering.
+    pub replay_buffer_capacity: usize,
 
     // --- High-Availability (HA) ---
     /// Pod identifier for HA mode. When set together with `ha_nats_url`,
@@ -172,6 +176,7 @@ impl Default for FederationConfig {
             jwt_expiry_secs: 3600,
             circuit_breaker_threshold: 5,
             circuit_breaker_timeout: Duration::from_secs(60),
+            replay_buffer_capacity: crate::replay_buffer::DEFAULT_REPLAY_CAPACITY,
             pod_id: None,
             ha_nats_url: None,
         }

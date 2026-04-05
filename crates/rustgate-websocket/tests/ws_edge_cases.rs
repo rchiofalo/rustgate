@@ -52,6 +52,9 @@ impl EdgeTestServer {
             throttle_config: None,
             replay_filter: None,
             circuit_breaker_threshold: 0,
+            ws_max_frames_per_sec: 0,
+            ws_max_bytes_per_sec: 0,
+            ws_max_violations: 0,
             shutdown: Arc::clone(&shutdown),
         };
 
