@@ -140,10 +140,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
 
-      - uses: taiki-e/install-action@735e5933943122c5ac182670a935f54a949265c1 # v2.52.4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          tool: cargo-nextest
+      - name: Install cargo-nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Run tests
         run: cargo nextest run --locked --workspace --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket,otel
@@ -223,10 +221,8 @@ jobs:
         if: contains(matrix.target, 'aarch64')
         run: sudo apt-get install -y gcc-aarch64-linux-gnu
 
-      - uses: taiki-e/install-action@735e5933943122c5ac182670a935f54a949265c1 # v2.52.4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          tool: cargo-nextest
+      - name: Install cargo-nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Clippy (FIPS)
         if: matrix.run_tests
