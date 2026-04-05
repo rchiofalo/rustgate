@@ -10,8 +10,9 @@
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use parking_lot::Mutex;
 
 /// Default replay window duration in seconds.
 const DEFAULT_WINDOW_SECS: u64 = 300;
@@ -81,10 +82,7 @@ impl ReplayFilter {
             None => return false,
         };
 
-        let Ok(mut guard) = self.inner.lock() else {
-            // If the mutex is poisoned, fail open (don't drop messages).
-            return false;
-        };
+        let mut guard = self.inner.lock();
 
         let now = Instant::now();
 
@@ -110,7 +108,7 @@ impl ReplayFilter {
 
     /// Number of entries currently tracked.
     pub fn len(&self) -> usize {
-        self.inner.lock().map(|g| g.seen.len()).unwrap_or(0)
+        self.inner.lock().seen.len()
     }
 
     /// Whether the filter is empty.
