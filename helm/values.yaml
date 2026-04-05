@@ -12,6 +12,16 @@ image:
 
 imagePullSecrets: []
 
+serviceAccount:
+  # Create a ServiceAccount for the rustgate pods.
+  create: false
+  # Name override; defaults to the fullname template.
+  name: ""
+  # Annotations to add (e.g., for IRSA / Workload Identity).
+  annotations: {}
+  # Mount the service account token into pods.
+  automountToken: false
+
 service:
   # Use LoadBalancer for external TCP access, ClusterIP for internal-only.
   type: ClusterIP

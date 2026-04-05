@@ -16,7 +16,12 @@ spec:
       labels:
         {{- include "rustgate.selectorLabels" . | nindent 8 }}
     spec:
+      {{- if .Values.serviceAccount.create }}
+      serviceAccountName: {{ .Values.serviceAccount.name | default (include "rustgate.fullname" .) }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountToken | default false }}
+      {{- else }}
       automountServiceAccountToken: false
+      {{- end }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:

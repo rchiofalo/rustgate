@@ -10,6 +10,11 @@ services:
       - "127.0.0.1:8222:8222"
     volumes:
       - nats-data:/data
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '1.0'
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
       interval: 2s
