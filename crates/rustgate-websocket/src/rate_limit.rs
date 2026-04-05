@@ -3,7 +3,7 @@
 //! Uses a sliding window approach: tracks consumption over the last second
 //! and rejects frames that would exceed the configured limits.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Per-connection rate limiter for WebSocket frames and bytes.
 ///
@@ -77,10 +77,30 @@ impl WsRateLimiter {
         self.max_violations > 0 && self.violations >= self.max_violations
     }
 
+    /// Current frame count in the active window.
+    pub fn frame_count(&self) -> u32 {
+        self.frame_count
+    }
+
+    /// Current byte count in the active window.
+    pub fn byte_count(&self) -> u64 {
+        self.byte_count
+    }
+
+    /// Configured maximum frames per second.
+    pub fn max_frames_per_sec(&self) -> u32 {
+        self.max_frames_per_sec
+    }
+
+    /// Configured maximum bytes per second.
+    pub fn max_bytes_per_sec(&self) -> u64 {
+        self.max_bytes_per_sec
+    }
+
     /// Reset the window if a second has elapsed.
     fn maybe_reset_window(&mut self) {
         let elapsed = self.window_start.elapsed();
-        if elapsed.as_secs() >= 1 {
+        if elapsed >= Duration::from_secs(1) {
             self.window_start = Instant::now();
             self.frame_count = 0;
             self.byte_count = 0;

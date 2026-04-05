@@ -249,10 +249,20 @@ async fn ws_read_loop(
             && let Err(exceeded) = limiter.check(payload.len())
         {
             if exceeded.frame_exceeded {
-                warn!(cn = %identity.cn, "WebSocket frame dropped: frame rate exceeded");
+                warn!(
+                    cn = %identity.cn,
+                    frames = limiter.frame_count(),
+                    limit = limiter.max_frames_per_sec(),
+                    "WebSocket frame dropped: frame rate exceeded",
+                );
             }
             if exceeded.byte_exceeded {
-                warn!(cn = %identity.cn, "WebSocket frame dropped: byte rate exceeded");
+                warn!(
+                    cn = %identity.cn,
+                    bytes = limiter.byte_count(),
+                    limit = limiter.max_bytes_per_sec(),
+                    "WebSocket frame dropped: byte rate exceeded",
+                );
             }
             if limiter.should_disconnect() {
                 return Err("disconnected: sustained rate limit violations".into());
