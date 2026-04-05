@@ -44,6 +44,9 @@ pub struct WsServerConfig {
     pub fed_forward: Option<OnFederationForward>,
     pub throttle_config: Option<ThrottleConfig>,
     pub replay_filter: Option<Arc<ReplayFilter>>,
+    /// Consecutive send failures before the circuit breaker disconnects a session.
+    /// Set to 0 to disable.
+    pub circuit_breaker_threshold: u32,
     pub shutdown: Arc<Notify>,
 }
 
@@ -76,6 +79,7 @@ impl WebSocketServer {
             fed_forward,
             throttle_config,
             replay_filter,
+            circuit_breaker_threshold,
             shutdown,
         } = config;
 
@@ -101,8 +105,9 @@ impl WebSocketServer {
                             let tc = throttle_config;
                             let rf = replay_filter.clone();
 
+                            let cb = circuit_breaker_threshold;
                             drop(tokio::spawn(handle_ws_session(
-                                session, router, session_codec, nats, fed, tc, rf, permit,
+                                session, router, session_codec, nats, fed, tc, rf, cb, permit,
                             )));
                         }
                         Err(e) => {
@@ -128,6 +133,7 @@ async fn handle_ws_session(
     fed_forward: Option<OnFederationForward>,
     throttle_config: Option<ThrottleConfig>,
     replay_filter: Option<Arc<ReplayFilter>>,
+    circuit_breaker_threshold: u32,
     _permit: OwnedSemaphorePermit,
 ) {
     let identity = session.identity_arc();
@@ -142,7 +148,11 @@ async fn handle_ws_session(
     );
 
     let (tx, mut rx) = mpsc::channel::<Arc<RoutableMessage>>(CHANNEL_CAPACITY);
-    let handle = SessionHandle::new(Arc::clone(&identity), tx);
+    let handle = if circuit_breaker_threshold > 0 {
+        SessionHandle::with_drop_threshold(Arc::clone(&identity), tx, circuit_breaker_threshold)
+    } else {
+        SessionHandle::with_drop_threshold(Arc::clone(&identity), tx, u32::MAX)
+    };
     let session_id = handle.id;
 
     router.register(handle.clone()).await;

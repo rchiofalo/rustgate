@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Session circuit breaker** — disconnects slow sessions after consecutive send failures exceed a configurable threshold (`--circuit-breaker-threshold`, default 10, env `RUSTGATE_CIRCUIT_BREAKER_THRESHOLD`). Prevents a single backpressured client from degrading group routing for other sessions. Set to 0 to disable. (#420)
+
 ## [0.6.0] - 2026-04-04
 
 ### Changed

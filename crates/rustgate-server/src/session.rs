@@ -45,6 +45,7 @@ pub(crate) struct SessionDeps<P: NatsPublish> {
     pub(crate) throttle_config: Option<ThrottleConfig>,
     pub(crate) archiver: Option<Arc<archive::CotArchiver>>,
     pub(crate) replay_filter: Option<Arc<ReplayFilter>>,
+    pub(crate) circuit_breaker_threshold: u32,
 }
 
 /// Runtime context for a connected session's read/write loops.
@@ -93,7 +94,15 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
     metrics::sessions_active().inc();
 
     let (tx, rx) = mpsc::channel::<Arc<RoutableMessage>>(64);
-    let handle = SessionHandle::new(Arc::clone(&identity), tx);
+    let handle = if deps.circuit_breaker_threshold > 0 {
+        SessionHandle::with_drop_threshold(
+            Arc::clone(&identity),
+            tx,
+            deps.circuit_breaker_threshold,
+        )
+    } else {
+        SessionHandle::with_drop_threshold(Arc::clone(&identity), tx, u32::MAX)
+    };
     let session_id = handle.id;
     deps.router.register(handle.clone()).await;
     deps.router.replay_positions(&handle).await;
@@ -388,6 +397,7 @@ pub(crate) struct PlaintextTcpConfig<P: NatsPublish> {
     pub(crate) throttle_config: Option<ThrottleConfig>,
     pub(crate) archiver: Option<Arc<archive::CotArchiver>>,
     pub(crate) replay_filter: Option<Arc<ReplayFilter>>,
+    pub(crate) circuit_breaker_threshold: u32,
     pub(crate) shutdown: Arc<tokio::sync::Notify>,
 }
 
@@ -409,6 +419,7 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
         throttle_config,
         archiver,
         replay_filter,
+        circuit_breaker_threshold,
         shutdown,
     } = config;
 
@@ -432,7 +443,11 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
                         tracing::info!(cn = %cn, peer = %peer_addr, "plaintext TCP connected");
 
                         let (tx, rx) = mpsc::channel::<Arc<RoutableMessage>>(64);
-                        let handle = SessionHandle::new(Arc::clone(&identity), tx);
+                        let handle = if circuit_breaker_threshold > 0 {
+                            SessionHandle::with_drop_threshold(Arc::clone(&identity), tx, circuit_breaker_threshold)
+                        } else {
+                            SessionHandle::with_drop_threshold(Arc::clone(&identity), tx, u32::MAX)
+                        };
                         let session_id = handle.id;
                         router.register(handle.clone()).await;
                         router.replay_positions(&handle).await;
