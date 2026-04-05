@@ -1,8 +1,9 @@
 //! NATS adapter for rustgate.
 //!
-//! Bridges local TAK sessions to a NATS event bus, enabling stateless
-//! horizontal scaling. Publishes inbound CoT to NATS subjects and
-//! subscribes for outbound delivery to connected clients.
+//! Bridges local sessions to a NATS event bus, enabling stateless
+//! horizontal scaling. Publishes inbound messages to NATS subjects and
+//! subscribes via JetStream pull consumers for outbound delivery to
+//! connected clients with real backpressure.
 
 pub mod config;
 pub mod jetstream;
@@ -43,11 +44,23 @@ impl NatsAdapter {
 
         let options = apply_tls_options(options, &config.tls);
 
+        let options = options
+            .subscription_capacity(config.subscription_capacity)
+            .event_callback(|event| async move {
+                if let async_nats::Event::SlowConsumer(sid) = event {
+                    tracing::warn!(
+                        subscription_id = sid,
+                        "NATS slow consumer detected: subscription buffer is full, messages may be dropped"
+                    );
+                }
+            });
+
         let client = options.connect(&config.url).await?;
 
         tracing::info!(
             url = %config.url,
             instance_id = %config.instance_id,
+            subscription_capacity = config.subscription_capacity,
             tls_required = config.tls.required,
             tls_client_auth = config.tls.has_client_auth(),
             "connected to NATS"

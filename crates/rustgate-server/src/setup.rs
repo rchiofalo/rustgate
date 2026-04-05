@@ -242,6 +242,9 @@ pub(crate) async fn connect_nats(
             ca_cert: cli.nats_tls_ca.clone(),
             required: cli.nats_tls_required,
         },
+        subscription_capacity: cli.nats_subscription_capacity,
+        live_stream: cli.nats_live_stream.clone(),
+        max_ack_pending: cli.nats_max_ack_pending,
         checkpoint_path: cli
             .nats_checkpoint_path
             .as_ref()
