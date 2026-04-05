@@ -12,6 +12,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
@@ -296,18 +298,18 @@ impl std::error::Error for JwtError {}
 /// Encode claims into a signed JWT string.
 fn encode(secret: &[u8], claims: &FederationClaims) -> Result<String, JwtError> {
     let header = r#"{"alg":"HS256","typ":"JWT"}"#;
-    let header_b64 = base64url_encode(header.as_bytes());
+    let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
 
     let payload_json =
         serde_json::to_string(claims).map_err(|e| JwtError::SerializationError(e.to_string()))?;
-    let payload_b64 = base64url_encode(payload_json.as_bytes());
+    let payload_b64 = URL_SAFE_NO_PAD.encode(payload_json.as_bytes());
 
     let signing_input = format!("{header_b64}.{payload_b64}");
 
     let mut mac = HmacSha256::new_from_slice(secret).map_err(|_| JwtError::InvalidSignature)?;
     mac.update(signing_input.as_bytes());
     let signature = mac.finalize().into_bytes();
-    let signature_b64 = base64url_encode(&signature);
+    let signature_b64 = URL_SAFE_NO_PAD.encode(signature);
 
     Ok(format!("{signing_input}.{signature_b64}"))
 }
@@ -320,7 +322,9 @@ fn decode(secret: &[u8], token: &str) -> Result<FederationClaims, JwtError> {
     }
 
     let signing_input = format!("{}.{}", parts[0], parts[1]);
-    let actual_sig = base64url_decode(parts[2]).map_err(|_| JwtError::Malformed)?;
+    let actual_sig = URL_SAFE_NO_PAD
+        .decode(parts[2])
+        .map_err(|_| JwtError::Malformed)?;
 
     let mut mac = HmacSha256::new_from_slice(secret).map_err(|_| JwtError::InvalidSignature)?;
     mac.update(signing_input.as_bytes());
@@ -328,79 +332,13 @@ fn decode(secret: &[u8], token: &str) -> Result<FederationClaims, JwtError> {
     mac.verify_slice(&actual_sig)
         .map_err(|_| JwtError::InvalidSignature)?;
 
-    let payload_bytes = base64url_decode(parts[1]).map_err(|_| JwtError::Malformed)?;
+    let payload_bytes = URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .map_err(|_| JwtError::Malformed)?;
     let claims: FederationClaims = serde_json::from_slice(&payload_bytes)
         .map_err(|e| JwtError::SerializationError(e.to_string()))?;
 
     Ok(claims)
-}
-
-// ── Base64url encoding/decoding ─────────────────────────────────────
-
-const B64URL_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-
-fn base64url_encode(data: &[u8]) -> String {
-    let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
-
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-
-        result.push(B64URL_ALPHABET[((triple >> 18) & 0x3F) as usize] as char);
-        result.push(B64URL_ALPHABET[((triple >> 12) & 0x3F) as usize] as char);
-        if chunk.len() > 1 {
-            result.push(B64URL_ALPHABET[((triple >> 6) & 0x3F) as usize] as char);
-        }
-        if chunk.len() > 2 {
-            result.push(B64URL_ALPHABET[(triple & 0x3F) as usize] as char);
-        }
-    }
-
-    result
-}
-
-fn base64url_decode(input: &str) -> Result<Vec<u8>, ()> {
-    let mut buf = Vec::with_capacity(input.len() * 3 / 4);
-    let bytes = input.as_bytes();
-    let chunks = bytes.chunks(4);
-
-    for chunk in chunks {
-        let mut sextet = [0u32; 4];
-        let mut pad = 0;
-
-        for (i, &b) in chunk.iter().enumerate() {
-            sextet[i] = b64url_char_to_val(b)?;
-        }
-        for s in sextet.iter_mut().skip(chunk.len()) {
-            *s = 0;
-            pad += 1;
-        }
-
-        let triple = (sextet[0] << 18) | (sextet[1] << 12) | (sextet[2] << 6) | sextet[3];
-
-        buf.push(((triple >> 16) & 0xFF) as u8);
-        if pad < 2 {
-            buf.push(((triple >> 8) & 0xFF) as u8);
-        }
-        if pad < 1 {
-            buf.push((triple & 0xFF) as u8);
-        }
-    }
-
-    Ok(buf)
-}
-
-fn b64url_char_to_val(c: u8) -> Result<u32, ()> {
-    match c {
-        b'A'..=b'Z' => Ok((c - b'A') as u32),
-        b'a'..=b'z' => Ok((c - b'a' + 26) as u32),
-        b'0'..=b'9' => Ok((c - b'0' + 52) as u32),
-        b'-' => Ok(62),
-        b'_' => Ok(63),
-        _ => Err(()),
-    }
 }
 
 /// Generate a unique token identifier from peer ID and timestamp.
@@ -613,8 +551,8 @@ mod tests {
     #[test]
     fn base64url_roundtrip() {
         let data = b"Hello, Federation JWT!";
-        let encoded = base64url_encode(data);
-        let decoded = base64url_decode(&encoded).expect("decode");
+        let encoded = URL_SAFE_NO_PAD.encode(data);
+        let decoded = URL_SAFE_NO_PAD.decode(&encoded).expect("decode");
         assert_eq!(decoded, data);
     }
 
