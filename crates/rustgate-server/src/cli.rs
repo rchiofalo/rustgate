@@ -253,6 +253,16 @@ pub(crate) struct Cli {
     )]
     pub(crate) federation_circuit_breaker_timeout: u64,
 
+    /// Maximum messages retained per federation peer for reconnection replay.
+    /// On reconnect, buffered messages are sent before resuming live delivery.
+    /// Set to 0 to disable.
+    #[arg(
+        long,
+        default_value_t = 1000,
+        env = "RUSTGATE_FEDERATION_REPLAY_BUFFER_SIZE"
+    )]
+    pub(crate) federation_replay_buffer_size: usize,
+
     /// NATS URL for federation HA coordination (enables distributed peer ownership).
     /// When set, only one pod manages each outbound peer in a multi-pod deployment.
     /// Requires --features federation-ha.
