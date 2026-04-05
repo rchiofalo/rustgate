@@ -2043,6 +2043,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rcgen",
+ "ring",
  "rustgate-core",
  "rustgate-test-utils",
  "rustls",

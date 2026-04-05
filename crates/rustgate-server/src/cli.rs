@@ -166,6 +166,19 @@ pub(crate) struct Cli {
     #[arg(long, env = "RUSTGATE_DATA_PACKAGE_DIR")]
     pub(crate) data_package_dir: Option<String>,
 
+    /// Path to PEM-encoded CA certificate for verifying data package signatures.
+    /// When set, uploaded packages with a signature are verified against this CA.
+    #[arg(long, env = "RUSTGATE_PACKAGE_SIGNATURE_CA")]
+    pub(crate) package_signature_ca: Option<String>,
+
+    /// Reject unsigned data package uploads. Requires --package-signature-ca.
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "RUSTGATE_PACKAGE_STRICT_SIGNATURES"
+    )]
+    pub(crate) package_strict_signatures: bool,
+
     /// Bind address for the Prometheus metrics HTTP server (e.g. 0.0.0.0:9090).
     /// Requires --features metrics.
     #[arg(long, env = "RUSTGATE_METRICS_BIND", value_parser = parse_socket_addr)]
@@ -553,6 +566,8 @@ mod tests {
             "RUSTGATE_ENROLLMENT_PASSWORD",
             "RUSTGATE_CA_ORG",
             "RUSTGATE_DATA_PACKAGE_DIR",
+            "RUSTGATE_PACKAGE_SIGNATURE_CA",
+            "RUSTGATE_PACKAGE_STRICT_SIGNATURES",
             "RUSTGATE_METRICS_BIND",
             "RUSTGATE_MAX_CONNECTIONS",
             "RUSTGATE_MAX_HANDSHAKES",

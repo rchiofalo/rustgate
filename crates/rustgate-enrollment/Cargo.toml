@@ -33,6 +33,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
 subtle = { workspace = true }
+ring = { workspace = true }
 
 [dev-dependencies]
 rustgate-test-utils = { workspace = true }
