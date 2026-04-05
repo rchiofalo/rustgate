@@ -37,6 +37,7 @@ futures = { workspace = true }
 bytes = { workspace = true }
 criterion = { workspace = true }
 tempfile = { workspace = true }
+proptest = { workspace = true }
 
 [[bench]]
 name = "codec"

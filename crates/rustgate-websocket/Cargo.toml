@@ -29,3 +29,4 @@ tokio-tungstenite = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
+futures = { workspace = true }
