@@ -15,7 +15,7 @@ rustgate-core = { workspace = true }
 bytes = { workspace = true }
 quick-xml = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["io-util"] }
+tokio = { workspace = true, features = ["io-util", "time"] }
 tokio-util = { workspace = true }
 prost = { workspace = true }
 
