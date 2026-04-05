@@ -1,0 +1,1 @@
+<event version="2.0" uid="MSG-1" type="b-t-f" how="h-g-i-g-o" time="2024-01-01T00:00:00Z" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><point lat="0" lon="0" hae="0" ce="9999999" le="9999999"/><detail><__chat chatroom="All Chat Rooms" senderCallsign="User1"><chatgrp uid0="User1" uid1="All Chat Rooms"/></__chat><remarks>Hello world</remarks></detail></event>
