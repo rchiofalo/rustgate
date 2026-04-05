@@ -301,6 +301,19 @@ impl WsListener {
     }
 }
 
+/// Extract client identity from TLS peer certificates.
+fn extract_client_identity(tls_stream: &TlsStream) -> Result<Identity> {
+    let (_, server_conn) = tls_stream.get_ref();
+
+    let certs = server_conn
+        .peer_certificates()
+        .ok_or(TransportError::NoCertificate)?;
+
+    let client_cert = certs.first().ok_or(TransportError::EmptyCertChain)?;
+
+    extract_identity(client_cert)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::panic, clippy::unwrap_used)]
@@ -432,17 +445,4 @@ mod tests {
             "stale IP should have been swept"
         );
     }
-}
-
-/// Extract client identity from TLS peer certificates.
-fn extract_client_identity(tls_stream: &TlsStream) -> Result<Identity> {
-    let (_, server_conn) = tls_stream.get_ref();
-
-    let certs = server_conn
-        .peer_certificates()
-        .ok_or(TransportError::NoCertificate)?;
-
-    let client_cert = certs.first().ok_or(TransportError::EmptyCertChain)?;
-
-    extract_identity(client_cert)
 }
