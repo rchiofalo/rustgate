@@ -2138,6 +2138,7 @@ dependencies = [
  "bytes",
  "criterion",
  "futures",
+ "parking_lot",
  "rustgate-core",
  "rustgate-cot",
  "rustgate-proto",
