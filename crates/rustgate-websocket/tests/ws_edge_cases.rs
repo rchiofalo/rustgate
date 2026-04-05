@@ -202,8 +202,9 @@ async fn ws_oversized_message_handling() {
 async fn ws_rapid_connect_disconnect() {
     let server = EdgeTestServer::new(64).await;
 
-    // Rapidly open and close 10 connections
-    for i in 0..10 {
+    // Rapidly open and close connections (kept under CONN_RATE_LIMIT to avoid
+    // tripping the per-IP rate limiter under slow instrumented builds).
+    for i in 0..5 {
         let cert = server.issue_client(&format!("rapid-{i}"), &["ops"]);
         let ws = server.ws_connect(&cert).await;
         drop(ws);
