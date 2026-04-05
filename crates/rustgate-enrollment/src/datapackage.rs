@@ -38,9 +38,7 @@ const MAX_UPLOAD_SIZE: usize = 50 * 1024 * 1024;
 impl DataPackageStore {
     /// Create a new store rooted at `base_dir`. Creates the directory if it doesn't exist.
     pub async fn new(base_dir: PathBuf) -> Result<Self, EnrollmentError> {
-        fs::create_dir_all(&base_dir)
-            .await
-            .map_err(EnrollmentError::Io)?;
+        fs::create_dir_all(&base_dir).await?;
         Ok(Self { base_dir })
     }
 
@@ -78,15 +76,10 @@ impl DataPackageStore {
             upload_time: now,
         };
 
-        fs::write(&pkg_path, data)
-            .await
-            .map_err(EnrollmentError::Io)?;
+        fs::write(&pkg_path, data).await?;
 
-        let meta_json =
-            serde_json::to_vec(&meta).map_err(|e| EnrollmentError::Config(e.to_string()))?;
-        fs::write(&meta_path, &meta_json)
-            .await
-            .map_err(EnrollmentError::Io)?;
+        let meta_json = serde_json::to_vec(&meta)?;
+        fs::write(&meta_path, &meta_json).await?;
 
         tracing::info!(hash = %hash, name = %name, size = data.len(), "data package stored");
 
@@ -100,9 +93,7 @@ impl DataPackageStore {
         }
 
         let meta = self.read_meta(hash).await?;
-        let data = fs::read(self.package_path(hash))
-            .await
-            .map_err(EnrollmentError::Io)?;
+        let data = fs::read(self.package_path(hash)).await?;
 
         Ok((meta, data))
     }
@@ -112,11 +103,9 @@ impl DataPackageStore {
         let keyword_lower = keyword.to_lowercase();
         let mut results = Vec::new();
 
-        let mut entries = fs::read_dir(&self.base_dir)
-            .await
-            .map_err(EnrollmentError::Io)?;
+        let mut entries = fs::read_dir(&self.base_dir).await?;
 
-        while let Some(entry) = entries.next_entry().await.map_err(EnrollmentError::Io)? {
+        while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
@@ -141,10 +130,8 @@ impl DataPackageStore {
     }
 
     async fn read_meta(&self, hash: &str) -> Result<PackageMeta, EnrollmentError> {
-        let data = fs::read(self.meta_path(hash))
-            .await
-            .map_err(EnrollmentError::Io)?;
-        serde_json::from_slice(&data).map_err(|e| EnrollmentError::Config(e.to_string()))
+        let data = fs::read(self.meta_path(hash)).await?;
+        Ok(serde_json::from_slice(&data)?)
     }
 
     fn package_path(&self, hash: &str) -> PathBuf {
