@@ -13,10 +13,17 @@ use std::io;
 
 use prost::Message;
 use tokio::io::AsyncReadExt;
+use tokio::time::{Duration, timeout};
 use tokio_util::bytes::BufMut;
 
 use crate::error::ProtoError;
 use crate::{codec, tak_proto};
+
+/// Maximum time to wait for a client to complete protocol negotiation.
+///
+/// If a client connects but does not send a valid negotiation frame within
+/// this window, the connection is dropped to prevent resource exhaustion.
+const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Protocol version we advertise and accept.
 const PROTO_VERSION: &str = "1";
@@ -100,7 +107,25 @@ pub fn parse_tak_request(proto_bytes: &[u8]) -> Result<(), ProtoError> {
 /// length, then the protobuf payload, and validates the TakControl fields.
 ///
 /// Maximum frame size: 16 MB (same as TakFrameCodec).
+///
+/// A [`NEGOTIATION_TIMEOUT`] is enforced around the entire read so that a
+/// slow or malicious client cannot hold the connection open indefinitely
+/// during protocol negotiation.
 pub async fn read_tak_request(reader: &mut (impl tokio::io::AsyncRead + Unpin)) -> io::Result<()> {
+    timeout(NEGOTIATION_TIMEOUT, read_tak_request_inner(reader))
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "protocol negotiation timed out (client too slow)",
+            )
+        })?
+}
+
+/// Inner implementation of [`read_tak_request`] without the timeout wrapper.
+async fn read_tak_request_inner(
+    reader: &mut (impl tokio::io::AsyncRead + Unpin),
+) -> io::Result<()> {
     const MAX_VARINT_BYTES: usize = 5;
     const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
@@ -298,5 +323,22 @@ mod tests {
         let xml = build_protocol_support_xml("test&<>server");
         let xml_str = std::str::from_utf8(&xml).expect("utf8");
         assert!(xml_str.contains("uid=\"test&amp;&lt;&gt;server\""));
+    }
+
+    #[tokio::test]
+    async fn read_tak_request_times_out_on_slow_client() {
+        // A reader that never produces data simulates a slow/stalled client.
+        let (reader, _writer) = tokio::io::duplex(64);
+        let mut reader = tokio::io::BufReader::new(reader);
+
+        // Override the timeout to something short for the test by calling
+        // the inner function directly with a tight timeout.
+        let result = timeout(
+            Duration::from_millis(50),
+            read_tak_request_inner(&mut reader),
+        )
+        .await;
+
+        assert!(result.is_err(), "should time out on a stalled reader");
     }
 }

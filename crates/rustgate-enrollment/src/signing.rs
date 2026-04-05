@@ -95,29 +95,38 @@ impl CsrSigner {
     /// - 365-day validity (starting 5 minutes in the past for clock skew)
     /// - KeyUsage: DigitalSignature
     /// - ExtKeyUsage: ClientAuth
+    ///
+    /// # Security: allowlist approach
+    ///
+    /// Rather than starting from the CSR's parameters and stripping known-bad
+    /// fields (denylist), we construct a fresh `CertificateParams` with only
+    /// server-controlled values and extract only the public key from the CSR.
+    /// This ensures that any new fields added to `CertificateParams` in future
+    /// rcgen versions default to safe values instead of inheriting attacker-
+    /// controlled data from the CSR.
     pub fn sign_csr(&self, csr_pem: &str, username: &str) -> Result<Vec<u8>, EnrollmentError> {
         let normalized = ensure_pem_headers(csr_pem);
 
         let csr = CertificateSigningRequestParams::from_pem(&normalized)
             .map_err(|e| EnrollmentError::Csr(format!("failed to parse CSR: {e}")))?;
 
-        // Build subject DN from the authenticated identity — never trust
-        // the CSR's subject fields. The CSR only contributes the public key.
+        // Build certificate params from scratch (allowlist approach).
+        // Only the public key is extracted from the CSR — all other fields
+        // are server-controlled to prevent extension/field injection.
         let mut dn = rcgen::DistinguishedName::new();
         dn.push(rcgen::DnType::CommonName, username);
         dn.push(rcgen::DnType::OrganizationName, &self.organization);
 
-        let mut params = csr.params;
+        let mut params = rcgen::CertificateParams::default();
         params.distinguished_name = dn;
-        // Strip any SANs or custom extensions from the CSR — only the
-        // server-controlled DN, validity, key usage, and EKU should survive.
-        params.subject_alt_names = Vec::new();
-        params.custom_extensions = Vec::new();
         params.not_before = time::OffsetDateTime::now_utc() - time::Duration::minutes(5);
         params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(365);
         params.is_ca = IsCa::NoCa;
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        // Explicitly empty — no SANs, no custom extensions, no name constraints.
+        params.subject_alt_names = Vec::new();
+        params.custom_extensions = Vec::new();
 
         let signed = params
             .signed_by(&csr.public_key, &self.issuer)
