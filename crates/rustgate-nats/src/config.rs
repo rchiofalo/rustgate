@@ -117,6 +117,11 @@ pub struct NatsConfig {
     /// Controls concurrency: the server will not deliver more than this
     /// many messages until earlier ones are acknowledged.
     pub max_ack_pending: i64,
+
+    /// Optional path for JetStream replay checkpoint file.
+    /// When set, stores the last processed sequence number so
+    /// subsequent restarts resume from the checkpoint.
+    pub checkpoint_path: Option<PathBuf>,
 }
 
 impl Default for NatsConfig {
@@ -135,6 +140,7 @@ impl Default for NatsConfig {
             subscription_capacity: 1024,
             live_stream: "RUSTGATE_LIVE".to_string(),
             max_ack_pending: 1000,
+            checkpoint_path: None,
         }
     }
 }

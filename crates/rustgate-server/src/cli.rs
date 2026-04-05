@@ -134,6 +134,12 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 1000, env = "RUSTGATE_NATS_MAX_ACK_PENDING")]
     pub(crate) nats_max_ack_pending: i64,
 
+    /// Path to JetStream replay checkpoint file. When set, the server
+    /// persists the last replayed sequence number and resumes from it
+    /// on restart instead of replaying the entire history stream.
+    #[arg(long, env = "RUSTGATE_NATS_CHECKPOINT_PATH")]
+    pub(crate) nats_checkpoint_path: Option<String>,
+
     /// Bind address for the enrollment HTTPS server (e.g. 0.0.0.0:8446).
     /// Requires --features enrollment.
     #[arg(long, env = "RUSTGATE_ENROLLMENT_BIND", value_parser = parse_socket_addr)]
@@ -540,6 +546,7 @@ mod tests {
             "RUSTGATE_NATS_SUBSCRIPTION_CAPACITY",
             "RUSTGATE_NATS_LIVE_STREAM",
             "RUSTGATE_NATS_MAX_ACK_PENDING",
+            "RUSTGATE_NATS_CHECKPOINT_PATH",
             "RUSTGATE_ENROLLMENT_BIND",
             "RUSTGATE_CA_KEY",
             "RUSTGATE_ENROLLMENT_USER",
