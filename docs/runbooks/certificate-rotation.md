@@ -59,7 +59,7 @@ If `--cert-reload-interval` is configured (e.g., `3600` for hourly checks):
    ```
 
 3. Wait for the next reload poll cycle. Check logs for:
-   - `certificate reloaded successfully` — rotation succeeded
+   - `server certificate rotated` — rotation succeeded
    - `certificate reload failed` — check that cert and key match
 
 4. No restart required. Existing connections continue with the old certificate; new connections use the new one.

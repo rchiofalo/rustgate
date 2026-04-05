@@ -131,8 +131,8 @@ When `--nats-checkpoint-path` is configured, the server persists the last proces
 # Find the current stream last sequence
 kubectl exec deploy/nats -- nats stream info RUSTGATE --json | jq '.state.last_seq'
 
-# Write that sequence to the checkpoint file
-echo '{"last_seq": 12345}' > /data/nats-checkpoint.json
+# Write that sequence number to the checkpoint file (plain text, not JSON)
+echo '12345' > /data/nats-checkpoint
 ```
 
 ### JetStream Stream Loss

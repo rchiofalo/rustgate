@@ -78,7 +78,7 @@ openssl crl -in crl.pem -text -noout | grep -A1 $(openssl x509 -in client.pem -n
 
 ### CN Mismatch in Federation
 
-**Symptom:** Federation peer connections fail with TLS errors. Logs show `federation peer handshake failed`.
+**Symptom:** Federation peer connections fail with TLS errors. Logs show `V1 federation peer session error`.
 
 **Likely Cause:** The peer's certificate CN does not match the expected value in `trust_cert_cn` in the peers JSON config.
 
@@ -101,7 +101,7 @@ cat peers.json | grep trust_cert_cn
 
 ### Wrong Peer Address
 
-**Symptom:** Logs show repeated `federation reconnect attempt` messages for a specific peer. The `rustgate_federation_errors_total` counter increases steadily.
+**Symptom:** Logs show repeated `connecting to V1 federation peer` messages for a specific peer. The `rustgate_federation_errors_total` counter increases steadily.
 
 **Likely Cause:** The peer address in `peers.json` is incorrect or the remote peer is not listening on that address.
 
@@ -529,10 +529,10 @@ When the `metrics` feature is enabled (`--metrics-bind`), Prometheus metrics are
 | `rustgate_connections_rejected_total` | counter | Clients rejected (limit reached) |
 | `rustgate_messages_routed_total` | counter | Messages successfully routed |
 | `rustgate_messages_replayed_total` | counter | Messages dropped by replay filter |
-| `federation_connections` | gauge | Active federation peer connections |
-| `federation_errors_total` | counter | Federation errors (connection, send) |
-| `federation_messages_in_total` | counter | Messages received from peers |
-| `federation_messages_out_total` | counter | Messages sent to peers |
+| `rustgate_federation_connections` | gauge | Active federation peer connections |
+| `rustgate_federation_errors_total` | counter | Federation errors (connection, send) |
+| `rustgate_federation_messages_in_total` | counter | Messages received from peers |
+| `rustgate_federation_messages_out_total` | counter | Messages sent to peers |
 | `rustgate_federation_circuit_breaker_trips_total` | counter | Circuit breaker activations |
 
 ### Health and Readiness Endpoints

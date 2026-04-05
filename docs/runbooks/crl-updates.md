@@ -1,5 +1,10 @@
 # Runbook: CRL Updates and Revocation Enforcement
 
+> **Important:** CRL files are loaded once at startup. There is no dynamic
+> reload mechanism — unlike server certificates (which support hot-reload via
+> `--cert-reload-interval`), all CRL updates require a process restart to
+> take effect.
+
 ## Symptoms
 
 - Warning logs about stale CRL: `CRL nextUpdate is in the past`
