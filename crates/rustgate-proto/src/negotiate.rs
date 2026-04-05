@@ -108,7 +108,7 @@ pub fn parse_tak_request(proto_bytes: &[u8]) -> Result<(), ProtoError> {
 ///
 /// Maximum frame size: 16 MB (same as TakFrameCodec).
 ///
-/// A [`NEGOTIATION_TIMEOUT`] is enforced around the entire read so that a
+/// A `NEGOTIATION_TIMEOUT` is enforced around the entire read so that a
 /// slow or malicious client cannot hold the connection open indefinitely
 /// during protocol negotiation.
 pub async fn read_tak_request(reader: &mut (impl tokio::io::AsyncRead + Unpin)) -> io::Result<()> {
