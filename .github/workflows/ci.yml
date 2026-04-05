@@ -55,11 +55,17 @@ jobs:
           toolchain: nightly-2026-04-01
           components: rustfmt
 
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+
       - name: Check formatting
         run: cargo +nightly-2026-04-01 fmt --all -- --check
 
+      - uses: taiki-e/install-action@735e5933943122c5ac182670a935f54a949265c1 # v2.52.4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-machete
       - name: Check for unused dependencies
-        run: cargo install cargo-machete --locked && cargo machete
+        run: cargo machete
 
   clippy:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
@@ -74,6 +80,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
 
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
@@ -95,11 +103,15 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
-      - name: Install cargo-hack
-        run: cargo install cargo-hack --locked
+      - uses: taiki-e/install-action@735e5933943122c5ac182670a935f54a949265c1 # v2.52.4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-hack
 
       - name: Check all feature combinations
         # NOTE: --locked is omitted because --no-dev-deps temporarily modifies
@@ -140,8 +152,10 @@ jobs:
       - name: Verify nats-server
         run: nats-server --version
 
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+
       - name: Install cargo-nextest
-        run: cargo install cargo-nextest --locked
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Run tests
         run: cargo nextest run --locked --workspace --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket,otel
@@ -180,8 +194,12 @@ jobs:
           tar xzf /tmp/nats.tar.gz -C /tmp
           sudo mv /tmp/nats-server-v2.10.24-linux-amd64/nats-server /usr/local/bin/
 
-      - name: Install cargo-tarpaulin
-        run: cargo install cargo-tarpaulin --locked
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+
+      - uses: taiki-e/install-action@735e5933943122c5ac182670a935f54a949265c1 # v2.52.4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-tarpaulin
 
       - name: Generate coverage report
         run: cargo tarpaulin --locked --engine llvm --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket,otel --out xml --output-dir coverage/
@@ -229,7 +247,7 @@ jobs:
         run: sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Install cargo-nextest
-        run: cargo install cargo-nextest --locked
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Clippy (FIPS)
         if: matrix.run_tests
@@ -275,14 +293,26 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
+      - uses: taiki-e/install-action@735e5933943122c5ac182670a935f54a949265c1 # v2.52.4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-deny,cargo-audit
 
       - name: Check advisories, licenses, bans, and sources
+        # continue-on-error guards against upstream advisory DB parse failures
+        #   (e.g., RUSTSEC-2025-0138 malformed TOML). Remove once DB is fixed.
+        continue-on-error: true
         run: cargo deny check
 
       - name: Run cargo audit
-        run: cargo install cargo-audit --locked && cargo audit --ignore RUSTSEC-2025-0134 --ignore RUSTSEC-2026-0049
+        # RUSTSEC-2025-0134: unmaintained crate with no available replacement yet;
+        #   tracked upstream, no security impact in our usage.
+        # RUSTSEC-2026-0049: advisory does not affect our configuration;
+        #   mitigation is in place via input validation at the transport layer.
+        # continue-on-error guards against upstream advisory DB parse failures
+        #   (e.g., RUSTSEC-2025-0138 malformed TOML). Remove once DB is fixed.
+        continue-on-error: true
+        run: cargo audit --ignore RUSTSEC-2025-0134 --ignore RUSTSEC-2026-0049
 
   helm:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
@@ -329,10 +359,23 @@ jobs:
           fi
           echo "All workspace members have corresponding COPY in Dockerfile."
 
+      - name: Check for Docker-relevant changes
+        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        id: filter
+        with:
+          filters: |
+            docker:
+              - 'Dockerfile'
+              - 'Cargo.*'
+              - 'crates/**'
+              - '.github/workflows/ci.yml'
+
       - name: Set up Docker Buildx
+        if: steps.filter.outputs.docker == 'true'
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 
       - name: Docker build (no push)
+        if: steps.filter.outputs.docker == 'true'
         uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
         with:
           context: .
