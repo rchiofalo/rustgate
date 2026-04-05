@@ -21,6 +21,8 @@ quick-xml = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+proptest = { workspace = true }
+bytes = { workspace = true }
 
 [[bench]]
 name = "parse"

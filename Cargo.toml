@@ -82,6 +82,7 @@ tikv-jemallocator = "0.6"
 tempfile = "3"
 criterion = { version = "0.8", features = ["html_reports"] }
 arbitrary = { version = "1", features = ["derive"] }
+proptest = "1"
 subtle = "2"
 zeroize = { version = "1", features = ["derive"] }
 
