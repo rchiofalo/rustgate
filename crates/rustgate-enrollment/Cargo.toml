@@ -32,6 +32,7 @@ time = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
+subtle = { workspace = true }
 
 [dev-dependencies]
 rustgate-test-utils = { workspace = true }

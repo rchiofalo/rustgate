@@ -1,6 +1,7 @@
 //! HTTP Basic Auth credential validation.
 
 use base64::Engine;
+use subtle::ConstantTimeEq;
 
 /// Enrollment credentials for HTTP Basic Auth.
 #[derive(Clone)]
@@ -37,29 +38,14 @@ impl Credentials {
 
         // Both comparisons always execute — no short-circuit — so an attacker
         // cannot distinguish "wrong username" from "wrong password" via timing.
-        let user_ok = constant_time_eq(user.as_bytes(), self.username.as_bytes());
-        let pass_ok = constant_time_eq(pass.as_bytes(), self.password.as_bytes());
-        if user_ok & pass_ok {
+        let user_ok = user.as_bytes().ct_eq(self.username.as_bytes());
+        let pass_ok = pass.as_bytes().ct_eq(self.password.as_bytes());
+        if (user_ok & pass_ok).into() {
             Some(&self.username)
         } else {
             None
         }
     }
-}
-
-/// Constant-time byte comparison to prevent timing side-channels on passwords.
-///
-/// Iterates over the caller-provided input (a) without early return,
-/// preventing attackers from learning the secret's length via timing.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    // Flag length mismatch without early return — an early return here
-    // would let an attacker determine the secret's length via timing.
-    let len_eq = a.len() == b.len();
-    let mut diff = 0u8;
-    for (i, &x) in a.iter().enumerate() {
-        diff |= x ^ b.get(i).copied().unwrap_or(0);
-    }
-    len_eq && diff == 0
 }
 
 #[cfg(test)]

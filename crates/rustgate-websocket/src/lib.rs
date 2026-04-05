@@ -170,7 +170,7 @@ impl WsListener {
                 Ok(id) => id,
                 Err(e) => {
                     warn!(peer_addr = %peer_addr, error = %e, "identity extraction failed");
-                    return Err(e);
+                    continue;
                 }
             };
 
