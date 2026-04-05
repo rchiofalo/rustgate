@@ -27,7 +27,7 @@ pub type OnEvent = Arc<dyn Fn(figpb::FederatedEvent, String) + Send + Sync>;
 /// Callback that drains the replay buffer on reconnection (V2).
 ///
 /// Returns deduped buffered messages and clears the buffer atomically.
-/// Arguments: (peer_id) -> Vec<BufferedMessage>
+/// Arguments: `(peer_id) -> Vec<BufferedMessage>`
 pub type V2ReplayDrain = Arc<dyn Fn(&str) -> Vec<BufferedMessage> + Send + Sync>;
 
 /// Configuration for a V2 federation gRPC client.

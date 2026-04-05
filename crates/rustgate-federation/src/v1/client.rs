@@ -32,7 +32,7 @@ pub type OnMessage = Arc<dyn Fn(String, Bytes) + Send + Sync>;
 /// Callback that drains the replay buffer on reconnection.
 ///
 /// Returns deduped buffered messages and clears the buffer atomically.
-/// Arguments: (peer_id) -> Vec<BufferedMessage>
+/// Arguments: `(peer_id) -> Vec<BufferedMessage>`
 pub type ReplayDrain = Arc<dyn Fn(&str) -> Vec<BufferedMessage> + Send + Sync>;
 
 /// Configuration for a V1 federation outbound client.
