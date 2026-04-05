@@ -40,6 +40,13 @@ impl SessionHandle {
     ) -> Result<(), mpsc::error::SendError<Arc<RoutableMessage>>> {
         self.sender.send(msg).await
     }
+
+    /// Non-blocking send attempt, useful when holding a lock that cannot
+    /// be kept across `.await` points. Returns `true` if the message was
+    /// enqueued, `false` if the channel is full or disconnected.
+    pub fn try_send(&self, msg: Arc<RoutableMessage>) -> bool {
+        self.sender.try_send(msg).is_ok()
+    }
 }
 
 /// Default maximum number of groups a single CN can join.
@@ -301,30 +308,30 @@ impl Router {
             return;
         }
 
-        let targets: Vec<SessionHandle> = {
+        let mut dropped = 0u32;
+        let mut total = 0u32;
+        {
             let state = self.state.read().await;
             let members = match state.groups.get(group) {
                 Some(m) => m,
                 None => return,
             };
-            members
+            for handle in members
                 .iter()
                 .filter(|cn| *cn != &msg.source.cn)
-                .filter_map(|cn| state.sessions.get(cn).cloned())
-                .collect()
-        };
-
-        let mut dropped = 0u32;
-        for handle in &targets {
-            if handle.send(Arc::clone(msg)).await.is_err() {
-                dropped += 1;
+                .filter_map(|cn| state.sessions.get(cn))
+            {
+                total += 1;
+                if !handle.try_send(msg.clone()) {
+                    dropped += 1;
+                }
             }
         }
         if dropped > 0 {
             warn!(
                 group = %group,
                 dropped = dropped,
-                total = targets.len(),
+                total = total,
                 "messages dropped during group send: channel full or disconnected"
             );
         }
