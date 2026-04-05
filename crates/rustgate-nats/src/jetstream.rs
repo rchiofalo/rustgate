@@ -152,10 +152,10 @@ impl JetStreamReplay {
                         continue;
                     }
 
-                    // Track sequence for checkpoint persistence
-                    if let Ok(info) = msg.info() {
-                        last_seq = Some(info.stream_sequence);
-                    }
+                    // Extract sequence early but only checkpoint after
+                    // successful processing to avoid skipping failed messages
+                    // on restart.
+                    let seq = msg.info().ok().map(|i| i.stream_sequence);
 
                     let wire_event: WireEvent = match serde_json::from_slice(&msg.payload) {
                         Ok(e) => e,
@@ -185,6 +185,11 @@ impl JetStreamReplay {
                     // Store directly into cache (no sessions connected yet during replay)
                     router.cache().store(routable).await;
                     count += 1;
+
+                    // Checkpoint only after the message was successfully processed
+                    if let Some(s) = seq {
+                        last_seq = Some(s);
+                    }
 
                     if self.config.max_replay_count > 0 && count >= self.config.max_replay_count {
                         tracing::info!(
