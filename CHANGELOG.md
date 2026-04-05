@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **REST API reference documentation** — comprehensive `docs/rest-api.md` covering all HTTP endpoints: metrics/health probes, federation peer management, certificate trust store, enrollment/signing, data packages, and WebSocket transport. Includes request/response schemas, authentication requirements, rate limits, curl examples, and status codes. (#454)
 - **Operational documentation** — troubleshooting guide, performance tuning guide, disaster recovery procedures, and four new runbooks (certificate rotation, CRL updates, WebSocket connection storms, TLS handshake failures) (#450, #451, #452, #453)
 - **NATS JetStream pull consumer** — subscriber uses a durable JetStream pull consumer for real backpressure instead of buffered push subscriptions. Messages are explicitly acknowledged after processing; the NATS server retains undelivered messages in the stream until the consumer catches up. Configurable via `--nats-live-stream` (env `RUSTGATE_NATS_LIVE_STREAM`, default `RUSTGATE_LIVE`) and `--nats-max-ack-pending` (env `RUSTGATE_NATS_MAX_ACK_PENDING`, default 1000). (#415)
 - **JetStream resumption checkpoints** — optional checkpoint file (`--nats-checkpoint-path`, env `RUSTGATE_NATS_CHECKPOINT_PATH`) persists the last processed sequence number so restarts resume from the checkpoint instead of replaying the entire history stream. (#413)
