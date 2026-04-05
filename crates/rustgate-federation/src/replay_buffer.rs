@@ -127,10 +127,10 @@ mod tests {
     #[test]
     fn evicts_oldest_at_capacity() {
         let mut buf = ReplayBuffer::new(3);
-        buf.push(Bytes::from("a"), vec![]);
-        buf.push(Bytes::from("b"), vec![]);
-        buf.push(Bytes::from("c"), vec![]);
-        buf.push(Bytes::from("d"), vec![]);
+        let _ = buf.push(Bytes::from("a"), vec![]);
+        let _ = buf.push(Bytes::from("b"), vec![]);
+        let _ = buf.push(Bytes::from("c"), vec![]);
+        let _ = buf.push(Bytes::from("d"), vec![]);
 
         assert_eq!(buf.len(), 3);
         let all = buf.all_messages();
@@ -155,8 +155,8 @@ mod tests {
     #[test]
     fn messages_since_zero_returns_all() {
         let mut buf = ReplayBuffer::new(10);
-        buf.push(Bytes::from("a"), vec![]);
-        buf.push(Bytes::from("b"), vec![]);
+        let _ = buf.push(Bytes::from("a"), vec![]);
+        let _ = buf.push(Bytes::from("b"), vec![]);
 
         let since = buf.messages_since(0);
         assert_eq!(since.len(), 2);
@@ -165,7 +165,7 @@ mod tests {
     #[test]
     fn messages_since_future_returns_empty() {
         let mut buf = ReplayBuffer::new(10);
-        buf.push(Bytes::from("a"), vec![]);
+        let _ = buf.push(Bytes::from("a"), vec![]);
 
         let since = buf.messages_since(999);
         assert!(since.is_empty());
@@ -183,20 +183,20 @@ mod tests {
     #[test]
     fn oldest_seq_tracks_eviction() {
         let mut buf = ReplayBuffer::new(2);
-        buf.push(Bytes::from("a"), vec![]);
+        let _ = buf.push(Bytes::from("a"), vec![]);
         assert_eq!(buf.oldest_seq(), Some(1));
 
-        buf.push(Bytes::from("b"), vec![]);
+        let _ = buf.push(Bytes::from("b"), vec![]);
         assert_eq!(buf.oldest_seq(), Some(1));
 
-        buf.push(Bytes::from("c"), vec![]);
+        let _ = buf.push(Bytes::from("c"), vec![]);
         assert_eq!(buf.oldest_seq(), Some(2)); // "a" evicted
     }
 
     #[test]
     fn zero_capacity_evicts_immediately() {
         let mut buf = ReplayBuffer::new(0);
-        buf.push(Bytes::from("a"), vec![]);
+        let _ = buf.push(Bytes::from("a"), vec![]);
         assert!(buf.is_empty());
     }
 }
