@@ -76,6 +76,14 @@ impl ReplayFilter {
     ///
     /// Non-CoT payloads (where uid/time cannot be extracted) always return
     /// `false` to avoid dropping unknown traffic.
+    ///
+    /// # Timing side-channel mitigation
+    ///
+    /// This method uses the [`HashMap::entry`] API so that every call
+    /// traverses to the insertion point regardless of whether the key
+    /// already exists. This ensures the HashMap lookup and mutation follow
+    /// the same code path for both hits and misses, preventing an attacker
+    /// from inferring replay status through response-time observation.
     pub fn is_replay(&self, payload: &[u8]) -> bool {
         let key = match message_key(payload) {
             Some(k) => k,
@@ -85,25 +93,37 @@ impl ReplayFilter {
         let mut guard = self.inner.lock();
 
         let now = Instant::now();
+        let window = guard.window;
 
-        // Check if this key was seen within the window.
-        if let Some(&first_seen) = guard.seen.get(&key)
-            && now.duration_since(first_seen) < guard.window
-        {
-            return true;
-        }
+        // Use the entry API to always traverse to the insertion point,
+        // eliminating the timing difference between hit and miss paths.
+        let is_duplicate = match guard.seen.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let first_seen = *entry.get();
+                if now.duration_since(first_seen) < window {
+                    // Still within window — this is a replay.
+                    true
+                } else {
+                    // Entry expired — treat as new and update timestamp.
+                    let _ = entry.insert(now);
+                    false
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let _ = entry.insert(now);
+                false
+            }
+        };
 
-        let _ = guard.seen.insert(key, now);
         guard.ops_since_evict += 1;
 
         // Periodic eviction to bound memory.
         if guard.ops_since_evict >= EVICT_INTERVAL {
             guard.ops_since_evict = 0;
-            let window = guard.window;
             guard.seen.retain(|_, ts| now.duration_since(*ts) < window);
         }
 
-        false
+        is_duplicate
     }
 
     /// Number of entries currently tracked.
