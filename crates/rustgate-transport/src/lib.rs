@@ -1,5 +1,6 @@
 //! TLS transport, session management, and message routing for rustgate.
 
+mod acl;
 mod cache;
 pub mod cert_reloader;
 mod codec;
@@ -15,6 +16,7 @@ mod session;
 mod throttle;
 mod verifier;
 
+pub use acl::{GroupAcl, GroupAclPolicy};
 pub use cache::PositionCache;
 pub use cert_reloader::CertReloader;
 pub use codec::{FramedCodec, LengthPrefixedCodec, LineDelimitedCodec, XmlStreamCodec};

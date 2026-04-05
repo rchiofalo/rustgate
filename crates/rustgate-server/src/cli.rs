@@ -274,6 +274,13 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 10, env = "RUSTGATE_CIRCUIT_BREAKER_THRESHOLD")]
     pub(crate) circuit_breaker_threshold: u32,
 
+    /// Path to JSON file containing group access control rules.
+    /// When set, per-group send/receive permissions are enforced at
+    /// router dispatch time. Groups not listed in the file operate in
+    /// open mode (any member can send/receive). See docs for format.
+    #[arg(long, env = "RUSTGATE_GROUP_ACL_FILE")]
+    pub(crate) group_acl_file: Option<String>,
+
     // -- Data retention / archival --
     /// Directory for CoT event archival (JSONL). Enables structured logging of
     /// all received CoT events to date-stamped files.
@@ -512,6 +519,7 @@ mod tests {
             "RUSTGATE_REPLAY_WINDOW",
             "RUSTGATE_CLIENT_MSG_RATE",
             "RUSTGATE_CLIENT_BURST",
+            "RUSTGATE_GROUP_ACL_FILE",
             "RUSTGATE_ARCHIVE_DIR",
             "RUSTGATE_PACKAGE_MAX_AGE_HOURS",
             "OTEL_EXPORTER_OTLP_ENDPOINT",

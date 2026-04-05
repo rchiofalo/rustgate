@@ -18,6 +18,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
+mod acl_config;
 mod archive;
 mod audit;
 mod cli;
@@ -118,7 +119,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     // ── Connection limit ────────────────────────────────────────────
     // CLI validation ensures max_connections is 1..=u32::MAX
     let max_connections: u32 = cli.max_connections as u32;
-    let router = Arc::new(Router::new());
+    let group_acl = setup::load_group_acl(&cli).await?;
+    let router = Arc::new(match group_acl {
+        Some(acl) => Router::with_acl(acl),
+        None => Router::new(),
+    });
     let connection_limit = Arc::new(Semaphore::new(max_connections as usize));
 
     // ── NATS ────────────────────────────────────────────────────────
