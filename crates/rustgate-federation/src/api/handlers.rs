@@ -229,7 +229,13 @@ pub(crate) fn handle_set_routing_mode<S: FederateStore>(
 pub(crate) fn handle_list_certificates<S: FederateStore>(
     state: &ApiState<S>,
 ) -> Response<Full<Bytes>> {
-    json_ok(&state.trust_store.list_certificates())
+    match state.trust_store.list_certificates() {
+        Ok(certs) => json_ok(&certs),
+        Err(e) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("trust store lock poisoned: {e}"),
+        ),
+    }
 }
 
 pub(crate) fn handle_add_certificate<S: FederateStore>(
@@ -250,8 +256,12 @@ pub(crate) fn handle_get_certificate<S: FederateStore>(
     cn: &str,
 ) -> Response<Full<Bytes>> {
     match state.trust_store.get_certificate_info(cn) {
-        Some(info) => json_ok(&info),
-        None => json_error(StatusCode::NOT_FOUND, "certificate not found"),
+        Ok(Some(info)) => json_ok(&info),
+        Ok(None) => json_error(StatusCode::NOT_FOUND, "certificate not found"),
+        Err(e) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("trust store lock poisoned: {e}"),
+        ),
     }
 }
 
@@ -259,10 +269,13 @@ pub(crate) fn handle_delete_certificate<S: FederateStore>(
     state: &ApiState<S>,
     cn: &str,
 ) -> Response<Full<Bytes>> {
-    if state.trust_store.remove_certificate(cn) {
-        json_ok(&serde_json::json!({ "deleted": cn }))
-    } else {
-        json_error(StatusCode::NOT_FOUND, "certificate not found")
+    match state.trust_store.remove_certificate(cn) {
+        Ok(true) => json_ok(&serde_json::json!({ "deleted": cn })),
+        Ok(false) => json_error(StatusCode::NOT_FOUND, "certificate not found"),
+        Err(e) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("trust store lock poisoned: {e}"),
+        ),
     }
 }
 
@@ -280,7 +293,7 @@ pub(crate) fn handle_stats<S: FederateStore>(state: &ApiState<S>) -> Response<Fu
         "running": status.running,
         "messages_sent": total_sent,
         "messages_received": total_recv,
-        "certificates": state.trust_store.count(),
+        "certificates": state.trust_store.count().unwrap_or(0),
     });
 
     json_ok(&stats)

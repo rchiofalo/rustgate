@@ -163,7 +163,7 @@ mod federation_gate {
     #[test]
     fn trust_store_empty() {
         let store = TrustStore::new(None);
-        assert!(store.list_certificates().is_empty());
+        assert!(store.list_certificates().expect("list certs").is_empty());
     }
 
     // The `api` sub-feature is automatically enabled when the server's

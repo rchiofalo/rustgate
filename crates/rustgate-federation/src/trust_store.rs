@@ -19,7 +19,7 @@ use rustls_pki_types::CertificateDer;
 use rustls_pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Metadata about a stored certificate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,7 +59,10 @@ pub struct TrustStore {
 
 impl std::fmt::Debug for TrustStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let count = self.certs.read().map(|c| c.len()).unwrap_or(0);
+        let count = match self.certs.read() {
+            Ok(c) => Some(c.len()),
+            Err(_) => None,
+        };
         f.debug_struct("TrustStore")
             .field("count", &count)
             .field("data_dir", &self.data_dir)
@@ -135,7 +138,7 @@ impl TrustStore {
             }
         }
 
-        let count = store.count();
+        let count = store.count()?;
         info!(count, dir = %dir.display(), "loaded trust store certificates");
 
         Ok(store)
@@ -193,12 +196,12 @@ impl TrustStore {
     /// Remove a certificate by common name.
     ///
     /// Returns `true` if the certificate was found and removed.
-    pub fn remove_certificate(&self, cn: &str) -> bool {
+    pub fn remove_certificate(&self, cn: &str) -> Result<bool> {
         let removed = {
-            let mut certs = match self.certs.write() {
-                Ok(c) => c,
-                Err(_) => return false,
-            };
+            let mut certs = self.certs.write().map_err(|e| {
+                error!("trust store lock poisoned — cannot remove certificate");
+                anyhow::anyhow!("trust store lock poisoned: {e}")
+            })?;
             certs.remove(cn).is_some()
         };
 
@@ -223,33 +226,43 @@ impl TrustStore {
             info!(cn = %cn, "removed certificate from trust store");
         }
 
-        removed
+        Ok(removed)
     }
 
     /// Get a certificate's PEM data by common name.
-    pub fn get_certificate_pem(&self, cn: &str) -> Option<Vec<u8>> {
-        let certs = self.certs.read().ok()?;
-        certs.get(cn).map(|c| c.pem.clone())
+    pub fn get_certificate_pem(&self, cn: &str) -> Result<Option<Vec<u8>>> {
+        let certs = self.certs.read().map_err(|e| {
+            error!("trust store lock poisoned — cannot retrieve certificate PEM");
+            anyhow::anyhow!("trust store lock poisoned: {e}")
+        })?;
+        Ok(certs.get(cn).map(|c| c.pem.clone()))
     }
 
     /// Get certificate metadata by common name.
-    pub fn get_certificate_info(&self, cn: &str) -> Option<CertInfo> {
-        let certs = self.certs.read().ok()?;
-        certs.get(cn).map(|c| c.info.clone())
+    pub fn get_certificate_info(&self, cn: &str) -> Result<Option<CertInfo>> {
+        let certs = self.certs.read().map_err(|e| {
+            error!("trust store lock poisoned — cannot retrieve certificate info");
+            anyhow::anyhow!("trust store lock poisoned: {e}")
+        })?;
+        Ok(certs.get(cn).map(|c| c.info.clone()))
     }
 
     /// List metadata for all stored certificates.
-    pub fn list_certificates(&self) -> Vec<CertInfo> {
-        let certs = match self.certs.read() {
-            Ok(c) => c,
-            Err(_) => return Vec::new(),
-        };
-        certs.values().map(|c| c.info.clone()).collect()
+    pub fn list_certificates(&self) -> Result<Vec<CertInfo>> {
+        let certs = self.certs.read().map_err(|e| {
+            error!("trust store lock poisoned — cannot list certificates");
+            anyhow::anyhow!("trust store lock poisoned: {e}")
+        })?;
+        Ok(certs.values().map(|c| c.info.clone()).collect())
     }
 
     /// Return the number of stored certificates.
-    pub fn count(&self) -> usize {
-        self.certs.read().map(|c| c.len()).unwrap_or(0)
+    pub fn count(&self) -> Result<usize> {
+        let certs = self.certs.read().map_err(|e| {
+            error!("trust store lock poisoned — cannot read certificate count");
+            anyhow::anyhow!("trust store lock poisoned: {e}")
+        })?;
+        Ok(certs.len())
     }
 
     /// Return the current generation counter.
@@ -263,25 +276,30 @@ impl TrustStore {
     }
 
     /// Check if a certificate with the given common name is trusted.
-    pub fn is_trusted(&self, cn: &str) -> bool {
-        let certs = match self.certs.read() {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
-        certs.contains_key(cn)
+    pub fn is_trusted(&self, cn: &str) -> Result<bool> {
+        let certs = self.certs.read().map_err(|e| {
+            error!("trust store lock poisoned — cannot check certificate trust");
+            anyhow::anyhow!("trust store lock poisoned: {e}")
+        })?;
+        Ok(certs.contains_key(cn))
     }
 
     /// Build a [`RootCertStore`] containing all certificates in the trust store.
     ///
     /// Used to construct TLS configurations that verify peer certificates
     /// against dynamically managed CAs.
-    pub fn build_root_cert_store(&self) -> RootCertStore {
+    ///
+    /// Returns an error if the internal lock is poisoned, which would
+    /// otherwise silently produce an empty store and disable CA verification.
+    pub fn build_root_cert_store(&self) -> Result<RootCertStore> {
         let mut store = RootCertStore::empty();
 
-        let certs = match self.certs.read() {
-            Ok(c) => c,
-            Err(_) => return store,
-        };
+        let certs = self.certs.read().map_err(|e| {
+            error!(
+                "trust store lock poisoned — cannot build root cert store, CA verification disabled"
+            );
+            anyhow::anyhow!("trust store lock poisoned: {e}")
+        })?;
 
         for (cn, cert) in certs.iter() {
             if let Err(e) = store.add(cert.der.clone()) {
@@ -289,7 +307,7 @@ impl TrustStore {
             }
         }
 
-        store
+        Ok(store)
     }
 
     /// Build a [`RootCertStore`] starting from a base CA PEM, then adding
@@ -396,7 +414,7 @@ fn sanitize_filename(cn: &str) -> String {
 }
 
 #[cfg(test)]
-#[allow(unused_results)]
+#[allow(unused_results, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -415,8 +433,8 @@ mod tests {
     #[test]
     fn new_creates_empty_store() {
         let store = TrustStore::new(None);
-        assert_eq!(store.count(), 0);
-        assert!(store.list_certificates().is_empty());
+        assert_eq!(store.count().unwrap(), 0);
+        assert!(store.list_certificates().unwrap().is_empty());
     }
 
     #[test]
@@ -438,7 +456,7 @@ mod tests {
 
         assert!(!info.common_name.is_empty());
         assert!(!info.fingerprint.is_empty());
-        assert_eq!(store.count(), 1);
+        assert_eq!(store.count().unwrap(), 1);
     }
 
     #[test]
@@ -465,14 +483,15 @@ mod tests {
 
         let retrieved = store
             .get_certificate_pem(&info.common_name)
-            .expect("get pem");
+            .expect("get pem")
+            .expect("should be Some");
         assert_eq!(retrieved, pem);
     }
 
     #[test]
     fn get_certificate_pem_nonexistent_returns_none() {
         let store = TrustStore::new(None);
-        assert!(store.get_certificate_pem("nonexistent").is_none());
+        assert!(store.get_certificate_pem("nonexistent").unwrap().is_none());
     }
 
     #[test]
@@ -485,7 +504,8 @@ mod tests {
 
         let retrieved = store
             .get_certificate_info(&info.common_name)
-            .expect("get info");
+            .expect("get info")
+            .expect("should be Some");
         assert_eq!(retrieved.common_name, info.common_name);
         assert_eq!(retrieved.fingerprint, info.fingerprint);
     }
@@ -493,7 +513,7 @@ mod tests {
     #[test]
     fn get_certificate_info_nonexistent_returns_none() {
         let store = TrustStore::new(None);
-        assert!(store.get_certificate_info("nonexistent").is_none());
+        assert!(store.get_certificate_info("nonexistent").unwrap().is_none());
     }
 
     #[test]
@@ -504,15 +524,20 @@ mod tests {
             .add_certificate_from_pem(&pem)
             .expect("add certificate");
 
-        assert!(store.remove_certificate(&info.common_name));
-        assert_eq!(store.count(), 0);
-        assert!(store.get_certificate_pem(&info.common_name).is_none());
+        assert!(store.remove_certificate(&info.common_name).unwrap());
+        assert_eq!(store.count().unwrap(), 0);
+        assert!(
+            store
+                .get_certificate_pem(&info.common_name)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn remove_nonexistent_returns_false() {
         let store = TrustStore::new(None);
-        assert!(!store.remove_certificate("nonexistent"));
+        assert!(!store.remove_certificate("nonexistent").unwrap());
     }
 
     #[test]
@@ -524,7 +549,7 @@ mod tests {
         store.add_certificate_from_pem(&pem1).expect("add cert 1");
         store.add_certificate_from_pem(&pem2).expect("add cert 2");
 
-        let list = store.list_certificates();
+        let list = store.list_certificates().unwrap();
         // Could be 1 or 2 depending on CN uniqueness
         assert!(!list.is_empty());
     }
@@ -537,8 +562,8 @@ mod tests {
             .add_certificate_from_pem(&pem)
             .expect("add certificate");
 
-        assert!(store.is_trusted(&info.common_name));
-        assert!(!store.is_trusted("untrusted"));
+        assert!(store.is_trusted(&info.common_name).unwrap());
+        assert!(!store.is_trusted("untrusted").unwrap());
     }
 
     #[test]
@@ -549,9 +574,9 @@ mod tests {
             .add_certificate_from_pem(&pem)
             .expect("add certificate");
 
-        assert!(store.is_trusted(&info.common_name));
-        store.remove_certificate(&info.common_name);
-        assert!(!store.is_trusted(&info.common_name));
+        assert!(store.is_trusted(&info.common_name).unwrap());
+        store.remove_certificate(&info.common_name).unwrap();
+        assert!(!store.is_trusted(&info.common_name).unwrap());
     }
 
     #[test]
@@ -560,14 +585,14 @@ mod tests {
         let pem = test_ca_pem();
         store.add_certificate_from_pem(&pem).expect("add cert");
 
-        let root_store = store.build_root_cert_store();
+        let root_store = store.build_root_cert_store().unwrap();
         assert!(!root_store.is_empty());
     }
 
     #[test]
     fn build_root_cert_store_empty() {
         let store = TrustStore::new(None);
-        let root_store = store.build_root_cert_store();
+        let root_store = store.build_root_cert_store().unwrap();
         assert!(root_store.is_empty());
     }
 
@@ -597,7 +622,7 @@ mod tests {
         let trust_dir = dir.path().join("trust");
 
         let store = TrustStore::load_from_directory(&trust_dir).expect("load");
-        assert_eq!(store.count(), 0);
+        assert_eq!(store.count().unwrap(), 0);
         assert!(trust_dir.exists());
     }
 
@@ -612,7 +637,7 @@ mod tests {
         fs::write(trust_dir.join("test-ca.pem"), &pem).expect("write cert");
 
         let store = TrustStore::load_from_directory(&trust_dir).expect("load");
-        assert_eq!(store.count(), 1);
+        assert_eq!(store.count().unwrap(), 1);
     }
 
     #[test]
@@ -626,7 +651,7 @@ mod tests {
         fs::write(trust_dir.join("config.json"), "{}").expect("write");
 
         let store = TrustStore::load_from_directory(&trust_dir).expect("load");
-        assert_eq!(store.count(), 0);
+        assert_eq!(store.count().unwrap(), 0);
     }
 
     #[test]
@@ -643,7 +668,7 @@ mod tests {
         fs::write(trust_dir.join("good.pem"), &pem).expect("write cert");
 
         let store = TrustStore::load_from_directory(&trust_dir).expect("load");
-        assert_eq!(store.count(), 1);
+        assert_eq!(store.count().unwrap(), 1);
     }
 
     #[test]
@@ -680,7 +705,7 @@ mod tests {
         let path = trust_dir.join(format!("{filename}.pem"));
         assert!(path.exists());
 
-        store.remove_certificate(&info.common_name);
+        store.remove_certificate(&info.common_name).unwrap();
         assert!(!path.exists());
     }
 
@@ -694,13 +719,13 @@ mod tests {
         {
             let store = TrustStore::load_from_directory(&trust_dir).expect("load");
             store.add_certificate_from_pem(&pem).expect("add");
-            assert_eq!(store.count(), 1);
+            assert_eq!(store.count().unwrap(), 1);
         }
 
         // Load from directory again
         {
             let store = TrustStore::load_from_directory(&trust_dir).expect("load");
-            assert_eq!(store.count(), 1);
+            assert_eq!(store.count().unwrap(), 1);
         }
     }
 
@@ -715,7 +740,7 @@ mod tests {
         let info2 = store.add_certificate_from_pem(&pem).expect("add second");
 
         assert_eq!(info1.common_name, info2.common_name);
-        assert_eq!(store.count(), 1);
+        assert_eq!(store.count().unwrap(), 1);
     }
 
     #[test]
@@ -770,7 +795,7 @@ mod tests {
         fs::write(trust_dir.join("test-ca.crt"), &pem).expect("write cert");
 
         let store = TrustStore::load_from_directory(&trust_dir).expect("load");
-        assert_eq!(store.count(), 1);
+        assert_eq!(store.count().unwrap(), 1);
     }
 
     #[test]
@@ -784,6 +809,6 @@ mod tests {
         fs::write(trust_dir.join("valid.pem"), &pem).expect("write cert");
 
         let store = TrustStore::load_from_directory(&trust_dir).expect("load");
-        assert_eq!(store.count(), 1);
+        assert_eq!(store.count().unwrap(), 1);
     }
 }

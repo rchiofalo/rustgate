@@ -28,6 +28,7 @@ use rustls::server::ResolvesServerCert;
 use rustls::sign::CertifiedKey;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
+use zeroize::Zeroizing;
 
 /// Serves the current server certificate and supports atomic reload.
 ///
@@ -56,12 +57,12 @@ impl CertReloader {
                 cert_path.display()
             )))
         })?;
-        let key_bytes = std::fs::read(&key_path).map_err(|e| {
+        let key_bytes = Zeroizing::new(std::fs::read(&key_path).map_err(|e| {
             RustgateError::from(ConfigError::Other(format!(
                 "failed to read key file {}: {e}",
                 key_path.display()
             )))
-        })?;
+        })?);
 
         let hash = Self::compute_hash(&cert_bytes, &key_bytes);
         let certified_key = Self::build_certified_key(&cert_bytes, &key_bytes)?;
@@ -90,12 +91,12 @@ impl CertReloader {
                 self.cert_path.display()
             )))
         })?;
-        let key_bytes = std::fs::read(&self.key_path).map_err(|e| {
+        let key_bytes = Zeroizing::new(std::fs::read(&self.key_path).map_err(|e| {
             RustgateError::from(ConfigError::Other(format!(
                 "failed to read key file {}: {e}",
                 self.key_path.display()
             )))
-        })?;
+        })?);
 
         let new_hash = Self::compute_hash(&cert_bytes, &key_bytes);
 
