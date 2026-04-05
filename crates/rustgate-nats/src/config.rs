@@ -103,6 +103,20 @@ pub struct NatsConfig {
     /// exerts backpressure on the NATS server. When the buffer is full,
     /// the NATS client triggers a slow consumer event. Default: 1024.
     pub subscription_capacity: usize,
+
+    /// JetStream stream name for live updates (default: "RUSTGATE_LIVE").
+    ///
+    /// The subscriber creates this stream (if it doesn't already exist) to
+    /// capture messages on `{subject_prefix}.>` via a durable pull consumer,
+    /// providing real backpressure instead of buffered push subscriptions.
+    pub live_stream: String,
+
+    /// Maximum number of unacknowledged messages for the pull consumer
+    /// (default: 1000).
+    ///
+    /// Controls concurrency: the server will not deliver more than this
+    /// many messages until earlier ones are acknowledged.
+    pub max_ack_pending: i64,
 }
 
 impl Default for NatsConfig {
@@ -119,6 +133,8 @@ impl Default for NatsConfig {
             max_replay_count: 0,
             instance_id: generate_instance_id(),
             subscription_capacity: 1024,
+            live_stream: "RUSTGATE_LIVE".to_string(),
+            max_ack_pending: 1000,
         }
     }
 }

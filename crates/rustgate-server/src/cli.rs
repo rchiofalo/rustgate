@@ -118,6 +118,22 @@ pub(crate) struct Cli {
     )]
     pub(crate) nats_subscription_capacity: usize,
 
+    /// JetStream stream name for live updates. The subscriber creates this
+    /// stream to capture `{subject_prefix}.>` subjects via a durable pull
+    /// consumer for real backpressure.
+    #[arg(
+        long,
+        default_value = "RUSTGATE_LIVE",
+        env = "RUSTGATE_NATS_LIVE_STREAM"
+    )]
+    pub(crate) nats_live_stream: String,
+
+    /// Maximum unacknowledged messages for the JetStream pull consumer.
+    /// Controls how many messages can be in-flight before the server
+    /// stops delivering more.
+    #[arg(long, default_value_t = 1000, env = "RUSTGATE_NATS_MAX_ACK_PENDING")]
+    pub(crate) nats_max_ack_pending: i64,
+
     /// Bind address for the enrollment HTTPS server (e.g. 0.0.0.0:8446).
     /// Requires --features enrollment.
     #[arg(long, env = "RUSTGATE_ENROLLMENT_BIND", value_parser = parse_socket_addr)]
@@ -499,6 +515,9 @@ mod tests {
             "RUSTGATE_NATS_TLS_KEY",
             "RUSTGATE_NATS_TLS_CA",
             "RUSTGATE_NATS_TLS_REQUIRED",
+            "RUSTGATE_NATS_SUBSCRIPTION_CAPACITY",
+            "RUSTGATE_NATS_LIVE_STREAM",
+            "RUSTGATE_NATS_MAX_ACK_PENDING",
             "RUSTGATE_ENROLLMENT_BIND",
             "RUSTGATE_CA_KEY",
             "RUSTGATE_ENROLLMENT_USER",

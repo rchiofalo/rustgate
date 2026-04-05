@@ -1,8 +1,9 @@
 //! NATS adapter for rustgate.
 //!
-//! Bridges local TAK sessions to a NATS event bus, enabling stateless
-//! horizontal scaling. Publishes inbound CoT to NATS subjects and
-//! subscribes for outbound delivery to connected clients.
+//! Bridges local sessions to a NATS event bus, enabling stateless
+//! horizontal scaling. Publishes inbound messages to NATS subjects and
+//! subscribes via JetStream pull consumers for outbound delivery to
+//! connected clients with real backpressure.
 
 pub mod config;
 pub mod jetstream;
