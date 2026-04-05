@@ -1,11 +1,14 @@
 //! Publishes inbound CoT messages to NATS subjects.
 
+use std::borrow::Cow;
+
 use async_nats::Client;
 use bytes::Bytes;
 #[cfg(not(feature = "full-detail"))]
 use rustgate_core::message::MessageType;
 use rustgate_core::message::RoutableMessage;
 use tracing::Instrument;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::config::NatsConfig;
 use crate::serde_compat::WireEvent;
@@ -60,7 +63,8 @@ impl NatsPublisher {
             .map(String::as_str)
             .unwrap_or("");
 
-        let group = sanitize_nats_token(raw_group).unwrap_or(self.config.default_group.as_str());
+        let group =
+            sanitize_nats_token(raw_group).unwrap_or(Cow::Borrowed(&self.config.default_group));
 
         let subject = format!("{}.{}.update", self.config.subject_prefix, group);
 
@@ -152,19 +156,34 @@ const MAX_TOKEN_LENGTH: usize = 255;
 /// reserved characters `.` (level separator), `>` (full wildcard),
 /// and `*` (partial wildcard). Rejects control chars, space, DEL,
 /// non-ASCII bytes, and tokens longer than [`MAX_TOKEN_LENGTH`] bytes.
-fn sanitize_nats_token(s: &str) -> Option<&str> {
+///
+/// Returns `Cow::Borrowed` on the fast path (already valid ASCII) and
+/// `Cow::Owned` when NFC normalization produces a valid ASCII result.
+fn sanitize_nats_token(s: &str) -> Option<Cow<'_, str>> {
     if s.is_empty() {
         return None;
     }
     if s.len() > MAX_TOKEN_LENGTH {
         return None;
     }
+    // Fast path: already valid ASCII
     if s.bytes()
+        .all(|b| b > 0x20 && b < 0x7F && !matches!(b, b'.' | b'>' | b'*'))
+    {
+        return Some(Cow::Borrowed(s));
+    }
+    // Slow path: apply NFC normalization, then re-check
+    let normalized: String = s.nfc().collect();
+    if normalized.is_empty() || normalized.len() > MAX_TOKEN_LENGTH {
+        return None;
+    }
+    if normalized
+        .bytes()
         .any(|b| b <= 0x20 || b >= 0x7F || matches!(b, b'.' | b'>' | b'*'))
     {
         return None;
     }
-    Some(s)
+    Some(Cow::Owned(normalized))
 }
 
 #[cfg(test)]
@@ -173,36 +192,61 @@ mod tests {
 
     #[test]
     fn sanitize_valid_tokens() {
-        assert_eq!(sanitize_nats_token("Cyan"), Some("Cyan"));
-        assert_eq!(sanitize_nats_token("__ANON__"), Some("__ANON__"));
-        assert_eq!(sanitize_nats_token("track-uid-123"), Some("track-uid-123"));
+        assert_eq!(sanitize_nats_token("Cyan").as_deref(), Some("Cyan"));
+        assert_eq!(sanitize_nats_token("__ANON__").as_deref(), Some("__ANON__"));
+        assert_eq!(
+            sanitize_nats_token("track-uid-123").as_deref(),
+            Some("track-uid-123")
+        );
     }
 
     #[test]
     fn sanitize_accepts_max_length_token() {
         let token = "a".repeat(MAX_TOKEN_LENGTH);
-        assert_eq!(sanitize_nats_token(&token), Some(token.as_str()));
+        assert_eq!(sanitize_nats_token(&token).as_deref(), Some(token.as_str()));
     }
 
     #[test]
     fn sanitize_rejects_overlength_token() {
         let token = "a".repeat(MAX_TOKEN_LENGTH + 1);
-        assert_eq!(sanitize_nats_token(&token), None);
+        assert_eq!(sanitize_nats_token(&token).as_deref(), None);
     }
 
     #[test]
     fn sanitize_rejects_invalid() {
-        assert_eq!(sanitize_nats_token(""), None);
-        assert_eq!(sanitize_nats_token("a.b"), None);
-        assert_eq!(sanitize_nats_token("a>b"), None);
-        assert_eq!(sanitize_nats_token("a*b"), None);
-        assert_eq!(sanitize_nats_token("a b"), None);
-        assert_eq!(sanitize_nats_token("a\tb"), None);
-        assert_eq!(sanitize_nats_token("a\0b"), None);
+        assert_eq!(sanitize_nats_token("").as_deref(), None);
+        assert_eq!(sanitize_nats_token("a.b").as_deref(), None);
+        assert_eq!(sanitize_nats_token("a>b").as_deref(), None);
+        assert_eq!(sanitize_nats_token("a*b").as_deref(), None);
+        assert_eq!(sanitize_nats_token("a b").as_deref(), None);
+        assert_eq!(sanitize_nats_token("a\tb").as_deref(), None);
+        assert_eq!(sanitize_nats_token("a\0b").as_deref(), None);
         // Control characters and DEL
-        assert_eq!(sanitize_nats_token("a\x01b"), None);
-        assert_eq!(sanitize_nats_token("a\x7Fb"), None);
+        assert_eq!(sanitize_nats_token("a\x01b").as_deref(), None);
+        assert_eq!(sanitize_nats_token("a\x7Fb").as_deref(), None);
         // Non-ASCII (NATS subjects are ASCII-only)
-        assert_eq!(sanitize_nats_token("caf\u{00e9}"), None);
+        assert_eq!(sanitize_nats_token("caf\u{00e9}").as_deref(), None);
+    }
+
+    #[test]
+    fn sanitize_ascii_returns_borrowed() {
+        let result = sanitize_nats_token("hello");
+        assert!(matches!(result, Some(Cow::Borrowed(_))));
+    }
+
+    #[test]
+    fn sanitize_nfc_normalization_applied() {
+        // U+00E9 (é) is already NFC but still non-ASCII → rejected
+        assert_eq!(sanitize_nats_token("caf\u{00e9}").as_deref(), None);
+        // U+0065 U+0301 (e + combining accent) normalizes to U+00E9, still non-ASCII → rejected
+        assert_eq!(sanitize_nats_token("caf\u{0065}\u{0301}").as_deref(), None);
+    }
+
+    #[test]
+    fn sanitize_nfc_consistent_for_equivalent_inputs() {
+        // Both representations of "é" should produce the same result
+        let nfc = sanitize_nats_token("caf\u{00e9}");
+        let nfd = sanitize_nats_token("caf\u{0065}\u{0301}");
+        assert_eq!(nfc, nfd);
     }
 }
