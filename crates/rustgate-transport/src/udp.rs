@@ -43,9 +43,15 @@ impl Default for UdpInputConfig {
 }
 
 /// Callback for NATS publishing after local routing.
+///
+/// Uses `Fn` (not `AsyncFn`) because `dyn AsyncFn` is not object-safe
+/// as of Rust 1.93. Async work is dispatched via `spawn_background()`.
 pub type OnNatsPublish = Arc<dyn Fn(RoutableMessage) + Send + Sync>;
 
 /// Callback for federation forwarding.
+///
+/// Uses `Fn` (not `AsyncFn`) because `dyn AsyncFn` is not object-safe
+/// as of Rust 1.93. Async work is dispatched via `spawn_background()`.
 pub type OnFederationForward = Arc<dyn Fn(Bytes, Vec<String>) + Send + Sync>;
 
 /// UDP input receiver that routes datagrams through the message router.

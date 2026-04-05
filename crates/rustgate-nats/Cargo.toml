@@ -27,6 +27,7 @@ thiserror = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt", "time"] }
 tracing = { workspace = true }
+unicode-normalization = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }

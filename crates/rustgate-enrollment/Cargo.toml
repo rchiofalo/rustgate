@@ -18,7 +18,7 @@ rustgate-core = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
-tokio = { workspace = true, features = ["net", "rt", "io-util", "sync", "fs"] }
+tokio = { workspace = true, features = ["net", "rt", "io-util", "sync", "fs", "time"] }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
 tokio-rustls = { workspace = true }

@@ -29,6 +29,10 @@ use crate::v1::{V1Client, V1Server};
 ///
 /// The caller is responsible for provenance checking, format conversion,
 /// and routing the message to local clients (e.g., via the Router).
+///
+/// NOTE: Uses `Fn` (not `AsyncFn`) because `dyn AsyncFn` is not object-safe
+/// as of Rust 1.93. Async work is dispatched via `spawn_background()` inside
+/// the closure body. Revisit when `dyn AsyncFn` stabilizes for trait objects.
 pub type OnInbound = Arc<dyn Fn(String, Bytes) + Send + Sync>;
 
 /// Capacity for HA peer adoption/loss event channels.

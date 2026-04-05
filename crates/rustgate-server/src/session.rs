@@ -31,6 +31,9 @@ use crate::metrics;
 /// The closure receives `(payload, source_groups)` and spawns async work
 /// internally (fire-and-forget). Defined unconditionally so the `Option`
 /// type is available regardless of feature flags.
+///
+/// Uses `Fn` (not `AsyncFn`) because `dyn AsyncFn` is not object-safe
+/// as of Rust 1.93. Async work is dispatched via `spawn_background()`.
 pub(crate) type FedForwardFn = Arc<dyn Fn(Bytes, Vec<String>) + Send + Sync>;
 
 /// Shared dependencies passed to each session handler task.
