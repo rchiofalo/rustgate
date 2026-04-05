@@ -29,13 +29,15 @@ pub enum CircuitState {
     HalfOpen = 2,
 }
 
-impl CircuitState {
-    fn from_u8(v: u8) -> Self {
+impl TryFrom<u8> for CircuitState {
+    type Error = u8;
+
+    fn try_from(v: u8) -> Result<Self, Self::Error> {
         match v {
-            0 => CircuitState::Closed,
-            1 => CircuitState::Open,
-            2 => CircuitState::HalfOpen,
-            _ => CircuitState::Closed,
+            0 => Ok(CircuitState::Closed),
+            1 => Ok(CircuitState::Open),
+            2 => Ok(CircuitState::HalfOpen),
+            _ => Err(v),
         }
     }
 }
@@ -69,14 +71,16 @@ pub enum PeerState {
     Reconnecting = 3,
 }
 
-impl PeerState {
-    fn from_u8(v: u8) -> Self {
+impl TryFrom<u8> for PeerState {
+    type Error = u8;
+
+    fn try_from(v: u8) -> Result<Self, Self::Error> {
         match v {
-            0 => PeerState::Disconnected,
-            1 => PeerState::Connecting,
-            2 => PeerState::Connected,
-            3 => PeerState::Reconnecting,
-            _ => PeerState::Disconnected,
+            0 => Ok(PeerState::Disconnected),
+            1 => Ok(PeerState::Connecting),
+            2 => Ok(PeerState::Connected),
+            3 => Ok(PeerState::Reconnecting),
+            _ => Err(v),
         }
     }
 }
@@ -172,7 +176,7 @@ impl PeerHandle {
 
     /// Get the current connection state.
     pub fn state(&self) -> PeerState {
-        PeerState::from_u8(self.state.load(Ordering::Relaxed))
+        PeerState::try_from(self.state.load(Ordering::Relaxed)).unwrap_or(PeerState::Disconnected)
     }
 
     /// Set the connection state.
@@ -267,7 +271,8 @@ impl PeerHandle {
     /// If the circuit is `Open` and the recovery timeout has elapsed, it
     /// automatically transitions to `HalfOpen` to allow a probe message.
     pub fn circuit_state(&self) -> CircuitState {
-        let state = CircuitState::from_u8(self.circuit.load(Ordering::Acquire));
+        let state = CircuitState::try_from(self.circuit.load(Ordering::Acquire))
+            .unwrap_or(CircuitState::Closed);
         if state == CircuitState::Open
             && let Ok(guard) = self.circuit_opened_at.lock()
             && let Some(opened_at) = *guard
@@ -291,7 +296,8 @@ impl PeerHandle {
     /// Returns `true` if the circuit was recovered from `HalfOpen`.
     pub fn record_success(&self) -> bool {
         self.consecutive_failures.store(0, Ordering::Relaxed);
-        let prev = CircuitState::from_u8(self.circuit.load(Ordering::Acquire));
+        let prev = CircuitState::try_from(self.circuit.load(Ordering::Acquire))
+            .unwrap_or(CircuitState::Closed);
         if prev == CircuitState::HalfOpen {
             self.circuit
                 .store(CircuitState::Closed as u8, Ordering::Release);
@@ -307,7 +313,8 @@ impl PeerHandle {
     ///
     /// Returns `true` if this failure caused the circuit to open.
     pub fn record_failure(&self) -> bool {
-        let prev_state = CircuitState::from_u8(self.circuit.load(Ordering::Acquire));
+        let prev_state = CircuitState::try_from(self.circuit.load(Ordering::Acquire))
+            .unwrap_or(CircuitState::Closed);
 
         // HalfOpen probe failed — immediately reopen
         if prev_state == CircuitState::HalfOpen {
@@ -520,17 +527,17 @@ mod tests {
     }
 
     #[test]
-    fn peer_state_from_u8_valid_values() {
-        assert_eq!(PeerState::from_u8(0), PeerState::Disconnected);
-        assert_eq!(PeerState::from_u8(1), PeerState::Connecting);
-        assert_eq!(PeerState::from_u8(2), PeerState::Connected);
-        assert_eq!(PeerState::from_u8(3), PeerState::Reconnecting);
+    fn peer_state_try_from_u8_valid_values() {
+        assert_eq!(PeerState::try_from(0), Ok(PeerState::Disconnected));
+        assert_eq!(PeerState::try_from(1), Ok(PeerState::Connecting));
+        assert_eq!(PeerState::try_from(2), Ok(PeerState::Connected));
+        assert_eq!(PeerState::try_from(3), Ok(PeerState::Reconnecting));
     }
 
     #[test]
-    fn peer_state_from_u8_invalid_defaults_to_disconnected() {
-        assert_eq!(PeerState::from_u8(4), PeerState::Disconnected);
-        assert_eq!(PeerState::from_u8(255), PeerState::Disconnected);
+    fn peer_state_try_from_u8_invalid_returns_error() {
+        assert_eq!(PeerState::try_from(4), Err(4));
+        assert_eq!(PeerState::try_from(255), Err(255));
     }
 
     #[test]
@@ -855,16 +862,16 @@ mod tests {
     }
 
     #[test]
-    fn circuit_state_from_u8_valid_values() {
-        assert_eq!(CircuitState::from_u8(0), CircuitState::Closed);
-        assert_eq!(CircuitState::from_u8(1), CircuitState::Open);
-        assert_eq!(CircuitState::from_u8(2), CircuitState::HalfOpen);
+    fn circuit_state_try_from_u8_valid_values() {
+        assert_eq!(CircuitState::try_from(0), Ok(CircuitState::Closed));
+        assert_eq!(CircuitState::try_from(1), Ok(CircuitState::Open));
+        assert_eq!(CircuitState::try_from(2), Ok(CircuitState::HalfOpen));
     }
 
     #[test]
-    fn circuit_state_from_u8_invalid_defaults_to_closed() {
-        assert_eq!(CircuitState::from_u8(3), CircuitState::Closed);
-        assert_eq!(CircuitState::from_u8(255), CircuitState::Closed);
+    fn circuit_state_try_from_u8_invalid_returns_error() {
+        assert_eq!(CircuitState::try_from(3), Err(3));
+        assert_eq!(CircuitState::try_from(255), Err(255));
     }
 
     #[test]
