@@ -64,6 +64,26 @@ proptest! {
     }
 }
 
+proptest! {
+    /// Payloads exceeding `max_frame_size` must be rejected at decode time.
+    #[test]
+    fn length_prefixed_rejects_oversized_frame(
+        payload in prop::collection::vec(any::<u8>(), 1025..2048)
+    ) {
+        // Encode with a permissive codec, then decode with a tight limit.
+        let mut encoder = LengthPrefixedCodec::new(HeaderSize::Four);
+        let mut decoder = LengthPrefixedCodec::new(HeaderSize::Four)
+            .with_max_frame_size(1024);
+
+        let mut encoded = BytesMut::new();
+        encoder.encode(BytesMut::from(payload.as_slice()), &mut encoded)
+            .expect("encode should succeed");
+
+        let result = decoder.decode(&mut encoded);
+        prop_assert!(result.is_err(), "should reject frames larger than max_frame_size");
+    }
+}
+
 // ── XmlStreamCodec ──────────────────────────────────────────────────────
 
 proptest! {

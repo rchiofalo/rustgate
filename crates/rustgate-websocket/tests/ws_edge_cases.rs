@@ -301,3 +301,38 @@ async fn ws_burst_traffic_on_single_connection() {
         "all burst messages should be delivered without rate limiting"
     );
 }
+
+/// Sending a message that exceeds the WebSocket max_message_size (64 MB)
+/// should cause the server to close the connection, not crash.
+#[tokio::test]
+async fn ws_oversized_frame_disconnects_client() {
+    let server = EdgeTestServer::new(64).await;
+    let alice_cert = server.issue_client("alice", &["alpha"]);
+
+    let mut alice_ws = server.ws_connect(&alice_cert).await;
+    server.wait_registered(1).await;
+
+    // The WebSocket server config sets max_message_size = 64 MB.
+    // Send a message larger than that. We use 65 MB to exceed the limit.
+    // Note: this test may be slow due to the large allocation.
+    let oversized = vec![b'X'; 65 * 1024 * 1024];
+    let send_result = alice_ws.send(Message::Binary(oversized.into())).await;
+
+    // Either the send itself fails or the next recv gets a close/error.
+    if send_result.is_ok() {
+        let next = tokio::time::timeout(std::time::Duration::from_secs(5), alice_ws.next()).await;
+        match next {
+            // Connection closed or errored — expected
+            Ok(Some(Err(_))) | Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Err(_) => {}
+            Ok(Some(Ok(other))) => {
+                panic!("expected close/error after oversized frame, got: {other:?}");
+            }
+        }
+    }
+
+    // Server should still be running — verify with a new connection
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let bob_cert = server.issue_client("bob", &["alpha"]);
+    let _bob_ws = server.ws_connect(&bob_cert).await;
+    server.wait_registered(1).await; // alice disconnected, bob connected
+}
