@@ -20,6 +20,7 @@ use crate::config::FederationConfig;
 use crate::connector::{OutboundConnector, PeerConnector};
 use crate::dedup::MessageDedup;
 use crate::peer::{PeerHandle, PeerStatus};
+use crate::replay_buffer::ReplayBuffer;
 use crate::trust_store::TrustStore;
 use crate::v1::{V1Client, V1Server};
 
@@ -87,6 +88,8 @@ pub struct FederationManager {
     /// Live trust store for dynamic TLS refresh (kept alive for the
     /// `DynamicCertVerifier` closure and the REST API).
     trust_store: Option<Arc<TrustStore>>,
+    /// Per-peer replay buffers for reconnection catch-up.
+    replay_buffers: Mutex<HashMap<PeerId, ReplayBuffer>>,
 
     // ── HA subsystem ─────────────────────────────────────────────────
     #[cfg(feature = "ha")]
@@ -152,6 +155,7 @@ impl FederationManager {
             v2_tls_config: None,
             ca_pem: None,
             trust_store: None,
+            replay_buffers: Mutex::new(HashMap::new()),
             #[cfg(feature = "ha")]
             claim_manager: None,
             #[cfg(feature = "ha")]
@@ -663,6 +667,9 @@ impl FederationManager {
         #[cfg(feature = "v2")]
         let mut v2_event: Option<crate::v2::proto::figpb::FederatedEvent> = None;
 
+        // Buffer the message for replay on reconnection
+        self.buffer_for_replay(&payload, source_groups);
+
         // Snapshot clients and peer handles so callers can release the outer
         // lock before we block on per-peer channel sends.
         let snapshot: Vec<(PeerId, Arc<FederationClient>, Arc<PeerHandle>)> = self
@@ -755,6 +762,44 @@ impl FederationManager {
             }
         }
         sent
+    }
+
+    /// Store a message in the replay buffer for all configured peers.
+    ///
+    /// Called during forwarding so that messages are available for replay
+    /// when a peer reconnects after a disconnection.
+    fn buffer_for_replay(&self, payload: &Bytes, groups: &[String]) {
+        if self.config.replay_buffer_capacity == 0 {
+            return;
+        }
+        if let Ok(mut buffers) = self.replay_buffers.lock() {
+            for peer_id in self.peers.keys() {
+                let buffer = buffers
+                    .entry(peer_id.clone())
+                    .or_insert_with(|| ReplayBuffer::new(self.config.replay_buffer_capacity));
+                let _ = buffer.push(payload.clone(), groups.to_vec());
+            }
+        }
+    }
+
+    /// Get buffered messages for a peer since a given sequence number.
+    ///
+    /// Returns all messages if `since_seq` is 0 (full replay).
+    /// Returns an empty vec if the peer has no replay buffer or if
+    /// the buffer lock cannot be acquired.
+    pub fn replay_messages(
+        &self,
+        peer_id: &str,
+        since_seq: u64,
+    ) -> Vec<crate::replay_buffer::BufferedMessage> {
+        if let Ok(buffers) = self.replay_buffers.lock() {
+            buffers
+                .get(peer_id)
+                .map(|buf| buf.messages_since(since_seq))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        }
     }
 
     /// Gracefully shut down the federation manager and all connections.
@@ -1226,6 +1271,7 @@ mod tests {
             jwt_expiry_secs: 3600,
             circuit_breaker_threshold: 5,
             circuit_breaker_timeout: Duration::from_secs(60),
+            replay_buffer_capacity: 1000,
             pod_id: None,
             ha_nats_url: None,
         }
