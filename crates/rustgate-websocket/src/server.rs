@@ -53,6 +53,12 @@ pub struct WsServerConfig {
     /// Consecutive send failures before the circuit breaker disconnects a session.
     /// Set to 0 to disable.
     pub circuit_breaker_threshold: u32,
+    /// Maximum WebSocket frames per second per connection (0 = unlimited).
+    pub ws_max_frames_per_sec: u32,
+    /// Maximum WebSocket bytes per second per connection (0 = unlimited).
+    pub ws_max_bytes_per_sec: u64,
+    /// Consecutive WebSocket rate limit violations before disconnecting.
+    pub ws_max_violations: u32,
     pub shutdown: Arc<Notify>,
 }
 
@@ -86,6 +92,9 @@ impl WebSocketServer {
             throttle_config,
             replay_filter,
             circuit_breaker_threshold,
+            ws_max_frames_per_sec,
+            ws_max_bytes_per_sec,
+            ws_max_violations,
             shutdown,
         } = config;
 
@@ -112,8 +121,12 @@ impl WebSocketServer {
                             let rf = replay_filter.clone();
 
                             let cb = circuit_breaker_threshold;
+                            let fps = ws_max_frames_per_sec;
+                            let bps = ws_max_bytes_per_sec;
+                            let vio = ws_max_violations;
                             drop(tokio::spawn(handle_ws_session(
-                                session, router, session_codec, nats, fed, tc, rf, cb, permit,
+                                session, router, session_codec, nats, fed, tc, rf, cb, fps,
+                                bps, vio, permit,
                             )));
                         }
                         Err(e) => {
@@ -140,6 +153,9 @@ async fn handle_ws_session(
     throttle_config: Option<ThrottleConfig>,
     replay_filter: Option<Arc<ReplayFilter>>,
     circuit_breaker_threshold: u32,
+    ws_max_frames_per_sec: u32,
+    ws_max_bytes_per_sec: u64,
+    ws_max_violations: u32,
     _permit: OwnedSemaphorePermit,
 ) {
     let identity = session.identity_arc();
@@ -169,10 +185,20 @@ async fn handle_ws_session(
 
     let throttle = throttle_config.map(|tc| tc.build());
 
+    let mut ws_rate_limiter = if ws_max_frames_per_sec > 0 || ws_max_bytes_per_sec > 0 {
+        Some(crate::rate_limit::WsRateLimiter::new(
+            ws_max_frames_per_sec,
+            ws_max_bytes_per_sec,
+            ws_max_violations,
+        ))
+    } else {
+        None
+    };
+
     let read_result = {
         let router = Arc::clone(&router);
         tokio::select! {
-            r = ws_read_loop(ws_read, &identity, &router, nats_publish.as_ref(), fed_forward.as_ref(), &throttle, &replay_filter) => r,
+            r = ws_read_loop(ws_read, &identity, &router, nats_publish.as_ref(), fed_forward.as_ref(), &throttle, &replay_filter, &mut ws_rate_limiter) => r,
             r = ws_write_loop(ws_write, &mut rx, &*codec) => r,
         }
     };
@@ -190,6 +216,7 @@ async fn handle_ws_session(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn ws_read_loop(
     mut ws_read: SplitStream<WsStream>,
     identity: &Identity,
@@ -198,6 +225,7 @@ async fn ws_read_loop(
     fed_forward: Option<&OnFederationForward>,
     throttle: &Option<ClientThrottle>,
     replay_filter: &Option<Arc<ReplayFilter>>,
+    ws_rate_limiter: &mut Option<crate::rate_limit::WsRateLimiter>,
 ) -> Result<(), String> {
     let mut msg_builder = MessageBuilder::new();
 
@@ -215,6 +243,32 @@ async fn ws_read_loop(
             Message::Close(_) => return Ok(()),
             _ => continue, // Ping/Pong handled by tungstenite
         };
+
+        // Per-connection frame/byte rate limiting
+        if let Some(limiter) = ws_rate_limiter
+            && let Err(exceeded) = limiter.check(payload.len())
+        {
+            if exceeded.frame_exceeded {
+                warn!(
+                    cn = %identity.cn,
+                    frames = limiter.frame_count(),
+                    limit = limiter.max_frames_per_sec(),
+                    "WebSocket frame dropped: frame rate exceeded",
+                );
+            }
+            if exceeded.byte_exceeded {
+                warn!(
+                    cn = %identity.cn,
+                    bytes = limiter.byte_count(),
+                    limit = limiter.max_bytes_per_sec(),
+                    "WebSocket frame dropped: byte rate exceeded",
+                );
+            }
+            if limiter.should_disconnect() {
+                return Err("disconnected: sustained rate limit violations".into());
+            }
+            continue;
+        }
 
         // Per-client rate limiting — drop excess messages
         if let Some(t) = throttle
