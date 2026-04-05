@@ -485,6 +485,7 @@ async fn build_federation_config(
         circuit_breaker_timeout: std::time::Duration::from_secs(
             cli.federation_circuit_breaker_timeout,
         ),
+        replay_buffer_capacity: cli.federation_replay_buffer_size,
         pod_id: cli.federation_pod_id.clone().or_else(|| {
             cli.federation_ha_nats_url
                 .as_ref()
