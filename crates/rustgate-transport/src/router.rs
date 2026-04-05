@@ -10,6 +10,7 @@ use rustgate_core::message::{Destination, MessageType, RoutableMessage};
 use tokio::sync::{RwLock, mpsc};
 use tracing::{Instrument, warn};
 
+use crate::acl::GroupAclPolicy;
 use crate::cache::PositionCache;
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
@@ -187,6 +188,7 @@ impl State {
 pub struct Router {
     state: RwLock<State>,
     cache: PositionCache,
+    acl: Option<GroupAclPolicy>,
 }
 
 impl Default for Router {
@@ -194,6 +196,7 @@ impl Default for Router {
         Self {
             state: RwLock::new(State::default()),
             cache: PositionCache::default(),
+            acl: None,
         }
     }
 }
@@ -216,6 +219,38 @@ impl Router {
                 ..State::default()
             }),
             cache: PositionCache::default(),
+            acl: None,
+        }
+    }
+
+    /// Create a new router with a group access control policy.
+    ///
+    /// Groups listed in the policy enforce per-CN send/receive permissions.
+    /// Groups not listed operate in open mode (any member can send/receive).
+    pub fn with_acl(acl: GroupAclPolicy) -> Self {
+        let acl = if acl.is_empty() { None } else { Some(acl) };
+        Self {
+            state: RwLock::new(State::default()),
+            cache: PositionCache::default(),
+            acl,
+        }
+    }
+
+    /// Create a router with custom group limits and access control policy.
+    pub fn with_limits_and_acl(
+        max_groups_per_cn: usize,
+        max_total_groups: usize,
+        acl: GroupAclPolicy,
+    ) -> Self {
+        let acl = if acl.is_empty() { None } else { Some(acl) };
+        Self {
+            state: RwLock::new(State {
+                max_groups_per_cn,
+                max_total_groups,
+                ..State::default()
+            }),
+            cache: PositionCache::default(),
+            acl,
         }
     }
 
@@ -339,8 +374,11 @@ impl Router {
                 .source
                 .groups
                 .intersection(&handle.identity.groups)
-                .next()
-                .is_some();
+                .any(|g| {
+                    self.acl
+                        .as_ref()
+                        .is_none_or(|acl| acl.is_receive_authorized(g, &handle.identity.cn))
+                });
             if shared || handle.identity.groups.is_empty() {
                 total += 1;
                 if handle.send(Arc::new(msg)).await.is_err() {
@@ -397,6 +435,18 @@ impl Router {
             return;
         }
 
+        // ACL send authorization — denies sender even if they are a group member
+        if let Some(ref acl) = self.acl
+            && !acl.is_send_authorized(group, &msg.source.cn)
+        {
+            tracing::warn!(
+                sender = %msg.source.cn,
+                group = %group,
+                "rejected group message: sender not authorized to send"
+            );
+            return;
+        }
+
         let mut dropped = 0u32;
         let mut total = 0u32;
         {
@@ -408,6 +458,11 @@ impl Router {
             for handle in members
                 .iter()
                 .filter(|cn| *cn != &msg.source.cn)
+                .filter(|cn| {
+                    self.acl
+                        .as_ref()
+                        .is_none_or(|acl| acl.is_receive_authorized(group, cn))
+                })
                 .filter_map(|cn| state.sessions.get(cn))
             {
                 total += 1;
@@ -458,6 +513,8 @@ impl Router {
 
 #[cfg(test)]
 mod tests {
+    #![allow(unused_results)]
+
     use std::collections::BTreeSet;
     use std::time::SystemTime;
 
@@ -850,5 +907,242 @@ mod tests {
         let _ = rx_slow.recv().await;
         // Receiver should see None (sender poisoned by circuit breaker)
         assert!(rx_slow.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn acl_denies_unauthorized_sender() {
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "alpha".to_string(),
+            crate::acl::GroupAcl::new(
+                std::collections::HashSet::from(["alice".to_string()]),
+                std::collections::HashSet::from(["alice".to_string(), "bob".to_string()]),
+            ),
+        );
+        let policy = crate::acl::GroupAclPolicy::new(groups);
+        let router = Router::with_acl(policy);
+
+        let alice = make_identity("alice", &["alpha"]);
+        let bob = make_identity("bob", &["alpha"]);
+
+        let (tx_a, mut rx_a) = mpsc::channel(16);
+        let (tx_b, _rx_b) = mpsc::channel(16);
+
+        router
+            .register(SessionHandle::new(alice.clone(), tx_a))
+            .await;
+        router.register(SessionHandle::new(bob.clone(), tx_b)).await;
+
+        // Bob is a member of alpha but NOT in the send ACL
+        let msg = make_chat(&bob, Destination::Group("alpha".to_string()));
+        router.route(msg).await;
+
+        assert!(
+            rx_a.try_recv().is_err(),
+            "alice must not receive: bob is not authorized to send to alpha"
+        );
+    }
+
+    #[tokio::test]
+    async fn acl_allows_authorized_sender() {
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "alpha".to_string(),
+            crate::acl::GroupAcl::new(
+                std::collections::HashSet::from(["alice".to_string(), "bob".to_string()]),
+                std::collections::HashSet::from(["alice".to_string(), "bob".to_string()]),
+            ),
+        );
+        let policy = crate::acl::GroupAclPolicy::new(groups);
+        let router = Router::with_acl(policy);
+
+        let alice = make_identity("alice", &["alpha"]);
+        let bob = make_identity("bob", &["alpha"]);
+
+        let (tx_a, mut rx_a) = mpsc::channel(16);
+        let (tx_b, _rx_b) = mpsc::channel(16);
+
+        router
+            .register(SessionHandle::new(alice.clone(), tx_a))
+            .await;
+        router.register(SessionHandle::new(bob.clone(), tx_b)).await;
+
+        // Bob is authorized to send
+        let msg = make_chat(&bob, Destination::Group("alpha".to_string()));
+        router.route(msg).await;
+
+        assert!(
+            rx_a.try_recv().is_ok(),
+            "alice must receive: bob is authorized to send to alpha"
+        );
+    }
+
+    #[tokio::test]
+    async fn acl_filters_unauthorized_receivers() {
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "alpha".to_string(),
+            crate::acl::GroupAcl::new(
+                std::collections::HashSet::from(["alice".to_string()]),
+                // Only alice can receive — bob and charlie cannot
+                std::collections::HashSet::from(["alice".to_string()]),
+            ),
+        );
+        let policy = crate::acl::GroupAclPolicy::new(groups);
+        let router = Router::with_acl(policy);
+
+        let alice = make_identity("alice", &["alpha"]);
+        let bob = make_identity("bob", &["alpha"]);
+        let charlie = make_identity("charlie", &["alpha"]);
+
+        let (tx_a, _rx_a) = mpsc::channel(16);
+        let (tx_b, mut rx_b) = mpsc::channel(16);
+        let (tx_c, mut rx_c) = mpsc::channel(16);
+
+        router
+            .register(SessionHandle::new(alice.clone(), tx_a))
+            .await;
+        router.register(SessionHandle::new(bob.clone(), tx_b)).await;
+        router
+            .register(SessionHandle::new(charlie.clone(), tx_c))
+            .await;
+
+        // Alice sends — authorized
+        let msg = make_chat(&alice, Destination::Group("alpha".to_string()));
+        router.route(msg).await;
+
+        assert!(
+            rx_b.try_recv().is_err(),
+            "bob must not receive: not in receive ACL"
+        );
+        assert!(
+            rx_c.try_recv().is_err(),
+            "charlie must not receive: not in receive ACL"
+        );
+    }
+
+    #[tokio::test]
+    async fn acl_open_when_no_policy() {
+        // Router without ACL — backward compatible open mode
+        let router = Router::new();
+
+        let alice = make_identity("alice", &["alpha"]);
+        let bob = make_identity("bob", &["alpha"]);
+
+        let (tx_a, mut rx_a) = mpsc::channel(16);
+        let (tx_b, _rx_b) = mpsc::channel(16);
+
+        router
+            .register(SessionHandle::new(alice.clone(), tx_a))
+            .await;
+        router.register(SessionHandle::new(bob.clone(), tx_b)).await;
+
+        let msg = make_chat(&bob, Destination::Group("alpha".to_string()));
+        router.route(msg).await;
+
+        assert!(
+            rx_a.try_recv().is_ok(),
+            "alice must receive: no ACL means open mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn acl_open_for_unconfigured_group() {
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "restricted".to_string(),
+            crate::acl::GroupAcl::new(
+                std::collections::HashSet::from(["admin".to_string()]),
+                std::collections::HashSet::from(["admin".to_string()]),
+            ),
+        );
+        let policy = crate::acl::GroupAclPolicy::new(groups);
+        let router = Router::with_acl(policy);
+
+        let alice = make_identity("alice", &["open-group"]);
+        let bob = make_identity("bob", &["open-group"]);
+
+        let (tx_a, mut rx_a) = mpsc::channel(16);
+        let (tx_b, _rx_b) = mpsc::channel(16);
+
+        router
+            .register(SessionHandle::new(alice.clone(), tx_a))
+            .await;
+        router.register(SessionHandle::new(bob.clone(), tx_b)).await;
+
+        // "open-group" is not in the policy — should allow freely
+        let msg = make_chat(&bob, Destination::Group("open-group".to_string()));
+        router.route(msg).await;
+
+        assert!(
+            rx_a.try_recv().is_ok(),
+            "alice must receive: open-group has no ACL"
+        );
+    }
+
+    #[tokio::test]
+    async fn acl_broadcast_ignores_policy() {
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "alpha".to_string(),
+            crate::acl::GroupAcl::new(
+                std::collections::HashSet::new(), // nobody can send
+                std::collections::HashSet::new(), // nobody can receive
+            ),
+        );
+        let policy = crate::acl::GroupAclPolicy::new(groups);
+        let router = Router::with_acl(policy);
+
+        let alice = make_identity("alice", &["alpha"]);
+        let bob = make_identity("bob", &["alpha"]);
+
+        let (tx_a, mut rx_a) = mpsc::channel(16);
+        let (tx_b, _rx_b) = mpsc::channel(16);
+
+        router
+            .register(SessionHandle::new(alice.clone(), tx_a))
+            .await;
+        router.register(SessionHandle::new(bob.clone(), tx_b)).await;
+
+        // Broadcast — should ignore ACL
+        let msg = make_chat(&bob, Destination::Broadcast);
+        router.route(msg).await;
+
+        assert!(
+            rx_a.try_recv().is_ok(),
+            "broadcasts must ignore group ACL policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn acl_replay_filters_unauthorized_receivers() {
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "alpha".to_string(),
+            crate::acl::GroupAcl::new(
+                std::collections::HashSet::from(["alice".to_string()]),
+                // Only alice can receive from alpha
+                std::collections::HashSet::from(["alice".to_string()]),
+            ),
+        );
+        let policy = crate::acl::GroupAclPolicy::new(groups);
+        let router = Router::with_acl(policy);
+
+        let alice = make_identity("alice", &["alpha"]);
+        let bob = make_identity("bob", &["alpha"]);
+
+        // Cache a position from alice
+        let pos = make_position(&alice, Destination::Broadcast);
+        router.cache().store(pos).await;
+
+        // Bob connects — member of alpha but NOT in receive ACL
+        let (tx, mut rx) = mpsc::channel(16);
+        let handle = SessionHandle::new(bob.clone(), tx);
+        router.replay_positions(&handle).await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "bob must not receive replayed position: not in alpha receive ACL"
+        );
     }
 }

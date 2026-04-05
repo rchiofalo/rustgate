@@ -29,6 +29,35 @@ use crate::cli::{Cli, Encoding, Framing};
 use crate::metrics;
 use crate::session::{FedForwardFn, NatsPublish, PlaintextTcpConfig};
 
+/// Load group access control policy from a JSON configuration file.
+///
+/// Returns `None` if no ACL file is configured (open mode).
+pub(crate) async fn load_group_acl(
+    cli: &Cli,
+) -> anyhow::Result<Option<rustgate_transport::GroupAclPolicy>> {
+    let Some(ref acl_file) = cli.group_acl_file else {
+        return Ok(None);
+    };
+
+    let data = tokio::fs::read_to_string(acl_file)
+        .await
+        .context("reading group ACL file")?;
+    let config: crate::acl_config::GroupAclFile =
+        serde_json::from_str(&data).context("parsing group ACL file")?;
+
+    let mut groups = std::collections::HashMap::new();
+    for (group_id, entry) in config.groups {
+        let _ = groups.insert(
+            group_id,
+            rustgate_transport::GroupAcl::new(entry.send, entry.receive),
+        );
+    }
+
+    let policy = rustgate_transport::GroupAclPolicy::new(groups);
+    tracing::info!(groups = policy.len(), "loaded group access control policy");
+    Ok(Some(policy))
+}
+
 /// Spawn a tokio task whose `JoinHandle` is intentionally not tracked.
 ///
 /// Logs a warning if the task panics. Prefer this over bare `drop(tokio::spawn(...))`
