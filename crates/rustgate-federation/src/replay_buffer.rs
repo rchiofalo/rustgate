@@ -4,7 +4,7 @@
 //! when a peer reconnects, missed messages can be replayed before
 //! resuming the live stream.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
@@ -99,6 +99,28 @@ impl ReplayBuffer {
     /// The oldest sequence number still in the buffer, or `None` if empty.
     pub fn oldest_seq(&self) -> Option<u64> {
         self.buffer.front().map(|m| m.seq)
+    }
+
+    /// Remove all buffered messages and reset the buffer.
+    ///
+    /// The sequence counter is **not** reset — new messages pushed after
+    /// `clear()` continue with the next monotonic sequence number.
+    pub fn clear(&mut self) {
+        self.buffer.clear();
+    }
+
+    /// Return all buffered messages, deduplicating by payload content.
+    ///
+    /// Messages with identical payloads are collapsed, keeping only the
+    /// first occurrence (lowest sequence number). This prevents resending
+    /// the same content multiple times during replay.
+    pub fn all_messages_deduped(&self) -> Vec<BufferedMessage> {
+        let mut seen = HashSet::new();
+        self.buffer
+            .iter()
+            .filter(|m| seen.insert(m.payload.clone()))
+            .cloned()
+            .collect()
     }
 }
 
@@ -198,5 +220,61 @@ mod tests {
         let mut buf = ReplayBuffer::new(0);
         let _ = buf.push(Bytes::from("a"), vec![]);
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn clear_removes_all_messages() {
+        let mut buf = ReplayBuffer::new(10);
+        let _ = buf.push(Bytes::from("a"), vec![]);
+        let _ = buf.push(Bytes::from("b"), vec![]);
+        assert_eq!(buf.len(), 2);
+
+        buf.clear();
+        assert!(buf.is_empty());
+        assert_eq!(buf.len(), 0);
+    }
+
+    #[test]
+    fn clear_preserves_sequence_counter() {
+        let mut buf = ReplayBuffer::new(10);
+        let _ = buf.push(Bytes::from("a"), vec![]);
+        let _ = buf.push(Bytes::from("b"), vec![]);
+        buf.clear();
+
+        // Next push should continue from seq 3, not restart at 1
+        let seq = buf.push(Bytes::from("c"), vec![]);
+        assert_eq!(seq, 3);
+    }
+
+    #[test]
+    fn all_messages_deduped_removes_duplicates() {
+        let mut buf = ReplayBuffer::new(10);
+        let _ = buf.push(Bytes::from("a"), vec!["g1".into()]);
+        let _ = buf.push(Bytes::from("b"), vec!["g2".into()]);
+        let _ = buf.push(Bytes::from("a"), vec!["g3".into()]); // duplicate payload
+
+        let deduped = buf.all_messages_deduped();
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped[0].payload, Bytes::from("a"));
+        assert_eq!(deduped[1].payload, Bytes::from("b"));
+    }
+
+    #[test]
+    fn all_messages_deduped_keeps_first_occurrence() {
+        let mut buf = ReplayBuffer::new(10);
+        let _ = buf.push(Bytes::from("x"), vec!["alpha".into()]);
+        let _ = buf.push(Bytes::from("x"), vec!["bravo".into()]);
+
+        let deduped = buf.all_messages_deduped();
+        assert_eq!(deduped.len(), 1);
+        // Should keep first occurrence (seq=1, groups=["alpha"])
+        assert_eq!(deduped[0].seq, 1);
+        assert_eq!(deduped[0].groups, vec!["alpha".to_string()]);
+    }
+
+    #[test]
+    fn all_messages_deduped_empty_buffer() {
+        let buf = ReplayBuffer::new(10);
+        assert!(buf.all_messages_deduped().is_empty());
     }
 }

@@ -22,11 +22,18 @@ use crate::connector::OutboundConnector;
 use crate::heartbeat::{create_heartbeat, is_heartbeat};
 use crate::peer::{PeerHandle, PeerState};
 use crate::reconnect::{backoff_delay, should_stop_reconnecting};
+use crate::replay_buffer::BufferedMessage;
 
 /// Callback invoked for each non-heartbeat message received from the peer.
 ///
 /// Arguments: (peer_id, payload_bytes)
 pub type OnMessage = Arc<dyn Fn(String, Bytes) + Send + Sync>;
+
+/// Callback that drains the replay buffer on reconnection.
+///
+/// Returns deduped buffered messages and clears the buffer atomically.
+/// Arguments: (peer_id) -> Vec<BufferedMessage>
+pub type ReplayDrain = Arc<dyn Fn(&str) -> Vec<BufferedMessage> + Send + Sync>;
 
 /// Configuration for a V1 federation outbound client.
 pub struct V1ClientConfig {
@@ -39,6 +46,10 @@ pub struct V1ClientConfig {
     pub reconnect_delay: Duration,
     pub max_reconnects: i32,
     pub on_message: OnMessage,
+    /// Optional replay drain callback. When set, called after reconnection
+    /// to retrieve and resend buffered messages before entering the live
+    /// session loop.
+    pub replay_drain: Option<ReplayDrain>,
 }
 
 impl fmt::Debug for V1ClientConfig {
@@ -200,13 +211,29 @@ async fn connection_loop(
             "connected to V1 federation peer"
         );
 
-        // Run the session
+        // Drain replay buffer for this peer (returns deduped messages and clears)
+        let replay_messages: Vec<BufferedMessage> = config
+            .replay_drain
+            .as_ref()
+            .map(|drain| drain(peer_id.as_ref()))
+            .unwrap_or_default();
+
+        if !replay_messages.is_empty() {
+            info!(
+                peer_id = %peer_id,
+                replayed_count = replay_messages.len(),
+                "replaying buffered messages after reconnection"
+            );
+        }
+
+        // Run the session (replay messages are sent before entering the live loop)
         let session_result = run_session(
             &peer,
             tls_stream,
             &config,
             &mut outbound_rx,
             &mut shutdown_rx,
+            replay_messages,
         )
         .await;
 
@@ -263,10 +290,29 @@ async fn run_session(
     config: &V1ClientConfig,
     outbound_rx: &mut mpsc::Receiver<Bytes>,
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+    replay_messages: Vec<BufferedMessage>,
 ) -> anyhow::Result<()> {
     let peer_id = peer.id.clone();
     let codec = LengthPrefixedCodec::new(HeaderSize::Four);
     let mut framed = Framed::new(tls_stream, codec);
+
+    // Send replay messages before entering the live loop
+    for msg in &replay_messages {
+        let buf = BytesMut::from(msg.payload.as_ref());
+        framed
+            .send(buf)
+            .await
+            .map_err(|e| anyhow::anyhow!("replay send error: {e}"))?;
+        peer.record_sent();
+    }
+
+    if !replay_messages.is_empty() {
+        debug!(
+            peer_id = %peer_id,
+            count = replay_messages.len(),
+            "finished replaying buffered messages"
+        );
+    }
 
     // Heartbeat tracking
     let mut last_heartbeat_received = tokio::time::Instant::now();
@@ -394,6 +440,7 @@ mod tests {
                 reconnect_delay: Duration::from_secs(1),
                 max_reconnects: 0, // no reconnects — should give up quickly
                 on_message: on_msg,
+                replay_drain: None,
             },
         );
 
@@ -450,6 +497,7 @@ mod tests {
                 reconnect_delay: Duration::from_secs(1),
                 max_reconnects: 0,
                 on_message: on_msg,
+                replay_drain: None,
             },
         );
 
@@ -507,6 +555,7 @@ mod tests {
                 reconnect_delay: Duration::from_millis(100),
                 max_reconnects: 0, // no reconnects
                 on_message: on_msg,
+                replay_drain: None,
             },
         );
 
@@ -565,6 +614,7 @@ mod tests {
                 reconnect_delay: Duration::from_secs(1),
                 max_reconnects: 0,
                 on_message: on_msg,
+                replay_drain: None,
             },
         );
 

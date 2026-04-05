@@ -19,9 +19,16 @@ use super::proto::figpb::federated_channel_client::FederatedChannelClient;
 use crate::peer::{PeerHandle, PeerState};
 use crate::provenance;
 use crate::reconnect::{backoff_delay, should_stop_reconnecting};
+use crate::replay_buffer::BufferedMessage;
 
 /// Callback invoked when a FederatedEvent is received from the remote peer.
 pub type OnEvent = Arc<dyn Fn(figpb::FederatedEvent, String) + Send + Sync>;
+
+/// Callback that drains the replay buffer on reconnection (V2).
+///
+/// Returns deduped buffered messages and clears the buffer atomically.
+/// Arguments: (peer_id) -> Vec<BufferedMessage>
+pub type V2ReplayDrain = Arc<dyn Fn(&str) -> Vec<BufferedMessage> + Send + Sync>;
 
 /// Configuration for a V2 federation gRPC client.
 pub struct V2ClientConfig {
@@ -33,6 +40,10 @@ pub struct V2ClientConfig {
     pub reconnect_delay: Duration,
     pub max_reconnects: i32,
     pub on_event: OnEvent,
+    /// Optional replay drain callback for reconnection replay.
+    pub replay_drain: Option<V2ReplayDrain>,
+    /// Maximum hops for provenance metadata (used during replay).
+    pub max_hops: u32,
 }
 
 impl fmt::Debug for V2ClientConfig {
@@ -217,8 +228,31 @@ async fn connection_loop(
 
         let client = FederatedChannelClient::new(channel);
 
+        // Drain replay buffer before entering the stream loop
+        let replay_messages: Vec<BufferedMessage> = config
+            .replay_drain
+            .as_ref()
+            .map(|drain| drain(peer.id.as_ref()))
+            .unwrap_or_default();
+
+        if !replay_messages.is_empty() {
+            info!(
+                peer = %peer.id,
+                replayed_count = replay_messages.len(),
+                "replaying buffered messages after reconnection"
+            );
+        }
+
         // Run the 5-stream handshake and event loop
-        let result = run_streams(&peer, client, &config, &mut outbound_rx, &mut shutdown_rx).await;
+        let result = run_streams(
+            &peer,
+            client,
+            &config,
+            &mut outbound_rx,
+            &mut shutdown_rx,
+            replay_messages,
+        )
+        .await;
 
         match result {
             Ok(()) => {
@@ -298,6 +332,7 @@ async fn run_streams(
     config: &V2ClientConfig,
     outbound_rx: &mut mpsc::Receiver<figpb::FederatedEvent>,
     shutdown_rx: &mut watch::Receiver<bool>,
+    replay_messages: Vec<BufferedMessage>,
 ) -> anyhow::Result<()> {
     let sub = our_subscription(&config.federate_id);
 
@@ -385,6 +420,36 @@ async fn run_streams(
         return Err(anyhow::anyhow!("initial health check failed: {e}"));
     }
     debug!(peer = %peer.id, "initial health check passed");
+
+    // Replay buffered messages after handshake completes
+    for msg in &replay_messages {
+        let mut metadata = crate::provenance::FederationMetadata::new(config.max_hops);
+        metadata.add_hop(&config.federate_id, &config.federate_id);
+        match crate::v2::convert::xml_to_federated_event(&msg.payload, &metadata) {
+            Ok(event) => {
+                if send_tx.send(event).await.is_err() {
+                    warn!(peer = %peer.id, "send stream closed during replay");
+                    return Err(anyhow::anyhow!("send stream closed during replay"));
+                }
+                peer.record_sent();
+            }
+            Err(e) => {
+                warn!(
+                    peer = %peer.id,
+                    error = %e,
+                    "failed to convert buffered message for V2 replay, skipping"
+                );
+            }
+        }
+    }
+
+    if !replay_messages.is_empty() {
+        debug!(
+            peer = %peer.id,
+            count = replay_messages.len(),
+            "finished replaying buffered messages"
+        );
+    }
 
     loop {
         tokio::select! {
@@ -554,6 +619,8 @@ mod tests {
                 reconnect_delay: Duration::from_secs(1),
                 max_reconnects: 0, // max_reconnects = 0 means immediate stop
                 on_event: noop_on_event(),
+                replay_drain: None,
+                max_hops: 10,
             },
         );
 
@@ -582,6 +649,8 @@ mod tests {
                 reconnect_delay: Duration::from_secs(1),
                 max_reconnects: 0,
                 on_event: noop_on_event(),
+                replay_drain: None,
+                max_hops: 10,
             },
         );
 
@@ -607,6 +676,8 @@ mod tests {
                 reconnect_delay: Duration::from_secs(1),
                 max_reconnects: 0,
                 on_event: noop_on_event(),
+                replay_drain: None,
+                max_hops: 10,
             },
         );
 
@@ -634,6 +705,8 @@ mod tests {
                 reconnect_delay: Duration::from_millis(50), // fast reconnect for test
                 max_reconnects: 1,
                 on_event: noop_on_event(),
+                replay_drain: None,
+                max_hops: 10,
             },
         );
 
