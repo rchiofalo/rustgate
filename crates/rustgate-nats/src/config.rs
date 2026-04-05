@@ -96,6 +96,11 @@ pub struct NatsConfig {
 
     /// Instance ID for echo prevention. Auto-generated if not set.
     pub instance_id: String,
+
+    /// Optional path for JetStream replay checkpoint file.
+    /// When set, stores the last processed sequence number so
+    /// subsequent restarts resume from the checkpoint.
+    pub checkpoint_path: Option<PathBuf>,
 }
 
 impl Default for NatsConfig {
@@ -111,6 +116,7 @@ impl Default for NatsConfig {
             max_payload_bytes: 256 * 1024,
             max_replay_count: 0,
             instance_id: generate_instance_id(),
+            checkpoint_path: None,
         }
     }
 }

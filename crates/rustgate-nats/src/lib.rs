@@ -67,8 +67,15 @@ impl NatsAdapter {
     }
 
     /// Create a JetStream replay handle for SA bootstrap.
+    ///
+    /// When the config has a `checkpoint_path` set, the replayer will
+    /// persist and resume from the last processed sequence number.
     pub fn jetstream_replay(&self) -> JetStreamReplay {
-        JetStreamReplay::new(self.client.clone(), self.config.clone())
+        JetStreamReplay::new(
+            self.client.clone(),
+            self.config.clone(),
+            self.config.checkpoint_path.clone(),
+        )
     }
 }
 

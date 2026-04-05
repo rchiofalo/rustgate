@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **JetStream resumption checkpoints** — optional checkpoint file (`--nats-checkpoint-path`, env `RUSTGATE_NATS_CHECKPOINT_PATH`) persists the last processed sequence number so restarts resume from the checkpoint instead of replaying the entire history stream. (#413)
 - **Federation replay buffer** — bounded per-peer ring buffer (`--federation-replay-buffer-size`, env `RUSTGATE_FEDERATION_REPLAY_BUFFER_SIZE`, default 1000) stores recent forwarded messages. On reconnection, missed messages can be replayed from the buffer before resuming the live stream. Set to 0 to disable. (#409)
 - **WebSocket per-connection rate limiting** — configurable frame-rate (`--ws-max-frames-per-sec`) and byte-rate (`--ws-max-bytes-per-sec`) limits per WebSocket connection. Clients exceeding limits have frames dropped; sustained violations trigger disconnection (`--ws-max-violations`, default 10). All disabled by default for backward compatibility. (#422)
 - **Session circuit breaker** — disconnects slow sessions after consecutive send failures exceed a configurable threshold (`--circuit-breaker-threshold`, default 10, env `RUSTGATE_CIRCUIT_BREAKER_THRESHOLD`). Prevents a single backpressured client from degrading group routing for other sessions. Set to 0 to disable. (#420)
