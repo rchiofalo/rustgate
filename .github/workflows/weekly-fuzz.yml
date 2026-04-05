@@ -38,7 +38,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
 
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler

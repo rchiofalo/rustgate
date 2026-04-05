@@ -9,8 +9,10 @@
 
 mod server;
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use rustgate_core::constants::HANDSHAKE_TIMEOUT;
 use rustgate_core::error::{Result, TransportError};
@@ -71,15 +73,35 @@ impl std::fmt::Debug for WsSession {
     }
 }
 
+/// Maximum connection attempts per IP within the rate limit window.
+const CONN_RATE_LIMIT: usize = 10;
+
+/// Sliding window duration for connection rate limiting.
+const CONN_RATE_WINDOW: Duration = Duration::from_secs(10);
+
+/// Number of tracked IPs that triggers an inline sweep of stale entries.
+const CONN_RATE_SWEEP_THRESHOLD: usize = 512;
+
 /// WebSocket listener with mandatory mTLS.
 ///
 /// Mirrors [`TlsListener`](rustgate_transport::TlsListener) but adds the
 /// WebSocket upgrade handshake after TLS completes. The accept loop handles
 /// TCP, TLS, identity extraction, and WS upgrade — callers receive a fully
 /// authenticated [`WsSession`] ready for message exchange.
+///
+/// Includes per-IP connection rate limiting to mitigate slow-handshake DoS
+/// attacks where an adversary repeatedly initiates and abandons TLS handshakes.
 pub struct WsListener {
     tcp: TcpListener,
     tls: TlsAcceptor,
+    conn_rate: Mutex<ConnRateState>,
+}
+
+/// Per-IP connection attempt tracking for DoS mitigation.
+#[derive(Debug)]
+struct ConnRateState {
+    map: HashMap<IpAddr, VecDeque<Instant>>,
+    last_sweep: Instant,
 }
 
 impl std::fmt::Debug for WsListener {
@@ -87,6 +109,7 @@ impl std::fmt::Debug for WsListener {
         f.debug_struct("WsListener")
             .field("tcp", &self.tcp)
             .field("tls", &"<TlsAcceptor>")
+            .field("conn_rate", &"<ConnRateState>")
             .finish()
     }
 }
@@ -128,7 +151,14 @@ impl WsListener {
 
         debug!(local_addr = ?tcp.local_addr().ok(), "WebSocket listener bound");
 
-        Ok(Self { tcp, tls })
+        Ok(Self {
+            tcp,
+            tls,
+            conn_rate: Mutex::new(ConnRateState {
+                map: HashMap::new(),
+                last_sweep: Instant::now(),
+            }),
+        })
     }
 
     /// Returns the local address this listener is bound to.
@@ -138,11 +168,58 @@ impl WsListener {
             .map_err(|e| TransportError::Other(format!("failed to get local address: {e}")).into())
     }
 
+    /// Check whether `ip` has exceeded the connection rate limit.
+    ///
+    /// Uses a sliding window of [`CONN_RATE_WINDOW`] seconds, rejecting IPs
+    /// with [`CONN_RATE_LIMIT`] or more attempts in the window. Records the
+    /// attempt timestamp when the IP is not rate-limited.
+    ///
+    /// Returns `true` if the IP is rate-limited, `false` otherwise.
+    fn is_conn_rate_limited(&self, ip: IpAddr) -> bool {
+        let now = Instant::now();
+        let cutoff = now - CONN_RATE_WINDOW;
+
+        let mut state = match self.conn_rate.lock() {
+            Ok(s) => s,
+            Err(e) => e.into_inner(),
+        };
+
+        // Periodic sweep of stale IPs to bound memory.
+        if state.map.len() > CONN_RATE_SWEEP_THRESHOLD
+            || now.duration_since(state.last_sweep) >= CONN_RATE_WINDOW
+        {
+            state.map.retain(|_, timestamps| {
+                while timestamps.front().is_some_and(|t| *t <= cutoff) {
+                    let _ = timestamps.pop_front();
+                }
+                !timestamps.is_empty()
+            });
+            state.last_sweep = now;
+        }
+
+        let timestamps = state.map.entry(ip).or_default();
+
+        // Prune expired entries for this IP.
+        while timestamps.front().is_some_and(|t| *t <= cutoff) {
+            let _ = timestamps.pop_front();
+        }
+
+        if timestamps.len() >= CONN_RATE_LIMIT {
+            return true;
+        }
+
+        timestamps.push_back(now);
+        false
+    }
+
     /// Accept a new WebSocket connection with mTLS authentication.
     ///
     /// Loops internally on TCP, TLS, and WebSocket handshake failures.
     /// Returns only when a fully authenticated session is ready, or
     /// when identity extraction fails (which is a configuration error).
+    ///
+    /// Connections are subject to per-IP rate limiting before the TLS
+    /// handshake to mitigate slow-handshake denial-of-service attacks.
     pub async fn accept(&self) -> Result<WsSession> {
         loop {
             let (tcp_stream, peer_addr) = match self.tcp.accept().await {
@@ -152,6 +229,16 @@ impl WsListener {
                     continue;
                 }
             };
+
+            // Per-IP connection rate limiting to mitigate slow-handshake DoS.
+            if self.is_conn_rate_limited(peer_addr.ip()) {
+                warn!(
+                    peer_addr = %peer_addr,
+                    "connection rejected: rate limit exceeded for IP"
+                );
+                drop(tcp_stream);
+                continue;
+            }
 
             configure_tcp_keepalive(&tcp_stream);
             debug!(peer_addr = %peer_addr, "TCP connection accepted");
@@ -225,4 +312,137 @@ fn extract_client_identity(tls_stream: &TlsStream) -> Result<Identity> {
     let client_cert = certs.first().ok_or(TransportError::EmptyCertChain)?;
 
     extract_identity(client_cert)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::panic, clippy::unwrap_used)]
+
+    use super::*;
+
+    /// Helper: create a `ConnRateState` for testing.
+    fn new_rate_state() -> Mutex<ConnRateState> {
+        Mutex::new(ConnRateState {
+            map: HashMap::new(),
+            last_sweep: Instant::now(),
+        })
+    }
+
+    /// Helper: call `is_conn_rate_limited` without needing a full `WsListener`.
+    ///
+    /// Duplicates the logic so we can test the algorithm without binding a socket.
+    fn check_rate_limit(state: &Mutex<ConnRateState>, ip: IpAddr) -> bool {
+        let now = Instant::now();
+        let cutoff = now - CONN_RATE_WINDOW;
+
+        let mut guard = state.lock().unwrap();
+
+        if guard.map.len() > CONN_RATE_SWEEP_THRESHOLD
+            || now.duration_since(guard.last_sweep) >= CONN_RATE_WINDOW
+        {
+            guard.map.retain(|_, timestamps| {
+                while timestamps.front().is_some_and(|t| *t <= cutoff) {
+                    let _ = timestamps.pop_front();
+                }
+                !timestamps.is_empty()
+            });
+            guard.last_sweep = now;
+        }
+
+        let timestamps = guard.map.entry(ip).or_default();
+
+        while timestamps.front().is_some_and(|t| *t <= cutoff) {
+            let _ = timestamps.pop_front();
+        }
+
+        if timestamps.len() >= CONN_RATE_LIMIT {
+            return true;
+        }
+
+        timestamps.push_back(now);
+        false
+    }
+
+    #[test]
+    fn rate_limit_allows_under_threshold() {
+        let state = new_rate_state();
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        for _ in 0..CONN_RATE_LIMIT - 1 {
+            assert!(!check_rate_limit(&state, ip));
+        }
+    }
+
+    #[test]
+    fn rate_limit_blocks_at_threshold() {
+        let state = new_rate_state();
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        for _ in 0..CONN_RATE_LIMIT {
+            assert!(!check_rate_limit(&state, ip));
+        }
+
+        // Next attempt should be blocked.
+        assert!(check_rate_limit(&state, ip));
+    }
+
+    #[test]
+    fn rate_limit_isolates_ips() {
+        let state = new_rate_state();
+        let ip_a: IpAddr = "10.0.0.1".parse().unwrap();
+        let ip_b: IpAddr = "10.0.0.2".parse().unwrap();
+
+        // Exhaust limit for ip_a.
+        for _ in 0..CONN_RATE_LIMIT {
+            assert!(!check_rate_limit(&state, ip_a));
+        }
+        assert!(check_rate_limit(&state, ip_a));
+
+        // ip_b should still be allowed.
+        assert!(!check_rate_limit(&state, ip_b));
+    }
+
+    #[test]
+    fn rate_limit_resets_after_window() {
+        let state = new_rate_state();
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        // Fill up the limit with timestamps in the past.
+        {
+            let mut guard = state.lock().unwrap();
+            let old = Instant::now() - CONN_RATE_WINDOW - Duration::from_secs(1);
+            let timestamps = guard.map.entry(ip).or_default();
+            for _ in 0..CONN_RATE_LIMIT {
+                timestamps.push_back(old);
+            }
+        }
+
+        // Old entries should be pruned; new attempt should succeed.
+        assert!(!check_rate_limit(&state, ip));
+    }
+
+    #[test]
+    fn rate_limit_sweep_cleans_stale_ips() {
+        let state = new_rate_state();
+        let stale_ip: IpAddr = "10.0.0.99".parse().unwrap();
+
+        // Insert a stale entry.
+        {
+            let mut guard = state.lock().unwrap();
+            let old = Instant::now() - CONN_RATE_WINDOW - Duration::from_secs(1);
+            guard.map.entry(stale_ip).or_default().push_back(old);
+            // Force sweep on next call by backdating last_sweep.
+            guard.last_sweep = old;
+        }
+
+        // Any call should trigger a sweep and remove the stale IP.
+        let fresh_ip: IpAddr = "10.0.0.1".parse().unwrap();
+        assert!(!check_rate_limit(&state, fresh_ip));
+
+        let guard = state.lock().unwrap();
+        assert!(
+            !guard.map.contains_key(&stale_ip),
+            "stale IP should have been swept"
+        );
+    }
 }
