@@ -32,9 +32,6 @@ pub struct ContactInfo {
 pub type ContactsProvider =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Vec<ContactInfo>> + Send>> + Send + Sync>;
 
-/// Default time-to-live for cached contacts data.
-const DEFAULT_CONTACTS_TTL: Duration = Duration::from_secs(30);
-
 struct CachedEntry {
     contacts: Vec<ContactInfo>,
     fetched_at: Instant,
@@ -74,19 +71,19 @@ impl CachedContactsProvider {
         // Fast path: read lock
         {
             let guard = self.cache.read().await;
-            if let Some(entry) = guard.as_ref() {
-                if entry.fetched_at.elapsed() < self.ttl {
-                    return entry.contacts.clone();
-                }
+            if let Some(entry) = guard.as_ref()
+                && entry.fetched_at.elapsed() < self.ttl
+            {
+                return entry.contacts.clone();
             }
         }
 
         // Slow path: write lock with double-check
         let mut guard = self.cache.write().await;
-        if let Some(entry) = guard.as_ref() {
-            if entry.fetched_at.elapsed() < self.ttl {
-                return entry.contacts.clone();
-            }
+        if let Some(entry) = guard.as_ref()
+            && entry.fetched_at.elapsed() < self.ttl
+        {
+            return entry.contacts.clone();
         }
 
         let contacts = (self.inner)().await;
@@ -110,6 +107,7 @@ pub fn cached_contacts_provider(inner: ContactsProvider, ttl: Duration) -> Conta
 }
 
 #[cfg(test)]
+#[allow(unused_results)]
 mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
