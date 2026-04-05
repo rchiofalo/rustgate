@@ -2164,6 +2164,7 @@ dependencies = [
  "rustgate-test-utils",
  "rustgate-transport",
  "rustgate-websocket",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "tempfile",

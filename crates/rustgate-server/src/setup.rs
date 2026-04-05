@@ -360,6 +360,10 @@ pub(crate) async fn start_enrollment(
                 .await
                 .context("initializing data package store")?;
 
+        if cli.package_strict_signatures && cli.package_signature_ca.is_none() {
+            anyhow::bail!("--package-strict-signatures requires --package-signature-ca to be set");
+        }
+
         store = store.with_strict_signatures(cli.package_strict_signatures);
 
         if let Some(ref ca_path) = cli.package_signature_ca {

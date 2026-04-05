@@ -196,6 +196,11 @@ impl DataPackageStore {
     }
 
     /// Read a data package by its SHA-256 hash. Returns `(metadata, bytes)`.
+    ///
+    /// When a signing CA is configured and the package has a stored signature,
+    /// the signature is re-verified against the on-disk data to detect
+    /// post-upload tampering. Verification failure returns an error and the
+    /// package is not served.
     pub async fn download(&self, hash: &str) -> Result<(PackageMeta, Vec<u8>), EnrollmentError> {
         if !is_valid_hex_hash(hash) {
             return Err(EnrollmentError::Config("invalid hash format".to_string()));
@@ -203,6 +208,21 @@ impl DataPackageStore {
 
         let meta = self.read_meta(hash).await?;
         let data = fs::read(self.package_path(hash)).await?;
+
+        // Re-verify signature at download time to detect on-disk tampering
+        if let (Some(sig_b64), Some(ca)) = (&meta.signature, &self.signing_ca) {
+            let sig_bytes =
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, sig_b64)
+                    .map_err(|e| {
+                        EnrollmentError::Config(format!("stored signature is invalid base64: {e}"))
+                    })?;
+            verify_signature(&ca.spki_bytes, &data, &sig_bytes).map_err(|_| {
+                tracing::error!(hash = %hash, "download-time signature verification failed — possible tampering");
+                EnrollmentError::Config(
+                    "package signature verification failed at download time".to_string(),
+                )
+            })?;
+        }
 
         Ok((meta, data))
     }
@@ -370,6 +390,8 @@ fn skip_tlv(data: &[u8], pos: &mut usize) -> Result<(), ()> {
 }
 
 /// Read a DER length field. Returns (length_value, offset_after_length).
+///
+/// Uses checked arithmetic to prevent integer overflow on malformed input.
 fn read_der_length(data: &[u8], pos: usize) -> Result<(usize, usize), ()> {
     if pos >= data.len() {
         return Err(());
@@ -379,14 +401,18 @@ fn read_der_length(data: &[u8], pos: usize) -> Result<(usize, usize), ()> {
         return Ok((first as usize, pos + 1));
     }
     let num_bytes = (first & 0x7f) as usize;
-    if num_bytes == 0 || num_bytes > 4 || pos + 1 + num_bytes > data.len() {
+    if num_bytes == 0 || num_bytes > 4 {
+        return Err(());
+    }
+    let after_length = pos.checked_add(1 + num_bytes).ok_or(())?;
+    if after_length > data.len() {
         return Err(());
     }
     let mut len: usize = 0;
     for i in 0..num_bytes {
-        len = (len << 8) | (data[pos + 1 + i] as usize);
+        len = len.checked_shl(8).ok_or(())? | (data[pos + 1 + i] as usize);
     }
-    Ok((len, pos + 1 + num_bytes))
+    Ok((len, after_length))
 }
 
 /// Verify a detached signature over `data` using the SPKI from the signing CA.
@@ -895,5 +921,78 @@ mod tests {
             .expect("test");
         let store = rt.block_on(store_future).expect("test");
         assert!(!store.strict_signatures());
+    }
+
+    #[test]
+    fn test_extract_spki_from_real_x509() {
+        // Generate a real X.509 certificate using TestCa
+        use rustls_pki_types::pem::PemObject;
+        let ca = rustgate_test_utils::certs::TestCa::new("test-spki-ca");
+        let ca_cert_der = rustls_pki_types::CertificateDer::from_pem_slice(ca.cert_pem.as_bytes())
+            .expect("parse CA PEM");
+
+        // extract_spki_from_der should succeed on a real certificate
+        let spki = extract_spki_from_der(&ca_cert_der)
+            .expect("SPKI extraction should succeed on a real X.509 certificate");
+
+        // SPKI should be non-empty and start with a SEQUENCE tag (0x30)
+        assert!(!spki.is_empty(), "SPKI bytes should not be empty");
+        assert_eq!(spki[0], 0x30, "SPKI should start with SEQUENCE tag (0x30)");
+    }
+
+    #[test]
+    fn test_read_der_length_overflow() {
+        // Craft a length field that would overflow: 0x84 means 4 bytes follow,
+        // with values that overflow usize on 32-bit or trigger checked_shl
+        let data = [0x30, 0x84, 0xff, 0xff, 0xff, 0xff];
+        let result = read_der_length(&data, 1);
+        // On 64-bit this parses to a huge length that will fail bounds checks
+        // downstream, but the arithmetic itself should not panic
+        if let Ok((len, _)) = result {
+            // The length 0xffffffff = 4294967295 should be valid arithmetic
+            // but would fail bounds checks when used
+            assert!(len > 0);
+        }
+        // On 32-bit this would be Err due to checked_shl overflow — both are fine
+    }
+
+    #[tokio::test]
+    async fn test_download_reverifies_signature() {
+        let (spki, key_pair) = test_ecdsa_keypair();
+        let dir = tempfile::tempdir().expect("test");
+        let store = DataPackageStore::new(dir.path().to_path_buf())
+            .await
+            .expect("test");
+        let store = DataPackageStore {
+            signing_ca: Some(SigningCa {
+                spki_bytes: spki.clone(),
+            }),
+            ..store
+        };
+
+        let data = b"PK\x03\x04signed content for reverify";
+        let sig_b64 = sign_data(&key_pair, data);
+
+        let meta = store
+            .upload_with_signature(data, "reverify.zip", "user-1", Some(&sig_b64))
+            .await
+            .expect("upload should succeed");
+
+        // Normal download should succeed
+        let (_, dl_data) = store
+            .download(&meta.hash)
+            .await
+            .expect("download should succeed");
+        assert_eq!(dl_data, data);
+
+        // Tamper with the on-disk file
+        let pkg_path = dir.path().join(format!("{}.zip", meta.hash));
+        tokio::fs::write(&pkg_path, b"TAMPERED CONTENT")
+            .await
+            .expect("write tampered file");
+
+        // Download should now fail due to signature mismatch
+        let result = store.download(&meta.hash).await;
+        assert!(result.is_err(), "download of tampered package should fail");
     }
 }
