@@ -74,6 +74,8 @@ impl Encoder<BytesMut> for FramedCodec {
 pub struct LengthPrefixedCodec {
     header_size: HeaderSize,
     pending_len: Option<usize>,
+    /// Configurable maximum frame size. Defaults to `MAX_FRAME_SIZE` if not set.
+    max_frame_size: usize,
 }
 
 #[derive(Debug, Default)]
@@ -86,7 +88,17 @@ impl LengthPrefixedCodec {
         Self {
             header_size,
             pending_len: None,
+            max_frame_size: MAX_FRAME_SIZE,
         }
+    }
+
+    /// Create a codec with a custom maximum frame size.
+    ///
+    /// Use this to enforce a tighter limit than the global `MAX_FRAME_SIZE`
+    /// constant, for example to match a configuration-level `max_message_size`.
+    pub fn with_max_frame_size(mut self, max_frame_size: usize) -> Self {
+        self.max_frame_size = max_frame_size;
+        self
     }
 
     fn header_bytes(&self) -> usize {
@@ -115,7 +127,7 @@ impl LengthPrefixedCodec {
             HeaderSize::Two => u16::MAX as usize,
             HeaderSize::Four => u32::MAX as usize,
         };
-        header_max.min(MAX_FRAME_SIZE)
+        header_max.min(self.max_frame_size)
     }
 }
 
@@ -131,10 +143,13 @@ impl Decoder for LengthPrefixedCodec {
                     return Ok(None);
                 }
                 let len = self.read_length(&src[..self.header_bytes()]);
-                if len > MAX_FRAME_SIZE {
+                if len > self.max_frame_size {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "frame too large",
+                        format!(
+                            "frame too large: {} bytes exceeds limit of {}",
+                            len, self.max_frame_size
+                        ),
                     ));
                 }
                 src.advance(self.header_bytes());

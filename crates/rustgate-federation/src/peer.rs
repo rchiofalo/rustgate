@@ -92,9 +92,25 @@ impl std::fmt::Display for PeerState {
     }
 }
 
+/// Mutable peer timestamps and error state, protected by a single lock.
+///
+/// Consolidating these fields avoids acquiring four separate mutexes
+/// when building a status snapshot or updating related state.
+#[derive(Debug, Default)]
+struct PeerTimestamps {
+    /// Timestamp of the last received heartbeat.
+    last_heartbeat: Option<Instant>,
+    /// Last error message, if any.
+    last_error: Option<String>,
+    /// Timestamp when the current connection was established.
+    connected_at: Option<Instant>,
+    /// When the circuit last tripped open.
+    circuit_opened_at: Option<Instant>,
+}
+
 /// Tracks the runtime state of a federation peer connection.
 ///
-/// Thread-safe — all fields use atomic types or mutexes.
+/// Thread-safe — all fields use atomic types or a consolidated mutex.
 #[derive(Debug)]
 pub struct PeerHandle {
     /// Peer identifier.
@@ -103,16 +119,12 @@ pub struct PeerHandle {
     pub config: PeerConfig,
     /// Current connection state (atomic for lock-free reads).
     state: AtomicU8,
-    /// Timestamp of the last received heartbeat.
-    last_heartbeat: Mutex<Option<Instant>>,
+    /// Consolidated mutable timestamps and error state.
+    timestamps: Mutex<PeerTimestamps>,
     /// Total messages sent to this peer.
     pub messages_sent: AtomicU64,
     /// Total messages received from this peer.
     pub messages_recv: AtomicU64,
-    /// Last error message, if any.
-    last_error: Mutex<Option<String>>,
-    /// Timestamp when the current connection was established.
-    connected_at: Mutex<Option<Instant>>,
     /// Number of reconnection attempts since last successful connection.
     reconnect_count: AtomicU64,
     // ── Circuit breaker ──────────────────────────────────────────────
@@ -124,8 +136,6 @@ pub struct PeerHandle {
     failure_threshold: u32,
     /// Seconds to wait before transitioning Open → HalfOpen.
     recovery_timeout_secs: u64,
-    /// When the circuit last tripped open.
-    circuit_opened_at: Mutex<Option<Instant>>,
     /// Lifetime count of circuit-breaker trips (for observability).
     circuit_trips: AtomicU64,
 }
@@ -143,17 +153,14 @@ impl PeerHandle {
             id,
             config,
             state: AtomicU8::new(PeerState::Disconnected as u8),
-            last_heartbeat: Mutex::new(None),
+            timestamps: Mutex::new(PeerTimestamps::default()),
             messages_sent: AtomicU64::new(0),
             messages_recv: AtomicU64::new(0),
-            last_error: Mutex::new(None),
-            connected_at: Mutex::new(None),
             reconnect_count: AtomicU64::new(0),
             circuit: AtomicU8::new(CircuitState::Closed as u8),
             consecutive_failures: AtomicU32::new(0),
             failure_threshold: Self::DEFAULT_FAILURE_THRESHOLD,
             recovery_timeout_secs: Self::DEFAULT_RECOVERY_TIMEOUT_SECS,
-            circuit_opened_at: Mutex::new(None),
             circuit_trips: AtomicU64::new(0),
         }
     }
@@ -187,8 +194,8 @@ impl PeerHandle {
 
     /// Record a received heartbeat at the current instant.
     pub fn record_heartbeat(&self) {
-        if let Ok(mut guard) = self.last_heartbeat.lock() {
-            *guard = Some(Instant::now());
+        if let Ok(mut guard) = self.timestamps.lock() {
+            guard.last_heartbeat = Some(Instant::now());
         }
     }
 
@@ -196,48 +203,52 @@ impl PeerHandle {
     ///
     /// Returns `None` if no heartbeat has been received.
     pub fn since_last_heartbeat(&self) -> Option<std::time::Duration> {
-        self.last_heartbeat
+        self.timestamps
             .lock()
             .ok()
-            .and_then(|guard| guard.map(|ts| ts.elapsed()))
+            .and_then(|guard| guard.last_heartbeat.map(|ts| ts.elapsed()))
     }
 
     /// Record a successful connection.
     pub fn mark_connected(&self) {
         self.set_state(PeerState::Connected);
-        if let Ok(mut guard) = self.connected_at.lock() {
-            *guard = Some(Instant::now());
+        if let Ok(mut guard) = self.timestamps.lock() {
+            let now = Instant::now();
+            guard.connected_at = Some(now);
+            guard.last_heartbeat = Some(now);
         }
         self.reconnect_count.store(0, Ordering::Relaxed);
-        self.record_heartbeat();
     }
 
     /// Record a disconnection.
     pub fn mark_disconnected(&self) {
         self.set_state(PeerState::Disconnected);
-        if let Ok(mut guard) = self.connected_at.lock() {
-            *guard = None;
+        if let Ok(mut guard) = self.timestamps.lock() {
+            guard.connected_at = None;
         }
     }
 
     /// Record an error.
     pub fn set_error(&self, err: &str) {
-        if let Ok(mut guard) = self.last_error.lock() {
-            *guard = Some(err.to_string());
+        if let Ok(mut guard) = self.timestamps.lock() {
+            guard.last_error = Some(err.to_string());
         }
     }
 
     /// Get the last error message.
     pub fn last_error(&self) -> Option<String> {
-        self.last_error.lock().ok().and_then(|guard| guard.clone())
+        self.timestamps
+            .lock()
+            .ok()
+            .and_then(|guard| guard.last_error.clone())
     }
 
     /// Get the duration this peer has been connected.
     pub fn connected_duration(&self) -> Option<std::time::Duration> {
-        self.connected_at
+        self.timestamps
             .lock()
             .ok()
-            .and_then(|guard| guard.map(|ts| ts.elapsed()))
+            .and_then(|guard| guard.connected_at.map(|ts| ts.elapsed()))
     }
 
     /// Increment and return the reconnection attempt counter.
@@ -269,8 +280,8 @@ impl PeerHandle {
     pub fn circuit_state(&self) -> CircuitState {
         let state = CircuitState::from_u8(self.circuit.load(Ordering::Acquire));
         if state == CircuitState::Open
-            && let Ok(guard) = self.circuit_opened_at.lock()
-            && let Some(opened_at) = *guard
+            && let Ok(guard) = self.timestamps.lock()
+            && let Some(opened_at) = guard.circuit_opened_at
             && opened_at.elapsed().as_secs() >= self.recovery_timeout_secs
         {
             self.circuit
@@ -295,8 +306,8 @@ impl PeerHandle {
         if prev == CircuitState::HalfOpen {
             self.circuit
                 .store(CircuitState::Closed as u8, Ordering::Release);
-            if let Ok(mut guard) = self.circuit_opened_at.lock() {
-                *guard = None;
+            if let Ok(mut guard) = self.timestamps.lock() {
+                guard.circuit_opened_at = None;
             }
             return true;
         }
@@ -313,8 +324,8 @@ impl PeerHandle {
         if prev_state == CircuitState::HalfOpen {
             self.circuit
                 .store(CircuitState::Open as u8, Ordering::Release);
-            if let Ok(mut guard) = self.circuit_opened_at.lock() {
-                *guard = Some(Instant::now());
+            if let Ok(mut guard) = self.timestamps.lock() {
+                guard.circuit_opened_at = Some(Instant::now());
             }
             let _ = self.circuit_trips.fetch_add(1, Ordering::Relaxed);
             return true;
@@ -324,8 +335,8 @@ impl PeerHandle {
         if failures >= self.failure_threshold && prev_state == CircuitState::Closed {
             self.circuit
                 .store(CircuitState::Open as u8, Ordering::Release);
-            if let Ok(mut guard) = self.circuit_opened_at.lock() {
-                *guard = Some(Instant::now());
+            if let Ok(mut guard) = self.timestamps.lock() {
+                guard.circuit_opened_at = Some(Instant::now());
             }
             let _ = self.circuit_trips.fetch_add(1, Ordering::Relaxed);
             return true;

@@ -154,8 +154,7 @@ impl TlsListener {
                 }
             };
 
-            // Permit released — handshake slot freed for the next connection.
-            drop(_permit);
+            // _permit is released here by RAII when it goes out of scope.
 
             debug!(peer_addr = %peer_addr, "TLS handshake completed");
 

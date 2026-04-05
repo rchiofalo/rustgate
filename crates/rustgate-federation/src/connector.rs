@@ -17,6 +17,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tracing::debug;
+use zeroize::Zeroizing;
 
 /// Outbound connector that supports both static and dynamic TLS configurations.
 ///
@@ -173,20 +174,13 @@ pub type OutboundRootStoreProvider = Arc<dyn Fn() -> (u64, RootCertStore) + Send
 ///
 /// The private key DER bytes are retained in `key_der` so the key can
 /// be re-parsed into a `PrivateKeyDer` on each config rebuild (`rustls`
-/// consumes the key by value). This means:
-///
-/// - The key material is not zeroized on drop (plain `Vec<u8>`).
-/// - A brief duplicate exists during each rebuild (the clone passed to
-///   `PrivateKeyDer::try_from`).
-///
-/// For production deployments where key material lifetime matters,
-/// consider wrapping `key_der` in `zeroize::Zeroizing<Vec<u8>>`. This
-/// was deferred to avoid adding a new dependency for a single field.
+/// consumes the key by value). The bytes are wrapped in
+/// [`Zeroizing`] so they are automatically zeroed on drop.
 #[derive(Clone)]
 pub struct DynamicPeerConnector {
     provider: OutboundRootStoreProvider,
     certs: Vec<CertificateDer<'static>>,
-    key_der: Vec<u8>,
+    key_der: Zeroizing<Vec<u8>>,
     skip_hostname_verify: bool,
     cached: Arc<std::sync::Mutex<(u64, Arc<rustls::ClientConfig>)>>,
 }
@@ -215,7 +209,7 @@ impl DynamicPeerConnector {
     ) -> anyhow::Result<Self> {
         let certs = parse_certs(cert_pem).context("loading federation client certificate")?;
         let key = parse_key(key_pem).context("loading federation client key")?;
-        let key_der = key.secret_der().to_vec();
+        let key_der = Zeroizing::new(key.secret_der().to_vec());
 
         let (initial_gen, root_store) = provider();
         let config = if skip_hostname_verify {
@@ -252,7 +246,7 @@ impl DynamicPeerConnector {
             "trust store changed, rebuilding outbound TLS config"
         );
 
-        let key = PrivateKeyDer::try_from(self.key_der.clone())
+        let key = PrivateKeyDer::try_from((*self.key_der).clone())
             .map_err(|e| anyhow::anyhow!("re-parse private key: {e}"))?;
 
         let config = if self.skip_hostname_verify {

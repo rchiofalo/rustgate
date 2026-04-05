@@ -11,9 +11,10 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use rustgate_core::{PeerId, audit};
+use rustls::RootCertStore;
 #[cfg(feature = "v2")]
 use tokio::task::JoinHandle;
-use tracing::{Instrument, info, warn};
+use tracing::{Instrument, error, info, warn};
 
 use crate::config::FederationConfig;
 use crate::connector::{OutboundConnector, PeerConnector};
@@ -190,7 +191,7 @@ impl FederationManager {
         let trust_store: Option<Arc<TrustStore>> =
             if let Some(ref dir) = self.config.trust_store_dir {
                 let ts = TrustStore::load_from_directory(dir)?;
-                let count = ts.count();
+                let count = ts.count()?;
                 if count == 0 {
                     info!(dir = %dir.display(), "trust store loaded (empty — using base CA only)");
                 } else {
@@ -210,8 +211,8 @@ impl FederationManager {
         // (V2/tonic, initial outbound connector, adopt_peer).
         let ca_pem = if let Some(ref ts) = trust_store {
             let mut merged = ca_pem;
-            for cert_info in &ts.list_certificates() {
-                if let Some(pem_bytes) = ts.get_certificate_pem(&cert_info.common_name) {
+            for cert_info in &ts.list_certificates()? {
+                if let Some(pem_bytes) = ts.get_certificate_pem(&cert_info.common_name)? {
                     let pem_str = std::str::from_utf8(&pem_bytes).map_err(|e| {
                         anyhow::anyhow!(
                             "trust store certificate '{}' contains invalid UTF-8: {e}",
@@ -246,7 +247,17 @@ impl FederationManager {
                              falling back to trust store CAs only — \
                              clients signed by the base CA may be rejected"
                         );
-                        ts_clone.build_root_cert_store()
+                        match ts_clone.build_root_cert_store() {
+                            Ok(s) => s,
+                            Err(e2) => {
+                                error!(
+                                    error = %e2,
+                                    "trust store lock poisoned — returning empty root store, \
+                                     CA verification is disabled"
+                                );
+                                RootCertStore::empty()
+                            }
+                        }
                     });
                 (current_gen, store)
             });
@@ -308,7 +319,17 @@ impl FederationManager {
                                      falling back to trust store CAs only — \
                                      clients signed by the base CA may be rejected"
                                 );
-                                ts_clone.build_root_cert_store()
+                                match ts_clone.build_root_cert_store() {
+                                    Ok(s) => s,
+                                    Err(e2) => {
+                                        error!(
+                                            error = %e2,
+                                            "trust store lock poisoned — returning empty root store, \
+                                             CA verification is disabled"
+                                        );
+                                        RootCertStore::empty()
+                                    }
+                                }
                             });
                         (current_gen, store)
                     }),
@@ -334,6 +355,7 @@ impl FederationManager {
                     self.config.heartbeat_interval,
                     self.config.heartbeat_timeout,
                     on_v1_server,
+                    Some(self.config.max_message_size),
                 )?
             } else {
                 V1Server::start(
@@ -343,6 +365,7 @@ impl FederationManager {
                     self.config.heartbeat_interval,
                     self.config.heartbeat_timeout,
                     on_v1_server,
+                    Some(self.config.max_message_size),
                 )
                 .await?
             };
@@ -1613,8 +1636,11 @@ mod tests {
             .expect("add extra CA to trust store");
 
         let mut merged_ca = base_ca.cert_pem.clone();
-        for info in trust_store.list_certificates() {
-            if let Some(pem) = trust_store.get_certificate_pem(&info.common_name) {
+        for info in trust_store.list_certificates().expect("list certificates") {
+            if let Some(pem) = trust_store
+                .get_certificate_pem(&info.common_name)
+                .expect("get certificate pem")
+            {
                 merged_ca.push('\n');
                 merged_ca.push_str(std::str::from_utf8(&pem).expect("PEM is valid UTF-8"));
             }

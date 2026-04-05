@@ -40,3 +40,11 @@ pub const FEDERATION_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Maximum reconnection backoff for federation clients.
 pub const FEDERATION_MAX_RECONNECT_DELAY: Duration = Duration::from_secs(300);
+
+// ── Identity / Plaintext ──────────────────────────────────────────
+
+/// Default group assigned to plaintext (TCP/UDP) connections.
+pub const PLAINTEXT_GROUP: &str = "__plaintext__";
+
+/// Default common name for anonymous plaintext clients.
+pub const ANONYMOUS_IDENTITY: &str = "anonymous";

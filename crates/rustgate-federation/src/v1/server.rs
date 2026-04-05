@@ -45,6 +45,7 @@ impl V1Server {
         heartbeat_interval: Duration,
         heartbeat_timeout: Duration,
         on_message: OnMessage,
+        max_message_size: Option<usize>,
     ) -> anyhow::Result<Self> {
         let listener = TlsListener::bind(listen_addr, tls_config).await?;
         Self::start_with_listener(
@@ -53,6 +54,7 @@ impl V1Server {
             heartbeat_interval,
             heartbeat_timeout,
             on_message,
+            max_message_size,
         )
     }
 
@@ -66,6 +68,7 @@ impl V1Server {
         heartbeat_interval: Duration,
         heartbeat_timeout: Duration,
         on_message: OnMessage,
+        max_message_size: Option<usize>,
     ) -> anyhow::Result<Self> {
         let local_addr = listener.local_addr()?;
         info!(addr = %local_addr, "V1 federation server listening");
@@ -79,6 +82,7 @@ impl V1Server {
             heartbeat_timeout,
             on_message,
             shutdown_rx,
+            max_message_size,
         ));
 
         Ok(Self {
@@ -107,6 +111,7 @@ async fn accept_loop(
     heartbeat_timeout: Duration,
     on_message: OnMessage,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    max_message_size: Option<usize>,
 ) {
     loop {
         tokio::select! {
@@ -133,6 +138,7 @@ async fn accept_loop(
                             heartbeat_interval,
                             heartbeat_timeout,
                             on_msg,
+                            max_message_size,
                         )));
                     }
                     Err(e) => {
@@ -154,13 +160,17 @@ async fn handle_inbound_peer(
     heartbeat_interval: Duration,
     heartbeat_timeout: Duration,
     on_message: OnMessage,
+    max_message_size: Option<usize>,
 ) {
     use futures::{SinkExt, StreamExt};
 
     let peer_cn = session.identity().cn.clone();
     let peer_addr = session.peer_addr();
 
-    let codec = LengthPrefixedCodec::new(HeaderSize::Four);
+    let mut codec = LengthPrefixedCodec::new(HeaderSize::Four);
+    if let Some(max_size) = max_message_size {
+        codec = codec.with_max_frame_size(max_size);
+    }
     let mut framed = Framed::new(session, codec);
 
     // Channel for sending messages to the write side
@@ -285,6 +295,7 @@ mod tests {
             Duration::from_secs(30),
             Duration::from_secs(90),
             on_msg,
+            None,
         )
         .await
         .expect("start server");
@@ -309,6 +320,7 @@ mod tests {
             Duration::from_secs(30),
             Duration::from_secs(90),
             on_msg,
+            None,
         )
         .await
         .expect("start server");
@@ -332,6 +344,7 @@ mod tests {
             Duration::from_secs(30),
             Duration::from_secs(90),
             on_msg,
+            None,
         )
         .await
         .expect("start server");
@@ -353,6 +366,7 @@ mod tests {
             Duration::from_secs(30),
             Duration::from_secs(90),
             on_msg,
+            None,
         )
         .await
         .expect("start server");
@@ -375,6 +389,7 @@ mod tests {
             Duration::from_millis(100),
             Duration::from_millis(500),
             on_msg,
+            None,
         )
         .await
         .expect("start server");
@@ -398,6 +413,7 @@ mod tests {
             Duration::from_secs(30),
             Duration::from_secs(90),
             on_msg,
+            None,
         )
         .await
         .expect("start server");
@@ -420,6 +436,7 @@ mod tests {
             Duration::from_secs(30),
             Duration::from_secs(90),
             on_msg1,
+            None,
         )
         .await
         .expect("start server 1");
@@ -431,6 +448,7 @@ mod tests {
             Duration::from_secs(30),
             Duration::from_secs(90),
             on_msg2,
+            None,
         )
         .await
         .expect("start server 2");

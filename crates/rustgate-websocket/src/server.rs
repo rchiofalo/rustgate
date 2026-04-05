@@ -141,7 +141,7 @@ async fn handle_ws_session(
         "WebSocket session started"
     );
 
-    let (tx, mut rx) = mpsc::channel::<RoutableMessage>(CHANNEL_CAPACITY);
+    let (tx, mut rx) = mpsc::channel::<Arc<RoutableMessage>>(CHANNEL_CAPACITY);
     let handle = SessionHandle::new(Arc::clone(&identity), tx);
     let session_id = handle.id;
 
@@ -232,7 +232,7 @@ async fn ws_read_loop(
 
 async fn ws_write_loop(
     mut ws_write: SplitSink<WsStream, Message>,
-    rx: &mut mpsc::Receiver<RoutableMessage>,
+    rx: &mut mpsc::Receiver<Arc<RoutableMessage>>,
     codec: &dyn Codec,
 ) -> Result<(), String> {
     while let Some(msg) = rx.recv().await {
