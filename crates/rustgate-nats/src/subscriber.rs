@@ -1,4 +1,11 @@
-//! Subscribes to NATS for messages destined to locally connected TAK clients.
+//! Subscribes to NATS for messages destined to locally connected clients.
+//!
+//! Includes periodic stats logging for backpressure observability. The
+//! subscriber processes messages sequentially, providing natural
+//! backpressure — when routing is slow, `next().await` pauses intake
+//! from the NATS subscription buffer. When that buffer fills, the
+//! `async_nats` client emits a slow consumer event (configured via
+//! [`NatsConfig::subscription_capacity`]).
 
 use std::sync::Arc;
 
@@ -27,11 +34,23 @@ impl NatsSubscriber {
 
     /// Run the subscriber loop. This is a long-running future that processes
     /// messages until the subscription ends or the runtime shuts down.
+    ///
+    /// Tracks processed and dropped message counts and emits periodic stats
+    /// logs (every 60 seconds) for backpressure observability.
     pub async fn run(self, router: Arc<Router>) -> Result<(), async_nats::Error> {
         let subject = format!("{}.>", self.config.subject_prefix);
         let mut subscription = self.client.subscribe(subject.clone()).await?;
 
-        tracing::info!(subject = %subject, "NATS subscriber started");
+        tracing::info!(
+            subject = %subject,
+            subscription_capacity = self.config.subscription_capacity,
+            "NATS subscriber started"
+        );
+
+        let mut processed: u64 = 0;
+        let mut dropped: u64 = 0;
+        let mut last_stats_log = tokio::time::Instant::now();
+        let stats_interval = std::time::Duration::from_secs(60);
 
         while let Some(msg) = subscription.next().await {
             // Echo prevention: skip messages published by this instance
@@ -51,6 +70,7 @@ impl NatsSubscriber {
                     subject = %msg.subject,
                     "dropping oversized NATS message"
                 );
+                dropped += 1;
                 continue;
             }
 
@@ -72,11 +92,13 @@ impl NatsSubscriber {
                     Ok(e) => e,
                     Err(e) => {
                         tracing::debug!(error = %e, subject = %msg.subject, "failed to parse NATS message");
+                        dropped += 1;
                         continue;
                     }
                 };
 
                 if wire_event.is_position_unknown() {
+                    dropped += 1;
                     continue;
                 }
 
@@ -84,6 +106,7 @@ impl NatsSubscriber {
                     Ok(r) => r,
                     Err(e) => {
                         tracing::warn!(error = %e, "invalid NATS message identity");
+                        dropped += 1;
                         continue;
                     }
                 }
@@ -91,9 +114,16 @@ impl NatsSubscriber {
             };
 
             router.route(routable).instrument(span).await;
+            processed += 1;
+
+            // Periodic stats logging for backpressure observability
+            if last_stats_log.elapsed() >= stats_interval {
+                tracing::info!(processed, dropped, "NATS subscriber stats");
+                last_stats_log = tokio::time::Instant::now();
+            }
         }
 
-        tracing::info!("NATS subscriber ended");
+        tracing::info!(processed, dropped, "NATS subscriber ended");
         Ok(())
     }
 }

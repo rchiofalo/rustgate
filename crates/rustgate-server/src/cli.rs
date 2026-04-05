@@ -109,6 +109,15 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = false, env = "RUSTGATE_NATS_TLS_REQUIRED")]
     pub(crate) nats_tls_required: bool,
 
+    /// Maximum pending messages per NATS subscription before slow consumer
+    /// detection activates. Controls backpressure from the NATS server.
+    #[arg(
+        long,
+        default_value_t = 1024,
+        env = "RUSTGATE_NATS_SUBSCRIPTION_CAPACITY"
+    )]
+    pub(crate) nats_subscription_capacity: usize,
+
     /// Bind address for the enrollment HTTPS server (e.g. 0.0.0.0:8446).
     /// Requires --features enrollment.
     #[arg(long, env = "RUSTGATE_ENROLLMENT_BIND", value_parser = parse_socket_addr)]

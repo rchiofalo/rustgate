@@ -96,6 +96,13 @@ pub struct NatsConfig {
 
     /// Instance ID for echo prevention. Auto-generated if not set.
     pub instance_id: String,
+
+    /// Internal buffer capacity for each NATS subscription.
+    ///
+    /// Controls how many messages can be buffered before the subscriber
+    /// exerts backpressure on the NATS server. When the buffer is full,
+    /// the NATS client triggers a slow consumer event. Default: 1024.
+    pub subscription_capacity: usize,
 }
 
 impl Default for NatsConfig {
@@ -111,6 +118,7 @@ impl Default for NatsConfig {
             max_payload_bytes: 256 * 1024,
             max_replay_count: 0,
             instance_id: generate_instance_id(),
+            subscription_capacity: 1024,
         }
     }
 }
@@ -230,5 +238,20 @@ mod tests {
     fn has_client_auth_none() {
         let config = NatsTlsConfig::default();
         assert!(!config.has_client_auth());
+    }
+
+    #[test]
+    fn default_subscription_capacity() {
+        let config = NatsConfig::default();
+        assert_eq!(config.subscription_capacity, 1024);
+    }
+
+    #[test]
+    fn custom_subscription_capacity() {
+        let config = NatsConfig {
+            subscription_capacity: 256,
+            ..Default::default()
+        };
+        assert_eq!(config.subscription_capacity, 256);
     }
 }

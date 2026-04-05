@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **NATS subscriber backpressure handling** — configurable subscription capacity (`--nats-subscription-capacity`, env `RUSTGATE_NATS_SUBSCRIPTION_CAPACITY`, default 1024) with slow consumer event detection and periodic subscriber stats logging for processing rate visibility. (#415)
 - **Session circuit breaker** — disconnects slow sessions after consecutive send failures exceed a configurable threshold (`--circuit-breaker-threshold`, default 10, env `RUSTGATE_CIRCUIT_BREAKER_THRESHOLD`). Prevents a single backpressured client from degrading group routing for other sessions. Set to 0 to disable. (#420)
 - **Per-group access control** — optional JSON-based ACL configuration (`--group-acl-file`, env `RUSTGATE_GROUP_ACL_FILE`) enforces per-group send and receive permissions at router dispatch. Groups listed in the ACL file restrict which certificate CNs may send to or receive from the group. Groups not listed operate in open mode (any member can send/receive), preserving backward compatibility. (#416, #417)
 

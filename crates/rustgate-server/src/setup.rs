@@ -242,6 +242,7 @@ pub(crate) async fn connect_nats(
             ca_cert: cli.nats_tls_ca.clone(),
             required: cli.nats_tls_required,
         },
+        subscription_capacity: cli.nats_subscription_capacity,
         ..Default::default()
     };
 
