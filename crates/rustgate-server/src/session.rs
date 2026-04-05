@@ -92,7 +92,7 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
     #[cfg(feature = "metrics")]
     metrics::sessions_active().inc();
 
-    let (tx, rx) = mpsc::channel::<RoutableMessage>(64);
+    let (tx, rx) = mpsc::channel::<Arc<RoutableMessage>>(64);
     let handle = SessionHandle::new(Arc::clone(&identity), tx);
     let session_id = handle.id;
     deps.router.register(handle.clone()).await;
@@ -238,7 +238,7 @@ async fn negotiate_tak_protocol(
 async fn run_session_loops(
     reader: rustgate_transport::SessionReader,
     writer: rustgate_transport::SessionWriter,
-    rx: mpsc::Receiver<RoutableMessage>,
+    rx: mpsc::Receiver<Arc<RoutableMessage>>,
     ctx: &SessionContext<'_, impl NatsPublish>,
     read_buf: tokio_util::bytes::BytesMut,
 ) -> std::io::Result<()> {
@@ -349,7 +349,7 @@ async fn read_loop(
 /// Encode outbound messages and send to the client with a write timeout.
 async fn write_loop(
     writer: rustgate_transport::SessionWriter,
-    mut rx: mpsc::Receiver<RoutableMessage>,
+    mut rx: mpsc::Receiver<Arc<RoutableMessage>>,
     codec: &dyn Codec,
 ) -> std::io::Result<()> {
     let mut framed = FramedWrite::new(writer, FramedCodec::from_strategy(&codec.framing()));
@@ -431,7 +431,7 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
 
                         tracing::info!(cn = %cn, peer = %peer_addr, "plaintext TCP connected");
 
-                        let (tx, rx) = mpsc::channel::<RoutableMessage>(64);
+                        let (tx, rx) = mpsc::channel::<Arc<RoutableMessage>>(64);
                         let handle = SessionHandle::new(Arc::clone(&identity), tx);
                         let session_id = handle.id;
                         router.register(handle.clone()).await;
@@ -490,7 +490,7 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
 struct PlaintextSessionContext<'a, P: NatsPublish> {
     reader: tokio::io::ReadHalf<tokio::net::TcpStream>,
     writer: tokio::io::WriteHalf<tokio::net::TcpStream>,
-    rx: mpsc::Receiver<RoutableMessage>,
+    rx: mpsc::Receiver<Arc<RoutableMessage>>,
     identity: &'a Identity,
     router: &'a Router,
     codec: &'a dyn Codec,

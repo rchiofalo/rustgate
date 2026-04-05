@@ -136,7 +136,7 @@ impl EmergencyRepeater {
     /// configured repeat interval. The task runs until shutdown.
     pub fn start_repeat_task(
         self: &Arc<Self>,
-        sender: tokio::sync::mpsc::Sender<RoutableMessage>,
+        sender: tokio::sync::mpsc::Sender<Arc<RoutableMessage>>,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> tokio::task::JoinHandle<()> {
         let repeater = Arc::clone(self);
@@ -152,7 +152,7 @@ impl EmergencyRepeater {
                     _ = ticker.tick() => {
                         let events = repeater.active_events().await;
                         for msg in events {
-                            if sender.send(msg).await.is_err() {
+                            if sender.send(Arc::new(msg)).await.is_err() {
                                 break;
                             }
                         }
