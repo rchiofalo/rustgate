@@ -109,6 +109,31 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = false, env = "RUSTGATE_NATS_TLS_REQUIRED")]
     pub(crate) nats_tls_required: bool,
 
+    /// Maximum pending messages per NATS subscription before slow consumer
+    /// detection activates. Controls backpressure from the NATS server.
+    #[arg(
+        long,
+        default_value_t = 1024,
+        env = "RUSTGATE_NATS_SUBSCRIPTION_CAPACITY"
+    )]
+    pub(crate) nats_subscription_capacity: usize,
+
+    /// JetStream stream name for live updates. The subscriber creates this
+    /// stream to capture `{subject_prefix}.>` subjects via a durable pull
+    /// consumer for real backpressure.
+    #[arg(
+        long,
+        default_value = "RUSTGATE_LIVE",
+        env = "RUSTGATE_NATS_LIVE_STREAM"
+    )]
+    pub(crate) nats_live_stream: String,
+
+    /// Maximum unacknowledged messages for the JetStream pull consumer.
+    /// Controls how many messages can be in-flight before the server
+    /// stops delivering more.
+    #[arg(long, default_value_t = 1000, env = "RUSTGATE_NATS_MAX_ACK_PENDING")]
+    pub(crate) nats_max_ack_pending: i64,
+
     /// Path to JetStream replay checkpoint file. When set, the server
     /// persists the last replayed sequence number and resumes from it
     /// on restart instead of replaying the entire history stream.
@@ -518,6 +543,9 @@ mod tests {
             "RUSTGATE_NATS_TLS_KEY",
             "RUSTGATE_NATS_TLS_CA",
             "RUSTGATE_NATS_TLS_REQUIRED",
+            "RUSTGATE_NATS_SUBSCRIPTION_CAPACITY",
+            "RUSTGATE_NATS_LIVE_STREAM",
+            "RUSTGATE_NATS_MAX_ACK_PENDING",
             "RUSTGATE_NATS_CHECKPOINT_PATH",
             "RUSTGATE_ENROLLMENT_BIND",
             "RUSTGATE_CA_KEY",

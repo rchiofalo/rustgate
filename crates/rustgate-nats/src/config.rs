@@ -97,6 +97,27 @@ pub struct NatsConfig {
     /// Instance ID for echo prevention. Auto-generated if not set.
     pub instance_id: String,
 
+    /// Internal buffer capacity for each NATS subscription.
+    ///
+    /// Controls how many messages can be buffered before the subscriber
+    /// exerts backpressure on the NATS server. When the buffer is full,
+    /// the NATS client triggers a slow consumer event. Default: 1024.
+    pub subscription_capacity: usize,
+
+    /// JetStream stream name for live updates (default: "RUSTGATE_LIVE").
+    ///
+    /// The subscriber creates this stream (if it doesn't already exist) to
+    /// capture messages on `{subject_prefix}.>` via a durable pull consumer,
+    /// providing real backpressure instead of buffered push subscriptions.
+    pub live_stream: String,
+
+    /// Maximum number of unacknowledged messages for the pull consumer
+    /// (default: 1000).
+    ///
+    /// Controls concurrency: the server will not deliver more than this
+    /// many messages until earlier ones are acknowledged.
+    pub max_ack_pending: i64,
+
     /// Optional path for JetStream replay checkpoint file.
     /// When set, stores the last processed sequence number so
     /// subsequent restarts resume from the checkpoint.
@@ -116,6 +137,9 @@ impl Default for NatsConfig {
             max_payload_bytes: 256 * 1024,
             max_replay_count: 0,
             instance_id: generate_instance_id(),
+            subscription_capacity: 1024,
+            live_stream: "RUSTGATE_LIVE".to_string(),
+            max_ack_pending: 1000,
             checkpoint_path: None,
         }
     }
@@ -236,5 +260,20 @@ mod tests {
     fn has_client_auth_none() {
         let config = NatsTlsConfig::default();
         assert!(!config.has_client_auth());
+    }
+
+    #[test]
+    fn default_subscription_capacity() {
+        let config = NatsConfig::default();
+        assert_eq!(config.subscription_capacity, 1024);
+    }
+
+    #[test]
+    fn custom_subscription_capacity() {
+        let config = NatsConfig {
+            subscription_capacity: 256,
+            ..Default::default()
+        };
+        assert_eq!(config.subscription_capacity, 256);
     }
 }

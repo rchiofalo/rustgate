@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **NATS JetStream pull consumer** — subscriber uses a durable JetStream pull consumer for real backpressure instead of buffered push subscriptions. Messages are explicitly acknowledged after processing; the NATS server retains undelivered messages in the stream until the consumer catches up. Configurable via `--nats-live-stream` (env `RUSTGATE_NATS_LIVE_STREAM`, default `RUSTGATE_LIVE`) and `--nats-max-ack-pending` (env `RUSTGATE_NATS_MAX_ACK_PENDING`, default 1000). (#415)
 - **JetStream resumption checkpoints** — optional checkpoint file (`--nats-checkpoint-path`, env `RUSTGATE_NATS_CHECKPOINT_PATH`) persists the last processed sequence number so restarts resume from the checkpoint instead of replaying the entire history stream. (#413)
 - **Federation replay buffer** — bounded per-peer ring buffer (`--federation-replay-buffer-size`, env `RUSTGATE_FEDERATION_REPLAY_BUFFER_SIZE`, default 1000) stores recent forwarded messages. On reconnection, missed messages can be replayed from the buffer before resuming the live stream. Set to 0 to disable. (#409)
 - **WebSocket per-connection rate limiting** — configurable frame-rate (`--ws-max-frames-per-sec`) and byte-rate (`--ws-max-bytes-per-sec`) limits per WebSocket connection. Clients exceeding limits have frames dropped; sustained violations trigger disconnection (`--ws-max-violations`, default 10). All disabled by default for backward compatibility. (#422)

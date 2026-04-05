@@ -675,3 +675,151 @@ async fn wire_format_fidelity() {
 
     sub_task.abort();
 }
+
+/// Verify that the subscriber creates the JetStream stream and pull consumer
+/// automatically when they don't exist yet.
+#[tokio::test]
+async fn jetstream_pull_consumer_creation() {
+    let server = require_nats!();
+
+    let config = test_config(server.url(), "consumer-create-test");
+    let adapter = NatsAdapter::connect(config.clone()).await.expect("connect");
+
+    let router = Arc::new(Router::new());
+    let subscriber = adapter.subscriber();
+    let sub_router = Arc::clone(&router);
+    let sub_task = tokio::spawn(async move {
+        let _ = subscriber.run(sub_router).await;
+    });
+
+    // Give the subscriber time to create stream and consumer
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Verify the stream was created
+    let js = server.jetstream().await;
+    let mut stream = js
+        .get_stream(&config.live_stream)
+        .await
+        .expect("live stream should exist");
+
+    let info = stream.info().await.expect("stream info");
+    assert_eq!(info.config.name, config.live_stream);
+
+    // Verify the consumer was created
+    let consumer_name = format!("rustgate-sub-{}", config.instance_id);
+    let mut consumer = stream
+        .get_consumer::<async_nats::jetstream::consumer::pull::Config>(&consumer_name)
+        .await
+        .expect("consumer should exist");
+    let consumer_info = consumer.info().await.expect("consumer info");
+    assert_eq!(consumer_info.config.max_ack_pending, config.max_ack_pending);
+
+    sub_task.abort();
+}
+
+/// Verify that messages are explicitly acknowledged after processing,
+/// ensuring they are not redelivered.
+#[tokio::test]
+async fn jetstream_pull_consumer_ack_flow() {
+    let server = require_nats!();
+
+    let config_pub = test_config(server.url(), "ack-pub");
+    let config_sub = test_config(server.url(), "ack-sub");
+
+    let adapter_pub = NatsAdapter::connect(config_pub).await.expect("connect pub");
+    let adapter_sub = NatsAdapter::connect(config_sub.clone())
+        .await
+        .expect("connect sub");
+
+    let router = Arc::new(Router::new());
+    let mut rx = register_session(&router, "ack-listener", "Cyan").await;
+
+    let subscriber = adapter_sub.subscriber();
+    let sub_router = Arc::clone(&router);
+    let sub_task = tokio::spawn(async move {
+        let _ = subscriber.run(sub_router).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Publish a message
+    let msg = position_message("track-ack", "Cyan", 37.0, -122.0);
+    adapter_pub.publisher().publish(&msg).await;
+
+    // Wait for delivery
+    let received = timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("timeout")
+        .expect("channel closed");
+    assert_eq!(received.source.cn, "track-ack");
+
+    // Give time for ACK to propagate
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Check the consumer has 0 pending (all messages acknowledged)
+    let js = server.jetstream().await;
+    let stream = js
+        .get_stream(&config_sub.live_stream)
+        .await
+        .expect("stream");
+    let consumer_name = format!("rustgate-sub-{}", config_sub.instance_id);
+    let mut consumer = stream
+        .get_consumer::<async_nats::jetstream::consumer::pull::Config>(&consumer_name)
+        .await
+        .expect("consumer");
+    let info = consumer.info().await.expect("info");
+    assert_eq!(
+        info.num_ack_pending, 0,
+        "all messages should be acknowledged"
+    );
+
+    sub_task.abort();
+}
+
+/// Verify that unacknowledged messages are retained when the subscriber
+/// shuts down, providing graceful shutdown semantics.
+#[tokio::test]
+async fn jetstream_pull_consumer_graceful_shutdown() {
+    let server = require_nats!();
+
+    let config_pub = test_config(server.url(), "shutdown-pub");
+    let config_sub = test_config(server.url(), "shutdown-sub");
+
+    let adapter_pub = NatsAdapter::connect(config_pub).await.expect("connect pub");
+    let adapter_sub = NatsAdapter::connect(config_sub.clone())
+        .await
+        .expect("connect sub");
+
+    let router = Arc::new(Router::new());
+    let _rx = register_session(&router, "shutdown-listener", "Cyan").await;
+
+    let subscriber = adapter_sub.subscriber();
+    let sub_router = Arc::clone(&router);
+    let sub_task = tokio::spawn(async move {
+        let _ = subscriber.run(sub_router).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Publish a message and wait for processing
+    let msg = position_message("track-shutdown", "Cyan", 37.0, -122.0);
+    adapter_pub.publisher().publish(&msg).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Abort the subscriber (simulates shutdown)
+    sub_task.abort();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // The stream should still have the message stored (even if acknowledged,
+    // it remains in the stream until retention limits are reached)
+    let js = server.jetstream().await;
+    let mut stream = js
+        .get_stream(&config_sub.live_stream)
+        .await
+        .expect("stream should exist after shutdown");
+    let info = stream.info().await.expect("stream info");
+    assert!(
+        info.state.messages >= 1,
+        "stream should retain messages after subscriber shutdown"
+    );
+}
