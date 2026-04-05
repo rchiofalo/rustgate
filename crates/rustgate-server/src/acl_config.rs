@@ -1,7 +1,7 @@
 //! JSON deserialization for group ACL configuration files.
 //!
 //! Converts the human-friendly JSON format into the runtime
-//! [`GroupAclPolicy`] used by the router.
+//! [`GroupAclPolicy`](rustgate_transport::GroupAclPolicy) used by the router.
 
 use std::collections::{HashMap, HashSet};
 
