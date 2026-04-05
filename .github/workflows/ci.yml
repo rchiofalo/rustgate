@@ -328,6 +328,9 @@ jobs:
       - name: Lint Helm chart
         run: helm lint helm/
 
+      - name: Validate template rendering with production values
+        run: helm template rustgate helm/ -f helm/values-production.yaml > /dev/null
+
   docker:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [check-features, test]

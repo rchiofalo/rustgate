@@ -61,5 +61,7 @@ spec:
           protocol: TCP
         - port: {{ .Values.federation.v2Port }}
           protocol: TCP
+        - port: 443
+          protocol: TCP
     {{- end }}
 {{- end }}

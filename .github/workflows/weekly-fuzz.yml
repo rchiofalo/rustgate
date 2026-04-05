@@ -1,0 +1,58 @@
+name: Weekly Extended Fuzz
+
+on:
+  schedule:
+    # Run every Saturday at 02:00 UTC for deeper coverage.
+    - cron: "0 2 * * 6"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - cot_parse
+          - crl_parse
+          - csr_parse
+          - jwt_parse
+          - length_prefixed_codec
+          - nats_wire_event
+          - proto_roundtrip
+          - structured_cot_event
+          - structured_routable_message
+          - tak_frame_codec
+          - v2_federation_convert
+          - ws_frame
+          - xml_stream_codec
+    name: fuzz-extended (${{ matrix.target }})
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install cargo-fuzz
+        run: cargo +nightly install cargo-fuzz --locked
+
+      - name: Run fuzzer for 30 minutes
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=1800
+
+      - name: Upload corpus artifacts
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: corpus-extended-${{ matrix.target }}
+          path: fuzz/corpus/${{ matrix.target }}/
+          retention-days: 90

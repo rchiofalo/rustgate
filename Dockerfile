@@ -57,6 +57,7 @@ EXPOSE 4433 8443 8446 9000 9001 9090
 STOPSIGNAL SIGTERM
 
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget --spider -q http://localhost:9090/healthz || exit 1
+    CMD wget --spider -q http://localhost:9090/healthz 2>/dev/null || \
+        nc -z localhost 4433 || exit 1
 
 ENTRYPOINT ["rustgate"]
