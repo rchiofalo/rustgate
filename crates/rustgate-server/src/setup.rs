@@ -310,6 +310,11 @@ pub(crate) async fn start_enrollment(
         })
     });
 
+    let contacts_provider = rustgate_enrollment::cached_contacts_provider(
+        contacts_provider,
+        std::time::Duration::from_secs(30),
+    );
+
     let mut enrollment_server = rustgate_enrollment::EnrollmentServer::new(signer, credentials)
         .with_contacts_provider(contacts_provider);
 
