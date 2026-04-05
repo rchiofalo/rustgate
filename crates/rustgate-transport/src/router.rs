@@ -2,8 +2,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use parking_lot::Mutex;
 use rustgate_core::identity::{GroupId, Identity};
 use rustgate_core::message::{Destination, MessageType, RoutableMessage};
 use tokio::sync::{RwLock, mpsc};
@@ -13,11 +14,17 @@ use crate::cache::PositionCache;
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
 
+/// Default number of consecutive send failures before the circuit breaker
+/// trips and disconnects the session.
+pub const DEFAULT_MAX_CONSECUTIVE_DROPS: u32 = 10;
+
 #[derive(Debug, Clone)]
 pub struct SessionHandle {
     pub id: u64,
     pub identity: Arc<Identity>,
-    sender: mpsc::Sender<Arc<RoutableMessage>>,
+    sender: Arc<Mutex<Option<mpsc::Sender<Arc<RoutableMessage>>>>>,
+    consecutive_drops: Arc<AtomicU32>,
+    max_consecutive_drops: u32,
 }
 
 impl SessionHandle {
@@ -25,7 +32,27 @@ impl SessionHandle {
         Self {
             id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             identity,
-            sender,
+            sender: Arc::new(Mutex::new(Some(sender))),
+            consecutive_drops: Arc::new(AtomicU32::new(0)),
+            max_consecutive_drops: DEFAULT_MAX_CONSECUTIVE_DROPS,
+        }
+    }
+
+    /// Create a session handle with a custom circuit breaker threshold.
+    ///
+    /// The session is disconnected after `threshold` consecutive failed
+    /// sends. Use `u32::MAX` to effectively disable the circuit breaker.
+    pub fn with_drop_threshold(
+        identity: Arc<Identity>,
+        sender: mpsc::Sender<Arc<RoutableMessage>>,
+        threshold: u32,
+    ) -> Self {
+        Self {
+            id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
+            identity,
+            sender: Arc::new(Mutex::new(Some(sender))),
+            consecutive_drops: Arc::new(AtomicU32::new(0)),
+            max_consecutive_drops: threshold,
         }
     }
 
@@ -34,18 +61,80 @@ impl SessionHandle {
     /// Messages are wrapped in `Arc` so that broadcast and group sends
     /// share a single allocation instead of cloning the full
     /// `RoutableMessage` per recipient.
+    ///
+    /// If the circuit breaker has tripped, returns `Err` immediately.
     pub async fn send(
         &self,
         msg: Arc<RoutableMessage>,
     ) -> Result<(), mpsc::error::SendError<Arc<RoutableMessage>>> {
-        self.sender.send(msg).await
+        let sender = {
+            let guard = self.sender.lock();
+            match guard.as_ref() {
+                Some(s) => s.clone(),
+                None => return Err(mpsc::error::SendError(msg)),
+            }
+        };
+        match sender.send(msg).await {
+            Ok(()) => {
+                self.consecutive_drops.store(0, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(e) => {
+                self.record_failure();
+                Err(e)
+            }
+        }
     }
 
     /// Non-blocking send attempt, useful when holding a lock that cannot
     /// be kept across `.await` points. Returns `true` if the message was
-    /// enqueued, `false` if the channel is full or disconnected.
+    /// enqueued, `false` if the channel is full, disconnected, or the
+    /// circuit breaker has tripped.
     pub fn try_send(&self, msg: Arc<RoutableMessage>) -> bool {
-        self.sender.try_send(msg).is_ok()
+        let mut guard = self.sender.lock();
+        let sender = match guard.as_ref() {
+            Some(s) => s,
+            None => return false,
+        };
+        match sender.try_send(msg) {
+            Ok(()) => {
+                self.consecutive_drops.store(0, Ordering::Relaxed);
+                true
+            }
+            Err(_) => {
+                let count = self.consecutive_drops.fetch_add(1, Ordering::Relaxed) + 1;
+                if count >= self.max_consecutive_drops {
+                    warn!(
+                        session = %self.identity.cn,
+                        consecutive_drops = count,
+                        threshold = self.max_consecutive_drops,
+                        "circuit breaker tripped: disconnecting slow session"
+                    );
+                    *guard = None;
+                }
+                false
+            }
+        }
+    }
+
+    /// Record a send failure and trip the circuit breaker if threshold exceeded.
+    fn record_failure(&self) {
+        let count = self.consecutive_drops.fetch_add(1, Ordering::Relaxed) + 1;
+        if count >= self.max_consecutive_drops {
+            warn!(
+                session = %self.identity.cn,
+                consecutive_drops = count,
+                threshold = self.max_consecutive_drops,
+                "circuit breaker tripped: disconnecting slow session"
+            );
+            let mut guard = self.sender.lock();
+            *guard = None;
+        }
+    }
+
+    /// Returns `true` if the circuit breaker has not tripped.
+    pub fn is_alive(&self) -> bool {
+        self.sender.lock().is_some()
     }
 }
 
@@ -642,5 +731,124 @@ mod tests {
         let cns: Vec<&str> = clients.iter().map(|c| c.cn.as_str()).collect();
         assert!(cns.contains(&"alice"));
         assert!(cns.contains(&"bob"));
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_trips_after_threshold() {
+        let identity = make_identity("slow-client", &["alpha"]);
+        let (tx, mut rx) = mpsc::channel(1);
+        let handle = SessionHandle::with_drop_threshold(identity, tx, 3);
+
+        // Fill the channel
+        let msg = Arc::new(make_position(
+            &make_identity("sender", &["alpha"]),
+            Destination::Broadcast,
+        ));
+        assert!(handle.try_send(msg.clone()));
+
+        // Next 3 attempts should fail (channel full), tripping breaker on 3rd
+        assert!(!handle.try_send(msg.clone()));
+        assert!(!handle.try_send(msg.clone()));
+        assert!(!handle.try_send(msg.clone()));
+
+        // Sender should be poisoned
+        assert!(!handle.is_alive());
+        assert!(!handle.try_send(msg.clone()));
+
+        // Receiver should get None (sender dropped)
+        let _ = rx.recv().await; // drain the one successful message
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_resets_on_success() {
+        let identity = make_identity("recovering-client", &["alpha"]);
+        let (tx, mut rx) = mpsc::channel(2);
+        let handle = SessionHandle::with_drop_threshold(identity, tx, 3);
+
+        // Fill channel
+        let msg = Arc::new(make_position(
+            &make_identity("sender", &["alpha"]),
+            Destination::Broadcast,
+        ));
+        assert!(handle.try_send(msg.clone()));
+        assert!(handle.try_send(msg.clone()));
+
+        // Fail twice (under threshold)
+        assert!(!handle.try_send(msg.clone()));
+        assert!(!handle.try_send(msg.clone()));
+
+        // Drain and succeed — should reset counter
+        let _ = rx.recv().await;
+        let _ = rx.recv().await;
+        assert!(handle.try_send(msg.clone()));
+
+        // Fill the remaining slot so subsequent sends fail
+        assert!(handle.try_send(msg.clone()));
+
+        // Fail twice again — should NOT trip because counter was reset
+        assert!(!handle.try_send(msg.clone()));
+        assert!(!handle.try_send(msg.clone()));
+        assert!(handle.is_alive());
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_does_not_trip_below_threshold() {
+        let identity = make_identity("borderline-client", &["alpha"]);
+        let (tx, mut rx) = mpsc::channel(1);
+        let handle = SessionHandle::with_drop_threshold(identity, tx, 5);
+
+        let msg = Arc::new(make_position(
+            &make_identity("sender", &["alpha"]),
+            Destination::Broadcast,
+        ));
+        assert!(handle.try_send(msg.clone()));
+
+        // Fail 4 times (threshold is 5)
+        for _ in 0..4 {
+            assert!(!handle.try_send(msg.clone()));
+        }
+
+        // Should still be alive
+        assert!(handle.is_alive());
+
+        // Drain and succeed to reset
+        let _ = rx.recv().await;
+        assert!(handle.try_send(msg.clone()));
+        assert!(handle.is_alive());
+    }
+
+    #[tokio::test]
+    async fn group_send_triggers_circuit_breaker() {
+        let router = Router::new();
+
+        let sender_id = make_identity("sender", &["ops"]);
+        let slow_id = make_identity("slow", &["ops"]);
+
+        let (tx_sender, _rx_sender) = mpsc::channel(64);
+        let (tx_slow, mut rx_slow) = mpsc::channel(1);
+
+        router
+            .register(SessionHandle::new(sender_id.clone(), tx_sender))
+            .await;
+        router
+            .register(SessionHandle::with_drop_threshold(
+                slow_id.clone(),
+                tx_slow,
+                3,
+            ))
+            .await;
+
+        // Send enough messages to trip the breaker
+        // Channel capacity is 1, so first message fills it, next 3 trip the breaker
+        for _ in 0..5 {
+            let msg = make_chat(&sender_id, Destination::Group("ops".to_string()));
+            router.route(msg).await;
+        }
+
+        // Drain the one message that made it through
+        let _ = rx_slow.recv().await;
+        // Receiver should see None (sender poisoned by circuit breaker)
+        assert!(rx_slow.recv().await.is_none());
     }
 }
