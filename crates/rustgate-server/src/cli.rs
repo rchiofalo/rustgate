@@ -267,6 +267,13 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 200, env = "RUSTGATE_CLIENT_BURST")]
     pub(crate) client_burst: u32,
 
+    /// Consecutive send failures before disconnecting a slow session.
+    /// When a session's outbound channel is full for this many consecutive
+    /// sends, the circuit breaker trips and the session is terminated.
+    /// Set to 0 to disable the circuit breaker.
+    #[arg(long, default_value_t = 10, env = "RUSTGATE_CIRCUIT_BREAKER_THRESHOLD")]
+    pub(crate) circuit_breaker_threshold: u32,
+
     // -- Data retention / archival --
     /// Directory for CoT event archival (JSONL). Enables structured logging of
     /// all received CoT events to date-stamped files.

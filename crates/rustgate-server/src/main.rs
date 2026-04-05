@@ -254,6 +254,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                             throttle_config: tc,
                             archiver: arch,
                             replay_filter: rf,
+                            circuit_breaker_threshold: cli.circuit_breaker_threshold,
                         };
                         setup::spawn_background("tls-session", session::handle_session(session, deps, permit));
                     }

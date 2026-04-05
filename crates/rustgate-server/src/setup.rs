@@ -735,6 +735,7 @@ pub(crate) fn start_websocket<P: NatsPublish + Send + Sync + 'static>(
         fed_forward: fed_forward.clone(),
         throttle_config,
         replay_filter: replay_filter.clone(),
+        circuit_breaker_threshold: cli.circuit_breaker_threshold,
         shutdown: Arc::clone(&shutdown),
     };
     let task = tokio::spawn(async move {
@@ -801,6 +802,7 @@ pub(crate) async fn start_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
         throttle_config,
         archiver: archiver.clone(),
         replay_filter: replay_filter.clone(),
+        circuit_breaker_threshold: cli.circuit_breaker_threshold,
         shutdown: shutdown_clone,
     };
 

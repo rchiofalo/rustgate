@@ -51,6 +51,7 @@ impl EdgeTestServer {
             fed_forward: None,
             throttle_config: None,
             replay_filter: None,
+            circuit_breaker_threshold: 0,
             shutdown: Arc::clone(&shutdown),
         };
 
