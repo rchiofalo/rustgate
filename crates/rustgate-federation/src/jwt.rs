@@ -23,6 +23,11 @@ const MIN_SECRET_LENGTH: usize = 32;
 /// Default maximum number of revoked JTIs tracked.
 const DEFAULT_REVOCATION_CAPACITY: usize = 10_000;
 
+/// Maximum clock skew tolerance in seconds for `iat` validation.
+/// Tokens issued slightly in the future (within this window) are accepted
+/// to account for clock drift between federation peers.
+const MAX_CLOCK_SKEW_SECS: u64 = 60;
+
 /// Warn when revocation cache reaches this fraction of capacity.
 const REVOCATION_WARN_THRESHOLD: f64 = 0.8;
 
@@ -161,6 +166,11 @@ impl JwtAuthority {
             return Err(JwtError::Expired);
         }
 
+        // Check issued-at: reject tokens with iat in the future (beyond clock skew)
+        if claims.iat > now.as_secs() + MAX_CLOCK_SKEW_SECS {
+            return Err(JwtError::IssuedInFuture);
+        }
+
         // Check issuer
         if claims.iss != self.issuer {
             return Err(JwtError::InvalidIssuer);
@@ -238,6 +248,8 @@ impl JwtAuthority {
 pub enum JwtError {
     /// Token has expired.
     Expired,
+    /// Token `iat` (issued-at) is in the future beyond clock skew tolerance.
+    IssuedInFuture,
     /// Token signature is invalid.
     InvalidSignature,
     /// Token format is malformed.
@@ -263,6 +275,7 @@ impl std::fmt::Display for JwtError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             JwtError::Expired => write!(f, "token expired"),
+            JwtError::IssuedInFuture => write!(f, "token issued in the future"),
             JwtError::InvalidSignature => write!(f, "invalid signature"),
             JwtError::Malformed => write!(f, "malformed token"),
             JwtError::InvalidIssuer => write!(f, "invalid issuer"),
@@ -440,6 +453,54 @@ mod tests {
         // Token expires immediately (exp == iat)
         let result = auth.validate(&token);
         assert_eq!(result, Err(JwtError::Expired));
+    }
+
+    #[test]
+    fn future_iat_rejected() {
+        let auth = make_authority();
+
+        // Manually create a token with iat far in the future
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time");
+        let future_iat = now.as_secs() + MAX_CLOCK_SKEW_SECS + 600;
+
+        let claims = FederationClaims {
+            sub: "peer-1".to_string(),
+            iss: "rustgate-test".to_string(),
+            exp: future_iat + 3600,
+            iat: future_iat,
+            jti: "test-jti".to_string(),
+            groups: vec![],
+        };
+
+        let token = encode(&auth.secret, &claims).expect("encode");
+        let result = auth.validate(&token);
+        assert_eq!(result, Err(JwtError::IssuedInFuture));
+    }
+
+    #[test]
+    fn iat_within_skew_accepted() {
+        let auth = make_authority();
+
+        // iat slightly in the future but within skew tolerance
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time");
+        let future_iat = now.as_secs() + MAX_CLOCK_SKEW_SECS - 5;
+
+        let claims = FederationClaims {
+            sub: "peer-1".to_string(),
+            iss: "rustgate-test".to_string(),
+            exp: future_iat + 3600,
+            iat: future_iat,
+            jti: "test-jti".to_string(),
+            groups: vec![],
+        };
+
+        let token = encode(&auth.secret, &claims).expect("encode");
+        let result = auth.validate(&token);
+        assert!(result.is_ok(), "iat within skew should be accepted");
     }
 
     #[test]

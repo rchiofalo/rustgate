@@ -355,6 +355,7 @@ impl FederationManager {
                     self.config.heartbeat_interval,
                     self.config.heartbeat_timeout,
                     on_v1_server,
+                    Some(self.config.max_message_size),
                 )?
             } else {
                 V1Server::start(
@@ -364,6 +365,7 @@ impl FederationManager {
                     self.config.heartbeat_interval,
                     self.config.heartbeat_timeout,
                     on_v1_server,
+                    Some(self.config.max_message_size),
                 )
                 .await?
             };
