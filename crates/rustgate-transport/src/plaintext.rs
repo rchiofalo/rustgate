@@ -8,6 +8,7 @@
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 
+use rustgate_core::constants::{ANONYMOUS_IDENTITY, PLAINTEXT_GROUP};
 use rustgate_core::error::{Result, TransportError};
 use rustgate_core::identity::Identity;
 use rustgate_core::net::configure_tcp_keepalive;
@@ -26,8 +27,8 @@ pub struct PlaintextIdentityConfig {
 impl Default for PlaintextIdentityConfig {
     fn default() -> Self {
         Self {
-            cn: "anonymous".to_string(),
-            default_group: "__plaintext__".to_string(),
+            cn: ANONYMOUS_IDENTITY.to_string(),
+            default_group: PLAINTEXT_GROUP.to_string(),
         }
     }
 }

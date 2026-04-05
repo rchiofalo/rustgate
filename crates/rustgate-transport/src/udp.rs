@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use rustgate_core::constants::PLAINTEXT_GROUP;
 use rustgate_core::identity::Identity;
 use rustgate_core::message::RoutableMessage;
 use rustgate_cot::MessageBuilder;
@@ -36,7 +37,7 @@ impl Default for UdpInputConfig {
     fn default() -> Self {
         Self {
             cn: "udp-anonymous".to_string(),
-            default_group: "__plaintext__".to_string(),
+            default_group: PLAINTEXT_GROUP.to_string(),
         }
     }
 }
