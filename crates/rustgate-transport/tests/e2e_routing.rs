@@ -52,7 +52,7 @@ fn spawn_session(session: AuthenticatedSession, router: Arc<Router>) {
         let identity = session.identity_arc();
         let cn = identity.cn.clone();
 
-        let (tx, rx) = mpsc::channel::<RoutableMessage>(64);
+        let (tx, rx) = mpsc::channel::<Arc<RoutableMessage>>(64);
         let handle = SessionHandle::new(Arc::clone(&identity), tx);
         let session_id = handle.id;
         router.register(handle).await;
@@ -89,7 +89,7 @@ async fn server_read(
 
 async fn server_write(
     writer: rustgate_transport::SessionWriter,
-    mut rx: mpsc::Receiver<RoutableMessage>,
+    mut rx: mpsc::Receiver<Arc<RoutableMessage>>,
 ) -> std::io::Result<()> {
     let mut framed = FramedWrite::new(writer, LengthPrefixedCodec::new(HeaderSize::Four));
     while let Some(msg) = rx.recv().await {
@@ -499,9 +499,9 @@ async fn route_to_group() {
     let bob = Arc::new(make_identity("bob", &["engineers"]));
     let charlie = Arc::new(make_identity("charlie", &["medics"]));
 
-    let (alice_tx, mut alice_rx) = mpsc::channel::<RoutableMessage>(16);
-    let (bob_tx, mut bob_rx) = mpsc::channel::<RoutableMessage>(16);
-    let (charlie_tx, mut charlie_rx) = mpsc::channel::<RoutableMessage>(16);
+    let (alice_tx, mut alice_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
+    let (bob_tx, mut bob_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
+    let (charlie_tx, mut charlie_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
 
     router
         .register(SessionHandle::new(alice.clone(), alice_tx))
@@ -543,9 +543,9 @@ async fn route_direct() {
     let bob = Arc::new(make_identity("bob", &["team"]));
     let charlie = Arc::new(make_identity("charlie", &["team"]));
 
-    let (alice_tx, mut alice_rx) = mpsc::channel::<RoutableMessage>(16);
-    let (bob_tx, mut bob_rx) = mpsc::channel::<RoutableMessage>(16);
-    let (charlie_tx, mut charlie_rx) = mpsc::channel::<RoutableMessage>(16);
+    let (alice_tx, mut alice_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
+    let (bob_tx, mut bob_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
+    let (charlie_tx, mut charlie_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
 
     router
         .register(SessionHandle::new(alice.clone(), alice_tx))
@@ -577,7 +577,7 @@ async fn route_direct_to_offline_user() {
     let router = Router::new();
 
     let alice = Arc::new(make_identity("alice", &["team"]));
-    let (alice_tx, _alice_rx) = mpsc::channel::<RoutableMessage>(16);
+    let (alice_tx, _alice_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
     router
         .register(SessionHandle::new(alice.clone(), alice_tx))
         .await;
@@ -595,7 +595,7 @@ async fn route_to_empty_group() {
     let router = Router::new();
 
     let alice = Arc::new(make_identity("alice", &["engineers"]));
-    let (alice_tx, _alice_rx) = mpsc::channel::<RoutableMessage>(16);
+    let (alice_tx, _alice_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
     router
         .register(SessionHandle::new(alice.clone(), alice_tx))
         .await;
@@ -616,9 +616,9 @@ async fn register_with_group_change() {
     let bob = Arc::new(make_identity("bob", &["alpha", "bravo"]));
     let charlie = Arc::new(make_identity("charlie", &["bravo"]));
 
-    let (alice_v1_tx, _alice_v1_rx) = mpsc::channel::<RoutableMessage>(16);
-    let (bob_tx, mut bob_rx) = mpsc::channel::<RoutableMessage>(16);
-    let (charlie_tx, mut charlie_rx) = mpsc::channel::<RoutableMessage>(16);
+    let (alice_v1_tx, _alice_v1_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
+    let (bob_tx, mut bob_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
+    let (charlie_tx, mut charlie_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
 
     router
         .register(SessionHandle::new(alice_v1.clone(), alice_v1_tx))
@@ -632,7 +632,7 @@ async fn register_with_group_change() {
 
     // Alice moves from "alpha" to "bravo"
     let alice_v2 = Arc::new(make_identity("alice", &["bravo"]));
-    let (alice_v2_tx, mut alice_v2_rx) = mpsc::channel::<RoutableMessage>(16);
+    let (alice_v2_tx, mut alice_v2_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
     router
         .register(SessionHandle::new(alice_v2.clone(), alice_v2_tx))
         .await;
@@ -671,7 +671,7 @@ async fn route_direct_to_self() {
     let router = Router::new();
 
     let alice = Arc::new(make_identity("alice", &["team"]));
-    let (alice_tx, mut alice_rx) = mpsc::channel::<RoutableMessage>(16);
+    let (alice_tx, mut alice_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
     router
         .register(SessionHandle::new(alice.clone(), alice_tx))
         .await;
@@ -693,7 +693,7 @@ async fn position_cache_replay() {
     let alice = Arc::new(make_identity("alice", &["team"]));
     let bob = Arc::new(make_identity("bob", &["team"]));
 
-    let (alice_tx, _alice_rx) = mpsc::channel::<RoutableMessage>(16);
+    let (alice_tx, _alice_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
     let alice_handle = SessionHandle::new(alice.clone(), alice_tx);
     router.register(alice_handle.clone()).await;
     router.replay_positions(&alice_handle).await;
@@ -716,7 +716,7 @@ async fn position_cache_replay() {
     assert_eq!(router.cache().len().await, 1);
 
     // Bob connects later
-    let (bob_tx, mut bob_rx) = mpsc::channel::<RoutableMessage>(16);
+    let (bob_tx, mut bob_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
     let bob_handle = SessionHandle::new(bob.clone(), bob_tx);
     router.register(bob_handle.clone()).await;
     router.replay_positions(&bob_handle).await;
@@ -735,7 +735,7 @@ async fn chat_messages_not_cached() {
     let router = Router::new();
 
     let alice = Arc::new(make_identity("alice", &["team"]));
-    let (alice_tx, _alice_rx) = mpsc::channel::<RoutableMessage>(16);
+    let (alice_tx, _alice_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
     router
         .register(SessionHandle::new(alice.clone(), alice_tx))
         .await;
@@ -764,7 +764,7 @@ async fn position_cache_replaces_old() {
     let router = Router::new();
 
     let alice = Arc::new(make_identity("alice", &["team"]));
-    let (alice_tx, _alice_rx) = mpsc::channel::<RoutableMessage>(16);
+    let (alice_tx, _alice_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
     router
         .register(SessionHandle::new(alice.clone(), alice_tx))
         .await;
@@ -802,7 +802,7 @@ async fn position_cache_replaces_old() {
 
     // Bob connects and gets the latest position
     let bob = Arc::new(make_identity("bob", &["team"]));
-    let (bob_tx, mut bob_rx) = mpsc::channel::<RoutableMessage>(16);
+    let (bob_tx, mut bob_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
     let bob_handle = SessionHandle::new(bob.clone(), bob_tx);
     router.register(bob_handle.clone()).await;
     router.replay_positions(&bob_handle).await;

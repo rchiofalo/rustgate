@@ -17,11 +17,11 @@ static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
 pub struct SessionHandle {
     pub id: u64,
     pub identity: Arc<Identity>,
-    sender: mpsc::Sender<RoutableMessage>,
+    sender: mpsc::Sender<Arc<RoutableMessage>>,
 }
 
 impl SessionHandle {
-    pub fn new(identity: Arc<Identity>, sender: mpsc::Sender<RoutableMessage>) -> Self {
+    pub fn new(identity: Arc<Identity>, sender: mpsc::Sender<Arc<RoutableMessage>>) -> Self {
         Self {
             id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             identity,
@@ -29,10 +29,15 @@ impl SessionHandle {
         }
     }
 
+    /// Send a shared message reference to this session.
+    ///
+    /// Messages are wrapped in `Arc` so that broadcast and group sends
+    /// share a single allocation instead of cloning the full
+    /// `RoutableMessage` per recipient.
     pub async fn send(
         &self,
-        msg: RoutableMessage,
-    ) -> Result<(), mpsc::error::SendError<RoutableMessage>> {
+        msg: Arc<RoutableMessage>,
+    ) -> Result<(), mpsc::error::SendError<Arc<RoutableMessage>>> {
         self.sender.send(msg).await
     }
 }
@@ -209,6 +214,10 @@ impl Router {
             self.cache.store(msg.clone()).await;
         }
 
+        // Wrap in Arc once so broadcast/group sends share one allocation
+        // instead of cloning the full RoutableMessage per recipient.
+        let msg = Arc::new(msg);
+
         match msg.destination {
             Destination::Direct(ref target) => {
                 let cn = target.cn.clone();
@@ -238,7 +247,7 @@ impl Router {
                 .is_some();
             if shared || handle.identity.groups.is_empty() {
                 total += 1;
-                if handle.send(msg).await.is_err() {
+                if handle.send(Arc::new(msg)).await.is_err() {
                     dropped += 1;
                 }
             }
@@ -267,7 +276,7 @@ impl Router {
             .collect()
     }
 
-    async fn send_to_session(&self, cn: &str, msg: RoutableMessage) {
+    async fn send_to_session(&self, cn: &str, msg: Arc<RoutableMessage>) {
         let handle = {
             let state = self.state.read().await;
             state.sessions.get(cn).cloned()
@@ -282,7 +291,7 @@ impl Router {
         }
     }
 
-    async fn send_to_group(&self, group: &str, msg: &RoutableMessage) {
+    async fn send_to_group(&self, group: &str, msg: &Arc<RoutableMessage>) {
         if !msg.source.is_member_of(group) {
             tracing::warn!(
                 sender = %msg.source.cn,
@@ -307,7 +316,7 @@ impl Router {
 
         let mut dropped = 0u32;
         for handle in &targets {
-            if handle.send(msg.clone()).await.is_err() {
+            if handle.send(Arc::clone(msg)).await.is_err() {
                 dropped += 1;
             }
         }
@@ -324,7 +333,7 @@ impl Router {
     /// Broadcast to all connected sessions (except sender).
     /// This is intentional for SA sharing — all authenticated clients
     /// receive broadcasts regardless of group membership.
-    async fn send_to_all(&self, msg: &RoutableMessage) {
+    async fn send_to_all(&self, msg: &Arc<RoutableMessage>) {
         let targets: Vec<SessionHandle> = {
             let state = self.state.read().await;
             state
@@ -337,7 +346,7 @@ impl Router {
 
         let mut dropped = 0u32;
         for handle in &targets {
-            if handle.send(msg.clone()).await.is_err() {
+            if handle.send(Arc::clone(msg)).await.is_err() {
                 dropped += 1;
             }
         }

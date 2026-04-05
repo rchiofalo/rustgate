@@ -87,7 +87,7 @@ impl UdpInput {
                 return;
             }
         };
-        let (tx, _rx) = mpsc::channel::<RoutableMessage>(1);
+        let (tx, _rx) = mpsc::channel::<Arc<RoutableMessage>>(1);
         let handle = SessionHandle::new(Arc::clone(&identity), tx);
         let session_id = handle.id;
         router.register(handle).await;
@@ -194,7 +194,7 @@ mod tests {
         let listener_identity = Arc::new(
             Identity::plaintext("test-listener".to_string(), groups).expect("valid identity"),
         );
-        let (listener_tx, mut listener_rx) = mpsc::channel::<RoutableMessage>(16);
+        let (listener_tx, mut listener_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
         let listener_handle = SessionHandle::new(listener_identity, listener_tx);
         router.register(listener_handle).await;
 
