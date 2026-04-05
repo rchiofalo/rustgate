@@ -630,6 +630,7 @@ Sign a CSR and return a PKCS#12 (.p12) bundle containing the signed client certi
 | `400 Bad Request` | `text/plain` | `CSR too large or unreadable`, `request body is not valid UTF-8`, or `failed to sign CSR` |
 | `401 Unauthorized` | `text/plain` | `unauthorized` (includes `WWW-Authenticate: Basic` header) |
 | `429 Too Many Requests` | `text/plain` | `rate limit exceeded` |
+| `500 Internal Server Error` | `text/plain` | `failed to create PKCS#12 bundle` |
 
 ```bash
 curl -X POST https://enrollment-host:8446/Marti/api/tls/signClient?clientUID=my-device \
@@ -690,6 +691,7 @@ Sign a CSR and return the signed certificate chain. Supports content negotiation
 | `400 Bad Request` | `CSR too large or unreadable`, `request body is not valid UTF-8`, or `failed to sign CSR` |
 | `401 Unauthorized` | `unauthorized` (includes `WWW-Authenticate: Basic` header) |
 | `429 Too Many Requests` | `rate limit exceeded` |
+| `500 Internal Server Error` | `failed to create PKCS#12 bundle` or internal signing error |
 
 ```bash
 # JSON response (default)
