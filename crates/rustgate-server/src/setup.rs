@@ -139,6 +139,8 @@ pub(crate) async fn bind_tls_listener(
     cli: &Cli,
     tls_config: &TlsConfig,
 ) -> anyhow::Result<TlsListener> {
+    // `mut` is only needed when `metrics` is enabled (for `set_on_handshake_error`).
+    #[allow(unused_mut)]
     let mut listener = if cli.cert_reload_interval > 0 {
         let reloader =
             CertReloader::new(&cli.cert, &cli.key).context("initializing certificate reloader")?;
