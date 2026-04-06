@@ -335,6 +335,12 @@ additionally register the Tier 2 per-identity metrics:
 (the default), these metrics are not registered at all and impose zero
 overhead.
 
+**Scope:** per-identity labels currently cover the TLS and plaintext TCP
+transports only. WebSocket sessions are not yet labelled and will not appear
+in `identity_cn`-labelled series. Byte counters report **application payload
+bytes** (post-decode / pre-encode), not wire bytes — they exclude TLS,
+framing, and codec overhead.
+
 ## Docker
 
 ```bash
