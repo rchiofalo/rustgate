@@ -13,6 +13,7 @@ workspace = true
 [features]
 proto = ["dep:rustgate-proto"]
 fips = ["rustls/aws_lc_rs", "rustls/fips"]
+post-quantum = ["rustls/aws_lc_rs", "rustls/prefer-post-quantum"]
 
 [dependencies]
 rustgate-core = { workspace = true }

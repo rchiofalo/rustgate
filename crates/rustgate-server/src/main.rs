@@ -68,13 +68,34 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    #[cfg(feature = "fips")]
+    // Install crypto provider. Only one can be active.
+    // When both `post-quantum` and `fips` are enabled, the PQ provider
+    // includes FIPS validation (same aws-lc-rs backend) plus PQ KX groups.
+    #[cfg(feature = "post-quantum")]
+    rustgate_transport::install_pq_provider()?;
+
+    #[cfg(all(feature = "fips", not(feature = "post-quantum")))]
     rustgate_transport::install_fips_provider()?;
 
     if cli.fips_required && !rustgate_transport::is_fips_provider_active() {
         anyhow::bail!(
             "--fips-required is set but FIPS crypto provider is not active. \
              Build with --features fips to enable FIPS 140-3 mode."
+        );
+    }
+
+    #[cfg(feature = "post-quantum")]
+    if rustgate_transport::is_pq_provider_active() {
+        tracing::info!("post-quantum key exchange available (X25519MLKEM768)");
+    } else {
+        tracing::warn!("post-quantum feature enabled but X25519MLKEM768 not found in provider");
+    }
+
+    #[cfg(not(feature = "post-quantum"))]
+    if cli.prefer_post_quantum {
+        tracing::warn!(
+            "--prefer-post-quantum set but the post-quantum feature is not compiled in; \
+             rebuild with --features post-quantum to enable PQ key exchange"
         );
     }
 

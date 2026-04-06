@@ -29,7 +29,7 @@ which supports pluggable `CryptoProvider` backends:
 |---|---|---|
 | _(default)_ | `ring` | Standard deployments, broadest platform support |
 | `fips` | `aws-lc-rs` (FIPS 140-3) | Government and regulated environments |
-| `post-quantum` _(planned)_ | `aws-lc-rs` | Post-quantum hybrid key exchange |
+| `post-quantum` | `aws-lc-rs` | Post-quantum hybrid key exchange (X25519MLKEM768) |
 
 Backend selection is compile-time only — a single binary uses exactly one
 `CryptoProvider`. This avoids runtime complexity and ensures the entire
@@ -68,7 +68,7 @@ the secure baseline.
 |---|---|
 | `ring` | X25519, secp256r1, secp384r1 |
 | `aws-lc-rs` | X25519, secp256r1, secp384r1 |
-| `aws-lc-rs` + PQ _(planned)_ | X25519MLKEM768, X25519, secp256r1, secp384r1 |
+| `aws-lc-rs` + PQ | X25519MLKEM768, SECP256R1MLKEM768, MLKEM768, MLKEM1024, X25519, secp256r1, secp384r1 |
 
 When post-quantum support is enabled, the hybrid `X25519MLKEM768` group is
 placed first in preference order. Clients that support ML-KEM negotiate

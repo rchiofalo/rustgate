@@ -116,7 +116,7 @@ jobs:
       - name: Check all feature combinations
         # NOTE: --locked is omitted because --no-dev-deps temporarily modifies
         # Cargo.toml files, which invalidates the lockfile.
-        run: cargo hack check --feature-powerset --depth 2 --exclude-features jemalloc,fips,otel --no-dev-deps
+        run: cargo hack check --feature-powerset --depth 2 --exclude-features jemalloc,fips,otel,post-quantum --no-dev-deps
 
   test:
     if: github.event.pull_request.draft == false || github.event_name == 'push'

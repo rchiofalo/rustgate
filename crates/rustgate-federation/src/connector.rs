@@ -145,7 +145,12 @@ impl PeerConnector {
             .await
             .map_err(|e| anyhow::anyhow!("TLS handshake with {addr}: {e}"))?;
 
-        debug!(peer_addr = %addr, "TLS handshake completed");
+        let kx_group = tls_stream
+            .get_ref()
+            .1
+            .negotiated_key_exchange_group()
+            .map(|g| g.name());
+        debug!(peer_addr = %addr, kx_group = ?kx_group, "TLS handshake completed");
 
         let identity = extract_server_identity(&tls_stream)
             .with_context(|| format!("extracting identity from peer at {addr}"))?;
@@ -290,7 +295,12 @@ impl DynamicPeerConnector {
             .await
             .map_err(|e| anyhow::anyhow!("TLS handshake with {addr}: {e}"))?;
 
-        debug!(peer_addr = %addr, "TLS handshake completed");
+        let kx_group = tls_stream
+            .get_ref()
+            .1
+            .negotiated_key_exchange_group()
+            .map(|g| g.name());
+        debug!(peer_addr = %addr, kx_group = ?kx_group, "TLS handshake completed");
 
         let identity = extract_server_identity(&tls_stream)
             .with_context(|| format!("extracting identity from peer at {addr}"))?;

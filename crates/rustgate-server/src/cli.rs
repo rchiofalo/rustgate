@@ -71,6 +71,12 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = false, env = "RUSTGATE_FIPS_REQUIRED")]
     pub(crate) fips_required: bool,
 
+    /// Prefer post-quantum key exchange (X25519MLKEM768). Build with
+    /// --features post-quantum to enable. PQ-capable clients negotiate hybrid
+    /// PQ+classical key exchange; others fall back to X25519 transparently.
+    #[arg(long, default_value_t = false, env = "RUSTGATE_PREFER_POST_QUANTUM")]
+    pub(crate) prefer_post_quantum: bool,
+
     /// Interval in seconds to check for certificate file changes.
     /// When set to a value > 0, the server periodically polls the --cert and
     /// --key files and hot-reloads them on change (zero-downtime rotation).
@@ -558,6 +564,7 @@ mod tests {
             "RUSTGATE_TLS_MIN_VERSION",
             "RUSTGATE_CRL_WARN_STALE",
             "RUSTGATE_FIPS_REQUIRED",
+            "RUSTGATE_PREFER_POST_QUANTUM",
             "RUSTGATE_CERT_RELOAD_INTERVAL",
             "RUSTGATE_FRAMING",
             "RUSTGATE_ENCODING",
