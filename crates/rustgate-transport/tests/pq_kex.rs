@@ -327,11 +327,31 @@ async fn pq_mlkem1024_negotiation() {
     let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
     let client_cert = ca.issue_client_cert("mlkem1024-client", &["team"]);
 
-    // Build server TLS config — the default PQ provider includes MLKEM1024
+    // Build server with a custom provider that prefers MLKEM1024.
+    // The default PQ provider has X25519MLKEM768 first, so we must
+    // override the group order for this test.
     let tls_config = TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
         .expect("tls config");
+    let verifier = tls_config.build_default_verifier().expect("verifier");
 
-    let listener = TlsListener::bind("127.0.0.1:0", &tls_config)
+    let server_certs = rustgate_test_utils::tls::parse_certs(&server_cert.cert_pem);
+    let server_key = rustgate_test_utils::tls::parse_key(&server_cert.key_pem);
+
+    let mut server_provider = rustls::crypto::aws_lc_rs::default_provider();
+    server_provider.kx_groups = vec![
+        rustls::crypto::aws_lc_rs::kx_group::MLKEM1024,
+        rustls::crypto::aws_lc_rs::kx_group::X25519,
+    ];
+
+    let mut server_config = rustls::ServerConfig::builder_with_provider(Arc::new(server_provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("tls13")
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(server_certs, server_key)
+        .expect("server cert");
+    server_config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+
+    let listener = TlsListener::bind_with_server_config("127.0.0.1:0", Arc::new(server_config), 10)
         .await
         .expect("bind");
     let addr = listener.local_addr().expect("addr");
