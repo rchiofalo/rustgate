@@ -3,35 +3,112 @@
 //! Defines optional per-group send/receive permissions enforced by the
 //! router at dispatch time. When no policy is loaded, all groups operate
 //! in open mode (backward compatible).
+//!
+//! Each [`GroupAcl`] supports both *allow lists* and *deny lists* for
+//! senders and receivers independently. Deny is always evaluated first
+//! and overrides any allow entry — if a CN appears in `deny_senders`, it
+//! cannot send to the group even if it is also listed in `senders`.
 
 use std::collections::{HashMap, HashSet};
 
 /// Access control entry for a single group.
 ///
-/// When a group has an ACL entry, only listed principals have the
-/// specified permissions. Unlisted principals are denied.
+/// Evaluation rules:
+/// - **Deny first**: a CN in `deny_senders` is rejected for sending even
+///   if it also appears in `senders` (same for receivers).
+/// - **Allow list**: when `senders` is non-empty, only listed CNs (minus
+///   any in `deny_senders`) may send. Same logic for `receivers`.
+/// - **Deny-only block list**: when `senders` is empty but
+///   `deny_senders` is non-empty, the group is open *except* for the
+///   denied CNs. Same for receivers.
+/// - **Open**: when both `senders` and `deny_senders` are empty, sending
+///   is unrestricted (backward-compatible default).
 #[derive(Debug, Clone, Default)]
 pub struct GroupAcl {
     /// CNs allowed to send to this group.
     senders: HashSet<String>,
     /// CNs allowed to receive from this group.
     receivers: HashSet<String>,
+    /// CNs explicitly denied from sending; overrides `senders`.
+    deny_senders: HashSet<String>,
+    /// CNs explicitly denied from receiving; overrides `receivers`.
+    deny_receivers: HashSet<String>,
 }
 
 impl GroupAcl {
-    /// Create a new ACL with explicit sender and receiver sets.
+    /// Create a new ACL with explicit allow lists for senders and receivers.
+    /// Deny lists default to empty.
     pub fn new(senders: HashSet<String>, receivers: HashSet<String>) -> Self {
-        Self { senders, receivers }
+        Self {
+            senders,
+            receivers,
+            deny_senders: HashSet::new(),
+            deny_receivers: HashSet::new(),
+        }
+    }
+
+    /// Create a new ACL with both allow and deny lists.
+    pub fn with_deny(
+        senders: HashSet<String>,
+        receivers: HashSet<String>,
+        deny_senders: HashSet<String>,
+        deny_receivers: HashSet<String>,
+    ) -> Self {
+        Self {
+            senders,
+            receivers,
+            deny_senders,
+            deny_receivers,
+        }
     }
 
     /// Returns `true` if `cn` is permitted to send to this group.
+    ///
+    /// Deny is checked first — a CN in `deny_senders` is always rejected,
+    /// regardless of whether it appears in `senders`.
     pub fn can_send(&self, cn: &str) -> bool {
+        if self.deny_senders.contains(cn) {
+            return false;
+        }
+        if self.senders.is_empty() {
+            // Open (or deny-only block list) mode.
+            return true;
+        }
         self.senders.contains(cn)
     }
 
     /// Returns `true` if `cn` is permitted to receive from this group.
+    ///
+    /// Deny is checked first — a CN in `deny_receivers` is always rejected,
+    /// regardless of whether it appears in `receivers`.
     pub fn can_receive(&self, cn: &str) -> bool {
+        if self.deny_receivers.contains(cn) {
+            return false;
+        }
+        if self.receivers.is_empty() {
+            return true;
+        }
         self.receivers.contains(cn)
+    }
+
+    /// CNs in the sender allow list.
+    pub fn senders(&self) -> &HashSet<String> {
+        &self.senders
+    }
+
+    /// CNs in the receiver allow list.
+    pub fn receivers(&self) -> &HashSet<String> {
+        &self.receivers
+    }
+
+    /// CNs in the sender deny list.
+    pub fn deny_senders(&self) -> &HashSet<String> {
+        &self.deny_senders
+    }
+
+    /// CNs in the receiver deny list.
+    pub fn deny_receivers(&self) -> &HashSet<String> {
+        &self.deny_receivers
     }
 }
 
@@ -83,6 +160,14 @@ impl GroupAclPolicy {
     /// Number of groups with ACL entries.
     pub fn len(&self) -> usize {
         self.groups.len()
+    }
+
+    /// Read-only access to the underlying group map.
+    ///
+    /// Used by management surfaces (REST API, diagnostics) to enumerate
+    /// or render the current policy.
+    pub fn groups(&self) -> &HashMap<String, GroupAcl> {
+        &self.groups
     }
 }
 
@@ -183,5 +268,110 @@ mod tests {
         let policy = GroupAclPolicy::new(groups);
         assert!(!policy.is_empty());
         assert_eq!(policy.len(), 1);
+    }
+
+    // ── Deny-rule tests ─────────────────────────────────────────────
+
+    #[test]
+    fn deny_sender_overrides_allow() {
+        let acl = GroupAcl::with_deny(
+            HashSet::from(["alice".to_string(), "bob".to_string()]),
+            HashSet::new(),
+            HashSet::from(["alice".to_string()]),
+            HashSet::new(),
+        );
+        // alice is allowed AND denied -- deny wins
+        assert!(!acl.can_send("alice"));
+        // bob is only allowed
+        assert!(acl.can_send("bob"));
+        // charlie is not in the allow list at all
+        assert!(!acl.can_send("charlie"));
+    }
+
+    #[test]
+    fn deny_receiver_overrides_allow() {
+        let acl = GroupAcl::with_deny(
+            HashSet::new(),
+            HashSet::from(["alice".to_string(), "bob".to_string()]),
+            HashSet::new(),
+            HashSet::from(["bob".to_string()]),
+        );
+        assert!(acl.can_receive("alice"));
+        assert!(!acl.can_receive("bob"));
+        assert!(!acl.can_receive("charlie"));
+    }
+
+    #[test]
+    fn deny_only_acts_as_block_list() {
+        // Empty allow + non-empty deny → open except for denied CNs.
+        let acl = GroupAcl::with_deny(
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::from(["mallory".to_string()]),
+            HashSet::from(["mallory".to_string()]),
+        );
+        assert!(acl.can_send("alice"));
+        assert!(acl.can_send("bob"));
+        assert!(!acl.can_send("mallory"));
+        assert!(acl.can_receive("alice"));
+        assert!(!acl.can_receive("mallory"));
+    }
+
+    #[test]
+    fn asymmetric_deny_send_only() {
+        // Denied from sending but still allowed to receive.
+        let acl = GroupAcl::with_deny(
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::from(["mallory".to_string()]),
+            HashSet::new(),
+        );
+        assert!(!acl.can_send("mallory"));
+        assert!(acl.can_receive("mallory"));
+    }
+
+    #[test]
+    fn asymmetric_deny_receive_only() {
+        let acl = GroupAcl::with_deny(
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::from(["mallory".to_string()]),
+        );
+        assert!(acl.can_send("mallory"));
+        assert!(!acl.can_receive("mallory"));
+    }
+
+    #[test]
+    fn legacy_constructor_has_empty_deny_lists() {
+        // Backward compatibility: GroupAcl::new must continue to work
+        // exactly like before — empty deny sets, allow-list semantics.
+        let acl = GroupAcl::new(
+            HashSet::from(["alice".to_string()]),
+            HashSet::from(["alice".to_string()]),
+        );
+        assert!(acl.deny_senders().is_empty());
+        assert!(acl.deny_receivers().is_empty());
+        assert!(acl.can_send("alice"));
+        assert!(!acl.can_send("bob"));
+    }
+
+    #[test]
+    fn deny_in_policy_routing() {
+        let mut groups = HashMap::new();
+        groups.insert(
+            "ops".to_string(),
+            GroupAcl::with_deny(
+                HashSet::new(),
+                HashSet::new(),
+                HashSet::from(["mallory".to_string()]),
+                HashSet::from(["mallory".to_string()]),
+            ),
+        );
+        let policy = GroupAclPolicy::new(groups);
+        assert!(policy.is_send_authorized("ops", "alice"));
+        assert!(!policy.is_send_authorized("ops", "mallory"));
+        assert!(policy.is_receive_authorized("ops", "alice"));
+        assert!(!policy.is_receive_authorized("ops", "mallory"));
     }
 }

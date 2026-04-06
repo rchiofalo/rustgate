@@ -81,7 +81,12 @@ impl AclReloader {
         for (group_id, entry) in config.groups {
             let _ = groups.insert(
                 group_id,
-                rustgate_transport::GroupAcl::new(entry.send, entry.receive),
+                rustgate_transport::GroupAcl::with_deny(
+                    entry.send,
+                    entry.receive,
+                    entry.deny_send,
+                    entry.deny_receive,
+                ),
             );
         }
 
