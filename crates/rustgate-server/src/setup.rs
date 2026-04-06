@@ -152,10 +152,10 @@ pub(crate) async fn build_tls_config(
 pub(crate) async fn bind_tls_listener(
     cli: &Cli,
     tls_config: &TlsConfig,
-) -> anyhow::Result<TlsListener> {
+) -> anyhow::Result<(TlsListener, Option<Arc<CertReloader>>)> {
     // `mut` is only needed when `metrics` is enabled (for `set_on_handshake_error`).
     #[allow(unused_mut)]
-    let mut listener = if cli.cert_reload_interval > 0 {
+    let (mut listener, cert_reloader) = if cli.cert_reload_interval > 0 {
         let reloader =
             CertReloader::new(&cli.cert, &cli.key).context("initializing certificate reloader")?;
 
@@ -172,17 +172,23 @@ pub(crate) async fn bind_tls_listener(
             "certificate hot-reload enabled"
         );
 
-        TlsListener::bind_with_server_config(
+        let listener = TlsListener::bind_with_server_config(
             &cli.bind,
             Arc::new(server_config),
             cli.max_concurrent_handshakes,
         )
         .await
-        .context("binding TLS listener with cert reloader")?
+        .context("binding TLS listener with cert reloader")?;
+        (listener, Some(reloader))
     } else {
-        TlsListener::bind_with_handshake_limit(&cli.bind, tls_config, cli.max_concurrent_handshakes)
-            .await
-            .context("binding TLS listener")?
+        let listener = TlsListener::bind_with_handshake_limit(
+            &cli.bind,
+            tls_config,
+            cli.max_concurrent_handshakes,
+        )
+        .await
+        .context("binding TLS listener")?;
+        (listener, None)
     };
 
     #[cfg(feature = "metrics")]
@@ -194,7 +200,7 @@ pub(crate) async fn bind_tls_listener(
             .inc();
     }));
 
-    Ok(listener)
+    Ok((listener, cert_reloader))
 }
 
 /// Validate framing/encoding feature requirements and consistency at startup.

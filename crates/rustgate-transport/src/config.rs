@@ -229,6 +229,43 @@ impl TlsConfig {
         &self.client_ca_store
     }
 
+    /// Re-read and validate a CRL PEM file from disk.
+    ///
+    /// Parses the PEM blocks, runs freshness checks, and emits the same
+    /// audit events that [`Self::with_crls`] does. Returns the number of
+    /// CRL entries found on success.
+    ///
+    /// Used by SIGHUP-driven config reload to detect operator errors in
+    /// CRL files without restarting the server. The active TLS listener
+    /// does not currently swap CRLs at runtime — applying CRL changes to
+    /// in-flight handshakes still requires a server restart.
+    pub fn validate_crl_file(path: &str) -> Result<usize> {
+        let crl_pem = std::fs::read_to_string(path).map_err(|e| {
+            RustgateError::from(ConfigError::Other(format!(
+                "failed to read CRL file {path}: {e}"
+            )))
+        })?;
+        let crls: Vec<CertificateRevocationListDer<'static>> =
+            CertificateRevocationListDer::pem_slice_iter(crl_pem.as_bytes())
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| {
+                    RustgateError::from(ConfigError::PemParse {
+                        kind: "CRL".to_string(),
+                        reason: e.to_string(),
+                    })
+                })?;
+        if crls.is_empty() {
+            return Err(ConfigError::EmptyPem {
+                kind: "CRLs".to_string(),
+            }
+            .into());
+        }
+        let count = crls.len();
+        rustgate_core::audit::crl_reload_success(count, path);
+        let _ = check_crl_freshness(&crls);
+        Ok(count)
+    }
+
     /// Get a clone of the loaded CRLs.
     ///
     /// Used by consumers that need to pass CRLs to a
