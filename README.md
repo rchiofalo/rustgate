@@ -307,6 +307,7 @@ All flags support environment variables (CLI takes precedence):
 | `--group-acl-file` | `RUSTGATE_GROUP_ACL_FILE` | — |
 | `--archive-dir` | `RUSTGATE_ARCHIVE_DIR` | — |
 | `--package-max-age-hours` | `RUSTGATE_PACKAGE_MAX_AGE_HOURS` | `0` (no expiration) |
+| `--audit-log` | `RUSTGATE_AUDIT_LOG` | — |
 | `--otel-endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` | — |
 | `--otel-service-name` | `OTEL_SERVICE_NAME` | `rustgate` |
 

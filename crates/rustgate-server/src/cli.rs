@@ -386,6 +386,12 @@ pub(crate) struct Cli {
     pub(crate) package_max_age_hours: u64,
 
     // -- Observability --
+    /// Write audit events as JSON lines to a dedicated file. When set,
+    /// audit events (target="audit") are written to this file in addition
+    /// to the main log stream. Use "-" for stdout.
+    #[arg(long, env = "RUSTGATE_AUDIT_LOG")]
+    pub(crate) audit_log: Option<String>,
+
     /// OTLP gRPC endpoint for OpenTelemetry trace export (e.g. http://localhost:4317).
     /// Requires --features otel. When not set, OTel tracing is disabled even if
     /// compiled with the otel feature.
@@ -626,6 +632,7 @@ mod tests {
             "RUSTGATE_GROUP_ACL_FILE",
             "RUSTGATE_ARCHIVE_DIR",
             "RUSTGATE_PACKAGE_MAX_AGE_HOURS",
+            "RUSTGATE_AUDIT_LOG",
             "OTEL_EXPORTER_OTLP_ENDPOINT",
             "OTEL_SERVICE_NAME",
         ];
@@ -709,6 +716,52 @@ mod tests {
         ])
         .expect("should parse");
         assert!(cli.federation_skip_hostname_verify);
+    }
+
+    #[test]
+    fn cli_audit_log_default_none() {
+        let cli = Cli::try_parse_from([
+            "rustgate", "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
+        ])
+        .expect("should parse");
+        assert!(cli.audit_log.is_none());
+    }
+
+    #[test]
+    fn cli_audit_log_file_path() {
+        let cli = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--audit-log",
+            "/var/log/rustgate/audit.jsonl",
+        ])
+        .expect("should parse");
+        assert_eq!(
+            cli.audit_log.as_deref(),
+            Some("/var/log/rustgate/audit.jsonl")
+        );
+    }
+
+    #[test]
+    fn cli_audit_log_stdout() {
+        let cli = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--audit-log",
+            "-",
+        ])
+        .expect("should parse");
+        assert_eq!(cli.audit_log.as_deref(), Some("-"));
     }
 
     // ── build_codec tests ──────────────────────────────────────────

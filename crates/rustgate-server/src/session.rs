@@ -89,9 +89,7 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
 ) {
     let identity = session.identity_arc();
     let cn = identity.cn.clone();
-
-    tracing::info!(cn = %cn, peer = %session.peer_addr(), "connected");
-    crate::audit::client_connected(&cn, session.peer_addr(), &identity.fingerprint);
+    let peer_addr = session.peer_addr();
 
     #[cfg(feature = "metrics")]
     metrics::sessions_active().inc();
@@ -111,6 +109,9 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
         SessionHandle::with_drop_threshold(Arc::clone(&identity), priority_tx, normal_tx, u32::MAX)
     };
     let session_id = handle.id;
+
+    tracing::info!(cn = %cn, peer = %peer_addr, session_id = session_id, "connected");
+    crate::audit::client_connected(&cn, peer_addr, &identity.fingerprint, session_id);
     deps.router.register(handle.clone()).await;
     deps.router.replay_positions(&handle).await;
 
@@ -148,7 +149,7 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
                         metrics::sessions_active().dec();
                         metrics::connections_active().dec();
                     }
-                    crate::audit::client_disconnected(&cn);
+                    crate::audit::client_disconnected(&cn, session_id);
                     tracing::info!(cn = %cn, "disconnected");
                     return;
                 }
@@ -181,7 +182,7 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
         metrics::sessions_active().dec();
         metrics::connections_active().dec();
     }
-    crate::audit::client_disconnected(&cn);
+    crate::audit::client_disconnected(&cn, session_id);
     tracing::info!(cn = %cn, "disconnected");
 }
 

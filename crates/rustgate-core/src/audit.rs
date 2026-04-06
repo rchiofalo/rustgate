@@ -25,22 +25,24 @@ macro_rules! audit {
 }
 
 /// Record a client connection event.
-pub fn client_connected(cn: &str, peer: SocketAddr, fingerprint: &str) {
+pub fn client_connected(cn: &str, peer: SocketAddr, fingerprint: &str, session_id: u64) {
     audit!(
         "client.connected",
         cn = %cn,
         peer = %peer,
         fingerprint = %fingerprint,
+        session_id = session_id,
         action = "connect",
         result = "success"
     );
 }
 
 /// Record a client disconnection event.
-pub fn client_disconnected(cn: &str) {
+pub fn client_disconnected(cn: &str, session_id: u64) {
     audit!(
         "client.disconnected",
         cn = %cn,
+        session_id = session_id,
         action = "disconnect",
         result = "success"
     );
@@ -306,15 +308,15 @@ mod tests {
 
     #[test]
     fn test_client_connected() {
-        client_connected("alpha-cn", v4_addr(), "sha256:abc123def456");
-        client_connected("", v6_addr(), "");
-        client_connected("cn/with-special.chars", v4_addr(), &"f".repeat(128));
+        client_connected("alpha-cn", v4_addr(), "sha256:abc123def456", 1);
+        client_connected("", v6_addr(), "", 42);
+        client_connected("cn/with-special.chars", v4_addr(), &"f".repeat(128), 0);
     }
 
     #[test]
     fn test_client_disconnected() {
-        client_disconnected("alpha-cn");
-        client_disconnected("");
+        client_disconnected("alpha-cn", 1);
+        client_disconnected("", 42);
     }
 
     #[test]

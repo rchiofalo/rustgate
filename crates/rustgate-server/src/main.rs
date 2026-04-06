@@ -14,9 +14,9 @@ use std::time::Duration;
 
 use clap::Parser;
 use tokio::sync::Semaphore;
-use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer};
 
 mod acl_config;
 mod archive;
@@ -39,6 +39,28 @@ fn main() -> anyhow::Result<()> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let fmt_layer = tracing_subscriber::fmt::layer().json();
 
+    // Dedicated audit log sink: filters only target="audit" events and writes
+    // JSON lines to the configured file (or stdout when "-").
+    let audit_layer = if let Some(ref audit_path) = cli.audit_log {
+        let writer: std::sync::Mutex<Box<dyn std::io::Write + Send>> = if audit_path == "-" {
+            std::sync::Mutex::new(Box::new(std::io::stdout()))
+        } else {
+            let file = std::fs::File::create(audit_path)
+                .map_err(|e| anyhow::anyhow!("failed to open audit log {audit_path}: {e}"))?;
+            std::sync::Mutex::new(Box::new(file))
+        };
+        let filter =
+            tracing_subscriber::filter::Targets::new().with_target("audit", tracing::Level::INFO);
+        Some(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(writer)
+                .with_filter(filter),
+        )
+    } else {
+        None
+    };
+
     #[cfg(feature = "otel")]
     let otel_layer = if let Some(ref endpoint) = cli.otel_endpoint {
         Some(otel::init_layer(endpoint, &cli.otel_service_name)?)
@@ -52,6 +74,7 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(env_filter)
         .with(fmt_layer)
+        .with(audit_layer)
         .with(otel_layer)
         .init();
 
