@@ -5,17 +5,21 @@
 
 use std::collections::{HashMap, HashSet};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Root structure of the group ACL JSON configuration file.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub(crate) struct GroupAclFile {
     /// Per-group access control rules.
     pub(crate) groups: HashMap<String, GroupAclEntry>,
 }
 
 /// ACL entry for a single group in the configuration file.
-#[derive(Debug, Deserialize)]
+///
+/// Backward-compatible: legacy files using only `send` and `receive`
+/// continue to deserialize unchanged (the new `deny_*` fields default
+/// to empty sets via `#[serde(default)]`).
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub(crate) struct GroupAclEntry {
     /// Certificate CNs permitted to send messages to this group.
     #[serde(default)]
@@ -23,6 +27,12 @@ pub(crate) struct GroupAclEntry {
     /// Certificate CNs permitted to receive messages from this group.
     #[serde(default)]
     pub(crate) receive: HashSet<String>,
+    /// Certificate CNs explicitly denied from sending; overrides `send`.
+    #[serde(default)]
+    pub(crate) deny_send: HashSet<String>,
+    /// Certificate CNs explicitly denied from receiving; overrides `receive`.
+    #[serde(default)]
+    pub(crate) deny_receive: HashSet<String>,
 }
 
 #[cfg(test)]
@@ -84,6 +94,42 @@ mod tests {
         let ops = &config.groups["ops"];
         assert!(ops.send.is_empty());
         assert!(ops.receive.contains("monitor"));
+    }
+
+    #[test]
+    fn parse_legacy_file_without_deny_fields() {
+        // Backward compat: files written before the deny extension
+        // must continue to parse, leaving deny lists empty.
+        let json = r#"{
+            "groups": {
+                "alpha": {
+                    "send": ["alice"],
+                    "receive": ["alice", "bob"]
+                }
+            }
+        }"#;
+        let config: GroupAclFile = serde_json::from_str(json).unwrap();
+        let alpha = &config.groups["alpha"];
+        assert!(alpha.deny_send.is_empty());
+        assert!(alpha.deny_receive.is_empty());
+    }
+
+    #[test]
+    fn parse_with_deny_fields() {
+        let json = r#"{
+            "groups": {
+                "alpha": {
+                    "send": ["alice", "bob"],
+                    "receive": ["alice", "bob"],
+                    "deny_send": ["bob"],
+                    "deny_receive": ["bob"]
+                }
+            }
+        }"#;
+        let config: GroupAclFile = serde_json::from_str(json).unwrap();
+        let alpha = &config.groups["alpha"];
+        assert!(alpha.deny_send.contains("bob"));
+        assert!(alpha.deny_receive.contains("bob"));
     }
 
     #[test]

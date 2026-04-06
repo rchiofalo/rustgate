@@ -313,6 +313,15 @@ impl Router {
         self.acl.store(Arc::new(new_acl));
     }
 
+    /// Snapshot the current group access control policy.
+    ///
+    /// Returns an `Arc` to the policy currently in effect, or `None` if
+    /// the router is in open mode. The snapshot is a point-in-time view;
+    /// concurrent calls to [`swap_acl`](Self::swap_acl) do not affect it.
+    pub fn acl_snapshot(&self) -> Arc<Option<GroupAclPolicy>> {
+        self.acl.load_full()
+    }
+
     /// Access the position cache for SA replay.
     pub fn cache(&self) -> &PositionCache {
         &self.cache

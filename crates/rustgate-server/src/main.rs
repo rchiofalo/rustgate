@@ -18,6 +18,8 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
+#[cfg(feature = "metrics")]
+mod acl_api;
 mod acl_config;
 mod acl_reloader;
 mod archive;
@@ -166,11 +168,16 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Arc::new(std::sync::OnceLock::new());
 
     #[cfg(feature = "metrics")]
+    let acl_api_slot: Arc<std::sync::OnceLock<metrics::AclApiHandler>> =
+        Arc::new(std::sync::OnceLock::new());
+
+    #[cfg(feature = "metrics")]
     setup::start_metrics(
         &cli,
         &ready,
         #[cfg(feature = "federation")]
         &fed_api_slot,
+        &acl_api_slot,
     )?;
 
     #[cfg(not(feature = "metrics"))]
@@ -179,13 +186,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     // ── Connection limit ────────────────────────────────────────────
     // CLI validation ensures max_connections is 1..=u32::MAX
     let max_connections: u32 = cli.max_connections as u32;
-    let (group_acl, acl_file_hash) = setup::load_group_acl(&cli).await?;
+    let (group_acl, acl_file_hash, acl_file_parsed) = setup::load_group_acl(&cli).await?;
     let router = Arc::new(match group_acl {
         Some(acl) => Router::with_acl(acl),
         None => Router::new(),
     });
 
     // ── ACL hot-reload ─────────────────────────────────────────────
+    #[cfg(feature = "metrics")]
+    let mut acl_reloader_for_api: Option<Arc<acl_reloader::AclReloader>> = None;
     if let Some(ref acl_file) = cli.group_acl_file
         && cli.acl_reload_interval > 0
     {
@@ -195,6 +204,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             acl_reloader::AclReloader::new(acl_file.clone(), Arc::clone(&router), initial_hash);
         let interval = Duration::from_secs(cli.acl_reload_interval);
         reloader.spawn_watcher(interval);
+        #[cfg(feature = "metrics")]
+        {
+            acl_reloader_for_api = Some(Arc::clone(&reloader));
+        }
 
         tracing::info!(
             interval_secs = cli.acl_reload_interval,
@@ -202,6 +215,55 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             "ACL hot-reload enabled"
         );
     }
+
+    // ── ACL REST API ───────────────────────────────────────────────
+    //
+    // Only registered when both `--group-acl-file` and
+    // `--acl-api-token-file` are set. The API exposes mutation of
+    // routing policy, so it must be explicitly opted into with a
+    // bearer token and is always backed by an on-disk file to
+    // persist mutations to.
+    #[cfg(feature = "metrics")]
+    {
+        match (&cli.group_acl_file, &cli.acl_api_token_file) {
+            (Some(acl_file), Some(token_file)) => {
+                let token = std::fs::read_to_string(token_file).map_err(|e| {
+                    anyhow::anyhow!("failed to read ACL API token file {token_file}: {e}")
+                })?;
+                let token = token.trim().as_bytes().to_vec();
+                if token.is_empty() {
+                    anyhow::bail!("ACL API token file {token_file} is empty");
+                }
+                let initial_file = acl_file_parsed.unwrap_or_default();
+                let api_state = Arc::new(acl_api::AclApiState {
+                    current: Arc::new(std::sync::RwLock::new(initial_file)),
+                    router: Arc::clone(&router),
+                    reloader: acl_reloader_for_api,
+                    file_path: std::path::PathBuf::from(acl_file),
+                    auth_token: token,
+                });
+                let handler: metrics::AclApiHandler = Arc::new(move |method, path, auth, body| {
+                    acl_api::handle_request(method, path, auth, body, &api_state)
+                });
+                let _ = acl_api_slot.set(handler);
+                tracing::warn!(
+                    "ACL REST API enabled at /api/acl/ — exposes mutation of routing policy; \
+                     bind the metrics endpoint to a trusted network only"
+                );
+            }
+            (Some(_), None) => {
+                tracing::info!(
+                    "ACL REST API disabled: --acl-api-token-file is required to expose /api/acl/"
+                );
+                let _ = acl_file_parsed;
+            }
+            _ => {
+                let _ = acl_file_parsed;
+            }
+        }
+    }
+    #[cfg(not(feature = "metrics"))]
+    let _ = acl_file_parsed;
 
     let connection_limit = Arc::new(Semaphore::new(max_connections as usize));
 

@@ -81,7 +81,12 @@ impl AclReloader {
         for (group_id, entry) in config.groups {
             let _ = groups.insert(
                 group_id,
-                rustgate_transport::GroupAcl::new(entry.send, entry.receive),
+                rustgate_transport::GroupAcl::with_deny(
+                    entry.send,
+                    entry.receive,
+                    entry.deny_send,
+                    entry.deny_receive,
+                ),
             );
         }
 
@@ -159,6 +164,17 @@ impl AclReloader {
                 }
             }
         }));
+    }
+
+    /// Overwrite the reloader's stored hash.
+    ///
+    /// Called by the REST API after it has persisted a mutation so the
+    /// next poll does not re-detect the same change as a pending reload.
+    #[cfg(feature = "metrics")]
+    pub(crate) fn set_hash(&self, hash: [u8; 32]) {
+        if let Ok(mut guard) = self.last_hash.lock() {
+            *guard = hash;
+        }
     }
 
     /// SHA-256 digest of the file bytes.

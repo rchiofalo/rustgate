@@ -36,9 +36,13 @@ use crate::session::{FedForwardFn, NatsPublish, PlaintextTcpConfig};
 /// file contents so the hot-reloader can detect subsequent changes.
 pub(crate) async fn load_group_acl(
     cli: &Cli,
-) -> anyhow::Result<(Option<rustgate_transport::GroupAclPolicy>, Option<[u8; 32]>)> {
+) -> anyhow::Result<(
+    Option<rustgate_transport::GroupAclPolicy>,
+    Option<[u8; 32]>,
+    Option<crate::acl_config::GroupAclFile>,
+)> {
     let Some(ref acl_file) = cli.group_acl_file else {
-        return Ok((None, None));
+        return Ok((None, None, None));
     };
 
     let data = tokio::fs::read_to_string(acl_file)
@@ -51,16 +55,21 @@ pub(crate) async fn load_group_acl(
         serde_json::from_str(&data).context("parsing group ACL file")?;
 
     let mut groups = std::collections::HashMap::new();
-    for (group_id, entry) in config.groups {
+    for (group_id, entry) in &config.groups {
         let _ = groups.insert(
-            group_id,
-            rustgate_transport::GroupAcl::new(entry.send, entry.receive),
+            group_id.clone(),
+            rustgate_transport::GroupAcl::with_deny(
+                entry.send.clone(),
+                entry.receive.clone(),
+                entry.deny_send.clone(),
+                entry.deny_receive.clone(),
+            ),
         );
     }
 
     let policy = rustgate_transport::GroupAclPolicy::new(groups);
     tracing::info!(groups = policy.len(), "loaded group access control policy");
-    Ok((Some(policy), Some(hash)))
+    Ok((Some(policy), Some(hash), Some(config)))
 }
 
 /// Spawn a tokio task whose `JoinHandle` is intentionally not tracked.
@@ -461,6 +470,7 @@ pub(crate) fn start_metrics(
     cli: &Cli,
     ready: &Arc<AtomicBool>,
     #[cfg(feature = "federation")] fed_api_slot: &Arc<std::sync::OnceLock<metrics::FedApiHandler>>,
+    acl_api_slot: &Arc<std::sync::OnceLock<metrics::AclApiHandler>>,
 ) -> anyhow::Result<()> {
     metrics::init().context("registering metrics")?;
 
@@ -472,12 +482,14 @@ pub(crate) fn start_metrics(
         let health_ready = Arc::clone(ready);
         #[cfg(feature = "federation")]
         let fed_api_for_metrics = Arc::clone(fed_api_slot);
+        let acl_api_for_metrics = Arc::clone(acl_api_slot);
         spawn_background("metrics-server", async move {
             if let Err(e) = metrics::serve(
                 bind_addr,
                 health_ready,
                 #[cfg(feature = "federation")]
                 fed_api_for_metrics,
+                acl_api_for_metrics,
             )
             .await
             {
