@@ -859,14 +859,14 @@ async fn expired_message_is_dropped() {
     let alice = Arc::new(make_identity("alice", &["team"]));
     let bob = Arc::new(make_identity("bob", &["team"]));
 
-    let (alice_tx, mut alice_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
-    let (bob_tx, mut bob_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
+    let (aptx, antx, mut _aprx, mut alice_rx) = make_channels(16);
+    let (bptx, bntx, mut _bprx, mut bob_rx) = make_channels(16);
 
     router
-        .register(SessionHandle::new(alice.clone(), alice_tx))
+        .register(SessionHandle::new(alice.clone(), aptx, antx))
         .await;
     router
-        .register(SessionHandle::new(bob.clone(), bob_tx))
+        .register(SessionHandle::new(bob.clone(), bptx, bntx))
         .await;
 
     // Build a message that is already expired: received 10s ago with 1s TTL
@@ -902,14 +902,14 @@ async fn message_without_ttl_routes_normally() {
     let alice = Arc::new(make_identity("alice", &["team"]));
     let bob = Arc::new(make_identity("bob", &["team"]));
 
-    let (_alice_tx, _alice_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
-    let (bob_tx, mut bob_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
+    let (_aptx, _antx, _aprx, _arx) = make_channels(16);
+    let (bptx, bntx, _bprx, mut bob_rx) = make_channels(16);
 
     router
-        .register(SessionHandle::new(alice.clone(), _alice_tx))
+        .register(SessionHandle::new(alice.clone(), _aptx, _antx))
         .await;
     router
-        .register(SessionHandle::new(bob.clone(), bob_tx))
+        .register(SessionHandle::new(bob.clone(), bptx, bntx))
         .await;
 
     // Message with no TTL — should be delivered regardless of age
@@ -940,14 +940,14 @@ async fn non_expired_ttl_message_routes_normally() {
     let alice = Arc::new(make_identity("alice", &["team"]));
     let bob = Arc::new(make_identity("bob", &["team"]));
 
-    let (_alice_tx, _alice_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
-    let (bob_tx, mut bob_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
+    let (_aptx, _antx, _aprx, _arx) = make_channels(16);
+    let (bptx, bntx, _bprx, mut bob_rx) = make_channels(16);
 
     router
-        .register(SessionHandle::new(alice.clone(), _alice_tx))
+        .register(SessionHandle::new(alice.clone(), _aptx, _antx))
         .await;
     router
-        .register(SessionHandle::new(bob.clone(), bob_tx))
+        .register(SessionHandle::new(bob.clone(), bptx, bntx))
         .await;
 
     // Message with a generous TTL — should be delivered
