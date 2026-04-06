@@ -5,7 +5,9 @@
 //! are registered with the default Prometheus registry and served at
 //! `/metrics` via a lightweight hyper HTTP server.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -14,7 +16,9 @@ use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-use prometheus::{Encoder, IntCounter, IntCounterVec, IntGauge, Opts, TextEncoder};
+use prometheus::{
+    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts, TextEncoder,
+};
 use rustgate_core::constants::HTTP_CONNECTION_TIMEOUT;
 
 /// Type-erased federation API handler.
@@ -50,10 +54,18 @@ static CONNECTIONS_REJECTED: OnceLock<IntCounter> = OnceLock::new();
 static ACCEPT_ERRORS: OnceLock<IntCounter> = OnceLock::new();
 
 static MESSAGES_RECEIVED: OnceLock<IntCounter> = OnceLock::new();
-static MESSAGES_DROPPED: OnceLock<IntCounter> = OnceLock::new();
+static MESSAGES_DROPPED: OnceLock<IntCounterVec> = OnceLock::new();
 static MESSAGES_EXPIRED: OnceLock<IntCounter> = OnceLock::new();
 static MESSAGES_REPLAYED: OnceLock<IntCounter> = OnceLock::new();
 static MESSAGES_ROUTED: OnceLock<IntCounterVec> = OnceLock::new();
+
+// Tier 2 (per-identity) metrics. Registered only when
+// `--metrics-per-identity` is enabled; remain `None` otherwise so they
+// add zero overhead.
+static PER_IDENTITY_HANDSHAKE_FAILURES: OnceLock<IntCounterVec> = OnceLock::new();
+static PER_IDENTITY_SESSION_DURATION: OnceLock<HistogramVec> = OnceLock::new();
+static PER_IDENTITY_BYTES_SENT: OnceLock<IntCounterVec> = OnceLock::new();
+static PER_IDENTITY_BYTES_RECEIVED: OnceLock<IntCounterVec> = OnceLock::new();
 static SESSIONS_ACTIVE: OnceLock<IntGauge> = OnceLock::new();
 
 static NATS_PUBLISHES: OnceLock<IntCounter> = OnceLock::new();
@@ -133,10 +145,13 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(messages_received.clone()))?;
     let _ = MESSAGES_RECEIVED.set(messages_received);
 
-    let messages_dropped = IntCounter::with_opts(Opts::new(
-        "rustgate_messages_dropped_total",
-        "Messages dropped due to per-client rate limiting",
-    ))?;
+    let messages_dropped = IntCounterVec::new(
+        Opts::new(
+            "rustgate_messages_dropped_total",
+            "Messages dropped due to per-client rate limiting",
+        ),
+        &["identity_cn"],
+    )?;
     registry.register(Box::new(messages_dropped.clone()))?;
     let _ = MESSAGES_DROPPED.set(messages_dropped);
 
@@ -157,9 +172,9 @@ pub fn init() -> prometheus::Result<()> {
     let messages_routed = IntCounterVec::new(
         Opts::new(
             "rustgate_messages_routed_total",
-            "Messages routed by destination type",
+            "Messages routed by destination type and source identity",
         ),
-        &["destination"],
+        &["destination", "identity_cn"],
     )?;
     registry.register(Box::new(messages_routed.clone()))?;
     let _ = MESSAGES_ROUTED.set(messages_routed);
@@ -232,8 +247,14 @@ pub fn messages_received() -> &'static IntCounter {
         .get_or_init(|| fallback_counter("rustgate_messages_received_total", "fallback"))
 }
 
-pub fn messages_dropped() -> &'static IntCounter {
-    MESSAGES_DROPPED.get_or_init(|| fallback_counter("rustgate_messages_dropped_total", "fallback"))
+pub fn messages_dropped() -> &'static IntCounterVec {
+    MESSAGES_DROPPED.get_or_init(|| {
+        fallback_counter_vec(
+            "rustgate_messages_dropped_total",
+            "fallback",
+            &["identity_cn"],
+        )
+    })
 }
 
 #[allow(dead_code)] // wired when router TTL drops are observed from the session layer
@@ -251,7 +272,7 @@ pub fn messages_routed() -> &'static IntCounterVec {
         fallback_counter_vec(
             "rustgate_messages_routed_total",
             "fallback",
-            &["destination"],
+            &["destination", "identity_cn"],
         )
     })
 }
@@ -303,6 +324,165 @@ pub fn classify_handshake_error(error: &str) -> &'static str {
     } else {
         "other"
     }
+}
+
+// ── Per-identity metrics (Tier 1 + Tier 2) ──────────────────────────
+
+/// Per-identity metrics configuration.
+///
+/// Holds the optional CN allowlist used to bound label cardinality, and
+/// a `per_identity` flag controlling whether Tier 2 metrics
+/// (handshake failures, session duration, bytes sent/received) are
+/// recorded with `identity_cn` labels.
+///
+/// When `allowlist` is `None`, allowlist mode is OFF and **all** CNs are
+/// bucketed under the literal `"other"` label, capping cardinality at 1.
+/// When `Some`, listed CNs pass through verbatim and unlisted CNs are
+/// bucketed under `"other"`.
+pub struct MetricsIdentity {
+    allowlist: Option<HashSet<String>>,
+    #[allow(dead_code)] // read by `per_identity_enabled` and used by callers when wiring Tier 2
+    per_identity: bool,
+}
+
+impl MetricsIdentity {
+    /// Construct a new `MetricsIdentity`.
+    ///
+    /// `per_identity` enables registration and recording of Tier 2
+    /// per-identity metrics. `allowlist` constrains the set of CNs that
+    /// appear as label values; pass `None` to bucket every CN under
+    /// `"other"`.
+    pub fn new(allowlist: Option<HashSet<String>>, per_identity: bool) -> Self {
+        Self {
+            allowlist,
+            per_identity,
+        }
+    }
+
+    /// Construct a disabled identity (no allowlist, Tier 2 off).
+    #[allow(dead_code)] // helper for tests and external embedders
+    pub fn disabled() -> Self {
+        Self {
+            allowlist: None,
+            per_identity: false,
+        }
+    }
+
+    /// Returns the bucketed label for a CN.
+    ///
+    /// Returns the CN if listed in the allowlist, else the literal
+    /// `"other"`. When the allowlist is `None`, always returns
+    /// `"other"`.
+    pub fn bucket<'a>(&'a self, cn: &'a str) -> &'a str {
+        bucket_cn(cn, &self.allowlist)
+    }
+
+    /// Whether Tier 2 per-identity metrics are enabled.
+    #[allow(dead_code)] // observable on the type for callers
+    pub fn per_identity_enabled(&self) -> bool {
+        self.per_identity
+    }
+}
+
+/// Bucket a CN against an optional allowlist.
+///
+/// Returns the original CN slice if it's a member of the allowlist,
+/// else the static `"other"` literal. If `allowlist` is `None`, always
+/// returns `"other"`.
+pub fn bucket_cn<'a>(cn: &'a str, allowlist: &Option<HashSet<String>>) -> &'a str {
+    match allowlist {
+        Some(set) if set.contains(cn) => cn,
+        _ => "other",
+    }
+}
+
+/// Load a CN allowlist from a file.
+///
+/// One CN per line; empty lines and lines beginning with `#` are
+/// ignored. Trailing whitespace is trimmed.
+pub fn load_identity_allowlist(path: &Path) -> std::io::Result<HashSet<String>> {
+    let contents = std::fs::read_to_string(path)?;
+    Ok(contents
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.to_string())
+        .collect())
+}
+
+/// Initialize Tier 2 per-identity metrics. Idempotent: subsequent calls
+/// are no-ops. Must be called after [`init`] and only when the operator
+/// has explicitly opted in via `--metrics-per-identity`.
+pub fn init_per_identity() -> prometheus::Result<()> {
+    let registry = prometheus::default_registry();
+
+    let handshake_failures = IntCounterVec::new(
+        Opts::new(
+            "rustgate_per_identity_handshake_failures_total",
+            "Per-identity TLS handshake failures (Tier 2, opt-in)",
+        ),
+        &["identity_cn"],
+    )?;
+    registry.register(Box::new(handshake_failures.clone()))?;
+    let _ = PER_IDENTITY_HANDSHAKE_FAILURES.set(handshake_failures);
+
+    let session_duration = HistogramVec::new(
+        HistogramOpts::new(
+            "rustgate_per_identity_session_duration_seconds",
+            "Per-identity session duration in seconds (Tier 2, opt-in)",
+        )
+        .buckets(vec![
+            1.0, 5.0, 30.0, 60.0, 300.0, 1_800.0, 3_600.0, 14_400.0, 86_400.0,
+        ]),
+        &["identity_cn"],
+    )?;
+    registry.register(Box::new(session_duration.clone()))?;
+    let _ = PER_IDENTITY_SESSION_DURATION.set(session_duration);
+
+    let bytes_sent = IntCounterVec::new(
+        Opts::new(
+            "rustgate_per_identity_bytes_sent_total",
+            "Per-identity bytes sent to client (Tier 2, opt-in)",
+        ),
+        &["identity_cn"],
+    )?;
+    registry.register(Box::new(bytes_sent.clone()))?;
+    let _ = PER_IDENTITY_BYTES_SENT.set(bytes_sent);
+
+    let bytes_received = IntCounterVec::new(
+        Opts::new(
+            "rustgate_per_identity_bytes_received_total",
+            "Per-identity bytes received from client (Tier 2, opt-in)",
+        ),
+        &["identity_cn"],
+    )?;
+    registry.register(Box::new(bytes_received.clone()))?;
+    let _ = PER_IDENTITY_BYTES_RECEIVED.set(bytes_received);
+
+    Ok(())
+}
+
+/// Returns the per-identity handshake failures counter, if Tier 2 is
+/// enabled. `None` indicates the metric was never registered.
+pub fn per_identity_handshake_failures() -> Option<&'static IntCounterVec> {
+    PER_IDENTITY_HANDSHAKE_FAILURES.get()
+}
+
+/// Returns the per-identity session duration histogram, if Tier 2 is
+/// enabled.
+pub fn per_identity_session_duration() -> Option<&'static HistogramVec> {
+    PER_IDENTITY_SESSION_DURATION.get()
+}
+
+/// Returns the per-identity bytes-sent counter, if Tier 2 is enabled.
+pub fn per_identity_bytes_sent() -> Option<&'static IntCounterVec> {
+    PER_IDENTITY_BYTES_SENT.get()
+}
+
+/// Returns the per-identity bytes-received counter, if Tier 2 is
+/// enabled.
+pub fn per_identity_bytes_received() -> Option<&'static IntCounterVec> {
+    PER_IDENTITY_BYTES_RECEIVED.get()
 }
 
 // ── HTTP server ─────────────────────────────────────────────────────
@@ -543,12 +723,89 @@ mod tests {
     fn counter_vec_labels() {
         ensure_init();
 
-        let before = messages_routed().with_label_values(&["broadcast"]).get();
-        messages_routed().with_label_values(&["broadcast"]).inc();
+        let before = messages_routed()
+            .with_label_values(&["broadcast", "other"])
+            .get();
+        messages_routed()
+            .with_label_values(&["broadcast", "other"])
+            .inc();
         assert_eq!(
-            messages_routed().with_label_values(&["broadcast"]).get(),
+            messages_routed()
+                .with_label_values(&["broadcast", "other"])
+                .get(),
             before + 1
         );
+    }
+
+    #[test]
+    fn bucket_cn_no_allowlist_returns_other() {
+        assert_eq!(bucket_cn("alice", &None), "other");
+        assert_eq!(bucket_cn("", &None), "other");
+    }
+
+    #[test]
+    fn bucket_cn_listed_returns_cn() {
+        let mut set = HashSet::new();
+        let _ = set.insert("alice".to_string());
+        let _ = set.insert("bob".to_string());
+        let allow = Some(set);
+        assert_eq!(bucket_cn("alice", &allow), "alice");
+        assert_eq!(bucket_cn("bob", &allow), "bob");
+        assert_eq!(bucket_cn("eve", &allow), "other");
+    }
+
+    #[test]
+    fn metrics_identity_disabled_buckets_to_other() {
+        let id = MetricsIdentity::disabled();
+        assert!(!id.per_identity_enabled());
+        assert_eq!(id.bucket("alice"), "other");
+    }
+
+    #[test]
+    fn metrics_identity_with_allowlist() {
+        let mut set = HashSet::new();
+        let _ = set.insert("alice".to_string());
+        let id = MetricsIdentity::new(Some(set), true);
+        assert!(id.per_identity_enabled());
+        assert_eq!(id.bucket("alice"), "alice");
+        assert_eq!(id.bucket("eve"), "other");
+    }
+
+    #[test]
+    fn tier2_metrics_none_when_not_initialized() {
+        // Note: this test only validates that accessors are Option-typed.
+        // We can't reliably assert None here because other tests may have
+        // called init_per_identity, but we can at least call the
+        // accessors without panicking.
+        let _ = per_identity_handshake_failures();
+        let _ = per_identity_session_duration();
+        let _ = per_identity_bytes_sent();
+        let _ = per_identity_bytes_received();
+    }
+
+    #[test]
+    fn tier2_metrics_some_when_initialized() {
+        // init_per_identity is idempotent: subsequent registrations
+        // return AlreadyReg, which we ignore here.
+        let _ = init_per_identity();
+        assert!(per_identity_handshake_failures().is_some());
+        assert!(per_identity_session_duration().is_some());
+        assert!(per_identity_bytes_sent().is_some());
+        assert!(per_identity_bytes_received().is_some());
+    }
+
+    #[test]
+    fn load_identity_allowlist_parses_file() {
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().expect("tmp");
+        writeln!(tmp, "# comment").expect("w");
+        writeln!(tmp, "alice").expect("w");
+        writeln!(tmp).expect("w");
+        writeln!(tmp, "  bob  ").expect("w");
+        let set = load_identity_allowlist(tmp.path()).expect("load");
+        assert!(set.contains("alice"));
+        assert!(set.contains("bob"));
+        assert_eq!(set.len(), 2);
     }
 
     #[tokio::test]

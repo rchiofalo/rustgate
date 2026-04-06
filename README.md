@@ -263,6 +263,8 @@ All flags support environment variables (CLI takes precedence):
 | `--plaintext-cn` | `RUSTGATE_PLAINTEXT_CN` | `anonymous` |
 | `--plaintext-group` | `RUSTGATE_PLAINTEXT_GROUP` | `__plaintext__` |
 | `--metrics-bind` | `RUSTGATE_METRICS_BIND` | — |
+| `--metrics-per-identity` | `RUSTGATE_METRICS_PER_IDENTITY` | `false` |
+| `--metrics-identity-allowlist` | `RUSTGATE_METRICS_IDENTITY_ALLOWLIST` | — |
 | `--nats-url` | `RUSTGATE_NATS_URL` | — |
 | `--nats-credentials` | `RUSTGATE_NATS_CREDENTIALS` | — |
 | `--nats-tls-cert` | `RUSTGATE_NATS_TLS_CERT` | — |
@@ -312,6 +314,26 @@ All flags support environment variables (CLI takes precedence):
 | `--otel-service-name` | `OTEL_SERVICE_NAME` | `rustgate` |
 
 </details>
+
+### Per-identity metrics (bounded cardinality)
+
+`messages_routed_total` and `messages_dropped_total` carry an
+`identity_cn` label so operators can attribute routing volume and rate-limit
+drops to individual clients. To prevent unbounded label growth from large
+or untrusted client populations, the label is bucketed against an optional
+allowlist (`--metrics-identity-allowlist`, one CN per line, `#` comments
+allowed). CNs that are not in the allowlist — or **all** CNs when the
+allowlist is unset — collapse into the literal `"other"` bucket, capping
+per-identity cardinality at 1 by default.
+
+Set `--metrics-per-identity` (or `RUSTGATE_METRICS_PER_IDENTITY=true`) to
+additionally register the Tier 2 per-identity metrics:
+`rustgate_per_identity_handshake_failures_total`,
+`rustgate_per_identity_session_duration_seconds`,
+`rustgate_per_identity_bytes_sent_total`, and
+`rustgate_per_identity_bytes_received_total`. When the flag is disabled
+(the default), these metrics are not registered at all and impose zero
+overhead.
 
 ## Docker
 

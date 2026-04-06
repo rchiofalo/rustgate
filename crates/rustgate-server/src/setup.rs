@@ -196,6 +196,11 @@ pub(crate) async fn bind_tls_listener(
         metrics::handshake_failures()
             .with_label_values(&[reason])
             .inc();
+        // Tier 2 per-identity handshake failures: identity is unknown
+        // because the handshake failed, so all events bucket under "other".
+        if let Some(c) = metrics::per_identity_handshake_failures() {
+            c.with_label_values(&["other"]).inc();
+        }
     }));
 
     Ok((listener, cert_reloader))
@@ -469,14 +474,45 @@ pub(crate) fn warn_enrollment_disabled(cli: &Cli) {
 // ---------------------------------------------------------------------------
 
 /// Initialize and optionally start the Prometheus metrics HTTP server.
+///
+/// Also constructs the [`metrics::MetricsIdentity`] used by the session
+/// layer to bucket per-identity labels and (optionally) record Tier 2
+/// per-identity metrics. Returns the identity wrapped in an `Arc` so it
+/// can be cheaply shared across spawned session tasks.
 #[cfg(feature = "metrics")]
 pub(crate) fn start_metrics(
     cli: &Cli,
     ready: &Arc<AtomicBool>,
     #[cfg(feature = "federation")] fed_api_slot: &Arc<std::sync::OnceLock<metrics::FedApiHandler>>,
     acl_api_slot: &Arc<std::sync::OnceLock<metrics::AclApiHandler>>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Arc<metrics::MetricsIdentity>> {
     metrics::init().context("registering metrics")?;
+
+    // Load the optional CN allowlist for per-identity metric label
+    // bucketing. When unset, all CNs collapse to the literal "other"
+    // label, capping cardinality at 1.
+    let allowlist = if let Some(ref path) = cli.metrics_identity_allowlist {
+        let set = metrics::load_identity_allowlist(path)
+            .with_context(|| format!("loading metrics identity allowlist {}", path.display()))?;
+        tracing::info!(
+            path = %path.display(),
+            count = set.len(),
+            "loaded per-identity metrics allowlist"
+        );
+        Some(set)
+    } else {
+        None
+    };
+
+    if cli.metrics_per_identity {
+        metrics::init_per_identity().context("registering per-identity metrics")?;
+        tracing::info!("Tier 2 per-identity metrics enabled");
+    }
+
+    let identity = Arc::new(metrics::MetricsIdentity::new(
+        allowlist,
+        cli.metrics_per_identity,
+    ));
 
     if let Some(ref metrics_bind) = cli.metrics_bind {
         let bind_addr: std::net::SocketAddr = metrics_bind
@@ -502,7 +538,7 @@ pub(crate) fn start_metrics(
         });
     }
 
-    Ok(())
+    Ok(identity)
 }
 
 /// Warn when metrics is requested without the feature.
@@ -510,6 +546,12 @@ pub(crate) fn start_metrics(
 pub(crate) fn warn_metrics_disabled(cli: &Cli) {
     if cli.metrics_bind.is_some() {
         tracing::warn!("--metrics-bind requires --features metrics; ignoring");
+    }
+    if cli.metrics_per_identity {
+        tracing::warn!("--metrics-per-identity requires --features metrics; ignoring");
+    }
+    if cli.metrics_identity_allowlist.is_some() {
+        tracing::warn!("--metrics-identity-allowlist requires --features metrics; ignoring");
     }
 }
 
@@ -885,6 +927,7 @@ pub(crate) async fn start_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
     throttle_config: Option<ThrottleConfig>,
     archiver: &Option<Arc<crate::archive::CotArchiver>>,
     replay_filter: &Option<Arc<rustgate_transport::ReplayFilter>>,
+    #[cfg(feature = "metrics")] metrics_identity: &Arc<metrics::MetricsIdentity>,
 ) -> anyhow::Result<Option<SubsystemHandle>> {
     let tcp_bind = match cli.tcp_bind.as_ref() {
         Some(b) => b,
@@ -921,6 +964,8 @@ pub(crate) async fn start_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
         replay_filter: replay_filter.clone(),
         circuit_breaker_threshold: cli.circuit_breaker_threshold,
         shutdown: shutdown_clone,
+        #[cfg(feature = "metrics")]
+        metrics_identity: Arc::clone(metrics_identity),
     };
 
     let task = tokio::spawn(async move {
