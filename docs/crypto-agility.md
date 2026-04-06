@@ -75,6 +75,14 @@ placed first in preference order. Clients that support ML-KEM negotiate
 post-quantum key exchange; clients that don't silently fall back to X25519.
 This is the core mechanism for zero-downtime PQ migration.
 
+The `--kx-groups` flag (env `RUSTGATE_KX_GROUPS`) overrides the default
+preference order at runtime. For example, to prefer MLKEM1024 (Level 5 /
+CNSA 2.0) over the default X25519MLKEM768 (Level 3):
+
+```
+--kx-groups MLKEM1024,X25519MLKEM768,X25519,secp256r1
+```
+
 ### TLS Version Control
 
 The `--tls-min-version` flag (default: `1.2`) controls the minimum accepted

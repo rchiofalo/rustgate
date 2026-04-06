@@ -77,6 +77,16 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = false, env = "RUSTGATE_PREFER_POST_QUANTUM")]
     pub(crate) prefer_post_quantum: bool,
 
+    /// Comma-separated key exchange group preference order. Overrides the
+    /// default group ordering from the crypto provider. Requires
+    /// --features post-quantum for PQ groups.
+    ///
+    /// Available groups (with --features post-quantum):
+    ///   X25519MLKEM768, SECP256R1MLKEM768, MLKEM768, MLKEM1024,
+    ///   X25519, secp256r1, secp384r1
+    #[arg(long, env = "RUSTGATE_KX_GROUPS")]
+    pub(crate) kx_groups: Option<String>,
+
     /// Interval in seconds to check for certificate file changes.
     /// When set to a value > 0, the server periodically polls the --cert and
     /// --key files and hot-reloads them on change (zero-downtime rotation).
@@ -565,6 +575,7 @@ mod tests {
             "RUSTGATE_CRL_WARN_STALE",
             "RUSTGATE_FIPS_REQUIRED",
             "RUSTGATE_PREFER_POST_QUANTUM",
+            "RUSTGATE_KX_GROUPS",
             "RUSTGATE_CERT_RELOAD_INTERVAL",
             "RUSTGATE_FRAMING",
             "RUSTGATE_ENCODING",
