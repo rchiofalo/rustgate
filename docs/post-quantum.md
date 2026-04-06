@@ -16,7 +16,7 @@ The primary risk is **harvest-now-decrypt-later (HNDL)**: an adversary records e
 
 ## Migration Plan
 
-### Phase 1: Hybrid Key Exchange (Target: v0.6.0)
+### Phase 1: Hybrid Key Exchange (Shipped: v0.7.0)
 
 Enable **X25519MLKEM768** (X25519 + ML-KEM 768) hybrid key exchange in rustls. This provides quantum resistance for key exchange while maintaining classical security as a fallback.
 

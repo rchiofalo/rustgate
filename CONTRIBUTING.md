@@ -21,7 +21,12 @@ cargo build --all-features
 cargo build --features nats          # NATS bridge
 cargo build --features enrollment    # Certificate enrollment
 cargo build --features proto         # TAK protobuf translation
+cargo build --features federation    # Server-to-server federation
+cargo build --features websocket     # WebSocket transport
 cargo build --features metrics       # Prometheus metrics + health endpoints
+cargo build --features fips          # FIPS 140-3 crypto (requires Go + cmake)
+cargo build --features post-quantum  # Post-quantum key exchange (requires Go + cmake)
+cargo build --features otel          # OpenTelemetry tracing (requires protoc)
 cargo build --features jemalloc      # jemalloc allocator (recommended for musl)
 ```
 
@@ -50,10 +55,11 @@ CI runs as parallel jobs. All checks must pass before merging to `main` (enforce
 | `commit-lint` | PR title follows Conventional Commits format |
 | `lint` | `cargo +nightly fmt --check` + `cargo machete` |
 | `clippy` | `cargo clippy` with all features + `cargo doc` |
-| `check-features` | `cargo hack` feature powerset (depth 2, excludes fips/jemalloc) |
-| `test` | `cargo nextest run` with all features (except fips/jemalloc) + doc tests |
+| `check-features` | `cargo hack` feature powerset (depth 2, excludes fips/jemalloc/post-quantum) |
+| `test` | `cargo nextest run` with all features (except fips/jemalloc/post-quantum) + doc tests |
 | `coverage` | `cargo tarpaulin` code coverage |
 | `fips` | Clippy, build, and tests with `--features fips` |
+| `post-quantum` | Clippy, build, and tests with `--features post-quantum` |
 | `audit` | `cargo deny check` + `cargo audit` |
 | `dependency-review` | Dependency diff review on pull requests (fails on high-severity) |
 | `helm` | `helm lint helm/` |

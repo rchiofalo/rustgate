@@ -2009,7 +2009,7 @@ dependencies = [
 
 [[package]]
 name = "rustgate-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "arbitrary",
  "bytes",
@@ -2023,7 +2023,7 @@ dependencies = [
 
 [[package]]
 name = "rustgate-cot"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "arbitrary",
  "bytes",
@@ -2035,7 +2035,7 @@ dependencies = [
 
 [[package]]
 name = "rustgate-enrollment"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "base64",
  "bytes",
@@ -2064,7 +2064,7 @@ dependencies = [
 
 [[package]]
 name = "rustgate-federation"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -2106,7 +2106,7 @@ dependencies = [
 
 [[package]]
 name = "rustgate-nats"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-nats",
  "bytes",
@@ -2128,7 +2128,7 @@ dependencies = [
 
 [[package]]
 name = "rustgate-proto"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "bytes",
  "prost",
@@ -2142,7 +2142,7 @@ dependencies = [
 
 [[package]]
 name = "rustgate-server"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2178,7 +2178,7 @@ dependencies = [
 
 [[package]]
 name = "rustgate-test-utils"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-nats",
  "rcgen",
@@ -2192,7 +2192,7 @@ dependencies = [
 
 [[package]]
 name = "rustgate-transport"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "bytes",
  "criterion",
@@ -2217,7 +2217,7 @@ dependencies = [
 
 [[package]]
 name = "rustgate-websocket"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "bytes",
  "futures",

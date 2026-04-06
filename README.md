@@ -269,13 +269,24 @@ All flags support environment variables (CLI takes precedence):
 | `--nats-tls-key` | `RUSTGATE_NATS_TLS_KEY` | — |
 | `--nats-tls-ca` | `RUSTGATE_NATS_TLS_CA` | — |
 | `--nats-tls-required` | `RUSTGATE_NATS_TLS_REQUIRED` | `false` |
+| `--nats-subscription-capacity` | `RUSTGATE_NATS_SUBSCRIPTION_CAPACITY` | `1024` |
+| `--nats-live-stream` | `RUSTGATE_NATS_LIVE_STREAM` | `RUSTGATE_LIVE` |
+| `--nats-max-ack-pending` | `RUSTGATE_NATS_MAX_ACK_PENDING` | `1000` |
+| `--nats-checkpoint-path` | `RUSTGATE_NATS_CHECKPOINT_PATH` | — |
 | `--websocket-bind` | `RUSTGATE_WEBSOCKET_BIND` | — |
+| `--ws-max-frames-per-sec` | `RUSTGATE_WS_MAX_FRAMES_PER_SEC` | `0` (disabled) |
+| `--ws-max-bytes-per-sec` | `RUSTGATE_WS_MAX_BYTES_PER_SEC` | `0` (disabled) |
+| `--ws-max-violations` | `RUSTGATE_WS_MAX_VIOLATIONS` | `10` |
 | `--enrollment-bind` | `RUSTGATE_ENROLLMENT_BIND` | — |
 | `--ca-key` | `RUSTGATE_CA_KEY` | — |
 | `--enrollment-user` | `RUSTGATE_ENROLLMENT_USER` | — |
 | `--enrollment-password` | `RUSTGATE_ENROLLMENT_PASSWORD` | — |
 | `--ca-organization` | `RUSTGATE_CA_ORG` | `rustgate` |
 | `--data-package-dir` | `RUSTGATE_DATA_PACKAGE_DIR` | — |
+| `--package-signature-ca` | `RUSTGATE_PACKAGE_SIGNATURE_CA` | — |
+| `--package-strict-signatures` | `RUSTGATE_PACKAGE_STRICT_SIGNATURES` | `false` |
+| `--revocation-db` | `RUSTGATE_REVOCATION_DB` | — |
+| `--crl-validity-days` | `RUSTGATE_CRL_VALIDITY_DAYS` | `7` |
 | `--federation-v1-bind` | `RUSTGATE_FEDERATION_V1_BIND` | — |
 | `--federation-v2-bind` | `RUSTGATE_FEDERATION_V2_BIND` | — |
 | `--federation-id` | `RUSTGATE_FEDERATION_ID` | `rustgate-federation-1` |
@@ -286,10 +297,14 @@ All flags support environment variables (CLI takes precedence):
 | `--federation-trust-store-dir` | `RUSTGATE_FEDERATION_TRUST_STORE_DIR` | — |
 | `--federation-circuit-breaker-threshold` | `RUSTGATE_FEDERATION_CIRCUIT_BREAKER_THRESHOLD` | `5` |
 | `--federation-circuit-breaker-timeout` | `RUSTGATE_FEDERATION_CIRCUIT_BREAKER_TIMEOUT` | `60` |
+| `--federation-replay-buffer-size` | `RUSTGATE_FEDERATION_REPLAY_BUFFER_SIZE` | `1000` |
+| `--federation-ha-nats-url` | `RUSTGATE_FEDERATION_HA_NATS_URL` | — |
 | `--federation-pod-id` | `RUSTGATE_FEDERATION_POD_ID` | — |
 | `--replay-window` | `RUSTGATE_REPLAY_WINDOW` | `300` |
-| `--client-message-rate` | `RUSTGATE_CLIENT_MSG_RATE` | `0` (disabled) |
+| `--client-msg-rate` | `RUSTGATE_CLIENT_MSG_RATE` | `0` (disabled) |
 | `--client-burst` | `RUSTGATE_CLIENT_BURST` | `200` |
+| `--circuit-breaker-threshold` | `RUSTGATE_CIRCUIT_BREAKER_THRESHOLD` | `10` |
+| `--group-acl-file` | `RUSTGATE_GROUP_ACL_FILE` | — |
 | `--archive-dir` | `RUSTGATE_ARCHIVE_DIR` | — |
 | `--package-max-age-hours` | `RUSTGATE_PACKAGE_MAX_AGE_HOURS` | `0` (no expiration) |
 | `--otel-endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` | — |

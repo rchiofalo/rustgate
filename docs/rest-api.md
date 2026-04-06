@@ -743,7 +743,7 @@ Server version information.
   "version": "3",
   "type": "ServerConfig",
   "data": {
-    "version": "0.6.0",
+    "version": "0.7.0",
     "api": "3",
     "hostname": "rustgate"
   },

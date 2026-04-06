@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-04-05
+
 ### Added
 
 - **Post-quantum key exchange** — new `post-quantum` feature flag enables hybrid X25519MLKEM768 key exchange via aws-lc-rs. PQ-capable clients negotiate hybrid PQ+classical key exchange; others fall back to X25519 transparently. Negotiated key exchange group is now logged for every TLS connection (transport, federation, WebSocket). New CLI flag `--prefer-post-quantum` (env `RUSTGATE_PREFER_POST_QUANTUM`). Requires Go 1.20+ and cmake at build time (same as `--features fips`). (#496, #498)
