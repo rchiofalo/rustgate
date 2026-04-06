@@ -46,6 +46,14 @@ pub struct ConnectionInfo {
     pub direction: Direction,
     /// When the connection was established (Unix timestamp in seconds).
     pub connected_at: u64,
+    /// Fencing token (NATS KV claim revision) for split-brain detection.
+    ///
+    /// A monotonically increasing integer tied to the peer ownership claim.
+    /// Pods must hold a current fencing token to operate on a peer. `None`
+    /// for pods running older versions without fencing support, or for
+    /// inbound connections (which are not claimed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fencing_token: Option<u64>,
 }
 
 /// Aggregated information about a pod's federation connections.
@@ -140,7 +148,16 @@ impl ConnectionRegistry {
     }
 
     /// Register a federation connection.
-    pub async fn register(&self, peer_id: &str, direction: Direction) -> Result<()> {
+    ///
+    /// The `fencing_token` is the NATS KV claim revision for outbound
+    /// connections. Pass `None` for inbound connections or when HA is
+    /// not active.
+    pub async fn register(
+        &self,
+        peer_id: &str,
+        direction: Direction,
+        fencing_token: Option<u64>,
+    ) -> Result<()> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -151,6 +168,7 @@ impl ConnectionRegistry {
             pod_id: self.pod_id.clone(),
             direction,
             connected_at: now,
+            fencing_token,
         };
 
         let data = serde_json::to_vec(&info).context("failed to serialize connection info")?;
@@ -331,6 +349,7 @@ mod tests {
             pod_id: "pod-abc".into(),
             direction: Direction::Outbound,
             connected_at: 1700000000,
+            fencing_token: Some(42),
         };
 
         let json = serde_json::to_string(&info).expect("serialize");
@@ -339,6 +358,33 @@ mod tests {
         assert_eq!(parsed.pod_id, "pod-abc");
         assert_eq!(parsed.direction, Direction::Outbound);
         assert_eq!(parsed.connected_at, 1700000000);
+        assert_eq!(parsed.fencing_token, Some(42));
+    }
+
+    #[test]
+    fn connection_info_serde_without_fencing_token() {
+        // Old pods don't include fencing_token — deserialize should default to None
+        let json = r#"{"peer_id":"peer-1","pod_id":"pod-abc","direction":"outbound","connected_at":1700000000}"#;
+        let parsed: ConnectionInfo = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(parsed.fencing_token, None);
+    }
+
+    #[test]
+    fn connection_info_no_fencing_token_omits_field() {
+        // When fencing_token is None, it should not appear in serialized JSON
+        let info = ConnectionInfo {
+            peer_id: rustgate_core::PeerId::new("peer-1"),
+            pod_id: "pod-abc".into(),
+            direction: Direction::Outbound,
+            connected_at: 1700000000,
+            fencing_token: None,
+        };
+
+        let json = serde_json::to_string(&info).expect("serialize");
+        assert!(
+            !json.contains("fencing_token"),
+            "None fencing_token should be omitted from JSON"
+        );
     }
 
     #[test]

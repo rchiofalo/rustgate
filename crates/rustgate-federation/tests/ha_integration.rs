@@ -31,13 +31,15 @@ async fn claim_gates_peer_connection() {
         .expect("create cm_b");
     cm_b.start().await;
 
-    // Pod A claims peer-1 first
-    assert!(cm_a.try_claim("peer-1").await, "pod-a should claim peer-1");
+    // Pod A claims peer-1 first — returns fencing token
+    let token = cm_a.try_claim("peer-1").await;
+    assert!(token.is_some(), "pod-a should claim peer-1");
+    assert!(token.unwrap() > 0, "fencing token should be positive");
     assert!(cm_a.is_owner("peer-1").await, "pod-a should own peer-1");
 
     // Pod B should fail to claim the same peer
     assert!(
-        !cm_b.try_claim("peer-1").await,
+        cm_b.try_claim("peer-1").await.is_none(),
         "pod-b should NOT claim peer-1 (already claimed by pod-a)"
     );
     assert!(
@@ -65,13 +67,13 @@ async fn claim_release_allows_reclaim() {
     cm_b.start().await;
 
     // Pod A claims and releases
-    assert!(cm_a.try_claim("peer-1").await);
+    assert!(cm_a.try_claim("peer-1").await.is_some());
     cm_a.release("peer-1").await.expect("release");
     assert!(!cm_a.is_owner("peer-1").await);
 
     // Pod B should now be able to claim it
     assert!(
-        cm_b.try_claim("peer-1").await,
+        cm_b.try_claim("peer-1").await.is_some(),
         "pod-b should claim peer-1 after release"
     );
     assert!(cm_b.is_owner("peer-1").await);
@@ -92,9 +94,9 @@ async fn shutdown_releases_all_claims() {
     cm_a.start().await;
 
     // Pod A claims 3 peers
-    assert!(cm_a.try_claim("peer-1").await);
-    assert!(cm_a.try_claim("peer-2").await);
-    assert!(cm_a.try_claim("peer-3").await);
+    assert!(cm_a.try_claim("peer-1").await.is_some());
+    assert!(cm_a.try_claim("peer-2").await.is_some());
+    assert!(cm_a.try_claim("peer-3").await.is_some());
     assert_eq!(cm_a.claimed_peers().await.len(), 3);
 
     // Stop releases all claims
@@ -107,15 +109,15 @@ async fn shutdown_releases_all_claims() {
     cm_b.start().await;
 
     assert!(
-        cm_b.try_claim("peer-1").await,
+        cm_b.try_claim("peer-1").await.is_some(),
         "peer-1 should be available after pod-a stop"
     );
     assert!(
-        cm_b.try_claim("peer-2").await,
+        cm_b.try_claim("peer-2").await.is_some(),
         "peer-2 should be available after pod-a stop"
     );
     assert!(
-        cm_b.try_claim("peer-3").await,
+        cm_b.try_claim("peer-3").await.is_some(),
         "peer-3 should be available after pod-a stop"
     );
 
@@ -142,9 +144,15 @@ async fn two_pods_partition_peers() {
 
     for (i, peer) in peers.iter().enumerate() {
         if i % 2 == 0 {
-            assert!(cm_a.try_claim(peer).await, "pod-a should claim {peer}");
+            assert!(
+                cm_a.try_claim(peer).await.is_some(),
+                "pod-a should claim {peer}"
+            );
         } else {
-            assert!(cm_b.try_claim(peer).await, "pod-b should claim {peer}");
+            assert!(
+                cm_b.try_claim(peer).await.is_some(),
+                "pod-b should claim {peer}"
+            );
         }
     }
 
@@ -177,7 +185,7 @@ async fn adoption_callback_fires_on_release() {
         .await
         .expect("create cm_a");
     cm_a.start().await;
-    assert!(cm_a.try_claim("peer-1").await);
+    assert!(cm_a.try_claim("peer-1").await.is_some());
 
     // Pod B watches for available peers via callback
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -188,7 +196,7 @@ async fn adoption_callback_fires_on_release() {
         Arc::new(move |peer_id| {
             let _ = tx.send(peer_id);
         }),
-        Arc::new(|_| {}),
+        Arc::new(|_peer_id, _stale_token| {}),
     );
     cm_b.start().await;
 
@@ -229,13 +237,13 @@ async fn registry_tracks_connections() {
     cr.start().await;
 
     // Register connections
-    cr.register("peer-1", Direction::Outbound)
+    cr.register("peer-1", Direction::Outbound, Some(1))
         .await
         .expect("register peer-1");
-    cr.register("peer-2", Direction::Outbound)
+    cr.register("peer-2", Direction::Outbound, Some(2))
         .await
         .expect("register peer-2");
-    cr.register("peer-3", Direction::Inbound)
+    cr.register("peer-3", Direction::Inbound, None)
         .await
         .expect("register peer-3");
 
@@ -288,13 +296,13 @@ async fn registry_multi_pod() {
         .expect("create registry_b");
     cr_b.start().await;
 
-    cr_a.register("peer-1", Direction::Outbound)
+    cr_a.register("peer-1", Direction::Outbound, Some(1))
         .await
         .expect("register");
-    cr_a.register("peer-2", Direction::Outbound)
+    cr_a.register("peer-2", Direction::Outbound, Some(2))
         .await
         .expect("register");
-    cr_b.register("peer-3", Direction::Outbound)
+    cr_b.register("peer-3", Direction::Outbound, Some(3))
         .await
         .expect("register");
 
@@ -335,13 +343,15 @@ async fn claim_and_register_workflow() {
     cr.start().await;
 
     // Claim + register (like the peer connection loop)
-    assert!(cm.try_claim("peer-1").await);
-    cr.register("peer-1", Direction::Outbound)
+    let token_1 = cm.try_claim("peer-1").await;
+    assert!(token_1.is_some());
+    cr.register("peer-1", Direction::Outbound, token_1)
         .await
         .expect("register");
 
-    assert!(cm.try_claim("peer-2").await);
-    cr.register("peer-2", Direction::Outbound)
+    let token_2 = cm.try_claim("peer-2").await;
+    assert!(token_2.is_some());
+    cr.register("peer-2", Direction::Outbound, token_2)
         .await
         .expect("register");
 
@@ -360,5 +370,143 @@ async fn claim_and_register_workflow() {
 
     // Simulate shutdown: stop both
     cm.stop().await;
+    cr.stop().await;
+}
+
+// ── Fencing Token tests ────────────────────────────────────────
+
+#[tokio::test]
+async fn fencing_token_returned_on_claim() {
+    let nats = require_nats!();
+    let js = nats.jetstream().await;
+
+    let cm = ClaimManager::new(js, "pod-a".into())
+        .await
+        .expect("create cm");
+    cm.start().await;
+
+    let token = cm.try_claim("peer-1").await;
+    assert!(token.is_some(), "try_claim should return a fencing token");
+    assert!(token.unwrap() > 0, "fencing token should be positive");
+
+    // fencing_token() should return the same value
+    let stored = cm.fencing_token("peer-1").await;
+    assert_eq!(stored, token);
+
+    cm.stop().await;
+}
+
+#[tokio::test]
+async fn fencing_token_none_for_unclaimed() {
+    let nats = require_nats!();
+    let js = nats.jetstream().await;
+
+    let cm = ClaimManager::new(js, "pod-a".into())
+        .await
+        .expect("create cm");
+    cm.start().await;
+
+    assert_eq!(
+        cm.fencing_token("unknown-peer").await,
+        None,
+        "unclaimed peer should have no fencing token"
+    );
+
+    cm.stop().await;
+}
+
+#[tokio::test]
+async fn is_token_valid_for_current_claim() {
+    let nats = require_nats!();
+    let js = nats.jetstream().await;
+
+    let cm = ClaimManager::new(js, "pod-a".into())
+        .await
+        .expect("create cm");
+    cm.start().await;
+
+    let token = cm.try_claim("peer-1").await.unwrap();
+    assert!(
+        cm.is_token_valid("peer-1", token).await,
+        "current token should be valid"
+    );
+
+    cm.stop().await;
+}
+
+#[tokio::test]
+async fn is_token_valid_false_after_release() {
+    let nats = require_nats!();
+    let js = nats.jetstream().await;
+
+    let cm = ClaimManager::new(js, "pod-a".into())
+        .await
+        .expect("create cm");
+    cm.start().await;
+
+    let token = cm.try_claim("peer-1").await.unwrap();
+    cm.release("peer-1").await.expect("release");
+
+    assert!(
+        !cm.is_token_valid("peer-1", token).await,
+        "released claim token should be invalid"
+    );
+
+    cm.stop().await;
+}
+
+#[tokio::test]
+async fn fencing_token_increases_across_reclaim() {
+    let nats = require_nats!();
+    let js = nats.jetstream().await;
+
+    let cm = ClaimManager::new(js, "pod-a".into())
+        .await
+        .expect("create cm");
+    cm.start().await;
+
+    let token_1 = cm.try_claim("peer-1").await.unwrap();
+    cm.release("peer-1").await.expect("release");
+
+    // Re-claim should get a higher fencing token
+    let token_2 = cm.try_claim("peer-1").await.unwrap();
+    assert!(
+        token_2 > token_1,
+        "new fencing token ({token_2}) should be greater than old ({token_1})"
+    );
+
+    cm.stop().await;
+}
+
+#[tokio::test]
+async fn registry_stores_fencing_token() {
+    let nats = require_nats!();
+    let js = nats.jetstream().await;
+
+    let cr = ConnectionRegistry::new(js, "pod-a".into())
+        .await
+        .expect("create registry");
+    cr.start().await;
+
+    cr.register("peer-1", Direction::Outbound, Some(42))
+        .await
+        .expect("register with token");
+
+    let conns = cr.list_connections().await.expect("list");
+    assert_eq!(conns.len(), 1);
+    assert_eq!(conns[0].fencing_token, Some(42));
+
+    // Inbound connection without fencing token
+    cr.register("peer-2", Direction::Inbound, None)
+        .await
+        .expect("register inbound");
+
+    let conns = cr.list_connections().await.expect("list");
+    let inbound = conns
+        .iter()
+        .find(|c| c.peer_id.as_str() == "peer-2")
+        .unwrap();
+    assert_eq!(inbound.fencing_token, None);
+
     cr.stop().await;
 }
