@@ -30,7 +30,7 @@ pub use config::{
 pub use config::{install_pq_provider, install_provider_with_kx_groups};
 pub use extract::{ExpectedKeyUsage, extract_identity, validate_key_usage};
 pub use filter::{GeoBounds, MessageFilter};
-pub use listener::{DEFAULT_MAX_HANDSHAKES, TlsListener};
+pub use listener::{DEFAULT_MAX_HANDSHAKES, OnHandshakeError, TlsListener};
 pub use repeater::EmergencyRepeater;
 pub use replay::ReplayFilter;
 pub use router::{NORMAL_CHANNEL_CAPACITY, PRIORITY_CHANNEL_CAPACITY, Router, SessionHandle};
