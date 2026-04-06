@@ -30,7 +30,10 @@ const CLAIM_BUCKET: &str = "federation-claims";
 pub type OnPeerAvailable = Arc<dyn Fn(String) + Send + Sync>;
 
 /// Callback invoked when a claim is lost to another pod.
-pub type OnClaimLost = Arc<dyn Fn(String) + Send + Sync>;
+///
+/// Arguments: `(peer_id, stale_fencing_token)`. The fencing token is the
+/// NATS KV revision that this pod held before the claim was lost.
+pub type OnClaimLost = Arc<dyn Fn(String, u64) + Send + Sync>;
 
 /// Manages distributed peer ownership using NATS JetStream KV.
 ///
@@ -160,16 +163,19 @@ impl ClaimManager {
     /// Attempt to claim a peer.
     ///
     /// Uses atomic KV `create` which only succeeds if the key does not exist.
-    /// Returns `true` if the claim was acquired.
-    pub async fn try_claim(&self, peer_id: &str) -> bool {
+    /// Returns the fencing token (NATS KV revision) on success, or `None` if
+    /// the peer is already claimed by another pod. The fencing token is a
+    /// monotonically increasing integer that prevents split-brain: a pod must
+    /// hold a current token to operate on a peer.
+    pub async fn try_claim(&self, peer_id: &str) -> Option<u64> {
         let value = bytes::Bytes::from(self.pod_id.clone());
 
         match self.kv.create(peer_id, value.clone()).await {
             Ok(revision) => {
                 let mut claims = self.claims.lock().await;
                 let _ = claims.insert(peer_id.to_string(), revision);
-                info!(peer_id = %peer_id, pod_id = %self.pod_id, "claimed peer");
-                true
+                info!(peer_id = %peer_id, pod_id = %self.pod_id, fence = revision, "claimed peer");
+                Some(revision)
             }
             Err(_) => {
                 // Key exists — check if we already own it (e.g., from a previous run)
@@ -177,15 +183,35 @@ impl ClaimManager {
                     Ok(Some(entry)) if entry.value == self.pod_id.as_bytes() => {
                         let mut claims = self.claims.lock().await;
                         let _ = claims.insert(peer_id.to_string(), entry.revision);
-                        debug!(peer_id = %peer_id, "reclaimed own peer");
-                        true
+                        debug!(peer_id = %peer_id, fence = entry.revision, "reclaimed own peer");
+                        Some(entry.revision)
                     }
                     _ => {
                         debug!(peer_id = %peer_id, "peer already claimed by another pod");
-                        false
+                        None
                     }
                 }
             }
+        }
+    }
+
+    /// Return the fencing token (NATS KV revision) for a claimed peer.
+    ///
+    /// Returns `None` if this pod does not own the claim.
+    pub async fn fencing_token(&self, peer_id: &str) -> Option<u64> {
+        let claims = self.claims.lock().await;
+        claims.get(peer_id).copied()
+    }
+
+    /// Check whether the given fencing token is still the current claim revision.
+    ///
+    /// Returns `true` if this pod still holds the claim with the given token
+    /// (or a newer one). Returns `false` if the claim has been lost.
+    pub async fn is_token_valid(&self, peer_id: &str, token: u64) -> bool {
+        let claims = self.claims.lock().await;
+        match claims.get(peer_id) {
+            Some(&current) => current >= token,
+            None => false,
         }
     }
 
@@ -292,6 +318,12 @@ async fn refresh_claims(
             Ok(new_rev) => {
                 let mut claims = claims.lock().await;
                 if let Some(rev) = claims.get_mut(peer_id) {
+                    debug!(
+                        peer_id = %peer_id,
+                        old_fence = %rev,
+                        new_fence = %new_rev,
+                        "refreshed claim"
+                    );
                     *rev = new_rev;
                 }
             }
@@ -302,6 +334,7 @@ async fn refresh_claims(
                         warn!(
                             peer_id = %peer_id,
                             new_owner = %String::from_utf8_lossy(&entry.value),
+                            stale_fence = %revision,
                             "lost claim to another pod"
                         );
                         let mut claims_guard = claims.lock().await;
@@ -309,7 +342,7 @@ async fn refresh_claims(
                         drop(claims_guard);
 
                         if let Some(callback) = on_claim_lost {
-                            callback(peer_id.clone());
+                            callback(peer_id.clone(), *revision);
                         }
                     }
                     Ok(None) => {
@@ -441,5 +474,21 @@ mod tests {
             jitter < adopt * 1000,
             "jitter must be less than adopt delay"
         );
+    }
+
+    #[test]
+    fn on_claim_lost_type_includes_fencing_token() {
+        // Verify the OnClaimLost callback accepts (peer_id, stale_token)
+        let called = Arc::new(std::sync::Mutex::new(None));
+        let called_clone = called.clone();
+
+        let callback: OnClaimLost = Arc::new(move |peer_id: String, token: u64| {
+            *called_clone.lock().expect("lock") = Some((peer_id, token));
+        });
+
+        callback("peer-1".to_string(), 42);
+
+        let result = called.lock().expect("lock").take();
+        assert_eq!(result, Some(("peer-1".to_string(), 42)));
     }
 }

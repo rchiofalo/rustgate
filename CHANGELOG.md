@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **HA fencing tokens** — peer ownership claims now carry monotonically increasing fencing tokens (NATS KV revisions) to prevent split-brain in multi-pod deployments. During adoption, the fencing token is re-validated after the delay period to detect stale claims. The connection registry stores fencing tokens alongside connection metadata for observability. Backward-compatible: pods without fencing support interoperate via `Option<u64>` with `#[serde(default)]`. (#458)
 - **Crypto agility strategy** — `docs/crypto-agility.md` documenting the approach to algorithm migration: feature-gated backends, TLS negotiation, backward-compatible rollout, certificate algorithm migration path, federation crypto alignment, and emergency algorithm disable procedures. (#456)
 - **REST API reference documentation** — comprehensive `docs/rest-api.md` covering all HTTP endpoints: metrics/health probes, federation peer management, certificate trust store, enrollment/signing, data packages, and WebSocket transport. Includes request/response schemas, authentication requirements, rate limits, curl examples, and status codes. (#454)
 - **Operational documentation** — troubleshooting guide, performance tuning guide, disaster recovery procedures, and four new runbooks (certificate rotation, CRL updates, WebSocket connection storms, TLS handshake failures) (#450, #451, #452, #453)

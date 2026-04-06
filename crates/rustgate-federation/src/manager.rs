@@ -14,7 +14,7 @@ use rustgate_core::{PeerId, audit};
 use rustls::RootCertStore;
 #[cfg(feature = "v2")]
 use tokio::task::JoinHandle;
-use tracing::{Instrument, error, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 
 use crate::config::FederationConfig;
 use crate::connector::{OutboundConnector, PeerConnector};
@@ -466,7 +466,12 @@ impl FederationManager {
                         warn!(error = %e, "HA adopt channel full, dropping event");
                     }
                 }),
-                Arc::new(move |peer_id: String| {
+                Arc::new(move |peer_id: String, stale_fence: u64| {
+                    debug!(
+                        peer_id = %peer_id,
+                        stale_fence = stale_fence,
+                        "claim lost, queuing disconnect"
+                    );
                     if let Err(e) = lost_tx.try_send(PeerId::new(peer_id)) {
                         warn!(error = %e, "HA claim-lost channel full, dropping event");
                     }
@@ -496,15 +501,20 @@ impl FederationManager {
 
             // In HA mode, only connect to peers we can claim
             #[cfg(feature = "ha")]
-            if let Some(ref cm) = self.claim_manager
-                && !cm.try_claim(peer_config.id.as_str()).await
-            {
-                info!(
-                    peer_id = %peer_config.id,
-                    "peer claimed by another pod, skipping"
-                );
-                continue;
-            }
+            let ha_fencing_token = if let Some(ref cm) = self.claim_manager {
+                match cm.try_claim(peer_config.id.as_str()).await {
+                    Some(token) => Some(token),
+                    None => {
+                        info!(
+                            peer_id = %peer_config.id,
+                            "peer claimed by another pod, skipping"
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
 
             let addr: std::net::SocketAddr = match peer_config.address.parse() {
                 Ok(a) => a,
@@ -610,6 +620,7 @@ impl FederationManager {
                     .register(
                         peer_config.id.as_str(),
                         crate::ha::registry::Direction::Outbound,
+                        ha_fencing_token,
                     )
                     .await
             {
@@ -1250,35 +1261,57 @@ impl FederationManager {
             return Ok(());
         }
 
-        // Try to claim the peer
-        let claimed = if let Some(ref cm) = self.claim_manager {
+        // Try to claim the peer and get the fencing token
+        let fencing_token = if let Some(ref cm) = self.claim_manager {
             cm.try_claim(peer_id.as_str()).await
         } else {
             return Err(anyhow::anyhow!("HA claim manager not initialized"));
         };
 
-        if !claimed {
-            info!(peer_id = %peer_id, "peer claimed by another pod during adoption");
-            return Ok(());
-        }
+        let fencing_token = match fencing_token {
+            Some(token) => token,
+            None => {
+                info!(peer_id = %peer_id, "peer claimed by another pod during adoption");
+                return Ok(());
+            }
+        };
 
         // Wait adoption delay + jitter to let the remote clean up
         let delay = crate::ha::claims::ClaimManager::adopt_delay()
             + crate::ha::claims::ClaimManager::adoption_jitter();
         info!(
             peer_id = %peer_id,
+            fence = fencing_token,
             delay_secs = delay.as_secs(),
             "waiting adoption delay before connecting"
         );
         tokio::time::sleep(delay).await;
 
+        // Re-validate fencing token after adoption delay (split-brain guard).
+        // During the delay, another pod may have claimed this peer with a
+        // newer token. If so, abort adoption to avoid duplicate connections.
+        if let Some(ref cm) = self.claim_manager
+            && !cm.is_token_valid(peer_id.as_str(), fencing_token).await
+        {
+            warn!(
+                peer_id = %peer_id,
+                fence = fencing_token,
+                "fencing token became stale during adoption delay, aborting"
+            );
+            return Ok(());
+        }
+
         // Connect
         self.connect_outbound_peer(&peer_config)?;
 
-        // Register in HA connection registry
+        // Register in HA connection registry with fencing token
         if let Some(ref cr) = self.connection_registry
             && let Err(e) = cr
-                .register(peer_id.as_str(), crate::ha::registry::Direction::Outbound)
+                .register(
+                    peer_id.as_str(),
+                    crate::ha::registry::Direction::Outbound,
+                    Some(fencing_token),
+                )
                 .await
         {
             warn!(peer_id = %peer_id, error = %e, "failed to register adopted connection");
