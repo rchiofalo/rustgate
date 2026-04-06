@@ -48,6 +48,14 @@ pub(crate) async fn handle_package_upload(
         .unwrap_or("")
         .to_string();
 
+    // Extract signature from header or query parameter before consuming the body
+    let signature = req
+        .headers()
+        .get("X-Package-Signature")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
+        .or_else(|| req.uri().query().and_then(|q| extract_param(q, "sig")));
+
     // Read body (limit to 50 MiB + overhead for multipart headers)
     let limited = Limited::new(req.into_body(), 52_428_800);
     let body = match limited.collect().await {
@@ -73,13 +81,21 @@ pub(crate) async fn handle_package_upload(
             (body.to_vec(), "upload.zip".to_string())
         };
 
-    match store.upload(&file_data, &filename, username).await {
+    match store
+        .upload_with_signature(&file_data, &filename, username, signature.as_deref())
+        .await
+    {
         Ok(meta) => {
-            let json = serde_json::json!({
+            let mut json = serde_json::json!({
                 "Hash": meta.hash,
                 "Name": meta.name,
                 "Size": meta.size,
             });
+            if let Some(ref sig) = meta.signature {
+                let _ = json
+                    .as_object_mut()
+                    .map(|m| m.insert("Signature".to_string(), serde_json::json!(sig)));
+            }
             build_response(
                 StatusCode::OK,
                 "application/json",
@@ -125,11 +141,19 @@ pub(crate) async fn handle_package_download(
     }
 
     match store.download(&hash).await {
-        Ok((_meta, data)) => build_response(
-            StatusCode::OK,
-            "application/x-zip-compressed",
-            Bytes::from(data),
-        ),
+        Ok((meta, data)) => {
+            let mut resp = build_response(
+                StatusCode::OK,
+                "application/x-zip-compressed",
+                Bytes::from(data),
+            );
+            if let Some(ref sig) = meta.signature
+                && let Ok(val) = hyper::header::HeaderValue::from_str(sig)
+            {
+                let _ = resp.headers_mut().insert("X-Package-Signature", val);
+            }
+            resp
+        }
         Err(_) => build_response(
             StatusCode::NOT_FOUND,
             "text/plain",
