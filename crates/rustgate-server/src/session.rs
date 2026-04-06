@@ -49,6 +49,10 @@ pub(crate) struct SessionDeps<P: NatsPublish> {
     pub(crate) archiver: Option<Arc<archive::CotArchiver>>,
     pub(crate) replay_filter: Option<Arc<ReplayFilter>>,
     pub(crate) circuit_breaker_threshold: u32,
+    /// Per-identity metrics configuration: allowlist for label
+    /// bucketing plus the Tier 2 enable flag.
+    #[cfg(feature = "metrics")]
+    pub(crate) metrics_identity: Arc<metrics::MetricsIdentity>,
 }
 
 /// Runtime context for a connected session's read/write loops.
@@ -61,6 +65,8 @@ struct SessionContext<'a, P: NatsPublish> {
     throttle: Option<rustgate_transport::ClientThrottle>,
     archiver: &'a Option<Arc<archive::CotArchiver>>,
     replay_filter: &'a Option<Arc<ReplayFilter>>,
+    #[cfg(feature = "metrics")]
+    metrics_identity: &'a metrics::MetricsIdentity,
 }
 
 /// Trait for optional NATS publishing. Allows the server to compile with or
@@ -159,6 +165,8 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
     };
 
     let throttle = deps.throttle_config.map(|tc| tc.build());
+    #[cfg(feature = "metrics")]
+    let session_started = std::time::Instant::now();
     let ctx = SessionContext {
         identity: &identity,
         router: &deps.router,
@@ -168,9 +176,21 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
         throttle,
         archiver: &deps.archiver,
         replay_filter: &deps.replay_filter,
+        #[cfg(feature = "metrics")]
+        metrics_identity: deps.metrics_identity.as_ref(),
     };
 
-    let result = run_session_loops(reader, writer, priority_rx, normal_rx, &ctx, read_buf).await;
+    let result = run_session_loops(
+        reader,
+        writer,
+        priority_rx,
+        normal_rx,
+        &ctx,
+        read_buf,
+        #[cfg(feature = "metrics")]
+        &cn,
+    )
+    .await;
 
     if let Err(e) = result {
         tracing::debug!(cn = %cn, error = %e, "session error");
@@ -181,6 +201,11 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
     {
         metrics::sessions_active().dec();
         metrics::connections_active().dec();
+        if let Some(hist) = metrics::per_identity_session_duration() {
+            let bucket = deps.metrics_identity.bucket(&cn);
+            hist.with_label_values(&[bucket])
+                .observe(session_started.elapsed().as_secs_f64());
+        }
     }
     crate::audit::client_disconnected(&cn, session_id);
     tracing::info!(cn = %cn, "disconnected");
@@ -259,10 +284,20 @@ async fn run_session_loops(
     normal_rx: mpsc::Receiver<Arc<RoutableMessage>>,
     ctx: &SessionContext<'_, impl NatsPublish>,
     read_buf: tokio_util::bytes::BytesMut,
+    #[cfg(feature = "metrics")] cn: &str,
 ) -> std::io::Result<()> {
+    #[cfg(feature = "metrics")]
+    let bucket = ctx.metrics_identity.bucket(cn).to_string();
     tokio::select! {
         r = read_loop(reader, ctx, read_buf) => r,
-        r = write_loop(writer, priority_rx, normal_rx, ctx.codec) => r,
+        r = write_loop(
+            writer,
+            priority_rx,
+            normal_rx,
+            ctx.codec,
+            #[cfg(feature = "metrics")]
+            bucket,
+        ) => r,
     }
 }
 
@@ -312,7 +347,12 @@ async fn read_loop(
         {
             tracing::debug!(cn = %ctx.identity.cn, "message dropped: rate limit exceeded");
             #[cfg(feature = "metrics")]
-            metrics::messages_dropped().inc();
+            {
+                let bucket = ctx.metrics_identity.bucket(&ctx.identity.cn);
+                metrics::messages_dropped()
+                    .with_label_values(&[bucket])
+                    .inc();
+            }
             continue;
         }
 
@@ -340,9 +380,15 @@ async fn read_loop(
                 Destination::Group(_) => "group",
                 Destination::Direct(_) => "direct",
             };
+            let bucket = ctx.metrics_identity.bucket(&ctx.identity.cn);
             metrics::messages_routed()
-                .with_label_values(&[dest_label])
+                .with_label_values(&[dest_label, bucket])
                 .inc();
+            // Tier 2: bytes received accounting (payload size)
+            if let Some(c) = metrics::per_identity_bytes_received() {
+                c.with_label_values(&[bucket])
+                    .inc_by(msg.payload.len() as u64);
+            }
         }
 
         ctx.router.route(msg.clone()).await;
@@ -373,6 +419,7 @@ async fn write_loop(
     mut priority_rx: mpsc::Receiver<Arc<RoutableMessage>>,
     mut normal_rx: mpsc::Receiver<Arc<RoutableMessage>>,
     codec: &dyn Codec,
+    #[cfg(feature = "metrics")] bucket: String,
 ) -> std::io::Result<()> {
     let mut framed = FramedWrite::new(writer, FramedCodec::from_strategy(&codec.framing()));
 
@@ -385,6 +432,11 @@ async fn write_loop(
         let Some(msg) = msg else { break };
 
         let encoded = codec.encode_payload(&msg)?;
+        #[cfg(feature = "metrics")]
+        if let Some(c) = metrics::per_identity_bytes_sent() {
+            c.with_label_values(&[bucket.as_str()])
+                .inc_by(encoded.len() as u64);
+        }
         let send_fut = framed.send(tokio_util::bytes::BytesMut::from(encoded.as_ref()));
 
         match tokio::time::timeout(WRITE_TIMEOUT, send_fut).await {
@@ -419,6 +471,8 @@ pub(crate) struct PlaintextTcpConfig<P: NatsPublish> {
     pub(crate) replay_filter: Option<Arc<ReplayFilter>>,
     pub(crate) circuit_breaker_threshold: u32,
     pub(crate) shutdown: Arc<tokio::sync::Notify>,
+    #[cfg(feature = "metrics")]
+    pub(crate) metrics_identity: Arc<metrics::MetricsIdentity>,
 }
 
 /// Accept loop for plaintext TCP connections.
@@ -441,6 +495,8 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
         replay_filter,
         circuit_breaker_threshold,
         shutdown,
+        #[cfg(feature = "metrics")]
+        metrics_identity,
     } = config;
 
     loop {
@@ -487,6 +543,8 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
                         let session_throttle = throttle_config.map(|tc| tc.build());
                         let session_arch = archiver.clone();
                         let session_rf = replay_filter.clone();
+                        #[cfg(feature = "metrics")]
+                        let session_metrics_id = Arc::clone(&metrics_identity);
 
                         crate::setup::spawn_background("plaintext-tcp-session", async move {
                             let _permit = permit;
@@ -504,6 +562,8 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
                                 throttle: session_throttle,
                                 archiver: &session_arch,
                                 replay_filter: &session_rf,
+                                #[cfg(feature = "metrics")]
+                                metrics_identity: session_metrics_id.as_ref(),
                             }).await;
 
                             if let Err(e) = result {
@@ -541,6 +601,8 @@ struct PlaintextSessionContext<'a, P: NatsPublish> {
     throttle: Option<rustgate_transport::ClientThrottle>,
     archiver: &'a Option<Arc<archive::CotArchiver>>,
     replay_filter: &'a Option<Arc<ReplayFilter>>,
+    #[cfg(feature = "metrics")]
+    metrics_identity: &'a metrics::MetricsIdentity,
 }
 
 /// Read/write loops for a plaintext TCP session.
@@ -563,6 +625,8 @@ async fn run_plaintext_session_loops<P: NatsPublish>(
         throttle,
         archiver,
         replay_filter,
+        #[cfg(feature = "metrics")]
+        metrics_identity,
     } = ctx;
     let framed_codec = FramedCodec::from_strategy(&codec.framing());
     let mut framed_read = FramedRead::new(reader, framed_codec);
@@ -593,7 +657,12 @@ async fn run_plaintext_session_loops<P: NatsPublish>(
                 {
                     tracing::debug!(cn = %identity.cn, "message dropped: rate limit exceeded");
                     #[cfg(feature = "metrics")]
-                    metrics::messages_dropped().inc();
+                    {
+                        let bucket = metrics_identity.bucket(&identity.cn);
+                        metrics::messages_dropped()
+                            .with_label_values(&[bucket])
+                            .inc();
+                    }
                     continue;
                 }
 

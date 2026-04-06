@@ -172,7 +172,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Arc::new(std::sync::OnceLock::new());
 
     #[cfg(feature = "metrics")]
-    setup::start_metrics(
+    let metrics_identity = setup::start_metrics(
         &cli,
         &ready,
         #[cfg(feature = "federation")]
@@ -354,6 +354,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         throttle_config,
         &archiver,
         &replay_filter,
+        #[cfg(feature = "metrics")]
+        &metrics_identity,
     )
     .await?;
 
@@ -435,6 +437,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                             archiver: arch,
                             replay_filter: rf,
                             circuit_breaker_threshold: cli.circuit_breaker_threshold,
+                            #[cfg(feature = "metrics")]
+                            metrics_identity: Arc::clone(&metrics_identity),
                         };
                         setup::spawn_background("tls-session", session::handle_session(session, deps, permit));
                     }
@@ -446,6 +450,14 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                             metrics::handshake_failures()
                                 .with_label_values(&[reason])
                                 .inc();
+                            // Tier 2 per-identity handshake failures: the
+                            // peer identity is unknown at this point
+                            // (handshake failed before client cert
+                            // verification surfaced a CN), so all events
+                            // bucket under the literal "other" label.
+                            if let Some(c) = metrics::per_identity_handshake_failures() {
+                                c.with_label_values(&["other"]).inc();
+                            }
                         }
                         tracing::warn!(error = %e, "accept error");
                     }

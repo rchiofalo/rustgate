@@ -211,6 +211,21 @@ pub(crate) struct Cli {
     #[arg(long, env = "RUSTGATE_METRICS_BIND", value_parser = parse_socket_addr)]
     pub(crate) metrics_bind: Option<String>,
 
+    /// Enable Tier 2 per-identity Prometheus metrics (handshake failures,
+    /// session duration, bytes sent/received) labelled by `identity_cn`.
+    /// When disabled the metrics are not registered at all and impose
+    /// zero overhead. Cardinality is bounded via the
+    /// `--metrics-identity-allowlist` flag.
+    #[arg(long, default_value_t = false, env = "RUSTGATE_METRICS_PER_IDENTITY")]
+    pub(crate) metrics_per_identity: bool,
+
+    /// Path to a file listing CNs that are exempt from `"other"` bucketing
+    /// in per-identity metric labels. One CN per line; lines starting with
+    /// `#` are treated as comments. When unset, ALL CNs are bucketed under
+    /// the literal `"other"` label, capping per-identity cardinality at 1.
+    #[arg(long, env = "RUSTGATE_METRICS_IDENTITY_ALLOWLIST")]
+    pub(crate) metrics_identity_allowlist: Option<std::path::PathBuf>,
+
     /// Maximum concurrent TLS sessions. Prevents resource exhaustion
     /// from connection floods.
     #[arg(long, default_value_t = 1024, env = "RUSTGATE_MAX_CONNECTIONS", value_parser = parse_max_connections)]
