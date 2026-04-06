@@ -716,7 +716,16 @@ mod tests {
         let router = Arc::new(rustgate_transport::Router::with_acl(
             rustgate_transport::GroupAclPolicy::new(HashMap::new()),
         ));
-        let reloader = acl_reloader::AclReloader::new(&acl_path, router, initial_hash);
+        let reloader = acl_reloader::AclReloader::new(&acl_path, Arc::clone(&router), initial_hash);
+
+        // Sanity-check pre-reload state: empty policy collapses to open mode (None).
+        {
+            let snap = router.acl_snapshot();
+            assert!(
+                snap.as_ref().is_none(),
+                "expected initial empty policy to be open mode"
+            );
+        }
 
         // Update the ACL file so reload() returns Ok(true)
         let updated = r#"{"groups":{"alpha":{"send":["alice"],"receive":["alice"]}}}"#;
@@ -724,5 +733,17 @@ mod tests {
 
         // Pass an invalid CRL path to verify partial failure tolerance.
         reload_all_configs(None, Some(&reloader), Some("/no/such/crl.pem")).await;
+
+        // Verify the router actually swapped to the new policy.
+        let snap = router.acl_snapshot();
+        let policy = snap
+            .as_ref()
+            .as_ref()
+            .expect("acl policy installed after reload");
+        assert!(
+            policy.groups().contains_key("alpha"),
+            "expected reloaded ACL to contain group 'alpha', got {:?}",
+            policy.groups().keys().collect::<Vec<_>>()
+        );
     }
 }

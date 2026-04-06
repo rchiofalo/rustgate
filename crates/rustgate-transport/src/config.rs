@@ -261,8 +261,30 @@ impl TlsConfig {
             .into());
         }
         let count = crls.len();
-        rustgate_core::audit::crl_reload_success(count, path);
-        let _ = check_crl_freshness(&crls);
+        // Note: do NOT emit a `crl_reload_success` audit event here. The
+        // canonical reload audit record is emitted by the caller
+        // (`reload_all_configs` in rustgate-server) so we avoid duplicate
+        // events when this fn is invoked from the SIGHUP path.
+        //
+        // `check_crl_freshness` already logs structured `tracing::warn!`
+        // entries for any stale CRLs, so we ignore its return value but
+        // additionally surface an audit-style warning so operators can
+        // correlate it with the outer config.reload event. We deliberately
+        // do not turn freshness failures into hard errors — operators may
+        // intentionally use stale CRLs.
+        let stale = check_crl_freshness(&crls);
+        if stale > 0 {
+            tracing::warn!(
+                target: "audit",
+                event_type = "config.reload",
+                component = "crl",
+                result = "warning",
+                reason = "expired",
+                stale_count = stale as u64,
+                path = %path,
+                "CRL file contains stale entries (nextUpdate in the past)"
+            );
+        }
         Ok(count)
     }
 

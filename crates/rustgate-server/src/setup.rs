@@ -153,43 +153,41 @@ pub(crate) async fn bind_tls_listener(
     cli: &Cli,
     tls_config: &TlsConfig,
 ) -> anyhow::Result<(TlsListener, Option<Arc<CertReloader>>)> {
-    // `mut` is only needed when `metrics` is enabled (for `set_on_handshake_error`).
-    #[allow(unused_mut)]
-    let (mut listener, cert_reloader) = if cli.cert_reload_interval > 0 {
-        let reloader =
-            CertReloader::new(&cli.cert, &cli.key).context("initializing certificate reloader")?;
+    // Always construct the `CertReloader` when `--cert` and `--key` are
+    // configured so that SIGHUP-driven reloads can rotate the certificate
+    // regardless of whether the polling watcher is enabled. The polling
+    // watcher itself is still only spawned when `cert_reload_interval > 0`.
+    let reloader =
+        CertReloader::new(&cli.cert, &cli.key).context("initializing certificate reloader")?;
 
-        let verifier = tls_config.build_default_verifier()?;
-        let server_config = tls_config
-            .build_reloadable_server_config(verifier, reloader.clone())
-            .context("building reloadable server config")?;
+    let verifier = tls_config.build_default_verifier()?;
+    let server_config = tls_config
+        .build_reloadable_server_config(verifier, reloader.clone())
+        .context("building reloadable server config")?;
 
+    if cli.cert_reload_interval > 0 {
         let interval = std::time::Duration::from_secs(cli.cert_reload_interval);
         reloader.spawn_watcher(interval);
-
         tracing::info!(
             interval_secs = cli.cert_reload_interval,
-            "certificate hot-reload enabled"
+            "certificate hot-reload polling enabled"
         );
-
-        let listener = TlsListener::bind_with_server_config(
-            &cli.bind,
-            Arc::new(server_config),
-            cli.max_concurrent_handshakes,
-        )
-        .await
-        .context("binding TLS listener with cert reloader")?;
-        (listener, Some(reloader))
     } else {
-        let listener = TlsListener::bind_with_handshake_limit(
-            &cli.bind,
-            tls_config,
-            cli.max_concurrent_handshakes,
-        )
-        .await
-        .context("binding TLS listener")?;
-        (listener, None)
-    };
+        tracing::info!(
+            "certificate hot-reload polling disabled; SIGHUP can still rotate certificates"
+        );
+    }
+
+    // `mut` is only needed when `metrics` is enabled (for `set_on_handshake_error`).
+    #[allow(unused_mut)]
+    let mut listener = TlsListener::bind_with_server_config(
+        &cli.bind,
+        Arc::new(server_config),
+        cli.max_concurrent_handshakes,
+    )
+    .await
+    .context("binding TLS listener with cert reloader")?;
+    let cert_reloader = Some(reloader);
 
     #[cfg(feature = "metrics")]
     listener.set_on_handshake_error(Arc::new(|_peer_addr, error| {
