@@ -598,6 +598,7 @@ mod tests {
     }
 
     /// Create a dual-channel pair and return (priority_tx, normal_tx, priority_rx, normal_rx).
+    #[allow(clippy::type_complexity)]
     fn make_channels(
         priority_cap: usize,
         normal_cap: usize,
