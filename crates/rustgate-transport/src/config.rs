@@ -229,6 +229,65 @@ impl TlsConfig {
         &self.client_ca_store
     }
 
+    /// Re-read and validate a CRL PEM file from disk.
+    ///
+    /// Parses the PEM blocks, runs freshness checks, and emits the same
+    /// audit events that [`Self::with_crls`] does. Returns the number of
+    /// CRL entries found on success.
+    ///
+    /// Used by SIGHUP-driven config reload to detect operator errors in
+    /// CRL files without restarting the server. The active TLS listener
+    /// does not currently swap CRLs at runtime — applying CRL changes to
+    /// in-flight handshakes still requires a server restart.
+    pub fn validate_crl_file(path: &str) -> Result<usize> {
+        let crl_pem = std::fs::read_to_string(path).map_err(|e| {
+            RustgateError::from(ConfigError::Other(format!(
+                "failed to read CRL file {path}: {e}"
+            )))
+        })?;
+        let crls: Vec<CertificateRevocationListDer<'static>> =
+            CertificateRevocationListDer::pem_slice_iter(crl_pem.as_bytes())
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| {
+                    RustgateError::from(ConfigError::PemParse {
+                        kind: "CRL".to_string(),
+                        reason: e.to_string(),
+                    })
+                })?;
+        if crls.is_empty() {
+            return Err(ConfigError::EmptyPem {
+                kind: "CRLs".to_string(),
+            }
+            .into());
+        }
+        let count = crls.len();
+        // Note: do NOT emit a `crl_reload_success` audit event here. The
+        // canonical reload audit record is emitted by the caller
+        // (`reload_all_configs` in rustgate-server) so we avoid duplicate
+        // events when this fn is invoked from the SIGHUP path.
+        //
+        // `check_crl_freshness` already logs structured `tracing::warn!`
+        // entries for any stale CRLs, so we ignore its return value but
+        // additionally surface an audit-style warning so operators can
+        // correlate it with the outer config.reload event. We deliberately
+        // do not turn freshness failures into hard errors — operators may
+        // intentionally use stale CRLs.
+        let stale = check_crl_freshness(&crls);
+        if stale > 0 {
+            tracing::warn!(
+                target: "audit",
+                event_type = "config.reload",
+                component = "crl",
+                result = "warning",
+                reason = "expired",
+                stale_count = stale as u64,
+                path = %path,
+                "CRL file contains stale entries (nextUpdate in the past)"
+            );
+        }
+        Ok(count)
+    }
+
     /// Get a clone of the loaded CRLs.
     ///
     /// Used by consumers that need to pass CRLs to a

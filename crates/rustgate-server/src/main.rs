@@ -149,7 +149,7 @@ fn main() -> anyhow::Result<()> {
 async fn run(cli: Cli) -> anyhow::Result<()> {
     // ── TLS setup ───────────────────────────────────────────────────
     let (tls_config, _cert_pem, _key_pem, _ca_pem) = setup::build_tls_config(&cli).await?;
-    let listener = setup::bind_tls_listener(&cli, &tls_config).await?;
+    let (listener, cert_reloader) = setup::bind_tls_listener(&cli, &tls_config).await?;
     let framing = cli.framing;
     let encoding = cli.encoding;
 
@@ -193,28 +193,30 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     });
 
     // ── ACL hot-reload ─────────────────────────────────────────────
-    #[cfg(feature = "metrics")]
-    let mut acl_reloader_for_api: Option<Arc<acl_reloader::AclReloader>> = None;
-    if let Some(ref acl_file) = cli.group_acl_file
-        && cli.acl_reload_interval > 0
-    {
+    //
+    // We always construct an `AclReloader` when an ACL file is configured
+    // (even if the polling interval is zero) so that SIGHUP-driven reloads
+    // can use the same code path. The polling watcher is only spawned when
+    // `acl_reload_interval > 0`.
+    let mut acl_reloader_handle: Option<Arc<acl_reloader::AclReloader>> = None;
+    if let Some(ref acl_file) = cli.group_acl_file {
         let initial_hash =
             acl_file_hash.unwrap_or_else(|| acl_reloader::AclReloader::compute_hash(b""));
         let reloader =
             acl_reloader::AclReloader::new(acl_file.clone(), Arc::clone(&router), initial_hash);
-        let interval = Duration::from_secs(cli.acl_reload_interval);
-        reloader.spawn_watcher(interval);
-        #[cfg(feature = "metrics")]
-        {
-            acl_reloader_for_api = Some(Arc::clone(&reloader));
+        if cli.acl_reload_interval > 0 {
+            let interval = Duration::from_secs(cli.acl_reload_interval);
+            reloader.spawn_watcher(interval);
+            tracing::info!(
+                interval_secs = cli.acl_reload_interval,
+                path = %acl_file,
+                "ACL hot-reload enabled"
+            );
         }
-
-        tracing::info!(
-            interval_secs = cli.acl_reload_interval,
-            path = %acl_file,
-            "ACL hot-reload enabled"
-        );
+        acl_reloader_handle = Some(reloader);
     }
+    #[cfg(feature = "metrics")]
+    let acl_reloader_for_api: Option<Arc<acl_reloader::AclReloader>> = acl_reloader_handle.clone();
 
     // ── ACL REST API ───────────────────────────────────────────────
     //
@@ -359,6 +361,38 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let udp_shutdown =
         setup::start_udp(&cli, &router, &nats_publisher, &fed_forward, &replay_filter).await?;
 
+    // ── SIGHUP config reload (Unix only) ───────────────────────────
+    //
+    // On SIGHUP we reload the server certificate, the group ACL policy,
+    // and re-validate the CRL file from disk. Each component is reloaded
+    // independently — partial failures do not abort the others. SIGHUP
+    // reload is Unix-only; on other platforms the handler is omitted.
+    #[cfg(unix)]
+    {
+        let cert_for_hup = cert_reloader.clone();
+        let acl_for_hup = acl_reloader_handle.clone();
+        let crl_path_for_hup = cli.crl.clone();
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+            Ok(mut sighup) => {
+                setup::spawn_background("sighup-reloader", async move {
+                    while sighup.recv().await.is_some() {
+                        tracing::info!("SIGHUP received, reloading config");
+                        reload_all_configs(
+                            cert_for_hup.as_ref(),
+                            acl_for_hup.as_ref(),
+                            crl_path_for_hup.as_deref(),
+                        )
+                        .await;
+                    }
+                });
+                tracing::info!("SIGHUP config reload handler installed");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to register SIGHUP handler");
+            }
+        }
+    }
+
     // ── Accept loop ─────────────────────────────────────────────────
     loop {
         tokio::select! {
@@ -498,5 +532,218 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Reload server config components in sequence on a SIGHUP-style signal.
+///
+/// Each component is reloaded independently — a failure in one does not
+/// prevent the others from running. Structured audit events are emitted
+/// per component so operators can correlate reload outcomes.
+///
+/// `crl_path` is best-effort: it re-reads and parses the CRL file from
+/// disk and reports parse / freshness issues, but the live TLS listener
+/// does not currently swap CRLs at runtime — applying CRL changes still
+/// requires a server restart. Re-parsing on SIGHUP catches operator
+/// errors before the next restart.
+async fn reload_all_configs(
+    cert_reloader: Option<&Arc<rustgate_transport::CertReloader>>,
+    acl_reloader: Option<&Arc<acl_reloader::AclReloader>>,
+    crl_path: Option<&str>,
+) {
+    // 1. Server certificate
+    if let Some(reloader) = cert_reloader {
+        let r = Arc::clone(reloader);
+        let join = tokio::task::spawn_blocking(move || r.reload()).await;
+        match join {
+            Ok(Ok(rotated)) => {
+                tracing::info!(
+                    target: "audit",
+                    event_type = "config.reload",
+                    component = "cert",
+                    result = "success",
+                    rotated = rotated,
+                    "certificate reload completed"
+                );
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    target: "audit",
+                    event_type = "config.reload",
+                    component = "cert",
+                    result = "failure",
+                    error = %e,
+                    "certificate reload failed"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "audit",
+                    event_type = "config.reload",
+                    component = "cert",
+                    result = "failure",
+                    error = %e,
+                    "certificate reload task panicked"
+                );
+            }
+        }
+    } else {
+        tracing::debug!("SIGHUP: no cert reloader configured (cert_reload_interval=0)");
+    }
+
+    // 2. Group ACL policy
+    if let Some(reloader) = acl_reloader {
+        let r = Arc::clone(reloader);
+        let join = tokio::task::spawn_blocking(move || r.reload()).await;
+        match join {
+            Ok(Ok(swapped)) => {
+                tracing::info!(
+                    target: "audit",
+                    event_type = "config.reload",
+                    component = "acl",
+                    result = "success",
+                    swapped = swapped,
+                    "ACL reload completed"
+                );
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    target: "audit",
+                    event_type = "config.reload",
+                    component = "acl",
+                    result = "failure",
+                    error = %e,
+                    "ACL reload failed"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "audit",
+                    event_type = "config.reload",
+                    component = "acl",
+                    result = "failure",
+                    error = %e,
+                    "ACL reload task panicked"
+                );
+            }
+        }
+    } else {
+        tracing::debug!("SIGHUP: no ACL reloader configured");
+    }
+
+    // 3. CRL file (re-parse only — see function docs)
+    if let Some(path) = crl_path {
+        let path_owned = path.to_string();
+        let join = tokio::task::spawn_blocking(move || reload_crl_file(&path_owned)).await;
+        match join {
+            Ok(Ok(count)) => {
+                tracing::info!(
+                    target: "audit",
+                    event_type = "config.reload",
+                    component = "crl",
+                    result = "success",
+                    crl_count = count as u64,
+                    path = %path,
+                    "CRL re-parsed (restart server to apply changes to active listener)"
+                );
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    target: "audit",
+                    event_type = "config.reload",
+                    component = "crl",
+                    result = "failure",
+                    path = %path,
+                    error = %e,
+                    "CRL reload failed"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "audit",
+                    event_type = "config.reload",
+                    component = "crl",
+                    result = "failure",
+                    path = %path,
+                    error = %e,
+                    "CRL reload task panicked"
+                );
+            }
+        }
+    } else {
+        tracing::debug!("SIGHUP: no CRL configured");
+    }
+}
+
+/// Read and parse a CRL PEM file. Returns the number of CRL entries on success.
+///
+/// Used by [`reload_all_configs`] to validate CRL files on SIGHUP without
+/// touching the live TLS listener.
+fn reload_crl_file(path: &str) -> anyhow::Result<usize> {
+    rustgate_transport::TlsConfig::validate_crl_file(path).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::panic, clippy::unwrap_used)]
+
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn reload_all_configs_tolerates_all_none() {
+        // Should not panic when nothing is configured.
+        reload_all_configs(None, None, None).await;
+    }
+
+    #[tokio::test]
+    async fn reload_all_configs_reports_crl_failure_without_aborting() {
+        // Missing CRL path should produce a structured failure but return.
+        reload_all_configs(None, None, Some("/definitely/not/a/real/path.pem")).await;
+    }
+
+    #[tokio::test]
+    async fn reload_all_configs_reloads_acl_and_continues_on_crl_failure() {
+        use std::collections::HashMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let acl_path = dir.path().join("acl.json");
+        let initial = r#"{"groups":{}}"#;
+        std::fs::write(&acl_path, initial).unwrap();
+        let initial_hash = acl_reloader::AclReloader::compute_hash(initial.as_bytes());
+
+        let router = Arc::new(rustgate_transport::Router::with_acl(
+            rustgate_transport::GroupAclPolicy::new(HashMap::new()),
+        ));
+        let reloader = acl_reloader::AclReloader::new(&acl_path, Arc::clone(&router), initial_hash);
+
+        // Sanity-check pre-reload state: empty policy collapses to open mode (None).
+        {
+            let snap = router.acl_snapshot();
+            assert!(
+                snap.as_ref().is_none(),
+                "expected initial empty policy to be open mode"
+            );
+        }
+
+        // Update the ACL file so reload() returns Ok(true)
+        let updated = r#"{"groups":{"alpha":{"send":["alice"],"receive":["alice"]}}}"#;
+        std::fs::write(&acl_path, updated).unwrap();
+
+        // Pass an invalid CRL path to verify partial failure tolerance.
+        reload_all_configs(None, Some(&reloader), Some("/no/such/crl.pem")).await;
+
+        // Verify the router actually swapped to the new policy.
+        let snap = router.acl_snapshot();
+        let policy = snap
+            .as_ref()
+            .as_ref()
+            .expect("acl policy installed after reload");
+        assert!(
+            policy.groups().contains_key("alpha"),
+            "expected reloaded ACL to contain group 'alpha', got {:?}",
+            policy.groups().keys().collect::<Vec<_>>()
+        );
     }
 }
