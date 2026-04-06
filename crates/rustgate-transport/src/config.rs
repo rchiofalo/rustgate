@@ -354,6 +354,70 @@ pub fn install_pq_provider() -> Result<()> {
     Ok(())
 }
 
+/// Install a crypto provider with a custom key exchange group preference order.
+///
+/// Parses group names from a comma-separated string and builds a
+/// `CryptoProvider` with those groups in the specified order.
+/// Requires `--features post-quantum` for PQ groups.
+///
+/// Returns an error if a group name is unrecognized or if a crypto provider
+/// is already installed.
+#[cfg(feature = "post-quantum")]
+pub fn install_provider_with_kx_groups(groups: &str) -> Result<()> {
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    let kx_groups = parse_kx_groups(groups)?;
+    provider.kx_groups = kx_groups;
+
+    rustls::crypto::CryptoProvider::install_default(provider).map_err(|_| {
+        RustgateError::from(ConfigError::Other(
+            "crypto provider already installed".to_string(),
+        ))
+    })?;
+
+    tracing::info!(groups = %groups, "crypto provider installed with custom key exchange groups");
+    Ok(())
+}
+
+/// Parse a comma-separated list of key exchange group names into rustls
+/// `SupportedKxGroup` references.
+///
+/// Group names are case-insensitive. Available groups depend on the compiled
+/// crypto backend.
+#[cfg(feature = "post-quantum")]
+fn parse_kx_groups(groups: &str) -> Result<Vec<&'static dyn rustls::crypto::SupportedKxGroup>> {
+    use rustls::crypto::aws_lc_rs::kx_group;
+
+    let mut result = Vec::new();
+    for name in groups.split(',') {
+        let name = name.trim();
+        let group: &'static dyn rustls::crypto::SupportedKxGroup =
+            match name.to_uppercase().as_str() {
+                "X25519MLKEM768" => kx_group::X25519MLKEM768,
+                "SECP256R1MLKEM768" => kx_group::SECP256R1MLKEM768,
+                "MLKEM768" => kx_group::MLKEM768,
+                "MLKEM1024" => kx_group::MLKEM1024,
+                "X25519" => kx_group::X25519,
+                "SECP256R1" => kx_group::SECP256R1,
+                "SECP384R1" => kx_group::SECP384R1,
+                _ => {
+                    return Err(ConfigError::Other(format!(
+                        "unknown key exchange group: {name}. Available groups: \
+                     X25519MLKEM768, SECP256R1MLKEM768, MLKEM768, MLKEM1024, \
+                     X25519, secp256r1, secp384r1"
+                    ))
+                    .into());
+                }
+            };
+        result.push(group);
+    }
+
+    if result.is_empty() {
+        return Err(ConfigError::Other("--kx-groups must not be empty".to_string()).into());
+    }
+
+    Ok(result)
+}
+
 /// Returns `true` if the installed crypto provider supports post-quantum
 /// key exchange groups (specifically `X25519MLKEM768`).
 pub fn is_pq_provider_active() -> bool {

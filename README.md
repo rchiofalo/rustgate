@@ -254,6 +254,7 @@ All flags support environment variables (CLI takes precedence):
 | `--max-concurrent-handshakes` | `RUSTGATE_MAX_HANDSHAKES` | `100` |
 | `--fips-required` | `RUSTGATE_FIPS_REQUIRED` | `false` |
 | `--prefer-post-quantum` | `RUSTGATE_PREFER_POST_QUANTUM` | `false` |
+| `--kx-groups` | `RUSTGATE_KX_GROUPS` | — (provider default) |
 | `--framing` | `RUSTGATE_FRAMING` | `xml` |
 | `--encoding` | `RUSTGATE_ENCODING` | `raw` |
 | `--max-connections` | `RUSTGATE_MAX_CONNECTIONS` | `1024` |

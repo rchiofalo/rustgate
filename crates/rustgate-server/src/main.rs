@@ -72,7 +72,11 @@ fn main() -> anyhow::Result<()> {
     // When both `post-quantum` and `fips` are enabled, the PQ provider
     // includes FIPS validation (same aws-lc-rs backend) plus PQ KX groups.
     #[cfg(feature = "post-quantum")]
-    rustgate_transport::install_pq_provider()?;
+    if let Some(ref groups) = cli.kx_groups {
+        rustgate_transport::install_provider_with_kx_groups(groups)?;
+    } else {
+        rustgate_transport::install_pq_provider()?;
+    }
 
     #[cfg(all(feature = "fips", not(feature = "post-quantum")))]
     rustgate_transport::install_fips_provider()?;
@@ -96,6 +100,14 @@ fn main() -> anyhow::Result<()> {
         tracing::warn!(
             "--prefer-post-quantum set but the post-quantum feature is not compiled in; \
              rebuild with --features post-quantum to enable PQ key exchange"
+        );
+    }
+
+    #[cfg(not(feature = "post-quantum"))]
+    if cli.kx_groups.is_some() {
+        tracing::warn!(
+            "--kx-groups set but the post-quantum feature is not compiled in; \
+             rebuild with --features post-quantum to enable custom key exchange groups"
         );
     }
 
