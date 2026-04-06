@@ -45,7 +45,10 @@ fn main() -> anyhow::Result<()> {
         let writer: std::sync::Mutex<Box<dyn std::io::Write + Send>> = if audit_path == "-" {
             std::sync::Mutex::new(Box::new(std::io::stdout()))
         } else {
-            let file = std::fs::File::create(audit_path)
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(audit_path)
                 .map_err(|e| anyhow::anyhow!("failed to open audit log {audit_path}: {e}"))?;
             std::sync::Mutex::new(Box::new(file))
         };
