@@ -19,7 +19,7 @@ pub(crate) struct GroupAclFile {
 /// Backward-compatible: legacy files using only `send` and `receive`
 /// continue to deserialize unchanged (the new `deny_*` fields default
 /// to empty sets via `#[serde(default)]`).
-#[derive(Debug, Default, Deserialize, serde::Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub(crate) struct GroupAclEntry {
     /// Certificate CNs permitted to send messages to this group.
     #[serde(default)]
