@@ -240,3 +240,91 @@ async fn fips_with_crl_rejects_revoked() {
         "server should timeout — revoked client under FIPS + CRL"
     );
 }
+
+/// Verify that negotiated TLS parameters (protocol version and cipher suite)
+/// are FIPS-approved at the connection level after a successful handshake.
+#[tokio::test]
+async fn fips_server_config_reports_fips() {
+    ensure_fips();
+
+    let ca = TestCa::new("FIPS Config CA");
+    let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
+    let client_cert = ca.issue_client_cert("config-check", &["team"]);
+
+    let tls_config = TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
+        .expect("tls config");
+
+    let listener = TlsListener::bind("127.0.0.1:0", &tls_config)
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    let server_handle = tokio::spawn(async move {
+        let _session = listener.accept().await.expect("accept");
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    });
+
+    let config = build_client_tls_config(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem);
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let tcp = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("tcp connect");
+    let server_name = "localhost".try_into().expect("server name");
+    let stream = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("tls connect");
+
+    let (_, conn) = stream.get_ref();
+
+    // Protocol version must be TLS 1.2 or 1.3 — both are FIPS-approved.
+    let version = conn
+        .protocol_version()
+        .expect("should have negotiated a protocol version");
+    assert!(
+        version == rustls::ProtocolVersion::TLSv1_2 || version == rustls::ProtocolVersion::TLSv1_3,
+        "negotiated protocol version {version:?} is not FIPS-approved (expected TLS 1.2 or 1.3)"
+    );
+
+    // Cipher suite must be AES-based (FIPS-approved suites use AES-GCM).
+    let suite = conn
+        .negotiated_cipher_suite()
+        .expect("should have negotiated a cipher suite");
+    let suite_name = format!("{:?}", suite.suite());
+    assert!(
+        suite_name.contains("AES"),
+        "negotiated cipher suite {suite_name} is not FIPS-approved (expected AES-based suite)"
+    );
+
+    // Verify peer certificates are accessible on the connection.
+    assert!(
+        conn.peer_certificates().is_some(),
+        "peer certificates should be available after mTLS handshake"
+    );
+
+    server_handle.abort();
+}
+
+/// Verify the FIPS crypto provider does not offer ChaCha20-Poly1305 cipher
+/// suites. ChaCha20 is not NIST-approved and must be excluded from the FIPS
+/// provider's cipher suite list.
+#[test]
+fn fips_provider_excludes_chacha20() {
+    ensure_fips();
+
+    let provider =
+        rustls::crypto::CryptoProvider::get_default().expect("crypto provider should be installed");
+
+    let suite_names: Vec<String> = provider
+        .cipher_suites
+        .iter()
+        .map(|s| format!("{:?}", s.suite()))
+        .collect();
+
+    for name in &suite_names {
+        assert!(
+            !name.contains("CHACHA20"),
+            "FIPS provider must not offer ChaCha20-Poly1305, but found: {name}"
+        );
+    }
+}
