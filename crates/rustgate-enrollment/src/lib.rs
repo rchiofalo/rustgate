@@ -13,6 +13,7 @@ mod handlers;
 pub mod pkcs12;
 pub mod ratelimit;
 pub mod response;
+pub mod revocation;
 pub mod server;
 pub mod signing;
 
@@ -20,5 +21,6 @@ pub use auth::Credentials;
 pub use contacts::{ContactInfo, ContactsProvider, cached_contacts_provider};
 pub use datapackage::DataPackageStore;
 pub use error::EnrollmentError;
+pub use revocation::RevocationStore;
 pub use server::EnrollmentServer;
 pub use signing::CsrSigner;

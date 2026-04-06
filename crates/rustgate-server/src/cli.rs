@@ -179,6 +179,17 @@ pub(crate) struct Cli {
     )]
     pub(crate) package_strict_signatures: bool,
 
+    /// Path to the certificate revocation database (JSON file).
+    /// Enables the `/api/revoke`, `/api/crl`, and `/api/revoked` endpoints
+    /// on the enrollment server. Revoked certificates are persisted to this
+    /// file and used to generate CRLs signed by the enrollment CA.
+    #[arg(long, env = "RUSTGATE_REVOCATION_DB")]
+    pub(crate) revocation_db: Option<String>,
+
+    /// CRL validity period in days (default 7).
+    #[arg(long, default_value_t = 7, env = "RUSTGATE_CRL_VALIDITY_DAYS")]
+    pub(crate) crl_validity_days: u32,
+
     /// Bind address for the Prometheus metrics HTTP server (e.g. 0.0.0.0:9090).
     /// Requires --features metrics.
     #[arg(long, env = "RUSTGATE_METRICS_BIND", value_parser = parse_socket_addr)]

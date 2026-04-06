@@ -33,8 +33,9 @@ use crate::contacts::ContactsProvider;
 use crate::datapackage::DataPackageStore;
 use crate::error::EnrollmentError;
 use crate::handlers::util::build_response;
-use crate::handlers::{api, packages, sign};
+use crate::handlers::{api, packages, revoke, sign};
 use crate::ratelimit::RateLimiter;
+use crate::revocation::RevocationStore;
 use crate::signing::CsrSigner;
 
 /// Maximum CSR signing requests per IP per minute.
@@ -49,6 +50,7 @@ pub struct EnrollmentServer {
     credentials: Arc<Credentials>,
     contacts_provider: Option<ContactsProvider>,
     packages: Option<Arc<DataPackageStore>>,
+    revocation: Option<Arc<RevocationStore>>,
     sign_limiter: Arc<RateLimiter>,
 }
 
@@ -59,6 +61,7 @@ impl std::fmt::Debug for EnrollmentServer {
             .field("credentials", &self.credentials)
             .field("contacts_provider", &self.contacts_provider.is_some())
             .field("packages", &self.packages.is_some())
+            .field("revocation", &self.revocation.is_some())
             .finish()
     }
 }
@@ -70,6 +73,7 @@ impl EnrollmentServer {
             credentials: Arc::new(credentials),
             contacts_provider: None,
             packages: None,
+            revocation: None,
             sign_limiter: Arc::new(RateLimiter::new(SIGN_RATE_LIMIT, SIGN_RATE_WINDOW)),
         }
     }
@@ -83,6 +87,12 @@ impl EnrollmentServer {
     /// Enable data package storage at the given store.
     pub fn with_packages(mut self, store: DataPackageStore) -> Self {
         self.packages = Some(Arc::new(store));
+        self
+    }
+
+    /// Enable certificate revocation and CRL generation.
+    pub fn with_revocation(mut self, store: RevocationStore) -> Self {
+        self.revocation = Some(Arc::new(store));
         self
     }
 
@@ -135,6 +145,7 @@ impl EnrollmentServer {
             let credentials = Arc::clone(&self.credentials);
             let contacts = self.contacts_provider.clone();
             let packages = self.packages.clone();
+            let revocation = self.revocation.clone();
             let sign_limiter = Arc::clone(&self.sign_limiter);
 
             drop(tokio::spawn(async move {
@@ -175,6 +186,7 @@ impl EnrollmentServer {
                     let credentials = Arc::clone(&credentials);
                     let contacts = contacts.clone();
                     let packages = packages.clone();
+                    let revocation = revocation.clone();
                     let sign_limiter = Arc::clone(&sign_limiter);
                     async move {
                         handle_request(
@@ -184,6 +196,7 @@ impl EnrollmentServer {
                             &credentials,
                             contacts.as_ref(),
                             packages.as_deref(),
+                            revocation.as_deref(),
                             &sign_limiter,
                         )
                         .await
@@ -200,6 +213,7 @@ impl EnrollmentServer {
 }
 
 /// Route an incoming HTTP request to the appropriate handler.
+#[allow(clippy::too_many_arguments)]
 async fn handle_request(
     req: Request<hyper::body::Incoming>,
     peer: SocketAddr,
@@ -207,6 +221,7 @@ async fn handle_request(
     credentials: &Credentials,
     contacts: Option<&ContactsProvider>,
     packages: Option<&DataPackageStore>,
+    revocation: Option<&RevocationStore>,
     sign_limiter: &RateLimiter,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let path = req.uri().path();
@@ -254,6 +269,33 @@ async fn handle_request(
         (&Method::GET, "/Marti/sync/search") => {
             packages::handle_package_search(req, packages).await
         }
+
+        (&Method::POST, "/api/revoke") => match revocation {
+            Some(store) => revoke::handle_revoke(req, peer, credentials, store).await,
+            None => build_response(
+                StatusCode::NOT_FOUND,
+                "text/plain",
+                Bytes::from("revocation not enabled"),
+            ),
+        },
+
+        (&Method::GET, "/api/crl") => match revocation {
+            Some(store) => revoke::handle_crl(store).await,
+            None => build_response(
+                StatusCode::NOT_FOUND,
+                "text/plain",
+                Bytes::from("revocation not enabled"),
+            ),
+        },
+
+        (&Method::GET, "/api/revoked") => match revocation {
+            Some(store) => revoke::handle_list_revoked(store).await,
+            None => build_response(
+                StatusCode::NOT_FOUND,
+                "text/plain",
+                Bytes::from("revocation not enabled"),
+            ),
+        },
 
         _ => build_response(
             StatusCode::NOT_FOUND,
