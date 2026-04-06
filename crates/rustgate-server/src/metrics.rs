@@ -49,6 +49,8 @@ static NATS_PUBLISHES: OnceLock<IntCounter> = OnceLock::new();
 
 static NEGOTIATIONS: OnceLock<IntCounterVec> = OnceLock::new();
 
+static HANDSHAKE_FAILURES: OnceLock<IntCounterVec> = OnceLock::new();
+
 // ── Fallback constructors ───────────────────────────────────────────
 //
 // When `init()` has not been called, accessor functions lazily create
@@ -175,6 +177,16 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(negotiations.clone()))?;
     let _ = NEGOTIATIONS.set(negotiations);
 
+    let handshake_failures = IntCounterVec::new(
+        Opts::new(
+            "rustgate_handshake_failures_total",
+            "TLS handshake failures by reason",
+        ),
+        &["reason"],
+    )?;
+    registry.register(Box::new(handshake_failures.clone()))?;
+    let _ = HANDSHAKE_FAILURES.set(handshake_failures);
+
     Ok(())
 }
 
@@ -246,6 +258,40 @@ pub fn negotiations() -> &'static IntCounterVec {
     NEGOTIATIONS.get_or_init(|| {
         fallback_counter_vec("rustgate_negotiations_total", "fallback", &["result"])
     })
+}
+
+pub fn handshake_failures() -> &'static IntCounterVec {
+    HANDSHAKE_FAILURES.get_or_init(|| {
+        fallback_counter_vec("rustgate_handshake_failures_total", "fallback", &["reason"])
+    })
+}
+
+/// Classify a TLS handshake error into a metric label.
+///
+/// Maps common TLS error strings to well-known reason labels for the
+/// `rustgate_handshake_failures_total` metric. Unknown errors are
+/// bucketed under `"other"`.
+pub fn classify_handshake_error(error: &str) -> &'static str {
+    let lower = error.to_lowercase();
+    if lower.contains("expired") || lower.contains("not yet valid") {
+        "expired_cert"
+    } else if lower.contains("revoked") {
+        "revoked_cert"
+    } else if lower.contains("unknown ca")
+        || lower.contains("untrusted")
+        || lower.contains("ca certificate")
+    {
+        "wrong_ca"
+    } else if lower.contains("key usage")
+        || lower.contains("eku")
+        || lower.contains("extended key usage")
+    {
+        "eku_mismatch"
+    } else if lower.contains("timeout") || lower.contains("timed out") {
+        "timeout"
+    } else {
+        "other"
+    }
 }
 
 // ── HTTP server ─────────────────────────────────────────────────────
@@ -429,6 +475,7 @@ mod tests {
         let _ = sessions_active();
         let _ = nats_publishes();
         let _ = negotiations();
+        let _ = handshake_failures();
     }
 
     #[test]
@@ -546,5 +593,87 @@ mod tests {
     fn internal_error_response_returns_500() {
         let resp = internal_error_response();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn classify_handshake_error_expired() {
+        assert_eq!(
+            classify_handshake_error("certificate has expired"),
+            "expired_cert"
+        );
+        assert_eq!(
+            classify_handshake_error("cert not yet valid"),
+            "expired_cert"
+        );
+    }
+
+    #[test]
+    fn classify_handshake_error_revoked() {
+        assert_eq!(
+            classify_handshake_error("certificate revoked by CRL"),
+            "revoked_cert"
+        );
+    }
+
+    #[test]
+    fn classify_handshake_error_wrong_ca() {
+        assert_eq!(classify_handshake_error("unknown ca in chain"), "wrong_ca");
+        assert_eq!(
+            classify_handshake_error("peer sent untrusted cert"),
+            "wrong_ca"
+        );
+        assert_eq!(
+            classify_handshake_error("invalid CA certificate"),
+            "wrong_ca"
+        );
+    }
+
+    #[test]
+    fn classify_handshake_error_eku_mismatch() {
+        assert_eq!(
+            classify_handshake_error("extended key usage violation"),
+            "eku_mismatch"
+        );
+        assert_eq!(
+            classify_handshake_error("invalid key usage bits"),
+            "eku_mismatch"
+        );
+        assert_eq!(
+            classify_handshake_error("wrong EKU on client cert"),
+            "eku_mismatch"
+        );
+    }
+
+    #[test]
+    fn classify_handshake_error_timeout() {
+        assert_eq!(classify_handshake_error("connection timed out"), "timeout");
+        assert_eq!(
+            classify_handshake_error("handshake timeout reached"),
+            "timeout"
+        );
+    }
+
+    #[test]
+    fn classify_handshake_error_other() {
+        assert_eq!(classify_handshake_error("some unknown error"), "other");
+        assert_eq!(classify_handshake_error(""), "other");
+    }
+
+    #[test]
+    fn handshake_failures_counter_vec() {
+        ensure_init();
+
+        let before = handshake_failures()
+            .with_label_values(&["expired_cert"])
+            .get();
+        handshake_failures()
+            .with_label_values(&["expired_cert"])
+            .inc();
+        assert_eq!(
+            handshake_failures()
+                .with_label_values(&["expired_cert"])
+                .get(),
+            before + 1
+        );
     }
 }

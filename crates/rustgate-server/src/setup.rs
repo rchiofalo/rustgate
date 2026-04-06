@@ -139,7 +139,7 @@ pub(crate) async fn bind_tls_listener(
     cli: &Cli,
     tls_config: &TlsConfig,
 ) -> anyhow::Result<TlsListener> {
-    if cli.cert_reload_interval > 0 {
+    let mut listener = if cli.cert_reload_interval > 0 {
         let reloader =
             CertReloader::new(&cli.cert, &cli.key).context("initializing certificate reloader")?;
 
@@ -162,12 +162,23 @@ pub(crate) async fn bind_tls_listener(
             cli.max_concurrent_handshakes,
         )
         .await
-        .context("binding TLS listener with cert reloader")
+        .context("binding TLS listener with cert reloader")?
     } else {
         TlsListener::bind_with_handshake_limit(&cli.bind, tls_config, cli.max_concurrent_handshakes)
             .await
-            .context("binding TLS listener")
-    }
+            .context("binding TLS listener")?
+    };
+
+    #[cfg(feature = "metrics")]
+    listener.set_on_handshake_error(Arc::new(|_peer_addr, error| {
+        let reason = metrics::classify_handshake_error(error);
+        metrics::accept_errors().inc();
+        metrics::handshake_failures()
+            .with_label_values(&[reason])
+            .inc();
+    }));
+
+    Ok(listener)
 }
 
 /// Validate framing/encoding feature requirements and consistency at startup.

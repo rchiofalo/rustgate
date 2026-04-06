@@ -298,7 +298,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     }
                     Err(e) => {
                         #[cfg(feature = "metrics")]
-                        metrics::accept_errors().inc();
+                        {
+                            metrics::accept_errors().inc();
+                            let reason = metrics::classify_handshake_error(&e.to_string());
+                            metrics::handshake_failures()
+                                .with_label_values(&[reason])
+                                .inc();
+                        }
                         tracing::warn!(error = %e, "accept error");
                     }
                 }

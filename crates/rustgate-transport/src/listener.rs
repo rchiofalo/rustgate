@@ -14,6 +14,12 @@ use crate::config::TlsConfig;
 use crate::extract::{ExpectedKeyUsage, extract_identity, validate_key_usage};
 use crate::session::AuthenticatedSession;
 
+/// Callback invoked when a TLS handshake fails.
+///
+/// Receives the peer address and the error message string, allowing the
+/// caller to classify and record the failure (e.g. for metrics).
+pub type OnHandshakeError = Arc<dyn Fn(SocketAddr, &str) + Send + Sync>;
+
 /// Default maximum number of concurrent TLS handshakes when no limit is specified.
 pub const DEFAULT_MAX_HANDSHAKES: usize = 100;
 
@@ -24,6 +30,8 @@ pub struct TlsListener {
     /// Each handshake acquires a permit before starting and releases it
     /// once the handshake completes (successfully or not).
     handshake_semaphore: Arc<Semaphore>,
+    /// Optional callback invoked on TLS handshake failures.
+    on_handshake_error: Option<OnHandshakeError>,
 }
 
 impl std::fmt::Debug for TlsListener {
@@ -87,7 +95,17 @@ impl TlsListener {
             tcp_listener,
             tls_acceptor,
             handshake_semaphore: Arc::new(Semaphore::new(max_concurrent_handshakes)),
+            on_handshake_error: None,
         })
+    }
+
+    /// Register a callback invoked whenever a TLS handshake fails.
+    ///
+    /// The callback receives the peer address and the error message,
+    /// allowing the caller to classify and record failure reasons
+    /// (e.g. for Prometheus metrics).
+    pub fn set_on_handshake_error(&mut self, cb: OnHandshakeError) {
+        self.on_handshake_error = Some(cb);
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
@@ -148,7 +166,11 @@ impl TlsListener {
                 Ok(stream) => stream,
                 Err(e) => {
                     // Permit is released here when `_permit` is dropped.
-                    rustgate_core::audit::tls_accept_error(peer_addr, &e.to_string());
+                    let err_msg = e.to_string();
+                    rustgate_core::audit::tls_accept_error(peer_addr, &err_msg);
+                    if let Some(ref cb) = self.on_handshake_error {
+                        cb(peer_addr, &err_msg);
+                    }
                     warn!(peer_addr = %peer_addr, error = %e, "TLS handshake failed");
                     continue;
                 }
