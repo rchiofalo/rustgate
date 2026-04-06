@@ -20,7 +20,7 @@ static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
 pub const DEFAULT_MAX_CONSECUTIVE_DROPS: u32 = 10;
 
 /// Capacity for the high-priority channel (Position and Alert messages).
-pub const PRIORITY_CHANNEL_CAPACITY: usize = 16;
+pub const PRIORITY_CHANNEL_CAPACITY: usize = 64;
 
 /// Capacity for the normal-priority channel (all other message types).
 pub const NORMAL_CHANNEL_CAPACITY: usize = 64;
