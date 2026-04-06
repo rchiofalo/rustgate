@@ -72,6 +72,15 @@ pub(crate) async fn handle_revoke(
         );
     }
 
+    // Validate serial is hex-only to prevent JSON injection in responses.
+    if !request.serial.chars().all(|c| c.is_ascii_hexdigit()) {
+        return build_response(
+            StatusCode::BAD_REQUEST,
+            "application/json",
+            Bytes::from(r#"{"error":"serial must be hex characters only"}"#),
+        );
+    }
+
     // Perform revocation
     match revocation
         .revoke(&request.serial, &request.reason, username)
