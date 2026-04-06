@@ -14,7 +14,7 @@ use rustgate_core::{PeerId, audit};
 use rustls::RootCertStore;
 #[cfg(feature = "v2")]
 use tokio::task::JoinHandle;
-use tracing::{Instrument, debug, error, info, warn};
+use tracing::{Instrument, error, info, warn};
 
 use crate::config::FederationConfig;
 use crate::connector::{OutboundConnector, PeerConnector};
@@ -467,7 +467,7 @@ impl FederationManager {
                     }
                 }),
                 Arc::new(move |peer_id: String, stale_fence: u64| {
-                    debug!(
+                    tracing::debug!(
                         peer_id = %peer_id,
                         stale_fence = stale_fence,
                         "claim lost, queuing disconnect"
