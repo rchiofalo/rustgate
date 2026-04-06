@@ -252,7 +252,12 @@ impl WsListener {
                 }
             };
 
-            debug!(peer_addr = %peer_addr, "TLS handshake completed");
+            let kx_group = tls_stream
+                .get_ref()
+                .1
+                .negotiated_key_exchange_group()
+                .map(|g| g.name());
+            debug!(peer_addr = %peer_addr, kx_group = ?kx_group, "TLS handshake completed");
 
             let identity = match extract_client_identity(&tls_stream) {
                 Ok(id) => id,

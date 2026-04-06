@@ -190,6 +190,7 @@ cargo build --release --features websocket      # WebSocket listener
 cargo build --release --features metrics        # Prometheus + health endpoints
 cargo build --release --features jemalloc       # jemalloc allocator (musl)
 cargo build --release --features fips           # FIPS 140-3 crypto (needs Go + cmake)
+cargo build --release --features post-quantum  # PQ key exchange (needs Go + cmake)
 cargo build --release --features otel           # OpenTelemetry tracing (needs protoc)
 
 # All features
@@ -209,6 +210,7 @@ cargo build --release --all-features
 | `metrics` | Prometheus metrics | — |
 | `full-detail` | Extended CoT parsing | — |
 | `fips` | FIPS 140-3 crypto (aws-lc-rs) | Go 1.20+, cmake |
+| `post-quantum` | Post-quantum key exchange (X25519MLKEM768) | Go 1.20+, cmake |
 | `otel` | OpenTelemetry distributed tracing | `protoc` |
 | `jemalloc` | jemalloc allocator | — |
 
@@ -251,6 +253,7 @@ All flags support environment variables (CLI takes precedence):
 | `--cert-reload-interval` | `RUSTGATE_CERT_RELOAD_INTERVAL` | `0` (disabled) |
 | `--max-concurrent-handshakes` | `RUSTGATE_MAX_HANDSHAKES` | `100` |
 | `--fips-required` | `RUSTGATE_FIPS_REQUIRED` | `false` |
+| `--prefer-post-quantum` | `RUSTGATE_PREFER_POST_QUANTUM` | `false` |
 | `--framing` | `RUSTGATE_FRAMING` | `xml` |
 | `--encoding` | `RUSTGATE_ENCODING` | `raw` |
 | `--max-connections` | `RUSTGATE_MAX_CONNECTIONS` | `1024` |

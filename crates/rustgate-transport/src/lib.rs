@@ -23,7 +23,11 @@ pub use codec::{FramedCodec, LengthPrefixedCodec, LineDelimitedCodec, XmlStreamC
 pub use codecs::{RawLengthPrefixedCodec, RawLineCodec, TakXmlCodec};
 #[cfg(feature = "fips")]
 pub use config::install_fips_provider;
-pub use config::{TlsConfig, TlsMinVersion, check_crl_freshness, is_fips_provider_active};
+#[cfg(feature = "post-quantum")]
+pub use config::install_pq_provider;
+pub use config::{
+    TlsConfig, TlsMinVersion, check_crl_freshness, is_fips_provider_active, is_pq_provider_active,
+};
 pub use extract::{ExpectedKeyUsage, extract_identity, validate_key_usage};
 pub use filter::{GeoBounds, MessageFilter};
 pub use listener::{DEFAULT_MAX_HANDSHAKES, TlsListener};

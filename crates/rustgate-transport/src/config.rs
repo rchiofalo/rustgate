@@ -331,6 +331,41 @@ pub fn is_fips_provider_active() -> bool {
         .unwrap_or(false)
 }
 
+/// Install the post-quantum crypto provider (aws-lc-rs with ML-KEM key exchange).
+///
+/// Uses `X25519MLKEM768` as the highest-priority key exchange group when
+/// `prefer-post-quantum` is enabled in rustls. Clients that don't support
+/// ML-KEM fall back to X25519 transparently.
+///
+/// Must be called once before any TLS operations. Replaces the default
+/// `ring` backend with `aws-lc-rs`.
+///
+/// Returns an error if a crypto provider is already installed.
+#[cfg(feature = "post-quantum")]
+pub fn install_pq_provider() -> Result<()> {
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .map_err(|_| {
+            RustgateError::from(ConfigError::Other(
+                "crypto provider already installed".to_string(),
+            ))
+        })?;
+
+    tracing::info!("post-quantum crypto provider (aws-lc-rs) installed — X25519MLKEM768 preferred");
+    Ok(())
+}
+
+/// Returns `true` if the installed crypto provider supports post-quantum
+/// key exchange groups (specifically `X25519MLKEM768`).
+pub fn is_pq_provider_active() -> bool {
+    rustls::crypto::CryptoProvider::get_default()
+        .map(|p| {
+            p.kx_groups
+                .iter()
+                .any(|g| (*g).name() == rustls::NamedGroup::X25519MLKEM768)
+        })
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::panic, clippy::unwrap_used)]

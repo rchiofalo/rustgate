@@ -19,6 +19,7 @@ v2 = ["dep:tonic", "dep:tonic-prost", "dep:tokio-stream", "dep:prost-types", "de
 ha = ["dep:async-nats"]
 api = ["dep:hyper", "dep:http-body-util", "dep:prometheus"]
 fips = ["rustls/aws_lc_rs", "rustls/fips", "tonic?/tls-aws-lc"]
+post-quantum = ["rustls/aws_lc_rs", "rustls/prefer-post-quantum", "tonic?/tls-aws-lc"]
 
 [dependencies]
 rustgate-core = { workspace = true }
