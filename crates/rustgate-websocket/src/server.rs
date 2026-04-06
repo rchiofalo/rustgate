@@ -21,9 +21,6 @@ use tracing::{debug, info, warn};
 
 use crate::{WsListener, WsSession, WsStream};
 
-/// Bounded channel capacity for outbound messages per session.
-const CHANNEL_CAPACITY: usize = 64;
-
 /// Callback for NATS publishing after local routing.
 ///
 /// The closure spawns async work internally (fire-and-forget).
@@ -169,11 +166,19 @@ async fn handle_ws_session(
         "WebSocket session started"
     );
 
-    let (tx, mut rx) = mpsc::channel::<Arc<RoutableMessage>>(CHANNEL_CAPACITY);
+    let (priority_tx, mut priority_rx) =
+        mpsc::channel::<Arc<RoutableMessage>>(rustgate_transport::PRIORITY_CHANNEL_CAPACITY);
+    let (normal_tx, mut normal_rx) =
+        mpsc::channel::<Arc<RoutableMessage>>(rustgate_transport::NORMAL_CHANNEL_CAPACITY);
     let handle = if circuit_breaker_threshold > 0 {
-        SessionHandle::with_drop_threshold(Arc::clone(&identity), tx, circuit_breaker_threshold)
+        SessionHandle::with_drop_threshold(
+            Arc::clone(&identity),
+            priority_tx,
+            normal_tx,
+            circuit_breaker_threshold,
+        )
     } else {
-        SessionHandle::with_drop_threshold(Arc::clone(&identity), tx, u32::MAX)
+        SessionHandle::with_drop_threshold(Arc::clone(&identity), priority_tx, normal_tx, u32::MAX)
     };
     let session_id = handle.id;
 
@@ -199,7 +204,7 @@ async fn handle_ws_session(
         let router = Arc::clone(&router);
         tokio::select! {
             r = ws_read_loop(ws_read, &identity, &router, nats_publish.as_ref(), fed_forward.as_ref(), &throttle, &replay_filter, &mut ws_rate_limiter) => r,
-            r = ws_write_loop(ws_write, &mut rx, &*codec) => r,
+            r = ws_write_loop(ws_write, &mut priority_rx, &mut normal_rx, &*codec) => r,
         }
     };
 
@@ -300,12 +305,25 @@ async fn ws_read_loop(
     }
 }
 
+/// Write loop for WebSocket sessions with biased priority drain.
+///
+/// Always checks the priority channel (Position and Alert messages)
+/// before the normal channel, ensuring time-sensitive messages are
+/// delivered first.
 async fn ws_write_loop(
     mut ws_write: SplitSink<WsStream, Message>,
-    rx: &mut mpsc::Receiver<Arc<RoutableMessage>>,
+    priority_rx: &mut mpsc::Receiver<Arc<RoutableMessage>>,
+    normal_rx: &mut mpsc::Receiver<Arc<RoutableMessage>>,
     codec: &dyn Codec,
 ) -> Result<(), String> {
-    while let Some(msg) = rx.recv().await {
+    loop {
+        let msg = tokio::select! {
+            biased;
+            msg = priority_rx.recv() => msg,
+            msg = normal_rx.recv() => msg,
+        };
+        let Some(msg) = msg else { break };
+
         let encoded = match codec.encode_payload(&msg) {
             Ok(bytes) => bytes,
             Err(e) => {

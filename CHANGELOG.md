@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Message priority channels** — replaced the single per-session mpsc channel with a dual-channel approach: a high-priority channel (capacity 16) for Position and Alert messages, and a normal-priority channel (capacity 64) for all other message types. Write loops use biased `tokio::select!` to always drain priority messages first, ensuring time-sensitive situational awareness data is delivered ahead of bulk traffic. The circuit breaker applies across both channels. (#519)
+
 ## [0.7.0] - 2026-04-05
 
 ### Added

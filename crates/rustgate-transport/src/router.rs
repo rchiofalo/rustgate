@@ -19,21 +19,37 @@ static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
 /// trips and disconnects the session.
 pub const DEFAULT_MAX_CONSECUTIVE_DROPS: u32 = 10;
 
+/// Capacity for the high-priority channel (Position and Alert messages).
+pub const PRIORITY_CHANNEL_CAPACITY: usize = 16;
+
+/// Capacity for the normal-priority channel (all other message types).
+pub const NORMAL_CHANNEL_CAPACITY: usize = 64;
+
 #[derive(Debug, Clone)]
 pub struct SessionHandle {
     pub id: u64,
     pub identity: Arc<Identity>,
-    sender: Arc<Mutex<Option<mpsc::Sender<Arc<RoutableMessage>>>>>,
+    priority_sender: Arc<Mutex<Option<mpsc::Sender<Arc<RoutableMessage>>>>>,
+    normal_sender: Arc<Mutex<Option<mpsc::Sender<Arc<RoutableMessage>>>>>,
     consecutive_drops: Arc<AtomicU32>,
     max_consecutive_drops: u32,
 }
 
 impl SessionHandle {
-    pub fn new(identity: Arc<Identity>, sender: mpsc::Sender<Arc<RoutableMessage>>) -> Self {
+    /// Create a new session handle with dual priority channels.
+    ///
+    /// `priority_sender` carries Position and Alert messages (capacity 16).
+    /// `normal_sender` carries all other message types (capacity 64).
+    pub fn new(
+        identity: Arc<Identity>,
+        priority_sender: mpsc::Sender<Arc<RoutableMessage>>,
+        normal_sender: mpsc::Sender<Arc<RoutableMessage>>,
+    ) -> Self {
         Self {
             id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             identity,
-            sender: Arc::new(Mutex::new(Some(sender))),
+            priority_sender: Arc::new(Mutex::new(Some(priority_sender))),
+            normal_sender: Arc::new(Mutex::new(Some(normal_sender))),
             consecutive_drops: Arc::new(AtomicU32::new(0)),
             max_consecutive_drops: DEFAULT_MAX_CONSECUTIVE_DROPS,
         }
@@ -45,16 +61,26 @@ impl SessionHandle {
     /// sends. Use `u32::MAX` to effectively disable the circuit breaker.
     pub fn with_drop_threshold(
         identity: Arc<Identity>,
-        sender: mpsc::Sender<Arc<RoutableMessage>>,
+        priority_sender: mpsc::Sender<Arc<RoutableMessage>>,
+        normal_sender: mpsc::Sender<Arc<RoutableMessage>>,
         threshold: u32,
     ) -> Self {
         Self {
             id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             identity,
-            sender: Arc::new(Mutex::new(Some(sender))),
+            priority_sender: Arc::new(Mutex::new(Some(priority_sender))),
+            normal_sender: Arc::new(Mutex::new(Some(normal_sender))),
             consecutive_drops: Arc::new(AtomicU32::new(0)),
             max_consecutive_drops: threshold,
         }
+    }
+
+    /// Returns `true` if the message type is high-priority (Position or Alert).
+    fn is_priority(msg: &RoutableMessage) -> bool {
+        matches!(
+            msg.metadata.message_type,
+            MessageType::Position | MessageType::Alert
+        )
     }
 
     /// Send a shared message reference to this session.
@@ -63,13 +89,21 @@ impl SessionHandle {
     /// share a single allocation instead of cloning the full
     /// `RoutableMessage` per recipient.
     ///
+    /// Position and Alert messages are routed to the priority channel;
+    /// all other types use the normal channel.
+    ///
     /// If the circuit breaker has tripped, returns `Err` immediately.
     pub async fn send(
         &self,
         msg: Arc<RoutableMessage>,
     ) -> Result<(), mpsc::error::SendError<Arc<RoutableMessage>>> {
         let sender = {
-            let guard = self.sender.lock();
+            let source = if Self::is_priority(&msg) {
+                &self.priority_sender
+            } else {
+                &self.normal_sender
+            };
+            let guard = source.lock();
             match guard.as_ref() {
                 Some(s) => s.clone(),
                 None => return Err(mpsc::error::SendError(msg)),
@@ -92,7 +126,12 @@ impl SessionHandle {
     /// enqueued, `false` if the channel is full, disconnected, or the
     /// circuit breaker has tripped.
     pub fn try_send(&self, msg: Arc<RoutableMessage>) -> bool {
-        let mut guard = self.sender.lock();
+        let source = if Self::is_priority(&msg) {
+            &self.priority_sender
+        } else {
+            &self.normal_sender
+        };
+        let mut guard = source.lock();
         let sender = match guard.as_ref() {
             Some(s) => s,
             None => return false,
@@ -112,6 +151,14 @@ impl SessionHandle {
                         "circuit breaker tripped: disconnecting slow session"
                     );
                     *guard = None;
+                    // Also close the other channel
+                    let other = if Arc::ptr_eq(source, &self.priority_sender) {
+                        &self.normal_sender
+                    } else {
+                        &self.priority_sender
+                    };
+                    let mut other_guard = other.lock();
+                    *other_guard = None;
                 }
                 false
             }
@@ -128,14 +175,16 @@ impl SessionHandle {
                 threshold = self.max_consecutive_drops,
                 "circuit breaker tripped: disconnecting slow session"
             );
-            let mut guard = self.sender.lock();
-            *guard = None;
+            let mut priority_guard = self.priority_sender.lock();
+            *priority_guard = None;
+            let mut normal_guard = self.normal_sender.lock();
+            *normal_guard = None;
         }
     }
 
     /// Returns `true` if the circuit breaker has not tripped.
     pub fn is_alive(&self) -> bool {
-        self.sender.lock().is_some()
+        self.priority_sender.lock().is_some() || self.normal_sender.lock().is_some()
     }
 }
 
@@ -548,6 +597,21 @@ mod tests {
         )
     }
 
+    /// Create a dual-channel pair and return (priority_tx, normal_tx, priority_rx, normal_rx).
+    fn make_channels(
+        priority_cap: usize,
+        normal_cap: usize,
+    ) -> (
+        mpsc::Sender<Arc<RoutableMessage>>,
+        mpsc::Sender<Arc<RoutableMessage>>,
+        mpsc::Receiver<Arc<RoutableMessage>>,
+        mpsc::Receiver<Arc<RoutableMessage>>,
+    ) {
+        let (ptx, prx) = mpsc::channel(priority_cap);
+        let (ntx, nrx) = mpsc::channel(normal_cap);
+        (ptx, ntx, prx, nrx)
+    }
+
     fn make_position(source: &Arc<Identity>, dest: Destination) -> RoutableMessage {
         RoutableMessage {
             source: (**source).clone(),
@@ -557,6 +621,20 @@ mod tests {
                 received_at: SystemTime::now(),
                 source_protocol: "cot".to_string(),
                 message_type: MessageType::Position,
+                ttl: None,
+            },
+        }
+    }
+
+    fn make_alert(source: &Arc<Identity>, dest: Destination) -> RoutableMessage {
+        RoutableMessage {
+            source: (**source).clone(),
+            destination: dest,
+            payload: Bytes::from_static(b"<alert/>"),
+            metadata: Metadata {
+                received_at: SystemTime::now(),
+                source_protocol: "cot".to_string(),
+                message_type: MessageType::Alert,
                 ttl: None,
             },
         }
@@ -583,13 +661,15 @@ mod tests {
         let alice = make_identity("alice", &["alpha"]);
         let bob = make_identity("bob", &["bravo"]);
 
-        let (tx_a, mut rx_a) = mpsc::channel(16);
-        let (tx_b, _rx_b) = mpsc::channel(16);
+        let (ptx_a, ntx_a, _prx_a, mut nrx_a) = make_channels(16, 16);
+        let (ptx_b, ntx_b, _prx_b, _nrx_b) = make_channels(16, 16);
 
         router
-            .register(SessionHandle::new(alice.clone(), tx_a))
+            .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
             .await;
-        router.register(SessionHandle::new(bob.clone(), tx_b)).await;
+        router
+            .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+            .await;
 
         // Bob sends to group "alpha" — but bob is only in "bravo".
         // The router must reject this: sender is not a member of the
@@ -598,7 +678,7 @@ mod tests {
         router.route(msg).await;
 
         assert!(
-            rx_a.try_recv().is_err(),
+            nrx_a.try_recv().is_err(),
             "alice must not receive: bob is not in alpha and cannot send to it"
         );
     }
@@ -611,30 +691,32 @@ mod tests {
         let bob = make_identity("bob", &["alpha"]);
         let charlie = make_identity("charlie", &["bravo"]);
 
-        let (tx_a, mut rx_a) = mpsc::channel(16);
-        let (tx_b, _rx_b) = mpsc::channel(16);
-        let (tx_c, mut rx_c) = mpsc::channel(16);
+        let (ptx_a, ntx_a, _prx_a, mut nrx_a) = make_channels(16, 16);
+        let (ptx_b, ntx_b, _prx_b, _nrx_b) = make_channels(16, 16);
+        let (ptx_c, ntx_c, _prx_c, mut nrx_c) = make_channels(16, 16);
 
         router
-            .register(SessionHandle::new(alice.clone(), tx_a))
+            .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
             .await;
-        router.register(SessionHandle::new(bob.clone(), tx_b)).await;
         router
-            .register(SessionHandle::new(charlie.clone(), tx_c))
+            .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+            .await;
+        router
+            .register(SessionHandle::new(charlie.clone(), ptx_c, ntx_c))
             .await;
 
         // Bob sends to group "alpha" — bob IS a member
         let msg = make_chat(&bob, Destination::Group("alpha".to_string()));
         router.route(msg).await;
 
-        // Alice (in alpha) receives with correct payload
-        let received = rx_a.try_recv().expect("alice must receive: both in alpha");
+        // Alice (in alpha) receives chat on normal channel
+        let received = nrx_a.try_recv().expect("alice must receive: both in alpha");
         assert_eq!(received.payload.as_ref(), b"<chat/>");
         assert_eq!(received.source.cn, "bob");
 
         // Charlie (in bravo, not alpha) must NOT receive
         assert!(
-            rx_c.try_recv().is_err(),
+            nrx_c.try_recv().is_err(),
             "charlie must not receive: not in alpha"
         );
     }
@@ -651,12 +733,12 @@ mod tests {
         router.cache().store(pos).await;
 
         // bravo_user connects — should NOT receive alpha_user's position
-        let (tx, mut rx) = mpsc::channel(16);
-        let handle = SessionHandle::new(bravo_user.clone(), tx);
+        let (ptx, ntx, mut prx, _nrx) = make_channels(16, 16);
+        let handle = SessionHandle::new(bravo_user.clone(), ptx, ntx);
         router.replay_positions(&handle).await;
 
         assert!(
-            rx.try_recv().is_err(),
+            prx.try_recv().is_err(),
             "bravo_user should not see alpha_user's position"
         );
     }
@@ -673,12 +755,13 @@ mod tests {
         router.cache().store(pos).await;
 
         // Bob connects — shares "shared" group with alice
-        let (tx, mut rx) = mpsc::channel(16);
-        let handle = SessionHandle::new(bob.clone(), tx);
+        // Position messages go to priority channel
+        let (ptx, ntx, mut prx, _nrx) = make_channels(16, 16);
+        let handle = SessionHandle::new(bob.clone(), ptx, ntx);
         router.replay_positions(&handle).await;
 
         assert!(
-            rx.try_recv().is_ok(),
+            prx.try_recv().is_ok(),
             "bob should see alice's position via shared group"
         );
     }
@@ -688,8 +771,8 @@ mod tests {
         let router = Router::new();
 
         let alice = make_identity("alice", &["alpha"]);
-        let (tx, _rx) = mpsc::channel(16);
-        let handle = SessionHandle::new(alice.clone(), tx);
+        let (ptx, ntx, _prx, _nrx) = make_channels(16, 16);
+        let handle = SessionHandle::new(alice.clone(), ptx, ntx);
         let session_id = handle.id;
 
         router.register(handle).await;
@@ -710,8 +793,10 @@ mod tests {
 
         // Client has 5 groups but limit is 3
         let alice = make_identity("alice", &["g1", "g2", "g3", "g4", "g5"]);
-        let (tx, _rx) = mpsc::channel(16);
-        router.register(SessionHandle::new(alice.clone(), tx)).await;
+        let (ptx, ntx, _prx, _nrx) = make_channels(16, 16);
+        router
+            .register(SessionHandle::new(alice.clone(), ptx, ntx))
+            .await;
 
         let state = router.state.read().await;
         // Only 3 groups should have been registered (BTreeSet is sorted, so g1, g2, g3)
@@ -733,15 +818,17 @@ mod tests {
 
         // First client joins 2 groups — fills the total limit
         let alice = make_identity("alice", &["g1", "g2"]);
-        let (tx_a, _rx_a) = mpsc::channel(16);
+        let (ptx_a, ntx_a, _prx_a, _nrx_a) = make_channels(16, 16);
         router
-            .register(SessionHandle::new(alice.clone(), tx_a))
+            .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
             .await;
 
         // Second client tries to join a new group — should be rejected
         let bob = make_identity("bob", &["g3"]);
-        let (tx_b, _rx_b) = mpsc::channel(16);
-        router.register(SessionHandle::new(bob.clone(), tx_b)).await;
+        let (ptx_b, ntx_b, _prx_b, _nrx_b) = make_channels(16, 16);
+        router
+            .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+            .await;
 
         let state = router.state.read().await;
         assert_eq!(state.groups.len(), 2, "total groups should be capped at 2");
@@ -757,15 +844,17 @@ mod tests {
         let router = Router::with_limits(128, 2);
 
         let alice = make_identity("alice", &["g1", "g2"]);
-        let (tx_a, _rx_a) = mpsc::channel(16);
+        let (ptx_a, ntx_a, _prx_a, _nrx_a) = make_channels(16, 16);
         router
-            .register(SessionHandle::new(alice.clone(), tx_a))
+            .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
             .await;
 
         // Bob joins g1 (already exists) — should succeed
         let bob = make_identity("bob", &["g1"]);
-        let (tx_b, _rx_b) = mpsc::channel(16);
-        router.register(SessionHandle::new(bob.clone(), tx_b)).await;
+        let (ptx_b, ntx_b, _prx_b, _nrx_b) = make_channels(16, 16);
+        router
+            .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+            .await;
 
         let state = router.state.read().await;
         let g1_members = state.groups.get("g1").expect("g1 should exist");
@@ -784,13 +873,15 @@ mod tests {
         let alice = make_identity("alice", &["alpha"]);
         let bob = make_identity("bob", &["bravo"]);
 
-        let (tx_a, _rx_a) = mpsc::channel(16);
-        let (tx_b, _rx_b) = mpsc::channel(16);
+        let (ptx_a, ntx_a, _prx_a, _nrx_a) = make_channels(16, 16);
+        let (ptx_b, ntx_b, _prx_b, _nrx_b) = make_channels(16, 16);
 
         router
-            .register(SessionHandle::new(alice.clone(), tx_a))
+            .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
             .await;
-        router.register(SessionHandle::new(bob.clone(), tx_b)).await;
+        router
+            .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+            .await;
 
         let clients = router.connected_clients().await;
         assert_eq!(clients.len(), 2);
@@ -803,10 +894,11 @@ mod tests {
     #[tokio::test]
     async fn circuit_breaker_trips_after_threshold() {
         let identity = make_identity("slow-client", &["alpha"]);
-        let (tx, mut rx) = mpsc::channel(1);
-        let handle = SessionHandle::with_drop_threshold(identity, tx, 3);
+        // Use capacity-1 priority channel for Position messages
+        let (ptx, _ntx, mut prx, _nrx) = make_channels(1, 16);
+        let handle = SessionHandle::with_drop_threshold(identity, ptx, _ntx, 3);
 
-        // Fill the channel
+        // Fill the priority channel with a Position message
         let msg = Arc::new(make_position(
             &make_identity("sender", &["alpha"]),
             Destination::Broadcast,
@@ -823,17 +915,17 @@ mod tests {
         assert!(!handle.try_send(msg.clone()));
 
         // Receiver should get None (sender dropped)
-        let _ = rx.recv().await; // drain the one successful message
-        assert!(rx.recv().await.is_none());
+        let _ = prx.recv().await; // drain the one successful message
+        assert!(prx.recv().await.is_none());
     }
 
     #[tokio::test]
     async fn circuit_breaker_resets_on_success() {
         let identity = make_identity("recovering-client", &["alpha"]);
-        let (tx, mut rx) = mpsc::channel(2);
-        let handle = SessionHandle::with_drop_threshold(identity, tx, 3);
+        let (ptx, _ntx, mut prx, _nrx) = make_channels(2, 16);
+        let handle = SessionHandle::with_drop_threshold(identity, ptx, _ntx, 3);
 
-        // Fill channel
+        // Fill priority channel
         let msg = Arc::new(make_position(
             &make_identity("sender", &["alpha"]),
             Destination::Broadcast,
@@ -846,8 +938,8 @@ mod tests {
         assert!(!handle.try_send(msg.clone()));
 
         // Drain and succeed — should reset counter
-        let _ = rx.recv().await;
-        let _ = rx.recv().await;
+        let _ = prx.recv().await;
+        let _ = prx.recv().await;
         assert!(handle.try_send(msg.clone()));
 
         // Fill the remaining slot so subsequent sends fail
@@ -862,8 +954,8 @@ mod tests {
     #[tokio::test]
     async fn circuit_breaker_does_not_trip_below_threshold() {
         let identity = make_identity("borderline-client", &["alpha"]);
-        let (tx, mut rx) = mpsc::channel(1);
-        let handle = SessionHandle::with_drop_threshold(identity, tx, 5);
+        let (ptx, _ntx, mut prx, _nrx) = make_channels(1, 16);
+        let handle = SessionHandle::with_drop_threshold(identity, ptx, _ntx, 5);
 
         let msg = Arc::new(make_position(
             &make_identity("sender", &["alpha"]),
@@ -880,7 +972,7 @@ mod tests {
         assert!(handle.is_alive());
 
         // Drain and succeed to reset
-        let _ = rx.recv().await;
+        let _ = prx.recv().await;
         assert!(handle.try_send(msg.clone()));
         assert!(handle.is_alive());
     }
@@ -892,21 +984,27 @@ mod tests {
         let sender_id = make_identity("sender", &["ops"]);
         let slow_id = make_identity("slow", &["ops"]);
 
-        let (tx_sender, _rx_sender) = mpsc::channel(64);
-        let (tx_slow, mut rx_slow) = mpsc::channel(1);
+        let (ptx_sender, ntx_sender, _prx_sender, _nrx_sender) = make_channels(64, 64);
+        // Normal channel capacity 1 for the slow client (chat goes to normal)
+        let (ptx_slow, ntx_slow, _prx_slow, mut nrx_slow) = make_channels(16, 1);
 
         router
-            .register(SessionHandle::new(sender_id.clone(), tx_sender))
+            .register(SessionHandle::new(
+                sender_id.clone(),
+                ptx_sender,
+                ntx_sender,
+            ))
             .await;
         router
             .register(SessionHandle::with_drop_threshold(
                 slow_id.clone(),
-                tx_slow,
+                ptx_slow,
+                ntx_slow,
                 3,
             ))
             .await;
 
-        // Send enough messages to trip the breaker
+        // Send enough chat messages to trip the breaker on normal channel
         // Channel capacity is 1, so first message fills it, next 3 trip the breaker
         for _ in 0..5 {
             let msg = make_chat(&sender_id, Destination::Group("ops".to_string()));
@@ -914,9 +1012,9 @@ mod tests {
         }
 
         // Drain the one message that made it through
-        let _ = rx_slow.recv().await;
+        let _ = nrx_slow.recv().await;
         // Receiver should see None (sender poisoned by circuit breaker)
-        assert!(rx_slow.recv().await.is_none());
+        assert!(nrx_slow.recv().await.is_none());
     }
 
     #[tokio::test]
@@ -935,20 +1033,22 @@ mod tests {
         let alice = make_identity("alice", &["alpha"]);
         let bob = make_identity("bob", &["alpha"]);
 
-        let (tx_a, mut rx_a) = mpsc::channel(16);
-        let (tx_b, _rx_b) = mpsc::channel(16);
+        let (ptx_a, ntx_a, _prx_a, mut nrx_a) = make_channels(16, 16);
+        let (ptx_b, ntx_b, _prx_b, _nrx_b) = make_channels(16, 16);
 
         router
-            .register(SessionHandle::new(alice.clone(), tx_a))
+            .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
             .await;
-        router.register(SessionHandle::new(bob.clone(), tx_b)).await;
+        router
+            .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+            .await;
 
         // Bob is a member of alpha but NOT in the send ACL
         let msg = make_chat(&bob, Destination::Group("alpha".to_string()));
         router.route(msg).await;
 
         assert!(
-            rx_a.try_recv().is_err(),
+            nrx_a.try_recv().is_err(),
             "alice must not receive: bob is not authorized to send to alpha"
         );
     }
@@ -969,20 +1069,22 @@ mod tests {
         let alice = make_identity("alice", &["alpha"]);
         let bob = make_identity("bob", &["alpha"]);
 
-        let (tx_a, mut rx_a) = mpsc::channel(16);
-        let (tx_b, _rx_b) = mpsc::channel(16);
+        let (ptx_a, ntx_a, _prx_a, mut nrx_a) = make_channels(16, 16);
+        let (ptx_b, ntx_b, _prx_b, _nrx_b) = make_channels(16, 16);
 
         router
-            .register(SessionHandle::new(alice.clone(), tx_a))
+            .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
             .await;
-        router.register(SessionHandle::new(bob.clone(), tx_b)).await;
+        router
+            .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+            .await;
 
         // Bob is authorized to send
         let msg = make_chat(&bob, Destination::Group("alpha".to_string()));
         router.route(msg).await;
 
         assert!(
-            rx_a.try_recv().is_ok(),
+            nrx_a.try_recv().is_ok(),
             "alice must receive: bob is authorized to send to alpha"
         );
     }
@@ -1005,16 +1107,18 @@ mod tests {
         let bob = make_identity("bob", &["alpha"]);
         let charlie = make_identity("charlie", &["alpha"]);
 
-        let (tx_a, _rx_a) = mpsc::channel(16);
-        let (tx_b, mut rx_b) = mpsc::channel(16);
-        let (tx_c, mut rx_c) = mpsc::channel(16);
+        let (ptx_a, ntx_a, _prx_a, _nrx_a) = make_channels(16, 16);
+        let (ptx_b, ntx_b, _prx_b, mut nrx_b) = make_channels(16, 16);
+        let (ptx_c, ntx_c, _prx_c, mut nrx_c) = make_channels(16, 16);
 
         router
-            .register(SessionHandle::new(alice.clone(), tx_a))
+            .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
             .await;
-        router.register(SessionHandle::new(bob.clone(), tx_b)).await;
         router
-            .register(SessionHandle::new(charlie.clone(), tx_c))
+            .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+            .await;
+        router
+            .register(SessionHandle::new(charlie.clone(), ptx_c, ntx_c))
             .await;
 
         // Alice sends — authorized
@@ -1022,11 +1126,11 @@ mod tests {
         router.route(msg).await;
 
         assert!(
-            rx_b.try_recv().is_err(),
+            nrx_b.try_recv().is_err(),
             "bob must not receive: not in receive ACL"
         );
         assert!(
-            rx_c.try_recv().is_err(),
+            nrx_c.try_recv().is_err(),
             "charlie must not receive: not in receive ACL"
         );
     }
@@ -1039,19 +1143,21 @@ mod tests {
         let alice = make_identity("alice", &["alpha"]);
         let bob = make_identity("bob", &["alpha"]);
 
-        let (tx_a, mut rx_a) = mpsc::channel(16);
-        let (tx_b, _rx_b) = mpsc::channel(16);
+        let (ptx_a, ntx_a, _prx_a, mut nrx_a) = make_channels(16, 16);
+        let (ptx_b, ntx_b, _prx_b, _nrx_b) = make_channels(16, 16);
 
         router
-            .register(SessionHandle::new(alice.clone(), tx_a))
+            .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
             .await;
-        router.register(SessionHandle::new(bob.clone(), tx_b)).await;
+        router
+            .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+            .await;
 
         let msg = make_chat(&bob, Destination::Group("alpha".to_string()));
         router.route(msg).await;
 
         assert!(
-            rx_a.try_recv().is_ok(),
+            nrx_a.try_recv().is_ok(),
             "alice must receive: no ACL means open mode"
         );
     }
@@ -1072,20 +1178,22 @@ mod tests {
         let alice = make_identity("alice", &["open-group"]);
         let bob = make_identity("bob", &["open-group"]);
 
-        let (tx_a, mut rx_a) = mpsc::channel(16);
-        let (tx_b, _rx_b) = mpsc::channel(16);
+        let (ptx_a, ntx_a, _prx_a, mut nrx_a) = make_channels(16, 16);
+        let (ptx_b, ntx_b, _prx_b, _nrx_b) = make_channels(16, 16);
 
         router
-            .register(SessionHandle::new(alice.clone(), tx_a))
+            .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
             .await;
-        router.register(SessionHandle::new(bob.clone(), tx_b)).await;
+        router
+            .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+            .await;
 
         // "open-group" is not in the policy — should allow freely
         let msg = make_chat(&bob, Destination::Group("open-group".to_string()));
         router.route(msg).await;
 
         assert!(
-            rx_a.try_recv().is_ok(),
+            nrx_a.try_recv().is_ok(),
             "alice must receive: open-group has no ACL"
         );
     }
@@ -1106,20 +1214,22 @@ mod tests {
         let alice = make_identity("alice", &["alpha"]);
         let bob = make_identity("bob", &["alpha"]);
 
-        let (tx_a, mut rx_a) = mpsc::channel(16);
-        let (tx_b, _rx_b) = mpsc::channel(16);
+        let (ptx_a, ntx_a, _prx_a, mut nrx_a) = make_channels(16, 16);
+        let (ptx_b, ntx_b, _prx_b, _nrx_b) = make_channels(16, 16);
 
         router
-            .register(SessionHandle::new(alice.clone(), tx_a))
+            .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
             .await;
-        router.register(SessionHandle::new(bob.clone(), tx_b)).await;
+        router
+            .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+            .await;
 
-        // Broadcast — should ignore ACL
+        // Broadcast chat — should ignore ACL, goes to normal channel
         let msg = make_chat(&bob, Destination::Broadcast);
         router.route(msg).await;
 
         assert!(
-            rx_a.try_recv().is_ok(),
+            nrx_a.try_recv().is_ok(),
             "broadcasts must ignore group ACL policy"
         );
     }
@@ -1146,13 +1256,103 @@ mod tests {
         router.cache().store(pos).await;
 
         // Bob connects — member of alpha but NOT in receive ACL
-        let (tx, mut rx) = mpsc::channel(16);
-        let handle = SessionHandle::new(bob.clone(), tx);
+        // Position messages go to priority channel
+        let (ptx, ntx, mut prx, _nrx) = make_channels(16, 16);
+        let handle = SessionHandle::new(bob.clone(), ptx, ntx);
         router.replay_positions(&handle).await;
 
         assert!(
-            rx.try_recv().is_err(),
+            prx.try_recv().is_err(),
             "bob must not receive replayed position: not in alpha receive ACL"
         );
+    }
+
+    #[tokio::test]
+    async fn priority_messages_route_to_priority_channel() {
+        let router = Router::new();
+
+        let alice = make_identity("alice", &["alpha"]);
+        let bob = make_identity("bob", &["alpha"]);
+
+        let (ptx_a, ntx_a, mut prx_a, mut nrx_a) = make_channels(16, 16);
+        let (ptx_b, ntx_b, _prx_b, _nrx_b) = make_channels(16, 16);
+
+        router
+            .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
+            .await;
+        router
+            .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+            .await;
+
+        // Send a Position message (priority)
+        let pos = make_position(&bob, Destination::Group("alpha".to_string()));
+        router.route(pos).await;
+
+        // Send an Alert message (priority)
+        let alert = make_alert(&bob, Destination::Group("alpha".to_string()));
+        router.route(alert).await;
+
+        // Send a Chat message (normal)
+        let chat = make_chat(&bob, Destination::Group("alpha".to_string()));
+        router.route(chat).await;
+
+        // Position and Alert should be on priority channel
+        let p = prx_a
+            .try_recv()
+            .expect("position must arrive on priority channel");
+        assert_eq!(p.metadata.message_type, MessageType::Position);
+
+        let a = prx_a
+            .try_recv()
+            .expect("alert must arrive on priority channel");
+        assert_eq!(a.metadata.message_type, MessageType::Alert);
+
+        // Chat should be on normal channel
+        let c = nrx_a
+            .try_recv()
+            .expect("chat must arrive on normal channel");
+        assert_eq!(c.metadata.message_type, MessageType::Chat);
+
+        // No more messages on either channel
+        assert!(prx_a.try_recv().is_err());
+        assert!(nrx_a.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_closes_both_channels() {
+        let identity = make_identity("slow-client", &["alpha"]);
+        // Priority channel capacity 1, normal channel capacity 16
+        let (ptx, ntx, mut prx, mut nrx) = make_channels(1, 16);
+        let handle = SessionHandle::with_drop_threshold(identity, ptx, ntx, 3);
+
+        // Fill the priority channel
+        let pos = Arc::new(make_position(
+            &make_identity("sender", &["alpha"]),
+            Destination::Broadcast,
+        ));
+        assert!(handle.try_send(pos.clone()));
+
+        // Trip the breaker on priority channel (3 consecutive failures)
+        assert!(!handle.try_send(pos.clone()));
+        assert!(!handle.try_send(pos.clone()));
+        assert!(!handle.try_send(pos.clone()));
+
+        // Both channels should be closed
+        assert!(!handle.is_alive());
+
+        // Normal channel should also be poisoned
+        let chat = Arc::new(make_chat(
+            &make_identity("sender", &["alpha"]),
+            Destination::Broadcast,
+        ));
+        assert!(!handle.try_send(chat));
+
+        // Drain priority and verify closed
+        let _ = prx.recv().await;
+        assert!(prx.recv().await.is_none());
+
+        // Normal receiver should also see closure eventually
+        // (no messages were sent to normal, but sender is dropped)
+        assert!(nrx.recv().await.is_none());
     }
 }

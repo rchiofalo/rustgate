@@ -67,13 +67,16 @@ async fn register_session(
     cn: &str,
     group: &str,
 ) -> mpsc::Receiver<Arc<RoutableMessage>> {
-    let (tx, rx) = mpsc::channel(64);
+    let (ptx, prx) = mpsc::channel(16);
+    let (ntx, _nrx) = mpsc::channel(64);
     let mut groups = BTreeSet::new();
     let _ = groups.insert(group.to_string());
     let identity = Arc::new(Identity::plaintext(cn.to_string(), groups).expect("valid identity"));
-    let handle = rustgate_transport::SessionHandle::new(identity, tx);
+    let handle = rustgate_transport::SessionHandle::new(identity, ptx, ntx);
     router.register(handle).await;
-    rx
+    // Return priority receiver — NATS-bridged messages are typically
+    // positions which route to the priority channel.
+    prx
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────

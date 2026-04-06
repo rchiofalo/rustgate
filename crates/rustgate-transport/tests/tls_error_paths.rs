@@ -261,14 +261,18 @@ async fn group_send_backpressure_drops_without_panic() {
         .expect("valid identity"),
     );
 
-    // Alice gets a tiny channel — capacity 1
-    let (tx_a, _rx_a) = mpsc::channel(1);
-    let (tx_b, _rx_b) = mpsc::channel(16);
+    // Alice gets a tiny normal channel — capacity 1 (chat goes to normal)
+    let (ptx_a, _prx_a) = mpsc::channel(16);
+    let (ntx_a, _nrx_a) = mpsc::channel(1);
+    let (ptx_b, _prx_b) = mpsc::channel(16);
+    let (ntx_b, _nrx_b) = mpsc::channel(16);
 
     router
-        .register(SessionHandle::new(alice.clone(), tx_a))
+        .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
         .await;
-    router.register(SessionHandle::new(bob.clone(), tx_b)).await;
+    router
+        .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+        .await;
 
     // Bob floods the group — alice's channel overflows.
     // Group sends use try_send, so this completes immediately.
@@ -315,17 +319,22 @@ async fn disconnected_receiver_drops_gracefully() {
             .expect("valid identity"),
     );
 
-    let (tx_a, _rx_a) = mpsc::channel(16);
-    let (tx_b, rx_b) = mpsc::channel(1);
+    let (ptx_a, _prx_a) = mpsc::channel(16);
+    let (ntx_a, _nrx_a) = mpsc::channel(16);
+    let (ptx_b, prx_b) = mpsc::channel(1);
+    let (ntx_b, nrx_b) = mpsc::channel(1);
 
     router
-        .register(SessionHandle::new(alice.clone(), tx_a))
+        .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
         .await;
-    router.register(SessionHandle::new(bob.clone(), tx_b)).await;
+    router
+        .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+        .await;
 
-    // Drop bob's receiver — simulates a disconnected session.
+    // Drop bob's receivers — simulates a disconnected session.
     // Now send().await will return Err immediately instead of blocking.
-    drop(rx_b);
+    drop(prx_b);
+    drop(nrx_b);
 
     // Direct send to disconnected bob
     for i in 0..5 {
