@@ -377,7 +377,7 @@ mod tests {
         let store = RevocationStore::new(db_path.clone(), &cert_pem, &key_pem)
             .await
             .unwrap();
-        store
+        let _ = store
             .revoke("112233", "superseded", "operator")
             .await
             .unwrap();
@@ -408,7 +408,7 @@ mod tests {
         assert!(crl.contains("-----END X509 CRL-----"));
 
         // Revoke and check CRL is updated
-        store
+        let _ = store
             .revoke("aabbccdd", "key_compromise", "admin")
             .await
             .unwrap();
@@ -475,7 +475,7 @@ mod tests {
             .await
             .unwrap();
 
-        store
+        let _ = store
             .revoke(&serial, "key_compromise", "admin")
             .await
             .unwrap();
