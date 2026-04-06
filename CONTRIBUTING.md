@@ -33,17 +33,19 @@ cargo build --features jemalloc      # jemalloc allocator (recommended for musl)
 ## Testing
 
 ```bash
-# Run all unit tests (default features)
-cargo test
+# Run all unit tests (default features) — CI uses nextest
+cargo nextest run
 
 # Run all tests including feature-gated ones
-cargo test --all-features
+cargo nextest run --all-features
 
 # Run a single crate's tests
-cargo test -p rustgate-transport
+cargo nextest run -p rustgate-transport
 
 # Run NATS integration tests (requires nats-server on PATH)
-cargo test -p rustgate-nats --test integration
+cargo nextest run -p rustgate-nats --test integration
+
+# cargo test also works but nextest is the CI runner
 ```
 
 ## Code Quality
