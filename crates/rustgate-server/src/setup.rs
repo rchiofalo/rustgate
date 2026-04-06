@@ -31,17 +31,22 @@ use crate::session::{FedForwardFn, NatsPublish, PlaintextTcpConfig};
 
 /// Load group access control policy from a JSON configuration file.
 ///
-/// Returns `None` if no ACL file is configured (open mode).
+/// Returns `(None, None)` if no ACL file is configured (open mode).
+/// When an ACL file is loaded, also returns the SHA-256 hash of the raw
+/// file contents so the hot-reloader can detect subsequent changes.
 pub(crate) async fn load_group_acl(
     cli: &Cli,
-) -> anyhow::Result<Option<rustgate_transport::GroupAclPolicy>> {
+) -> anyhow::Result<(Option<rustgate_transport::GroupAclPolicy>, Option<[u8; 32]>)> {
     let Some(ref acl_file) = cli.group_acl_file else {
-        return Ok(None);
+        return Ok((None, None));
     };
 
     let data = tokio::fs::read_to_string(acl_file)
         .await
         .context("reading group ACL file")?;
+
+    let hash = crate::acl_reloader::AclReloader::compute_hash(data.as_bytes());
+
     let config: crate::acl_config::GroupAclFile =
         serde_json::from_str(&data).context("parsing group ACL file")?;
 
@@ -55,7 +60,7 @@ pub(crate) async fn load_group_acl(
 
     let policy = rustgate_transport::GroupAclPolicy::new(groups);
     tracing::info!(groups = policy.len(), "loaded group access control policy");
-    Ok(Some(policy))
+    Ok((Some(policy), Some(hash)))
 }
 
 /// Spawn a tokio task whose `JoinHandle` is intentionally not tracked.

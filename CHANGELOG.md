@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - **JSON audit log sink** — new `--audit-log` CLI flag (env `RUSTGATE_AUDIT_LOG`) writes audit events as JSON lines to a dedicated file, separate from the main log stream. Filters only `target="audit"` events using a per-layer `Targets` filter. Use `"-"` for stdout. Audit events now include `session_id` on connect/disconnect for correlation. (#525)
+- **Hot-reloadable ACL** — the group access control policy can now be updated at runtime without restarting the server. The router's ACL is stored in an `ArcSwap` for lock-free reads, and a new `--acl-reload-interval` CLI flag (env `RUSTGATE_ACL_RELOAD_INTERVAL`, default 0 = disabled) enables periodic polling of the `--group-acl-file` for changes. File changes are detected via SHA-256 hash comparison; only modified files trigger a policy swap. Audit events are emitted on reload success and failure. (#521)
 - **Message priority channels** — replaced the single per-session mpsc channel with a dual-channel approach: a high-priority channel (capacity 16) for Position and Alert messages, and a normal-priority channel (capacity 64) for all other message types. Write loops use biased `tokio::select!` to always drain priority messages first, ensuring time-sensitive situational awareness data is delivered ahead of bulk traffic. The circuit breaker applies across both channels. (#519)
 
 ## [0.7.0] - 2026-04-05

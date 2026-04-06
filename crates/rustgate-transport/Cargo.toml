@@ -19,6 +19,7 @@ post-quantum = ["rustls/aws_lc_rs", "rustls/prefer-post-quantum"]
 rustgate-core = { workspace = true }
 rustgate-cot = { workspace = true }
 rustgate-proto = { workspace = true, optional = true }
+arc-swap = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true, features = ["net", "io-util", "sync", "rt", "time", "macros"] }
 tokio-util = { workspace = true }
