@@ -338,8 +338,11 @@ mod tests {
 
     #[test]
     fn asymmetric_deny_receive_only() {
+        // Allow sending (non-empty allow list including mallory),
+        // deny receiving (allow list populated so receive evaluates to
+        // allow-list-minus-deny).
         let acl = GroupAcl::with_deny(
-            HashSet::new(),
+            HashSet::from(["mallory".to_string()]),
             HashSet::from(["mallory".to_string()]),
             HashSet::new(),
             HashSet::from(["mallory".to_string()]),
