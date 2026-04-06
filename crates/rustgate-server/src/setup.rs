@@ -385,6 +385,26 @@ pub(crate) async fn start_enrollment(
         tracing::info!(dir = %pkg_dir, "data package storage enabled");
     }
 
+    if let Some(ref db_path) = cli.revocation_db {
+        let revocation_store = rustgate_enrollment::RevocationStore::new(
+            std::path::PathBuf::from(db_path),
+            cert_pem,
+            key_pem,
+        )
+        .await
+        .context("initializing revocation store")?
+        .with_crl_validity_days(cli.crl_validity_days);
+
+        let revoked_count = revocation_store.count().await;
+        enrollment_server = enrollment_server.with_revocation(revocation_store);
+        tracing::info!(
+            db = %db_path,
+            revoked = revoked_count,
+            crl_validity_days = cli.crl_validity_days,
+            "certificate revocation enabled"
+        );
+    }
+
     let bind_addr: std::net::SocketAddr = enrollment_bind
         .parse()
         .context("parsing --enrollment-bind address")?;

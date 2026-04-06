@@ -215,6 +215,18 @@ pub fn enrollment_certificate_issued(username: &str, client_uid: &str, serial: &
     );
 }
 
+/// Record a certificate revocation event.
+pub fn enrollment_certificate_revoked(serial: &str, reason: &str, revoked_by: &str) {
+    audit!(
+        "enrollment.certificate_revoked",
+        serial = %serial,
+        reason = %reason,
+        revoked_by = %revoked_by,
+        action = "revoke_certificate",
+        result = "success"
+    );
+}
+
 /// Record a rate limit triggered event.
 pub fn rate_limit_triggered(peer: &str, endpoint: &str, limit: usize) {
     audit!(
