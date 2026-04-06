@@ -52,8 +52,9 @@ fn spawn_session(session: AuthenticatedSession, router: Arc<Router>) {
         let identity = session.identity_arc();
         let cn = identity.cn.clone();
 
-        let (tx, rx) = mpsc::channel::<Arc<RoutableMessage>>(64);
-        let handle = SessionHandle::new(Arc::clone(&identity), tx);
+        let (ptx, priority_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
+        let (ntx, normal_rx) = mpsc::channel::<Arc<RoutableMessage>>(64);
+        let handle = SessionHandle::new(Arc::clone(&identity), ptx, ntx);
         let session_id = handle.id;
         router.register(handle).await;
 
@@ -63,7 +64,7 @@ fn spawn_session(session: AuthenticatedSession, router: Arc<Router>) {
             r = server_read(reader, &identity, &router) => {
                 if let Err(e) = r { eprintln!("{cn} read: {e}"); }
             }
-            r = server_write(writer, rx) => {
+            r = server_write(writer, priority_rx, normal_rx) => {
                 if let Err(e) = r { eprintln!("{cn} write: {e}"); }
             }
         }
@@ -89,10 +90,17 @@ async fn server_read(
 
 async fn server_write(
     writer: rustgate_transport::SessionWriter,
-    mut rx: mpsc::Receiver<Arc<RoutableMessage>>,
+    mut priority_rx: mpsc::Receiver<Arc<RoutableMessage>>,
+    mut normal_rx: mpsc::Receiver<Arc<RoutableMessage>>,
 ) -> std::io::Result<()> {
     let mut framed = FramedWrite::new(writer, LengthPrefixedCodec::new(HeaderSize::Four));
-    while let Some(msg) = rx.recv().await {
+    loop {
+        let msg = tokio::select! {
+            biased;
+            msg = priority_rx.recv() => msg,
+            msg = normal_rx.recv() => msg,
+        };
+        let Some(msg) = msg else { break };
         framed
             .send(tokio_util::bytes::BytesMut::from(msg.payload.as_ref()))
             .await?;
@@ -499,39 +507,70 @@ async fn route_to_group() {
     let bob = Arc::new(make_identity("bob", &["engineers"]));
     let charlie = Arc::new(make_identity("charlie", &["medics"]));
 
-    let (alice_tx, mut alice_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
-    let (bob_tx, mut bob_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
-    let (charlie_tx, mut charlie_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
+    let (alice_ptx, alice_ntx, _alice_prx, mut alice_nrx) = {
+        let (p, pr) = mpsc::channel::<Arc<RoutableMessage>>(16);
+        let (n, nr) = mpsc::channel::<Arc<RoutableMessage>>(16);
+        (p, n, pr, nr)
+    };
+    let (bob_ptx, bob_ntx, _bob_prx, mut bob_nrx) = {
+        let (p, pr) = mpsc::channel::<Arc<RoutableMessage>>(16);
+        let (n, nr) = mpsc::channel::<Arc<RoutableMessage>>(16);
+        (p, n, pr, nr)
+    };
+    let (charlie_ptx, charlie_ntx, _charlie_prx, mut charlie_nrx) = {
+        let (p, pr) = mpsc::channel::<Arc<RoutableMessage>>(16);
+        let (n, nr) = mpsc::channel::<Arc<RoutableMessage>>(16);
+        (p, n, pr, nr)
+    };
 
     router
-        .register(SessionHandle::new(alice.clone(), alice_tx))
+        .register(SessionHandle::new(alice.clone(), alice_ptx, alice_ntx))
         .await;
     router
-        .register(SessionHandle::new(bob.clone(), bob_tx))
+        .register(SessionHandle::new(bob.clone(), bob_ptx, bob_ntx))
         .await;
     router
-        .register(SessionHandle::new(charlie.clone(), charlie_tx))
+        .register(SessionHandle::new(
+            charlie.clone(),
+            charlie_ptx,
+            charlie_ntx,
+        ))
         .await;
 
     // Alice sends to group "engineers"
     let msg = build_message(&alice, b"eng-only", Destination::Group("engineers".into()));
     router.route(msg).await;
 
-    // Bob is in engineers — should receive
-    let got = bob_rx.try_recv().expect("bob should receive");
+    // Bob is in engineers — should receive (Other type → normal channel)
+    let got = bob_nrx.try_recv().expect("bob should receive");
     assert_eq!(got.payload.as_ref(), b"eng-only");
 
     // Alice is in engineers but is the sender — should not receive
     assert!(
-        alice_rx.try_recv().is_err(),
+        alice_nrx.try_recv().is_err(),
         "sender should not self-receive"
     );
 
     // Charlie is in medics — should not receive
     assert!(
-        charlie_rx.try_recv().is_err(),
+        charlie_nrx.try_recv().is_err(),
         "wrong group should not receive"
     );
+}
+
+/// Helper: create dual-channel senders and a pair of receivers.
+#[allow(clippy::type_complexity)]
+fn make_channels(
+    cap: usize,
+) -> (
+    mpsc::Sender<Arc<RoutableMessage>>,
+    mpsc::Sender<Arc<RoutableMessage>>,
+    mpsc::Receiver<Arc<RoutableMessage>>,
+    mpsc::Receiver<Arc<RoutableMessage>>,
+) {
+    let (ptx, prx) = mpsc::channel(cap);
+    let (ntx, nrx) = mpsc::channel(cap);
+    (ptx, ntx, prx, nrx)
 }
 
 /// Route directly to a specific CN — only the target receives it.
@@ -543,32 +582,32 @@ async fn route_direct() {
     let bob = Arc::new(make_identity("bob", &["team"]));
     let charlie = Arc::new(make_identity("charlie", &["team"]));
 
-    let (alice_tx, mut alice_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
-    let (bob_tx, mut bob_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
-    let (charlie_tx, mut charlie_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
+    let (aptx, antx, _aprx, mut anrx) = make_channels(16);
+    let (bptx, bntx, _bprx, mut bnrx) = make_channels(16);
+    let (cptx, cntx, _cprx, mut cnrx) = make_channels(16);
 
     router
-        .register(SessionHandle::new(alice.clone(), alice_tx))
+        .register(SessionHandle::new(alice.clone(), aptx, antx))
         .await;
     router
-        .register(SessionHandle::new(bob.clone(), bob_tx))
+        .register(SessionHandle::new(bob.clone(), bptx, bntx))
         .await;
     router
-        .register(SessionHandle::new(charlie.clone(), charlie_tx))
+        .register(SessionHandle::new(charlie.clone(), cptx, cntx))
         .await;
 
-    // Alice sends directly to bob
+    // Alice sends directly to bob (Other type → normal channel)
     let target = (*bob).clone();
     let msg = build_message(&alice, b"for-bob-only", Destination::Direct(target));
     router.route(msg).await;
 
-    // Bob should receive
-    let got = bob_rx.try_recv().expect("bob should receive direct");
+    // Bob should receive on normal channel
+    let got = bnrx.try_recv().expect("bob should receive direct");
     assert_eq!(got.payload.as_ref(), b"for-bob-only");
 
     // Nobody else
-    assert!(alice_rx.try_recv().is_err());
-    assert!(charlie_rx.try_recv().is_err());
+    assert!(anrx.try_recv().is_err());
+    assert!(cnrx.try_recv().is_err());
 }
 
 /// Direct message to a CN that isn't registered — must not panic.
@@ -577,9 +616,9 @@ async fn route_direct_to_offline_user() {
     let router = Router::new();
 
     let alice = Arc::new(make_identity("alice", &["team"]));
-    let (alice_tx, _alice_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
+    let (ptx, ntx, _prx, _nrx) = make_channels(16);
     router
-        .register(SessionHandle::new(alice.clone(), alice_tx))
+        .register(SessionHandle::new(alice.clone(), ptx, ntx))
         .await;
 
     let ghost = make_identity("ghost", &["team"]);
@@ -595,9 +634,9 @@ async fn route_to_empty_group() {
     let router = Router::new();
 
     let alice = Arc::new(make_identity("alice", &["engineers"]));
-    let (alice_tx, _alice_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
+    let (ptx, ntx, _prx, _nrx) = make_channels(16);
     router
-        .register(SessionHandle::new(alice.clone(), alice_tx))
+        .register(SessionHandle::new(alice.clone(), ptx, ntx))
         .await;
 
     let msg = build_message(&alice, b"anyone?", Destination::Group("ghosts".into()));
@@ -616,25 +655,25 @@ async fn register_with_group_change() {
     let bob = Arc::new(make_identity("bob", &["alpha", "bravo"]));
     let charlie = Arc::new(make_identity("charlie", &["bravo"]));
 
-    let (alice_v1_tx, _alice_v1_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
-    let (bob_tx, mut bob_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
-    let (charlie_tx, mut charlie_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
+    let (av1ptx, av1ntx, _av1prx, _av1nrx) = make_channels(16);
+    let (bptx, bntx, _bprx, mut bnrx) = make_channels(16);
+    let (cptx, cntx, _cprx, mut cnrx) = make_channels(16);
 
     router
-        .register(SessionHandle::new(alice_v1.clone(), alice_v1_tx))
+        .register(SessionHandle::new(alice_v1.clone(), av1ptx, av1ntx))
         .await;
     router
-        .register(SessionHandle::new(bob.clone(), bob_tx))
+        .register(SessionHandle::new(bob.clone(), bptx, bntx))
         .await;
     router
-        .register(SessionHandle::new(charlie.clone(), charlie_tx))
+        .register(SessionHandle::new(charlie.clone(), cptx, cntx))
         .await;
 
     // Alice moves from "alpha" to "bravo"
     let alice_v2 = Arc::new(make_identity("alice", &["bravo"]));
-    let (alice_v2_tx, mut alice_v2_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
+    let (av2ptx, av2ntx, _av2prx, mut av2nrx) = make_channels(16);
     router
-        .register(SessionHandle::new(alice_v2.clone(), alice_v2_tx))
+        .register(SessionHandle::new(alice_v2.clone(), av2ptx, av2ntx))
         .await;
 
     // Alice (now in bravo) sends to group "alpha" — rejected because
@@ -643,11 +682,11 @@ async fn register_with_group_change() {
     router.route(msg).await;
 
     assert!(
-        bob_rx.try_recv().is_err(),
+        bnrx.try_recv().is_err(),
         "alice is not in alpha, message should be rejected"
     );
     assert!(
-        alice_v2_rx.try_recv().is_err(),
+        av2nrx.try_recv().is_err(),
         "alice left alpha, should not receive"
     );
 
@@ -655,13 +694,13 @@ async fn register_with_group_change() {
     let msg = build_message(&charlie, b"bravo-msg", Destination::Group("bravo".into()));
     router.route(msg).await;
 
-    let got = alice_v2_rx.try_recv().expect("alice is now in bravo");
+    let got = av2nrx.try_recv().expect("alice is now in bravo");
     assert_eq!(got.payload.as_ref(), b"bravo-msg");
-    let got = bob_rx.try_recv().expect("bob is in bravo");
+    let got = bnrx.try_recv().expect("bob is in bravo");
     assert_eq!(got.payload.as_ref(), b"bravo-msg");
 
     // Charlie sent bravo-msg → self-filtered. Not in alpha → nothing from there.
-    assert!(charlie_rx.try_recv().is_err());
+    assert!(cnrx.try_recv().is_err());
 }
 
 /// Direct-message to yourself. `send_to_session` does not filter the sender,
@@ -671,16 +710,16 @@ async fn route_direct_to_self() {
     let router = Router::new();
 
     let alice = Arc::new(make_identity("alice", &["team"]));
-    let (alice_tx, mut alice_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
+    let (ptx, ntx, _prx, mut nrx) = make_channels(16);
     router
-        .register(SessionHandle::new(alice.clone(), alice_tx))
+        .register(SessionHandle::new(alice.clone(), ptx, ntx))
         .await;
 
     let target = (*alice).clone();
     let msg = build_message(&alice, b"note-to-self", Destination::Direct(target));
     router.route(msg).await;
 
-    let got = alice_rx.try_recv().expect("direct to self should deliver");
+    let got = nrx.try_recv().expect("direct to self should deliver");
     assert_eq!(got.payload.as_ref(), b"note-to-self");
 }
 
@@ -693,8 +732,8 @@ async fn position_cache_replay() {
     let alice = Arc::new(make_identity("alice", &["team"]));
     let bob = Arc::new(make_identity("bob", &["team"]));
 
-    let (alice_tx, _alice_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
-    let alice_handle = SessionHandle::new(alice.clone(), alice_tx);
+    let (aptx, antx, _aprx, _anrx) = make_channels(16);
+    let alice_handle = SessionHandle::new(alice.clone(), aptx, antx);
     router.register(alice_handle.clone()).await;
     router.replay_positions(&alice_handle).await;
 
@@ -715,16 +754,14 @@ async fn position_cache_replay() {
     // Verify it's cached
     assert_eq!(router.cache().len().await, 1);
 
-    // Bob connects later
-    let (bob_tx, mut bob_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
-    let bob_handle = SessionHandle::new(bob.clone(), bob_tx);
+    // Bob connects later — position goes to priority channel
+    let (bptx, bntx, mut bprx, _bnrx) = make_channels(16);
+    let bob_handle = SessionHandle::new(bob.clone(), bptx, bntx);
     router.register(bob_handle.clone()).await;
     router.replay_positions(&bob_handle).await;
 
-    // Bob should receive Alice's cached position
-    let got = bob_rx
-        .try_recv()
-        .expect("bob should receive cached position");
+    // Bob should receive Alice's cached position on priority channel
+    let got = bprx.try_recv().expect("bob should receive cached position");
     assert_eq!(got.source.cn, "alice");
     assert_eq!(got.metadata.message_type, MessageType::Position);
 }
@@ -735,9 +772,9 @@ async fn chat_messages_not_cached() {
     let router = Router::new();
 
     let alice = Arc::new(make_identity("alice", &["team"]));
-    let (alice_tx, _alice_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
+    let (ptx, ntx, _prx, _nrx) = make_channels(16);
     router
-        .register(SessionHandle::new(alice.clone(), alice_tx))
+        .register(SessionHandle::new(alice.clone(), ptx, ntx))
         .await;
 
     // Alice sends a chat message
@@ -764,9 +801,9 @@ async fn position_cache_replaces_old() {
     let router = Router::new();
 
     let alice = Arc::new(make_identity("alice", &["team"]));
-    let (alice_tx, _alice_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
+    let (ptx, ntx, _prx, _nrx) = make_channels(16);
     router
-        .register(SessionHandle::new(alice.clone(), alice_tx))
+        .register(SessionHandle::new(alice.clone(), ptx, ntx))
         .await;
 
     // Alice sends first position
@@ -800,16 +837,14 @@ async fn position_cache_replaces_old() {
     // Only one entry (latest)
     assert_eq!(router.cache().len().await, 1);
 
-    // Bob connects and gets the latest position
+    // Bob connects and gets the latest position (priority channel)
     let bob = Arc::new(make_identity("bob", &["team"]));
-    let (bob_tx, mut bob_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
-    let bob_handle = SessionHandle::new(bob.clone(), bob_tx);
+    let (bptx, bntx, mut bprx, _bnrx) = make_channels(16);
+    let bob_handle = SessionHandle::new(bob.clone(), bptx, bntx);
     router.register(bob_handle.clone()).await;
     router.replay_positions(&bob_handle).await;
 
-    let got = bob_rx
-        .try_recv()
-        .expect("bob should receive cached position");
+    let got = bprx.try_recv().expect("bob should receive cached position");
     assert_eq!(got.payload.as_ref(), b"pos2");
 }
 
@@ -824,14 +859,14 @@ async fn expired_message_is_dropped() {
     let alice = Arc::new(make_identity("alice", &["team"]));
     let bob = Arc::new(make_identity("bob", &["team"]));
 
-    let (alice_tx, mut alice_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
-    let (bob_tx, mut bob_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
+    let (aptx, antx, mut _aprx, mut alice_rx) = make_channels(16);
+    let (bptx, bntx, mut _bprx, mut bob_rx) = make_channels(16);
 
     router
-        .register(SessionHandle::new(alice.clone(), alice_tx))
+        .register(SessionHandle::new(alice.clone(), aptx, antx))
         .await;
     router
-        .register(SessionHandle::new(bob.clone(), bob_tx))
+        .register(SessionHandle::new(bob.clone(), bptx, bntx))
         .await;
 
     // Build a message that is already expired: received 10s ago with 1s TTL
@@ -867,14 +902,14 @@ async fn message_without_ttl_routes_normally() {
     let alice = Arc::new(make_identity("alice", &["team"]));
     let bob = Arc::new(make_identity("bob", &["team"]));
 
-    let (_alice_tx, _alice_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
-    let (bob_tx, mut bob_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
+    let (_aptx, _antx, _aprx, _arx) = make_channels(16);
+    let (bptx, bntx, _bprx, mut bob_rx) = make_channels(16);
 
     router
-        .register(SessionHandle::new(alice.clone(), _alice_tx))
+        .register(SessionHandle::new(alice.clone(), _aptx, _antx))
         .await;
     router
-        .register(SessionHandle::new(bob.clone(), bob_tx))
+        .register(SessionHandle::new(bob.clone(), bptx, bntx))
         .await;
 
     // Message with no TTL — should be delivered regardless of age
@@ -905,14 +940,14 @@ async fn non_expired_ttl_message_routes_normally() {
     let alice = Arc::new(make_identity("alice", &["team"]));
     let bob = Arc::new(make_identity("bob", &["team"]));
 
-    let (_alice_tx, _alice_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
-    let (bob_tx, mut bob_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
+    let (_aptx, _antx, _aprx, _arx) = make_channels(16);
+    let (bptx, bntx, _bprx, mut bob_rx) = make_channels(16);
 
     router
-        .register(SessionHandle::new(alice.clone(), _alice_tx))
+        .register(SessionHandle::new(alice.clone(), _aptx, _antx))
         .await;
     router
-        .register(SessionHandle::new(bob.clone(), bob_tx))
+        .register(SessionHandle::new(bob.clone(), bptx, bntx))
         .await;
 
     // Message with a generous TTL — should be delivered

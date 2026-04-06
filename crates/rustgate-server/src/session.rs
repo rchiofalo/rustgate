@@ -96,15 +96,19 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
     #[cfg(feature = "metrics")]
     metrics::sessions_active().inc();
 
-    let (tx, rx) = mpsc::channel::<Arc<RoutableMessage>>(64);
+    let (priority_tx, priority_rx) =
+        mpsc::channel::<Arc<RoutableMessage>>(rustgate_transport::PRIORITY_CHANNEL_CAPACITY);
+    let (normal_tx, normal_rx) =
+        mpsc::channel::<Arc<RoutableMessage>>(rustgate_transport::NORMAL_CHANNEL_CAPACITY);
     let handle = if deps.circuit_breaker_threshold > 0 {
         SessionHandle::with_drop_threshold(
             Arc::clone(&identity),
-            tx,
+            priority_tx,
+            normal_tx,
             deps.circuit_breaker_threshold,
         )
     } else {
-        SessionHandle::with_drop_threshold(Arc::clone(&identity), tx, u32::MAX)
+        SessionHandle::with_drop_threshold(Arc::clone(&identity), priority_tx, normal_tx, u32::MAX)
     };
     let session_id = handle.id;
     deps.router.register(handle.clone()).await;
@@ -165,7 +169,7 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
         replay_filter: &deps.replay_filter,
     };
 
-    let result = run_session_loops(reader, writer, rx, &ctx, read_buf).await;
+    let result = run_session_loops(reader, writer, priority_rx, normal_rx, &ctx, read_buf).await;
 
     if let Err(e) = result {
         tracing::debug!(cn = %cn, error = %e, "session error");
@@ -250,13 +254,14 @@ async fn negotiate_tak_protocol(
 async fn run_session_loops(
     reader: rustgate_transport::SessionReader,
     writer: rustgate_transport::SessionWriter,
-    rx: mpsc::Receiver<Arc<RoutableMessage>>,
+    priority_rx: mpsc::Receiver<Arc<RoutableMessage>>,
+    normal_rx: mpsc::Receiver<Arc<RoutableMessage>>,
     ctx: &SessionContext<'_, impl NatsPublish>,
     read_buf: tokio_util::bytes::BytesMut,
 ) -> std::io::Result<()> {
     tokio::select! {
         r = read_loop(reader, ctx, read_buf) => r,
-        r = write_loop(writer, rx, ctx.codec) => r,
+        r = write_loop(writer, priority_rx, normal_rx, ctx.codec) => r,
     }
 }
 
@@ -359,14 +364,25 @@ async fn read_loop(
 }
 
 /// Encode outbound messages and send to the client with a write timeout.
+///
+/// Uses biased `tokio::select!` to always drain the priority channel
+/// (Position and Alert messages) before processing normal messages.
 async fn write_loop(
     writer: rustgate_transport::SessionWriter,
-    mut rx: mpsc::Receiver<Arc<RoutableMessage>>,
+    mut priority_rx: mpsc::Receiver<Arc<RoutableMessage>>,
+    mut normal_rx: mpsc::Receiver<Arc<RoutableMessage>>,
     codec: &dyn Codec,
 ) -> std::io::Result<()> {
     let mut framed = FramedWrite::new(writer, FramedCodec::from_strategy(&codec.framing()));
 
-    while let Some(msg) = rx.recv().await {
+    loop {
+        let msg = tokio::select! {
+            biased;
+            msg = priority_rx.recv() => msg,
+            msg = normal_rx.recv() => msg,
+        };
+        let Some(msg) = msg else { break };
+
         let encoded = codec.encode_payload(&msg)?;
         let send_fut = framed.send(tokio_util::bytes::BytesMut::from(encoded.as_ref()));
 
@@ -445,11 +461,16 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
 
                         tracing::info!(cn = %cn, peer = %peer_addr, "plaintext TCP connected");
 
-                        let (tx, rx) = mpsc::channel::<Arc<RoutableMessage>>(64);
+                        let (priority_tx, priority_rx) = mpsc::channel::<Arc<RoutableMessage>>(
+                            rustgate_transport::PRIORITY_CHANNEL_CAPACITY,
+                        );
+                        let (normal_tx, normal_rx) = mpsc::channel::<Arc<RoutableMessage>>(
+                            rustgate_transport::NORMAL_CHANNEL_CAPACITY,
+                        );
                         let handle = if circuit_breaker_threshold > 0 {
-                            SessionHandle::with_drop_threshold(Arc::clone(&identity), tx, circuit_breaker_threshold)
+                            SessionHandle::with_drop_threshold(Arc::clone(&identity), priority_tx, normal_tx, circuit_breaker_threshold)
                         } else {
-                            SessionHandle::with_drop_threshold(Arc::clone(&identity), tx, u32::MAX)
+                            SessionHandle::with_drop_threshold(Arc::clone(&identity), priority_tx, normal_tx, u32::MAX)
                         };
                         let session_id = handle.id;
                         router.register(handle.clone()).await;
@@ -472,7 +493,8 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
                             let result = run_plaintext_session_loops(PlaintextSessionContext {
                                 reader,
                                 writer,
-                                rx,
+                                priority_rx,
+                                normal_rx,
                                 identity: &identity,
                                 router: &session_router,
                                 codec: session_codec.as_ref(),
@@ -508,7 +530,8 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
 struct PlaintextSessionContext<'a, P: NatsPublish> {
     reader: tokio::io::ReadHalf<tokio::net::TcpStream>,
     writer: tokio::io::WriteHalf<tokio::net::TcpStream>,
-    rx: mpsc::Receiver<Arc<RoutableMessage>>,
+    priority_rx: mpsc::Receiver<Arc<RoutableMessage>>,
+    normal_rx: mpsc::Receiver<Arc<RoutableMessage>>,
     identity: &'a Identity,
     router: &'a Router,
     codec: &'a dyn Codec,
@@ -529,7 +552,8 @@ async fn run_plaintext_session_loops<P: NatsPublish>(
     let PlaintextSessionContext {
         reader,
         writer,
-        mut rx,
+        mut priority_rx,
+        mut normal_rx,
         identity,
         router,
         codec,
@@ -603,7 +627,13 @@ async fn run_plaintext_session_loops<P: NatsPublish>(
             Ok(())
         } => r,
         r = async {
-            while let Some(msg) = rx.recv().await {
+            loop {
+                let msg = tokio::select! {
+                    biased;
+                    msg = priority_rx.recv() => msg,
+                    msg = normal_rx.recv() => msg,
+                };
+                let Some(msg) = msg else { break };
                 let encoded = codec.encode_payload(&msg)?;
                 let send_fut = framed_write.send(tokio_util::bytes::BytesMut::from(encoded.as_ref()));
                 match tokio::time::timeout(WRITE_TIMEOUT, send_fut).await {

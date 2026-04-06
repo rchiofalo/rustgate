@@ -33,7 +33,7 @@ pub use filter::{GeoBounds, MessageFilter};
 pub use listener::{DEFAULT_MAX_HANDSHAKES, TlsListener};
 pub use repeater::EmergencyRepeater;
 pub use replay::ReplayFilter;
-pub use router::{Router, SessionHandle};
+pub use router::{NORMAL_CHANNEL_CAPACITY, PRIORITY_CHANNEL_CAPACITY, Router, SessionHandle};
 #[cfg(feature = "proto")]
 pub use rustgate_proto::TakFrameCodec;
 pub use session::{AuthenticatedSession, SessionReader, SessionWriter};

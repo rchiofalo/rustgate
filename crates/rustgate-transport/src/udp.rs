@@ -94,8 +94,9 @@ impl UdpInput {
                 return;
             }
         };
-        let (tx, _rx) = mpsc::channel::<Arc<RoutableMessage>>(1);
-        let handle = SessionHandle::new(Arc::clone(&identity), tx);
+        let (ptx, _prx) = mpsc::channel::<Arc<RoutableMessage>>(1);
+        let (ntx, _nrx) = mpsc::channel::<Arc<RoutableMessage>>(1);
+        let handle = SessionHandle::new(Arc::clone(&identity), ptx, ntx);
         let session_id = handle.id;
         router.register(handle).await;
 
@@ -201,8 +202,9 @@ mod tests {
         let listener_identity = Arc::new(
             Identity::plaintext("test-listener".to_string(), groups).expect("valid identity"),
         );
-        let (listener_tx, mut listener_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
-        let listener_handle = SessionHandle::new(listener_identity, listener_tx);
+        let (listener_ptx, mut listener_prx) = mpsc::channel::<Arc<RoutableMessage>>(16);
+        let (listener_ntx, mut listener_nrx) = mpsc::channel::<Arc<RoutableMessage>>(16);
+        let listener_handle = SessionHandle::new(listener_identity, listener_ptx, listener_ntx);
         router.register(listener_handle).await;
 
         let router_clone = Arc::clone(&router);
@@ -233,10 +235,18 @@ mod tests {
         // Note: The UDP identity CN is per-datagram with address suffix,
         // so broadcast routing will deliver to all except the sender CN.
         // Since test-listener has a different CN, it should receive it.
-        let msg = tokio::time::timeout(std::time::Duration::from_secs(1), listener_rx.recv())
-            .await
-            .expect("timeout")
-            .expect("recv");
+        // UDP messages are broadcast-routed; try both channels since
+        // message type depends on CoT classification of the payload.
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::select! {
+                biased;
+                msg = listener_prx.recv() => msg,
+                msg = listener_nrx.recv() => msg,
+            }
+        })
+        .await
+        .expect("timeout")
+        .expect("recv");
         assert_eq!(msg.metadata.source_protocol, "udp");
 
         shutdown.notify_one();
