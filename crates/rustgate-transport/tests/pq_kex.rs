@@ -250,3 +250,139 @@ async fn pq_with_crl_rejects_revoked() {
         "server should timeout — revoked client under PQ + CRL"
     );
 }
+
+/// When a client only supports classical key exchange (X25519 via ring),
+/// the PQ-enabled server must gracefully fall back to X25519.
+#[tokio::test]
+async fn pq_classical_client_falls_back_to_x25519() {
+    ensure_pq();
+
+    let ca = TestCa::new("PQ Fallback CA");
+    let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
+    let client_cert = ca.issue_client_cert("classical-client", &["team"]);
+
+    // Server uses the PQ provider (installed by ensure_pq)
+    let tls_config = TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
+        .expect("tls config");
+
+    let listener = TlsListener::bind("127.0.0.1:0", &tls_config)
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    let server_handle = tokio::spawn(async move {
+        let _session = listener.accept().await.expect("accept");
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    });
+
+    // Build a client config using the ring provider (classical groups only)
+    let certs = rustgate_test_utils::tls::parse_certs(&client_cert.cert_pem);
+    let key = rustgate_test_utils::tls::parse_key(&client_cert.key_pem);
+    let mut root_store = rustls::RootCertStore::empty();
+    for cert in rustgate_test_utils::tls::parse_certs(&ca.cert_pem) {
+        root_store.add(cert).expect("add CA");
+    }
+
+    let ring_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .expect("tls13")
+    .with_root_certificates(root_store)
+    .with_client_auth_cert(certs, key)
+    .expect("client auth");
+
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(ring_config));
+    let tcp = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("tcp connect");
+    let server_name = "localhost".try_into().expect("server name");
+    let stream = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("tls connect — fallback to classical must succeed");
+
+    let (_, conn) = stream.get_ref();
+    let kx_group = conn
+        .negotiated_key_exchange_group()
+        .expect("should have negotiated a key exchange group");
+
+    assert_eq!(
+        kx_group.name(),
+        rustls::NamedGroup::X25519,
+        "classical-only client should negotiate X25519, got {:?}",
+        kx_group.name()
+    );
+
+    server_handle.abort();
+}
+
+/// Verify that ML-KEM-1024 (Level 5) negotiates end-to-end when both
+/// client and server include it as the preferred key exchange group.
+#[tokio::test]
+async fn pq_mlkem1024_negotiation() {
+    ensure_pq();
+
+    let ca = TestCa::new("PQ MLKEM1024 CA");
+    let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
+    let client_cert = ca.issue_client_cert("mlkem1024-client", &["team"]);
+
+    // Build server TLS config — the default PQ provider includes MLKEM1024
+    let tls_config = TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
+        .expect("tls config");
+
+    let listener = TlsListener::bind("127.0.0.1:0", &tls_config)
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    let server_handle = tokio::spawn(async move {
+        let _session = listener.accept().await.expect("accept");
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    });
+
+    // Build client with aws-lc-rs provider, MLKEM1024 as preferred group
+    let certs = rustgate_test_utils::tls::parse_certs(&client_cert.cert_pem);
+    let key = rustgate_test_utils::tls::parse_key(&client_cert.key_pem);
+    let mut root_store = rustls::RootCertStore::empty();
+    for cert in rustgate_test_utils::tls::parse_certs(&ca.cert_pem) {
+        root_store.add(cert).expect("add CA");
+    }
+
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    provider.kx_groups = vec![
+        rustls::crypto::aws_lc_rs::kx_group::MLKEM1024,
+        rustls::crypto::aws_lc_rs::kx_group::X25519,
+    ];
+
+    let mlkem_config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("tls13")
+        .with_root_certificates(root_store)
+        .with_client_auth_cert(certs, key)
+        .expect("client auth");
+
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(mlkem_config));
+    let tcp = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("tcp connect");
+    let server_name = "localhost".try_into().expect("server name");
+    let stream = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("tls connect — MLKEM1024 negotiation must succeed");
+
+    let (_, conn) = stream.get_ref();
+    let kx_group = conn
+        .negotiated_key_exchange_group()
+        .expect("should have negotiated a key exchange group");
+
+    assert_eq!(
+        kx_group.name(),
+        rustls::NamedGroup::MLKEM1024,
+        "both sides prefer MLKEM1024 — should negotiate it, got {:?}",
+        kx_group.name()
+    );
+
+    server_handle.abort();
+}
