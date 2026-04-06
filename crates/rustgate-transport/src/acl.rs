@@ -21,8 +21,10 @@ use std::collections::{HashMap, HashSet};
 /// - **Deny-only block list**: when `senders` is empty but
 ///   `deny_senders` is non-empty, the group is open *except* for the
 ///   denied CNs. Same for receivers.
-/// - **Open**: when both `senders` and `deny_senders` are empty, sending
-///   is unrestricted (backward-compatible default).
+/// - **Both empty (deny-all)**: when both `senders` and `deny_senders`
+///   are empty the group denies all sends. This matches the pre-deny
+///   semantics where an empty allow list denied everything, and keeps
+///   `GroupAcl::default()` a safe no-permissions value.
 #[derive(Debug, Clone, Default)]
 pub struct GroupAcl {
     /// CNs allowed to send to this group.
@@ -70,11 +72,12 @@ impl GroupAcl {
         if self.deny_senders.contains(cn) {
             return false;
         }
-        if self.senders.is_empty() {
-            // Open (or deny-only block list) mode.
-            return true;
+        if !self.senders.is_empty() {
+            return self.senders.contains(cn);
         }
-        self.senders.contains(cn)
+        // Empty allow list: deny-only block list when deny list is
+        // populated, otherwise deny-all (pre-existing semantics).
+        !self.deny_senders.is_empty()
     }
 
     /// Returns `true` if `cn` is permitted to receive from this group.
@@ -85,10 +88,10 @@ impl GroupAcl {
         if self.deny_receivers.contains(cn) {
             return false;
         }
-        if self.receivers.is_empty() {
-            return true;
+        if !self.receivers.is_empty() {
+            return self.receivers.contains(cn);
         }
-        self.receivers.contains(cn)
+        !self.deny_receivers.is_empty()
     }
 
     /// CNs in the sender allow list.
@@ -319,27 +322,39 @@ mod tests {
 
     #[test]
     fn asymmetric_deny_send_only() {
-        // Denied from sending but still allowed to receive.
+        // Denied from sending. Receive side uses a non-empty deny list
+        // with an empty allow list so it stays in block-list mode
+        // (non-denied CNs may still receive).
         let acl = GroupAcl::with_deny(
             HashSet::new(),
             HashSet::new(),
             HashSet::from(["mallory".to_string()]),
-            HashSet::new(),
+            HashSet::from(["eve".to_string()]),
         );
         assert!(!acl.can_send("mallory"));
         assert!(acl.can_receive("mallory"));
+        assert!(!acl.can_receive("eve"));
     }
 
     #[test]
     fn asymmetric_deny_receive_only() {
         let acl = GroupAcl::with_deny(
             HashSet::new(),
-            HashSet::new(),
+            HashSet::from(["mallory".to_string()]),
             HashSet::new(),
             HashSet::from(["mallory".to_string()]),
         );
         assert!(acl.can_send("mallory"));
         assert!(!acl.can_receive("mallory"));
+    }
+
+    #[test]
+    fn empty_allow_and_deny_is_deny_all() {
+        // Default-constructed ACL must deny everything — matches the
+        // pre-deny semantics where an empty allow list denied all CNs.
+        let acl = GroupAcl::default();
+        assert!(!acl.can_send("alice"));
+        assert!(!acl.can_receive("alice"));
     }
 
     #[test]
