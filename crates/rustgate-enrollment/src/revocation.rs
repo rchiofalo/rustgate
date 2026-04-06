@@ -290,9 +290,15 @@ fn parse_revocation_reason(reason: &str) -> RevocationReason {
 /// Convert a hex string to bytes.
 fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
     let hex = hex.trim_start_matches("0x").trim_start_matches("0X");
-    if !hex.len().is_multiple_of(2) {
-        return Err("odd-length hex string".to_string());
-    }
+    // Left-pad odd-length hex with a leading zero. X.509 serial numbers
+    // can naturally produce odd-length hex when the leading byte is < 0x10.
+    let padded;
+    let hex = if !hex.len().is_multiple_of(2) {
+        padded = format!("0{hex}");
+        &padded
+    } else {
+        hex
+    };
     (0..hex.len())
         .step_by(2)
         .map(|i| {
@@ -443,8 +449,14 @@ mod tests {
 
     #[test]
     fn hex_to_bytes_errors() {
-        assert!(hex_to_bytes("aab").is_err()); // odd length
         assert!(hex_to_bytes("gggg").is_err()); // invalid hex
+    }
+
+    #[test]
+    fn hex_to_bytes_odd_length_padded() {
+        // Odd-length hex is left-padded with a leading zero (common for X.509 serials)
+        assert_eq!(hex_to_bytes("aab").unwrap(), vec![0x0a, 0xab]);
+        assert_eq!(hex_to_bytes("1").unwrap(), vec![0x01]);
     }
 
     #[test]
