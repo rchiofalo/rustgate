@@ -813,6 +813,128 @@ async fn position_cache_replaces_old() {
     assert_eq!(got.payload.as_ref(), b"pos2");
 }
 
+// ── TTL enforcement ─────────────────────────────────────────────────────
+
+/// Messages whose TTL has expired before delivery are silently dropped
+/// and never delivered to any session.
+#[tokio::test]
+async fn expired_message_is_dropped() {
+    let router = Router::new();
+
+    let alice = Arc::new(make_identity("alice", &["team"]));
+    let bob = Arc::new(make_identity("bob", &["team"]));
+
+    let (alice_tx, mut alice_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
+    let (bob_tx, mut bob_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
+
+    router
+        .register(SessionHandle::new(alice.clone(), alice_tx))
+        .await;
+    router
+        .register(SessionHandle::new(bob.clone(), bob_tx))
+        .await;
+
+    // Build a message that is already expired: received 10s ago with 1s TTL
+    let expired_msg = RoutableMessage {
+        source: (*alice).clone(),
+        destination: Destination::Broadcast,
+        payload: Bytes::from("stale"),
+        metadata: Metadata {
+            received_at: SystemTime::now() - std::time::Duration::from_secs(10),
+            source_protocol: "tcp".into(),
+            message_type: MessageType::Other("raw".into()),
+            ttl: Some(std::time::Duration::from_secs(1)),
+        },
+    };
+    router.route(expired_msg).await;
+
+    // Neither alice (sender) nor bob should receive the expired message
+    assert!(
+        alice_rx.try_recv().is_err(),
+        "expired message should not be delivered to sender"
+    );
+    assert!(
+        bob_rx.try_recv().is_err(),
+        "expired message should not be delivered to any session"
+    );
+}
+
+/// Messages without a TTL are never considered expired and route normally.
+#[tokio::test]
+async fn message_without_ttl_routes_normally() {
+    let router = Router::new();
+
+    let alice = Arc::new(make_identity("alice", &["team"]));
+    let bob = Arc::new(make_identity("bob", &["team"]));
+
+    let (_alice_tx, _alice_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
+    let (bob_tx, mut bob_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
+
+    router
+        .register(SessionHandle::new(alice.clone(), _alice_tx))
+        .await;
+    router
+        .register(SessionHandle::new(bob.clone(), bob_tx))
+        .await;
+
+    // Message with no TTL — should be delivered regardless of age
+    let msg = RoutableMessage {
+        source: (*alice).clone(),
+        destination: Destination::Broadcast,
+        payload: Bytes::from("no-ttl"),
+        metadata: Metadata {
+            received_at: SystemTime::now() - std::time::Duration::from_secs(3600),
+            source_protocol: "tcp".into(),
+            message_type: MessageType::Other("raw".into()),
+            ttl: None,
+        },
+    };
+    router.route(msg).await;
+
+    let got = bob_rx
+        .try_recv()
+        .expect("message without TTL should be delivered");
+    assert_eq!(got.payload.as_ref(), b"no-ttl");
+}
+
+/// Messages with a TTL that has not yet expired route normally.
+#[tokio::test]
+async fn non_expired_ttl_message_routes_normally() {
+    let router = Router::new();
+
+    let alice = Arc::new(make_identity("alice", &["team"]));
+    let bob = Arc::new(make_identity("bob", &["team"]));
+
+    let (_alice_tx, _alice_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
+    let (bob_tx, mut bob_rx) = mpsc::channel::<Arc<RoutableMessage>>(16);
+
+    router
+        .register(SessionHandle::new(alice.clone(), _alice_tx))
+        .await;
+    router
+        .register(SessionHandle::new(bob.clone(), bob_tx))
+        .await;
+
+    // Message with a generous TTL — should be delivered
+    let msg = RoutableMessage {
+        source: (*alice).clone(),
+        destination: Destination::Broadcast,
+        payload: Bytes::from("fresh"),
+        metadata: Metadata {
+            received_at: SystemTime::now(),
+            source_protocol: "tcp".into(),
+            message_type: MessageType::Other("raw".into()),
+            ttl: Some(std::time::Duration::from_secs(300)),
+        },
+    };
+    router.route(msg).await;
+
+    let got = bob_rx
+        .try_recv()
+        .expect("non-expired TTL message should be delivered");
+    assert_eq!(got.payload.as_ref(), b"fresh");
+}
+
 // ── codec: header sizes and overflow ─────────────────────────────────────
 
 /// HeaderSize::One — encode and decode a frame within the 255-byte limit.

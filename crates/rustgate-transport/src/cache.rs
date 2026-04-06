@@ -51,11 +51,11 @@ pub struct PositionCache {
     max_entries: usize,
 }
 
-/// Check if a position message has expired based on its TTL.
+/// Check if a message has expired based on its TTL.
 ///
 /// A message is expired when `received_at + ttl < now`. Messages without
 /// a TTL never expire (they are only evicted on disconnect or replacement).
-fn is_expired(msg: &RoutableMessage) -> bool {
+pub(crate) fn is_expired(msg: &RoutableMessage) -> bool {
     let Some(ttl) = msg.metadata.ttl else {
         return false;
     };
