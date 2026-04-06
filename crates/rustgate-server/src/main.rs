@@ -19,6 +19,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
 mod acl_config;
+mod acl_reloader;
 mod archive;
 mod audit;
 mod cli;
@@ -178,11 +179,30 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     // ── Connection limit ────────────────────────────────────────────
     // CLI validation ensures max_connections is 1..=u32::MAX
     let max_connections: u32 = cli.max_connections as u32;
-    let group_acl = setup::load_group_acl(&cli).await?;
+    let (group_acl, acl_file_hash) = setup::load_group_acl(&cli).await?;
     let router = Arc::new(match group_acl {
         Some(acl) => Router::with_acl(acl),
         None => Router::new(),
     });
+
+    // ── ACL hot-reload ─────────────────────────────────────────────
+    if let Some(ref acl_file) = cli.group_acl_file
+        && cli.acl_reload_interval > 0
+    {
+        let initial_hash =
+            acl_file_hash.unwrap_or_else(|| acl_reloader::AclReloader::compute_hash(b""));
+        let reloader =
+            acl_reloader::AclReloader::new(acl_file.clone(), Arc::clone(&router), initial_hash);
+        let interval = Duration::from_secs(cli.acl_reload_interval);
+        reloader.spawn_watcher(interval);
+
+        tracing::info!(
+            interval_secs = cli.acl_reload_interval,
+            path = %acl_file,
+            "ACL hot-reload enabled"
+        );
+    }
+
     let connection_limit = Arc::new(Semaphore::new(max_connections as usize));
 
     // ── NATS ────────────────────────────────────────────────────────

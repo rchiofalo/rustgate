@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use rustgate_core::identity::{GroupId, Identity};
 use rustgate_core::message::{Destination, MessageType, RoutableMessage};
@@ -237,7 +238,7 @@ impl State {
 pub struct Router {
     state: RwLock<State>,
     cache: PositionCache,
-    acl: Option<GroupAclPolicy>,
+    acl: ArcSwap<Option<GroupAclPolicy>>,
 }
 
 impl Default for Router {
@@ -245,7 +246,7 @@ impl Default for Router {
         Self {
             state: RwLock::new(State::default()),
             cache: PositionCache::default(),
-            acl: None,
+            acl: ArcSwap::from_pointee(None),
         }
     }
 }
@@ -268,7 +269,7 @@ impl Router {
                 ..State::default()
             }),
             cache: PositionCache::default(),
-            acl: None,
+            acl: ArcSwap::from_pointee(None),
         }
     }
 
@@ -281,7 +282,7 @@ impl Router {
         Self {
             state: RwLock::new(State::default()),
             cache: PositionCache::default(),
-            acl,
+            acl: ArcSwap::from_pointee(acl),
         }
     }
 
@@ -299,8 +300,17 @@ impl Router {
                 ..State::default()
             }),
             cache: PositionCache::default(),
-            acl,
+            acl: ArcSwap::from_pointee(acl),
         }
+    }
+
+    /// Atomically replace the group access control policy.
+    ///
+    /// Active routing operations will continue using the previous policy
+    /// until they complete; new operations see the updated policy
+    /// immediately. Pass `None` to revert to open mode.
+    pub fn swap_acl(&self, new_acl: Option<GroupAclPolicy>) {
+        self.acl.store(Arc::new(new_acl));
     }
 
     /// Access the position cache for SA replay.
@@ -426,6 +436,8 @@ impl Router {
     /// Only replays positions from clients that share at least one group
     /// with the connecting session to enforce group-level isolation.
     pub async fn replay_positions(&self, handle: &SessionHandle) {
+        let acl_guard = self.acl.load();
+        let acl_ref: &Option<GroupAclPolicy> = &acl_guard;
         let mut dropped = 0u32;
         let mut total = 0u32;
         for msg in self.cache.get_all().await {
@@ -434,7 +446,7 @@ impl Router {
                 .groups
                 .intersection(&handle.identity.groups)
                 .any(|g| {
-                    self.acl
+                    acl_ref
                         .as_ref()
                         .is_none_or(|acl| acl.is_receive_authorized(g, &handle.identity.cn))
                 });
@@ -494,8 +506,11 @@ impl Router {
             return;
         }
 
+        let acl_guard = self.acl.load();
+        let acl_ref: &Option<GroupAclPolicy> = &acl_guard;
+
         // ACL send authorization — denies sender even if they are a group member
-        if let Some(ref acl) = self.acl
+        if let Some(ref acl) = *acl_ref
             && !acl.is_send_authorized(group, &msg.source.cn)
         {
             tracing::warn!(
@@ -518,7 +533,7 @@ impl Router {
                 .iter()
                 .filter(|cn| *cn != &msg.source.cn)
                 .filter(|cn| {
-                    self.acl
+                    acl_ref
                         .as_ref()
                         .is_none_or(|acl| acl.is_receive_authorized(group, cn))
                 })
@@ -1317,6 +1332,94 @@ mod tests {
         // No more messages on either channel
         assert!(prx_a.try_recv().is_err());
         assert!(nrx_a.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn swap_acl_atomically_replaces_policy() {
+        // Start with no ACL — open mode
+        let router = Router::new();
+
+        let alice = make_identity("alice", &["alpha"]);
+        let bob = make_identity("bob", &["alpha"]);
+
+        let (ptx_a, ntx_a, _prx_a, mut nrx_a) = make_channels(16, 16);
+        let (ptx_b, ntx_b, _prx_b, _nrx_b) = make_channels(16, 16);
+
+        router
+            .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
+            .await;
+        router
+            .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+            .await;
+
+        // Open mode: bob can send to alpha
+        let msg = make_chat(&bob, Destination::Group("alpha".to_string()));
+        router.route(msg).await;
+        assert!(nrx_a.try_recv().is_ok(), "alice must receive in open mode");
+
+        // Swap in a restrictive ACL: only alice can send
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "alpha".to_string(),
+            crate::acl::GroupAcl::new(
+                std::collections::HashSet::from(["alice".to_string()]),
+                std::collections::HashSet::from(["alice".to_string(), "bob".to_string()]),
+            ),
+        );
+        let policy = crate::acl::GroupAclPolicy::new(groups);
+        router.swap_acl(Some(policy));
+
+        // Bob can no longer send to alpha
+        let msg = make_chat(&bob, Destination::Group("alpha".to_string()));
+        router.route(msg).await;
+        assert!(
+            nrx_a.try_recv().is_err(),
+            "alice must NOT receive: bob is no longer authorized after swap"
+        );
+
+        // Swap back to open mode
+        router.swap_acl(None);
+
+        let msg = make_chat(&bob, Destination::Group("alpha".to_string()));
+        router.route(msg).await;
+        assert!(
+            nrx_a.try_recv().is_ok(),
+            "alice must receive after reverting to open mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn swap_acl_affects_replay_positions() {
+        let router = Router::new();
+
+        let alice = make_identity("alice", &["alpha"]);
+        let bob = make_identity("bob", &["alpha"]);
+
+        // Cache a position from alice
+        let pos = make_position(&alice, Destination::Broadcast);
+        router.cache().store(pos).await;
+
+        // Swap in ACL: bob cannot receive from alpha
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "alpha".to_string(),
+            crate::acl::GroupAcl::new(
+                std::collections::HashSet::from(["alice".to_string()]),
+                std::collections::HashSet::from(["alice".to_string()]),
+            ),
+        );
+        let policy = crate::acl::GroupAclPolicy::new(groups);
+        router.swap_acl(Some(policy));
+
+        // Bob should NOT receive the replayed position
+        let (ptx, ntx, mut prx, _nrx) = make_channels(16, 16);
+        let handle = SessionHandle::new(bob.clone(), ptx, ntx);
+        router.replay_positions(&handle).await;
+
+        assert!(
+            prx.try_recv().is_err(),
+            "bob must not receive replayed position after ACL swap"
+        );
     }
 
     #[tokio::test]

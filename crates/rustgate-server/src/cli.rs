@@ -374,6 +374,13 @@ pub(crate) struct Cli {
     #[arg(long, env = "RUSTGATE_GROUP_ACL_FILE")]
     pub(crate) group_acl_file: Option<String>,
 
+    /// Interval in seconds to check the group ACL file for changes.
+    /// When set to a value > 0 and --group-acl-file is provided, the server
+    /// periodically polls the ACL file and hot-reloads the policy on change.
+    /// Set to 0 (default) to disable automatic ACL reloading.
+    #[arg(long, default_value_t = 0, env = "RUSTGATE_ACL_RELOAD_INTERVAL")]
+    pub(crate) acl_reload_interval: u64,
+
     // -- Data retention / archival --
     /// Directory for CoT event archival (JSONL). Enables structured logging of
     /// all received CoT events to date-stamped files.
