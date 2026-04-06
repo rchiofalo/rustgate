@@ -319,3 +319,143 @@ fn with_crls_cert_instead_of_crl_fails() {
         "certificate PEM should not be accepted as CRL"
     );
 }
+
+// ── CRL hot-swap tests ─────────────────────────────────────────────────
+
+/// Verify that a client accepted before CRL loading is correctly rejected
+/// after CRL is applied to a new TLS config. This simulates an operator
+/// revoking a certificate and reloading the server configuration without
+/// a full restart.
+///
+/// 1. Server starts WITHOUT CRL — revoked-to-be client connects successfully.
+/// 2. CRL is generated revoking client B.
+/// 3. New TlsConfig is built WITH CRL, new listener is bound.
+/// 4. Good client A connects to new listener — succeeds.
+/// 5. Revoked client B connects to new listener — rejected.
+#[tokio::test]
+async fn crl_hot_swap_rejects_newly_revoked() {
+    let ca = TestCa::new("CRL Hot Swap CA");
+    let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
+    let client_a = ca.issue_client_cert("good-user", &["ops"]);
+    let client_b = ca.issue_client_cert("revoked-user", &["ops"]);
+
+    // ── Phase 1: Server without CRL — client B connects successfully ────
+    let tls_no_crl = TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
+        .expect("tls config without CRL");
+
+    let listener_no_crl = TlsListener::bind("127.0.0.1:0", &tls_no_crl)
+        .await
+        .expect("bind without CRL");
+    let addr_no_crl = listener_no_crl.local_addr().expect("addr");
+
+    let server_handle = tokio::spawn(async move {
+        let session = listener_no_crl.accept().await.expect("accept");
+        let identity = session.identity().clone();
+        let (mut reader, mut writer) = session.split();
+
+        let mut buf = [0u8; 4];
+        let _ = reader.read_exact(&mut buf).await.expect("read");
+        assert_eq!(&buf, b"ping");
+        writer.write_all(b"pong").await.expect("write");
+
+        identity
+    });
+
+    let config_b = build_client_tls_config(&client_b.cert_pem, &client_b.key_pem, &ca.cert_pem);
+    let mut stream = try_connect(addr_no_crl, &config_b)
+        .await
+        .expect("client B should connect before CRL is loaded");
+
+    stream.write_all(b"ping").await.expect("client B write");
+    let mut buf = [0u8; 4];
+    let _ = stream.read_exact(&mut buf).await.expect("client B read");
+    assert_eq!(&buf, b"pong");
+
+    let identity = server_handle.await.expect("server task phase 1");
+    assert_eq!(identity.cn, "revoked-user");
+
+    // ── Phase 2: Generate CRL revoking client B, rebuild config ─────────
+    let crl_pem = ca.generate_crl(&[&client_b.cert_pem]);
+
+    let tls_with_crl =
+        TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
+            .expect("tls config with CRL")
+            .with_crls(&crl_pem)
+            .expect("load CRL");
+
+    let listener_crl = TlsListener::bind("127.0.0.1:0", &tls_with_crl)
+        .await
+        .expect("bind with CRL");
+    let addr_crl = listener_crl.local_addr().expect("addr");
+
+    // ── Phase 3: Client A connects to CRL-enabled server — succeeds ─────
+    let listener_for_a = TlsListener::bind("127.0.0.1:0", &tls_with_crl)
+        .await
+        .expect("bind for client A");
+    let addr_a = listener_for_a.local_addr().expect("addr for client A");
+
+    let server_handle_a = tokio::spawn(async move {
+        let session = listener_for_a.accept().await.expect("accept client A");
+        let identity = session.identity().clone();
+        let (mut reader, mut writer) = session.split();
+
+        let mut buf = [0u8; 5];
+        let _ = reader.read_exact(&mut buf).await.expect("read from A");
+        assert_eq!(&buf, b"hello");
+        writer.write_all(b"world").await.expect("write to A");
+
+        identity
+    });
+
+    let config_a = build_client_tls_config(&client_a.cert_pem, &client_a.key_pem, &ca.cert_pem);
+    let mut stream_a = try_connect(addr_a, &config_a)
+        .await
+        .expect("client A should connect — not revoked");
+
+    stream_a.write_all(b"hello").await.expect("client A write");
+    let mut buf_a = [0u8; 5];
+    let _ = stream_a
+        .read_exact(&mut buf_a)
+        .await
+        .expect("client A read");
+    assert_eq!(&buf_a, b"world");
+
+    let identity_a = server_handle_a.await.expect("server task for client A");
+    assert_eq!(identity_a.cn, "good-user");
+
+    // ── Phase 4: Client B connects to CRL-enabled server — rejected ─────
+    let server_handle_b = tokio::spawn(async move {
+        tokio::time::timeout(std::time::Duration::from_secs(5), listener_crl.accept()).await
+    });
+
+    let result = try_connect(addr_crl, &config_b).await;
+
+    let failed = match result {
+        Err(_) => true,
+        Ok(mut stream) => {
+            // TLS 1.3 may defer the alert — try using the connection
+            if stream.write_all(b"x").await.is_err() || stream.flush().await.is_err() {
+                true
+            } else {
+                let mut buf = [0u8; 1];
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    stream.read(&mut buf),
+                )
+                .await
+                {
+                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => true,
+                    Ok(Ok(_)) => false,
+                }
+            }
+        }
+    };
+
+    assert!(failed, "client B should be rejected after CRL is loaded");
+
+    let server_result = server_handle_b.await.expect("server task for client B");
+    assert!(
+        server_result.is_err(),
+        "server should timeout — no valid session from revoked client B"
+    );
+}
