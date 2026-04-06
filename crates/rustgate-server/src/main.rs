@@ -217,19 +217,50 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     }
 
     // ── ACL REST API ───────────────────────────────────────────────
+    //
+    // Only registered when both `--group-acl-file` and
+    // `--acl-api-token-file` are set. The API exposes mutation of
+    // routing policy, so it must be explicitly opted into with a
+    // bearer token and is always backed by an on-disk file to
+    // persist mutations to.
     #[cfg(feature = "metrics")]
     {
-        let initial_file = acl_file_parsed.unwrap_or_default();
-        let api_state = Arc::new(acl_api::AclApiState {
-            current: Arc::new(std::sync::RwLock::new(initial_file)),
-            router: Arc::clone(&router),
-            reloader: acl_reloader_for_api,
-        });
-        let handler: metrics::AclApiHandler = Arc::new(move |method, path, body| {
-            acl_api::handle_request(method, path, body, &api_state)
-        });
-        let _ = acl_api_slot.set(handler);
-        tracing::info!("ACL REST API wired into metrics server");
+        match (&cli.group_acl_file, &cli.acl_api_token_file) {
+            (Some(acl_file), Some(token_file)) => {
+                let token = std::fs::read_to_string(token_file).map_err(|e| {
+                    anyhow::anyhow!("failed to read ACL API token file {token_file}: {e}")
+                })?;
+                let token = token.trim().as_bytes().to_vec();
+                if token.is_empty() {
+                    anyhow::bail!("ACL API token file {token_file} is empty");
+                }
+                let initial_file = acl_file_parsed.unwrap_or_default();
+                let api_state = Arc::new(acl_api::AclApiState {
+                    current: Arc::new(std::sync::RwLock::new(initial_file)),
+                    router: Arc::clone(&router),
+                    reloader: acl_reloader_for_api,
+                    file_path: std::path::PathBuf::from(acl_file),
+                    auth_token: token,
+                });
+                let handler: metrics::AclApiHandler = Arc::new(move |method, path, auth, body| {
+                    acl_api::handle_request(method, path, auth, body, &api_state)
+                });
+                let _ = acl_api_slot.set(handler);
+                tracing::warn!(
+                    "ACL REST API enabled at /api/acl/ — exposes mutation of routing policy; \
+                     bind the metrics endpoint to a trusted network only"
+                );
+            }
+            (Some(_), None) => {
+                tracing::info!(
+                    "ACL REST API disabled: --acl-api-token-file is required to expose /api/acl/"
+                );
+                let _ = acl_file_parsed;
+            }
+            _ => {
+                let _ = acl_file_parsed;
+            }
+        }
     }
     #[cfg(not(feature = "metrics"))]
     let _ = acl_file_parsed;

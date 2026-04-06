@@ -20,6 +20,7 @@
 //! disk are therefore discarded by a reload.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
@@ -27,6 +28,7 @@ use http_body_util::Full;
 use hyper::{Method, Response, StatusCode};
 use rustgate_transport::Router;
 use serde::Serialize;
+use subtle::ConstantTimeEq;
 
 use crate::acl_config::{GroupAclEntry, GroupAclFile};
 use crate::acl_reloader::AclReloader;
@@ -41,6 +43,13 @@ pub struct AclApiState {
     pub current: Arc<RwLock<GroupAclFile>>,
     pub router: Arc<Router>,
     pub reloader: Option<Arc<AclReloader>>,
+    /// On-disk ACL file to rewrite atomically when mutations succeed.
+    /// The API is only registered when both this path and a token file
+    /// are configured, so handlers can assume it is always set.
+    pub file_path: PathBuf,
+    /// Bearer token required on every `/api/acl/` request. Stored as
+    /// raw bytes so we can use constant-time comparison.
+    pub auth_token: Vec<u8>,
 }
 
 impl std::fmt::Debug for AclApiState {
@@ -116,18 +125,48 @@ fn install_current(state: &AclApiState) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Validate a group identifier against a strict allow list of characters.
+///
+/// Permitted: ASCII alphanumeric plus `_ . : -`. Length must be 1..=128.
+fn valid_group_id(group: &str) -> bool {
+    let len = group.len();
+    if !(1..=128).contains(&len) {
+        return false;
+    }
+    group
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-'))
+}
+
+/// Constant-time check of the supplied bearer token against the configured one.
+fn auth_ok(header: Option<&str>, expected: &[u8]) -> bool {
+    let Some(raw) = header else {
+        return false;
+    };
+    let Some(token) = raw.strip_prefix("Bearer ") else {
+        return false;
+    };
+    token.as_bytes().ct_eq(expected).into()
+}
+
 /// Handle an ACL API request.
 ///
 /// Returns `None` if `path` is outside `/api/acl/`, allowing the caller
-/// to fall through to other handlers.
+/// to fall through to other handlers. All `/api/acl/` routes require a
+/// valid `Authorization: Bearer <token>` header; missing or mismatched
+/// tokens yield a 401 response.
 pub fn handle_request(
     method: &Method,
     path: &str,
+    authorization: Option<&str>,
     body: &[u8],
     state: &AclApiState,
 ) -> Option<Response<Full<Bytes>>> {
     if !path.starts_with("/api/acl/") {
         return None;
+    }
+    if !auth_ok(authorization, &state.auth_token) {
+        return Some(json_error(StatusCode::UNAUTHORIZED, "unauthorized"));
     }
     let sub_path = &path["/api/acl/".len()..];
     Some(route(method, sub_path, body, state))
@@ -143,14 +182,14 @@ fn route(
         (&Method::GET, "groups") => list_groups(state),
         (&Method::PUT, path) if path.starts_with("groups/") => {
             let group = &path["groups/".len()..];
-            if group.is_empty() || group.contains('/') {
+            if !valid_group_id(group) {
                 return json_error(StatusCode::BAD_REQUEST, "invalid group id");
             }
             put_group(state, group, body)
         }
         (&Method::DELETE, path) if path.starts_with("groups/") => {
             let group = &path["groups/".len()..];
-            if group.is_empty() || group.contains('/') {
+            if !valid_group_id(group) {
                 return json_error(StatusCode::BAD_REQUEST, "invalid group id");
             }
             delete_group(state, group)
@@ -158,6 +197,60 @@ fn route(
         (&Method::POST, "reload") => reload(state),
         _ => json_error(StatusCode::NOT_FOUND, "not found"),
     }
+}
+
+/// Atomically persist the in-memory ACL state to disk.
+///
+/// Writes to `<path>.tmp`, fsyncs, then renames over the target so
+/// concurrent readers (and the hot reloader) never see a partial file.
+fn persist_current(state: &AclApiState) -> Result<(), String> {
+    use std::io::Write;
+
+    let file = state
+        .current
+        .read()
+        .map_err(|_| "ACL state lock poisoned".to_string())?;
+    let json = serde_json::to_vec_pretty(&*file).map_err(|e| format!("serialize ACL file: {e}"))?;
+    drop(file);
+
+    let mut tmp = state.file_path.clone();
+    let mut name = tmp
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_default();
+    name.push(".tmp");
+    tmp.set_file_name(name);
+
+    {
+        let mut f =
+            std::fs::File::create(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
+        f.write_all(&json)
+            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        f.sync_all()
+            .map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
+    }
+    std::fs::rename(&tmp, &state.file_path)
+        .map_err(|e| format!("rename {}: {e}", state.file_path.display()))?;
+    Ok(())
+}
+
+/// Persist the current in-memory ACL and, if a reloader is wired in,
+/// update its stored SHA-256 hash so the next background poll does not
+/// re-detect the same change.
+fn persist_and_sync_hash(state: &AclApiState) -> Result<(), String> {
+    persist_current(state)?;
+    if let Some(reloader) = state.reloader.as_ref() {
+        match std::fs::read(&state.file_path) {
+            Ok(bytes) => reloader.set_hash(AclReloader::compute_hash(&bytes)),
+            Err(e) => {
+                return Err(format!(
+                    "re-read {} for hash sync: {e}",
+                    state.file_path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn list_groups(state: &AclApiState) -> Response<Full<Bytes>> {
@@ -183,6 +276,9 @@ fn put_group(state: &AclApiState, group: &str, body: &[u8]) -> Response<Full<Byt
     }
     if let Err(e) = install_current(state) {
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, e);
+    }
+    if let Err(e) = persist_and_sync_hash(state) {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, &e);
     }
     tracing::info!(
         target: "audit",
@@ -210,6 +306,9 @@ fn delete_group(state: &AclApiState, group: &str) -> Response<Full<Bytes>> {
     }
     if let Err(e) = install_current(state) {
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, e);
+    }
+    if let Err(e) = persist_and_sync_hash(state) {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, &e);
     }
     tracing::info!(
         target: "audit",
@@ -241,7 +340,10 @@ mod tests {
 
     use super::*;
 
-    fn make_state() -> AclApiState {
+    const TEST_TOKEN: &str = "s3cret-token";
+    const TEST_AUTH: Option<&str> = Some("Bearer s3cret-token");
+
+    fn make_state_with_dir(dir: &std::path::Path) -> AclApiState {
         let mut file = GroupAclFile::default();
         let _ = file.groups.insert(
             "alpha".to_string(),
@@ -252,11 +354,22 @@ mod tests {
                 deny_receive: HashSet::new(),
             },
         );
+        let path = dir.join("acl.json");
+        // Seed the file so persistence round-trips work.
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
         AclApiState {
             current: Arc::new(RwLock::new(file)),
             router: Arc::new(Router::new()),
             reloader: None,
+            file_path: path,
+            auth_token: TEST_TOKEN.as_bytes().to_vec(),
         }
+    }
+
+    fn make_state() -> (tempfile::TempDir, AclApiState) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = make_state_with_dir(dir.path());
+        (dir, state)
     }
 
     fn body_string(resp: Response<Full<Bytes>>) -> String {
@@ -286,22 +399,26 @@ mod tests {
 
     #[test]
     fn non_acl_path_returns_none() {
-        let state = make_state();
-        assert!(handle_request(&Method::GET, "/healthz", &[], &state).is_none());
-        assert!(handle_request(&Method::GET, "/api/federation/foo", &[], &state).is_none());
+        let (_d, state) = make_state();
+        assert!(handle_request(&Method::GET, "/healthz", TEST_AUTH, &[], &state).is_none());
+        assert!(
+            handle_request(&Method::GET, "/api/federation/foo", TEST_AUTH, &[], &state).is_none()
+        );
     }
 
     #[test]
     fn unknown_acl_path_returns_404() {
-        let state = make_state();
-        let resp = handle_request(&Method::GET, "/api/acl/unknown", &[], &state).expect("handled");
+        let (_d, state) = make_state();
+        let resp = handle_request(&Method::GET, "/api/acl/unknown", TEST_AUTH, &[], &state)
+            .expect("handled");
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]
     fn list_groups_returns_current_state() {
-        let state = make_state();
-        let resp = handle_request(&Method::GET, "/api/acl/groups", &[], &state).expect("handled");
+        let (_d, state) = make_state();
+        let resp = handle_request(&Method::GET, "/api/acl/groups", TEST_AUTH, &[], &state)
+            .expect("handled");
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_string(resp);
         assert!(body.contains("alpha"));
@@ -309,8 +426,44 @@ mod tests {
     }
 
     #[test]
+    fn missing_token_returns_401() {
+        let (_d, state) = make_state();
+        let resp =
+            handle_request(&Method::GET, "/api/acl/groups", None, &[], &state).expect("handled");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn wrong_token_returns_401() {
+        let (_d, state) = make_state();
+        let resp = handle_request(
+            &Method::GET,
+            "/api/acl/groups",
+            Some("Bearer not-the-token"),
+            &[],
+            &state,
+        )
+        .expect("handled");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn malformed_authorization_header_returns_401() {
+        let (_d, state) = make_state();
+        let resp = handle_request(
+            &Method::GET,
+            "/api/acl/groups",
+            Some("Basic s3cret-token"),
+            &[],
+            &state,
+        )
+        .expect("handled");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
     fn put_group_adds_new_entry_and_swaps_router() {
-        let state = make_state();
+        let (_d, state) = make_state();
         let body = serde_json::to_vec(&serde_json::json!({
             "send": ["carol"],
             "receive": ["carol"],
@@ -318,8 +471,14 @@ mod tests {
         }))
         .unwrap();
 
-        let resp =
-            handle_request(&Method::PUT, "/api/acl/groups/bravo", &body, &state).expect("handled");
+        let resp = handle_request(
+            &Method::PUT,
+            "/api/acl/groups/bravo",
+            TEST_AUTH,
+            &body,
+            &state,
+        )
+        .expect("handled");
         assert_eq!(resp.status(), StatusCode::OK);
 
         // In-memory state must contain the new group.
@@ -333,18 +492,29 @@ mod tests {
         let policy = snap.as_ref().as_ref().expect("policy installed");
         assert!(!policy.is_send_authorized("bravo", "mallory"));
         assert!(policy.is_send_authorized("bravo", "carol"));
+
+        // Persistence: the on-disk file should now include the new group.
+        let on_disk = std::fs::read_to_string(&state.file_path).unwrap();
+        assert!(on_disk.contains("bravo"));
+        assert!(on_disk.contains("mallory"));
     }
 
     #[test]
     fn put_group_updates_existing_entry() {
-        let state = make_state();
+        let (_d, state) = make_state();
         let body = serde_json::to_vec(&serde_json::json!({
             "send": ["alice", "bob"],
             "receive": ["alice", "bob"]
         }))
         .unwrap();
-        let resp =
-            handle_request(&Method::PUT, "/api/acl/groups/alpha", &body, &state).expect("handled");
+        let resp = handle_request(
+            &Method::PUT,
+            "/api/acl/groups/alpha",
+            TEST_AUTH,
+            &body,
+            &state,
+        )
+        .expect("handled");
         assert_eq!(resp.status(), StatusCode::OK);
         let file = state.current.read().unwrap();
         assert!(file.groups["alpha"].send.contains("bob"));
@@ -352,25 +522,52 @@ mod tests {
 
     #[test]
     fn put_group_invalid_json_rejected() {
-        let state = make_state();
-        let resp = handle_request(&Method::PUT, "/api/acl/groups/bravo", b"not json", &state)
-            .expect("handled");
+        let (_d, state) = make_state();
+        let resp = handle_request(
+            &Method::PUT,
+            "/api/acl/groups/bravo",
+            TEST_AUTH,
+            b"not json",
+            &state,
+        )
+        .expect("handled");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
     fn put_group_empty_id_rejected() {
-        let state = make_state();
-        let resp =
-            handle_request(&Method::PUT, "/api/acl/groups/", b"{}", &state).expect("handled");
+        let (_d, state) = make_state();
+        let resp = handle_request(&Method::PUT, "/api/acl/groups/", TEST_AUTH, b"{}", &state)
+            .expect("handled");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn put_group_invalid_chars_rejected() {
+        let (_d, state) = make_state();
+        // Space is not in the allow list.
+        let resp = handle_request(
+            &Method::PUT,
+            "/api/acl/groups/has space",
+            TEST_AUTH,
+            b"{}",
+            &state,
+        )
+        .expect("handled");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
     fn delete_group_removes_entry() {
-        let state = make_state();
-        let resp =
-            handle_request(&Method::DELETE, "/api/acl/groups/alpha", &[], &state).expect("handled");
+        let (_d, state) = make_state();
+        let resp = handle_request(
+            &Method::DELETE,
+            "/api/acl/groups/alpha",
+            TEST_AUTH,
+            &[],
+            &state,
+        )
+        .expect("handled");
         assert_eq!(resp.status(), StatusCode::OK);
         let file = state.current.read().unwrap();
         assert!(!file.groups.contains_key("alpha"));
@@ -381,16 +578,23 @@ mod tests {
 
     #[test]
     fn delete_group_not_found() {
-        let state = make_state();
-        let resp = handle_request(&Method::DELETE, "/api/acl/groups/missing", &[], &state)
-            .expect("handled");
+        let (_d, state) = make_state();
+        let resp = handle_request(
+            &Method::DELETE,
+            "/api/acl/groups/missing",
+            TEST_AUTH,
+            &[],
+            &state,
+        )
+        .expect("handled");
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]
     fn reload_without_reloader_returns_503() {
-        let state = make_state();
-        let resp = handle_request(&Method::POST, "/api/acl/reload", &[], &state).expect("handled");
+        let (_d, state) = make_state();
+        let resp = handle_request(&Method::POST, "/api/acl/reload", TEST_AUTH, &[], &state)
+            .expect("handled");
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
@@ -412,9 +616,12 @@ mod tests {
             current: Arc::new(RwLock::new(GroupAclFile::default())),
             router: Arc::clone(&router),
             reloader: Some(Arc::clone(&reloader)),
+            file_path: path.clone(),
+            auth_token: TEST_TOKEN.as_bytes().to_vec(),
         };
 
-        let resp = handle_request(&Method::POST, "/api/acl/reload", &[], &state).expect("handled");
+        let resp = handle_request(&Method::POST, "/api/acl/reload", TEST_AUTH, &[], &state)
+            .expect("handled");
         assert_eq!(resp.status(), StatusCode::OK);
 
         // Router should now have the gamma policy installed.
@@ -426,7 +633,7 @@ mod tests {
 
     #[test]
     fn put_then_list_round_trips() {
-        let state = make_state();
+        let (_d, state) = make_state();
         let body = serde_json::to_vec(&serde_json::json!({
             "send": ["x"],
             "receive": ["y"],
@@ -434,10 +641,17 @@ mod tests {
             "deny_receive": ["w"]
         }))
         .unwrap();
-        let _ =
-            handle_request(&Method::PUT, "/api/acl/groups/delta", &body, &state).expect("handled");
+        let _ = handle_request(
+            &Method::PUT,
+            "/api/acl/groups/delta",
+            TEST_AUTH,
+            &body,
+            &state,
+        )
+        .expect("handled");
 
-        let resp = handle_request(&Method::GET, "/api/acl/groups", &[], &state).expect("handled");
+        let resp = handle_request(&Method::GET, "/api/acl/groups", TEST_AUTH, &[], &state)
+            .expect("handled");
         let s = body_string(resp);
         assert!(s.contains("delta"));
         assert!(s.contains("deny_send"));

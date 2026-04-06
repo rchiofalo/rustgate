@@ -166,6 +166,17 @@ impl AclReloader {
         }));
     }
 
+    /// Overwrite the reloader's stored hash.
+    ///
+    /// Called by the REST API after it has persisted a mutation so the
+    /// next poll does not re-detect the same change as a pending reload.
+    #[cfg(feature = "metrics")]
+    pub(crate) fn set_hash(&self, hash: [u8; 32]) {
+        if let Ok(mut guard) = self.last_hash.lock() {
+            *guard = hash;
+        }
+    }
+
     /// SHA-256 digest of the file bytes.
     pub(crate) fn compute_hash(data: &[u8]) -> [u8; 32] {
         let mut hasher = Sha256::new();

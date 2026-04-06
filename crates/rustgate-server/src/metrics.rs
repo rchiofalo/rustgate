@@ -31,8 +31,11 @@ pub type FedApiHandler =
 /// When set, the metrics server delegates requests under `/api/acl/`
 /// to this handler. Returns `None` for unrecognized paths so the caller
 /// can fall through to 404.
-pub type AclApiHandler =
-    Arc<dyn Fn(&hyper::Method, &str, &[u8]) -> Option<Response<Full<Bytes>>> + Send + Sync>;
+pub type AclApiHandler = Arc<
+    dyn Fn(&hyper::Method, &str, Option<&str>, &[u8]) -> Option<Response<Full<Bytes>>>
+        + Send
+        + Sync,
+>;
 
 /// Maximum concurrent connections to the metrics HTTP server.
 /// Bounds memory usage from connection floods against the unauthenticated
@@ -429,23 +432,32 @@ pub async fn serve(
                                     .unwrap_or_else(|_| internal_error_response()));
                             }
                             // Delegate /api/acl/ paths to the ACL management handler
-                            if req.uri().path().starts_with("/api/acl/") {
-                                if let Some(handler) = acl_api.get() {
-                                    let method = req.method().clone();
-                                    let path = req.uri().path().to_string();
-                                    let body = http_body_util::BodyExt::collect(req.into_body())
-                                        .await
-                                        .map(|b| b.to_bytes())
-                                        .unwrap_or_default();
-                                    if let Some(resp) = handler(&method, &path, &body) {
-                                        return Ok(resp);
-                                    }
+                            if req.uri().path().starts_with("/api/acl/")
+                                && let Some(handler) = acl_api.get()
+                            {
+                                let method = req.method().clone();
+                                let path = req.uri().path().to_string();
+                                let auth = req
+                                    .headers()
+                                    .get(hyper::header::AUTHORIZATION)
+                                    .and_then(|v| v.to_str().ok())
+                                    .map(|s| s.to_string());
+                                let body = http_body_util::BodyExt::collect(req.into_body())
+                                    .await
+                                    .map(|b| b.to_bytes())
+                                    .unwrap_or_default();
+                                if let Some(resp) = handler(&method, &path, auth.as_deref(), &body)
+                                {
+                                    return Ok(resp);
                                 }
                                 return Ok(Response::builder()
-                                    .status(StatusCode::SERVICE_UNAVAILABLE)
-                                    .body(Full::new(Bytes::from("ACL API not ready")))
+                                    .status(StatusCode::NOT_FOUND)
+                                    .body(Full::new(Bytes::from("not found")))
                                     .unwrap_or_else(|_| internal_error_response()));
                             }
+                            // If no ACL handler is registered, fall
+                            // through to the generic request handler,
+                            // which returns 404 for unknown paths.
                             handle_request(req, ready)
                         }
                     }),

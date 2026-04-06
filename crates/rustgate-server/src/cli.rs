@@ -381,6 +381,21 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 0, env = "RUSTGATE_ACL_RELOAD_INTERVAL")]
     pub(crate) acl_reload_interval: u64,
 
+    /// Path to a file containing the bearer token required to access the
+    /// `/api/acl/` REST endpoints (both read and mutation routes).
+    ///
+    /// When unset, the ACL API is not registered at all — requests under
+    /// `/api/acl/` fall through to the metrics server's 404 handler.
+    /// When set, every request must present `Authorization: Bearer <token>`
+    /// and the supplied token is compared to the file contents in constant
+    /// time.
+    ///
+    /// WARNING: the ACL API exposes mutation of routing policy. Bind the
+    /// metrics endpoint to a trusted network only; never expose it to the
+    /// public internet.
+    #[arg(long, env = "RUSTGATE_ACL_API_TOKEN_FILE")]
+    pub(crate) acl_api_token_file: Option<String>,
+
     // -- Data retention / archival --
     /// Directory for CoT event archival (JSONL). Enables structured logging of
     /// all received CoT events to date-stamped files.
