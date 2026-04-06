@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use rustgate_core::identity::{GroupId, Identity};
 use rustgate_core::message::{Destination, MessageType, RoutableMessage};
 use tokio::sync::{RwLock, mpsc};
-use tracing::{Instrument, warn};
+use tracing::{Instrument, debug, warn};
 
 use crate::acl::GroupAclPolicy;
 use crate::cache::PositionCache;
@@ -343,6 +343,16 @@ impl Router {
         // Cache position reports for SA replay to new sessions
         if msg.metadata.message_type == MessageType::Position {
             self.cache.store(msg.clone()).await;
+        }
+
+        // Drop messages that expired while waiting in the ingest pipeline
+        if crate::cache::is_expired(&msg) {
+            debug!(
+                source = %msg.source.cn,
+                message_type = %msg.metadata.message_type,
+                "message expired before delivery — dropping",
+            );
+            return;
         }
 
         // Wrap in Arc once so broadcast/group sends share one allocation

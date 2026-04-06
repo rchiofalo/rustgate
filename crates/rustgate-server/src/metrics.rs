@@ -40,6 +40,7 @@ static ACCEPT_ERRORS: OnceLock<IntCounter> = OnceLock::new();
 
 static MESSAGES_RECEIVED: OnceLock<IntCounter> = OnceLock::new();
 static MESSAGES_DROPPED: OnceLock<IntCounter> = OnceLock::new();
+static MESSAGES_EXPIRED: OnceLock<IntCounter> = OnceLock::new();
 static MESSAGES_REPLAYED: OnceLock<IntCounter> = OnceLock::new();
 static MESSAGES_ROUTED: OnceLock<IntCounterVec> = OnceLock::new();
 static SESSIONS_ACTIVE: OnceLock<IntGauge> = OnceLock::new();
@@ -126,6 +127,13 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(messages_dropped.clone()))?;
     let _ = MESSAGES_DROPPED.set(messages_dropped);
 
+    let messages_expired = IntCounter::with_opts(Opts::new(
+        "rustgate_messages_expired_total",
+        "Messages dropped due to TTL expiration before delivery",
+    ))?;
+    registry.register(Box::new(messages_expired.clone()))?;
+    let _ = MESSAGES_EXPIRED.set(messages_expired);
+
     let messages_replayed = IntCounter::with_opts(Opts::new(
         "rustgate_messages_replayed_total",
         "Messages dropped due to anti-replay detection",
@@ -203,6 +211,11 @@ pub fn messages_received() -> &'static IntCounter {
 
 pub fn messages_dropped() -> &'static IntCounter {
     MESSAGES_DROPPED.get_or_init(|| fallback_counter("rustgate_messages_dropped_total", "fallback"))
+}
+
+#[allow(dead_code)] // wired when router TTL drops are observed from the session layer
+pub fn messages_expired() -> &'static IntCounter {
+    MESSAGES_EXPIRED.get_or_init(|| fallback_counter("rustgate_messages_expired_total", "fallback"))
 }
 
 pub fn messages_replayed() -> &'static IntCounter {
@@ -411,6 +424,7 @@ mod tests {
         let _ = connections_rejected();
         let _ = accept_errors();
         let _ = messages_received();
+        let _ = messages_expired();
         let _ = messages_routed();
         let _ = sessions_active();
         let _ = nats_publishes();
