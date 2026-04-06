@@ -26,6 +26,14 @@ use rustgate_core::constants::HTTP_CONNECTION_TIMEOUT;
 pub type FedApiHandler =
     Arc<dyn Fn(&hyper::Method, &str, &[u8]) -> Option<Response<Full<Bytes>>> + Send + Sync>;
 
+/// Type-erased ACL API handler.
+///
+/// When set, the metrics server delegates requests under `/api/acl/`
+/// to this handler. Returns `None` for unrecognized paths so the caller
+/// can fall through to 404.
+pub type AclApiHandler =
+    Arc<dyn Fn(&hyper::Method, &str, &[u8]) -> Option<Response<Full<Bytes>>> + Send + Sync>;
+
 /// Maximum concurrent connections to the metrics HTTP server.
 /// Bounds memory usage from connection floods against the unauthenticated
 /// HTTP endpoint (the TLS listener has its own separate limit).
@@ -366,6 +374,7 @@ pub async fn serve(
     bind: SocketAddr,
     ready: Arc<AtomicBool>,
     #[cfg(feature = "federation")] fed_api: Arc<OnceLock<FedApiHandler>>,
+    acl_api: Arc<OnceLock<AclApiHandler>>,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let conn_limit = Arc::new(tokio::sync::Semaphore::new(MAX_HTTP_CONNECTIONS));
@@ -386,6 +395,7 @@ pub async fn serve(
         let ready = Arc::clone(&ready);
         #[cfg(feature = "federation")]
         let fed_api = Arc::clone(&fed_api);
+        let acl_api = Arc::clone(&acl_api);
         drop(tokio::spawn(async move {
             let _permit = permit;
             let conn = hyper::server::conn::http1::Builder::new()
@@ -397,6 +407,7 @@ pub async fn serve(
                         let ready = Arc::clone(&ready);
                         #[cfg(feature = "federation")]
                         let fed_api = Arc::clone(&fed_api);
+                        let acl_api = Arc::clone(&acl_api);
                         async move {
                             // Delegate /api/federation/ paths to the federation handler
                             #[cfg(feature = "federation")]
@@ -415,6 +426,24 @@ pub async fn serve(
                                 return Ok(Response::builder()
                                     .status(StatusCode::SERVICE_UNAVAILABLE)
                                     .body(Full::new(Bytes::from("federation API not ready")))
+                                    .unwrap_or_else(|_| internal_error_response()));
+                            }
+                            // Delegate /api/acl/ paths to the ACL management handler
+                            if req.uri().path().starts_with("/api/acl/") {
+                                if let Some(handler) = acl_api.get() {
+                                    let method = req.method().clone();
+                                    let path = req.uri().path().to_string();
+                                    let body = http_body_util::BodyExt::collect(req.into_body())
+                                        .await
+                                        .map(|b| b.to_bytes())
+                                        .unwrap_or_default();
+                                    if let Some(resp) = handler(&method, &path, &body) {
+                                        return Ok(resp);
+                                    }
+                                }
+                                return Ok(Response::builder()
+                                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                                    .body(Full::new(Bytes::from("ACL API not ready")))
                                     .unwrap_or_else(|_| internal_error_response()));
                             }
                             handle_request(req, ready)
@@ -528,6 +557,7 @@ mod tests {
                 addr,
                 server_ready,
                 #[cfg(feature = "federation")]
+                Arc::new(OnceLock::new()),
                 Arc::new(OnceLock::new()),
             )
             .await;

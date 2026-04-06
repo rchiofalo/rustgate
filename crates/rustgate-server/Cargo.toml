@@ -64,3 +64,7 @@ rustgate-test-utils = { workspace = true }
 rustgate-transport = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+http-body = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+bytes = { workspace = true }
