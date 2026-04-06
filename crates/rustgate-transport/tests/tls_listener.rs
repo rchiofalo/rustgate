@@ -522,3 +522,71 @@ async fn mtls_rejects_server_auth_only_client_cert() {
         "server should reject server-auth-only client cert"
     );
 }
+
+// ── Session resumption ─────────────────────────────────────────────────
+
+/// Verify that the server disables TLS session resumption (session tickets),
+/// forcing a full mTLS handshake on every connection. We check this by
+/// inspecting `handshake_kind()` on the client connection — both connections
+/// must report `HandshakeKind::Full`, not `HandshakeKind::Resumed`.
+#[tokio::test]
+async fn tls_session_resumption_disabled() {
+    let ca = TestCa::new("Test CA");
+    let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
+    let client_cert = ca.issue_client_cert("alice", &["operators"]);
+
+    let tls_config = TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
+        .expect("tls config");
+    let listener = TlsListener::bind("127.0.0.1:0", &tls_config)
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    let server_handle = tokio::spawn(async move {
+        let s1 = listener.accept().await.expect("accept first");
+        let id1 = s1.identity().clone();
+        drop(s1);
+
+        let s2 = listener.accept().await.expect("accept second");
+        let id2 = s2.identity().clone();
+
+        (id1, id2)
+    });
+
+    // Build a single client config — rustls enables session caching by default
+    // via `Resumption::in_memory_sessions(256)`. If the server allowed session
+    // tickets, the second connection would resume without a full handshake.
+    let config = build_client_tls_config(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem);
+
+    // First connection: must be a full handshake.
+    let stream1 = connect(addr, &config).await;
+    let kind1 = stream1.get_ref().1.handshake_kind();
+    assert_eq!(
+        kind1,
+        Some(rustls::HandshakeKind::Full),
+        "first connection must be a full handshake, got {kind1:?}"
+    );
+    drop(stream1);
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Second connection with the same config: must ALSO be a full handshake
+    // because the server does not issue session tickets (NoServerSessionStorage).
+    let stream2 = connect(addr, &config).await;
+    let kind2 = stream2.get_ref().1.handshake_kind();
+    assert_eq!(
+        kind2,
+        Some(rustls::HandshakeKind::Full),
+        "second connection must be a full handshake (no resumption), got {kind2:?}"
+    );
+    drop(stream2);
+
+    let (id1, id2) = server_handle.await.expect("server task");
+
+    // Both connections extracted valid identities.
+    assert_eq!(id1.cn, "alice");
+    assert!(id1.is_member_of("operators"));
+    assert_eq!(id2.cn, "alice");
+    assert!(id2.is_member_of("operators"));
+    assert_eq!(id1.fingerprint, id2.fingerprint);
+}
