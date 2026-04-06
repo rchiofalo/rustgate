@@ -16,7 +16,7 @@ workspace = true
 
 [features]
 nats = ["dep:rustgate-nats"]
-enrollment = ["dep:rustgate-enrollment"]
+enrollment = ["dep:rustgate-enrollment", "dep:rustls-pki-types"]
 proto = ["dep:rustgate-proto", "rustgate-transport/proto"]
 full-detail = ["nats", "rustgate-nats/full-detail"]
 metrics = ["dep:prometheus", "dep:hyper", "dep:hyper-util", "dep:http-body-util"]
@@ -45,6 +45,7 @@ opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 tikv-jemallocator = { workspace = true, optional = true }
+rustls-pki-types = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "signal", "fs", "macros", "time", "net"] }
 tokio-util = { workspace = true }
 bytes = { workspace = true }

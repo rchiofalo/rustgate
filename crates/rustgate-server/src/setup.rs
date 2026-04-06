@@ -355,9 +355,32 @@ pub(crate) async fn start_enrollment(
         .with_contacts_provider(contacts_provider);
 
     if let Some(ref pkg_dir) = cli.data_package_dir {
-        let store = rustgate_enrollment::DataPackageStore::new(std::path::PathBuf::from(pkg_dir))
-            .await
-            .context("initializing data package store")?;
+        let mut store =
+            rustgate_enrollment::DataPackageStore::new(std::path::PathBuf::from(pkg_dir))
+                .await
+                .context("initializing data package store")?;
+
+        if cli.package_strict_signatures && cli.package_signature_ca.is_none() {
+            anyhow::bail!("--package-strict-signatures requires --package-signature-ca to be set");
+        }
+
+        store = store.with_strict_signatures(cli.package_strict_signatures);
+
+        if let Some(ref ca_path) = cli.package_signature_ca {
+            let pem_data = tokio::fs::read_to_string(ca_path)
+                .await
+                .context("reading --package-signature-ca")?;
+            let ca_der: Vec<u8> = {
+                use rustls_pki_types::pem::PemObject;
+                let cert = rustls_pki_types::CertificateDer::from_pem_slice(pem_data.as_bytes())
+                    .context("parsing package signature CA PEM")?;
+                cert.to_vec()
+            };
+            store = store
+                .with_signing_ca(&ca_der)
+                .context("configuring package signature CA")?;
+        }
+
         enrollment_server = enrollment_server.with_packages(store);
         tracing::info!(dir = %pkg_dir, "data package storage enabled");
     }
