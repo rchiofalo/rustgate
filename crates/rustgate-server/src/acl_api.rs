@@ -12,7 +12,7 @@
 //! - `DELETE /api/acl/groups/{group}` — remove a single group entry
 //! - `POST   /api/acl/reload`         — re-read the on-disk ACL file
 //!
-//! Mutations rebuild the full [`GroupAclPolicy`] from the in-memory
+//! Mutations rebuild the full [`rustgate_transport::GroupAclPolicy`] from the in-memory
 //! source-of-truth and atomically install it on the [`Router`] via
 //! [`Router::swap_acl`]. Calling `POST /api/acl/reload` re-reads the
 //! configured ACL file and replaces both the in-memory state and the
@@ -92,7 +92,7 @@ fn json_error(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
         .unwrap_or_else(|_| internal_error_response())
 }
 
-/// Convert an in-memory [`GroupAclFile`] into a runtime [`GroupAclPolicy`].
+/// Convert an in-memory [`GroupAclFile`] into a runtime [`rustgate_transport::GroupAclPolicy`].
 fn build_policy(file: &GroupAclFile) -> rustgate_transport::GroupAclPolicy {
     let mut groups = HashMap::with_capacity(file.groups.len());
     for (group_id, entry) in &file.groups {
