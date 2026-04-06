@@ -459,4 +459,67 @@ mod tests {
         let result = TlsMinVersion::from_str_version("");
         assert!(result.is_err());
     }
+
+    #[cfg(feature = "post-quantum")]
+    mod kx_groups {
+        use super::super::parse_kx_groups;
+
+        #[test]
+        fn parse_single_group() {
+            let groups = parse_kx_groups("X25519").unwrap();
+            assert_eq!(groups.len(), 1);
+            assert_eq!(groups[0].name(), rustls::NamedGroup::X25519);
+        }
+
+        #[test]
+        fn parse_multiple_groups() {
+            let groups = parse_kx_groups("X25519MLKEM768,X25519,secp256r1").unwrap();
+            assert_eq!(groups.len(), 3);
+            assert_eq!(groups[0].name(), rustls::NamedGroup::X25519MLKEM768);
+            assert_eq!(groups[1].name(), rustls::NamedGroup::X25519);
+            assert_eq!(groups[2].name(), rustls::NamedGroup::secp256r1);
+        }
+
+        #[test]
+        fn parse_case_insensitive() {
+            let groups = parse_kx_groups("x25519mlkem768").unwrap();
+            assert_eq!(groups[0].name(), rustls::NamedGroup::X25519MLKEM768);
+
+            let groups = parse_kx_groups("mlkem1024").unwrap();
+            assert_eq!(groups[0].name(), rustls::NamedGroup::MLKEM1024);
+        }
+
+        #[test]
+        fn parse_trims_whitespace() {
+            let groups = parse_kx_groups("  X25519 , MLKEM768 ").unwrap();
+            assert_eq!(groups.len(), 2);
+            assert_eq!(groups[0].name(), rustls::NamedGroup::X25519);
+            assert_eq!(groups[1].name(), rustls::NamedGroup::MLKEM768);
+        }
+
+        #[test]
+        fn parse_unknown_group_errors() {
+            let result = parse_kx_groups("NOTAGROUP");
+            assert!(result.is_err());
+            let err = format!("{}", result.unwrap_err());
+            assert!(
+                err.contains("unknown key exchange group"),
+                "error should mention unknown group: {err}"
+            );
+        }
+
+        #[test]
+        fn parse_empty_string_errors() {
+            let result = parse_kx_groups("");
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn parse_all_pq_groups() {
+            let groups =
+                parse_kx_groups("X25519MLKEM768,SECP256R1MLKEM768,MLKEM768,MLKEM1024").unwrap();
+            assert_eq!(groups.len(), 4);
+            assert_eq!(groups[0].name(), rustls::NamedGroup::X25519MLKEM768);
+        }
+    }
 }

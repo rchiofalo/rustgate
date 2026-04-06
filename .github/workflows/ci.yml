@@ -264,6 +264,35 @@ jobs:
         if: matrix.run_tests
         run: cargo nextest run --locked -p rustgate-transport --features fips
 
+  post-quantum:
+    if: github.event.pull_request.draft == false || github.event_name == 'push'
+    needs: [lint, clippy]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: clippy
+
+      - name: Install PQ build dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake golang-go
+
+      - name: Install cargo-nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Clippy (post-quantum)
+        run: cargo clippy --locked -p rustgate-transport -p rustgate-server --features post-quantum --all-targets
+
+      - name: Build server with post-quantum
+        run: cargo build --locked -p rustgate-server --features post-quantum,federation,enrollment
+
+      - name: Run PQ tests
+        run: cargo nextest run --locked -p rustgate-transport --features post-quantum
+
   dependency-review:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
