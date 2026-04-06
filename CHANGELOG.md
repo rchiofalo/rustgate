@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **JSON audit log sink** — new `--audit-log` CLI flag (env `RUSTGATE_AUDIT_LOG`) writes audit events as JSON lines to a dedicated file, separate from the main log stream. Filters only `target="audit"` events using a per-layer `Targets` filter. Use `"-"` for stdout. Audit events now include `session_id` on connect/disconnect for correlation. (#525)
 - **Message priority channels** — replaced the single per-session mpsc channel with a dual-channel approach: a high-priority channel (capacity 16) for Position and Alert messages, and a normal-priority channel (capacity 64) for all other message types. Write loops use biased `tokio::select!` to always drain priority messages first, ensuring time-sensitive situational awareness data is delivered ahead of bulk traffic. The circuit breaker applies across both channels. (#519)
 
 ## [0.7.0] - 2026-04-05

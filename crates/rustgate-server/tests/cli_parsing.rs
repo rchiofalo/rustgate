@@ -277,6 +277,26 @@ fn env_var_for_optional_flags_shown_in_help() {
     );
 }
 
+// ── Audit log flag ──────────────────────────────────────────────────
+
+#[test]
+fn help_shows_audit_log_flag() {
+    let output = Command::new(rustgate_bin())
+        .arg("--help")
+        .output()
+        .expect("failed to execute binary");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--audit-log"),
+        "help should show --audit-log flag"
+    );
+    assert!(
+        stdout.contains("RUSTGATE_AUDIT_LOG"),
+        "help should document RUSTGATE_AUDIT_LOG env var"
+    );
+}
+
 // ── Feature-gated flag documentation ─────────────────────────────────
 
 #[test]
