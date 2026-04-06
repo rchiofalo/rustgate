@@ -42,6 +42,7 @@ fn make_chat(source: &Arc<Identity>, dest: Destination) -> RoutableMessage {
 }
 
 /// Helper: create dual-channel senders and receivers.
+#[allow(clippy::type_complexity)]
 fn make_channels(
     cap: usize,
 ) -> (

@@ -559,6 +559,7 @@ async fn route_to_group() {
 }
 
 /// Helper: create dual-channel senders and a pair of receivers.
+#[allow(clippy::type_complexity)]
 fn make_channels(
     cap: usize,
 ) -> (
