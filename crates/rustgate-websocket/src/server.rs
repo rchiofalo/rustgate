@@ -328,13 +328,29 @@ async fn ws_write_loop(
     normal_rx: &mut mpsc::Receiver<rustgate_transport::RoutedMessage>,
     codec: &dyn Codec,
 ) -> Result<(), String> {
+    let mut priority_open = true;
+    let mut normal_open = true;
     loop {
+        if !priority_open && !normal_open {
+            break;
+        }
         let msg = tokio::select! {
             biased;
-            msg = priority_rx.recv() => msg,
-            msg = normal_rx.recv() => msg,
+            msg = priority_rx.recv(), if priority_open => match msg {
+                Some(m) => m,
+                None => {
+                    priority_open = false;
+                    continue;
+                }
+            },
+            msg = normal_rx.recv(), if normal_open => match msg {
+                Some(m) => m,
+                None => {
+                    normal_open = false;
+                    continue;
+                }
+            },
         };
-        let Some(msg) = msg else { break };
 
         let encoded = match codec.encode_payload(&msg) {
             Ok(bytes) => bytes,

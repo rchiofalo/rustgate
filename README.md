@@ -366,8 +366,12 @@ All flags support environment variables (CLI takes precedence):
 | `--circuit-breaker-threshold` | `RUSTGATE_CIRCUIT_BREAKER_THRESHOLD` | `10` |
 | `--group-acl-file` | `RUSTGATE_GROUP_ACL_FILE` | — |
 | `--archive-dir` | `RUSTGATE_ARCHIVE_DIR` | — |
+| `--archive-max-size` | `RUSTGATE_ARCHIVE_MAX_SIZE` | `0` (unlimited) |
+| `--archive-max-age` | `RUSTGATE_ARCHIVE_MAX_AGE` | `0` (unlimited, seconds) |
+| `--archive-rotate-interval` | `RUSTGATE_ARCHIVE_ROTATE_INTERVAL` | `60` (seconds) |
 | `--package-max-age-hours` | `RUSTGATE_PACKAGE_MAX_AGE_HOURS` | `0` (no expiration) |
 | `--audit-log` | `RUSTGATE_AUDIT_LOG` | — |
+| `--access-log` | `RUSTGATE_ACCESS_LOG` | — |
 | `--client-queue-dir` | `RUSTGATE_CLIENT_QUEUE_DIR` | — (disabled) |
 | `--client-queue-max-bytes` | `RUSTGATE_CLIENT_QUEUE_MAX_BYTES` | `104857600` (100 MiB) |
 | `--otel-endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` | — |
@@ -533,6 +537,7 @@ All tests use ephemeral certificates generated at runtime via `rustgate-test-uti
 | Document | Description |
 |----------|-------------|
 | [Architecture](docs/architecture.md) | System design and crate responsibilities |
+| [Protocol Specification](docs/protocol.md) | Wire format, framing, codecs, routing, federation, HA |
 | [TLS Certificates](docs/tls-certificates.md) | Certificate requirements, generation, and management |
 | [Deployment](docs/deployment.md) | Binary, Docker Compose, and Kubernetes deployment |
 | [FIPS 140-3](docs/fips.md) | FIPS crypto provider setup and known limitations |
