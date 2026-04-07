@@ -518,6 +518,22 @@ pub(crate) struct Cli {
     #[arg(long, env = "RUSTGATE_AUDIT_LOG")]
     pub(crate) audit_log: Option<String>,
 
+    /// Directory in which to keep the per-client store-and-forward
+    /// queue database. When unset, offline messages are dropped (the
+    /// default pre-v0.7 behavior). When set, messages destined for a
+    /// disconnected CN are persisted to a bounded disk queue and
+    /// drained on reconnect.
+    #[arg(long, env = "RUSTGATE_CLIENT_QUEUE_DIR")]
+    pub(crate) client_queue_dir: Option<std::path::PathBuf>,
+
+    /// Global byte cap for the client store-and-forward queue. When
+    /// inserting a message would exceed this cap, the oldest entries
+    /// across all CNs are evicted until the new message fits. Only
+    /// honored when `--client-queue-dir` is also set. Defaults to
+    /// 100 MiB.
+    #[arg(long, default_value_t = 100 * 1024 * 1024, env = "RUSTGATE_CLIENT_QUEUE_MAX_BYTES")]
+    pub(crate) client_queue_max_bytes: u64,
+
     /// OTLP gRPC endpoint for OpenTelemetry trace export (e.g. http://localhost:4317).
     /// Requires --features otel. When not set, OTel tracing is disabled even if
     /// compiled with the otel feature.
@@ -728,6 +744,8 @@ define_config_file! {
     archive_dir: Option<String>,
     package_max_age_hours: u64,
     audit_log: Option<String>,
+    client_queue_dir: Option<std::path::PathBuf>,
+    client_queue_max_bytes: u64,
     otel_endpoint: Option<String>,
     otel_service_name: String,
     dedup_window_secs: u64,

@@ -15,6 +15,7 @@ mod repeater;
 mod replay;
 mod router;
 mod session;
+pub mod store_forward;
 mod throttle;
 mod verifier;
 
@@ -51,6 +52,9 @@ pub use router::{
 pub use rustgate_proto::TakFrameCodec;
 pub use rustls::server::ResolvesServerCert;
 pub use session::{AuthenticatedSession, SessionReader, SessionWriter};
+pub use store_forward::{
+    ClientQueue, DEFAULT_CLIENT_QUEUE_MAX_BYTES, QueueStats, StoreForwardError,
+};
 pub use throttle::{ClientThrottle, ThrottleConfig};
 pub use verifier::{DynamicCertVerifier, RootStoreProvider};
 

@@ -2255,6 +2255,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08ad765b21a08b1a8e5cdce052719188a23772bcbefb3c439f0baaf62c56ceac"
 
 [[package]]
+name = "redb"
+version = "2.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8eca1e9d98d5a7e9002d0013e18d5a9b000aee942eb134883a82f06ebffb6c01"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2584,6 +2593,7 @@ dependencies = [
  "ocsp-stapler",
  "parking_lot",
  "proptest",
+ "redb",
  "rustgate-core",
  "rustgate-cot",
  "rustgate-proto",
@@ -2592,6 +2602,7 @@ dependencies = [
  "rustls-pki-types",
  "sha2",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
  "tokio-util",
