@@ -60,6 +60,7 @@ static MESSAGES_REPLAYED: OnceLock<IntCounter> = OnceLock::new();
 static MESSAGES_ROUTED: OnceLock<IntCounterVec> = OnceLock::new();
 
 static DEDUP_HITS: OnceLock<IntCounter> = OnceLock::new();
+static DEDUP_CACHE_SIZE: OnceLock<IntGauge> = OnceLock::new();
 
 // Tier 2 (per-identity) metrics. Registered only when
 // `--metrics-per-identity` is enabled; remain `None` otherwise so they
@@ -178,6 +179,13 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(dedup_hits.clone()))?;
     let _ = DEDUP_HITS.set(dedup_hits);
 
+    let dedup_cache_size = IntGauge::with_opts(Opts::new(
+        "rustgate_dedup_cache_size",
+        "Current number of entries in the cross-path dedup cache",
+    ))?;
+    registry.register(Box::new(dedup_cache_size.clone()))?;
+    let _ = DEDUP_CACHE_SIZE.set(dedup_cache_size);
+
     let messages_routed = IntCounterVec::new(
         Opts::new(
             "rustgate_messages_routed_total",
@@ -278,6 +286,10 @@ pub fn messages_replayed() -> &'static IntCounter {
 
 pub fn dedup_hits() -> &'static IntCounter {
     DEDUP_HITS.get_or_init(|| fallback_counter("rustgate_dedup_hits_total", "fallback"))
+}
+
+pub fn dedup_cache_size() -> &'static IntGauge {
+    DEDUP_CACHE_SIZE.get_or_init(|| fallback_gauge("rustgate_dedup_cache_size", "fallback"))
 }
 
 pub fn messages_routed() -> &'static IntCounterVec {

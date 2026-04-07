@@ -3,12 +3,17 @@
 //! When the same logical message arrives via multiple ingress paths
 //! (for example, a direct client connection and a federation peer that
 //! forwarded it), subscribers should only receive it once. This module
-//! provides a bounded LRU cache, keyed by `(uid, time, sha256(payload))`,
-//! that the router consults on the dispatch hot path.
+//! provides a bounded LRU cache, keyed by
+//! `SHA-256(uid || 0x00 || time_le || 0x00 || payload)`, that the router
+//! consults on the dispatch hot path.
 //!
-//! The content hash defends against UID/time collisions: two messages
-//! that share a `(uid, time)` pair but have different payloads are
-//! treated as distinct and both delivered.
+//! For CoT XML payloads the `uid` and `time` attributes are extracted
+//! and folded into the key alongside the payload hash. For non-CoT
+//! payloads (protobuf, raw binary, anything the XML attribute scanner
+//! cannot parse) the cache falls back to a pure content-hash key, with
+//! `uid` empty and `time` set to zero. Either way, two byte-identical
+//! payloads within the window are suppressed; two different payloads
+//! sharing a `(uid, time)` pair pass through independently.
 //!
 //! Disabled by default; the server enables it via the
 //! `--dedup-window-secs` CLI flag (a value of `0` keeps it off).
@@ -30,7 +35,13 @@ pub const DEFAULT_MAX_ENTRIES: usize = 100_000;
 /// taking a direct dependency on the metrics layer.
 pub type OnDuplicate = Arc<dyn Fn() + Send + Sync>;
 
-/// Cache key combining `uid`, `time`, and a SHA-256 digest of the payload.
+/// Optional callback invoked after a fresh entry is inserted into the
+/// cache. The server crate uses this to publish the current cache size
+/// as a Prometheus gauge without pulling a metrics dependency into
+/// `rustgate-transport`.
+pub type OnInsert = Arc<dyn Fn(usize) + Send + Sync>;
+
+/// Cache key: a 32-byte SHA-256 digest.
 type Key = [u8; 32];
 
 /// Bounded, time-windowed deduplication cache.
@@ -43,6 +54,7 @@ pub struct DedupCache {
     window: Duration,
     hits: AtomicU64,
     on_duplicate: Option<OnDuplicate>,
+    on_insert: Option<OnInsert>,
 }
 
 impl std::fmt::Debug for DedupCache {
@@ -60,16 +72,13 @@ impl DedupCache {
     /// `max_entries` of zero is normalized to `1` since the underlying
     /// LRU implementation requires a non-zero capacity.
     pub fn new(window: Duration, max_entries: usize) -> Self {
-        let cap = NonZeroUsize::new(max_entries.max(1)).unwrap_or(
-            // Safe: 1 is always non-zero.
-            #[allow(clippy::unwrap_used)]
-            NonZeroUsize::new(1).expect("1 is non-zero"),
-        );
+        let cap = NonZeroUsize::new(max_entries.max(1)).unwrap_or(NonZeroUsize::MIN);
         Self {
             inner: Mutex::new(LruCache::new(cap)),
             window,
             hits: AtomicU64::new(0),
             on_duplicate: None,
+            on_insert: None,
         }
     }
 
@@ -85,6 +94,12 @@ impl DedupCache {
     /// Install a callback fired once per suppressed duplicate.
     pub fn set_on_duplicate(&mut self, cb: OnDuplicate) {
         self.on_duplicate = Some(cb);
+    }
+
+    /// Install a callback fired after each fresh insert, receiving the
+    /// current cache size.
+    pub fn set_on_insert(&mut self, cb: OnInsert) {
+        self.on_insert = Some(cb);
     }
 
     /// Total number of duplicates suppressed since startup.
@@ -107,12 +122,14 @@ impl DedupCache {
         self.window
     }
 
-    /// Check whether `(uid, time, sha256(payload))` was already seen
-    /// within the configured window. Returns `true` if it is a duplicate
-    /// (and the caller should drop the message); otherwise inserts the
-    /// key and returns `false`.
-    pub fn check_and_insert(&self, uid: &str, time: i64, payload: &[u8]) -> bool {
-        let key = build_key(uid, time, payload);
+    /// Check whether `SHA-256(uid || 0x00 || 0 || 0x00 || payload)` was
+    /// already seen within the configured window. Returns `true` on
+    /// duplicate; otherwise inserts and returns `false`.
+    ///
+    /// The `time` parameter has been removed from the public API; the
+    /// payload hash alone subsumes it (see [`build_key`]).
+    pub fn check_and_insert(&self, uid: &str, payload: &[u8]) -> bool {
+        let key = build_key(uid, payload);
         let now = Instant::now();
         let window = self.window;
 
@@ -128,56 +145,48 @@ impl DedupCache {
             }
             // Entry expired — refresh and treat as new.
             let _ = cache.put(key, now);
+            let len = cache.len();
+            drop(cache);
+            if let Some(cb) = &self.on_insert {
+                cb(len);
+            }
             return false;
         }
         let _ = cache.put(key, now);
+        let len = cache.len();
+        drop(cache);
+        if let Some(cb) = &self.on_insert {
+            cb(len);
+        }
         false
     }
 
     /// Convenience wrapper for callers that have only the raw payload.
     ///
-    /// Extracts the CoT `uid` and `time` attributes from the payload and
-    /// runs `check_and_insert`. Non-CoT payloads (where the attributes
-    /// cannot be extracted) bypass dedup and return `false`.
+    /// For CoT XML payloads the `uid` attribute is extracted and folded
+    /// into the key. For non-CoT payloads (protobuf, raw binary) the
+    /// cache falls back to a pure content-hash key with an empty `uid`,
+    /// so byte-identical payloads are still deduped.
     pub fn check_payload(&self, payload: &[u8]) -> bool {
-        let (Some(uid), Some(time)) = (
-            crate::replay::extract_xml_attr_pub(payload, b"uid="),
-            crate::replay::extract_xml_attr_pub(payload, b"time="),
-        ) else {
-            return false;
-        };
-        let uid_s = match std::str::from_utf8(uid) {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
-        // We hash the time bytes alongside the digest, so the numeric
-        // value passed in is informational only — use a stable hash of
-        // the raw bytes via i64::from_ne_bytes when possible, otherwise 0.
-        let time_key = stable_time_key(time);
-        self.check_and_insert(uid_s, time_key, payload)
+        let uid = crate::replay::extract_xml_attr(payload, b"uid=")
+            .and_then(|u| std::str::from_utf8(u).ok())
+            .unwrap_or("");
+        self.check_and_insert(uid, payload)
     }
 }
 
-/// Derive a stable i64 from the raw bytes of the `time` attribute.
+/// Build the 32-byte cache key.
 ///
-/// CoT timestamps are typically ISO-8601 strings; we collapse them to a
-/// 64-bit value via FNV-1a so the public API can stay numeric while still
-/// being collision-resistant in combination with the SHA-256 of the
-/// payload.
-fn stable_time_key(time: &[u8]) -> i64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in time {
-        hash ^= u64::from(b);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
-    }
-    hash as i64
-}
-
-fn build_key(uid: &str, time: i64, payload: &[u8]) -> Key {
+/// The format is `SHA-256(uid || 0x00 || 0_i64_le || 0x00 || payload)`.
+/// The `time` slot is fixed at zero (little-endian i64) and retained in
+/// the hash preimage for stability with any external tooling that may
+/// hash the same shape; since the full payload is also hashed, the time
+/// slot is informational and cannot cause collisions.
+fn build_key(uid: &str, payload: &[u8]) -> Key {
     let mut hasher = Sha256::new();
     hasher.update(uid.as_bytes());
     hasher.update([0u8]);
-    hasher.update(time.to_le_bytes());
+    hasher.update(0i64.to_le_bytes());
     hasher.update([0u8]);
     hasher.update(payload);
     hasher.finalize().into()
@@ -195,36 +204,39 @@ mod tests {
     #[test]
     fn duplicate_is_detected() {
         let c = cache(60, 16);
-        assert!(!c.check_and_insert("UID-1", 100, b"hello"));
-        assert!(c.check_and_insert("UID-1", 100, b"hello"));
+        assert!(!c.check_and_insert("UID-1", b"hello"));
+        assert!(c.check_and_insert("UID-1", b"hello"));
         assert_eq!(c.hits(), 1);
     }
 
     #[test]
-    fn different_payload_same_uid_time_passes() {
+    fn different_payload_same_uid_passes() {
         let c = cache(60, 16);
-        assert!(!c.check_and_insert("UID-1", 100, b"hello"));
-        assert!(!c.check_and_insert("UID-1", 100, b"world"));
+        assert!(!c.check_and_insert("UID-1", b"hello"));
+        assert!(!c.check_and_insert("UID-1", b"world"));
         assert_eq!(c.hits(), 0);
     }
 
     #[test]
     fn expired_entry_is_not_duplicate() {
-        let c = DedupCache::new(Duration::from_millis(0), 16);
-        assert!(!c.check_and_insert("UID-1", 100, b"hello"));
-        // Zero-window means the previous entry is immediately stale.
-        assert!(!c.check_and_insert("UID-1", 100, b"hello"));
+        // Use a real 10ms window and sleep past it to exercise the TTL
+        // expiry branch (not the zero-window short-circuit).
+        let c = DedupCache::new(Duration::from_millis(10), 16);
+        assert!(!c.check_and_insert("UID-1", b"hello"));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(!c.check_and_insert("UID-1", b"hello"));
+        assert_eq!(c.hits(), 0);
     }
 
     #[test]
     fn lru_eviction_drops_oldest() {
         let c = cache(3600, 2);
-        assert!(!c.check_and_insert("U1", 1, b"a"));
-        assert!(!c.check_and_insert("U2", 2, b"b"));
-        assert!(!c.check_and_insert("U3", 3, b"c")); // evicts U1
+        assert!(!c.check_and_insert("U1", b"a"));
+        assert!(!c.check_and_insert("U2", b"b"));
+        assert!(!c.check_and_insert("U3", b"c")); // evicts U1
         assert_eq!(c.len(), 2);
         // U1 was evicted — re-insertion is not a duplicate.
-        assert!(!c.check_and_insert("U1", 1, b"a"));
+        assert!(!c.check_and_insert("U1", b"a"));
     }
 
     #[test]
@@ -241,10 +253,27 @@ mod tests {
         c.set_on_duplicate(Arc::new(move || {
             let _ = cc.fetch_add(1, Ordering::Relaxed);
         }));
-        assert!(!c.check_and_insert("U", 1, b"x"));
-        assert!(c.check_and_insert("U", 1, b"x"));
-        assert!(c.check_and_insert("U", 1, b"x"));
+        assert!(!c.check_and_insert("U", b"x"));
+        assert!(c.check_and_insert("U", b"x"));
+        assert!(c.check_and_insert("U", b"x"));
         assert_eq!(counter.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn on_insert_callback_receives_len() {
+        let last_len = Arc::new(AtomicU64::new(0));
+        let mut c = cache(60, 16);
+        let ll = Arc::clone(&last_len);
+        c.set_on_insert(Arc::new(move |len| {
+            ll.store(len as u64, Ordering::Relaxed);
+        }));
+        assert!(!c.check_and_insert("U1", b"x"));
+        assert_eq!(last_len.load(Ordering::Relaxed), 1);
+        assert!(!c.check_and_insert("U2", b"y"));
+        assert_eq!(last_len.load(Ordering::Relaxed), 2);
+        // Duplicate should NOT fire on_insert.
+        assert!(c.check_and_insert("U1", b"x"));
+        assert_eq!(last_len.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -256,9 +285,25 @@ mod tests {
     }
 
     #[test]
-    fn check_payload_bypasses_non_cot() {
+    fn check_payload_dedupes_protobuf_binary() {
+        // Non-CoT binary (protobuf-style) payload: no uid/time attrs.
+        // With content-hash fallback, the second arrival is suppressed.
         let c = cache(60, 16);
-        assert!(!c.check_payload(b"not xml"));
-        assert!(!c.check_payload(b"not xml"));
+        let payload: &[u8] = &[
+            0x0a, 0x05, b'h', b'e', b'l', b'l', b'o', 0x10, 0x2a, 0x18, 0xff, 0x01,
+        ];
+        assert!(!c.check_payload(payload));
+        assert!(c.check_payload(payload));
+        assert_eq!(c.hits(), 1);
+    }
+
+    #[test]
+    fn check_payload_distinct_binary_passes_through() {
+        let c = cache(60, 16);
+        let a: &[u8] = &[0x0a, 0x01, 0x41];
+        let b: &[u8] = &[0x0a, 0x01, 0x42];
+        assert!(!c.check_payload(a));
+        assert!(!c.check_payload(b));
+        assert_eq!(c.hits(), 0);
     }
 }

@@ -32,7 +32,9 @@ pub use config::{
 };
 #[cfg(feature = "post-quantum")]
 pub use config::{install_pq_provider, install_provider_with_kx_groups};
-pub use dedup::{DEFAULT_MAX_ENTRIES as DEFAULT_DEDUP_MAX_ENTRIES, DedupCache, OnDuplicate};
+pub use dedup::{
+    DEFAULT_MAX_ENTRIES as DEFAULT_DEDUP_MAX_ENTRIES, DedupCache, OnDuplicate, OnInsert,
+};
 pub use extract::{ExpectedKeyUsage, extract_identity, validate_key_usage};
 pub use filter::{GeoBounds, MessageFilter};
 pub use listener::{DEFAULT_MAX_HANDSHAKES, OnHandshakeError, TlsListener};

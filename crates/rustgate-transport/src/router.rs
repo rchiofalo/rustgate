@@ -433,6 +433,13 @@ impl Router {
         // Cross-path deduplication: drop the message before any
         // dispatch work if it has already been delivered via another
         // ingress path within the configured window.
+        //
+        // This MUST run before `PositionCache::store` below: if a
+        // duplicate position report reached `store`, the SA replay
+        // cache would be updated with the redundant copy and new
+        // sessions would receive stale/wrong state on connect. Running
+        // dedup first keeps the position cache authoritative on
+        // first-arrival-wins semantics.
         {
             let guard = self.dedup.load();
             if let Some(ref dedup) = **guard
@@ -1613,5 +1620,46 @@ mod tests {
         assert!(nrx.recv().await.is_some());
         assert!(nrx.recv().await.is_some());
         assert_eq!(router.dedup_stats().map(|s| s.0), Some(0));
+    }
+
+    #[tokio::test]
+    async fn cross_path_dedup_disabled_by_default_passes_duplicates() {
+        // Regression: with `set_dedup(None)` (the default), identical
+        // messages arriving twice must BOTH be delivered — dedup must
+        // not suppress anything when disabled.
+        let router = Router::new();
+        router.set_dedup(None);
+
+        let alice = make_identity("alice", &[]);
+        let bob = make_identity("bob", &[]);
+        let (ptx, ntx, _prx, mut nrx) = make_channels(16, 16);
+        router
+            .register(SessionHandle::new(alice.clone(), ptx, ntx))
+            .await;
+
+        let payload: &'static [u8] =
+            br#"<event uid="MSG-1" time="2024-01-01T00:00:00Z" type="a-f-G"/>"#;
+
+        router
+            .route(make_cot_chat(
+                &bob,
+                Destination::Direct((*alice).clone()),
+                payload,
+            ))
+            .await;
+        router
+            .route(make_cot_chat(
+                &bob,
+                Destination::Direct((*alice).clone()),
+                payload,
+            ))
+            .await;
+
+        assert!(nrx.recv().await.is_some(), "first copy must arrive");
+        assert!(
+            nrx.recv().await.is_some(),
+            "second copy must also arrive when dedup is disabled"
+        );
+        assert!(router.dedup_stats().is_none());
     }
 }
