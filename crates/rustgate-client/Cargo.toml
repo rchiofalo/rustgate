@@ -25,3 +25,8 @@ tracing = { workspace = true }
 tokio-stream = { workspace = true, features = ["sync"] }
 fastrand = { workspace = true }
 zeroize = { workspace = true }
+
+[dev-dependencies]
+rustgate-test-utils = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+anyhow = { workspace = true }

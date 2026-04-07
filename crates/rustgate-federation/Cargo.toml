@@ -57,6 +57,14 @@ prost-build = { workspace = true, optional = true }
 tonic-build = { workspace = true, optional = true }
 tonic-prost-build = { workspace = true, optional = true }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+tonic = { workspace = true, features = ["router", "transport", "server"] }
+tempfile = { workspace = true }
+rustgate-test-utils = { workspace = true, features = ["nats"] }
+criterion = { workspace = true }
+http-body = { workspace = true }
+
 [[bench]]
 name = "convert"
 harness = false

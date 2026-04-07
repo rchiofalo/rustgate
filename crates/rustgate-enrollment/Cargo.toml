@@ -34,3 +34,17 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 subtle = { workspace = true }
 ring = { workspace = true }
+
+[dev-dependencies]
+rustgate-test-utils = { workspace = true }
+x509-parser = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+hyper = { workspace = true, features = ["client"] }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+rcgen = { workspace = true }
