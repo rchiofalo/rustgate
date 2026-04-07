@@ -16,6 +16,8 @@ use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
+#[cfg(feature = "nats")]
+use prometheus::Histogram;
 use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts, TextEncoder,
 };
@@ -74,6 +76,15 @@ static PER_IDENTITY_BYTES_RECEIVED: OnceLock<IntCounterVec> = OnceLock::new();
 static SESSIONS_ACTIVE: OnceLock<IntGauge> = OnceLock::new();
 
 static NATS_PUBLISHES: OnceLock<IntCounter> = OnceLock::new();
+
+#[cfg(feature = "nats")]
+static NATS_CONSUMER_PENDING: OnceLock<IntGauge> = OnceLock::new();
+#[cfg(feature = "nats")]
+static NATS_CONSUMER_NUM_REDELIVERED: OnceLock<IntGauge> = OnceLock::new();
+#[cfg(feature = "nats")]
+static NATS_CONSUMER_ACK_FLOOR_STREAM_SEQ: OnceLock<IntGauge> = OnceLock::new();
+#[cfg(feature = "nats")]
+static NATS_CONSUMER_INFO_SECONDS: OnceLock<Histogram> = OnceLock::new();
 
 static NEGOTIATIONS: OnceLock<IntCounterVec> = OnceLock::new();
 
@@ -237,6 +248,37 @@ pub fn init() -> prometheus::Result<()> {
     ))?;
     registry.register(Box::new(nats_publishes.clone()))?;
     let _ = NATS_PUBLISHES.set(nats_publishes);
+
+    #[cfg(feature = "nats")]
+    {
+        let pending = IntGauge::with_opts(Opts::new(
+            "rustgate_nats_consumer_pending",
+            "JetStream pull-consumer messages pending delivery (num_pending)",
+        ))?;
+        registry.register(Box::new(pending.clone()))?;
+        let _ = NATS_CONSUMER_PENDING.set(pending);
+
+        let redelivered = IntGauge::with_opts(Opts::new(
+            "rustgate_nats_consumer_num_redelivered",
+            "JetStream pull-consumer messages currently in a redelivered state (num_redelivered)",
+        ))?;
+        registry.register(Box::new(redelivered.clone()))?;
+        let _ = NATS_CONSUMER_NUM_REDELIVERED.set(redelivered);
+
+        let ack_floor = IntGauge::with_opts(Opts::new(
+            "rustgate_nats_consumer_ack_floor_stream_seq",
+            "JetStream pull-consumer ack floor stream sequence (ack_floor.stream_seq)",
+        ))?;
+        registry.register(Box::new(ack_floor.clone()))?;
+        let _ = NATS_CONSUMER_ACK_FLOOR_STREAM_SEQ.set(ack_floor);
+
+        let info_seconds = Histogram::with_opts(HistogramOpts::new(
+            "rustgate_nats_consumer_info_seconds",
+            "Latency of JetStream pull-consumer info() poll calls in seconds",
+        ))?;
+        registry.register(Box::new(info_seconds.clone()))?;
+        let _ = NATS_CONSUMER_INFO_SECONDS.set(info_seconds);
+    }
 
     let negotiations = IntCounterVec::new(
         Opts::new(
@@ -427,6 +469,30 @@ pub fn sessions_active() -> &'static IntGauge {
 
 pub fn nats_publishes() -> &'static IntCounter {
     NATS_PUBLISHES.get_or_init(|| fallback_counter("rustgate_nats_publishes_total", "fallback"))
+}
+
+/// Returns the JetStream consumer `num_pending` gauge if registered.
+#[cfg(feature = "nats")]
+pub fn nats_consumer_pending() -> Option<&'static IntGauge> {
+    NATS_CONSUMER_PENDING.get()
+}
+
+/// Returns the JetStream consumer `num_redelivered` gauge if registered.
+#[cfg(feature = "nats")]
+pub fn nats_consumer_num_redelivered() -> Option<&'static IntGauge> {
+    NATS_CONSUMER_NUM_REDELIVERED.get()
+}
+
+/// Returns the JetStream consumer `ack_floor.stream_seq` gauge if registered.
+#[cfg(feature = "nats")]
+pub fn nats_consumer_ack_floor_stream_seq() -> Option<&'static IntGauge> {
+    NATS_CONSUMER_ACK_FLOOR_STREAM_SEQ.get()
+}
+
+/// Returns the JetStream `consumer.info()` poll latency histogram if registered.
+#[cfg(feature = "nats")]
+pub fn nats_consumer_info_seconds() -> Option<&'static Histogram> {
+    NATS_CONSUMER_INFO_SECONDS.get()
 }
 
 #[allow(dead_code)] // only used when `proto` feature enables TAK negotiation
