@@ -7,6 +7,7 @@
 //! anything above `rustgate-core`.
 
 pub mod audit;
+pub mod audit_chain;
 pub mod codec;
 pub mod constants;
 pub mod error;
