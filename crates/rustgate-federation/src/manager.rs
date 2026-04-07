@@ -148,8 +148,10 @@ pub struct PeerSwapDiff {
     pub removed: Vec<PeerId>,
     /// Peer IDs whose configuration was unchanged.
     pub unchanged: Vec<PeerId>,
-    /// Peer IDs that failed to start (logged + skipped).
-    pub failed: Vec<PeerId>,
+    /// Peers that failed to start, paired with the error message that caused
+    /// the failure. Surfacing the reason here lets callers (e.g. the hot
+    /// reloader) emit per-peer diagnostics instead of only a count.
+    pub failed: Vec<(PeerId, String)>,
 }
 
 /// Structural equality of two peer configurations for hot-reload diffing.
@@ -1507,8 +1509,9 @@ impl FederationManager {
                     match self.add_peer(peer).await {
                         Ok(()) => diff.added.push(id),
                         Err(e) => {
-                            warn!(peer_id = %id, error = %e, "failed to add peer during swap");
-                            diff.failed.push(id);
+                            let err_str = e.to_string();
+                            warn!(peer_id = %id, error = %err_str, "failed to add peer during swap");
+                            diff.failed.push((id, err_str));
                         }
                     }
                 }

@@ -9,6 +9,14 @@
 //! are unchanged are left alone — existing connections are preserved.
 //!
 //! Mirrors the polling pattern used by [`crate::acl_reloader::AclReloader`].
+//!
+//! The watcher is intended to be **single-instance** per server process: a
+//! single `FederationPeerReloader` is constructed at startup and shared
+//! between the periodic poller and the SIGHUP handler. To guarantee that the
+//! hash check, file parse, and `swap_peers` call execute as one atomic unit
+//! (and to avoid a TOCTOU between two reload triggers firing concurrently),
+//! [`FederationPeerReloader::reload`] takes an internal `tokio::sync::Mutex`
+//! for the duration of the reconcile.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,15 +24,23 @@ use std::time::Duration;
 
 use rustgate_federation::manager::FederationManager;
 use sha2::{Digest, Sha256};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 /// Watches a federation peers JSON file and reconciles the manager's peer set
 /// on change.
+///
+/// Designed to be instantiated **once** per server process. Concurrent calls
+/// to [`Self::reload`] are serialized through `reload_lock` so that the hash
+/// compare, parse, and swap form a single critical section.
 pub(crate) struct FederationPeerReloader {
     peers_path: PathBuf,
     manager: Arc<RwLock<FederationManager>>,
     last_hash: std::sync::Mutex<[u8; 32]>,
+    /// Serializes the entire reload pipeline (hash check + parse + swap) so
+    /// that two reload triggers (e.g. SIGHUP racing the periodic poller) can
+    /// never both observe an unchanged hash and then both call `swap_peers`.
+    reload_lock: Mutex<()>,
 }
 
 impl FederationPeerReloader {
@@ -38,6 +54,7 @@ impl FederationPeerReloader {
             peers_path: peers_path.into(),
             manager,
             last_hash: std::sync::Mutex::new(initial_hash),
+            reload_lock: Mutex::new(()),
         })
     }
 
@@ -54,6 +71,10 @@ impl FederationPeerReloader {
     /// Returns `Ok(true)` if a swap was performed, `Ok(false)` if the file
     /// was unchanged.
     pub(crate) async fn reload(&self) -> anyhow::Result<bool> {
+        // Hold this lock for the entire reconcile so the hash check and the
+        // subsequent swap_peers cannot interleave with another reload trigger.
+        let _reload_guard = self.reload_lock.lock().await;
+
         let data = tokio::fs::read_to_string(&self.peers_path)
             .await
             .map_err(|e| {
@@ -98,6 +119,17 @@ impl FederationPeerReloader {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("federation reloader hash lock poisoned"))?;
             *guard = new_hash;
+        }
+
+        // Surface per-peer error reasons so operators pushing a bad entry can
+        // see why immediately, instead of only seeing a `failed=N` count in
+        // the audit summary.
+        for (peer_id, err) in &diff.failed {
+            warn!(
+                peer_id = %peer_id,
+                error = %err,
+                "failed to add federation peer"
+            );
         }
 
         info!(
