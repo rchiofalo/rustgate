@@ -80,11 +80,14 @@ rustgate \
 ### Verifying
 
 ```bash
-# Health check (requires --features metrics)
-curl http://localhost:9090/healthz
+# Liveness probe (requires --features metrics)
+curl http://localhost:9090/health/live
 
-# Readiness check
-curl http://localhost:9090/readyz
+# Readiness probe
+curl http://localhost:9090/health/ready
+
+# Startup probe
+curl http://localhost:9090/health/startup
 
 # Prometheus metrics
 curl http://localhost:9090/metrics
@@ -180,7 +183,7 @@ docker compose restart        # Restart
 
 ```bash
 # Health check
-docker exec rustgate wget -qO- http://localhost:9090/healthz
+docker exec rustgate wget -qO- http://localhost:9090/health/live
 
 # Metrics
 curl http://localhost:9090/metrics
@@ -337,9 +340,9 @@ The Helm chart configures three probes when metrics are enabled:
 
 | Probe | Path | Purpose |
 |-------|------|---------|
-| Startup | `/healthz` | Wait for server to be ready (30 retries, 2s apart) |
-| Liveness | `/healthz` | Restart if unresponsive |
-| Readiness | `/readyz` | Remove from LB during shutdown/drain |
+| Startup | `/health/startup` | Wait for the accept loop to be entered (30 retries, 2s apart). One-shot — never re-checked once it succeeds. |
+| Liveness | `/health/live` | Restart if the metrics HTTP server is unresponsive |
+| Readiness | `/health/ready` | Remove from LB during shutdown/drain |
 
 ### Network Policy
 

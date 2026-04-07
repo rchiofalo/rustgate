@@ -15,7 +15,7 @@ pub use config::{NatsConfig, NatsTlsConfig, NatsTlsConfigError};
 pub use jetstream::JetStreamReplay;
 pub use publisher::NatsPublisher;
 pub use serde_compat::WireEvent;
-pub use subscriber::NatsSubscriber;
+pub use subscriber::{LagCallback, LagSnapshot, LatencyCallback, NatsSubscriber};
 
 /// Top-level adapter that owns the NATS client and provides access to
 /// the publisher, subscriber, and JetStream replay components.
