@@ -11,6 +11,7 @@ members = [
     "crates/rustgate-websocket",
     "crates/rustgate-server",
     "crates/rustgate-test-utils",
+    "crates/rustgate-client",
 ]
 exclude = ["fuzz"]
 
@@ -89,6 +90,7 @@ unicode-normalization = "0.1"
 arc-swap = "1"
 zeroize = { version = "1", features = ["derive"] }
 ocsp-stapler = "0.4"
+fastrand = "2"
 figment = { version = "0.10", features = ["toml"] }
 toml = "0.8"
 serial_test = "3"
@@ -103,6 +105,7 @@ rustgate-federation = { path = "crates/rustgate-federation" }
 rustgate-transport = { path = "crates/rustgate-transport" }
 rustgate-websocket = { path = "crates/rustgate-websocket" }
 rustgate-test-utils = { path = "crates/rustgate-test-utils" }
+rustgate-client = { path = "crates/rustgate-client" }
 
 [profile.release]
 lto = true

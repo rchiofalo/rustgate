@@ -9,6 +9,7 @@ WORKDIR /src
 
 # Cache dependency build: copy only manifests, create stub sources, build.
 COPY Cargo.toml Cargo.lock ./
+COPY crates/rustgate-client/Cargo.toml      crates/rustgate-client/Cargo.toml
 COPY crates/rustgate-core/Cargo.toml        crates/rustgate-core/Cargo.toml
 COPY crates/rustgate-cot/Cargo.toml         crates/rustgate-cot/Cargo.toml
 COPY crates/rustgate-enrollment/Cargo.toml  crates/rustgate-enrollment/Cargo.toml
