@@ -11,7 +11,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 use tracing::warn;
 
-use crate::replay_persist::ReplayStore;
+use crate::replay_persist::{ReplayStore, RestoredEntry};
+
+impl From<RestoredEntry> for BufferedMessage {
+    fn from(e: RestoredEntry) -> Self {
+        Self {
+            seq: e.seq,
+            payload: e.payload,
+            groups: e.groups,
+            enqueued_at_unix_ms: e.enqueued_at_unix_ms,
+            ttl_ms: e.ttl_ms,
+        }
+    }
+}
 
 /// Default maximum number of messages retained per peer.
 pub const DEFAULT_REPLAY_CAPACITY: usize = 1000;
@@ -25,6 +37,14 @@ pub struct BufferedMessage {
     pub payload: Bytes,
     /// Source groups for routing.
     pub groups: Vec<String>,
+    /// Wall-clock time (Unix milliseconds) at which the message was
+    /// first buffered. Persisted to disk so TTL can be re-evaluated on
+    /// rehydrate (#557 follow-up): without it, persistence would
+    /// silently bypass `Metadata::is_expired()` across restarts.
+    pub enqueued_at_unix_ms: u64,
+    /// Original TTL in milliseconds, or `None` if the message had no
+    /// TTL when it was buffered.
+    pub ttl_ms: Option<u64>,
 }
 
 /// Bounded ring buffer for storing recent federation messages.
@@ -115,6 +135,19 @@ impl ReplayBuffer {
     /// Returns the sequence number assigned to the message. If capacity is
     /// zero, the message is discarded but a sequence number is still assigned.
     pub fn push(&mut self, payload: Bytes, groups: Vec<String>) -> u64 {
+        self.push_with_metadata(payload, groups, now_unix_ms(), None)
+    }
+
+    /// Store a message in the buffer with explicit TTL metadata so the
+    /// persisted record can be re-checked against `Metadata::is_expired()`
+    /// on a future rehydrate.
+    pub fn push_with_metadata(
+        &mut self,
+        payload: Bytes,
+        groups: Vec<String>,
+        enqueued_at_unix_ms: u64,
+        ttl_ms: Option<u64>,
+    ) -> u64 {
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         if self.capacity == 0 {
             return seq;
@@ -127,7 +160,14 @@ impl ReplayBuffer {
             warn!(error = %e, "failed to delete evicted replay entry");
         }
         if let Some(store) = self.store.as_ref() {
-            match store.put(&self.peer_id, seq, &groups, &payload) {
+            match store.put(
+                &self.peer_id,
+                seq,
+                enqueued_at_unix_ms,
+                ttl_ms,
+                &groups,
+                &payload,
+            ) {
                 Ok(()) => {
                     #[cfg(feature = "api")]
                     crate::metrics::replay_persisted().inc();
@@ -139,10 +179,24 @@ impl ReplayBuffer {
             seq,
             payload,
             groups,
+            enqueued_at_unix_ms,
+            ttl_ms,
         });
         seq
     }
+}
 
+/// Current wall-clock time in Unix milliseconds, saturating at 0 if the
+/// system clock is set before the epoch.
+pub(crate) fn now_unix_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+impl ReplayBuffer {
     /// Return all messages with sequence numbers greater than `since_seq`.
     ///
     /// Used during reconnection: the peer reports its last seen sequence
@@ -411,13 +465,34 @@ mod tests {
         let (_dir, store) = open_store();
         // Pretend a previous run wrote three entries.
         store
-            .put("peer-a", 1, &["alpha".into()], &Bytes::from_static(b"a"))
+            .put(
+                "peer-a",
+                1,
+                10,
+                None,
+                &["alpha".into()],
+                &Bytes::from_static(b"a"),
+            )
             .unwrap();
         store
-            .put("peer-a", 2, &["alpha".into()], &Bytes::from_static(b"b"))
+            .put(
+                "peer-a",
+                2,
+                20,
+                None,
+                &["alpha".into()],
+                &Bytes::from_static(b"b"),
+            )
             .unwrap();
         store
-            .put("peer-a", 3, &["alpha".into()], &Bytes::from_static(b"c"))
+            .put(
+                "peer-a",
+                3,
+                30,
+                None,
+                &["alpha".into()],
+                &Bytes::from_static(b"c"),
+            )
             .unwrap();
 
         let mut buf = ReplayBuffer::with_store(10, "peer-a", Arc::clone(&store));
@@ -426,11 +501,7 @@ mod tests {
             .unwrap()
             .into_iter()
             .filter(|e| e.peer_id == "peer-a")
-            .map(|e| BufferedMessage {
-                seq: e.seq,
-                payload: e.payload,
-                groups: e.groups,
-            })
+            .map(BufferedMessage::from)
             .collect();
         buf.hydrate_from_records(restored);
 
@@ -445,7 +516,7 @@ mod tests {
         let (_dir, store) = open_store();
         for i in 1u64..=5 {
             store
-                .put("peer-a", i, &[], &Bytes::from(vec![b'x']))
+                .put("peer-a", i, 100 + i, None, &[], &Bytes::from(vec![b'x']))
                 .unwrap();
         }
         let mut buf = ReplayBuffer::with_store(2, "peer-a", Arc::clone(&store));
@@ -454,11 +525,7 @@ mod tests {
             .unwrap()
             .into_iter()
             .filter(|e| e.peer_id == "peer-a")
-            .map(|e| BufferedMessage {
-                seq: e.seq,
-                payload: e.payload,
-                groups: e.groups,
-            })
+            .map(BufferedMessage::from)
             .collect();
         buf.hydrate_from_records(restored);
         assert_eq!(buf.len(), 2);
@@ -492,11 +559,7 @@ mod tests {
             .unwrap()
             .into_iter()
             .filter(|e| e.peer_id == "peer-a")
-            .map(|e| BufferedMessage {
-                seq: e.seq,
-                payload: e.payload,
-                groups: e.groups,
-            })
+            .map(BufferedMessage::from)
             .collect();
         buf.hydrate_from_records(restored);
 

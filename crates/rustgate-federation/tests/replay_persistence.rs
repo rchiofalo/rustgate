@@ -45,11 +45,7 @@ fn replay_resumes_after_simulated_restart() {
     let restored: Vec<BufferedMessage> = entries
         .into_iter()
         .filter(|e| e.peer_id == "peer-alpha")
-        .map(|e| BufferedMessage {
-            seq: e.seq,
-            payload: e.payload,
-            groups: e.groups,
-        })
+        .map(BufferedMessage::from)
         .collect();
 
     let mut buf = ReplayBuffer::with_store(1000, "peer-alpha", Arc::clone(&store));
@@ -91,11 +87,7 @@ fn partial_replay_after_restart_uses_persisted_seq_numbers() {
         .unwrap()
         .into_iter()
         .filter(|e| e.peer_id == "peer-bravo")
-        .map(|e| BufferedMessage {
-            seq: e.seq,
-            payload: e.payload,
-            groups: e.groups,
-        })
+        .map(BufferedMessage::from)
         .collect();
     let mut buf = ReplayBuffer::with_store(1000, "peer-bravo", store);
     buf.hydrate_from_records(restored);
@@ -132,7 +124,9 @@ fn clear_after_replay_persists_across_restart() {
 fn byte_cap_eviction_survives_restart() {
     let dir = tempfile::tempdir().unwrap();
     // Tiny cap so just a couple of entries fit.
-    let cap = 64u64;
+    // Cap is large enough to fit a couple of records once the
+    // accounted size now includes key bytes + redb overhead.
+    let cap = 256u64;
     {
         let store = Arc::new(ReplayStore::open(dir.path(), cap).unwrap());
         let mut buf = ReplayBuffer::with_store(1000, "peer-delta", Arc::clone(&store));
@@ -147,4 +141,58 @@ fn byte_cap_eviction_survives_restart() {
         store.total_bytes()
     );
     assert!(!store.is_empty());
+}
+
+/// Records whose TTL has already elapsed at rehydrate time must not
+/// be returned to the replay buffer — persistence cannot become a
+/// TTL-bypass channel across restarts.
+#[test]
+fn expired_ttl_records_are_skipped_on_rehydrate() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ReplayStore::open(dir.path(), 1024 * 1024).unwrap();
+    // Enqueued long ago with a 1 ms TTL — already expired.
+    store
+        .put(
+            "peer-echo",
+            1,
+            1, // year 1970
+            Some(1),
+            &[],
+            &Bytes::from_static(b"stale"),
+        )
+        .unwrap();
+    // Same peer, fresh TTL — must survive.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    store
+        .put(
+            "peer-echo",
+            2,
+            now_ms,
+            Some(60_000),
+            &[],
+            &Bytes::from_static(b"fresh"),
+        )
+        .unwrap();
+
+    // Filter exactly the way the manager does on rehydrate.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let restored: Vec<BufferedMessage> = store
+        .load_all()
+        .unwrap()
+        .into_iter()
+        .filter(|e| {
+            e.ttl_ms
+                .map(|ttl| e.enqueued_at_unix_ms.saturating_add(ttl) >= now_ms)
+                .unwrap_or(true)
+        })
+        .map(BufferedMessage::from)
+        .collect();
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].payload, Bytes::from_static(b"fresh"));
 }

@@ -10,7 +10,10 @@
 //!
 //! ```text
 //! key   = peer_id (str) + b"\x00" + seq (u64 big-endian)
-//! value = u32 groups_len, [u32 group_len, group_bytes]*, payload bytes
+//! value = u64 enqueued_at_unix_ms,
+//!         u64 ttl_ms (0 = no TTL),
+//!         u32 groups_len, [u32 group_len, group_bytes]*,
+//!         payload bytes
 //! ```
 //!
 //! A single redb table is used so we can iterate by peer prefix on
@@ -34,7 +37,21 @@ use tracing::{debug, warn};
 
 /// redb table backing persisted replay-buffer entries. The key is the
 /// composite (peer_id, seq) blob described in the module docs.
-const REPLAY_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("federation_replay_v1");
+// Bumped from `federation_replay_v1` when the value schema gained the
+// `enqueued_at_unix_ms` and `ttl_ms` prefix used for TTL-on-rehydrate
+// (#557 follow-up). Older databases that only contain the v1 table will
+// open cleanly with an empty v2 table — those legacy entries are
+// effectively dropped on first start of the new binary.
+const REPLAY_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("federation_replay_v2");
+
+/// Per-record overhead estimate added to the raw key + value byte counts
+/// when enforcing the global byte cap. Covers redb's per-entry metadata
+/// (page accounting, b-tree pointers, etc.) without paying the cost of a
+/// full `Database::stats()` round-trip on every put. The constant is
+/// intentionally generous: undercounting overhead would let the on-disk
+/// footprint exceed the operator's `--federation-replay-max-bytes`
+/// budget, which is the failure mode we are trying to avoid.
+const REDB_PER_RECORD_OVERHEAD: u64 = 32;
 
 /// Default global byte cap when the operator enables persistence
 /// without an explicit `--federation-replay-max-bytes`.
@@ -58,6 +75,13 @@ pub struct RestoredEntry {
     pub peer_id: String,
     /// Sequence number originally assigned by the in-memory ring.
     pub seq: u64,
+    /// Wall-clock time (Unix milliseconds) at which the entry was first
+    /// enqueued. Used to enforce TTL-on-rehydrate so persistence cannot
+    /// resurrect messages that should have been dropped.
+    pub enqueued_at_unix_ms: u64,
+    /// Original TTL in milliseconds, or `None` if the source message
+    /// had no TTL.
+    pub ttl_ms: Option<u64>,
     /// Source groups for routing.
     pub groups: Vec<String>,
     /// Raw message payload.
@@ -68,7 +92,13 @@ pub struct RestoredEntry {
 struct Entry {
     peer_id: String,
     seq: u64,
+    /// Accounted on-disk size including key bytes, value bytes, and a
+    /// constant overhead estimate for redb's per-record metadata.
     bytes: u64,
+    /// Enqueue timestamp used to drive global drop-oldest eviction —
+    /// not insertion order, so peers that drain at different rates
+    /// still age out in the right order after a rehydrate.
+    enqueued_at_unix_ms: u64,
 }
 
 #[derive(Debug)]
@@ -145,7 +175,7 @@ impl ReplayStore {
                     }
                 };
                 let key = k.value();
-                let bytes = v.value().len() as u64;
+                let value = v.value();
                 let (peer_id, seq) = match decode_key(key) {
                     Some(p) => p,
                     None => {
@@ -153,13 +183,27 @@ impl ReplayStore {
                         continue;
                     }
                 };
+                let Some((enqueued_at_unix_ms, _ttl_ms, _groups, _payload)) = decode_value(value)
+                else {
+                    debug!("skipping malformed replay-store value on rebuild");
+                    continue;
+                };
+                let bytes = accounted_size(key.len(), value.len());
                 inner.total_bytes = inner.total_bytes.saturating_add(bytes);
                 inner.global.push_back(Entry {
                     peer_id,
                     seq,
                     bytes,
+                    enqueued_at_unix_ms,
                 });
             }
+            // Restore global drop-oldest ordering by original enqueue
+            // timestamp, not by the (peer_id, seq) iteration order we
+            // happened to read off disk.
+            inner
+                .global
+                .make_contiguous()
+                .sort_by_key(|e| e.enqueued_at_unix_ms);
         }
 
         Ok(Self {
@@ -177,30 +221,47 @@ impl ReplayStore {
         &self,
         peer_id: &str,
         seq: u64,
+        enqueued_at_unix_ms: u64,
+        ttl_ms: Option<u64>,
         groups: &[String],
         payload: &Bytes,
     ) -> Result<(), ReplayStoreError> {
-        let value = encode_value(groups, payload);
-        let value_len = value.len() as u64;
+        let value = encode_value(enqueued_at_unix_ms, ttl_ms, groups, payload);
         let key = encode_key(peer_id, seq);
+        let accounted = accounted_size(key.len(), value.len());
 
         // Evict from the front until we have room. Done before the
         // write so the database commit reflects the post-eviction state.
+        // The deque is kept ordered by `enqueued_at_unix_ms` so the
+        // front is always the globally-oldest record across peers,
+        // even when peers drain at different rates.
         let to_delete: Vec<(String, u64)> = {
             let mut inner = self.inner.lock();
             let mut victims = Vec::new();
-            while inner.total_bytes.saturating_add(value_len) > self.max_bytes
+            while inner.total_bytes.saturating_add(accounted) > self.max_bytes
                 && let Some(front) = inner.global.pop_front()
             {
                 inner.total_bytes = inner.total_bytes.saturating_sub(front.bytes);
                 victims.push((front.peer_id, front.seq));
             }
-            inner.global.push_back(Entry {
+            // Insertion-sorted by enqueue timestamp. Since timestamps
+            // are monotonic for live writes, this almost always lands
+            // at the back; the search exists to keep correctness if a
+            // hydrate or clock skew produces an out-of-order put.
+            let new_entry = Entry {
                 peer_id: peer_id.to_string(),
                 seq,
-                bytes: value_len,
-            });
-            inner.total_bytes = inner.total_bytes.saturating_add(value_len);
+                bytes: accounted,
+                enqueued_at_unix_ms,
+            };
+            let pos = inner
+                .global
+                .iter()
+                .rposition(|e| e.enqueued_at_unix_ms <= enqueued_at_unix_ms)
+                .map(|p| p + 1)
+                .unwrap_or(0);
+            inner.global.insert(pos, new_entry);
+            inner.total_bytes = inner.total_bytes.saturating_add(accounted);
             victims
         };
 
@@ -332,13 +393,16 @@ impl ReplayStore {
                 debug!("skipping malformed replay-store key on load");
                 continue;
             };
-            let Some((groups, payload)) = decode_value(v.value()) else {
+            let Some((enqueued_at_unix_ms, ttl_ms, groups, payload)) = decode_value(v.value())
+            else {
                 debug!("skipping malformed replay-store value on load");
                 continue;
             };
             out.push(RestoredEntry {
                 peer_id,
                 seq,
+                enqueued_at_unix_ms,
+                ttl_ms,
                 groups,
                 payload,
             });
@@ -385,8 +449,17 @@ fn decode_key(raw: &[u8]) -> Option<(String, u64)> {
     Some((peer, u64::from_be_bytes(seq_bytes)))
 }
 
-fn encode_value(groups: &[String], payload: &Bytes) -> Vec<u8> {
+fn encode_value(
+    enqueued_at_unix_ms: u64,
+    ttl_ms: Option<u64>,
+    groups: &[String],
+    payload: &Bytes,
+) -> Vec<u8> {
     let mut buf = BytesMut::new();
+    buf.put_u64(enqueued_at_unix_ms);
+    // Encode `None` as 0; live messages are never enqueued with a 0 ms
+    // TTL because the forward boundary would have already dropped them.
+    buf.put_u64(ttl_ms.unwrap_or(0));
     buf.put_u32(groups.len() as u32);
     for g in groups {
         buf.put_u32(g.len() as u32);
@@ -396,10 +469,13 @@ fn encode_value(groups: &[String], payload: &Bytes) -> Vec<u8> {
     buf.to_vec()
 }
 
-fn decode_value(mut raw: &[u8]) -> Option<(Vec<String>, Bytes)> {
-    if raw.len() < 4 {
+fn decode_value(mut raw: &[u8]) -> Option<(u64, Option<u64>, Vec<String>, Bytes)> {
+    if raw.len() < 8 + 8 + 4 {
         return None;
     }
+    let enqueued_at_unix_ms = raw.get_u64();
+    let ttl_raw = raw.get_u64();
+    let ttl_ms = if ttl_raw == 0 { None } else { Some(ttl_raw) };
     let n = raw.get_u32() as usize;
     let mut groups = Vec::with_capacity(n);
     for _ in 0..n {
@@ -414,7 +490,25 @@ fn decode_value(mut raw: &[u8]) -> Option<(Vec<String>, Bytes)> {
         raw.advance(glen);
         groups.push(g);
     }
-    Some((groups, Bytes::copy_from_slice(raw)))
+    Some((
+        enqueued_at_unix_ms,
+        ttl_ms,
+        groups,
+        Bytes::copy_from_slice(raw),
+    ))
+}
+
+/// Estimated on-disk footprint for a (key, value) pair, used by the
+/// global byte-cap. We deliberately overcount by adding a constant
+/// `REDB_PER_RECORD_OVERHEAD` to cover redb's per-entry b-tree and
+/// page metadata, which `value.len()` alone does not include. This is
+/// the simplification documented at the top of this module: cheaper
+/// than calling `Database::stats()` on every put, and biased toward
+/// staying *under* the operator's byte budget rather than over it.
+fn accounted_size(key_len: usize, value_len: usize) -> u64 {
+    (key_len as u64)
+        .saturating_add(value_len as u64)
+        .saturating_add(REDB_PER_RECORD_OVERHEAD)
 }
 
 #[cfg(test)]
@@ -422,6 +516,12 @@ mod tests {
     #![allow(clippy::panic, clippy::unwrap_used)]
 
     use super::*;
+
+    fn put(store: &ReplayStore, peer: &str, seq: u64, ts_ms: u64, payload: &'static [u8]) {
+        store
+            .put(peer, seq, ts_ms, None, &[], &Bytes::from_static(payload))
+            .unwrap();
+    }
 
     #[test]
     fn round_trip_persist_and_load() {
@@ -432,6 +532,8 @@ mod tests {
             .put(
                 "peer-a",
                 1,
+                100,
+                Some(60_000),
                 &["alpha".into(), "bravo".into()],
                 &Bytes::from_static(b"hello"),
             )
@@ -440,12 +542,14 @@ mod tests {
             .put(
                 "peer-a",
                 2,
+                200,
+                None,
                 &["alpha".into()],
                 &Bytes::from_static(b"world"),
             )
             .unwrap();
         store
-            .put("peer-b", 1, &[], &Bytes::from_static(b"solo"))
+            .put("peer-b", 1, 300, None, &[], &Bytes::from_static(b"solo"))
             .unwrap();
         drop(store);
 
@@ -455,6 +559,8 @@ mod tests {
         assert_eq!(all.len(), 3);
         assert_eq!(all[0].peer_id, "peer-a");
         assert_eq!(all[0].seq, 1);
+        assert_eq!(all[0].enqueued_at_unix_ms, 100);
+        assert_eq!(all[0].ttl_ms, Some(60_000));
         assert_eq!(
             all[0].groups,
             vec!["alpha".to_string(), "bravo".to_string()]
@@ -462,15 +568,16 @@ mod tests {
         assert_eq!(all[0].payload, Bytes::from_static(b"hello"));
         assert_eq!(all[2].peer_id, "peer-b");
         assert_eq!(all[2].payload, Bytes::from_static(b"solo"));
+        assert_eq!(all[2].ttl_ms, None);
     }
 
     #[test]
     fn clear_peer_removes_only_that_peer() {
         let dir = tempfile::tempdir().unwrap();
         let store = ReplayStore::open(dir.path(), 1024 * 1024).unwrap();
-        store.put("a", 1, &[], &Bytes::from_static(b"1")).unwrap();
-        store.put("a", 2, &[], &Bytes::from_static(b"2")).unwrap();
-        store.put("b", 1, &[], &Bytes::from_static(b"3")).unwrap();
+        put(&store, "a", 1, 10, b"1");
+        put(&store, "a", 2, 20, b"2");
+        put(&store, "b", 1, 30, b"3");
         store.clear_peer("a").unwrap();
         let all = store.load_all().unwrap();
         assert_eq!(all.len(), 1);
@@ -481,8 +588,8 @@ mod tests {
     fn delete_single_entry() {
         let dir = tempfile::tempdir().unwrap();
         let store = ReplayStore::open(dir.path(), 1024 * 1024).unwrap();
-        store.put("a", 1, &[], &Bytes::from_static(b"1")).unwrap();
-        store.put("a", 2, &[], &Bytes::from_static(b"2")).unwrap();
+        put(&store, "a", 1, 10, b"1");
+        put(&store, "a", 2, 20, b"2");
         store.delete("a", 1).unwrap();
         let all = store.load_all().unwrap();
         assert_eq!(all.len(), 1);
@@ -490,20 +597,107 @@ mod tests {
     }
 
     #[test]
-    fn byte_cap_evicts_oldest() {
+    fn byte_cap_evicts_oldest_by_enqueue_timestamp() {
         let dir = tempfile::tempdir().unwrap();
-        // Each value encodes to 4 (groups_len) + payload bytes; cap of
-        // 32 bytes is enough for ~3 small messages.
-        let store = ReplayStore::open(dir.path(), 32).unwrap();
+        // Each accounted record is roughly: key (~10) + value
+        // (16 header + 4 groups_len + 8 payload) + 32 overhead ≈ 70 B.
+        // A 200 B cap is enough for ~2-3 records.
+        let store = ReplayStore::open(dir.path(), 200).unwrap();
         for i in 0u64..6 {
             store
-                .put("p", i + 1, &[], &Bytes::from(vec![b'x'; 8]))
+                .put(
+                    "p",
+                    i + 1,
+                    1_000 + i,
+                    None,
+                    &[],
+                    &Bytes::from(vec![b'x'; 8]),
+                )
                 .unwrap();
         }
         let all = store.load_all().unwrap();
         assert!(all.len() < 6, "expected eviction to drop oldest entries");
         // Newest entry must still be there.
         assert!(all.iter().any(|e| e.seq == 6));
-        assert!(store.total_bytes() <= 32);
+        assert!(store.total_bytes() <= 200);
+    }
+
+    #[test]
+    fn byte_cap_evicts_globally_oldest_across_peers() {
+        // Two peers: peer A enqueued first, then peer B. Under cap
+        // pressure, A's records must be evicted before B's even though
+        // B's seq numbers are equal — eviction is by enqueue time, not
+        // per-peer insertion order.
+        let dir = tempfile::tempdir().unwrap();
+        let store = ReplayStore::open(dir.path(), 350).unwrap();
+        // Two A records first.
+        store
+            .put("a", 1, 1_000, None, &[], &Bytes::from(vec![b'x'; 32]))
+            .unwrap();
+        store
+            .put("a", 2, 1_001, None, &[], &Bytes::from(vec![b'x'; 32]))
+            .unwrap();
+        // Then two B records.
+        store
+            .put("b", 1, 2_000, None, &[], &Bytes::from(vec![b'x'; 32]))
+            .unwrap();
+        store
+            .put("b", 2, 2_001, None, &[], &Bytes::from(vec![b'x'; 32]))
+            .unwrap();
+        // One more push triggers eviction; peer A is the oldest.
+        store
+            .put("b", 3, 3_000, None, &[], &Bytes::from(vec![b'x'; 32]))
+            .unwrap();
+
+        let all = store.load_all().unwrap();
+        let a_seqs: Vec<u64> = all
+            .iter()
+            .filter(|e| e.peer_id == "a")
+            .map(|e| e.seq)
+            .collect();
+        let b_seqs: Vec<u64> = all
+            .iter()
+            .filter(|e| e.peer_id == "b")
+            .map(|e| e.seq)
+            .collect();
+        // At least one A record was evicted before any B record.
+        assert!(
+            a_seqs.len() < 2,
+            "expected peer A's oldest record to be evicted first, got a_seqs={a_seqs:?} b_seqs={b_seqs:?}"
+        );
+        assert!(b_seqs.contains(&3));
+    }
+
+    #[test]
+    fn rehydrated_store_preserves_global_oldest_ordering() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = ReplayStore::open(dir.path(), 4096).unwrap();
+            // Out-of-order writes to ensure the in-memory deque doesn't
+            // accidentally rely on insertion order.
+            store
+                .put("a", 1, 1_000, None, &[], &Bytes::from_static(b"a1"))
+                .unwrap();
+            store
+                .put("b", 1, 2_000, None, &[], &Bytes::from_static(b"b1"))
+                .unwrap();
+            store
+                .put("a", 2, 3_000, None, &[], &Bytes::from_static(b"a2"))
+                .unwrap();
+        }
+        // Reopen and shrink the cap so eviction happens against the
+        // restored deque. The very first record (a/seq=1, ts=1_000)
+        // must be evicted before the later ones.
+        let store = ReplayStore::open(dir.path(), 130).unwrap();
+        store
+            .put("b", 2, 4_000, None, &[], &Bytes::from_static(b"b2"))
+            .unwrap();
+        let all = store.load_all().unwrap();
+        let still_there: Vec<(String, u64)> =
+            all.iter().map(|e| (e.peer_id.clone(), e.seq)).collect();
+        assert!(
+            !still_there.contains(&("a".to_string(), 1)),
+            "expected globally-oldest entry to be evicted, got {still_there:?}"
+        );
     }
 }

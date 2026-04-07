@@ -191,6 +191,13 @@ impl FederationManager {
 
         // Open the persistent replay store (issue #557) and rehydrate any
         // entries persisted from a previous run before we accept connections.
+        //
+        // Ordering matters: this MUST run before the V1/V2 federation
+        // listeners bind below. If a peer reconnects between bind and
+        // rehydrate, its `messages_since(seq)` query would race against
+        // an empty in-memory buffer and the operator would see a
+        // spurious "no replay available" gap on the very restart that
+        // persistence is supposed to cover.
         if let Some(dir) = self.config.replay_buffer_dir.clone() {
             match ReplayStore::open(&dir, self.config.replay_max_bytes) {
                 Ok(store) => {
@@ -723,14 +730,19 @@ impl FederationManager {
             source_groups = ?source_groups,
         );
 
-        self.forward_inner(payload, source_groups)
+        self.forward_inner(payload, source_groups, metadata)
             .instrument(span)
             .await
     }
 
     /// Inner forwarding logic, separated so the caller can `.instrument()` a
     /// span around this future without holding an `EnteredSpan` across `.await`.
-    async fn forward_inner(&self, payload: Bytes, source_groups: &[String]) -> usize {
+    async fn forward_inner(
+        &self,
+        payload: Bytes,
+        source_groups: &[String],
+        metadata: Option<&Metadata>,
+    ) -> usize {
         let mut sent = 0;
 
         // Inject flow tag for traceability (identifies which federation server
@@ -747,8 +759,10 @@ impl FederationManager {
         #[cfg(feature = "v2")]
         let mut v2_event: Option<crate::v2::proto::figpb::FederatedEvent> = None;
 
-        // Buffer the message for replay on reconnection
-        self.buffer_for_replay(&payload, source_groups);
+        // Buffer the message for replay on reconnection. Pass through
+        // the originating TTL so the persistent store can re-evaluate
+        // expiry on a future rehydrate.
+        self.buffer_for_replay(&payload, source_groups, metadata);
 
         // Snapshot clients and peer handles so callers can release the outer
         // lock before we block on per-peer channel sends.
@@ -848,10 +862,14 @@ impl FederationManager {
     ///
     /// Called during forwarding so that messages are available for replay
     /// when a peer reconnects after a disconnection.
-    fn buffer_for_replay(&self, payload: &Bytes, groups: &[String]) {
+    fn buffer_for_replay(&self, payload: &Bytes, groups: &[String], metadata: Option<&Metadata>) {
         if self.config.replay_buffer_capacity == 0 {
             return;
         }
+        let enqueued_at_unix_ms = crate::replay_buffer::now_unix_ms();
+        let ttl_ms: Option<u64> = metadata
+            .and_then(|m| m.ttl)
+            .map(|d| d.as_millis().min(u64::MAX as u128) as u64);
         if let Ok(mut buffers) = self.replay_buffers.lock() {
             for peer_id in self.peers.keys() {
                 let buffer = buffers.entry(peer_id.clone()).or_insert_with(|| {
@@ -861,7 +879,12 @@ impl FederationManager {
                         self.replay_store.as_ref(),
                     )
                 });
-                let _ = buffer.push(payload.clone(), groups.to_vec());
+                let _ = buffer.push_with_metadata(
+                    payload.clone(),
+                    groups.to_vec(),
+                    enqueued_at_unix_ms,
+                    ttl_ms,
+                );
             }
         }
     }
@@ -901,17 +924,46 @@ impl FederationManager {
             return;
         }
 
-        // Group by peer id while preserving ascending seq order.
+        // Drop entries whose TTL (per `Metadata::is_expired()`) has
+        // already elapsed before they ever land in an in-memory ring.
+        // Without this filter, persistence would silently bypass the
+        // forward-time TTL check (#554) across restarts: a server
+        // bounce would resurrect messages that should have been
+        // dropped. Expired records are also deleted from the store so
+        // they don't accumulate across reboots.
+        let now_ms = crate::replay_buffer::now_unix_ms();
         let mut by_peer: HashMap<String, Vec<BufferedMessage>> = HashMap::new();
+        let mut skipped_ttl: u64 = 0;
         for entry in entries {
+            if let Some(ttl_ms) = entry.ttl_ms
+                && entry.enqueued_at_unix_ms.saturating_add(ttl_ms) < now_ms
+            {
+                skipped_ttl = skipped_ttl.saturating_add(1);
+                if let Err(e) = store.delete(&entry.peer_id, entry.seq) {
+                    warn!(
+                        peer_id = %entry.peer_id,
+                        seq = entry.seq,
+                        error = %e,
+                        "failed to delete expired persisted replay entry"
+                    );
+                }
+                continue;
+            }
             by_peer
-                .entry(entry.peer_id)
+                .entry(entry.peer_id.clone())
                 .or_default()
-                .push(BufferedMessage {
-                    seq: entry.seq,
-                    payload: entry.payload,
-                    groups: entry.groups,
-                });
+                .push(BufferedMessage::from(entry));
+        }
+        if skipped_ttl > 0 {
+            #[cfg(feature = "api")]
+            crate::metrics::replay_restored_skipped_ttl().inc_by(skipped_ttl);
+            info!(
+                skipped = skipped_ttl,
+                "skipped expired persisted replay entries during rehydrate"
+            );
+        }
+        if by_peer.is_empty() {
+            return;
         }
 
         let Ok(mut buffers) = self.replay_buffers.lock() else {
@@ -2323,8 +2375,8 @@ mod tests {
         let _ = manager.peers.insert("peer-1".into(), peer1);
         let _ = manager.peers.insert("peer-2".into(), peer2);
 
-        manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()]);
-        manager.buffer_for_replay(&Bytes::from("msg2"), &["Beta".into()]);
+        manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()], None);
+        manager.buffer_for_replay(&Bytes::from("msg2"), &["Beta".into()], None);
 
         let msgs1 = manager.replay_messages("peer-1", 0);
         assert_eq!(msgs1.len(), 2);
@@ -2345,7 +2397,7 @@ mod tests {
         )));
         let _ = manager.peers.insert("peer-1".into(), peer);
 
-        manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()]);
+        manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()], None);
 
         let msgs = manager.replay_messages("peer-1", 0);
         assert!(msgs.is_empty());
@@ -2363,7 +2415,7 @@ mod tests {
         )));
         let _ = manager.peers.insert("peer-1".into(), peer);
 
-        manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()]);
+        manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()], None);
         assert_eq!(manager.replay_messages("peer-1", 0).len(), 1);
 
         manager.remove_replay_buffer("peer-1");
@@ -2382,15 +2434,15 @@ mod tests {
         )));
         let _ = manager.peers.insert("peer-1".into(), peer);
 
-        manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()]);
-        manager.buffer_for_replay(&Bytes::from("msg2"), &["Alpha".into()]);
+        manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()], None);
+        manager.buffer_for_replay(&Bytes::from("msg2"), &["Alpha".into()], None);
         assert_eq!(manager.replay_messages("peer-1", 0).len(), 2);
 
         manager.clear_replay_buffer("peer-1");
         assert!(manager.replay_messages("peer-1", 0).is_empty());
 
         // Buffer entry still exists — new messages can be buffered
-        manager.buffer_for_replay(&Bytes::from("msg3"), &["Alpha".into()]);
+        manager.buffer_for_replay(&Bytes::from("msg3"), &["Alpha".into()], None);
         assert_eq!(manager.replay_messages("peer-1", 0).len(), 1);
     }
 
@@ -2406,9 +2458,9 @@ mod tests {
         )));
         let _ = manager.peers.insert("peer-1".into(), peer);
 
-        manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()]);
-        manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()]); // duplicate
-        manager.buffer_for_replay(&Bytes::from("msg2"), &["Beta".into()]);
+        manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()], None);
+        manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()], None); // duplicate
+        manager.buffer_for_replay(&Bytes::from("msg2"), &["Beta".into()], None);
 
         let deduped = manager.replay_messages_deduped("peer-1");
         assert_eq!(deduped.len(), 2);
