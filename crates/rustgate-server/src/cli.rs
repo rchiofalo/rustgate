@@ -234,6 +234,14 @@ pub(crate) struct Cli {
     #[arg(long, default_value = "rustgate", env = "RUSTGATE_CA_ORG")]
     pub(crate) ca_organization: String,
 
+    /// Maximum CSR signing requests per source IP per minute on the
+    /// enrollment server. CSR signing is an expensive RSA operation, so
+    /// this throttle prevents trivial DoS by capping per-IP traffic to
+    /// the `/Marti/api/tls/signClient` endpoints. Set to 0 to disable
+    /// the throttle (not recommended). Requires `--features enrollment`.
+    #[arg(long, default_value_t = 10, env = "RUSTGATE_ENROLLMENT_RATE_LIMIT")]
+    pub(crate) enrollment_rate_limit: u32,
+
     /// Directory for data package storage. Enables the Marti sync API
     /// endpoints when set. Requires --features enrollment.
     #[arg(long, env = "RUSTGATE_DATA_PACKAGE_DIR")]
@@ -720,6 +728,7 @@ define_config_file! {
     enrollment_user: Option<String>,
     enrollment_password: Option<String>,
     ca_organization: String,
+    enrollment_rate_limit: u32,
     data_package_dir: Option<String>,
     package_signature_ca: Option<String>,
     package_strict_signatures: bool,

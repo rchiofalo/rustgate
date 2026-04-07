@@ -54,6 +54,11 @@ impl RateLimiter {
         }
     }
 
+    /// Configured maximum requests per IP within the window.
+    pub fn max_requests(&self) -> usize {
+        self.max_requests
+    }
+
     /// Check if a request from `ip` is allowed.
     ///
     /// Returns `true` if under the limit, `false` if rate-limited.
