@@ -201,6 +201,18 @@ impl PeerHandle {
         }
     }
 
+    /// Reset the queue accounting to empty. Used when a send loop terminates
+    /// permanently (e.g. shutdown, max reconnects exhausted) and any messages
+    /// still buffered in the outbound channel will be dropped without delivery.
+    /// Without this, the per-peer queue-bytes gauge would leak counter weight
+    /// for the lifetime of the process.
+    pub fn reset_queue(&self) {
+        self.queue_bytes.store(0, Ordering::Relaxed);
+        if let Ok(mut guard) = self.queue_ages.lock() {
+            guard.clear();
+        }
+    }
+
     /// Current queued bytes for this peer.
     pub fn queue_bytes(&self) -> u64 {
         self.queue_bytes.load(Ordering::Relaxed)
@@ -491,6 +503,20 @@ mod tests {
         assert!(handle.oldest_queued_age_secs().is_some());
 
         handle.record_dequeue();
+        assert_eq!(handle.queue_bytes(), 0);
+        assert!(handle.oldest_queued_age_secs().is_none());
+    }
+
+    #[test]
+    fn reset_queue_clears_pending_accounting() {
+        let handle = PeerHandle::new(test_config());
+        handle.record_enqueue(100);
+        handle.record_enqueue(250);
+        handle.record_enqueue(400);
+        assert_eq!(handle.queue_bytes(), 750);
+        assert!(handle.oldest_queued_age_secs().is_some());
+
+        handle.reset_queue();
         assert_eq!(handle.queue_bytes(), 0);
         assert!(handle.oldest_queued_age_secs().is_none());
     }

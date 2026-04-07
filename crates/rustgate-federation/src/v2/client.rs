@@ -292,6 +292,25 @@ async fn connection_loop(
 
         reconnect_count += 1;
     }
+
+    // Drain any messages still buffered in the outbound channel and clear
+    // the per-peer queue accounting so the metrics gauges return to zero.
+    // Without this, messages queued for a peer that has given up reconnecting
+    // (or been shut down) would leak counter weight on the gauges for the
+    // lifetime of the process.
+    outbound_rx.close();
+    let mut drained = 0usize;
+    while outbound_rx.try_recv().is_ok() {
+        drained += 1;
+    }
+    if drained > 0 {
+        debug!(
+            peer = %peer.id,
+            drained,
+            "discarded buffered events on V2 client exit"
+        );
+    }
+    peer.reset_queue();
 }
 
 /// Build a tonic gRPC channel with TLS.
