@@ -10,6 +10,8 @@
 use std::io::Write;
 use std::process::Command;
 
+use serial_test::serial;
+
 fn rustgate_bin() -> String {
     env!("CARGO_BIN_EXE_rustgate").to_string()
 }
@@ -23,9 +25,33 @@ fn write_temp(contents: &str) -> tempfile::NamedTempFile {
     f
 }
 
+// ── required args ───────────────────────────────────────────────────
+
+#[test]
+#[serial]
+fn rustgate_without_cert_or_config_fails_at_clap_parse() {
+    // With neither --cert nor --config, clap must refuse to parse before
+    // we ever reach the merge/validate logic. This guarantees the
+    // pre-config-file behaviour is preserved.
+    let out = Command::new(rustgate_bin())
+        .env_remove("RUSTGATE_CERT")
+        .env_remove("RUSTGATE_KEY")
+        .env_remove("RUSTGATE_CA")
+        .env_remove("RUSTGATE_CONFIG")
+        .output()
+        .expect("spawn");
+    assert!(!out.status.success(), "rustgate with no args must fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--cert"),
+        "clap error should mention --cert: {stderr}"
+    );
+}
+
 // ── validate-config ─────────────────────────────────────────────────
 
 #[test]
+#[serial]
 fn validate_config_accepts_minimal_valid_file() {
     let toml = r#"
 cert = "/tmp/cert.pem"
@@ -46,6 +72,7 @@ ca   = "/tmp/ca.pem"
 }
 
 #[test]
+#[serial]
 fn validate_config_rejects_missing_required_fields() {
     // No cert/key/ca anywhere — must fail.
     let f = write_temp("bind = \"0.0.0.0:4433\"\n");
@@ -60,6 +87,7 @@ fn validate_config_rejects_missing_required_fields() {
 }
 
 #[test]
+#[serial]
 fn validate_config_rejects_unknown_keys() {
     let toml = r#"
 cert = "/tmp/cert.pem"
@@ -76,6 +104,7 @@ totally_made_up_key = "nope"
 }
 
 #[test]
+#[serial]
 fn validate_config_rejects_malformed_toml() {
     let f = write_temp("this is not = valid toml [[[");
     let out = Command::new(rustgate_bin())
@@ -88,6 +117,7 @@ fn validate_config_rejects_malformed_toml() {
 // ── print-config ────────────────────────────────────────────────────
 
 #[test]
+#[serial]
 fn print_config_emits_reparseable_toml() {
     let toml = r#"
 bind = "127.0.0.1:14433"
@@ -108,12 +138,18 @@ max-connections = 256
     );
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
 
-    // The emitted TOML must contain the merged values.
-    assert!(stdout.contains("127.0.0.1:14433"), "stdout: {stdout}");
-    assert!(stdout.contains("256"), "stdout: {stdout}");
-
-    // And it must round-trip through the TOML parser.
-    let _: toml::Value = toml::from_str(&stdout).expect("emitted TOML must reparse");
+    // Reparse as TOML and assert on typed field values rather than fragile
+    // substring matches.
+    let parsed: toml::Value = toml::from_str(&stdout).expect("emitted TOML must reparse");
+    let t = parsed.as_table().expect("table");
+    assert_eq!(
+        t.get("bind").and_then(|v| v.as_str()),
+        Some("127.0.0.1:14433")
+    );
+    assert_eq!(
+        t.get("max-connections").and_then(|v| v.as_integer()),
+        Some(256)
+    );
 
     // Feed the printed TOML back through validate-config.
     let f2 = write_temp(&stdout);
@@ -131,6 +167,7 @@ max-connections = 256
 // ── precedence ──────────────────────────────────────────────────────
 
 #[test]
+#[serial]
 fn cli_flag_overrides_env_and_file() {
     // file says A, env says B, CLI says C → effective is C.
     let toml = r#"
@@ -153,12 +190,18 @@ ca   = "/tmp/ca.pem"
         .expect("spawn");
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    assert!(stdout.contains("127.0.0.1:33333"), "stdout: {stdout}");
-    assert!(!stdout.contains("127.0.0.1:11111"));
-    assert!(!stdout.contains("127.0.0.1:22222"));
+    let parsed: toml::Value = toml::from_str(&stdout).expect("reparse");
+    assert_eq!(
+        parsed
+            .as_table()
+            .and_then(|t| t.get("bind"))
+            .and_then(|v| v.as_str()),
+        Some("127.0.0.1:33333")
+    );
 }
 
 #[test]
+#[serial]
 fn env_overrides_file() {
     // file says A, env says B, no CLI → effective is B.
     let toml = r#"
@@ -175,11 +218,18 @@ ca   = "/tmp/ca.pem"
         .expect("spawn");
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    assert!(stdout.contains("127.0.0.1:22222"), "stdout: {stdout}");
-    assert!(!stdout.contains("127.0.0.1:11111"));
+    let parsed: toml::Value = toml::from_str(&stdout).expect("reparse");
+    assert_eq!(
+        parsed
+            .as_table()
+            .and_then(|t| t.get("bind"))
+            .and_then(|v| v.as_str()),
+        Some("127.0.0.1:22222")
+    );
 }
 
 #[test]
+#[serial]
 fn file_overrides_defaults() {
     // file says A, no env, no CLI → effective is A (not the clap default).
     let toml = r#"
@@ -198,16 +248,51 @@ max-connections = 77
         .expect("spawn");
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    assert!(stdout.contains("127.0.0.1:11111"), "stdout: {stdout}");
-    assert!(stdout.contains("77"), "stdout: {stdout}");
-    // The clap default of 1024 must not appear as the effective value.
-    assert!(
-        !stdout.contains("max-connections = 1024") && !stdout.contains("max_connections = 1024"),
-        "stdout: {stdout}"
+    let parsed: toml::Value = toml::from_str(&stdout).expect("reparse");
+    let t = parsed.as_table().expect("table");
+    assert_eq!(
+        t.get("bind").and_then(|v| v.as_str()),
+        Some("127.0.0.1:11111")
+    );
+    assert_eq!(
+        t.get("max-connections").and_then(|v| v.as_integer()),
+        Some(77)
     );
 }
 
 #[test]
+#[serial]
+fn print_config_redacts_enrollment_password() {
+    let toml = r#"
+cert = "/tmp/cert.pem"
+key  = "/tmp/key.pem"
+ca   = "/tmp/ca.pem"
+enrollment-password = "hunter2-please-do-not-leak"
+"#;
+    let f = write_temp(toml);
+    let out = Command::new(rustgate_bin())
+        .args(["--config", f.path().to_str().unwrap(), "print-config"])
+        .env_remove("RUSTGATE_ENROLLMENT_PASSWORD")
+        .output()
+        .expect("spawn");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        !stdout.contains("hunter2-please-do-not-leak"),
+        "enrollment password leaked into print-config output: {stdout}"
+    );
+    let parsed: toml::Value = toml::from_str(&stdout).expect("reparse");
+    assert_eq!(
+        parsed
+            .as_table()
+            .and_then(|t| t.get("enrollment-password"))
+            .and_then(|v| v.as_str()),
+        Some("<redacted>")
+    );
+}
+
+#[test]
+#[serial]
 fn round_trip_preserves_field_values() {
     // Round-trip: write a TOML file with a representative set of fields,
     // run print-config, parse the result, and assert each field matches.

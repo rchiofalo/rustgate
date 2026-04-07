@@ -29,6 +29,22 @@ fn parse_max_connections(s: &str) -> Result<usize, String> {
     Ok(n)
 }
 
+/// Serde `serialize_with` helper that replaces any non-empty secret with the
+/// literal string `"<redacted>"` so `print-config` never leaks sensitive
+/// values (passwords, tokens) into logs or stdout. `None` and empty strings
+/// pass through unchanged so the output still reflects whether the field is
+/// set.
+fn redact_optional_secret<S>(value: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match value {
+        Some(v) if !v.is_empty() => serializer.serialize_some("<redacted>"),
+        Some(_) => serializer.serialize_some(""),
+        None => serializer.serialize_none(),
+    }
+}
+
 /// Validate a positive usize (must be >= 1).
 fn parse_nonzero_usize(s: &str) -> Result<usize, String> {
     let n: usize = s.parse().map_err(|e| format!("{e}"))?;
@@ -57,13 +73,28 @@ pub(crate) struct Cli {
     #[arg(short, long, default_value = "0.0.0.0:4433", env = "RUSTGATE_BIND", value_parser = parse_socket_addr)]
     pub(crate) bind: String,
 
-    #[arg(long, default_value = "", env = "RUSTGATE_CERT")]
+    #[arg(
+        long,
+        default_value = "",
+        env = "RUSTGATE_CERT",
+        required_unless_present = "config"
+    )]
     pub(crate) cert: String,
 
-    #[arg(long, default_value = "", env = "RUSTGATE_KEY")]
+    #[arg(
+        long,
+        default_value = "",
+        env = "RUSTGATE_KEY",
+        required_unless_present = "config"
+    )]
     pub(crate) key: String,
 
-    #[arg(long, default_value = "", env = "RUSTGATE_CA")]
+    #[arg(
+        long,
+        default_value = "",
+        env = "RUSTGATE_CA",
+        required_unless_present = "config"
+    )]
     pub(crate) ca: String,
 
     /// Path to PEM-encoded Certificate Revocation List file.
@@ -196,6 +227,7 @@ pub(crate) struct Cli {
 
     /// Password for enrollment HTTP Basic Auth.
     #[arg(long, env = "RUSTGATE_ENROLLMENT_PASSWORD")]
+    #[serde(serialize_with = "redact_optional_secret")]
     pub(crate) enrollment_password: Option<String>,
 
     /// Organization name for issued client certificates.
@@ -563,8 +595,8 @@ pub(crate) fn build_codec(
 /// entry lists the field name (matching `Cli`) and its concrete type.
 ///
 /// The macro keeps `Cli` and `ConfigFile` field names 1:1 so TOML keys map
-/// directly onto CLI flag names (with hyphens replaced by underscores per
-/// TOML conventions, handled via `serde(rename_all = "kebab-case")`).
+/// directly onto CLI flag names in kebab-case (hyphens preserved) via
+/// `serde(rename_all = "kebab-case")`.
 macro_rules! define_config_file {
     ( $( $field:ident : $ty:ty ),* $(,)? ) => {
         /// All-optional mirror of [`Cli`] used for TOML deserialization.
@@ -721,6 +753,31 @@ mod tests {
     #![allow(clippy::panic, clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn redact_enrollment_password_in_toml() {
+        let cli = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--enrollment-password",
+            "super-secret-42",
+        ])
+        .expect("parse");
+        let out = cli.to_toml().expect("toml");
+        assert!(
+            !out.contains("super-secret-42"),
+            "password leaked into print-config output: {out}"
+        );
+        assert!(
+            out.contains("<redacted>"),
+            "expected <redacted> marker in output: {out}"
+        );
+    }
 
     #[test]
     fn cli_parses_defaults() {

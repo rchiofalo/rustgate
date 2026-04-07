@@ -89,8 +89,9 @@ unicode-normalization = "0.1"
 arc-swap = "1"
 zeroize = { version = "1", features = ["derive"] }
 ocsp-stapler = "0.4"
-figment = { version = "0.10", features = ["toml", "env"] }
+figment = { version = "0.10", features = ["toml"] }
 toml = "0.8"
+serial_test = "3"
 
 # Internal crates
 rustgate-core = { path = "crates/rustgate-core" }
