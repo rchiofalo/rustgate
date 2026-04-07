@@ -43,6 +43,12 @@ pub struct LagSnapshot {
 /// keeping `rustgate-nats` agnostic of the metrics backend.
 pub type LagCallback = Arc<dyn Fn(LagSnapshot) + Send + Sync>;
 
+/// Callback invoked with the wall-clock duration of each `consumer.info()`
+/// poll, regardless of success or failure. Wired by the binary crate to
+/// observe a Prometheus histogram so the `rustgate-nats` crate stays free
+/// of metrics dependencies.
+pub type LatencyCallback = Arc<dyn Fn(Duration) + Send + Sync>;
+
 /// Receives messages from NATS via a JetStream pull consumer and delivers
 /// them to local sessions.
 ///
@@ -53,6 +59,7 @@ pub struct NatsSubscriber {
     client: async_nats::Client,
     config: NatsConfig,
     lag_callback: Option<LagCallback>,
+    latency_callback: Option<LatencyCallback>,
     lag_poll_interval: Duration,
 }
 
@@ -61,6 +68,7 @@ impl std::fmt::Debug for NatsSubscriber {
         f.debug_struct("NatsSubscriber")
             .field("config", &self.config)
             .field("lag_callback", &self.lag_callback.is_some())
+            .field("latency_callback", &self.latency_callback.is_some())
             .field("lag_poll_interval", &self.lag_poll_interval)
             .finish()
     }
@@ -72,8 +80,17 @@ impl NatsSubscriber {
             client,
             config,
             lag_callback: None,
+            latency_callback: None,
             lag_poll_interval: DEFAULT_LAG_POLL_INTERVAL,
         }
+    }
+
+    /// Register a callback that observes the wall-clock duration of every
+    /// `consumer.info()` poll, including ones that returned an error. The
+    /// binary crate wires this to a Prometheus histogram.
+    pub fn with_latency_callback(mut self, callback: LatencyCallback) -> Self {
+        self.latency_callback = Some(callback);
+        self
     }
 
     /// Register a callback that will receive a [`LagSnapshot`] every
@@ -157,10 +174,14 @@ impl NatsSubscriber {
         // Spawn the lag-poll task before draining messages so the first
         // observation lands shortly after startup. The task is aborted
         // when the subscriber returns.
-        let lag_task = self
-            .lag_callback
-            .as_ref()
-            .map(|cb| spawn_lag_poller(consumer.clone(), Arc::clone(cb), self.lag_poll_interval));
+        let lag_task = self.lag_callback.as_ref().map(|cb| {
+            spawn_lag_poller(
+                consumer.clone(),
+                Arc::clone(cb),
+                self.latency_callback.as_ref().map(Arc::clone),
+                self.lag_poll_interval,
+            )
+        });
         let _lag_guard = lag_task.map(LagPollerGuard);
 
         let mut messages = consumer.messages().await?;
@@ -294,11 +315,17 @@ impl Drop for LagPollerGuard {
 }
 
 /// Spawn a background task that periodically calls `consumer.info()` and
-/// forwards the lag indicators to `callback`. Errors from `info()` are
-/// logged at `debug` and do not stop the loop.
+/// forwards the lag indicators to `lag_callback`.
+///
+/// Transient failures (including JetStream timeouts and temporary
+/// disconnects) are logged at `warn` and the loop continues to the next
+/// tick — they must NOT kill the lag poller. The optional
+/// `latency_callback` observes the wall-clock duration of every poll,
+/// regardless of outcome.
 fn spawn_lag_poller(
     mut consumer: jetstream::consumer::Consumer<jetstream::consumer::pull::Config>,
-    callback: LagCallback,
+    lag_callback: LagCallback,
+    latency_callback: Option<LatencyCallback>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -306,21 +333,44 @@ fn spawn_lag_poller(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let _ = ticker.tick().await;
-            match consumer.info().await {
-                Ok(info) => {
-                    let snapshot = LagSnapshot {
-                        num_pending: info.num_pending,
-                        num_redelivered: info.num_redelivered as u64,
-                        ack_floor_stream_seq: info.ack_floor.stream_sequence,
-                    };
-                    callback(snapshot);
-                }
-                Err(e) => {
-                    tracing::debug!(error = %e, "JetStream consumer.info() failed");
-                }
-            }
+            let started = tokio::time::Instant::now();
+            let result = consumer.info().await;
+            let elapsed = started.elapsed();
+            handle_lag_poll_result(
+                result.map(|info| LagSnapshot {
+                    num_pending: info.num_pending,
+                    num_redelivered: info.num_redelivered as u64,
+                    ack_floor_stream_seq: info.ack_floor.stream_sequence,
+                }),
+                elapsed,
+                &lag_callback,
+                latency_callback.as_ref(),
+            );
         }
     })
+}
+
+/// Process the outcome of a single `consumer.info()` poll.
+///
+/// Factored out so it can be unit-tested without a live JetStream
+/// consumer. Transient errors are logged at `warn` and the caller is
+/// expected to continue to the next tick — a single failed poll must
+/// NOT kill the lag poller.
+fn handle_lag_poll_result<E: std::fmt::Display>(
+    result: Result<LagSnapshot, E>,
+    elapsed: Duration,
+    lag_callback: &LagCallback,
+    latency_callback: Option<&LatencyCallback>,
+) {
+    if let Some(cb) = latency_callback {
+        cb(elapsed);
+    }
+    match result {
+        Ok(snapshot) => lag_callback(snapshot),
+        Err(e) => {
+            tracing::warn!(error = %e, "consumer.info() failed; will retry");
+        }
+    }
 }
 
 /// Extract the group segment from a NATS subject.
@@ -376,6 +426,48 @@ mod tests {
         assert_eq!(got.num_pending, 9);
         assert_eq!(got.num_redelivered, 1);
         assert_eq!(got.ack_floor_stream_seq, 100);
+    }
+
+    #[test]
+    fn handle_lag_poll_result_error_then_ok_keeps_going() {
+        use std::sync::Mutex;
+
+        // Lag callback records every successful snapshot it receives.
+        let lag_seen: Arc<Mutex<Vec<LagSnapshot>>> = Arc::new(Mutex::new(Vec::new()));
+        let lag_seen_cb = Arc::clone(&lag_seen);
+        let lag_cb: LagCallback = Arc::new(move |snap| {
+            lag_seen_cb.lock().unwrap().push(snap);
+        });
+
+        // Latency callback fires on every poll, success or failure.
+        let latency_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let latency_count_cb = Arc::clone(&latency_count);
+        let lat_cb: LatencyCallback = Arc::new(move |_d| {
+            *latency_count_cb.lock().unwrap() += 1;
+        });
+
+        // Simulate two ticks: the first poll fails (transient error), the
+        // second succeeds. Both must invoke the latency callback, only the
+        // success must invoke the lag callback, and the helper must not
+        // panic on the error path.
+        let results: Vec<Result<LagSnapshot, &'static str>> = vec![
+            Err("connection reset by peer"),
+            Ok(LagSnapshot {
+                num_pending: 5,
+                num_redelivered: 1,
+                ack_floor_stream_seq: 99,
+            }),
+        ];
+        for r in results {
+            handle_lag_poll_result(r, Duration::from_millis(3), &lag_cb, Some(&lat_cb));
+        }
+
+        assert_eq!(*latency_count.lock().unwrap(), 2);
+        let seen = lag_seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].num_pending, 5);
+        assert_eq!(seen[0].num_redelivered, 1);
+        assert_eq!(seen[0].ack_floor_stream_seq, 99);
     }
 
     #[test]

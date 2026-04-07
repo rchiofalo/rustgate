@@ -354,7 +354,7 @@ pub(crate) async fn connect_nats(
             let mut subscriber = adapter.subscriber();
             #[cfg(feature = "metrics")]
             {
-                use rustgate_nats::{LagCallback, LagSnapshot};
+                use rustgate_nats::{LagCallback, LagSnapshot, LatencyCallback};
                 let cb: LagCallback = std::sync::Arc::new(|snap: LagSnapshot| {
                     if let Some(g) = crate::metrics::nats_consumer_pending() {
                         g.set(snap.num_pending as i64);
@@ -366,7 +366,14 @@ pub(crate) async fn connect_nats(
                         g.set(snap.ack_floor_stream_seq as i64);
                     }
                 });
-                subscriber = subscriber.with_lag_callback(cb, None);
+                let lat_cb: LatencyCallback = std::sync::Arc::new(|d: std::time::Duration| {
+                    if let Some(h) = crate::metrics::nats_consumer_info_seconds() {
+                        h.observe(d.as_secs_f64());
+                    }
+                });
+                subscriber = subscriber
+                    .with_lag_callback(cb, None)
+                    .with_latency_callback(lat_cb);
             }
             let sub_router = Arc::clone(router);
             spawn_background("nats-subscriber", async move {

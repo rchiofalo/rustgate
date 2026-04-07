@@ -16,6 +16,8 @@ use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
+#[cfg(feature = "nats")]
+use prometheus::Histogram;
 use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts, TextEncoder,
 };
@@ -81,6 +83,8 @@ static NATS_CONSUMER_PENDING: OnceLock<IntGauge> = OnceLock::new();
 static NATS_CONSUMER_NUM_REDELIVERED: OnceLock<IntGauge> = OnceLock::new();
 #[cfg(feature = "nats")]
 static NATS_CONSUMER_ACK_FLOOR_STREAM_SEQ: OnceLock<IntGauge> = OnceLock::new();
+#[cfg(feature = "nats")]
+static NATS_CONSUMER_INFO_SECONDS: OnceLock<Histogram> = OnceLock::new();
 
 static NEGOTIATIONS: OnceLock<IntCounterVec> = OnceLock::new();
 
@@ -266,6 +270,13 @@ pub fn init() -> prometheus::Result<()> {
         ))?;
         registry.register(Box::new(ack_floor.clone()))?;
         let _ = NATS_CONSUMER_ACK_FLOOR_STREAM_SEQ.set(ack_floor);
+
+        let info_seconds = Histogram::with_opts(HistogramOpts::new(
+            "rustgate_nats_consumer_info_seconds",
+            "Latency of JetStream pull-consumer info() poll calls in seconds",
+        ))?;
+        registry.register(Box::new(info_seconds.clone()))?;
+        let _ = NATS_CONSUMER_INFO_SECONDS.set(info_seconds);
     }
 
     let negotiations = IntCounterVec::new(
@@ -462,6 +473,12 @@ pub fn nats_consumer_num_redelivered() -> Option<&'static IntGauge> {
 #[cfg(feature = "nats")]
 pub fn nats_consumer_ack_floor_stream_seq() -> Option<&'static IntGauge> {
     NATS_CONSUMER_ACK_FLOOR_STREAM_SEQ.get()
+}
+
+/// Returns the JetStream `consumer.info()` poll latency histogram if registered.
+#[cfg(feature = "nats")]
+pub fn nats_consumer_info_seconds() -> Option<&'static Histogram> {
+    NATS_CONSUMER_INFO_SECONDS.get()
 }
 
 #[allow(dead_code)] // only used when `proto` feature enables TAK negotiation
