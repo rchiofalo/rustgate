@@ -4,8 +4,10 @@
 //! enums, and the conversion from `Framing` to the transport layer's
 //! `FramingStrategy`.
 
-use clap::{Parser, ValueEnum};
+use clap::parser::ValueSource;
+use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use rustgate_core::protocol::{FramingStrategy, HeaderSize};
+use serde::{Deserialize, Serialize};
 
 /// Validate that a CLI argument is a valid socket address (ip:port).
 fn parse_socket_addr(s: &str) -> Result<String, String> {
@@ -36,19 +38,32 @@ fn parse_nonzero_usize(s: &str) -> Result<usize, String> {
     Ok(n)
 }
 
-#[derive(Parser)]
+#[derive(Parser, Serialize)]
 #[command(name = "rustgate", about = "Secure tactical message router")]
+#[serde(rename_all = "kebab-case")]
 pub(crate) struct Cli {
+    /// Subcommand. When omitted, the server runs normally with the supplied flags.
+    #[command(subcommand)]
+    #[serde(skip)]
+    pub(crate) command: Option<Command>,
+
+    /// Path to a TOML configuration file. Settings are merged in the order
+    /// defaults -> file -> environment variables -> CLI flags. Command-line
+    /// flags always win.
+    #[arg(long, env = "RUSTGATE_CONFIG")]
+    #[serde(skip_serializing)]
+    pub(crate) config: Option<String>,
+
     #[arg(short, long, default_value = "0.0.0.0:4433", env = "RUSTGATE_BIND", value_parser = parse_socket_addr)]
     pub(crate) bind: String,
 
-    #[arg(long, env = "RUSTGATE_CERT")]
+    #[arg(long, default_value = "", env = "RUSTGATE_CERT")]
     pub(crate) cert: String,
 
-    #[arg(long, env = "RUSTGATE_KEY")]
+    #[arg(long, default_value = "", env = "RUSTGATE_KEY")]
     pub(crate) key: String,
 
-    #[arg(long, env = "RUSTGATE_CA")]
+    #[arg(long, default_value = "", env = "RUSTGATE_CA")]
     pub(crate) ca: String,
 
     /// Path to PEM-encoded Certificate Revocation List file.
@@ -450,7 +465,17 @@ pub(crate) struct Cli {
     pub(crate) otel_service_name: String,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+/// Top-level subcommands. The default (no subcommand) runs the server.
+#[derive(Subcommand, Clone, Debug)]
+pub(crate) enum Command {
+    /// Print the effective merged configuration as TOML and exit.
+    PrintConfig,
+    /// Validate the configuration file (parse + cross-field checks) and exit.
+    ValidateConfig,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub(crate) enum Framing {
     Xml,
     LengthPrefixed,
@@ -462,7 +487,8 @@ pub(crate) enum Framing {
     TakNegotiate,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub(crate) enum Encoding {
     Raw,
     Cot,
@@ -519,6 +545,175 @@ pub(crate) fn build_codec(
         #[cfg(not(feature = "proto"))]
         (Framing::TakProtobuf, _) => Arc::new(rustgate_transport::TakXmlCodec),
     }
+}
+
+// ── Configuration file support ──────────────────────────────────────
+//
+// `ConfigFile` is a serde-only mirror of `Cli` where every field is optional.
+// It is loaded from a TOML file via figment and then merged into a freshly
+// parsed `Cli` instance: for each field, if the user did not pass it on the
+// command line and did not set its environment variable, the file value
+// (when present) replaces the clap default. The result is the precedence
+//
+//     defaults < file < env < CLI flags
+//
+// which matches the documented behaviour in the README.
+
+/// Macro to define `ConfigFile` and the corresponding merge routine. Each
+/// entry lists the field name (matching `Cli`) and its concrete type.
+///
+/// The macro keeps `Cli` and `ConfigFile` field names 1:1 so TOML keys map
+/// directly onto CLI flag names (with hyphens replaced by underscores per
+/// TOML conventions, handled via `serde(rename_all = "kebab-case")`).
+macro_rules! define_config_file {
+    ( $( $field:ident : $ty:ty ),* $(,)? ) => {
+        /// All-optional mirror of [`Cli`] used for TOML deserialization.
+        #[derive(Debug, Default, Deserialize, Serialize)]
+        #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+        pub(crate) struct ConfigFile {
+            $( pub(crate) $field: Option<$ty>, )*
+        }
+
+        impl ConfigFile {
+            /// Apply this file's values to `cli`, overwriting only fields
+            /// whose value source is `DefaultValue` (i.e. not supplied by
+            /// the user on the command line or via an environment variable).
+            fn apply_to(self, cli: &mut Cli, matches: &ArgMatches) {
+                $(
+                    if let Some(v) = self.$field
+                        && matches!(matches.value_source(stringify!($field)), Some(ValueSource::DefaultValue) | None)
+                    {
+                        cli.$field = v;
+                    }
+                )*
+            }
+        }
+    };
+}
+
+define_config_file! {
+    bind: String,
+    cert: String,
+    key: String,
+    ca: String,
+    crl: Option<String>,
+    tls_min_version: String,
+    crl_warn_stale: bool,
+    fips_required: bool,
+    prefer_post_quantum: bool,
+    kx_groups: Option<String>,
+    cert_reload_interval: u64,
+    ocsp_stapling: bool,
+    framing: Framing,
+    encoding: Encoding,
+    nats_url: Option<String>,
+    nats_credentials: Option<String>,
+    nats_tls_cert: Option<std::path::PathBuf>,
+    nats_tls_key: Option<std::path::PathBuf>,
+    nats_tls_ca: Option<std::path::PathBuf>,
+    nats_tls_required: bool,
+    nats_subscription_capacity: usize,
+    nats_live_stream: String,
+    nats_max_ack_pending: i64,
+    nats_checkpoint_path: Option<String>,
+    enrollment_bind: Option<String>,
+    ca_key: Option<String>,
+    enrollment_user: Option<String>,
+    enrollment_password: Option<String>,
+    ca_organization: String,
+    data_package_dir: Option<String>,
+    package_signature_ca: Option<String>,
+    package_strict_signatures: bool,
+    revocation_db: Option<String>,
+    crl_validity_days: u32,
+    metrics_bind: Option<String>,
+    metrics_per_identity: bool,
+    metrics_identity_allowlist: Option<std::path::PathBuf>,
+    max_connections: usize,
+    max_concurrent_handshakes: usize,
+    websocket_bind: Option<String>,
+    ws_max_frames_per_sec: u32,
+    ws_max_bytes_per_sec: u64,
+    ws_max_violations: u32,
+    tcp_bind: Option<String>,
+    udp_bind: Option<String>,
+    plaintext_cn: String,
+    plaintext_group: String,
+    federation_v1_bind: Option<String>,
+    federation_v2_bind: Option<String>,
+    federation_id: String,
+    federation_peers_file: Option<String>,
+    federation_skip_hostname_verify: bool,
+    federation_max_hops: u32,
+    federation_store_path: Option<String>,
+    federation_trust_store_dir: Option<String>,
+    federation_circuit_breaker_threshold: u32,
+    federation_circuit_breaker_timeout: u64,
+    federation_replay_buffer_size: usize,
+    federation_ha_nats_url: Option<String>,
+    federation_pod_id: Option<String>,
+    replay_window: u64,
+    client_message_rate: u32,
+    client_burst: u32,
+    circuit_breaker_threshold: u32,
+    group_acl_file: Option<String>,
+    acl_reload_interval: u64,
+    acl_api_token_file: Option<String>,
+    archive_dir: Option<String>,
+    package_max_age_hours: u64,
+    audit_log: Option<String>,
+    otel_endpoint: Option<String>,
+    otel_service_name: String,
+}
+
+impl Cli {
+    /// Parse command-line arguments, then layer in any TOML configuration
+    /// file specified via `--config` / `RUSTGATE_CONFIG`. CLI flags and
+    /// environment variables always override file values.
+    pub(crate) fn parse_with_config() -> anyhow::Result<Self> {
+        let matches = Cli::command().get_matches();
+        let mut cli = Cli::from_arg_matches(&matches)
+            .map_err(|e| anyhow::anyhow!("failed to parse CLI: {e}"))?;
+
+        if let Some(ref path) = cli.config {
+            let file = load_config_file(path)?;
+            file.apply_to(&mut cli, &matches);
+        }
+
+        Ok(cli)
+    }
+
+    /// Validate cross-field invariants on the merged configuration.
+    /// Currently checks that the mTLS material (cert/key/ca) is non-empty,
+    /// matching the original required-flag behaviour.
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        if self.cert.is_empty() {
+            anyhow::bail!("--cert (or [cert] in the config file) is required");
+        }
+        if self.key.is_empty() {
+            anyhow::bail!("--key (or [key] in the config file) is required");
+        }
+        if self.ca.is_empty() {
+            anyhow::bail!("--ca (or [ca] in the config file) is required");
+        }
+        Ok(())
+    }
+
+    /// Serialize the merged configuration as TOML for `print-config`.
+    pub(crate) fn to_toml(&self) -> anyhow::Result<String> {
+        toml::to_string_pretty(self)
+            .map_err(|e| anyhow::anyhow!("failed to serialize config to TOML: {e}"))
+    }
+}
+
+/// Load and parse a TOML configuration file via figment.
+pub(crate) fn load_config_file(path: &str) -> anyhow::Result<ConfigFile> {
+    use figment::Figment;
+    use figment::providers::{Format, Toml};
+    Figment::new()
+        .merge(Toml::file(path))
+        .extract::<ConfigFile>()
+        .map_err(|e| anyhow::anyhow!("failed to load config file {path}: {e}"))
 }
 
 #[cfg(test)]

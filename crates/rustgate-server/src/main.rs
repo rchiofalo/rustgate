@@ -12,7 +12,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use clap::Parser;
 use tokio::sync::Semaphore;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -32,12 +31,30 @@ mod otel;
 mod session;
 mod setup;
 
-use cli::Cli;
+use cli::{Cli, Command};
 use rustgate_transport::Router;
 use session::{FedForwardFn, SessionDeps};
 
 fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_with_config()?;
+
+    // Handle subcommands before any tracing/runtime setup. These are pure
+    // utilities: print or validate the merged configuration and exit.
+    match cli.command {
+        Some(Command::PrintConfig) => {
+            let toml = cli.to_toml()?;
+            print!("{toml}");
+            return Ok(());
+        }
+        Some(Command::ValidateConfig) => {
+            cli.validate()?;
+            println!("configuration is valid");
+            return Ok(());
+        }
+        None => {}
+    }
+
+    cli.validate()?;
 
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let fmt_layer = tracing_subscriber::fmt::layer().json();

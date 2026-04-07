@@ -89,7 +89,7 @@ fn server_starts_with_archive_dir_flag() {
             "--archive-dir",
             archive_str,
         ],
-        Duration::from_secs(1),
+        Duration::from_secs(3),
     );
 
     // The server logs JSON to stdout. Check that it started successfully
@@ -132,7 +132,7 @@ fn server_starts_with_valid_crl_file() {
             "--bind",
             "127.0.0.1:0",
         ],
-        Duration::from_secs(1),
+        Duration::from_secs(3),
     );
 
     let combined = format!("{_stdout}{stderr}");
