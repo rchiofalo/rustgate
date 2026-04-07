@@ -395,7 +395,16 @@ Notes:
 - **Best with private / enterprise CAs.** Let's Encrypt stopped serving OCSP responses in 2025.
   OCSP stapling is most valuable for internal PKIs that operate their own OCSP responder.
 - **First handshakes after startup may be unstapled** until the background fetcher completes its
-  initial cycle (~60s). This is the same fallback path clients already use when stapling is off.
+  initial cycle (~60s). The server preloads the active certificate into the stapler at startup so
+  the fetch is queued immediately, but the very first handshakes can still arrive before the
+  response lands. This is the same fallback path clients already use when stapling is off.
+- **After a certificate rotation (SIGHUP or polling), there is a brief window — typically under
+  one minute — during which handshakes may be served unstapled until the background fetcher
+  refreshes.** The SIGHUP path also re-preloads the rotated certificate into the stapler to
+  shorten this window.
+- **Requires outbound network access to the issuing CA's OCSP responder**; air-gapped deployments
+  should leave this flag off.
+- **Responder failures degrade gracefully** — handshakes continue without a stapled response.
 - **CRL and OCSP can be enabled together.** OCSP stapling lives on the *server certificate*
   resolver path; CRL revocation lives on the *client certificate* verifier path. They are
   independent layers and may be combined freely.

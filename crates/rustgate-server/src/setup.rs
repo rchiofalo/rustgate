@@ -171,10 +171,14 @@ pub(crate) async fn bind_tls_listener(
         Option<std::sync::Arc<rustgate_transport::ocsp::Stapler>>,
     ) = if cli.ocsp_stapling {
         let stapler = rustgate_transport::ocsp::wrap_resolver(reloader.clone());
-        // The stapler queues an OCSP fetch when it first sees the active
-        // certificate during a handshake. Early handshakes (within ~60s of
-        // startup) may therefore arrive without a stapled response — this is
-        // acceptable for the no-OCSP fallback that clients use today.
+        // Preload the active certificate so the stapler queues its first
+        // OCSP fetch immediately rather than waiting for the inaugural
+        // handshake to surface it. This shrinks (but does not eliminate)
+        // the unstapled window at startup; the background fetcher still
+        // needs one cycle (up to ~60s) to actually populate the cache.
+        if let Some(ckey) = reloader.certified_key() {
+            rustgate_transport::ocsp::preload(&stapler, ckey);
+        }
         tracing::info!("OCSP stapling enabled for server certificate");
         (stapler.clone(), Some(stapler))
     } else {
