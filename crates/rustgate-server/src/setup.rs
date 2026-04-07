@@ -833,11 +833,13 @@ pub(crate) async fn start_federation(
     setup_ha_handlers(&rwlock).await;
 
     let rwlock_for_forward = Arc::clone(&rwlock);
-    let forward_fn: FedForwardFn = Arc::new(move |payload, groups| {
+    let forward_fn: FedForwardFn = Arc::new(move |payload, groups, metadata| {
         let inner = Arc::clone(&rwlock_for_forward);
         spawn_background("federation-forward", async move {
             let mgr = inner.read().await;
-            let _ = mgr.forward(payload, &groups).await;
+            let _ = mgr
+                .forward_with_metadata(payload, &groups, Some(&metadata))
+                .await;
         });
     });
 
@@ -1084,8 +1086,8 @@ pub(crate) async fn start_udp<P: NatsPublish + Send + Sync + 'static>(
         fed_forward
             .clone()
             .map(|fwd| -> rustgate_transport::udp::OnFederationForward {
-                Arc::new(move |payload, groups| {
-                    fwd(payload, groups);
+                Arc::new(move |payload, groups, metadata| {
+                    fwd(payload, groups, metadata);
                 })
             });
 

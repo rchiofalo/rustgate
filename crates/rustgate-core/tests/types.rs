@@ -562,3 +562,36 @@ fn peer_id_and_server_name_are_distinct_types() {
     assert_eq!(takes_peer_id(&peer), "p1");
     assert_eq!(takes_server_name(&server), "s1");
 }
+
+#[test]
+fn metadata_is_expired_no_ttl() {
+    let m = Metadata {
+        received_at: SystemTime::now(),
+        source_protocol: "tcp".into(),
+        message_type: MessageType::Position,
+        ttl: None,
+    };
+    assert!(!m.is_expired());
+}
+
+#[test]
+fn metadata_is_expired_future_ttl() {
+    let m = Metadata {
+        received_at: SystemTime::now(),
+        source_protocol: "tcp".into(),
+        message_type: MessageType::Position,
+        ttl: Some(Duration::from_secs(3600)),
+    };
+    assert!(!m.is_expired());
+}
+
+#[test]
+fn metadata_is_expired_past_ttl() {
+    let m = Metadata {
+        received_at: SystemTime::now() - Duration::from_secs(10),
+        source_protocol: "tcp".into(),
+        message_type: MessageType::Position,
+        ttl: Some(Duration::from_secs(1)),
+    };
+    assert!(m.is_expired());
+}

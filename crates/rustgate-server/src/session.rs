@@ -34,7 +34,8 @@ use crate::metrics;
 ///
 /// Uses `Fn` (not `AsyncFn`) because `dyn AsyncFn` is not object-safe
 /// as of Rust 1.93. Async work is dispatched via `spawn_background()`.
-pub(crate) type FedForwardFn = Arc<dyn Fn(Bytes, Vec<String>) + Send + Sync>;
+pub(crate) type FedForwardFn =
+    Arc<dyn Fn(Bytes, Vec<String>, rustgate_core::message::Metadata) + Send + Sync>;
 
 /// Shared dependencies passed to each session handler task.
 pub(crate) struct SessionDeps<P: NatsPublish> {
@@ -415,7 +416,7 @@ async fn read_loop(
         // Forward to federation peers (fire-and-forget)
         if let Some(fwd) = ctx.fed_forward {
             let groups: Vec<String> = msg.source.groups.iter().cloned().collect();
-            fwd(msg.payload.clone(), groups);
+            fwd(msg.payload.clone(), groups, msg.metadata.clone());
         }
     }
 
@@ -711,7 +712,7 @@ async fn run_plaintext_session_loops<P: NatsPublish>(
 
                 if let Some(fwd) = fed_forward {
                     let groups: Vec<String> = msg.source.groups.iter().cloned().collect();
-                    fwd(msg.payload.clone(), groups);
+                    fwd(msg.payload.clone(), groups, msg.metadata.clone());
                 }
             }
             Ok(())

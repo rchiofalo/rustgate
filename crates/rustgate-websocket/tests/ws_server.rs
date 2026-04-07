@@ -427,7 +427,7 @@ async fn ws_nats_and_federation_callbacks_fire() {
 
     let fed_counter = Arc::clone(&fed_count);
     let fed_forward: rustgate_websocket::OnFederationForward =
-        Arc::new(move |_payload, _groups| {
+        Arc::new(move |_payload, _groups, _meta| {
             let _ = fed_counter.fetch_add(1, Ordering::Relaxed);
         });
 
