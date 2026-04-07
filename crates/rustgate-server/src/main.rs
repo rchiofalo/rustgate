@@ -622,9 +622,20 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     // ── Connection draining ─────────────────────────────────────────
 
     let active = router.session_count().await;
-    tracing::info!(sessions = active, "draining connections");
+    tracing::info!(
+        sessions = active,
+        drain_timeout_secs = cli.shutdown_drain_timeout,
+        "draining connections"
+    );
 
-    let drain_timeout = Duration::from_secs(110);
+    // Close every session's outbound channels so write loops observe a
+    // clean EOF after flushing whatever is currently buffered. The
+    // session task itself still runs through its normal cleanup path,
+    // releasing its semaphore permit when the writer returns.
+    let closed = router.close_all_session_senders().await;
+    tracing::debug!(closed_sessions = closed, "closed session outbound channels");
+
+    let drain_timeout = Duration::from_secs(cli.shutdown_drain_timeout);
     let drain = connection_limit.acquire_many(max_connections);
 
     match tokio::time::timeout(drain_timeout, drain).await {

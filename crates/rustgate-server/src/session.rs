@@ -435,13 +435,29 @@ async fn write_loop(
 ) -> std::io::Result<()> {
     let mut framed = FramedWrite::new(writer, FramedCodec::from_strategy(&codec.framing()));
 
+    let mut priority_open = true;
+    let mut normal_open = true;
     loop {
+        if !priority_open && !normal_open {
+            break;
+        }
         let msg = tokio::select! {
             biased;
-            msg = priority_rx.recv() => msg,
-            msg = normal_rx.recv() => msg,
+            msg = priority_rx.recv(), if priority_open => match msg {
+                Some(m) => m,
+                None => {
+                    priority_open = false;
+                    continue;
+                }
+            },
+            msg = normal_rx.recv(), if normal_open => match msg {
+                Some(m) => m,
+                None => {
+                    normal_open = false;
+                    continue;
+                }
+            },
         };
-        let Some(msg) = msg else { break };
 
         let encoded = codec.encode_payload(&msg)?;
         #[cfg(feature = "metrics")]
@@ -717,13 +733,29 @@ async fn run_plaintext_session_loops<P: NatsPublish>(
             Ok(())
         } => r,
         r = async {
+            let mut priority_open = true;
+            let mut normal_open = true;
             loop {
+                if !priority_open && !normal_open {
+                    break;
+                }
                 let msg = tokio::select! {
                     biased;
-                    msg = priority_rx.recv() => msg,
-                    msg = normal_rx.recv() => msg,
+                    msg = priority_rx.recv(), if priority_open => match msg {
+                        Some(m) => m,
+                        None => {
+                            priority_open = false;
+                            continue;
+                        }
+                    },
+                    msg = normal_rx.recv(), if normal_open => match msg {
+                        Some(m) => m,
+                        None => {
+                            normal_open = false;
+                            continue;
+                        }
+                    },
                 };
-                let Some(msg) = msg else { break };
                 let encoded = codec.encode_payload(&msg)?;
                 let send_fut = framed_write.send(tokio_util::bytes::BytesMut::from(encoded.as_ref()));
                 match tokio::time::timeout(WRITE_TIMEOUT, send_fut).await {

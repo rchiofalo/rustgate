@@ -288,6 +288,15 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 1024, env = "RUSTGATE_MAX_CONNECTIONS", value_parser = parse_max_connections)]
     pub(crate) max_connections: usize,
 
+    /// Maximum number of seconds to wait for in-flight queued messages
+    /// to be flushed to clients during graceful shutdown. After the
+    /// listeners have stopped accepting new connections and SIGTERM has
+    /// been observed, every active session is given up to this many
+    /// seconds to drain its priority and normal channels before the
+    /// process exits. Set to `0` to skip draining (immediate close).
+    #[arg(long, default_value_t = 10, env = "RUSTGATE_SHUTDOWN_DRAIN_TIMEOUT")]
+    pub(crate) shutdown_drain_timeout: u64,
+
     /// Maximum number of TLS handshakes that may be in progress simultaneously.
     /// Limits the CPU cost of concurrent cryptographic operations during
     /// connection floods. Incoming connections that exceed this limit will
@@ -710,6 +719,7 @@ define_config_file! {
     metrics_per_identity: bool,
     metrics_identity_allowlist: Option<std::path::PathBuf>,
     max_connections: usize,
+    shutdown_drain_timeout: u64,
     max_concurrent_handshakes: usize,
     max_queued_bytes: usize,
     max_queued_bytes_low_water: Option<usize>,
