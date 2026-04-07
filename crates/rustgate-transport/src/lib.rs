@@ -1,6 +1,7 @@
 //! TLS transport, session management, and message routing for rustgate.
 
 mod acl;
+pub mod backpressure;
 mod cache;
 pub mod cert_reloader;
 mod codec;
@@ -22,6 +23,9 @@ mod verifier;
 pub mod ocsp;
 
 pub use acl::{GroupAcl, GroupAclPolicy};
+pub use backpressure::{
+    BackpressureGate, BackpressurePermit, DEFAULT_MAX_QUEUED_BYTES, OnBytesChanged, OnDeferred,
+};
 pub use cache::PositionCache;
 pub use cert_reloader::CertReloader;
 pub use codec::{FramedCodec, LengthPrefixedCodec, LineDelimitedCodec, XmlStreamCodec};
@@ -41,7 +45,9 @@ pub use filter::{GeoBounds, MessageFilter};
 pub use listener::{DEFAULT_MAX_HANDSHAKES, OnHandshakeError, TlsListener};
 pub use repeater::EmergencyRepeater;
 pub use replay::ReplayFilter;
-pub use router::{NORMAL_CHANNEL_CAPACITY, PRIORITY_CHANNEL_CAPACITY, Router, SessionHandle};
+pub use router::{
+    NORMAL_CHANNEL_CAPACITY, PRIORITY_CHANNEL_CAPACITY, RoutedMessage, Router, SessionHandle,
+};
 #[cfg(feature = "proto")]
 pub use rustgate_proto::TakFrameCodec;
 pub use rustls::server::ResolvesServerCert;

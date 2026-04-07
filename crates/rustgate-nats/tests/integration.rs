@@ -66,7 +66,7 @@ async fn register_session(
     router: &Router,
     cn: &str,
     group: &str,
-) -> mpsc::Receiver<Arc<RoutableMessage>> {
+) -> mpsc::Receiver<rustgate_transport::RoutedMessage> {
     let (ptx, prx) = mpsc::channel(16);
     let (ntx, _nrx) = mpsc::channel(64);
     let mut groups = BTreeSet::new();

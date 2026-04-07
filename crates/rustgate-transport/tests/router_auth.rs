@@ -46,10 +46,10 @@ fn make_chat(source: &Arc<Identity>, dest: Destination) -> RoutableMessage {
 fn make_channels(
     cap: usize,
 ) -> (
-    mpsc::Sender<Arc<RoutableMessage>>,
-    mpsc::Sender<Arc<RoutableMessage>>,
-    mpsc::Receiver<Arc<RoutableMessage>>,
-    mpsc::Receiver<Arc<RoutableMessage>>,
+    mpsc::Sender<rustgate_transport::RoutedMessage>,
+    mpsc::Sender<rustgate_transport::RoutedMessage>,
+    mpsc::Receiver<rustgate_transport::RoutedMessage>,
+    mpsc::Receiver<rustgate_transport::RoutedMessage>,
 ) {
     let (ptx, prx) = mpsc::channel(cap);
     let (ntx, nrx) = mpsc::channel(cap);

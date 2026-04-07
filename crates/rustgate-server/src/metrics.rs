@@ -52,6 +52,8 @@ static CONNECTIONS_ACCEPTED: OnceLock<IntCounter> = OnceLock::new();
 static CONNECTIONS_ACTIVE: OnceLock<IntGauge> = OnceLock::new();
 static CONNECTIONS_REJECTED: OnceLock<IntCounter> = OnceLock::new();
 static ACCEPT_ERRORS: OnceLock<IntCounter> = OnceLock::new();
+static QUEUED_BYTES: OnceLock<IntGauge> = OnceLock::new();
+static ADMISSION_DEFERRED_TOTAL: OnceLock<IntCounter> = OnceLock::new();
 
 static MESSAGES_RECEIVED: OnceLock<IntCounter> = OnceLock::new();
 static MESSAGES_DROPPED: OnceLock<IntCounterVec> = OnceLock::new();
@@ -151,6 +153,20 @@ pub fn init() -> prometheus::Result<()> {
     ))?;
     registry.register(Box::new(accept_errors.clone()))?;
     let _ = ACCEPT_ERRORS.set(accept_errors);
+
+    let queued_bytes = IntGauge::with_opts(Opts::new(
+        "rustgate_queued_bytes",
+        "Current in-flight queued bytes tracked by the admission-control gate",
+    ))?;
+    registry.register(Box::new(queued_bytes.clone()))?;
+    let _ = QUEUED_BYTES.set(queued_bytes);
+
+    let admission_deferred_total = IntCounter::with_opts(Opts::new(
+        "rustgate_admission_deferred_total",
+        "Number of times the TLS accept loop was deferred due to backpressure",
+    ))?;
+    registry.register(Box::new(admission_deferred_total.clone()))?;
+    let _ = ADMISSION_DEFERRED_TOTAL.set(admission_deferred_total);
 
     let messages_received = IntCounter::with_opts(Opts::new(
         "rustgate_messages_received_total",
@@ -337,6 +353,15 @@ pub fn connections_rejected() -> &'static IntCounter {
 
 pub fn accept_errors() -> &'static IntCounter {
     ACCEPT_ERRORS.get_or_init(|| fallback_counter("rustgate_accept_errors_total", "fallback"))
+}
+
+pub fn queued_bytes() -> &'static IntGauge {
+    QUEUED_BYTES.get_or_init(|| fallback_gauge("rustgate_queued_bytes", "fallback"))
+}
+
+pub fn admission_deferred_total() -> &'static IntCounter {
+    ADMISSION_DEFERRED_TOTAL
+        .get_or_init(|| fallback_counter("rustgate_admission_deferred_total", "fallback"))
 }
 
 pub fn messages_received() -> &'static IntCounter {
