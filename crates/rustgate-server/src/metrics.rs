@@ -78,6 +78,10 @@ static CLIENT_QUEUE_DEPTH: OnceLock<prometheus::IntGaugeVec> = OnceLock::new();
 static CLIENT_QUEUE_BYTES: OnceLock<prometheus::IntGaugeVec> = OnceLock::new();
 static CLIENT_QUEUE_DROPS: OnceLock<IntCounter> = OnceLock::new();
 static CLIENT_QUEUE_DRAINS: OnceLock<IntCounter> = OnceLock::new();
+static CLIENT_QUEUE_ENQUEUES: OnceLock<IntCounter> = OnceLock::new();
+static CLIENT_QUEUE_WRITER_DROPS: OnceLock<IntCounter> = OnceLock::new();
+static CLIENT_QUEUE_EXPIRED: OnceLock<IntCounter> = OnceLock::new();
+static CLIENT_QUEUE_SKIPPED_UNSUPPORTED: OnceLock<IntCounter> = OnceLock::new();
 
 // ── Fallback constructors ───────────────────────────────────────────
 //
@@ -252,6 +256,34 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(client_queue_drains.clone()))?;
     let _ = CLIENT_QUEUE_DRAINS.set(client_queue_drains);
 
+    let client_queue_enqueues = IntCounter::with_opts(Opts::new(
+        "rustgate_client_queue_enqueues_total",
+        "Total messages successfully submitted to the client store-and-forward writer",
+    ))?;
+    registry.register(Box::new(client_queue_enqueues.clone()))?;
+    let _ = CLIENT_QUEUE_ENQUEUES.set(client_queue_enqueues);
+
+    let client_queue_writer_drops = IntCounter::with_opts(Opts::new(
+        "rustgate_client_queue_writer_drops_total",
+        "Messages dropped because the async writer channel was full or closed",
+    ))?;
+    registry.register(Box::new(client_queue_writer_drops.clone()))?;
+    let _ = CLIENT_QUEUE_WRITER_DROPS.set(client_queue_writer_drops);
+
+    let client_queue_expired = IntCounter::with_opts(Opts::new(
+        "rustgate_client_queue_expired_total",
+        "Queued messages skipped during drain because their TTL had elapsed",
+    ))?;
+    registry.register(Box::new(client_queue_expired.clone()))?;
+    let _ = CLIENT_QUEUE_EXPIRED.set(client_queue_expired);
+
+    let client_queue_skipped_unsupported = IntCounter::with_opts(Opts::new(
+        "rustgate_client_queue_skipped_unsupported_total",
+        "Queue entries skipped on reopen because destination was not direct (broadcast/group)",
+    ))?;
+    registry.register(Box::new(client_queue_skipped_unsupported.clone()))?;
+    let _ = CLIENT_QUEUE_SKIPPED_UNSUPPORTED.set(client_queue_skipped_unsupported);
+
     Ok(())
 }
 
@@ -358,6 +390,26 @@ pub fn client_queue_drains() -> Option<&'static IntCounter> {
     CLIENT_QUEUE_DRAINS.get()
 }
 
+/// Returns the client-queue enqueues counter.
+pub fn client_queue_enqueues() -> Option<&'static IntCounter> {
+    CLIENT_QUEUE_ENQUEUES.get()
+}
+
+/// Returns the client-queue async writer overflow/close drop counter.
+pub fn client_queue_writer_drops() -> Option<&'static IntCounter> {
+    CLIENT_QUEUE_WRITER_DROPS.get()
+}
+
+/// Returns the client-queue TTL-expired-on-drain counter.
+pub fn client_queue_expired() -> Option<&'static IntCounter> {
+    CLIENT_QUEUE_EXPIRED.get()
+}
+
+/// Returns the client-queue skipped-non-direct-on-reopen counter.
+pub fn client_queue_skipped_unsupported() -> Option<&'static IntCounter> {
+    CLIENT_QUEUE_SKIPPED_UNSUPPORTED.get()
+}
+
 /// Spawn a background task that periodically samples the given client
 /// queue and updates the Prometheus metrics. CN labels are bucketed
 /// against `identity` to bound label cardinality.
@@ -371,6 +423,10 @@ pub fn spawn_client_queue_metrics_task(
     drop(tokio::spawn(async move {
         let mut last_drops: u64 = 0;
         let mut last_drains: u64 = 0;
+        let mut last_enqueues: u64 = 0;
+        let mut last_writer_drops: u64 = 0;
+        let mut last_expired: u64 = 0;
+        let mut last_skipped: u64 = 0;
         let mut ticker = tokio::time::interval(Duration::from_secs(5));
         loop {
             let _ = ticker.tick().await;
@@ -413,6 +469,38 @@ pub fn spawn_client_queue_metrics_task(
                 c.inc_by(drains_now - last_drains);
             }
             last_drains = drains_now;
+
+            let enq_now = queue.enqueues_total();
+            if enq_now > last_enqueues
+                && let Some(c) = client_queue_enqueues()
+            {
+                c.inc_by(enq_now - last_enqueues);
+            }
+            last_enqueues = enq_now;
+
+            let wd_now = queue.writer_drops_total();
+            if wd_now > last_writer_drops
+                && let Some(c) = client_queue_writer_drops()
+            {
+                c.inc_by(wd_now - last_writer_drops);
+            }
+            last_writer_drops = wd_now;
+
+            let exp_now = queue.expired_total();
+            if exp_now > last_expired
+                && let Some(c) = client_queue_expired()
+            {
+                c.inc_by(exp_now - last_expired);
+            }
+            last_expired = exp_now;
+
+            let skip_now = queue.skipped_unsupported_total();
+            if skip_now > last_skipped
+                && let Some(c) = client_queue_skipped_unsupported()
+            {
+                c.inc_by(skip_now - last_skipped);
+            }
+            last_skipped = skip_now;
         }
     }));
 }

@@ -118,11 +118,17 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
 
     tracing::info!(cn = %cn, peer = %peer_addr, session_id = session_id, "connected");
     crate::audit::client_connected(&cn, peer_addr, &identity.fingerprint, session_id);
-    deps.router.register(handle.clone()).await;
     // Drain any messages persisted while this CN was offline BEFORE
-    // replaying live position cache so queued traffic is delivered
-    // first.
-    let _drained = deps.router.drain_client_queue(&handle).await;
+    // registering the handle — otherwise live traffic routed between
+    // `register` and the drain would slip ahead of the queued
+    // messages, breaking FIFO across the reconnect boundary.
+    let buffered_offline = deps.router.drain_offline_messages(&cn).await;
+    deps.router.register(handle.clone()).await;
+    for m in buffered_offline {
+        if handle.send(Arc::new(m)).await.is_err() {
+            break;
+        }
+    }
     deps.router.replay_positions(&handle).await;
 
     #[allow(unused_mut)] // Mutable borrows needed for proto negotiation
@@ -534,8 +540,15 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
                             SessionHandle::with_drop_threshold(Arc::clone(&identity), priority_tx, normal_tx, u32::MAX)
                         };
                         let session_id = handle.id;
+                        // Drain offline queue BEFORE register so live
+                        // traffic cannot race ahead of queued entries.
+                        let buffered_offline = router.drain_offline_messages(&cn).await;
                         router.register(handle.clone()).await;
-                        let _drained = router.drain_client_queue(&handle).await;
+                        for m in buffered_offline {
+                            if handle.send(Arc::new(m)).await.is_err() {
+                                break;
+                            }
+                        }
                         router.replay_positions(&handle).await;
 
                         let (reader, writer) = session.into_split();

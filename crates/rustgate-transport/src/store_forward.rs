@@ -33,7 +33,13 @@ use redb::{Database, ReadableTable, TableDefinition};
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
 use thiserror::Error;
+use tokio::sync::mpsc;
 use tracing::{debug, warn};
+
+/// Bounded capacity of the async writer channel. Enqueues submitted
+/// beyond this point are dropped and counted via
+/// [`ClientQueue::writer_drops_total`] rather than stalling the caller.
+pub const CLIENT_QUEUE_WRITER_CHANNEL_CAPACITY: usize = 8192;
 
 /// Default global byte cap applied when the operator enables
 /// store-and-forward without specifying `--client-queue-max-bytes`.
@@ -97,6 +103,10 @@ struct Inner {
     next_seq: u64,
     drops: u64,
     drains: u64,
+    enqueues: u64,
+    writer_drops: u64,
+    expired: u64,
+    skipped_unsupported: u64,
 }
 
 impl Inner {
@@ -108,6 +118,10 @@ impl Inner {
             next_seq: 0,
             drops: 0,
             drains: 0,
+            enqueues: 0,
+            writer_drops: 0,
+            expired: 0,
+            skipped_unsupported: 0,
         }
     }
 }
@@ -122,6 +136,9 @@ pub struct ClientQueue {
     inner: Arc<Mutex<Inner>>,
     max_bytes: u64,
     path: PathBuf,
+    /// Bounded sender feeding a dedicated background writer task. Keeps
+    /// `enqueue` non-blocking and off the async runtime's worker threads.
+    writer_tx: mpsc::Sender<(String, RoutableMessage)>,
 }
 
 impl ClientQueue {
@@ -174,11 +191,16 @@ impl ClientQueue {
                 let seq = k.value();
                 let raw = v.value();
                 let size = raw.len() as u64;
-                // We only need the CN — peek it without materializing
-                // the full RoutableMessage.
-                let cn = match peek_cn(raw) {
-                    Some(cn) => cn,
-                    None => {
+                // We only need the destination CN — peek it without
+                // materializing the full RoutableMessage.
+                let cn = match peek_dest_cn(raw) {
+                    PeekDest::Direct(cn) => cn,
+                    PeekDest::NonDirect => {
+                        debug!(seq, "skipping non-direct queue entry on rebuild");
+                        inner.skipped_unsupported = inner.skipped_unsupported.saturating_add(1);
+                        continue;
+                    }
+                    PeekDest::Malformed => {
                         warn!(seq, "dropping malformed client-queue entry on open");
                         continue;
                     }
@@ -194,11 +216,18 @@ impl ClientQueue {
             }
         }
 
+        let db = Arc::new(db);
+        let inner = Arc::new(Mutex::new(inner));
+        let (writer_tx, writer_rx) =
+            mpsc::channel::<(String, RoutableMessage)>(CLIENT_QUEUE_WRITER_CHANNEL_CAPACITY);
+        spawn_writer_task(Arc::clone(&db), Arc::clone(&inner), max_bytes, writer_rx);
+
         Ok(Self {
-            db: Arc::new(db),
-            inner: Arc::new(Mutex::new(inner)),
+            db,
+            inner,
             max_bytes,
             path,
+            writer_tx,
         })
     }
 
@@ -212,103 +241,69 @@ impl ClientQueue {
         self.max_bytes
     }
 
-    /// Persist `msg` to the queue for delivery to `cn` when it
-    /// reconnects. If the insertion pushes the total byte count above
-    /// the configured cap, the oldest entries (globally, across all
-    /// CNs) are evicted until the queue fits. Returns the number of
-    /// messages that were dropped to make room.
+    /// Submit `msg` to the async writer for durable persistence to the
+    /// on-disk queue. Returns immediately without touching redb — the
+    /// actual `begin_write` / `commit` is performed off the async
+    /// runtime by a dedicated background task.
+    ///
+    /// If the writer channel is full, the message is dropped and
+    /// [`Self::writer_drops_total`] is incremented. This preserves live
+    /// routing latency under pathological bursts at the cost of
+    /// losing the offending offline messages.
     pub fn enqueue(&self, cn: &str, msg: &RoutableMessage) -> Result<u64, StoreForwardError> {
-        let encoded = encode(msg);
-        let size = encoded.len() as u64;
-        if size > self.max_bytes {
-            // A single message larger than the entire cap cannot be
-            // stored — account it as a drop and skip.
-            let mut inner = self.inner.lock();
-            inner.drops = inner.drops.saturating_add(1);
-            warn!(
-                cn,
-                size_bytes = size,
-                cap_bytes = self.max_bytes,
-                "client queue: message larger than global cap; dropping"
-            );
-            return Ok(1);
-        }
-
-        let mut dropped_victims: Vec<u64> = Vec::new();
-        let seq;
-        {
-            let mut inner = self.inner.lock();
-            seq = inner.next_seq;
-            inner.next_seq += 1;
-
-            // Evict oldest entries until the new message fits.
-            while inner.total_bytes + size > self.max_bytes {
-                let Some((victim_seq, victim_cn, victim_size)) = inner.global.pop_front() else {
-                    break;
-                };
-                if let Some(idx) = inner.per_cn.get_mut(&victim_cn) {
-                    if let Some(front) = idx.seqs.front().copied()
-                        && front == victim_seq
-                    {
-                        let _ = idx.seqs.pop_front();
-                    } else {
-                        // Rare: victim not at front (already drained).
-                        // Remove by value to keep index coherent.
-                        idx.seqs.retain(|s| *s != victim_seq);
-                    }
-                    idx.bytes = idx.bytes.saturating_sub(victim_size);
-                    if idx.seqs.is_empty() {
-                        let _ = inner.per_cn.remove(&victim_cn);
-                    }
-                }
-                inner.total_bytes = inner.total_bytes.saturating_sub(victim_size);
-                inner.drops = inner.drops.saturating_add(1);
-                dropped_victims.push(victim_seq);
+        match self.writer_tx.try_send((cn.to_string(), msg.clone())) {
+            Ok(()) => {
+                let mut inner = self.inner.lock();
+                inner.enqueues = inner.enqueues.saturating_add(1);
+                Ok(0)
             }
-
-            // Record the new entry in memory first so a crash between
-            // the memory update and the commit only leaks unreferenced
-            // DB bytes (handled on next open).
-            inner.global.push_back((seq, cn.to_string(), size));
-            let idx = inner
-                .per_cn
-                .entry(cn.to_string())
-                .or_insert_with(PerCnIndex::new);
-            idx.seqs.push_back(seq);
-            idx.bytes = idx.bytes.saturating_add(size);
-            inner.total_bytes = inner.total_bytes.saturating_add(size);
-        }
-
-        // Perform the durable write in a single transaction that both
-        // removes evicted victims and inserts the new record.
-        let write = self
-            .db
-            .begin_write()
-            .map_err(|e| StoreForwardError::Database(e.to_string()))?;
-        {
-            let mut table = write
-                .open_table(QUEUE_TABLE)
-                .map_err(|e| StoreForwardError::Database(e.to_string()))?;
-            for v in &dropped_victims {
-                let _ = table
-                    .remove(v)
-                    .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let mut inner = self.inner.lock();
+                inner.writer_drops = inner.writer_drops.saturating_add(1);
+                warn!(
+                    cn,
+                    cap = CLIENT_QUEUE_WRITER_CHANNEL_CAPACITY,
+                    "client queue: writer channel full; dropping message"
+                );
+                Ok(0)
             }
-            let _ = table
-                .insert(seq, encoded.as_slice())
-                .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                let mut inner = self.inner.lock();
+                inner.writer_drops = inner.writer_drops.saturating_add(1);
+                warn!(cn, "client queue: writer task gone; dropping message");
+                Ok(0)
+            }
         }
-        write
-            .commit()
-            .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+    }
 
-        debug!(cn, seq, size_bytes = size, "client queue: enqueued");
-        Ok(dropped_victims.len() as u64)
+    /// Total messages successfully submitted to the async writer.
+    pub fn enqueues_total(&self) -> u64 {
+        self.inner.lock().enqueues
+    }
+
+    /// Total messages dropped because the async writer channel was
+    /// full or closed.
+    pub fn writer_drops_total(&self) -> u64 {
+        self.inner.lock().writer_drops
+    }
+
+    /// Total messages skipped during drain because their TTL had
+    /// expired before the client reconnected.
+    pub fn expired_total(&self) -> u64 {
+        self.inner.lock().expired
+    }
+
+    /// Total queue entries skipped on reopen because their destination
+    /// was not a direct-addressed CN (broadcast/group).
+    pub fn skipped_unsupported_total(&self) -> u64 {
+        self.inner.lock().skipped_unsupported
     }
 
     /// Drain every queued message for `cn` in FIFO order, removing them
     /// from durable storage. Returns the decoded messages ready for
-    /// re-routing. Malformed entries are skipped with a warning.
+    /// re-routing. Entries whose TTL has elapsed are silently removed
+    /// and counted via [`Self::expired_total`]. Malformed entries are
+    /// skipped with a warning.
     pub fn drain(&self, cn: &str) -> Result<Vec<RoutableMessage>, StoreForwardError> {
         let seqs: Vec<u64> = {
             let mut inner = self.inner.lock();
@@ -329,6 +324,7 @@ impl ClientQueue {
         }
 
         let mut out: Vec<RoutableMessage> = Vec::with_capacity(seqs.len());
+        let mut expired_count: u64 = 0;
         let write = self
             .db
             .begin_write()
@@ -343,7 +339,14 @@ impl ClientQueue {
                     .map_err(|e| StoreForwardError::Database(e.to_string()))?;
                 if let Some(access) = removed {
                     match decode(access.value()) {
-                        Ok(msg) => out.push(msg),
+                        Ok(msg) => {
+                            if msg_expired(&msg) {
+                                expired_count = expired_count.saturating_add(1);
+                                debug!(seq, cn, "client queue: dropping expired entry on drain");
+                            } else {
+                                out.push(msg);
+                            }
+                        }
                         Err(_) => {
                             warn!(seq, cn, "client queue: dropping malformed entry on drain");
                         }
@@ -355,7 +358,17 @@ impl ClientQueue {
             .commit()
             .map_err(|e| StoreForwardError::Database(e.to_string()))?;
 
-        debug!(cn, drained = out.len(), "client queue: drained");
+        if expired_count > 0 {
+            let mut inner = self.inner.lock();
+            inner.expired = inner.expired.saturating_add(expired_count);
+        }
+
+        debug!(
+            cn,
+            drained = out.len(),
+            expired = expired_count,
+            "client queue: drained"
+        );
         Ok(out)
     }
 
@@ -600,33 +613,168 @@ pub fn decode(raw: &[u8]) -> Result<RoutableMessage, StoreForwardError> {
     })
 }
 
-/// Extract just the source CN from an encoded envelope without
-/// allocating the full message. Returns `None` on malformed input.
+/// Result of peeking the destination CN of an encoded envelope without
+/// fully decoding it.
+enum PeekDest {
+    /// Direct-addressed to this CN — the store-and-forward index keys
+    /// queue entries by this value.
+    Direct(String),
+    /// Broadcast/group destination; currently never persisted but may
+    /// appear in older on-disk data.
+    NonDirect,
+    /// Envelope is structurally invalid and should be dropped.
+    Malformed,
+}
+
+/// Extract just the destination CN from an encoded envelope without
+/// allocating the full message.
 ///
-/// The envelope layout starts with `[version u8][cn u16 len + bytes]...`
-/// so we only need to skip the version byte.
-fn peek_cn(raw: &[u8]) -> Option<String> {
+/// The envelope layout starts with
+/// `[version u8][source identity][dest tag u8]...`, so we skip the
+/// version byte and the source identity before reading the destination.
+fn peek_dest_cn(raw: &[u8]) -> PeekDest {
     let mut buf: &[u8] = raw;
     if buf.remaining() < 1 {
-        return None;
+        return PeekDest::Malformed;
     }
     let _ = buf.get_u8();
-    // NOTE: the peeked string is the *source* CN, but the queue is
-    // keyed by *destination* CN. We therefore need to parse on through
-    // to the destination. Fall back to full decode for robustness.
-    let _source = get_identity(&mut buf)?;
+    let Some(_source) = get_identity(&mut buf) else {
+        return PeekDest::Malformed;
+    };
     if buf.remaining() < 1 {
-        return None;
+        return PeekDest::Malformed;
     }
     match buf.get_u8() {
-        DEST_BROADCAST => None,
-        DEST_GROUP => None,
-        DEST_DIRECT => {
-            // Only the CN of the direct destination is needed.
-            get_str(&mut buf)
-        }
-        _ => None,
+        DEST_BROADCAST | DEST_GROUP => PeekDest::NonDirect,
+        DEST_DIRECT => match get_str(&mut buf) {
+            Some(cn) => PeekDest::Direct(cn),
+            None => PeekDest::Malformed,
+        },
+        _ => PeekDest::Malformed,
     }
+}
+
+/// Returns `true` if `msg` carries a TTL that has elapsed since its
+/// `received_at` timestamp. Used by drain to skip stale queued entries.
+fn msg_expired(msg: &RoutableMessage) -> bool {
+    let Some(ttl) = msg.metadata.ttl else {
+        return false;
+    };
+    let deadline = msg.metadata.received_at + ttl;
+    SystemTime::now() > deadline
+}
+
+/// Spawn the background writer task that services an async queue of
+/// pending enqueues. Each message is persisted via a synchronous
+/// redb transaction inside `spawn_blocking` so the runtime's async
+/// workers are never parked on file I/O.
+fn spawn_writer_task(
+    db: Arc<Database>,
+    inner: Arc<Mutex<Inner>>,
+    max_bytes: u64,
+    mut rx: mpsc::Receiver<(String, RoutableMessage)>,
+) {
+    drop(tokio::spawn(async move {
+        while let Some((cn, msg)) = rx.recv().await {
+            let db = Arc::clone(&db);
+            let inner = Arc::clone(&inner);
+            let join =
+                tokio::task::spawn_blocking(move || persist_one(&db, &inner, max_bytes, &cn, &msg))
+                    .await;
+            match join {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!(error = %e, "client queue writer: persist failed"),
+                Err(e) => warn!(error = %e, "client queue writer: join failed"),
+            }
+        }
+    }));
+}
+
+/// Synchronous durable write path executed inside `spawn_blocking`.
+/// Holds the in-memory index lock briefly to reserve a sequence number
+/// and apply eviction bookkeeping, then commits the redb transaction.
+fn persist_one(
+    db: &Database,
+    inner: &Mutex<Inner>,
+    max_bytes: u64,
+    cn: &str,
+    msg: &RoutableMessage,
+) -> Result<(), StoreForwardError> {
+    let encoded = encode(msg);
+    let size = encoded.len() as u64;
+    if size > max_bytes {
+        let mut guard = inner.lock();
+        guard.drops = guard.drops.saturating_add(1);
+        warn!(
+            cn,
+            size_bytes = size,
+            cap_bytes = max_bytes,
+            "client queue: message larger than global cap; dropping"
+        );
+        return Ok(());
+    }
+
+    let mut dropped_victims: Vec<u64> = Vec::new();
+    let seq;
+    {
+        let mut guard = inner.lock();
+        seq = guard.next_seq;
+        guard.next_seq += 1;
+
+        while guard.total_bytes + size > max_bytes {
+            let Some((victim_seq, victim_cn, victim_size)) = guard.global.pop_front() else {
+                break;
+            };
+            if let Some(idx) = guard.per_cn.get_mut(&victim_cn) {
+                if let Some(front) = idx.seqs.front().copied()
+                    && front == victim_seq
+                {
+                    let _ = idx.seqs.pop_front();
+                } else {
+                    idx.seqs.retain(|s| *s != victim_seq);
+                }
+                idx.bytes = idx.bytes.saturating_sub(victim_size);
+                if idx.seqs.is_empty() {
+                    let _ = guard.per_cn.remove(&victim_cn);
+                }
+            }
+            guard.total_bytes = guard.total_bytes.saturating_sub(victim_size);
+            guard.drops = guard.drops.saturating_add(1);
+            dropped_victims.push(victim_seq);
+        }
+
+        guard.global.push_back((seq, cn.to_string(), size));
+        let idx = guard
+            .per_cn
+            .entry(cn.to_string())
+            .or_insert_with(PerCnIndex::new);
+        idx.seqs.push_back(seq);
+        idx.bytes = idx.bytes.saturating_add(size);
+        guard.total_bytes = guard.total_bytes.saturating_add(size);
+    }
+
+    let write = db
+        .begin_write()
+        .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+    {
+        let mut table = write
+            .open_table(QUEUE_TABLE)
+            .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+        for v in &dropped_victims {
+            let _ = table
+                .remove(v)
+                .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+        }
+        let _ = table
+            .insert(seq, encoded.as_slice())
+            .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+    }
+    write
+        .commit()
+        .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+
+    debug!(cn, seq, size_bytes = size, "client queue: enqueued");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -676,13 +824,28 @@ mod tests {
         }
     }
 
-    #[test]
-    fn enqueue_and_drain_preserves_fifo() {
+    async fn wait_for_depth(q: &ClientQueue, cn: &str, expected: u64) {
+        for _ in 0..200 {
+            if q.stats(cn).depth == expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!(
+            "timed out waiting for depth={} on {cn} (got {})",
+            expected,
+            q.stats(cn).depth
+        );
+    }
+
+    #[tokio::test]
+    async fn enqueue_and_drain_preserves_fifo() {
         let tmp = TempDir::new().unwrap();
         let q = ClientQueue::open(tmp.path(), 1_000_000).unwrap();
         for i in 0..5u8 {
             q.enqueue("bob", &msg_for("alice", "bob", &[i])).unwrap();
         }
+        wait_for_depth(&q, "bob", 5).await;
         assert_eq!(q.stats("bob").depth, 5);
         let drained = q.drain("bob").unwrap();
         assert_eq!(drained.len(), 5);
@@ -693,8 +856,8 @@ mod tests {
         assert_eq!(q.drains_total(), 1);
     }
 
-    #[test]
-    fn byte_cap_drops_oldest() {
+    #[tokio::test]
+    async fn byte_cap_drops_oldest() {
         let tmp = TempDir::new().unwrap();
         // Small cap forces eviction after a couple of messages.
         let payload = vec![0u8; 256];
@@ -705,20 +868,31 @@ mod tests {
         for _ in 0..10 {
             q.enqueue("bob", &one).unwrap();
         }
+        // Wait for writer task to catch up.
+        for _ in 0..200 {
+            if q.drops_total() >= 7 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         let stats = q.stats("bob");
         assert!(stats.depth <= 3, "depth {} exceeds cap", stats.depth);
         assert!(q.drops_total() >= 7);
     }
 
-    #[test]
-    fn survives_reopen() {
+    #[tokio::test]
+    async fn survives_reopen() {
         let tmp = TempDir::new().unwrap();
         {
             let q = ClientQueue::open(tmp.path(), 1_000_000).unwrap();
             q.enqueue("bob", &msg_for("alice", "bob", b"one")).unwrap();
             q.enqueue("bob", &msg_for("alice", "bob", b"two")).unwrap();
+            wait_for_depth(&q, "bob", 2).await;
             drop(q);
         }
+        // Give the writer task a moment to observe the closed channel
+        // and release its Arc<Database> so redb can unlock the file.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let q2 = ClientQueue::open(tmp.path(), 1_000_000).unwrap();
         assert_eq!(q2.stats("bob").depth, 2);
         let drained = q2.drain("bob").unwrap();
@@ -727,10 +901,52 @@ mod tests {
         assert_eq!(drained[1].payload.as_ref(), b"two");
     }
 
-    #[test]
-    fn drain_unknown_cn_is_empty() {
+    #[tokio::test]
+    async fn drain_unknown_cn_is_empty() {
         let tmp = TempDir::new().unwrap();
         let q = ClientQueue::open(tmp.path(), 1_000).unwrap();
         assert!(q.drain("ghost").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_skips_expired_and_counts() {
+        let tmp = TempDir::new().unwrap();
+        let q = ClientQueue::open(tmp.path(), 1_000_000).unwrap();
+        // One message already expired (ttl 0 + received_at in the past).
+        let mut m1 = msg_for("alice", "bob", b"stale");
+        m1.metadata.received_at = SystemTime::now() - Duration::from_secs(60);
+        m1.metadata.ttl = Some(Duration::from_secs(1));
+        // One still fresh.
+        let mut m2 = msg_for("alice", "bob", b"fresh");
+        m2.metadata.ttl = Some(Duration::from_secs(3600));
+        q.enqueue("bob", &m1).unwrap();
+        q.enqueue("bob", &m2).unwrap();
+        wait_for_depth(&q, "bob", 2).await;
+
+        let drained = q.drain("bob").unwrap();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].payload.as_ref(), b"fresh");
+        assert_eq!(q.expired_total(), 1);
+    }
+
+    #[tokio::test]
+    async fn writer_channel_overflow_increments_drops() {
+        // Shrink throughput by filling the channel faster than
+        // spawn_blocking can drain it. The channel cap is large, so we
+        // simulate a flood with many sends; the `try_send` path should
+        // eventually begin reporting drops.
+        let tmp = TempDir::new().unwrap();
+        let q = ClientQueue::open(tmp.path(), 100 * 1024 * 1024).unwrap();
+        let m = msg_for("alice", "bob", b"x");
+        // Flood well above CLIENT_QUEUE_WRITER_CHANNEL_CAPACITY without
+        // yielding so the writer task cannot drain in between.
+        for _ in 0..(CLIENT_QUEUE_WRITER_CHANNEL_CAPACITY * 3) {
+            q.enqueue("bob", &m).unwrap();
+        }
+        assert!(
+            q.writer_drops_total() > 0,
+            "expected writer overflow drops, got {}",
+            q.writer_drops_total()
+        );
     }
 }

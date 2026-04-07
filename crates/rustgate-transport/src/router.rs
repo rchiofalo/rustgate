@@ -466,38 +466,45 @@ impl Router {
     }
 
     /// Drain any messages persisted for this CN while it was
-    /// disconnected, delivering them before live traffic resumes.
+    /// disconnected. The caller MUST invoke this BEFORE
+    /// [`Self::register`] so that no live traffic can be delivered to
+    /// the session until the returned buffered messages have been
+    /// flushed to the session writer. This preserves strict FIFO across
+    /// the reconnect boundary.
     ///
-    /// Returns the number of messages that were actually re-delivered
-    /// to the session channel. Silently no-ops if no client queue is
-    /// attached.
-    pub async fn drain_client_queue(&self, handle: &SessionHandle) -> u32 {
+    /// Returns an empty vec if no client queue is attached or the
+    /// drain fails — the caller should proceed with registration
+    /// either way.
+    pub async fn drain_offline_messages(&self, cn: &str) -> Vec<RoutableMessage> {
         let Some(queue) = self.client_queue.clone() else {
-            return 0;
+            return Vec::new();
         };
-        let cn = handle.identity.cn.clone();
+        let cn_owned = cn.to_string();
         // redb operations are synchronous; run on a blocking thread to
         // avoid stalling the runtime for large drains.
-        let drained = tokio::task::spawn_blocking(move || queue.drain(&cn)).await;
-        let msgs = match drained {
+        let drained = tokio::task::spawn_blocking(move || queue.drain(&cn_owned)).await;
+        match drained {
             Ok(Ok(m)) => m,
             Ok(Err(e)) => {
-                warn!(
-                    session = %handle.identity.cn,
-                    error = %e,
-                    "client queue drain failed"
-                );
-                return 0;
+                warn!(session = %cn, error = %e, "client queue drain failed");
+                Vec::new()
             }
             Err(e) => {
-                warn!(
-                    session = %handle.identity.cn,
-                    error = %e,
-                    "client queue drain task join failed"
-                );
-                return 0;
+                warn!(session = %cn, error = %e, "client queue drain task join failed");
+                Vec::new()
             }
-        };
+        }
+    }
+
+    /// Legacy/test helper that drains queued offline messages and
+    /// delivers them directly through a session handle. Kept for unit
+    /// tests that exercise the drain path without a full session loop.
+    ///
+    /// New code should use [`Self::drain_offline_messages`] and flush
+    /// the returned buffer explicitly BEFORE
+    /// [`Self::register`] to avoid live/queued ordering hazards.
+    pub async fn drain_client_queue(&self, handle: &SessionHandle) -> u32 {
+        let msgs = self.drain_offline_messages(&handle.identity.cn).await;
         let mut delivered = 0u32;
         for m in msgs {
             if handle.send(Arc::new(m)).await.is_ok() {
@@ -571,12 +578,13 @@ impl Router {
         match handle {
             Some(handle) => {
                 if let Err(e) = handle.send(msg).await {
-                    warn!(
-                        session = %cn,
-                        "message dropped: session channel full or disconnected"
-                    );
-                    // Channel closed or full — persist for redelivery
-                    // if a store-and-forward queue is attached.
+                    // `tokio::mpsc::Sender::send().await` only returns
+                    // Err when the receiver has been closed — a full
+                    // channel awaits capacity rather than failing —
+                    // so this path strictly means the session writer
+                    // task has gone away. Persist for redelivery if
+                    // a store-and-forward queue is attached.
+                    warn!(session = %cn, "session channel closed");
                     self.persist_for_offline(cn, &e.0);
                 }
             }
@@ -1597,6 +1605,12 @@ mod tests {
         };
         router.route(chat).await;
 
+        for _ in 0..200 {
+            if queue.stats("bob").depth == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         assert_eq!(queue.stats("bob").depth, 1, "message must be queued");
 
         // Now bob connects — drain_client_queue must deliver the
@@ -1610,6 +1624,94 @@ mod tests {
         let received = nrx_b.try_recv().expect("bob receives buffered chat");
         assert_eq!(received.payload.as_ref(), b"hello bob");
         assert_eq!(queue.stats("bob").depth, 0);
+    }
+
+    #[tokio::test]
+    async fn store_forward_drain_before_register_preserves_order() {
+        use tempfile::TempDir;
+
+        use crate::store_forward::ClientQueue;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let queue = Arc::new(ClientQueue::open(tmp.path(), 1_000_000).expect("open queue"));
+        let router = Arc::new(Router::new().with_client_queue(Arc::clone(&queue)));
+
+        let alice = make_identity("alice", &["alpha"]);
+        let bob = make_identity("bob", &["alpha"]);
+
+        // Three offline messages queued before reconnect.
+        for i in 0..3u8 {
+            let payload = Bytes::copy_from_slice(&[b'o', b'0' + i]);
+            router
+                .route(RoutableMessage {
+                    source: (*alice).clone(),
+                    destination: Destination::Direct((*bob).clone()),
+                    payload,
+                    metadata: Metadata {
+                        received_at: SystemTime::now(),
+                        source_protocol: "test".to_string(),
+                        message_type: MessageType::Chat,
+                        ttl: None,
+                    },
+                })
+                .await;
+        }
+        // Wait for the async writer task to persist them.
+        for _ in 0..200 {
+            if queue.stats("bob").depth == 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(queue.stats("bob").depth, 3);
+
+        let (ptx_b, ntx_b, _prx_b, mut nrx_b) = make_channels(32, 32);
+        let handle = SessionHandle::new(bob.clone(), ptx_b, ntx_b);
+
+        // Drain BEFORE register (the fix). Then register, then flush
+        // the buffered messages, then route live traffic.
+        let buffered = router.drain_offline_messages("bob").await;
+        assert_eq!(buffered.len(), 3);
+        router.register(handle.clone()).await;
+        for m in buffered {
+            handle.send(Arc::new(m)).await.expect("flush offline");
+        }
+
+        // Race three live messages immediately after registration.
+        for i in 0..3u8 {
+            let payload = Bytes::copy_from_slice(&[b'L', b'0' + i]);
+            router
+                .route(RoutableMessage {
+                    source: (*alice).clone(),
+                    destination: Destination::Direct((*bob).clone()),
+                    payload,
+                    metadata: Metadata {
+                        received_at: SystemTime::now(),
+                        source_protocol: "test".to_string(),
+                        message_type: MessageType::Chat,
+                        ttl: None,
+                    },
+                })
+                .await;
+        }
+
+        // Expect strict offline-then-live ordering.
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..6 {
+            let m = nrx_b.recv().await.expect("receive");
+            seen.push(m.payload.to_vec());
+        }
+        assert_eq!(
+            seen,
+            vec![
+                b"o0".to_vec(),
+                b"o1".to_vec(),
+                b"o2".to_vec(),
+                b"L0".to_vec(),
+                b"L1".to_vec(),
+                b"L2".to_vec(),
+            ]
+        );
     }
 
     #[tokio::test]
