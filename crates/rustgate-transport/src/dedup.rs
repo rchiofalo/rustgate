@@ -127,7 +127,7 @@ impl DedupCache {
     /// duplicate; otherwise inserts and returns `false`.
     ///
     /// The `time` parameter has been removed from the public API; the
-    /// payload hash alone subsumes it (see [`build_key`]).
+    /// payload hash alone subsumes it.
     pub fn check_and_insert(&self, uid: &str, payload: &[u8]) -> bool {
         let key = build_key(uid, payload);
         let now = Instant::now();
