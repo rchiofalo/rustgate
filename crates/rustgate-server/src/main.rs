@@ -211,6 +211,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let max_connections: u32 = cli.max_connections as u32;
     let (group_acl, acl_file_hash, acl_file_parsed) = setup::load_group_acl(&cli).await?;
     // ── Global admission control / backpressure gate ─────────────
+    #[cfg_attr(not(feature = "metrics"), allow(unused_mut))]
     let mut backpressure_gate = BackpressureGate::with_limits(
         cli.max_queued_bytes,
         cli.max_queued_bytes_low_water
