@@ -84,6 +84,31 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Dedicated access log sink: filters only target="access" events and
+    // appends one JSON line per routed message. Opt-in via --access-log.
+    let access_layer = if let Some(ref access_path) = cli.access_log {
+        let writer: std::sync::Mutex<Box<dyn std::io::Write + Send>> = if access_path == "-" {
+            std::sync::Mutex::new(Box::new(std::io::stdout()))
+        } else {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(access_path)
+                .map_err(|e| anyhow::anyhow!("failed to open access log {access_path}: {e}"))?;
+            std::sync::Mutex::new(Box::new(file))
+        };
+        let filter = tracing_subscriber::filter::Targets::new()
+            .with_target(rustgate_transport::ACCESS_LOG_TARGET, tracing::Level::INFO);
+        Some(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(writer)
+                .with_filter(filter),
+        )
+    } else {
+        None
+    };
+
     #[cfg(feature = "otel")]
     let otel_layer = if let Some(ref endpoint) = cli.otel_endpoint {
         Some(otel::init_layer(endpoint, &cli.otel_service_name)?)
@@ -98,6 +123,7 @@ fn main() -> anyhow::Result<()> {
         .with(env_filter)
         .with(fmt_layer)
         .with(audit_layer)
+        .with(access_layer)
         .with(otel_layer)
         .init();
 

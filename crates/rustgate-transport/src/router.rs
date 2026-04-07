@@ -17,6 +17,60 @@ use crate::cache::PositionCache;
 use crate::dedup::DedupCache;
 use crate::store_forward::ClientQueue;
 
+/// Access-log target. A dedicated tracing layer in the server binary
+/// filters on this target and writes JSON lines to the configured sink
+/// (file or stdout). The target is a constant so emission sites and the
+/// subscriber filter cannot drift.
+pub const ACCESS_LOG_TARGET: &str = "access";
+
+/// Best-effort extraction of a CoT `uid="..."` attribute from a payload
+/// without doing a full XML parse. Returns an empty string when the
+/// payload is not CoT-shaped or no uid is present. Bounded scan over at
+/// most the first 512 bytes so cost stays O(1) per message.
+fn extract_cot_uid(payload: &[u8]) -> &str {
+    const NEEDLE: &[u8] = b"uid=\"";
+    let limit = payload.len().min(512);
+    let window = &payload[..limit];
+    let Some(start) = window
+        .windows(NEEDLE.len())
+        .position(|w| w == NEEDLE)
+        .map(|p| p + NEEDLE.len())
+    else {
+        return "";
+    };
+    let tail = &window[start..];
+    let Some(end) = tail.iter().position(|&b| b == b'"') else {
+        return "";
+    };
+    // Safety: we sliced from a u8 window; convert with a lossy fallback.
+    std::str::from_utf8(&tail[..end]).unwrap_or("")
+}
+
+/// Emit one structured access-log event for a routed message. Cheap when
+/// the access target is filtered out — the `tracing::enabled!` check is
+/// O(1) against the global subscriber, and the field expressions are not
+/// evaluated when no layer is interested.
+fn emit_access(msg: &RoutableMessage, outcome: &'static str) {
+    if !tracing::enabled!(target: ACCESS_LOG_TARGET, tracing::Level::INFO) {
+        return;
+    }
+    let dst = match &msg.destination {
+        Destination::Direct(target) => format!("direct:{}", target.cn),
+        Destination::Group(group) => format!("group:{group}"),
+        Destination::Broadcast => "broadcast".to_string(),
+    };
+    let uid = extract_cot_uid(&msg.payload);
+    tracing::info!(
+        target: ACCESS_LOG_TARGET,
+        src_cn = %msg.source.cn,
+        dst = %dst,
+        msg_uid = %uid,
+        size = msg.payload.len(),
+        proto = %msg.metadata.source_protocol,
+        outcome = %outcome,
+    );
+}
+
 /// Envelope wrapping an `Arc<RoutableMessage>` together with a shared
 /// admission-control permit. Cloned once per recipient so the permit's
 /// `Drop` fires only when the *last* session has consumed the message,
@@ -557,6 +611,7 @@ impl Router {
                     message_type = %msg.metadata.message_type,
                     "duplicate message suppressed by cross-path dedup",
                 );
+                emit_access(&msg, "dedup");
                 return;
             }
         }
@@ -573,8 +628,15 @@ impl Router {
                 message_type = %msg.metadata.message_type,
                 "message expired before delivery — dropping",
             );
+            emit_access(&msg, "expired");
             return;
         }
+
+        // Successful path: emit one access-log event per routed message.
+        // Outcome is "delivered" — per-recipient drop counts (full
+        // session channels) are still surfaced via the existing warn!
+        // logs and metrics.
+        emit_access(&msg, "delivered");
 
         // Wrap in Arc once so broadcast/group sends share one allocation
         // instead of cloning the full RoutableMessage per recipient.
@@ -2018,5 +2080,32 @@ mod tests {
             "second copy must also arrive when dedup is disabled"
         );
         assert!(router.dedup_stats().is_none());
+    }
+
+    // ── Access log helpers ────────────────────────────────────────────
+
+    #[test]
+    fn extract_cot_uid_finds_attribute() {
+        let payload = br#"<event uid="ANDROID-1234" time="2024" type="a-f-G"/>"#;
+        assert_eq!(super::extract_cot_uid(payload), "ANDROID-1234");
+    }
+
+    #[test]
+    fn extract_cot_uid_returns_empty_when_missing() {
+        let payload = br#"<event time="2024" type="a-f-G"/>"#;
+        assert_eq!(super::extract_cot_uid(payload), "");
+    }
+
+    #[test]
+    fn extract_cot_uid_returns_empty_for_binary_payload() {
+        let payload: &[u8] = &[0xBF, 0x01, 0x02, 0x03, 0x04];
+        assert_eq!(super::extract_cot_uid(payload), "");
+    }
+
+    #[test]
+    fn extract_cot_uid_bounds_scan_to_first_512_bytes() {
+        let mut payload = vec![b' '; 600];
+        payload.extend_from_slice(br#"uid="LATE""#);
+        assert_eq!(super::extract_cot_uid(&payload), "");
     }
 }

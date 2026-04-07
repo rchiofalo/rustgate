@@ -367,6 +367,7 @@ All flags support environment variables (CLI takes precedence):
 | `--archive-dir` | `RUSTGATE_ARCHIVE_DIR` | — |
 | `--package-max-age-hours` | `RUSTGATE_PACKAGE_MAX_AGE_HOURS` | `0` (no expiration) |
 | `--audit-log` | `RUSTGATE_AUDIT_LOG` | — |
+| `--access-log` | `RUSTGATE_ACCESS_LOG` | — |
 | `--client-queue-dir` | `RUSTGATE_CLIENT_QUEUE_DIR` | — (disabled) |
 | `--client-queue-max-bytes` | `RUSTGATE_CLIENT_QUEUE_MAX_BYTES` | `104857600` (100 MiB) |
 | `--otel-endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` | — |
