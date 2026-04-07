@@ -692,6 +692,35 @@ impl Router {
         self.state.read().await.sessions.len()
     }
 
+    /// Close all outbound session channels so writer tasks observe `None`
+    /// after draining whatever is already queued. Used during graceful
+    /// shutdown: by dropping the senders held in each `SessionHandle`,
+    /// each session's write loop finishes the in-flight messages and
+    /// then exits cleanly. Returns the number of sessions whose senders
+    /// were closed.
+    ///
+    /// Sessions are NOT removed from the routing map — `unregister` is
+    /// still called from each session task on its own exit path. This
+    /// keeps `session_count` accurate while writers are draining and
+    /// avoids racing with concurrent route attempts.
+    pub async fn close_all_session_senders(&self) -> usize {
+        let state = self.state.read().await;
+        let mut closed = 0usize;
+        for handle in state.sessions.values() {
+            {
+                let mut guard = handle.priority_sender.lock();
+                if guard.take().is_some() {
+                    closed += 1;
+                }
+            }
+            {
+                let mut guard = handle.normal_sender.lock();
+                let _ = guard.take();
+            }
+        }
+        closed
+    }
+
     /// Return a snapshot of all connected client identities.
     pub async fn connected_clients(&self) -> Vec<Arc<Identity>> {
         let state = self.state.read().await;
