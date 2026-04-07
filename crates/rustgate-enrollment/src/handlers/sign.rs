@@ -10,10 +10,8 @@ use super::util::{build_response, extract_param};
 use crate::auth::Credentials;
 use crate::ratelimit::RateLimiter;
 use crate::response;
+use crate::server::RateLimitCallback;
 use crate::signing::CsrSigner;
-
-/// Maximum CSR signing requests per IP per minute.
-pub(crate) const SIGN_RATE_LIMIT: usize = 10;
 
 /// Handle the `/Marti/api/tls/config` endpoint.
 pub(crate) fn handle_tls_config(signer: &CsrSigner) -> Response<Full<Bytes>> {
@@ -32,6 +30,7 @@ pub(crate) async fn handle_sign_client_v1(
     signer: &CsrSigner,
     credentials: &Credentials,
     sign_limiter: &RateLimiter,
+    on_rate_limit: Option<&RateLimitCallback>,
 ) -> Response<Full<Bytes>> {
     // Rate limit before doing any work
     if !sign_limiter.check(peer.ip()) {
@@ -40,8 +39,11 @@ pub(crate) async fn handle_sign_client_v1(
         rustgate_core::audit::rate_limit_triggered(
             &masked_peer,
             "/Marti/api/tls/signClient",
-            SIGN_RATE_LIMIT,
+            sign_limiter.max_requests(),
         );
+        if let Some(cb) = on_rate_limit {
+            cb();
+        }
         return build_response(
             StatusCode::TOO_MANY_REQUESTS,
             "text/plain",
@@ -157,6 +159,7 @@ pub(crate) async fn handle_sign_client_v2(
     signer: &CsrSigner,
     credentials: &Credentials,
     sign_limiter: &RateLimiter,
+    on_rate_limit: Option<&RateLimitCallback>,
 ) -> Response<Full<Bytes>> {
     // Rate limit before doing any work
     if !sign_limiter.check(peer.ip()) {
@@ -165,8 +168,11 @@ pub(crate) async fn handle_sign_client_v2(
         rustgate_core::audit::rate_limit_triggered(
             &masked_peer,
             "/Marti/api/tls/signClient/v2",
-            SIGN_RATE_LIMIT,
+            sign_limiter.max_requests(),
         );
+        if let Some(cb) = on_rate_limit {
+            cb();
+        }
         return build_response(
             StatusCode::TOO_MANY_REQUESTS,
             "text/plain",
