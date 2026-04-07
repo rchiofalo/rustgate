@@ -311,6 +311,8 @@ All flags support environment variables (CLI takes precedence):
 | `--framing` | `RUSTGATE_FRAMING` | `xml` |
 | `--encoding` | `RUSTGATE_ENCODING` | `raw` |
 | `--max-connections` | `RUSTGATE_MAX_CONNECTIONS` | `1024` |
+| `--max-queued-bytes` | `RUSTGATE_MAX_QUEUED_BYTES` | `536870912` (512 MiB) |
+| `--max-queued-bytes-low-water` | `RUSTGATE_MAX_QUEUED_BYTES_LOW_WATER` | 90% of high-water |
 | `--tcp-bind` | `RUSTGATE_TCP_BIND` | — |
 | `--udp-bind` | `RUSTGATE_UDP_BIND` | — |
 | `--plaintext-cn` | `RUSTGATE_PLAINTEXT_CN` | `anonymous` |

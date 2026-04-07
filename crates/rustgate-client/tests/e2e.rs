@@ -41,8 +41,8 @@ fn build_message(source: &Identity, payload: &[u8]) -> RoutableMessage {
 fn spawn_session(session: AuthenticatedSession, router: Arc<Router>) {
     drop(tokio::spawn(async move {
         let identity = session.identity_arc();
-        let (ptx, mut prx) = mpsc::channel::<Arc<RoutableMessage>>(16);
-        let (ntx, mut nrx) = mpsc::channel::<Arc<RoutableMessage>>(64);
+        let (ptx, mut prx) = mpsc::channel::<rustgate_transport::RoutedMessage>(16);
+        let (ntx, mut nrx) = mpsc::channel::<rustgate_transport::RoutedMessage>(64);
         let handle = SessionHandle::new(Arc::clone(&identity), ptx, ntx);
         let session_id = handle.id;
         router.register(handle).await;
@@ -178,8 +178,8 @@ async fn client_recovers_after_server_restart() {
         // Stash the session-task future so we can abort it later.
         let jh = tokio::spawn(async move {
             let identity = session.identity_arc();
-            let (ptx, mut prx) = mpsc::channel::<Arc<RoutableMessage>>(16);
-            let (ntx, mut nrx) = mpsc::channel::<Arc<RoutableMessage>>(64);
+            let (ptx, mut prx) = mpsc::channel::<rustgate_transport::RoutedMessage>(16);
+            let (ntx, mut nrx) = mpsc::channel::<rustgate_transport::RoutedMessage>(64);
             let handle = SessionHandle::new(Arc::clone(&identity), ptx, ntx);
             router.register(handle).await;
             let (reader, writer) = session.split();

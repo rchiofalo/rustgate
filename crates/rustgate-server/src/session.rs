@@ -100,10 +100,12 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
     #[cfg(feature = "metrics")]
     metrics::sessions_active().inc();
 
-    let (priority_tx, priority_rx) =
-        mpsc::channel::<Arc<RoutableMessage>>(rustgate_transport::PRIORITY_CHANNEL_CAPACITY);
-    let (normal_tx, normal_rx) =
-        mpsc::channel::<Arc<RoutableMessage>>(rustgate_transport::NORMAL_CHANNEL_CAPACITY);
+    let (priority_tx, priority_rx) = mpsc::channel::<rustgate_transport::RoutedMessage>(
+        rustgate_transport::PRIORITY_CHANNEL_CAPACITY,
+    );
+    let (normal_tx, normal_rx) = mpsc::channel::<rustgate_transport::RoutedMessage>(
+        rustgate_transport::NORMAL_CHANNEL_CAPACITY,
+    );
     let handle = if deps.circuit_breaker_threshold > 0 {
         SessionHandle::with_drop_threshold(
             Arc::clone(&identity),
@@ -290,8 +292,8 @@ async fn negotiate_tak_protocol(
 async fn run_session_loops(
     reader: rustgate_transport::SessionReader,
     writer: rustgate_transport::SessionWriter,
-    priority_rx: mpsc::Receiver<Arc<RoutableMessage>>,
-    normal_rx: mpsc::Receiver<Arc<RoutableMessage>>,
+    priority_rx: mpsc::Receiver<rustgate_transport::RoutedMessage>,
+    normal_rx: mpsc::Receiver<rustgate_transport::RoutedMessage>,
     ctx: &SessionContext<'_, impl NatsPublish>,
     read_buf: tokio_util::bytes::BytesMut,
     #[cfg(feature = "metrics")] cn: &str,
@@ -426,8 +428,8 @@ async fn read_loop(
 /// (Position and Alert messages) before processing normal messages.
 async fn write_loop(
     writer: rustgate_transport::SessionWriter,
-    mut priority_rx: mpsc::Receiver<Arc<RoutableMessage>>,
-    mut normal_rx: mpsc::Receiver<Arc<RoutableMessage>>,
+    mut priority_rx: mpsc::Receiver<rustgate_transport::RoutedMessage>,
+    mut normal_rx: mpsc::Receiver<rustgate_transport::RoutedMessage>,
     codec: &dyn Codec,
     #[cfg(feature = "metrics")] bucket: String,
 ) -> std::io::Result<()> {
@@ -528,10 +530,10 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
 
                         tracing::info!(cn = %cn, peer = %peer_addr, "plaintext TCP connected");
 
-                        let (priority_tx, priority_rx) = mpsc::channel::<Arc<RoutableMessage>>(
+                        let (priority_tx, priority_rx) = mpsc::channel::<rustgate_transport::RoutedMessage>(
                             rustgate_transport::PRIORITY_CHANNEL_CAPACITY,
                         );
-                        let (normal_tx, normal_rx) = mpsc::channel::<Arc<RoutableMessage>>(
+                        let (normal_tx, normal_rx) = mpsc::channel::<rustgate_transport::RoutedMessage>(
                             rustgate_transport::NORMAL_CHANNEL_CAPACITY,
                         );
                         let handle = if circuit_breaker_threshold > 0 {
@@ -609,8 +611,8 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
 struct PlaintextSessionContext<'a, P: NatsPublish> {
     reader: tokio::io::ReadHalf<tokio::net::TcpStream>,
     writer: tokio::io::WriteHalf<tokio::net::TcpStream>,
-    priority_rx: mpsc::Receiver<Arc<RoutableMessage>>,
-    normal_rx: mpsc::Receiver<Arc<RoutableMessage>>,
+    priority_rx: mpsc::Receiver<rustgate_transport::RoutedMessage>,
+    normal_rx: mpsc::Receiver<rustgate_transport::RoutedMessage>,
     identity: &'a Identity,
     router: &'a Router,
     codec: &'a dyn Codec,
