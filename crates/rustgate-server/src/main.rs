@@ -522,7 +522,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     #[cfg(feature = "metrics")]
     {
         health.set_ready(true);
-        health.set_started(true);
+        // One-shot transition: never resets, even on shutdown.
+        let _ = health.mark_started();
     }
     loop {
         // Global backpressure: park the accept loop while the router's

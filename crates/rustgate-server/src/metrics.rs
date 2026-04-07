@@ -814,8 +814,32 @@ impl HealthState {
 
     /// Mark initial startup as complete. One-shot — typically called once
     /// after the accept loop is entered.
+    ///
+    /// Prefer [`HealthState::mark_started`] for the typical
+    /// "transition false → true exactly once" use case. This setter is
+    /// retained for tests and other edge cases that need to construct a
+    /// specific state, but production code paths must not call it with
+    /// `false` after startup has been observed.
+    #[cfg(test)]
     pub fn set_started(&self, v: bool) {
         self.started.store(v, Ordering::Release);
+    }
+
+    /// One-shot transition of the `started` flag from `false` to `true`.
+    ///
+    /// Returns `true` if this call performed the transition, `false` if
+    /// the flag was already set. Implemented with `compare_exchange` so
+    /// concurrent callers race safely and the flag can never regress to
+    /// `false` once observed as `true`.
+    pub fn mark_started(&self) -> bool {
+        let result =
+            self.started
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire);
+        debug_assert!(
+            result.is_ok() || result == Err(true),
+            "started flag must never regress",
+        );
+        result.is_ok()
     }
 
     /// Returns `true` once the process loop is reachable.
@@ -1230,7 +1254,7 @@ mod tests {
         assert_eq!(status, 503);
         assert_eq!(body, "starting");
 
-        health.set_started(true);
+        assert!(health.mark_started());
         let (status, body) = http_get(addr, "/health/startup").await;
         assert_eq!(status, 200);
         assert_eq!(body, "ok");
@@ -1274,6 +1298,23 @@ mod tests {
         // Readiness can flip back (graceful shutdown), startup does not.
         h.set_ready(false);
         assert!(!h.is_ready());
+        assert!(h.is_started());
+    }
+
+    #[test]
+    fn mark_started_is_one_shot() {
+        let h = HealthState::new();
+        assert!(!h.is_started());
+
+        // First call performs the transition.
+        assert!(h.mark_started());
+        assert!(h.is_started());
+
+        // Subsequent calls are no-ops and report `false`, but the
+        // observable flag remains `true`.
+        assert!(!h.mark_started());
+        assert!(h.is_started());
+        assert!(!h.mark_started());
         assert!(h.is_started());
     }
 
