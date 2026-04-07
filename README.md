@@ -521,6 +521,7 @@ All tests use ephemeral certificates generated at runtime via `rustgate-test-uti
 | Document | Description |
 |----------|-------------|
 | [Architecture](docs/architecture.md) | System design and crate responsibilities |
+| [Protocol Specification](docs/protocol.md) | Wire format, framing, codecs, routing, federation, HA |
 | [TLS Certificates](docs/tls-certificates.md) | Certificate requirements, generation, and management |
 | [Deployment](docs/deployment.md) | Binary, Docker Compose, and Kubernetes deployment |
 | [FIPS 140-3](docs/fips.md) | FIPS crypto provider setup and known limitations |
