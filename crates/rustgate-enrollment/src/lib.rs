@@ -22,5 +22,7 @@ pub use contacts::{ContactInfo, ContactsProvider, cached_contacts_provider};
 pub use datapackage::DataPackageStore;
 pub use error::EnrollmentError;
 pub use revocation::RevocationStore;
-pub use server::EnrollmentServer;
+pub use server::{
+    DEFAULT_SIGN_RATE_LIMIT, DEFAULT_SIGN_RATE_WINDOW, EnrollmentServer, RateLimitCallback,
+};
 pub use signing::CsrSigner;

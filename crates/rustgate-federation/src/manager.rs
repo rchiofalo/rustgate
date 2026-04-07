@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
+use rustgate_core::message::Metadata;
 use rustgate_core::{PeerId, audit};
 use rustls::RootCertStore;
 #[cfg(feature = "v2")]
@@ -656,6 +657,36 @@ impl FederationManager {
     ///
     /// Returns the number of peers the message was successfully queued to.
     pub async fn forward(&self, payload: Bytes, source_groups: &[String]) -> usize {
+        self.forward_with_metadata(payload, source_groups, None)
+            .await
+    }
+
+    /// Forward a message and re-check its TTL at the federation boundary.
+    ///
+    /// If `metadata` is supplied and the message is already expired by the
+    /// time forwarding runs, the message is dropped without being queued to
+    /// any peer. This guards against in-flight expiration: a message that
+    /// was queued for federation but stalled (e.g. behind a slow channel
+    /// or backpressured peer) past its TTL must not waste bandwidth.
+    pub async fn forward_with_metadata(
+        &self,
+        payload: Bytes,
+        source_groups: &[String],
+        metadata: Option<&Metadata>,
+    ) -> usize {
+        if let Some(meta) = metadata
+            && meta.is_expired()
+        {
+            warn!(
+                source_groups = ?source_groups,
+                ttl = ?meta.ttl,
+                "dropping expired message at federation forward boundary"
+            );
+            #[cfg(feature = "api")]
+            crate::metrics::forward_ttl_expired().inc();
+            return 0;
+        }
+
         let span = tracing::debug_span!(
             "federation_forward",
             peer_count = self.clients.len(),
@@ -1885,6 +1916,86 @@ mod tests {
             .forward(Bytes::from("test"), &["Alpha".into()])
             .await;
         assert_eq!(sent, 0);
+    }
+
+    /// Issue #554: a message whose TTL has expired between local routing
+    /// and the federation forward boundary must be dropped, not forwarded.
+    #[tokio::test]
+    async fn forward_with_metadata_drops_expired_ttl() {
+        use std::time::{Duration, SystemTime};
+
+        use rustgate_core::message::{MessageType, Metadata};
+
+        let manager = FederationManager::new(test_config());
+
+        // Build a metadata header that expired in the past: received_at is
+        // 2 seconds ago, ttl is 1 second.
+        let metadata = Metadata {
+            received_at: SystemTime::now() - Duration::from_secs(2),
+            source_protocol: "tcp".into(),
+            message_type: MessageType::Position,
+            ttl: Some(Duration::from_secs(1)),
+        };
+        assert!(metadata.is_expired(), "test fixture must be expired");
+
+        let sent = manager
+            .forward_with_metadata(Bytes::from("expired"), &["Alpha".into()], Some(&metadata))
+            .await;
+        assert_eq!(sent, 0, "expired messages must not be forwarded");
+    }
+
+    /// Acceptance test for issue #554: queue a TTL=1s message, stall the
+    /// forward path for 2s, assert the message is dropped at the boundary.
+    #[tokio::test]
+    async fn forward_with_metadata_stall_then_expired_is_dropped() {
+        use std::time::{Duration, SystemTime};
+
+        use rustgate_core::message::{MessageType, Metadata};
+
+        let manager = FederationManager::new(test_config());
+
+        let metadata = Metadata {
+            received_at: SystemTime::now(),
+            source_protocol: "tcp".into(),
+            message_type: MessageType::Position,
+            ttl: Some(Duration::from_secs(1)),
+        };
+
+        // Stall: simulate the message sitting in a federation queue for 2s.
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+        let sent = manager
+            .forward_with_metadata(Bytes::from("stalled"), &["Alpha".into()], Some(&metadata))
+            .await;
+        assert_eq!(
+            sent, 0,
+            "TTL must be re-checked at the federation forward boundary"
+        );
+    }
+
+    /// A message without a TTL must never be considered expired.
+    #[tokio::test]
+    async fn forward_with_metadata_no_ttl_not_expired() {
+        use std::time::SystemTime;
+
+        use rustgate_core::message::{MessageType, Metadata};
+
+        let manager = FederationManager::new(test_config());
+
+        let metadata = Metadata {
+            received_at: SystemTime::now(),
+            source_protocol: "tcp".into(),
+            message_type: MessageType::Position,
+            ttl: None,
+        };
+
+        // No peers, so the call still returns 0 — but it must reach the
+        // peer-iteration path rather than short-circuit on TTL.
+        let sent = manager
+            .forward_with_metadata(Bytes::from("alive"), &["Alpha".into()], Some(&metadata))
+            .await;
+        assert_eq!(sent, 0);
+        assert!(!metadata.is_expired());
     }
 
     #[test]

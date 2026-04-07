@@ -437,8 +437,29 @@ pub(crate) async fn start_enrollment(
         std::time::Duration::from_secs(30),
     );
 
+    let rate_window = std::time::Duration::from_secs(60);
+    // 0 disables the throttle by treating it as effectively unbounded.
+    let rate_limit = if cli.enrollment_rate_limit == 0 {
+        usize::MAX
+    } else {
+        cli.enrollment_rate_limit as usize
+    };
+
     let mut enrollment_server = rustgate_enrollment::EnrollmentServer::new(signer, credentials)
-        .with_contacts_provider(contacts_provider);
+        .with_contacts_provider(contacts_provider)
+        .with_rate_limit(rate_limit, rate_window);
+
+    #[cfg(feature = "metrics")]
+    {
+        enrollment_server = enrollment_server.with_rate_limit_callback(std::sync::Arc::new(|| {
+            crate::metrics::enrollment_rate_limited().inc();
+        }));
+    }
+
+    tracing::info!(
+        max_per_minute = cli.enrollment_rate_limit,
+        "enrollment CSR signing rate limit configured"
+    );
 
     if let Some(ref pkg_dir) = cli.data_package_dir {
         let mut store =
@@ -833,11 +854,13 @@ pub(crate) async fn start_federation(
     setup_ha_handlers(&rwlock).await;
 
     let rwlock_for_forward = Arc::clone(&rwlock);
-    let forward_fn: FedForwardFn = Arc::new(move |payload, groups| {
+    let forward_fn: FedForwardFn = Arc::new(move |payload, groups, metadata| {
         let inner = Arc::clone(&rwlock_for_forward);
         spawn_background("federation-forward", async move {
             let mgr = inner.read().await;
-            let _ = mgr.forward(payload, &groups).await;
+            let _ = mgr
+                .forward_with_metadata(payload, &groups, Some(&metadata))
+                .await;
         });
     });
 
@@ -1084,8 +1107,8 @@ pub(crate) async fn start_udp<P: NatsPublish + Send + Sync + 'static>(
         fed_forward
             .clone()
             .map(|fwd| -> rustgate_transport::udp::OnFederationForward {
-                Arc::new(move |payload, groups| {
-                    fwd(payload, groups);
+                Arc::new(move |payload, groups, metadata| {
+                    fwd(payload, groups, metadata);
                 })
             });
 
