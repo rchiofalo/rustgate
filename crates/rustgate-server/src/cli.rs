@@ -426,6 +426,24 @@ pub(crate) struct Cli {
     )]
     pub(crate) federation_replay_buffer_size: usize,
 
+    /// Directory for persisting per-peer federation replay buffers to disk.
+    /// When set, replay buffers survive server restarts so a peer that
+    /// reconnects after a restart can resume replay from the last
+    /// persisted point. The store is a redb database at
+    /// `<dir>/federation_replay.redb`.
+    #[arg(long, env = "RUSTGATE_FEDERATION_REPLAY_DIR")]
+    pub(crate) federation_replay_dir: Option<std::path::PathBuf>,
+
+    /// Global byte cap for the persistent federation replay store
+    /// (drop-oldest eviction). Only honored when `--federation-replay-dir`
+    /// is set. Defaults to 64 MiB.
+    #[arg(
+        long,
+        default_value_t = 64 * 1024 * 1024,
+        env = "RUSTGATE_FEDERATION_REPLAY_MAX_BYTES"
+    )]
+    pub(crate) federation_replay_max_bytes: u64,
+
     /// NATS URL for federation HA coordination (enables distributed peer ownership).
     /// When set, only one pod manages each outbound peer in a multi-pod deployment.
     /// Requires --features federation-ha.
@@ -732,6 +750,8 @@ define_config_file! {
     federation_circuit_breaker_threshold: u32,
     federation_circuit_breaker_timeout: u64,
     federation_replay_buffer_size: usize,
+    federation_replay_dir: Option<std::path::PathBuf>,
+    federation_replay_max_bytes: u64,
     federation_ha_nats_url: Option<String>,
     federation_pod_id: Option<String>,
     replay_window: u64,

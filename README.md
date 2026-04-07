@@ -355,6 +355,8 @@ All flags support environment variables (CLI takes precedence):
 | `--federation-circuit-breaker-threshold` | `RUSTGATE_FEDERATION_CIRCUIT_BREAKER_THRESHOLD` | `5` |
 | `--federation-circuit-breaker-timeout` | `RUSTGATE_FEDERATION_CIRCUIT_BREAKER_TIMEOUT` | `60` |
 | `--federation-replay-buffer-size` | `RUSTGATE_FEDERATION_REPLAY_BUFFER_SIZE` | `1000` |
+| `--federation-replay-dir` | `RUSTGATE_FEDERATION_REPLAY_DIR` | — |
+| `--federation-replay-max-bytes` | `RUSTGATE_FEDERATION_REPLAY_MAX_BYTES` | `67108864` (64 MiB) |
 | `--federation-ha-nats-url` | `RUSTGATE_FEDERATION_HA_NATS_URL` | — |
 | `--federation-pod-id` | `RUSTGATE_FEDERATION_POD_ID` | — |
 | `--replay-window` | `RUSTGATE_REPLAY_WINDOW` | `300` |

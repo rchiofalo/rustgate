@@ -21,7 +21,8 @@ use crate::config::FederationConfig;
 use crate::connector::{OutboundConnector, PeerConnector};
 use crate::dedup::MessageDedup;
 use crate::peer::{PeerHandle, PeerStatus};
-use crate::replay_buffer::ReplayBuffer;
+use crate::replay_buffer::{BufferedMessage, ReplayBuffer};
+use crate::replay_persist::ReplayStore;
 use crate::trust_store::TrustStore;
 use crate::v1::{V1Client, V1Server};
 
@@ -94,6 +95,10 @@ pub struct FederationManager {
     trust_store: Option<Arc<TrustStore>>,
     /// Per-peer replay buffers for reconnection catch-up.
     replay_buffers: SharedReplayBuffers,
+    /// Optional disk-backed store for replay buffers (issue #557).
+    /// When set, every push/eviction/clear is mirrored so buffers
+    /// survive server restarts.
+    replay_store: Option<Arc<ReplayStore>>,
 
     // ── HA subsystem ─────────────────────────────────────────────────
     #[cfg(feature = "ha")]
@@ -160,6 +165,7 @@ impl FederationManager {
             ca_pem: None,
             trust_store: None,
             replay_buffers: Arc::new(Mutex::new(HashMap::new())),
+            replay_store: None,
             #[cfg(feature = "ha")]
             claim_manager: None,
             #[cfg(feature = "ha")]
@@ -181,6 +187,30 @@ impl FederationManager {
     pub async fn start(&mut self, on_inbound: OnInbound) -> anyhow::Result<()> {
         if self.running {
             return Err(anyhow::anyhow!("federation manager is already running"));
+        }
+
+        // Open the persistent replay store (issue #557) and rehydrate any
+        // entries persisted from a previous run before we accept connections.
+        if let Some(dir) = self.config.replay_buffer_dir.clone() {
+            match ReplayStore::open(&dir, self.config.replay_max_bytes) {
+                Ok(store) => {
+                    let store = Arc::new(store);
+                    self.replay_store = Some(Arc::clone(&store));
+                    self.rehydrate_replay_buffers_from_store(&store);
+                    info!(
+                        dir = %dir.display(),
+                        max_bytes = self.config.replay_max_bytes,
+                        "federation replay buffer persistence enabled"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        dir = %dir.display(),
+                        error = %e,
+                        "failed to open federation replay store; persistence disabled"
+                    );
+                }
+            }
         }
 
         // Read TLS certificate material
@@ -824,11 +854,85 @@ impl FederationManager {
         }
         if let Ok(mut buffers) = self.replay_buffers.lock() {
             for peer_id in self.peers.keys() {
-                let buffer = buffers
-                    .entry(peer_id.clone())
-                    .or_insert_with(|| ReplayBuffer::new(self.config.replay_buffer_capacity));
+                let buffer = buffers.entry(peer_id.clone()).or_insert_with(|| {
+                    Self::make_replay_buffer_for(
+                        peer_id,
+                        self.config.replay_buffer_capacity,
+                        self.replay_store.as_ref(),
+                    )
+                });
                 let _ = buffer.push(payload.clone(), groups.to_vec());
             }
+        }
+    }
+
+    /// Construct a fresh [`ReplayBuffer`] for `peer_id`, attaching the
+    /// shared persistent store when one is configured.
+    fn make_replay_buffer_for(
+        peer_id: &PeerId,
+        capacity: usize,
+        store: Option<&Arc<ReplayStore>>,
+    ) -> ReplayBuffer {
+        match store {
+            Some(s) => ReplayBuffer::with_store(capacity, peer_id.as_str(), Arc::clone(s)),
+            None => ReplayBuffer::new(capacity),
+        }
+    }
+
+    /// Restore per-peer replay buffers from the persistent store on startup.
+    ///
+    /// Reads every entry from `store`, groups by peer id, and inserts a
+    /// hydrated [`ReplayBuffer`] into the manager's in-memory map for each
+    /// peer that has at least one persisted entry. Excess entries beyond
+    /// the in-memory capacity are evicted (and deleted from the store)
+    /// during hydrate.
+    fn rehydrate_replay_buffers_from_store(&self, store: &Arc<ReplayStore>) {
+        if self.config.replay_buffer_capacity == 0 {
+            return;
+        }
+        let entries = match store.load_all() {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(error = %e, "failed to load persisted replay entries");
+                return;
+            }
+        };
+        if entries.is_empty() {
+            return;
+        }
+
+        // Group by peer id while preserving ascending seq order.
+        let mut by_peer: HashMap<String, Vec<BufferedMessage>> = HashMap::new();
+        for entry in entries {
+            by_peer
+                .entry(entry.peer_id)
+                .or_default()
+                .push(BufferedMessage {
+                    seq: entry.seq,
+                    payload: entry.payload,
+                    groups: entry.groups,
+                });
+        }
+
+        let Ok(mut buffers) = self.replay_buffers.lock() else {
+            return;
+        };
+        for (peer_id_str, mut records) in by_peer {
+            records.sort_by_key(|m| m.seq);
+            let pid = PeerId::from(peer_id_str.as_str());
+            let mut buf =
+                Self::make_replay_buffer_for(&pid, self.config.replay_buffer_capacity, Some(store));
+            let restored_count = records.len();
+            buf.hydrate_from_records(records);
+            #[cfg(feature = "api")]
+            crate::metrics::replay_restored().inc_by(restored_count as u64);
+            info!(
+                peer_id = %peer_id_str,
+                restored = restored_count,
+                in_memory = buf.len(),
+                "rehydrated persisted replay buffer"
+            );
+            let _ = buffers.insert(pid, buf);
         }
     }
 
@@ -1448,6 +1552,8 @@ mod tests {
             circuit_breaker_threshold: 5,
             circuit_breaker_timeout: Duration::from_secs(60),
             replay_buffer_capacity: 1000,
+            replay_buffer_dir: None,
+            replay_max_bytes: crate::replay_persist::DEFAULT_REPLAY_MAX_BYTES,
             pod_id: None,
             ha_nats_url: None,
         }

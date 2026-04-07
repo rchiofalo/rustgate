@@ -30,6 +30,9 @@ static CIRCUIT_BREAKER_RECOVERIES: OnceLock<IntCounter> = OnceLock::new();
 
 static FORWARD_TTL_EXPIRED: OnceLock<IntCounter> = OnceLock::new();
 
+static REPLAY_PERSISTED: OnceLock<IntCounter> = OnceLock::new();
+static REPLAY_RESTORED: OnceLock<IntCounter> = OnceLock::new();
+
 // ── Registration ────────────────────────────────────────────────────
 
 /// Register all federation metrics with the default Prometheus registry.
@@ -126,6 +129,20 @@ pub fn init() -> prometheus::Result<()> {
     ))?;
     registry.register(Box::new(forward_ttl_expired.clone()))?;
     let _ = FORWARD_TTL_EXPIRED.set(forward_ttl_expired);
+
+    let replay_persisted = IntCounter::with_opts(Opts::new(
+        "rustgate_federation_replay_persisted_total",
+        "Total federation replay buffer entries persisted to disk",
+    ))?;
+    registry.register(Box::new(replay_persisted.clone()))?;
+    let _ = REPLAY_PERSISTED.set(replay_persisted);
+
+    let replay_restored = IntCounter::with_opts(Opts::new(
+        "rustgate_federation_replay_restored_total",
+        "Total federation replay buffer entries restored from disk on startup",
+    ))?;
+    registry.register(Box::new(replay_restored.clone()))?;
+    let _ = REPLAY_RESTORED.set(replay_restored);
 
     Ok(())
 }
@@ -246,6 +263,18 @@ pub fn forward_ttl_expired() -> &'static IntCounter {
     FORWARD_TTL_EXPIRED.get_or_init(|| {
         fallback_counter("rustgate_federation_forward_ttl_expired_total", "fallback")
     })
+}
+
+/// Replay buffer entries persisted to disk (counter).
+pub fn replay_persisted() -> &'static IntCounter {
+    REPLAY_PERSISTED
+        .get_or_init(|| fallback_counter("rustgate_federation_replay_persisted_total", "fallback"))
+}
+
+/// Replay buffer entries restored from disk on startup (counter).
+pub fn replay_restored() -> &'static IntCounter {
+    REPLAY_RESTORED
+        .get_or_init(|| fallback_counter("rustgate_federation_replay_restored_total", "fallback"))
 }
 
 // ── Snapshot ────────────────────────────────────────────────────────

@@ -5,9 +5,13 @@
 //! resuming the live stream.
 
 use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
+use tracing::warn;
+
+use crate::replay_persist::ReplayStore;
 
 /// Default maximum number of messages retained per peer.
 pub const DEFAULT_REPLAY_CAPACITY: usize = 1000;
@@ -32,15 +36,77 @@ pub struct ReplayBuffer {
     buffer: VecDeque<BufferedMessage>,
     capacity: usize,
     next_seq: AtomicU64,
+    /// Optional disk-backed store. When set, every push/eviction/clear is
+    /// mirrored to the store so the buffer can be restored across restarts.
+    store: Option<Arc<ReplayStore>>,
+    /// Peer id this buffer belongs to. Only meaningful when `store` is set.
+    peer_id: String,
 }
 
 impl ReplayBuffer {
-    /// Create a new replay buffer with the given capacity.
+    /// Create a new in-memory replay buffer with the given capacity.
     pub fn new(capacity: usize) -> Self {
         Self {
             buffer: VecDeque::with_capacity(capacity.min(1024)),
             capacity,
             next_seq: AtomicU64::new(1),
+            store: None,
+            peer_id: String::new(),
+        }
+    }
+
+    /// Create a new persistent replay buffer for `peer_id` backed by `store`.
+    ///
+    /// New pushes are written through to disk; eviction and clear are
+    /// reflected to the store so the on-disk state stays bounded.
+    pub fn with_store(
+        capacity: usize,
+        peer_id: impl Into<String>,
+        store: Arc<ReplayStore>,
+    ) -> Self {
+        Self {
+            buffer: VecDeque::with_capacity(capacity.min(1024)),
+            capacity,
+            next_seq: AtomicU64::new(1),
+            store: Some(store),
+            peer_id: peer_id.into(),
+        }
+    }
+
+    /// Hydrate this buffer from already-restored persistent records.
+    ///
+    /// Records must be supplied in ascending sequence order. The buffer's
+    /// `next_seq` is advanced past the highest restored seq. If more records
+    /// than `capacity` are supplied, only the most recent `capacity` are
+    /// retained in memory and the older ones are deleted from the store.
+    pub fn hydrate_from_records<I>(&mut self, records: I)
+    where
+        I: IntoIterator<Item = BufferedMessage>,
+    {
+        let mut max_seq: u64 = 0;
+        for msg in records {
+            if msg.seq > max_seq {
+                max_seq = msg.seq;
+            }
+            if self.capacity == 0 {
+                if let Some(store) = self.store.as_ref()
+                    && let Err(e) = store.delete(&self.peer_id, msg.seq)
+                {
+                    warn!(error = %e, "failed to delete restored replay entry");
+                }
+                continue;
+            }
+            if self.buffer.len() >= self.capacity
+                && let Some(evicted) = self.buffer.pop_front()
+                && let Some(store) = self.store.as_ref()
+                && let Err(e) = store.delete(&self.peer_id, evicted.seq)
+            {
+                warn!(error = %e, "failed to delete evicted replay entry");
+            }
+            self.buffer.push_back(msg);
+        }
+        if max_seq > 0 {
+            self.next_seq.store(max_seq + 1, Ordering::Relaxed);
         }
     }
 
@@ -53,8 +119,21 @@ impl ReplayBuffer {
         if self.capacity == 0 {
             return seq;
         }
-        if self.buffer.len() >= self.capacity {
-            let _ = self.buffer.pop_front();
+        if self.buffer.len() >= self.capacity
+            && let Some(evicted) = self.buffer.pop_front()
+            && let Some(store) = self.store.as_ref()
+            && let Err(e) = store.delete(&self.peer_id, evicted.seq)
+        {
+            warn!(error = %e, "failed to delete evicted replay entry");
+        }
+        if let Some(store) = self.store.as_ref() {
+            match store.put(&self.peer_id, seq, &groups, &payload) {
+                Ok(()) => {
+                    #[cfg(feature = "api")]
+                    crate::metrics::replay_persisted().inc();
+                }
+                Err(e) => warn!(error = %e, "failed to persist replay entry"),
+            }
         }
         self.buffer.push_back(BufferedMessage {
             seq,
@@ -107,6 +186,11 @@ impl ReplayBuffer {
     /// `clear()` continue with the next monotonic sequence number.
     pub fn clear(&mut self) {
         self.buffer.clear();
+        if let Some(store) = self.store.as_ref()
+            && let Err(e) = store.clear_peer(&self.peer_id)
+        {
+            warn!(error = %e, "failed to clear persisted replay entries");
+        }
     }
 
     /// Return all buffered messages, deduplicating by payload content.
@@ -276,5 +360,149 @@ mod tests {
     fn all_messages_deduped_empty_buffer() {
         let buf = ReplayBuffer::new(10);
         assert!(buf.all_messages_deduped().is_empty());
+    }
+
+    // ── persistence tests (issue #557) ─────────────────────────────────
+
+    use crate::replay_persist::ReplayStore;
+
+    fn open_store() -> (tempfile::TempDir, Arc<ReplayStore>) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(ReplayStore::open(dir.path(), 1024 * 1024).unwrap());
+        (dir, store)
+    }
+
+    #[test]
+    fn persistent_push_writes_through_to_store() {
+        let (_dir, store) = open_store();
+        let mut buf = ReplayBuffer::with_store(10, "peer-a", Arc::clone(&store));
+        let _ = buf.push(Bytes::from_static(b"hello"), vec!["alpha".into()]);
+        let _ = buf.push(Bytes::from_static(b"world"), vec!["bravo".into()]);
+        assert_eq!(store.load_all().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn persistent_eviction_deletes_oldest_from_store() {
+        let (_dir, store) = open_store();
+        let mut buf = ReplayBuffer::with_store(2, "peer-a", Arc::clone(&store));
+        let _ = buf.push(Bytes::from_static(b"a"), vec![]);
+        let _ = buf.push(Bytes::from_static(b"b"), vec![]);
+        let _ = buf.push(Bytes::from_static(b"c"), vec![]);
+        let all = store.load_all().unwrap();
+        assert_eq!(all.len(), 2);
+        let seqs: Vec<u64> = all.iter().map(|e| e.seq).collect();
+        assert!(seqs.contains(&2));
+        assert!(seqs.contains(&3));
+        assert!(!seqs.contains(&1));
+    }
+
+    #[test]
+    fn persistent_clear_drops_peer_entries() {
+        let (_dir, store) = open_store();
+        let mut buf = ReplayBuffer::with_store(10, "peer-a", Arc::clone(&store));
+        let _ = buf.push(Bytes::from_static(b"a"), vec![]);
+        let _ = buf.push(Bytes::from_static(b"b"), vec![]);
+        buf.clear();
+        assert!(store.load_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn hydrate_restores_buffer_and_continues_seq() {
+        let (_dir, store) = open_store();
+        // Pretend a previous run wrote three entries.
+        store
+            .put("peer-a", 1, &["alpha".into()], &Bytes::from_static(b"a"))
+            .unwrap();
+        store
+            .put("peer-a", 2, &["alpha".into()], &Bytes::from_static(b"b"))
+            .unwrap();
+        store
+            .put("peer-a", 3, &["alpha".into()], &Bytes::from_static(b"c"))
+            .unwrap();
+
+        let mut buf = ReplayBuffer::with_store(10, "peer-a", Arc::clone(&store));
+        let restored: Vec<BufferedMessage> = store
+            .load_all()
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.peer_id == "peer-a")
+            .map(|e| BufferedMessage {
+                seq: e.seq,
+                payload: e.payload,
+                groups: e.groups,
+            })
+            .collect();
+        buf.hydrate_from_records(restored);
+
+        assert_eq!(buf.len(), 3);
+        // New pushes continue past the restored max seq (3 -> next is 4).
+        let next = buf.push(Bytes::from_static(b"d"), vec![]);
+        assert_eq!(next, 4);
+    }
+
+    #[test]
+    fn hydrate_evicts_excess_records_beyond_capacity() {
+        let (_dir, store) = open_store();
+        for i in 1u64..=5 {
+            store
+                .put("peer-a", i, &[], &Bytes::from(vec![b'x']))
+                .unwrap();
+        }
+        let mut buf = ReplayBuffer::with_store(2, "peer-a", Arc::clone(&store));
+        let restored: Vec<BufferedMessage> = store
+            .load_all()
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.peer_id == "peer-a")
+            .map(|e| BufferedMessage {
+                seq: e.seq,
+                payload: e.payload,
+                groups: e.groups,
+            })
+            .collect();
+        buf.hydrate_from_records(restored);
+        assert_eq!(buf.len(), 2);
+        let in_mem: Vec<u64> = buf.all_messages().iter().map(|m| m.seq).collect();
+        assert_eq!(in_mem, vec![4, 5]);
+        // Disk should match memory after hydrate-driven eviction.
+        let on_disk: Vec<u64> = store.load_all().unwrap().iter().map(|e| e.seq).collect();
+        assert_eq!(on_disk, vec![4, 5]);
+    }
+
+    #[test]
+    fn restart_then_messages_since_returns_pending() {
+        // Simulates issue #557 acceptance: restart the server, peer reconnects
+        // and replay resumes from its last seen seq.
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path();
+        let last_seen;
+        {
+            let store = Arc::new(ReplayStore::open(store_path, 1024 * 1024).unwrap());
+            let mut buf = ReplayBuffer::with_store(10, "peer-a", Arc::clone(&store));
+            let _ = buf.push(Bytes::from_static(b"a"), vec![]);
+            last_seen = buf.push(Bytes::from_static(b"b"), vec![]);
+            let _ = buf.push(Bytes::from_static(b"c"), vec![]);
+            let _ = buf.push(Bytes::from_static(b"d"), vec![]);
+        }
+        // "Restart" — open the store fresh and rehydrate.
+        let store = Arc::new(ReplayStore::open(store_path, 1024 * 1024).unwrap());
+        let mut buf = ReplayBuffer::with_store(10, "peer-a", Arc::clone(&store));
+        let restored: Vec<BufferedMessage> = store
+            .load_all()
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.peer_id == "peer-a")
+            .map(|e| BufferedMessage {
+                seq: e.seq,
+                payload: e.payload,
+                groups: e.groups,
+            })
+            .collect();
+        buf.hydrate_from_records(restored);
+
+        let pending = buf.messages_since(last_seen);
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].payload, Bytes::from_static(b"c"));
+        assert_eq!(pending[1].payload, Bytes::from_static(b"d"));
     }
 }
