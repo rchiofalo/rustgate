@@ -337,6 +337,7 @@ All flags support environment variables (CLI takes precedence):
 | `--enrollment-user` | `RUSTGATE_ENROLLMENT_USER` | — |
 | `--enrollment-password` | `RUSTGATE_ENROLLMENT_PASSWORD` | — |
 | `--ca-organization` | `RUSTGATE_CA_ORG` | `rustgate` |
+| `--enrollment-rate-limit` | `RUSTGATE_ENROLLMENT_RATE_LIMIT` | `10` (per IP per minute, 0 = unlimited) |
 | `--data-package-dir` | `RUSTGATE_DATA_PACKAGE_DIR` | — |
 | `--package-signature-ca` | `RUSTGATE_PACKAGE_SIGNATURE_CA` | — |
 | `--package-strict-signatures` | `RUSTGATE_PACKAGE_STRICT_SIGNATURES` | `false` |
