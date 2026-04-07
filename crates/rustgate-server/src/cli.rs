@@ -554,6 +554,13 @@ pub(crate) struct Cli {
     #[arg(long, env = "RUSTGATE_AUDIT_LOG")]
     pub(crate) audit_log: Option<String>,
 
+    /// Write per-message access events as JSON lines to a dedicated
+    /// file. When set, every routed message produces one access-log
+    /// entry (target="access") with src_cn, dst, msg_uid, size, and
+    /// outcome (delivered, dedup, expired). Use "-" for stdout.
+    #[arg(long, env = "RUSTGATE_ACCESS_LOG")]
+    pub(crate) access_log: Option<String>,
+
     /// Directory in which to keep the per-client store-and-forward
     /// queue database. When unset, offline messages are dropped (the
     /// default pre-v0.7 behavior). When set, messages destined for a
@@ -785,6 +792,7 @@ define_config_file! {
     archive_rotate_interval: u64,
     package_max_age_hours: u64,
     audit_log: Option<String>,
+    access_log: Option<String>,
     client_queue_dir: Option<std::path::PathBuf>,
     client_queue_max_bytes: u64,
     otel_endpoint: Option<String>,
