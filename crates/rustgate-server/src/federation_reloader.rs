@@ -2,7 +2,7 @@
 //!
 //! [`FederationPeerReloader`] watches the on-disk federation peers JSON file
 //! for changes (via SHA-256 digest comparison) and atomically reconciles the
-//! [`FederationManager`](rustgate_federation::manager::FederationManager)'s
+//! [`rustgate_federation::manager::FederationManager`]'s
 //! configured peer set when the file content differs. Peers added to the file
 //! are connected, peers removed are gracefully disconnected, and peers whose
 //! configuration changed are reconnected with the new settings. Peers that
