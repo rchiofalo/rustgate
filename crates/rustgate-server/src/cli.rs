@@ -377,6 +377,18 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 300, env = "RUSTGATE_REPLAY_WINDOW")]
     pub(crate) replay_window: u64,
 
+    /// Cross-path deduplication window in seconds. When > 0, the router
+    /// suppresses duplicate messages that arrive via multiple ingress
+    /// paths (e.g. direct client + federation) within this window.
+    /// Disabled by default.
+    #[arg(long, default_value_t = 0, env = "RUSTGATE_DEDUP_WINDOW_SECS")]
+    pub(crate) dedup_window_secs: u64,
+
+    /// Maximum number of entries retained in the cross-path dedup cache.
+    /// Bounds memory usage; oldest entries are evicted in LRU order.
+    #[arg(long, default_value_t = 100_000, env = "RUSTGATE_DEDUP_CACHE_SIZE")]
+    pub(crate) dedup_cache_size: usize,
+
     /// Maximum sustained messages per second per connected client (0 = disabled).
     #[arg(long, default_value_t = 0, env = "RUSTGATE_CLIENT_MSG_RATE")]
     pub(crate) client_message_rate: u32,

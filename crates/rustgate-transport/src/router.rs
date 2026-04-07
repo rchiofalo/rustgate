@@ -13,6 +13,7 @@ use tracing::{Instrument, debug, warn};
 
 use crate::acl::GroupAclPolicy;
 use crate::cache::PositionCache;
+use crate::dedup::DedupCache;
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -239,6 +240,7 @@ pub struct Router {
     state: RwLock<State>,
     cache: PositionCache,
     acl: ArcSwap<Option<GroupAclPolicy>>,
+    dedup: ArcSwap<Option<DedupCache>>,
 }
 
 impl Default for Router {
@@ -247,6 +249,7 @@ impl Default for Router {
             state: RwLock::new(State::default()),
             cache: PositionCache::default(),
             acl: ArcSwap::from_pointee(None),
+            dedup: ArcSwap::from_pointee(None),
         }
     }
 }
@@ -270,6 +273,7 @@ impl Router {
             }),
             cache: PositionCache::default(),
             acl: ArcSwap::from_pointee(None),
+            dedup: ArcSwap::from_pointee(None),
         }
     }
 
@@ -283,6 +287,7 @@ impl Router {
             state: RwLock::new(State::default()),
             cache: PositionCache::default(),
             acl: ArcSwap::from_pointee(acl),
+            dedup: ArcSwap::from_pointee(None),
         }
     }
 
@@ -301,6 +306,7 @@ impl Router {
             }),
             cache: PositionCache::default(),
             acl: ArcSwap::from_pointee(acl),
+            dedup: ArcSwap::from_pointee(None),
         }
     }
 
@@ -325,6 +331,22 @@ impl Router {
     /// Access the position cache for SA replay.
     pub fn cache(&self) -> &PositionCache {
         &self.cache
+    }
+
+    /// Install (or replace) the cross-path deduplication cache.
+    ///
+    /// Pass `None` to disable dedup. When set, every routed message is
+    /// checked against the cache before dispatch; duplicates are
+    /// suppressed and never reach subscribers.
+    pub fn set_dedup(&self, dedup: Option<DedupCache>) {
+        self.dedup.store(Arc::new(dedup));
+    }
+
+    /// Snapshot of dedup cache statistics, returning `(hits, len)` if
+    /// enabled. Useful for tests and operational diagnostics.
+    pub fn dedup_stats(&self) -> Option<(u64, usize)> {
+        let guard = self.dedup.load();
+        guard.as_ref().as_ref().map(|d| (d.hits(), d.len()))
     }
 
     pub async fn register(&self, handle: SessionHandle) {
@@ -408,6 +430,23 @@ impl Router {
     /// Inner routing logic, separated so the caller can `.instrument()` a span
     /// around this future without holding an `EnteredSpan` across `.await`.
     async fn route_inner(&self, msg: RoutableMessage) {
+        // Cross-path deduplication: drop the message before any
+        // dispatch work if it has already been delivered via another
+        // ingress path within the configured window.
+        {
+            let guard = self.dedup.load();
+            if let Some(ref dedup) = **guard
+                && dedup.check_payload(&msg.payload)
+            {
+                debug!(
+                    source = %msg.source.cn,
+                    message_type = %msg.metadata.message_type,
+                    "duplicate message suppressed by cross-path dedup",
+                );
+                return;
+            }
+        }
+
         // Cache position reports for SA replay to new sessions
         if msg.metadata.message_type == MessageType::Position {
             self.cache.store(msg.clone()).await;
@@ -1467,5 +1506,112 @@ mod tests {
         // Normal receiver should also see closure eventually
         // (no messages were sent to normal, but sender is dropped)
         assert!(nrx.recv().await.is_none());
+    }
+
+    fn make_cot_chat(
+        source: &Arc<Identity>,
+        dest: Destination,
+        payload: &'static [u8],
+    ) -> RoutableMessage {
+        RoutableMessage {
+            source: (**source).clone(),
+            destination: dest,
+            payload: Bytes::from_static(payload),
+            metadata: Metadata {
+                received_at: SystemTime::now(),
+                source_protocol: "cot".to_string(),
+                message_type: MessageType::Chat,
+                ttl: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn cross_path_dedup_suppresses_second_arrival() {
+        use crate::dedup::DedupCache;
+
+        let router = Router::new();
+        router.set_dedup(Some(DedupCache::new(
+            std::time::Duration::from_secs(60),
+            128,
+        )));
+
+        let alice = make_identity("alice", &[]);
+        let bob = make_identity("bob", &[]);
+        let (ptx, ntx, _prx, mut nrx) = make_channels(16, 16);
+        router
+            .register(SessionHandle::new(alice.clone(), ptx, ntx))
+            .await;
+
+        let payload: &'static [u8] =
+            br#"<event uid="MSG-1" time="2024-01-01T00:00:00Z" type="a-f-G"/>"#;
+
+        // First arrival via the "direct client" path.
+        router
+            .route(make_cot_chat(
+                &bob,
+                Destination::Direct((*alice).clone()),
+                payload,
+            ))
+            .await;
+        // Second arrival of the exact same logical message via a
+        // different ingress (e.g. federation) — must be suppressed.
+        router
+            .route(make_cot_chat(
+                &bob,
+                Destination::Direct((*alice).clone()),
+                payload,
+            ))
+            .await;
+
+        let first = nrx.recv().await;
+        assert!(first.is_some(), "alice must receive the first copy");
+        assert!(
+            nrx.try_recv().is_err(),
+            "the duplicate must not reach the subscriber"
+        );
+
+        let stats = router.dedup_stats().expect("dedup enabled");
+        assert_eq!(stats.0, 1, "exactly one duplicate should be recorded");
+    }
+
+    #[tokio::test]
+    async fn cross_path_dedup_distinct_payloads_pass_through() {
+        use crate::dedup::DedupCache;
+
+        let router = Router::new();
+        router.set_dedup(Some(DedupCache::new(
+            std::time::Duration::from_secs(60),
+            128,
+        )));
+
+        let alice = make_identity("alice", &[]);
+        let bob = make_identity("bob", &[]);
+        let (ptx, ntx, _prx, mut nrx) = make_channels(16, 16);
+        router
+            .register(SessionHandle::new(alice.clone(), ptx, ntx))
+            .await;
+
+        let p1: &'static [u8] = br#"<event uid="X" time="T" type="a-f-G">one</event>"#;
+        let p2: &'static [u8] = br#"<event uid="X" time="T" type="a-f-G">two</event>"#;
+
+        router
+            .route(make_cot_chat(
+                &bob,
+                Destination::Direct((*alice).clone()),
+                p1,
+            ))
+            .await;
+        router
+            .route(make_cot_chat(
+                &bob,
+                Destination::Direct((*alice).clone()),
+                p2,
+            ))
+            .await;
+
+        assert!(nrx.recv().await.is_some());
+        assert!(nrx.recv().await.is_some());
+        assert_eq!(router.dedup_stats().map(|s| s.0), Some(0));
     }
 }

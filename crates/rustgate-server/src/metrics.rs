@@ -59,6 +59,8 @@ static MESSAGES_EXPIRED: OnceLock<IntCounter> = OnceLock::new();
 static MESSAGES_REPLAYED: OnceLock<IntCounter> = OnceLock::new();
 static MESSAGES_ROUTED: OnceLock<IntCounterVec> = OnceLock::new();
 
+static DEDUP_HITS: OnceLock<IntCounter> = OnceLock::new();
+
 // Tier 2 (per-identity) metrics. Registered only when
 // `--metrics-per-identity` is enabled; remain `None` otherwise so they
 // add zero overhead.
@@ -169,6 +171,13 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(messages_replayed.clone()))?;
     let _ = MESSAGES_REPLAYED.set(messages_replayed);
 
+    let dedup_hits = IntCounter::with_opts(Opts::new(
+        "rustgate_dedup_hits_total",
+        "Cross-path duplicate messages suppressed before dispatch",
+    ))?;
+    registry.register(Box::new(dedup_hits.clone()))?;
+    let _ = DEDUP_HITS.set(dedup_hits);
+
     let messages_routed = IntCounterVec::new(
         Opts::new(
             "rustgate_messages_routed_total",
@@ -265,6 +274,10 @@ pub fn messages_expired() -> &'static IntCounter {
 pub fn messages_replayed() -> &'static IntCounter {
     MESSAGES_REPLAYED
         .get_or_init(|| fallback_counter("rustgate_messages_replayed_total", "fallback"))
+}
+
+pub fn dedup_hits() -> &'static IntCounter {
+    DEDUP_HITS.get_or_init(|| fallback_counter("rustgate_dedup_hits_total", "fallback"))
 }
 
 pub fn messages_routed() -> &'static IntCounterVec {

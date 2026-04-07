@@ -147,6 +147,12 @@ impl Default for ReplayFilter {
 // Key extraction (shared logic with federation dedup)
 // ---------------------------------------------------------------------------
 
+/// Internal re-export of `extract_xml_attr` for sibling modules
+/// (e.g. `dedup`) so the XML attribute parser is shared, not duplicated.
+pub(crate) fn extract_xml_attr_pub<'a>(payload: &'a [u8], attr: &[u8]) -> Option<&'a [u8]> {
+    extract_xml_attr(payload, attr)
+}
+
 /// Extract a hash key from a CoT XML payload.
 ///
 /// Scans for `uid="..."` and `time="..."` attributes in the first 512
