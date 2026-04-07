@@ -51,6 +51,21 @@ fn main() -> anyhow::Result<()> {
             println!("configuration is valid");
             return Ok(());
         }
+        Some(Command::VerifyAudit { ref file }) => {
+            match rustgate_core::audit_chain::verify_audit_log(std::path::Path::new(file)) {
+                Ok(report) => {
+                    println!(
+                        "audit log OK: {} records verified, tip={}",
+                        report.records, report.tip
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!("audit log verification FAILED: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         None => {}
     }
 
@@ -63,14 +78,25 @@ fn main() -> anyhow::Result<()> {
     // JSON lines to the configured file (or stdout when "-").
     let audit_layer = if let Some(ref audit_path) = cli.audit_log {
         let writer: std::sync::Mutex<Box<dyn std::io::Write + Send>> = if audit_path == "-" {
-            std::sync::Mutex::new(Box::new(std::io::stdout()))
+            // Stdout sinks start each process with a genesis chain since
+            // there is no persistent file to resume from.
+            let chain = rustgate_core::audit_chain::HashChainWriter::new(
+                std::io::stdout(),
+                rustgate_core::audit_chain::GENESIS_PREV.to_string(),
+            );
+            std::sync::Mutex::new(Box::new(chain))
         } else {
+            let path = std::path::Path::new(audit_path);
+            let prev = rustgate_core::audit_chain::read_chain_tip(path).map_err(|e| {
+                anyhow::anyhow!("failed to read audit log chain tip {audit_path}: {e}")
+            })?;
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(audit_path)
                 .map_err(|e| anyhow::anyhow!("failed to open audit log {audit_path}: {e}"))?;
-            std::sync::Mutex::new(Box::new(file))
+            let chain = rustgate_core::audit_chain::HashChainWriter::new(file, prev);
+            std::sync::Mutex::new(Box::new(chain))
         };
         let filter =
             tracing_subscriber::filter::Targets::new().with_target("audit", tracing::Level::INFO);

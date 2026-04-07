@@ -560,6 +560,12 @@ pub(crate) enum Command {
     PrintConfig,
     /// Validate the configuration file (parse + cross-field checks) and exit.
     ValidateConfig,
+    /// Verify the integrity of a hash-chained audit log.
+    VerifyAudit {
+        /// Path to the audit log file (newline-delimited JSON records).
+        #[arg(long)]
+        file: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Serialize, Deserialize)]
