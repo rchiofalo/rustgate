@@ -130,7 +130,7 @@ impl ClientQueue {
     /// created if it does not already exist.
     ///
     /// On open, any messages persisted by a previous process are
-    /// scanned to rebuild the in-memory index so that [`stats`] and
+    /// scanned to rebuild the in-memory index so that [`Self::stats`] and
     /// eviction work correctly immediately after restart. Corrupt
     /// records are skipped with a warning rather than failing open.
     pub fn open(dir: &Path, max_bytes: u64) -> Result<Self, StoreForwardError> {
@@ -378,7 +378,7 @@ impl ClientQueue {
         self.inner.lock().drops
     }
 
-    /// Total number of [`drain`] calls that returned at least one
+    /// Total number of [`Self::drain`] calls that returned at least one
     /// message.
     pub fn drains_total(&self) -> u64 {
         self.inner.lock().drains
