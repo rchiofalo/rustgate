@@ -751,29 +751,118 @@ fn internal_error_response() -> Response<Full<Bytes>> {
     resp
 }
 
+/// Differentiated health probe state for Kubernetes-style probes.
+///
+/// Three independent flags expose distinct lifecycle stages:
+///
+/// - `live` — process is alive. Flipped to `true` once the metrics server
+///   starts handling requests; never flipped back. A failing liveness
+///   probe instructs the orchestrator to restart the pod.
+/// - `ready` — instance can serve traffic. Flipped to `true` after the
+///   listener is bound and core subsystems (ACL, federation if enabled)
+///   have completed initial wiring. Flipped back to `false` during
+///   graceful shutdown so load balancers stop routing new traffic.
+/// - `started` — one-shot initial warmup complete. Flipped exactly once
+///   after the server enters its accept loop and never reset. The startup
+///   probe gives slow-starting pods extra grace before liveness/readiness
+///   checks begin in earnest.
+#[derive(Debug)]
+pub struct HealthState {
+    live: AtomicBool,
+    ready: AtomicBool,
+    started: AtomicBool,
+}
+
+impl HealthState {
+    /// Create a new `HealthState`. All flags start as `false`; callers
+    /// flip them as the corresponding lifecycle stage completes.
+    pub fn new() -> Self {
+        Self {
+            live: AtomicBool::new(false),
+            ready: AtomicBool::new(false),
+            started: AtomicBool::new(false),
+        }
+    }
+
+    /// Mark the process as live. Idempotent.
+    pub fn set_live(&self, v: bool) {
+        self.live.store(v, Ordering::Release);
+    }
+
+    /// Mark the instance as ready (or not) to serve traffic.
+    pub fn set_ready(&self, v: bool) {
+        self.ready.store(v, Ordering::Release);
+    }
+
+    /// Mark initial startup as complete. One-shot — typically called once
+    /// after the accept loop is entered.
+    pub fn set_started(&self, v: bool) {
+        self.started.store(v, Ordering::Release);
+    }
+
+    /// Returns `true` once the process loop is reachable.
+    pub fn is_live(&self) -> bool {
+        self.live.load(Ordering::Acquire)
+    }
+
+    /// Returns `true` when the instance can serve traffic.
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+
+    /// Returns `true` once initial warmup has completed.
+    pub fn is_started(&self) -> bool {
+        self.started.load(Ordering::Acquire)
+    }
+}
+
+impl Default for HealthState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn probe_response(
+    ok: bool,
+    ok_body: &'static str,
+    fail_body: &'static str,
+) -> Response<Full<Bytes>> {
+    if ok {
+        Response::builder()
+            .status(StatusCode::OK)
+            .body(Full::new(Bytes::from(ok_body)))
+            .unwrap_or_else(|_| internal_error_response())
+    } else {
+        Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(Full::new(Bytes::from(fail_body)))
+            .unwrap_or_else(|_| internal_error_response())
+    }
+}
+
 fn handle_request(
     req: Request<hyper::body::Incoming>,
-    ready: Arc<AtomicBool>,
+    health: Arc<HealthState>,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
     match req.uri().path() {
-        "/healthz" => Ok(Response::builder()
-            .status(StatusCode::OK)
-            .body(Full::new(Bytes::from("ok")))
-            .unwrap_or_else(|_| internal_error_response())),
+        // Liveness: process loop is reachable. Returns 200 once the
+        // metrics server is up; orchestrators interpret a non-200 as
+        // "restart the pod".
+        "/health/live" => Ok(probe_response(health.is_live(), "ok", "not live")),
 
-        "/readyz" => {
-            if ready.load(Ordering::Acquire) {
-                Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .body(Full::new(Bytes::from("ok")))
-                    .unwrap_or_else(|_| internal_error_response()))
-            } else {
-                Ok(Response::builder()
-                    .status(StatusCode::SERVICE_UNAVAILABLE)
-                    .body(Full::new(Bytes::from("not ready")))
-                    .unwrap_or_else(|_| internal_error_response()))
-            }
-        }
+        // Readiness: instance can accept traffic. Flips to 503 during
+        // graceful shutdown so load balancers stop sending new requests.
+        "/health/ready" => Ok(probe_response(health.is_ready(), "ok", "not ready")),
+
+        // Startup: initial warmup complete. Allows slow-starting pods to
+        // delay liveness/readiness checks during boot.
+        "/health/startup" => Ok(probe_response(health.is_started(), "ok", "starting")),
+
+        // Legacy aliases — kept for backwards compatibility. `/healthz`
+        // mirrors `/health/live` and `/readyz` mirrors `/health/ready`.
+        "/healthz" => Ok(probe_response(health.is_live(), "ok", "not live")),
+
+        "/readyz" => Ok(probe_response(health.is_ready(), "ok", "not ready")),
 
         "/metrics" => {
             let encoder = TextEncoder::new();
@@ -802,9 +891,12 @@ fn handle_request(
 /// Serve Prometheus metrics and health endpoints at the given address.
 ///
 /// Routes:
-/// - `GET /metrics` — Prometheus text format
-/// - `GET /healthz` — Liveness probe (always 200)
-/// - `GET /readyz`  — Readiness probe (200 when ready, 503 during shutdown)
+/// - `GET /metrics`        — Prometheus text format
+/// - `GET /health/live`    — Kubernetes liveness probe
+/// - `GET /health/ready`   — Kubernetes readiness probe
+/// - `GET /health/startup` — Kubernetes startup probe
+/// - `GET /healthz`        — Deprecated alias for `/health/live`
+/// - `GET /readyz`         — Deprecated alias for `/health/ready`
 ///
 /// The server is hardened against unauthenticated abuse:
 /// - Connection count bounded by [`MAX_HTTP_CONNECTIONS`]
@@ -812,12 +904,16 @@ fn handle_request(
 /// - Header read timeout of 5 seconds
 pub async fn serve(
     bind: SocketAddr,
-    ready: Arc<AtomicBool>,
+    health: Arc<HealthState>,
     #[cfg(feature = "federation")] fed_api: Arc<OnceLock<FedApiHandler>>,
     acl_api: Arc<OnceLock<AclApiHandler>>,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let conn_limit = Arc::new(tokio::sync::Semaphore::new(MAX_HTTP_CONNECTIONS));
+    // The metrics server is up — the process loop is reachable, so the
+    // liveness flag may flip on. Readiness/startup remain controlled by
+    // the main server lifecycle.
+    health.set_live(true);
     tracing::info!(addr = %bind, "metrics server started");
 
     loop {
@@ -832,7 +928,7 @@ pub async fn serve(
         };
 
         let io = hyper_util::rt::TokioIo::new(stream);
-        let ready = Arc::clone(&ready);
+        let health = Arc::clone(&health);
         #[cfg(feature = "federation")]
         let fed_api = Arc::clone(&fed_api);
         let acl_api = Arc::clone(&acl_api);
@@ -844,7 +940,7 @@ pub async fn serve(
                 .serve_connection(
                     io,
                     service_fn(move |req: Request<hyper::body::Incoming>| {
-                        let ready = Arc::clone(&ready);
+                        let health = Arc::clone(&health);
                         #[cfg(feature = "federation")]
                         let fed_api = Arc::clone(&fed_api);
                         let acl_api = Arc::clone(&acl_api);
@@ -895,7 +991,7 @@ pub async fn serve(
                             // If no ACL handler is registered, fall
                             // through to the generic request handler,
                             // which returns 404 for unknown paths.
-                            handle_request(req, ready)
+                            handle_request(req, health)
                         }
                     }),
                 );
@@ -1069,7 +1165,9 @@ mod tests {
     async fn serve_health_and_metrics_endpoints() {
         ensure_init();
 
-        let ready = Arc::new(AtomicBool::new(true));
+        let health = Arc::new(HealthState::new());
+        // Mark ready for the bulk of the test; serve() flips live=true.
+        health.set_ready(true);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1077,11 +1175,11 @@ mod tests {
         let addr = listener.local_addr().expect("local_addr");
         drop(listener);
 
-        let server_ready = Arc::clone(&ready);
+        let server_health = Arc::clone(&health);
         drop(tokio::spawn(async move {
             let _ = serve(
                 addr,
-                server_ready,
+                server_health,
                 #[cfg(feature = "federation")]
                 Arc::new(OnceLock::new()),
                 Arc::new(OnceLock::new()),
@@ -1091,21 +1189,41 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // /healthz always returns 200
-        let (status, body) = http_get(addr, "/healthz").await;
+        // /health/live returns 200 once serve() is up.
+        let (status, body) = http_get(addr, "/health/live").await;
         assert_eq!(status, 200);
         assert_eq!(body, "ok");
 
-        // /readyz returns 200 when ready
-        let (status, body) = http_get(addr, "/readyz").await;
+        // Legacy alias /healthz mirrors /health/live.
+        let (status, _) = http_get(addr, "/healthz").await;
+        assert_eq!(status, 200);
+
+        // /health/ready returns 200 when ready.
+        let (status, body) = http_get(addr, "/health/ready").await;
         assert_eq!(status, 200);
         assert_eq!(body, "ok");
 
-        // /readyz returns 503 after marking not ready
-        ready.store(false, Ordering::Release);
-        let (status, body) = http_get(addr, "/readyz").await;
+        // Legacy alias /readyz mirrors /health/ready.
+        let (status, _) = http_get(addr, "/readyz").await;
+        assert_eq!(status, 200);
+
+        // /health/startup is 503 until startup is marked complete.
+        let (status, body) = http_get(addr, "/health/startup").await;
+        assert_eq!(status, 503);
+        assert_eq!(body, "starting");
+
+        health.set_started(true);
+        let (status, body) = http_get(addr, "/health/startup").await;
+        assert_eq!(status, 200);
+        assert_eq!(body, "ok");
+
+        // /health/ready returns 503 after marking not ready (shutdown).
+        health.set_ready(false);
+        let (status, body) = http_get(addr, "/health/ready").await;
         assert_eq!(status, 503);
         assert_eq!(body, "not ready");
+        let (status, _) = http_get(addr, "/readyz").await;
+        assert_eq!(status, 503);
 
         // /metrics returns Prometheus text
         let (status, body) = http_get(addr, "/metrics").await;
@@ -1115,6 +1233,30 @@ mod tests {
         // Unknown path returns 404
         let (status, _) = http_get(addr, "/unknown").await;
         assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn health_state_flags_are_independent() {
+        let h = HealthState::new();
+        assert!(!h.is_live());
+        assert!(!h.is_ready());
+        assert!(!h.is_started());
+
+        h.set_live(true);
+        assert!(h.is_live());
+        assert!(!h.is_ready());
+        assert!(!h.is_started());
+
+        h.set_ready(true);
+        h.set_started(true);
+        assert!(h.is_live());
+        assert!(h.is_ready());
+        assert!(h.is_started());
+
+        // Readiness can flip back (graceful shutdown), startup does not.
+        h.set_ready(false);
+        assert!(!h.is_ready());
+        assert!(h.is_started());
     }
 
     /// Minimal HTTP GET using raw TCP. Returns (status_code, body).

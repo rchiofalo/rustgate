@@ -220,22 +220,24 @@ spec:
           {{- if .Values.metrics.enabled }}
           startupProbe:
             httpGet:
-              path: /healthz
+              path: /health/startup
               port: metrics
             failureThreshold: 30
             periodSeconds: 2
           livenessProbe:
             httpGet:
-              path: /healthz
+              path: /health/live
               port: metrics
             initialDelaySeconds: 5
             periodSeconds: 10
+            failureThreshold: 3
           readinessProbe:
             httpGet:
-              path: /readyz
+              path: /health/ready
               port: metrics
             initialDelaySeconds: 3
             periodSeconds: 5
+            failureThreshold: 3
           {{- else }}
           startupProbe:
             tcpSocket:

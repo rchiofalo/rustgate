@@ -182,7 +182,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     tracing::info!(addr = %listener.local_addr()?, framing = ?cli.framing, encoding = ?encoding, "listening");
 
-    // Readiness flag for K8s health probes
+    // Differentiated health probe state for K8s liveness/readiness/startup.
+    // `live` flips on inside `metrics::serve` when the metrics server binds.
+    // `ready` is set after listener + ACL + (optional) federation init.
+    // `started` is a one-shot, flipped after the accept loop is reached.
+    #[cfg(feature = "metrics")]
+    let health = Arc::new(metrics::HealthState::new());
+    // Legacy compatibility shim: a number of code paths still use a bare
+    // `ready` AtomicBool to gate accept-loop behaviour. Keep it for now —
+    // it shadows the readiness portion of `HealthState`.
     let ready = Arc::new(AtomicBool::new(true));
 
     // ── Metrics ─────────────────────────────────────────────────────
@@ -197,7 +205,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     #[cfg(feature = "metrics")]
     let metrics_identity = setup::start_metrics(
         &cli,
-        &ready,
+        &health,
         #[cfg(feature = "federation")]
         &fed_api_slot,
         &acl_api_slot,
@@ -508,6 +516,14 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     }
 
     // ── Accept loop ─────────────────────────────────────────────────
+    // Initial init pass is complete: listener bound, ACL loaded, and
+    // (when enabled) federation peers wired. Flip readiness on, then
+    // mark startup as complete (one-shot — never flipped back).
+    #[cfg(feature = "metrics")]
+    {
+        health.set_ready(true);
+        health.set_started(true);
+    }
     loop {
         // Global backpressure: park the accept loop while the router's
         // in-flight byte counter is over the high-water mark. Connections
@@ -584,6 +600,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             _ = shutdown_signal() => {
                 tracing::info!("shutdown signal received");
                 ready.store(false, Ordering::Release);
+                #[cfg(feature = "metrics")]
+                health.set_ready(false);
                 break;
             }
         }
