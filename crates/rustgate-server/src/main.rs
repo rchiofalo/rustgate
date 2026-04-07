@@ -461,6 +461,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             max_bytes: cli.archive_max_size,
             max_age: std::time::Duration::from_secs(cli.archive_max_age),
             interval: std::time::Duration::from_secs(cli.archive_rotate_interval.max(1)),
+            archiver: archiver.clone(),
         };
         tracing::info!(
             dir = %dir,

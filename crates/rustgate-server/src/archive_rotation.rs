@@ -15,10 +15,13 @@
 //! Both bounds default to `0`, which disables them.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use crate::archive::CotArchiver;
+
 /// Configuration for the archive rotation task.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RotationConfig {
     /// Archive directory to scan.
     pub dir: PathBuf,
@@ -28,6 +31,11 @@ pub struct RotationConfig {
     pub max_age: Duration,
     /// Interval between rotation passes.
     pub interval: Duration,
+    /// Optional reference to the live archiver. When set, the rotation
+    /// pass will exclude the archiver's currently active segment from
+    /// both size accounting and deletion sweeps so it never races the
+    /// writer.
+    pub archiver: Option<Arc<CotArchiver>>,
 }
 
 /// Outcome of a single rotation pass.
@@ -51,12 +59,24 @@ struct Entry {
 /// Errors from individual file operations are logged via `tracing` and
 /// do not abort the pass — a transient I/O failure on one file should
 /// not block retention for the rest of the directory.
-pub fn run_pass(dir: &Path, max_bytes: u64, max_age: Duration) -> std::io::Result<RotationStats> {
+pub fn run_pass(
+    dir: &Path,
+    max_bytes: u64,
+    max_age: Duration,
+    active_path: Option<&Path>,
+) -> std::io::Result<RotationStats> {
     if !dir.exists() {
         return Ok(RotationStats::default());
     }
 
     let mut entries = collect_entries(dir)?;
+
+    // Exclude the writer's currently active segment from both size
+    // accounting and deletion. We never want to delete (or even count
+    // the size of) a file the archiver is actively appending to.
+    if let Some(active) = active_path {
+        entries.retain(|e| e.path != active);
+    }
 
     let mut stats = RotationStats::default();
     let now = SystemTime::now();
@@ -161,8 +181,11 @@ pub fn spawn(cfg: RotationConfig) -> tokio::task::JoinHandle<()> {
             let dir = cfg.dir.clone();
             let max_bytes = cfg.max_bytes;
             let max_age = cfg.max_age;
-            let join =
-                tokio::task::spawn_blocking(move || run_pass(&dir, max_bytes, max_age)).await;
+            let active = cfg.archiver.as_ref().map(|a| a.active_path());
+            let join = tokio::task::spawn_blocking(move || {
+                run_pass(&dir, max_bytes, max_age, active.as_deref())
+            })
+            .await;
             match join {
                 Ok(Ok(stats)) => {
                     #[cfg(feature = "metrics")]
@@ -235,7 +258,7 @@ mod tests {
         set_mtime(&f5, Duration::from_secs(3600));
 
         // Cap at ~2.5 KiB; expect the three oldest files (f1, f2, f3) to be deleted.
-        let stats = run_pass(&dir, 2560, Duration::ZERO).unwrap();
+        let stats = run_pass(&dir, 2560, Duration::ZERO, None).unwrap();
 
         assert_eq!(stats.files_deleted, 3, "should drop three oldest files");
         assert!(!f1.exists(), "f1 should be deleted");
@@ -260,7 +283,7 @@ mod tests {
         set_mtime(&old, Duration::from_secs(7200));
         set_mtime(&fresh, Duration::from_secs(60));
 
-        let stats = run_pass(&dir, 0, Duration::from_secs(3600)).unwrap();
+        let stats = run_pass(&dir, 0, Duration::from_secs(3600), None).unwrap();
 
         assert_eq!(stats.files_deleted, 1);
         assert!(!old.exists());
@@ -277,10 +300,43 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         let f = write_file(&dir, "cot-1.jsonl", 4096);
-        let stats = run_pass(&dir, 0, Duration::ZERO).unwrap();
+        let stats = run_pass(&dir, 0, Duration::ZERO, None).unwrap();
         assert_eq!(stats.files_deleted, 0);
         assert_eq!(stats.bytes_after, 4096);
         assert!(f.exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotation_never_deletes_active_file_even_when_over_caps() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustgate-archive-rot-active-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // The "active" segment: large and ancient. Under both the size
+        // and age caps it would normally be deleted first, but the
+        // rotation pass must skip it because the writer owns it.
+        let active = write_file(&dir, "cot-active.jsonl", 8192);
+        set_mtime(&active, Duration::from_secs(86_400 * 30));
+
+        // A rolled / closed segment that *should* be eligible for
+        // deletion under both bounds.
+        let rolled = write_file(&dir, "cot-rolled.jsonl", 4096);
+        set_mtime(&rolled, Duration::from_secs(86_400 * 30));
+
+        // Cap of 1 KiB and max age of 1 hour: without exclusion both
+        // files would be deleted. With exclusion, only `rolled` goes.
+        let stats = run_pass(&dir, 1024, Duration::from_secs(3600), Some(&active)).unwrap();
+
+        assert!(active.exists(), "active segment must never be deleted");
+        assert!(!rolled.exists(), "rolled segment should be deleted");
+        assert_eq!(stats.files_deleted, 1);
+        // The active file's bytes are also excluded from accounting.
+        assert_eq!(stats.bytes_after, 0);
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -292,7 +348,7 @@ mod tests {
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&dir);
-        let stats = run_pass(&dir, 1024, Duration::from_secs(60)).unwrap();
+        let stats = run_pass(&dir, 1024, Duration::from_secs(60), None).unwrap();
         assert_eq!(stats.files_deleted, 0);
         assert_eq!(stats.bytes_after, 0);
     }
