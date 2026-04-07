@@ -88,6 +88,8 @@ static CLIENT_QUEUE_WRITER_DROPS: OnceLock<IntCounter> = OnceLock::new();
 static CLIENT_QUEUE_EXPIRED: OnceLock<IntCounter> = OnceLock::new();
 static CLIENT_QUEUE_SKIPPED_UNSUPPORTED: OnceLock<IntCounter> = OnceLock::new();
 
+static ENROLLMENT_RATE_LIMITED: OnceLock<IntCounter> = OnceLock::new();
+
 // ── Fallback constructors ───────────────────────────────────────────
 //
 // When `init()` has not been called, accessor functions lazily create
@@ -317,6 +319,13 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(client_queue_skipped_unsupported.clone()))?;
     let _ = CLIENT_QUEUE_SKIPPED_UNSUPPORTED.set(client_queue_skipped_unsupported);
 
+    let enrollment_rate_limited = IntCounter::with_opts(Opts::new(
+        "rustgate_enrollment_rate_limited_total",
+        "CSR signing requests rejected by the per-IP rate limiter",
+    ))?;
+    registry.register(Box::new(enrollment_rate_limited.clone()))?;
+    let _ = ENROLLMENT_RATE_LIMITED.set(enrollment_rate_limited);
+
     Ok(())
 }
 
@@ -417,6 +426,15 @@ pub fn handshake_failures() -> &'static IntCounterVec {
     HANDSHAKE_FAILURES.get_or_init(|| {
         fallback_counter_vec("rustgate_handshake_failures_total", "fallback", &["reason"])
     })
+}
+
+/// Counter for CSR signing requests rejected by the enrollment server's
+/// per-IP rate limiter. Wired from a callback registered on
+/// `EnrollmentServer` in `setup::start_enrollment`.
+#[cfg(feature = "enrollment")]
+pub fn enrollment_rate_limited() -> &'static IntCounter {
+    ENROLLMENT_RATE_LIMITED
+        .get_or_init(|| fallback_counter("rustgate_enrollment_rate_limited_total", "fallback"))
 }
 
 /// Returns the client-queue depth gauge vector (Tier 1, registered
