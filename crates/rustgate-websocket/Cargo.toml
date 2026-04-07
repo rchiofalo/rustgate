@@ -21,12 +21,3 @@ tokio-rustls = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tracing = { workspace = true }
 socket2 = { workspace = true }
-
-[dev-dependencies]
-rustgate-test-utils = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
-tokio-tungstenite = { workspace = true }
-tokio-rustls = { workspace = true }
-rustls = { workspace = true }
-rustls-pki-types = { workspace = true }
-futures = { workspace = true }

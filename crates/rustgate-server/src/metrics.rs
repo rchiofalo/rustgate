@@ -431,6 +431,7 @@ pub fn handshake_failures() -> &'static IntCounterVec {
 /// Counter for CSR signing requests rejected by the enrollment server's
 /// per-IP rate limiter. Wired from a callback registered on
 /// `EnrollmentServer` in `setup::start_enrollment`.
+#[cfg(feature = "enrollment")]
 pub fn enrollment_rate_limited() -> &'static IntCounter {
     ENROLLMENT_RATE_LIMITED
         .get_or_init(|| fallback_counter("rustgate_enrollment_rate_limited_total", "fallback"))

@@ -19,8 +19,5 @@ tokio = { workspace = true, features = ["io-util", "time"] }
 tokio-util = { workspace = true }
 prost = { workspace = true }
 
-[dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
-
 [build-dependencies]
 prost-build = { workspace = true }
