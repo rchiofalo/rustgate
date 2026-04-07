@@ -65,6 +65,9 @@ crate = "rustgate-federation"
 [[licenses.exceptions]]
 allow = ["LicenseRef-Proprietary"]
 crate = "rustgate-test-utils"
+[[licenses.exceptions]]
+allow = ["LicenseRef-Proprietary"]
+crate = "rustgate-client"
 
 [bans]
 multiple-versions = "warn"
