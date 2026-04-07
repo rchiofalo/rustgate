@@ -35,7 +35,8 @@ pub type OnNatsPublish = Arc<dyn Fn(RoutableMessage) + Send + Sync>;
 ///
 /// Uses `Fn` (not `AsyncFn`) because `dyn AsyncFn` is not object-safe
 /// as of Rust 1.93. Async work is dispatched via `spawn_background()`.
-pub type OnFederationForward = Arc<dyn Fn(Bytes, Vec<String>) + Send + Sync>;
+pub type OnFederationForward =
+    Arc<dyn Fn(Bytes, Vec<String>, rustgate_core::message::Metadata) + Send + Sync>;
 
 /// Configuration for the WebSocket server.
 pub struct WsServerConfig {
@@ -311,7 +312,7 @@ async fn ws_read_loop(
         }
         if let Some(fwd) = fed_forward {
             let groups: Vec<String> = msg.source.groups.iter().cloned().collect();
-            fwd(msg.payload.clone(), groups);
+            fwd(msg.payload.clone(), groups, msg.metadata.clone());
         }
     }
 }

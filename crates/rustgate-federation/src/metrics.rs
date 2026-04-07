@@ -28,6 +28,8 @@ static RECONNECTS: OnceLock<IntCounter> = OnceLock::new();
 static CIRCUIT_BREAKER_TRIPS: OnceLock<IntCounter> = OnceLock::new();
 static CIRCUIT_BREAKER_RECOVERIES: OnceLock<IntCounter> = OnceLock::new();
 
+static FORWARD_TTL_EXPIRED: OnceLock<IntCounter> = OnceLock::new();
+
 // ── Registration ────────────────────────────────────────────────────
 
 /// Register all federation metrics with the default Prometheus registry.
@@ -117,6 +119,13 @@ pub fn init() -> prometheus::Result<()> {
     ))?;
     registry.register(Box::new(circuit_recoveries.clone()))?;
     let _ = CIRCUIT_BREAKER_RECOVERIES.set(circuit_recoveries);
+
+    let forward_ttl_expired = IntCounter::with_opts(Opts::new(
+        "rustgate_federation_forward_ttl_expired_total",
+        "Messages dropped at the federation forward boundary because their TTL had expired",
+    ))?;
+    registry.register(Box::new(forward_ttl_expired.clone()))?;
+    let _ = FORWARD_TTL_EXPIRED.set(forward_ttl_expired);
 
     Ok(())
 }
@@ -232,6 +241,13 @@ pub fn circuit_breaker_recoveries() -> &'static IntCounter {
     })
 }
 
+/// Messages dropped at the federation forward boundary due to TTL expiry (counter).
+pub fn forward_ttl_expired() -> &'static IntCounter {
+    FORWARD_TTL_EXPIRED.get_or_init(|| {
+        fallback_counter("rustgate_federation_forward_ttl_expired_total", "fallback")
+    })
+}
+
 // ── Snapshot ────────────────────────────────────────────────────────
 
 /// A point-in-time snapshot of all federation metric values.
@@ -251,6 +267,7 @@ pub struct MetricsSnapshot {
     pub reconnects: u64,
     pub circuit_breaker_trips: u64,
     pub circuit_breaker_recoveries: u64,
+    pub forward_ttl_expired: u64,
 }
 
 /// Capture a snapshot of all current federation metric values.
@@ -268,6 +285,7 @@ pub fn snapshot() -> MetricsSnapshot {
         reconnects: reconnects().get(),
         circuit_breaker_trips: circuit_breaker_trips().get(),
         circuit_breaker_recoveries: circuit_breaker_recoveries().get(),
+        forward_ttl_expired: forward_ttl_expired().get(),
     }
 }
 

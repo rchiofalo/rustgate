@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Federation TTL re-check at forward boundary** — the federation manager now re-evaluates each message's TTL immediately before queuing it to peer outbound channels via the new `FederationManager::forward_with_metadata` API. Messages whose `received_at + ttl` has elapsed between local routing and federation forwarding are dropped with a warning instead of consuming peer bandwidth. A new `rustgate_federation_forward_ttl_expired_total` Prometheus counter (under the `api` feature) tracks drops, and the `federation` snapshot endpoint exposes the same value as `forward_ttl_expired`. The legacy `forward(payload, groups)` entrypoint is preserved for callers that have no TTL context. (#554)
+
 ### Added
 
 - **Global admission control / backpressure** — new `--max-queued-bytes` CLI flag (env `RUSTGATE_MAX_QUEUED_BYTES`, default 512 MiB) caps the total in-flight routed bytes tracked across all sessions. When the counter crosses the high-water mark, the TLS accept loop is **deferred** (not errored) until the counter drops back below the low-water mark, which defaults to 90% of the high-water value and is overridable via `--max-queued-bytes-low-water`. Implemented as a shared `BackpressureGate` (AtomicUsize + `tokio::sync::Notify`) wired into `Router::route` via an RAII permit that releases its byte reservation on drop, making accounting panic-safe. Two new Prometheus metrics track the gate: `rustgate_queued_bytes` (gauge) and `rustgate_admission_deferred_total` (counter). Prevents a flood of slow readers from exhausting server memory on top of the existing per-session circuit breakers. (#551)

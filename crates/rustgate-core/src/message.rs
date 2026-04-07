@@ -45,6 +45,23 @@ pub struct Metadata {
     pub ttl: Option<Duration>,
 }
 
+impl Metadata {
+    /// Returns `true` when this message has a TTL and `received_at + ttl`
+    /// is in the past.
+    ///
+    /// Messages without a TTL never expire. A message whose `received_at`
+    /// timestamp is in the future (clock skew) is treated as not expired.
+    pub fn is_expired(&self) -> bool {
+        let Some(ttl) = self.ttl else {
+            return false;
+        };
+        match self.received_at.elapsed() {
+            Ok(elapsed) => elapsed > ttl,
+            Err(_) => false,
+        }
+    }
+}
+
 /// Routing destination for a message.
 #[derive(Debug, Clone)]
 pub enum Destination {
