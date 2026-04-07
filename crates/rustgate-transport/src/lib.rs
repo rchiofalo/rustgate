@@ -1,6 +1,7 @@
 //! TLS transport, session management, and message routing for rustgate.
 
 mod acl;
+pub mod backpressure;
 mod cache;
 pub mod cert_reloader;
 mod codec;
@@ -20,6 +21,9 @@ mod verifier;
 pub mod ocsp;
 
 pub use acl::{GroupAcl, GroupAclPolicy};
+pub use backpressure::{
+    BackpressureGate, BackpressurePermit, DEFAULT_MAX_QUEUED_BYTES, OnBytesChanged, OnDeferred,
+};
 pub use cache::PositionCache;
 pub use cert_reloader::CertReloader;
 pub use codec::{FramedCodec, LengthPrefixedCodec, LineDelimitedCodec, XmlStreamCodec};

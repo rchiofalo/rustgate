@@ -12,6 +12,7 @@ use tokio::sync::{RwLock, mpsc};
 use tracing::{Instrument, debug, warn};
 
 use crate::acl::GroupAclPolicy;
+use crate::backpressure::BackpressureGate;
 use crate::cache::PositionCache;
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
@@ -239,6 +240,7 @@ pub struct Router {
     state: RwLock<State>,
     cache: PositionCache,
     acl: ArcSwap<Option<GroupAclPolicy>>,
+    backpressure: Option<Arc<BackpressureGate>>,
 }
 
 impl Default for Router {
@@ -247,6 +249,7 @@ impl Default for Router {
             state: RwLock::new(State::default()),
             cache: PositionCache::default(),
             acl: ArcSwap::from_pointee(None),
+            backpressure: None,
         }
     }
 }
@@ -270,7 +273,24 @@ impl Router {
             }),
             cache: PositionCache::default(),
             acl: ArcSwap::from_pointee(None),
+            backpressure: None,
         }
+    }
+
+    /// Attach a global admission-control gate to the router.
+    ///
+    /// Every call to [`Router::route`] will acquire a byte-sized permit
+    /// against the gate at entry and release it via RAII when the route
+    /// operation completes, feeding the TLS accept loop's backpressure
+    /// signal.
+    pub fn with_backpressure(mut self, gate: Arc<BackpressureGate>) -> Self {
+        self.backpressure = Some(gate);
+        self
+    }
+
+    /// Reference to the router's admission-control gate, if any.
+    pub fn backpressure(&self) -> Option<&Arc<BackpressureGate>> {
+        self.backpressure.as_ref()
     }
 
     /// Create a new router with a group access control policy.
@@ -283,6 +303,7 @@ impl Router {
             state: RwLock::new(State::default()),
             cache: PositionCache::default(),
             acl: ArcSwap::from_pointee(acl),
+            backpressure: None,
         }
     }
 
@@ -301,6 +322,7 @@ impl Router {
             }),
             cache: PositionCache::default(),
             acl: ArcSwap::from_pointee(acl),
+            backpressure: None,
         }
     }
 
@@ -390,6 +412,14 @@ impl Router {
     }
 
     pub async fn route(&self, msg: RoutableMessage) {
+        // Account for the message's payload in the global backpressure
+        // gate. The permit releases its reservation when this future
+        // returns (successfully or via panic unwind).
+        let _bp_permit = self
+            .backpressure
+            .as_ref()
+            .map(|gate| gate.acquire(msg.payload.len()));
+
         let destination_label = match &msg.destination {
             Destination::Direct(target) => target.cn.as_str(),
             Destination::Group(group) => group.as_ref(),

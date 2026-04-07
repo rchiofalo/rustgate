@@ -295,6 +295,26 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 100, env = "RUSTGATE_MAX_HANDSHAKES", value_parser = parse_nonzero_usize)]
     pub(crate) max_concurrent_handshakes: usize,
 
+    /// Global admission-control high-water mark in bytes. The router tracks
+    /// total in-flight queued bytes across all sessions; when the counter
+    /// crosses this mark, the TLS accept loop is deferred (not errored)
+    /// until the counter drops back below the low-water mark. Prevents a
+    /// flood of slow readers from exhausting server memory.
+    /// Default: 512 MiB.
+    #[arg(
+        long,
+        default_value_t = rustgate_transport::DEFAULT_MAX_QUEUED_BYTES,
+        env = "RUSTGATE_MAX_QUEUED_BYTES"
+    )]
+    pub(crate) max_queued_bytes: usize,
+
+    /// Optional low-water mark (in bytes) for the admission-control gate.
+    /// When the queued-bytes counter drops at or below this value after
+    /// crossing the high-water mark, the accept loop resumes. Defaults to
+    /// 90% of `--max-queued-bytes` when omitted.
+    #[arg(long, env = "RUSTGATE_MAX_QUEUED_BYTES_LOW_WATER")]
+    pub(crate) max_queued_bytes_low_water: Option<usize>,
+
     /// Bind address for the WebSocket (wss://) listener (e.g. 0.0.0.0:8443).
     /// Requires --features websocket.
     #[arg(long, env = "RUSTGATE_WEBSOCKET_BIND", value_parser = parse_socket_addr)]
@@ -663,6 +683,8 @@ define_config_file! {
     metrics_identity_allowlist: Option<std::path::PathBuf>,
     max_connections: usize,
     max_concurrent_handshakes: usize,
+    max_queued_bytes: usize,
+    max_queued_bytes_low_water: Option<usize>,
     websocket_bind: Option<String>,
     ws_max_frames_per_sec: u32,
     ws_max_bytes_per_sec: u64,

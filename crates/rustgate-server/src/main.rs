@@ -32,7 +32,7 @@ mod session;
 mod setup;
 
 use cli::{Cli, Command};
-use rustgate_transport::Router;
+use rustgate_transport::{BackpressureGate, Router};
 use session::{FedForwardFn, SessionDeps};
 
 fn main() -> anyhow::Result<()> {
@@ -210,10 +210,40 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     // CLI validation ensures max_connections is 1..=u32::MAX
     let max_connections: u32 = cli.max_connections as u32;
     let (group_acl, acl_file_hash, acl_file_parsed) = setup::load_group_acl(&cli).await?;
-    let router = Arc::new(match group_acl {
-        Some(acl) => Router::with_acl(acl),
-        None => Router::new(),
-    });
+    // ── Global admission control / backpressure gate ─────────────
+    let mut backpressure_gate = BackpressureGate::with_limits(
+        cli.max_queued_bytes,
+        cli.max_queued_bytes_low_water
+            .unwrap_or_else(|| cli.max_queued_bytes.saturating_mul(9) / 10),
+    );
+    #[cfg(feature = "metrics")]
+    {
+        BackpressureGate::set_on_deferred(
+            &mut backpressure_gate,
+            Arc::new(|| {
+                metrics::admission_deferred_total().inc();
+            }),
+        );
+        BackpressureGate::set_on_bytes_changed(
+            &mut backpressure_gate,
+            Arc::new(|n| {
+                metrics::queued_bytes().set(n as i64);
+            }),
+        );
+    }
+    tracing::info!(
+        max_queued_bytes = backpressure_gate.high_water(),
+        low_water_bytes = backpressure_gate.low_water(),
+        "admission control enabled"
+    );
+
+    let router = Arc::new(
+        (match group_acl {
+            Some(acl) => Router::with_acl(acl),
+            None => Router::new(),
+        })
+        .with_backpressure(Arc::clone(&backpressure_gate)),
+    );
 
     // ── ACL hot-reload ─────────────────────────────────────────────
     //
@@ -424,6 +454,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     // ── Accept loop ─────────────────────────────────────────────────
     loop {
+        // Global backpressure: park the accept loop while the router's
+        // in-flight byte counter is over the high-water mark. Connections
+        // are deferred (not errored) until the counter drops back below
+        // the low-water mark.
+        backpressure_gate.wait_for_capacity().await;
+
         tokio::select! {
             accept_result = listener.accept() => {
                 match accept_result {
