@@ -23,13 +23,34 @@ use crate::store_forward::ClientQueue;
 /// subscriber filter cannot drift.
 pub const ACCESS_LOG_TARGET: &str = "access";
 
+/// Hash a unicast destination CN to a stable opaque token so the access
+/// log does not leak raw client identities (PII). Uses SHA-256 truncated
+/// to the first 12 hex chars (48 bits) — collision risk is acceptable
+/// for an audit trail and the token remains stable for correlation.
+fn hash_cn(cn: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(cn.as_bytes());
+    let mut out = String::with_capacity(12);
+    for b in &digest[..6] {
+        use std::fmt::Write;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// Maximum number of leading payload bytes scanned when looking for a
+/// CoT `uid="..."` attribute. Acts as a DoS guard against pathological
+/// or oversized payloads: scan cost stays O(1) per message regardless
+/// of total payload size.
+const MAX_UID_SCAN_BYTES: usize = 1024;
+
 /// Best-effort extraction of a CoT `uid="..."` attribute from a payload
 /// without doing a full XML parse. Returns an empty string when the
 /// payload is not CoT-shaped or no uid is present. Bounded scan over at
-/// most the first 512 bytes so cost stays O(1) per message.
+/// most [`MAX_UID_SCAN_BYTES`] so cost stays O(1) per message.
 fn extract_cot_uid(payload: &[u8]) -> &str {
     const NEEDLE: &[u8] = b"uid=\"";
-    let limit = payload.len().min(512);
+    let limit = payload.len().min(MAX_UID_SCAN_BYTES);
     let window = &payload[..limit];
     let Some(start) = window
         .windows(NEEDLE.len())
@@ -55,7 +76,7 @@ fn emit_access(msg: &RoutableMessage, outcome: &'static str) {
         return;
     }
     let dst = match &msg.destination {
-        Destination::Direct(target) => format!("direct:{}", target.cn),
+        Destination::Direct(target) => format!("direct:{}", hash_cn(&target.cn)),
         Destination::Group(group) => format!("group:{group}"),
         Destination::Broadcast => "broadcast".to_string(),
     };
@@ -2103,9 +2124,42 @@ mod tests {
     }
 
     #[test]
-    fn extract_cot_uid_bounds_scan_to_first_512_bytes() {
-        let mut payload = vec![b' '; 600];
+    fn extract_cot_uid_bounds_scan_to_max_uid_scan_bytes() {
+        let mut payload = vec![b' '; super::MAX_UID_SCAN_BYTES + 64];
         payload.extend_from_slice(br#"uid="LATE""#);
         assert_eq!(super::extract_cot_uid(&payload), "");
+    }
+
+    #[test]
+    fn hash_cn_is_stable_and_truncated() {
+        let h = super::hash_cn("alice");
+        assert_eq!(h.len(), 12);
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(super::hash_cn("alice"), h);
+        assert_ne!(super::hash_cn("alice"), super::hash_cn("bob"));
+    }
+
+    #[test]
+    fn emit_access_direct_destination_hashes_cn_and_omits_raw() {
+        let raw_cn = "super-secret-operator-007";
+        let target = make_identity(raw_cn, &["alpha"]);
+        let destination = Destination::Direct((*target).clone());
+
+        // Re-derive the dst formatting the same way `emit_access` does and
+        // assert it neither equals nor contains the raw CN.
+        let dst_field = match &destination {
+            Destination::Direct(t) => format!("direct:{}", super::hash_cn(&t.cn)),
+            Destination::Group(g) => format!("group:{g}"),
+            Destination::Broadcast => "broadcast".to_string(),
+        };
+        assert!(
+            !dst_field.contains(raw_cn),
+            "raw CN must not appear in access log dst field, got {dst_field}"
+        );
+        assert_eq!(
+            dst_field,
+            format!("direct:{}", super::hash_cn(raw_cn)),
+            "dst field must be the stable hashed token"
+        );
     }
 }

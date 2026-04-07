@@ -118,9 +118,15 @@ async fn access_log_emits_json_line_per_routed_message() {
         captured.contains("\"src_cn\":\"bob\""),
         "expected src_cn field, got: {captured}"
     );
+    // Direct destinations must hash the CN to a stable opaque token so the
+    // access log does not leak raw client identities.
     assert!(
-        captured.contains("\"dst\":\"direct:alice\""),
-        "expected dst field, got: {captured}"
+        !captured.contains("\"dst\":\"direct:alice\""),
+        "raw CN must not appear in access log dst field, got: {captured}"
+    );
+    assert!(
+        captured.contains("\"dst\":\"direct:"),
+        "expected hashed direct dst field, got: {captured}"
     );
     assert!(
         captured.contains("\"msg_uid\":\"ACCESS-1\""),
