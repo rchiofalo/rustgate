@@ -20,7 +20,7 @@
 //!     .build()?;
 //!
 //! let client = Client::connect(config).await?;
-//! let mut stream = client.subscribe("default");
+//! let mut stream = client.subscribe();
 //!
 //! client.send(Bytes::from_static(b"hello")).await?;
 //!
