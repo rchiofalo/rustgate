@@ -199,6 +199,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     });
 
     // ── Cross-path deduplication ───────────────────────────────────
+    #[cfg_attr(not(feature = "metrics"), allow(unused_mut))]
     if let Some(mut dedup) =
         rustgate_transport::DedupCache::from_secs(cli.dedup_window_secs, cli.dedup_cache_size)
     {
@@ -206,6 +207,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         {
             dedup.set_on_duplicate(std::sync::Arc::new(|| {
                 metrics::dedup_hits().inc();
+            }));
+            dedup.set_on_insert(std::sync::Arc::new(|len| {
+                metrics::dedup_cache_size().set(len as i64);
             }));
         }
         router.set_dedup(Some(dedup));
