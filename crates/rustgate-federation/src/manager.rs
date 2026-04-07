@@ -977,6 +977,23 @@ impl FederationManager {
         self.peers.values().map(|p| p.status()).collect()
     }
 
+    /// Snapshot per-peer outbound queue lag for metrics export.
+    ///
+    /// Returns a vector of `(peer_id, queue_bytes, oldest_age_seconds)`
+    /// tuples. `oldest_age_seconds` is `0.0` when the peer's queue is empty.
+    pub fn peer_lag_snapshot(&self) -> Vec<(String, u64, f64)> {
+        self.peers
+            .iter()
+            .map(|(id, p)| {
+                (
+                    id.to_string(),
+                    p.queue_bytes(),
+                    p.oldest_queued_age_secs().unwrap_or(0.0),
+                )
+            })
+            .collect()
+    }
+
     /// Get the live trust store, if one is configured.
     ///
     /// The returned `Arc<TrustStore>` is the same instance used by the

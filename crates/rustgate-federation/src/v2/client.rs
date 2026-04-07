@@ -104,11 +104,13 @@ impl V2Client {
 
     /// Send a FederatedEvent to the remote peer.
     pub async fn send(&self, event: figpb::FederatedEvent) -> anyhow::Result<()> {
-        self.outbound_tx
-            .send(event)
-            .await
-            .map_err(|_| anyhow::anyhow!("outbound channel closed"))?;
-        self.peer.record_sent();
+        use prost::Message;
+        let bytes_len = event.encoded_len();
+        self.peer.record_enqueue(bytes_len);
+        if self.outbound_tx.send(event).await.is_err() {
+            self.peer.record_dequeue();
+            return Err(anyhow::anyhow!("outbound channel closed"));
+        }
         Ok(())
     }
 
@@ -496,6 +498,7 @@ async fn run_streams(
 
             // Forward outbound events to remote
             Some(event) = outbound_rx.recv() => {
+                peer.record_dequeue();
                 if send_tx.send(event).await.is_err() {
                     warn!(peer = %peer.id, "send stream closed");
                     break;

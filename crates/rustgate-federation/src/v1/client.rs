@@ -111,10 +111,16 @@ impl V1Client {
     ///
     /// Returns an error if the send channel is full or the client is shut down.
     pub async fn send(&self, data: Bytes) -> anyhow::Result<()> {
-        self.outbound_tx
-            .send(data)
-            .await
-            .map_err(|_| anyhow::anyhow!("V1 client send channel closed"))
+        let bytes_len = data.len();
+        self.peer.record_enqueue(bytes_len);
+        match self.outbound_tx.send(data).await {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                // Send failed before delivery — undo the enqueue accounting.
+                self.peer.record_dequeue();
+                Err(anyhow::anyhow!("V1 client send channel closed"))
+            }
+        }
     }
 
     /// Get the current peer state.
@@ -350,6 +356,7 @@ async fn run_session(
                 match msg {
                     Some(data) => {
                         let buf = BytesMut::from(data.as_ref());
+                        peer.record_dequeue();
                         framed.send(buf).await
                             .map_err(|e| anyhow::anyhow!("write error: {e}"))?;
                         peer.record_sent();

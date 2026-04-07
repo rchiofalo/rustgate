@@ -829,6 +829,17 @@ pub(crate) async fn start_federation(
     #[cfg(feature = "metrics")]
     wire_federation_api(cli, &rwlock, fed_api_slot)?;
 
+    #[cfg(feature = "metrics")]
+    {
+        // Detached task; runs until process exit. We intentionally drop
+        // the JoinHandle here.
+        let handle = metrics::spawn_federation_lag_updater(
+            Arc::clone(&rwlock),
+            std::time::Duration::from_secs(1),
+        );
+        std::mem::drop(handle);
+    }
+
     #[cfg(feature = "federation-ha")]
     setup_ha_handlers(&rwlock).await;
 

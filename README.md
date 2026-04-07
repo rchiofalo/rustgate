@@ -419,6 +419,22 @@ in `identity_cn`-labelled series. Byte counters report **application payload
 bytes** (post-decode / pre-encode), not wire bytes — they exclude TLS,
 framing, and codec overhead.
 
+### Per-peer federation lag
+
+When the `federation` and `metrics` features are both enabled, two
+gauges expose how far behind each federation peer is, so operators can
+spot cascading backpressure:
+
+- `rustgate_federation_peer_queue_bytes{peer="..."}` — bytes currently
+  queued on the peer's outbound channel.
+- `rustgate_federation_peer_oldest_seconds{peer="..."}` — age in seconds
+  of the oldest message still waiting for delivery (`0` when the queue
+  is empty).
+
+Both gauges are refreshed once per second by a background task that
+snapshots the federation manager. Labels for peers that disappear are
+removed on the following tick.
+
 ## Docker
 
 ```bash
