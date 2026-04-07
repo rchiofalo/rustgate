@@ -6,6 +6,7 @@
 //! Messages are explicitly acknowledged after successful processing.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_nats::jetstream;
 use async_nats::jetstream::consumer::AckPolicy;
@@ -17,21 +18,73 @@ use tracing::Instrument;
 use crate::config::NatsConfig;
 use crate::serde_compat::WireEvent;
 
+/// Default interval between JetStream consumer lag polls.
+const DEFAULT_LAG_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Snapshot of JetStream pull-consumer lag indicators.
+///
+/// Captured periodically from `consumer.info()` and forwarded to a
+/// caller-supplied [`LagCallback`] so the `rustgate-nats` crate can stay
+/// free of any Prometheus / metrics dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LagSnapshot {
+    /// Messages pending delivery to the consumer (`num_pending`).
+    pub num_pending: u64,
+    /// Number of messages that have been redelivered.
+    pub num_redelivered: u64,
+    /// Stream sequence of the highest contiguous ACK
+    /// (`ack_floor.stream_seq`).
+    pub ack_floor_stream_seq: u64,
+}
+
+/// Callback invoked with the latest [`LagSnapshot`] each poll cycle.
+///
+/// Wired by the binary crate to publish the values as Prometheus gauges,
+/// keeping `rustgate-nats` agnostic of the metrics backend.
+pub type LagCallback = Arc<dyn Fn(LagSnapshot) + Send + Sync>;
+
 /// Receives messages from NATS via a JetStream pull consumer and delivers
 /// them to local sessions.
 ///
 /// Runs as a background task. Creates (or fetches) a JetStream stream
 /// capturing `{prefix}.>` subjects, then creates a durable pull consumer
 /// for explicit-ACK message delivery with real backpressure.
-#[derive(Debug)]
 pub struct NatsSubscriber {
     client: async_nats::Client,
     config: NatsConfig,
+    lag_callback: Option<LagCallback>,
+    lag_poll_interval: Duration,
+}
+
+impl std::fmt::Debug for NatsSubscriber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NatsSubscriber")
+            .field("config", &self.config)
+            .field("lag_callback", &self.lag_callback.is_some())
+            .field("lag_poll_interval", &self.lag_poll_interval)
+            .finish()
+    }
 }
 
 impl NatsSubscriber {
     pub fn new(client: async_nats::Client, config: NatsConfig) -> Self {
-        Self { client, config }
+        Self {
+            client,
+            config,
+            lag_callback: None,
+            lag_poll_interval: DEFAULT_LAG_POLL_INTERVAL,
+        }
+    }
+
+    /// Register a callback that will receive a [`LagSnapshot`] every
+    /// `interval` while the subscriber is running. Pass `None` for
+    /// `interval` to use the default polling cadence.
+    pub fn with_lag_callback(mut self, callback: LagCallback, interval: Option<Duration>) -> Self {
+        self.lag_callback = Some(callback);
+        if let Some(i) = interval {
+            self.lag_poll_interval = i;
+        }
+        self
     }
 
     /// Ensure the live-update JetStream stream exists, creating it if needed.
@@ -100,6 +153,15 @@ impl NatsSubscriber {
         let js = jetstream::new(self.client.clone());
         let stream = self.ensure_stream(&js).await?;
         let consumer = self.ensure_consumer(&stream).await?;
+
+        // Spawn the lag-poll task before draining messages so the first
+        // observation lands shortly after startup. The task is aborted
+        // when the subscriber returns.
+        let lag_task = self
+            .lag_callback
+            .as_ref()
+            .map(|cb| spawn_lag_poller(consumer.clone(), Arc::clone(cb), self.lag_poll_interval));
+        let _lag_guard = lag_task.map(LagPollerGuard);
 
         let mut messages = consumer.messages().await?;
 
@@ -222,6 +284,45 @@ impl NatsSubscriber {
     }
 }
 
+/// Aborts the lag-poll task on drop so it cannot outlive the subscriber.
+struct LagPollerGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for LagPollerGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Spawn a background task that periodically calls `consumer.info()` and
+/// forwards the lag indicators to `callback`. Errors from `info()` are
+/// logged at `debug` and do not stop the loop.
+fn spawn_lag_poller(
+    mut consumer: jetstream::consumer::Consumer<jetstream::consumer::pull::Config>,
+    callback: LagCallback,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            let _ = ticker.tick().await;
+            match consumer.info().await {
+                Ok(info) => {
+                    let snapshot = LagSnapshot {
+                        num_pending: info.num_pending,
+                        num_redelivered: info.num_redelivered as u64,
+                        ack_floor_stream_seq: info.ack_floor.stream_sequence,
+                    };
+                    callback(snapshot);
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "JetStream consumer.info() failed");
+                }
+            }
+        }
+    })
+}
+
 /// Extract the group segment from a NATS subject.
 ///
 /// Expected format: `"{prefix}.{group}.{action}"` (e.g., `"points.ALPHA.update"`).
@@ -242,7 +343,40 @@ fn extract_group_from_subject(subject: &str, prefix: &str, default: &str) -> Str
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn lag_snapshot_fields_round_trip() {
+        let snap = LagSnapshot {
+            num_pending: 42,
+            num_redelivered: 7,
+            ack_floor_stream_seq: 1234,
+        };
+        let copy = snap;
+        assert_eq!(copy.num_pending, 42);
+        assert_eq!(copy.num_redelivered, 7);
+        assert_eq!(copy.ack_floor_stream_seq, 1234);
+    }
+
+    #[test]
+    fn lag_callback_invoked_with_snapshot() {
+        use std::sync::Mutex;
+        let captured: Arc<Mutex<Option<LagSnapshot>>> = Arc::new(Mutex::new(None));
+        let captured_cb = Arc::clone(&captured);
+        let cb: LagCallback = Arc::new(move |snap| {
+            *captured_cb.lock().unwrap() = Some(snap);
+        });
+        cb(LagSnapshot {
+            num_pending: 9,
+            num_redelivered: 1,
+            ack_floor_stream_seq: 100,
+        });
+        let got = captured.lock().unwrap().unwrap();
+        assert_eq!(got.num_pending, 9);
+        assert_eq!(got.num_redelivered, 1);
+        assert_eq!(got.ack_floor_stream_seq, 100);
+    }
 
     #[test]
     fn extract_group_standard() {

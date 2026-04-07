@@ -393,6 +393,21 @@ incremented. The current cache occupancy is exposed as
 (default 100 000 entries, oldest evicted in LRU order). Disabled by
 default.
 
+### NATS JetStream consumer lag metrics
+
+When built with `--features metrics,nats` and `--nats-url` is configured,
+the NATS pull-consumer subscriber polls `consumer.info()` every five
+seconds and exports three gauges so operators can alert on cross-instance
+bridge lag and redelivery storms:
+
+- `rustgate_nats_consumer_pending` — messages pending delivery to this
+  instance's pull consumer (`num_pending`).
+- `rustgate_nats_consumer_num_redelivered` — current count of messages in
+  a redelivered state (`num_redelivered`).
+- `rustgate_nats_consumer_ack_floor_stream_seq` — stream sequence of the
+  highest contiguous ACK (`ack_floor.stream_seq`); a flat value while
+  `pending` grows indicates the consumer is stuck.
+
 ### Per-identity metrics (bounded cardinality)
 
 `messages_routed_total` and `messages_dropped_total` carry an
