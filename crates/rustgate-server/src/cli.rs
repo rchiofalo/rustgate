@@ -708,6 +708,8 @@ define_config_file! {
     audit_log: Option<String>,
     otel_endpoint: Option<String>,
     otel_service_name: String,
+    dedup_window_secs: u64,
+    dedup_cache_size: usize,
 }
 
 impl Cli {
