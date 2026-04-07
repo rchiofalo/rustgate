@@ -379,6 +379,20 @@ pub(crate) struct Cli {
     #[arg(long, env = "RUSTGATE_FEDERATION_PEERS_FILE")]
     pub(crate) federation_peers_file: Option<String>,
 
+    /// Interval in seconds to poll the federation peers file for changes.
+    /// When set to a value > 0 and `--federation-peers-file` is provided,
+    /// the server periodically re-reads the peers file and reconciles the
+    /// active peer set on change (adds new peers, gracefully disconnects
+    /// removed peers, leaves unchanged peers untouched). SIGHUP also
+    /// triggers a reconcile when this is configured.
+    /// Set to 0 (default) to disable automatic federation peer reloading.
+    #[arg(
+        long,
+        default_value_t = 0,
+        env = "RUSTGATE_FEDERATION_PEERS_RELOAD_INTERVAL"
+    )]
+    pub(crate) federation_peers_reload_interval: u64,
+
     /// Skip TLS hostname verification for federation peers.
     #[arg(
         long,
@@ -725,6 +739,7 @@ define_config_file! {
     federation_v2_bind: Option<String>,
     federation_id: String,
     federation_peers_file: Option<String>,
+    federation_peers_reload_interval: u64,
     federation_skip_hostname_verify: bool,
     federation_max_hops: u32,
     federation_store_path: Option<String>,

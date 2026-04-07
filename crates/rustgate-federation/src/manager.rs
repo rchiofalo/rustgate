@@ -139,6 +139,31 @@ impl std::fmt::Debug for FederationManager {
     }
 }
 
+/// Summary of changes applied by [`FederationManager::swap_peers`].
+#[derive(Debug, Default, Clone)]
+pub struct PeerSwapDiff {
+    /// Peer IDs newly added.
+    pub added: Vec<PeerId>,
+    /// Peer IDs removed (and disconnected).
+    pub removed: Vec<PeerId>,
+    /// Peer IDs whose configuration was unchanged.
+    pub unchanged: Vec<PeerId>,
+    /// Peer IDs that failed to start (logged + skipped).
+    pub failed: Vec<PeerId>,
+}
+
+/// Structural equality of two peer configurations for hot-reload diffing.
+fn peers_equal(a: &crate::config::PeerConfig, b: &crate::config::PeerConfig) -> bool {
+    a.id == b.id
+        && a.address == b.address
+        && a.groups == b.groups
+        && a.inbound_groups == b.inbound_groups
+        && a.outbound_groups == b.outbound_groups
+        && a.enabled == b.enabled
+        && a.is_outbound == b.is_outbound
+        && a.protocol_version == b.protocol_version
+}
+
 impl FederationManager {
     /// Create a new federation manager from configuration.
     ///
@@ -1151,9 +1176,8 @@ impl FederationManager {
     /// Connect a single outbound peer, creating its client and PeerHandle.
     ///
     /// Requires that `start()` has been called (connector, on_inbound, etc. are set).
-    /// Used by both `start()` loop (indirectly) and `adopt_peer()`.
-    #[cfg(feature = "ha")]
-    fn connect_outbound_peer(
+    /// Used by `adopt_peer()` (HA), `add_peer()`, and `swap_peers()` (hot reload).
+    pub fn connect_outbound_peer(
         &mut self,
         peer_config: &crate::config::PeerConfig,
     ) -> anyhow::Result<()> {
@@ -1352,11 +1376,11 @@ impl FederationManager {
         Ok(())
     }
 
-    /// Disconnect a peer whose claim was lost to another pod.
+    /// Disconnect a peer cleanly.
     ///
-    /// Stops the outbound client, removes the peer handle, unregisters from the
-    /// HA connection registry, and releases the claim.
-    #[cfg(feature = "ha")]
+    /// Stops the outbound client, removes the peer handle and replay buffer.
+    /// When HA is enabled, also unregisters from the HA connection registry
+    /// and releases the claim.
     pub async fn disconnect_peer(&mut self, peer_id: &PeerId) {
         // Remove and shut down the client
         if let Some(client) = self.clients.remove(peer_id.as_str()) {
@@ -1381,19 +1405,125 @@ impl FederationManager {
         // Clean up the replay buffer for this peer
         self.remove_replay_buffer(peer_id.as_str());
 
-        // Unregister from connection registry
-        if let Some(ref cr) = self.connection_registry
-            && let Err(e) = cr.unregister(peer_id.as_str()).await
+        // Unregister from connection registry / release claim (HA only)
+        #[cfg(feature = "ha")]
         {
-            warn!(peer_id = %peer_id, error = %e, "failed to unregister connection");
+            if let Some(ref cr) = self.connection_registry
+                && let Err(e) = cr.unregister(peer_id.as_str()).await
+            {
+                warn!(peer_id = %peer_id, error = %e, "failed to unregister connection");
+            }
+
+            if let Some(ref cm) = self.claim_manager
+                && let Err(e) = cm.release(peer_id.as_str()).await
+            {
+                warn!(peer_id = %peer_id, error = %e, "failed to release claim");
+            }
+        }
+    }
+
+    // ── Hot reload ────────────────────────────────────────────────────
+
+    /// Add (or replace) a single outbound peer at runtime.
+    ///
+    /// If the peer already exists in the configured set with the same id,
+    /// it is first disconnected and then reconnected with the new config.
+    /// Disabled or inbound-only peers are stored in config but no client
+    /// is started for them.
+    pub async fn add_peer(&mut self, peer_config: crate::config::PeerConfig) -> anyhow::Result<()> {
+        let id = peer_config.id.clone();
+
+        if self.clients.contains_key(id.as_str()) {
+            self.disconnect_peer(&id).await;
         }
 
-        // Release claim
-        if let Some(ref cm) = self.claim_manager
-            && let Err(e) = cm.release(peer_id.as_str()).await
-        {
-            warn!(peer_id = %peer_id, error = %e, "failed to release claim");
+        if let Some(slot) = self.config.peers.iter_mut().find(|p| p.id == id) {
+            *slot = peer_config.clone();
+        } else {
+            self.config.peers.push(peer_config.clone());
         }
+
+        if !peer_config.enabled || !peer_config.is_outbound {
+            info!(peer_id = %id, "peer added (no outbound client started)");
+            return Ok(());
+        }
+
+        if !self.running {
+            info!(peer_id = %id, "peer added; client will start when manager starts");
+            return Ok(());
+        }
+
+        self.connect_outbound_peer(&peer_config)?;
+        info!(peer_id = %id, "peer added and outbound client started");
+        Ok(())
+    }
+
+    /// Remove a peer from the configuration and disconnect it cleanly.
+    ///
+    /// Returns `true` if the peer was present in the configured set.
+    pub async fn remove_peer(&mut self, peer_id: &str) -> bool {
+        let pid = PeerId::from(peer_id.to_string());
+        self.disconnect_peer(&pid).await;
+        let before = self.config.peers.len();
+        self.config.peers.retain(|p| p.id.as_str() != peer_id);
+        before != self.config.peers.len()
+    }
+
+    /// Atomically reconcile the configured peer set against `new_peers`.
+    ///
+    /// Peers present in `new_peers` but not currently configured are added
+    /// (and connected if enabled+outbound). Peers no longer in `new_peers`
+    /// are disconnected and removed. Peers whose configuration changed are
+    /// disconnected and reconnected with the new settings.
+    pub async fn swap_peers(&mut self, new_peers: Vec<crate::config::PeerConfig>) -> PeerSwapDiff {
+        let mut diff = PeerSwapDiff::default();
+
+        let new_ids: std::collections::HashSet<String> = new_peers
+            .iter()
+            .map(|p| p.id.as_str().to_string())
+            .collect();
+
+        let removed: Vec<String> = self
+            .config
+            .peers
+            .iter()
+            .filter(|p| !new_ids.contains(p.id.as_str()))
+            .map(|p| p.id.as_str().to_string())
+            .collect();
+        for id in removed {
+            if self.remove_peer(&id).await {
+                diff.removed.push(PeerId::from(id));
+            }
+        }
+
+        for peer in new_peers {
+            let existing = self.config.peers.iter().find(|p| p.id == peer.id).cloned();
+            match existing {
+                Some(prev) if peers_equal(&prev, &peer) => {
+                    diff.unchanged.push(peer.id.clone());
+                }
+                _ => {
+                    let id = peer.id.clone();
+                    match self.add_peer(peer).await {
+                        Ok(()) => diff.added.push(id),
+                        Err(e) => {
+                            warn!(peer_id = %id, error = %e, "failed to add peer during swap");
+                            diff.failed.push(id);
+                        }
+                    }
+                }
+            }
+        }
+
+        info!(
+            added = diff.added.len(),
+            removed = diff.removed.len(),
+            unchanged = diff.unchanged.len(),
+            failed = diff.failed.len(),
+            "federation peer set reconciled"
+        );
+
+        diff
     }
 
     /// Take the HA event receivers (adoption and claim-lost channels).
@@ -2364,5 +2494,85 @@ mod tests {
 
         let buffers = manager.replay_buffers.lock().expect("lock");
         assert!(buffers.is_empty());
+    }
+
+    // ── Hot reload (swap_peers) tests ────────────────────────────────
+
+    #[tokio::test]
+    async fn swap_peers_adds_new_peer_to_config_when_not_running() {
+        let mut manager = FederationManager::new(test_config());
+        let new_peers = vec![
+            test_peer_config("alpha", vec!["g1".into()]),
+            test_peer_config("beta", vec!["g2".into()]),
+        ];
+        let diff = manager.swap_peers(new_peers).await;
+        assert_eq!(diff.added.len(), 2);
+        assert_eq!(diff.removed.len(), 0);
+        assert_eq!(manager.config().peers.len(), 2);
+        assert_eq!(manager.peer_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn swap_peers_removes_peers_no_longer_in_set() {
+        let mut config = test_config();
+        config.peers = vec![
+            test_peer_config("alpha", vec!["g1".into()]),
+            test_peer_config("beta", vec!["g2".into()]),
+        ];
+        let mut manager = FederationManager::new(config);
+
+        let diff = manager
+            .swap_peers(vec![test_peer_config("beta", vec!["g2".into()])])
+            .await;
+        assert_eq!(diff.removed.len(), 1);
+        assert_eq!(diff.removed[0].as_str(), "alpha");
+        assert_eq!(diff.unchanged.len(), 1);
+        assert_eq!(manager.config().peers.len(), 1);
+        assert_eq!(manager.config().peers[0].id.as_str(), "beta");
+    }
+
+    #[tokio::test]
+    async fn swap_peers_reports_unchanged_peers() {
+        let mut config = test_config();
+        config.peers = vec![test_peer_config("alpha", vec!["g1".into()])];
+        let mut manager = FederationManager::new(config);
+
+        let diff = manager
+            .swap_peers(vec![test_peer_config("alpha", vec!["g1".into()])])
+            .await;
+        assert_eq!(diff.added.len(), 0);
+        assert_eq!(diff.removed.len(), 0);
+        assert_eq!(diff.unchanged.len(), 1);
+        assert_eq!(diff.unchanged[0].as_str(), "alpha");
+    }
+
+    #[tokio::test]
+    async fn swap_peers_replaces_peer_when_address_changes() {
+        let mut config = test_config();
+        config.peers = vec![test_peer_config("alpha", vec!["g1".into()])];
+        let mut manager = FederationManager::new(config);
+
+        let mut updated = test_peer_config("alpha", vec!["g1".into()]);
+        updated.address = "127.0.0.1:9999".into();
+        let diff = manager.swap_peers(vec![updated]).await;
+        assert_eq!(diff.added.len(), 1);
+        assert_eq!(manager.config().peers.len(), 1);
+        assert_eq!(manager.config().peers[0].address, "127.0.0.1:9999");
+    }
+
+    #[tokio::test]
+    async fn remove_peer_returns_false_for_unknown() {
+        let mut manager = FederationManager::new(test_config());
+        assert!(!manager.remove_peer("ghost").await);
+    }
+
+    #[tokio::test]
+    async fn add_peer_inserts_into_config() {
+        let mut manager = FederationManager::new(test_config());
+        let mut p = test_peer_config("alpha", vec!["g1".into()]);
+        p.is_outbound = false;
+        manager.add_peer(p).await.expect("add_peer");
+        assert_eq!(manager.config().peers.len(), 1);
+        assert_eq!(manager.config().peers[0].id.as_str(), "alpha");
     }
 }
