@@ -215,6 +215,28 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         None => Router::new(),
     });
 
+    // ── Cross-path deduplication ───────────────────────────────────
+    #[cfg_attr(not(feature = "metrics"), allow(unused_mut))]
+    if let Some(mut dedup) =
+        rustgate_transport::DedupCache::from_secs(cli.dedup_window_secs, cli.dedup_cache_size)
+    {
+        #[cfg(feature = "metrics")]
+        {
+            dedup.set_on_duplicate(std::sync::Arc::new(|| {
+                metrics::dedup_hits().inc();
+            }));
+            dedup.set_on_insert(std::sync::Arc::new(|len| {
+                metrics::dedup_cache_size().set(len as i64);
+            }));
+        }
+        router.set_dedup(Some(dedup));
+        tracing::info!(
+            window_secs = cli.dedup_window_secs,
+            cache_size = cli.dedup_cache_size,
+            "cross-path message deduplication enabled"
+        );
+    }
+
     // ── ACL hot-reload ─────────────────────────────────────────────
     //
     // We always construct an `AclReloader` when an ACL file is configured

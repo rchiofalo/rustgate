@@ -167,7 +167,7 @@ fn message_key(payload: &[u8]) -> Option<u64> {
 /// Searches for `name="value"` or `name='value'` in the first 512 bytes.
 /// Uses a forward scan with quote-state tracking to avoid matching attribute
 /// names that appear inside another attribute's quoted value.
-fn extract_xml_attr<'a>(payload: &'a [u8], attr: &[u8]) -> Option<&'a [u8]> {
+pub(crate) fn extract_xml_attr<'a>(payload: &'a [u8], attr: &[u8]) -> Option<&'a [u8]> {
     let search_limit = payload.len().min(512);
     let haystack = &payload[..search_limit];
     let attr_len = attr.len();

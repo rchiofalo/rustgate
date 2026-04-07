@@ -356,6 +356,8 @@ All flags support environment variables (CLI takes precedence):
 | `--federation-ha-nats-url` | `RUSTGATE_FEDERATION_HA_NATS_URL` | — |
 | `--federation-pod-id` | `RUSTGATE_FEDERATION_POD_ID` | — |
 | `--replay-window` | `RUSTGATE_REPLAY_WINDOW` | `300` |
+| `--dedup-window-secs` | `RUSTGATE_DEDUP_WINDOW_SECS` | `0` (disabled) |
+| `--dedup-cache-size` | `RUSTGATE_DEDUP_CACHE_SIZE` | `100000` |
 | `--client-msg-rate` | `RUSTGATE_CLIENT_MSG_RATE` | `0` (disabled) |
 | `--client-burst` | `RUSTGATE_CLIENT_BURST` | `200` |
 | `--circuit-breaker-threshold` | `RUSTGATE_CIRCUIT_BREAKER_THRESHOLD` | `10` |
@@ -367,6 +369,25 @@ All flags support environment variables (CLI takes precedence):
 | `--otel-service-name` | `OTEL_SERVICE_NAME` | `rustgate` |
 
 </details>
+
+### Cross-path deduplication
+
+When the same logical message reaches the server via more than one
+ingress path — for example, a directly-connected client and a federation
+peer that forwarded the same event — subscribers would normally receive
+two copies. Setting `--dedup-window-secs` to a non-zero value enables a
+router-level LRU cache keyed by
+`SHA-256(uid || 0x00 || time_le || 0x00 || payload)`. For CoT XML the
+`uid` attribute is extracted from the payload; for non-CoT payloads
+(protobuf, raw binary) `uid` is empty and the key degenerates to a
+pure content hash so byte-identical payloads are still deduped. The
+router consults the cache before dispatching a message; if the same
+key was already seen within the window, the duplicate is dropped before
+it reaches any subscriber and the `rustgate_dedup_hits_total` counter is
+incremented. The current cache occupancy is exposed as
+`rustgate_dedup_cache_size`. Use `--dedup-cache-size` to bound the cache
+(default 100 000 entries, oldest evicted in LRU order). Disabled by
+default.
 
 ### Per-identity metrics (bounded cardinality)
 
