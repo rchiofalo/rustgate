@@ -454,8 +454,29 @@ pub(crate) async fn start_enrollment(
         std::time::Duration::from_secs(30),
     );
 
+    let rate_window = std::time::Duration::from_secs(60);
+    // 0 disables the throttle by treating it as effectively unbounded.
+    let rate_limit = if cli.enrollment_rate_limit == 0 {
+        usize::MAX
+    } else {
+        cli.enrollment_rate_limit as usize
+    };
+
     let mut enrollment_server = rustgate_enrollment::EnrollmentServer::new(signer, credentials)
-        .with_contacts_provider(contacts_provider);
+        .with_contacts_provider(contacts_provider)
+        .with_rate_limit(rate_limit, rate_window);
+
+    #[cfg(feature = "metrics")]
+    {
+        enrollment_server = enrollment_server.with_rate_limit_callback(std::sync::Arc::new(|| {
+            crate::metrics::enrollment_rate_limited().inc();
+        }));
+    }
+
+    tracing::info!(
+        max_per_minute = cli.enrollment_rate_limit,
+        "enrollment CSR signing rate limit configured"
+    );
 
     if let Some(ref pkg_dir) = cli.data_package_dir {
         let mut store =
