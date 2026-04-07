@@ -2317,6 +2317,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustgate-client"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "futures",
+ "rustgate-core",
+ "rustgate-test-utils",
+ "rustgate-transport",
+ "rustls",
+ "rustls-pki-types",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "rustgate-core"
 version = "0.7.0"
 dependencies = [
@@ -3164,6 +3184,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

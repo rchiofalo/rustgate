@@ -1,0 +1,30 @@
+[package]
+name = "rustgate-client"
+description = "Reference client library for connecting to a rustgate server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rustgate-core = { workspace = true }
+rustgate-transport = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util", "sync", "rt", "time", "macros"] }
+tokio-util = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+rustgate-test-utils = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+anyhow = { workspace = true }

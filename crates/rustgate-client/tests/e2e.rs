@@ -1,0 +1,186 @@
+#![allow(clippy::panic, clippy::unwrap_used)]
+//! End-to-end tests using `rustgate-client` against a real `TlsListener`.
+//!
+//! These mirror two existing transport-layer tests
+//! (`broadcast_between_two_clients` and `binary_payload` in
+//! `crates/rustgate-transport/tests/e2e_routing.rs`) but use the high-level
+//! `Client` API instead of hand-rolled TLS + framing setup. The original
+//! versions stand at ~30 lines of TLS plumbing each; here they reduce to a
+//! few `Client::connect` calls.
+
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+use bytes::Bytes;
+use futures::{SinkExt, StreamExt};
+use rustgate_client::{Client, ClientConfig, Codec, Message};
+use rustgate_core::identity::Identity;
+use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
+use rustgate_core::protocol::HeaderSize;
+use rustgate_test_utils::certs::TestCa;
+use rustgate_transport::{
+    AuthenticatedSession, LengthPrefixedCodec, Router, SessionHandle, TlsConfig, TlsListener,
+};
+use tokio::sync::mpsc;
+use tokio_util::codec::{FramedRead, FramedWrite};
+
+fn build_message(source: &Identity, payload: &[u8]) -> RoutableMessage {
+    RoutableMessage {
+        source: source.clone(),
+        destination: Destination::Broadcast,
+        payload: Bytes::copy_from_slice(payload),
+        metadata: Metadata {
+            received_at: SystemTime::now(),
+            source_protocol: "tcp".into(),
+            message_type: MessageType::Other("raw".into()),
+            ttl: None,
+        },
+    }
+}
+
+fn spawn_session(session: AuthenticatedSession, router: Arc<Router>) {
+    drop(tokio::spawn(async move {
+        let identity = session.identity_arc();
+        let (ptx, mut prx) = mpsc::channel::<Arc<RoutableMessage>>(16);
+        let (ntx, mut nrx) = mpsc::channel::<Arc<RoutableMessage>>(64);
+        let handle = SessionHandle::new(Arc::clone(&identity), ptx, ntx);
+        let session_id = handle.id;
+        router.register(handle).await;
+        let (reader, writer) = session.split();
+        let id_for_read = Arc::clone(&identity);
+        let router_for_read = Arc::clone(&router);
+
+        let read_task = tokio::spawn(async move {
+            let mut framed = FramedRead::new(reader, LengthPrefixedCodec::new(HeaderSize::Four));
+            while let Some(Ok(frame)) = framed.next().await {
+                router_for_read
+                    .route(build_message(&id_for_read, &frame))
+                    .await;
+            }
+        });
+        let write_task = tokio::spawn(async move {
+            let mut framed = FramedWrite::new(writer, LengthPrefixedCodec::new(HeaderSize::Four));
+            loop {
+                let msg = tokio::select! {
+                    biased;
+                    msg = prx.recv() => msg,
+                    msg = nrx.recv() => msg,
+                };
+                let Some(msg) = msg else { break };
+                if framed
+                    .send(tokio_util::bytes::BytesMut::from(msg.payload.as_ref()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        let _ = read_task.await;
+        write_task.abort();
+        let _ = write_task.await;
+        router.unregister(&identity.cn, session_id).await;
+    }));
+}
+
+struct TestServer {
+    addr: std::net::SocketAddr,
+    ca: TestCa,
+}
+
+async fn start_server(accept_count: usize) -> (TestServer, tokio::task::JoinHandle<()>) {
+    let ca = TestCa::new("Test CA");
+    let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
+    let tls_config =
+        TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem).unwrap();
+    let listener = TlsListener::bind("127.0.0.1:0", &tls_config).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = Arc::new(Router::new());
+    let r = Arc::clone(&router);
+    let h = tokio::spawn(async move {
+        for _ in 0..accept_count {
+            let session = listener.accept().await.unwrap();
+            spawn_session(session, Arc::clone(&r));
+        }
+    });
+    (TestServer { addr, ca }, h)
+}
+
+async fn connect_via_client(server: &TestServer, cn: &str, groups: &[&str]) -> Client {
+    let cert = server.ca.issue_client_cert(cn, groups);
+    let config = ClientConfig::builder()
+        .server_addr(server.addr.to_string())
+        .server_name("localhost")
+        .mtls_pem_bytes(
+            cert.cert_pem.into_bytes(),
+            cert.key_pem.into_bytes(),
+            server.ca.cert_pem.clone().into_bytes(),
+        )
+        .codec(Codec::LengthPrefixed4)
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    Client::connect(config).await.unwrap()
+}
+
+async fn recv_one(
+    stream: &mut (impl futures::Stream<Item = rustgate_client::Result<Message>> + Unpin),
+    label: &str,
+) -> Bytes {
+    let msg = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .unwrap_or_else(|_| panic!("{label}: timeout"))
+        .unwrap_or_else(|| panic!("{label}: stream ended"))
+        .unwrap_or_else(|e| panic!("{label}: error: {e}"));
+    msg.payload
+}
+
+#[tokio::test]
+async fn broadcast_between_two_clients_via_client_api() {
+    let (server, accept_handle) = start_server(2).await;
+    let alice = connect_via_client(&server, "alice", &["engineers"]).await;
+    let bob = connect_via_client(&server, "bob", &["engineers"]).await;
+    accept_handle.await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut bob_rx = Box::pin(bob.subscribe("default"));
+    let mut alice_rx = Box::pin(alice.subscribe("default"));
+
+    alice
+        .send("default", Bytes::from_static(b"hello bob"))
+        .await
+        .unwrap();
+    assert_eq!(recv_one(&mut bob_rx, "bob").await, &b"hello bob"[..]);
+
+    bob.send("default", Bytes::from_static(b"hey alice"))
+        .await
+        .unwrap();
+    assert_eq!(recv_one(&mut alice_rx, "alice").await, &b"hey alice"[..]);
+
+    alice.disconnect().await;
+    bob.disconnect().await;
+}
+
+#[tokio::test]
+async fn binary_payload_via_client_api() {
+    let (server, accept_handle) = start_server(2).await;
+    let alice = connect_via_client(&server, "alice", &["sigint"]).await;
+    let bob = connect_via_client(&server, "bob", &["sigint"]).await;
+    accept_handle.await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut bob_rx = Box::pin(bob.subscribe("default"));
+
+    let payload: Vec<u8> = (0u8..=255).collect();
+    alice
+        .send("default", Bytes::from(payload.clone()))
+        .await
+        .unwrap();
+
+    let got = recv_one(&mut bob_rx, "binary").await;
+    assert_eq!(got.as_ref(), payload.as_slice());
+
+    alice.disconnect().await;
+    bob.disconnect().await;
+}
