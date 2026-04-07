@@ -365,6 +365,9 @@ All flags support environment variables (CLI takes precedence):
 | `--circuit-breaker-threshold` | `RUSTGATE_CIRCUIT_BREAKER_THRESHOLD` | `10` |
 | `--group-acl-file` | `RUSTGATE_GROUP_ACL_FILE` | — |
 | `--archive-dir` | `RUSTGATE_ARCHIVE_DIR` | — |
+| `--archive-max-size` | `RUSTGATE_ARCHIVE_MAX_SIZE` | `0` (unlimited) |
+| `--archive-max-age` | `RUSTGATE_ARCHIVE_MAX_AGE` | `0` (unlimited, seconds) |
+| `--archive-rotate-interval` | `RUSTGATE_ARCHIVE_ROTATE_INTERVAL` | `60` (seconds) |
 | `--package-max-age-hours` | `RUSTGATE_PACKAGE_MAX_AGE_HOURS` | `0` (no expiration) |
 | `--audit-log` | `RUSTGATE_AUDIT_LOG` | — |
 | `--client-queue-dir` | `RUSTGATE_CLIENT_QUEUE_DIR` | — (disabled) |

@@ -22,6 +22,7 @@ mod acl_api;
 mod acl_config;
 mod acl_reloader;
 mod archive;
+mod archive_rotation;
 mod audit;
 mod cli;
 #[cfg(feature = "metrics")]
@@ -451,6 +452,28 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         None
     };
 
+    // ── CoT archive retention / rotation ───────────────────────────
+    let archive_rotation_handle = if let Some(ref dir) = cli.archive_dir
+        && (cli.archive_max_size > 0 || cli.archive_max_age > 0)
+    {
+        let cfg = archive_rotation::RotationConfig {
+            dir: std::path::PathBuf::from(dir),
+            max_bytes: cli.archive_max_size,
+            max_age: std::time::Duration::from_secs(cli.archive_max_age),
+            interval: std::time::Duration::from_secs(cli.archive_rotate_interval.max(1)),
+        };
+        tracing::info!(
+            dir = %dir,
+            max_bytes = cli.archive_max_size,
+            max_age_secs = cli.archive_max_age,
+            interval_secs = cli.archive_rotate_interval,
+            "CoT archive rotation enabled",
+        );
+        Some(archive_rotation::spawn(cfg))
+    } else {
+        None
+    };
+
     // ── Plaintext TCP listener ──────────────────────────────────────
     let tcp_plaintext_shutdown = setup::start_plaintext_tcp(
         &cli,
@@ -617,6 +640,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     }
     if let Some(handle) = udp_shutdown {
         setup::stop_subsystem("udp", handle).await;
+    }
+    if let Some(handle) = archive_rotation_handle {
+        handle.abort();
     }
 
     // ── Connection draining ─────────────────────────────────────────

@@ -506,6 +506,25 @@ pub(crate) struct Cli {
     #[arg(long, env = "RUSTGATE_ARCHIVE_DIR")]
     pub(crate) archive_dir: Option<String>,
 
+    /// Maximum total bytes retained across the CoT archive directory.
+    /// When the directory exceeds this cap, the rotation task deletes
+    /// the oldest archive files (by mtime) until the total drops below
+    /// the cap. `0` = unlimited (no size-based retention).
+    #[arg(long, default_value_t = 0, env = "RUSTGATE_ARCHIVE_MAX_SIZE")]
+    pub(crate) archive_max_size: u64,
+
+    /// Maximum age (in seconds) for CoT archive files. Files older than
+    /// this are deleted by the rotation task. `0` = unlimited (no
+    /// time-based retention).
+    #[arg(long, default_value_t = 0, env = "RUSTGATE_ARCHIVE_MAX_AGE")]
+    pub(crate) archive_max_age: u64,
+
+    /// Interval (in seconds) between archive rotation passes. Defaults
+    /// to 60s. Has no effect unless `--archive-dir` is set and at least
+    /// one of `--archive-max-size` or `--archive-max-age` is non-zero.
+    #[arg(long, default_value_t = 60, env = "RUSTGATE_ARCHIVE_ROTATE_INTERVAL")]
+    pub(crate) archive_rotate_interval: u64,
+
     /// Maximum age (in hours) for uploaded data packages. Packages older than
     /// this are eligible for cleanup. 0 = no expiration.
     #[arg(long, default_value_t = 0, env = "RUSTGATE_PACKAGE_MAX_AGE_HOURS")]
@@ -742,6 +761,9 @@ define_config_file! {
     acl_reload_interval: u64,
     acl_api_token_file: Option<String>,
     archive_dir: Option<String>,
+    archive_max_size: u64,
+    archive_max_age: u64,
+    archive_rotate_interval: u64,
     package_max_age_hours: u64,
     audit_log: Option<String>,
     client_queue_dir: Option<std::path::PathBuf>,
@@ -984,6 +1006,9 @@ mod tests {
             "RUSTGATE_CLIENT_BURST",
             "RUSTGATE_GROUP_ACL_FILE",
             "RUSTGATE_ARCHIVE_DIR",
+            "RUSTGATE_ARCHIVE_MAX_SIZE",
+            "RUSTGATE_ARCHIVE_MAX_AGE",
+            "RUSTGATE_ARCHIVE_ROTATE_INTERVAL",
             "RUSTGATE_PACKAGE_MAX_AGE_HOURS",
             "RUSTGATE_AUDIT_LOG",
             "OTEL_EXPORTER_OTLP_ENDPOINT",

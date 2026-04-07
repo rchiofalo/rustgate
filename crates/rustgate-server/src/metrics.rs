@@ -88,6 +88,8 @@ static CLIENT_QUEUE_WRITER_DROPS: OnceLock<IntCounter> = OnceLock::new();
 static CLIENT_QUEUE_EXPIRED: OnceLock<IntCounter> = OnceLock::new();
 static CLIENT_QUEUE_SKIPPED_UNSUPPORTED: OnceLock<IntCounter> = OnceLock::new();
 
+static ARCHIVE_BYTES: OnceLock<IntGauge> = OnceLock::new();
+
 // ── Fallback constructors ───────────────────────────────────────────
 //
 // When `init()` has not been called, accessor functions lazily create
@@ -317,7 +319,20 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(client_queue_skipped_unsupported.clone()))?;
     let _ = CLIENT_QUEUE_SKIPPED_UNSUPPORTED.set(client_queue_skipped_unsupported);
 
+    let archive_bytes = IntGauge::with_opts(Opts::new(
+        "rustgate_archive_bytes",
+        "Total bytes currently held in the CoT event archive directory",
+    ))?;
+    registry.register(Box::new(archive_bytes.clone()))?;
+    let _ = ARCHIVE_BYTES.set(archive_bytes);
+
     Ok(())
+}
+
+/// Returns the archive-bytes gauge (current total size of the CoT
+/// archive directory, refreshed by the rotation task).
+pub fn archive_bytes() -> &'static IntGauge {
+    ARCHIVE_BYTES.get_or_init(|| fallback_gauge("rustgate_archive_bytes", "fallback"))
 }
 
 // ── Accessor functions ──────────────────────────────────────────────
