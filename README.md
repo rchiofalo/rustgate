@@ -217,6 +217,57 @@ cargo build --release --all-features
 
 ## Running
 
+### Configuration file
+
+In addition to CLI flags and environment variables, all server settings can be
+loaded from a TOML file. Pass `--config <path>` (or set `RUSTGATE_CONFIG`) to
+the binary; keys mirror the CLI flag names in kebab-case:
+
+```toml
+# /etc/rustgate/rustgate.toml
+bind = "0.0.0.0:4433"
+cert = "/etc/rustgate/server.pem"
+key  = "/etc/rustgate/server-key.pem"
+ca   = "/etc/rustgate/ca.pem"
+
+tls-min-version  = "1.3"
+max-connections  = 4096
+metrics-bind     = "0.0.0.0:9090"
+audit-log        = "/var/log/rustgate/audit.jsonl"
+
+federation-id        = "rustgate-east-1"
+federation-v1-bind   = "0.0.0.0:9000"
+federation-v2-bind   = "0.0.0.0:9001"
+federation-max-hops  = 8
+
+framing  = "tak-negotiate"
+encoding = "raw"
+```
+
+Settings are merged in this order, with later sources overriding earlier ones:
+
+1. **Built-in defaults** (the same defaults shown in the flag table below)
+2. **Configuration file** (when `--config` is set)
+3. **Environment variables** (`RUSTGATE_*` and friends)
+4. **Command-line flags**
+
+In other words: command-line flags always win, environment variables override
+the file, and the file overrides defaults. Unknown keys in the file are
+rejected.
+
+Two helper subcommands ship alongside the flag:
+
+```bash
+# Print the effective merged configuration as TOML, then exit.
+rustgate --config /etc/rustgate/rustgate.toml print-config
+
+# Parse and validate a configuration file (cross-field checks). Exits 0 on
+# success, non-zero with a descriptive error on failure.
+rustgate --config /etc/rustgate/rustgate.toml validate-config
+```
+
+Running `rustgate` with no subcommand starts the server as before.
+
 Minimal:
 
 ```bash
@@ -244,6 +295,7 @@ All flags support environment variables (CLI takes precedence):
 
 | Flag | Env Var | Default |
 |------|---------|---------|
+| `--config` | `RUSTGATE_CONFIG` | — (TOML file; merged under env/CLI) |
 | `--bind` | `RUSTGATE_BIND` | `0.0.0.0:4433` |
 | `--cert` | `RUSTGATE_CERT` | — |
 | `--key` | `RUSTGATE_KEY` | — |
