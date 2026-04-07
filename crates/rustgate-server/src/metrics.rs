@@ -88,6 +88,7 @@ static CLIENT_QUEUE_WRITER_DROPS: OnceLock<IntCounter> = OnceLock::new();
 static CLIENT_QUEUE_EXPIRED: OnceLock<IntCounter> = OnceLock::new();
 static CLIENT_QUEUE_SKIPPED_UNSUPPORTED: OnceLock<IntCounter> = OnceLock::new();
 
+static ARCHIVE_BYTES: OnceLock<IntGauge> = OnceLock::new();
 static ENROLLMENT_RATE_LIMITED: OnceLock<IntCounter> = OnceLock::new();
 
 // ── Fallback constructors ───────────────────────────────────────────
@@ -319,6 +320,13 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(client_queue_skipped_unsupported.clone()))?;
     let _ = CLIENT_QUEUE_SKIPPED_UNSUPPORTED.set(client_queue_skipped_unsupported);
 
+    let archive_bytes = IntGauge::with_opts(Opts::new(
+        "rustgate_archive_bytes",
+        "Total bytes currently held in the CoT event archive directory",
+    ))?;
+    registry.register(Box::new(archive_bytes.clone()))?;
+    let _ = ARCHIVE_BYTES.set(archive_bytes);
+
     let enrollment_rate_limited = IntCounter::with_opts(Opts::new(
         "rustgate_enrollment_rate_limited_total",
         "CSR signing requests rejected by the per-IP rate limiter",
@@ -327,6 +335,12 @@ pub fn init() -> prometheus::Result<()> {
     let _ = ENROLLMENT_RATE_LIMITED.set(enrollment_rate_limited);
 
     Ok(())
+}
+
+/// Returns the archive-bytes gauge (current total size of the CoT
+/// archive directory, refreshed by the rotation task).
+pub fn archive_bytes() -> &'static IntGauge {
+    ARCHIVE_BYTES.get_or_init(|| fallback_gauge("rustgate_archive_bytes", "fallback"))
 }
 
 // ── Accessor functions ──────────────────────────────────────────────
