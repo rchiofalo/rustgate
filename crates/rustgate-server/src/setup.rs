@@ -152,7 +152,7 @@ pub(crate) async fn build_tls_config(
 pub(crate) async fn bind_tls_listener(
     cli: &Cli,
     tls_config: &TlsConfig,
-) -> anyhow::Result<(TlsListener, Option<Arc<CertReloader>>)> {
+) -> anyhow::Result<TlsListenerHandle> {
     // Always construct the `CertReloader` when `--cert` and `--key` are
     // configured so that SIGHUP-driven reloads can rotate the certificate
     // regardless of whether the polling watcher is enabled. The polling
@@ -161,8 +161,39 @@ pub(crate) async fn bind_tls_listener(
         CertReloader::new(&cli.cert, &cli.key).context("initializing certificate reloader")?;
 
     let verifier = tls_config.build_default_verifier()?;
+
+    // OCSP stapling sits on the *resolver* (server certificate) side of the
+    // handshake; the existing CRL verifier sits on the *client certificate*
+    // side. The two layers are independent and may be enabled together.
+    #[cfg(feature = "ocsp")]
+    let (resolver, ocsp_stapler): (
+        std::sync::Arc<dyn rustgate_transport::ResolvesServerCert>,
+        Option<std::sync::Arc<rustgate_transport::ocsp::Stapler>>,
+    ) = if cli.ocsp_stapling {
+        let stapler = rustgate_transport::ocsp::wrap_resolver(reloader.clone());
+        // The stapler queues an OCSP fetch when it first sees the active
+        // certificate during a handshake. Early handshakes (within ~60s of
+        // startup) may therefore arrive without a stapled response — this is
+        // acceptable for the no-OCSP fallback that clients use today.
+        tracing::info!("OCSP stapling enabled for server certificate");
+        (stapler.clone(), Some(stapler))
+    } else {
+        (reloader.clone(), None)
+    };
+
+    #[cfg(not(feature = "ocsp"))]
+    let resolver: std::sync::Arc<dyn rustgate_transport::ResolvesServerCert> = reloader.clone();
+
+    #[cfg(not(feature = "ocsp"))]
+    if cli.ocsp_stapling {
+        tracing::warn!(
+            "--ocsp-stapling set but the ocsp feature is not compiled in; \
+             rebuild with --features ocsp to enable OCSP stapling"
+        );
+    }
+
     let server_config = tls_config
-        .build_reloadable_server_config(verifier, reloader.clone())
+        .build_reloadable_server_config(verifier, resolver)
         .context("building reloadable server config")?;
 
     if cli.cert_reload_interval > 0 {
@@ -203,7 +234,22 @@ pub(crate) async fn bind_tls_listener(
         }
     }));
 
-    Ok((listener, cert_reloader))
+    Ok(TlsListenerHandle {
+        listener,
+        cert_reloader,
+        #[cfg(feature = "ocsp")]
+        ocsp_stapler,
+    })
+}
+
+/// Handle returned by [`bind_tls_listener`] grouping the bound TLS listener
+/// with the optional cert reloader and (when the `ocsp` feature is enabled)
+/// the OCSP stapler whose background task must be stopped at shutdown.
+pub(crate) struct TlsListenerHandle {
+    pub(crate) listener: TlsListener,
+    pub(crate) cert_reloader: Option<Arc<CertReloader>>,
+    #[cfg(feature = "ocsp")]
+    pub(crate) ocsp_stapler: Option<Arc<rustgate_transport::ocsp::Stapler>>,
 }
 
 /// Validate framing/encoding feature requirements and consistency at startup.

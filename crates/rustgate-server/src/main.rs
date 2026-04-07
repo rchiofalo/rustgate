@@ -149,7 +149,13 @@ fn main() -> anyhow::Result<()> {
 async fn run(cli: Cli) -> anyhow::Result<()> {
     // ── TLS setup ───────────────────────────────────────────────────
     let (tls_config, _cert_pem, _key_pem, _ca_pem) = setup::build_tls_config(&cli).await?;
-    let (listener, cert_reloader) = setup::bind_tls_listener(&cli, &tls_config).await?;
+    let tls_handle = setup::bind_tls_listener(&cli, &tls_config).await?;
+    let setup::TlsListenerHandle {
+        listener,
+        cert_reloader,
+        #[cfg(feature = "ocsp")]
+        ocsp_stapler,
+    } = tls_handle;
     let framing = cli.framing;
     let encoding = cli.encoding;
 
@@ -473,6 +479,14 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     // ── Shutdown ────────────────────────────────────────────────────
     // Stop listeners first so no new connections are accepted during drain.
+
+    // Stop the OCSP stapler background fetcher (if it was started). Done
+    // early so the task wakes up and exits while other subsystems drain.
+    #[cfg(feature = "ocsp")]
+    if let Some(ref stapler) = ocsp_stapler {
+        stapler.stop().await;
+        tracing::info!("OCSP stapler stopped");
+    }
 
     #[cfg(feature = "federation")]
     if let Some(ref rwlock) = fed_shutdown_handle {

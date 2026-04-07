@@ -16,6 +16,9 @@ mod session;
 mod throttle;
 mod verifier;
 
+#[cfg(feature = "ocsp")]
+pub mod ocsp;
+
 pub use acl::{GroupAcl, GroupAclPolicy};
 pub use cache::PositionCache;
 pub use cert_reloader::CertReloader;
@@ -36,6 +39,7 @@ pub use replay::ReplayFilter;
 pub use router::{NORMAL_CHANNEL_CAPACITY, PRIORITY_CHANNEL_CAPACITY, Router, SessionHandle};
 #[cfg(feature = "proto")]
 pub use rustgate_proto::TakFrameCodec;
+pub use rustls::server::ResolvesServerCert;
 pub use session::{AuthenticatedSession, SessionReader, SessionWriter};
 pub use throttle::{ClientThrottle, ThrottleConfig};
 pub use verifier::{DynamicCertVerifier, RootStoreProvider};

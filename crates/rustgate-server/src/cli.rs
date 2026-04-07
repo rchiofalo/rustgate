@@ -94,6 +94,16 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 0, env = "RUSTGATE_CERT_RELOAD_INTERVAL")]
     pub(crate) cert_reload_interval: u64,
 
+    /// Enable OCSP stapling for the server certificate. When set, the server
+    /// fetches OCSP responses for the active certificate in a background task
+    /// and attaches them to the TLS handshake so clients can verify revocation
+    /// status without contacting the issuing CA themselves.
+    ///
+    /// Requires --features ocsp. Most useful with enterprise/private CAs that
+    /// run an OCSP responder; Let's Encrypt dropped OCSP support in 2025.
+    #[arg(long, default_value_t = false, env = "RUSTGATE_OCSP_STAPLING")]
+    pub(crate) ocsp_stapling: bool,
+
     #[arg(long, value_enum, default_value_t = Framing::Xml, env = "RUSTGATE_FRAMING")]
     pub(crate) framing: Framing,
 

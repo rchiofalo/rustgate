@@ -27,6 +27,14 @@ crate = "aws-lc-sys"
 allow = ["OpenSSL"]
 crate = "aws-lc-fips-sys"
 
+# ocsp-stapler is MPL-2.0. The MPL-2.0 is a file-level (weak) copyleft: only
+# modifications to MPL-licensed source files must be released under MPL.
+# Linking the unmodified upstream crate into a proprietary binary is
+# explicitly permitted, so this exception is safe for downstream consumers.
+[[licenses.exceptions]]
+allow = ["MPL-2.0"]
+crate = "ocsp-stapler"
+
 [[licenses.exceptions]]
 allow = ["LicenseRef-Proprietary"]
 crate = "rustgate-core"

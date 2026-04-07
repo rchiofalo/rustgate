@@ -27,6 +27,7 @@ otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", 
 fips = ["rustgate-transport/fips", "rustgate-federation?/fips", "rustgate-enrollment?/fips"]
 post-quantum = ["rustgate-transport/post-quantum", "rustgate-federation?/post-quantum"]
 jemalloc = ["dep:tikv-jemallocator"]
+ocsp = ["rustgate-transport/ocsp"]
 
 [dependencies]
 rustgate-core = { workspace = true }
