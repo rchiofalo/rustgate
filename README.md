@@ -212,6 +212,7 @@ cargo build --release --all-features
 | `fips` | FIPS 140-3 crypto (aws-lc-rs) | Go 1.20+, cmake |
 | `post-quantum` | Post-quantum key exchange (X25519MLKEM768) | Go 1.20+, cmake |
 | `otel` | OpenTelemetry distributed tracing | `protoc` |
+| `ocsp` | OCSP stapling for server certificates | — |
 | `jemalloc` | jemalloc allocator | — |
 
 ## Running
@@ -373,12 +374,42 @@ For full deployment documentation see [docs/deployment.md](docs/deployment.md).
 
 - **mTLS everywhere** — all client and federation connections require mutual TLS with certificate verification
 - **CRL revocation** — revoked certificates are rejected at the TLS handshake via `--crl`
+- **OCSP stapling** — optional `ocsp` feature staples OCSP responses to the server certificate (see below)
 - **FIPS 140-3** — optional aws-lc-rs crypto provider for FIPS-validated TLS ([details](docs/fips.md))
 - **No unsafe code** — `unsafe_code = "forbid"` enforced workspace-wide
 - **No panics** — `clippy::panic = "deny"` and `clippy::unwrap_used = "deny"` in production code
 - **Subject DN enforcement** — enrollment certificates carry the authenticated username to prevent impersonation
 - **Container hardening** — non-root UID (10001), read-only filesystem, STOPSIGNAL SIGTERM
 - **TLS session resumption disabled** — forces full handshake with CRL check on every connection
+
+### OCSP stapling
+
+Build with `--features ocsp` and pass `--ocsp-stapling` (env `RUSTGATE_OCSP_STAPLING`) to wrap the
+server certificate resolver with [`ocsp-stapler`](https://crates.io/crates/ocsp-stapler). The
+stapler runs a background tokio task that periodically fetches an OCSP response for the active
+certificate from the issuing CA's OCSP responder and attaches it to the TLS handshake, so clients
+can verify revocation status without contacting the CA themselves.
+
+Notes:
+
+- **Best with private / enterprise CAs.** Let's Encrypt stopped serving OCSP responses in 2025.
+  OCSP stapling is most valuable for internal PKIs that operate their own OCSP responder.
+- **First handshakes after startup may be unstapled** until the background fetcher completes its
+  initial cycle (~60s). The server preloads the active certificate into the stapler at startup so
+  the fetch is queued immediately, but the very first handshakes can still arrive before the
+  response lands. This is the same fallback path clients already use when stapling is off.
+- **After a certificate rotation (SIGHUP or polling), there is a brief window — typically under
+  one minute — during which handshakes may be served unstapled until the background fetcher
+  refreshes.** The SIGHUP path also re-preloads the rotated certificate into the stapler to
+  shorten this window.
+- **Requires outbound network access to the issuing CA's OCSP responder**; air-gapped deployments
+  should leave this flag off.
+- **Responder failures degrade gracefully** — handshakes continue without a stapled response.
+- **CRL and OCSP can be enabled together.** OCSP stapling lives on the *server certificate*
+  resolver path; CRL revocation lives on the *client certificate* verifier path. They are
+  independent layers and may be combined freely.
+- **SHA-1 OCSP requests.** The upstream `ocsp-stapler` crate currently issues OCSP requests with
+  SHA-1 issuer hashes. Most CAs accept this — verify compatibility with strict modern responders.
 
 For security policy and vulnerability reporting see [SECURITY.md](SECURITY.md).
 

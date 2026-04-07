@@ -14,6 +14,7 @@ workspace = true
 proto = ["dep:rustgate-proto"]
 fips = ["rustls/aws_lc_rs", "rustls/fips"]
 post-quantum = ["rustls/aws_lc_rs", "rustls/prefer-post-quantum"]
+ocsp = ["dep:ocsp-stapler"]
 
 [dependencies]
 rustgate-core = { workspace = true }
@@ -31,6 +32,7 @@ sha2 = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
 zeroize = { workspace = true }
+ocsp-stapler = { workspace = true, optional = true }
 
 [dev-dependencies]
 rustgate-test-utils = { workspace = true }

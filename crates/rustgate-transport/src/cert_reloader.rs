@@ -80,6 +80,21 @@ impl CertReloader {
         }))
     }
 
+    /// Return a clone of the current [`CertifiedKey`] handle.
+    ///
+    /// Useful for callers that need to seed an external cache (such as the
+    /// OCSP stapler) with the active certificate before the first TLS
+    /// handshake arrives. Returns `None` if the internal lock is poisoned.
+    pub fn certified_key(&self) -> Option<Arc<CertifiedKey>> {
+        match self.state.read() {
+            Ok(guard) => Some(Arc::clone(&guard.0)),
+            Err(_) => {
+                warn!("CertReloader lock poisoned during certified_key access");
+                None
+            }
+        }
+    }
+
     /// Re-read the certificate and key files. If their content has changed,
     /// atomically swap the [`CertifiedKey`] used for future TLS handshakes.
     ///

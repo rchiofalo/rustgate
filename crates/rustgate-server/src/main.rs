@@ -149,7 +149,13 @@ fn main() -> anyhow::Result<()> {
 async fn run(cli: Cli) -> anyhow::Result<()> {
     // ── TLS setup ───────────────────────────────────────────────────
     let (tls_config, _cert_pem, _key_pem, _ca_pem) = setup::build_tls_config(&cli).await?;
-    let (listener, cert_reloader) = setup::bind_tls_listener(&cli, &tls_config).await?;
+    let tls_handle = setup::bind_tls_listener(&cli, &tls_config).await?;
+    let setup::TlsListenerHandle {
+        listener,
+        cert_reloader,
+        #[cfg(feature = "ocsp")]
+        ocsp_stapler,
+    } = tls_handle;
     let framing = cli.framing;
     let encoding = cli.encoding;
 
@@ -374,6 +380,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         let cert_for_hup = cert_reloader.clone();
         let acl_for_hup = acl_reloader_handle.clone();
         let crl_path_for_hup = cli.crl.clone();
+        #[cfg(feature = "ocsp")]
+        let ocsp_for_hup = ocsp_stapler.clone();
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
             Ok(mut sighup) => {
                 setup::spawn_background("sighup-reloader", async move {
@@ -383,6 +391,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                             cert_for_hup.as_ref(),
                             acl_for_hup.as_ref(),
                             crl_path_for_hup.as_deref(),
+                            #[cfg(feature = "ocsp")]
+                            ocsp_for_hup.as_ref(),
                         )
                         .await;
                     }
@@ -474,6 +484,14 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     // ── Shutdown ────────────────────────────────────────────────────
     // Stop listeners first so no new connections are accepted during drain.
 
+    // Stop the OCSP stapler background fetcher (if it was started). Done
+    // early so the task wakes up and exits while other subsystems drain.
+    #[cfg(feature = "ocsp")]
+    if let Some(ref stapler) = ocsp_stapler {
+        stapler.stop().await;
+        tracing::info!("OCSP stapler stopped");
+    }
+
     #[cfg(feature = "federation")]
     if let Some(ref rwlock) = fed_shutdown_handle {
         let mut mgr = rwlock.write().await;
@@ -562,6 +580,7 @@ async fn reload_all_configs(
     cert_reloader: Option<&Arc<rustgate_transport::CertReloader>>,
     acl_reloader: Option<&Arc<acl_reloader::AclReloader>>,
     crl_path: Option<&str>,
+    #[cfg(feature = "ocsp")] ocsp_stapler: Option<&Arc<rustgate_transport::ocsp::Stapler>>,
 ) {
     // 1. Server certificate
     if let Some(reloader) = cert_reloader {
@@ -569,6 +588,18 @@ async fn reload_all_configs(
         let join = tokio::task::spawn_blocking(move || r.reload()).await;
         match join {
             Ok(Ok(rotated)) => {
+                #[cfg(feature = "ocsp")]
+                if rotated
+                    && let Some(stapler) = ocsp_stapler
+                    && let Some(ckey) = reloader.certified_key()
+                {
+                    // Seed the stapler with the freshly rotated cert so the
+                    // background fetcher refreshes the OCSP cache without
+                    // waiting for the next inbound handshake to surface the
+                    // new leaf. There is still a brief unstapled window
+                    // until the fetcher completes its OCSP request.
+                    rustgate_transport::ocsp::preload(stapler, ckey);
+                }
                 tracing::info!(
                     target: "audit",
                     event_type = "config.reload",
@@ -706,13 +737,27 @@ mod tests {
     #[tokio::test]
     async fn reload_all_configs_tolerates_all_none() {
         // Should not panic when nothing is configured.
-        reload_all_configs(None, None, None).await;
+        reload_all_configs(
+            None,
+            None,
+            None,
+            #[cfg(feature = "ocsp")]
+            None,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn reload_all_configs_reports_crl_failure_without_aborting() {
         // Missing CRL path should produce a structured failure but return.
-        reload_all_configs(None, None, Some("/definitely/not/a/real/path.pem")).await;
+        reload_all_configs(
+            None,
+            None,
+            Some("/definitely/not/a/real/path.pem"),
+            #[cfg(feature = "ocsp")]
+            None,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -744,7 +789,14 @@ mod tests {
         std::fs::write(&acl_path, updated).unwrap();
 
         // Pass an invalid CRL path to verify partial failure tolerance.
-        reload_all_configs(None, Some(&reloader), Some("/no/such/crl.pem")).await;
+        reload_all_configs(
+            None,
+            Some(&reloader),
+            Some("/no/such/crl.pem"),
+            #[cfg(feature = "ocsp")]
+            None,
+        )
+        .await;
 
         // Verify the router actually swapped to the new policy.
         let snap = router.acl_snapshot();

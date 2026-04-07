@@ -351,3 +351,18 @@ fn help_shows_rate_limit_flags() {
         "help should show --client-burst"
     );
 }
+
+#[cfg(feature = "ocsp")]
+#[test]
+fn help_shows_ocsp_stapling_flag() {
+    let output = Command::new(rustgate_bin())
+        .arg("--help")
+        .output()
+        .expect("failed to execute binary");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--ocsp-stapling"),
+        "help should show --ocsp-stapling when ocsp feature is enabled"
+    );
+}
