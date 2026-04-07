@@ -99,6 +99,11 @@ static CLIENT_QUEUE_WRITER_DROPS: OnceLock<IntCounter> = OnceLock::new();
 static CLIENT_QUEUE_EXPIRED: OnceLock<IntCounter> = OnceLock::new();
 static CLIENT_QUEUE_SKIPPED_UNSUPPORTED: OnceLock<IntCounter> = OnceLock::new();
 
+#[cfg(feature = "federation")]
+static FEDERATION_PEER_QUEUE_BYTES: OnceLock<prometheus::IntGaugeVec> = OnceLock::new();
+#[cfg(feature = "federation")]
+static FEDERATION_PEER_OLDEST_SECONDS: OnceLock<prometheus::IntGaugeVec> = OnceLock::new();
+
 static ARCHIVE_BYTES: OnceLock<IntGauge> = OnceLock::new();
 static ENROLLMENT_RATE_LIMITED: OnceLock<IntCounter> = OnceLock::new();
 
@@ -362,6 +367,29 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(client_queue_skipped_unsupported.clone()))?;
     let _ = CLIENT_QUEUE_SKIPPED_UNSUPPORTED.set(client_queue_skipped_unsupported);
 
+    #[cfg(feature = "federation")]
+    {
+        let federation_peer_queue_bytes = prometheus::IntGaugeVec::new(
+            Opts::new(
+                "rustgate_federation_peer_queue_bytes",
+                "Bytes currently queued for delivery to a federation peer",
+            ),
+            &["peer"],
+        )?;
+        registry.register(Box::new(federation_peer_queue_bytes.clone()))?;
+        let _ = FEDERATION_PEER_QUEUE_BYTES.set(federation_peer_queue_bytes);
+
+        let federation_peer_oldest_seconds = prometheus::IntGaugeVec::new(
+            Opts::new(
+                "rustgate_federation_peer_oldest_seconds",
+                "Age in seconds of the oldest message still queued for a federation peer",
+            ),
+            &["peer"],
+        )?;
+        registry.register(Box::new(federation_peer_oldest_seconds.clone()))?;
+        let _ = FEDERATION_PEER_OLDEST_SECONDS.set(federation_peer_oldest_seconds);
+    }
+
     let archive_bytes = IntGauge::with_opts(Opts::new(
         "rustgate_archive_bytes",
         "Total bytes currently held in the CoT event archive directory",
@@ -377,6 +405,69 @@ pub fn init() -> prometheus::Result<()> {
     let _ = ENROLLMENT_RATE_LIMITED.set(enrollment_rate_limited);
 
     Ok(())
+}
+
+/// Returns the federation per-peer queue-bytes gauge vector.
+#[cfg(feature = "federation")]
+#[allow(dead_code)] // exposed for future API consumers / tests
+pub fn federation_peer_queue_bytes() -> Option<&'static prometheus::IntGaugeVec> {
+    FEDERATION_PEER_QUEUE_BYTES.get()
+}
+
+/// Returns the federation per-peer oldest-message-age gauge vector.
+#[cfg(feature = "federation")]
+#[allow(dead_code)] // exposed for future API consumers / tests
+pub fn federation_peer_oldest_seconds() -> Option<&'static prometheus::IntGaugeVec> {
+    FEDERATION_PEER_OLDEST_SECONDS.get()
+}
+
+/// Spawn a background task that periodically snapshots per-peer federation
+/// lag from the manager and publishes it to the Prometheus gauges.
+///
+/// The task runs until the provided shutdown signal fires. It is a no-op
+/// if the gauges were never registered.
+#[cfg(feature = "federation")]
+pub fn spawn_federation_lag_updater(
+    manager: std::sync::Arc<tokio::sync::RwLock<rustgate_federation::manager::FederationManager>>,
+    interval: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut known_peers: std::collections::HashSet<String> = std::collections::HashSet::new();
+        loop {
+            let _ = ticker.tick().await;
+            let snapshot = {
+                let guard = manager.read().await;
+                guard.peer_lag_snapshot()
+            };
+            let bytes_vec = FEDERATION_PEER_QUEUE_BYTES.get();
+            let oldest_vec = FEDERATION_PEER_OLDEST_SECONDS.get();
+            let mut current: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for (peer, bytes, oldest) in &snapshot {
+                let _ = current.insert(peer.clone());
+                if let Some(g) = bytes_vec
+                    && let Ok(child) = g.get_metric_with_label_values(&[peer.as_str()])
+                {
+                    child.set(*bytes as i64);
+                }
+                if let Some(g) = oldest_vec
+                    && let Ok(child) = g.get_metric_with_label_values(&[peer.as_str()])
+                {
+                    child.set(oldest.round() as i64);
+                }
+            }
+            for stale in known_peers.difference(&current) {
+                if let Some(g) = bytes_vec {
+                    let _ = g.remove_label_values(&[stale.as_str()]);
+                }
+                if let Some(g) = oldest_vec {
+                    let _ = g.remove_label_values(&[stale.as_str()]);
+                }
+            }
+            known_peers = current;
+        }
+    })
 }
 
 /// Returns the archive-bytes gauge (current total size of the CoT
