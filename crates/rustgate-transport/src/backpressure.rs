@@ -89,6 +89,10 @@ impl BackpressureGate {
     /// Register a callback invoked each time the accept loop is deferred
     /// because the gate is over the high-water mark.
     pub fn set_on_deferred(self: &mut Arc<Self>, cb: OnDeferred) {
+        debug_assert!(
+            Arc::get_mut(self).is_some(),
+            "set_on_deferred must be called before the gate is cloned"
+        );
         if let Some(this) = Arc::get_mut(self) {
             this.on_deferred = Some(cb);
         }
@@ -97,6 +101,10 @@ impl BackpressureGate {
     /// Register a callback invoked on every byte-count change. Typically
     /// used to refresh a Prometheus gauge.
     pub fn set_on_bytes_changed(self: &mut Arc<Self>, cb: OnBytesChanged) {
+        debug_assert!(
+            Arc::get_mut(self).is_some(),
+            "set_on_bytes_changed must be called before the gate is cloned"
+        );
         if let Some(this) = Arc::get_mut(self) {
             this.on_bytes_changed = Some(cb);
         }
@@ -152,6 +160,12 @@ impl BackpressureGate {
     ///
     /// Returns immediately when [`is_admitting`](Self::is_admitting) is
     /// `true`. Otherwise, awaits a wakeup from [`sub`](Self::sub).
+    ///
+    /// When called from a TLS accept loop, stalling here does not
+    /// immediately drop incoming TCP connections: the kernel SYN backlog
+    /// (controlled by `somaxconn` / the listener backlog) absorbs new
+    /// connection attempts while the loop is parked, and they are drained
+    /// once admission resumes.
     pub async fn wait_for_capacity(&self) {
         // Fast path: gate is currently admitting.
         if !self.blocking.load(Ordering::Relaxed) {
@@ -292,6 +306,64 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(100), gate.wait_for_capacity())
             .await
             .expect("should return immediately");
+    }
+
+    #[test]
+    fn shared_permit_releases_only_on_last_clone_drop() {
+        use std::sync::Arc;
+        use std::time::SystemTime;
+
+        use bytes::Bytes;
+        use rustgate_core::identity::Identity;
+        use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
+
+        use crate::router::RoutedMessage;
+
+        let gate = BackpressureGate::new(10_000);
+        let permit = Arc::new(gate.acquire(1024));
+        assert_eq!(gate.current(), 1024);
+
+        let sender = Identity::plaintext("sender".to_string(), Default::default()).unwrap();
+        let msg = Arc::new(RoutableMessage {
+            source: sender.clone(),
+            destination: Destination::Broadcast,
+            payload: Bytes::from(vec![0u8; 1024]),
+            metadata: Metadata {
+                received_at: SystemTime::now(),
+                source_protocol: "test".to_string(),
+                message_type: MessageType::Chat,
+                ttl: None,
+            },
+        });
+
+        // Build several recipient envelopes from the same shared permit —
+        // modeling `Router::route` fan-out into per-session mpsc channels.
+        let env = RoutedMessage::with_permit(Arc::clone(&msg), Arc::clone(&permit));
+        let copies = [env.clone(), env.clone(), env.clone()];
+
+        // Drop the "route()-local" Arc<Permit> handle: the per-recipient
+        // envelopes still hold it, so the counter must stay pegged.
+        drop(permit);
+        assert_eq!(
+            gate.current(),
+            1024,
+            "permit must stay alive while any envelope clone holds it"
+        );
+
+        // Drop envelopes one by one; only the last drop releases.
+        let mut iter = copies.into_iter();
+        drop(iter.next());
+        assert_eq!(gate.current(), 1024);
+        drop(iter.next());
+        assert_eq!(gate.current(), 1024);
+        drop(iter.next());
+        assert_eq!(gate.current(), 1024);
+        drop(env);
+        assert_eq!(
+            gate.current(),
+            0,
+            "final envelope drop must release the permit"
+        );
     }
 
     #[test]

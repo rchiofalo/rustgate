@@ -12,8 +12,55 @@ use tokio::sync::{RwLock, mpsc};
 use tracing::{Instrument, debug, warn};
 
 use crate::acl::GroupAclPolicy;
-use crate::backpressure::BackpressureGate;
+use crate::backpressure::{BackpressureGate, BackpressurePermit};
 use crate::cache::PositionCache;
+
+/// Envelope wrapping an `Arc<RoutableMessage>` together with a shared
+/// admission-control permit. Cloned once per recipient so the permit's
+/// `Drop` fires only when the *last* session has consumed the message,
+/// keeping the global queued-bytes counter pegged while downstream
+/// session channels still reference the payload.
+#[derive(Clone, Debug)]
+pub struct RoutedMessage {
+    msg: Arc<RoutableMessage>,
+    // Held purely for its Drop side effect: releasing the permit returns
+    // the reservation to the gate. Option so that callers without a gate
+    // (tests, disabled path) pay no cost.
+    _permit: Option<Arc<BackpressurePermit>>,
+}
+
+impl RoutedMessage {
+    /// Wrap an `Arc<RoutableMessage>` without a backpressure permit.
+    pub fn new(msg: Arc<RoutableMessage>) -> Self {
+        Self { msg, _permit: None }
+    }
+
+    /// Wrap an `Arc<RoutableMessage>` with a shared backpressure permit.
+    pub fn with_permit(msg: Arc<RoutableMessage>, permit: Arc<BackpressurePermit>) -> Self {
+        Self {
+            msg,
+            _permit: Some(permit),
+        }
+    }
+
+    /// Borrow the underlying `Arc<RoutableMessage>`.
+    pub fn inner(&self) -> &Arc<RoutableMessage> {
+        &self.msg
+    }
+}
+
+impl std::ops::Deref for RoutedMessage {
+    type Target = RoutableMessage;
+    fn deref(&self) -> &RoutableMessage {
+        &self.msg
+    }
+}
+
+impl From<Arc<RoutableMessage>> for RoutedMessage {
+    fn from(msg: Arc<RoutableMessage>) -> Self {
+        Self::new(msg)
+    }
+}
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -31,8 +78,8 @@ pub const NORMAL_CHANNEL_CAPACITY: usize = 64;
 pub struct SessionHandle {
     pub id: u64,
     pub identity: Arc<Identity>,
-    priority_sender: Arc<Mutex<Option<mpsc::Sender<Arc<RoutableMessage>>>>>,
-    normal_sender: Arc<Mutex<Option<mpsc::Sender<Arc<RoutableMessage>>>>>,
+    priority_sender: Arc<Mutex<Option<mpsc::Sender<RoutedMessage>>>>,
+    normal_sender: Arc<Mutex<Option<mpsc::Sender<RoutedMessage>>>>,
     consecutive_drops: Arc<AtomicU32>,
     max_consecutive_drops: u32,
 }
@@ -44,8 +91,8 @@ impl SessionHandle {
     /// `normal_sender` carries all other message types (capacity 64).
     pub fn new(
         identity: Arc<Identity>,
-        priority_sender: mpsc::Sender<Arc<RoutableMessage>>,
-        normal_sender: mpsc::Sender<Arc<RoutableMessage>>,
+        priority_sender: mpsc::Sender<RoutedMessage>,
+        normal_sender: mpsc::Sender<RoutedMessage>,
     ) -> Self {
         Self {
             id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
@@ -63,8 +110,8 @@ impl SessionHandle {
     /// sends. Use `u32::MAX` to effectively disable the circuit breaker.
     pub fn with_drop_threshold(
         identity: Arc<Identity>,
-        priority_sender: mpsc::Sender<Arc<RoutableMessage>>,
-        normal_sender: mpsc::Sender<Arc<RoutableMessage>>,
+        priority_sender: mpsc::Sender<RoutedMessage>,
+        normal_sender: mpsc::Sender<RoutedMessage>,
         threshold: u32,
     ) -> Self {
         Self {
@@ -85,11 +132,12 @@ impl SessionHandle {
         )
     }
 
-    /// Send a shared message reference to this session.
+    /// Send a `RoutedMessage` envelope to this session.
     ///
-    /// Messages are wrapped in `Arc` so that broadcast and group sends
-    /// share a single allocation instead of cloning the full
-    /// `RoutableMessage` per recipient.
+    /// The envelope wraps a shared `Arc<RoutableMessage>` together with
+    /// an optional shared `BackpressurePermit` so that admission-control
+    /// reservations stay alive until the last recipient has consumed the
+    /// message from its session channel.
     ///
     /// Position and Alert messages are routed to the priority channel;
     /// all other types use the normal channel.
@@ -97,8 +145,9 @@ impl SessionHandle {
     /// If the circuit breaker has tripped, returns `Err` immediately.
     pub async fn send(
         &self,
-        msg: Arc<RoutableMessage>,
-    ) -> Result<(), mpsc::error::SendError<Arc<RoutableMessage>>> {
+        msg: impl Into<RoutedMessage>,
+    ) -> Result<(), mpsc::error::SendError<RoutedMessage>> {
+        let msg: RoutedMessage = msg.into();
         let sender = {
             let source = if Self::is_priority(&msg) {
                 &self.priority_sender
@@ -127,7 +176,8 @@ impl SessionHandle {
     /// be kept across `.await` points. Returns `true` if the message was
     /// enqueued, `false` if the channel is full, disconnected, or the
     /// circuit breaker has tripped.
-    pub fn try_send(&self, msg: Arc<RoutableMessage>) -> bool {
+    pub fn try_send(&self, msg: impl Into<RoutedMessage>) -> bool {
+        let msg: RoutedMessage = msg.into();
         let source = if Self::is_priority(&msg) {
             &self.priority_sender
         } else {
@@ -412,13 +462,16 @@ impl Router {
     }
 
     pub async fn route(&self, msg: RoutableMessage) {
-        // Account for the message's payload in the global backpressure
-        // gate. The permit releases its reservation when this future
-        // returns (successfully or via panic unwind).
-        let _bp_permit = self
+        // Acquire a byte-sized permit from the global backpressure gate
+        // for this message's payload. Wrap it in `Arc` so every
+        // per-recipient envelope clone shares ownership — the permit's
+        // `Drop` (and thus the byte-counter release) only fires when the
+        // *last* session channel has drained this message. This is the
+        // property that lets slow readers actually press the gate.
+        let permit: Option<Arc<BackpressurePermit>> = self
             .backpressure
             .as_ref()
-            .map(|gate| gate.acquire(msg.payload.len()));
+            .map(|gate| Arc::new(gate.acquire(msg.payload.len())));
 
         let destination_label = match &msg.destination {
             Destination::Direct(target) => target.cn.as_str(),
@@ -432,12 +485,12 @@ impl Router {
             destination = %destination_label,
         );
 
-        self.route_inner(msg).instrument(span).await;
+        self.route_inner(msg, permit).instrument(span).await;
     }
 
     /// Inner routing logic, separated so the caller can `.instrument()` a span
     /// around this future without holding an `EnteredSpan` across `.await`.
-    async fn route_inner(&self, msg: RoutableMessage) {
+    async fn route_inner(&self, msg: RoutableMessage, permit: Option<Arc<BackpressurePermit>>) {
         // Cache position reports for SA replay to new sessions
         if msg.metadata.message_type == MessageType::Position {
             self.cache.store(msg.clone()).await;
@@ -455,18 +508,21 @@ impl Router {
 
         // Wrap in Arc once so broadcast/group sends share one allocation
         // instead of cloning the full RoutableMessage per recipient.
-        let msg = Arc::new(msg);
+        let arc_msg = Arc::new(msg);
+        let envelope = match permit {
+            Some(p) => RoutedMessage::with_permit(arc_msg, p),
+            None => RoutedMessage::new(arc_msg),
+        };
 
-        match msg.destination {
-            Destination::Direct(ref target) => {
-                let cn = target.cn.clone();
-                self.send_to_session(&cn, msg).await;
+        match envelope.destination.clone() {
+            Destination::Direct(target) => {
+                self.send_to_session(&target.cn, envelope).await;
             }
-            Destination::Group(ref group) => {
-                self.send_to_group(group, &msg).await;
+            Destination::Group(group) => {
+                self.send_to_group(&group, envelope).await;
             }
             Destination::Broadcast => {
-                self.send_to_all(&msg).await;
+                self.send_to_all(envelope).await;
             }
         }
     }
@@ -520,7 +576,7 @@ impl Router {
             .collect()
     }
 
-    async fn send_to_session(&self, cn: &str, msg: Arc<RoutableMessage>) {
+    async fn send_to_session(&self, cn: &str, msg: RoutedMessage) {
         let handle = {
             let state = self.state.read().await;
             state.sessions.get(cn).cloned()
@@ -535,7 +591,7 @@ impl Router {
         }
     }
 
-    async fn send_to_group(&self, group: &str, msg: &Arc<RoutableMessage>) {
+    async fn send_to_group(&self, group: &str, msg: RoutedMessage) {
         if !msg.source.is_member_of(group) {
             tracing::warn!(
                 sender = %msg.source.cn,
@@ -583,6 +639,10 @@ impl Router {
                     dropped += 1;
                 }
             }
+            // `msg` is dropped at end of scope: the original envelope
+            // clone held by `route_inner` is released here so the permit
+            // count reflects only the surviving recipient clones that
+            // now live inside the session mpsc channels.
         }
         if dropped > 0 {
             warn!(
@@ -597,7 +657,7 @@ impl Router {
     /// Broadcast to all connected sessions (except sender).
     /// This is intentional for SA sharing — all authenticated clients
     /// receive broadcasts regardless of group membership.
-    async fn send_to_all(&self, msg: &Arc<RoutableMessage>) {
+    async fn send_to_all(&self, msg: RoutedMessage) {
         let targets: Vec<SessionHandle> = {
             let state = self.state.read().await;
             state
@@ -610,7 +670,7 @@ impl Router {
 
         let mut dropped = 0u32;
         for handle in &targets {
-            if handle.send(Arc::clone(msg)).await.is_err() {
+            if handle.send(msg.clone()).await.is_err() {
                 dropped += 1;
             }
         }
@@ -657,10 +717,10 @@ mod tests {
         priority_cap: usize,
         normal_cap: usize,
     ) -> (
-        mpsc::Sender<Arc<RoutableMessage>>,
-        mpsc::Sender<Arc<RoutableMessage>>,
-        mpsc::Receiver<Arc<RoutableMessage>>,
-        mpsc::Receiver<Arc<RoutableMessage>>,
+        mpsc::Sender<RoutedMessage>,
+        mpsc::Sender<RoutedMessage>,
+        mpsc::Receiver<RoutedMessage>,
+        mpsc::Receiver<RoutedMessage>,
     ) {
         let (ptx, prx) = mpsc::channel(priority_cap);
         let (ntx, nrx) = mpsc::channel(normal_cap);

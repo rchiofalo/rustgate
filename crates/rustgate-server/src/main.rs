@@ -228,7 +228,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         BackpressureGate::set_on_bytes_changed(
             &mut backpressure_gate,
             Arc::new(|n| {
-                metrics::queued_bytes().set(n as i64);
+                metrics::queued_bytes().set(i64::try_from(n).unwrap_or(i64::MAX));
             }),
         );
     }

@@ -166,10 +166,12 @@ async fn handle_ws_session(
         "WebSocket session started"
     );
 
-    let (priority_tx, mut priority_rx) =
-        mpsc::channel::<Arc<RoutableMessage>>(rustgate_transport::PRIORITY_CHANNEL_CAPACITY);
-    let (normal_tx, mut normal_rx) =
-        mpsc::channel::<Arc<RoutableMessage>>(rustgate_transport::NORMAL_CHANNEL_CAPACITY);
+    let (priority_tx, mut priority_rx) = mpsc::channel::<rustgate_transport::RoutedMessage>(
+        rustgate_transport::PRIORITY_CHANNEL_CAPACITY,
+    );
+    let (normal_tx, mut normal_rx) = mpsc::channel::<rustgate_transport::RoutedMessage>(
+        rustgate_transport::NORMAL_CHANNEL_CAPACITY,
+    );
     let handle = if circuit_breaker_threshold > 0 {
         SessionHandle::with_drop_threshold(
             Arc::clone(&identity),
@@ -312,8 +314,8 @@ async fn ws_read_loop(
 /// delivered first.
 async fn ws_write_loop(
     mut ws_write: SplitSink<WsStream, Message>,
-    priority_rx: &mut mpsc::Receiver<Arc<RoutableMessage>>,
-    normal_rx: &mut mpsc::Receiver<Arc<RoutableMessage>>,
+    priority_rx: &mut mpsc::Receiver<rustgate_transport::RoutedMessage>,
+    normal_rx: &mut mpsc::Receiver<rustgate_transport::RoutedMessage>,
     codec: &dyn Codec,
 ) -> Result<(), String> {
     loop {
