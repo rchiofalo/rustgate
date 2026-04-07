@@ -53,10 +53,29 @@ impl TestEnv {
 
     /// Spawn the enrollment server as a background task.
     fn spawn_server(&self) -> tokio::task::JoinHandle<()> {
+        self.spawn_server_with_rate_limit(10)
+    }
+
+    /// Spawn the enrollment server with a custom CSR rate limit (per minute).
+    fn spawn_server_with_rate_limit(&self, max_per_minute: usize) -> tokio::task::JoinHandle<()> {
+        self.spawn_server_with(max_per_minute, None)
+    }
+
+    /// Spawn the server with a rate limit and optional callback fired on
+    /// every rate-limited request.
+    fn spawn_server_with(
+        &self,
+        max_per_minute: usize,
+        on_rate_limit: Option<rustgate_enrollment::RateLimitCallback>,
+    ) -> tokio::task::JoinHandle<()> {
         let signer = CsrSigner::from_pem(&self.ca_cert_pem, &self.ca_key_pem, "TestOrg")
             .expect("build signer for server");
         let credentials = Credentials::new("admin".to_string(), "secret".to_string());
-        let server = EnrollmentServer::new(signer, credentials);
+        let mut server = EnrollmentServer::new(signer, credentials)
+            .with_rate_limit(max_per_minute, std::time::Duration::from_secs(60));
+        if let Some(cb) = on_rate_limit {
+            server = server.with_rate_limit_callback(cb);
+        }
 
         let addr = self.addr;
         let cert_pem = self.server_cert_pem.clone();
@@ -300,6 +319,63 @@ async fn get_tls_config() {
     assert!(
         body_str.contains("TestOrg"),
         "should contain the organization name"
+    );
+}
+
+#[tokio::test]
+async fn csr_rate_limit_returns_429_and_fires_callback() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let env = TestEnv::new();
+    let counter = Arc::new(AtomicU64::new(0));
+    let cb_counter = Arc::clone(&counter);
+    let cb: rustgate_enrollment::RateLimitCallback = Arc::new(move || {
+        let _ = cb_counter.fetch_add(1, Ordering::Relaxed);
+    });
+
+    // Allow only 2 requests per minute per IP, with a callback registered.
+    let _server = env.spawn_server_with(2, Some(cb));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let make_req = || {
+        let csr = generate_csr("rl-client");
+        Request::builder()
+            .method("POST")
+            .uri(format!(
+                "https://localhost:{}/Marti/api/tls/signClient/v2",
+                env.addr.port()
+            ))
+            .header("Authorization", encode_basic_auth("admin", "secret"))
+            .header("Host", "localhost")
+            .body(Full::new(Bytes::from(csr)))
+            .expect("build request")
+    };
+
+    // First two requests should succeed.
+    for _ in 0..2 {
+        let resp = env.send_request(make_req()).await;
+        assert_eq!(resp.status(), 200, "request under limit should succeed");
+    }
+
+    // Third request from the same IP must be rejected with 429.
+    let resp = env.send_request(make_req()).await;
+    assert_eq!(
+        resp.status(),
+        429,
+        "third request should exceed the rate limit"
+    );
+
+    let body = resp.collect().await.expect("collect body").to_bytes();
+    let body_str = std::str::from_utf8(&body).expect("body is UTF-8");
+    assert!(
+        body_str.contains("rate limit"),
+        "429 body should mention rate limit, got: {body_str}"
+    );
+
+    assert!(
+        counter.load(Ordering::Relaxed) >= 1,
+        "rate-limit callback should fire on rejection"
     );
 }
 
