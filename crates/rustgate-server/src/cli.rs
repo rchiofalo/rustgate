@@ -150,6 +150,19 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = false, env = "RUSTGATE_OCSP_STAPLING")]
     pub(crate) ocsp_stapling: bool,
 
+    /// Enable client-certificate OCSP verification (Tier 1, fail-open).
+    ///
+    /// When set, every accepted client certificate is checked against an
+    /// in-memory OCSP cache keyed by Subject Key Identifier. On a cache
+    /// miss the inner verifier's decision stands and a background task
+    /// fetches an OCSP response so the *next* handshake can be checked.
+    /// Cached `Revoked` responses cause the handshake to be rejected.
+    ///
+    /// Requires --features ocsp. Useful as a near-real-time complement
+    /// to CRLs, which only refresh on a schedule.
+    #[arg(long, default_value_t = false, env = "RUSTGATE_CLIENT_OCSP")]
+    pub(crate) client_ocsp: bool,
+
     #[arg(long, value_enum, default_value_t = Framing::Xml, env = "RUSTGATE_FRAMING")]
     pub(crate) framing: Framing,
 
@@ -684,6 +697,7 @@ define_config_file! {
     kx_groups: Option<String>,
     cert_reload_interval: u64,
     ocsp_stapling: bool,
+    client_ocsp: bool,
     framing: Framing,
     encoding: Encoding,
     nats_url: Option<String>,
