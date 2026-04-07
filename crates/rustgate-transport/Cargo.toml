@@ -30,6 +30,7 @@ rustls-pki-types = { workspace = true }
 x509-parser = { workspace = true }
 sha2 = { workspace = true }
 parking_lot = { workspace = true }
+lru = { workspace = true }
 tracing = { workspace = true }
 zeroize = { workspace = true }
 ocsp-stapler = { workspace = true, optional = true }
