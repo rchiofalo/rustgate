@@ -22,6 +22,7 @@ mod acl_api;
 mod acl_config;
 mod acl_reloader;
 mod archive;
+mod archive_rotation;
 mod audit;
 mod cli;
 #[cfg(feature = "metrics")]
@@ -110,6 +111,31 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Dedicated access log sink: filters only target="access" events and
+    // appends one JSON line per routed message. Opt-in via --access-log.
+    let access_layer = if let Some(ref access_path) = cli.access_log {
+        let writer: std::sync::Mutex<Box<dyn std::io::Write + Send>> = if access_path == "-" {
+            std::sync::Mutex::new(Box::new(std::io::stdout()))
+        } else {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(access_path)
+                .map_err(|e| anyhow::anyhow!("failed to open access log {access_path}: {e}"))?;
+            std::sync::Mutex::new(Box::new(file))
+        };
+        let filter = tracing_subscriber::filter::Targets::new()
+            .with_target(rustgate_transport::ACCESS_LOG_TARGET, tracing::Level::INFO);
+        Some(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(writer)
+                .with_filter(filter),
+        )
+    } else {
+        None
+    };
+
     #[cfg(feature = "otel")]
     let otel_layer = if let Some(ref endpoint) = cli.otel_endpoint {
         Some(otel::init_layer(endpoint, &cli.otel_service_name)?)
@@ -124,6 +150,7 @@ fn main() -> anyhow::Result<()> {
         .with(env_filter)
         .with(fmt_layer)
         .with(audit_layer)
+        .with(access_layer)
         .with(otel_layer)
         .init();
 
@@ -208,7 +235,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     tracing::info!(addr = %listener.local_addr()?, framing = ?cli.framing, encoding = ?encoding, "listening");
 
-    // Readiness flag for K8s health probes
+    // Differentiated health probe state for K8s liveness/readiness/startup.
+    // `live` flips on inside `metrics::serve` when the metrics server binds.
+    // `ready` is set after listener + ACL + (optional) federation init.
+    // `started` is a one-shot, flipped after the accept loop is reached.
+    #[cfg(feature = "metrics")]
+    let health = Arc::new(metrics::HealthState::new());
+    // Legacy compatibility shim: a number of code paths still use a bare
+    // `ready` AtomicBool to gate accept-loop behaviour. Keep it for now —
+    // it shadows the readiness portion of `HealthState`.
     let ready = Arc::new(AtomicBool::new(true));
 
     // ── Metrics ─────────────────────────────────────────────────────
@@ -223,7 +258,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     #[cfg(feature = "metrics")]
     let metrics_identity = setup::start_metrics(
         &cli,
-        &ready,
+        &health,
         #[cfg(feature = "federation")]
         &fed_api_slot,
         &acl_api_slot,
@@ -477,6 +512,29 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         None
     };
 
+    // ── CoT archive retention / rotation ───────────────────────────
+    let archive_rotation_handle = if let Some(ref dir) = cli.archive_dir
+        && (cli.archive_max_size > 0 || cli.archive_max_age > 0)
+    {
+        let cfg = archive_rotation::RotationConfig {
+            dir: std::path::PathBuf::from(dir),
+            max_bytes: cli.archive_max_size,
+            max_age: std::time::Duration::from_secs(cli.archive_max_age),
+            interval: std::time::Duration::from_secs(cli.archive_rotate_interval.max(1)),
+            archiver: archiver.clone(),
+        };
+        tracing::info!(
+            dir = %dir,
+            max_bytes = cli.archive_max_size,
+            max_age_secs = cli.archive_max_age,
+            interval_secs = cli.archive_rotate_interval,
+            "CoT archive rotation enabled",
+        );
+        Some(archive_rotation::spawn(cfg))
+    } else {
+        None
+    };
+
     // ── Plaintext TCP listener ──────────────────────────────────────
     let tcp_plaintext_shutdown = setup::start_plaintext_tcp(
         &cli,
@@ -534,6 +592,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     }
 
     // ── Accept loop ─────────────────────────────────────────────────
+    // Initial init pass is complete: listener bound, ACL loaded, and
+    // (when enabled) federation peers wired. Flip readiness on, then
+    // mark startup as complete (one-shot — never flipped back).
+    #[cfg(feature = "metrics")]
+    {
+        health.set_ready(true);
+        // One-shot transition: never resets, even on shutdown.
+        let _ = health.mark_started();
+    }
     loop {
         // Global backpressure: park the accept loop while the router's
         // in-flight byte counter is over the high-water mark. Connections
@@ -610,6 +677,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             _ = shutdown_signal() => {
                 tracing::info!("shutdown signal received");
                 ready.store(false, Ordering::Release);
+                #[cfg(feature = "metrics")]
+                health.set_ready(false);
                 break;
             }
         }
@@ -644,13 +713,27 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     if let Some(handle) = udp_shutdown {
         setup::stop_subsystem("udp", handle).await;
     }
+    if let Some(handle) = archive_rotation_handle {
+        handle.abort();
+    }
 
     // ── Connection draining ─────────────────────────────────────────
 
     let active = router.session_count().await;
-    tracing::info!(sessions = active, "draining connections");
+    tracing::info!(
+        sessions = active,
+        drain_timeout_secs = cli.shutdown_drain_timeout,
+        "draining connections"
+    );
 
-    let drain_timeout = Duration::from_secs(110);
+    // Close every session's outbound channels so write loops observe a
+    // clean EOF after flushing whatever is currently buffered. The
+    // session task itself still runs through its normal cleanup path,
+    // releasing its semaphore permit when the writer returns.
+    let closed = router.close_all_session_senders().await;
+    tracing::debug!(closed_sessions = closed, "closed session outbound channels");
+
+    let drain_timeout = Duration::from_secs(cli.shutdown_drain_timeout);
     let drain = connection_limit.acquire_many(max_connections);
 
     match tokio::time::timeout(drain_timeout, drain).await {

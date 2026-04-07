@@ -7,8 +7,6 @@
 #[cfg(feature = "federation")]
 use std::collections::BTreeSet;
 use std::sync::Arc;
-#[cfg(feature = "metrics")]
-use std::sync::atomic::AtomicBool;
 #[cfg(feature = "federation")]
 use std::time::SystemTime;
 
@@ -350,7 +348,31 @@ pub(crate) async fn connect_nats(
             }
 
             // Spawn NATS subscriber as a background task
-            let subscriber = adapter.subscriber();
+            #[cfg_attr(not(feature = "metrics"), allow(unused_mut))]
+            let mut subscriber = adapter.subscriber();
+            #[cfg(feature = "metrics")]
+            {
+                use rustgate_nats::{LagCallback, LagSnapshot, LatencyCallback};
+                let cb: LagCallback = std::sync::Arc::new(|snap: LagSnapshot| {
+                    if let Some(g) = crate::metrics::nats_consumer_pending() {
+                        g.set(snap.num_pending as i64);
+                    }
+                    if let Some(g) = crate::metrics::nats_consumer_num_redelivered() {
+                        g.set(snap.num_redelivered as i64);
+                    }
+                    if let Some(g) = crate::metrics::nats_consumer_ack_floor_stream_seq() {
+                        g.set(snap.ack_floor_stream_seq as i64);
+                    }
+                });
+                let lat_cb: LatencyCallback = std::sync::Arc::new(|d: std::time::Duration| {
+                    if let Some(h) = crate::metrics::nats_consumer_info_seconds() {
+                        h.observe(d.as_secs_f64());
+                    }
+                });
+                subscriber = subscriber
+                    .with_lag_callback(cb, None)
+                    .with_latency_callback(lat_cb);
+            }
             let sub_router = Arc::clone(router);
             spawn_background("nats-subscriber", async move {
                 if let Err(e) = subscriber.run(sub_router).await {
@@ -553,7 +575,7 @@ pub(crate) fn warn_enrollment_disabled(cli: &Cli) {
 #[cfg(feature = "metrics")]
 pub(crate) fn start_metrics(
     cli: &Cli,
-    ready: &Arc<AtomicBool>,
+    health: &Arc<metrics::HealthState>,
     #[cfg(feature = "federation")] fed_api_slot: &Arc<std::sync::OnceLock<metrics::FedApiHandler>>,
     acl_api_slot: &Arc<std::sync::OnceLock<metrics::AclApiHandler>>,
 ) -> anyhow::Result<Arc<metrics::MetricsIdentity>> {
@@ -590,14 +612,14 @@ pub(crate) fn start_metrics(
             .parse()
             .context("parsing --metrics-bind address")?;
 
-        let health_ready = Arc::clone(ready);
+        let health_for_metrics = Arc::clone(health);
         #[cfg(feature = "federation")]
         let fed_api_for_metrics = Arc::clone(fed_api_slot);
         let acl_api_for_metrics = Arc::clone(acl_api_slot);
         spawn_background("metrics-server", async move {
             if let Err(e) = metrics::serve(
                 bind_addr,
-                health_ready,
+                health_for_metrics,
                 #[cfg(feature = "federation")]
                 fed_api_for_metrics,
                 acl_api_for_metrics,
