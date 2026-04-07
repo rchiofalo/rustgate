@@ -71,6 +71,30 @@ Operational guidance:
   to export historical files for inspection or backup. The decrypted
   output is plaintext and should be deleted when no longer needed.
 
+### Nonce-collision bound and key rotation cadence
+
+Each encrypted file uses an 8-byte random base nonce concatenated with a
+4-byte chunk counter to form the 96-bit ChaCha20-Poly1305 nonce. Because
+the base nonce is random rather than a counter, the dominant safety
+limit is the birthday bound on the **base nonce across files written
+under the same key**:
+
+- 2^32 files per key gives a ~50% chance of base-nonce collision.
+- 2^16 files per key keeps the collision probability below ~2^-32.
+
+Recommendation: rotate the active key (add a new id and update
+`active_key_id`) before any single key has been used to write more than
+~2^16 files (≈65k). For most deployments — one archive file per UTC day
+plus one audit log per restart — this means rotating every few years is
+ample, but high-rotation environments (frequent restarts, many small
+files) should rotate sooner.
+
+A future enhancement under consideration is migrating to
+**XChaCha20-Poly1305**, whose 24-byte nonce makes random nonces safe for
+all practical workloads and removes the birthday bound as an
+operational concern. Tracking issue: see the encrypted-archive design
+notes.
+
 The following are generally **not** security issues:
 
 - Bugs that require local access to the server
