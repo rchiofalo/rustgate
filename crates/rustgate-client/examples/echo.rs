@@ -45,13 +45,13 @@ async fn main() -> anyhow::Result<()> {
         .build()?;
 
     let client = Client::connect(config).await?;
-    println!("connected; echoing inbound frames on group 'test'");
-    let mut inbound = client.subscribe("test");
+    println!("connected; echoing inbound frames");
+    let mut inbound = client.subscribe();
 
     while let Some(msg) = inbound.next().await {
         let msg = msg?;
         println!("rx {} bytes; echoing back", msg.payload.len());
-        client.send("test", msg.payload).await?;
+        client.send(msg.payload).await?;
     }
 
     client.disconnect().await;

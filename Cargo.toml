@@ -90,6 +90,7 @@ unicode-normalization = "0.1"
 arc-swap = "1"
 zeroize = { version = "1", features = ["derive"] }
 ocsp-stapler = "0.4"
+fastrand = "2"
 
 # Internal crates
 rustgate-core = { path = "crates/rustgate-core" }

@@ -15,8 +15,8 @@ framing, or reconnection bookkeeping.
   - `.connect_timeout(Duration)` — bound the initial dial
   - `.reconnect(ReconnectPolicy::default())` — opt in to exponential-backoff reconnect
 - `Client::connect(config) -> Result<Client>` — TLS handshake, returns connected client
-- `client.send(group, payload) -> Result<()>`
-- `client.subscribe(group) -> impl Stream<Item = Result<Message>>`
+- `client.send(payload) -> Result<()>`
+- `client.subscribe() -> impl Stream<Item = Result<Message>>`
 - `client.disconnect()` — graceful shutdown with TLS close_notify
 
 ## Example
@@ -35,9 +35,9 @@ async fn main() -> anyhow::Result<()> {
         .build()?;
 
     let client = Client::connect(config).await?;
-    let mut inbound = client.subscribe("default");
+    let mut inbound = client.subscribe();
 
-    client.send("default", Bytes::from_static(b"hello")).await?;
+    client.send(Bytes::from_static(b"hello")).await?;
 
     if let Some(msg) = inbound.next().await {
         let msg = msg?;
@@ -54,7 +54,6 @@ A runnable echo client lives in `examples/echo.rs`.
 ## Wire-protocol note
 
 The on-wire protocol is opaque framed bytes. The rustgate server determines
-routing from the sender's certificate OUs, not from any per-message group tag.
-The `group` argument to `send`/`subscribe` is therefore informational and
-reserved for future use; sent payloads go wherever the server's routing rules
-dictate, and subscribers receive every inbound frame on the connection.
+routing from the sender's certificate OUs, not from any per-message tag.
+Sent payloads go wherever the server's routing rules dictate, and subscribers
+receive every inbound frame on the connection.

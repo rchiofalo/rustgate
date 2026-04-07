@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
-use rustgate_client::{Client, ClientConfig, Codec, Message};
+use rustgate_client::{Client, ClientConfig, Codec, Message, ReconnectPolicy};
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
 use rustgate_core::protocol::HeaderSize;
@@ -144,22 +144,169 @@ async fn broadcast_between_two_clients_via_client_api() {
     accept_handle.await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let mut bob_rx = Box::pin(bob.subscribe("default"));
-    let mut alice_rx = Box::pin(alice.subscribe("default"));
+    let mut bob_rx = Box::pin(bob.subscribe());
+    let mut alice_rx = Box::pin(alice.subscribe());
 
-    alice
-        .send("default", Bytes::from_static(b"hello bob"))
-        .await
-        .unwrap();
+    alice.send(Bytes::from_static(b"hello bob")).await.unwrap();
     assert_eq!(recv_one(&mut bob_rx, "bob").await, &b"hello bob"[..]);
 
-    bob.send("default", Bytes::from_static(b"hey alice"))
-        .await
-        .unwrap();
+    bob.send(Bytes::from_static(b"hey alice")).await.unwrap();
     assert_eq!(recv_one(&mut alice_rx, "alice").await, &b"hey alice"[..]);
 
     alice.disconnect().await;
     bob.disconnect().await;
+}
+
+#[tokio::test]
+async fn client_recovers_after_server_restart() {
+    // First server: accept one connection, then drop the listener so the
+    // port is released. The accepted session's task is aborted to force
+    // the client's read loop to see a connection-reset/EOF.
+    let ca = TestCa::new("Test CA");
+    let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
+    let tls_config =
+        TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem).unwrap();
+    let listener = TlsListener::bind("127.0.0.1:0", &tls_config).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let session_slot: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    let slot_clone = Arc::clone(&session_slot);
+    let accept_handle = tokio::spawn(async move {
+        let session = listener.accept().await.unwrap();
+        let router = Arc::new(Router::new());
+        // Stash the session-task future so we can abort it later.
+        let jh = tokio::spawn(async move {
+            let identity = session.identity_arc();
+            let (ptx, mut prx) = mpsc::channel::<Arc<RoutableMessage>>(16);
+            let (ntx, mut nrx) = mpsc::channel::<Arc<RoutableMessage>>(64);
+            let handle = SessionHandle::new(Arc::clone(&identity), ptx, ntx);
+            router.register(handle).await;
+            let (reader, writer) = session.split();
+            let mut framed_r = FramedRead::new(reader, LengthPrefixedCodec::new(HeaderSize::Four));
+            let mut framed_w = FramedWrite::new(writer, LengthPrefixedCodec::new(HeaderSize::Four));
+            loop {
+                tokio::select! {
+                    frame = framed_r.next() => {
+                        if frame.is_none() { break; }
+                    }
+                    msg = prx.recv() => {
+                        let Some(msg) = msg else { break };
+                        let _ = framed_w
+                            .send(tokio_util::bytes::BytesMut::from(msg.payload.as_ref()))
+                            .await;
+                    }
+                    msg = nrx.recv() => {
+                        let Some(msg) = msg else { break };
+                        let _ = framed_w
+                            .send(tokio_util::bytes::BytesMut::from(msg.payload.as_ref()))
+                            .await;
+                    }
+                }
+            }
+        });
+        *slot_clone.lock().await = Some(jh);
+        // Drop listener by exiting the task.
+    });
+
+    let client_cert = ca.issue_client_cert("alice", &["engineers"]);
+    let cert_pem_bytes = client_cert.cert_pem.into_bytes();
+    let key_pem_bytes = client_cert.key_pem.into_bytes();
+    let ca_pem_bytes = ca.cert_pem.clone().into_bytes();
+    let config = ClientConfig::builder()
+        .server_addr(addr.to_string())
+        .server_name("localhost")
+        .mtls_pem_bytes(
+            cert_pem_bytes.clone(),
+            key_pem_bytes.clone(),
+            ca_pem_bytes.clone(),
+        )
+        .codec(Codec::LengthPrefixed4)
+        .connect_timeout(Duration::from_secs(5))
+        .reconnect(ReconnectPolicy {
+            initial_backoff: Duration::from_millis(50),
+            max_backoff: Duration::from_secs(1),
+            max_attempts: 0,
+        })
+        .build()
+        .unwrap();
+
+    let client = Client::connect(config).await.unwrap();
+    accept_handle.await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Tear down the first server's session, freeing the connection.
+    if let Some(jh) = session_slot.lock().await.take() {
+        jh.abort();
+        let _ = jh.await;
+    }
+    // Give the OS a moment to release the port.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Restart on the same address.
+    let server_cert2 = ca.issue_server_cert("localhost", &["localhost"]);
+    let tls_config2 =
+        TlsConfig::from_pem(&server_cert2.cert_pem, &server_cert2.key_pem, &ca.cert_pem).unwrap();
+    let listener2 = TlsListener::bind(addr, &tls_config2).await.unwrap();
+    // Second server: accept the reconnect, then immediately echo back the
+    // first frame we read on that session so the client can observe it.
+    let (echo_tx, mut echo_rx) = tokio::sync::mpsc::channel::<Bytes>(1);
+    let accept2 = tokio::spawn(async move {
+        let session = listener2.accept().await.unwrap();
+        let (reader, writer) = session.split();
+        let mut framed_r = FramedRead::new(reader, LengthPrefixedCodec::new(HeaderSize::Four));
+        let mut framed_w = FramedWrite::new(writer, LengthPrefixedCodec::new(HeaderSize::Four));
+        while let Some(Ok(frame)) = framed_r.next().await {
+            let bytes = frame.freeze();
+            let _ = echo_tx.send(bytes.clone()).await;
+            if framed_w
+                .send(tokio_util::bytes::BytesMut::from(bytes.as_ref()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    // Client should reconnect; keep sending until the second server reports
+    // it received a frame, then verify the client observes the echo.
+    let mut rx = Box::pin(client.subscribe());
+    let mut received_on_server = false;
+    for _ in 0..60 {
+        let _ = client.send(Bytes::from_static(b"post-reconnect")).await;
+        if let Ok(Some(got)) =
+            tokio::time::timeout(Duration::from_millis(200), echo_rx.recv()).await
+        {
+            assert_eq!(got.as_ref(), b"post-reconnect");
+            received_on_server = true;
+            break;
+        }
+    }
+    assert!(
+        received_on_server,
+        "client did not reconnect to restarted server"
+    );
+
+    // The second server echoes; the client's subscribe stream should see it.
+    let delivered = tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(Ok(msg)) = rx.next().await {
+            if msg.payload.as_ref() == b"post-reconnect" {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        delivered,
+        "client did not receive echoed frame after reconnect"
+    );
+
+    client.disconnect().await;
+    accept2.abort();
+    let _ = accept2.await;
 }
 
 #[tokio::test]
@@ -170,13 +317,10 @@ async fn binary_payload_via_client_api() {
     accept_handle.await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let mut bob_rx = Box::pin(bob.subscribe("default"));
+    let mut bob_rx = Box::pin(bob.subscribe());
 
     let payload: Vec<u8> = (0u8..=255).collect();
-    alice
-        .send("default", Bytes::from(payload.clone()))
-        .await
-        .unwrap();
+    alice.send(Bytes::from(payload.clone())).await.unwrap();
 
     let got = recv_one(&mut bob_rx, "binary").await;
     assert_eq!(got.as_ref(), payload.as_slice());

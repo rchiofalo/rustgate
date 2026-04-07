@@ -22,7 +22,7 @@
 //! let client = Client::connect(config).await?;
 //! let mut stream = client.subscribe("default");
 //!
-//! client.send("default", Bytes::from_static(b"hello")).await?;
+//! client.send(Bytes::from_static(b"hello")).await?;
 //!
 //! while let Some(msg) = stream.next().await {
 //!     let msg = msg?;
@@ -38,10 +38,9 @@
 //!
 //! The on-wire protocol is opaque framed bytes — the rustgate server
 //! determines routing from the sender's certificate OUs, not from any
-//! per-message group tag. The `group` argument to [`Client::send`] and
-//! [`Client::subscribe`] is therefore informational; sent payloads go to
-//! whichever destinations the server's routing rules dictate, and
-//! subscribers receive every inbound frame on the connection.
+//! per-message tag. Sent payloads go to whichever destinations the
+//! server's routing rules dictate, and subscribers receive every inbound
+//! frame on the connection.
 
 #![deny(missing_docs)]
 
@@ -49,6 +48,7 @@ mod connect;
 mod reconnect;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -56,6 +56,8 @@ use futures::Stream;
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+use zeroize::Zeroizing;
 
 pub use crate::connect::ConnectOptions;
 pub use crate::reconnect::ReconnectPolicy;
@@ -90,6 +92,13 @@ pub enum ClientError {
     /// Reconnect attempts were exhausted.
     #[error("reconnect attempts exhausted ({0} attempts)")]
     ReconnectExhausted(u32),
+
+    /// Inbound subscriber lagged behind the broadcast buffer and dropped messages.
+    #[error("subscriber lagged and dropped {dropped} messages")]
+    Lagged {
+        /// Number of messages dropped.
+        dropped: u64,
+    },
 }
 
 /// A `Result` alias parameterised by [`ClientError`].
@@ -146,15 +155,15 @@ pub enum TlsMaterial {
     PemBytes {
         /// Client certificate chain.
         cert: Vec<u8>,
-        /// Client private key.
-        key: Vec<u8>,
+        /// Client private key. Zeroized on drop.
+        key: Zeroizing<Vec<u8>>,
         /// Trusted CA bundle.
         ca: Vec<u8>,
     },
 }
 
 /// Configuration for a [`Client`]. Build with [`ClientConfig::builder`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ClientConfig {
     pub(crate) server_addr: String,
     pub(crate) server_name: String,
@@ -169,6 +178,20 @@ impl ClientConfig {
     /// Start a new builder.
     pub fn builder() -> ClientConfigBuilder {
         ClientConfigBuilder::default()
+    }
+}
+
+impl std::fmt::Debug for ClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientConfig")
+            .field("server_addr", &self.server_addr)
+            .field("server_name", &self.server_name)
+            .field("tls", &"<redacted>")
+            .field("codec", &self.codec)
+            .field("plaintext", &self.plaintext)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("reconnect", &self.reconnect)
+            .finish()
     }
 }
 
@@ -216,7 +239,11 @@ impl ClientConfigBuilder {
 
     /// Configure mTLS using in-memory PEM byte buffers.
     pub fn mtls_pem_bytes(mut self, cert: Vec<u8>, key: Vec<u8>, ca: Vec<u8>) -> Self {
-        self.tls = Some(TlsMaterial::PemBytes { cert, key, ca });
+        self.tls = Some(TlsMaterial::PemBytes {
+            cert,
+            key: Zeroizing::new(key),
+            ca,
+        });
         self
     }
 
@@ -274,10 +301,6 @@ impl ClientConfigBuilder {
 /// A message received from the server.
 #[derive(Debug, Clone)]
 pub struct Message {
-    /// The (informational) group this message is associated with. Currently
-    /// always `None` because the wire protocol does not carry a group tag —
-    /// reserved for future use.
-    pub group: Option<String>,
     /// Raw frame bytes as decoded by the configured [`Codec`].
     pub payload: Bytes,
 }
@@ -296,6 +319,7 @@ struct ClientInner {
     inbound: broadcast::Sender<Message>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     shutdown: Arc<tokio::sync::Notify>,
+    disconnected: AtomicBool,
 }
 
 impl Client {
@@ -326,13 +350,16 @@ impl Client {
                 inbound: in_tx,
                 tasks: Mutex::new(vec![task]),
                 shutdown,
+                disconnected: AtomicBool::new(false),
             }),
         })
     }
 
-    /// Send a payload to the given group. The current wire protocol ignores
-    /// the `group` argument — see the crate docs for details.
-    pub async fn send(&self, _group: &str, payload: Bytes) -> Result<()> {
+    /// Send a payload to the server.
+    pub async fn send(&self, payload: Bytes) -> Result<()> {
+        if self.inner.disconnected.load(Ordering::Acquire) {
+            return Err(ClientError::Disconnected);
+        }
         self.inner
             .out_tx
             .send(payload)
@@ -345,26 +372,21 @@ impl Client {
     ///
     /// Multiple subscribers may coexist; each gets its own independent view
     /// of the inbound stream (broadcast semantics).
-    pub fn subscribe(&self, _group: &str) -> impl Stream<Item = Result<Message>> + Send + 'static {
+    pub fn subscribe(&self) -> impl Stream<Item = Result<Message>> + Send + 'static {
         use futures::StreamExt;
         let rx = self.inner.inbound.subscribe();
         BroadcastStream::new(rx).map(|res| {
-            res.map_err(|e| ClientError::Io(std::io::Error::other(format!("subscribe lag: {e}"))))
+            res.map_err(|BroadcastStreamRecvError::Lagged(dropped)| ClientError::Lagged { dropped })
         })
     }
 
     /// Gracefully disconnect: signal the background loop to shut down,
-    /// flush pending writes, and send a TLS close_notify.
+    /// flush pending writes, send a TLS close_notify, and await tasks.
     pub async fn disconnect(&self) {
+        self.inner.disconnected.store(true, Ordering::Release);
         self.inner.shutdown.notify_waiters();
-        // Drop the outbound sender so the writer loop exits cleanly.
-        // We can't move `out_tx` out of Arc, but closing the channel from
-        // the only sender side requires dropping all clones — calling
-        // `notify_waiters` is enough for the run loop to exit, which then
-        // drops its receivers and shuts down the TLS half.
         let mut tasks = self.inner.tasks.lock().await;
         for task in tasks.drain(..) {
-            task.abort();
             let _ = task.await;
         }
     }

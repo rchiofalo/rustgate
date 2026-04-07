@@ -12,7 +12,7 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing::{debug, warn};
 
 use crate::connect::{Stream, dial};
-use crate::{ClientConfig, Message};
+use crate::{ClientConfig, ClientError, Message};
 
 /// Exponential backoff policy for reconnect attempts.
 #[derive(Debug, Clone, Copy)]
@@ -73,6 +73,10 @@ pub(crate) async fn run(
                             s
                         }
                         Err(e) => {
+                            if is_fatal_dial_error(&e) {
+                                warn!(error = %e, "client redial failed with fatal error; giving up");
+                                return;
+                            }
                             warn!(error = %e, "client redial failed");
                             continue;
                         }
@@ -125,7 +129,6 @@ where
         match frame {
             Ok(bytes) => {
                 let msg = Message {
-                    group: None,
                     payload: bytes.freeze(),
                 };
                 // Ignore lag/no-receivers — broadcast keeps going.
@@ -157,8 +160,15 @@ where
     ExitReason::WriteEnded
 }
 
+fn is_fatal_dial_error(e: &ClientError) -> bool {
+    matches!(
+        e,
+        ClientError::Tls(_) | ClientError::CertParse(_) | ClientError::MissingField(_)
+    )
+}
+
 fn compute_backoff(policy: ReconnectPolicy, attempt: u32) -> Duration {
-    // 100ms, 200ms, 400ms, ... capped at max_backoff.
+    // 100ms, 200ms, 400ms, ... capped at max_backoff, with ±20% uniform jitter.
     let exp = attempt.saturating_sub(1).min(20);
     let multiplier = 1u64 << exp;
     let nanos = policy
@@ -166,7 +176,18 @@ fn compute_backoff(policy: ReconnectPolicy, attempt: u32) -> Duration {
         .as_nanos()
         .saturating_mul(multiplier as u128);
     let dur = Duration::from_nanos(nanos.min(u64::MAX as u128) as u64);
-    dur.min(policy.max_backoff)
+    let capped = dur.min(policy.max_backoff);
+    // ±20% jitter: multiply by a factor in [0.8, 1.2).
+    let base_nanos = capped.as_nanos() as u64;
+    if base_nanos == 0 {
+        return capped;
+    }
+    let jitter_range = (base_nanos / 5).saturating_mul(2); // 40% of base
+    let offset = fastrand::u64(0..=jitter_range);
+    let jittered = base_nanos
+        .saturating_sub(base_nanos / 5)
+        .saturating_add(offset);
+    Duration::from_nanos(jittered)
 }
 
 #[cfg(test)]
@@ -175,6 +196,12 @@ mod tests {
 
     use super::*;
 
+    fn in_jitter_range(actual: Duration, base_ms: u64) -> bool {
+        let lo = Duration::from_nanos((base_ms * 1_000_000) * 80 / 100);
+        let hi = Duration::from_nanos((base_ms * 1_000_000) * 120 / 100);
+        actual >= lo && actual <= hi
+    }
+
     #[test]
     fn backoff_grows_then_caps() {
         let p = ReconnectPolicy {
@@ -182,10 +209,12 @@ mod tests {
             max_backoff: Duration::from_secs(30),
             max_attempts: 0,
         };
-        assert_eq!(compute_backoff(p, 1), Duration::from_millis(100));
-        assert_eq!(compute_backoff(p, 2), Duration::from_millis(200));
-        assert_eq!(compute_backoff(p, 3), Duration::from_millis(400));
-        // Eventually caps at max_backoff
-        assert_eq!(compute_backoff(p, 20), Duration::from_secs(30));
+        // Sample several times; each call must stay within ±20% of the expected base.
+        for _ in 0..32 {
+            assert!(in_jitter_range(compute_backoff(p, 1), 100));
+            assert!(in_jitter_range(compute_backoff(p, 2), 200));
+            assert!(in_jitter_range(compute_backoff(p, 3), 400));
+            assert!(in_jitter_range(compute_backoff(p, 20), 30_000));
+        }
     }
 }

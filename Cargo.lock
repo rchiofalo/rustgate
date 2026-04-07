@@ -2322,6 +2322,7 @@ version = "0.7.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "fastrand",
  "futures",
  "rustgate-core",
  "rustgate-test-utils",
@@ -2334,6 +2335,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

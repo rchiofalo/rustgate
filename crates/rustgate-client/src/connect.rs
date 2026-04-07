@@ -109,8 +109,9 @@ fn build_tls_config(material: &TlsMaterial) -> Result<rustls::ClientConfig> {
             let a = std::fs::read(ca)?;
             (c, k, a)
         }
-        TlsMaterial::PemBytes { cert, key, ca } => (cert.clone(), key.clone(), ca.clone()),
+        TlsMaterial::PemBytes { cert, key, ca } => (cert.clone(), key.to_vec(), ca.clone()),
     };
+    let key_pem = zeroize::Zeroizing::new(key_pem);
 
     let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_pem)
         .collect::<std::result::Result<Vec<_>, _>>()
