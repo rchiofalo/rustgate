@@ -210,10 +210,44 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     // CLI validation ensures max_connections is 1..=u32::MAX
     let max_connections: u32 = cli.max_connections as u32;
     let (group_acl, acl_file_hash, acl_file_parsed) = setup::load_group_acl(&cli).await?;
-    let router = Arc::new(match group_acl {
-        Some(acl) => Router::with_acl(acl),
-        None => Router::new(),
+    let client_queue: Option<Arc<rustgate_transport::ClientQueue>> =
+        if let Some(ref dir) = cli.client_queue_dir {
+            match rustgate_transport::ClientQueue::open(dir, cli.client_queue_max_bytes) {
+                Ok(q) => {
+                    tracing::info!(
+                        dir = %dir.display(),
+                        max_bytes = cli.client_queue_max_bytes,
+                        "per-client store-and-forward queue enabled"
+                    );
+                    Some(Arc::new(q))
+                }
+                Err(e) => {
+                    tracing::error!(
+                        dir = %dir.display(),
+                        error = %e,
+                        "failed to open client store-and-forward queue; continuing without it"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+    let router = Arc::new({
+        let base = match group_acl {
+            Some(acl) => Router::with_acl(acl),
+            None => Router::new(),
+        };
+        match client_queue.as_ref() {
+            Some(q) => base.with_client_queue(Arc::clone(q)),
+            None => base,
+        }
     });
+
+    #[cfg(feature = "metrics")]
+    if let Some(ref q) = client_queue {
+        metrics::spawn_client_queue_metrics_task(Arc::clone(q), Arc::clone(&metrics_identity));
+    }
 
     // ── Cross-path deduplication ───────────────────────────────────
     #[cfg_attr(not(feature = "metrics"), allow(unused_mut))]

@@ -34,6 +34,8 @@ lru = { workspace = true }
 tracing = { workspace = true }
 zeroize = { workspace = true }
 ocsp-stapler = { workspace = true, optional = true }
+redb = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 rustgate-test-utils = { workspace = true }

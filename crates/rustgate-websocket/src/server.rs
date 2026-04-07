@@ -182,7 +182,16 @@ async fn handle_ws_session(
     };
     let session_id = handle.id;
 
+    // Drain offline queue BEFORE register so queued messages are
+    // delivered ahead of any live traffic routed to this CN after
+    // registration completes.
+    let buffered_offline = router.drain_offline_messages(&identity.cn).await;
     router.register(handle.clone()).await;
+    for m in buffered_offline {
+        if handle.send(Arc::new(m)).await.is_err() {
+            break;
+        }
+    }
     router.replay_positions(&handle).await;
 
     let ws_stream = session.into_stream();
