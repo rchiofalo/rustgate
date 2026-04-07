@@ -13,6 +13,7 @@ use tracing::{Instrument, debug, warn};
 
 use crate::acl::GroupAclPolicy;
 use crate::cache::PositionCache;
+use crate::store_forward::ClientQueue;
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -239,6 +240,11 @@ pub struct Router {
     state: RwLock<State>,
     cache: PositionCache,
     acl: ArcSwap<Option<GroupAclPolicy>>,
+    /// Optional per-client store-and-forward disk queue. When `None`,
+    /// the router behaves exactly as before: messages destined for
+    /// offline CNs are dropped. When `Some`, they are persisted and
+    /// drained on reconnect.
+    client_queue: Option<Arc<ClientQueue>>,
 }
 
 impl Default for Router {
@@ -247,6 +253,7 @@ impl Default for Router {
             state: RwLock::new(State::default()),
             cache: PositionCache::default(),
             acl: ArcSwap::from_pointee(None),
+            client_queue: None,
         }
     }
 }
@@ -270,6 +277,7 @@ impl Router {
             }),
             cache: PositionCache::default(),
             acl: ArcSwap::from_pointee(None),
+            client_queue: None,
         }
     }
 
@@ -283,7 +291,22 @@ impl Router {
             state: RwLock::new(State::default()),
             cache: PositionCache::default(),
             acl: ArcSwap::from_pointee(acl),
+            client_queue: None,
         }
+    }
+
+    /// Attach an optional client store-and-forward queue. Builder-style:
+    /// ```ignore
+    /// let router = Router::new().with_client_queue(queue);
+    /// ```
+    pub fn with_client_queue(mut self, queue: Arc<ClientQueue>) -> Self {
+        self.client_queue = Some(queue);
+        self
+    }
+
+    /// Access the attached client store-and-forward queue, if any.
+    pub fn client_queue(&self) -> Option<&Arc<ClientQueue>> {
+        self.client_queue.as_ref()
     }
 
     /// Create a router with custom group limits and access control policy.
@@ -301,6 +324,7 @@ impl Router {
             }),
             cache: PositionCache::default(),
             acl: ArcSwap::from_pointee(acl),
+            client_queue: None,
         }
     }
 
@@ -441,6 +465,55 @@ impl Router {
         }
     }
 
+    /// Drain any messages persisted for this CN while it was
+    /// disconnected, delivering them before live traffic resumes.
+    ///
+    /// Returns the number of messages that were actually re-delivered
+    /// to the session channel. Silently no-ops if no client queue is
+    /// attached.
+    pub async fn drain_client_queue(&self, handle: &SessionHandle) -> u32 {
+        let Some(queue) = self.client_queue.clone() else {
+            return 0;
+        };
+        let cn = handle.identity.cn.clone();
+        // redb operations are synchronous; run on a blocking thread to
+        // avoid stalling the runtime for large drains.
+        let drained = tokio::task::spawn_blocking(move || queue.drain(&cn)).await;
+        let msgs = match drained {
+            Ok(Ok(m)) => m,
+            Ok(Err(e)) => {
+                warn!(
+                    session = %handle.identity.cn,
+                    error = %e,
+                    "client queue drain failed"
+                );
+                return 0;
+            }
+            Err(e) => {
+                warn!(
+                    session = %handle.identity.cn,
+                    error = %e,
+                    "client queue drain task join failed"
+                );
+                return 0;
+            }
+        };
+        let mut delivered = 0u32;
+        for m in msgs {
+            if handle.send(Arc::new(m)).await.is_ok() {
+                delivered += 1;
+            }
+        }
+        if delivered > 0 {
+            debug!(
+                session = %handle.identity.cn,
+                delivered,
+                "drained client queue on reconnect"
+            );
+        }
+        delivered
+    }
+
     /// Replay cached positions to a newly connected session.
     /// Only replays positions from clients that share at least one group
     /// with the connecting session to enforce group-level isolation.
@@ -495,13 +568,40 @@ impl Router {
             let state = self.state.read().await;
             state.sessions.get(cn).cloned()
         };
-        if let Some(handle) = handle
-            && handle.send(msg).await.is_err()
-        {
-            warn!(
-                session = %cn,
-                "message dropped: session channel full or disconnected"
-            );
+        match handle {
+            Some(handle) => {
+                if let Err(e) = handle.send(msg).await {
+                    warn!(
+                        session = %cn,
+                        "message dropped: session channel full or disconnected"
+                    );
+                    // Channel closed or full — persist for redelivery
+                    // if a store-and-forward queue is attached.
+                    self.persist_for_offline(cn, &e.0);
+                }
+            }
+            None => {
+                // No live subscriber — persist for redelivery.
+                self.persist_for_offline(cn, &msg);
+            }
+        }
+    }
+
+    /// Persist a message for later delivery to `cn`, if a client queue
+    /// is attached. On error the message is dropped and a warning is
+    /// logged — the queue is best-effort durability, not a blocker for
+    /// live routing.
+    fn persist_for_offline(&self, cn: &str, msg: &RoutableMessage) {
+        let Some(queue) = self.client_queue.as_ref() else {
+            return;
+        };
+        match queue.enqueue(cn, msg) {
+            Ok(_dropped) => {
+                debug!(cn, "message persisted to client queue for offline delivery");
+            }
+            Err(e) => {
+                warn!(cn, error = %e, "client queue enqueue failed");
+            }
         }
     }
 
@@ -1467,5 +1567,70 @@ mod tests {
         // Normal receiver should also see closure eventually
         // (no messages were sent to normal, but sender is dropped)
         assert!(nrx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn store_forward_enqueue_on_disconnect_drain_on_reconnect() {
+        use tempfile::TempDir;
+
+        use crate::store_forward::ClientQueue;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let queue = Arc::new(ClientQueue::open(tmp.path(), 1_000_000).expect("open queue"));
+        let router = Router::new().with_client_queue(Arc::clone(&queue));
+
+        let alice = make_identity("alice", &["alpha"]);
+        let bob = make_identity("bob", &["alpha"]);
+
+        // Route a direct chat to bob while bob is NOT registered.
+        // The message must be persisted, not dropped.
+        let chat = RoutableMessage {
+            source: (*alice).clone(),
+            destination: Destination::Direct((*bob).clone()),
+            payload: Bytes::from_static(b"hello bob"),
+            metadata: Metadata {
+                received_at: SystemTime::now(),
+                source_protocol: "test".to_string(),
+                message_type: MessageType::Chat,
+                ttl: None,
+            },
+        };
+        router.route(chat).await;
+
+        assert_eq!(queue.stats("bob").depth, 1, "message must be queued");
+
+        // Now bob connects — drain_client_queue must deliver the
+        // buffered message to his session channel.
+        let (ptx_b, ntx_b, _prx_b, mut nrx_b) = make_channels(16, 16);
+        let handle = SessionHandle::new(bob.clone(), ptx_b, ntx_b);
+        router.register(handle.clone()).await;
+        let delivered = router.drain_client_queue(&handle).await;
+        assert_eq!(delivered, 1);
+
+        let received = nrx_b.try_recv().expect("bob receives buffered chat");
+        assert_eq!(received.payload.as_ref(), b"hello bob");
+        assert_eq!(queue.stats("bob").depth, 0);
+    }
+
+    #[tokio::test]
+    async fn store_forward_disabled_does_not_persist() {
+        // Regression: when no client queue is attached, routing to an
+        // offline CN must remain a silent drop (no panic, no state).
+        let router = Router::new();
+        let alice = make_identity("alice", &["alpha"]);
+        let ghost = make_identity("ghost", &["alpha"]);
+        let chat = RoutableMessage {
+            source: (*alice).clone(),
+            destination: Destination::Direct((*ghost).clone()),
+            payload: Bytes::from_static(b"into the void"),
+            metadata: Metadata {
+                received_at: SystemTime::now(),
+                source_protocol: "test".to_string(),
+                message_type: MessageType::Chat,
+                ttl: None,
+            },
+        };
+        router.route(chat).await;
+        assert!(router.client_queue().is_none());
     }
 }

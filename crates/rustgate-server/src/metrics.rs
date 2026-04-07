@@ -74,6 +74,11 @@ static NEGOTIATIONS: OnceLock<IntCounterVec> = OnceLock::new();
 
 static HANDSHAKE_FAILURES: OnceLock<IntCounterVec> = OnceLock::new();
 
+static CLIENT_QUEUE_DEPTH: OnceLock<prometheus::IntGaugeVec> = OnceLock::new();
+static CLIENT_QUEUE_BYTES: OnceLock<prometheus::IntGaugeVec> = OnceLock::new();
+static CLIENT_QUEUE_DROPS: OnceLock<IntCounter> = OnceLock::new();
+static CLIENT_QUEUE_DRAINS: OnceLock<IntCounter> = OnceLock::new();
+
 // ── Fallback constructors ───────────────────────────────────────────
 //
 // When `init()` has not been called, accessor functions lazily create
@@ -213,6 +218,40 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(handshake_failures.clone()))?;
     let _ = HANDSHAKE_FAILURES.set(handshake_failures);
 
+    let client_queue_depth = prometheus::IntGaugeVec::new(
+        Opts::new(
+            "rustgate_client_queue_depth",
+            "Current number of messages queued for store-and-forward per CN (bucketed)",
+        ),
+        &["identity_cn"],
+    )?;
+    registry.register(Box::new(client_queue_depth.clone()))?;
+    let _ = CLIENT_QUEUE_DEPTH.set(client_queue_depth);
+
+    let client_queue_bytes = prometheus::IntGaugeVec::new(
+        Opts::new(
+            "rustgate_client_queue_bytes",
+            "Current encoded bytes queued for store-and-forward per CN (bucketed)",
+        ),
+        &["identity_cn"],
+    )?;
+    registry.register(Box::new(client_queue_bytes.clone()))?;
+    let _ = CLIENT_QUEUE_BYTES.set(client_queue_bytes);
+
+    let client_queue_drops = IntCounter::with_opts(Opts::new(
+        "rustgate_client_queue_drops_total",
+        "Total messages dropped from the client store-and-forward queue (cap eviction)",
+    ))?;
+    registry.register(Box::new(client_queue_drops.clone()))?;
+    let _ = CLIENT_QUEUE_DROPS.set(client_queue_drops);
+
+    let client_queue_drains = IntCounter::with_opts(Opts::new(
+        "rustgate_client_queue_drains_total",
+        "Total successful client store-and-forward drain operations",
+    ))?;
+    registry.register(Box::new(client_queue_drains.clone()))?;
+    let _ = CLIENT_QUEUE_DRAINS.set(client_queue_drains);
+
     Ok(())
 }
 
@@ -296,6 +335,86 @@ pub fn handshake_failures() -> &'static IntCounterVec {
     HANDSHAKE_FAILURES.get_or_init(|| {
         fallback_counter_vec("rustgate_handshake_failures_total", "fallback", &["reason"])
     })
+}
+
+/// Returns the client-queue depth gauge vector (Tier 1, registered
+/// only when `init()` succeeded).
+pub fn client_queue_depth() -> Option<&'static prometheus::IntGaugeVec> {
+    CLIENT_QUEUE_DEPTH.get()
+}
+
+/// Returns the client-queue byte-usage gauge vector.
+pub fn client_queue_bytes() -> Option<&'static prometheus::IntGaugeVec> {
+    CLIENT_QUEUE_BYTES.get()
+}
+
+/// Returns the client-queue drop counter.
+pub fn client_queue_drops() -> Option<&'static IntCounter> {
+    CLIENT_QUEUE_DROPS.get()
+}
+
+/// Returns the client-queue drain counter.
+pub fn client_queue_drains() -> Option<&'static IntCounter> {
+    CLIENT_QUEUE_DRAINS.get()
+}
+
+/// Spawn a background task that periodically samples the given client
+/// queue and updates the Prometheus metrics. CN labels are bucketed
+/// against `identity` to bound label cardinality.
+///
+/// The task exits when the queue's last `Arc` reference is dropped.
+pub fn spawn_client_queue_metrics_task(
+    queue: Arc<rustgate_transport::ClientQueue>,
+    identity: Arc<MetricsIdentity>,
+) {
+    use std::collections::HashMap;
+    drop(tokio::spawn(async move {
+        let mut last_drops: u64 = 0;
+        let mut last_drains: u64 = 0;
+        let mut ticker = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            let _ = ticker.tick().await;
+            if Arc::strong_count(&queue) == 1 {
+                return;
+            }
+            // Aggregate per-bucket depth/bytes across every CN that
+            // currently has queued entries. CNs not in the allowlist
+            // are bucketed under the "other" label, matching the Tier
+            // 2 per-identity cardinality guarantees.
+            let snapshot = queue.snapshot();
+            let mut bucket_depth: HashMap<String, i64> = HashMap::new();
+            let mut bucket_bytes: HashMap<String, i64> = HashMap::new();
+            for (cn, stats) in &snapshot {
+                let label = identity.bucket(cn).to_string();
+                *bucket_depth.entry(label.clone()).or_insert(0) += stats.depth as i64;
+                *bucket_bytes.entry(label).or_insert(0) += stats.bytes as i64;
+            }
+            if let Some(gauge) = client_queue_depth() {
+                for (label, v) in &bucket_depth {
+                    gauge.with_label_values(&[label.as_str()]).set(*v);
+                }
+            }
+            if let Some(gauge) = client_queue_bytes() {
+                for (label, v) in &bucket_bytes {
+                    gauge.with_label_values(&[label.as_str()]).set(*v);
+                }
+            }
+            let drops_now = queue.drops_total();
+            if drops_now > last_drops
+                && let Some(c) = client_queue_drops()
+            {
+                c.inc_by(drops_now - last_drops);
+            }
+            last_drops = drops_now;
+            let drains_now = queue.drains_total();
+            if drains_now > last_drains
+                && let Some(c) = client_queue_drains()
+            {
+                c.inc_by(drains_now - last_drains);
+            }
+            last_drains = drains_now;
+        }
+    }));
 }
 
 /// Classify a TLS handshake error into a metric label.

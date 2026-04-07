@@ -92,6 +92,7 @@ ocsp-stapler = "0.4"
 figment = { version = "0.10", features = ["toml"] }
 toml = "0.8"
 serial_test = "3"
+redb = "2"
 
 # Internal crates
 rustgate-core = { path = "crates/rustgate-core" }

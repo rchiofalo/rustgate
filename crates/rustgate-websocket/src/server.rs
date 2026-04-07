@@ -183,6 +183,7 @@ async fn handle_ws_session(
     let session_id = handle.id;
 
     router.register(handle.clone()).await;
+    let _drained = router.drain_client_queue(&handle).await;
     router.replay_positions(&handle).await;
 
     let ws_stream = session.into_stream();

@@ -119,6 +119,10 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
     tracing::info!(cn = %cn, peer = %peer_addr, session_id = session_id, "connected");
     crate::audit::client_connected(&cn, peer_addr, &identity.fingerprint, session_id);
     deps.router.register(handle.clone()).await;
+    // Drain any messages persisted while this CN was offline BEFORE
+    // replaying live position cache so queued traffic is delivered
+    // first.
+    let _drained = deps.router.drain_client_queue(&handle).await;
     deps.router.replay_positions(&handle).await;
 
     #[allow(unused_mut)] // Mutable borrows needed for proto negotiation
@@ -531,6 +535,7 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
                         };
                         let session_id = handle.id;
                         router.register(handle.clone()).await;
+                        let _drained = router.drain_client_queue(&handle).await;
                         router.replay_positions(&handle).await;
 
                         let (reader, writer) = session.into_split();
