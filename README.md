@@ -365,6 +365,7 @@ All flags support environment variables (CLI takes precedence):
 | `--circuit-breaker-threshold` | `RUSTGATE_CIRCUIT_BREAKER_THRESHOLD` | `10` |
 | `--group-acl-file` | `RUSTGATE_GROUP_ACL_FILE` | — |
 | `--archive-dir` | `RUSTGATE_ARCHIVE_DIR` | — |
+| `--archive-key-file` | `RUSTGATE_ARCHIVE_KEY_FILE` | — |
 | `--package-max-age-hours` | `RUSTGATE_PACKAGE_MAX_AGE_HOURS` | `0` (no expiration) |
 | `--audit-log` | `RUSTGATE_AUDIT_LOG` | — |
 | `--client-queue-dir` | `RUSTGATE_CLIENT_QUEUE_DIR` | — (disabled) |
@@ -373,6 +374,42 @@ All flags support environment variables (CLI takes precedence):
 | `--otel-service-name` | `OTEL_SERVICE_NAME` | `rustgate` |
 
 </details>
+
+### Encrypted-at-rest archive and audit log
+
+When `--archive-key-file <path>` is supplied, the CoT archive
+(`--archive-dir`) and the audit log (`--audit-log`) are written through
+a streaming ChaCha20-Poly1305 sink instead of plaintext JSONL. The key
+file is a small JSON document:
+
+```json
+{
+  "active_key_id": "k1",
+  "keys": {
+    "k1": "1111111111111111111111111111111111111111111111111111111111111111"
+  }
+}
+```
+
+Each key is a 32-byte (64-character) lowercase hex string. The `active_key_id`
+is used for new writes; rotating keys is as simple as adding a new entry
+and updating `active_key_id` — historical files written under the prior
+key remain readable as long as that key is still listed. Encrypted files
+gain an `.enc` suffix and start with an authenticated header that records
+the key id used.
+
+To inspect or export an encrypted file:
+
+```bash
+rustgate decrypt-archive \
+  --in  /var/log/rustgate/cot-2026-04-06.jsonl.enc \
+  --out /tmp/cot-2026-04-06.jsonl \
+  --key-file /etc/rustgate/archive-keys.json
+```
+
+Tampering with any byte of the on-disk ciphertext fails AEAD verification
+on read. Key bytes are held in `zeroize::Zeroizing` buffers and wiped on
+drop.
 
 ### Cross-path deduplication
 

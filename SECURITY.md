@@ -46,6 +46,31 @@ The following are considered security issues:
 - Information disclosure (e.g., leaking client identities or positions to unauthorized parties)
 - Injection attacks (XML, command, etc.)
 
+### At-rest encryption
+
+The CoT archive (`--archive-dir`) and JSON audit log (`--audit-log`)
+can be encrypted with ChaCha20-Poly1305 by supplying
+`--archive-key-file <path>`. Each output file is sealed under a
+per-file random nonce using the active key from the supplied JSON
+key ring; key rotation is supported by adding new key ids without
+removing old ones, so historical files remain decryptable.
+
+Operational guidance:
+
+- Store the key file on a tmpfs or hardware-protected mount; treat it
+  with the same care as the server's TLS private key.
+- Rotate keys periodically by adding a new id and updating
+  `active_key_id`. Old keys must remain in the file until every file
+  written under them has been migrated or expired.
+- Encryption is independent of full-disk encryption (FDE) and is
+  intended for environments that require application-level protection
+  (classified, regulated, or multi-tenant deployments). FDE alone does
+  not protect against an operator with shell access reading archive
+  files.
+- Use `rustgate decrypt-archive --in <enc> --out <plaintext> --key-file <path>`
+  to export historical files for inspection or backup. The decrypted
+  output is plaintext and should be deleted when no longer needed.
+
 The following are generally **not** security issues:
 
 - Bugs that require local access to the server
