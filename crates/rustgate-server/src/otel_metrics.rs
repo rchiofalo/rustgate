@@ -34,16 +34,28 @@
 //! The `SdkMeterProvider` is stored in a module-level `OnceLock` so
 //! that `shutdown` can call `provider.shutdown()` directly, flushing the
 //! last batch of metrics before process exit.
-
-use std::sync::OnceLock;
-use std::time::Duration;
+//!
+//! # Gather coalescing
+//!
+//! Each OTEL collection cycle invokes every observable instrument's
+//! callback serially. A naive implementation where each callback calls
+//! `prometheus::default_registry().gather()` on its own would produce
+//! `O(F²)` gather work per cycle for `F` metric families. Instead, all
+//! callbacks share a module-level `FamilyCache` keyed by family name. The
+//! first callback of a collection cycle gathers the Prometheus registry
+//! once, populates the cache, and subsequent callbacks do `HashMap`
+//! lookups. The cache is invalidated after a short TTL so back-to-back
+//! collection cycles always see fresh values.
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use opentelemetry::metrics::MeterProvider;
 use opentelemetry::{InstrumentationScope, KeyValue};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
-use prometheus::proto::MetricType;
+use prometheus::proto::{MetricFamily, MetricType};
 
 /// Module-level storage for the meter provider.
 ///
@@ -51,6 +63,82 @@ use prometheus::proto::MetricType;
 /// `shutdown` can drive `provider.shutdown()` directly, rather than
 /// relying on `Drop` of a cloned `Arc` (which is a no-op).
 static PROVIDER: OnceLock<SdkMeterProvider> = OnceLock::new();
+
+/// Short-lived cache of gathered Prometheus metric families, shared by
+/// every observable instrument callback so a single OTEL collection cycle
+/// only walks the Prometheus registry once.
+///
+/// The cache is refreshed lazily: any callback that observes a stale
+/// entry (`refreshed_at + CACHE_TTL < now`) triggers a single gather and
+/// repopulates the `HashMap` for the remainder of the collection window.
+/// `CACHE_TTL` is intentionally well below the minimum OTLP push interval
+/// (1 s) so consecutive collection cycles always see fresh data, but long
+/// enough to cover the burst of callbacks within one cycle.
+struct FamilyCache {
+    refreshed_at: Option<Instant>,
+    families: HashMap<String, MetricFamily>,
+}
+
+impl FamilyCache {
+    /// Staleness threshold. Any gather older than this is discarded at
+    /// the next `refresh_if_stale` call.
+    const CACHE_TTL: Duration = Duration::from_millis(500);
+
+    fn new() -> Self {
+        Self {
+            refreshed_at: None,
+            families: HashMap::new(),
+        }
+    }
+
+    /// Gather the Prometheus default registry if the cached snapshot is
+    /// missing or older than `CACHE_TTL`.
+    fn refresh_if_stale(&mut self) {
+        let stale = match self.refreshed_at {
+            None => true,
+            Some(t) => t.elapsed() >= Self::CACHE_TTL,
+        };
+        if !stale {
+            return;
+        }
+        self.families.clear();
+        for fam in prometheus::default_registry().gather() {
+            // The existing value (if any) was just cleared; discard the
+            // `None` returned by `insert` to keep `-Dwarnings` happy.
+            let _ = self.families.insert(fam.name().to_string(), fam);
+        }
+        self.refreshed_at = Some(Instant::now());
+    }
+}
+
+static FAMILY_CACHE: LazyLock<Mutex<FamilyCache>> =
+    LazyLock::new(|| Mutex::new(FamilyCache::new()));
+
+/// Run `f` against the cached `MetricFamily` for `name`, refreshing the
+/// cache first if it's stale. Silently no-ops if the family is not
+/// currently registered (it may have been unregistered at runtime) or if
+/// the cache mutex is poisoned.
+fn with_cached_family<F>(name: &str, mut f: F)
+where
+    F: FnMut(&MetricFamily),
+{
+    let Ok(mut guard) = FAMILY_CACHE.lock() else {
+        return;
+    };
+    guard.refresh_if_stale();
+    if let Some(fam) = guard.families.get(name) {
+        f(fam);
+    }
+}
+
+/// Force the cache to refresh on its next access. Called from `shutdown`
+/// so the final `force_flush` sees freshly-gathered values rather than a
+/// sub-500 ms stale snapshot.
+fn invalidate_cache() {
+    if let Ok(mut guard) = FAMILY_CACHE.lock() {
+        guard.refreshed_at = None;
+    }
+}
 
 /// Configure an OTLP push exporter that scrapes the Prometheus default
 /// registry and sends the translated metrics to `endpoint` every
@@ -113,11 +201,12 @@ pub(crate) fn init(endpoint: &str, service_name: &str, interval: Duration) -> an
     Ok(())
 }
 
-/// Attach one observable instrument to `meter` that gathers the named
+/// Attach one observable instrument to `meter` that observes the named
 /// Prometheus metric family on every collection cycle.
 ///
-/// The callback filters `prometheus::gather()` output to the specific
-/// family by name, translates each metric's label pairs to OTEL
+/// The callback looks the family up in the shared `FamilyCache` (which
+/// lazily gathers `prometheus::default_registry()` at most once per
+/// collection cycle), translates each metric's label pairs to OTEL
 /// `KeyValue` attributes, and forwards the value to the appropriate
 /// observable instrument. Histograms and summaries produce two
 /// instruments (`<name>_sum`, `<name>_count`) via a companion call.
@@ -129,16 +218,12 @@ fn attach_family(meter: &opentelemetry::metrics::Meter, name: String, kind: Metr
                 .f64_observable_counter(name)
                 .with_description("bridged from prometheus counter")
                 .with_callback(move |obs| {
-                    let families = prometheus::default_registry().gather();
-                    for family in families {
-                        if family.name() != family_name {
-                            continue;
-                        }
+                    with_cached_family(&family_name, |family| {
                         for metric in family.get_metric() {
                             let attrs = label_pairs_to_kv(metric.get_label());
                             obs.observe(metric.get_counter().get_value(), &attrs);
                         }
-                    }
+                    });
                 })
                 .build();
         }
@@ -148,16 +233,12 @@ fn attach_family(meter: &opentelemetry::metrics::Meter, name: String, kind: Metr
                 .f64_observable_gauge(name)
                 .with_description("bridged from prometheus gauge")
                 .with_callback(move |obs| {
-                    let families = prometheus::default_registry().gather();
-                    for family in families {
-                        if family.name() != family_name {
-                            continue;
-                        }
+                    with_cached_family(&family_name, |family| {
                         for metric in family.get_metric() {
                             let attrs = label_pairs_to_kv(metric.get_label());
                             obs.observe(metric.get_gauge().get_value(), &attrs);
                         }
-                    }
+                    });
                 })
                 .build();
         }
@@ -194,11 +275,7 @@ fn attach_histogram_or_summary_like(
             "bridged sum of prometheus summary observations"
         })
         .with_callback(move |obs| {
-            let families = prometheus::default_registry().gather();
-            for family in families {
-                if family.name() != family_for_sum {
-                    continue;
-                }
+            with_cached_family(&family_for_sum, |family| {
                 for metric in family.get_metric() {
                     let attrs = label_pairs_to_kv(metric.get_label());
                     let sum = if is_histogram {
@@ -208,7 +285,7 @@ fn attach_histogram_or_summary_like(
                     };
                     obs.observe(sum, &attrs);
                 }
-            }
+            });
         })
         .build();
 
@@ -221,11 +298,7 @@ fn attach_histogram_or_summary_like(
             "bridged count of prometheus summary observations"
         })
         .with_callback(move |obs| {
-            let families = prometheus::default_registry().gather();
-            for family in families {
-                if family.name() != family_for_count {
-                    continue;
-                }
+            with_cached_family(&family_for_count, |family| {
                 for metric in family.get_metric() {
                     let attrs = label_pairs_to_kv(metric.get_label());
                     let count = if is_histogram {
@@ -235,7 +308,7 @@ fn attach_histogram_or_summary_like(
                     };
                     obs.observe(count, &attrs);
                 }
-            }
+            });
         })
         .build();
 }
@@ -255,6 +328,9 @@ fn label_pairs_to_kv(labels: &[prometheus::proto::LabelPair]) -> Vec<KeyValue> {
 /// avoid losing the final batch of metrics.
 pub(crate) fn shutdown() {
     if let Some(provider) = PROVIDER.get() {
+        // Drop any stale cached families so the final force_flush sees a
+        // fresh gather rather than a sub-TTL snapshot.
+        invalidate_cache();
         if let Err(e) = provider.force_flush() {
             tracing::debug!(error = %e, "OTLP meter provider force_flush failed");
         }
@@ -300,5 +376,30 @@ mod tests {
     fn shutdown_without_init_is_safe() {
         // Calling shutdown before init should not panic.
         shutdown();
+    }
+
+    #[test]
+    fn family_cache_refreshes_on_first_use_and_reuses_within_ttl() {
+        // Use a private FamilyCache instance (not the global one) so the
+        // test doesn't race with any other parallel test touching OTEL.
+        let mut cache = FamilyCache::new();
+        assert!(
+            cache.refreshed_at.is_none(),
+            "fresh cache should have no refresh timestamp"
+        );
+
+        cache.refresh_if_stale();
+        let first = cache
+            .refreshed_at
+            .expect("refresh_if_stale must populate the timestamp");
+        // refreshed_at should not advance on a subsequent call within TTL.
+        cache.refresh_if_stale();
+        let second = cache
+            .refreshed_at
+            .expect("second call must leave the timestamp set");
+        assert_eq!(
+            first, second,
+            "within-TTL refresh_if_stale should be a no-op"
+        );
     }
 }
