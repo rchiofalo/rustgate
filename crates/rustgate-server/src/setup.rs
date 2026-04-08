@@ -702,6 +702,8 @@ async fn build_federation_config(
             cli.federation_circuit_breaker_timeout,
         ),
         replay_buffer_capacity: cli.federation_replay_buffer_size,
+        replay_buffer_dir: cli.federation_replay_dir.clone(),
+        replay_max_bytes: cli.federation_replay_max_bytes,
         pod_id: cli.federation_pod_id.clone().or_else(|| {
             cli.federation_ha_nats_url
                 .as_ref()

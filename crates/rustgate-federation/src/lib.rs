@@ -18,6 +18,7 @@ pub mod peer;
 pub mod provenance;
 mod reconnect;
 pub mod replay_buffer;
+pub mod replay_persist;
 pub mod store;
 pub mod trust_store;
 pub mod v1;

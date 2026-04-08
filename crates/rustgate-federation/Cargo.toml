@@ -51,6 +51,9 @@ hyper = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
 prometheus = { workspace = true, optional = true }
 zeroize = { workspace = true }
+redb = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
 
 [build-dependencies]
 prost-build = { workspace = true, optional = true }
