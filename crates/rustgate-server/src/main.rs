@@ -640,6 +640,30 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             None
         };
 
+    // ── Federation peer discovery (issue #571) ──────────────────────
+    //
+    // Spawned only when `--federation-peer-discovery` selects a backend
+    // other than `none`. Returns a shutdown sender that's held here so
+    // the reconciler exits cleanly during graceful shutdown. Mutually
+    // exclusive with `--federation-peers-file` (enforced by clap's
+    // `conflicts_with`).
+    #[cfg(feature = "federation")]
+    let _fed_discovery_shutdown: Option<tokio::sync::watch::Sender<bool>> =
+        if let Some(rwlock) = fed_shutdown_handle.as_ref() {
+            setup::start_federation_peer_discovery(&cli, rwlock)?
+        } else {
+            // Federation disabled at runtime — warn if the flag was set.
+            use crate::cli::PeerDiscoveryBackend;
+            if cli.federation_peer_discovery != PeerDiscoveryBackend::None {
+                tracing::warn!(
+                    "--federation-peer-discovery requires federation to be configured; ignoring"
+                );
+            }
+            None
+        };
+    #[cfg(not(feature = "federation"))]
+    setup::warn_federation_peer_discovery_disabled(&cli);
+
     // ── Per-client rate limiting ────────────────────────────────────
     let throttle_config = setup::build_throttle_config(&cli);
 

@@ -543,6 +543,76 @@ pub(crate) struct Cli {
     #[arg(long, env = "RUSTGATE_FEDERATION_POD_ID")]
     pub(crate) federation_pod_id: Option<String>,
 
+    // -- Federation peer discovery (issue #571) --
+    /// Dynamic federation peer discovery backend.
+    ///
+    /// When set to anything other than `none`, rustgate spawns a background
+    /// reconciler that polls the selected backend on a fixed interval and
+    /// pipes the result into the same `swap_peers` API used by the file
+    /// reloader. Mutually exclusive with `--federation-peers-file`.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = PeerDiscoveryBackend::None,
+        env = "RUSTGATE_FEDERATION_PEER_DISCOVERY",
+        conflicts_with = "federation_peers_file"
+    )]
+    pub(crate) federation_peer_discovery: PeerDiscoveryBackend,
+
+    /// Polling interval in seconds for the federation peer discovery
+    /// reconciler. Ignored when `--federation-peer-discovery=none`.
+    #[arg(
+        long,
+        default_value_t = 30,
+        env = "RUSTGATE_FEDERATION_PEER_DISCOVERY_INTERVAL",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub(crate) federation_peer_discovery_interval: u64,
+
+    /// Service type browsed by the DNS-SD peer discovery backend.
+    #[arg(
+        long,
+        default_value = "_rustgate._tcp.local.",
+        env = "RUSTGATE_FEDERATION_PEER_DISCOVERY_DNS_SD_SERVICE"
+    )]
+    pub(crate) federation_peer_discovery_dns_sd_service: String,
+
+    /// Consul catalog HTTP endpoint used by the Consul peer discovery
+    /// backend (e.g. `http://consul.default.svc:8500`).
+    #[arg(
+        long,
+        default_value = "http://127.0.0.1:8500",
+        env = "RUSTGATE_FEDERATION_PEER_DISCOVERY_CONSUL_ADDR"
+    )]
+    pub(crate) federation_peer_discovery_consul_addr: String,
+
+    /// Consul service name queried by the Consul peer discovery backend.
+    #[arg(
+        long,
+        default_value = "rustgate",
+        env = "RUSTGATE_FEDERATION_PEER_DISCOVERY_CONSUL_SERVICE"
+    )]
+    pub(crate) federation_peer_discovery_consul_service: String,
+
+    /// Comma-separated list of etcd gRPC endpoints for the etcd peer
+    /// discovery backend (e.g.
+    /// `http://etcd-0:2379,http://etcd-1:2379,http://etcd-2:2379`).
+    #[arg(
+        long,
+        default_value = "http://127.0.0.1:2379",
+        env = "RUSTGATE_FEDERATION_PEER_DISCOVERY_ETCD_ENDPOINTS"
+    )]
+    pub(crate) federation_peer_discovery_etcd_endpoints: String,
+
+    /// Key prefix scanned by the etcd peer discovery backend. Each key
+    /// under this prefix becomes one federation peer entry.
+    #[arg(
+        long,
+        default_value = "rustgate/peers/",
+        env = "RUSTGATE_FEDERATION_PEER_DISCOVERY_ETCD_PREFIX"
+    )]
+    pub(crate) federation_peer_discovery_etcd_prefix: String,
+
     // -- QoS / rate limiting --
     /// Sliding-window replay detection window in seconds. Messages with the same
     /// (uid, time) pair seen within this window are dropped as replays.
@@ -757,6 +827,24 @@ pub(crate) enum Encoding {
     TakProtobuf,
 }
 
+/// Selects which dynamic federation peer discovery backend is used.
+///
+/// `None` (the default) disables discovery entirely; static peer
+/// configuration via `--federation-peers-file` remains the only source of
+/// truth. The other variants each map to a backend gated behind its own
+/// cargo feature (`peer-discovery-dns-sd`, `peer-discovery-consul`,
+/// `peer-discovery-etcd`); selecting a backend whose feature was not
+/// compiled in surfaces a startup error.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum PeerDiscoveryBackend {
+    #[default]
+    None,
+    DnsSd,
+    Consul,
+    Etcd,
+}
+
 impl From<Framing> for FramingStrategy {
     fn from(f: Framing) -> Self {
         match f {
@@ -925,6 +1013,13 @@ define_config_file! {
     federation_replay_max_bytes: u64,
     federation_ha_nats_url: Option<String>,
     federation_pod_id: Option<String>,
+    federation_peer_discovery: PeerDiscoveryBackend,
+    federation_peer_discovery_interval: u64,
+    federation_peer_discovery_dns_sd_service: String,
+    federation_peer_discovery_consul_addr: String,
+    federation_peer_discovery_consul_service: String,
+    federation_peer_discovery_etcd_endpoints: String,
+    federation_peer_discovery_etcd_prefix: String,
     replay_window: u64,
     client_message_rate: u32,
     client_burst: u32,

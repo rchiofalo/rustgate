@@ -99,6 +99,11 @@ redb = "2"
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc", "getrandom"] }
 hex = "0.4"
 spiffe = { version = "0.12", default-features = false, features = ["workload-api-x509"] }
+async-trait = "0.1.89"
+mdns-sd = { version = "0.19", default-features = false, features = ["async"] }
+etcd-client = { version = "0.18", default-features = false, features = ["tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
+wiremock = "0.6"
 
 # Internal crates
 rustgate-core = { path = "crates/rustgate-core" }

@@ -9,6 +9,12 @@
 pub mod config;
 pub mod connector;
 pub mod dedup;
+#[cfg(any(
+    feature = "peer-discovery-dns-sd",
+    feature = "peer-discovery-consul",
+    feature = "peer-discovery-etcd"
+))]
+pub mod discovery;
 #[cfg(feature = "ha")]
 pub mod ha;
 pub mod heartbeat;
