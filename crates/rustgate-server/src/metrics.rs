@@ -90,6 +90,9 @@ static NEGOTIATIONS: OnceLock<IntCounterVec> = OnceLock::new();
 
 static HANDSHAKE_FAILURES: OnceLock<IntCounterVec> = OnceLock::new();
 
+static CLIENT_OCSP_CACHE_HITS: OnceLock<IntCounter> = OnceLock::new();
+static CLIENT_OCSP_CACHE_MISSES: OnceLock<IntCounter> = OnceLock::new();
+
 static CLIENT_QUEUE_DEPTH: OnceLock<prometheus::IntGaugeVec> = OnceLock::new();
 static CLIENT_QUEUE_BYTES: OnceLock<prometheus::IntGaugeVec> = OnceLock::new();
 static CLIENT_QUEUE_DROPS: OnceLock<IntCounter> = OnceLock::new();
@@ -309,6 +312,20 @@ pub fn init() -> prometheus::Result<()> {
     )?;
     registry.register(Box::new(handshake_failures.clone()))?;
     let _ = HANDSHAKE_FAILURES.set(handshake_failures);
+
+    let client_ocsp_cache_hits = IntCounter::with_opts(Opts::new(
+        "rustgate_client_ocsp_cache_hits_total",
+        "Client certificate OCSP cache hits (cached good or revoked status served)",
+    ))?;
+    registry.register(Box::new(client_ocsp_cache_hits.clone()))?;
+    let _ = CLIENT_OCSP_CACHE_HITS.set(client_ocsp_cache_hits);
+
+    let client_ocsp_cache_misses = IntCounter::with_opts(Opts::new(
+        "rustgate_client_ocsp_cache_misses_total",
+        "Client certificate OCSP cache misses (background fetch dispatched)",
+    ))?;
+    registry.register(Box::new(client_ocsp_cache_misses.clone()))?;
+    let _ = CLIENT_OCSP_CACHE_MISSES.set(client_ocsp_cache_misses);
 
     let client_queue_depth = prometheus::IntGaugeVec::new(
         Opts::new(
@@ -629,6 +646,18 @@ pub fn spiffe_svid_expiry_seconds() -> &'static IntGauge {
             "Active SPIFFE SVID leaf notAfter (unix seconds)",
         )
     })
+}
+
+/// Returns the client-cert OCSP cache hit counter.
+#[allow(dead_code)] // only referenced when the `ocsp` feature is enabled
+pub fn client_ocsp_cache_hits() -> Option<&'static IntCounter> {
+    CLIENT_OCSP_CACHE_HITS.get()
+}
+
+/// Returns the client-cert OCSP cache miss counter.
+#[allow(dead_code)] // only referenced when the `ocsp` feature is enabled
+pub fn client_ocsp_cache_misses() -> Option<&'static IntCounter> {
+    CLIENT_OCSP_CACHE_MISSES.get()
 }
 
 /// Counter for CSR signing requests rejected by the enrollment server's
