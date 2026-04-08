@@ -564,6 +564,21 @@ Notes:
 - **SHA-1 OCSP requests.** The upstream `ocsp-stapler` crate currently issues OCSP requests with
   SHA-1 issuer hashes. Most CAs accept this — verify compatibility with strict modern responders.
 
+### Client certificate OCSP verification
+
+Build with `--features ocsp` and pass `--client-ocsp` (env `RUSTGATE_CLIENT_OCSP`) to wrap the
+client certificate verifier with a SKI-keyed OCSP cache. On a cache miss the inner verifier's
+decision still stands (Tier 1, fail-open) and a background task fetches an OCSP response so the
+*next* handshake for the same client certificate can be answered from the cache; cached
+`Revoked` responses cause the handshake to be rejected before the session is established.
+
+This complements CRL-based revocation (which only refreshes on a schedule) with near-real-time
+revocation for the incoming client cert. Two Prometheus counters track cache effectiveness when
+`--features metrics` is enabled:
+
+- `rustgate_client_ocsp_cache_hits_total`
+- `rustgate_client_ocsp_cache_misses_total`
+
 For security policy and vulnerability reporting see [SECURITY.md](SECURITY.md).
 
 ## Testing
