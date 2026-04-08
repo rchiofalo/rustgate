@@ -24,6 +24,9 @@ pub mod client_ocsp;
 #[cfg(feature = "ocsp")]
 pub mod ocsp;
 
+#[cfg(feature = "spiffe")]
+pub mod spiffe;
+
 pub use acl::{GroupAcl, GroupAclPolicy};
 pub use backpressure::{
     BackpressureGate, BackpressurePermit, DEFAULT_MAX_QUEUED_BYTES, OnBytesChanged, OnDeferred,

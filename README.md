@@ -213,7 +213,35 @@ cargo build --release --all-features
 | `post-quantum` | Post-quantum key exchange (X25519MLKEM768) | Go 1.20+, cmake |
 | `otel` | OpenTelemetry distributed tracing | `protoc` |
 | `ocsp` | OCSP stapling for server certificates | — |
+| `spiffe` | SPIFFE / SPIRE workload identity (server cert + trust bundle from the Workload API) | `protoc` |
 | `jemalloc` | jemalloc allocator | — |
+
+#### SPIFFE workload identity
+
+When the `spiffe` feature is compiled in, rustgate can obtain its server
+TLS identity from a SPIRE agent via the SPIFFE Workload API instead of
+from static `--cert` / `--key` / `--ca` files. Enable it by passing
+`--spiffe` on the command line (or `RUSTGATE_SPIFFE=true`) alongside an
+optional `--spiffe-workload-api-socket`:
+
+```
+rustgate \
+  --bind 0.0.0.0:4433 \
+  --spiffe \
+  --spiffe-workload-api-socket unix:///tmp/spire-agent/public/api.sock \
+  --spiffe-trust-domain example.org
+```
+
+The X.509-SVID and trust bundle are fetched at startup, installed as the
+active rustls server certificate and client-cert verifier CA bundle, and
+then re-fetched on the interval set by `--spiffe-refresh-interval`
+(default 300 s). Rotations reuse the existing zero-downtime hot-reload
+path used by file-based certs. `--spiffe` is mutually exclusive with
+`--cert`/`--key`/`--ca` and `--enrollment-bind`. Refresh outcomes are
+exposed via the `rustgate_spiffe_svid_refresh_total{outcome="success|failure"}`
+counter and the `rustgate_spiffe_svid_expiry_seconds` gauge when the
+`metrics` feature is also enabled, and via
+`target="audit", event_type="spiffe.svid_refresh"` audit events.
 
 ## Running
 
