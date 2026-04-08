@@ -22,6 +22,7 @@ jobs:
           - cot_parse
           - crl_parse
           - csr_parse
+          - federation_frame_parse
           - jwt_parse
           - length_prefixed_codec
           - nats_wire_event
