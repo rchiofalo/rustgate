@@ -16,7 +16,7 @@
 //!   across re-issuances is *not* a goal — we want one entry per
 //!   distinct cert, not per identity.
 //! - **Background fetcher.** A single bounded `tokio::sync::mpsc` channel
-//!   feeds a background task that calls [`ocsp_stapler::Client::query`]
+//!   feeds a background task that calls `ocsp_stapler::Client::query`
 //!   and inserts the result into the cache. Verification never blocks on
 //!   network I/O — it only ever reads from the in-memory cache.
 //! - **Why piggyback on `ocsp_stapler::Client`?** It already implements
@@ -57,7 +57,7 @@ pub type OnCacheMiss = Arc<dyn Fn() + Send + Sync>;
 ///
 /// Abstracted so tests can inject a deterministic responder without
 /// running a real HTTP server. The production implementation
-/// ([`OcspStaplerFetcher`]) wraps [`ocsp_stapler::Client`].
+/// (`OcspStaplerFetcher`) wraps `ocsp_stapler::Client`.
 /// Boxed future returned by [`OcspFetcher::fetch`].
 pub type FetchFuture<'a> = Pin<Box<dyn Future<Output = Result<bool, String>> + Send + 'a>>;
 
@@ -71,7 +71,7 @@ pub trait OcspFetcher: Send + Sync + 'static {
     fn fetch<'a>(&'a self, leaf_der: &'a [u8], issuer_der: &'a [u8]) -> FetchFuture<'a>;
 }
 
-/// Production OCSP fetcher backed by [`ocsp_stapler::Client`].
+/// Production OCSP fetcher backed by `ocsp_stapler::Client`.
 #[cfg(feature = "ocsp")]
 #[allow(missing_debug_implementations)]
 pub struct OcspStaplerFetcher {
@@ -143,7 +143,7 @@ const FETCH_QUEUE_CAPACITY: usize = 256;
 impl ClientOcspVerifier {
     /// Wrap an inner verifier with the OCSP cache and background fetcher.
     ///
-    /// Spawns one tokio task that consumes [`FETCH_QUEUE_CAPACITY`]
+    /// Spawns one tokio task that consumes `FETCH_QUEUE_CAPACITY`
     /// pending fetch requests at a time. The task exits when the
     /// returned `Arc` is dropped.
     pub fn new(
