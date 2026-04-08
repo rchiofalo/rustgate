@@ -111,7 +111,7 @@ pub(crate) async fn stop_subsystem(name: &str, handle: SubsystemHandle) {
 ///
 /// Returns the `TlsConfig`, the raw PEM strings (needed by enrollment and
 /// federation setup), and — when SPIFFE is enabled — the already-fetched
-/// [`SpiffeIdentity`] so that [`bind_tls_listener`] can reuse it without
+/// `SpiffeIdentity` so that `bind_tls_listener` can reuse it without
 /// hitting the Workload API a second time.
 pub(crate) async fn build_tls_config(cli: &Cli) -> anyhow::Result<TlsConfigBuild> {
     #[cfg(feature = "spiffe")]
@@ -202,7 +202,7 @@ pub(crate) async fn build_tls_config(cli: &Cli) -> anyhow::Result<TlsConfigBuild
 
 /// Result of [`build_tls_config`]. Carries the PEM strings consumed by the
 /// rest of the server plus, under `--spiffe`, the already-fetched
-/// [`SpiffeIdentity`] so [`bind_tls_listener`] can reuse the initial SVID
+/// `SpiffeIdentity` so `bind_tls_listener` can reuse the initial SVID
 /// and `CertReloader` without a second Workload API round-trip.
 pub(crate) struct TlsConfigBuild {
     pub(crate) tls_config: TlsConfig,
