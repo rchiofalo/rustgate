@@ -133,7 +133,12 @@ pub(crate) struct Cli {
     /// Workload API. Defaults to 300s (5 minutes). SPIFFE SVIDs are
     /// short-lived (typically 1 hour), so the default gives ample margin.
     /// Only used when `--spiffe` is enabled.
-    #[arg(long, default_value_t = 300, env = "RUSTGATE_SPIFFE_REFRESH_INTERVAL")]
+    #[arg(
+        long,
+        default_value_t = 300,
+        env = "RUSTGATE_SPIFFE_REFRESH_INTERVAL",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
     pub(crate) spiffe_refresh_interval: u64,
 
     /// Path to PEM-encoded Certificate Revocation List file.

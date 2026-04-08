@@ -109,11 +109,11 @@ pub(crate) async fn stop_subsystem(name: &str, handle: SubsystemHandle) {
 
 /// Build the TLS configuration from CLI flags.
 ///
-/// Returns the `TlsConfig` along with the raw PEM strings (needed by
-/// enrollment and federation setup).
-pub(crate) async fn build_tls_config(
-    cli: &Cli,
-) -> anyhow::Result<(TlsConfig, String, String, String)> {
+/// Returns the `TlsConfig`, the raw PEM strings (needed by enrollment and
+/// federation setup), and — when SPIFFE is enabled — the already-fetched
+/// [`SpiffeIdentity`] so that [`bind_tls_listener`] can reuse it without
+/// hitting the Workload API a second time.
+pub(crate) async fn build_tls_config(cli: &Cli) -> anyhow::Result<TlsConfigBuild> {
     #[cfg(feature = "spiffe")]
     if cli.spiffe {
         let spiffe_cfg = rustgate_transport::spiffe::SpiffeConfig {
@@ -139,6 +139,8 @@ pub(crate) async fn build_tls_config(
         // CRL support via SPIFFE is not defined by the SPIFFE spec; operators
         // that need CRLs can still point `--crl` at a static file alongside
         // `--spiffe`. This mirrors how OCSP stapling coexists with SPIFFE.
+        // Note: the CRL is loaded once at startup and does not hot-reload
+        // under `--spiffe`; restart to pick up new CRLs.
         if let Some(ref crl_path) = cli.crl {
             let crl_pem = tokio::fs::read_to_string(crl_path)
                 .await
@@ -146,12 +148,13 @@ pub(crate) async fn build_tls_config(
             tls_config = tls_config.with_crls(&crl_pem).context("loading CRL data")?;
         }
 
-        return Ok((
+        return Ok(TlsConfigBuild {
             tls_config,
-            identity.cert_pem,
-            identity.key_pem,
-            identity.trust_bundle_pem,
-        ));
+            cert_pem: identity.cert_pem.clone(),
+            key_pem: identity.key_pem.clone(),
+            ca_pem: identity.trust_bundle_pem.clone(),
+            spiffe_identity: Some(identity),
+        });
     }
 
     #[cfg(not(feature = "spiffe"))]
@@ -187,7 +190,27 @@ pub(crate) async fn build_tls_config(
         tls_config = tls_config.with_crls(&crl_pem).context("loading CRL data")?;
     }
 
-    Ok((tls_config, cert_pem, key_pem, ca_pem))
+    Ok(TlsConfigBuild {
+        tls_config,
+        cert_pem,
+        key_pem,
+        ca_pem,
+        #[cfg(feature = "spiffe")]
+        spiffe_identity: None,
+    })
+}
+
+/// Result of [`build_tls_config`]. Carries the PEM strings consumed by the
+/// rest of the server plus, under `--spiffe`, the already-fetched
+/// [`SpiffeIdentity`] so [`bind_tls_listener`] can reuse the initial SVID
+/// and `CertReloader` without a second Workload API round-trip.
+pub(crate) struct TlsConfigBuild {
+    pub(crate) tls_config: TlsConfig,
+    pub(crate) cert_pem: String,
+    pub(crate) key_pem: String,
+    pub(crate) ca_pem: String,
+    #[cfg(feature = "spiffe")]
+    pub(crate) spiffe_identity: Option<rustgate_transport::spiffe::SpiffeIdentity>,
 }
 
 /// Bind the TLS listener with a handshake concurrency limit.
@@ -198,20 +221,21 @@ pub(crate) async fn build_tls_config(
 pub(crate) async fn bind_tls_listener(
     cli: &Cli,
     tls_config: &TlsConfig,
+    #[cfg(feature = "spiffe")] spiffe_identity: Option<rustgate_transport::spiffe::SpiffeIdentity>,
 ) -> anyhow::Result<TlsListenerHandle> {
-    // When SPIFFE is enabled, the cert reloader is seeded from the Workload
-    // API and driven by a background refresh task rather than by polling
-    // files on disk. Fall back to the file-backed path otherwise.
+    // When SPIFFE is enabled, reuse the `SpiffeIdentity` already fetched by
+    // `build_tls_config` so we do not double-fetch from the Workload API at
+    // startup (which would briefly leave the TlsConfig and CertReloader
+    // tracking two different SVIDs).
     #[cfg(feature = "spiffe")]
     let reloader = if cli.spiffe {
+        let identity = spiffe_identity
+            .ok_or_else(|| anyhow::anyhow!("SPIFFE enabled but no preloaded identity passed"))?;
         let spiffe_cfg = rustgate_transport::spiffe::SpiffeConfig {
             workload_api_socket: cli.spiffe_workload_api_socket.clone(),
             expected_trust_domain: cli.spiffe_trust_domain.clone(),
             refresh_interval: std::time::Duration::from_secs(cli.spiffe_refresh_interval),
         };
-        let identity = rustgate_transport::spiffe::fetch_initial_identity(&spiffe_cfg)
-            .await
-            .context("fetching SPIFFE SVID for listener")?;
         let reloader = identity.cert_reloader.clone();
 
         #[cfg(feature = "metrics")]
@@ -231,7 +255,11 @@ pub(crate) async fn bind_tls_listener(
         #[cfg(not(feature = "metrics"))]
         let hooks: Option<rustgate_transport::spiffe::SpiffeHooks> = None;
 
-        rustgate_transport::spiffe::spawn_refresh_task(Arc::clone(&reloader), spiffe_cfg, hooks);
+        rustgate_transport::spiffe::spawn_refresh_task(
+            Arc::downgrade(&reloader),
+            spiffe_cfg,
+            hooks,
+        );
         tracing::info!(
             spiffe_id = %identity.spiffe_id,
             trust_domain = %identity.trust_domain,

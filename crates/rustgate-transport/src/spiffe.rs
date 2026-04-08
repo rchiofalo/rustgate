@@ -13,7 +13,7 @@
 //! as the client identity in place of the X.509 CN) is tracked as a
 //! follow-up and continues to use the existing CN-based identity path.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use rustgate_core::error::{ConfigError, Result, RustgateError};
@@ -175,7 +175,7 @@ pub async fn fetch_initial_identity(cfg: &SpiffeConfig) -> Result<SpiffeIdentity
 /// expires, at which point clients will see handshake failures — that's
 /// the same behavior as file-based rotation when the file is deleted.
 pub fn spawn_refresh_task(
-    reloader: Arc<CertReloader>,
+    reloader: Weak<CertReloader>,
     cfg: SpiffeConfig,
     hooks: Option<SpiffeHooks>,
 ) {
@@ -187,6 +187,13 @@ pub fn spawn_refresh_task(
         let _ = tick.tick().await; // skip the immediate tick
         loop {
             let _ = tick.tick().await;
+            // Exit cleanly when the owning `TlsListenerHandle` drops its
+            // `Arc<CertReloader>` during shutdown — no further Workload API
+            // calls are made after the reloader is gone.
+            let Some(reloader) = reloader.upgrade() else {
+                tracing::debug!("SPIFFE refresh task exiting: reloader dropped");
+                return;
+            };
             match refresh_once(&reloader, &cfg).await {
                 Ok(Some((spiffe_id, trust_domain, expiry))) => {
                     info!(
@@ -267,15 +274,22 @@ fn append_cert_pem(out: &mut String, cert: &Certificate) {
 }
 
 /// Append an arbitrary DER blob as PEM with the given label.
+///
+/// Base64 output is pure ASCII, so we wrap at 64 columns using direct
+/// string slicing (char boundaries == byte boundaries for ASCII) instead
+/// of a `from_utf8` round-trip with a silent fallback.
 fn append_der_as_pem(out: &mut String, label: &str, der: &[u8]) {
     use base64::Engine;
     out.push_str("-----BEGIN ");
     out.push_str(label);
     out.push_str("-----\n");
     let encoded = base64::engine::general_purpose::STANDARD.encode(der);
-    for chunk in encoded.as_bytes().chunks(64) {
-        out.push_str(std::str::from_utf8(chunk).unwrap_or(""));
+    let mut idx = 0;
+    while idx < encoded.len() {
+        let end = (idx + 64).min(encoded.len());
+        out.push_str(&encoded[idx..end]);
         out.push('\n');
+        idx = end;
     }
     out.push_str("-----END ");
     out.push_str(label);
