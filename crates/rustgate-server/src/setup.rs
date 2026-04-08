@@ -114,6 +114,54 @@ pub(crate) async fn stop_subsystem(name: &str, handle: SubsystemHandle) {
 pub(crate) async fn build_tls_config(
     cli: &Cli,
 ) -> anyhow::Result<(TlsConfig, String, String, String)> {
+    #[cfg(feature = "spiffe")]
+    if cli.spiffe {
+        let spiffe_cfg = rustgate_transport::spiffe::SpiffeConfig {
+            workload_api_socket: cli.spiffe_workload_api_socket.clone(),
+            expected_trust_domain: cli.spiffe_trust_domain.clone(),
+            refresh_interval: std::time::Duration::from_secs(cli.spiffe_refresh_interval),
+        };
+        let identity = rustgate_transport::spiffe::fetch_initial_identity(&spiffe_cfg)
+            .await
+            .context("fetching initial SPIFFE X.509-SVID")?;
+
+        let tls_min_version = TlsMinVersion::from_str_version(&cli.tls_min_version)
+            .context("parsing TLS minimum version")?;
+        let mut tls_config = TlsConfig::from_pem(
+            &identity.cert_pem,
+            &identity.key_pem,
+            &identity.trust_bundle_pem,
+        )
+        .context("building SPIFFE-backed TLS config")?;
+        tls_config = tls_config.with_tls_min_version(tls_min_version);
+        tls_config = tls_config.with_crl_warn_stale(cli.crl_warn_stale);
+
+        // CRL support via SPIFFE is not defined by the SPIFFE spec; operators
+        // that need CRLs can still point `--crl` at a static file alongside
+        // `--spiffe`. This mirrors how OCSP stapling coexists with SPIFFE.
+        if let Some(ref crl_path) = cli.crl {
+            let crl_pem = tokio::fs::read_to_string(crl_path)
+                .await
+                .context("reading CRL file")?;
+            tls_config = tls_config.with_crls(&crl_pem).context("loading CRL data")?;
+        }
+
+        return Ok((
+            tls_config,
+            identity.cert_pem,
+            identity.key_pem,
+            identity.trust_bundle_pem,
+        ));
+    }
+
+    #[cfg(not(feature = "spiffe"))]
+    if cli.spiffe {
+        anyhow::bail!(
+            "--spiffe was set but rustgate was built without the `spiffe` feature; \
+             rebuild with --features spiffe to enable SPIFFE workload identity"
+        );
+    }
+
     let cert_pem = tokio::fs::read_to_string(&cli.cert)
         .await
         .context("reading server certificate")?;
@@ -151,10 +199,50 @@ pub(crate) async fn bind_tls_listener(
     cli: &Cli,
     tls_config: &TlsConfig,
 ) -> anyhow::Result<TlsListenerHandle> {
-    // Always construct the `CertReloader` when `--cert` and `--key` are
-    // configured so that SIGHUP-driven reloads can rotate the certificate
-    // regardless of whether the polling watcher is enabled. The polling
-    // watcher itself is still only spawned when `cert_reload_interval > 0`.
+    // When SPIFFE is enabled, the cert reloader is seeded from the Workload
+    // API and driven by a background refresh task rather than by polling
+    // files on disk. Fall back to the file-backed path otherwise.
+    #[cfg(feature = "spiffe")]
+    let reloader = if cli.spiffe {
+        let spiffe_cfg = rustgate_transport::spiffe::SpiffeConfig {
+            workload_api_socket: cli.spiffe_workload_api_socket.clone(),
+            expected_trust_domain: cli.spiffe_trust_domain.clone(),
+            refresh_interval: std::time::Duration::from_secs(cli.spiffe_refresh_interval),
+        };
+        let identity = rustgate_transport::spiffe::fetch_initial_identity(&spiffe_cfg)
+            .await
+            .context("fetching SPIFFE SVID for listener")?;
+        let reloader = identity.cert_reloader.clone();
+
+        #[cfg(feature = "metrics")]
+        let hooks = Some(rustgate_transport::spiffe::SpiffeHooks {
+            on_success: Arc::new(|expiry| {
+                metrics::spiffe_refresh_total()
+                    .with_label_values(&["success"])
+                    .inc();
+                metrics::spiffe_svid_expiry_seconds().set(expiry);
+            }),
+            on_failure: Arc::new(|| {
+                metrics::spiffe_refresh_total()
+                    .with_label_values(&["failure"])
+                    .inc();
+            }),
+        });
+        #[cfg(not(feature = "metrics"))]
+        let hooks: Option<rustgate_transport::spiffe::SpiffeHooks> = None;
+
+        rustgate_transport::spiffe::spawn_refresh_task(Arc::clone(&reloader), spiffe_cfg, hooks);
+        tracing::info!(
+            spiffe_id = %identity.spiffe_id,
+            trust_domain = %identity.trust_domain,
+            "SPIFFE workload identity active"
+        );
+        reloader
+    } else {
+        CertReloader::new(&cli.cert, &cli.key).context("initializing certificate reloader")?
+    };
+
+    #[cfg(not(feature = "spiffe"))]
     let reloader =
         CertReloader::new(&cli.cert, &cli.key).context("initializing certificate reloader")?;
 

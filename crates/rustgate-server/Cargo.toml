@@ -28,6 +28,7 @@ fips = ["rustgate-transport/fips", "rustgate-federation?/fips", "rustgate-enroll
 post-quantum = ["rustgate-transport/post-quantum", "rustgate-federation?/post-quantum"]
 jemalloc = ["dep:tikv-jemallocator"]
 ocsp = ["rustgate-transport/ocsp"]
+spiffe = ["rustgate-transport/spiffe"]
 
 [dependencies]
 rustgate-core = { workspace = true }
