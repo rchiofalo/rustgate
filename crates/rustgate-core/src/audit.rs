@@ -275,6 +275,28 @@ pub fn cert_rotation_failed(cert_path: &str, error: &str) {
     );
 }
 
+/// Record a successful SPIFFE X.509-SVID refresh from the Workload API.
+pub fn spiffe_svid_refresh_success(spiffe_id: &str, trust_domain: &str, expiry_unix: i64) {
+    audit!(
+        "spiffe.svid_refresh",
+        spiffe_id = %spiffe_id,
+        trust_domain = %trust_domain,
+        expiry_unix = expiry_unix,
+        action = "refresh",
+        result = "success"
+    );
+}
+
+/// Record a failed SPIFFE X.509-SVID refresh attempt.
+pub fn spiffe_svid_refresh_failure(error: &str) {
+    audit!(
+        "spiffe.svid_refresh",
+        error = %error,
+        action = "refresh",
+        result = "failure"
+    );
+}
+
 /// Record server startup.
 pub fn server_started(bind: &str, version: &str) {
     let timestamp = SystemTime::now()

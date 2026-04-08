@@ -115,6 +115,11 @@ static FEDERATION_PEER_OLDEST_SECONDS: OnceLock<prometheus::IntGaugeVec> = OnceL
 static ARCHIVE_BYTES: OnceLock<IntGauge> = OnceLock::new();
 static ENROLLMENT_RATE_LIMITED: OnceLock<IntCounter> = OnceLock::new();
 
+#[cfg(feature = "spiffe")]
+static SPIFFE_SVID_REFRESH_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
+#[cfg(feature = "spiffe")]
+static SPIFFE_SVID_EXPIRY_SECONDS: OnceLock<IntGauge> = OnceLock::new();
+
 // ── Fallback constructors ───────────────────────────────────────────
 //
 // When `init()` has not been called, accessor functions lazily create
@@ -664,6 +669,33 @@ pub fn negotiations() -> &'static IntCounterVec {
 pub fn handshake_failures() -> &'static IntCounterVec {
     HANDSHAKE_FAILURES.get_or_init(|| {
         fallback_counter_vec("rustgate_handshake_failures_total", "fallback", &["reason"])
+    })
+}
+
+/// Counter for SPIFFE X.509-SVID refresh outcomes, labelled by
+/// `outcome="success"` or `outcome="failure"`. Incremented by the refresh
+/// task each time the Workload API is polled.
+#[cfg(feature = "spiffe")]
+pub fn spiffe_refresh_total() -> &'static IntCounterVec {
+    SPIFFE_SVID_REFRESH_TOTAL.get_or_init(|| {
+        fallback_counter_vec(
+            "rustgate_spiffe_svid_refresh_total",
+            "SPIFFE SVID refresh attempts by outcome",
+            &["outcome"],
+        )
+    })
+}
+
+/// Gauge tracking the unix-seconds expiry (`notAfter`) of the active
+/// SPIFFE X.509-SVID leaf certificate. Updated whenever the refresh task
+/// rotates the SVID.
+#[cfg(feature = "spiffe")]
+pub fn spiffe_svid_expiry_seconds() -> &'static IntGauge {
+    SPIFFE_SVID_EXPIRY_SECONDS.get_or_init(|| {
+        fallback_gauge(
+            "rustgate_spiffe_svid_expiry_seconds",
+            "Active SPIFFE SVID leaf notAfter (unix seconds)",
+        )
     })
 }
 

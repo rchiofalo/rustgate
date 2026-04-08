@@ -98,6 +98,7 @@ serial_test = "3"
 redb = "2"
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc", "getrandom"] }
 hex = "0.4"
+spiffe = { version = "0.12", default-features = false, features = ["workload-api-x509"] }
 
 # Internal crates
 rustgate-core = { path = "crates/rustgate-core" }

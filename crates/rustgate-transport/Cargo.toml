@@ -15,6 +15,7 @@ proto = ["dep:rustgate-proto"]
 fips = ["rustls/aws_lc_rs", "rustls/fips"]
 post-quantum = ["rustls/aws_lc_rs", "rustls/prefer-post-quantum"]
 ocsp = ["dep:ocsp-stapler"]
+spiffe = ["dep:spiffe", "dep:base64"]
 
 [dependencies]
 rustgate-core = { workspace = true }
@@ -34,6 +35,8 @@ lru = { workspace = true }
 tracing = { workspace = true }
 zeroize = { workspace = true }
 ocsp-stapler = { workspace = true, optional = true }
+spiffe = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
 redb = { workspace = true }
 thiserror = { workspace = true }
 
