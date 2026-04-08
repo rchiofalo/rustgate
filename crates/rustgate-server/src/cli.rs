@@ -641,6 +641,24 @@ pub(crate) struct Cli {
     /// OpenTelemetry service name reported in traces.
     #[arg(long, default_value = "rustgate", env = "OTEL_SERVICE_NAME")]
     pub(crate) otel_service_name: String,
+
+    /// Enable pushing metrics over OTLP alongside the Prometheus
+    /// `/metrics` endpoint. Requires `--otel-endpoint` (reused for both
+    /// traces and metrics) and the `otel` + `metrics` features to be
+    /// compiled in. The Prometheus scrape target is unaffected; this is
+    /// purely additive.
+    #[arg(long, default_value_t = false, env = "RUSTGATE_OTLP_METRICS")]
+    pub(crate) otlp_metrics: bool,
+
+    /// Push interval in seconds for the OTLP metrics exporter.
+    /// Only honored when `--otlp-metrics` is set. Must be at least 1.
+    #[arg(
+        long,
+        default_value_t = 60,
+        env = "RUSTGATE_OTLP_METRICS_INTERVAL",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub(crate) otlp_metrics_interval: u64,
 }
 
 /// Top-level subcommands. The default (no subcommand) runs the server.
@@ -878,6 +896,8 @@ define_config_file! {
     client_queue_max_bytes: u64,
     otel_endpoint: Option<String>,
     otel_service_name: String,
+    otlp_metrics: bool,
+    otlp_metrics_interval: u64,
     dedup_window_secs: u64,
     dedup_cache_size: usize,
 }
@@ -1121,6 +1141,8 @@ mod tests {
             "RUSTGATE_AUDIT_LOG",
             "OTEL_EXPORTER_OTLP_ENDPOINT",
             "OTEL_SERVICE_NAME",
+            "RUSTGATE_OTLP_METRICS",
+            "RUSTGATE_OTLP_METRICS_INTERVAL",
         ];
 
         for var in expected_env_vars {

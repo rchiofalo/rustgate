@@ -31,6 +31,8 @@ mod federation_reloader;
 mod metrics;
 #[cfg(feature = "otel")]
 mod otel;
+#[cfg(all(feature = "otel", feature = "metrics"))]
+mod otel_metrics;
 mod session;
 mod setup;
 
@@ -344,6 +346,53 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     #[cfg(not(feature = "metrics"))]
     setup::warn_metrics_disabled(&cli);
+
+    // ── OTLP metrics export (optional) ──────────────────────────────
+    //
+    // When `--otlp-metrics` is set we install a second exporter that
+    // scrapes the Prometheus default registry on an interval and pushes
+    // the translated metrics to the same OTLP endpoint configured for
+    // traces. The `/metrics` scrape target is unaffected — this is an
+    // additive sink, not a replacement.
+    #[cfg(all(feature = "otel", feature = "metrics"))]
+    if cli.otlp_metrics {
+        match cli.otel_endpoint.as_deref() {
+            Some(endpoint) => {
+                otel_metrics::init(
+                    endpoint,
+                    &cli.otel_service_name,
+                    Duration::from_secs(cli.otlp_metrics_interval),
+                )?;
+                tracing::info!(
+                    endpoint = %endpoint,
+                    interval_secs = cli.otlp_metrics_interval,
+                    "OTLP metrics export enabled"
+                );
+            }
+            None => {
+                anyhow::bail!(
+                    "--otlp-metrics requires --otel-endpoint (or OTEL_EXPORTER_OTLP_ENDPOINT) \
+                     to be set so traces and metrics can share the same OTLP collector URL"
+                );
+            }
+        }
+    }
+
+    #[cfg(all(feature = "otel", not(feature = "metrics")))]
+    if cli.otlp_metrics {
+        tracing::warn!(
+            "--otlp-metrics requires --features metrics; rebuild with --features metrics,otel \
+             to enable OTLP metrics export"
+        );
+    }
+
+    #[cfg(not(feature = "otel"))]
+    if cli.otlp_metrics {
+        anyhow::bail!(
+            "--otlp-metrics requires --features otel; rebuild with --features otel,metrics \
+             to enable OTLP metrics export"
+        );
+    }
 
     // ── Connection limit ────────────────────────────────────────────
     // CLI validation ensures max_connections is 1..=u32::MAX
@@ -886,6 +935,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     // Flush pending OTel spans before exit.
     #[cfg(feature = "otel")]
     otel::shutdown();
+
+    // Flush pending OTLP metrics before exit so the last batch is
+    // delivered to the collector rather than dropped on the floor.
+    #[cfg(all(feature = "otel", feature = "metrics"))]
+    otel_metrics::shutdown();
 
     Ok(())
 }

@@ -380,3 +380,93 @@ fn help_shows_ocsp_stapling_flag() {
         "help should show --ocsp-stapling when ocsp feature is enabled"
     );
 }
+
+// ── OTLP metrics export ─────────────────────────────────────────────
+
+#[cfg(feature = "otel")]
+#[test]
+fn help_shows_otlp_metrics_flags() {
+    let output = Command::new(rustgate_bin())
+        .arg("--help")
+        .output()
+        .expect("failed to execute binary");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--otlp-metrics"),
+        "help should show --otlp-metrics flag"
+    );
+    assert!(
+        stdout.contains("--otlp-metrics-interval"),
+        "help should show --otlp-metrics-interval flag"
+    );
+    assert!(
+        stdout.contains("RUSTGATE_OTLP_METRICS"),
+        "help should show RUSTGATE_OTLP_METRICS env var"
+    );
+    assert!(
+        stdout.contains("RUSTGATE_OTLP_METRICS_INTERVAL"),
+        "help should show RUSTGATE_OTLP_METRICS_INTERVAL env var"
+    );
+}
+
+#[cfg(feature = "otel")]
+#[test]
+fn otlp_metrics_interval_rejects_zero() {
+    // `clap::value_parser!(u64).range(1..)` should refuse 0.
+    let output = Command::new(rustgate_bin())
+        .args([
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--otlp-metrics-interval",
+            "0",
+            "validate-config",
+        ])
+        .output()
+        .expect("failed to execute binary");
+
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit for --otlp-metrics-interval 0"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("otlp-metrics-interval")
+            || stderr.contains("not in")
+            || stderr.contains("invalid value"),
+        "stderr should mention the invalid interval: {stderr}"
+    );
+}
+
+#[cfg(feature = "otel")]
+#[test]
+fn otlp_metrics_interval_accepts_positive_value() {
+    // Parsing should succeed even without --otel-endpoint — the missing
+    // endpoint is only checked at runtime when the exporter is actually
+    // booted, not during pure CLI parsing for `validate-config`.
+    let output = Command::new(rustgate_bin())
+        .args([
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--otlp-metrics",
+            "--otlp-metrics-interval",
+            "30",
+            "validate-config",
+        ])
+        .output()
+        .expect("failed to execute binary");
+
+    assert!(
+        output.status.success(),
+        "expected --otlp-metrics-interval 30 to parse cleanly; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
