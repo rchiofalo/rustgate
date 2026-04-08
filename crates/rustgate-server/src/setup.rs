@@ -158,7 +158,55 @@ pub(crate) async fn bind_tls_listener(
     let reloader =
         CertReloader::new(&cli.cert, &cli.key).context("initializing certificate reloader")?;
 
-    let verifier = tls_config.build_default_verifier()?;
+    let inner_verifier = tls_config.build_default_verifier()?;
+
+    // Optionally wrap the inner verifier with the client-cert OCSP
+    // verifier so revoked client certificates can be detected
+    // near-real-time without waiting for the next CRL refresh. The
+    // wrapper is gated on `--features ocsp` because it reuses the
+    // OCSP fetcher from the same upstream crate as server stapling.
+    #[cfg(feature = "ocsp")]
+    let verifier: std::sync::Arc<dyn rustgate_transport::ClientCertVerifier> = if cli.client_ocsp {
+        #[cfg(feature = "metrics")]
+        let on_hit: Option<rustgate_transport::client_ocsp::OnCacheHit> =
+            Some(std::sync::Arc::new(|| {
+                if let Some(c) = metrics::client_ocsp_cache_hits() {
+                    c.inc();
+                }
+            }));
+        #[cfg(feature = "metrics")]
+        let on_miss: Option<rustgate_transport::client_ocsp::OnCacheMiss> =
+            Some(std::sync::Arc::new(|| {
+                if let Some(c) = metrics::client_ocsp_cache_misses() {
+                    c.inc();
+                }
+            }));
+        #[cfg(not(feature = "metrics"))]
+        let on_hit: Option<rustgate_transport::client_ocsp::OnCacheHit> = None;
+        #[cfg(not(feature = "metrics"))]
+        let on_miss: Option<rustgate_transport::client_ocsp::OnCacheMiss> = None;
+
+        let fetcher: std::sync::Arc<dyn rustgate_transport::OcspFetcher> =
+            std::sync::Arc::new(rustgate_transport::OcspStaplerFetcher::default());
+        let wrapped =
+            rustgate_transport::ClientOcspVerifier::new(inner_verifier, fetcher, on_hit, on_miss);
+        tracing::info!(
+            "client certificate OCSP verification enabled (Tier 1, fail-open, SKI cache)"
+        );
+        wrapped as std::sync::Arc<dyn rustgate_transport::ClientCertVerifier>
+    } else {
+        inner_verifier
+    };
+
+    #[cfg(not(feature = "ocsp"))]
+    let verifier = inner_verifier;
+    #[cfg(not(feature = "ocsp"))]
+    if cli.client_ocsp {
+        tracing::warn!(
+            "--client-ocsp set but the ocsp feature is not compiled in; \
+             rebuild with --features ocsp to enable client OCSP verification"
+        );
+    }
 
     // OCSP stapling sits on the *resolver* (server certificate) side of the
     // handshake; the existing CRL verifier sits on the *client certificate*
