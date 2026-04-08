@@ -97,9 +97,11 @@ impl ConsulDiscovery {
     /// the Consul `ServiceID` (unique per node), and the address uses
     /// `ServiceAddress` when set, falling back to the node's `Address`.
     fn entry_to_peer(entry: &CatalogEntry) -> PeerConfig {
-        let host = match &entry.service_address {
-            Some(s) if !s.is_empty() => s.clone(),
-            _ => entry.address.clone(),
+        // Borrow the chosen host string to avoid allocating; only the final
+        // `format!` produces a new String for the peer address.
+        let host: &str = match entry.service_address.as_deref() {
+            Some(s) if !s.is_empty() => s,
+            _ => entry.address.as_str(),
         };
         let address = if host.contains(':') && !host.starts_with('[') {
             format!("[{host}]:{}", entry.service_port)
