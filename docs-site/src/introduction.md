@@ -1,52 +1,31 @@
 # rustgate
 
-**rustgate** is a tactical mutual-TLS message router written in Rust. It
-provides secure, authenticated communication using mTLS, certificate
-enrollment, message routing, federation, and NATS bridging.
+**rustgate** is a tactical mTLS message router written in Rust. It is a single-binary, edge-ready alternative to heavyweight Java messaging servers — designed to run in resource-constrained environments without sacrificing security, observability, or operational rigor.
 
-While originally designed for tactical use cases, rustgate is
-protocol-agnostic: the core transport, routing, and federation layers do
-not assume any particular message format.
+While the original motivating use case was Team Awareness Kit (TAK) traffic, the architecture is protocol-agnostic. It routes any message that fits its codec interface and authenticates clients via mutual TLS with group membership derived from X.509 certificates.
 
-```admonish info
-This site is the authoritative source for rustgate documentation,
-operational runbooks, security analysis, and research. It is built from
-the `docs-site/` directory of the [rustgate repository][repo] and
-published to GitHub Pages on every push to `main`.
+## What this site covers
 
-[repo]: https://github.com/rchiofalo/rustgate
-```
+This documentation is the canonical reference for operators, integrators, and contributors. It mirrors the in-repo `docs/` tree and is rebuilt automatically from `main` whenever documentation changes.
 
-## What rustgate gives you
+- **Getting Started** — install, run, and configure a single instance.
+- **Architecture** — every workspace crate, the wire protocol, transport, federation, NATS bridging, and enrollment.
+- **Operations** — deployment, observability, performance tuning, disaster recovery, graceful degradation, and a complete runbook library.
+- **Security** — threat model, mTLS configuration, FIPS 140-3, post-quantum key exchange, and crypto agility.
+- **Reference** — REST API and the full configuration surface.
 
-- **Mutually-authenticated transport** — every client presents an X.509
-  certificate, validated against a configurable CA bundle with CRL
-  enforcement and hot-reload.
-- **Pluggable crypto backends** — default `ring`, opt-in FIPS 140-3
-  (`aws-lc-rs`), opt-in post-quantum key exchange (X25519MLKEM768).
-- **Federation** — server-to-server links with JWT peer authentication,
-  persistent replay buffers, and per-peer lag metrics.
-- **Admission control** — global byte-budget backpressure, per-session
-  circuit breakers, and bounded per-client store-and-forward queues.
-- **Tamper-evident audit log** — hash-chained audit records with a
-  `verify-audit` CLI for integrity proofs.
-- **No unsafe code** — `#![forbid(unsafe_code)]` is set workspace-wide.
-- **No panics in production code** — clippy denies `unwrap`, `panic`,
-  and `dbg!` across every crate.
+## Project at a glance
 
-## How the docs are organized
+- **Rust workspace** with 10 crates and edition 2024 (`rust-version = 1.93`)
+- **`unsafe_code = "forbid"`** workspace-wide; `clippy::panic` and `clippy::unwrap_used` denied in production code
+- **rustls + tokio-rustls** by default; **aws-lc-rs** under the `fips` feature for FIPS 140-3
+- **Post-quantum** key exchange via X25519MLKEM768 (`post-quantum` feature)
+- **Federation v2** server-to-server with JWT and high-availability coordination
+- **NATS / JetStream** bridge for horizontal scale
+- **Hash-chained, tamper-evident audit log** and **encrypted-at-rest archive**
 
-- **Getting Started** walks you from `cargo install` to a running
-  router with a test client.
-- **Architecture** documents the 10-crate workspace and how the pieces
-  fit together.
-- **Operations** covers deployment (Docker, Helm), metrics, health
-  probes, and runbooks for incident response.
-- **API Reference** is the CLI, REST endpoints, and auto-generated
-  rustdoc.
-- **Security** describes the threat model, mTLS configuration, audit
-  log guarantees, FIPS and post-quantum modes, and a structured matrix
-  of attacks rustgate is immune or resistant to.
-- **Research** is long-form advocacy: why rustgate exists, how it
-  compares to alternatives, attack-class analysis, benchmarks, and
-  downloadable papers.
+## Source
+
+- Repository: <https://github.com/rchiofalo/rustgate>
+- License: Proprietary — see [LICENSE](https://github.com/rchiofalo/rustgate/blob/main/LICENSE)
+- Security policy: [SECURITY.md](https://github.com/rchiofalo/rustgate/blob/main/SECURITY.md)

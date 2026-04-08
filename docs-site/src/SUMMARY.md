@@ -12,6 +12,7 @@
 
 - [Overview](./architecture/overview.md)
 - [Workspace Crates](./architecture/crates.md)
+- [Wire Protocol](./architecture/protocol.md)
 - [Transport & mTLS](./architecture/transport.md)
 - [Federation](./architecture/federation.md)
 - [NATS Bridge](./architecture/nats-bridge.md)
@@ -20,33 +21,34 @@
 # Operations
 
 - [Deployment](./operations/deployment.md)
-- [Metrics](./operations/metrics.md)
-- [Health Probes](./operations/health-probes.md)
+- [Observability & Metrics](./operations/observability.md)
+- [Performance Tuning](./operations/performance-tuning.md)
+- [Disaster Recovery](./operations/disaster-recovery.md)
+- [Graceful Degradation](./operations/graceful-degradation.md)
+- [Troubleshooting](./operations/troubleshooting.md)
 - [Runbooks](./operations/runbooks/index.md)
-
-# API Reference
-
-- [CLI](./api/cli.md)
-- [Federation API](./api/federation-api.md)
-- [Enrollment API](./api/enrollment-api.md)
-- [Rustdoc](./api/rustdoc.md)
+  - [Anti-Replay](./operations/runbooks/anti-replay.md)
+  - [Certificate Rotation](./operations/runbooks/certificate-rotation.md)
+  - [CRL Updates](./operations/runbooks/crl-updates.md)
+  - [Federation Reconnect](./operations/runbooks/federation-reconnect.md)
+  - [High Memory](./operations/runbooks/high-memory.md)
+  - [NATS Bridge Failure](./operations/runbooks/nats-bridge-failure.md)
+  - [TLS Handshake Failures](./operations/runbooks/tls-handshake-failures.md)
+  - [WebSocket Storms](./operations/runbooks/websocket-storms.md)
 
 # Security
 
+- [Security Posture](./security/posture.md)
 - [Threat Model](./security/threat-model.md)
-- [mTLS](./security/mtls.md)
-- [Audit Log](./security/audit-log.md)
+- [TLS Certificates & mTLS](./security/mtls.md)
+- [Crypto Agility](./security/crypto-agility.md)
 - [FIPS 140-3](./security/fips.md)
 - [Post-Quantum KEX](./security/post-quantum.md)
-- [Exploit Resistance Matrix](./security/cve-resistance.md)
 
-# Research
+# Reference
 
-- [Why rustgate](./research/why-rustgate.md)
-- [Comparison to Alternatives](./research/comparison.md)
-- [Attack Immunity Analysis](./research/exploit-matrix.md)
-- [Benchmarks](./research/benchmarks.md)
-- [Papers & Long-form Writeups](./research/papers/index.md)
+- [REST API](./reference/rest-api.md)
+- [Configuration Reference](./reference/configuration.md)
 
 ---
 

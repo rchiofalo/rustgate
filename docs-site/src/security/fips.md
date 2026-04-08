@@ -1,5 +1,3 @@
-# Fips
+# FIPS 140-3
 
-```admonish note
-This page is a stub. Contributions welcome — edit this file on GitHub using the ✏ icon above.
-```
+{{#include ../../../docs/fips.md}}

@@ -1,5 +1,29 @@
-# Transport
+# Transport & mTLS
 
-```admonish note
-This page is a stub. Contributions welcome — edit this file on GitHub using the ✏ icon above.
-```
+The transport crate (`rustgate-transport`) owns the TLS listener, mTLS handshake, CRL/OCSP enforcement, codec, router, and admission control. It is the lowest layer above the operating system socket and the only layer that ever touches raw bytes.
+
+For TLS configuration, certificate rotation, and CRL/OCSP semantics see the dedicated security page: [TLS Certificates & mTLS](../security/mtls.md).
+
+For the on-the-wire framing and message format see [Wire Protocol](./protocol.md).
+
+## Responsibilities
+
+- **TLS listener** — accepts mTLS connections via `rustls` (ring backend by default, `aws-lc-rs` under the `fips` feature).
+- **Identity extraction** — derives the `Identity` (CN + group memberships) from the peer certificate during handshake.
+- **CRL enforcement** — periodically loads CRLs from disk; revoked certificates are rejected on next connection attempt and may also trigger active disconnect of in-flight sessions.
+- **OCSP stapling** — when enabled, validates server-stapled OCSP responses and optionally enforces client OCSP via Tier 1 client checks.
+- **Codec** — frames inbound bytes into `RoutableMessage` envelopes; serializes outbound.
+- **Router** — looks up destination identities in the in-memory routing table, deduplicates by message UID, and dispatches.
+- **Admission control** — bounded backpressure gate (Tokio `Notify` + `AtomicUsize`) protects downstream queues from unbounded ingress.
+- **Graceful drain** — on shutdown, stops accepting new connections, lets in-flight messages settle, then closes existing connections within the configured drain window.
+
+## Feature flags
+
+| Feature | Effect on transport |
+|---|---|
+| `fips` | Swaps the default `ring` crypto provider for `aws-lc-rs` in FIPS mode. |
+| `post-quantum` | Enables X25519MLKEM768 hybrid key exchange. |
+| `metrics` | Publishes per-listener and per-identity Prometheus gauges. |
+| `websocket` | Compiles in the WebSocket listener (`rustgate-websocket` re-exports). |
+
+See also [FIPS 140-3](../security/fips.md) and [Post-Quantum KEX](../security/post-quantum.md).
