@@ -343,6 +343,17 @@ impl DeltaDecoder {
     /// unchanged. If it is a delta, the decoder merges it against the
     /// cached snapshot for its `uid` and returns the reconstructed full
     /// event XML.
+    ///
+    /// # Canonicalization
+    ///
+    /// The reconstructed XML is **canonical form**, not byte-identical to
+    /// the sender's original. Numeric attributes are re-serialized via
+    /// `fmt_f64`, which always renders integer-valued floats with a
+    /// trailing `.0` (e.g. `hae="100"` in the source becomes `hae="100.0"`
+    /// on reconstruction). Every semantic field — `lat`, `lon`, `hae`,
+    /// `ce`, `le`, `time`, `start`, `stale`, `type`, `how`, `detail` —
+    /// round-trips exactly; only the text form may differ. Downstream
+    /// consumers that parse the XML see the same values as the sender.
     pub fn decode(&mut self, raw: &Bytes) -> Result<Bytes, DeltaError> {
         let snapshot = parse_snapshot(raw).ok_or(DeltaError::NotCot)?;
         if snapshot.uid.is_empty() {
@@ -844,6 +855,16 @@ fn merge_snapshots(prior: CotSnapshot, delta: &CotSnapshot) -> CotSnapshot {
 /// Approximate ground distance in meters using an equirectangular
 /// projection. Accurate enough for sub-kilometer position drift checks in
 /// the epsilon suppression path; not intended for navigation.
+///
+/// # Latitude caveat
+///
+/// The equirectangular approximation assumes a locally-flat earth around
+/// the midpoint latitude. At operational epsilon values (1–10 m) this is
+/// fine anywhere on the globe. Beyond ~70° latitude the projection error
+/// starts to grow noticeably (a few percent of the true distance at 80°+),
+/// so callers should not use this helper for suppression thresholds of
+/// kilometers near the poles. For rustgate's default 1 m epsilon the
+/// error is negligible everywhere.
 fn approx_distance_meters(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     const R: f64 = 6_371_000.0; // mean earth radius in meters
     let dlat = (lat2 - lat1).to_radians();
