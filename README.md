@@ -349,6 +349,7 @@ All flags support environment variables (CLI takes precedence):
 | `--federation-v2-bind` | `RUSTGATE_FEDERATION_V2_BIND` | — |
 | `--federation-id` | `RUSTGATE_FEDERATION_ID` | `rustgate-federation-1` |
 | `--federation-peers-file` | `RUSTGATE_FEDERATION_PEERS_FILE` | — |
+| `--federation-peers-reload-interval` | `RUSTGATE_FEDERATION_PEERS_RELOAD_INTERVAL` | `0` |
 | `--federation-skip-hostname-verify` | `RUSTGATE_FEDERATION_SKIP_HOSTNAME_VERIFY` | `false` |
 | `--federation-max-hops` | `RUSTGATE_FEDERATION_MAX_HOPS` | `10` |
 | `--federation-store-path` | `RUSTGATE_FEDERATION_STORE_PATH` | — |

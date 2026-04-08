@@ -25,6 +25,8 @@ mod archive;
 mod archive_rotation;
 mod audit;
 mod cli;
+#[cfg(feature = "federation")]
+mod federation_reloader;
 #[cfg(feature = "metrics")]
 mod metrics;
 #[cfg(feature = "otel")]
@@ -550,6 +552,38 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     #[cfg(not(feature = "federation-ha"))]
     setup::warn_federation_ha_disabled(&cli);
 
+    // ── Federation peer hot-reload ──────────────────────────────────
+    //
+    // When `--federation-peers-file` is set, install a reloader that
+    // re-reads the file on SIGHUP (and optionally on a polling interval)
+    // and reconciles the manager's active peer set. Adds/removes are
+    // applied without disturbing existing connections.
+    #[cfg(feature = "federation")]
+    let fed_peer_reloader: Option<Arc<federation_reloader::FederationPeerReloader>> =
+        if let (Some(peers_path), Some(rwlock)) = (
+            cli.federation_peers_file.as_ref(),
+            fed_shutdown_handle.as_ref(),
+        ) {
+            let initial = std::fs::read(peers_path).unwrap_or_default();
+            let initial_hash = federation_reloader::FederationPeerReloader::compute_hash(&initial);
+            let reloader = federation_reloader::FederationPeerReloader::new(
+                std::path::PathBuf::from(peers_path),
+                Arc::clone(rwlock),
+                initial_hash,
+            );
+            if cli.federation_peers_reload_interval > 0 {
+                reloader.spawn_watcher(Duration::from_secs(cli.federation_peers_reload_interval));
+                tracing::info!(
+                    interval_secs = cli.federation_peers_reload_interval,
+                    path = %peers_path,
+                    "federation peer hot-reload enabled"
+                );
+            }
+            Some(reloader)
+        } else {
+            None
+        };
+
     // ── Per-client rate limiting ────────────────────────────────────
     let throttle_config = setup::build_throttle_config(&cli);
 
@@ -666,6 +700,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         let crl_path_for_hup = cli.crl.clone();
         #[cfg(feature = "ocsp")]
         let ocsp_for_hup = ocsp_stapler.clone();
+        #[cfg(feature = "federation")]
+        let fed_peers_for_hup = fed_peer_reloader.clone();
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
             Ok(mut sighup) => {
                 setup::spawn_background("sighup-reloader", async move {
@@ -677,6 +713,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                             crl_path_for_hup.as_deref(),
                             #[cfg(feature = "ocsp")]
                             ocsp_for_hup.as_ref(),
+                            #[cfg(feature = "federation")]
+                            fed_peers_for_hup.as_ref(),
                         )
                         .await;
                     }
@@ -896,6 +934,9 @@ async fn reload_all_configs(
     acl_reloader: Option<&Arc<acl_reloader::AclReloader>>,
     crl_path: Option<&str>,
     #[cfg(feature = "ocsp")] ocsp_stapler: Option<&Arc<rustgate_transport::ocsp::Stapler>>,
+    #[cfg(feature = "federation")] fed_peer_reloader: Option<
+        &Arc<federation_reloader::FederationPeerReloader>,
+    >,
 ) {
     // 1. Server certificate
     if let Some(reloader) = cert_reloader {
@@ -1031,6 +1072,36 @@ async fn reload_all_configs(
     } else {
         tracing::debug!("SIGHUP: no CRL configured");
     }
+
+    // 4. Federation peers
+    #[cfg(feature = "federation")]
+    if let Some(reloader) = fed_peer_reloader {
+        match reloader.reload().await {
+            Ok(swapped) => {
+                tracing::info!(
+                    target: "audit",
+                    event_type = "config.reload",
+                    component = "federation_peers",
+                    result = "success",
+                    swapped = swapped,
+                    "federation peer reload completed"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "audit",
+                    event_type = "config.reload",
+                    component = "federation_peers",
+                    result = "failure",
+                    error = %e,
+                    "federation peer reload failed"
+                );
+            }
+        }
+    } else {
+        #[cfg(feature = "federation")]
+        tracing::debug!("SIGHUP: no federation peer reloader configured");
+    }
 }
 
 /// Read and parse a CRL PEM file. Returns the number of CRL entries on success.
@@ -1058,6 +1129,8 @@ mod tests {
             None,
             #[cfg(feature = "ocsp")]
             None,
+            #[cfg(feature = "federation")]
+            None,
         )
         .await;
     }
@@ -1070,6 +1143,8 @@ mod tests {
             None,
             Some("/definitely/not/a/real/path.pem"),
             #[cfg(feature = "ocsp")]
+            None,
+            #[cfg(feature = "federation")]
             None,
         )
         .await;
@@ -1109,6 +1184,8 @@ mod tests {
             Some(&reloader),
             Some("/no/such/crl.pem"),
             #[cfg(feature = "ocsp")]
+            None,
+            #[cfg(feature = "federation")]
             None,
         )
         .await;
