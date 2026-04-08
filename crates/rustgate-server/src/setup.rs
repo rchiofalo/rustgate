@@ -1361,6 +1361,11 @@ pub(crate) async fn start_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
         archiver: archiver.clone(),
         replay_filter: replay_filter.clone(),
         circuit_breaker_threshold: cli.circuit_breaker_threshold,
+        delta_config: crate::session::DeltaConfig {
+            enabled: cli.cot_delta_encoding,
+            cache_size: cli.cot_delta_cache_size,
+            epsilon_meters: cli.cot_delta_epsilon_meters,
+        },
         shutdown: shutdown_clone,
         #[cfg(feature = "metrics")]
         metrics_identity: Arc::clone(metrics_identity),

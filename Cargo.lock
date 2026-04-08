@@ -2675,6 +2675,7 @@ dependencies = [
  "arbitrary",
  "bytes",
  "criterion",
+ "lru",
  "proptest",
  "quick-xml",
  "rustgate-core",

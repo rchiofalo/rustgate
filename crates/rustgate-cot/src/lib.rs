@@ -6,6 +6,8 @@
 //! external entities or process DTD declarations. This design prevents
 //! XXE (XML External Entity) injection attacks by default.
 
+pub mod delta;
+
 use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};
 

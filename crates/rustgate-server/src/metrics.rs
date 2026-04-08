@@ -66,6 +66,11 @@ static MESSAGES_ROUTED: OnceLock<IntCounterVec> = OnceLock::new();
 static DEDUP_HITS: OnceLock<IntCounter> = OnceLock::new();
 static DEDUP_CACHE_SIZE: OnceLock<IntGauge> = OnceLock::new();
 
+static COT_DELTA_FULL: OnceLock<IntCounter> = OnceLock::new();
+static COT_DELTA_DELTA: OnceLock<IntCounter> = OnceLock::new();
+static COT_DELTA_SUPPRESSED: OnceLock<IntCounter> = OnceLock::new();
+static COT_DELTA_BYTES_SAVED: OnceLock<IntCounter> = OnceLock::new();
+
 // Tier 2 (per-identity) metrics. Registered only when
 // `--metrics-per-identity` is enabled; remain `None` otherwise so they
 // add zero overhead.
@@ -237,6 +242,34 @@ pub fn init() -> prometheus::Result<()> {
     ))?;
     registry.register(Box::new(dedup_cache_size.clone()))?;
     let _ = DEDUP_CACHE_SIZE.set(dedup_cache_size);
+
+    let cot_delta_full = IntCounter::with_opts(Opts::new(
+        "rustgate_cot_delta_full_total",
+        "Outbound CoT events emitted as full by the per-UID delta encoder",
+    ))?;
+    registry.register(Box::new(cot_delta_full.clone()))?;
+    let _ = COT_DELTA_FULL.set(cot_delta_full);
+
+    let cot_delta_delta = IntCounter::with_opts(Opts::new(
+        "rustgate_cot_delta_delta_total",
+        "Outbound CoT events emitted as deltas by the per-UID delta encoder",
+    ))?;
+    registry.register(Box::new(cot_delta_delta.clone()))?;
+    let _ = COT_DELTA_DELTA.set(cot_delta_delta);
+
+    let cot_delta_suppressed = IntCounter::with_opts(Opts::new(
+        "rustgate_cot_delta_suppressed_total",
+        "Outbound CoT events suppressed by the per-UID delta encoder (sub-epsilon drift, no field change)",
+    ))?;
+    registry.register(Box::new(cot_delta_suppressed.clone()))?;
+    let _ = COT_DELTA_SUPPRESSED.set(cot_delta_suppressed);
+
+    let cot_delta_bytes_saved = IntCounter::with_opts(Opts::new(
+        "rustgate_cot_delta_bytes_saved_total",
+        "Total bytes saved by the per-UID delta encoder (full_len - delta_len per emitted delta)",
+    ))?;
+    registry.register(Box::new(cot_delta_bytes_saved.clone()))?;
+    let _ = COT_DELTA_BYTES_SAVED.set(cot_delta_bytes_saved);
 
     let messages_routed = IntCounterVec::new(
         Opts::new(
@@ -564,6 +597,24 @@ pub fn dedup_hits() -> &'static IntCounter {
 
 pub fn dedup_cache_size() -> &'static IntGauge {
     DEDUP_CACHE_SIZE.get_or_init(|| fallback_gauge("rustgate_dedup_cache_size", "fallback"))
+}
+
+pub fn cot_delta_full() -> &'static IntCounter {
+    COT_DELTA_FULL.get_or_init(|| fallback_counter("rustgate_cot_delta_full_total", "fallback"))
+}
+
+pub fn cot_delta_delta() -> &'static IntCounter {
+    COT_DELTA_DELTA.get_or_init(|| fallback_counter("rustgate_cot_delta_delta_total", "fallback"))
+}
+
+pub fn cot_delta_suppressed() -> &'static IntCounter {
+    COT_DELTA_SUPPRESSED
+        .get_or_init(|| fallback_counter("rustgate_cot_delta_suppressed_total", "fallback"))
+}
+
+pub fn cot_delta_bytes_saved() -> &'static IntCounter {
+    COT_DELTA_BYTES_SAVED
+        .get_or_init(|| fallback_counter("rustgate_cot_delta_bytes_saved_total", "fallback"))
 }
 
 pub fn messages_routed() -> &'static IntCounterVec {
