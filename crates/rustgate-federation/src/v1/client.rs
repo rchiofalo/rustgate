@@ -111,10 +111,16 @@ impl V1Client {
     ///
     /// Returns an error if the send channel is full or the client is shut down.
     pub async fn send(&self, data: Bytes) -> anyhow::Result<()> {
-        self.outbound_tx
-            .send(data)
-            .await
-            .map_err(|_| anyhow::anyhow!("V1 client send channel closed"))
+        let bytes_len = data.len();
+        self.peer.record_enqueue(bytes_len);
+        match self.outbound_tx.send(data).await {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                // Send failed before delivery — undo the enqueue accounting.
+                self.peer.record_dequeue();
+                Err(anyhow::anyhow!("V1 client send channel closed"))
+            }
+        }
     }
 
     /// Get the current peer state.
@@ -148,139 +154,163 @@ async fn connection_loop(
     let peer_id = peer.id.clone();
     let mut reconnect_count: u32 = 0;
 
-    loop {
-        // Check shutdown before connecting
-        if *shutdown_rx.borrow() {
-            debug!(peer_id = %peer_id, "V1 client shutdown requested");
-            return;
-        }
-
-        peer.set_state(PeerState::Connecting);
-        info!(
-            peer_id = %peer_id,
-            addr = %config.addr,
-            attempt = reconnect_count + 1,
-            "connecting to V1 federation peer"
-        );
-
-        // Attempt connection
-        let connect_result = config
-            .connector
-            .connect(config.addr, &config.server_name)
-            .await;
-        let (tls_stream, identity) = match connect_result {
-            Ok(result) => result,
-            Err(e) => {
-                rustgate_core::audit::federation_connect_failed(&peer_id, &e.to_string());
-                warn!(
-                    peer_id = %peer_id,
-                    error = %e,
-                    "failed to connect to V1 federation peer"
-                );
-                peer.set_state(PeerState::Reconnecting);
-                peer.set_error(&e.to_string());
-
-                if should_stop_reconnecting(config.max_reconnects, reconnect_count) {
-                    error!(
-                        peer_id = %peer_id,
-                        max_reconnects = config.max_reconnects,
-                        "max reconnection attempts reached, giving up"
-                    );
-                    peer.set_state(PeerState::Disconnected);
-                    return;
-                }
-
-                let delay = backoff_delay(config.reconnect_delay, reconnect_count);
-                reconnect_count += 1;
-
-                tokio::select! {
-                    _ = tokio::time::sleep(delay) => continue,
-                    _ = shutdown_rx.changed() => return,
-                }
+    // Run the reconnect loop in an inner async block so every exit path falls
+    // through to the queue-drain below. Without this, messages still buffered
+    // in `outbound_rx` when the client gives up (max reconnects, shutdown,
+    // unrecoverable error) would leak counter weight on the per-peer queue
+    // gauges for the lifetime of the process.
+    let _: () = async {
+        loop {
+            // Check shutdown before connecting
+            if *shutdown_rx.borrow() {
+                debug!(peer_id = %peer_id, "V1 client shutdown requested");
+                return;
             }
-        };
 
-        // Connected successfully
-        peer.mark_connected();
-        reconnect_count = 0;
-        rustgate_core::audit::federation_peer_connected(&peer_id, &identity.cn, "outbound");
-        info!(
-            peer_id = %peer_id,
-            peer_cn = %identity.cn,
-            addr = %config.addr,
-            "connected to V1 federation peer"
-        );
-
-        // Drain replay buffer for this peer (returns deduped messages and clears)
-        let replay_messages: Vec<BufferedMessage> = config
-            .replay_drain
-            .as_ref()
-            .map(|drain| drain(peer_id.as_ref()))
-            .unwrap_or_default();
-
-        if !replay_messages.is_empty() {
+            peer.set_state(PeerState::Connecting);
             info!(
                 peer_id = %peer_id,
-                replayed_count = replay_messages.len(),
-                "replaying buffered messages after reconnection"
+                addr = %config.addr,
+                attempt = reconnect_count + 1,
+                "connecting to V1 federation peer"
             );
-        }
 
-        // Run the session (replay messages are sent before entering the live loop)
-        let session_result = run_session(
-            &peer,
-            tls_stream,
-            &config,
-            &mut outbound_rx,
-            &mut shutdown_rx,
-            replay_messages,
-        )
-        .await;
+            // Attempt connection
+            let connect_result = config
+                .connector
+                .connect(config.addr, &config.server_name)
+                .await;
+            let (tls_stream, identity) = match connect_result {
+                Ok(result) => result,
+                Err(e) => {
+                    rustgate_core::audit::federation_connect_failed(&peer_id, &e.to_string());
+                    warn!(
+                        peer_id = %peer_id,
+                        error = %e,
+                        "failed to connect to V1 federation peer"
+                    );
+                    peer.set_state(PeerState::Reconnecting);
+                    peer.set_error(&e.to_string());
 
-        peer.set_state(PeerState::Disconnected);
+                    if should_stop_reconnecting(config.max_reconnects, reconnect_count) {
+                        error!(
+                            peer_id = %peer_id,
+                            max_reconnects = config.max_reconnects,
+                            "max reconnection attempts reached, giving up"
+                        );
+                        peer.set_state(PeerState::Disconnected);
+                        return;
+                    }
 
-        match session_result {
-            Ok(()) => {
-                rustgate_core::audit::federation_peer_disconnected(&peer_id, "clean shutdown");
-                info!(peer_id = %peer_id, "V1 federation peer disconnected cleanly");
-            }
-            Err(e) => {
-                rustgate_core::audit::federation_peer_disconnected(&peer_id, &e.to_string());
-                warn!(peer_id = %peer_id, error = %e, "V1 federation peer session error");
-                peer.set_error(&e.to_string());
-            }
-        }
+                    let delay = backoff_delay(config.reconnect_delay, reconnect_count);
+                    reconnect_count += 1;
 
-        if *shutdown_rx.borrow() {
-            return;
-        }
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => continue,
+                        _ = shutdown_rx.changed() => return,
+                    }
+                }
+            };
 
-        // Wait before reconnecting
-        peer.set_state(PeerState::Reconnecting);
-        if should_stop_reconnecting(config.max_reconnects, reconnect_count) {
-            error!(
+            // Connected successfully
+            peer.mark_connected();
+            reconnect_count = 0;
+            rustgate_core::audit::federation_peer_connected(&peer_id, &identity.cn, "outbound");
+            info!(
                 peer_id = %peer_id,
-                max_reconnects = config.max_reconnects,
-                "max reconnection attempts reached, giving up"
+                peer_cn = %identity.cn,
+                addr = %config.addr,
+                "connected to V1 federation peer"
             );
+
+            // Drain replay buffer for this peer (returns deduped messages and clears)
+            let replay_messages: Vec<BufferedMessage> = config
+                .replay_drain
+                .as_ref()
+                .map(|drain| drain(peer_id.as_ref()))
+                .unwrap_or_default();
+
+            if !replay_messages.is_empty() {
+                info!(
+                    peer_id = %peer_id,
+                    replayed_count = replay_messages.len(),
+                    "replaying buffered messages after reconnection"
+                );
+            }
+
+            // Run the session (replay messages are sent before entering the live loop)
+            let session_result = run_session(
+                &peer,
+                tls_stream,
+                &config,
+                &mut outbound_rx,
+                &mut shutdown_rx,
+                replay_messages,
+            )
+            .await;
+
             peer.set_state(PeerState::Disconnected);
-            return;
-        }
 
-        let delay = backoff_delay(config.reconnect_delay, reconnect_count);
-        reconnect_count += 1;
+            match session_result {
+                Ok(()) => {
+                    rustgate_core::audit::federation_peer_disconnected(&peer_id, "clean shutdown");
+                    info!(peer_id = %peer_id, "V1 federation peer disconnected cleanly");
+                }
+                Err(e) => {
+                    rustgate_core::audit::federation_peer_disconnected(&peer_id, &e.to_string());
+                    warn!(peer_id = %peer_id, error = %e, "V1 federation peer session error");
+                    peer.set_error(&e.to_string());
+                }
+            }
 
-        info!(
-            peer_id = %peer_id,
-            delay = ?delay,
-            "waiting before reconnecting to V1 federation peer"
-        );
+            if *shutdown_rx.borrow() {
+                return;
+            }
 
-        tokio::select! {
-            _ = tokio::time::sleep(delay) => {},
-            _ = shutdown_rx.changed() => return,
+            // Wait before reconnecting
+            peer.set_state(PeerState::Reconnecting);
+            if should_stop_reconnecting(config.max_reconnects, reconnect_count) {
+                error!(
+                    peer_id = %peer_id,
+                    max_reconnects = config.max_reconnects,
+                    "max reconnection attempts reached, giving up"
+                );
+                peer.set_state(PeerState::Disconnected);
+                return;
+            }
+
+            let delay = backoff_delay(config.reconnect_delay, reconnect_count);
+            reconnect_count += 1;
+
+            info!(
+                peer_id = %peer_id,
+                delay = ?delay,
+                "waiting before reconnecting to V1 federation peer"
+            );
+
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {},
+                _ = shutdown_rx.changed() => return,
+            }
         }
     }
+    .await;
+
+    // Drain any messages still buffered in the outbound channel and clear
+    // the per-peer queue accounting so the metrics gauges return to zero.
+    outbound_rx.close();
+    let mut drained = 0usize;
+    while outbound_rx.try_recv().is_ok() {
+        drained += 1;
+    }
+    if drained > 0 {
+        debug!(
+            peer_id = %peer_id,
+            drained,
+            "discarded buffered messages on V1 client exit"
+        );
+    }
+    peer.reset_queue();
 }
 
 /// Run a connected V1 session — read/write loops + heartbeat.
@@ -350,6 +380,7 @@ async fn run_session(
                 match msg {
                     Some(data) => {
                         let buf = BytesMut::from(data.as_ref());
+                        peer.record_dequeue();
                         framed.send(buf).await
                             .map_err(|e| anyhow::anyhow!("write error: {e}"))?;
                         peer.record_sent();
@@ -507,6 +538,84 @@ mod tests {
         // so sends should fail eventually
         let result = client.send(Bytes::from("test")).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn client_drains_queue_bytes_on_shutdown_with_pending_sends() {
+        use rustgate_test_utils::certs::TestCa;
+
+        use crate::config::{PeerConfig, RoutingMode};
+
+        let ca = TestCa::new("Test CA");
+        let client_cert = ca.issue_client_cert("federation-client", &["Alpha"]);
+
+        let connector = PeerConnector::from_pem(
+            &client_cert.cert_pem,
+            &client_cert.key_pem,
+            &ca.cert_pem,
+            false,
+        )
+        .expect("connector");
+
+        let peer_config = PeerConfig {
+            id: "drain-peer".into(),
+            address: "127.0.0.1:19996".into(),
+            groups: vec!["Alpha".into()],
+            inbound_groups: None,
+            outbound_groups: None,
+            enabled: true,
+            is_outbound: true,
+            trust_cert_cn: None,
+            routing_mode: RoutingMode::default(),
+            protocol_version: 1,
+            jwt_token: None,
+        };
+
+        let peer = Arc::new(PeerHandle::new(peer_config));
+        let on_msg: OnMessage = Arc::new(|_id, _data| {});
+
+        let mut client = V1Client::start(
+            Arc::clone(&peer),
+            V1ClientConfig {
+                connector: OutboundConnector::Static(connector),
+                // Unreachable address — connection_loop fails fast and exits
+                // because max_reconnects = 0.
+                addr: "127.0.0.1:19996".parse().expect("addr"),
+                server_name: "localhost".into(),
+                server_uid: "test-uid".into(),
+                heartbeat_interval: Duration::from_secs(30),
+                heartbeat_timeout: Duration::from_secs(90),
+                reconnect_delay: Duration::from_millis(50),
+                max_reconnects: 0,
+                on_message: on_msg,
+                replay_drain: None,
+            },
+        );
+
+        // Enqueue several messages while the client is still alive. Sends
+        // succeed because the outbound channel has buffer capacity, but the
+        // peer can never connect so nothing is ever delivered. Each
+        // successful send increments the per-peer queue-bytes counter.
+        for i in 0..5u8 {
+            let payload = Bytes::from(vec![i; 64]);
+            // Send may fail once the loop has exited; either outcome is fine
+            // — the post-condition we care about is queue_bytes == 0.
+            let _ = client.send(payload).await;
+        }
+
+        // Wait for the connection attempt to fail and the loop to exit on
+        // its own (max_reconnects = 0). The drain runs after the inner loop
+        // returns and must zero out the per-peer queue accounting even though
+        // the buffered messages were never delivered.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        client.shutdown().await;
+
+        assert_eq!(
+            peer.queue_bytes(),
+            0,
+            "queue_bytes must return to zero after the V1 send loop exits with pending messages"
+        );
+        assert!(peer.oldest_queued_age_secs().is_none());
     }
 
     #[tokio::test]

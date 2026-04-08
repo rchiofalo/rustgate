@@ -104,11 +104,13 @@ impl V2Client {
 
     /// Send a FederatedEvent to the remote peer.
     pub async fn send(&self, event: figpb::FederatedEvent) -> anyhow::Result<()> {
-        self.outbound_tx
-            .send(event)
-            .await
-            .map_err(|_| anyhow::anyhow!("outbound channel closed"))?;
-        self.peer.record_sent();
+        use prost::Message;
+        let bytes_len = event.encoded_len();
+        self.peer.record_enqueue(bytes_len);
+        if self.outbound_tx.send(event).await.is_err() {
+            self.peer.record_dequeue();
+            return Err(anyhow::anyhow!("outbound channel closed"));
+        }
         Ok(())
     }
 
@@ -290,6 +292,25 @@ async fn connection_loop(
 
         reconnect_count += 1;
     }
+
+    // Drain any messages still buffered in the outbound channel and clear
+    // the per-peer queue accounting so the metrics gauges return to zero.
+    // Without this, messages queued for a peer that has given up reconnecting
+    // (or been shut down) would leak counter weight on the gauges for the
+    // lifetime of the process.
+    outbound_rx.close();
+    let mut drained = 0usize;
+    while outbound_rx.try_recv().is_ok() {
+        drained += 1;
+    }
+    if drained > 0 {
+        debug!(
+            peer = %peer.id,
+            drained,
+            "discarded buffered events on V2 client exit"
+        );
+    }
+    peer.reset_queue();
 }
 
 /// Build a tonic gRPC channel with TLS.
@@ -496,6 +517,7 @@ async fn run_streams(
 
             // Forward outbound events to remote
             Some(event) = outbound_rx.recv() => {
+                peer.record_dequeue();
                 if send_tx.send(event).await.is_err() {
                     warn!(peer = %peer.id, "send stream closed");
                     break;

@@ -17,14 +17,15 @@ fuzz = ["dep:arbitrary"]
 arbitrary = { workspace = true, optional = true }
 bytes = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
 socket2 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 chacha20poly1305 = { workspace = true }
 zeroize = { workspace = true }
-serde_json = { workspace = true }
 hex = { workspace = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
 proptest = { workspace = true }
+tempfile = { workspace = true }

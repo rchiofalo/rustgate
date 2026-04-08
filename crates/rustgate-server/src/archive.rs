@@ -112,6 +112,21 @@ impl CotArchiver {
         .await;
     }
 
+    /// Return the path of the archive segment that is currently active
+    /// (i.e. the file the writer would append to right now).
+    ///
+    /// The rotation task uses this to exclude the in-progress file from
+    /// both size accounting and deletion sweeps, avoiding races against
+    /// the writer.
+    pub fn active_path(&self) -> PathBuf {
+        let secs = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let today = utc_date_string(secs);
+        self.dir.join(format!("cot-{today}.jsonl"))
+    }
+
     /// Flush any buffered data to disk.
     pub fn flush(&self) {
         let mut state = match self.inner.lock() {

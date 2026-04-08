@@ -296,6 +296,15 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 1024, env = "RUSTGATE_MAX_CONNECTIONS", value_parser = parse_max_connections)]
     pub(crate) max_connections: usize,
 
+    /// Maximum number of seconds to wait for in-flight queued messages
+    /// to be flushed to clients during graceful shutdown. After the
+    /// listeners have stopped accepting new connections and SIGTERM has
+    /// been observed, every active session is given up to this many
+    /// seconds to drain its priority and normal channels before the
+    /// process exits. Set to `0` to skip draining (immediate close).
+    #[arg(long, default_value_t = 10, env = "RUSTGATE_SHUTDOWN_DRAIN_TIMEOUT")]
+    pub(crate) shutdown_drain_timeout: u64,
+
     /// Maximum number of TLS handshakes that may be in progress simultaneously.
     /// Limits the CPU cost of concurrent cryptographic operations during
     /// connection floods. Incoming connections that exceed this limit will
@@ -434,6 +443,24 @@ pub(crate) struct Cli {
     )]
     pub(crate) federation_replay_buffer_size: usize,
 
+    /// Directory for persisting per-peer federation replay buffers to disk.
+    /// When set, replay buffers survive server restarts so a peer that
+    /// reconnects after a restart can resume replay from the last
+    /// persisted point. The store is a redb database at
+    /// `<dir>/federation_replay.redb`.
+    #[arg(long, env = "RUSTGATE_FEDERATION_REPLAY_DIR")]
+    pub(crate) federation_replay_dir: Option<std::path::PathBuf>,
+
+    /// Global byte cap for the persistent federation replay store
+    /// (drop-oldest eviction). Only honored when `--federation-replay-dir`
+    /// is set. Defaults to 64 MiB.
+    #[arg(
+        long,
+        default_value_t = 64 * 1024 * 1024,
+        env = "RUSTGATE_FEDERATION_REPLAY_MAX_BYTES"
+    )]
+    pub(crate) federation_replay_max_bytes: u64,
+
     /// NATS URL for federation HA coordination (enables distributed peer ownership).
     /// When set, only one pod manages each outbound peer in a multi-pod deployment.
     /// Requires --features federation-ha.
@@ -524,6 +551,25 @@ pub(crate) struct Cli {
     #[arg(long, env = "RUSTGATE_ARCHIVE_KEY_FILE")]
     pub(crate) archive_key_file: Option<std::path::PathBuf>,
 
+    /// Maximum total bytes retained across the CoT archive directory.
+    /// When the directory exceeds this cap, the rotation task deletes
+    /// the oldest archive files (by mtime) until the total drops below
+    /// the cap. `0` = unlimited (no size-based retention).
+    #[arg(long, default_value_t = 0, env = "RUSTGATE_ARCHIVE_MAX_SIZE")]
+    pub(crate) archive_max_size: u64,
+
+    /// Maximum age (in seconds) for CoT archive files. Files older than
+    /// this are deleted by the rotation task. `0` = unlimited (no
+    /// time-based retention).
+    #[arg(long, default_value_t = 0, env = "RUSTGATE_ARCHIVE_MAX_AGE")]
+    pub(crate) archive_max_age: u64,
+
+    /// Interval (in seconds) between archive rotation passes. Defaults
+    /// to 60s. Has no effect unless `--archive-dir` is set and at least
+    /// one of `--archive-max-size` or `--archive-max-age` is non-zero.
+    #[arg(long, default_value_t = 60, env = "RUSTGATE_ARCHIVE_ROTATE_INTERVAL")]
+    pub(crate) archive_rotate_interval: u64,
+
     /// Maximum age (in hours) for uploaded data packages. Packages older than
     /// this are eligible for cleanup. 0 = no expiration.
     #[arg(long, default_value_t = 0, env = "RUSTGATE_PACKAGE_MAX_AGE_HOURS")]
@@ -535,6 +581,13 @@ pub(crate) struct Cli {
     /// to the main log stream. Use "-" for stdout.
     #[arg(long, env = "RUSTGATE_AUDIT_LOG")]
     pub(crate) audit_log: Option<String>,
+
+    /// Write per-message access events as JSON lines to a dedicated
+    /// file. When set, every routed message produces one access-log
+    /// entry (target="access") with src_cn, dst, msg_uid, size, and
+    /// outcome (delivered, dedup, expired). Use "-" for stdout.
+    #[arg(long, env = "RUSTGATE_ACCESS_LOG")]
+    pub(crate) access_log: Option<String>,
 
     /// Directory in which to keep the per-client store-and-forward
     /// queue database. When unset, offline messages are dropped (the
@@ -584,6 +637,12 @@ pub(crate) enum Command {
         /// in the input header (the active key need not match).
         #[arg(long = "key-file", value_name = "PATH")]
         key_file: std::path::PathBuf,
+    },
+    /// Verify the integrity of a hash-chained audit log.
+    VerifyAudit {
+        /// Path to the audit log file (newline-delimited JSON records).
+        #[arg(long)]
+        file: String,
     },
 }
 
@@ -744,6 +803,7 @@ define_config_file! {
     metrics_per_identity: bool,
     metrics_identity_allowlist: Option<std::path::PathBuf>,
     max_connections: usize,
+    shutdown_drain_timeout: u64,
     max_concurrent_handshakes: usize,
     max_queued_bytes: usize,
     max_queued_bytes_low_water: Option<usize>,
@@ -766,6 +826,8 @@ define_config_file! {
     federation_circuit_breaker_threshold: u32,
     federation_circuit_breaker_timeout: u64,
     federation_replay_buffer_size: usize,
+    federation_replay_dir: Option<std::path::PathBuf>,
+    federation_replay_max_bytes: u64,
     federation_ha_nats_url: Option<String>,
     federation_pod_id: Option<String>,
     replay_window: u64,
@@ -777,8 +839,12 @@ define_config_file! {
     acl_api_token_file: Option<String>,
     archive_dir: Option<String>,
     archive_key_file: Option<std::path::PathBuf>,
+    archive_max_size: u64,
+    archive_max_age: u64,
+    archive_rotate_interval: u64,
     package_max_age_hours: u64,
     audit_log: Option<String>,
+    access_log: Option<String>,
     client_queue_dir: Option<std::path::PathBuf>,
     client_queue_max_bytes: u64,
     otel_endpoint: Option<String>,
@@ -1019,6 +1085,9 @@ mod tests {
             "RUSTGATE_CLIENT_BURST",
             "RUSTGATE_GROUP_ACL_FILE",
             "RUSTGATE_ARCHIVE_DIR",
+            "RUSTGATE_ARCHIVE_MAX_SIZE",
+            "RUSTGATE_ARCHIVE_MAX_AGE",
+            "RUSTGATE_ARCHIVE_ROTATE_INTERVAL",
             "RUSTGATE_PACKAGE_MAX_AGE_HOURS",
             "RUSTGATE_AUDIT_LOG",
             "OTEL_EXPORTER_OTLP_ENDPOINT",
