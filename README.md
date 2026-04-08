@@ -61,7 +61,7 @@ cp ca.pem certs/ca.crt && cp server.pem certs/server.crt && cp server-key.pem ce
 docker compose up -d
 
 # Verify
-curl http://localhost:9090/healthz
+curl http://localhost:9090/health/live
 ```
 
 For production certificate management see [docs/tls-certificates.md](docs/tls-certificates.md).
@@ -149,7 +149,7 @@ For detailed architecture documentation see [docs/architecture.md](docs/architec
 |---------|-------------|
 | Prometheus metrics | Connection lifecycle, message routing, NATS, federation ([unauthenticated](docs/deployment.md#ports) — firewall in hostile environments) |
 | OpenTelemetry tracing | Distributed trace export via OTLP (Jaeger, Tempo, etc.) |
-| Health endpoints | `/healthz` (liveness), `/readyz` (readiness) |
+| Health endpoints | `/health/live`, `/health/ready`, `/health/startup` (plus deprecated `/healthz`, `/readyz` aliases) |
 | Graceful shutdown | SIGTERM handling, readiness 503, connection draining |
 | Helm chart | Pod Security Standards, PDB, HPA, probes, NetworkPolicy |
 | Docker Compose | Local development stack with NATS and JetStream |
@@ -368,8 +368,12 @@ All flags support environment variables (CLI takes precedence):
 | `--circuit-breaker-threshold` | `RUSTGATE_CIRCUIT_BREAKER_THRESHOLD` | `10` |
 | `--group-acl-file` | `RUSTGATE_GROUP_ACL_FILE` | — |
 | `--archive-dir` | `RUSTGATE_ARCHIVE_DIR` | — |
+| `--archive-max-size` | `RUSTGATE_ARCHIVE_MAX_SIZE` | `0` (unlimited) |
+| `--archive-max-age` | `RUSTGATE_ARCHIVE_MAX_AGE` | `0` (unlimited, seconds) |
+| `--archive-rotate-interval` | `RUSTGATE_ARCHIVE_ROTATE_INTERVAL` | `60` (seconds) |
 | `--package-max-age-hours` | `RUSTGATE_PACKAGE_MAX_AGE_HOURS` | `0` (no expiration) |
 | `--audit-log` | `RUSTGATE_AUDIT_LOG` | — |
+| `--access-log` | `RUSTGATE_ACCESS_LOG` | — |
 | `--client-queue-dir` | `RUSTGATE_CLIENT_QUEUE_DIR` | — (disabled) |
 | `--client-queue-max-bytes` | `RUSTGATE_CLIENT_QUEUE_MAX_BYTES` | `104857600` (100 MiB) |
 | `--otel-endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` | — |
@@ -395,6 +399,21 @@ incremented. The current cache occupancy is exposed as
 `rustgate_dedup_cache_size`. Use `--dedup-cache-size` to bound the cache
 (default 100 000 entries, oldest evicted in LRU order). Disabled by
 default.
+
+### NATS JetStream consumer lag metrics
+
+When built with `--features metrics,nats` and `--nats-url` is configured,
+the NATS pull-consumer subscriber polls `consumer.info()` every five
+seconds and exports three gauges so operators can alert on cross-instance
+bridge lag and redelivery storms:
+
+- `rustgate_nats_consumer_pending` — messages pending delivery to this
+  instance's pull consumer (`num_pending`).
+- `rustgate_nats_consumer_num_redelivered` — current count of messages in
+  a redelivered state (`num_redelivered`).
+- `rustgate_nats_consumer_ack_floor_stream_seq` — stream sequence of the
+  highest contiguous ACK (`ack_floor.stream_seq`); a flat value while
+  `pending` grows indicates the consumer is stuck.
 
 ### Per-identity metrics (bounded cardinality)
 
@@ -422,6 +441,22 @@ in `identity_cn`-labelled series. Byte counters report **application payload
 bytes** (post-decode / pre-encode), not wire bytes — they exclude TLS,
 framing, and codec overhead.
 
+### Per-peer federation lag
+
+When the `federation` and `metrics` features are both enabled, two
+gauges expose how far behind each federation peer is, so operators can
+spot cascading backpressure:
+
+- `rustgate_federation_peer_queue_bytes{peer="..."}` — bytes currently
+  queued on the peer's outbound channel.
+- `rustgate_federation_peer_oldest_seconds{peer="..."}` — age in seconds
+  of the oldest message still waiting for delivery (`0` when the queue
+  is empty).
+
+Both gauges are refreshed once per second by a background task that
+snapshots the federation manager. Labels for peers that disappear are
+removed on the following tick.
+
 ## Docker
 
 ```bash
@@ -430,7 +465,7 @@ docker compose up -d
 
 This starts NATS with JetStream, a one-shot stream setup container, and rustgate on port 4433 with metrics on 9090.
 
-The Dockerfile builds all features (including jemalloc) in a multi-stage Alpine build. The final image runs as UID 10001 with a read-only root filesystem. Health is checked via `/healthz` on port 9090.
+The Dockerfile builds all features (including jemalloc) in a multi-stage Alpine build. The final image runs as UID 10001 with a read-only root filesystem. Health is checked via `/health/live` on port 9090.
 
 To build the image standalone:
 
@@ -520,6 +555,7 @@ All tests use ephemeral certificates generated at runtime via `rustgate-test-uti
 | Document | Description |
 |----------|-------------|
 | [Architecture](docs/architecture.md) | System design and crate responsibilities |
+| [Protocol Specification](docs/protocol.md) | Wire format, framing, codecs, routing, federation, HA |
 | [TLS Certificates](docs/tls-certificates.md) | Certificate requirements, generation, and management |
 | [Deployment](docs/deployment.md) | Binary, Docker Compose, and Kubernetes deployment |
 | [FIPS 140-3](docs/fips.md) | FIPS crypto provider setup and known limitations |

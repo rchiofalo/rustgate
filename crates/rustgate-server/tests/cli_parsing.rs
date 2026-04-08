@@ -60,6 +60,20 @@ fn help_shows_default_max_connections() {
 }
 
 #[test]
+fn help_shows_default_shutdown_drain_timeout() {
+    let output = Command::new(rustgate_bin())
+        .arg("--help")
+        .output()
+        .expect("failed to execute binary");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--shutdown-drain-timeout"),
+        "help should advertise the shutdown drain timeout flag"
+    );
+}
+
+#[test]
 fn help_shows_default_max_handshakes() {
     let output = Command::new(rustgate_bin())
         .arg("--help")
