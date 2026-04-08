@@ -1,0 +1,36 @@
+groups:
+  - name: rustgate.recording
+    interval: 30s
+    rules:
+      - record: rustgate:message_rate:5m
+        expr: sum(rate(rustgate_messages_routed_total[5m]))
+
+      - record: rustgate:message_drop_rate:5m
+        expr: sum(rate(rustgate_messages_dropped_total[5m]))
+
+      - record: rustgate:handshake_error_ratio:5m
+        expr: |
+          sum(rate(rustgate_handshake_failures_total[5m]))
+            /
+          clamp_min(sum(rate(rustgate_negotiations_total[5m])), 1)
+
+      - record: rustgate:admission_deferred_rate:5m
+        expr: sum(rate(rustgate_admission_deferred_total[5m]))
+
+      - record: rustgate:client_queue_drop_rate:5m
+        expr: sum(rate(rustgate_client_queue_drops_total[5m]))
+
+      - record: rustgate:federation_peer_lag_seconds:max
+        expr: max(rustgate_federation_peer_oldest_seconds)
+
+      - record: rustgate:federation_peer_queue_bytes:max
+        expr: max(rustgate_federation_peer_queue_bytes)
+
+      - record: rustgate:federation_message_rate:5m
+        expr: sum(rate(rustgate_federation_messages_out_total[5m]))
+
+      - record: rustgate:nats_consumer_pending:max
+        expr: max(rustgate_nats_consumer_pending)
+
+      - record: rustgate:nats_redelivery_rate:5m
+        expr: sum(rate(rustgate_nats_consumer_num_redelivered[5m]))

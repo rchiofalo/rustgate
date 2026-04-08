@@ -1,0 +1,55 @@
+name: ops-lint
+
+on:
+  pull_request:
+    paths:
+      - "ops/**"
+      - ".github/workflows/ops-lint.yml"
+  push:
+    branches: [main]
+    paths:
+      - "ops/**"
+      - ".github/workflows/ops-lint.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  promtool:
+    name: promtool check rules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install promtool
+        run: |
+          set -euo pipefail
+          PROM_VERSION=3.1.0
+          curl -sSL "https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/prometheus-${PROM_VERSION}.linux-amd64.tar.gz" \
+            | tar -xz
+          sudo install -m 0755 "prometheus-${PROM_VERSION}.linux-amd64/promtool" /usr/local/bin/promtool
+          promtool --version
+
+      - name: Check alert rules
+        run: promtool check rules ops/prometheus/alerts.yml
+
+      - name: Check recording rules
+        run: promtool check rules ops/prometheus/recording-rules.yml
+
+  dashboards-json:
+    name: validate dashboard JSON
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: jq empty on every dashboard
+        run: |
+          set -euo pipefail
+          for f in ops/grafana/dashboards/*.json; do
+            echo "validating $f"
+            jq empty "$f"
+          done

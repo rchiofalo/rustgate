@@ -1,0 +1,126 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "id": null,
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Federation connections",
+      "id": 1,
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum(rustgate_federation_connections)", "refId": "A"}]
+    },
+    {
+      "type": "stat",
+      "title": "Inbound peers",
+      "id": 2,
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum(rustgate_federation_connections_inbound)", "refId": "A"}]
+    },
+    {
+      "type": "stat",
+      "title": "Outbound peers",
+      "id": 3,
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum(rustgate_federation_connections_outbound)", "refId": "A"}]
+    },
+    {
+      "type": "stat",
+      "title": "Max peer lag (s)",
+      "id": 4,
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "max(rustgate_federation_peer_oldest_seconds)", "refId": "A"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Federation messages in/out per second",
+      "id": 5,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum(rate(rustgate_federation_messages_in_total[5m]))", "refId": "A", "legendFormat": "in"},
+        {"expr": "sum(rate(rustgate_federation_messages_out_total[5m]))", "refId": "B", "legendFormat": "out"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Per-peer queue bytes",
+      "id": 6,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "rustgate_federation_peer_queue_bytes", "refId": "A", "legendFormat": "{{peer}}"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Per-peer oldest message age (seconds)",
+      "id": 7,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "rustgate_federation_peer_oldest_seconds", "refId": "A", "legendFormat": "{{peer}}"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Errors / dropped / reconnects",
+      "id": 8,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum(rate(rustgate_federation_errors_total[5m]))", "refId": "A", "legendFormat": "errors"},
+        {"expr": "sum(rate(rustgate_federation_messages_dropped_total[5m]))", "refId": "B", "legendFormat": "dropped"},
+        {"expr": "sum(rate(rustgate_federation_reconnects_total[5m]))", "refId": "C", "legendFormat": "reconnects"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Circuit breaker trips vs recoveries",
+      "id": 9,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 20},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum(rate(rustgate_federation_circuit_breaker_trips_total[5m]))", "refId": "A", "legendFormat": "trips"},
+        {"expr": "sum(rate(rustgate_federation_circuit_breaker_recoveries_total[5m]))", "refId": "B", "legendFormat": "recoveries"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Forward TTL expired",
+      "id": 10,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 20},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum(rate(rustgate_federation_forward_ttl_expired_total[5m]))", "refId": "A", "legendFormat": "ttl expired"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Replay buffer persisted / restored / skipped-ttl",
+      "id": 11,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 28},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum(rate(rustgate_federation_replay_persisted_total[5m]))", "refId": "A", "legendFormat": "persisted"},
+        {"expr": "sum(rate(rustgate_federation_replay_restored_total[5m]))", "refId": "B", "legendFormat": "restored"},
+        {"expr": "sum(rate(rustgate_federation_replay_restored_skipped_ttl_total[5m]))", "refId": "C", "legendFormat": "skipped_ttl"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Heartbeats per second",
+      "id": 12,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 28},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum(rate(rustgate_federation_heartbeats_total[5m]))", "refId": "A", "legendFormat": "heartbeats"}]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "tags": ["rustgate", "federation"],
+  "templating": {"list": []},
+  "time": {"from": "now-1h", "to": "now"},
+  "timezone": "",
+  "title": "rustgate / Federation",
+  "uid": "rustgate-federation",
+  "version": 1
+}
