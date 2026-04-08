@@ -1,0 +1,122 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Global queued bytes",
+      "id": 1,
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "rustgate_queued_bytes", "refId": "A"}]
+    },
+    {
+      "type": "stat",
+      "title": "Sessions active",
+      "id": 2,
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum(rustgate_sessions_active)", "refId": "A"}]
+    },
+    {
+      "type": "stat",
+      "title": "Dedup cache entries",
+      "id": 3,
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "rustgate_dedup_cache_size", "refId": "A"}]
+    },
+    {
+      "type": "stat",
+      "title": "Accept errors (5m)",
+      "id": 4,
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum(increase(rustgate_accept_errors_total[5m]))", "refId": "A"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Messages routed per second",
+      "id": 5,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum(rate(rustgate_messages_routed_total[5m]))", "refId": "A", "legendFormat": "routed"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Client queue drops vs drains vs expired",
+      "id": 6,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum(rate(rustgate_client_queue_drops_total[5m]))", "refId": "A", "legendFormat": "drops"},
+        {"expr": "sum(rate(rustgate_client_queue_drains_total[5m]))", "refId": "B", "legendFormat": "drains"},
+        {"expr": "sum(rate(rustgate_client_queue_expired_total[5m]))", "refId": "C", "legendFormat": "expired"},
+        {"expr": "sum(rate(rustgate_client_queue_writer_drops_total[5m]))", "refId": "D", "legendFormat": "writer_drops"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Client queue depth (top 10)",
+      "id": 7,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "topk(10, rustgate_client_queue_depth)", "refId": "A"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Client queue bytes (top 10)",
+      "id": 8,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "topk(10, rustgate_client_queue_bytes)", "refId": "A"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Handshake failures by reason",
+      "id": 9,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 20},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum by (reason) (rate(rustgate_handshake_failures_total[5m]))", "refId": "A", "legendFormat": "{{reason}}"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Dedup hits per second",
+      "id": 10,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 20},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum(rate(rustgate_dedup_hits_total[5m]))", "refId": "A", "legendFormat": "dedup hits"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Per-identity bytes sent/received (top 10)",
+      "id": 11,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 28},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "topk(10, rate(rustgate_per_identity_bytes_sent_total[5m]))", "refId": "A", "legendFormat": "sent {{identity}}"},
+        {"expr": "topk(10, rate(rustgate_per_identity_bytes_received_total[5m]))", "refId": "B", "legendFormat": "recv {{identity}}"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Admission deferred",
+      "id": 12,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 28},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum(rate(rustgate_admission_deferred_total[5m]))", "refId": "A", "legendFormat": "deferred/s"}]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "tags": ["rustgate", "transport"],
+  "templating": {"list": []},
+  "time": {"from": "now-1h", "to": "now"},
+  "timezone": "",
+  "title": "rustgate / Transport",
+  "uid": "rustgate-transport",
+  "version": 1
+}

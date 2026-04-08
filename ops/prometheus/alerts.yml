@@ -1,0 +1,142 @@
+groups:
+  - name: rustgate.transport
+    rules:
+      - alert: RustgateHandshakeFailuresHigh
+        expr: |
+          sum(rate(rustgate_handshake_failures_total[5m]))
+            /
+          clamp_min(sum(rate(rustgate_negotiations_total[5m])), 1)
+            > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "rustgate handshake failure ratio > 10%"
+          description: "More than 10% of TLS negotiations have failed over the last 5 minutes. Check CA / CRL / client cert validity."
+          runbook_url: "https://github.com/rchiofalo/rustgate/tree/main/docs/runbooks/handshake-failures.md"
+
+      - alert: RustgateAdmissionDeferredSustained
+        expr: sum(rate(rustgate_admission_deferred_total[5m])) > 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "rustgate admission gate sustained deferrals"
+          description: "Admission control has been deferring new sessions for 15 minutes. Server is likely saturated (queued_bytes or session cap)."
+          runbook_url: "https://github.com/rchiofalo/rustgate/tree/main/docs/runbooks/admission-deferred.md"
+
+      - alert: RustgateClientQueueDropsRising
+        expr: sum(rate(rustgate_client_queue_drops_total[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "rustgate client queue drops increasing"
+          description: "Slow clients are causing message drops. Investigate client_queue_depth and client_queue_bytes for the affected sessions."
+          runbook_url: "https://github.com/rchiofalo/rustgate/tree/main/docs/runbooks/client-queue-drops.md"
+
+      - alert: RustgateAcceptErrorsHigh
+        expr: sum(rate(rustgate_accept_errors_total[5m])) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "rustgate listener accept errors elevated"
+          description: "Listener is returning accept errors. Check fd limits and network stack."
+          runbook_url: "https://github.com/rchiofalo/rustgate/tree/main/docs/runbooks/accept-errors.md"
+
+  - name: rustgate.federation
+    rules:
+      - alert: RustgateFederationPeerLagHigh
+        expr: max(rustgate_federation_peer_oldest_seconds) > 60
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "rustgate federation peer lag > 60s"
+          description: "At least one federation peer has messages older than 60s in its outbound queue."
+          runbook_url: "https://github.com/rchiofalo/rustgate/tree/main/docs/runbooks/federation.md"
+
+      - alert: RustgateFederationPeerQueueBytesHigh
+        expr: max(rustgate_federation_peer_queue_bytes) > 50 * 1024 * 1024
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "rustgate federation peer queue > 50MiB"
+          description: "A federation peer has accumulated more than 50MiB of pending outbound bytes."
+          runbook_url: "https://github.com/rchiofalo/rustgate/tree/main/docs/runbooks/federation.md"
+
+      - alert: RustgateFederationCircuitBreakerOpen
+        expr: sum(rate(rustgate_federation_circuit_breaker_trips_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "rustgate federation circuit breaker tripping"
+          description: "Federation circuit breaker has tripped in the last 5 minutes. Peer connectivity is unhealthy."
+          runbook_url: "https://github.com/rchiofalo/rustgate/tree/main/docs/runbooks/federation.md"
+
+      - alert: RustgateFederationForwardTtlExpiredRising
+        expr: sum(rate(rustgate_federation_forward_ttl_expired_total[5m])) > 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "rustgate federation forward TTL expirations rising"
+          description: "Messages are exceeding their forward TTL before being delivered to peers."
+          runbook_url: "https://github.com/rchiofalo/rustgate/tree/main/docs/runbooks/federation.md"
+
+      - alert: RustgateFederationPeerDown
+        expr: sum(rustgate_federation_connections) == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "rustgate has no federation peers connected"
+          description: "No federation peers have been connected for 10 minutes."
+          runbook_url: "https://github.com/rchiofalo/rustgate/tree/main/docs/runbooks/federation.md"
+
+  - name: rustgate.nats
+    rules:
+      - alert: RustgateNatsConsumerLagHigh
+        expr: max(rustgate_nats_consumer_pending) > 10000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "rustgate NATS consumer pending > 10k"
+          description: "A JetStream consumer has more than 10k pending messages for 10 minutes."
+          runbook_url: "https://github.com/rchiofalo/rustgate/tree/main/docs/runbooks/nats.md"
+
+      - alert: RustgateNatsConsumerRedeliveryStorm
+        expr: max(rate(rustgate_nats_consumer_num_redelivered[5m])) > 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "rustgate NATS consumer redelivery storm"
+          description: "Consumer redelivery rate exceeds 5/s — downstream is failing to ack."
+          runbook_url: "https://github.com/rchiofalo/rustgate/tree/main/docs/runbooks/nats.md"
+
+      - alert: RustgateNatsConsumerInfoSlow
+        expr: histogram_quantile(0.95, sum(rate(rustgate_nats_consumer_info_seconds_bucket[5m])) by (le)) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "rustgate NATS consumer info p95 latency > 1s"
+          description: "JetStream consumer info requests are slow. NATS cluster may be degraded."
+          runbook_url: "https://github.com/rchiofalo/rustgate/tree/main/docs/runbooks/nats.md"
+
+  - name: rustgate.enrollment
+    rules:
+      - alert: RustgateEnrollmentRateLimited
+        expr: sum(rate(rustgate_enrollment_rate_limited_total[5m])) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "rustgate enrollment rate limiter active"
+          description: "CSR rate limiter is rejecting requests above baseline — possible abuse or misconfigured client."
+          runbook_url: "https://github.com/rchiofalo/rustgate/tree/main/docs/runbooks/enrollment.md"
