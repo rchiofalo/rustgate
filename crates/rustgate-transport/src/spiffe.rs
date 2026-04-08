@@ -1,0 +1,393 @@
+//! SPIFFE Workload API identity source.
+//!
+//! This module wires the [`spiffe`] crate's `WorkloadApiClient` into
+//! rustgate's existing [`CertReloader`] so that the server can obtain its
+//! X.509-SVID and trust bundle from a SPIRE agent rather than from static
+//! files on disk. Refreshes flow through the same atomic `CertifiedKey`
+//! swap that file-based rotation uses, so in-flight TLS handshakes continue
+//! to resolve the previous certificate until the swap completes.
+//!
+//! This is the first half of the SPIFFE integration (issue #570): loading
+//! the server identity from a workload API. Accepting SPIFFE IDs from
+//! *connecting* clients (extracting the URI SAN post-handshake and using it
+//! as the client identity in place of the X.509 CN) is tracked as a
+//! follow-up and continues to use the existing CN-based identity path.
+
+use std::sync::{Arc, Weak};
+use std::time::Duration;
+
+use rustgate_core::error::{ConfigError, Result, RustgateError};
+use spiffe::cert::Certificate;
+use spiffe::svid::x509::X509Svid;
+use spiffe::workload_api::client::WorkloadApiClient;
+use tracing::{info, warn};
+
+use crate::cert_reloader::CertReloader;
+
+/// Initial material fetched from the Workload API at startup.
+///
+/// The caller uses [`cert_reloader`](Self::cert_reloader) as the rustls
+/// cert resolver and [`trust_bundle_pem`](Self::trust_bundle_pem) as the
+/// CA bundle for verifying connecting clients.
+#[derive(Debug)]
+pub struct SpiffeIdentity {
+    /// Cert reloader seeded with the initial X.509-SVID. Subsequent
+    /// refreshes by the background task call
+    /// [`CertReloader::update_from_der`] to atomically swap the active key.
+    pub cert_reloader: Arc<CertReloader>,
+    /// Concatenated trust bundle(s) in PEM form. Used once at startup to
+    /// build the client-cert verifier; dynamic trust bundle rotation is
+    /// deferred (clients reconnect within SVID TTL to pick up new roots).
+    pub trust_bundle_pem: String,
+    /// Leaf + intermediate certificates in PEM form. Used by the rest of
+    /// the server (federation, enrollment, metrics) which still expect
+    /// PEM-encoded material.
+    pub cert_pem: String,
+    /// PKCS#8 private key in PEM form.
+    pub key_pem: String,
+    /// SPIFFE ID of the fetched SVID, e.g. `spiffe://example.org/rustgate`.
+    pub spiffe_id: String,
+    /// Trust domain of the fetched SVID, e.g. `example.org`.
+    pub trust_domain: String,
+}
+
+/// Configuration for the SPIFFE identity source.
+#[derive(Debug, Clone)]
+pub struct SpiffeConfig {
+    /// Path to the SPIRE agent Workload API Unix socket.
+    /// Example: `unix:///tmp/spire-agent/public/api.sock`.
+    pub workload_api_socket: String,
+    /// Optional trust domain to enforce. When set, the fetched SVID must
+    /// belong to this trust domain or startup fails.
+    pub expected_trust_domain: Option<String>,
+    /// Polling interval for SVID refresh when the streaming API is not
+    /// available. Set to zero to disable polling (used only for tests).
+    pub refresh_interval: Duration,
+}
+
+impl Default for SpiffeConfig {
+    fn default() -> Self {
+        Self {
+            workload_api_socket: "unix:///tmp/spire-agent/public/api.sock".to_string(),
+            expected_trust_domain: None,
+            refresh_interval: Duration::from_secs(300),
+        }
+    }
+}
+
+/// Fetch the initial X.509-SVID from the Workload API, seed a
+/// [`CertReloader`] with it, and return both the reloader and the trust
+/// bundle PEM so the caller can construct the TLS server config.
+///
+/// This function is async because the underlying SPIFFE client uses a
+/// gRPC transport over the Workload API Unix socket.
+pub async fn fetch_initial_identity(cfg: &SpiffeConfig) -> Result<SpiffeIdentity> {
+    let client = WorkloadApiClient::connect_to(&cfg.workload_api_socket)
+        .await
+        .map_err(|e| {
+            RustgateError::from(ConfigError::Other(format!(
+                "failed to connect to SPIFFE Workload API at {}: {e}",
+                cfg.workload_api_socket
+            )))
+        })?;
+
+    let ctx = client.fetch_x509_context().await.map_err(|e| {
+        RustgateError::from(ConfigError::Other(format!(
+            "failed to fetch X.509 context from SPIFFE Workload API: {e}"
+        )))
+    })?;
+
+    let svid = ctx.default_svid().ok_or_else(|| {
+        RustgateError::from(ConfigError::Other(
+            "SPIFFE Workload API returned no default X.509-SVID".to_string(),
+        ))
+    })?;
+
+    let spiffe_id = svid.spiffe_id().to_string();
+    let trust_domain = svid.spiffe_id().trust_domain().to_string();
+
+    if let Some(expected) = &cfg.expected_trust_domain
+        && expected != &trust_domain
+    {
+        return Err(ConfigError::Other(format!(
+            "SPIFFE trust domain mismatch: expected {expected}, got {trust_domain}"
+        ))
+        .into());
+    }
+
+    let (cert_chain_der, private_key_der) = svid_to_der(svid.as_ref());
+
+    let reloader = CertReloader::from_der(&cert_chain_der, &private_key_der)?;
+
+    // Build a PEM bundle from all authorities in all trust bundles. PEM
+    // form is used so the bundle plugs into the existing `TlsConfig` path
+    // unchanged.
+    let mut trust_bundle_pem = String::new();
+    for (_td, bundle) in ctx.bundle_set().iter() {
+        for authority in bundle.authorities() {
+            append_cert_pem(&mut trust_bundle_pem, authority);
+        }
+    }
+
+    // Build PEM encodings of the cert chain and private key for consumers
+    // (federation, enrollment, TlsConfig::from_pem) that still expect PEM.
+    let mut cert_pem = String::new();
+    for der in &cert_chain_der {
+        append_der_as_pem(&mut cert_pem, "CERTIFICATE", der);
+    }
+    let mut key_pem = String::new();
+    append_der_as_pem(&mut key_pem, "PRIVATE KEY", &private_key_der);
+
+    if trust_bundle_pem.is_empty() {
+        return Err(ConfigError::Other(
+            "SPIFFE Workload API returned an empty trust bundle".to_string(),
+        )
+        .into());
+    }
+
+    info!(
+        spiffe_id = %spiffe_id,
+        trust_domain = %trust_domain,
+        "loaded initial SPIFFE X.509-SVID from Workload API"
+    );
+
+    let expiry = svid_expiry_unix(&cert_chain_der);
+    rustgate_core::audit::spiffe_svid_refresh_success(&spiffe_id, &trust_domain, expiry);
+
+    Ok(SpiffeIdentity {
+        cert_reloader: reloader,
+        trust_bundle_pem,
+        cert_pem,
+        key_pem,
+        spiffe_id,
+        trust_domain,
+    })
+}
+
+/// Spawn a background task that periodically re-fetches the X.509-SVID
+/// from the Workload API and hands it to [`CertReloader::update_from_der`]
+/// for atomic rotation. On success, the task emits an audit event and
+/// (when the `metrics` feature is enabled) updates the SPIFFE refresh
+/// metrics. On failure the task logs and retries on the next tick.
+///
+/// The task is best-effort: a single failed poll does not take down the
+/// server. The currently loaded SVID continues to serve traffic until it
+/// expires, at which point clients will see handshake failures — that's
+/// the same behavior as file-based rotation when the file is deleted.
+pub fn spawn_refresh_task(
+    reloader: Weak<CertReloader>,
+    cfg: SpiffeConfig,
+    hooks: Option<SpiffeHooks>,
+) {
+    if cfg.refresh_interval.is_zero() {
+        return;
+    }
+    drop(tokio::spawn(async move {
+        let mut tick = tokio::time::interval(cfg.refresh_interval);
+        let _ = tick.tick().await; // skip the immediate tick
+        loop {
+            let _ = tick.tick().await;
+            // Exit cleanly when the owning `TlsListenerHandle` drops its
+            // `Arc<CertReloader>` during shutdown — no further Workload API
+            // calls are made after the reloader is gone.
+            let Some(reloader) = reloader.upgrade() else {
+                tracing::debug!("SPIFFE refresh task exiting: reloader dropped");
+                return;
+            };
+            match refresh_once(&reloader, &cfg).await {
+                Ok(Some((spiffe_id, trust_domain, expiry))) => {
+                    info!(
+                        spiffe_id = %spiffe_id,
+                        trust_domain = %trust_domain,
+                        "SPIFFE X.509-SVID rotated"
+                    );
+                    rustgate_core::audit::spiffe_svid_refresh_success(
+                        &spiffe_id,
+                        &trust_domain,
+                        expiry,
+                    );
+                    if let Some(h) = hooks.as_ref() {
+                        (h.on_success)(expiry);
+                    }
+                }
+                Ok(None) => {
+                    // unchanged
+                }
+                Err(e) => {
+                    warn!(error = %e, "SPIFFE SVID refresh failed");
+                    rustgate_core::audit::spiffe_svid_refresh_failure(&e.to_string());
+                    if let Some(h) = hooks.as_ref() {
+                        (h.on_failure)();
+                    }
+                }
+            }
+        }
+    }));
+}
+
+/// Fetch once and update the reloader. Returns the new SPIFFE ID, trust
+/// domain, and expiry on rotation; `None` if the material is unchanged.
+async fn refresh_once(
+    reloader: &CertReloader,
+    cfg: &SpiffeConfig,
+) -> Result<Option<(String, String, i64)>> {
+    let client = WorkloadApiClient::connect_to(&cfg.workload_api_socket)
+        .await
+        .map_err(|e| {
+            RustgateError::from(ConfigError::Other(format!(
+                "workload api connect failed: {e}"
+            )))
+        })?;
+    let svid = client.fetch_x509_svid().await.map_err(|e| {
+        RustgateError::from(ConfigError::Other(format!(
+            "workload api fetch failed: {e}"
+        )))
+    })?;
+
+    let (cert_chain_der, private_key_der) = svid_to_der(&svid);
+
+    let changed = reloader.update_from_der(&cert_chain_der, &private_key_der)?;
+    if !changed {
+        return Ok(None);
+    }
+    let spiffe_id = svid.spiffe_id().to_string();
+    let trust_domain = svid.spiffe_id().trust_domain().to_string();
+    let expiry = svid_expiry_unix(&cert_chain_der);
+    Ok(Some((spiffe_id, trust_domain, expiry)))
+}
+
+/// Convert an [`X509Svid`] into the DER-encoded cert chain + PKCS#8 private
+/// key bytes expected by [`CertReloader::update_from_der`].
+fn svid_to_der(svid: &X509Svid) -> (Vec<Vec<u8>>, Vec<u8>) {
+    let chain: Vec<Vec<u8>> = svid
+        .cert_chain()
+        .iter()
+        .map(|c: &Certificate| c.as_bytes().to_vec())
+        .collect();
+    let key = svid.private_key().as_bytes().to_vec();
+    (chain, key)
+}
+
+/// Append a single DER-encoded certificate to a PEM string buffer.
+fn append_cert_pem(out: &mut String, cert: &Certificate) {
+    append_der_as_pem(out, "CERTIFICATE", cert.as_bytes());
+}
+
+/// Append an arbitrary DER blob as PEM with the given label.
+///
+/// Base64 output is pure ASCII, so we wrap at 64 columns using direct
+/// string slicing (char boundaries == byte boundaries for ASCII) instead
+/// of a `from_utf8` round-trip with a silent fallback.
+fn append_der_as_pem(out: &mut String, label: &str, der: &[u8]) {
+    use base64::Engine;
+    out.push_str("-----BEGIN ");
+    out.push_str(label);
+    out.push_str("-----\n");
+    let encoded = base64::engine::general_purpose::STANDARD.encode(der);
+    let mut idx = 0;
+    while idx < encoded.len() {
+        let end = (idx + 64).min(encoded.len());
+        out.push_str(&encoded[idx..end]);
+        out.push('\n');
+        idx = end;
+    }
+    out.push_str("-----END ");
+    out.push_str(label);
+    out.push_str("-----\n");
+}
+
+/// Extract the notAfter field of the leaf cert as a unix timestamp.
+/// Returns 0 if parsing fails — the caller only uses this for audit/metrics.
+fn svid_expiry_unix(cert_chain_der: &[Vec<u8>]) -> i64 {
+    let leaf = match cert_chain_der.first() {
+        Some(c) => c,
+        None => return 0,
+    };
+    match x509_parser::prelude::parse_x509_certificate(leaf) {
+        Ok((_, parsed)) => parsed.validity().not_after.timestamp(),
+        Err(_) => 0,
+    }
+}
+
+/// Hooks for observing SPIFFE refresh outcomes from the background task.
+/// The server crate wires these up to Prometheus counters/gauges when the
+/// `metrics` feature is on; with metrics off, the hooks are simply `None`
+/// and the refresh task still updates the reloader and emits audit events.
+#[derive(Clone)]
+pub struct SpiffeHooks {
+    /// Called on a successful refresh with the new leaf expiry (unix seconds).
+    pub on_success: Arc<dyn Fn(i64) + Send + Sync>,
+    /// Called on a failed refresh.
+    pub on_failure: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl std::fmt::Debug for SpiffeHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpiffeHooks").finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::panic, clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn default_config_has_standard_socket() {
+        let cfg = SpiffeConfig::default();
+        assert!(cfg.workload_api_socket.starts_with("unix://"));
+        assert!(cfg.expected_trust_domain.is_none());
+    }
+
+    #[test]
+    fn svid_expiry_returns_zero_for_empty_chain() {
+        assert_eq!(svid_expiry_unix(&[]), 0);
+    }
+
+    #[test]
+    fn svid_expiry_returns_zero_for_garbage() {
+        assert_eq!(svid_expiry_unix(&[vec![0, 1, 2, 3]]), 0);
+    }
+
+    #[test]
+    fn cert_reloader_update_from_der_roundtrip() {
+        // This exercises the CertReloader in-memory path that the SPIFFE
+        // refresh task drives. We build certs via TestCa (DER form) and
+        // confirm that update_from_der swaps the active CertifiedKey.
+        use rustgate_test_utils::certs::TestCa;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let ca = TestCa::new("SPIFFE Test CA");
+        let cert_a = ca.issue_server_cert("svid-a.spiffe.test", &["svid-a.spiffe.test"]);
+        let cert_b = ca.issue_server_cert("svid-b.spiffe.test", &["svid-b.spiffe.test"]);
+
+        let chain_a = pem_to_der_chain(&cert_a.cert_pem);
+        let key_a = pem_private_key_to_der(&cert_a.key_pem);
+        let reloader = CertReloader::from_der(&chain_a, &key_a).expect("from_der");
+
+        // Same material → no change.
+        assert!(!reloader.update_from_der(&chain_a, &key_a).unwrap());
+
+        // Different cert → rotated.
+        let chain_b = pem_to_der_chain(&cert_b.cert_pem);
+        let key_b = pem_private_key_to_der(&cert_b.key_pem);
+        assert!(reloader.update_from_der(&chain_b, &key_b).unwrap());
+    }
+
+    fn pem_to_der_chain(pem: &str) -> Vec<Vec<u8>> {
+        use rustls_pki_types::CertificateDer;
+        use rustls_pki_types::pem::PemObject;
+        CertificateDer::pem_slice_iter(pem.as_bytes())
+            .filter_map(|r| r.ok())
+            .map(|c| c.as_ref().to_vec())
+            .collect()
+    }
+
+    fn pem_private_key_to_der(pem: &str) -> Vec<u8> {
+        use rustls_pki_types::PrivateKeyDer;
+        use rustls_pki_types::pem::PemObject;
+        let key = PrivateKeyDer::from_pem_slice(pem.as_bytes()).expect("parse key");
+        key.secret_der().to_vec()
+    }
+}

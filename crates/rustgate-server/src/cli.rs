@@ -77,7 +77,8 @@ pub(crate) struct Cli {
         long,
         default_value = "",
         env = "RUSTGATE_CERT",
-        required_unless_present = "config"
+        required_unless_present_any = ["config", "spiffe"],
+        conflicts_with = "spiffe"
     )]
     pub(crate) cert: String,
 
@@ -85,7 +86,8 @@ pub(crate) struct Cli {
         long,
         default_value = "",
         env = "RUSTGATE_KEY",
-        required_unless_present = "config"
+        required_unless_present_any = ["config", "spiffe"],
+        conflicts_with = "spiffe"
     )]
     pub(crate) key: String,
 
@@ -93,9 +95,51 @@ pub(crate) struct Cli {
         long,
         default_value = "",
         env = "RUSTGATE_CA",
-        required_unless_present = "config"
+        required_unless_present_any = ["config", "spiffe"],
+        conflicts_with = "spiffe"
     )]
     pub(crate) ca: String,
+
+    /// Enable SPIFFE workload identity. When set, the server obtains its
+    /// TLS certificate, private key, and trust bundle from a SPIRE agent
+    /// via the SPIFFE Workload API instead of from `--cert`/`--key`/`--ca`.
+    /// Requires `--features spiffe`. Mutually exclusive with `--cert`,
+    /// `--key`, `--ca`, and `--enrollment-bind`.
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "RUSTGATE_SPIFFE",
+        conflicts_with_all = ["cert", "key", "ca", "enrollment_bind"]
+    )]
+    pub(crate) spiffe: bool,
+
+    /// Path to the SPIRE agent Workload API endpoint. Defaults to the
+    /// SPIFFE standard socket at `unix:///tmp/spire-agent/public/api.sock`.
+    /// Only used when `--spiffe` is enabled.
+    #[arg(
+        long,
+        default_value = "unix:///tmp/spire-agent/public/api.sock",
+        env = "RUSTGATE_SPIFFE_WORKLOAD_API_SOCKET"
+    )]
+    pub(crate) spiffe_workload_api_socket: String,
+
+    /// Expected SPIFFE trust domain. When set, the SVID fetched from the
+    /// Workload API must belong to this trust domain or startup fails.
+    /// Only used when `--spiffe` is enabled.
+    #[arg(long, env = "RUSTGATE_SPIFFE_TRUST_DOMAIN")]
+    pub(crate) spiffe_trust_domain: Option<String>,
+
+    /// Interval in seconds to refresh the SPIFFE X.509-SVID from the
+    /// Workload API. Defaults to 300s (5 minutes). SPIFFE SVIDs are
+    /// short-lived (typically 1 hour), so the default gives ample margin.
+    /// Only used when `--spiffe` is enabled.
+    #[arg(
+        long,
+        default_value_t = 300,
+        env = "RUSTGATE_SPIFFE_REFRESH_INTERVAL",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub(crate) spiffe_refresh_interval: u64,
 
     /// Path to PEM-encoded Certificate Revocation List file.
     /// Connections using revoked certificates will be rejected at the TLS handshake.
@@ -821,6 +865,10 @@ define_config_file! {
     kx_groups: Option<String>,
     cert_reload_interval: u64,
     ocsp_stapling: bool,
+    spiffe: bool,
+    spiffe_workload_api_socket: String,
+    spiffe_trust_domain: Option<String>,
+    spiffe_refresh_interval: u64,
     client_ocsp: bool,
     framing: Framing,
     encoding: Encoding,

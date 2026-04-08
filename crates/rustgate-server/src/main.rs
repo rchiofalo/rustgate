@@ -298,7 +298,14 @@ fn main() -> anyhow::Result<()> {
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
     // ── TLS setup ───────────────────────────────────────────────────
-    let (tls_config, _cert_pem, _key_pem, _ca_pem) = setup::build_tls_config(&cli).await?;
+    let tls_build = setup::build_tls_config(&cli).await?;
+    let tls_config = tls_build.tls_config;
+    let _cert_pem = tls_build.cert_pem;
+    let _key_pem = tls_build.key_pem;
+    let _ca_pem = tls_build.ca_pem;
+    #[cfg(feature = "spiffe")]
+    let tls_handle = setup::bind_tls_listener(&cli, &tls_config, tls_build.spiffe_identity).await?;
+    #[cfg(not(feature = "spiffe"))]
     let tls_handle = setup::bind_tls_listener(&cli, &tls_config).await?;
     let setup::TlsListenerHandle {
         listener,

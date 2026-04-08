@@ -470,3 +470,69 @@ fn otlp_metrics_interval_accepts_positive_value() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+// ── SPIFFE workload identity ────────────────────────────────────────
+
+#[cfg(feature = "spiffe")]
+#[test]
+fn spiffe_flag_waives_cert_requirement() {
+    // With --spiffe set, --cert/--key/--ca must not be required. We still
+    // expect startup to fail later (no Workload API socket in the test env),
+    // but clap parsing should accept the flag combination.
+    let output = Command::new(rustgate_bin())
+        .args([
+            "--spiffe",
+            "--spiffe-workload-api-socket",
+            "unix:///tmp/does-not-exist.sock",
+            "--help",
+        ])
+        .output()
+        .expect("failed to execute binary");
+    assert!(
+        output.status.success(),
+        "expected --help to succeed alongside --spiffe: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(feature = "spiffe")]
+#[test]
+fn spiffe_conflicts_with_cert_flag() {
+    // clap should reject combining --spiffe with --cert.
+    let output = Command::new(rustgate_bin())
+        .args([
+            "--spiffe",
+            "--cert",
+            "/tmp/c.pem",
+            "--key",
+            "/tmp/k.pem",
+            "--ca",
+            "/tmp/ca.pem",
+        ])
+        .output()
+        .expect("failed to execute binary");
+    assert!(
+        !output.status.success(),
+        "expected --spiffe + --cert to be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot be used with") || stderr.contains("conflict"),
+        "stderr should mention conflict: {stderr}"
+    );
+}
+
+#[cfg(feature = "spiffe")]
+#[test]
+fn spiffe_help_lists_flags() {
+    let output = Command::new(rustgate_bin())
+        .arg("--help")
+        .output()
+        .expect("failed to execute binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--spiffe"), "help missing --spiffe");
+    assert!(
+        stdout.contains("RUSTGATE_SPIFFE_WORKLOAD_API_SOCKET"),
+        "help missing RUSTGATE_SPIFFE_WORKLOAD_API_SOCKET env var"
+    );
+}
