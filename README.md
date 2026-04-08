@@ -149,6 +149,7 @@ For detailed architecture documentation see [docs/architecture.md](docs/architec
 |---------|-------------|
 | Prometheus metrics | Connection lifecycle, message routing, NATS, federation ([unauthenticated](docs/deployment.md#ports) — firewall in hostile environments) |
 | OpenTelemetry tracing | Distributed trace export via OTLP (Jaeger, Tempo, etc.) |
+| OpenTelemetry metrics | Optional OTLP metrics push alongside the Prometheus `/metrics` scrape endpoint (shares the OTLP collector URL with traces) |
 | Health endpoints | `/health/live`, `/health/ready`, `/health/startup` (plus deprecated `/healthz`, `/readyz` aliases) |
 | Graceful shutdown | SIGTERM handling, readiness 503, connection draining |
 | Helm chart | Pod Security Standards, PDB, HPA, probes, NetworkPolicy |
@@ -415,6 +416,8 @@ All flags support environment variables (CLI takes precedence):
 | `--client-queue-max-bytes` | `RUSTGATE_CLIENT_QUEUE_MAX_BYTES` | `104857600` (100 MiB) |
 | `--otel-endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` | — |
 | `--otel-service-name` | `OTEL_SERVICE_NAME` | `rustgate` |
+| `--otlp-metrics` | `RUSTGATE_OTLP_METRICS` | `false` |
+| `--otlp-metrics-interval` | `RUSTGATE_OTLP_METRICS_INTERVAL` | `60` (seconds, min 1) |
 
 </details>
 
