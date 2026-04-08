@@ -119,6 +119,7 @@ For detailed architecture documentation see [docs/architecture.md](docs/architec
 | WebSocket | wss:// listener with mTLS, interoperable with TCP clients |
 | Protobuf | Bidirectional XML ↔ protobuf translation |
 | Protocol negotiation | Automatic upgrade from XML to protobuf framing |
+| CoT delta encoding | Opt-in per-UID delta + epsilon suppression on XML sessions ([details](docs/cot-delta-encoding.md)) |
 | CoT archival | Structured JSONL logging of all received events |
 | Data packages | Upload, download, and search via Marti sync API |
 

@@ -784,6 +784,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                             archiver: arch,
                             replay_filter: rf,
                             circuit_breaker_threshold: cli.circuit_breaker_threshold,
+                            delta_config: session::DeltaConfig {
+                                enabled: cli.cot_delta_encoding,
+                                cache_size: cli.cot_delta_cache_size,
+                                epsilon_meters: cli.cot_delta_epsilon_meters,
+                            },
                             #[cfg(feature = "metrics")]
                             metrics_identity: Arc::clone(&metrics_identity),
                         };

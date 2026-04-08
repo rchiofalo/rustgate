@@ -518,6 +518,26 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 100_000, env = "RUSTGATE_DEDUP_CACHE_SIZE")]
     pub(crate) dedup_cache_size: usize,
 
+    /// Enable per-UID delta encoding for outbound CoT events on XML sessions.
+    /// When enabled, each writer task tracks the last-sent event per UID
+    /// and emits a compact `<delta>` wrapper carrying only the fields
+    /// that changed. Disabled by default. Applies only to XML-framed
+    /// sessions; protobuf sessions always receive full events.
+    #[arg(long, default_value_t = false, env = "RUSTGATE_COT_DELTA_ENCODING")]
+    pub(crate) cot_delta_encoding: bool,
+
+    /// Per-session LRU cache capacity for the CoT delta encoder (entries).
+    /// Oldest UIDs are evicted first; the next event for an evicted UID
+    /// is emitted as a full event.
+    #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u64).range(1..), env = "RUSTGATE_COT_DELTA_CACHE_SIZE")]
+    pub(crate) cot_delta_cache_size: u64,
+
+    /// Ground distance in meters below which position-only CoT updates
+    /// are suppressed entirely. Set to `0` to disable suppression and
+    /// ship every event (either full or delta, never suppressed).
+    #[arg(long, default_value_t = 1.0, env = "RUSTGATE_COT_DELTA_EPSILON_METERS")]
+    pub(crate) cot_delta_epsilon_meters: f64,
+
     /// Maximum sustained messages per second per connected client (0 = disabled).
     #[arg(long, default_value_t = 0, env = "RUSTGATE_CLIENT_MSG_RATE")]
     pub(crate) client_message_rate: u32,
@@ -880,6 +900,9 @@ define_config_file! {
     otel_service_name: String,
     dedup_window_secs: u64,
     dedup_cache_size: usize,
+    cot_delta_encoding: bool,
+    cot_delta_cache_size: u64,
+    cot_delta_epsilon_meters: f64,
 }
 
 impl Cli {
