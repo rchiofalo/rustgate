@@ -541,6 +541,16 @@ pub(crate) struct Cli {
     #[arg(long, env = "RUSTGATE_ARCHIVE_DIR")]
     pub(crate) archive_dir: Option<String>,
 
+    /// Path to a JSON key file enabling at-rest ChaCha20-Poly1305 encryption
+    /// for the CoT archive (when `--archive-dir` is set) and the audit log
+    /// (when `--audit-log` is a file path). The file must contain
+    /// `{ "active_key_id": "<id>", "keys": { "<id>": "<64-char hex>" } }`
+    /// where each key is 32 bytes. Adding new keys without removing old ones
+    /// supports rotation: historical files written under prior keys remain
+    /// readable as long as their key id is still present in this file.
+    #[arg(long, env = "RUSTGATE_ARCHIVE_KEY_FILE")]
+    pub(crate) archive_key_file: Option<std::path::PathBuf>,
+
     /// Maximum total bytes retained across the CoT archive directory.
     /// When the directory exceeds this cap, the rotation task deletes
     /// the oldest archive files (by mtime) until the total drops below
@@ -613,6 +623,21 @@ pub(crate) enum Command {
     PrintConfig,
     /// Validate the configuration file (parse + cross-field checks) and exit.
     ValidateConfig,
+    /// Decrypt an encrypted archive or audit log file produced when
+    /// `--archive-key-file` was active. The output is written verbatim
+    /// (e.g. JSONL) and can then be inspected with standard tools.
+    DecryptArchive {
+        /// Path to the encrypted input file.
+        #[arg(long = "in", value_name = "PATH")]
+        input: std::path::PathBuf,
+        /// Path to write the decrypted plaintext output.
+        #[arg(long = "out", value_name = "PATH")]
+        output: std::path::PathBuf,
+        /// Path to the JSON key file. Must contain the key id referenced
+        /// in the input header (the active key need not match).
+        #[arg(long = "key-file", value_name = "PATH")]
+        key_file: std::path::PathBuf,
+    },
     /// Verify the integrity of a hash-chained audit log.
     VerifyAudit {
         /// Path to the audit log file (newline-delimited JSON records).
@@ -813,6 +838,7 @@ define_config_file! {
     acl_reload_interval: u64,
     acl_api_token_file: Option<String>,
     archive_dir: Option<String>,
+    archive_key_file: Option<std::path::PathBuf>,
     archive_max_size: u64,
     archive_max_age: u64,
     archive_rotate_interval: u64,

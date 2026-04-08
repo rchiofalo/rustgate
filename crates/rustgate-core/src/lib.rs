@@ -10,6 +10,7 @@ pub mod audit;
 pub mod audit_chain;
 pub mod codec;
 pub mod constants;
+pub mod encrypted;
 pub mod error;
 pub mod identity;
 pub mod masking;

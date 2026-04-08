@@ -36,6 +36,41 @@ use cli::{Cli, Command};
 use rustgate_transport::{BackpressureGate, Router};
 use session::{FedForwardFn, SessionDeps};
 
+/// Adapter that buffers `Write` calls and emits a single AEAD-sealed chunk
+/// per `flush`. Used by the audit log layer so each tracing event becomes
+/// one encrypted record on disk.
+struct EncryptedLineWriter {
+    inner: Arc<rustgate_core::encrypted::SharedEncryptedWriter>,
+    buf: Vec<u8>,
+}
+
+impl EncryptedLineWriter {
+    fn new(inner: Arc<rustgate_core::encrypted::SharedEncryptedWriter>) -> Self {
+        Self {
+            inner,
+            buf: Vec::with_capacity(1024),
+        }
+    }
+}
+
+impl std::io::Write for EncryptedLineWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        self.inner
+            .write_line(&self.buf)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        self.buf.clear();
+        Ok(())
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse_with_config()?;
 
@@ -50,6 +85,18 @@ fn main() -> anyhow::Result<()> {
         Some(Command::ValidateConfig) => {
             cli.validate()?;
             println!("configuration is valid");
+            return Ok(());
+        }
+        Some(Command::DecryptArchive {
+            ref input,
+            ref output,
+            ref key_file,
+        }) => {
+            let ring = rustgate_core::encrypted::KeyRing::load(key_file)
+                .map_err(|e| anyhow::anyhow!("failed to load key file: {e}"))?;
+            rustgate_core::encrypted::decrypt_file(input, output, &ring)
+                .map_err(|e| anyhow::anyhow!("decrypt failed: {e}"))?;
+            println!("decrypted {} -> {}", input.display(), output.display());
             return Ok(());
         }
         Some(Command::VerifyAudit { ref file }) => {
@@ -75,14 +122,43 @@ fn main() -> anyhow::Result<()> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let fmt_layer = tracing_subscriber::fmt::layer().json();
 
+    // Optional encryption key ring shared by the audit log and CoT archive.
+    let archive_key_ring: Option<Arc<rustgate_core::encrypted::KeyRing>> =
+        if let Some(ref kp) = cli.archive_key_file {
+            let ring = rustgate_core::encrypted::KeyRing::load(kp).map_err(|e| {
+                anyhow::anyhow!("failed to load --archive-key-file {}: {e}", kp.display())
+            })?;
+            tracing::debug!(active_key_id = %ring.active_key_id(), "loaded archive key ring");
+            Some(Arc::new(ring))
+        } else {
+            None
+        };
+
     // Dedicated audit log sink: filters only target="audit" events and writes
-    // JSON lines to the configured file (or stdout when "-").
+    // JSON lines to the configured file (or stdout when "-"). When an archive
+    // key file is configured and the path is not "-", events are encrypted
+    // per-line using ChaCha20-Poly1305.
     let audit_layer = if let Some(ref audit_path) = cli.audit_log {
         let writer: std::sync::Mutex<Box<dyn std::io::Write + Send>> = if audit_path == "-" {
             // Stdout sinks start each process with a genesis chain since
             // there is no persistent file to resume from.
             let chain = rustgate_core::audit_chain::HashChainWriter::new(
                 std::io::stdout(),
+                rustgate_core::audit_chain::GENESIS_PREV.to_string(),
+            );
+            std::sync::Mutex::new(Box::new(chain))
+        } else if let Some(ref ring) = archive_key_ring {
+            // Encrypted audit log: wrap the encrypted line writer in the
+            // hash chain so each line is hash-chained, then encrypted.
+            // The chain restarts at genesis because the on-disk format is
+            // opaque without the key; tip recovery is not supported here.
+            let enc = rustgate_core::encrypted::SharedEncryptedWriter::create(
+                std::path::Path::new(audit_path),
+                ring,
+            )
+            .map_err(|e| anyhow::anyhow!("failed to open encrypted audit log {audit_path}: {e}"))?;
+            let chain = rustgate_core::audit_chain::HashChainWriter::new(
+                EncryptedLineWriter::new(Arc::new(enc)),
                 rustgate_core::audit_chain::GENESIS_PREV.to_string(),
             );
             std::sync::Mutex::new(Box::new(chain))
@@ -505,9 +581,31 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     setup::warn_websocket_disabled(&cli);
 
     // ── CoT event archival ──────────────────────────────────────────
+    let archive_key_ring: Option<Arc<rustgate_core::encrypted::KeyRing>> =
+        if let Some(ref kp) = cli.archive_key_file {
+            Some(Arc::new(
+                rustgate_core::encrypted::KeyRing::load(kp)
+                    .map_err(|e| anyhow::anyhow!("failed to load archive key file: {e}"))?,
+            ))
+        } else {
+            None
+        };
+
     let archiver = if let Some(ref dir) = cli.archive_dir {
-        tracing::info!(dir = %dir, "CoT event archival enabled");
-        Some(Arc::new(archive::CotArchiver::new(dir)))
+        if let Some(ref ring) = archive_key_ring {
+            tracing::info!(
+                dir = %dir,
+                active_key_id = %ring.active_key_id(),
+                "CoT event archival enabled (encrypted)"
+            );
+            Some(Arc::new(archive::CotArchiver::with_encryption(
+                dir,
+                Arc::clone(ring),
+            )))
+        } else {
+            tracing::info!(dir = %dir, "CoT event archival enabled");
+            Some(Arc::new(archive::CotArchiver::new(dir)))
+        }
     } else {
         None
     };
