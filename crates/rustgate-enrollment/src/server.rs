@@ -38,11 +38,16 @@ use crate::ratelimit::RateLimiter;
 use crate::revocation::RevocationStore;
 use crate::signing::CsrSigner;
 
-/// Maximum CSR signing requests per IP per minute.
-const SIGN_RATE_LIMIT: usize = 10;
+/// Default maximum CSR signing requests per IP per minute.
+pub const DEFAULT_SIGN_RATE_LIMIT: usize = 10;
 
-/// Rate limit window for CSR signing.
-const SIGN_RATE_WINDOW: Duration = Duration::from_secs(60);
+/// Default rate limit window for CSR signing.
+pub const DEFAULT_SIGN_RATE_WINDOW: Duration = Duration::from_secs(60);
+
+/// Callback fired when a CSR signing request is rejected by the
+/// per-IP rate limiter. Wired by the server binary to a Prometheus
+/// counter; left unset in tests and embedders that do not need it.
+pub type RateLimitCallback = Arc<dyn Fn() + Send + Sync>;
 
 /// HTTPS enrollment server for client certificate provisioning.
 pub struct EnrollmentServer {
@@ -52,6 +57,7 @@ pub struct EnrollmentServer {
     packages: Option<Arc<DataPackageStore>>,
     revocation: Option<Arc<RevocationStore>>,
     sign_limiter: Arc<RateLimiter>,
+    on_rate_limit: Option<RateLimitCallback>,
 }
 
 impl std::fmt::Debug for EnrollmentServer {
@@ -74,8 +80,30 @@ impl EnrollmentServer {
             contacts_provider: None,
             packages: None,
             revocation: None,
-            sign_limiter: Arc::new(RateLimiter::new(SIGN_RATE_LIMIT, SIGN_RATE_WINDOW)),
+            sign_limiter: Arc::new(RateLimiter::new(
+                DEFAULT_SIGN_RATE_LIMIT,
+                DEFAULT_SIGN_RATE_WINDOW,
+            )),
+            on_rate_limit: None,
         }
+    }
+
+    /// Override the per-IP CSR signing rate limit.
+    ///
+    /// `max_requests` is the maximum number of CSR signing requests permitted
+    /// from any single IP within `window`. Wired from the
+    /// `--enrollment-rate-limit` CLI flag in the server binary.
+    pub fn with_rate_limit(mut self, max_requests: usize, window: Duration) -> Self {
+        self.sign_limiter = Arc::new(RateLimiter::new(max_requests, window));
+        self
+    }
+
+    /// Register a callback fired whenever a CSR signing request is
+    /// rejected for exceeding the per-IP rate limit. Used by the server
+    /// binary to increment a Prometheus counter.
+    pub fn with_rate_limit_callback(mut self, cb: RateLimitCallback) -> Self {
+        self.on_rate_limit = Some(cb);
+        self
     }
 
     /// Set the contacts provider for Marti API compatibility endpoints.
@@ -147,6 +175,7 @@ impl EnrollmentServer {
             let packages = self.packages.clone();
             let revocation = self.revocation.clone();
             let sign_limiter = Arc::clone(&self.sign_limiter);
+            let on_rate_limit = self.on_rate_limit.clone();
 
             drop(tokio::spawn(async move {
                 let _permit = permit;
@@ -188,6 +217,7 @@ impl EnrollmentServer {
                     let packages = packages.clone();
                     let revocation = revocation.clone();
                     let sign_limiter = Arc::clone(&sign_limiter);
+                    let on_rate_limit = on_rate_limit.clone();
                     async move {
                         handle_request(
                             req,
@@ -198,6 +228,7 @@ impl EnrollmentServer {
                             packages.as_deref(),
                             revocation.as_deref(),
                             &sign_limiter,
+                            on_rate_limit.as_ref(),
                         )
                         .await
                     }
@@ -223,6 +254,7 @@ async fn handle_request(
     packages: Option<&DataPackageStore>,
     revocation: Option<&RevocationStore>,
     sign_limiter: &RateLimiter,
+    on_rate_limit: Option<&RateLimitCallback>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let path = req.uri().path();
     let method = req.method();
@@ -231,11 +263,13 @@ async fn handle_request(
         (&Method::GET, "/Marti/api/tls/config") => sign::handle_tls_config(signer),
 
         (&Method::POST, "/Marti/api/tls/signClient") => {
-            sign::handle_sign_client_v1(req, peer, signer, credentials, sign_limiter).await
+            sign::handle_sign_client_v1(req, peer, signer, credentials, sign_limiter, on_rate_limit)
+                .await
         }
 
         (&Method::POST, "/Marti/api/tls/signClient/v2") => {
-            sign::handle_sign_client_v2(req, peer, signer, credentials, sign_limiter).await
+            sign::handle_sign_client_v2(req, peer, signer, credentials, sign_limiter, on_rate_limit)
+                .await
         }
 
         (&Method::GET, "/Marti/api/tls/profile/enrollment") => {

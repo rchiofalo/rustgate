@@ -15,14 +15,25 @@ use std::time::SystemTime;
 use rustgate_core::message::RoutableMessage;
 
 /// Writes CoT events as JSONL to date-stamped archive files.
+///
+/// When constructed via [`CotArchiver::with_encryption`], each daily file is
+/// written through a streaming ChaCha20-Poly1305 sink and gains an `.enc`
+/// suffix. Plaintext callers continue to use [`CotArchiver::new`].
 pub struct CotArchiver {
     dir: PathBuf,
+    key_ring: Option<Arc<rustgate_core::encrypted::KeyRing>>,
     inner: Arc<Mutex<ArchiverState>>,
+}
+
+#[derive(Debug)]
+enum ArchiveSink {
+    Plain(std::io::BufWriter<std::fs::File>),
+    Encrypted(rustgate_core::encrypted::EncryptedWriter),
 }
 
 struct ArchiverState {
     current_date: String,
-    writer: Option<std::io::BufWriter<std::fs::File>>,
+    writer: Option<ArchiveSink>,
 }
 
 impl CotArchiver {
@@ -32,6 +43,23 @@ impl CotArchiver {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self {
             dir: dir.into(),
+            key_ring: None,
+            inner: Arc::new(Mutex::new(ArchiverState {
+                current_date: String::new(),
+                writer: None,
+            })),
+        }
+    }
+
+    /// Construct an archiver that encrypts each daily file with the active
+    /// key from the supplied [`KeyRing`](rustgate_core::encrypted::KeyRing).
+    pub fn with_encryption(
+        dir: impl Into<PathBuf>,
+        key_ring: Arc<rustgate_core::encrypted::KeyRing>,
+    ) -> Self {
+        Self {
+            dir: dir.into(),
+            key_ring: Some(key_ring),
             inner: Arc::new(Mutex::new(ArchiverState {
                 current_date: String::new(),
                 writer: None,
@@ -77,10 +105,26 @@ impl CotArchiver {
         // Move all blocking file I/O onto the blocking thread pool.
         let inner = Arc::clone(&self.inner);
         let dir = self.dir.clone();
+        let key_ring = self.key_ring.clone();
         let _result = tokio::task::spawn_blocking(move || {
-            write_line(&inner, &dir, &today, &line);
+            write_line(&inner, &dir, &today, &line, key_ring.as_deref());
         })
         .await;
+    }
+
+    /// Return the path of the archive segment that is currently active
+    /// (i.e. the file the writer would append to right now).
+    ///
+    /// The rotation task uses this to exclude the in-progress file from
+    /// both size accounting and deletion sweeps, avoiding races against
+    /// the writer.
+    pub fn active_path(&self) -> PathBuf {
+        let secs = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let today = utc_date_string(secs);
+        self.dir.join(format!("cot-{today}.jsonl"))
     }
 
     /// Flush any buffered data to disk.
@@ -90,7 +134,14 @@ impl CotArchiver {
             Err(poisoned) => poisoned.into_inner(),
         };
         if let Some(ref mut w) = state.writer {
-            let _ = w.flush();
+            match w {
+                ArchiveSink::Plain(p) => {
+                    let _ = p.flush();
+                }
+                ArchiveSink::Encrypted(e) => {
+                    let _ = e.flush();
+                }
+            }
         }
     }
 }
@@ -105,7 +156,13 @@ impl Drop for CotArchiver {
 ///
 /// Extracted as a free function so it can be called inside
 /// `spawn_blocking` without borrowing `self`.
-fn write_line(inner: &Mutex<ArchiverState>, dir: &std::path::Path, today: &str, line: &str) {
+fn write_line(
+    inner: &Mutex<ArchiverState>,
+    dir: &std::path::Path,
+    today: &str,
+    line: &str,
+    key_ring: Option<&rustgate_core::encrypted::KeyRing>,
+) {
     let mut state = match inner.lock() {
         Ok(s) => s,
         Err(poisoned) => poisoned.into_inner(),
@@ -114,14 +171,21 @@ fn write_line(inner: &Mutex<ArchiverState>, dir: &std::path::Path, today: &str, 
     // Rotate file if date changed
     if state.current_date != today {
         if let Some(ref mut w) = state.writer {
-            let _ = w.flush();
+            match w {
+                ArchiveSink::Plain(p) => {
+                    let _ = p.flush();
+                }
+                ArchiveSink::Encrypted(e) => {
+                    let _ = e.flush();
+                }
+            }
         }
         state.writer = None;
         state.current_date = today.to_owned();
 
-        match open_file(dir, today) {
-            Ok(file) => {
-                state.writer = Some(std::io::BufWriter::new(file));
+        match open_sink(dir, today, key_ring) {
+            Ok(sink) => {
+                state.writer = Some(sink);
             }
             Err(e) => {
                 tracing::error!(error = %e, dir = %dir.display(), "failed to open archive file");
@@ -134,18 +198,37 @@ fn write_line(inner: &Mutex<ArchiverState>, dir: &std::path::Path, today: &str, 
         return;
     };
 
-    if let Err(e) = writer.write_all(line.as_bytes()) {
+    let res = match writer {
+        ArchiveSink::Plain(p) => p.write_all(line.as_bytes()).map_err(|e| e.to_string()),
+        ArchiveSink::Encrypted(e) => e
+            .write_chunk(line.as_bytes())
+            .map_err(|err| err.to_string()),
+    };
+    if let Err(e) = res {
         tracing::error!(error = %e, "failed to write archive line");
     }
 }
 
-fn open_file(dir: &std::path::Path, date: &str) -> std::io::Result<std::fs::File> {
-    std::fs::create_dir_all(dir)?;
-    let path = dir.join(format!("cot-{date}.jsonl"));
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
+fn open_sink(
+    dir: &std::path::Path,
+    date: &str,
+    key_ring: Option<&rustgate_core::encrypted::KeyRing>,
+) -> Result<ArchiveSink, String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    if let Some(ring) = key_ring {
+        let path = dir.join(format!("cot-{date}.jsonl.enc"));
+        rustgate_core::encrypted::EncryptedWriter::create(&path, ring)
+            .map(ArchiveSink::Encrypted)
+            .map_err(|e| e.to_string())
+    } else {
+        let path = dir.join(format!("cot-{date}.jsonl"));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| e.to_string())?;
+        Ok(ArchiveSink::Plain(std::io::BufWriter::new(file)))
+    }
 }
 
 /// Compute UTC date string (YYYY-MM-DD) from Unix epoch seconds.
@@ -299,6 +382,80 @@ mod tests {
             content.contains(r#"direct:evil\"user\\name"#),
             "CN with special chars should be escaped: {content}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn archiver_encrypts_when_key_ring_present() {
+        use std::collections::BTreeMap;
+
+        let dir =
+            std::env::temp_dir().join(format!("rustgate-archive-enc-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Build a key ring with one 32-byte key.
+        let mut keys = BTreeMap::new();
+        let _ = keys.insert(
+            "k1".to_string(),
+            "1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+        );
+        let kf = rustgate_core::encrypted::KeyFile {
+            active_key_id: "k1".to_string(),
+            keys,
+        };
+        let bytes = serde_json::to_vec(&kf).expect("serialize");
+        let ring = std::sync::Arc::new(
+            rustgate_core::encrypted::KeyRing::from_bytes(&bytes).expect("ring"),
+        );
+
+        let archiver = CotArchiver::with_encryption(&dir, std::sync::Arc::clone(&ring));
+
+        let msg = rustgate_core::message::RoutableMessage {
+            source: rustgate_core::identity::Identity::new(
+                "alice".to_string(),
+                "fp-123".to_string(),
+                std::collections::BTreeSet::new(),
+            )
+            .expect("valid identity"),
+            destination: rustgate_core::message::Destination::Broadcast,
+            payload: bytes::Bytes::from_static(b"<event/>"),
+            metadata: rustgate_core::message::Metadata {
+                received_at: SystemTime::now(),
+                source_protocol: "cot".to_string(),
+                message_type: rustgate_core::message::MessageType::Position,
+                ttl: None,
+            },
+        };
+
+        archiver.record(&msg).await;
+        archiver.flush();
+        drop(archiver);
+
+        // Locate the encrypted file
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .expect("dir should exist")
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let enc_path = entries[0].path();
+        assert!(
+            enc_path.extension().and_then(|s| s.to_str()) == Some("enc"),
+            "expected .enc suffix, got {enc_path:?}"
+        );
+
+        // Magic header check
+        let raw = std::fs::read(&enc_path).expect("read");
+        assert_eq!(&raw[..8], rustgate_core::encrypted::MAGIC);
+        // Plaintext "alice" must NOT appear in ciphertext.
+        assert!(!raw.windows(5).any(|w| w == b"alice"));
+
+        // Round-trip: decrypt to a sibling file and check the JSONL line.
+        let out_path = dir.join("decrypted.jsonl");
+        rustgate_core::encrypted::decrypt_file(&enc_path, &out_path, &ring).expect("decrypt");
+        let plaintext = std::fs::read_to_string(&out_path).expect("read decrypted");
+        assert!(plaintext.contains("\"cn\":\"alice\""));
+        assert!(plaintext.ends_with('\n'));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

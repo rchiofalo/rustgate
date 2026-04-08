@@ -17,9 +17,9 @@ Served on the metrics HTTP server (default port 9090). These endpoints are alway
 
 The metrics server is hardened against unauthenticated abuse: connections are bounded to 128 concurrent, with a per-connection timeout and a 5-second header read timeout.
 
-### GET /healthz
+### GET /health/live
 
-Liveness probe. Always returns 200 while the server process is running.
+Kubernetes **liveness** probe. Returns 200 once the metrics HTTP server is reachable; never flips back. Orchestrators interpret a non-200 here as "the process is wedged — restart the pod".
 
 **Authentication:** None
 
@@ -27,24 +27,58 @@ Liveness probe. Always returns 200 while the server process is running.
 
 | Status | Body |
 |--------|------|
-| `200 OK` | `ok` (plain text) |
+| `200 OK` | `ok` |
+| `503 Service Unavailable` | `not live` |
+
+```bash
+curl http://localhost:9090/health/live
+```
+
+### GET /health/ready
+
+Kubernetes **readiness** probe. Returns 200 only when the listener is bound and core subsystems (ACL, federation if enabled) have completed initial wiring. Flips back to 503 during graceful shutdown so load balancers stop sending new traffic while in-flight sessions drain.
+
+**Authentication:** None
+
+**Response:**
+
+| Status | Body |
+|--------|------|
+| `200 OK` | `ok` |
+| `503 Service Unavailable` | `not ready` |
+
+```bash
+curl http://localhost:9090/health/ready
+```
+
+### GET /health/startup
+
+Kubernetes **startup** probe. Returns 200 only after the server has entered its accept loop — i.e. one full init pass has completed. One-shot: never flipped back. Allows slow-starting pods to defer liveness/readiness checks during boot.
+
+**Authentication:** None
+
+**Response:**
+
+| Status | Body |
+|--------|------|
+| `200 OK` | `ok` |
+| `503 Service Unavailable` | `starting` |
+
+```bash
+curl http://localhost:9090/health/startup
+```
+
+### GET /healthz (deprecated alias)
+
+Backwards-compatible alias for `/health/live`. Prefer the new path.
 
 ```bash
 curl http://localhost:9090/healthz
 ```
 
-### GET /readyz
+### GET /readyz (deprecated alias)
 
-Readiness probe. Returns 200 when the server is ready to accept traffic, 503 during startup or graceful shutdown.
-
-**Authentication:** None
-
-**Response:**
-
-| Status | Body |
-|--------|------|
-| `200 OK` | `ok` (plain text) |
-| `503 Service Unavailable` | `not ready` (plain text) |
+Backwards-compatible alias for `/health/ready`. Prefer the new path.
 
 ```bash
 curl http://localhost:9090/readyz
@@ -1046,4 +1080,4 @@ websocat wss://server:8444/ \
 | `404 Not Found` | Resource not found | Federation: unknown peer/cert; Enrollment: unknown path |
 | `429 Too Many Requests` | Rate limit exceeded | Enrollment: CSR signing (10 req/IP/min) |
 | `500 Internal Server Error` | Server-side failure | All endpoints |
-| `503 Service Unavailable` | Server not ready | Health: readyz; Federation: API not initialized |
+| `503 Service Unavailable` | Server not ready | Health: `/health/ready` or `/health/startup`; Federation: API not initialized |

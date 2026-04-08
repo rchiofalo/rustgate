@@ -22,8 +22,11 @@ mod acl_api;
 mod acl_config;
 mod acl_reloader;
 mod archive;
+mod archive_rotation;
 mod audit;
 mod cli;
+#[cfg(feature = "federation")]
+mod federation_reloader;
 #[cfg(feature = "metrics")]
 mod metrics;
 #[cfg(feature = "otel")]
@@ -34,6 +37,41 @@ mod setup;
 use cli::{Cli, Command};
 use rustgate_transport::{BackpressureGate, Router};
 use session::{FedForwardFn, SessionDeps};
+
+/// Adapter that buffers `Write` calls and emits a single AEAD-sealed chunk
+/// per `flush`. Used by the audit log layer so each tracing event becomes
+/// one encrypted record on disk.
+struct EncryptedLineWriter {
+    inner: Arc<rustgate_core::encrypted::SharedEncryptedWriter>,
+    buf: Vec<u8>,
+}
+
+impl EncryptedLineWriter {
+    fn new(inner: Arc<rustgate_core::encrypted::SharedEncryptedWriter>) -> Self {
+        Self {
+            inner,
+            buf: Vec::with_capacity(1024),
+        }
+    }
+}
+
+impl std::io::Write for EncryptedLineWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        self.inner
+            .write_line(&self.buf)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        self.buf.clear();
+        Ok(())
+    }
+}
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse_with_config()?;
@@ -51,6 +89,33 @@ fn main() -> anyhow::Result<()> {
             println!("configuration is valid");
             return Ok(());
         }
+        Some(Command::DecryptArchive {
+            ref input,
+            ref output,
+            ref key_file,
+        }) => {
+            let ring = rustgate_core::encrypted::KeyRing::load(key_file)
+                .map_err(|e| anyhow::anyhow!("failed to load key file: {e}"))?;
+            rustgate_core::encrypted::decrypt_file(input, output, &ring)
+                .map_err(|e| anyhow::anyhow!("decrypt failed: {e}"))?;
+            println!("decrypted {} -> {}", input.display(), output.display());
+            return Ok(());
+        }
+        Some(Command::VerifyAudit { ref file }) => {
+            match rustgate_core::audit_chain::verify_audit_log(std::path::Path::new(file)) {
+                Ok(report) => {
+                    println!(
+                        "audit log OK: {} records verified, tip={}",
+                        report.records, report.tip
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!("audit log verification FAILED: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         None => {}
     }
 
@@ -59,21 +124,86 @@ fn main() -> anyhow::Result<()> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let fmt_layer = tracing_subscriber::fmt::layer().json();
 
+    // Optional encryption key ring shared by the audit log and CoT archive.
+    let archive_key_ring: Option<Arc<rustgate_core::encrypted::KeyRing>> =
+        if let Some(ref kp) = cli.archive_key_file {
+            let ring = rustgate_core::encrypted::KeyRing::load(kp).map_err(|e| {
+                anyhow::anyhow!("failed to load --archive-key-file {}: {e}", kp.display())
+            })?;
+            tracing::debug!(active_key_id = %ring.active_key_id(), "loaded archive key ring");
+            Some(Arc::new(ring))
+        } else {
+            None
+        };
+
     // Dedicated audit log sink: filters only target="audit" events and writes
-    // JSON lines to the configured file (or stdout when "-").
+    // JSON lines to the configured file (or stdout when "-"). When an archive
+    // key file is configured and the path is not "-", events are encrypted
+    // per-line using ChaCha20-Poly1305.
     let audit_layer = if let Some(ref audit_path) = cli.audit_log {
         let writer: std::sync::Mutex<Box<dyn std::io::Write + Send>> = if audit_path == "-" {
-            std::sync::Mutex::new(Box::new(std::io::stdout()))
+            // Stdout sinks start each process with a genesis chain since
+            // there is no persistent file to resume from.
+            let chain = rustgate_core::audit_chain::HashChainWriter::new(
+                std::io::stdout(),
+                rustgate_core::audit_chain::GENESIS_PREV.to_string(),
+            );
+            std::sync::Mutex::new(Box::new(chain))
+        } else if let Some(ref ring) = archive_key_ring {
+            // Encrypted audit log: wrap the encrypted line writer in the
+            // hash chain so each line is hash-chained, then encrypted.
+            // The chain restarts at genesis because the on-disk format is
+            // opaque without the key; tip recovery is not supported here.
+            let enc = rustgate_core::encrypted::SharedEncryptedWriter::create(
+                std::path::Path::new(audit_path),
+                ring,
+            )
+            .map_err(|e| anyhow::anyhow!("failed to open encrypted audit log {audit_path}: {e}"))?;
+            let chain = rustgate_core::audit_chain::HashChainWriter::new(
+                EncryptedLineWriter::new(Arc::new(enc)),
+                rustgate_core::audit_chain::GENESIS_PREV.to_string(),
+            );
+            std::sync::Mutex::new(Box::new(chain))
         } else {
+            let path = std::path::Path::new(audit_path);
+            let prev = rustgate_core::audit_chain::read_chain_tip(path).map_err(|e| {
+                anyhow::anyhow!("failed to read audit log chain tip {audit_path}: {e}")
+            })?;
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(audit_path)
                 .map_err(|e| anyhow::anyhow!("failed to open audit log {audit_path}: {e}"))?;
-            std::sync::Mutex::new(Box::new(file))
+            let chain = rustgate_core::audit_chain::HashChainWriter::new(file, prev);
+            std::sync::Mutex::new(Box::new(chain))
         };
         let filter =
             tracing_subscriber::filter::Targets::new().with_target("audit", tracing::Level::INFO);
+        Some(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(writer)
+                .with_filter(filter),
+        )
+    } else {
+        None
+    };
+
+    // Dedicated access log sink: filters only target="access" events and
+    // appends one JSON line per routed message. Opt-in via --access-log.
+    let access_layer = if let Some(ref access_path) = cli.access_log {
+        let writer: std::sync::Mutex<Box<dyn std::io::Write + Send>> = if access_path == "-" {
+            std::sync::Mutex::new(Box::new(std::io::stdout()))
+        } else {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(access_path)
+                .map_err(|e| anyhow::anyhow!("failed to open access log {access_path}: {e}"))?;
+            std::sync::Mutex::new(Box::new(file))
+        };
+        let filter = tracing_subscriber::filter::Targets::new()
+            .with_target(rustgate_transport::ACCESS_LOG_TARGET, tracing::Level::INFO);
         Some(
             tracing_subscriber::fmt::layer()
                 .json()
@@ -98,6 +228,7 @@ fn main() -> anyhow::Result<()> {
         .with(env_filter)
         .with(fmt_layer)
         .with(audit_layer)
+        .with(access_layer)
         .with(otel_layer)
         .init();
 
@@ -182,7 +313,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     tracing::info!(addr = %listener.local_addr()?, framing = ?cli.framing, encoding = ?encoding, "listening");
 
-    // Readiness flag for K8s health probes
+    // Differentiated health probe state for K8s liveness/readiness/startup.
+    // `live` flips on inside `metrics::serve` when the metrics server binds.
+    // `ready` is set after listener + ACL + (optional) federation init.
+    // `started` is a one-shot, flipped after the accept loop is reached.
+    #[cfg(feature = "metrics")]
+    let health = Arc::new(metrics::HealthState::new());
+    // Legacy compatibility shim: a number of code paths still use a bare
+    // `ready` AtomicBool to gate accept-loop behaviour. Keep it for now —
+    // it shadows the readiness portion of `HealthState`.
     let ready = Arc::new(AtomicBool::new(true));
 
     // ── Metrics ─────────────────────────────────────────────────────
@@ -197,7 +336,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     #[cfg(feature = "metrics")]
     let metrics_identity = setup::start_metrics(
         &cli,
-        &ready,
+        &health,
         #[cfg(feature = "federation")]
         &fed_api_slot,
         &acl_api_slot,
@@ -413,6 +552,38 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     #[cfg(not(feature = "federation-ha"))]
     setup::warn_federation_ha_disabled(&cli);
 
+    // ── Federation peer hot-reload ──────────────────────────────────
+    //
+    // When `--federation-peers-file` is set, install a reloader that
+    // re-reads the file on SIGHUP (and optionally on a polling interval)
+    // and reconciles the manager's active peer set. Adds/removes are
+    // applied without disturbing existing connections.
+    #[cfg(feature = "federation")]
+    let fed_peer_reloader: Option<Arc<federation_reloader::FederationPeerReloader>> =
+        if let (Some(peers_path), Some(rwlock)) = (
+            cli.federation_peers_file.as_ref(),
+            fed_shutdown_handle.as_ref(),
+        ) {
+            let initial = std::fs::read(peers_path).unwrap_or_default();
+            let initial_hash = federation_reloader::FederationPeerReloader::compute_hash(&initial);
+            let reloader = federation_reloader::FederationPeerReloader::new(
+                std::path::PathBuf::from(peers_path),
+                Arc::clone(rwlock),
+                initial_hash,
+            );
+            if cli.federation_peers_reload_interval > 0 {
+                reloader.spawn_watcher(Duration::from_secs(cli.federation_peers_reload_interval));
+                tracing::info!(
+                    interval_secs = cli.federation_peers_reload_interval,
+                    path = %peers_path,
+                    "federation peer hot-reload enabled"
+                );
+            }
+            Some(reloader)
+        } else {
+            None
+        };
+
     // ── Per-client rate limiting ────────────────────────────────────
     let throttle_config = setup::build_throttle_config(&cli);
 
@@ -444,9 +615,54 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     setup::warn_websocket_disabled(&cli);
 
     // ── CoT event archival ──────────────────────────────────────────
+    let archive_key_ring: Option<Arc<rustgate_core::encrypted::KeyRing>> =
+        if let Some(ref kp) = cli.archive_key_file {
+            Some(Arc::new(
+                rustgate_core::encrypted::KeyRing::load(kp)
+                    .map_err(|e| anyhow::anyhow!("failed to load archive key file: {e}"))?,
+            ))
+        } else {
+            None
+        };
+
     let archiver = if let Some(ref dir) = cli.archive_dir {
-        tracing::info!(dir = %dir, "CoT event archival enabled");
-        Some(Arc::new(archive::CotArchiver::new(dir)))
+        if let Some(ref ring) = archive_key_ring {
+            tracing::info!(
+                dir = %dir,
+                active_key_id = %ring.active_key_id(),
+                "CoT event archival enabled (encrypted)"
+            );
+            Some(Arc::new(archive::CotArchiver::with_encryption(
+                dir,
+                Arc::clone(ring),
+            )))
+        } else {
+            tracing::info!(dir = %dir, "CoT event archival enabled");
+            Some(Arc::new(archive::CotArchiver::new(dir)))
+        }
+    } else {
+        None
+    };
+
+    // ── CoT archive retention / rotation ───────────────────────────
+    let archive_rotation_handle = if let Some(ref dir) = cli.archive_dir
+        && (cli.archive_max_size > 0 || cli.archive_max_age > 0)
+    {
+        let cfg = archive_rotation::RotationConfig {
+            dir: std::path::PathBuf::from(dir),
+            max_bytes: cli.archive_max_size,
+            max_age: std::time::Duration::from_secs(cli.archive_max_age),
+            interval: std::time::Duration::from_secs(cli.archive_rotate_interval.max(1)),
+            archiver: archiver.clone(),
+        };
+        tracing::info!(
+            dir = %dir,
+            max_bytes = cli.archive_max_size,
+            max_age_secs = cli.archive_max_age,
+            interval_secs = cli.archive_rotate_interval,
+            "CoT archive rotation enabled",
+        );
+        Some(archive_rotation::spawn(cfg))
     } else {
         None
     };
@@ -484,6 +700,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         let crl_path_for_hup = cli.crl.clone();
         #[cfg(feature = "ocsp")]
         let ocsp_for_hup = ocsp_stapler.clone();
+        #[cfg(feature = "federation")]
+        let fed_peers_for_hup = fed_peer_reloader.clone();
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
             Ok(mut sighup) => {
                 setup::spawn_background("sighup-reloader", async move {
@@ -495,6 +713,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                             crl_path_for_hup.as_deref(),
                             #[cfg(feature = "ocsp")]
                             ocsp_for_hup.as_ref(),
+                            #[cfg(feature = "federation")]
+                            fed_peers_for_hup.as_ref(),
                         )
                         .await;
                     }
@@ -508,6 +728,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     }
 
     // ── Accept loop ─────────────────────────────────────────────────
+    // Initial init pass is complete: listener bound, ACL loaded, and
+    // (when enabled) federation peers wired. Flip readiness on, then
+    // mark startup as complete (one-shot — never flipped back).
+    #[cfg(feature = "metrics")]
+    {
+        health.set_ready(true);
+        // One-shot transition: never resets, even on shutdown.
+        let _ = health.mark_started();
+    }
     loop {
         // Global backpressure: park the accept loop while the router's
         // in-flight byte counter is over the high-water mark. Connections
@@ -584,6 +813,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             _ = shutdown_signal() => {
                 tracing::info!("shutdown signal received");
                 ready.store(false, Ordering::Release);
+                #[cfg(feature = "metrics")]
+                health.set_ready(false);
                 break;
             }
         }
@@ -618,13 +849,27 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     if let Some(handle) = udp_shutdown {
         setup::stop_subsystem("udp", handle).await;
     }
+    if let Some(handle) = archive_rotation_handle {
+        handle.abort();
+    }
 
     // ── Connection draining ─────────────────────────────────────────
 
     let active = router.session_count().await;
-    tracing::info!(sessions = active, "draining connections");
+    tracing::info!(
+        sessions = active,
+        drain_timeout_secs = cli.shutdown_drain_timeout,
+        "draining connections"
+    );
 
-    let drain_timeout = Duration::from_secs(110);
+    // Close every session's outbound channels so write loops observe a
+    // clean EOF after flushing whatever is currently buffered. The
+    // session task itself still runs through its normal cleanup path,
+    // releasing its semaphore permit when the writer returns.
+    let closed = router.close_all_session_senders().await;
+    tracing::debug!(closed_sessions = closed, "closed session outbound channels");
+
+    let drain_timeout = Duration::from_secs(cli.shutdown_drain_timeout);
     let drain = connection_limit.acquire_many(max_connections);
 
     match tokio::time::timeout(drain_timeout, drain).await {
@@ -689,6 +934,9 @@ async fn reload_all_configs(
     acl_reloader: Option<&Arc<acl_reloader::AclReloader>>,
     crl_path: Option<&str>,
     #[cfg(feature = "ocsp")] ocsp_stapler: Option<&Arc<rustgate_transport::ocsp::Stapler>>,
+    #[cfg(feature = "federation")] fed_peer_reloader: Option<
+        &Arc<federation_reloader::FederationPeerReloader>,
+    >,
 ) {
     // 1. Server certificate
     if let Some(reloader) = cert_reloader {
@@ -824,6 +1072,36 @@ async fn reload_all_configs(
     } else {
         tracing::debug!("SIGHUP: no CRL configured");
     }
+
+    // 4. Federation peers
+    #[cfg(feature = "federation")]
+    if let Some(reloader) = fed_peer_reloader {
+        match reloader.reload().await {
+            Ok(swapped) => {
+                tracing::info!(
+                    target: "audit",
+                    event_type = "config.reload",
+                    component = "federation_peers",
+                    result = "success",
+                    swapped = swapped,
+                    "federation peer reload completed"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "audit",
+                    event_type = "config.reload",
+                    component = "federation_peers",
+                    result = "failure",
+                    error = %e,
+                    "federation peer reload failed"
+                );
+            }
+        }
+    } else {
+        #[cfg(feature = "federation")]
+        tracing::debug!("SIGHUP: no federation peer reloader configured");
+    }
 }
 
 /// Read and parse a CRL PEM file. Returns the number of CRL entries on success.
@@ -851,6 +1129,8 @@ mod tests {
             None,
             #[cfg(feature = "ocsp")]
             None,
+            #[cfg(feature = "federation")]
+            None,
         )
         .await;
     }
@@ -863,6 +1143,8 @@ mod tests {
             None,
             Some("/definitely/not/a/real/path.pem"),
             #[cfg(feature = "ocsp")]
+            None,
+            #[cfg(feature = "federation")]
             None,
         )
         .await;
@@ -902,6 +1184,8 @@ mod tests {
             Some(&reloader),
             Some("/no/such/crl.pem"),
             #[cfg(feature = "ocsp")]
+            None,
+            #[cfg(feature = "federation")]
             None,
         )
         .await;
