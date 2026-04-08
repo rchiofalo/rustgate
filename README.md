@@ -378,6 +378,13 @@ All flags support environment variables (CLI takes precedence):
 | `--federation-id` | `RUSTGATE_FEDERATION_ID` | `rustgate-federation-1` |
 | `--federation-peers-file` | `RUSTGATE_FEDERATION_PEERS_FILE` | — |
 | `--federation-peers-reload-interval` | `RUSTGATE_FEDERATION_PEERS_RELOAD_INTERVAL` | `0` |
+| `--federation-peer-discovery` | `RUSTGATE_FEDERATION_PEER_DISCOVERY` | `none` (one of `none`, `dns-sd`, `consul`, `etcd`) |
+| `--federation-peer-discovery-interval` | `RUSTGATE_FEDERATION_PEER_DISCOVERY_INTERVAL` | `30` (seconds) |
+| `--federation-peer-discovery-dns-sd-service` | `RUSTGATE_FEDERATION_PEER_DISCOVERY_DNS_SD_SERVICE` | `_rustgate._tcp.local.` |
+| `--federation-peer-discovery-consul-addr` | `RUSTGATE_FEDERATION_PEER_DISCOVERY_CONSUL_ADDR` | `http://127.0.0.1:8500` |
+| `--federation-peer-discovery-consul-service` | `RUSTGATE_FEDERATION_PEER_DISCOVERY_CONSUL_SERVICE` | `rustgate` |
+| `--federation-peer-discovery-etcd-endpoints` | `RUSTGATE_FEDERATION_PEER_DISCOVERY_ETCD_ENDPOINTS` | `http://127.0.0.1:2379` (comma-separated) |
+| `--federation-peer-discovery-etcd-prefix` | `RUSTGATE_FEDERATION_PEER_DISCOVERY_ETCD_PREFIX` | `rustgate/peers/` |
 | `--federation-skip-hostname-verify` | `RUSTGATE_FEDERATION_SKIP_HOSTNAME_VERIFY` | `false` |
 | `--federation-max-hops` | `RUSTGATE_FEDERATION_MAX_HOPS` | `10` |
 | `--federation-store-path` | `RUSTGATE_FEDERATION_STORE_PATH` | — |
@@ -506,6 +513,52 @@ transports only. WebSocket sessions are not yet labelled and will not appear
 in `identity_cn`-labelled series. Byte counters report **application payload
 bytes** (post-decode / pre-encode), not wire bytes — they exclude TLS,
 framing, and codec overhead.
+
+### Federation peer discovery (DNS-SD, Consul, etcd)
+
+Static peer lists via `--federation-peers-file` remain the recommended
+source of truth for production meshes, but rustgate can also pull its
+peer set from an external service registry so nodes joining or leaving a
+cluster are reflected automatically. Set `--federation-peer-discovery` to
+one of `dns-sd`, `consul`, or `etcd` (it is mutually exclusive with
+`--federation-peers-file`), and a background reconciler will poll the
+selected backend every `--federation-peer-discovery-interval` seconds
+(default 30) and pipe the result into the same `swap_peers` machinery
+used by the file reloader. Adds, removes, and unchanged peers take the
+usual zero-downtime path: unchanged peers keep their existing connection,
+removed peers are disconnected cleanly, and new peers are connected.
+
+Each backend ships behind its own cargo sub-feature so minimal images
+only pay for the registry they actually use:
+
+- **DNS-SD / mDNS** (`--features peer-discovery-dns-sd`) — browses an
+  mDNS service type on the local link (default
+  `--federation-peer-discovery-dns-sd-service=_rustgate._tcp.local.`).
+  Each resolved service instance becomes an outbound peer whose address
+  is the instance's advertised host and port. Useful for self-forming
+  edge clusters on a flat L2 network; requires multicast between nodes.
+- **Consul** (`--features peer-discovery-consul`) — queries
+  `GET /v1/catalog/service/<name>` on the agent or server endpoint given
+  by `--federation-peer-discovery-consul-addr` (default
+  `http://127.0.0.1:8500`). Service instances with a non-empty
+  `ServiceAddress` use that field; otherwise the fallback is the node's
+  `Address`. The service name is configurable via
+  `--federation-peer-discovery-consul-service` (default `rustgate`).
+- **etcd** (`--features peer-discovery-etcd`) — performs a prefix scan
+  against the gRPC endpoints listed in
+  `--federation-peer-discovery-etcd-endpoints` (comma-separated) under
+  `--federation-peer-discovery-etcd-prefix` (default `rustgate/peers/`).
+  Values may be either a plain `host:port` string or a serialized
+  `PeerConfig` JSON object for full control over groups and routing.
+
+The umbrella feature `peer-discovery` enables all three backends. Mixing
+backends is not supported — a single reconciler runs at a time — but the
+`PeerDiscovery` trait is public so operators can provide their own.
+
+Selecting a backend whose sub-feature was not compiled in fails fast at
+startup with a clear error instead of silently ignoring the setting. See
+[docs/runbooks/federation-reconnect.md](docs/runbooks/federation-reconnect.md)
+for troubleshooting guidance on each backend.
 
 ### Per-peer federation lag
 

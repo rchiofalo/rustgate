@@ -1078,6 +1078,132 @@ pub(crate) fn warn_federation_disabled(cli: &Cli) -> Option<FedForwardFn> {
     None
 }
 
+/// Spawn the federation peer discovery reconciler (issue #571).
+///
+/// Inspects `--federation-peer-discovery`; when set to a backend other than
+/// `none`, constructs the corresponding `PeerDiscovery` implementation and
+/// hands it to `rustgate_federation::discovery::reconciler` together with a
+/// shutdown watch channel. Returns the shutdown sender so the main loop can
+/// signal the reconciler to exit during graceful shutdown; returns `None`
+/// when discovery is disabled.
+///
+/// Each backend's code path is gated behind its own sub-feature; selecting
+/// a backend whose feature was not compiled in surfaces a clear
+/// `anyhow::bail!` so misconfigured images fail fast at startup instead of
+/// silently ignoring the setting.
+#[cfg(feature = "federation")]
+pub(crate) fn start_federation_peer_discovery(
+    cli: &Cli,
+    manager: &Arc<tokio::sync::RwLock<rustgate_federation::manager::FederationManager>>,
+) -> anyhow::Result<Option<tokio::sync::watch::Sender<bool>>> {
+    use crate::cli::PeerDiscoveryBackend;
+
+    if cli.federation_peer_discovery == PeerDiscoveryBackend::None {
+        return Ok(None);
+    }
+
+    #[cfg(any(
+        feature = "peer-discovery-dns-sd",
+        feature = "peer-discovery-consul",
+        feature = "peer-discovery-etcd"
+    ))]
+    {
+        use rustgate_federation::discovery::PeerDiscovery;
+
+        let source: Arc<dyn PeerDiscovery> = match cli.federation_peer_discovery {
+            PeerDiscoveryBackend::None => unreachable!(),
+            #[cfg(feature = "peer-discovery-dns-sd")]
+            PeerDiscoveryBackend::DnsSd => {
+                let svc = cli.federation_peer_discovery_dns_sd_service.clone();
+                Arc::new(rustgate_federation::discovery::dns_sd::DnsSdDiscovery::new(
+                    svc,
+                )?)
+            }
+            #[cfg(not(feature = "peer-discovery-dns-sd"))]
+            PeerDiscoveryBackend::DnsSd => {
+                anyhow::bail!(
+                    "--federation-peer-discovery=dns-sd requires --features peer-discovery-dns-sd"
+                );
+            }
+            #[cfg(feature = "peer-discovery-consul")]
+            PeerDiscoveryBackend::Consul => Arc::new(
+                rustgate_federation::discovery::consul::ConsulDiscovery::new(
+                    cli.federation_peer_discovery_consul_addr.clone(),
+                    cli.federation_peer_discovery_consul_service.clone(),
+                )?,
+            ),
+            #[cfg(not(feature = "peer-discovery-consul"))]
+            PeerDiscoveryBackend::Consul => {
+                anyhow::bail!(
+                    "--federation-peer-discovery=consul requires --features peer-discovery-consul"
+                );
+            }
+            #[cfg(feature = "peer-discovery-etcd")]
+            PeerDiscoveryBackend::Etcd => {
+                let endpoints: Vec<String> = cli
+                    .federation_peer_discovery_etcd_endpoints
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if endpoints.is_empty() {
+                    anyhow::bail!(
+                        "--federation-peer-discovery-etcd-endpoints must contain at least one endpoint"
+                    );
+                }
+                Arc::new(rustgate_federation::discovery::etcd::EtcdDiscovery::new(
+                    endpoints,
+                    cli.federation_peer_discovery_etcd_prefix.clone(),
+                ))
+            }
+            #[cfg(not(feature = "peer-discovery-etcd"))]
+            PeerDiscoveryBackend::Etcd => {
+                anyhow::bail!(
+                    "--federation-peer-discovery=etcd requires --features peer-discovery-etcd"
+                );
+            }
+        };
+
+        let interval = std::time::Duration::from_secs(cli.federation_peer_discovery_interval);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = rustgate_federation::discovery::reconciler(
+            Arc::clone(manager),
+            source,
+            interval,
+            shutdown_rx,
+        );
+        // Detached: the task owns itself until its shutdown receiver fires.
+        std::mem::drop(handle);
+        tracing::info!(
+            backend = ?cli.federation_peer_discovery,
+            interval_secs = cli.federation_peer_discovery_interval,
+            "federation peer discovery reconciler started"
+        );
+        Ok(Some(shutdown_tx))
+    }
+
+    #[cfg(not(any(
+        feature = "peer-discovery-dns-sd",
+        feature = "peer-discovery-consul",
+        feature = "peer-discovery-etcd"
+    )))]
+    {
+        let _ = manager;
+        anyhow::bail!(
+            "--federation-peer-discovery requires one of --features peer-discovery, peer-discovery-dns-sd, peer-discovery-consul, peer-discovery-etcd"
+        );
+    }
+}
+
+/// Warn when peer-discovery flags are set but federation itself is disabled.
+#[cfg(not(feature = "federation"))]
+pub(crate) fn warn_federation_peer_discovery_disabled(cli: &Cli) {
+    use crate::cli::PeerDiscoveryBackend;
+    if cli.federation_peer_discovery != PeerDiscoveryBackend::None {
+        tracing::warn!("--federation-peer-discovery requires --features federation; ignoring");
+    }
+}
+
 /// Warn when federation-ha is requested without the feature.
 #[cfg(not(feature = "federation-ha"))]
 pub(crate) fn warn_federation_ha_disabled(cli: &Cli) {
