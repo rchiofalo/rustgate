@@ -31,6 +31,8 @@ mod federation_reloader;
 mod metrics;
 #[cfg(feature = "otel")]
 mod otel;
+#[cfg(all(feature = "otel", feature = "metrics"))]
+mod otel_metrics;
 mod session;
 mod setup;
 
@@ -352,6 +354,53 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     #[cfg(not(feature = "metrics"))]
     setup::warn_metrics_disabled(&cli);
 
+    // ── OTLP metrics export (optional) ──────────────────────────────
+    //
+    // When `--otlp-metrics` is set we install a second exporter that
+    // scrapes the Prometheus default registry on an interval and pushes
+    // the translated metrics to the same OTLP endpoint configured for
+    // traces. The `/metrics` scrape target is unaffected — this is an
+    // additive sink, not a replacement.
+    #[cfg(all(feature = "otel", feature = "metrics"))]
+    if cli.otlp_metrics {
+        match cli.otel_endpoint.as_deref() {
+            Some(endpoint) => {
+                otel_metrics::init(
+                    endpoint,
+                    &cli.otel_service_name,
+                    Duration::from_secs(cli.otlp_metrics_interval),
+                )?;
+                tracing::info!(
+                    endpoint = %endpoint,
+                    interval_secs = cli.otlp_metrics_interval,
+                    "OTLP metrics export enabled"
+                );
+            }
+            None => {
+                anyhow::bail!(
+                    "--otlp-metrics requires --otel-endpoint (or OTEL_EXPORTER_OTLP_ENDPOINT) \
+                     to be set so traces and metrics can share the same OTLP collector URL"
+                );
+            }
+        }
+    }
+
+    #[cfg(all(feature = "otel", not(feature = "metrics")))]
+    if cli.otlp_metrics {
+        tracing::warn!(
+            "--otlp-metrics requires --features metrics; rebuild with --features metrics,otel \
+             to enable OTLP metrics export"
+        );
+    }
+
+    #[cfg(not(feature = "otel"))]
+    if cli.otlp_metrics {
+        anyhow::bail!(
+            "--otlp-metrics requires --features otel; rebuild with --features otel,metrics \
+             to enable OTLP metrics export"
+        );
+    }
+
     // ── Connection limit ────────────────────────────────────────────
     // CLI validation ensures max_connections is 1..=u32::MAX
     let max_connections: u32 = cli.max_connections as u32;
@@ -590,6 +639,30 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         } else {
             None
         };
+
+    // ── Federation peer discovery (issue #571) ──────────────────────
+    //
+    // Spawned only when `--federation-peer-discovery` selects a backend
+    // other than `none`. Returns a shutdown sender that's held here so
+    // the reconciler exits cleanly during graceful shutdown. Mutually
+    // exclusive with `--federation-peers-file` (enforced by clap's
+    // `conflicts_with`).
+    #[cfg(feature = "federation")]
+    let _fed_discovery_shutdown: Option<tokio::sync::watch::Sender<bool>> =
+        if let Some(rwlock) = fed_shutdown_handle.as_ref() {
+            setup::start_federation_peer_discovery(&cli, rwlock)?
+        } else {
+            // Federation disabled at runtime — warn if the flag was set.
+            use crate::cli::PeerDiscoveryBackend;
+            if cli.federation_peer_discovery != PeerDiscoveryBackend::None {
+                tracing::warn!(
+                    "--federation-peer-discovery requires federation to be configured; ignoring"
+                );
+            }
+            None
+        };
+    #[cfg(not(feature = "federation"))]
+    setup::warn_federation_peer_discovery_disabled(&cli);
 
     // ── Per-client rate limiting ────────────────────────────────────
     let throttle_config = setup::build_throttle_config(&cli);
@@ -898,6 +971,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     // Flush pending OTel spans before exit.
     #[cfg(feature = "otel")]
     otel::shutdown();
+
+    // Flush pending OTLP metrics before exit so the last batch is
+    // delivered to the collector rather than dropped on the floor.
+    #[cfg(all(feature = "otel", feature = "metrics"))]
+    otel_metrics::shutdown();
 
     Ok(())
 }
