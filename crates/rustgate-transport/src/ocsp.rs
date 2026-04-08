@@ -54,7 +54,7 @@ pub fn wrap_resolver(inner: Arc<dyn ResolvesServerCert>) -> Arc<Stapler> {
     Arc::new(Stapler::new(inner))
 }
 
-/// Pre-fetch the OCSP response for the given [`CertifiedKey`] so the very
+/// Pre-fetch the OCSP response for the given `CertifiedKey` so the very
 /// first TLS handshake after startup can include a stapled response.
 ///
 /// This is a thin sync wrapper around [`Stapler::preload`] kept here for
