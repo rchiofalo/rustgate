@@ -89,3 +89,8 @@ doc = false
 name = "structured_cot_event"
 path = "fuzz_targets/structured_cot_event.rs"
 doc = false
+
+[[bin]]
+name = "federation_frame_parse"
+path = "fuzz_targets/federation_frame_parse.rs"
+doc = false
