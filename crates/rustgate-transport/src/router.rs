@@ -180,6 +180,10 @@ pub const NORMAL_CHANNEL_CAPACITY: usize = 64;
 pub struct SessionHandle {
     pub id: u64,
     pub identity: Arc<Identity>,
+    /// Precomputed 128-bit authz subject hash, derived once at session
+    /// construction so the PEP hot path performs zero hashing over
+    /// the identity on every routed message.
+    subject_hash: rustgate_authz::SubjectHash,
     priority_sender: Arc<Mutex<Option<mpsc::Sender<RoutedMessage>>>>,
     normal_sender: Arc<Mutex<Option<mpsc::Sender<RoutedMessage>>>>,
     consecutive_drops: Arc<AtomicU32>,
@@ -196,14 +200,22 @@ impl SessionHandle {
         priority_sender: mpsc::Sender<RoutedMessage>,
         normal_sender: mpsc::Sender<RoutedMessage>,
     ) -> Self {
+        let subject_hash = AuthzSubject::compute_hash(&identity);
         Self {
             id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             identity,
+            subject_hash,
             priority_sender: Arc::new(Mutex::new(Some(priority_sender))),
             normal_sender: Arc::new(Mutex::new(Some(normal_sender))),
             consecutive_drops: Arc::new(AtomicU32::new(0)),
             max_consecutive_drops: DEFAULT_MAX_CONSECUTIVE_DROPS,
         }
+    }
+
+    /// Precomputed authz subject hash suitable for
+    /// `rustgate_authz::Subject::with_hash` on the PEP hot path.
+    pub fn subject_hash(&self) -> rustgate_authz::SubjectHash {
+        self.subject_hash
     }
 
     /// Create a session handle with a custom circuit breaker threshold.
@@ -216,9 +228,11 @@ impl SessionHandle {
         normal_sender: mpsc::Sender<RoutedMessage>,
         threshold: u32,
     ) -> Self {
+        let subject_hash = AuthzSubject::compute_hash(&identity);
         Self {
             id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             identity,
+            subject_hash,
             priority_sender: Arc::new(Mutex::new(Some(priority_sender))),
             normal_sender: Arc::new(Mutex::new(Some(normal_sender))),
             consecutive_drops: Arc::new(AtomicU32::new(0)),
@@ -1118,7 +1132,7 @@ impl Router {
                     let Some(engine) = authz else {
                         return true;
                     };
-                    let subject = AuthzSubject::from_identity(&handle.identity);
+                    let subject = AuthzSubject::with_hash(&handle.identity, handle.subject_hash);
                     let resource = AuthzResource::Group { group };
                     let outcome =
                         self.authz_evaluate(engine, &subject, &resource, AuthzAction::Receive);

@@ -160,6 +160,9 @@ jobs:
       - name: Run tests
         run: cargo nextest run --locked --workspace --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket,otel
 
+      - name: Authz P99 budget gate (release)
+        run: cargo nextest run --locked --release -p rustgate-authz --run-ignored all perf_budget
+
       - name: Run doc tests
         run: cargo test --locked --workspace --doc --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket,otel
 

@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- rustgate-authz now caches decisions in a sharded epoch-keyed LRU; criterion bench gate enforces P99 < 10µs on every supported pattern (#563).
 - Identity now carries SPIFFE ID and an extensible attribute bag derived from mTLS cert SANs and subject fields, foundation for upcoming RBAC/ABAC (#563).
 - Server now loads an rustgate-authz policy file via `--authz-policy-file` with hot-reload, deny-by-default semantics, audit events on every deny and reload outcome, and Prometheus metrics for decisions, eval latency, and reload results (#563).
 - New rustgate-authz crate providing the RBAC/ABAC policy model and native evaluation engine, foundation for per-message authorization (#563).

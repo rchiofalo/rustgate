@@ -5,7 +5,7 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use rustgate_authz::parser::parse_json;
-use rustgate_authz::{Action, NativeEngine, PolicyEngine, Resource, Subject};
+use rustgate_authz::{Action, NativeEngine, PolicyEngine, Resource, Subject, SubjectHash};
 use rustgate_core::AttrValue;
 use rustgate_core::identity::Identity;
 
@@ -52,6 +52,7 @@ fn many_rules(n: usize, match_at: Option<usize>) -> String {
 
 fn bench_eval(c: &mut Criterion) {
     let id = make_identity();
+    let subject_hash = Subject::compute_hash(&id);
 
     let one = build_engine(
         br#"{"version":1,"rules":[
@@ -62,7 +63,7 @@ fn bench_eval(c: &mut Criterion) {
     );
     c.bench_function("rbac_single_rule_hit", |b| {
         b.iter(|| {
-            let s = Subject::from_identity(&id);
+            let s = Subject::with_hash(&id, subject_hash);
             black_box(one.evaluate(&s, &Resource::Broadcast, Action::Send));
         })
     });
@@ -70,7 +71,7 @@ fn bench_eval(c: &mut Criterion) {
     let ten = build_engine(many_rules(10, Some(9)).as_bytes());
     c.bench_function("rbac_10_rules", |b| {
         b.iter(|| {
-            let s = Subject::from_identity(&id);
+            let s = Subject::with_hash(&id, subject_hash);
             black_box(ten.evaluate(&s, &Resource::Broadcast, Action::Send));
         })
     });
@@ -78,7 +79,7 @@ fn bench_eval(c: &mut Criterion) {
     let hundred = build_engine(many_rules(100, Some(99)).as_bytes());
     c.bench_function("rbac_100_rules", |b| {
         b.iter(|| {
-            let s = Subject::from_identity(&id);
+            let s = Subject::with_hash(&id, subject_hash);
             black_box(hundred.evaluate(&s, &Resource::Broadcast, Action::Send));
         })
     });
@@ -92,7 +93,7 @@ fn bench_eval(c: &mut Criterion) {
     );
     c.bench_function("abac_spiffe_prefix", |b| {
         b.iter(|| {
-            let s = Subject::from_identity(&id);
+            let s = Subject::with_hash(&id, subject_hash);
             black_box(spiffe.evaluate(
                 &s,
                 &Resource::NatsSubject { subject: "cot.red" },
@@ -113,15 +114,46 @@ fn bench_eval(c: &mut Criterion) {
     );
     c.bench_function("abac_5_predicates", |b| {
         b.iter(|| {
-            let s = Subject::from_identity(&id);
+            let s = Subject::with_hash(&id, subject_hash);
             black_box(five.evaluate(&s, &Resource::Broadcast, Action::Send));
+        })
+    });
+
+    // Cache-hit case: run one eval to warm, then bench the repeat.
+    let cache_hit_engine = build_engine(many_rules(100, Some(50)).as_bytes());
+    {
+        let s = Subject::with_hash(&id, subject_hash);
+        let _ = cache_hit_engine.evaluate(&s, &Resource::Broadcast, Action::Send);
+    }
+    c.bench_function("cache_hit", |b| {
+        b.iter(|| {
+            let s = Subject::with_hash(&id, subject_hash);
+            black_box(cache_hit_engine.evaluate(&s, &Resource::Broadcast, Action::Send));
+        })
+    });
+
+    // Cache-miss case: vary subject hash every iteration so every lookup misses.
+    let cache_miss_engine = build_engine(many_rules(10, Some(5)).as_bytes());
+    c.bench_function("cache_miss_cold", |b| {
+        let mut counter: u64 = 0;
+        b.iter(|| {
+            counter = counter.wrapping_add(1);
+            // Perturb both halves so the cache never hits. The
+            // engine only reads `subject_hash` when building the
+            // cache key, so this is safe for benching.
+            let perturbed = SubjectHash {
+                primary: subject_hash.primary ^ counter,
+                secondary: subject_hash.secondary ^ counter.rotate_left(17),
+            };
+            let s = Subject::with_hash(&id, perturbed);
+            black_box(cache_miss_engine.evaluate(&s, &Resource::Broadcast, Action::Send));
         })
     });
 
     let fallthrough = build_engine(many_rules(100, None).as_bytes());
     c.bench_function("worst_case_fallthrough", |b| {
         b.iter(|| {
-            let s = Subject::from_identity(&id);
+            let s = Subject::with_hash(&id, subject_hash);
             black_box(fallthrough.evaluate(&s, &Resource::Broadcast, Action::Send));
         })
     });
