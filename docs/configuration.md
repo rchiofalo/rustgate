@@ -72,6 +72,28 @@ Per-client rate limiting uses a token bucket algorithm. When a client exceeds th
 | `--data-package-dir` | `RUSTGATE_DATA_PACKAGE_DIR` | — | Directory for client data packages |
 | `--package-max-age-hours` | `RUSTGATE_PACKAGE_MAX_AGE_HOURS` | `0` (no expiration) | Maximum age for data packages |
 
+### CoT Delta Encoding
+
+Per-UID delta encoding reduces outbound bandwidth for CoT workloads where the same UID pings repeatedly with small changes (typically just a new timestamp and position). Each XML-framed writer task keeps a bounded LRU cache of the last full event sent for each `uid`; subsequent events are emitted as a compact `<delta>` wrapper carrying only the fields that changed. Disabled by default. See [cot-delta-encoding.md](cot-delta-encoding.md) for the wire format and tuning guidance.
+
+| Flag | Env Var | Default | Description |
+|------|---------|---------|-------------|
+| `--cot-delta-encoding` | `RUSTGATE_COT_DELTA_ENCODING` | `false` | Enable per-UID delta encoding on XML sessions |
+| `--cot-delta-cache-size` | `RUSTGATE_COT_DELTA_CACHE_SIZE` | `512` | Per-session LRU cache size (UIDs) |
+| `--cot-delta-epsilon-meters` | `RUSTGATE_COT_DELTA_EPSILON_METERS` | `1.0` | Ground distance below which position-only updates are suppressed entirely (`0` = ship every event) |
+
+### Authorization (RBAC / ABAC)
+
+| Flag | Env Var | Default | Description |
+|------|---------|---------|-------------|
+| `--authz-policy-file` | `RUSTGATE_AUTHZ_POLICY_FILE` | — | Path to a JSON rustgate-authz policy file (or Cedar source when paired with `--authz-policy-format cedar`). When set, the router enforces per-message RBAC/ABAC decisions via the PEP. |
+| `--authz-policy-format` | `RUSTGATE_AUTHZ_POLICY_FORMAT` | `native` | Policy format: `native` (default JSON ruleset) or `cedar` (requires `--features cedar`). |
+| `--authz-reload-interval` | `RUSTGATE_AUTHZ_RELOAD_INTERVAL` | `5` | Seconds between hot-reload polls of the policy file. Must be >= 1 when `--authz-policy-file` is set. Native backend only. |
+| `--authz-fail-open` | `RUSTGATE_AUTHZ_FAIL_OPEN` | `false` | When the initial load fails, start without an engine instead of aborting. Default is fail-closed. |
+
+See [docs/authorization.md](authorization.md) for the policy format and
+[docs/runbooks/authz.md](runbooks/authz.md) for operational guidance.
+
 ### NATS (requires `--features nats`)
 
 | Flag | Env Var | Default | Description |

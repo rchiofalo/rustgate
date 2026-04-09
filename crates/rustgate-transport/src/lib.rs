@@ -19,8 +19,13 @@ pub mod store_forward;
 mod throttle;
 mod verifier;
 
+pub mod client_ocsp;
+
 #[cfg(feature = "ocsp")]
 pub mod ocsp;
+
+#[cfg(feature = "spiffe")]
+pub mod spiffe;
 
 pub use acl::{GroupAcl, GroupAclPolicy};
 pub use backpressure::{
@@ -28,6 +33,9 @@ pub use backpressure::{
 };
 pub use cache::PositionCache;
 pub use cert_reloader::CertReloader;
+#[cfg(feature = "ocsp")]
+pub use client_ocsp::OcspStaplerFetcher;
+pub use client_ocsp::{ClientOcspVerifier, FetchFuture, OcspFetcher, OnCacheHit, OnCacheMiss};
 pub use codec::{FramedCodec, LengthPrefixedCodec, LineDelimitedCodec, XmlStreamCodec};
 pub use codecs::{RawLengthPrefixedCodec, RawLineCodec, TakXmlCodec};
 #[cfg(feature = "fips")]
@@ -46,12 +54,14 @@ pub use listener::{DEFAULT_MAX_HANDSHAKES, OnHandshakeError, TlsListener};
 pub use repeater::EmergencyRepeater;
 pub use replay::ReplayFilter;
 pub use router::{
-    ACCESS_LOG_TARGET, NORMAL_CHANNEL_CAPACITY, PRIORITY_CHANNEL_CAPACITY, RoutedMessage, Router,
-    SessionHandle,
+    ACCESS_LOG_TARGET, AuthzEvent, AuthzObserver, NORMAL_CHANNEL_CAPACITY,
+    PRIORITY_CHANNEL_CAPACITY, RoutedMessage, Router, SessionHandle,
 };
+pub use rustgate_authz;
 #[cfg(feature = "proto")]
 pub use rustgate_proto::TakFrameCodec;
 pub use rustls::server::ResolvesServerCert;
+pub use rustls::server::danger::ClientCertVerifier;
 pub use session::{AuthenticatedSession, SessionReader, SessionWriter};
 pub use store_forward::{
     ClientQueue, DEFAULT_CLIENT_QUEUE_MAX_BYTES, QueueStats, StoreForwardError,

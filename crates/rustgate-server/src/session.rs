@@ -4,6 +4,7 @@
 //! negotiation), the plaintext TCP accept loop, and the `NatsPublish` trait
 //! that abstracts over optional NATS support.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -15,6 +16,7 @@ use rustgate_core::identity::Identity;
 use rustgate_core::message::Destination;
 use rustgate_core::message::RoutableMessage;
 use rustgate_cot::MessageBuilder;
+use rustgate_cot::delta::{DeltaEncoder, DeltaOutput};
 use rustgate_transport::{
     AuthenticatedSession, FramedCodec, ReplayFilter, Router, SessionHandle, ThrottleConfig,
 };
@@ -37,6 +39,31 @@ use crate::metrics;
 pub(crate) type FedForwardFn =
     Arc<dyn Fn(Bytes, Vec<String>, rustgate_core::message::Metadata) + Send + Sync>;
 
+/// Configuration for the per-session CoT delta encoder.
+///
+/// When `enabled`, each writer task constructs a [`DeltaEncoder`] with
+/// `cache_size` capacity and `epsilon_meters` suppression threshold. See
+/// `rustgate_cot::delta` for the wire format and suppression semantics.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DeltaConfig {
+    pub(crate) enabled: bool,
+    pub(crate) cache_size: u64,
+    pub(crate) epsilon_meters: f64,
+}
+
+impl DeltaConfig {
+    /// Construct a [`DeltaEncoder`] matching this configuration when
+    /// enabled. Returns `None` when `enabled` is false so the writer task
+    /// can cheaply skip delta processing.
+    pub(crate) fn build_encoder(&self) -> Option<DeltaEncoder> {
+        if !self.enabled {
+            return None;
+        }
+        let cap = NonZeroUsize::new(self.cache_size.max(1) as usize).unwrap_or(NonZeroUsize::MIN);
+        Some(DeltaEncoder::new(cap, self.epsilon_meters))
+    }
+}
+
 /// Shared dependencies passed to each session handler task.
 pub(crate) struct SessionDeps<P: NatsPublish> {
     pub(crate) router: Arc<Router>,
@@ -50,6 +77,8 @@ pub(crate) struct SessionDeps<P: NatsPublish> {
     pub(crate) archiver: Option<Arc<archive::CotArchiver>>,
     pub(crate) replay_filter: Option<Arc<ReplayFilter>>,
     pub(crate) circuit_breaker_threshold: u32,
+    /// Optional per-session CoT delta encoding for outbound XML sessions.
+    pub(crate) delta_config: DeltaConfig,
     /// Per-identity metrics configuration: allowlist for label
     /// bucketing plus the Tier 2 enable flag.
     #[cfg(feature = "metrics")]
@@ -66,6 +95,7 @@ struct SessionContext<'a, P: NatsPublish> {
     throttle: Option<rustgate_transport::ClientThrottle>,
     archiver: &'a Option<Arc<archive::CotArchiver>>,
     replay_filter: &'a Option<Arc<ReplayFilter>>,
+    delta_config: DeltaConfig,
     #[cfg(feature = "metrics")]
     metrics_identity: &'a metrics::MetricsIdentity,
 }
@@ -189,6 +219,7 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
         throttle,
         archiver: &deps.archiver,
         replay_filter: &deps.replay_filter,
+        delta_config: deps.delta_config,
         #[cfg(feature = "metrics")]
         metrics_identity: deps.metrics_identity.as_ref(),
     };
@@ -301,6 +332,11 @@ async fn run_session_loops(
 ) -> std::io::Result<()> {
     #[cfg(feature = "metrics")]
     let bucket = ctx.metrics_identity.bucket(cn).to_string();
+    let delta_encoder = if codec_is_xml(ctx.codec) {
+        ctx.delta_config.build_encoder()
+    } else {
+        None
+    };
     tokio::select! {
         r = read_loop(reader, ctx, read_buf) => r,
         r = write_loop(
@@ -308,10 +344,18 @@ async fn run_session_loops(
             priority_rx,
             normal_rx,
             ctx.codec,
+            delta_encoder,
             #[cfg(feature = "metrics")]
             bucket,
         ) => r,
     }
+}
+
+/// Whether the active codec speaks XML on the wire. The delta encoder
+/// only operates on XML-framed sessions — protobuf and raw length-prefixed
+/// codecs are passed through unchanged.
+fn codec_is_xml(codec: &dyn Codec) -> bool {
+    codec.protocol_id() == "tak-xml"
 }
 
 /// Decode inbound frames, apply rate limiting, and route to local clients,
@@ -432,6 +476,7 @@ async fn write_loop(
     mut priority_rx: mpsc::Receiver<rustgate_transport::RoutedMessage>,
     mut normal_rx: mpsc::Receiver<rustgate_transport::RoutedMessage>,
     codec: &dyn Codec,
+    mut delta_encoder: Option<DeltaEncoder>,
     #[cfg(feature = "metrics")] bucket: String,
 ) -> std::io::Result<()> {
     let mut framed = FramedWrite::new(writer, FramedCodec::from_strategy(&codec.framing()));
@@ -461,12 +506,19 @@ async fn write_loop(
         };
 
         let encoded = codec.encode_payload(&msg)?;
+        let wire_bytes = match delta_encoder.as_mut() {
+            Some(enc) => match apply_delta(enc, &encoded) {
+                DeltaDispatch::Send(bytes) => bytes,
+                DeltaDispatch::Skip => continue,
+            },
+            None => encoded,
+        };
         #[cfg(feature = "metrics")]
         if let Some(c) = metrics::per_identity_bytes_sent() {
             c.with_label_values(&[bucket.as_str()])
-                .inc_by(encoded.len() as u64);
+                .inc_by(wire_bytes.len() as u64);
         }
-        let send_fut = framed.send(tokio_util::bytes::BytesMut::from(encoded.as_ref()));
+        let send_fut = framed.send(tokio_util::bytes::BytesMut::from(wire_bytes.as_ref()));
 
         match tokio::time::timeout(WRITE_TIMEOUT, send_fut).await {
             Ok(result) => result?,
@@ -480,6 +532,48 @@ async fn write_loop(
     }
 
     Ok(())
+}
+
+/// Outcome of feeding an outbound payload through the delta encoder.
+enum DeltaDispatch {
+    /// Bytes to actually write to the socket.
+    Send(Bytes),
+    /// The encoder suppressed the event entirely — skip the write.
+    Skip,
+}
+
+/// Run one payload through the per-session delta encoder, updating the
+/// matching Prometheus counters. Returns the bytes to send, or `Skip` when
+/// the encoder determined the update was redundant.
+fn apply_delta(enc: &mut DeltaEncoder, encoded: &Bytes) -> DeltaDispatch {
+    let prior = enc.stats();
+    let out = enc.encode(encoded);
+    let stats = enc.stats();
+    #[cfg(feature = "metrics")]
+    {
+        let full_delta = stats.full.saturating_sub(prior.full);
+        if full_delta > 0 {
+            metrics::cot_delta_full().inc_by(full_delta);
+        }
+        let delta_delta = stats.delta.saturating_sub(prior.delta);
+        if delta_delta > 0 {
+            metrics::cot_delta_delta().inc_by(delta_delta);
+        }
+        let suppressed_delta = stats.suppressed.saturating_sub(prior.suppressed);
+        if suppressed_delta > 0 {
+            metrics::cot_delta_suppressed().inc_by(suppressed_delta);
+        }
+        let bytes_delta = stats.bytes_saved.saturating_sub(prior.bytes_saved);
+        if bytes_delta > 0 {
+            metrics::cot_delta_bytes_saved().inc_by(bytes_delta);
+        }
+    }
+    #[cfg(not(feature = "metrics"))]
+    let _ = (prior, stats);
+    match out {
+        DeltaOutput::Full(b) | DeltaOutput::Delta(b) => DeltaDispatch::Send(b),
+        DeltaOutput::Suppressed => DeltaDispatch::Skip,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -499,6 +593,7 @@ pub(crate) struct PlaintextTcpConfig<P: NatsPublish> {
     pub(crate) archiver: Option<Arc<archive::CotArchiver>>,
     pub(crate) replay_filter: Option<Arc<ReplayFilter>>,
     pub(crate) circuit_breaker_threshold: u32,
+    pub(crate) delta_config: DeltaConfig,
     pub(crate) shutdown: Arc<tokio::sync::Notify>,
     #[cfg(feature = "metrics")]
     pub(crate) metrics_identity: Arc<metrics::MetricsIdentity>,
@@ -523,6 +618,7 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
         archiver,
         replay_filter,
         circuit_breaker_threshold,
+        delta_config,
         shutdown,
         #[cfg(feature = "metrics")]
         metrics_identity,
@@ -599,6 +695,7 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
                                 throttle: session_throttle,
                                 archiver: &session_arch,
                                 replay_filter: &session_rf,
+                                delta_config,
                                 #[cfg(feature = "metrics")]
                                 metrics_identity: session_metrics_id.as_ref(),
                             }).await;
@@ -638,6 +735,7 @@ struct PlaintextSessionContext<'a, P: NatsPublish> {
     throttle: Option<rustgate_transport::ClientThrottle>,
     archiver: &'a Option<Arc<archive::CotArchiver>>,
     replay_filter: &'a Option<Arc<ReplayFilter>>,
+    delta_config: DeltaConfig,
     #[cfg(feature = "metrics")]
     metrics_identity: &'a metrics::MetricsIdentity,
 }
@@ -662,9 +760,15 @@ async fn run_plaintext_session_loops<P: NatsPublish>(
         throttle,
         archiver,
         replay_filter,
+        delta_config,
         #[cfg(feature = "metrics")]
         metrics_identity,
     } = ctx;
+    let mut plaintext_delta_encoder = if codec_is_xml(codec) {
+        delta_config.build_encoder()
+    } else {
+        None
+    };
     let framed_codec = FramedCodec::from_strategy(&codec.framing());
     let mut framed_read = FramedRead::new(reader, framed_codec);
     let mut msg_builder = MessageBuilder::new();
@@ -758,7 +862,14 @@ async fn run_plaintext_session_loops<P: NatsPublish>(
                     },
                 };
                 let encoded = codec.encode_payload(&msg)?;
-                let send_fut = framed_write.send(tokio_util::bytes::BytesMut::from(encoded.as_ref()));
+                let wire_bytes = match plaintext_delta_encoder.as_mut() {
+                    Some(enc) => match apply_delta(enc, &encoded) {
+                        DeltaDispatch::Send(b) => b,
+                        DeltaDispatch::Skip => continue,
+                    },
+                    None => encoded,
+                };
+                let send_fut = framed_write.send(tokio_util::bytes::BytesMut::from(wire_bytes.as_ref()));
                 match tokio::time::timeout(WRITE_TIMEOUT, send_fut).await {
                     Ok(result) => result?,
                     Err(_) => {

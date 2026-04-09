@@ -380,3 +380,159 @@ fn help_shows_ocsp_stapling_flag() {
         "help should show --ocsp-stapling when ocsp feature is enabled"
     );
 }
+
+// ── OTLP metrics export ─────────────────────────────────────────────
+
+#[cfg(feature = "otel")]
+#[test]
+fn help_shows_otlp_metrics_flags() {
+    let output = Command::new(rustgate_bin())
+        .arg("--help")
+        .output()
+        .expect("failed to execute binary");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--otlp-metrics"),
+        "help should show --otlp-metrics flag"
+    );
+    assert!(
+        stdout.contains("--otlp-metrics-interval"),
+        "help should show --otlp-metrics-interval flag"
+    );
+    assert!(
+        stdout.contains("RUSTGATE_OTLP_METRICS"),
+        "help should show RUSTGATE_OTLP_METRICS env var"
+    );
+    assert!(
+        stdout.contains("RUSTGATE_OTLP_METRICS_INTERVAL"),
+        "help should show RUSTGATE_OTLP_METRICS_INTERVAL env var"
+    );
+}
+
+#[cfg(feature = "otel")]
+#[test]
+fn otlp_metrics_interval_rejects_zero() {
+    // `clap::value_parser!(u64).range(1..)` should refuse 0.
+    let output = Command::new(rustgate_bin())
+        .args([
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--otlp-metrics-interval",
+            "0",
+            "validate-config",
+        ])
+        .output()
+        .expect("failed to execute binary");
+
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit for --otlp-metrics-interval 0"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("otlp-metrics-interval")
+            || stderr.contains("not in")
+            || stderr.contains("invalid value"),
+        "stderr should mention the invalid interval: {stderr}"
+    );
+}
+
+#[cfg(feature = "otel")]
+#[test]
+fn otlp_metrics_interval_accepts_positive_value() {
+    // Parsing should succeed even without --otel-endpoint — the missing
+    // endpoint is only checked at runtime when the exporter is actually
+    // booted, not during pure CLI parsing for `validate-config`.
+    let output = Command::new(rustgate_bin())
+        .args([
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--otlp-metrics",
+            "--otlp-metrics-interval",
+            "30",
+            "validate-config",
+        ])
+        .output()
+        .expect("failed to execute binary");
+
+    assert!(
+        output.status.success(),
+        "expected --otlp-metrics-interval 30 to parse cleanly; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// ── SPIFFE workload identity ────────────────────────────────────────
+
+#[cfg(feature = "spiffe")]
+#[test]
+fn spiffe_flag_waives_cert_requirement() {
+    // With --spiffe set, --cert/--key/--ca must not be required. We still
+    // expect startup to fail later (no Workload API socket in the test env),
+    // but clap parsing should accept the flag combination.
+    let output = Command::new(rustgate_bin())
+        .args([
+            "--spiffe",
+            "--spiffe-workload-api-socket",
+            "unix:///tmp/does-not-exist.sock",
+            "--help",
+        ])
+        .output()
+        .expect("failed to execute binary");
+    assert!(
+        output.status.success(),
+        "expected --help to succeed alongside --spiffe: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(feature = "spiffe")]
+#[test]
+fn spiffe_conflicts_with_cert_flag() {
+    // clap should reject combining --spiffe with --cert.
+    let output = Command::new(rustgate_bin())
+        .args([
+            "--spiffe",
+            "--cert",
+            "/tmp/c.pem",
+            "--key",
+            "/tmp/k.pem",
+            "--ca",
+            "/tmp/ca.pem",
+        ])
+        .output()
+        .expect("failed to execute binary");
+    assert!(
+        !output.status.success(),
+        "expected --spiffe + --cert to be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot be used with") || stderr.contains("conflict"),
+        "stderr should mention conflict: {stderr}"
+    );
+}
+
+#[cfg(feature = "spiffe")]
+#[test]
+fn spiffe_help_lists_flags() {
+    let output = Command::new(rustgate_bin())
+        .arg("--help")
+        .output()
+        .expect("failed to execute binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--spiffe"), "help missing --spiffe");
+    assert!(
+        stdout.contains("RUSTGATE_SPIFFE_WORKLOAD_API_SOCKET"),
+        "help missing RUSTGATE_SPIFFE_WORKLOAD_API_SOCKET env var"
+    );
+}

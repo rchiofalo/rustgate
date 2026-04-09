@@ -109,11 +109,62 @@ pub(crate) async fn stop_subsystem(name: &str, handle: SubsystemHandle) {
 
 /// Build the TLS configuration from CLI flags.
 ///
-/// Returns the `TlsConfig` along with the raw PEM strings (needed by
-/// enrollment and federation setup).
-pub(crate) async fn build_tls_config(
-    cli: &Cli,
-) -> anyhow::Result<(TlsConfig, String, String, String)> {
+/// Returns the `TlsConfig`, the raw PEM strings (needed by enrollment and
+/// federation setup), and — when SPIFFE is enabled — the already-fetched
+/// `SpiffeIdentity` so that `bind_tls_listener` can reuse it without
+/// hitting the Workload API a second time.
+pub(crate) async fn build_tls_config(cli: &Cli) -> anyhow::Result<TlsConfigBuild> {
+    #[cfg(feature = "spiffe")]
+    if cli.spiffe {
+        let spiffe_cfg = rustgate_transport::spiffe::SpiffeConfig {
+            workload_api_socket: cli.spiffe_workload_api_socket.clone(),
+            expected_trust_domain: cli.spiffe_trust_domain.clone(),
+            refresh_interval: std::time::Duration::from_secs(cli.spiffe_refresh_interval),
+        };
+        let identity = rustgate_transport::spiffe::fetch_initial_identity(&spiffe_cfg)
+            .await
+            .context("fetching initial SPIFFE X.509-SVID")?;
+
+        let tls_min_version = TlsMinVersion::from_str_version(&cli.tls_min_version)
+            .context("parsing TLS minimum version")?;
+        let mut tls_config = TlsConfig::from_pem(
+            &identity.cert_pem,
+            &identity.key_pem,
+            &identity.trust_bundle_pem,
+        )
+        .context("building SPIFFE-backed TLS config")?;
+        tls_config = tls_config.with_tls_min_version(tls_min_version);
+        tls_config = tls_config.with_crl_warn_stale(cli.crl_warn_stale);
+
+        // CRL support via SPIFFE is not defined by the SPIFFE spec; operators
+        // that need CRLs can still point `--crl` at a static file alongside
+        // `--spiffe`. This mirrors how OCSP stapling coexists with SPIFFE.
+        // Note: the CRL is loaded once at startup and does not hot-reload
+        // under `--spiffe`; restart to pick up new CRLs.
+        if let Some(ref crl_path) = cli.crl {
+            let crl_pem = tokio::fs::read_to_string(crl_path)
+                .await
+                .context("reading CRL file")?;
+            tls_config = tls_config.with_crls(&crl_pem).context("loading CRL data")?;
+        }
+
+        return Ok(TlsConfigBuild {
+            tls_config,
+            cert_pem: identity.cert_pem.clone(),
+            key_pem: identity.key_pem.clone(),
+            ca_pem: identity.trust_bundle_pem.clone(),
+            spiffe_identity: Some(identity),
+        });
+    }
+
+    #[cfg(not(feature = "spiffe"))]
+    if cli.spiffe {
+        anyhow::bail!(
+            "--spiffe was set but rustgate was built without the `spiffe` feature; \
+             rebuild with --features spiffe to enable SPIFFE workload identity"
+        );
+    }
+
     let cert_pem = tokio::fs::read_to_string(&cli.cert)
         .await
         .context("reading server certificate")?;
@@ -139,7 +190,27 @@ pub(crate) async fn build_tls_config(
         tls_config = tls_config.with_crls(&crl_pem).context("loading CRL data")?;
     }
 
-    Ok((tls_config, cert_pem, key_pem, ca_pem))
+    Ok(TlsConfigBuild {
+        tls_config,
+        cert_pem,
+        key_pem,
+        ca_pem,
+        #[cfg(feature = "spiffe")]
+        spiffe_identity: None,
+    })
+}
+
+/// Result of [`build_tls_config`]. Carries the PEM strings consumed by the
+/// rest of the server plus, under `--spiffe`, the already-fetched
+/// `SpiffeIdentity` so `bind_tls_listener` can reuse the initial SVID
+/// and `CertReloader` without a second Workload API round-trip.
+pub(crate) struct TlsConfigBuild {
+    pub(crate) tls_config: TlsConfig,
+    pub(crate) cert_pem: String,
+    pub(crate) key_pem: String,
+    pub(crate) ca_pem: String,
+    #[cfg(feature = "spiffe")]
+    pub(crate) spiffe_identity: Option<rustgate_transport::spiffe::SpiffeIdentity>,
 }
 
 /// Bind the TLS listener with a handshake concurrency limit.
@@ -150,15 +221,108 @@ pub(crate) async fn build_tls_config(
 pub(crate) async fn bind_tls_listener(
     cli: &Cli,
     tls_config: &TlsConfig,
+    #[cfg(feature = "spiffe")] spiffe_identity: Option<rustgate_transport::spiffe::SpiffeIdentity>,
 ) -> anyhow::Result<TlsListenerHandle> {
-    // Always construct the `CertReloader` when `--cert` and `--key` are
-    // configured so that SIGHUP-driven reloads can rotate the certificate
-    // regardless of whether the polling watcher is enabled. The polling
-    // watcher itself is still only spawned when `cert_reload_interval > 0`.
+    // When SPIFFE is enabled, reuse the `SpiffeIdentity` already fetched by
+    // `build_tls_config` so we do not double-fetch from the Workload API at
+    // startup (which would briefly leave the TlsConfig and CertReloader
+    // tracking two different SVIDs).
+    #[cfg(feature = "spiffe")]
+    let reloader = if cli.spiffe {
+        let identity = spiffe_identity
+            .ok_or_else(|| anyhow::anyhow!("SPIFFE enabled but no preloaded identity passed"))?;
+        let spiffe_cfg = rustgate_transport::spiffe::SpiffeConfig {
+            workload_api_socket: cli.spiffe_workload_api_socket.clone(),
+            expected_trust_domain: cli.spiffe_trust_domain.clone(),
+            refresh_interval: std::time::Duration::from_secs(cli.spiffe_refresh_interval),
+        };
+        let reloader = identity.cert_reloader.clone();
+
+        #[cfg(feature = "metrics")]
+        let hooks = Some(rustgate_transport::spiffe::SpiffeHooks {
+            on_success: Arc::new(|expiry| {
+                metrics::spiffe_refresh_total()
+                    .with_label_values(&["success"])
+                    .inc();
+                metrics::spiffe_svid_expiry_seconds().set(expiry);
+            }),
+            on_failure: Arc::new(|| {
+                metrics::spiffe_refresh_total()
+                    .with_label_values(&["failure"])
+                    .inc();
+            }),
+        });
+        #[cfg(not(feature = "metrics"))]
+        let hooks: Option<rustgate_transport::spiffe::SpiffeHooks> = None;
+
+        rustgate_transport::spiffe::spawn_refresh_task(
+            Arc::downgrade(&reloader),
+            spiffe_cfg,
+            hooks,
+        );
+        tracing::info!(
+            spiffe_id = %identity.spiffe_id,
+            trust_domain = %identity.trust_domain,
+            "SPIFFE workload identity active"
+        );
+        reloader
+    } else {
+        CertReloader::new(&cli.cert, &cli.key).context("initializing certificate reloader")?
+    };
+
+    #[cfg(not(feature = "spiffe"))]
     let reloader =
         CertReloader::new(&cli.cert, &cli.key).context("initializing certificate reloader")?;
 
-    let verifier = tls_config.build_default_verifier()?;
+    let inner_verifier = tls_config.build_default_verifier()?;
+
+    // Optionally wrap the inner verifier with the client-cert OCSP
+    // verifier so revoked client certificates can be detected
+    // near-real-time without waiting for the next CRL refresh. The
+    // wrapper is gated on `--features ocsp` because it reuses the
+    // OCSP fetcher from the same upstream crate as server stapling.
+    #[cfg(feature = "ocsp")]
+    let verifier: std::sync::Arc<dyn rustgate_transport::ClientCertVerifier> = if cli.client_ocsp {
+        #[cfg(feature = "metrics")]
+        let on_hit: Option<rustgate_transport::client_ocsp::OnCacheHit> =
+            Some(std::sync::Arc::new(|| {
+                if let Some(c) = metrics::client_ocsp_cache_hits() {
+                    c.inc();
+                }
+            }));
+        #[cfg(feature = "metrics")]
+        let on_miss: Option<rustgate_transport::client_ocsp::OnCacheMiss> =
+            Some(std::sync::Arc::new(|| {
+                if let Some(c) = metrics::client_ocsp_cache_misses() {
+                    c.inc();
+                }
+            }));
+        #[cfg(not(feature = "metrics"))]
+        let on_hit: Option<rustgate_transport::client_ocsp::OnCacheHit> = None;
+        #[cfg(not(feature = "metrics"))]
+        let on_miss: Option<rustgate_transport::client_ocsp::OnCacheMiss> = None;
+
+        let fetcher: std::sync::Arc<dyn rustgate_transport::OcspFetcher> =
+            std::sync::Arc::new(rustgate_transport::OcspStaplerFetcher::default());
+        let wrapped =
+            rustgate_transport::ClientOcspVerifier::new(inner_verifier, fetcher, on_hit, on_miss);
+        tracing::info!(
+            "client certificate OCSP verification enabled (Tier 1, fail-open, SKI cache)"
+        );
+        wrapped as std::sync::Arc<dyn rustgate_transport::ClientCertVerifier>
+    } else {
+        inner_verifier
+    };
+
+    #[cfg(not(feature = "ocsp"))]
+    let verifier = inner_verifier;
+    #[cfg(not(feature = "ocsp"))]
+    if cli.client_ocsp {
+        tracing::warn!(
+            "--client-ocsp set but the ocsp feature is not compiled in; \
+             rebuild with --features ocsp to enable client OCSP verification"
+        );
+    }
 
     // OCSP stapling sits on the *resolver* (server certificate) side of the
     // handshake; the existing CRL verifier sits on the *client certificate*
@@ -471,6 +635,12 @@ pub(crate) async fn start_enrollment(
         .with_contacts_provider(contacts_provider)
         .with_rate_limit(rate_limit, rate_window);
 
+    #[cfg(feature = "est")]
+    if cli.est_enabled {
+        enrollment_server = enrollment_server.with_est();
+        tracing::info!("EST (RFC 7030) endpoints enabled");
+    }
+
     #[cfg(feature = "metrics")]
     {
         enrollment_server = enrollment_server.with_rate_limit_callback(std::sync::Arc::new(|| {
@@ -702,6 +872,8 @@ async fn build_federation_config(
             cli.federation_circuit_breaker_timeout,
         ),
         replay_buffer_capacity: cli.federation_replay_buffer_size,
+        replay_buffer_dir: cli.federation_replay_dir.clone(),
+        replay_max_bytes: cli.federation_replay_max_bytes,
         pod_id: cli.federation_pod_id.clone().or_else(|| {
             cli.federation_ha_nats_url
                 .as_ref()
@@ -872,6 +1044,17 @@ pub(crate) async fn start_federation(
     #[cfg(feature = "metrics")]
     wire_federation_api(cli, &rwlock, fed_api_slot)?;
 
+    #[cfg(feature = "metrics")]
+    {
+        // Detached task; runs until process exit. We intentionally drop
+        // the JoinHandle here.
+        let handle = metrics::spawn_federation_lag_updater(
+            Arc::clone(&rwlock),
+            std::time::Duration::from_secs(1),
+        );
+        std::mem::drop(handle);
+    }
+
     #[cfg(feature = "federation-ha")]
     setup_ha_handlers(&rwlock).await;
 
@@ -899,6 +1082,132 @@ pub(crate) fn warn_federation_disabled(cli: &Cli) -> Option<FedForwardFn> {
         tracing::warn!("--federation-v2-bind requires --features federation; ignoring");
     }
     None
+}
+
+/// Spawn the federation peer discovery reconciler (issue #571).
+///
+/// Inspects `--federation-peer-discovery`; when set to a backend other than
+/// `none`, constructs the corresponding `PeerDiscovery` implementation and
+/// hands it to `rustgate_federation::discovery::reconciler` together with a
+/// shutdown watch channel. Returns the shutdown sender so the main loop can
+/// signal the reconciler to exit during graceful shutdown; returns `None`
+/// when discovery is disabled.
+///
+/// Each backend's code path is gated behind its own sub-feature; selecting
+/// a backend whose feature was not compiled in surfaces a clear
+/// `anyhow::bail!` so misconfigured images fail fast at startup instead of
+/// silently ignoring the setting.
+#[cfg(feature = "federation")]
+pub(crate) fn start_federation_peer_discovery(
+    cli: &Cli,
+    manager: &Arc<tokio::sync::RwLock<rustgate_federation::manager::FederationManager>>,
+) -> anyhow::Result<Option<tokio::sync::watch::Sender<bool>>> {
+    use crate::cli::PeerDiscoveryBackend;
+
+    if cli.federation_peer_discovery == PeerDiscoveryBackend::None {
+        return Ok(None);
+    }
+
+    #[cfg(any(
+        feature = "peer-discovery-dns-sd",
+        feature = "peer-discovery-consul",
+        feature = "peer-discovery-etcd"
+    ))]
+    {
+        use rustgate_federation::discovery::PeerDiscovery;
+
+        let source: Arc<dyn PeerDiscovery> = match cli.federation_peer_discovery {
+            PeerDiscoveryBackend::None => unreachable!(),
+            #[cfg(feature = "peer-discovery-dns-sd")]
+            PeerDiscoveryBackend::DnsSd => {
+                let svc = cli.federation_peer_discovery_dns_sd_service.clone();
+                Arc::new(rustgate_federation::discovery::dns_sd::DnsSdDiscovery::new(
+                    svc,
+                )?)
+            }
+            #[cfg(not(feature = "peer-discovery-dns-sd"))]
+            PeerDiscoveryBackend::DnsSd => {
+                anyhow::bail!(
+                    "--federation-peer-discovery=dns-sd requires --features peer-discovery-dns-sd"
+                );
+            }
+            #[cfg(feature = "peer-discovery-consul")]
+            PeerDiscoveryBackend::Consul => Arc::new(
+                rustgate_federation::discovery::consul::ConsulDiscovery::new(
+                    cli.federation_peer_discovery_consul_addr.clone(),
+                    cli.federation_peer_discovery_consul_service.clone(),
+                )?,
+            ),
+            #[cfg(not(feature = "peer-discovery-consul"))]
+            PeerDiscoveryBackend::Consul => {
+                anyhow::bail!(
+                    "--federation-peer-discovery=consul requires --features peer-discovery-consul"
+                );
+            }
+            #[cfg(feature = "peer-discovery-etcd")]
+            PeerDiscoveryBackend::Etcd => {
+                let endpoints: Vec<String> = cli
+                    .federation_peer_discovery_etcd_endpoints
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if endpoints.is_empty() {
+                    anyhow::bail!(
+                        "--federation-peer-discovery-etcd-endpoints must contain at least one endpoint"
+                    );
+                }
+                Arc::new(rustgate_federation::discovery::etcd::EtcdDiscovery::new(
+                    endpoints,
+                    cli.federation_peer_discovery_etcd_prefix.clone(),
+                ))
+            }
+            #[cfg(not(feature = "peer-discovery-etcd"))]
+            PeerDiscoveryBackend::Etcd => {
+                anyhow::bail!(
+                    "--federation-peer-discovery=etcd requires --features peer-discovery-etcd"
+                );
+            }
+        };
+
+        let interval = std::time::Duration::from_secs(cli.federation_peer_discovery_interval);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = rustgate_federation::discovery::reconciler(
+            Arc::clone(manager),
+            source,
+            interval,
+            shutdown_rx,
+        );
+        // Detached: the task owns itself until its shutdown receiver fires.
+        std::mem::drop(handle);
+        tracing::info!(
+            backend = ?cli.federation_peer_discovery,
+            interval_secs = cli.federation_peer_discovery_interval,
+            "federation peer discovery reconciler started"
+        );
+        Ok(Some(shutdown_tx))
+    }
+
+    #[cfg(not(any(
+        feature = "peer-discovery-dns-sd",
+        feature = "peer-discovery-consul",
+        feature = "peer-discovery-etcd"
+    )))]
+    {
+        let _ = manager;
+        anyhow::bail!(
+            "--federation-peer-discovery requires one of --features peer-discovery, peer-discovery-dns-sd, peer-discovery-consul, peer-discovery-etcd"
+        );
+    }
+}
+
+/// Warn when peer-discovery flags are set but federation itself is disabled.
+#[cfg(not(feature = "federation"))]
+pub(crate) fn warn_federation_peer_discovery_disabled(cli: &Cli) {
+    use crate::cli::PeerDiscoveryBackend;
+    if cli.federation_peer_discovery != PeerDiscoveryBackend::None {
+        tracing::warn!("--federation-peer-discovery requires --features federation; ignoring");
+    }
 }
 
 /// Warn when federation-ha is requested without the feature.
@@ -1007,6 +1316,56 @@ pub(crate) fn warn_websocket_disabled(cli: &Cli) {
 }
 
 // ---------------------------------------------------------------------------
+// MQTT
+// ---------------------------------------------------------------------------
+
+/// Start the MQTT listener and return its subsystem handle.
+#[cfg(feature = "mqtt")]
+pub(crate) fn start_mqtt(
+    cli: &Cli,
+    tls_config: &TlsConfig,
+    router: &Arc<Router>,
+    connection_limit: &Arc<Semaphore>,
+) -> anyhow::Result<Option<SubsystemHandle>> {
+    let mqtt_bind = match cli.mqtt_bind.as_ref() {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+
+    if let Some(prefix) = cli.mqtt_topic_prefix.as_deref() {
+        rustgate_mqtt::validate_topic_prefix(prefix)
+            .map_err(|e| anyhow::anyhow!("invalid --mqtt-topic-prefix: {e}"))?;
+    }
+
+    let addr: std::net::SocketAddr = mqtt_bind.parse().context("parsing --mqtt-bind address")?;
+    let mqtt_listener = rustgate_mqtt::MqttListener::bind(addr, tls_config)?;
+    tracing::info!(addr = %mqtt_listener.local_addr()?, "MQTT listener bound");
+
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+
+    let config = rustgate_mqtt::MqttServerConfig {
+        listener: mqtt_listener,
+        router: Arc::clone(router),
+        connection_limit: Arc::clone(connection_limit),
+        shutdown: Arc::clone(&shutdown),
+        topic_prefix: cli.mqtt_topic_prefix.clone(),
+        max_packet_size: cli.mqtt_max_packet_size,
+    };
+    let task = tokio::spawn(async move {
+        rustgate_mqtt::MqttServer::run(config).await;
+    });
+    Ok(Some(SubsystemHandle { shutdown, task }))
+}
+
+/// Warn when MQTT is requested without the feature.
+#[cfg(not(feature = "mqtt"))]
+pub(crate) fn warn_mqtt_disabled(cli: &Cli) {
+    if cli.mqtt_bind.is_some() {
+        tracing::warn!("--mqtt-bind requires --features mqtt; ignoring");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Plaintext TCP
 // ---------------------------------------------------------------------------
 
@@ -1058,6 +1417,11 @@ pub(crate) async fn start_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
         archiver: archiver.clone(),
         replay_filter: replay_filter.clone(),
         circuit_breaker_threshold: cli.circuit_breaker_threshold,
+        delta_config: crate::session::DeltaConfig {
+            enabled: cli.cot_delta_encoding,
+            cache_size: cli.cot_delta_cache_size,
+            epsilon_meters: cli.cot_delta_epsilon_meters,
+        },
         shutdown: shutdown_clone,
         #[cfg(feature = "metrics")]
         metrics_identity: Arc::clone(metrics_identity),

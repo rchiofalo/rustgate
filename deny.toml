@@ -35,6 +35,19 @@ crate = "aws-lc-fips-sys"
 allow = ["MPL-2.0"]
 crate = "ocsp-stapler"
 
+# ar_archive_writer is "Apache-2.0 WITH LLVM-exception". It is a transitive
+# build-time dependency pulled in only via the `cedar` feature:
+#   cedar-policy -> cedar-policy-core -> stacker -> psm -> ar_archive_writer
+# (as a build dep). The LLVM exception is the standard LLVM linking
+# exemption that waives GPL-style copyleft propagation when linked into
+# a downstream binary; it is strictly more permissive than plain
+# Apache-2.0 for our usage and is explicitly listed as acceptable by
+# the FSF. Pinning the exception at the crate name keeps us from
+# silently widening the LLVM-exception allowance to unrelated crates.
+[[licenses.exceptions]]
+allow = ["Apache-2.0 WITH LLVM-exception"]
+crate = "ar_archive_writer"
+
 [[licenses.exceptions]]
 allow = ["LicenseRef-Proprietary"]
 crate = "rustgate-core"
@@ -68,6 +81,12 @@ crate = "rustgate-test-utils"
 [[licenses.exceptions]]
 allow = ["LicenseRef-Proprietary"]
 crate = "rustgate-client"
+[[licenses.exceptions]]
+allow = ["LicenseRef-Proprietary"]
+crate = "rustgate-authz"
+[[licenses.exceptions]]
+allow = ["LicenseRef-Proprietary"]
+crate = "rustgate-mqtt"
 
 [bans]
 multiple-versions = "warn"

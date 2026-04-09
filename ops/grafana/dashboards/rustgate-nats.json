@@ -1,0 +1,92 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "id": null,
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Publishes/s",
+      "id": 1,
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum(rate(rustgate_nats_publishes_total[5m]))", "refId": "A"}]
+    },
+    {
+      "type": "stat",
+      "title": "Max consumer pending",
+      "id": 2,
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "max(rustgate_nats_consumer_pending)", "refId": "A"}]
+    },
+    {
+      "type": "stat",
+      "title": "Total redeliveries (5m)",
+      "id": 3,
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum(increase(rustgate_nats_consumer_num_redelivered[5m]))", "refId": "A"}]
+    },
+    {
+      "type": "stat",
+      "title": "Consumer info latency p95",
+      "id": 4,
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "histogram_quantile(0.95, sum(rate(rustgate_nats_consumer_info_seconds_bucket[5m])) by (le))", "refId": "A"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Consumer pending by consumer",
+      "id": 5,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "rustgate_nats_consumer_pending", "refId": "A", "legendFormat": "{{consumer}}"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Num redelivered by consumer",
+      "id": 6,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "rate(rustgate_nats_consumer_num_redelivered[5m])", "refId": "A", "legendFormat": "{{consumer}}"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Ack floor stream seq by consumer",
+      "id": 7,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "rustgate_nats_consumer_ack_floor_stream_seq", "refId": "A", "legendFormat": "{{consumer}}"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Consumer info latency buckets",
+      "id": 8,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, sum(rate(rustgate_nats_consumer_info_seconds_bucket[5m])) by (le))", "refId": "A", "legendFormat": "p50"},
+        {"expr": "histogram_quantile(0.95, sum(rate(rustgate_nats_consumer_info_seconds_bucket[5m])) by (le))", "refId": "B", "legendFormat": "p95"},
+        {"expr": "histogram_quantile(0.99, sum(rate(rustgate_nats_consumer_info_seconds_bucket[5m])) by (le))", "refId": "C", "legendFormat": "p99"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Publishes per second (total)",
+      "id": 9,
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 20},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum(rate(rustgate_nats_publishes_total[5m]))", "refId": "A", "legendFormat": "publishes/s"}]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "tags": ["rustgate", "nats"],
+  "templating": {"list": []},
+  "time": {"from": "now-1h", "to": "now"},
+  "timezone": "",
+  "title": "rustgate / NATS",
+  "uid": "rustgate-nats",
+  "version": 1
+}

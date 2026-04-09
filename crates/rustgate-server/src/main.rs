@@ -24,17 +24,57 @@ mod acl_reloader;
 mod archive;
 mod archive_rotation;
 mod audit;
+mod authz_reloader;
 mod cli;
+#[cfg(feature = "federation")]
+mod federation_reloader;
 #[cfg(feature = "metrics")]
 mod metrics;
 #[cfg(feature = "otel")]
 mod otel;
+#[cfg(all(feature = "otel", feature = "metrics"))]
+mod otel_metrics;
 mod session;
 mod setup;
 
 use cli::{Cli, Command};
 use rustgate_transport::{BackpressureGate, Router};
 use session::{FedForwardFn, SessionDeps};
+
+/// Adapter that buffers `Write` calls and emits a single AEAD-sealed chunk
+/// per `flush`. Used by the audit log layer so each tracing event becomes
+/// one encrypted record on disk.
+struct EncryptedLineWriter {
+    inner: Arc<rustgate_core::encrypted::SharedEncryptedWriter>,
+    buf: Vec<u8>,
+}
+
+impl EncryptedLineWriter {
+    fn new(inner: Arc<rustgate_core::encrypted::SharedEncryptedWriter>) -> Self {
+        Self {
+            inner,
+            buf: Vec::with_capacity(1024),
+        }
+    }
+}
+
+impl std::io::Write for EncryptedLineWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        self.inner
+            .write_line(&self.buf)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        self.buf.clear();
+        Ok(())
+    }
+}
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse_with_config()?;
@@ -50,6 +90,18 @@ fn main() -> anyhow::Result<()> {
         Some(Command::ValidateConfig) => {
             cli.validate()?;
             println!("configuration is valid");
+            return Ok(());
+        }
+        Some(Command::DecryptArchive {
+            ref input,
+            ref output,
+            ref key_file,
+        }) => {
+            let ring = rustgate_core::encrypted::KeyRing::load(key_file)
+                .map_err(|e| anyhow::anyhow!("failed to load key file: {e}"))?;
+            rustgate_core::encrypted::decrypt_file(input, output, &ring)
+                .map_err(|e| anyhow::anyhow!("decrypt failed: {e}"))?;
+            println!("decrypted {} -> {}", input.display(), output.display());
             return Ok(());
         }
         Some(Command::VerifyAudit { ref file }) => {
@@ -75,14 +127,43 @@ fn main() -> anyhow::Result<()> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let fmt_layer = tracing_subscriber::fmt::layer().json();
 
+    // Optional encryption key ring shared by the audit log and CoT archive.
+    let archive_key_ring: Option<Arc<rustgate_core::encrypted::KeyRing>> =
+        if let Some(ref kp) = cli.archive_key_file {
+            let ring = rustgate_core::encrypted::KeyRing::load(kp).map_err(|e| {
+                anyhow::anyhow!("failed to load --archive-key-file {}: {e}", kp.display())
+            })?;
+            tracing::debug!(active_key_id = %ring.active_key_id(), "loaded archive key ring");
+            Some(Arc::new(ring))
+        } else {
+            None
+        };
+
     // Dedicated audit log sink: filters only target="audit" events and writes
-    // JSON lines to the configured file (or stdout when "-").
+    // JSON lines to the configured file (or stdout when "-"). When an archive
+    // key file is configured and the path is not "-", events are encrypted
+    // per-line using ChaCha20-Poly1305.
     let audit_layer = if let Some(ref audit_path) = cli.audit_log {
         let writer: std::sync::Mutex<Box<dyn std::io::Write + Send>> = if audit_path == "-" {
             // Stdout sinks start each process with a genesis chain since
             // there is no persistent file to resume from.
             let chain = rustgate_core::audit_chain::HashChainWriter::new(
                 std::io::stdout(),
+                rustgate_core::audit_chain::GENESIS_PREV.to_string(),
+            );
+            std::sync::Mutex::new(Box::new(chain))
+        } else if let Some(ref ring) = archive_key_ring {
+            // Encrypted audit log: wrap the encrypted line writer in the
+            // hash chain so each line is hash-chained, then encrypted.
+            // The chain restarts at genesis because the on-disk format is
+            // opaque without the key; tip recovery is not supported here.
+            let enc = rustgate_core::encrypted::SharedEncryptedWriter::create(
+                std::path::Path::new(audit_path),
+                ring,
+            )
+            .map_err(|e| anyhow::anyhow!("failed to open encrypted audit log {audit_path}: {e}"))?;
+            let chain = rustgate_core::audit_chain::HashChainWriter::new(
+                EncryptedLineWriter::new(Arc::new(enc)),
                 rustgate_core::audit_chain::GENESIS_PREV.to_string(),
             );
             std::sync::Mutex::new(Box::new(chain))
@@ -218,7 +299,14 @@ fn main() -> anyhow::Result<()> {
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
     // ── TLS setup ───────────────────────────────────────────────────
-    let (tls_config, _cert_pem, _key_pem, _ca_pem) = setup::build_tls_config(&cli).await?;
+    let tls_build = setup::build_tls_config(&cli).await?;
+    let tls_config = tls_build.tls_config;
+    let _cert_pem = tls_build.cert_pem;
+    let _key_pem = tls_build.key_pem;
+    let _ca_pem = tls_build.ca_pem;
+    #[cfg(feature = "spiffe")]
+    let tls_handle = setup::bind_tls_listener(&cli, &tls_config, tls_build.spiffe_identity).await?;
+    #[cfg(not(feature = "spiffe"))]
     let tls_handle = setup::bind_tls_listener(&cli, &tls_config).await?;
     let setup::TlsListenerHandle {
         listener,
@@ -266,6 +354,53 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     #[cfg(not(feature = "metrics"))]
     setup::warn_metrics_disabled(&cli);
+
+    // ── OTLP metrics export (optional) ──────────────────────────────
+    //
+    // When `--otlp-metrics` is set we install a second exporter that
+    // scrapes the Prometheus default registry on an interval and pushes
+    // the translated metrics to the same OTLP endpoint configured for
+    // traces. The `/metrics` scrape target is unaffected — this is an
+    // additive sink, not a replacement.
+    #[cfg(all(feature = "otel", feature = "metrics"))]
+    if cli.otlp_metrics {
+        match cli.otel_endpoint.as_deref() {
+            Some(endpoint) => {
+                otel_metrics::init(
+                    endpoint,
+                    &cli.otel_service_name,
+                    Duration::from_secs(cli.otlp_metrics_interval),
+                )?;
+                tracing::info!(
+                    endpoint = %endpoint,
+                    interval_secs = cli.otlp_metrics_interval,
+                    "OTLP metrics export enabled"
+                );
+            }
+            None => {
+                anyhow::bail!(
+                    "--otlp-metrics requires --otel-endpoint (or OTEL_EXPORTER_OTLP_ENDPOINT) \
+                     to be set so traces and metrics can share the same OTLP collector URL"
+                );
+            }
+        }
+    }
+
+    #[cfg(all(feature = "otel", not(feature = "metrics")))]
+    if cli.otlp_metrics {
+        tracing::warn!(
+            "--otlp-metrics requires --features metrics; rebuild with --features metrics,otel \
+             to enable OTLP metrics export"
+        );
+    }
+
+    #[cfg(not(feature = "otel"))]
+    if cli.otlp_metrics {
+        anyhow::bail!(
+            "--otlp-metrics requires --features otel; rebuild with --features otel,metrics \
+             to enable OTLP metrics export"
+        );
+    }
 
     // ── Connection limit ────────────────────────────────────────────
     // CLI validation ensures max_connections is 1..=u32::MAX
@@ -387,6 +522,189 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     #[cfg(feature = "metrics")]
     let acl_reloader_for_api: Option<Arc<acl_reloader::AclReloader>> = acl_reloader_handle.clone();
 
+    // ── Authz (RBAC/ABAC) policy + hot-reload ──────────────────────
+    //
+    // If `--authz-policy-file` is set, load it synchronously so startup
+    // fails fast on a malformed policy (unless `--authz-fail-open` is
+    // set, in which case we log a warning and continue without any
+    // engine installed). On success, install the engine on the router,
+    // wire the metrics observer, and spawn the polling reloader.
+    if let Some(ref authz_path) = cli.authz_policy_file {
+        let path = std::path::PathBuf::from(authz_path);
+
+        // Cedar backend selection is mutually exclusive with the native
+        // reloader path: the native polling watcher assumes a
+        // `NativeEngine`, so Cedar loads once at startup without
+        // hot-reload. Future follow-up can generalize the reloader.
+        match cli.authz_policy_format {
+            crate::cli::AuthzPolicyFormat::Cedar => {
+                #[cfg(feature = "cedar")]
+                {
+                    match rustgate_authz::CedarBackend::from_file(&path) {
+                        Ok(engine) => {
+                            let arc_engine: Arc<dyn rustgate_authz::PolicyEngine> =
+                                Arc::new(engine);
+                            let policy_id = arc_engine.policy_id().to_string();
+                            router.swap_authz(arc_engine);
+                            #[cfg(feature = "metrics")]
+                            {
+                                router.set_authz_observer(Some(Arc::new(
+                                    metrics::observe_authz_event,
+                                )));
+                                metrics::record_authz_reload(true, None);
+                            }
+                            rustgate_core::audit::authz_reload_success(authz_path, &policy_id, 0);
+                            tracing::info!(
+                                path = %authz_path,
+                                policy_id = %policy_id,
+                                backend = "cedar",
+                                "authz policy loaded"
+                            );
+                        }
+                        Err(e) if cli.authz_fail_open => {
+                            rustgate_core::audit::authz_reload_failed(
+                                authz_path,
+                                "startup",
+                                &e.to_string(),
+                            );
+                            #[cfg(feature = "metrics")]
+                            metrics::record_authz_reload(false, None);
+                            tracing::warn!(
+                                path = %authz_path,
+                                error = %e,
+                                "cedar authz policy failed to load; continuing in fail-open mode"
+                            );
+                        }
+                        Err(e) => {
+                            #[cfg(feature = "metrics")]
+                            metrics::record_authz_reload(false, None);
+                            return Err(anyhow::anyhow!(
+                                "failed to load cedar policy {authz_path}: {e}"
+                            ));
+                        }
+                    }
+                }
+                #[cfg(not(feature = "cedar"))]
+                {
+                    return Err(anyhow::anyhow!(
+                        "--authz-policy-format=cedar requires building rustgate with --features cedar"
+                    ));
+                }
+            }
+            crate::cli::AuthzPolicyFormat::Native => match authz_reloader::load_once(&path) {
+                Ok(loaded) => {
+                    let rule_count = loaded.rule_count;
+                    let initial_hash = loaded.hash;
+                    let arc_engine: Arc<dyn rustgate_authz::PolicyEngine> = Arc::new(loaded.engine);
+                    let policy_id = arc_engine.policy_id().to_string();
+                    router.swap_authz(arc_engine);
+                    #[cfg(feature = "metrics")]
+                    {
+                        router.set_authz_observer(Some(Arc::new(metrics::observe_authz_event)));
+                        metrics::record_authz_reload(true, Some(rule_count));
+                    }
+                    rustgate_core::audit::authz_reload_success(authz_path, &policy_id, rule_count);
+                    tracing::info!(
+                        path = %authz_path,
+                        policy_id = %policy_id,
+                        rule_count,
+                        "authz policy loaded"
+                    );
+
+                    let interval = Duration::from_secs(cli.authz_reload_interval);
+                    let _reloader = authz_reloader::spawn_authz_reloader(
+                        Arc::clone(&router),
+                        path,
+                        initial_hash,
+                        interval,
+                    );
+
+                    // Background cache-stats scraper: every 10s, snapshot the
+                    // currently installed engine's decision-cache counters and
+                    // publish deltas to the Prometheus counters. Uses the
+                    // router's `authz_snapshot()` so a reload naturally picks
+                    // up the new engine on the next tick instead of pinning
+                    // the old `Arc`.
+                    #[cfg(feature = "metrics")]
+                    {
+                        let router_for_stats = Arc::clone(&router);
+                        drop(tokio::spawn(async move {
+                            let mut tick = tokio::time::interval(Duration::from_secs(10));
+                            let mut last_hits: u64 = 0;
+                            let mut last_misses: u64 = 0;
+                            let _ = tick.tick().await;
+                            loop {
+                                let _ = tick.tick().await;
+                                let Some(engine) = router_for_stats.authz_snapshot() else {
+                                    continue;
+                                };
+                                if let Some(stats) = engine.cache_stats() {
+                                    let hits = stats.hits;
+                                    let misses = stats.misses;
+                                    // Deltas vs last snapshot. A policy swap
+                                    // resets the counters on the new engine,
+                                    // so clamp to zero to avoid underflow.
+                                    let hd = hits.saturating_sub(last_hits);
+                                    let md = misses.saturating_sub(last_misses);
+                                    metrics::record_authz_cache_stats(hd, md);
+                                    last_hits = hits;
+                                    last_misses = misses;
+                                }
+                            }
+                        }));
+                    }
+                    tracing::info!(
+                        interval_secs = cli.authz_reload_interval,
+                        path = %authz_path,
+                        "authz hot-reload enabled"
+                    );
+                }
+                Err(e) if cli.authz_fail_open => {
+                    rustgate_core::audit::authz_reload_failed(
+                        authz_path,
+                        "startup",
+                        &e.to_string(),
+                    );
+                    #[cfg(feature = "metrics")]
+                    metrics::record_authz_reload(false, None);
+                    tracing::warn!(
+                        path = %authz_path,
+                        error = %e,
+                        "authz policy failed to load; continuing in fail-open mode (no engine installed)"
+                    );
+
+                    // Even in fail-open mode, spawn the watcher so that
+                    // once the operator fixes the policy file on disk the
+                    // next poll cycle parses, compiles, and installs it
+                    // without requiring a server restart. The sentinel
+                    // hash `[0u8; 32]` can never match a real SHA-256
+                    // digest of any file the reloader successfully reads,
+                    // so the first successful parse+compile will swap
+                    // the engine in.
+                    #[cfg(feature = "metrics")]
+                    router.set_authz_observer(Some(Arc::new(metrics::observe_authz_event)));
+                    let interval = Duration::from_secs(cli.authz_reload_interval);
+                    let _reloader = authz_reloader::spawn_authz_reloader(
+                        Arc::clone(&router),
+                        path,
+                        [0u8; 32],
+                        interval,
+                    );
+                    tracing::info!(
+                        interval_secs = cli.authz_reload_interval,
+                        path = %authz_path,
+                        "authz hot-reload enabled (fail-open retry)"
+                    );
+                }
+                Err(e) => {
+                    #[cfg(feature = "metrics")]
+                    metrics::record_authz_reload(false, None);
+                    return Err(e);
+                }
+            },
+        }
+    }
+
     // ── ACL REST API ───────────────────────────────────────────────
     //
     // Only registered when both `--group-acl-file` and
@@ -474,6 +792,62 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     #[cfg(not(feature = "federation-ha"))]
     setup::warn_federation_ha_disabled(&cli);
 
+    // ── Federation peer hot-reload ──────────────────────────────────
+    //
+    // When `--federation-peers-file` is set, install a reloader that
+    // re-reads the file on SIGHUP (and optionally on a polling interval)
+    // and reconciles the manager's active peer set. Adds/removes are
+    // applied without disturbing existing connections.
+    #[cfg(feature = "federation")]
+    let fed_peer_reloader: Option<Arc<federation_reloader::FederationPeerReloader>> =
+        if let (Some(peers_path), Some(rwlock)) = (
+            cli.federation_peers_file.as_ref(),
+            fed_shutdown_handle.as_ref(),
+        ) {
+            let initial = std::fs::read(peers_path).unwrap_or_default();
+            let initial_hash = federation_reloader::FederationPeerReloader::compute_hash(&initial);
+            let reloader = federation_reloader::FederationPeerReloader::new(
+                std::path::PathBuf::from(peers_path),
+                Arc::clone(rwlock),
+                initial_hash,
+            );
+            if cli.federation_peers_reload_interval > 0 {
+                reloader.spawn_watcher(Duration::from_secs(cli.federation_peers_reload_interval));
+                tracing::info!(
+                    interval_secs = cli.federation_peers_reload_interval,
+                    path = %peers_path,
+                    "federation peer hot-reload enabled"
+                );
+            }
+            Some(reloader)
+        } else {
+            None
+        };
+
+    // ── Federation peer discovery (issue #571) ──────────────────────
+    //
+    // Spawned only when `--federation-peer-discovery` selects a backend
+    // other than `none`. Returns a shutdown sender that's held here so
+    // the reconciler exits cleanly during graceful shutdown. Mutually
+    // exclusive with `--federation-peers-file` (enforced by clap's
+    // `conflicts_with`).
+    #[cfg(feature = "federation")]
+    let _fed_discovery_shutdown: Option<tokio::sync::watch::Sender<bool>> =
+        if let Some(rwlock) = fed_shutdown_handle.as_ref() {
+            setup::start_federation_peer_discovery(&cli, rwlock)?
+        } else {
+            // Federation disabled at runtime — warn if the flag was set.
+            use crate::cli::PeerDiscoveryBackend;
+            if cli.federation_peer_discovery != PeerDiscoveryBackend::None {
+                tracing::warn!(
+                    "--federation-peer-discovery requires federation to be configured; ignoring"
+                );
+            }
+            None
+        };
+    #[cfg(not(feature = "federation"))]
+    setup::warn_federation_peer_discovery_disabled(&cli);
+
     // ── Per-client rate limiting ────────────────────────────────────
     let throttle_config = setup::build_throttle_config(&cli);
 
@@ -504,10 +878,39 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     #[cfg(not(feature = "websocket"))]
     setup::warn_websocket_disabled(&cli);
 
+    // ── MQTT listener ──────────────────────────────────────────────
+    #[cfg(feature = "mqtt")]
+    let mqtt_shutdown = setup::start_mqtt(&cli, &tls_config, &router, &connection_limit)?;
+
+    #[cfg(not(feature = "mqtt"))]
+    setup::warn_mqtt_disabled(&cli);
+
     // ── CoT event archival ──────────────────────────────────────────
+    let archive_key_ring: Option<Arc<rustgate_core::encrypted::KeyRing>> =
+        if let Some(ref kp) = cli.archive_key_file {
+            Some(Arc::new(
+                rustgate_core::encrypted::KeyRing::load(kp)
+                    .map_err(|e| anyhow::anyhow!("failed to load archive key file: {e}"))?,
+            ))
+        } else {
+            None
+        };
+
     let archiver = if let Some(ref dir) = cli.archive_dir {
-        tracing::info!(dir = %dir, "CoT event archival enabled");
-        Some(Arc::new(archive::CotArchiver::new(dir)))
+        if let Some(ref ring) = archive_key_ring {
+            tracing::info!(
+                dir = %dir,
+                active_key_id = %ring.active_key_id(),
+                "CoT event archival enabled (encrypted)"
+            );
+            Some(Arc::new(archive::CotArchiver::with_encryption(
+                dir,
+                Arc::clone(ring),
+            )))
+        } else {
+            tracing::info!(dir = %dir, "CoT event archival enabled");
+            Some(Arc::new(archive::CotArchiver::new(dir)))
+        }
     } else {
         None
     };
@@ -568,6 +971,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         let crl_path_for_hup = cli.crl.clone();
         #[cfg(feature = "ocsp")]
         let ocsp_for_hup = ocsp_stapler.clone();
+        #[cfg(feature = "federation")]
+        let fed_peers_for_hup = fed_peer_reloader.clone();
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
             Ok(mut sighup) => {
                 setup::spawn_background("sighup-reloader", async move {
@@ -579,6 +984,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                             crl_path_for_hup.as_deref(),
                             #[cfg(feature = "ocsp")]
                             ocsp_for_hup.as_ref(),
+                            #[cfg(feature = "federation")]
+                            fed_peers_for_hup.as_ref(),
                         )
                         .await;
                     }
@@ -648,6 +1055,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                             archiver: arch,
                             replay_filter: rf,
                             circuit_breaker_threshold: cli.circuit_breaker_threshold,
+                            delta_config: session::DeltaConfig {
+                                enabled: cli.cot_delta_encoding,
+                                cache_size: cli.cot_delta_cache_size,
+                                epsilon_meters: cli.cot_delta_epsilon_meters,
+                            },
                             #[cfg(feature = "metrics")]
                             metrics_identity: Arc::clone(&metrics_identity),
                         };
@@ -707,6 +1119,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         setup::stop_subsystem("websocket", handle).await;
     }
 
+    #[cfg(feature = "mqtt")]
+    if let Some(handle) = mqtt_shutdown {
+        setup::stop_subsystem("mqtt", handle).await;
+    }
+
     if let Some(handle) = tcp_plaintext_shutdown {
         setup::stop_subsystem("plaintext-tcp", handle).await;
     }
@@ -750,6 +1167,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     // Flush pending OTel spans before exit.
     #[cfg(feature = "otel")]
     otel::shutdown();
+
+    // Flush pending OTLP metrics before exit so the last batch is
+    // delivered to the collector rather than dropped on the floor.
+    #[cfg(all(feature = "otel", feature = "metrics"))]
+    otel_metrics::shutdown();
 
     Ok(())
 }
@@ -798,6 +1220,9 @@ async fn reload_all_configs(
     acl_reloader: Option<&Arc<acl_reloader::AclReloader>>,
     crl_path: Option<&str>,
     #[cfg(feature = "ocsp")] ocsp_stapler: Option<&Arc<rustgate_transport::ocsp::Stapler>>,
+    #[cfg(feature = "federation")] fed_peer_reloader: Option<
+        &Arc<federation_reloader::FederationPeerReloader>,
+    >,
 ) {
     // 1. Server certificate
     if let Some(reloader) = cert_reloader {
@@ -933,6 +1358,36 @@ async fn reload_all_configs(
     } else {
         tracing::debug!("SIGHUP: no CRL configured");
     }
+
+    // 4. Federation peers
+    #[cfg(feature = "federation")]
+    if let Some(reloader) = fed_peer_reloader {
+        match reloader.reload().await {
+            Ok(swapped) => {
+                tracing::info!(
+                    target: "audit",
+                    event_type = "config.reload",
+                    component = "federation_peers",
+                    result = "success",
+                    swapped = swapped,
+                    "federation peer reload completed"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "audit",
+                    event_type = "config.reload",
+                    component = "federation_peers",
+                    result = "failure",
+                    error = %e,
+                    "federation peer reload failed"
+                );
+            }
+        }
+    } else {
+        #[cfg(feature = "federation")]
+        tracing::debug!("SIGHUP: no federation peer reloader configured");
+    }
 }
 
 /// Read and parse a CRL PEM file. Returns the number of CRL entries on success.
@@ -960,6 +1415,8 @@ mod tests {
             None,
             #[cfg(feature = "ocsp")]
             None,
+            #[cfg(feature = "federation")]
+            None,
         )
         .await;
     }
@@ -972,6 +1429,8 @@ mod tests {
             None,
             Some("/definitely/not/a/real/path.pem"),
             #[cfg(feature = "ocsp")]
+            None,
+            #[cfg(feature = "federation")]
             None,
         )
         .await;
@@ -1011,6 +1470,8 @@ mod tests {
             Some(&reloader),
             Some("/no/such/crl.pem"),
             #[cfg(feature = "ocsp")]
+            None,
+            #[cfg(feature = "federation")]
             None,
         )
         .await;

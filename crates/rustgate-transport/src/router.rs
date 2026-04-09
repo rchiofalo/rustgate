@@ -6,6 +6,31 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
+use rustgate_authz::{
+    Action as AuthzAction, Decision as AuthzDecision, PolicyEngine, Resource as AuthzResource,
+    Subject as AuthzSubject,
+};
+
+/// Callback invoked after every authz evaluation so operators can wire
+/// the engine into metrics and audit without making `rustgate-transport`
+/// depend on `prometheus`. The server binary installs one of these via
+/// [`Router::with_authz_observer`].
+pub type AuthzObserver = Arc<dyn Fn(&AuthzEvent<'_>) + Send + Sync>;
+
+/// Event emitted by the Router PEP for every authz evaluation.
+#[derive(Debug)]
+pub struct AuthzEvent<'a> {
+    /// Action that was evaluated (Send / Receive).
+    pub action: AuthzAction,
+    /// Policy decision (Allow / Deny).
+    pub decision: AuthzDecision,
+    /// Wall-clock evaluation duration in nanoseconds.
+    pub eval_nanos: u64,
+    /// Matched rule id, when present.
+    pub rule_id: Option<&'a str>,
+    /// Stable policy identifier of the engine that produced the verdict.
+    pub policy_id: &'a str,
+}
 use rustgate_core::identity::{GroupId, Identity};
 use rustgate_core::message::{Destination, MessageType, RoutableMessage};
 use tokio::sync::{RwLock, mpsc};
@@ -155,6 +180,10 @@ pub const NORMAL_CHANNEL_CAPACITY: usize = 64;
 pub struct SessionHandle {
     pub id: u64,
     pub identity: Arc<Identity>,
+    /// Precomputed 128-bit authz subject hash, derived once at session
+    /// construction so the PEP hot path performs zero hashing over
+    /// the identity on every routed message.
+    subject_hash: rustgate_authz::SubjectHash,
     priority_sender: Arc<Mutex<Option<mpsc::Sender<RoutedMessage>>>>,
     normal_sender: Arc<Mutex<Option<mpsc::Sender<RoutedMessage>>>>,
     consecutive_drops: Arc<AtomicU32>,
@@ -171,14 +200,22 @@ impl SessionHandle {
         priority_sender: mpsc::Sender<RoutedMessage>,
         normal_sender: mpsc::Sender<RoutedMessage>,
     ) -> Self {
+        let subject_hash = AuthzSubject::compute_hash(&identity);
         Self {
             id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             identity,
+            subject_hash,
             priority_sender: Arc::new(Mutex::new(Some(priority_sender))),
             normal_sender: Arc::new(Mutex::new(Some(normal_sender))),
             consecutive_drops: Arc::new(AtomicU32::new(0)),
             max_consecutive_drops: DEFAULT_MAX_CONSECUTIVE_DROPS,
         }
+    }
+
+    /// Precomputed authz subject hash suitable for
+    /// `rustgate_authz::Subject::with_hash` on the PEP hot path.
+    pub fn subject_hash(&self) -> rustgate_authz::SubjectHash {
+        self.subject_hash
     }
 
     /// Create a session handle with a custom circuit breaker threshold.
@@ -191,9 +228,11 @@ impl SessionHandle {
         normal_sender: mpsc::Sender<RoutedMessage>,
         threshold: u32,
     ) -> Self {
+        let subject_hash = AuthzSubject::compute_hash(&identity);
         Self {
             id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             identity,
+            subject_hash,
             priority_sender: Arc::new(Mutex::new(Some(priority_sender))),
             normal_sender: Arc::new(Mutex::new(Some(normal_sender))),
             consecutive_drops: Arc::new(AtomicU32::new(0)),
@@ -334,6 +373,10 @@ const DEFAULT_GROUP_CAPACITY: usize = 64;
 struct State {
     sessions: HashMap<String, SessionHandle>,
     groups: HashMap<GroupId, HashSet<String>>,
+    /// Secondary index: number of groups each CN belongs to.
+    /// Maintained by `join_group`, `leave_group`, `register`, and `unregister`
+    /// so that the per-CN group limit check is O(1) instead of O(G).
+    cn_group_count: HashMap<String, usize>,
     max_groups_per_cn: usize,
     max_total_groups: usize,
 }
@@ -343,6 +386,7 @@ impl Default for State {
         Self {
             sessions: HashMap::with_capacity(DEFAULT_SESSION_CAPACITY),
             groups: HashMap::with_capacity(DEFAULT_GROUP_CAPACITY),
+            cn_group_count: HashMap::with_capacity(DEFAULT_SESSION_CAPACITY),
             max_groups_per_cn: DEFAULT_MAX_GROUPS_PER_CN,
             max_total_groups: DEFAULT_MAX_TOTAL_GROUPS,
         }
@@ -353,20 +397,41 @@ impl State {
     fn remove_from_groups(&mut self, cn: &str, groups: &std::collections::BTreeSet<GroupId>) {
         for group in groups {
             if let Some(members) = self.groups.get_mut(group) {
-                let _ = members.remove(cn);
+                if members.remove(cn) {
+                    Self::decrement_cn_count(&mut self.cn_group_count, cn);
+                }
                 if members.is_empty() {
                     let _ = self.groups.remove(group);
                 }
             }
         }
     }
+
+    /// Decrement the per-CN group count, removing the entry when it hits 0.
+    fn decrement_cn_count(cn_group_count: &mut HashMap<String, usize>, cn: &str) {
+        if let Some(count) = cn_group_count.get_mut(cn) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                let _ = cn_group_count.remove(cn);
+            }
+        }
+    }
 }
 
-#[derive(Debug)]
 pub struct Router {
     state: RwLock<State>,
     cache: PositionCache,
     acl: ArcSwap<Option<GroupAclPolicy>>,
+    /// Optional RBAC/ABAC policy engine evaluated on every routed message.
+    /// When `None`, the router behaves as before and only the legacy
+    /// [`GroupAclPolicy`] path is consulted. When set, the engine is
+    /// evaluated *in addition* to the ACL — both must allow for a
+    /// message to flow.
+    authz: ArcSwap<Option<Arc<dyn PolicyEngine>>>,
+    /// Optional observer invoked after each authz evaluation. Kept as an
+    /// `ArcSwap` so the server can install it once at startup without a
+    /// lock on the hot path.
+    authz_observer: ArcSwap<Option<AuthzObserver>>,
     backpressure: Option<Arc<BackpressureGate>>,
     /// Optional per-client store-and-forward disk queue. When `None`,
     /// the router behaves exactly as before: messages destined for
@@ -376,12 +441,28 @@ pub struct Router {
     dedup: ArcSwap<Option<DedupCache>>,
 }
 
+impl std::fmt::Debug for Router {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Router")
+            .field("state", &self.state)
+            .field("cache", &self.cache)
+            .field("acl", &self.acl)
+            .field("authz_installed", &(**self.authz.load()).is_some())
+            .field("backpressure", &self.backpressure)
+            .field("client_queue", &self.client_queue)
+            .field("dedup", &self.dedup)
+            .finish()
+    }
+}
+
 impl Default for Router {
     fn default() -> Self {
         Self {
             state: RwLock::new(State::default()),
             cache: PositionCache::default(),
             acl: ArcSwap::from_pointee(None),
+            authz: ArcSwap::from_pointee(None),
+            authz_observer: ArcSwap::from_pointee(None),
             backpressure: None,
             client_queue: None,
             dedup: ArcSwap::from_pointee(None),
@@ -408,6 +489,8 @@ impl Router {
             }),
             cache: PositionCache::default(),
             acl: ArcSwap::from_pointee(None),
+            authz: ArcSwap::from_pointee(None),
+            authz_observer: ArcSwap::from_pointee(None),
             backpressure: None,
             client_queue: None,
             dedup: ArcSwap::from_pointee(None),
@@ -440,6 +523,8 @@ impl Router {
             state: RwLock::new(State::default()),
             cache: PositionCache::default(),
             acl: ArcSwap::from_pointee(acl),
+            authz: ArcSwap::from_pointee(None),
+            authz_observer: ArcSwap::from_pointee(None),
             backpressure: None,
             client_queue: None,
             dedup: ArcSwap::from_pointee(None),
@@ -475,6 +560,8 @@ impl Router {
             }),
             cache: PositionCache::default(),
             acl: ArcSwap::from_pointee(acl),
+            authz: ArcSwap::from_pointee(None),
+            authz_observer: ArcSwap::from_pointee(None),
             backpressure: None,
             client_queue: None,
             dedup: ArcSwap::from_pointee(None),
@@ -497,6 +584,76 @@ impl Router {
     /// concurrent calls to [`swap_acl`](Self::swap_acl) do not affect it.
     pub fn acl_snapshot(&self) -> Arc<Option<GroupAclPolicy>> {
         self.acl.load_full()
+    }
+
+    /// Attach an RBAC/ABAC [`PolicyEngine`] to the router.
+    ///
+    /// The engine is evaluated on every routed message — once on the
+    /// send path with [`AuthzAction::Send`], and once per recipient
+    /// inside group delivery with [`AuthzAction::Receive`]. A deny
+    /// verdict drops the message for that hop. The legacy
+    /// [`GroupAclPolicy`] path remains active; both must allow for the
+    /// message to flow.
+    pub fn with_authz(self, engine: Arc<dyn PolicyEngine>) -> Self {
+        self.authz.store(Arc::new(Some(engine)));
+        self
+    }
+
+    /// Atomically replace the installed policy engine.
+    pub fn swap_authz(&self, engine: Arc<dyn PolicyEngine>) {
+        self.authz.store(Arc::new(Some(engine)));
+    }
+
+    /// Remove the installed policy engine, reverting to ACL-only mode.
+    pub fn clear_authz(&self) {
+        self.authz.store(Arc::new(None));
+    }
+
+    /// Snapshot the current policy engine, if any.
+    pub fn authz_snapshot(&self) -> Option<Arc<dyn PolicyEngine>> {
+        self.authz.load_full().as_ref().clone()
+    }
+
+    /// Attach an observer invoked after every authz evaluation.
+    ///
+    /// The observer receives both Allow and Deny verdicts and the wall-clock
+    /// evaluation duration, enabling metrics/audit without introducing a
+    /// `prometheus` dependency on this crate.
+    pub fn with_authz_observer(self, observer: AuthzObserver) -> Self {
+        self.authz_observer.store(Arc::new(Some(observer)));
+        self
+    }
+
+    /// Atomically replace the authz observer.
+    pub fn set_authz_observer(&self, observer: Option<AuthzObserver>) {
+        self.authz_observer.store(Arc::new(observer));
+    }
+
+    /// Evaluate the installed engine, invoke the observer, and return the
+    /// [`DecisionOutcome`]. Wrapped in a helper so both the send and receive
+    /// PEPs share identical instrumentation.
+    fn authz_evaluate(
+        &self,
+        engine: &Arc<dyn PolicyEngine>,
+        subject: &AuthzSubject<'_>,
+        resource: &AuthzResource<'_>,
+        action: AuthzAction,
+    ) -> rustgate_authz::DecisionOutcome {
+        let start = std::time::Instant::now();
+        let outcome = engine.evaluate(subject, resource, action);
+        let eval_nanos = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let observer_guard = self.authz_observer.load();
+        if let Some(observer) = (**observer_guard).as_ref() {
+            let ev = AuthzEvent {
+                action,
+                decision: outcome.decision,
+                eval_nanos,
+                rule_id: outcome.rule_id.as_deref(),
+                policy_id: engine.policy_id(),
+            };
+            observer(&ev);
+        }
+        outcome
     }
 
     /// Access the position cache for SA replay.
@@ -557,11 +714,10 @@ impl Router {
                 continue;
             }
 
-            let _ = state
-                .groups
-                .entry(group.clone())
-                .or_default()
-                .insert(cn.clone());
+            let members = state.groups.entry(group.clone()).or_default();
+            if members.insert(cn.clone()) {
+                *state.cn_group_count.entry(cn.clone()).or_insert(0) += 1;
+            }
             joined += 1;
         }
     }
@@ -580,6 +736,84 @@ impl Router {
         }
         drop(state);
         self.cache.remove(cn).await;
+    }
+
+    /// Dynamically add a session to a group.
+    ///
+    /// Used by transports with explicit subscribe semantics (e.g. MQTT
+    /// SUBSCRIBE). The session must already be registered. Returns `true`
+    /// if the group was joined, `false` if the session is unknown, the
+    /// session ID is stale, or group limits are exceeded.
+    pub async fn join_group(&self, cn: &str, session_id: u64, group: &str) -> bool {
+        let mut state = self.state.write().await;
+
+        // Verify the session exists and the caller's session_id matches.
+        let Some(handle) = state.sessions.get(cn) else {
+            return false;
+        };
+        if handle.id != session_id {
+            return false;
+        }
+
+        // O(1) lookup via secondary index.
+        let current_count = state.cn_group_count.get(cn).copied().unwrap_or(0);
+        if current_count >= state.max_groups_per_cn {
+            warn!(
+                cn = %cn,
+                group = %group,
+                limit = state.max_groups_per_cn,
+                "dynamic join rejected: CN exceeded max groups per CN limit"
+            );
+            return false;
+        }
+
+        // Enforce total group limit for new groups.
+        if !state.groups.contains_key(group) && state.groups.len() >= state.max_total_groups {
+            warn!(
+                cn = %cn,
+                group = %group,
+                limit = state.max_total_groups,
+                "dynamic join rejected: router exceeded max total groups limit"
+            );
+            return false;
+        }
+
+        let members = state.groups.entry(group.to_owned()).or_default();
+        if members.insert(cn.to_owned()) {
+            *state.cn_group_count.entry(cn.to_owned()).or_insert(0) += 1;
+        }
+        true
+    }
+
+    /// Dynamically remove a session from a group.
+    ///
+    /// Used by transports with explicit unsubscribe semantics (e.g. MQTT
+    /// UNSUBSCRIBE). The session must already be registered. Returns `true`
+    /// if the session was removed from the group (or was not a member),
+    /// `false` if the session is unknown or the session ID is stale.
+    pub async fn leave_group(&self, cn: &str, session_id: u64, group: &str) -> bool {
+        let mut state = self.state.write().await;
+
+        let Some(handle) = state.sessions.get(cn) else {
+            return false;
+        };
+        if handle.id != session_id {
+            return false;
+        }
+
+        let mut removed = false;
+        let mut empty = false;
+        if let Some(members) = state.groups.get_mut(group) {
+            removed = members.remove(cn);
+            empty = members.is_empty();
+        }
+        if empty {
+            let _ = state.groups.remove(group);
+        }
+        if removed {
+            State::decrement_cn_count(&mut state.cn_group_count, cn);
+        }
+        true
     }
 
     pub async fn route(&self, msg: RoutableMessage) {
@@ -637,11 +871,6 @@ impl Router {
             }
         }
 
-        // Cache position reports for SA replay to new sessions
-        if msg.metadata.message_type == MessageType::Position {
-            self.cache.store(msg.clone()).await;
-        }
-
         // Drop messages that expired while waiting in the ingest pipeline
         if crate::cache::is_expired(&msg) {
             debug!(
@@ -651,6 +880,60 @@ impl Router {
             );
             emit_access(&msg, "expired");
             return;
+        }
+
+        // Policy enforcement point: if an RBAC/ABAC engine is installed,
+        // evaluate the send action before ANY state mutation (position
+        // cache store, access log, dispatch). A deny verdict drops the
+        // message outright and leaves no observable side effect beyond
+        // the audit deny event.
+        //
+        // Running the PEP ahead of `cache.store` matters: a denied
+        // position report must not leak into the SA replay cache, or a
+        // newly connected session would receive the denied position on
+        // replay even though no live session ever received it.
+        //
+        // The legacy `GroupAclPolicy` path in `send_to_group` still runs
+        // independently — both must allow for a group message to flow,
+        // which is what lets operators migrate incrementally.
+        let authz_guard = self.authz.load();
+        if let Some(engine) = (**authz_guard).as_ref() {
+            let subject = AuthzSubject::from_identity(&msg.source);
+            let resource = match &msg.destination {
+                Destination::Direct(target) => AuthzResource::Direct {
+                    target_cn: target.cn.as_str(),
+                },
+                Destination::Group(group) => AuthzResource::Group {
+                    group: group.as_ref(),
+                },
+                Destination::Broadcast => AuthzResource::Broadcast,
+            };
+            let outcome = self.authz_evaluate(engine, &subject, &resource, AuthzAction::Send);
+            if !outcome.is_allow() {
+                let (kind, id) = match &msg.destination {
+                    Destination::Direct(target) => ("direct", target.cn.as_str()),
+                    Destination::Group(group) => ("group", group.as_ref()),
+                    Destination::Broadcast => ("broadcast", ""),
+                };
+                rustgate_core::audit::authz_denied(
+                    msg.source.cn.as_str(),
+                    msg.source.fingerprint.as_str(),
+                    "send",
+                    kind,
+                    id,
+                    outcome.rule_id.as_deref(),
+                    engine.policy_id(),
+                );
+                emit_access(&msg, "authz_deny");
+                return;
+            }
+        }
+
+        // Cache position reports for SA replay to new sessions. This
+        // MUST run after the authz PEP above: a denied position must
+        // not enter the replay cache.
+        if msg.metadata.message_type == MessageType::Position {
+            self.cache.store(msg.clone()).await;
         }
 
         // Successful path: emit one access-log event per routed message.
@@ -821,6 +1104,32 @@ impl Router {
         };
         match handle {
             Some(handle) => {
+                // Per-recipient authz Receive PEP for direct unicast.
+                // A policy rule that denies `charlie` from receiving any
+                // direct message only takes effect if we evaluate here,
+                // not just on the sender-side Send PEP in `route_inner`.
+                //
+                // When the message is persisted for offline delivery
+                // below, the authz check runs again at live-delivery
+                // time (on the next successful `send_to_session` path
+                // after drain), which is the correct behavior: policy
+                // may have changed in the interim.
+                let authz_guard = self.authz.load();
+                if let Some(engine) = (**authz_guard).as_ref() {
+                    let subject = AuthzSubject::from_identity(&handle.identity);
+                    let resource = AuthzResource::Direct { target_cn: cn };
+                    let outcome = engine.evaluate(&subject, &resource, AuthzAction::Receive);
+                    if !outcome.is_allow() {
+                        tracing::debug!(
+                            target: "authz",
+                            recipient_cn = %cn,
+                            rule_id = ?outcome.rule_id,
+                            policy_id = %engine.policy_id(),
+                            "authz deny on direct receive"
+                        );
+                        return;
+                    }
+                }
                 if let Err(e) = handle.send(msg).await {
                     // `tokio::mpsc::Sender::send().await` only returns
                     // Err when the receiver has been closed — a full
@@ -833,7 +1142,11 @@ impl Router {
                 }
             }
             None => {
-                // No live subscriber — persist for redelivery.
+                // No live subscriber — persist for redelivery. The
+                // authz Receive PEP runs at drain time when the session
+                // reconnects; persisting a currently-denied message is
+                // acceptable because policy may change before the
+                // session returns.
                 self.persist_for_offline(cn, &msg);
             }
         }
@@ -882,6 +1195,12 @@ impl Router {
             return;
         }
 
+        // Snapshot the optional authz engine once so the per-recipient
+        // hot path below is just a virtual call per candidate rather
+        // than an atomic load per iteration.
+        let authz_guard = self.authz.load();
+        let authz: Option<&Arc<dyn PolicyEngine>> = (**authz_guard).as_ref();
+
         let mut dropped = 0u32;
         let mut total = 0u32;
         {
@@ -899,6 +1218,31 @@ impl Router {
                         .is_none_or(|acl| acl.is_receive_authorized(group, cn))
                 })
                 .filter_map(|cn| state.sessions.get(cn))
+                .filter(|handle| {
+                    // Per-recipient authz Receive check. The Subject is
+                    // built from the *recipient's* identity so policies
+                    // that deny a specific CN or attribute on receive
+                    // actually take effect.
+                    let Some(engine) = authz else {
+                        return true;
+                    };
+                    let subject = AuthzSubject::with_hash(&handle.identity, handle.subject_hash);
+                    let resource = AuthzResource::Group { group };
+                    let outcome =
+                        self.authz_evaluate(engine, &subject, &resource, AuthzAction::Receive);
+                    if !outcome.is_allow() {
+                        rustgate_core::audit::authz_denied(
+                            handle.identity.cn.as_str(),
+                            handle.identity.fingerprint.as_str(),
+                            "receive",
+                            "group",
+                            group,
+                            outcome.rule_id.as_deref(),
+                            engine.policy_id(),
+                        );
+                    }
+                    outcome.is_allow()
+                })
             {
                 total += 1;
                 if !handle.try_send(msg.clone()) {
@@ -922,7 +1266,9 @@ impl Router {
 
     /// Broadcast to all connected sessions (except sender).
     /// This is intentional for SA sharing — all authenticated clients
-    /// receive broadcasts regardless of group membership.
+    /// receive broadcasts regardless of group membership. Per-recipient
+    /// authz Receive PEP still applies: a policy rule denying broadcast
+    /// receipt to a specific subject filters that recipient out here.
     async fn send_to_all(&self, msg: RoutedMessage) {
         let targets: Vec<SessionHandle> = {
             let state = self.state.read().await;
@@ -934,8 +1280,30 @@ impl Router {
                 .collect()
         };
 
+        // Snapshot the authz engine once so the per-recipient loop is a
+        // virtual call at worst, not an atomic load per iteration.
+        let authz_guard = self.authz.load();
+        let authz: Option<&Arc<dyn PolicyEngine>> = (**authz_guard).as_ref();
+
         let mut dropped = 0u32;
+        let mut filtered = 0u32;
         for handle in &targets {
+            if let Some(engine) = authz {
+                let subject = AuthzSubject::from_identity(&handle.identity);
+                let resource = AuthzResource::Broadcast;
+                let outcome = engine.evaluate(&subject, &resource, AuthzAction::Receive);
+                if !outcome.is_allow() {
+                    tracing::debug!(
+                        target: "authz",
+                        recipient_cn = %handle.identity.cn,
+                        rule_id = ?outcome.rule_id,
+                        policy_id = %engine.policy_id(),
+                        "authz deny on broadcast receive"
+                    );
+                    filtered += 1;
+                    continue;
+                }
+            }
             if handle.send(msg.clone()).await.is_err() {
                 dropped += 1;
             }
@@ -945,6 +1313,13 @@ impl Router {
                 dropped = dropped,
                 total = targets.len(),
                 "messages dropped during broadcast: channel full or disconnected"
+            );
+        }
+        if filtered > 0 {
+            debug!(
+                filtered = filtered,
+                total = targets.len(),
+                "broadcast recipients filtered by authz policy"
             );
         }
     }
@@ -2190,5 +2565,122 @@ mod tests {
             format!("direct:{}", super::hash_cn(raw_cn)),
             "dst field must be the stable hashed token"
         );
+    }
+
+    // ── Dynamic group join/leave ────────────────────────────────────
+
+    #[tokio::test]
+    async fn join_group_adds_session_to_group() {
+        let router = Router::new();
+        let alice = make_identity("alice", &["alpha"]);
+
+        let (ptx, ntx, _prx, mut nrx) = make_channels(16, 16);
+        let handle = SessionHandle::new(alice.clone(), ptx, ntx);
+        let sid = handle.id;
+        router.register(handle).await;
+
+        // Alice is in "alpha" from cert. Dynamically join "bravo".
+        assert!(router.join_group("alice", sid, "bravo").await);
+
+        // Now route a message to "bravo" from a sender who is a member.
+        let bob = make_identity("bob", &["bravo"]);
+        let (ptx_b, ntx_b, _prx_b, _nrx_b) = make_channels(16, 16);
+        router
+            .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+            .await;
+
+        let msg = make_chat(&bob, Destination::Group("bravo".into()));
+        router.route(msg).await;
+
+        // Alice should receive it via the dynamic subscription.
+        let received = nrx.try_recv();
+        assert!(received.is_ok(), "alice should receive bravo group message");
+    }
+
+    #[tokio::test]
+    async fn leave_group_removes_session_from_group() {
+        let router = Router::new();
+        let alice = make_identity("alice", &["alpha"]);
+
+        let (ptx, ntx, _prx, mut nrx) = make_channels(16, 16);
+        let handle = SessionHandle::new(alice.clone(), ptx, ntx);
+        let sid = handle.id;
+        router.register(handle).await;
+
+        // Dynamically join then leave "bravo".
+        assert!(router.join_group("alice", sid, "bravo").await);
+        assert!(router.leave_group("alice", sid, "bravo").await);
+
+        // Route to "bravo" — alice should NOT receive it.
+        let bob = make_identity("bob", &["bravo"]);
+        let (ptx_b, ntx_b, _prx_b, _nrx_b) = make_channels(16, 16);
+        router
+            .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+            .await;
+
+        let msg = make_chat(&bob, Destination::Group("bravo".into()));
+        router.route(msg).await;
+
+        assert!(
+            nrx.try_recv().is_err(),
+            "alice should not receive bravo after leaving"
+        );
+    }
+
+    #[tokio::test]
+    async fn join_group_rejects_stale_session_id() {
+        let router = Router::new();
+        let alice = make_identity("alice", &["alpha"]);
+
+        let (ptx, ntx, _prx, _nrx) = make_channels(16, 16);
+        let handle = SessionHandle::new(alice.clone(), ptx, ntx);
+        let stale_id = handle.id;
+        router.register(handle).await;
+
+        // Re-register (simulates reconnect), gets a new session ID.
+        let (ptx2, ntx2, _prx2, _nrx2) = make_channels(16, 16);
+        let handle2 = SessionHandle::new(alice.clone(), ptx2, ntx2);
+        router.register(handle2).await;
+
+        // Old session ID should be rejected.
+        assert!(!router.join_group("alice", stale_id, "bravo").await);
+    }
+
+    #[tokio::test]
+    async fn join_group_respects_per_cn_limit() {
+        let router = Router::with_limits(2, 100);
+        let alice = make_identity("alice", &["alpha"]);
+
+        let (ptx, ntx, _prx, _nrx) = make_channels(16, 16);
+        let handle = SessionHandle::new(alice.clone(), ptx, ntx);
+        let sid = handle.id;
+        router.register(handle).await;
+
+        // "alpha" is already joined from cert (1/2). Join "bravo" (2/2).
+        assert!(router.join_group("alice", sid, "bravo").await);
+        // Third group should be rejected.
+        assert!(!router.join_group("alice", sid, "charlie").await);
+    }
+
+    #[tokio::test]
+    async fn join_group_respects_total_group_limit() {
+        let router = Router::with_limits(128, 2);
+        let alice = make_identity("alice", &["alpha"]);
+
+        let (ptx, ntx, _prx, _nrx) = make_channels(16, 16);
+        let handle = SessionHandle::new(alice.clone(), ptx, ntx);
+        let sid = handle.id;
+        router.register(handle).await;
+
+        // "alpha" exists (1/2). Add "bravo" (2/2).
+        assert!(router.join_group("alice", sid, "bravo").await);
+        // Third distinct group should be rejected.
+        assert!(!router.join_group("alice", sid, "charlie").await);
+    }
+
+    #[tokio::test]
+    async fn leave_group_returns_false_for_unknown_session() {
+        let router = Router::new();
+        assert!(!router.leave_group("nonexistent", 999, "alpha").await);
     }
 }

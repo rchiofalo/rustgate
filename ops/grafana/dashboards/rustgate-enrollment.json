@@ -1,0 +1,48 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "id": null,
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Rate-limited CSRs (5m)",
+      "id": 1,
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum(increase(rustgate_enrollment_rate_limited_total[5m]))", "refId": "A"}]
+    },
+    {
+      "type": "stat",
+      "title": "Rate-limited CSRs (1h)",
+      "id": 2,
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum(increase(rustgate_enrollment_rate_limited_total[1h]))", "refId": "A"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Rate-limited CSRs per second",
+      "id": 3,
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 4},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum(rate(rustgate_enrollment_rate_limited_total[5m]))", "refId": "A", "legendFormat": "rate limited/s"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Handshake failures (proxy for post-enroll auth errors)",
+      "id": 4,
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 12},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum by (reason) (rate(rustgate_handshake_failures_total[5m]))", "refId": "A", "legendFormat": "{{reason}}"}]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "tags": ["rustgate", "enrollment"],
+  "templating": {"list": []},
+  "time": {"from": "now-1h", "to": "now"},
+  "timezone": "",
+  "title": "rustgate / Enrollment",
+  "uid": "rustgate-enrollment",
+  "version": 1
+}

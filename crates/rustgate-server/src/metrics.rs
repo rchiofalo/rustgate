@@ -16,10 +16,9 @@ use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-#[cfg(feature = "nats")]
-use prometheus::Histogram;
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts, TextEncoder,
+    Encoder, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts,
+    TextEncoder,
 };
 use rustgate_core::constants::HTTP_CONNECTION_TIMEOUT;
 
@@ -66,6 +65,11 @@ static MESSAGES_ROUTED: OnceLock<IntCounterVec> = OnceLock::new();
 static DEDUP_HITS: OnceLock<IntCounter> = OnceLock::new();
 static DEDUP_CACHE_SIZE: OnceLock<IntGauge> = OnceLock::new();
 
+static COT_DELTA_FULL: OnceLock<IntCounter> = OnceLock::new();
+static COT_DELTA_DELTA: OnceLock<IntCounter> = OnceLock::new();
+static COT_DELTA_SUPPRESSED: OnceLock<IntCounter> = OnceLock::new();
+static COT_DELTA_BYTES_SAVED: OnceLock<IntCounter> = OnceLock::new();
+
 // Tier 2 (per-identity) metrics. Registered only when
 // `--metrics-per-identity` is enabled; remain `None` otherwise so they
 // add zero overhead.
@@ -90,6 +94,9 @@ static NEGOTIATIONS: OnceLock<IntCounterVec> = OnceLock::new();
 
 static HANDSHAKE_FAILURES: OnceLock<IntCounterVec> = OnceLock::new();
 
+static CLIENT_OCSP_CACHE_HITS: OnceLock<IntCounter> = OnceLock::new();
+static CLIENT_OCSP_CACHE_MISSES: OnceLock<IntCounter> = OnceLock::new();
+
 static CLIENT_QUEUE_DEPTH: OnceLock<prometheus::IntGaugeVec> = OnceLock::new();
 static CLIENT_QUEUE_BYTES: OnceLock<prometheus::IntGaugeVec> = OnceLock::new();
 static CLIENT_QUEUE_DROPS: OnceLock<IntCounter> = OnceLock::new();
@@ -99,8 +106,25 @@ static CLIENT_QUEUE_WRITER_DROPS: OnceLock<IntCounter> = OnceLock::new();
 static CLIENT_QUEUE_EXPIRED: OnceLock<IntCounter> = OnceLock::new();
 static CLIENT_QUEUE_SKIPPED_UNSUPPORTED: OnceLock<IntCounter> = OnceLock::new();
 
+#[cfg(feature = "federation")]
+static FEDERATION_PEER_QUEUE_BYTES: OnceLock<prometheus::IntGaugeVec> = OnceLock::new();
+#[cfg(feature = "federation")]
+static FEDERATION_PEER_OLDEST_SECONDS: OnceLock<prometheus::IntGaugeVec> = OnceLock::new();
+
+static AUTHZ_DECISIONS: OnceLock<IntCounterVec> = OnceLock::new();
+static AUTHZ_EVAL_NANOS: OnceLock<Histogram> = OnceLock::new();
+static AUTHZ_RELOADS: OnceLock<IntCounterVec> = OnceLock::new();
+static AUTHZ_POLICY_RULES: OnceLock<IntGauge> = OnceLock::new();
+static AUTHZ_CACHE_HITS: OnceLock<IntCounter> = OnceLock::new();
+static AUTHZ_CACHE_MISSES: OnceLock<IntCounter> = OnceLock::new();
+
 static ARCHIVE_BYTES: OnceLock<IntGauge> = OnceLock::new();
 static ENROLLMENT_RATE_LIMITED: OnceLock<IntCounter> = OnceLock::new();
+
+#[cfg(feature = "spiffe")]
+static SPIFFE_SVID_REFRESH_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
+#[cfg(feature = "spiffe")]
+static SPIFFE_SVID_EXPIRY_SECONDS: OnceLock<IntGauge> = OnceLock::new();
 
 // ── Fallback constructors ───────────────────────────────────────────
 //
@@ -225,6 +249,34 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(dedup_cache_size.clone()))?;
     let _ = DEDUP_CACHE_SIZE.set(dedup_cache_size);
 
+    let cot_delta_full = IntCounter::with_opts(Opts::new(
+        "rustgate_cot_delta_full_total",
+        "Outbound CoT events emitted as full by the per-UID delta encoder",
+    ))?;
+    registry.register(Box::new(cot_delta_full.clone()))?;
+    let _ = COT_DELTA_FULL.set(cot_delta_full);
+
+    let cot_delta_delta = IntCounter::with_opts(Opts::new(
+        "rustgate_cot_delta_delta_total",
+        "Outbound CoT events emitted as deltas by the per-UID delta encoder",
+    ))?;
+    registry.register(Box::new(cot_delta_delta.clone()))?;
+    let _ = COT_DELTA_DELTA.set(cot_delta_delta);
+
+    let cot_delta_suppressed = IntCounter::with_opts(Opts::new(
+        "rustgate_cot_delta_suppressed_total",
+        "Outbound CoT events suppressed by the per-UID delta encoder (sub-epsilon drift, no field change)",
+    ))?;
+    registry.register(Box::new(cot_delta_suppressed.clone()))?;
+    let _ = COT_DELTA_SUPPRESSED.set(cot_delta_suppressed);
+
+    let cot_delta_bytes_saved = IntCounter::with_opts(Opts::new(
+        "rustgate_cot_delta_bytes_saved_total",
+        "Total bytes saved by the per-UID delta encoder (full_len - delta_len per emitted delta)",
+    ))?;
+    registry.register(Box::new(cot_delta_bytes_saved.clone()))?;
+    let _ = COT_DELTA_BYTES_SAVED.set(cot_delta_bytes_saved);
+
     let messages_routed = IntCounterVec::new(
         Opts::new(
             "rustgate_messages_routed_total",
@@ -300,6 +352,20 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(handshake_failures.clone()))?;
     let _ = HANDSHAKE_FAILURES.set(handshake_failures);
 
+    let client_ocsp_cache_hits = IntCounter::with_opts(Opts::new(
+        "rustgate_client_ocsp_cache_hits_total",
+        "Client certificate OCSP cache hits (cached good or revoked status served)",
+    ))?;
+    registry.register(Box::new(client_ocsp_cache_hits.clone()))?;
+    let _ = CLIENT_OCSP_CACHE_HITS.set(client_ocsp_cache_hits);
+
+    let client_ocsp_cache_misses = IntCounter::with_opts(Opts::new(
+        "rustgate_client_ocsp_cache_misses_total",
+        "Client certificate OCSP cache misses (background fetch dispatched)",
+    ))?;
+    registry.register(Box::new(client_ocsp_cache_misses.clone()))?;
+    let _ = CLIENT_OCSP_CACHE_MISSES.set(client_ocsp_cache_misses);
+
     let client_queue_depth = prometheus::IntGaugeVec::new(
         Opts::new(
             "rustgate_client_queue_depth",
@@ -362,6 +428,29 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(client_queue_skipped_unsupported.clone()))?;
     let _ = CLIENT_QUEUE_SKIPPED_UNSUPPORTED.set(client_queue_skipped_unsupported);
 
+    #[cfg(feature = "federation")]
+    {
+        let federation_peer_queue_bytes = prometheus::IntGaugeVec::new(
+            Opts::new(
+                "rustgate_federation_peer_queue_bytes",
+                "Bytes currently queued for delivery to a federation peer",
+            ),
+            &["peer"],
+        )?;
+        registry.register(Box::new(federation_peer_queue_bytes.clone()))?;
+        let _ = FEDERATION_PEER_QUEUE_BYTES.set(federation_peer_queue_bytes);
+
+        let federation_peer_oldest_seconds = prometheus::IntGaugeVec::new(
+            Opts::new(
+                "rustgate_federation_peer_oldest_seconds",
+                "Age in seconds of the oldest message still queued for a federation peer",
+            ),
+            &["peer"],
+        )?;
+        registry.register(Box::new(federation_peer_oldest_seconds.clone()))?;
+        let _ = FEDERATION_PEER_OLDEST_SECONDS.set(federation_peer_oldest_seconds);
+    }
+
     let archive_bytes = IntGauge::with_opts(Opts::new(
         "rustgate_archive_bytes",
         "Total bytes currently held in the CoT event archive directory",
@@ -376,7 +465,223 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(enrollment_rate_limited.clone()))?;
     let _ = ENROLLMENT_RATE_LIMITED.set(enrollment_rate_limited);
 
+    let authz_decisions = IntCounterVec::new(
+        Opts::new(
+            "rustgate_authz_decisions_total",
+            "Authz decisions emitted by the router PEP, labelled by action and decision",
+        ),
+        &["action", "decision"],
+    )?;
+    registry.register(Box::new(authz_decisions.clone()))?;
+    let _ = AUTHZ_DECISIONS.set(authz_decisions);
+
+    // Bucket floor is 50 ns: the native engine's measured P99 on a
+    // single rule is ~80 ns, and we need at least one bucket below
+    // that so the dashboards and the P99 SLO test are not all
+    // crammed into the first bucket. The ceiling stays at 100 µs to
+    // catch pathological slow decisions. 10 µs is the documented
+    // SLO — `histogram_quantile(0.99, …) <= 10_000` is the gate.
+    let authz_eval_nanos = Histogram::with_opts(
+        HistogramOpts::new(
+            "rustgate_authz_eval_nanos",
+            "Authz policy evaluation duration in nanoseconds",
+        )
+        .buckets(vec![
+            50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 10_000.0, 100_000.0,
+        ]),
+    )?;
+    registry.register(Box::new(authz_eval_nanos.clone()))?;
+    let _ = AUTHZ_EVAL_NANOS.set(authz_eval_nanos);
+
+    let authz_reloads = IntCounterVec::new(
+        Opts::new(
+            "rustgate_authz_reloads_total",
+            "Authz policy reload outcomes, labelled by result",
+        ),
+        &["result"],
+    )?;
+    registry.register(Box::new(authz_reloads.clone()))?;
+    let _ = AUTHZ_RELOADS.set(authz_reloads);
+
+    let authz_policy_rules = IntGauge::with_opts(Opts::new(
+        "rustgate_authz_policy_rules",
+        "Number of rules in the currently installed authz policy",
+    ))?;
+    registry.register(Box::new(authz_policy_rules.clone()))?;
+    let _ = AUTHZ_POLICY_RULES.set(authz_policy_rules);
+
+    let authz_cache_hits = IntCounter::with_opts(Opts::new(
+        "rustgate_authz_cache_hits_total",
+        "Authz decision-cache lookups that returned a cached outcome",
+    ))?;
+    registry.register(Box::new(authz_cache_hits.clone()))?;
+    let _ = AUTHZ_CACHE_HITS.set(authz_cache_hits);
+
+    let authz_cache_misses = IntCounter::with_opts(Opts::new(
+        "rustgate_authz_cache_misses_total",
+        "Authz decision-cache lookups that ran the full scan and populated the cache",
+    ))?;
+    registry.register(Box::new(authz_cache_misses.clone()))?;
+    let _ = AUTHZ_CACHE_MISSES.set(authz_cache_misses);
+
     Ok(())
+}
+
+fn fallback_histogram(name: &str, help: &str) -> Histogram {
+    match Histogram::with_opts(HistogramOpts::new(name, help)) {
+        Ok(h) => h,
+        Err(_) => std::process::abort(),
+    }
+}
+
+/// Observe an authz evaluation event emitted by the router PEP.
+///
+/// Installed as the router's `AuthzObserver` at startup so every Allow
+/// and Deny decision increments the decisions counter and records the
+/// evaluation latency histogram.
+///
+/// Both match statements include a wildcard `_` arm to satisfy the
+/// `#[non_exhaustive]` contract on [`rustgate_authz::Action`] and
+/// [`rustgate_authz::Decision`]: the authz crate may add new variants
+/// in future releases without making this a breaking change, and we
+/// degrade to a neutral `"unknown"` label rather than failing the
+/// metric update so the decision counter never drops events.
+pub fn observe_authz_event(ev: &rustgate_transport::AuthzEvent<'_>) {
+    let action = match ev.action {
+        rustgate_authz::Action::Send => "send",
+        rustgate_authz::Action::Receive => "receive",
+        rustgate_authz::Action::Federate => "federate",
+        rustgate_authz::Action::Publish => "publish",
+        rustgate_authz::Action::Subscribe => "subscribe",
+        _ => "unknown",
+    };
+    let decision = match ev.decision {
+        rustgate_authz::Decision::Allow => "allow",
+        rustgate_authz::Decision::Deny => "deny",
+        _ => "unknown",
+    };
+    if let Ok(child) = authz_decisions().get_metric_with_label_values(&[action, decision]) {
+        child.inc();
+    }
+    authz_eval_nanos().observe(ev.eval_nanos as f64);
+}
+
+/// Record an authz policy reload outcome and update the rule-count gauge.
+pub fn record_authz_reload(success: bool, rule_count: Option<usize>) {
+    let label = if success { "success" } else { "failure" };
+    if let Ok(child) = authz_reloads().get_metric_with_label_values(&[label]) {
+        child.inc();
+    }
+    if let Some(n) = rule_count {
+        authz_policy_rules().set(i64::try_from(n).unwrap_or(i64::MAX));
+    }
+}
+
+pub fn authz_decisions() -> &'static IntCounterVec {
+    AUTHZ_DECISIONS.get_or_init(|| {
+        fallback_counter_vec(
+            "rustgate_authz_decisions_total",
+            "fallback",
+            &["action", "decision"],
+        )
+    })
+}
+
+pub fn authz_eval_nanos() -> &'static Histogram {
+    AUTHZ_EVAL_NANOS.get_or_init(|| fallback_histogram("rustgate_authz_eval_nanos", "fallback"))
+}
+
+pub fn authz_reloads() -> &'static IntCounterVec {
+    AUTHZ_RELOADS.get_or_init(|| {
+        fallback_counter_vec("rustgate_authz_reloads_total", "fallback", &["result"])
+    })
+}
+
+pub fn authz_policy_rules() -> &'static IntGauge {
+    AUTHZ_POLICY_RULES.get_or_init(|| fallback_gauge("rustgate_authz_policy_rules", "fallback"))
+}
+
+pub fn authz_cache_hits() -> &'static IntCounter {
+    AUTHZ_CACHE_HITS.get_or_init(|| fallback_counter("rustgate_authz_cache_hits_total", "fallback"))
+}
+
+pub fn authz_cache_misses() -> &'static IntCounter {
+    AUTHZ_CACHE_MISSES
+        .get_or_init(|| fallback_counter("rustgate_authz_cache_misses_total", "fallback"))
+}
+
+/// Record a delta of authz decision-cache hits/misses. Called on a timer
+/// from the background cache-stats scraper in `main.rs`.
+pub fn record_authz_cache_stats(hits_delta: u64, misses_delta: u64) {
+    if hits_delta > 0 {
+        authz_cache_hits().inc_by(hits_delta);
+    }
+    if misses_delta > 0 {
+        authz_cache_misses().inc_by(misses_delta);
+    }
+}
+
+/// Returns the federation per-peer queue-bytes gauge vector.
+#[cfg(feature = "federation")]
+#[allow(dead_code)] // exposed for future API consumers / tests
+pub fn federation_peer_queue_bytes() -> Option<&'static prometheus::IntGaugeVec> {
+    FEDERATION_PEER_QUEUE_BYTES.get()
+}
+
+/// Returns the federation per-peer oldest-message-age gauge vector.
+#[cfg(feature = "federation")]
+#[allow(dead_code)] // exposed for future API consumers / tests
+pub fn federation_peer_oldest_seconds() -> Option<&'static prometheus::IntGaugeVec> {
+    FEDERATION_PEER_OLDEST_SECONDS.get()
+}
+
+/// Spawn a background task that periodically snapshots per-peer federation
+/// lag from the manager and publishes it to the Prometheus gauges.
+///
+/// The task runs until the provided shutdown signal fires. It is a no-op
+/// if the gauges were never registered.
+#[cfg(feature = "federation")]
+pub fn spawn_federation_lag_updater(
+    manager: std::sync::Arc<tokio::sync::RwLock<rustgate_federation::manager::FederationManager>>,
+    interval: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut known_peers: std::collections::HashSet<String> = std::collections::HashSet::new();
+        loop {
+            let _ = ticker.tick().await;
+            let snapshot = {
+                let guard = manager.read().await;
+                guard.peer_lag_snapshot()
+            };
+            let bytes_vec = FEDERATION_PEER_QUEUE_BYTES.get();
+            let oldest_vec = FEDERATION_PEER_OLDEST_SECONDS.get();
+            let mut current: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for (peer, bytes, oldest) in &snapshot {
+                let _ = current.insert(peer.clone());
+                if let Some(g) = bytes_vec
+                    && let Ok(child) = g.get_metric_with_label_values(&[peer.as_str()])
+                {
+                    child.set(*bytes as i64);
+                }
+                if let Some(g) = oldest_vec
+                    && let Ok(child) = g.get_metric_with_label_values(&[peer.as_str()])
+                {
+                    child.set(oldest.round() as i64);
+                }
+            }
+            for stale in known_peers.difference(&current) {
+                if let Some(g) = bytes_vec {
+                    let _ = g.remove_label_values(&[stale.as_str()]);
+                }
+                if let Some(g) = oldest_vec {
+                    let _ = g.remove_label_values(&[stale.as_str()]);
+                }
+            }
+            known_peers = current;
+        }
+    })
 }
 
 /// Returns the archive-bytes gauge (current total size of the CoT
@@ -453,6 +758,24 @@ pub fn dedup_cache_size() -> &'static IntGauge {
     DEDUP_CACHE_SIZE.get_or_init(|| fallback_gauge("rustgate_dedup_cache_size", "fallback"))
 }
 
+pub fn cot_delta_full() -> &'static IntCounter {
+    COT_DELTA_FULL.get_or_init(|| fallback_counter("rustgate_cot_delta_full_total", "fallback"))
+}
+
+pub fn cot_delta_delta() -> &'static IntCounter {
+    COT_DELTA_DELTA.get_or_init(|| fallback_counter("rustgate_cot_delta_delta_total", "fallback"))
+}
+
+pub fn cot_delta_suppressed() -> &'static IntCounter {
+    COT_DELTA_SUPPRESSED
+        .get_or_init(|| fallback_counter("rustgate_cot_delta_suppressed_total", "fallback"))
+}
+
+pub fn cot_delta_bytes_saved() -> &'static IntCounter {
+    COT_DELTA_BYTES_SAVED
+        .get_or_init(|| fallback_counter("rustgate_cot_delta_bytes_saved_total", "fallback"))
+}
+
 pub fn messages_routed() -> &'static IntCounterVec {
     MESSAGES_ROUTED.get_or_init(|| {
         fallback_counter_vec(
@@ -506,6 +829,45 @@ pub fn handshake_failures() -> &'static IntCounterVec {
     HANDSHAKE_FAILURES.get_or_init(|| {
         fallback_counter_vec("rustgate_handshake_failures_total", "fallback", &["reason"])
     })
+}
+
+/// Counter for SPIFFE X.509-SVID refresh outcomes, labelled by
+/// `outcome="success"` or `outcome="failure"`. Incremented by the refresh
+/// task each time the Workload API is polled.
+#[cfg(feature = "spiffe")]
+pub fn spiffe_refresh_total() -> &'static IntCounterVec {
+    SPIFFE_SVID_REFRESH_TOTAL.get_or_init(|| {
+        fallback_counter_vec(
+            "rustgate_spiffe_svid_refresh_total",
+            "SPIFFE SVID refresh attempts by outcome",
+            &["outcome"],
+        )
+    })
+}
+
+/// Gauge tracking the unix-seconds expiry (`notAfter`) of the active
+/// SPIFFE X.509-SVID leaf certificate. Updated whenever the refresh task
+/// rotates the SVID.
+#[cfg(feature = "spiffe")]
+pub fn spiffe_svid_expiry_seconds() -> &'static IntGauge {
+    SPIFFE_SVID_EXPIRY_SECONDS.get_or_init(|| {
+        fallback_gauge(
+            "rustgate_spiffe_svid_expiry_seconds",
+            "Active SPIFFE SVID leaf notAfter (unix seconds)",
+        )
+    })
+}
+
+/// Returns the client-cert OCSP cache hit counter.
+#[allow(dead_code)] // only referenced when the `ocsp` feature is enabled
+pub fn client_ocsp_cache_hits() -> Option<&'static IntCounter> {
+    CLIENT_OCSP_CACHE_HITS.get()
+}
+
+/// Returns the client-cert OCSP cache miss counter.
+#[allow(dead_code)] // only referenced when the `ocsp` feature is enabled
+pub fn client_ocsp_cache_misses() -> Option<&'static IntCounter> {
+    CLIENT_OCSP_CACHE_MISSES.get()
 }
 
 /// Counter for CSR signing requests rejected by the enrollment server's

@@ -77,7 +77,8 @@ pub(crate) struct Cli {
         long,
         default_value = "",
         env = "RUSTGATE_CERT",
-        required_unless_present = "config"
+        required_unless_present_any = ["config", "spiffe"],
+        conflicts_with = "spiffe"
     )]
     pub(crate) cert: String,
 
@@ -85,7 +86,8 @@ pub(crate) struct Cli {
         long,
         default_value = "",
         env = "RUSTGATE_KEY",
-        required_unless_present = "config"
+        required_unless_present_any = ["config", "spiffe"],
+        conflicts_with = "spiffe"
     )]
     pub(crate) key: String,
 
@@ -93,9 +95,51 @@ pub(crate) struct Cli {
         long,
         default_value = "",
         env = "RUSTGATE_CA",
-        required_unless_present = "config"
+        required_unless_present_any = ["config", "spiffe"],
+        conflicts_with = "spiffe"
     )]
     pub(crate) ca: String,
+
+    /// Enable SPIFFE workload identity. When set, the server obtains its
+    /// TLS certificate, private key, and trust bundle from a SPIRE agent
+    /// via the SPIFFE Workload API instead of from `--cert`/`--key`/`--ca`.
+    /// Requires `--features spiffe`. Mutually exclusive with `--cert`,
+    /// `--key`, `--ca`, and `--enrollment-bind`.
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "RUSTGATE_SPIFFE",
+        conflicts_with_all = ["cert", "key", "ca", "enrollment_bind"]
+    )]
+    pub(crate) spiffe: bool,
+
+    /// Path to the SPIRE agent Workload API endpoint. Defaults to the
+    /// SPIFFE standard socket at `unix:///tmp/spire-agent/public/api.sock`.
+    /// Only used when `--spiffe` is enabled.
+    #[arg(
+        long,
+        default_value = "unix:///tmp/spire-agent/public/api.sock",
+        env = "RUSTGATE_SPIFFE_WORKLOAD_API_SOCKET"
+    )]
+    pub(crate) spiffe_workload_api_socket: String,
+
+    /// Expected SPIFFE trust domain. When set, the SVID fetched from the
+    /// Workload API must belong to this trust domain or startup fails.
+    /// Only used when `--spiffe` is enabled.
+    #[arg(long, env = "RUSTGATE_SPIFFE_TRUST_DOMAIN")]
+    pub(crate) spiffe_trust_domain: Option<String>,
+
+    /// Interval in seconds to refresh the SPIFFE X.509-SVID from the
+    /// Workload API. Defaults to 300s (5 minutes). SPIFFE SVIDs are
+    /// short-lived (typically 1 hour), so the default gives ample margin.
+    /// Only used when `--spiffe` is enabled.
+    #[arg(
+        long,
+        default_value_t = 300,
+        env = "RUSTGATE_SPIFFE_REFRESH_INTERVAL",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub(crate) spiffe_refresh_interval: u64,
 
     /// Path to PEM-encoded Certificate Revocation List file.
     /// Connections using revoked certificates will be rejected at the TLS handshake.
@@ -149,6 +193,19 @@ pub(crate) struct Cli {
     /// run an OCSP responder; Let's Encrypt dropped OCSP support in 2025.
     #[arg(long, default_value_t = false, env = "RUSTGATE_OCSP_STAPLING")]
     pub(crate) ocsp_stapling: bool,
+
+    /// Enable client-certificate OCSP verification (Tier 1, fail-open).
+    ///
+    /// When set, every accepted client certificate is checked against an
+    /// in-memory OCSP cache keyed by Subject Key Identifier. On a cache
+    /// miss the inner verifier's decision stands and a background task
+    /// fetches an OCSP response so the *next* handshake can be checked.
+    /// Cached `Revoked` responses cause the handshake to be rejected.
+    ///
+    /// Requires --features ocsp. Useful as a near-real-time complement
+    /// to CRLs, which only refresh on a schedule.
+    #[arg(long, default_value_t = false, env = "RUSTGATE_CLIENT_OCSP")]
+    pub(crate) client_ocsp: bool,
 
     #[arg(long, value_enum, default_value_t = Framing::Xml, env = "RUSTGATE_FRAMING")]
     pub(crate) framing: Framing,
@@ -271,6 +328,13 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 7, env = "RUSTGATE_CRL_VALIDITY_DAYS")]
     pub(crate) crl_validity_days: u32,
 
+    /// Enable EST (RFC 7030) enrollment endpoints on the enrollment server.
+    /// Adds `/.well-known/est/` paths for CA certificate distribution and
+    /// CSR-based enrollment alongside the existing Marti-compatible endpoints.
+    /// Requires `--features est` and `--enrollment-bind`.
+    #[arg(long, default_value_t = false, env = "RUSTGATE_EST_ENABLED")]
+    pub(crate) est_enabled: bool,
+
     /// Bind address for the Prometheus metrics HTTP server (e.g. 0.0.0.0:9090).
     /// Requires --features metrics.
     #[arg(long, env = "RUSTGATE_METRICS_BIND", value_parser = parse_socket_addr)]
@@ -349,6 +413,26 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 10, env = "RUSTGATE_WS_MAX_VIOLATIONS")]
     pub(crate) ws_max_violations: u32,
 
+    // -- MQTT flags --
+    /// Bind address for the MQTT (mqtts://) listener (e.g. 0.0.0.0:8883).
+    /// Requires --features mqtt.
+    #[arg(long, env = "RUSTGATE_MQTT_BIND", value_parser = parse_socket_addr)]
+    pub(crate) mqtt_bind: Option<String>,
+
+    /// Optional topic prefix to strip from MQTT topics before mapping to groups.
+    /// For example, with prefix "rustgate/" the MQTT topic "rustgate/alpha" maps
+    /// to group "alpha".
+    #[arg(long, env = "RUSTGATE_MQTT_TOPIC_PREFIX")]
+    pub(crate) mqtt_topic_prefix: Option<String>,
+
+    /// Maximum MQTT packet size in bytes (default: 16 MiB).
+    #[arg(
+        long,
+        default_value_t = 16 * 1024 * 1024,
+        env = "RUSTGATE_MQTT_MAX_PACKET_SIZE"
+    )]
+    pub(crate) mqtt_max_packet_size: usize,
+
     // -- Plaintext input flags --
     /// Bind address for plaintext TCP input (e.g. 0.0.0.0:8087).
     /// WARNING: connections are NOT encrypted. Use only on trusted networks.
@@ -395,6 +479,20 @@ pub(crate) struct Cli {
     /// Path to JSON file containing federation peer configurations.
     #[arg(long, env = "RUSTGATE_FEDERATION_PEERS_FILE")]
     pub(crate) federation_peers_file: Option<String>,
+
+    /// Interval in seconds to poll the federation peers file for changes.
+    /// When set to a value > 0 and `--federation-peers-file` is provided,
+    /// the server periodically re-reads the peers file and reconciles the
+    /// active peer set on change (adds new peers, gracefully disconnects
+    /// removed peers, leaves unchanged peers untouched). SIGHUP also
+    /// triggers a reconcile when this is configured.
+    /// Set to 0 (default) to disable automatic federation peer reloading.
+    #[arg(
+        long,
+        default_value_t = 0,
+        env = "RUSTGATE_FEDERATION_PEERS_RELOAD_INTERVAL"
+    )]
+    pub(crate) federation_peers_reload_interval: u64,
 
     /// Skip TLS hostname verification for federation peers.
     #[arg(
@@ -443,6 +541,24 @@ pub(crate) struct Cli {
     )]
     pub(crate) federation_replay_buffer_size: usize,
 
+    /// Directory for persisting per-peer federation replay buffers to disk.
+    /// When set, replay buffers survive server restarts so a peer that
+    /// reconnects after a restart can resume replay from the last
+    /// persisted point. The store is a redb database at
+    /// `<dir>/federation_replay.redb`.
+    #[arg(long, env = "RUSTGATE_FEDERATION_REPLAY_DIR")]
+    pub(crate) federation_replay_dir: Option<std::path::PathBuf>,
+
+    /// Global byte cap for the persistent federation replay store
+    /// (drop-oldest eviction). Only honored when `--federation-replay-dir`
+    /// is set. Defaults to 64 MiB.
+    #[arg(
+        long,
+        default_value_t = 64 * 1024 * 1024,
+        env = "RUSTGATE_FEDERATION_REPLAY_MAX_BYTES"
+    )]
+    pub(crate) federation_replay_max_bytes: u64,
+
     /// NATS URL for federation HA coordination (enables distributed peer ownership).
     /// When set, only one pod manages each outbound peer in a multi-pod deployment.
     /// Requires --features federation-ha.
@@ -453,6 +569,76 @@ pub(crate) struct Cli {
     /// --federation-ha-nats-url is set.
     #[arg(long, env = "RUSTGATE_FEDERATION_POD_ID")]
     pub(crate) federation_pod_id: Option<String>,
+
+    // -- Federation peer discovery (issue #571) --
+    /// Dynamic federation peer discovery backend.
+    ///
+    /// When set to anything other than `none`, rustgate spawns a background
+    /// reconciler that polls the selected backend on a fixed interval and
+    /// pipes the result into the same `swap_peers` API used by the file
+    /// reloader. Mutually exclusive with `--federation-peers-file`.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = PeerDiscoveryBackend::None,
+        env = "RUSTGATE_FEDERATION_PEER_DISCOVERY",
+        conflicts_with = "federation_peers_file"
+    )]
+    pub(crate) federation_peer_discovery: PeerDiscoveryBackend,
+
+    /// Polling interval in seconds for the federation peer discovery
+    /// reconciler. Ignored when `--federation-peer-discovery=none`.
+    #[arg(
+        long,
+        default_value_t = 30,
+        env = "RUSTGATE_FEDERATION_PEER_DISCOVERY_INTERVAL",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub(crate) federation_peer_discovery_interval: u64,
+
+    /// Service type browsed by the DNS-SD peer discovery backend.
+    #[arg(
+        long,
+        default_value = "_rustgate._tcp.local.",
+        env = "RUSTGATE_FEDERATION_PEER_DISCOVERY_DNS_SD_SERVICE"
+    )]
+    pub(crate) federation_peer_discovery_dns_sd_service: String,
+
+    /// Consul catalog HTTP endpoint used by the Consul peer discovery
+    /// backend (e.g. `http://consul.default.svc:8500`).
+    #[arg(
+        long,
+        default_value = "http://127.0.0.1:8500",
+        env = "RUSTGATE_FEDERATION_PEER_DISCOVERY_CONSUL_ADDR"
+    )]
+    pub(crate) federation_peer_discovery_consul_addr: String,
+
+    /// Consul service name queried by the Consul peer discovery backend.
+    #[arg(
+        long,
+        default_value = "rustgate",
+        env = "RUSTGATE_FEDERATION_PEER_DISCOVERY_CONSUL_SERVICE"
+    )]
+    pub(crate) federation_peer_discovery_consul_service: String,
+
+    /// Comma-separated list of etcd gRPC endpoints for the etcd peer
+    /// discovery backend (e.g.
+    /// `http://etcd-0:2379,http://etcd-1:2379,http://etcd-2:2379`).
+    #[arg(
+        long,
+        default_value = "http://127.0.0.1:2379",
+        env = "RUSTGATE_FEDERATION_PEER_DISCOVERY_ETCD_ENDPOINTS"
+    )]
+    pub(crate) federation_peer_discovery_etcd_endpoints: String,
+
+    /// Key prefix scanned by the etcd peer discovery backend. Each key
+    /// under this prefix becomes one federation peer entry.
+    #[arg(
+        long,
+        default_value = "rustgate/peers/",
+        env = "RUSTGATE_FEDERATION_PEER_DISCOVERY_ETCD_PREFIX"
+    )]
+    pub(crate) federation_peer_discovery_etcd_prefix: String,
 
     // -- QoS / rate limiting --
     /// Sliding-window replay detection window in seconds. Messages with the same
@@ -472,6 +658,26 @@ pub(crate) struct Cli {
     /// Bounds memory usage; oldest entries are evicted in LRU order.
     #[arg(long, default_value_t = 100_000, env = "RUSTGATE_DEDUP_CACHE_SIZE")]
     pub(crate) dedup_cache_size: usize,
+
+    /// Enable per-UID delta encoding for outbound CoT events on XML sessions.
+    /// When enabled, each writer task tracks the last-sent event per UID
+    /// and emits a compact `<delta>` wrapper carrying only the fields
+    /// that changed. Disabled by default. Applies only to XML-framed
+    /// sessions; protobuf sessions always receive full events.
+    #[arg(long, default_value_t = false, env = "RUSTGATE_COT_DELTA_ENCODING")]
+    pub(crate) cot_delta_encoding: bool,
+
+    /// Per-session LRU cache capacity for the CoT delta encoder (entries).
+    /// Oldest UIDs are evicted first; the next event for an evicted UID
+    /// is emitted as a full event.
+    #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u64).range(1..), env = "RUSTGATE_COT_DELTA_CACHE_SIZE")]
+    pub(crate) cot_delta_cache_size: u64,
+
+    /// Ground distance in meters below which position-only CoT updates
+    /// are suppressed entirely. Set to `0` to disable suppression and
+    /// ship every event (either full or delta, never suppressed).
+    #[arg(long, default_value_t = 1.0, env = "RUSTGATE_COT_DELTA_EPSILON_METERS")]
+    pub(crate) cot_delta_epsilon_meters: f64,
 
     /// Maximum sustained messages per second per connected client (0 = disabled).
     #[arg(long, default_value_t = 0, env = "RUSTGATE_CLIENT_MSG_RATE")]
@@ -502,6 +708,35 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 0, env = "RUSTGATE_ACL_RELOAD_INTERVAL")]
     pub(crate) acl_reload_interval: u64,
 
+    /// Path to a JSON rustgate-authz policy file.
+    ///
+    /// When set, the server loads the policy at startup and installs the
+    /// resulting engine on the router's RBAC/ABAC enforcement point. The
+    /// file is validated before it is swapped in, so a malformed policy
+    /// keeps the last known-good policy serving.
+    #[arg(long, env = "RUSTGATE_AUTHZ_POLICY_FILE")]
+    pub(crate) authz_policy_file: Option<String>,
+
+    /// Authz policy format. `native` is the default rustgate-authz JSON
+    /// ruleset; `cedar` loads a Cedar policy corpus via the optional
+    /// `cedar` feature. Selecting `cedar` on a binary that was not
+    /// compiled with `--features cedar` is rejected at startup.
+    #[arg(long, value_enum, default_value_t = AuthzPolicyFormat::Native, env = "RUSTGATE_AUTHZ_POLICY_FORMAT")]
+    pub(crate) authz_policy_format: AuthzPolicyFormat,
+
+    /// Interval in seconds to check the authz policy file for changes.
+    /// Must be >= 1. Applied only when `--authz-policy-file` is set.
+    #[arg(long, default_value_t = 5, env = "RUSTGATE_AUTHZ_RELOAD_INTERVAL")]
+    pub(crate) authz_reload_interval: u64,
+
+    /// Fail-open mode: when the initial policy load fails, the server
+    /// continues to start without an engine installed (no PEP) instead of
+    /// aborting. The default (`false`) is fail-closed: a broken policy at
+    /// startup prevents the server from coming up, which matches the
+    /// deny-by-default security posture.
+    #[arg(long, default_value_t = false, env = "RUSTGATE_AUTHZ_FAIL_OPEN")]
+    pub(crate) authz_fail_open: bool,
+
     /// Path to a file containing the bearer token required to access the
     /// `/api/acl/` REST endpoints (both read and mutation routes).
     ///
@@ -522,6 +757,16 @@ pub(crate) struct Cli {
     /// all received CoT events to date-stamped files.
     #[arg(long, env = "RUSTGATE_ARCHIVE_DIR")]
     pub(crate) archive_dir: Option<String>,
+
+    /// Path to a JSON key file enabling at-rest ChaCha20-Poly1305 encryption
+    /// for the CoT archive (when `--archive-dir` is set) and the audit log
+    /// (when `--audit-log` is a file path). The file must contain
+    /// `{ "active_key_id": "<id>", "keys": { "<id>": "<64-char hex>" } }`
+    /// where each key is 32 bytes. Adding new keys without removing old ones
+    /// supports rotation: historical files written under prior keys remain
+    /// readable as long as their key id is still present in this file.
+    #[arg(long, env = "RUSTGATE_ARCHIVE_KEY_FILE")]
+    pub(crate) archive_key_file: Option<std::path::PathBuf>,
 
     /// Maximum total bytes retained across the CoT archive directory.
     /// When the directory exceeds this cap, the rotation task deletes
@@ -586,6 +831,24 @@ pub(crate) struct Cli {
     /// OpenTelemetry service name reported in traces.
     #[arg(long, default_value = "rustgate", env = "OTEL_SERVICE_NAME")]
     pub(crate) otel_service_name: String,
+
+    /// Enable pushing metrics over OTLP alongside the Prometheus
+    /// `/metrics` endpoint. Requires `--otel-endpoint` (reused for both
+    /// traces and metrics) and the `otel` + `metrics` features to be
+    /// compiled in. The Prometheus scrape target is unaffected; this is
+    /// purely additive.
+    #[arg(long, default_value_t = false, env = "RUSTGATE_OTLP_METRICS")]
+    pub(crate) otlp_metrics: bool,
+
+    /// Push interval in seconds for the OTLP metrics exporter.
+    /// Only honored when `--otlp-metrics` is set. Must be at least 1.
+    #[arg(
+        long,
+        default_value_t = 60,
+        env = "RUSTGATE_OTLP_METRICS_INTERVAL",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub(crate) otlp_metrics_interval: u64,
 }
 
 /// Top-level subcommands. The default (no subcommand) runs the server.
@@ -595,6 +858,21 @@ pub(crate) enum Command {
     PrintConfig,
     /// Validate the configuration file (parse + cross-field checks) and exit.
     ValidateConfig,
+    /// Decrypt an encrypted archive or audit log file produced when
+    /// `--archive-key-file` was active. The output is written verbatim
+    /// (e.g. JSONL) and can then be inspected with standard tools.
+    DecryptArchive {
+        /// Path to the encrypted input file.
+        #[arg(long = "in", value_name = "PATH")]
+        input: std::path::PathBuf,
+        /// Path to write the decrypted plaintext output.
+        #[arg(long = "out", value_name = "PATH")]
+        output: std::path::PathBuf,
+        /// Path to the JSON key file. Must contain the key id referenced
+        /// in the input header (the active key need not match).
+        #[arg(long = "key-file", value_name = "PATH")]
+        key_file: std::path::PathBuf,
+    },
     /// Verify the integrity of a hash-chained audit log.
     VerifyAudit {
         /// Path to the audit log file (newline-delimited JSON records).
@@ -623,6 +901,35 @@ pub(crate) enum Encoding {
     Cot,
     /// TAK protobuf encoding (proto <-> XML at session edge). Requires --features proto.
     TakProtobuf,
+}
+
+/// Selects which dynamic federation peer discovery backend is used.
+///
+/// `None` (the default) disables discovery entirely; static peer
+/// configuration via `--federation-peers-file` remains the only source of
+/// truth. The other variants each map to a backend gated behind its own
+/// cargo feature (`peer-discovery-dns-sd`, `peer-discovery-consul`,
+/// `peer-discovery-etcd`); selecting a backend whose feature was not
+/// compiled in surfaces a startup error.
+/// Authz policy-file format selector.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum AuthzPolicyFormat {
+    /// Native rustgate-authz JSON ruleset.
+    #[default]
+    Native,
+    /// Cedar policy corpus (requires the `cedar` feature).
+    Cedar,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum PeerDiscoveryBackend {
+    #[default]
+    None,
+    DnsSd,
+    Consul,
+    Etcd,
 }
 
 impl From<Framing> for FramingStrategy {
@@ -733,6 +1040,11 @@ define_config_file! {
     kx_groups: Option<String>,
     cert_reload_interval: u64,
     ocsp_stapling: bool,
+    spiffe: bool,
+    spiffe_workload_api_socket: String,
+    spiffe_trust_domain: Option<String>,
+    spiffe_refresh_interval: u64,
+    client_ocsp: bool,
     framing: Framing,
     encoding: Encoding,
     nats_url: Option<String>,
@@ -756,6 +1068,7 @@ define_config_file! {
     package_strict_signatures: bool,
     revocation_db: Option<String>,
     crl_validity_days: u32,
+    est_enabled: bool,
     metrics_bind: Option<String>,
     metrics_per_identity: bool,
     metrics_identity_allowlist: Option<std::path::PathBuf>,
@@ -768,6 +1081,9 @@ define_config_file! {
     ws_max_frames_per_sec: u32,
     ws_max_bytes_per_sec: u64,
     ws_max_violations: u32,
+    mqtt_bind: Option<String>,
+    mqtt_topic_prefix: Option<String>,
+    mqtt_max_packet_size: usize,
     tcp_bind: Option<String>,
     udp_bind: Option<String>,
     plaintext_cn: String,
@@ -776,6 +1092,7 @@ define_config_file! {
     federation_v2_bind: Option<String>,
     federation_id: String,
     federation_peers_file: Option<String>,
+    federation_peers_reload_interval: u64,
     federation_skip_hostname_verify: bool,
     federation_max_hops: u32,
     federation_store_path: Option<String>,
@@ -783,16 +1100,30 @@ define_config_file! {
     federation_circuit_breaker_threshold: u32,
     federation_circuit_breaker_timeout: u64,
     federation_replay_buffer_size: usize,
+    federation_replay_dir: Option<std::path::PathBuf>,
+    federation_replay_max_bytes: u64,
     federation_ha_nats_url: Option<String>,
     federation_pod_id: Option<String>,
+    federation_peer_discovery: PeerDiscoveryBackend,
+    federation_peer_discovery_interval: u64,
+    federation_peer_discovery_dns_sd_service: String,
+    federation_peer_discovery_consul_addr: String,
+    federation_peer_discovery_consul_service: String,
+    federation_peer_discovery_etcd_endpoints: String,
+    federation_peer_discovery_etcd_prefix: String,
     replay_window: u64,
     client_message_rate: u32,
     client_burst: u32,
     circuit_breaker_threshold: u32,
     group_acl_file: Option<String>,
     acl_reload_interval: u64,
+    authz_policy_file: Option<String>,
+    authz_policy_format: AuthzPolicyFormat,
+    authz_reload_interval: u64,
+    authz_fail_open: bool,
     acl_api_token_file: Option<String>,
     archive_dir: Option<String>,
+    archive_key_file: Option<std::path::PathBuf>,
     archive_max_size: u64,
     archive_max_age: u64,
     archive_rotate_interval: u64,
@@ -803,8 +1134,13 @@ define_config_file! {
     client_queue_max_bytes: u64,
     otel_endpoint: Option<String>,
     otel_service_name: String,
+    otlp_metrics: bool,
+    otlp_metrics_interval: u64,
     dedup_window_secs: u64,
     dedup_cache_size: usize,
+    cot_delta_encoding: bool,
+    cot_delta_cache_size: u64,
+    cot_delta_epsilon_meters: f64,
 }
 
 impl Cli {
@@ -836,6 +1172,9 @@ impl Cli {
         }
         if self.ca.is_empty() {
             anyhow::bail!("--ca (or [ca] in the config file) is required");
+        }
+        if self.authz_policy_file.is_some() && self.authz_reload_interval == 0 {
+            anyhow::bail!("--authz-reload-interval must be >= 1 when --authz-policy-file is set");
         }
         Ok(())
     }
@@ -1046,6 +1385,8 @@ mod tests {
             "RUSTGATE_AUDIT_LOG",
             "OTEL_EXPORTER_OTLP_ENDPOINT",
             "OTEL_SERVICE_NAME",
+            "RUSTGATE_OTLP_METRICS",
+            "RUSTGATE_OTLP_METRICS_INTERVAL",
         ];
 
         for var in expected_env_vars {

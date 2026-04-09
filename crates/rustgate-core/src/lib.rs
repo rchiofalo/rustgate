@@ -10,6 +10,7 @@ pub mod audit;
 pub mod audit_chain;
 pub mod codec;
 pub mod constants;
+pub mod encrypted;
 pub mod error;
 pub mod identity;
 pub mod masking;
@@ -19,4 +20,5 @@ pub mod peer_id;
 pub mod protocol;
 pub mod sanitize;
 
+pub use identity::AttrValue;
 pub use peer_id::{PeerId, ServerName};

@@ -17,23 +17,43 @@ workspace = true
 [features]
 nats = ["dep:rustgate-nats"]
 enrollment = ["dep:rustgate-enrollment", "dep:rustls-pki-types"]
+est = ["enrollment", "rustgate-enrollment/est"]
 proto = ["dep:rustgate-proto", "rustgate-transport/proto"]
 full-detail = ["nats", "rustgate-nats/full-detail"]
 metrics = ["dep:prometheus", "dep:hyper", "dep:hyper-util", "dep:http-body-util"]
 federation = ["dep:rustgate-federation", "rustgate-federation/v2", "rustgate-federation/api"]
 federation-ha = ["federation", "rustgate-federation/ha"]
+# Sub-features selecting which dynamic peer-discovery backends the server
+# binary will ship with (issue #571). The `peer-discovery` umbrella enables
+# all three; each sub-feature may be enabled independently.
+peer-discovery = [
+    "federation",
+    "rustgate-federation/peer-discovery",
+    "peer-discovery-dns-sd",
+    "peer-discovery-consul",
+    "peer-discovery-etcd",
+]
+peer-discovery-dns-sd = ["federation", "rustgate-federation/peer-discovery-dns-sd"]
+peer-discovery-consul = ["federation", "rustgate-federation/peer-discovery-consul"]
+peer-discovery-etcd = ["federation", "rustgate-federation/peer-discovery-etcd"]
 websocket = ["dep:rustgate-websocket"]
+mqtt = ["dep:rustgate-mqtt"]
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
 fips = ["rustgate-transport/fips", "rustgate-federation?/fips", "rustgate-enrollment?/fips"]
 post-quantum = ["rustgate-transport/post-quantum", "rustgate-federation?/post-quantum"]
 jemalloc = ["dep:tikv-jemallocator"]
 ocsp = ["rustgate-transport/ocsp"]
+spiffe = ["rustgate-transport/spiffe"]
+# Enables the optional Cedar authz policy backend and `--authz-policy-format cedar`.
+cedar = ["rustgate-authz/cedar"]
 
 [dependencies]
+rustgate-authz = { workspace = true }
 rustgate-core = { workspace = true }
 rustgate-cot = { workspace = true }
 rustgate-transport = { workspace = true }
 rustgate-websocket = { workspace = true, optional = true }
+rustgate-mqtt = { workspace = true, optional = true }
 rustgate-nats = { workspace = true, optional = true }
 rustgate-enrollment = { workspace = true, optional = true }
 rustgate-proto = { workspace = true, optional = true }

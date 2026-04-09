@@ -20,6 +20,12 @@ ha = ["dep:async-nats"]
 api = ["dep:hyper", "dep:http-body-util", "dep:prometheus"]
 fips = ["rustls/aws_lc_rs", "rustls/fips", "tonic?/tls-aws-lc"]
 post-quantum = ["rustls/aws_lc_rs", "rustls/prefer-post-quantum", "tonic?/tls-aws-lc"]
+# Dynamic peer discovery backends (issue #571). Each backend is independently
+# selectable; the `peer-discovery` umbrella enables all three.
+peer-discovery = ["peer-discovery-dns-sd", "peer-discovery-consul", "peer-discovery-etcd"]
+peer-discovery-dns-sd = ["dep:async-trait", "dep:mdns-sd"]
+peer-discovery-consul = ["dep:async-trait", "dep:reqwest"]
+peer-discovery-etcd = ["dep:async-trait", "dep:etcd-client"]
 
 [dependencies]
 rustgate-core = { workspace = true }
@@ -51,6 +57,13 @@ hyper = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
 prometheus = { workspace = true, optional = true }
 zeroize = { workspace = true }
+redb = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true, optional = true }
+mdns-sd = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+etcd-client = { workspace = true, optional = true }
 
 [build-dependencies]
 prost-build = { workspace = true, optional = true }
@@ -64,6 +77,7 @@ tempfile = { workspace = true }
 rustgate-test-utils = { workspace = true, features = ["nats"] }
 criterion = { workspace = true }
 http-body = { workspace = true }
+wiremock = { workspace = true }
 
 [[bench]]
 name = "convert"

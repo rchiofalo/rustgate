@@ -10,6 +10,7 @@ crates/
   rustgate-cot/           Cursor on Target XML parsing, MessageBuilder
   rustgate-transport/     mTLS listener, codecs, session management, message router
   rustgate-websocket/     WebSocket (wss://) listener with mTLS, router integration
+  rustgate-mqtt/          MQTT 5.0/3.1.1 transport with mTLS, dynamic group subscriptions
   rustgate-nats/          NATS pub/sub bridge with JetStream history replay
   rustgate-enrollment/    HTTPS certificate enrollment (Marti v2 CSR signing)
   rustgate-proto/         Protobuf translation (XML / proto) and negotiation
@@ -93,6 +94,7 @@ All optional features are compile-time feature gates, keeping the base binary mi
 | Feature | Crate | What It Adds |
 |---------|-------|--------------|
 | `websocket` | rustgate-websocket | WebSocket (wss://) listener with mTLS, router integration |
+| `mqtt` | rustgate-mqtt | MQTT 5.0/3.1.1 transport with mTLS, dynamic group subscriptions |
 | `nats` | rustgate-nats | NATS pub/sub bridge, JetStream SA replay |
 | `enrollment` | rustgate-enrollment | HTTPS certificate enrollment server |
 | `proto` | rustgate-proto | TAK protobuf translation, protocol negotiation |

@@ -7,9 +7,10 @@
 //! of consecutive failures the circuit "opens" and messages are skipped
 //! until a recovery timeout elapses.
 
+use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use rustgate_core::PeerId;
 
@@ -142,6 +143,12 @@ pub struct PeerHandle {
     recovery_timeout_secs: u64,
     /// Lifetime count of circuit-breaker trips (for observability).
     circuit_trips: AtomicU64,
+    /// Bytes currently sitting in this peer's outbound queue (for lag metrics).
+    queue_bytes: AtomicU64,
+    /// FIFO of (enqueue time, byte size) pairs for in-flight messages — head
+    /// is the oldest message still queued. Used to compute "oldest message age"
+    /// without scanning the actual mpsc channel.
+    queue_ages: Mutex<VecDeque<(SystemTime, usize)>>,
 }
 
 impl PeerHandle {
@@ -166,7 +173,56 @@ impl PeerHandle {
             failure_threshold: Self::DEFAULT_FAILURE_THRESHOLD,
             recovery_timeout_secs: Self::DEFAULT_RECOVERY_TIMEOUT_SECS,
             circuit_trips: AtomicU64::new(0),
+            queue_bytes: AtomicU64::new(0),
+            queue_ages: Mutex::new(VecDeque::new()),
         }
+    }
+
+    /// Record that `bytes` worth of payload has been enqueued for delivery
+    /// to this peer. Updates the per-peer queue-bytes counter and tracks
+    /// the message's enqueue time so the oldest-message age can be reported.
+    pub fn record_enqueue(&self, bytes: usize) {
+        let _ = self.queue_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        if let Ok(mut guard) = self.queue_ages.lock() {
+            guard.push_back((SystemTime::now(), bytes));
+        }
+    }
+
+    /// Record that a previously enqueued message has been delivered or
+    /// dropped. Decrements the queue-bytes counter and pops the oldest
+    /// pending entry so the next call reports the new head's age.
+    pub fn record_dequeue(&self) {
+        let popped_bytes = match self.queue_ages.lock() {
+            Ok(mut guard) => guard.pop_front().map(|(_, b)| b),
+            Err(_) => None,
+        };
+        if let Some(bytes) = popped_bytes {
+            let _ = self.queue_bytes.fetch_sub(bytes as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Reset the queue accounting to empty. Used when a send loop terminates
+    /// permanently (e.g. shutdown, max reconnects exhausted) and any messages
+    /// still buffered in the outbound channel will be dropped without delivery.
+    /// Without this, the per-peer queue-bytes gauge would leak counter weight
+    /// for the lifetime of the process.
+    pub fn reset_queue(&self) {
+        self.queue_bytes.store(0, Ordering::Relaxed);
+        if let Ok(mut guard) = self.queue_ages.lock() {
+            guard.clear();
+        }
+    }
+
+    /// Current queued bytes for this peer.
+    pub fn queue_bytes(&self) -> u64 {
+        self.queue_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Age (in seconds) of the oldest queued message for this peer, or
+    /// `None` if the queue is empty.
+    pub fn oldest_queued_age_secs(&self) -> Option<f64> {
+        let ts = self.queue_ages.lock().ok()?.front().map(|(t, _)| *t)?;
+        ts.elapsed().ok().map(|d| d.as_secs_f64())
     }
 
     /// Create a new peer handle with explicit circuit breaker parameters.
@@ -428,6 +484,48 @@ mod tests {
             protocol_version: 2,
             jwt_token: None,
         }
+    }
+
+    #[test]
+    fn lag_tracking_enqueue_and_drain() {
+        let handle = PeerHandle::new(test_config());
+        assert_eq!(handle.queue_bytes(), 0);
+        assert!(handle.oldest_queued_age_secs().is_none());
+
+        handle.record_enqueue(100);
+        handle.record_enqueue(250);
+        assert_eq!(handle.queue_bytes(), 350);
+        let age = handle.oldest_queued_age_secs().expect("age present");
+        assert!(age >= 0.0);
+
+        handle.record_dequeue();
+        assert_eq!(handle.queue_bytes(), 250);
+        assert!(handle.oldest_queued_age_secs().is_some());
+
+        handle.record_dequeue();
+        assert_eq!(handle.queue_bytes(), 0);
+        assert!(handle.oldest_queued_age_secs().is_none());
+    }
+
+    #[test]
+    fn reset_queue_clears_pending_accounting() {
+        let handle = PeerHandle::new(test_config());
+        handle.record_enqueue(100);
+        handle.record_enqueue(250);
+        handle.record_enqueue(400);
+        assert_eq!(handle.queue_bytes(), 750);
+        assert!(handle.oldest_queued_age_secs().is_some());
+
+        handle.reset_queue();
+        assert_eq!(handle.queue_bytes(), 0);
+        assert!(handle.oldest_queued_age_secs().is_none());
+    }
+
+    #[test]
+    fn lag_tracking_dequeue_when_empty_is_noop() {
+        let handle = PeerHandle::new(test_config());
+        handle.record_dequeue();
+        assert_eq!(handle.queue_bytes(), 0);
     }
 
     #[test]

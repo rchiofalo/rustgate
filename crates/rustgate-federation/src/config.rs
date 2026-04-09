@@ -137,6 +137,16 @@ pub struct FederationConfig {
     /// On reconnection, buffered messages are replayed before resuming live stream.
     /// Set to 0 to disable replay buffering.
     pub replay_buffer_capacity: usize,
+    /// Directory to persist the per-peer replay buffer to disk (redb).
+    /// When set, buffered messages survive server restarts so a peer
+    /// reconnecting after a restart can resume replay from the last
+    /// persisted point. When `None`, replay buffers live in RAM only.
+    pub replay_buffer_dir: Option<PathBuf>,
+    /// Global byte cap for the persisted replay buffer. Only honored
+    /// when `replay_buffer_dir` is set. When inserting a record would
+    /// exceed this cap, the oldest persisted entries (across all peers)
+    /// are evicted until the new entry fits.
+    pub replay_max_bytes: u64,
 
     // --- High-Availability (HA) ---
     /// Pod identifier for HA mode. When set together with `ha_nats_url`,
@@ -177,6 +187,8 @@ impl Default for FederationConfig {
             circuit_breaker_threshold: 5,
             circuit_breaker_timeout: Duration::from_secs(60),
             replay_buffer_capacity: crate::replay_buffer::DEFAULT_REPLAY_CAPACITY,
+            replay_buffer_dir: None,
+            replay_max_bytes: crate::replay_persist::DEFAULT_REPLAY_MAX_BYTES,
             pod_id: None,
             ha_nats_url: None,
         }

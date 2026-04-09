@@ -21,7 +21,8 @@ use crate::config::FederationConfig;
 use crate::connector::{OutboundConnector, PeerConnector};
 use crate::dedup::MessageDedup;
 use crate::peer::{PeerHandle, PeerStatus};
-use crate::replay_buffer::ReplayBuffer;
+use crate::replay_buffer::{BufferedMessage, ReplayBuffer};
+use crate::replay_persist::ReplayStore;
 use crate::trust_store::TrustStore;
 use crate::v1::{V1Client, V1Server};
 
@@ -94,6 +95,10 @@ pub struct FederationManager {
     trust_store: Option<Arc<TrustStore>>,
     /// Per-peer replay buffers for reconnection catch-up.
     replay_buffers: SharedReplayBuffers,
+    /// Optional disk-backed store for replay buffers (issue #557).
+    /// When set, every push/eviction/clear is mirrored so buffers
+    /// survive server restarts.
+    replay_store: Option<Arc<ReplayStore>>,
 
     // ── HA subsystem ─────────────────────────────────────────────────
     #[cfg(feature = "ha")]
@@ -139,6 +144,33 @@ impl std::fmt::Debug for FederationManager {
     }
 }
 
+/// Summary of changes applied by [`FederationManager::swap_peers`].
+#[derive(Debug, Default, Clone)]
+pub struct PeerSwapDiff {
+    /// Peer IDs newly added.
+    pub added: Vec<PeerId>,
+    /// Peer IDs removed (and disconnected).
+    pub removed: Vec<PeerId>,
+    /// Peer IDs whose configuration was unchanged.
+    pub unchanged: Vec<PeerId>,
+    /// Peers that failed to start, paired with the error message that caused
+    /// the failure. Surfacing the reason here lets callers (e.g. the hot
+    /// reloader) emit per-peer diagnostics instead of only a count.
+    pub failed: Vec<(PeerId, String)>,
+}
+
+/// Structural equality of two peer configurations for hot-reload diffing.
+fn peers_equal(a: &crate::config::PeerConfig, b: &crate::config::PeerConfig) -> bool {
+    a.id == b.id
+        && a.address == b.address
+        && a.groups == b.groups
+        && a.inbound_groups == b.inbound_groups
+        && a.outbound_groups == b.outbound_groups
+        && a.enabled == b.enabled
+        && a.is_outbound == b.is_outbound
+        && a.protocol_version == b.protocol_version
+}
+
 impl FederationManager {
     /// Create a new federation manager from configuration.
     ///
@@ -160,6 +192,7 @@ impl FederationManager {
             ca_pem: None,
             trust_store: None,
             replay_buffers: Arc::new(Mutex::new(HashMap::new())),
+            replay_store: None,
             #[cfg(feature = "ha")]
             claim_manager: None,
             #[cfg(feature = "ha")]
@@ -181,6 +214,37 @@ impl FederationManager {
     pub async fn start(&mut self, on_inbound: OnInbound) -> anyhow::Result<()> {
         if self.running {
             return Err(anyhow::anyhow!("federation manager is already running"));
+        }
+
+        // Open the persistent replay store (issue #557) and rehydrate any
+        // entries persisted from a previous run before we accept connections.
+        //
+        // Ordering matters: this MUST run before the V1/V2 federation
+        // listeners bind below. If a peer reconnects between bind and
+        // rehydrate, its `messages_since(seq)` query would race against
+        // an empty in-memory buffer and the operator would see a
+        // spurious "no replay available" gap on the very restart that
+        // persistence is supposed to cover.
+        if let Some(dir) = self.config.replay_buffer_dir.clone() {
+            match ReplayStore::open(&dir, self.config.replay_max_bytes) {
+                Ok(store) => {
+                    let store = Arc::new(store);
+                    self.replay_store = Some(Arc::clone(&store));
+                    self.rehydrate_replay_buffers_from_store(&store);
+                    info!(
+                        dir = %dir.display(),
+                        max_bytes = self.config.replay_max_bytes,
+                        "federation replay buffer persistence enabled"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        dir = %dir.display(),
+                        error = %e,
+                        "failed to open federation replay store; persistence disabled"
+                    );
+                }
+            }
         }
 
         // Read TLS certificate material
@@ -693,14 +757,19 @@ impl FederationManager {
             source_groups = ?source_groups,
         );
 
-        self.forward_inner(payload, source_groups)
+        self.forward_inner(payload, source_groups, metadata)
             .instrument(span)
             .await
     }
 
     /// Inner forwarding logic, separated so the caller can `.instrument()` a
     /// span around this future without holding an `EnteredSpan` across `.await`.
-    async fn forward_inner(&self, payload: Bytes, source_groups: &[String]) -> usize {
+    async fn forward_inner(
+        &self,
+        payload: Bytes,
+        source_groups: &[String],
+        metadata: Option<&Metadata>,
+    ) -> usize {
         let mut sent = 0;
 
         // Inject flow tag for traceability (identifies which federation server
@@ -717,8 +786,10 @@ impl FederationManager {
         #[cfg(feature = "v2")]
         let mut v2_event: Option<crate::v2::proto::figpb::FederatedEvent> = None;
 
-        // Buffer the message for replay on reconnection
-        self.buffer_for_replay(&payload, source_groups);
+        // Buffer the message for replay on reconnection. Pass through
+        // the originating TTL so the persistent store can re-evaluate
+        // expiry on a future rehydrate.
+        self.buffer_for_replay(&payload, source_groups, metadata);
 
         // Snapshot clients and peer handles so callers can release the outer
         // lock before we block on per-peer channel sends.
@@ -818,17 +889,129 @@ impl FederationManager {
     ///
     /// Called during forwarding so that messages are available for replay
     /// when a peer reconnects after a disconnection.
-    fn buffer_for_replay(&self, payload: &Bytes, groups: &[String]) {
+    fn buffer_for_replay(&self, payload: &Bytes, groups: &[String], metadata: Option<&Metadata>) {
         if self.config.replay_buffer_capacity == 0 {
             return;
         }
+        let enqueued_at_unix_ms = crate::replay_buffer::now_unix_ms();
+        let ttl_ms: Option<u64> = metadata
+            .and_then(|m| m.ttl)
+            .map(|d| d.as_millis().min(u64::MAX as u128) as u64);
         if let Ok(mut buffers) = self.replay_buffers.lock() {
             for peer_id in self.peers.keys() {
-                let buffer = buffers
-                    .entry(peer_id.clone())
-                    .or_insert_with(|| ReplayBuffer::new(self.config.replay_buffer_capacity));
-                let _ = buffer.push(payload.clone(), groups.to_vec());
+                let buffer = buffers.entry(peer_id.clone()).or_insert_with(|| {
+                    Self::make_replay_buffer_for(
+                        peer_id,
+                        self.config.replay_buffer_capacity,
+                        self.replay_store.as_ref(),
+                    )
+                });
+                let _ = buffer.push_with_metadata(
+                    payload.clone(),
+                    groups.to_vec(),
+                    enqueued_at_unix_ms,
+                    ttl_ms,
+                );
             }
+        }
+    }
+
+    /// Construct a fresh [`ReplayBuffer`] for `peer_id`, attaching the
+    /// shared persistent store when one is configured.
+    fn make_replay_buffer_for(
+        peer_id: &PeerId,
+        capacity: usize,
+        store: Option<&Arc<ReplayStore>>,
+    ) -> ReplayBuffer {
+        match store {
+            Some(s) => ReplayBuffer::with_store(capacity, peer_id.as_str(), Arc::clone(s)),
+            None => ReplayBuffer::new(capacity),
+        }
+    }
+
+    /// Restore per-peer replay buffers from the persistent store on startup.
+    ///
+    /// Reads every entry from `store`, groups by peer id, and inserts a
+    /// hydrated [`ReplayBuffer`] into the manager's in-memory map for each
+    /// peer that has at least one persisted entry. Excess entries beyond
+    /// the in-memory capacity are evicted (and deleted from the store)
+    /// during hydrate.
+    fn rehydrate_replay_buffers_from_store(&self, store: &Arc<ReplayStore>) {
+        if self.config.replay_buffer_capacity == 0 {
+            return;
+        }
+        let entries = match store.load_all() {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(error = %e, "failed to load persisted replay entries");
+                return;
+            }
+        };
+        if entries.is_empty() {
+            return;
+        }
+
+        // Drop entries whose TTL (per `Metadata::is_expired()`) has
+        // already elapsed before they ever land in an in-memory ring.
+        // Without this filter, persistence would silently bypass the
+        // forward-time TTL check (#554) across restarts: a server
+        // bounce would resurrect messages that should have been
+        // dropped. Expired records are also deleted from the store so
+        // they don't accumulate across reboots.
+        let now_ms = crate::replay_buffer::now_unix_ms();
+        let mut by_peer: HashMap<String, Vec<BufferedMessage>> = HashMap::new();
+        let mut skipped_ttl: u64 = 0;
+        for entry in entries {
+            if let Some(ttl_ms) = entry.ttl_ms
+                && entry.enqueued_at_unix_ms.saturating_add(ttl_ms) < now_ms
+            {
+                skipped_ttl = skipped_ttl.saturating_add(1);
+                if let Err(e) = store.delete(&entry.peer_id, entry.seq) {
+                    warn!(
+                        peer_id = %entry.peer_id,
+                        seq = entry.seq,
+                        error = %e,
+                        "failed to delete expired persisted replay entry"
+                    );
+                }
+                continue;
+            }
+            by_peer
+                .entry(entry.peer_id.clone())
+                .or_default()
+                .push(BufferedMessage::from(entry));
+        }
+        if skipped_ttl > 0 {
+            #[cfg(feature = "api")]
+            crate::metrics::replay_restored_skipped_ttl().inc_by(skipped_ttl);
+            info!(
+                skipped = skipped_ttl,
+                "skipped expired persisted replay entries during rehydrate"
+            );
+        }
+        if by_peer.is_empty() {
+            return;
+        }
+
+        let Ok(mut buffers) = self.replay_buffers.lock() else {
+            return;
+        };
+        for (peer_id_str, mut records) in by_peer {
+            records.sort_by_key(|m| m.seq);
+            let pid = PeerId::from(peer_id_str.as_str());
+            let mut buf =
+                Self::make_replay_buffer_for(&pid, self.config.replay_buffer_capacity, Some(store));
+            let restored_count = records.len();
+            buf.hydrate_from_records(records);
+            #[cfg(feature = "api")]
+            crate::metrics::replay_restored().inc_by(restored_count as u64);
+            info!(
+                peer_id = %peer_id_str,
+                restored = restored_count,
+                in_memory = buf.len(),
+                "rehydrated persisted replay buffer"
+            );
+            let _ = buffers.insert(pid, buf);
         }
     }
 
@@ -975,6 +1158,23 @@ impl FederationManager {
     /// Get status snapshots for all peers.
     pub fn all_peer_statuses(&self) -> Vec<PeerStatus> {
         self.peers.values().map(|p| p.status()).collect()
+    }
+
+    /// Snapshot per-peer outbound queue lag for metrics export.
+    ///
+    /// Returns a vector of `(peer_id, queue_bytes, oldest_age_seconds)`
+    /// tuples. `oldest_age_seconds` is `0.0` when the peer's queue is empty.
+    pub fn peer_lag_snapshot(&self) -> Vec<(String, u64, f64)> {
+        self.peers
+            .iter()
+            .map(|(id, p)| {
+                (
+                    id.to_string(),
+                    p.queue_bytes(),
+                    p.oldest_queued_age_secs().unwrap_or(0.0),
+                )
+            })
+            .collect()
     }
 
     /// Get the live trust store, if one is configured.
@@ -1151,9 +1351,8 @@ impl FederationManager {
     /// Connect a single outbound peer, creating its client and PeerHandle.
     ///
     /// Requires that `start()` has been called (connector, on_inbound, etc. are set).
-    /// Used by both `start()` loop (indirectly) and `adopt_peer()`.
-    #[cfg(feature = "ha")]
-    fn connect_outbound_peer(
+    /// Used by `adopt_peer()` (HA), `add_peer()`, and `swap_peers()` (hot reload).
+    pub fn connect_outbound_peer(
         &mut self,
         peer_config: &crate::config::PeerConfig,
     ) -> anyhow::Result<()> {
@@ -1352,11 +1551,11 @@ impl FederationManager {
         Ok(())
     }
 
-    /// Disconnect a peer whose claim was lost to another pod.
+    /// Disconnect a peer cleanly.
     ///
-    /// Stops the outbound client, removes the peer handle, unregisters from the
-    /// HA connection registry, and releases the claim.
-    #[cfg(feature = "ha")]
+    /// Stops the outbound client, removes the peer handle and replay buffer.
+    /// When HA is enabled, also unregisters from the HA connection registry
+    /// and releases the claim.
     pub async fn disconnect_peer(&mut self, peer_id: &PeerId) {
         // Remove and shut down the client
         if let Some(client) = self.clients.remove(peer_id.as_str()) {
@@ -1381,19 +1580,126 @@ impl FederationManager {
         // Clean up the replay buffer for this peer
         self.remove_replay_buffer(peer_id.as_str());
 
-        // Unregister from connection registry
-        if let Some(ref cr) = self.connection_registry
-            && let Err(e) = cr.unregister(peer_id.as_str()).await
+        // Unregister from connection registry / release claim (HA only)
+        #[cfg(feature = "ha")]
         {
-            warn!(peer_id = %peer_id, error = %e, "failed to unregister connection");
+            if let Some(ref cr) = self.connection_registry
+                && let Err(e) = cr.unregister(peer_id.as_str()).await
+            {
+                warn!(peer_id = %peer_id, error = %e, "failed to unregister connection");
+            }
+
+            if let Some(ref cm) = self.claim_manager
+                && let Err(e) = cm.release(peer_id.as_str()).await
+            {
+                warn!(peer_id = %peer_id, error = %e, "failed to release claim");
+            }
+        }
+    }
+
+    // ── Hot reload ────────────────────────────────────────────────────
+
+    /// Add (or replace) a single outbound peer at runtime.
+    ///
+    /// If the peer already exists in the configured set with the same id,
+    /// it is first disconnected and then reconnected with the new config.
+    /// Disabled or inbound-only peers are stored in config but no client
+    /// is started for them.
+    pub async fn add_peer(&mut self, peer_config: crate::config::PeerConfig) -> anyhow::Result<()> {
+        let id = peer_config.id.clone();
+
+        if self.clients.contains_key(id.as_str()) {
+            self.disconnect_peer(&id).await;
         }
 
-        // Release claim
-        if let Some(ref cm) = self.claim_manager
-            && let Err(e) = cm.release(peer_id.as_str()).await
-        {
-            warn!(peer_id = %peer_id, error = %e, "failed to release claim");
+        if let Some(slot) = self.config.peers.iter_mut().find(|p| p.id == id) {
+            *slot = peer_config.clone();
+        } else {
+            self.config.peers.push(peer_config.clone());
         }
+
+        if !peer_config.enabled || !peer_config.is_outbound {
+            info!(peer_id = %id, "peer added (no outbound client started)");
+            return Ok(());
+        }
+
+        if !self.running {
+            info!(peer_id = %id, "peer added; client will start when manager starts");
+            return Ok(());
+        }
+
+        self.connect_outbound_peer(&peer_config)?;
+        info!(peer_id = %id, "peer added and outbound client started");
+        Ok(())
+    }
+
+    /// Remove a peer from the configuration and disconnect it cleanly.
+    ///
+    /// Returns `true` if the peer was present in the configured set.
+    pub async fn remove_peer(&mut self, peer_id: &str) -> bool {
+        let pid = PeerId::from(peer_id.to_string());
+        self.disconnect_peer(&pid).await;
+        let before = self.config.peers.len();
+        self.config.peers.retain(|p| p.id.as_str() != peer_id);
+        before != self.config.peers.len()
+    }
+
+    /// Atomically reconcile the configured peer set against `new_peers`.
+    ///
+    /// Peers present in `new_peers` but not currently configured are added
+    /// (and connected if enabled+outbound). Peers no longer in `new_peers`
+    /// are disconnected and removed. Peers whose configuration changed are
+    /// disconnected and reconnected with the new settings.
+    pub async fn swap_peers(&mut self, new_peers: Vec<crate::config::PeerConfig>) -> PeerSwapDiff {
+        let mut diff = PeerSwapDiff::default();
+
+        let new_ids: std::collections::HashSet<String> = new_peers
+            .iter()
+            .map(|p| p.id.as_str().to_string())
+            .collect();
+
+        let removed: Vec<String> = self
+            .config
+            .peers
+            .iter()
+            .filter(|p| !new_ids.contains(p.id.as_str()))
+            .map(|p| p.id.as_str().to_string())
+            .collect();
+        for id in removed {
+            if self.remove_peer(&id).await {
+                diff.removed.push(PeerId::from(id));
+            }
+        }
+
+        for peer in new_peers {
+            let existing = self.config.peers.iter().find(|p| p.id == peer.id).cloned();
+            match existing {
+                Some(prev) if peers_equal(&prev, &peer) => {
+                    diff.unchanged.push(peer.id.clone());
+                }
+                _ => {
+                    let id = peer.id.clone();
+                    match self.add_peer(peer).await {
+                        Ok(()) => diff.added.push(id),
+                        Err(e) => {
+                            let err_str = e.to_string();
+                            warn!(peer_id = %id, error = %err_str, "failed to add peer during swap");
+                            diff.failed.push((id, err_str));
+                        }
+                    }
+                }
+            }
+        }
+
+        info!(
+            added = diff.added.len(),
+            removed = diff.removed.len(),
+            unchanged = diff.unchanged.len(),
+            failed = diff.failed.len(),
+            "federation peer set reconciled"
+        );
+
+        diff
     }
 
     /// Take the HA event receivers (adoption and claim-lost channels).
@@ -1448,6 +1754,8 @@ mod tests {
             circuit_breaker_threshold: 5,
             circuit_breaker_timeout: Duration::from_secs(60),
             replay_buffer_capacity: 1000,
+            replay_buffer_dir: None,
+            replay_max_bytes: crate::replay_persist::DEFAULT_REPLAY_MAX_BYTES,
             pod_id: None,
             ha_nats_url: None,
         }
@@ -2217,8 +2525,8 @@ mod tests {
         let _ = manager.peers.insert("peer-1".into(), peer1);
         let _ = manager.peers.insert("peer-2".into(), peer2);
 
-        manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()]);
-        manager.buffer_for_replay(&Bytes::from("msg2"), &["Beta".into()]);
+        manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()], None);
+        manager.buffer_for_replay(&Bytes::from("msg2"), &["Beta".into()], None);
 
         let msgs1 = manager.replay_messages("peer-1", 0);
         assert_eq!(msgs1.len(), 2);
@@ -2239,7 +2547,7 @@ mod tests {
         )));
         let _ = manager.peers.insert("peer-1".into(), peer);
 
-        manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()]);
+        manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()], None);
 
         let msgs = manager.replay_messages("peer-1", 0);
         assert!(msgs.is_empty());
@@ -2257,7 +2565,7 @@ mod tests {
         )));
         let _ = manager.peers.insert("peer-1".into(), peer);
 
-        manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()]);
+        manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()], None);
         assert_eq!(manager.replay_messages("peer-1", 0).len(), 1);
 
         manager.remove_replay_buffer("peer-1");
@@ -2276,15 +2584,15 @@ mod tests {
         )));
         let _ = manager.peers.insert("peer-1".into(), peer);
 
-        manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()]);
-        manager.buffer_for_replay(&Bytes::from("msg2"), &["Alpha".into()]);
+        manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()], None);
+        manager.buffer_for_replay(&Bytes::from("msg2"), &["Alpha".into()], None);
         assert_eq!(manager.replay_messages("peer-1", 0).len(), 2);
 
         manager.clear_replay_buffer("peer-1");
         assert!(manager.replay_messages("peer-1", 0).is_empty());
 
         // Buffer entry still exists — new messages can be buffered
-        manager.buffer_for_replay(&Bytes::from("msg3"), &["Alpha".into()]);
+        manager.buffer_for_replay(&Bytes::from("msg3"), &["Alpha".into()], None);
         assert_eq!(manager.replay_messages("peer-1", 0).len(), 1);
     }
 
@@ -2300,9 +2608,9 @@ mod tests {
         )));
         let _ = manager.peers.insert("peer-1".into(), peer);
 
-        manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()]);
-        manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()]); // duplicate
-        manager.buffer_for_replay(&Bytes::from("msg2"), &["Beta".into()]);
+        manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()], None);
+        manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()], None); // duplicate
+        manager.buffer_for_replay(&Bytes::from("msg2"), &["Beta".into()], None);
 
         let deduped = manager.replay_messages_deduped("peer-1");
         assert_eq!(deduped.len(), 2);
@@ -2364,5 +2672,85 @@ mod tests {
 
         let buffers = manager.replay_buffers.lock().expect("lock");
         assert!(buffers.is_empty());
+    }
+
+    // ── Hot reload (swap_peers) tests ────────────────────────────────
+
+    #[tokio::test]
+    async fn swap_peers_adds_new_peer_to_config_when_not_running() {
+        let mut manager = FederationManager::new(test_config());
+        let new_peers = vec![
+            test_peer_config("alpha", vec!["g1".into()]),
+            test_peer_config("beta", vec!["g2".into()]),
+        ];
+        let diff = manager.swap_peers(new_peers).await;
+        assert_eq!(diff.added.len(), 2);
+        assert_eq!(diff.removed.len(), 0);
+        assert_eq!(manager.config().peers.len(), 2);
+        assert_eq!(manager.peer_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn swap_peers_removes_peers_no_longer_in_set() {
+        let mut config = test_config();
+        config.peers = vec![
+            test_peer_config("alpha", vec!["g1".into()]),
+            test_peer_config("beta", vec!["g2".into()]),
+        ];
+        let mut manager = FederationManager::new(config);
+
+        let diff = manager
+            .swap_peers(vec![test_peer_config("beta", vec!["g2".into()])])
+            .await;
+        assert_eq!(diff.removed.len(), 1);
+        assert_eq!(diff.removed[0].as_str(), "alpha");
+        assert_eq!(diff.unchanged.len(), 1);
+        assert_eq!(manager.config().peers.len(), 1);
+        assert_eq!(manager.config().peers[0].id.as_str(), "beta");
+    }
+
+    #[tokio::test]
+    async fn swap_peers_reports_unchanged_peers() {
+        let mut config = test_config();
+        config.peers = vec![test_peer_config("alpha", vec!["g1".into()])];
+        let mut manager = FederationManager::new(config);
+
+        let diff = manager
+            .swap_peers(vec![test_peer_config("alpha", vec!["g1".into()])])
+            .await;
+        assert_eq!(diff.added.len(), 0);
+        assert_eq!(diff.removed.len(), 0);
+        assert_eq!(diff.unchanged.len(), 1);
+        assert_eq!(diff.unchanged[0].as_str(), "alpha");
+    }
+
+    #[tokio::test]
+    async fn swap_peers_replaces_peer_when_address_changes() {
+        let mut config = test_config();
+        config.peers = vec![test_peer_config("alpha", vec!["g1".into()])];
+        let mut manager = FederationManager::new(config);
+
+        let mut updated = test_peer_config("alpha", vec!["g1".into()]);
+        updated.address = "127.0.0.1:9999".into();
+        let diff = manager.swap_peers(vec![updated]).await;
+        assert_eq!(diff.added.len(), 1);
+        assert_eq!(manager.config().peers.len(), 1);
+        assert_eq!(manager.config().peers[0].address, "127.0.0.1:9999");
+    }
+
+    #[tokio::test]
+    async fn remove_peer_returns_false_for_unknown() {
+        let mut manager = FederationManager::new(test_config());
+        assert!(!manager.remove_peer("ghost").await);
+    }
+
+    #[tokio::test]
+    async fn add_peer_inserts_into_config() {
+        let mut manager = FederationManager::new(test_config());
+        let mut p = test_peer_config("alpha", vec!["g1".into()]);
+        p.is_outbound = false;
+        manager.add_peer(p).await.expect("add_peer");
+        assert_eq!(manager.config().peers.len(), 1);
+        assert_eq!(manager.config().peers[0].id.as_str(), "alpha");
     }
 }

@@ -87,10 +87,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       - name: Clippy (all features)
-        run: cargo clippy --locked --workspace --all-targets --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket,otel
+        run: cargo clippy --locked --workspace --all-targets --features nats,enrollment,est,proto,full-detail,metrics,federation,federation-ha,websocket,mqtt,otel
 
       - name: Build documentation
-        run: cargo doc --workspace --no-deps --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket,otel
+        run: cargo doc --workspace --no-deps --features nats,enrollment,est,proto,full-detail,metrics,federation,federation-ha,websocket,mqtt,otel
 
   check-features:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
@@ -158,10 +158,13 @@ jobs:
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Run tests
-        run: cargo nextest run --locked --workspace --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket,otel
+        run: cargo nextest run --locked --workspace --features nats,enrollment,est,proto,full-detail,metrics,federation,federation-ha,websocket,mqtt,otel
+
+      - name: Authz P99 budget gate (release)
+        run: cargo nextest run --locked --release -p rustgate-authz --run-ignored all perf_budget
 
       - name: Run doc tests
-        run: cargo test --locked --workspace --doc --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket,otel
+        run: cargo test --locked --workspace --doc --features nats,enrollment,est,proto,full-detail,metrics,federation,federation-ha,websocket,mqtt,otel
 
   coverage:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
@@ -202,7 +205,7 @@ jobs:
           tool: cargo-tarpaulin
 
       - name: Generate coverage report
-        run: cargo tarpaulin --locked --engine llvm --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket,otel --out xml --output-dir coverage/
+        run: cargo tarpaulin --locked --engine llvm --features nats,enrollment,est,proto,full-detail,metrics,federation,federation-ha,websocket,mqtt,otel --out xml --output-dir coverage/
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0

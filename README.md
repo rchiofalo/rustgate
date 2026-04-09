@@ -72,11 +72,11 @@ For production certificate management see [docs/tls-certificates.md](docs/tls-ce
 ┌─────────────────────────────────────────────────────────────────────────────────────────┐
 │                                     rustgate-server                                     │
 │                                        (binary)                                         │
-├──────────────┬──────────────┬──────────────┬──────────────┬──────────────┬──────────────┤
-│  rustgate-   │  rustgate-   │  rustgate-   │  rustgate-   │  rustgate-   │  rustgate-   │
-│  transport   │  websocket   │  nats        │  enrollment  │  proto       │  federation  │
-│  TLS·codec   │  wss://mTLS  │  NATS pubsub │  HTTPS·CSR   │  protobuf    │  V1·V2·gRPC  │
-│  router      │  WS sessions │  JetStream   │  Basic Auth  │  XML/proto   │  peer mgmt   │
+├──────────┬──────────┬──────────┬──────────┬──────────┬──────────┬──────────────┤
+│ rustgate-│ rustgate-│ rustgate-│ rustgate-│ rustgate-│ rustgate-│  rustgate-   │
+│ transport│ websocket│ mqtt     │ nats     │enrollment│ proto    │  federation  │
+│ TLS·codec│ wss://   │ MQTT 5.0 │ NATS pub │ HTTPS·CSR│ protobuf │  V1·V2·gRPC  │
+│ router   │ mTLS WS  │ 3.1.1    │ JetStream│ Auth     │ XML/proto│  peer mgmt   │
 ├──────────────┴──────────────┴──────────────┼──────────────┴──────────────┴──────────────┤
 │                rustgate-cot                │               rustgate-core                │
 │      CoT XML parsing · MessageBuilder      │    Codec trait · Identity · RoutableMessage│
@@ -89,6 +89,7 @@ For production certificate management see [docs/tls-certificates.md](docs/tls-ce
 | `rustgate-cot` | Cursor on Target XML parsing and message building |
 | `rustgate-transport` | mTLS listener, codec, session management, CRL, FIPS provider, routing engine |
 | `rustgate-websocket` | WebSocket (wss://) listener with mTLS client authentication |
+| `rustgate-mqtt` | MQTT 5.0/3.1.1 transport adapter with mTLS and dynamic subscriptions |
 | `rustgate-nats` | NATS/JetStream bridge for cross-instance message delivery |
 | `rustgate-enrollment` | HTTPS certificate enrollment server (CSR signing, PKCS#12) |
 | `rustgate-proto` | Protobuf message translation (XML ↔ proto) |
@@ -110,6 +111,7 @@ For detailed architecture documentation see [docs/architecture.md](docs/architec
 | Codecs | Length-prefixed, XML stream, and line-delimited codecs |
 | Position cache | Replay cached positions on client connect |
 | Rate limiting | Per-client message rate and burst controls |
+| MQTT transport | MQTT 5.0/3.1.1 sessions over mTLS with dynamic group subscriptions |
 | Plaintext input | TCP and UDP listeners for trusted-network scenarios |
 
 ### Protocols & Codecs
@@ -119,6 +121,7 @@ For detailed architecture documentation see [docs/architecture.md](docs/architec
 | WebSocket | wss:// listener with mTLS, interoperable with TCP clients |
 | Protobuf | Bidirectional XML ↔ protobuf translation |
 | Protocol negotiation | Automatic upgrade from XML to protobuf framing |
+| CoT delta encoding | Opt-in per-UID delta + epsilon suppression on XML sessions ([details](docs/cot-delta-encoding.md)) |
 | CoT archival | Structured JSONL logging of all received events |
 | Data packages | Upload, download, and search via Marti sync API |
 
@@ -128,6 +131,7 @@ For detailed architecture documentation see [docs/architecture.md](docs/architec
 |---------|-------------|
 | CRL revocation | PEM-encoded CRL loaded via `--crl`, enforced at TLS handshake |
 | FIPS 140-3 | aws-lc-rs crypto provider via `--features fips` ([details](docs/fips.md)) |
+| RBAC/ABAC authorization | Hot-reloadable policies and sub-microsecond evaluation ([details](docs/authorization.md)) |
 | Subject DN enforcement | Enrollment certs carry the authenticated username — prevents impersonation |
 | No unsafe code | `unsafe_code = "forbid"` workspace-wide |
 | Container hardening | Non-root UID, read-only filesystem, STOPSIGNAL SIGTERM |
@@ -149,6 +153,7 @@ For detailed architecture documentation see [docs/architecture.md](docs/architec
 |---------|-------------|
 | Prometheus metrics | Connection lifecycle, message routing, NATS, federation ([unauthenticated](docs/deployment.md#ports) — firewall in hostile environments) |
 | OpenTelemetry tracing | Distributed trace export via OTLP (Jaeger, Tempo, etc.) |
+| OpenTelemetry metrics | Optional OTLP metrics push alongside the Prometheus `/metrics` scrape endpoint (shares the OTLP collector URL with traces) |
 | Health endpoints | `/health/live`, `/health/ready`, `/health/startup` (plus deprecated `/healthz`, `/readyz` aliases) |
 | Graceful shutdown | SIGTERM handling, readiness 503, connection draining |
 | Helm chart | Pod Security Standards, PDB, HPA, probes, NetworkPolicy |
@@ -203,17 +208,47 @@ cargo build --release --all-features
 |---------|---------|-----------------|
 | `nats` | NATS/JetStream bridge | — |
 | `enrollment` | PKCS#12 enrollment server | — |
+| `est` | EST (RFC 7030) enrollment endpoints | — |
 | `proto` | Protobuf message support | `protoc` |
 | `federation` | Server-to-server federation | `protoc` |
 | `federation-ha` | HA federation with JWT | `protoc` |
 | `websocket` | WebSocket transport | — |
+| `mqtt` | MQTT 5.0/3.1.1 transport | — |
 | `metrics` | Prometheus metrics | — |
 | `full-detail` | Extended CoT parsing | — |
 | `fips` | FIPS 140-3 crypto (aws-lc-rs) | Go 1.20+, cmake |
 | `post-quantum` | Post-quantum key exchange (X25519MLKEM768) | Go 1.20+, cmake |
 | `otel` | OpenTelemetry distributed tracing | `protoc` |
 | `ocsp` | OCSP stapling for server certificates | — |
+| `spiffe` | SPIFFE / SPIRE workload identity (server cert + trust bundle from the Workload API) | `protoc` |
 | `jemalloc` | jemalloc allocator | — |
+
+#### SPIFFE workload identity
+
+When the `spiffe` feature is compiled in, rustgate can obtain its server
+TLS identity from a SPIRE agent via the SPIFFE Workload API instead of
+from static `--cert` / `--key` / `--ca` files. Enable it by passing
+`--spiffe` on the command line (or `RUSTGATE_SPIFFE=true`) alongside an
+optional `--spiffe-workload-api-socket`:
+
+```
+rustgate \
+  --bind 0.0.0.0:4433 \
+  --spiffe \
+  --spiffe-workload-api-socket unix:///tmp/spire-agent/public/api.sock \
+  --spiffe-trust-domain example.org
+```
+
+The X.509-SVID and trust bundle are fetched at startup, installed as the
+active rustls server certificate and client-cert verifier CA bundle, and
+then re-fetched on the interval set by `--spiffe-refresh-interval`
+(default 300 s). Rotations reuse the existing zero-downtime hot-reload
+path used by file-based certs. `--spiffe` is mutually exclusive with
+`--cert`/`--key`/`--ca` and `--enrollment-bind`. Refresh outcomes are
+exposed via the `rustgate_spiffe_svid_refresh_total{outcome="success|failure"}`
+counter and the `rustgate_spiffe_svid_expiry_seconds` gauge when the
+`metrics` feature is also enabled, and via
+`target="audit", event_type="spiffe.svid_refresh"` audit events.
 
 ## Running
 
@@ -345,10 +380,19 @@ All flags support environment variables (CLI takes precedence):
 | `--package-strict-signatures` | `RUSTGATE_PACKAGE_STRICT_SIGNATURES` | `false` |
 | `--revocation-db` | `RUSTGATE_REVOCATION_DB` | — |
 | `--crl-validity-days` | `RUSTGATE_CRL_VALIDITY_DAYS` | `7` |
+| `--est-enabled` | `RUSTGATE_EST_ENABLED` | `false` |
 | `--federation-v1-bind` | `RUSTGATE_FEDERATION_V1_BIND` | — |
 | `--federation-v2-bind` | `RUSTGATE_FEDERATION_V2_BIND` | — |
 | `--federation-id` | `RUSTGATE_FEDERATION_ID` | `rustgate-federation-1` |
 | `--federation-peers-file` | `RUSTGATE_FEDERATION_PEERS_FILE` | — |
+| `--federation-peers-reload-interval` | `RUSTGATE_FEDERATION_PEERS_RELOAD_INTERVAL` | `0` |
+| `--federation-peer-discovery` | `RUSTGATE_FEDERATION_PEER_DISCOVERY` | `none` (one of `none`, `dns-sd`, `consul`, `etcd`) |
+| `--federation-peer-discovery-interval` | `RUSTGATE_FEDERATION_PEER_DISCOVERY_INTERVAL` | `30` (seconds) |
+| `--federation-peer-discovery-dns-sd-service` | `RUSTGATE_FEDERATION_PEER_DISCOVERY_DNS_SD_SERVICE` | `_rustgate._tcp.local.` |
+| `--federation-peer-discovery-consul-addr` | `RUSTGATE_FEDERATION_PEER_DISCOVERY_CONSUL_ADDR` | `http://127.0.0.1:8500` |
+| `--federation-peer-discovery-consul-service` | `RUSTGATE_FEDERATION_PEER_DISCOVERY_CONSUL_SERVICE` | `rustgate` |
+| `--federation-peer-discovery-etcd-endpoints` | `RUSTGATE_FEDERATION_PEER_DISCOVERY_ETCD_ENDPOINTS` | `http://127.0.0.1:2379` (comma-separated) |
+| `--federation-peer-discovery-etcd-prefix` | `RUSTGATE_FEDERATION_PEER_DISCOVERY_ETCD_PREFIX` | `rustgate/peers/` |
 | `--federation-skip-hostname-verify` | `RUSTGATE_FEDERATION_SKIP_HOSTNAME_VERIFY` | `false` |
 | `--federation-max-hops` | `RUSTGATE_FEDERATION_MAX_HOPS` | `10` |
 | `--federation-store-path` | `RUSTGATE_FEDERATION_STORE_PATH` | — |
@@ -356,6 +400,8 @@ All flags support environment variables (CLI takes precedence):
 | `--federation-circuit-breaker-threshold` | `RUSTGATE_FEDERATION_CIRCUIT_BREAKER_THRESHOLD` | `5` |
 | `--federation-circuit-breaker-timeout` | `RUSTGATE_FEDERATION_CIRCUIT_BREAKER_TIMEOUT` | `60` |
 | `--federation-replay-buffer-size` | `RUSTGATE_FEDERATION_REPLAY_BUFFER_SIZE` | `1000` |
+| `--federation-replay-dir` | `RUSTGATE_FEDERATION_REPLAY_DIR` | — |
+| `--federation-replay-max-bytes` | `RUSTGATE_FEDERATION_REPLAY_MAX_BYTES` | `67108864` (64 MiB) |
 | `--federation-ha-nats-url` | `RUSTGATE_FEDERATION_HA_NATS_URL` | — |
 | `--federation-pod-id` | `RUSTGATE_FEDERATION_POD_ID` | — |
 | `--replay-window` | `RUSTGATE_REPLAY_WINDOW` | `300` |
@@ -366,6 +412,7 @@ All flags support environment variables (CLI takes precedence):
 | `--circuit-breaker-threshold` | `RUSTGATE_CIRCUIT_BREAKER_THRESHOLD` | `10` |
 | `--group-acl-file` | `RUSTGATE_GROUP_ACL_FILE` | — |
 | `--archive-dir` | `RUSTGATE_ARCHIVE_DIR` | — |
+| `--archive-key-file` | `RUSTGATE_ARCHIVE_KEY_FILE` | — |
 | `--archive-max-size` | `RUSTGATE_ARCHIVE_MAX_SIZE` | `0` (unlimited) |
 | `--archive-max-age` | `RUSTGATE_ARCHIVE_MAX_AGE` | `0` (unlimited, seconds) |
 | `--archive-rotate-interval` | `RUSTGATE_ARCHIVE_ROTATE_INTERVAL` | `60` (seconds) |
@@ -376,8 +423,46 @@ All flags support environment variables (CLI takes precedence):
 | `--client-queue-max-bytes` | `RUSTGATE_CLIENT_QUEUE_MAX_BYTES` | `104857600` (100 MiB) |
 | `--otel-endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` | — |
 | `--otel-service-name` | `OTEL_SERVICE_NAME` | `rustgate` |
+| `--otlp-metrics` | `RUSTGATE_OTLP_METRICS` | `false` |
+| `--otlp-metrics-interval` | `RUSTGATE_OTLP_METRICS_INTERVAL` | `60` (seconds, min 1) |
 
 </details>
+
+### Encrypted-at-rest archive and audit log
+
+When `--archive-key-file <path>` is supplied, the CoT archive
+(`--archive-dir`) and the audit log (`--audit-log`) are written through
+a streaming ChaCha20-Poly1305 sink instead of plaintext JSONL. The key
+file is a small JSON document:
+
+```json
+{
+  "active_key_id": "k1",
+  "keys": {
+    "k1": "1111111111111111111111111111111111111111111111111111111111111111"
+  }
+}
+```
+
+Each key is a 32-byte (64-character) lowercase hex string. The `active_key_id`
+is used for new writes; rotating keys is as simple as adding a new entry
+and updating `active_key_id` — historical files written under the prior
+key remain readable as long as that key is still listed. Encrypted files
+gain an `.enc` suffix and start with an authenticated header that records
+the key id used.
+
+To inspect or export an encrypted file:
+
+```bash
+rustgate decrypt-archive \
+  --in  /var/log/rustgate/cot-2026-04-06.jsonl.enc \
+  --out /tmp/cot-2026-04-06.jsonl \
+  --key-file /etc/rustgate/archive-keys.json
+```
+
+Tampering with any byte of the on-disk ciphertext fails AEAD verification
+on read. Key bytes are held in `zeroize::Zeroizing` buffers and wiped on
+drop.
 
 ### Cross-path deduplication
 
@@ -438,6 +523,68 @@ transports only. WebSocket sessions are not yet labelled and will not appear
 in `identity_cn`-labelled series. Byte counters report **application payload
 bytes** (post-decode / pre-encode), not wire bytes — they exclude TLS,
 framing, and codec overhead.
+
+### Federation peer discovery (DNS-SD, Consul, etcd)
+
+Static peer lists via `--federation-peers-file` remain the recommended
+source of truth for production meshes, but rustgate can also pull its
+peer set from an external service registry so nodes joining or leaving a
+cluster are reflected automatically. Set `--federation-peer-discovery` to
+one of `dns-sd`, `consul`, or `etcd` (it is mutually exclusive with
+`--federation-peers-file`), and a background reconciler will poll the
+selected backend every `--federation-peer-discovery-interval` seconds
+(default 30) and pipe the result into the same `swap_peers` machinery
+used by the file reloader. Adds, removes, and unchanged peers take the
+usual zero-downtime path: unchanged peers keep their existing connection,
+removed peers are disconnected cleanly, and new peers are connected.
+
+Each backend ships behind its own cargo sub-feature so minimal images
+only pay for the registry they actually use:
+
+- **DNS-SD / mDNS** (`--features peer-discovery-dns-sd`) — browses an
+  mDNS service type on the local link (default
+  `--federation-peer-discovery-dns-sd-service=_rustgate._tcp.local.`).
+  Each resolved service instance becomes an outbound peer whose address
+  is the instance's advertised host and port. Useful for self-forming
+  edge clusters on a flat L2 network; requires multicast between nodes.
+- **Consul** (`--features peer-discovery-consul`) — queries
+  `GET /v1/catalog/service/<name>` on the agent or server endpoint given
+  by `--federation-peer-discovery-consul-addr` (default
+  `http://127.0.0.1:8500`). Service instances with a non-empty
+  `ServiceAddress` use that field; otherwise the fallback is the node's
+  `Address`. The service name is configurable via
+  `--federation-peer-discovery-consul-service` (default `rustgate`).
+- **etcd** (`--features peer-discovery-etcd`) — performs a prefix scan
+  against the gRPC endpoints listed in
+  `--federation-peer-discovery-etcd-endpoints` (comma-separated) under
+  `--federation-peer-discovery-etcd-prefix` (default `rustgate/peers/`).
+  Values may be either a plain `host:port` string or a serialized
+  `PeerConfig` JSON object for full control over groups and routing.
+
+The umbrella feature `peer-discovery` enables all three backends. Mixing
+backends is not supported — a single reconciler runs at a time — but the
+`PeerDiscovery` trait is public so operators can provide their own.
+
+Selecting a backend whose sub-feature was not compiled in fails fast at
+startup with a clear error instead of silently ignoring the setting. See
+[docs/runbooks/federation-reconnect.md](docs/runbooks/federation-reconnect.md)
+for troubleshooting guidance on each backend.
+
+### Per-peer federation lag
+
+When the `federation` and `metrics` features are both enabled, two
+gauges expose how far behind each federation peer is, so operators can
+spot cascading backpressure:
+
+- `rustgate_federation_peer_queue_bytes{peer="..."}` — bytes currently
+  queued on the peer's outbound channel.
+- `rustgate_federation_peer_oldest_seconds{peer="..."}` — age in seconds
+  of the oldest message still waiting for delivery (`0` when the queue
+  is empty).
+
+Both gauges are refreshed once per second by a background task that
+snapshots the federation manager. Labels for peers that disappear are
+removed on the following tick.
 
 ## Docker
 
@@ -508,6 +655,21 @@ Notes:
 - **SHA-1 OCSP requests.** The upstream `ocsp-stapler` crate currently issues OCSP requests with
   SHA-1 issuer hashes. Most CAs accept this — verify compatibility with strict modern responders.
 
+### Client certificate OCSP verification
+
+Build with `--features ocsp` and pass `--client-ocsp` (env `RUSTGATE_CLIENT_OCSP`) to wrap the
+client certificate verifier with a SKI-keyed OCSP cache. On a cache miss the inner verifier's
+decision still stands (Tier 1, fail-open) and a background task fetches an OCSP response so the
+*next* handshake for the same client certificate can be answered from the cache; cached
+`Revoked` responses cause the handshake to be rejected before the session is established.
+
+This complements CRL-based revocation (which only refreshes on a schedule) with near-real-time
+revocation for the incoming client cert. Two Prometheus counters track cache effectiveness when
+`--features metrics` is enabled:
+
+- `rustgate_client_ocsp_cache_hits_total`
+- `rustgate_client_ocsp_cache_misses_total`
+
 For security policy and vulnerability reporting see [SECURITY.md](SECURITY.md).
 
 ## Testing
@@ -523,7 +685,7 @@ cargo nextest run -p rustgate-nats --test integration  # NATS integration (needs
 | `rustgate-transport` | `tls_listener`, `e2e_routing`, `encoder`, `crl`, `fips`, `cert_rotation` | mTLS, routing, codecs, CRL, FIPS, certificate hot-reload |
 | `rustgate-cot` | `parser` | CoT XML parsing |
 | `rustgate-core` | `types` | Core type invariants |
-| `rustgate-enrollment` | `server_integration` | PKCS#12 enrollment, CSR signing |
+| `rustgate-enrollment` | `server_integration`, `est_integration` | PKCS#12 enrollment, CSR signing, EST (RFC 7030) |
 | `rustgate-federation` | `v2_integration`, `api_integration`, `ha_integration` | Federation V2 protocol, REST API, HA coordination |
 | `rustgate-nats` | `integration` | NATS bridge, echo prevention, JetStream replay |
 | `rustgate-proto` | `codec_integration` | XML ↔ protobuf conversion |

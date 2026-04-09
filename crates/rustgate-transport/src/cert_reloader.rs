@@ -37,8 +37,11 @@ use zeroize::Zeroizing;
 /// Call [`spawn_watcher`](Self::spawn_watcher) to start the background
 /// polling task.
 pub struct CertReloader {
-    cert_path: PathBuf,
-    key_path: PathBuf,
+    /// File-backed cert path. `None` when the reloader is driven by an
+    /// in-memory identity source such as SPIFFE.
+    cert_path: Option<PathBuf>,
+    /// File-backed key path. `None` for in-memory identity sources.
+    key_path: Option<PathBuf>,
     /// The current `CertifiedKey` paired with the SHA-256 digest of the raw
     /// cert + key file bytes that produced it. A single lock ensures both
     /// are always in sync.
@@ -74,8 +77,50 @@ impl CertReloader {
         );
 
         Ok(Arc::new(Self {
-            cert_path,
-            key_path,
+            cert_path: Some(cert_path),
+            key_path: Some(key_path),
+            state: RwLock::new((Arc::new(certified_key), hash)),
+        }))
+    }
+
+    /// Construct a reloader from an initial in-memory certificate chain and
+    /// private key (both DER-encoded). Used by identity sources such as the
+    /// SPIFFE Workload API.
+    ///
+    /// The returned reloader has no file paths, so the file-polling watcher
+    /// is a no-op; callers are expected to drive updates via
+    /// [`update_from_der`](Self::update_from_der) from their own refresh task.
+    pub fn from_der(cert_chain_der: &[Vec<u8>], private_key_der: &[u8]) -> Result<Arc<Self>> {
+        if cert_chain_der.is_empty() {
+            return Err(ConfigError::EmptyPem {
+                kind: "certificates".to_string(),
+            }
+            .into());
+        }
+
+        let mut cert_flat: Vec<u8> = Vec::new();
+        for c in cert_chain_der {
+            cert_flat.extend_from_slice(c);
+        }
+        let hash = Self::compute_hash(&cert_flat, private_key_der);
+
+        let certs: Vec<CertificateDer<'static>> = cert_chain_der
+            .iter()
+            .map(|c| CertificateDer::from(c.clone()))
+            .collect();
+        let key_der = PrivateKeyDer::try_from(private_key_der.to_vec()).map_err(|e| {
+            RustgateError::from(ConfigError::Other(format!(
+                "failed to parse private key DER: {e}"
+            )))
+        })?;
+        let signing_key = Self::load_signing_key(key_der)?;
+        let certified_key = CertifiedKey::new(certs, signing_key);
+
+        info!("certificate reloader initialized from in-memory DER material");
+
+        Ok(Arc::new(Self {
+            cert_path: None,
+            key_path: None,
             state: RwLock::new((Arc::new(certified_key), hash)),
         }))
     }
@@ -100,16 +145,23 @@ impl CertReloader {
     ///
     /// Returns `true` if the certificate was rotated, `false` if unchanged.
     pub fn reload(&self) -> Result<bool> {
-        let cert_bytes = std::fs::read(&self.cert_path).map_err(|e| {
+        let Some(cert_path) = self.cert_path.as_ref() else {
+            // In-memory identity source: file reload is a no-op.
+            return Ok(false);
+        };
+        let Some(key_path) = self.key_path.as_ref() else {
+            return Ok(false);
+        };
+        let cert_bytes = std::fs::read(cert_path).map_err(|e| {
             RustgateError::from(ConfigError::Other(format!(
                 "failed to read certificate file {}: {e}",
-                self.cert_path.display()
+                cert_path.display()
             )))
         })?;
-        let key_bytes = Zeroizing::new(std::fs::read(&self.key_path).map_err(|e| {
+        let key_bytes = Zeroizing::new(std::fs::read(key_path).map_err(|e| {
             RustgateError::from(ConfigError::Other(format!(
                 "failed to read key file {}: {e}",
-                self.key_path.display()
+                key_path.display()
             )))
         })?);
 
@@ -123,7 +175,7 @@ impl CertReloader {
                 .map_err(|_| ConfigError::Other("state lock poisoned".to_string()))?;
             if guard.1 == new_hash {
                 debug!(
-                    cert = %self.cert_path.display(),
+                    cert = %cert_path.display(),
                     "certificate files unchanged"
                 );
                 return Ok(false);
@@ -144,11 +196,11 @@ impl CertReloader {
         }
 
         info!(
-            cert = %self.cert_path.display(),
+            cert = %cert_path.display(),
             serial = %serial,
             "server certificate rotated"
         );
-        rustgate_core::audit::cert_rotation_success(&self.cert_path.to_string_lossy(), &serial);
+        rustgate_core::audit::cert_rotation_success(&cert_path.to_string_lossy(), &serial);
 
         Ok(true)
     }
@@ -160,6 +212,11 @@ impl CertReloader {
     /// [`tokio::task::spawn_blocking`] to avoid stalling the async runtime,
     /// particularly when certificate files reside on a network filesystem.
     pub fn spawn_watcher(self: &Arc<Self>, interval: Duration) {
+        // In-memory identity sources (e.g. SPIFFE) don't have files to poll.
+        if self.cert_path.is_none() || self.key_path.is_none() {
+            debug!("cert reloader watcher skipped: no file paths (in-memory source)");
+            return;
+        }
         let reloader = Arc::clone(self);
         drop(tokio::spawn(async move {
             let mut tick = tokio::time::interval(interval);
@@ -172,11 +229,17 @@ impl CertReloader {
                 let r = Arc::clone(&reloader);
                 let result = tokio::task::spawn_blocking(move || r.reload()).await;
 
+                let display_path = reloader
+                    .cert_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<memory>".to_string());
+
                 let reload_result = match result {
                     Ok(inner) => inner,
                     Err(e) => {
                         warn!(
-                            cert = %reloader.cert_path.display(),
+                            cert = %display_path,
                             error = %e,
                             "certificate reload task panicked"
                         );
@@ -186,14 +249,11 @@ impl CertReloader {
 
                 if let Err(e) = reload_result {
                     warn!(
-                        cert = %reloader.cert_path.display(),
+                        cert = %display_path,
                         error = %e,
                         "certificate reload failed"
                     );
-                    rustgate_core::audit::cert_rotation_failed(
-                        &reloader.cert_path.to_string_lossy(),
-                        &e.to_string(),
-                    );
+                    rustgate_core::audit::cert_rotation_failed(&display_path, &e.to_string());
                 }
             }
         }));
@@ -262,6 +322,70 @@ impl CertReloader {
             Ok((_, cert)) => cert.serial.to_str_radix(16),
             Err(_) => "unknown".to_string(),
         }
+    }
+
+    /// Atomically swap the active [`CertifiedKey`] from an in-memory
+    /// certificate chain and private key supplied as DER bytes.
+    ///
+    /// This path is used by identity sources that deliver material directly
+    /// into the process (e.g. the SPIFFE Workload API) rather than through
+    /// files on disk. The reload reuses the same `RwLock`-guarded state
+    /// that file-based reloads use, so in-flight TLS handshakes continue to
+    /// resolve the previous `CertifiedKey` until the swap completes.
+    ///
+    /// Returns `true` if the certificate material changed, `false` if the
+    /// incoming bytes hash to the same value as the current state.
+    pub fn update_from_der(
+        &self,
+        cert_chain_der: &[Vec<u8>],
+        private_key_der: &[u8],
+    ) -> Result<bool> {
+        // Concatenate DER bytes for change detection.
+        let mut cert_flat: Vec<u8> = Vec::new();
+        for c in cert_chain_der {
+            cert_flat.extend_from_slice(c);
+        }
+        let new_hash = Self::compute_hash(&cert_flat, private_key_der);
+
+        {
+            let guard = self
+                .state
+                .read()
+                .map_err(|_| ConfigError::Other("state lock poisoned".to_string()))?;
+            if guard.1 == new_hash {
+                return Ok(false);
+            }
+        }
+
+        let certs: Vec<CertificateDer<'static>> = cert_chain_der
+            .iter()
+            .map(|c| CertificateDer::from(c.clone()))
+            .collect();
+        if certs.is_empty() {
+            return Err(ConfigError::EmptyPem {
+                kind: "certificates".to_string(),
+            }
+            .into());
+        }
+
+        let key_der = PrivateKeyDer::try_from(private_key_der.to_vec()).map_err(|e| {
+            RustgateError::from(ConfigError::Other(format!(
+                "failed to parse private key DER: {e}"
+            )))
+        })?;
+
+        let signing_key = Self::load_signing_key(key_der)?;
+        let certified_key = CertifiedKey::new(certs, signing_key);
+
+        {
+            let mut guard = self
+                .state
+                .write()
+                .map_err(|_| ConfigError::Other("state lock poisoned".to_string()))?;
+            *guard = (Arc::new(certified_key), new_hash);
+        }
+
+        Ok(true)
     }
 }
 
