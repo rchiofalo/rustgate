@@ -2852,6 +2852,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "prometheus",
+ "rustgate-authz",
  "rustgate-core",
  "rustgate-cot",
  "rustgate-enrollment",

@@ -7,8 +7,30 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use rustgate_authz::{
-    Action as AuthzAction, PolicyEngine, Resource as AuthzResource, Subject as AuthzSubject,
+    Action as AuthzAction, Decision as AuthzDecision, PolicyEngine, Resource as AuthzResource,
+    Subject as AuthzSubject,
 };
+
+/// Callback invoked after every authz evaluation so operators can wire
+/// the engine into metrics and audit without making `rustgate-transport`
+/// depend on `prometheus`. The server binary installs one of these via
+/// [`Router::with_authz_observer`].
+pub type AuthzObserver = Arc<dyn Fn(&AuthzEvent<'_>) + Send + Sync>;
+
+/// Event emitted by the Router PEP for every authz evaluation.
+#[derive(Debug)]
+pub struct AuthzEvent<'a> {
+    /// Action that was evaluated (Send / Receive).
+    pub action: AuthzAction,
+    /// Policy decision (Allow / Deny).
+    pub decision: AuthzDecision,
+    /// Wall-clock evaluation duration in nanoseconds.
+    pub eval_nanos: u64,
+    /// Matched rule id, when present.
+    pub rule_id: Option<&'a str>,
+    /// Stable policy identifier of the engine that produced the verdict.
+    pub policy_id: &'a str,
+}
 use rustgate_core::identity::{GroupId, Identity};
 use rustgate_core::message::{Destination, MessageType, RoutableMessage};
 use tokio::sync::{RwLock, mpsc};
@@ -375,6 +397,10 @@ pub struct Router {
     /// evaluated *in addition* to the ACL — both must allow for a
     /// message to flow.
     authz: ArcSwap<Option<Arc<dyn PolicyEngine>>>,
+    /// Optional observer invoked after each authz evaluation. Kept as an
+    /// `ArcSwap` so the server can install it once at startup without a
+    /// lock on the hot path.
+    authz_observer: ArcSwap<Option<AuthzObserver>>,
     backpressure: Option<Arc<BackpressureGate>>,
     /// Optional per-client store-and-forward disk queue. When `None`,
     /// the router behaves exactly as before: messages destined for
@@ -405,6 +431,7 @@ impl Default for Router {
             cache: PositionCache::default(),
             acl: ArcSwap::from_pointee(None),
             authz: ArcSwap::from_pointee(None),
+            authz_observer: ArcSwap::from_pointee(None),
             backpressure: None,
             client_queue: None,
             dedup: ArcSwap::from_pointee(None),
@@ -432,6 +459,7 @@ impl Router {
             cache: PositionCache::default(),
             acl: ArcSwap::from_pointee(None),
             authz: ArcSwap::from_pointee(None),
+            authz_observer: ArcSwap::from_pointee(None),
             backpressure: None,
             client_queue: None,
             dedup: ArcSwap::from_pointee(None),
@@ -465,6 +493,7 @@ impl Router {
             cache: PositionCache::default(),
             acl: ArcSwap::from_pointee(acl),
             authz: ArcSwap::from_pointee(None),
+            authz_observer: ArcSwap::from_pointee(None),
             backpressure: None,
             client_queue: None,
             dedup: ArcSwap::from_pointee(None),
@@ -501,6 +530,7 @@ impl Router {
             cache: PositionCache::default(),
             acl: ArcSwap::from_pointee(acl),
             authz: ArcSwap::from_pointee(None),
+            authz_observer: ArcSwap::from_pointee(None),
             backpressure: None,
             client_queue: None,
             dedup: ArcSwap::from_pointee(None),
@@ -551,6 +581,48 @@ impl Router {
     /// Snapshot the current policy engine, if any.
     pub fn authz_snapshot(&self) -> Option<Arc<dyn PolicyEngine>> {
         self.authz.load_full().as_ref().clone()
+    }
+
+    /// Attach an observer invoked after every authz evaluation.
+    ///
+    /// The observer receives both Allow and Deny verdicts and the wall-clock
+    /// evaluation duration, enabling metrics/audit without introducing a
+    /// `prometheus` dependency on this crate.
+    pub fn with_authz_observer(self, observer: AuthzObserver) -> Self {
+        self.authz_observer.store(Arc::new(Some(observer)));
+        self
+    }
+
+    /// Atomically replace the authz observer.
+    pub fn set_authz_observer(&self, observer: Option<AuthzObserver>) {
+        self.authz_observer.store(Arc::new(observer));
+    }
+
+    /// Evaluate the installed engine, invoke the observer, and return the
+    /// [`DecisionOutcome`]. Wrapped in a helper so both the send and receive
+    /// PEPs share identical instrumentation.
+    fn authz_evaluate(
+        &self,
+        engine: &Arc<dyn PolicyEngine>,
+        subject: &AuthzSubject<'_>,
+        resource: &AuthzResource<'_>,
+        action: AuthzAction,
+    ) -> rustgate_authz::DecisionOutcome {
+        let start = std::time::Instant::now();
+        let outcome = engine.evaluate(subject, resource, action);
+        let eval_nanos = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let observer_guard = self.authz_observer.load();
+        if let Some(observer) = (**observer_guard).as_ref() {
+            let ev = AuthzEvent {
+                action,
+                decision: outcome.decision,
+                eval_nanos,
+                rule_id: outcome.rule_id.as_deref(),
+                policy_id: engine.policy_id(),
+            };
+            observer(&ev);
+        }
+        outcome
     }
 
     /// Access the position cache for SA replay.
@@ -728,14 +800,21 @@ impl Router {
                 },
                 Destination::Broadcast => AuthzResource::Broadcast,
             };
-            let outcome = engine.evaluate(&subject, &resource, AuthzAction::Send);
+            let outcome = self.authz_evaluate(engine, &subject, &resource, AuthzAction::Send);
             if !outcome.is_allow() {
-                tracing::debug!(
-                    target: "authz",
-                    subject_cn = %msg.source.cn,
-                    rule_id = ?outcome.rule_id,
-                    policy_id = %engine.policy_id(),
-                    "authz deny on send"
+                let (kind, id) = match &msg.destination {
+                    Destination::Direct(target) => ("direct", target.cn.as_str()),
+                    Destination::Group(group) => ("group", group.as_ref()),
+                    Destination::Broadcast => ("broadcast", ""),
+                };
+                rustgate_core::audit::authz_denied(
+                    msg.source.cn.as_str(),
+                    msg.source.fingerprint.as_str(),
+                    "send",
+                    kind,
+                    id,
+                    outcome.rule_id.as_deref(),
+                    engine.policy_id(),
                 );
                 emit_access(&msg, "authz_deny");
                 return;
@@ -1041,14 +1120,17 @@ impl Router {
                     };
                     let subject = AuthzSubject::from_identity(&handle.identity);
                     let resource = AuthzResource::Group { group };
-                    let outcome = engine.evaluate(&subject, &resource, AuthzAction::Receive);
+                    let outcome =
+                        self.authz_evaluate(engine, &subject, &resource, AuthzAction::Receive);
                     if !outcome.is_allow() {
-                        tracing::debug!(
-                            target: "authz",
-                            recipient_cn = %handle.identity.cn,
-                            group = %group,
-                            rule_id = ?outcome.rule_id,
-                            "authz deny on receive"
+                        rustgate_core::audit::authz_denied(
+                            handle.identity.cn.as_str(),
+                            handle.identity.fingerprint.as_str(),
+                            "receive",
+                            "group",
+                            group,
+                            outcome.rule_id.as_deref(),
+                            engine.policy_id(),
                         );
                     }
                     outcome.is_allow()

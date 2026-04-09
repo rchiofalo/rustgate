@@ -297,6 +297,59 @@ pub fn spiffe_svid_refresh_failure(error: &str) {
     );
 }
 
+/// Record an authz deny decision.
+///
+/// Emitted by the router's policy enforcement point whenever an installed
+/// [`PolicyEngine`](https://docs.rs/rustgate-authz) returns a Deny verdict,
+/// including when the default effect denies an unmatched request.
+#[allow(clippy::too_many_arguments)]
+pub fn authz_denied(
+    subject_cn: &str,
+    subject_fingerprint: &str,
+    action: &str,
+    resource_kind: &str,
+    resource_id: &str,
+    rule_id: Option<&str>,
+    policy_id: &str,
+) {
+    audit!(
+        "authz.denied",
+        subject_cn = %subject_cn,
+        subject_fingerprint = %subject_fingerprint,
+        action = %action,
+        resource_kind = %resource_kind,
+        resource_id = %resource_id,
+        rule_id = rule_id.unwrap_or(""),
+        policy_id = %policy_id,
+        result = "deny"
+    );
+}
+
+/// Record a successful authz policy reload.
+pub fn authz_reload_success(path: &str, policy_id: &str, rule_count: usize) {
+    audit!(
+        "authz.reload_success",
+        path = %path,
+        policy_id = %policy_id,
+        rule_count = rule_count,
+        action = "reload",
+        result = "success"
+    );
+}
+
+/// Record a failed authz policy reload. `stage` identifies which phase
+/// failed: `"read"`, `"parse"`, `"compile"`, or `"startup"`.
+pub fn authz_reload_failed(path: &str, stage: &str, error: &str) {
+    audit!(
+        "authz.reload_failed",
+        path = %path,
+        stage = %stage,
+        error = %error,
+        action = "reload",
+        result = "failure"
+    );
+}
+
 /// Record server startup.
 pub fn server_started(bind: &str, version: &str) {
     let timestamp = SystemTime::now()

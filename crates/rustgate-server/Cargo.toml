@@ -44,6 +44,7 @@ ocsp = ["rustgate-transport/ocsp"]
 spiffe = ["rustgate-transport/spiffe"]
 
 [dependencies]
+rustgate-authz = { workspace = true }
 rustgate-core = { workspace = true }
 rustgate-cot = { workspace = true }
 rustgate-transport = { workspace = true }

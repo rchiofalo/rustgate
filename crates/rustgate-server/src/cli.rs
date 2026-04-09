@@ -681,6 +681,28 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 0, env = "RUSTGATE_ACL_RELOAD_INTERVAL")]
     pub(crate) acl_reload_interval: u64,
 
+    /// Path to a JSON rustgate-authz policy file.
+    ///
+    /// When set, the server loads the policy at startup and installs the
+    /// resulting engine on the router's RBAC/ABAC enforcement point. The
+    /// file is validated before it is swapped in, so a malformed policy
+    /// keeps the last known-good policy serving.
+    #[arg(long, env = "RUSTGATE_AUTHZ_POLICY_FILE")]
+    pub(crate) authz_policy_file: Option<String>,
+
+    /// Interval in seconds to check the authz policy file for changes.
+    /// Must be >= 1. Applied only when `--authz-policy-file` is set.
+    #[arg(long, default_value_t = 5, env = "RUSTGATE_AUTHZ_RELOAD_INTERVAL")]
+    pub(crate) authz_reload_interval: u64,
+
+    /// Fail-open mode: when the initial policy load fails, the server
+    /// continues to start without an engine installed (no PEP) instead of
+    /// aborting. The default (`false`) is fail-closed: a broken policy at
+    /// startup prevents the server from coming up, which matches the
+    /// deny-by-default security posture.
+    #[arg(long, default_value_t = false, env = "RUSTGATE_AUTHZ_FAIL_OPEN")]
+    pub(crate) authz_fail_open: bool,
+
     /// Path to a file containing the bearer token required to access the
     /// `/api/acl/` REST endpoints (both read and mutation routes).
     ///
@@ -1046,6 +1068,9 @@ define_config_file! {
     circuit_breaker_threshold: u32,
     group_acl_file: Option<String>,
     acl_reload_interval: u64,
+    authz_policy_file: Option<String>,
+    authz_reload_interval: u64,
+    authz_fail_open: bool,
     acl_api_token_file: Option<String>,
     archive_dir: Option<String>,
     archive_key_file: Option<std::path::PathBuf>,
@@ -1097,6 +1122,9 @@ impl Cli {
         }
         if self.ca.is_empty() {
             anyhow::bail!("--ca (or [ca] in the config file) is required");
+        }
+        if self.authz_policy_file.is_some() && self.authz_reload_interval == 0 {
+            anyhow::bail!("--authz-reload-interval must be >= 1 when --authz-policy-file is set");
         }
         Ok(())
     }
