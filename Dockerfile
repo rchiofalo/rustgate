@@ -11,6 +11,7 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates/rustgate-authz/Cargo.toml       crates/rustgate-authz/Cargo.toml
 COPY crates/rustgate-client/Cargo.toml      crates/rustgate-client/Cargo.toml
+COPY crates/rustgate-mqtt/Cargo.toml        crates/rustgate-mqtt/Cargo.toml
 COPY crates/rustgate-core/Cargo.toml        crates/rustgate-core/Cargo.toml
 COPY crates/rustgate-cot/Cargo.toml         crates/rustgate-cot/Cargo.toml
 COPY crates/rustgate-enrollment/Cargo.toml  crates/rustgate-enrollment/Cargo.toml
@@ -32,13 +33,13 @@ COPY crates/rustgate-proto/build.rs crates/rustgate-proto/build.rs
 COPY crates/rustgate-federation/proto crates/rustgate-federation/proto
 COPY crates/rustgate-federation/build.rs crates/rustgate-federation/build.rs
 
-RUN cargo build --release --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket,otel 2>/dev/null || true
+RUN cargo build --release --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket,otel,mqtt 2>/dev/null || true
 
 # Now copy real source and build for real.
 COPY . .
 # Touch all source files so cargo sees them as newer than the stubs.
 RUN find crates -name "*.rs" -exec touch {} +
-RUN cargo build --release --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket,otel
+RUN cargo build --release --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket,otel,mqtt
 
 # ── Runtime stage ────────────────────────────────────────────────────────
 FROM alpine:3.23@sha256:25109184c71bdad752c8312a8623239686a9a2071e8825f20acb8f2198c3f659
@@ -54,7 +55,7 @@ USER 10001
 
 COPY --from=builder --chmod=755 /src/target/release/rustgate /usr/local/bin/rustgate
 
-EXPOSE 4433 8443 8446 9000 9001 9090
+EXPOSE 4433 8443 8446 8883 9000 9001 9090
 
 STOPSIGNAL SIGTERM
 

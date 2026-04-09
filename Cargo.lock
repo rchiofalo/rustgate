@@ -3211,6 +3211,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustgate-mqtt"
+version = "0.7.0"
+dependencies = [
+ "rustgate-core",
+ "rustgate-test-utils",
+ "rustgate-transport",
+ "rustls",
+ "rustls-pki-types",
+ "socket2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+]
+
+[[package]]
 name = "rustgate-nats"
 version = "0.7.0"
 dependencies = [
@@ -3895,7 +3911,6 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.52.0",
  "windows-sys 0.59.0",
 ]
 

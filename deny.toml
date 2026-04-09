@@ -84,6 +84,9 @@ crate = "rustgate-client"
 [[licenses.exceptions]]
 allow = ["LicenseRef-Proprietary"]
 crate = "rustgate-authz"
+[[licenses.exceptions]]
+allow = ["LicenseRef-Proprietary"]
+crate = "rustgate-mqtt"
 
 [bans]
 multiple-versions = "warn"
