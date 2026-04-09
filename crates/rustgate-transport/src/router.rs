@@ -6,6 +6,9 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
+use rustgate_authz::{
+    Action as AuthzAction, PolicyEngine, Resource as AuthzResource, Subject as AuthzSubject,
+};
 use rustgate_core::identity::{GroupId, Identity};
 use rustgate_core::message::{Destination, MessageType, RoutableMessage};
 use tokio::sync::{RwLock, mpsc};
@@ -362,11 +365,16 @@ impl State {
     }
 }
 
-#[derive(Debug)]
 pub struct Router {
     state: RwLock<State>,
     cache: PositionCache,
     acl: ArcSwap<Option<GroupAclPolicy>>,
+    /// Optional RBAC/ABAC policy engine evaluated on every routed message.
+    /// When `None`, the router behaves as before and only the legacy
+    /// [`GroupAclPolicy`] path is consulted. When set, the engine is
+    /// evaluated *in addition* to the ACL — both must allow for a
+    /// message to flow.
+    authz: ArcSwap<Option<Arc<dyn PolicyEngine>>>,
     backpressure: Option<Arc<BackpressureGate>>,
     /// Optional per-client store-and-forward disk queue. When `None`,
     /// the router behaves exactly as before: messages destined for
@@ -376,12 +384,27 @@ pub struct Router {
     dedup: ArcSwap<Option<DedupCache>>,
 }
 
+impl std::fmt::Debug for Router {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Router")
+            .field("state", &self.state)
+            .field("cache", &self.cache)
+            .field("acl", &self.acl)
+            .field("authz_installed", &(**self.authz.load()).is_some())
+            .field("backpressure", &self.backpressure)
+            .field("client_queue", &self.client_queue)
+            .field("dedup", &self.dedup)
+            .finish()
+    }
+}
+
 impl Default for Router {
     fn default() -> Self {
         Self {
             state: RwLock::new(State::default()),
             cache: PositionCache::default(),
             acl: ArcSwap::from_pointee(None),
+            authz: ArcSwap::from_pointee(None),
             backpressure: None,
             client_queue: None,
             dedup: ArcSwap::from_pointee(None),
@@ -408,6 +431,7 @@ impl Router {
             }),
             cache: PositionCache::default(),
             acl: ArcSwap::from_pointee(None),
+            authz: ArcSwap::from_pointee(None),
             backpressure: None,
             client_queue: None,
             dedup: ArcSwap::from_pointee(None),
@@ -440,6 +464,7 @@ impl Router {
             state: RwLock::new(State::default()),
             cache: PositionCache::default(),
             acl: ArcSwap::from_pointee(acl),
+            authz: ArcSwap::from_pointee(None),
             backpressure: None,
             client_queue: None,
             dedup: ArcSwap::from_pointee(None),
@@ -475,6 +500,7 @@ impl Router {
             }),
             cache: PositionCache::default(),
             acl: ArcSwap::from_pointee(acl),
+            authz: ArcSwap::from_pointee(None),
             backpressure: None,
             client_queue: None,
             dedup: ArcSwap::from_pointee(None),
@@ -497,6 +523,34 @@ impl Router {
     /// concurrent calls to [`swap_acl`](Self::swap_acl) do not affect it.
     pub fn acl_snapshot(&self) -> Arc<Option<GroupAclPolicy>> {
         self.acl.load_full()
+    }
+
+    /// Attach an RBAC/ABAC [`PolicyEngine`] to the router.
+    ///
+    /// The engine is evaluated on every routed message — once on the
+    /// send path with [`AuthzAction::Send`], and once per recipient
+    /// inside group delivery with [`AuthzAction::Receive`]. A deny
+    /// verdict drops the message for that hop. The legacy
+    /// [`GroupAclPolicy`] path remains active; both must allow for the
+    /// message to flow.
+    pub fn with_authz(self, engine: Arc<dyn PolicyEngine>) -> Self {
+        self.authz.store(Arc::new(Some(engine)));
+        self
+    }
+
+    /// Atomically replace the installed policy engine.
+    pub fn swap_authz(&self, engine: Arc<dyn PolicyEngine>) {
+        self.authz.store(Arc::new(Some(engine)));
+    }
+
+    /// Remove the installed policy engine, reverting to ACL-only mode.
+    pub fn clear_authz(&self) {
+        self.authz.store(Arc::new(None));
+    }
+
+    /// Snapshot the current policy engine, if any.
+    pub fn authz_snapshot(&self) -> Option<Arc<dyn PolicyEngine>> {
+        self.authz.load_full().as_ref().clone()
     }
 
     /// Access the position cache for SA replay.
@@ -637,11 +691,6 @@ impl Router {
             }
         }
 
-        // Cache position reports for SA replay to new sessions
-        if msg.metadata.message_type == MessageType::Position {
-            self.cache.store(msg.clone()).await;
-        }
-
         // Drop messages that expired while waiting in the ingest pipeline
         if crate::cache::is_expired(&msg) {
             debug!(
@@ -651,6 +700,53 @@ impl Router {
             );
             emit_access(&msg, "expired");
             return;
+        }
+
+        // Policy enforcement point: if an RBAC/ABAC engine is installed,
+        // evaluate the send action before ANY state mutation (position
+        // cache store, access log, dispatch). A deny verdict drops the
+        // message outright and leaves no observable side effect beyond
+        // the audit deny event.
+        //
+        // Running the PEP ahead of `cache.store` matters: a denied
+        // position report must not leak into the SA replay cache, or a
+        // newly connected session would receive the denied position on
+        // replay even though no live session ever received it.
+        //
+        // The legacy `GroupAclPolicy` path in `send_to_group` still runs
+        // independently — both must allow for a group message to flow,
+        // which is what lets operators migrate incrementally.
+        let authz_guard = self.authz.load();
+        if let Some(engine) = (**authz_guard).as_ref() {
+            let subject = AuthzSubject::from_identity(&msg.source);
+            let resource = match &msg.destination {
+                Destination::Direct(target) => AuthzResource::Direct {
+                    target_cn: target.cn.as_str(),
+                },
+                Destination::Group(group) => AuthzResource::Group {
+                    group: group.as_ref(),
+                },
+                Destination::Broadcast => AuthzResource::Broadcast,
+            };
+            let outcome = engine.evaluate(&subject, &resource, AuthzAction::Send);
+            if !outcome.is_allow() {
+                tracing::debug!(
+                    target: "authz",
+                    subject_cn = %msg.source.cn,
+                    rule_id = ?outcome.rule_id,
+                    policy_id = %engine.policy_id(),
+                    "authz deny on send"
+                );
+                emit_access(&msg, "authz_deny");
+                return;
+            }
+        }
+
+        // Cache position reports for SA replay to new sessions. This
+        // MUST run after the authz PEP above: a denied position must
+        // not enter the replay cache.
+        if msg.metadata.message_type == MessageType::Position {
+            self.cache.store(msg.clone()).await;
         }
 
         // Successful path: emit one access-log event per routed message.
@@ -821,6 +917,32 @@ impl Router {
         };
         match handle {
             Some(handle) => {
+                // Per-recipient authz Receive PEP for direct unicast.
+                // A policy rule that denies `charlie` from receiving any
+                // direct message only takes effect if we evaluate here,
+                // not just on the sender-side Send PEP in `route_inner`.
+                //
+                // When the message is persisted for offline delivery
+                // below, the authz check runs again at live-delivery
+                // time (on the next successful `send_to_session` path
+                // after drain), which is the correct behavior: policy
+                // may have changed in the interim.
+                let authz_guard = self.authz.load();
+                if let Some(engine) = (**authz_guard).as_ref() {
+                    let subject = AuthzSubject::from_identity(&handle.identity);
+                    let resource = AuthzResource::Direct { target_cn: cn };
+                    let outcome = engine.evaluate(&subject, &resource, AuthzAction::Receive);
+                    if !outcome.is_allow() {
+                        tracing::debug!(
+                            target: "authz",
+                            recipient_cn = %cn,
+                            rule_id = ?outcome.rule_id,
+                            policy_id = %engine.policy_id(),
+                            "authz deny on direct receive"
+                        );
+                        return;
+                    }
+                }
                 if let Err(e) = handle.send(msg).await {
                     // `tokio::mpsc::Sender::send().await` only returns
                     // Err when the receiver has been closed — a full
@@ -833,7 +955,11 @@ impl Router {
                 }
             }
             None => {
-                // No live subscriber — persist for redelivery.
+                // No live subscriber — persist for redelivery. The
+                // authz Receive PEP runs at drain time when the session
+                // reconnects; persisting a currently-denied message is
+                // acceptable because policy may change before the
+                // session returns.
                 self.persist_for_offline(cn, &msg);
             }
         }
@@ -882,6 +1008,12 @@ impl Router {
             return;
         }
 
+        // Snapshot the optional authz engine once so the per-recipient
+        // hot path below is just a virtual call per candidate rather
+        // than an atomic load per iteration.
+        let authz_guard = self.authz.load();
+        let authz: Option<&Arc<dyn PolicyEngine>> = (**authz_guard).as_ref();
+
         let mut dropped = 0u32;
         let mut total = 0u32;
         {
@@ -899,6 +1031,28 @@ impl Router {
                         .is_none_or(|acl| acl.is_receive_authorized(group, cn))
                 })
                 .filter_map(|cn| state.sessions.get(cn))
+                .filter(|handle| {
+                    // Per-recipient authz Receive check. The Subject is
+                    // built from the *recipient's* identity so policies
+                    // that deny a specific CN or attribute on receive
+                    // actually take effect.
+                    let Some(engine) = authz else {
+                        return true;
+                    };
+                    let subject = AuthzSubject::from_identity(&handle.identity);
+                    let resource = AuthzResource::Group { group };
+                    let outcome = engine.evaluate(&subject, &resource, AuthzAction::Receive);
+                    if !outcome.is_allow() {
+                        tracing::debug!(
+                            target: "authz",
+                            recipient_cn = %handle.identity.cn,
+                            group = %group,
+                            rule_id = ?outcome.rule_id,
+                            "authz deny on receive"
+                        );
+                    }
+                    outcome.is_allow()
+                })
             {
                 total += 1;
                 if !handle.try_send(msg.clone()) {
@@ -922,7 +1076,9 @@ impl Router {
 
     /// Broadcast to all connected sessions (except sender).
     /// This is intentional for SA sharing — all authenticated clients
-    /// receive broadcasts regardless of group membership.
+    /// receive broadcasts regardless of group membership. Per-recipient
+    /// authz Receive PEP still applies: a policy rule denying broadcast
+    /// receipt to a specific subject filters that recipient out here.
     async fn send_to_all(&self, msg: RoutedMessage) {
         let targets: Vec<SessionHandle> = {
             let state = self.state.read().await;
@@ -934,8 +1090,30 @@ impl Router {
                 .collect()
         };
 
+        // Snapshot the authz engine once so the per-recipient loop is a
+        // virtual call at worst, not an atomic load per iteration.
+        let authz_guard = self.authz.load();
+        let authz: Option<&Arc<dyn PolicyEngine>> = (**authz_guard).as_ref();
+
         let mut dropped = 0u32;
+        let mut filtered = 0u32;
         for handle in &targets {
+            if let Some(engine) = authz {
+                let subject = AuthzSubject::from_identity(&handle.identity);
+                let resource = AuthzResource::Broadcast;
+                let outcome = engine.evaluate(&subject, &resource, AuthzAction::Receive);
+                if !outcome.is_allow() {
+                    tracing::debug!(
+                        target: "authz",
+                        recipient_cn = %handle.identity.cn,
+                        rule_id = ?outcome.rule_id,
+                        policy_id = %engine.policy_id(),
+                        "authz deny on broadcast receive"
+                    );
+                    filtered += 1;
+                    continue;
+                }
+            }
             if handle.send(msg.clone()).await.is_err() {
                 dropped += 1;
             }
@@ -945,6 +1123,13 @@ impl Router {
                 dropped = dropped,
                 total = targets.len(),
                 "messages dropped during broadcast: channel full or disconnected"
+            );
+        }
+        if filtered > 0 {
+            debug!(
+                filtered = filtered,
+                total = targets.len(),
+                "broadcast recipients filtered by authz policy"
             );
         }
     }

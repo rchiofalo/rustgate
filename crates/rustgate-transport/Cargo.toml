@@ -20,6 +20,7 @@ spiffe = ["dep:spiffe", "dep:base64"]
 [dependencies]
 rustgate-core = { workspace = true }
 rustgate-cot = { workspace = true }
+rustgate-authz = { workspace = true }
 rustgate-proto = { workspace = true, optional = true }
 arc-swap = { workspace = true }
 bytes = { workspace = true }
@@ -42,6 +43,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 rustgate-test-utils = { workspace = true }
+smol_str = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 futures = { workspace = true }
 bytes = { workspace = true }
