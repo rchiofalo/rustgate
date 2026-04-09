@@ -11,7 +11,7 @@ pub mod publisher;
 pub mod serde_compat;
 pub mod subscriber;
 
-pub use config::{NatsConfig, NatsTlsConfig, NatsTlsConfigError};
+pub use config::{NatsConfig, NatsConfigError, NatsTlsConfig, NatsTlsConfigError};
 pub use jetstream::JetStreamReplay;
 pub use publisher::NatsPublisher;
 pub use serde_compat::WireEvent;
@@ -34,7 +34,7 @@ impl NatsAdapter {
     pub async fn connect(
         config: NatsConfig,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        config.tls.validate()?;
+        config.validate()?;
 
         let options = if let Some(ref creds) = config.credentials_file {
             async_nats::ConnectOptions::with_credentials_file(creds).await?
