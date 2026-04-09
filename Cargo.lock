@@ -2656,6 +2656,7 @@ version = "0.7.0"
 dependencies = [
  "ahash",
  "criterion",
+ "parking_lot",
  "proptest",
  "rustgate-core",
  "serde",

@@ -115,17 +115,82 @@ pub struct Subject<'a> {
     pub attributes: &'a BTreeMap<String, AttrValue>,
     /// SHA-256 certificate fingerprint, empty for plaintext sessions.
     pub fingerprint: &'a str,
+    /// Stable hash of `(cn, sorted groups, sorted attributes, spiffe_id)`.
+    ///
+    /// Callers on the hot path should precompute this once per session
+    /// (see `Subject::compute_hash`) and reuse it via `Subject::with_hash`
+    /// rather than paying the hashing cost on every evaluation.
+    pub subject_hash: u64,
 }
 
 impl<'a> Subject<'a> {
-    /// Borrow an [`Identity`] as a [`Subject`] without cloning.
+    /// Borrow an [`Identity`] as a [`Subject`], computing `subject_hash`
+    /// inline. Convenient for test/cold paths; the hot path should use
+    /// `Subject::with_hash` and a session-cached hash.
     pub fn from_identity(id: &'a Identity) -> Self {
+        let subject_hash = Self::compute_hash(id);
+        Self::with_hash(id, subject_hash)
+    }
+
+    /// Borrow an [`Identity`] as a [`Subject`] using a caller-provided,
+    /// precomputed hash. Zero-work per call on the dataplane hot path.
+    pub fn with_hash(id: &'a Identity, subject_hash: u64) -> Self {
         Self {
             cn: id.cn.as_str(),
             spiffe_id: id.spiffe_id.as_deref(),
             groups: &id.groups,
             attributes: id.attributes.as_ref(),
             fingerprint: id.fingerprint.as_str(),
+            subject_hash,
+        }
+    }
+
+    /// Deterministic hash of the policy-relevant identity fields.
+    ///
+    /// Uses `ahash` seeded with fixed keys so the same identity yields
+    /// the same hash for the lifetime of a process. The cache is
+    /// per-process so we only need stability within a single run; a
+    /// seeded construction avoids needing to store a `RandomState`
+    /// alongside every cache.
+    pub fn compute_hash(id: &Identity) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = ahash::AHasher::default();
+        id.cn.hash(&mut h);
+        // BTreeSet/BTreeMap already iterate in sorted order.
+        for g in &id.groups {
+            g.hash(&mut h);
+        }
+        for (k, v) in id.attributes.as_ref() {
+            k.hash(&mut h);
+            hash_attr(v, &mut h);
+        }
+        if let Some(s) = id.spiffe_id.as_deref() {
+            s.hash(&mut h);
+        }
+        h.finish()
+    }
+}
+
+fn hash_attr<H: std::hash::Hasher>(v: &AttrValue, h: &mut H) {
+    use std::hash::Hash;
+    match v {
+        AttrValue::Str(s) => {
+            0u8.hash(h);
+            s.hash(h);
+        }
+        AttrValue::Int(i) => {
+            1u8.hash(h);
+            i.hash(h);
+        }
+        AttrValue::Bool(b) => {
+            2u8.hash(h);
+            b.hash(h);
+        }
+        AttrValue::Set(items) => {
+            3u8.hash(h);
+            for item in items {
+                item.hash(h);
+            }
         }
     }
 }
