@@ -151,7 +151,7 @@ pub(crate) async fn build_tls_config(cli: &Cli) -> anyhow::Result<TlsConfigBuild
         return Ok(TlsConfigBuild {
             tls_config,
             cert_pem: identity.cert_pem.clone(),
-            key_pem: identity.key_pem.clone(),
+            key_pem: zeroize::Zeroizing::new(identity.key_pem.clone()),
             ca_pem: identity.trust_bundle_pem.clone(),
             spiffe_identity: Some(identity),
         });
@@ -168,9 +168,11 @@ pub(crate) async fn build_tls_config(cli: &Cli) -> anyhow::Result<TlsConfigBuild
     let cert_pem = tokio::fs::read_to_string(&cli.cert)
         .await
         .context("reading server certificate")?;
-    let key_pem = tokio::fs::read_to_string(&cli.key)
-        .await
-        .context("reading server private key")?;
+    let key_pem = zeroize::Zeroizing::new(
+        tokio::fs::read_to_string(&cli.key)
+            .await
+            .context("reading server private key")?,
+    );
     let ca_pem = tokio::fs::read_to_string(&cli.ca)
         .await
         .context("reading CA certificate")?;
@@ -207,7 +209,8 @@ pub(crate) async fn build_tls_config(cli: &Cli) -> anyhow::Result<TlsConfigBuild
 pub(crate) struct TlsConfigBuild {
     pub(crate) tls_config: TlsConfig,
     pub(crate) cert_pem: String,
-    pub(crate) key_pem: String,
+    /// Wrapped in [`Zeroizing`] so the private key PEM is wiped from memory on drop.
+    pub(crate) key_pem: zeroize::Zeroizing<String>,
     pub(crate) ca_pem: String,
     #[cfg(feature = "spiffe")]
     pub(crate) spiffe_identity: Option<rustgate_transport::spiffe::SpiffeIdentity>,
@@ -590,9 +593,11 @@ pub(crate) async fn start_enrollment(
         anyhow::anyhow!("--enrollment-password is required when --enrollment-bind is set")
     })?;
 
-    let ca_key_pem = tokio::fs::read_to_string(ca_key_path)
-        .await
-        .context("reading CA private key for enrollment")?;
+    let ca_key_pem = zeroize::Zeroizing::new(
+        tokio::fs::read_to_string(ca_key_path)
+            .await
+            .context("reading CA private key for enrollment")?,
+    );
 
     let signer =
         rustgate_enrollment::CsrSigner::from_pem(ca_pem, &ca_key_pem, &cli.ca_organization)
@@ -709,7 +714,7 @@ pub(crate) async fn start_enrollment(
         .context("parsing --enrollment-bind address")?;
 
     let enrollment_cert = cert_pem.to_string();
-    let enrollment_key = key_pem.to_string();
+    let enrollment_key = zeroize::Zeroizing::new(key_pem.to_string());
 
     spawn_background("enrollment-server", async move {
         if let Err(e) = enrollment_server

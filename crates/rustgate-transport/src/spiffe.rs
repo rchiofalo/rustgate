@@ -21,6 +21,7 @@ use spiffe::cert::Certificate;
 use spiffe::svid::x509::X509Svid;
 use spiffe::workload_api::client::WorkloadApiClient;
 use tracing::{info, warn};
+use zeroize::Zeroizing;
 
 use crate::cert_reloader::CertReloader;
 
@@ -43,8 +44,9 @@ pub struct SpiffeIdentity {
     /// the server (federation, enrollment, metrics) which still expect
     /// PEM-encoded material.
     pub cert_pem: String,
-    /// PKCS#8 private key in PEM form.
-    pub key_pem: String,
+    /// PKCS#8 private key in PEM form. Wrapped in [`Zeroizing`] so the
+    /// private key is wiped from memory on drop.
+    pub key_pem: Zeroizing<String>,
     /// SPIFFE ID of the fetched SVID, e.g. `spiffe://example.org/rustgate`.
     pub spiffe_id: String,
     /// Trust domain of the fetched SVID, e.g. `example.org`.
@@ -135,8 +137,9 @@ pub async fn fetch_initial_identity(cfg: &SpiffeConfig) -> Result<SpiffeIdentity
     for der in &cert_chain_der {
         append_der_as_pem(&mut cert_pem, "CERTIFICATE", der);
     }
-    let mut key_pem = String::new();
-    append_der_as_pem(&mut key_pem, "PRIVATE KEY", &private_key_der);
+    let mut key_pem_raw = String::new();
+    append_der_as_pem(&mut key_pem_raw, "PRIVATE KEY", &private_key_der);
+    let key_pem = Zeroizing::new(key_pem_raw);
 
     if trust_bundle_pem.is_empty() {
         return Err(ConfigError::Other(
