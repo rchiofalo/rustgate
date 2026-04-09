@@ -180,10 +180,10 @@ pub const NORMAL_CHANNEL_CAPACITY: usize = 64;
 pub struct SessionHandle {
     pub id: u64,
     pub identity: Arc<Identity>,
-    /// Precomputed authz subject hash, derived once at session
+    /// Precomputed 128-bit authz subject hash, derived once at session
     /// construction so the PEP hot path performs zero hashing over
     /// the identity on every routed message.
-    subject_hash: u64,
+    subject_hash: rustgate_authz::SubjectHash,
     priority_sender: Arc<Mutex<Option<mpsc::Sender<RoutedMessage>>>>,
     normal_sender: Arc<Mutex<Option<mpsc::Sender<RoutedMessage>>>>,
     consecutive_drops: Arc<AtomicU32>,
@@ -214,7 +214,7 @@ impl SessionHandle {
 
     /// Precomputed authz subject hash suitable for
     /// `rustgate_authz::Subject::with_hash` on the PEP hot path.
-    pub fn subject_hash(&self) -> u64 {
+    pub fn subject_hash(&self) -> rustgate_authz::SubjectHash {
         self.subject_hash
     }
 

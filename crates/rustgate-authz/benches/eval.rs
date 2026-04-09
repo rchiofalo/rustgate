@@ -5,7 +5,7 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use rustgate_authz::parser::parse_json;
-use rustgate_authz::{Action, NativeEngine, PolicyEngine, Resource, Subject};
+use rustgate_authz::{Action, NativeEngine, PolicyEngine, Resource, Subject, SubjectHash};
 use rustgate_core::AttrValue;
 use rustgate_core::identity::Identity;
 
@@ -138,7 +138,14 @@ fn bench_eval(c: &mut Criterion) {
         let mut counter: u64 = 0;
         b.iter(|| {
             counter = counter.wrapping_add(1);
-            let s = Subject::with_hash(&id, subject_hash ^ counter);
+            // Perturb both halves so the cache never hits. The
+            // engine only reads `subject_hash` when building the
+            // cache key, so this is safe for benching.
+            let perturbed = SubjectHash {
+                primary: subject_hash.primary ^ counter,
+                secondary: subject_hash.secondary ^ counter.rotate_left(17),
+            };
+            let s = Subject::with_hash(&id, perturbed);
             black_box(cache_miss_engine.evaluate(&s, &Resource::Broadcast, Action::Send));
         })
     });
