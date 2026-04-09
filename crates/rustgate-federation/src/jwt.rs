@@ -16,6 +16,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -54,8 +55,9 @@ pub struct FederationClaims {
 
 /// Manages JWT issuance, validation, and revocation for federation.
 pub struct JwtAuthority {
-    /// HMAC-SHA256 signing key.
-    secret: Vec<u8>,
+    /// HMAC-SHA256 signing key. Wrapped in [`Zeroizing`] so the key
+    /// material is wiped from memory when the authority is dropped.
+    secret: Zeroizing<Vec<u8>>,
     /// Issuer name stamped into tokens.
     issuer: String,
     /// Default token lifetime.
@@ -82,7 +84,7 @@ impl JwtAuthority {
     /// The secret must be at least 32 bytes (`MIN_SECRET_LENGTH`) to
     /// provide full HMAC-SHA256 security.
     pub fn new(secret: impl Into<Vec<u8>>, issuer: impl Into<String>) -> Result<Self, JwtError> {
-        let secret = secret.into();
+        let secret = Zeroizing::new(secret.into());
         if secret.len() < MIN_SECRET_LENGTH {
             return Err(JwtError::SecretTooShort {
                 min: MIN_SECRET_LENGTH,

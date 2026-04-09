@@ -3201,6 +3201,7 @@ dependencies = [
  "tracing",
  "x509-cert",
  "x509-parser",
+ "zeroize",
 ]
 
 [[package]]
@@ -3350,6 +3351,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

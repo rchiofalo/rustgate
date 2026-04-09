@@ -729,7 +729,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     router: Arc::clone(&router),
                     reloader: acl_reloader_for_api,
                     file_path: std::path::PathBuf::from(acl_file),
-                    auth_token: token,
+                    auth_token: zeroize::Zeroizing::new(token),
                 });
                 let handler: metrics::AclApiHandler = Arc::new(move |method, path, auth, body| {
                     acl_api::handle_request(method, path, auth, body, &api_state)

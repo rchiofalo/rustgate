@@ -2,12 +2,14 @@
 
 use base64::Engine;
 use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
 /// Enrollment credentials for HTTP Basic Auth.
 #[derive(Clone)]
 pub struct Credentials {
     username: String,
-    password: String,
+    /// Wrapped in [`Zeroizing`] so the password is wiped from memory on drop.
+    password: Zeroizing<String>,
 }
 
 impl std::fmt::Debug for Credentials {
@@ -20,7 +22,10 @@ impl std::fmt::Debug for Credentials {
 
 impl Credentials {
     pub fn new(username: String, password: String) -> Self {
-        Self { username, password }
+        Self {
+            username,
+            password: Zeroizing::new(password),
+        }
     }
 
     /// Validate a Basic Auth header value. Returns the username on success.

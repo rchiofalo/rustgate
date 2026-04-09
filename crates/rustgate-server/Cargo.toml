@@ -82,6 +82,7 @@ figment = { workspace = true }
 toml = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 rustgate-test-utils = { workspace = true }

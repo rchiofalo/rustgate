@@ -29,6 +29,7 @@ use hyper::{Method, Response, StatusCode};
 use rustgate_transport::Router;
 use serde::Serialize;
 use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
 use crate::acl_config::{GroupAclEntry, GroupAclFile};
 use crate::acl_reloader::AclReloader;
@@ -49,7 +50,8 @@ pub struct AclApiState {
     pub file_path: PathBuf,
     /// Bearer token required on every `/api/acl/` request. Stored as
     /// raw bytes so we can use constant-time comparison.
-    pub auth_token: Vec<u8>,
+    /// Wrapped in [`Zeroizing`] so the token is wiped from memory on drop.
+    pub auth_token: Zeroizing<Vec<u8>>,
 }
 
 impl std::fmt::Debug for AclApiState {
@@ -362,7 +364,7 @@ mod tests {
             router: Arc::new(Router::new()),
             reloader: None,
             file_path: path,
-            auth_token: TEST_TOKEN.as_bytes().to_vec(),
+            auth_token: Zeroizing::new(TEST_TOKEN.as_bytes().to_vec()),
         }
     }
 
@@ -617,7 +619,7 @@ mod tests {
             router: Arc::clone(&router),
             reloader: Some(Arc::clone(&reloader)),
             file_path: path.clone(),
-            auth_token: TEST_TOKEN.as_bytes().to_vec(),
+            auth_token: Zeroizing::new(TEST_TOKEN.as_bytes().to_vec()),
         };
 
         let resp = handle_request(&Method::POST, "/api/acl/reload", TEST_AUTH, &[], &state)

@@ -10,6 +10,7 @@
 
 use sha1::Sha1;
 use sha2::digest::Digest;
+use zeroize::Zeroizing;
 
 use crate::error::EnrollmentError;
 
@@ -270,11 +271,11 @@ fn pkcs12_kdf<D: Digest + Default>(
     let s_block = expand_to_block(salt, block_size);
 
     // Step 3: Encode password as BMPString (UTF-16BE with NUL terminator)
-    let bmp_password = to_bmp_string(password);
+    let bmp_password = Zeroizing::new(to_bmp_string(password));
     let p_block = expand_to_block(&bmp_password, block_size);
 
     // Step 4: I = S || P
-    let mut i_block = Vec::with_capacity(s_block.len() + p_block.len());
+    let mut i_block = Zeroizing::new(Vec::with_capacity(s_block.len() + p_block.len()));
     i_block.extend_from_slice(&s_block);
     i_block.extend_from_slice(&p_block);
 
@@ -284,13 +285,13 @@ fn pkcs12_kdf<D: Digest + Default>(
         // Hash(D || I)
         let mut hasher = D::default();
         hasher.update(&d_block);
-        hasher.update(&i_block);
-        let mut a = hasher.finalize().to_vec();
+        hasher.update(i_block.as_slice());
+        let mut a = Zeroizing::new(hasher.finalize().to_vec());
 
         for _ in 1..iterations {
             let mut h = D::default();
-            h.update(&a);
-            a = h.finalize().to_vec();
+            h.update(a.as_slice());
+            a = Zeroizing::new(h.finalize().to_vec());
         }
 
         result.extend_from_slice(&a[..std::cmp::min(hash_len, key_len - result.len())]);
@@ -300,7 +301,7 @@ fn pkcs12_kdf<D: Digest + Default>(
         }
 
         // Adjust I for next block
-        let b_block = expand_to_block(&a, block_size);
+        let b_block = Zeroizing::new(expand_to_block(&a, block_size));
         let mut j = 0;
         while j < i_block.len() {
             let mut carry: u16 = 1;
@@ -348,8 +349,8 @@ fn to_bmp_string(password: &[u8]) -> Vec<u8> {
 fn hmac_sha1(key: &[u8], data: &[u8]) -> Vec<u8> {
     let block_size = 64;
 
-    // Prepare key
-    let mut k = vec![0u8; block_size];
+    // Prepare key — zeroized on drop to prevent key material leaking.
+    let mut k = Zeroizing::new(vec![0u8; block_size]);
     if key.len() > block_size {
         let hash = Sha1::digest(key);
         k[..hash.len()].copy_from_slice(&hash);
@@ -357,25 +358,25 @@ fn hmac_sha1(key: &[u8], data: &[u8]) -> Vec<u8> {
         k[..key.len()].copy_from_slice(key);
     }
 
-    // Inner hash
-    let mut i_pad = vec![0x36u8; block_size];
+    // Inner hash — i_pad derived from key, zeroized on drop.
+    let mut i_pad = Zeroizing::new(vec![0x36u8; block_size]);
     for (i, byte) in i_pad.iter_mut().enumerate() {
         *byte ^= k[i];
     }
 
     let mut inner = Sha1::new();
-    inner.update(&i_pad);
+    inner.update(i_pad.as_slice());
     inner.update(data);
     let inner_hash = inner.finalize();
 
-    // Outer hash
-    let mut o_pad = vec![0x5cu8; block_size];
+    // Outer hash — o_pad derived from key, zeroized on drop.
+    let mut o_pad = Zeroizing::new(vec![0x5cu8; block_size]);
     for (i, byte) in o_pad.iter_mut().enumerate() {
         *byte ^= k[i];
     }
 
     let mut outer = Sha1::new();
-    outer.update(&o_pad);
+    outer.update(o_pad.as_slice());
     outer.update(inner_hash);
     outer.finalize().to_vec()
 }
