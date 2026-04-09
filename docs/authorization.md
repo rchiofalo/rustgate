@@ -19,9 +19,12 @@ the optional Cedar backend.
   works as written.
 - **Per-evaluation allocation-free**: subjects and resources are
   borrowed views into caller-owned data. The decision cache is a
-  sharded LRU keyed on a stable hash of the subject plus the resource
-  descriptor plus the policy epoch, so repeated evaluations of the
-  same tuple complete in tens of nanoseconds.
+  sharded, fixed-capacity FIFO-eviction table keyed on a 128-bit
+  `SubjectHash` (a pair of independently-seeded ahash outputs), a
+  per-call resource hash, the action, and the compiled policy epoch.
+  Swapping a policy bumps the epoch so stale entries are never looked
+  up. Repeated evaluations of the same tuple complete in tens of
+  nanoseconds.
 - **Fail-closed reload**: hot-reloads run the full parse + compile
   pipeline before swapping the engine. A bad edit never interrupts
   enforcement — the previous policy continues to serve.
@@ -214,7 +217,13 @@ permit(
 
 Any error from Cedar — parse failure, request construction, evaluation
 — is mapped to `Deny` and logged at `warn!` on the `authz` target. The
-backend is deliberately fail-closed.
+backend is deliberately fail-closed. In particular, Cedar treats a
+policy that errors at evaluation time as if it had not matched, which
+for a `forbid(...)` rule would silently turn a crash into a
+policy-overriding-safety footgun (an unrelated `permit` that happened
+to match would win). The backend inspects `Response::diagnostics()`
+after every evaluation and forces the verdict to `Deny` whenever any
+policy reports an error, regardless of what the authorizer returned.
 
 Limitations today:
 - No context or entity attributes are forwarded to Cedar. Policies that

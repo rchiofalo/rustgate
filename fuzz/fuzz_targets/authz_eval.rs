@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 
 use libfuzzer_sys::fuzz_target;
 use rustgate_authz::{
-    Action, Decision, NativeEngine, PolicyEngine, Resource, Subject,
+    Action, Decision, NativeEngine, PolicyEngine, Resource, Subject, SubjectHash,
 };
 
 static ENGINE: OnceLock<NativeEngine> = OnceLock::new();
@@ -59,6 +59,34 @@ fuzz_target!(|data: &[u8]| {
         _ => Action::Subscribe,
     };
 
+    // Derive a fresh 128-bit SubjectHash per iteration from the fuzz
+    // input so the cache exercise both halves of the pair and their
+    // interaction in the shard-index mix (primary ^ secondary<<17 ^
+    // resource_hash<<31). A constant hash would wedge every request
+    // into the same shard and defeat the length-prefix and
+    // discriminant disambiguation the key is designed to resist.
+    let primary = u64::from_le_bytes([
+        data[0],
+        data[data.len().saturating_sub(1)],
+        cn_byte.wrapping_mul(17),
+        target_byte.wrapping_mul(31),
+        cn_byte ^ 0x5a,
+        target_byte ^ 0xa5,
+        cn_byte.rotate_left(3),
+        target_byte.rotate_left(5),
+    ]);
+    let secondary = u64::from_le_bytes([
+        target_byte,
+        cn_byte,
+        data[data.len().saturating_sub(1)].wrapping_add(13),
+        data[0].wrapping_add(29),
+        (cn_byte ^ target_byte).wrapping_mul(11),
+        cn_byte.rotate_right(2),
+        target_byte.rotate_right(4),
+        (cn_byte.wrapping_add(target_byte)) ^ 0x3c,
+    ]);
+    let subject_hash = SubjectHash { primary, secondary };
+
     let groups: BTreeSet<String> = BTreeSet::new();
     let attrs: BTreeMap<String, rustgate_core::AttrValue> = BTreeMap::new();
     let subject = Subject {
@@ -67,7 +95,7 @@ fuzz_target!(|data: &[u8]| {
         groups: &groups,
         attributes: &attrs,
         fingerprint: "",
-        subject_hash: 0,
+        subject_hash,
     };
     let resource = Resource::Direct { target_cn: target };
 

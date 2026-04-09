@@ -54,16 +54,19 @@ lines:
 ```json
 {
   "target": "audit",
-  "event_type": "authz.deny",
+  "event_type": "authz.denied",
   "subject_cn": "alpha",
+  "subject_fingerprint": "9f86d0...",
   "action": "send",
-  "resource": "direct:bravo",
+  "resource_kind": "direct",
+  "resource_id": "bravo",
   "rule_id": "deny-test-group-broadcast",
-  "policy_id": "ab12...cd34"
+  "policy_id": "ab12...cd34",
+  "result": "deny"
 }
 ```
 
-A missing `rule_id` means the deny came from `default_effect: "deny"`
+An empty `rule_id` means the deny came from `default_effect: "deny"`
 rather than an explicit rule — expect to see these on any subject whose
 identity was not matched by any allow rule.
 
@@ -71,7 +74,7 @@ identity was not matched by any allow rule.
 
 ```bash
 # Last 100 denies by rule id
-jq -r 'select(.event_type=="authz.deny") | .rule_id // "default"' \
+jq -r 'select(.event_type=="authz.denied") | .rule_id // "default"' \
     /var/log/rustgate/audit.jsonl | tail -100 | sort | uniq -c | sort -rn
 ```
 
@@ -109,22 +112,29 @@ increase(rustgate_authz_reloads_total{result="failure"}[1h])
 
 ## Tuning the decision cache
 
-The engine owns a sharded FIFO-LRU keyed on
-`(subject_hash, resource_hash, action, policy_epoch)`:
+The engine owns a sharded, fixed-capacity FIFO-eviction table keyed on
+`(SubjectHash, resource_hash, action, policy_epoch)`:
 
 - Default: 16 shards × 4096 entries = 65,536 cached decisions.
-- Subject hashes are precomputed once per session in the transport
-  layer, so the hot path performs zero hashing over the identity.
+- `SubjectHash` is a 128-bit pair (two independently-seeded ahash
+  outputs) precomputed once per session in the transport layer, so the
+  hot path performs zero hashing over the identity. The double-width
+  keeps collisions infeasible even when an attacker controls CN/SAN
+  contents through enrollment.
 - Policy swaps auto-invalidate because the new `CompiledPolicy` carries
   a new epoch; no explicit `clear()` call is needed or possible.
+- Eviction is strict FIFO rather than LRU: entries are not reordered on
+  hit, so a cache hit never writes to the per-shard queue. This keeps
+  the lock critical section tiny on the hot path at the cost of a
+  slightly cooler steady-state working set.
 
 ### When to bump the shard count
 
-The shard count only matters for contention on the per-shard LRU lock.
-If `rustgate_authz_eval_nanos` shows P99 tail latency drifting above
-the 10µs budget while `rustgate_authz_cache_hits_total` dominates
-`_misses_total`, more shards may reduce lock contention. Shards are
-always a power of two; the builder rounds up.
+The shard count only matters for contention on the per-shard eviction
+queue lock. If `rustgate_authz_eval_nanos` shows P99 tail latency
+drifting above the 10µs budget while `rustgate_authz_cache_hits_total`
+dominates `_misses_total`, more shards may reduce lock contention.
+Shards are always a power of two; the builder rounds up.
 
 ### When to bump the per-shard capacity
 

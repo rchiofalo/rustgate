@@ -27,6 +27,16 @@
 //! evaluation — is mapped to a [`Decision::Deny`] outcome and logged at
 //! `warn!`. This preserves the deny-by-default invariant of the rest
 //! of the crate.
+//!
+//! Cedar treats a policy that errors during evaluation as if it were
+//! not matched at all. For a `forbid(...)` policy that pattern is a
+//! **policy-overriding-safety** footgun: a forbid rule that crashes
+//! silently drops out of the decision, and any unrelated `permit(...)`
+//! that matches will grant access the operator never intended. We
+//! guard against this by inspecting `Response::diagnostics()` after
+//! every evaluation; if Cedar reports any per-policy errors, we
+//! override the verdict to `Deny` regardless of what the underlying
+//! authorizer decided.
 
 use std::path::Path;
 use std::str::FromStr;
@@ -124,29 +134,51 @@ fn action_name(action: Action) -> &'static str {
     }
 }
 
-fn resource_uid_str(resource: &Resource<'_>) -> String {
-    match resource {
-        Resource::Direct { target_cn } => format!(r#"Direct::"{}""#, escape(target_cn)),
-        Resource::Group { group } => format!(r#"Group::"{}""#, escape(group)),
+/// Build the resource entity UID literal, or return `None` if any
+/// component escapes to the empty string. Broadcast has a constant
+/// UID and can never fail.
+fn resource_uid_str(resource: &Resource<'_>) -> Option<String> {
+    Some(match resource {
+        Resource::Direct { target_cn } => format!(r#"Direct::"{}""#, escape(target_cn)?),
+        Resource::Group { group } => format!(r#"Group::"{}""#, escape(group)?),
         Resource::Broadcast => r#"Broadcast::"all""#.to_string(),
-        Resource::Federation { peer_id } => format!(r#"Federation::"{}""#, escape(peer_id)),
-        Resource::NatsSubject { subject } => format!(r#"NatsSubject::"{}""#, escape(subject)),
-    }
+        Resource::Federation { peer_id } => format!(r#"Federation::"{}""#, escape(peer_id)?),
+        Resource::NatsSubject { subject } => format!(r#"NatsSubject::"{}""#, escape(subject)?),
+    })
 }
 
-/// Minimal escape: strip double-quotes and backslashes so the entity id
-/// remains a valid Cedar literal. Cedar's lexer does not accept arbitrary
-/// Unicode in quoted ids, so we defensively fall back to a placeholder
-/// when the input is empty after escaping.
-fn escape(s: &str) -> String {
+/// Minimal escape: strip double-quotes, backslashes, and control
+/// characters so the entity id remains a valid Cedar literal. Returns
+/// `None` if the result would be empty, which the evaluator treats as
+/// a hard deny.
+///
+/// An empty result signals one of two things:
+///
+///   1. The caller passed an already-empty string, which means
+///      `Identity::new` or `Resource::*` construction let through a
+///      degenerate value the upstream validator was supposed to catch.
+///   2. The caller passed an all-pathological string (all quotes,
+///      all backslashes, all control characters). An operator
+///      controlling their own cert SAN could potentially choose such
+///      a CN on purpose.
+///
+/// Earlier revisions folded both cases to the sentinel literal
+/// `"unknown"`, but that collapses distinct hostile inputs onto the
+/// same Cedar principal. A policy that mentions
+/// `RustgatePrincipal::"unknown"` (perhaps for debugging) would then
+/// match any attacker who chose a pathological CN. Rejecting with
+/// `None` and forcing a deny in the evaluator eliminates that
+/// collapse entirely — distinct hostile inputs all deny,
+/// independently, instead of sharing a single fallback identity.
+fn escape(s: &str) -> Option<String> {
     let cleaned: String = s
         .chars()
         .filter(|c| *c != '"' && *c != '\\' && !c.is_control())
         .collect();
     if cleaned.is_empty() {
-        "unknown".to_string()
+        None
     } else {
-        cleaned
+        Some(cleaned)
     }
 }
 
@@ -157,9 +189,26 @@ impl PolicyEngine for CedarBackend {
         resource: &Resource<'_>,
         action: Action,
     ) -> DecisionOutcome {
-        let principal_str = format!(r#"RustgatePrincipal::"{}""#, escape(subject.cn));
+        // Fail closed if any input escapes to the empty string.
+        // Returning a placeholder here would fold distinct hostile
+        // principals onto the same Cedar UID, so we deny instead.
+        let Some(principal_escaped) = escape(subject.cn) else {
+            warn!(
+                target: "authz",
+                cn = %subject.cn.escape_debug(),
+                "cedar: principal escaped to empty string; denying"
+            );
+            return DecisionOutcome::deny();
+        };
+        let principal_str = format!(r#"RustgatePrincipal::"{principal_escaped}""#);
         let action_str = format!(r#"Action::"{}""#, action_name(action));
-        let resource_str = resource_uid_str(resource);
+        let Some(resource_str) = resource_uid_str(resource) else {
+            warn!(
+                target: "authz",
+                "cedar: resource escaped to empty string; denying"
+            );
+            return DecisionOutcome::deny();
+        };
 
         let principal = match EntityUid::from_str(&principal_str) {
             Ok(uid) => uid,
@@ -195,6 +244,29 @@ impl PolicyEngine for CedarBackend {
         let response = self
             .authorizer
             .is_authorized(&request, &self.policy_set, &self.entities);
+
+        // Fail-closed override: if any policy errored during
+        // evaluation, Cedar will have silently skipped it, and any
+        // `forbid(...)` that errored becomes a no-op. That is
+        // unacceptable in a deny-by-default system — a forbid rule
+        // must deny even when it crashes. Inspect the diagnostics
+        // for errors and, if present, force the verdict to Deny
+        // regardless of what the authorizer returned.
+        let mut had_errors = false;
+        for err in response.diagnostics().errors() {
+            had_errors = true;
+            warn!(
+                target: "authz",
+                error = %err,
+                principal = %principal_str,
+                action = %action_str,
+                resource = %resource_str,
+                "cedar: policy evaluation error; forcing deny"
+            );
+        }
+        if had_errors {
+            return DecisionOutcome::deny();
+        }
 
         match response.decision() {
             CedarDecision::Allow => DecisionOutcome {
