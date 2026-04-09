@@ -58,6 +58,9 @@ pub struct EnrollmentServer {
     revocation: Option<Arc<RevocationStore>>,
     sign_limiter: Arc<RateLimiter>,
     on_rate_limit: Option<RateLimitCallback>,
+    /// Whether EST (RFC 7030) endpoints are enabled at runtime.
+    #[cfg(feature = "est")]
+    est_enabled: bool,
 }
 
 impl std::fmt::Debug for EnrollmentServer {
@@ -85,6 +88,8 @@ impl EnrollmentServer {
                 DEFAULT_SIGN_RATE_WINDOW,
             )),
             on_rate_limit: None,
+            #[cfg(feature = "est")]
+            est_enabled: false,
         }
     }
 
@@ -121,6 +126,16 @@ impl EnrollmentServer {
     /// Enable certificate revocation and CRL generation.
     pub fn with_revocation(mut self, store: RevocationStore) -> Self {
         self.revocation = Some(Arc::new(store));
+        self
+    }
+
+    /// Enable EST (RFC 7030) enrollment endpoints.
+    ///
+    /// When enabled, the server responds to `/.well-known/est/` paths
+    /// for CA certificate distribution and CSR-based enrollment.
+    #[cfg(feature = "est")]
+    pub fn with_est(mut self) -> Self {
+        self.est_enabled = true;
         self
     }
 
@@ -176,6 +191,8 @@ impl EnrollmentServer {
             let revocation = self.revocation.clone();
             let sign_limiter = Arc::clone(&self.sign_limiter);
             let on_rate_limit = self.on_rate_limit.clone();
+            #[cfg(feature = "est")]
+            let est_enabled = self.est_enabled;
 
             drop(tokio::spawn(async move {
                 let _permit = permit;
@@ -229,6 +246,8 @@ impl EnrollmentServer {
                             revocation.as_deref(),
                             &sign_limiter,
                             on_rate_limit.as_ref(),
+                            #[cfg(feature = "est")]
+                            est_enabled,
                         )
                         .await
                     }
@@ -255,7 +274,25 @@ async fn handle_request(
     revocation: Option<&RevocationStore>,
     sign_limiter: &RateLimiter,
     on_rate_limit: Option<&RateLimitCallback>,
+    #[cfg(feature = "est")] est_enabled: bool,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    // EST endpoints (RFC 7030) — route /.well-known/est/ paths when enabled.
+    // Checked before borrowing path so we can move `req` into the handler.
+    #[cfg(feature = "est")]
+    if est_enabled && req.uri().path().starts_with("/.well-known/est/") {
+        let path = req.uri().path().to_owned();
+        return Ok(route_est(
+            req,
+            peer,
+            signer,
+            credentials,
+            sign_limiter,
+            on_rate_limit,
+            &path,
+        )
+        .await);
+    }
+
     let path = req.uri().path();
     let method = req.method();
 
@@ -339,6 +376,50 @@ async fn handle_request(
     };
 
     Ok(response)
+}
+
+/// Route EST (RFC 7030) requests to the appropriate handler.
+///
+/// Called only when `est_enabled` is true and the path starts with
+/// `/.well-known/est/`. Handles both unlabeled and labeled paths.
+#[cfg(feature = "est")]
+async fn route_est(
+    req: Request<hyper::body::Incoming>,
+    peer: SocketAddr,
+    signer: &CsrSigner,
+    credentials: &Credentials,
+    sign_limiter: &RateLimiter,
+    on_rate_limit: Option<&RateLimitCallback>,
+    path: &str,
+) -> Response<Full<Bytes>> {
+    use crate::est;
+
+    // Strip the EST prefix, supporting optional labels:
+    //   /.well-known/est/cacerts          → operation = "cacerts"
+    //   /.well-known/est/my-ca/cacerts    → operation = "cacerts" (label = "my-ca")
+    let suffix = path.strip_prefix("/.well-known/est/").unwrap_or("");
+
+    // The operation is the last path segment.
+    let operation = suffix.rsplit('/').next().unwrap_or(suffix);
+    let method = req.method().clone();
+
+    match (method.as_ref(), operation) {
+        ("GET", "cacerts") => est::handle_cacerts(signer),
+        ("POST", "simpleenroll") => {
+            est::handle_simpleenroll(req, peer, signer, credentials, sign_limiter, on_rate_limit)
+                .await
+        }
+        ("POST", "simplereenroll") => {
+            est::handle_simplereenroll(req, peer, signer, credentials, sign_limiter, on_rate_limit)
+                .await
+        }
+        ("GET", "csrattrs") => est::handle_csrattrs(),
+        _ => build_response(
+            StatusCode::NOT_FOUND,
+            "text/plain",
+            Bytes::from("unknown EST operation"),
+        ),
+    }
 }
 
 /// Build a server-only TLS configuration for the enrollment HTTPS endpoint.

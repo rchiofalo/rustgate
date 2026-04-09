@@ -6,9 +6,13 @@
 //! so TAK clients can self-provision without manual `.p12` distribution.
 
 pub mod auth;
+#[cfg(feature = "est")]
+pub mod cms_bag;
 pub mod contacts;
 pub mod datapackage;
 pub mod error;
+#[cfg(feature = "est")]
+pub mod est;
 mod handlers;
 pub mod pkcs12;
 pub mod ratelimit;

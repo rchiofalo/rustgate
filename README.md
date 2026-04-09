@@ -206,6 +206,7 @@ cargo build --release --all-features
 |---------|---------|-----------------|
 | `nats` | NATS/JetStream bridge | — |
 | `enrollment` | PKCS#12 enrollment server | — |
+| `est` | EST (RFC 7030) enrollment endpoints | — |
 | `proto` | Protobuf message support | `protoc` |
 | `federation` | Server-to-server federation | `protoc` |
 | `federation-ha` | HA federation with JWT | `protoc` |
@@ -376,6 +377,7 @@ All flags support environment variables (CLI takes precedence):
 | `--package-strict-signatures` | `RUSTGATE_PACKAGE_STRICT_SIGNATURES` | `false` |
 | `--revocation-db` | `RUSTGATE_REVOCATION_DB` | — |
 | `--crl-validity-days` | `RUSTGATE_CRL_VALIDITY_DAYS` | `7` |
+| `--est-enabled` | `RUSTGATE_EST_ENABLED` | `false` |
 | `--federation-v1-bind` | `RUSTGATE_FEDERATION_V1_BIND` | — |
 | `--federation-v2-bind` | `RUSTGATE_FEDERATION_V2_BIND` | — |
 | `--federation-id` | `RUSTGATE_FEDERATION_ID` | `rustgate-federation-1` |
@@ -680,7 +682,7 @@ cargo nextest run -p rustgate-nats --test integration  # NATS integration (needs
 | `rustgate-transport` | `tls_listener`, `e2e_routing`, `encoder`, `crl`, `fips`, `cert_rotation` | mTLS, routing, codecs, CRL, FIPS, certificate hot-reload |
 | `rustgate-cot` | `parser` | CoT XML parsing |
 | `rustgate-core` | `types` | Core type invariants |
-| `rustgate-enrollment` | `server_integration` | PKCS#12 enrollment, CSR signing |
+| `rustgate-enrollment` | `server_integration`, `est_integration` | PKCS#12 enrollment, CSR signing, EST (RFC 7030) |
 | `rustgate-federation` | `v2_integration`, `api_integration`, `ha_integration` | Federation V2 protocol, REST API, HA coordination |
 | `rustgate-nats` | `integration` | NATS bridge, echo prevention, JetStream replay |
 | `rustgate-proto` | `codec_integration` | XML ↔ protobuf conversion |

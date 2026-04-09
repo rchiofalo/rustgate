@@ -635,6 +635,12 @@ pub(crate) async fn start_enrollment(
         .with_contacts_provider(contacts_provider)
         .with_rate_limit(rate_limit, rate_window);
 
+    #[cfg(feature = "est")]
+    if cli.est_enabled {
+        enrollment_server = enrollment_server.with_est();
+        tracing::info!("EST (RFC 7030) endpoints enabled");
+    }
+
     #[cfg(feature = "metrics")]
     {
         enrollment_server = enrollment_server.with_rate_limit_callback(std::sync::Arc::new(|| {
