@@ -151,7 +151,7 @@ pub(crate) async fn build_tls_config(cli: &Cli) -> anyhow::Result<TlsConfigBuild
         return Ok(TlsConfigBuild {
             tls_config,
             cert_pem: identity.cert_pem.clone(),
-            key_pem: zeroize::Zeroizing::new(identity.key_pem.clone()),
+            key_pem: identity.key_pem.clone(),
             ca_pem: identity.trust_bundle_pem.clone(),
             spiffe_identity: Some(identity),
         });
