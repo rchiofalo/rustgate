@@ -14,7 +14,14 @@ use crate::model::{Action, Obligation};
 
 /// A set of rules plus default effect. The wire format has a `version` field
 /// to allow forward-compatible evolution.
+///
+/// `deny_unknown_fields` is load-bearing: a misspelled top-level key in an
+/// operator-authored policy (e.g. `"default_efect": "deny"`) must fail the
+/// parse rather than silently falling back to the serde default. Without
+/// it, a typo can silently grant full permissions because the surrounding
+/// rule array still parses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuleSet {
     /// Schema version, currently `1`.
     pub version: u32,
@@ -42,7 +49,12 @@ pub enum Effect {
 }
 
 /// A single policy rule.
+///
+/// `deny_unknown_fields` prevents typos like `subjeect` or `rsource` from
+/// silently dropping the affected predicate and leaving a rule that
+/// matches everything the author meant to restrict.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Rule {
     /// Stable identifier used in decision outcomes and audit records.
     pub id: SmolStr,
@@ -60,8 +72,12 @@ pub struct Rule {
 }
 
 /// Resource-side matcher.
+///
+/// `deny_unknown_fields` guards against kind-tagged typos
+/// (`target_ccn`, `peerr_id`, etc.) that would otherwise be accepted
+/// as a no-op and silently widen the rule's reach.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ResourceMatcher {
     /// Match a direct send. `target_cn = None` matches any target CN.
     Direct {
@@ -94,7 +110,14 @@ pub enum ResourceMatcher {
 
 /// Subject-side matcher. All fields are AND-combined; an all-empty matcher
 /// matches every subject.
+///
+/// `deny_unknown_fields` is critical: a rule like
+/// `{"subject": {"groups_all_off": ["admin"]}}` (trailing `f`) would
+/// otherwise parse into an empty predicate that matches *every*
+/// subject, silently granting the rule to everyone. Same reasoning for
+/// `cn_eeq`, `atribute_eq`, and every other field name.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubjectMatcher {
     /// Exact CN equality.
     #[serde(default)]
