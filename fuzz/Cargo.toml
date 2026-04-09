@@ -1,3 +1,5 @@
+[workspace]
+
 [package]
 name = "rustgate-fuzz"
 version = "0.0.0"
@@ -20,6 +22,7 @@ rustgate-cot = { path = "../crates/rustgate-cot", features = ["fuzz"] }
 rustgate-proto = { path = "../crates/rustgate-proto" }
 rustgate-federation = { path = "../crates/rustgate-federation", features = ["v2"] }
 rustgate-nats = { path = "../crates/rustgate-nats" }
+rustgate-authz = { path = "../crates/rustgate-authz" }
 rcgen = { version = "0.14", features = ["x509-parser"] }
 serde_json = "1"
 rustls-pki-types = { version = "1", features = ["std"] }
@@ -93,4 +96,14 @@ doc = false
 [[bin]]
 name = "federation_frame_parse"
 path = "fuzz_targets/federation_frame_parse.rs"
+doc = false
+
+[[bin]]
+name = "authz_policy_parse"
+path = "fuzz_targets/authz_policy_parse.rs"
+doc = false
+
+[[bin]]
+name = "authz_eval"
+path = "fuzz_targets/authz_eval.rs"
 doc = false

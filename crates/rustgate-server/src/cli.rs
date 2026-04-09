@@ -690,6 +690,13 @@ pub(crate) struct Cli {
     #[arg(long, env = "RUSTGATE_AUTHZ_POLICY_FILE")]
     pub(crate) authz_policy_file: Option<String>,
 
+    /// Authz policy format. `native` is the default rustgate-authz JSON
+    /// ruleset; `cedar` loads a Cedar policy corpus via the optional
+    /// `cedar` feature. Selecting `cedar` on a binary that was not
+    /// compiled with `--features cedar` is rejected at startup.
+    #[arg(long, value_enum, default_value_t = AuthzPolicyFormat::Native, env = "RUSTGATE_AUTHZ_POLICY_FORMAT")]
+    pub(crate) authz_policy_format: AuthzPolicyFormat,
+
     /// Interval in seconds to check the authz policy file for changes.
     /// Must be >= 1. Applied only when `--authz-policy-file` is set.
     #[arg(long, default_value_t = 5, env = "RUSTGATE_AUTHZ_RELOAD_INTERVAL")]
@@ -877,6 +884,17 @@ pub(crate) enum Encoding {
 /// cargo feature (`peer-discovery-dns-sd`, `peer-discovery-consul`,
 /// `peer-discovery-etcd`); selecting a backend whose feature was not
 /// compiled in surfaces a startup error.
+/// Authz policy-file format selector.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum AuthzPolicyFormat {
+    /// Native rustgate-authz JSON ruleset.
+    #[default]
+    Native,
+    /// Cedar policy corpus (requires the `cedar` feature).
+    Cedar,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum PeerDiscoveryBackend {
@@ -1069,6 +1087,7 @@ define_config_file! {
     group_acl_file: Option<String>,
     acl_reload_interval: u64,
     authz_policy_file: Option<String>,
+    authz_policy_format: AuthzPolicyFormat,
     authz_reload_interval: u64,
     authz_fail_open: bool,
     acl_api_token_file: Option<String>,

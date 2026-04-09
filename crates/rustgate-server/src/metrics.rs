@@ -115,6 +115,8 @@ static AUTHZ_DECISIONS: OnceLock<IntCounterVec> = OnceLock::new();
 static AUTHZ_EVAL_NANOS: OnceLock<Histogram> = OnceLock::new();
 static AUTHZ_RELOADS: OnceLock<IntCounterVec> = OnceLock::new();
 static AUTHZ_POLICY_RULES: OnceLock<IntGauge> = OnceLock::new();
+static AUTHZ_CACHE_HITS: OnceLock<IntCounter> = OnceLock::new();
+static AUTHZ_CACHE_MISSES: OnceLock<IntCounter> = OnceLock::new();
 
 static ARCHIVE_BYTES: OnceLock<IntGauge> = OnceLock::new();
 static ENROLLMENT_RATE_LIMITED: OnceLock<IntCounter> = OnceLock::new();
@@ -508,6 +510,20 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(authz_policy_rules.clone()))?;
     let _ = AUTHZ_POLICY_RULES.set(authz_policy_rules);
 
+    let authz_cache_hits = IntCounter::with_opts(Opts::new(
+        "rustgate_authz_cache_hits_total",
+        "Authz decision-cache lookups that returned a cached outcome",
+    ))?;
+    registry.register(Box::new(authz_cache_hits.clone()))?;
+    let _ = AUTHZ_CACHE_HITS.set(authz_cache_hits);
+
+    let authz_cache_misses = IntCounter::with_opts(Opts::new(
+        "rustgate_authz_cache_misses_total",
+        "Authz decision-cache lookups that ran the full scan and populated the cache",
+    ))?;
+    registry.register(Box::new(authz_cache_misses.clone()))?;
+    let _ = AUTHZ_CACHE_MISSES.set(authz_cache_misses);
+
     Ok(())
 }
 
@@ -583,6 +599,26 @@ pub fn authz_reloads() -> &'static IntCounterVec {
 
 pub fn authz_policy_rules() -> &'static IntGauge {
     AUTHZ_POLICY_RULES.get_or_init(|| fallback_gauge("rustgate_authz_policy_rules", "fallback"))
+}
+
+pub fn authz_cache_hits() -> &'static IntCounter {
+    AUTHZ_CACHE_HITS.get_or_init(|| fallback_counter("rustgate_authz_cache_hits_total", "fallback"))
+}
+
+pub fn authz_cache_misses() -> &'static IntCounter {
+    AUTHZ_CACHE_MISSES
+        .get_or_init(|| fallback_counter("rustgate_authz_cache_misses_total", "fallback"))
+}
+
+/// Record a delta of authz decision-cache hits/misses. Called on a timer
+/// from the background cache-stats scraper in `main.rs`.
+pub fn record_authz_cache_stats(hits_delta: u64, misses_delta: u64) {
+    if hits_delta > 0 {
+        authz_cache_hits().inc_by(hits_delta);
+    }
+    if misses_delta > 0 {
+        authz_cache_misses().inc_by(misses_delta);
+    }
 }
 
 /// Returns the federation per-peer queue-bytes gauge vector.

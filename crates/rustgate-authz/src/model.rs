@@ -11,6 +11,19 @@ use rustgate_core::AttrValue;
 use rustgate_core::identity::Identity;
 use serde::{Deserialize, Serialize};
 
+/// Snapshot of decision-cache effectiveness counters.
+///
+/// Lifted to [`crate::PolicyEngine`] as an optional trait method so backends
+/// without a cache can still report `None`. The hot-path [`crate::NativeEngine`]
+/// populates both counters on every evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CacheStats {
+    /// Number of evaluations that returned a cached outcome.
+    pub hits: u64,
+    /// Number of evaluations that ran the full scan and populated the cache.
+    pub misses: u64,
+}
+
 /// The action a subject is attempting to perform on a resource.
 ///
 /// `#[non_exhaustive]` so that adding new actions (e.g. a future

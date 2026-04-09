@@ -129,6 +129,7 @@ For detailed architecture documentation see [docs/architecture.md](docs/architec
 |---------|-------------|
 | CRL revocation | PEM-encoded CRL loaded via `--crl`, enforced at TLS handshake |
 | FIPS 140-3 | aws-lc-rs crypto provider via `--features fips` ([details](docs/fips.md)) |
+| RBAC/ABAC authorization | Hot-reloadable policies and sub-microsecond evaluation ([details](docs/authorization.md)) |
 | Subject DN enforcement | Enrollment certs carry the authenticated username — prevents impersonation |
 | No unsafe code | `unsafe_code = "forbid"` workspace-wide |
 | Container hardening | Non-root UID, read-only filesystem, STOPSIGNAL SIGTERM |
