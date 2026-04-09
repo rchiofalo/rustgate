@@ -5,9 +5,20 @@
 //! resulting slice. All string allocations and JSON-value decoding happen
 //! here, at compile time, so the hot path does no heap work.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use ahash::AHashMap;
 use sha2::{Digest, Sha256};
 use smol_str::SmolStr;
+
+/// Process-global monotonic counter: every compiled policy receives a
+/// fresh epoch so decision caches keyed on the epoch automatically
+/// invalidate on policy swap without any explicit clear.
+static POLICY_EPOCH_COUNTER: AtomicU32 = AtomicU32::new(1);
+
+fn next_policy_epoch() -> u32 {
+    POLICY_EPOCH_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
 
 use crate::error::AuthzError;
 use crate::model::{Action, Obligation, Resource, Subject};
@@ -87,7 +98,6 @@ pub(crate) struct CompiledRule {
 #[derive(Debug, Clone)]
 pub struct CompiledPolicy {
     pub(crate) policy_id: SmolStr,
-    #[allow(dead_code)]
     pub(crate) epoch: u32,
     pub(crate) default_effect: Effect,
     pub(crate) buckets: AHashMap<BucketKey, Vec<CompiledRule>>,
@@ -124,7 +134,7 @@ impl RuleSet {
 
         Ok(CompiledPolicy {
             policy_id,
-            epoch: 0,
+            epoch: next_policy_epoch(),
             default_effect: self.default_effect,
             buckets,
             any_resource,
