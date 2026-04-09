@@ -239,6 +239,11 @@ impl PacketCodec {
     }
 
     /// Write a v5 CONNACK with a reason code.
+    ///
+    /// Uses `Some(ConnAckProperties::new())` instead of `None` because
+    /// mqttbytes 0.6 has a bug: `ConnAck::write` omits the required
+    /// properties length byte when `properties` is `None`, causing the
+    /// reader to choke on the incomplete packet.
     pub(crate) async fn write_connack_v5(
         &mut self,
         code: mqttbytes::v5::ConnectReturnCode,
@@ -246,7 +251,7 @@ impl PacketCodec {
         let connack = mqttbytes::v5::ConnAck {
             session_present: false,
             code,
-            properties: None,
+            properties: Some(mqttbytes::v5::ConnAckProperties::new()),
         };
         self.write_v5(&mqttbytes::v5::Packet::ConnAck(connack))
             .await

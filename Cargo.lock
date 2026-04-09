@@ -3235,6 +3235,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -3295,6 +3296,7 @@ dependencies = [
  "rustgate-cot",
  "rustgate-enrollment",
  "rustgate-federation",
+ "rustgate-mqtt",
  "rustgate-nats",
  "rustgate-proto",
  "rustgate-test-utils",
