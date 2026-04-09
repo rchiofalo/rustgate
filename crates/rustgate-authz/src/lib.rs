@@ -18,5 +18,5 @@ pub mod policy;
 
 pub use engine::{CacheStats, NativeEngine, PolicyEngine};
 pub use error::AuthzError;
-pub use model::{Action, Decision, DecisionOutcome, Obligation, Resource, Subject};
+pub use model::{Action, Decision, DecisionOutcome, Obligation, Resource, Subject, SubjectHash};
 pub use policy::{Effect, ResourceMatcher, Rule, RuleSet, SubjectMatcher};

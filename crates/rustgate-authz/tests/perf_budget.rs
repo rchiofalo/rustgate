@@ -23,7 +23,9 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use rustgate_authz::parser::parse_json;
-use rustgate_authz::{Action, DecisionOutcome, NativeEngine, PolicyEngine, Resource, Subject};
+use rustgate_authz::{
+    Action, DecisionOutcome, NativeEngine, PolicyEngine, Resource, Subject, SubjectHash,
+};
 use rustgate_core::AttrValue;
 use rustgate_core::identity::Identity;
 
@@ -182,7 +184,11 @@ fn perf_budget_p99_under_10us() {
         let mut counter: u64 = 0;
         run_with_p99_gate("cache_miss_cold", || {
             counter = counter.wrapping_add(1);
-            let s = Subject::with_hash(&id, subject_hash ^ counter);
+            let perturbed = SubjectHash {
+                primary: subject_hash.primary ^ counter,
+                secondary: subject_hash.secondary ^ counter.rotate_left(17),
+            };
+            let s = Subject::with_hash(&id, perturbed);
             e.evaluate(&s, &Resource::Broadcast, Action::Send)
         });
     }

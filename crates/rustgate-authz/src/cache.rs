@@ -1,10 +1,17 @@
 //! Sharded decision cache.
 //!
-//! A small, fixed-capacity FIFO-LRU approximation keyed on
-//! `(subject_hash, resource_hash, action, policy_epoch)`. The epoch is
+//! A small, fixed-capacity FIFO-eviction cache keyed on
+//! `(SubjectHash, resource_hash, action, policy_epoch)`. The epoch is
 //! bumped by the compiler every time a [`CompiledPolicy`] is built, so
 //! swapping policies implicitly invalidates all prior cache entries
 //! without any explicit `clear()` call.
+//!
+//! `SubjectHash` is a pair of 64-bit ahash outputs seeded with distinct
+//! nothing-up-my-sleeve constants, giving 128 bits of collision
+//! resistance against adversarial identities. A single 64-bit hash
+//! would expose the cache to a birthday-bound attack at ~2^32 entries;
+//! doubling the width makes collisions infeasible even when an
+//! attacker controls CN/SAN contents through enrollment.
 //!
 //! The cache is sharded to reduce contention; each shard owns a
 //! `parking_lot::Mutex`-guarded map plus a FIFO order queue used as a
@@ -28,14 +35,14 @@ use ahash::AHashMap;
 use parking_lot::Mutex;
 use smol_str::SmolStr;
 
-use crate::model::{Action, Decision, DecisionOutcome, Obligation};
+use crate::model::{Action, Decision, DecisionOutcome, Obligation, SubjectHash};
 
-/// Composite key: session-stable subject hash, per-call resource hash,
-/// action, and the compiled policy epoch. Swapping the policy bumps the
-/// epoch so stale entries are simply never looked up.
+/// Composite key: 128-bit session-stable subject hash, per-call
+/// resource hash, action, and the compiled policy epoch. Swapping the
+/// policy bumps the epoch so stale entries are simply never looked up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct DecisionKey {
-    pub subject_hash: u64,
+    pub subject_hash: SubjectHash,
     pub resource_hash: u64,
     pub action: Action,
     pub policy_epoch: u32,
@@ -137,7 +144,13 @@ impl DecisionCache {
 
     #[inline]
     fn shard_idx(&self, key: &DecisionKey) -> usize {
-        (key.subject_hash ^ key.resource_hash) as usize & self.shard_mask
+        // Mix both halves of the 128-bit subject hash plus the resource
+        // hash into the shard index so that adversarial collisions on
+        // any single component don't funnel traffic into one shard.
+        let mixed = key.subject_hash.primary
+            ^ key.subject_hash.secondary.rotate_left(17)
+            ^ key.resource_hash.rotate_left(31);
+        mixed as usize & self.shard_mask
     }
 
     /// Hit-path lookup. Returns a fresh [`DecisionOutcome`] on hit.
@@ -191,7 +204,13 @@ mod tests {
 
     fn key(s: u64, r: u64, epoch: u32) -> DecisionKey {
         DecisionKey {
-            subject_hash: s,
+            subject_hash: SubjectHash {
+                primary: s,
+                // Derive a deterministic secondary from the primary
+                // so that two test keys with the same `s` still
+                // compare equal in `DecisionKey::eq`.
+                secondary: s.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            },
             resource_hash: r,
             action: Action::Send,
             policy_epoch: epoch,
