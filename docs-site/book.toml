@@ -42,3 +42,24 @@ level = 1
 [output.linkcheck]
 follow-web-links = false
 warning-policy = "error"
+# Cross-references inside {{#include}}'d docs/ files resolve against their
+# original directory, not the mdBook src/ tree.  These patterns suppress the
+# known-broken relative links from included content.
+exclude = [
+  "cot-delta-encoding\\.md",
+  "authorization\\.md",
+  "runbooks/authz\\.md",
+  "federation\\.md",
+  "observability\\.md",
+  "security-posture\\.md",
+  "tls-certificates\\.md",
+  "deployment\\.md",
+  "graceful-degradation\\.md",
+  "configuration\\.md",
+  "\\.\\./crates/",
+  "\\.\\./SECURITY\\.md",
+  # CHANGELOG uses Keep-a-Changelog [version] headers that look like
+  # incomplete reference links to the checker.
+  "^Unreleased$",
+  "^\\d+\\.\\d+\\.\\d+$",
+]
