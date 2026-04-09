@@ -878,6 +878,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     #[cfg(not(feature = "websocket"))]
     setup::warn_websocket_disabled(&cli);
 
+    // ── MQTT listener ──────────────────────────────────────────────
+    #[cfg(feature = "mqtt")]
+    let mqtt_shutdown = setup::start_mqtt(&cli, &tls_config, &router, &connection_limit)?;
+
+    #[cfg(not(feature = "mqtt"))]
+    setup::warn_mqtt_disabled(&cli);
+
     // ── CoT event archival ──────────────────────────────────────────
     let archive_key_ring: Option<Arc<rustgate_core::encrypted::KeyRing>> =
         if let Some(ref kp) = cli.archive_key_file {
@@ -1110,6 +1117,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     #[cfg(feature = "websocket")]
     if let Some(handle) = ws_shutdown {
         setup::stop_subsystem("websocket", handle).await;
+    }
+
+    #[cfg(feature = "mqtt")]
+    if let Some(handle) = mqtt_shutdown {
+        setup::stop_subsystem("mqtt", handle).await;
     }
 
     if let Some(handle) = tcp_plaintext_shutdown {

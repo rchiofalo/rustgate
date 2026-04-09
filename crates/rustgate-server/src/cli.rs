@@ -406,6 +406,26 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 10, env = "RUSTGATE_WS_MAX_VIOLATIONS")]
     pub(crate) ws_max_violations: u32,
 
+    // -- MQTT flags --
+    /// Bind address for the MQTT (mqtts://) listener (e.g. 0.0.0.0:8883).
+    /// Requires --features mqtt.
+    #[arg(long, env = "RUSTGATE_MQTT_BIND", value_parser = parse_socket_addr)]
+    pub(crate) mqtt_bind: Option<String>,
+
+    /// Optional topic prefix to strip from MQTT topics before mapping to groups.
+    /// For example, with prefix "rustgate/" the MQTT topic "rustgate/alpha" maps
+    /// to group "alpha".
+    #[arg(long, env = "RUSTGATE_MQTT_TOPIC_PREFIX")]
+    pub(crate) mqtt_topic_prefix: Option<String>,
+
+    /// Maximum MQTT packet size in bytes (default: 16 MiB).
+    #[arg(
+        long,
+        default_value_t = 16 * 1024 * 1024,
+        env = "RUSTGATE_MQTT_MAX_PACKET_SIZE"
+    )]
+    pub(crate) mqtt_max_packet_size: usize,
+
     // -- Plaintext input flags --
     /// Bind address for plaintext TCP input (e.g. 0.0.0.0:8087).
     /// WARNING: connections are NOT encrypted. Use only on trusted networks.
@@ -1053,6 +1073,9 @@ define_config_file! {
     ws_max_frames_per_sec: u32,
     ws_max_bytes_per_sec: u64,
     ws_max_violations: u32,
+    mqtt_bind: Option<String>,
+    mqtt_topic_prefix: Option<String>,
+    mqtt_max_packet_size: usize,
     tcp_bind: Option<String>,
     udp_bind: Option<String>,
     plaintext_cn: String,

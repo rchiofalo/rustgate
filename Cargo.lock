@@ -2038,6 +2038,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mqttbytes"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7bd39d24e28e1544d74ff5746e322a477e52353c8ba7adcaa83d2e760752853"
+dependencies = [
+ "bytes",
+]
+
+[[package]]
 name = "multimap"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3211,6 +3220,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustgate-mqtt"
+version = "0.7.0"
+dependencies = [
+ "bytes",
+ "mqttbytes",
+ "rustgate-core",
+ "rustgate-test-utils",
+ "rustgate-transport",
+ "rustls",
+ "rustls-pki-types",
+ "socket2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "rustgate-nats"
 version = "0.7.0"
 dependencies = [
@@ -3268,6 +3296,7 @@ dependencies = [
  "rustgate-cot",
  "rustgate-enrollment",
  "rustgate-federation",
+ "rustgate-mqtt",
  "rustgate-nats",
  "rustgate-proto",
  "rustgate-test-utils",
@@ -3895,7 +3924,6 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.52.0",
  "windows-sys 0.59.0",
 ]
 

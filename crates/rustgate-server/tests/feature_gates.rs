@@ -229,3 +229,28 @@ mod websocket_gate {
         _assert_send::<WsServerConfig>();
     }
 }
+
+// ── MQTT feature ────────────────────────────────────────────────────
+
+#[cfg(feature = "mqtt")]
+mod mqtt_gate {
+    use rustgate_mqtt::{MqttListener, MqttServer, MqttServerConfig};
+
+    #[test]
+    fn mqtt_types_accessible() {
+        fn _assert_send<T: Send>() {}
+        _assert_send::<MqttServer>();
+    }
+
+    #[test]
+    fn mqtt_server_config_type_exists() {
+        fn _assert_send<T: Send>() {}
+        _assert_send::<MqttServerConfig>();
+    }
+
+    #[test]
+    fn mqtt_listener_type_exists() {
+        fn _assert_send<T: Send>() {}
+        _assert_send::<MqttListener>();
+    }
+}
