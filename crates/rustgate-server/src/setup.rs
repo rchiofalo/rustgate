@@ -209,7 +209,7 @@ pub(crate) async fn build_tls_config(cli: &Cli) -> anyhow::Result<TlsConfigBuild
 pub(crate) struct TlsConfigBuild {
     pub(crate) tls_config: TlsConfig,
     pub(crate) cert_pem: String,
-    /// Wrapped in [`Zeroizing`] so the private key PEM is wiped from memory on drop.
+    /// Wrapped in `Zeroizing` so the private key PEM is wiped from memory on drop.
     pub(crate) key_pem: zeroize::Zeroizing<String>,
     pub(crate) ca_pem: String,
     #[cfg(feature = "spiffe")]
