@@ -24,6 +24,7 @@ mod acl_reloader;
 mod archive;
 mod archive_rotation;
 mod audit;
+mod authz_reloader;
 mod cli;
 #[cfg(feature = "federation")]
 mod federation_reloader;
@@ -520,6 +521,66 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     }
     #[cfg(feature = "metrics")]
     let acl_reloader_for_api: Option<Arc<acl_reloader::AclReloader>> = acl_reloader_handle.clone();
+
+    // ── Authz (RBAC/ABAC) policy + hot-reload ──────────────────────
+    //
+    // If `--authz-policy-file` is set, load it synchronously so startup
+    // fails fast on a malformed policy (unless `--authz-fail-open` is
+    // set, in which case we log a warning and continue without any
+    // engine installed). On success, install the engine on the router,
+    // wire the metrics observer, and spawn the polling reloader.
+    if let Some(ref authz_path) = cli.authz_policy_file {
+        let path = std::path::PathBuf::from(authz_path);
+        match authz_reloader::load_once(&path) {
+            Ok(loaded) => {
+                let rule_count = loaded.rule_count;
+                let initial_hash = loaded.hash;
+                let arc_engine: Arc<dyn rustgate_authz::PolicyEngine> = Arc::new(loaded.engine);
+                let policy_id = arc_engine.policy_id().to_string();
+                router.swap_authz(arc_engine);
+                #[cfg(feature = "metrics")]
+                {
+                    router.set_authz_observer(Some(Arc::new(metrics::observe_authz_event)));
+                    metrics::record_authz_reload(true, Some(rule_count));
+                }
+                rustgate_core::audit::authz_reload_success(authz_path, &policy_id, rule_count);
+                tracing::info!(
+                    path = %authz_path,
+                    policy_id = %policy_id,
+                    rule_count,
+                    "authz policy loaded"
+                );
+
+                let interval = Duration::from_secs(cli.authz_reload_interval);
+                let _reloader = authz_reloader::spawn_authz_reloader(
+                    Arc::clone(&router),
+                    path,
+                    initial_hash,
+                    interval,
+                );
+                tracing::info!(
+                    interval_secs = cli.authz_reload_interval,
+                    path = %authz_path,
+                    "authz hot-reload enabled"
+                );
+            }
+            Err(e) if cli.authz_fail_open => {
+                rustgate_core::audit::authz_reload_failed(authz_path, "startup", &e.to_string());
+                #[cfg(feature = "metrics")]
+                metrics::record_authz_reload(false, None);
+                tracing::warn!(
+                    path = %authz_path,
+                    error = %e,
+                    "authz policy failed to load; continuing in fail-open mode (no engine installed)"
+                );
+            }
+            Err(e) => {
+                #[cfg(feature = "metrics")]
+                metrics::record_authz_reload(false, None);
+                return Err(e);
+            }
+        }
+    }
 
     // ── ACL REST API ───────────────────────────────────────────────
     //
