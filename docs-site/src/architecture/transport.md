@@ -25,5 +25,16 @@ For the on-the-wire framing and message format see [Wire Protocol](./protocol.md
 | `post-quantum` | Enables X25519MLKEM768 hybrid key exchange. |
 | `metrics` | Publishes per-listener and per-identity Prometheus gauges. |
 | `websocket` | Compiles in the WebSocket listener (`rustgate-websocket` re-exports). |
+| `mqtt` | Compiles in the MQTT 5.0/3.1.1 transport adapter (`rustgate-mqtt`). |
+
+## Additional Transport Layers
+
+Beyond the core TLS listener, rustgate supports multiple transport adapters that all feed into the same router:
+
+- **WebSocket** (`--websocket-bind`) — wss:// listener with mTLS, interoperable with TCP clients. See `rustgate-websocket`.
+- **MQTT** (`--mqtt-bind`) — MQTT 5.0/3.1.1 adapter with topic-to-group mapping. See [MQTT Transport](./mqtt.md).
+- **Plaintext TCP/UDP** (`--tcp-bind`, `--udp-bind`) — unencrypted transports for trusted network segments.
+
+All transports share the same `Router`, deduplication cache, authorization policies, and federation pipeline.
 
 See also [FIPS 140-3](../security/fips.md) and [Post-Quantum KEX](../security/post-quantum.md).

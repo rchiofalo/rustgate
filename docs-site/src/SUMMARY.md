@@ -17,6 +17,7 @@
 - [Federation](./architecture/federation.md)
 - [NATS Bridge](./architecture/nats-bridge.md)
 - [Enrollment](./architecture/enrollment.md)
+- [MQTT Transport](./architecture/mqtt.md)
 
 # Operations
 
@@ -44,6 +45,7 @@
 - [Crypto Agility](./security/crypto-agility.md)
 - [FIPS 140-3](./security/fips.md)
 - [Post-Quantum KEX](./security/post-quantum.md)
+- [Authorization](./security/authorization.md)
 
 # Reference
 

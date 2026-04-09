@@ -16,11 +16,14 @@ This documentation is the canonical reference for operators, integrators, and co
 
 ## Project at a glance
 
-- **Rust workspace** with 10 crates and edition 2024 (`rust-version = 1.93`)
+- **Rust workspace** with 12 crates and edition 2024 (`rust-version = 1.93`)
 - **`unsafe_code = "forbid"`** workspace-wide; `clippy::panic` and `clippy::unwrap_used` denied in production code
 - **rustls + tokio-rustls** by default; **aws-lc-rs** under the `fips` feature for FIPS 140-3
 - **Post-quantum** key exchange via X25519MLKEM768 (`post-quantum` feature)
-- **Federation v2** server-to-server with JWT and high-availability coordination
+- **Multi-transport** — TLS, WebSocket, MQTT 5.0/3.1.1, plaintext TCP/UDP
+- **EST (RFC 7030)** enrollment alongside PKCS#12 certificate provisioning
+- **Per-message authorization** — RBAC/ABAC with JSON and Cedar policy backends
+- **Federation v2** server-to-server with JWT, HA coordination, and dynamic peer discovery (DNS-SD, Consul, etcd)
 - **NATS / JetStream** bridge for horizontal scale
 - **Hash-chained, tamper-evident audit log** and **encrypted-at-rest archive**
 
