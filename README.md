@@ -72,11 +72,11 @@ For production certificate management see [docs/tls-certificates.md](docs/tls-ce
 ┌─────────────────────────────────────────────────────────────────────────────────────────┐
 │                                     rustgate-server                                     │
 │                                        (binary)                                         │
-├──────────────┬──────────────┬──────────────┬──────────────┬──────────────┬──────────────┤
-│  rustgate-   │  rustgate-   │  rustgate-   │  rustgate-   │  rustgate-   │  rustgate-   │
-│  transport   │  websocket   │  nats        │  enrollment  │  proto       │  federation  │
-│  TLS·codec   │  wss://mTLS  │  NATS pubsub │  HTTPS·CSR   │  protobuf    │  V1·V2·gRPC  │
-│  router      │  WS sessions │  JetStream   │  Basic Auth  │  XML/proto   │  peer mgmt   │
+├──────────┬──────────┬──────────┬──────────┬──────────┬──────────┬──────────────┤
+│ rustgate-│ rustgate-│ rustgate-│ rustgate-│ rustgate-│ rustgate-│  rustgate-   │
+│ transport│ websocket│ mqtt     │ nats     │enrollment│ proto    │  federation  │
+│ TLS·codec│ wss://   │ MQTT 5.0 │ NATS pub │ HTTPS·CSR│ protobuf │  V1·V2·gRPC  │
+│ router   │ mTLS WS  │ 3.1.1    │ JetStream│ Auth     │ XML/proto│  peer mgmt   │
 ├──────────────┴──────────────┴──────────────┼──────────────┴──────────────┴──────────────┤
 │                rustgate-cot                │               rustgate-core                │
 │      CoT XML parsing · MessageBuilder      │    Codec trait · Identity · RoutableMessage│
@@ -89,6 +89,7 @@ For production certificate management see [docs/tls-certificates.md](docs/tls-ce
 | `rustgate-cot` | Cursor on Target XML parsing and message building |
 | `rustgate-transport` | mTLS listener, codec, session management, CRL, FIPS provider, routing engine |
 | `rustgate-websocket` | WebSocket (wss://) listener with mTLS client authentication |
+| `rustgate-mqtt` | MQTT 5.0/3.1.1 transport adapter with mTLS and dynamic subscriptions |
 | `rustgate-nats` | NATS/JetStream bridge for cross-instance message delivery |
 | `rustgate-enrollment` | HTTPS certificate enrollment server (CSR signing, PKCS#12) |
 | `rustgate-proto` | Protobuf message translation (XML ↔ proto) |
@@ -110,6 +111,7 @@ For detailed architecture documentation see [docs/architecture.md](docs/architec
 | Codecs | Length-prefixed, XML stream, and line-delimited codecs |
 | Position cache | Replay cached positions on client connect |
 | Rate limiting | Per-client message rate and burst controls |
+| MQTT transport | MQTT 5.0/3.1.1 sessions over mTLS with dynamic group subscriptions |
 | Plaintext input | TCP and UDP listeners for trusted-network scenarios |
 
 ### Protocols & Codecs
@@ -210,6 +212,7 @@ cargo build --release --all-features
 | `federation` | Server-to-server federation | `protoc` |
 | `federation-ha` | HA federation with JWT | `protoc` |
 | `websocket` | WebSocket transport | — |
+| `mqtt` | MQTT 5.0/3.1.1 transport | — |
 | `metrics` | Prometheus metrics | — |
 | `full-detail` | Extended CoT parsing | — |
 | `fips` | FIPS 140-3 crypto (aws-lc-rs) | Go 1.20+, cmake |
