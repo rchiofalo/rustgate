@@ -36,6 +36,7 @@ peer-discovery-dns-sd = ["federation", "rustgate-federation/peer-discovery-dns-s
 peer-discovery-consul = ["federation", "rustgate-federation/peer-discovery-consul"]
 peer-discovery-etcd = ["federation", "rustgate-federation/peer-discovery-etcd"]
 websocket = ["dep:rustgate-websocket"]
+mqtt = ["dep:rustgate-mqtt"]
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
 fips = ["rustgate-transport/fips", "rustgate-federation?/fips", "rustgate-enrollment?/fips"]
 post-quantum = ["rustgate-transport/post-quantum", "rustgate-federation?/post-quantum"]
@@ -51,6 +52,7 @@ rustgate-core = { workspace = true }
 rustgate-cot = { workspace = true }
 rustgate-transport = { workspace = true }
 rustgate-websocket = { workspace = true, optional = true }
+rustgate-mqtt = { workspace = true, optional = true }
 rustgate-nats = { workspace = true, optional = true }
 rustgate-enrollment = { workspace = true, optional = true }
 rustgate-proto = { workspace = true, optional = true }

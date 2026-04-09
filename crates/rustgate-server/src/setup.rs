@@ -1310,6 +1310,51 @@ pub(crate) fn warn_websocket_disabled(cli: &Cli) {
 }
 
 // ---------------------------------------------------------------------------
+// MQTT
+// ---------------------------------------------------------------------------
+
+/// Start the MQTT listener and return its subsystem handle.
+#[cfg(feature = "mqtt")]
+pub(crate) fn start_mqtt(
+    cli: &Cli,
+    tls_config: &TlsConfig,
+    router: &Arc<Router>,
+    connection_limit: &Arc<Semaphore>,
+) -> anyhow::Result<Option<SubsystemHandle>> {
+    let mqtt_bind = match cli.mqtt_bind.as_ref() {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+
+    let addr: std::net::SocketAddr = mqtt_bind.parse().context("parsing --mqtt-bind address")?;
+    let mqtt_listener = rustgate_mqtt::MqttListener::bind(addr, tls_config)?;
+    tracing::info!(addr = %mqtt_listener.local_addr()?, "MQTT listener bound");
+
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+
+    let config = rustgate_mqtt::MqttServerConfig {
+        listener: mqtt_listener,
+        router: Arc::clone(router),
+        connection_limit: Arc::clone(connection_limit),
+        shutdown: Arc::clone(&shutdown),
+        topic_prefix: cli.mqtt_topic_prefix.clone(),
+        max_packet_size: cli.mqtt_max_packet_size,
+    };
+    let task = tokio::spawn(async move {
+        rustgate_mqtt::MqttServer::run(config).await;
+    });
+    Ok(Some(SubsystemHandle { shutdown, task }))
+}
+
+/// Warn when MQTT is requested without the feature.
+#[cfg(not(feature = "mqtt"))]
+pub(crate) fn warn_mqtt_disabled(cli: &Cli) {
+    if cli.mqtt_bind.is_some() {
+        tracing::warn!("--mqtt-bind requires --features mqtt; ignoring");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Plaintext TCP
 // ---------------------------------------------------------------------------
 
