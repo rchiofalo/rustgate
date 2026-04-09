@@ -2038,6 +2038,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mqttbytes"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7bd39d24e28e1544d74ff5746e322a477e52353c8ba7adcaa83d2e760752853"
+dependencies = [
+ "bytes",
+]
+
+[[package]]
 name = "multimap"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3214,6 +3223,8 @@ dependencies = [
 name = "rustgate-mqtt"
 version = "0.7.0"
 dependencies = [
+ "bytes",
+ "mqttbytes",
  "rustgate-core",
  "rustgate-test-utils",
  "rustgate-transport",
