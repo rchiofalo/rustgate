@@ -57,6 +57,7 @@ pub use router::{
     ACCESS_LOG_TARGET, NORMAL_CHANNEL_CAPACITY, PRIORITY_CHANNEL_CAPACITY, RoutedMessage, Router,
     SessionHandle,
 };
+pub use rustgate_authz;
 #[cfg(feature = "proto")]
 pub use rustgate_proto::TakFrameCodec;
 pub use rustls::server::ResolvesServerCert;
