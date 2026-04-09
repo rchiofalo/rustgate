@@ -95,6 +95,7 @@ pub(crate) async fn handle_mqtt_session(
             &mut codec,
             &identity,
             &router,
+            session_id,
             topic_prefix.as_deref(),
             keep_alive_duration,
         ) => r,
@@ -214,6 +215,7 @@ async fn mqtt_read_loop(
     codec: &mut PacketCodec,
     identity: &Identity,
     router: &Router,
+    session_id: u64,
     topic_prefix: Option<&str>,
     keep_alive: std::time::Duration,
 ) -> Result<(), MqttError> {
@@ -235,10 +237,12 @@ async fn mqtt_read_loop(
                     handle_publish_v5(codec, identity, router, topic_prefix, publish).await?;
                 }
                 mqttbytes::v5::Packet::Subscribe(sub) => {
-                    handle_subscribe_v5(codec, identity, topic_prefix, sub).await?;
+                    handle_subscribe_v5(codec, identity, router, session_id, topic_prefix, sub)
+                        .await?;
                 }
                 mqttbytes::v5::Packet::Unsubscribe(unsub) => {
-                    handle_unsubscribe_v5(codec, unsub).await?;
+                    handle_unsubscribe_v5(codec, identity, router, session_id, topic_prefix, unsub)
+                        .await?;
                 }
                 mqttbytes::v5::Packet::PingReq => {
                     codec.write_pingresp().await?;
@@ -257,10 +261,12 @@ async fn mqtt_read_loop(
                     handle_publish_v4(codec, identity, router, topic_prefix, publish).await?;
                 }
                 mqttbytes::v4::Packet::Subscribe(sub) => {
-                    handle_subscribe_v4(codec, identity, topic_prefix, sub).await?;
+                    handle_subscribe_v4(codec, identity, router, session_id, topic_prefix, sub)
+                        .await?;
                 }
                 mqttbytes::v4::Packet::Unsubscribe(unsub) => {
-                    handle_unsubscribe_v4(codec, unsub).await?;
+                    handle_unsubscribe_v4(codec, identity, router, session_id, topic_prefix, unsub)
+                        .await?;
                 }
                 mqttbytes::v4::Packet::PingReq => {
                     codec.write_pingresp().await?;
@@ -369,13 +375,15 @@ async fn handle_publish_v4(
 
 /// Handle a v5 SUBSCRIBE packet.
 ///
-/// For v1, wildcards are rejected and group membership is certificate-based.
-/// Each filter is validated and mapped to a group; the client must already
-/// be a member (via their certificate OU) for the subscription to succeed.
-/// Dynamic group joining will be added in a future commit.
+/// Each filter is validated, mapped to a group, and dynamically joined
+/// via [`Router::join_group`]. The client's certificate groups serve as
+/// an authorization check — the client must be a member of the group
+/// (via their certificate OU) to subscribe. Wildcards are rejected in v1.
 async fn handle_subscribe_v5(
     codec: &mut PacketCodec,
     identity: &Identity,
+    router: &Router,
+    session_id: u64,
     topic_prefix: Option<&str>,
     sub: mqttbytes::v5::Subscribe,
 ) -> Result<(), MqttError> {
@@ -387,14 +395,15 @@ async fn handle_subscribe_v5(
             continue;
         }
 
-        let code = match validate_subscription(identity, &filter.path, topic_prefix) {
-            Ok(()) => match filter.qos {
-                mqttbytes::QoS::AtMostOnce => mqttbytes::v5::SubscribeReasonCode::QoS0,
-                mqttbytes::QoS::AtLeastOnce => mqttbytes::v5::SubscribeReasonCode::QoS1,
-                mqttbytes::QoS::ExactlyOnce => unreachable!(),
-            },
-            Err(_) => mqttbytes::v5::SubscribeReasonCode::NotAuthorized,
-        };
+        let code =
+            match try_join_group(identity, router, session_id, &filter.path, topic_prefix).await {
+                Ok(()) => match filter.qos {
+                    mqttbytes::QoS::AtMostOnce => mqttbytes::v5::SubscribeReasonCode::QoS0,
+                    mqttbytes::QoS::AtLeastOnce => mqttbytes::v5::SubscribeReasonCode::QoS1,
+                    mqttbytes::QoS::ExactlyOnce => unreachable!(),
+                },
+                Err(_) => mqttbytes::v5::SubscribeReasonCode::NotAuthorized,
+            };
         return_codes.push(code);
     }
 
@@ -409,6 +418,8 @@ async fn handle_subscribe_v5(
 async fn handle_subscribe_v4(
     codec: &mut PacketCodec,
     identity: &Identity,
+    router: &Router,
+    session_id: u64,
     topic_prefix: Option<&str>,
     sub: mqttbytes::v4::Subscribe,
 ) -> Result<(), MqttError> {
@@ -420,10 +431,11 @@ async fn handle_subscribe_v4(
             continue;
         }
 
-        let code = match validate_subscription(identity, &filter.path, topic_prefix) {
-            Ok(()) => mqttbytes::v4::SubscribeReasonCode::Success(filter.qos),
-            Err(_) => mqttbytes::v4::SubscribeReasonCode::Failure,
-        };
+        let code =
+            match try_join_group(identity, router, session_id, &filter.path, topic_prefix).await {
+                Ok(()) => mqttbytes::v4::SubscribeReasonCode::Success(filter.qos),
+                Err(_) => mqttbytes::v4::SubscribeReasonCode::Failure,
+            };
         return_codes.push(code);
     }
 
@@ -435,12 +447,15 @@ async fn handle_subscribe_v4(
     Ok(())
 }
 
-/// Validate that the client is authorized for a subscription filter.
+/// Validate a subscription filter and dynamically join the mapped group.
 ///
-/// Checks topic validity, maps to a group name, and verifies the client's
-/// certificate includes that group in its OU.
-fn validate_subscription(
+/// Authorization: the client's certificate must include the group in its
+/// OU. If authorized, [`Router::join_group`] adds the session to the
+/// group's recipient set.
+async fn try_join_group(
     identity: &Identity,
+    router: &Router,
+    session_id: u64,
     filter: &str,
     topic_prefix: Option<&str>,
 ) -> Result<(), MqttError> {
@@ -453,6 +468,13 @@ fn validate_subscription(
         )));
     }
 
+    if !router.join_group(&identity.cn, session_id, &group).await {
+        return Err(MqttError::NotAuthorized(format!(
+            "failed to join group '{group}' (limit exceeded)"
+        )));
+    }
+
+    debug!(cn = %identity.cn, group = %group, "MQTT subscribed to group");
     Ok(())
 }
 
@@ -462,11 +484,26 @@ fn validate_subscription(
 
 async fn handle_unsubscribe_v5(
     codec: &mut PacketCodec,
+    identity: &Identity,
+    router: &Router,
+    session_id: u64,
+    topic_prefix: Option<&str>,
     unsub: mqttbytes::v5::Unsubscribe,
 ) -> Result<(), MqttError> {
-    // Acknowledge all filters. Dynamic unsubscribe is a no-op for now
-    // since group membership is certificate-based.
-    let reasons = vec![mqttbytes::v5::UnsubAckReason::Success; unsub.filters.len()];
+    let mut reasons = Vec::with_capacity(unsub.filters.len());
+
+    for filter in &unsub.filters {
+        let reason = match topic::topic_to_group(filter, topic_prefix) {
+            Ok(group) => {
+                let _ = router.leave_group(&identity.cn, session_id, &group).await;
+                debug!(cn = %identity.cn, group = %group, "MQTT unsubscribed from group");
+                mqttbytes::v5::UnsubAckReason::Success
+            }
+            Err(_) => mqttbytes::v5::UnsubAckReason::TopicFilterInvalid,
+        };
+        reasons.push(reason);
+    }
+
     let unsuback = mqttbytes::v5::UnsubAck {
         pkid: unsub.pkid,
         reasons,
@@ -480,8 +517,19 @@ async fn handle_unsubscribe_v5(
 
 async fn handle_unsubscribe_v4(
     codec: &mut PacketCodec,
+    identity: &Identity,
+    router: &Router,
+    session_id: u64,
+    topic_prefix: Option<&str>,
     unsub: mqttbytes::v4::Unsubscribe,
 ) -> Result<(), MqttError> {
+    for filter in &unsub.topics {
+        if let Ok(group) = topic::topic_to_group(filter, topic_prefix) {
+            let _ = router.leave_group(&identity.cn, session_id, &group).await;
+            debug!(cn = %identity.cn, group = %group, "MQTT unsubscribed from group");
+        }
+    }
+
     let unsuback = mqttbytes::v4::UnsubAck { pkid: unsub.pkid };
     codec
         .write_v4(&mqttbytes::v4::Packet::UnsubAck(unsuback))
