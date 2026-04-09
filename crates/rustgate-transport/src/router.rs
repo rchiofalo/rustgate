@@ -373,6 +373,10 @@ const DEFAULT_GROUP_CAPACITY: usize = 64;
 struct State {
     sessions: HashMap<String, SessionHandle>,
     groups: HashMap<GroupId, HashSet<String>>,
+    /// Secondary index: number of groups each CN belongs to.
+    /// Maintained by `join_group`, `leave_group`, `register`, and `unregister`
+    /// so that the per-CN group limit check is O(1) instead of O(G).
+    cn_group_count: HashMap<String, usize>,
     max_groups_per_cn: usize,
     max_total_groups: usize,
 }
@@ -382,6 +386,7 @@ impl Default for State {
         Self {
             sessions: HashMap::with_capacity(DEFAULT_SESSION_CAPACITY),
             groups: HashMap::with_capacity(DEFAULT_GROUP_CAPACITY),
+            cn_group_count: HashMap::with_capacity(DEFAULT_SESSION_CAPACITY),
             max_groups_per_cn: DEFAULT_MAX_GROUPS_PER_CN,
             max_total_groups: DEFAULT_MAX_TOTAL_GROUPS,
         }
@@ -392,10 +397,22 @@ impl State {
     fn remove_from_groups(&mut self, cn: &str, groups: &std::collections::BTreeSet<GroupId>) {
         for group in groups {
             if let Some(members) = self.groups.get_mut(group) {
-                let _ = members.remove(cn);
+                if members.remove(cn) {
+                    Self::decrement_cn_count(&mut self.cn_group_count, cn);
+                }
                 if members.is_empty() {
                     let _ = self.groups.remove(group);
                 }
+            }
+        }
+    }
+
+    /// Decrement the per-CN group count, removing the entry when it hits 0.
+    fn decrement_cn_count(cn_group_count: &mut HashMap<String, usize>, cn: &str) {
+        if let Some(count) = cn_group_count.get_mut(cn) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                let _ = cn_group_count.remove(cn);
             }
         }
     }
@@ -697,11 +714,10 @@ impl Router {
                 continue;
             }
 
-            let _ = state
-                .groups
-                .entry(group.clone())
-                .or_default()
-                .insert(cn.clone());
+            let members = state.groups.entry(group.clone()).or_default();
+            if members.insert(cn.clone()) {
+                *state.cn_group_count.entry(cn.clone()).or_insert(0) += 1;
+            }
             joined += 1;
         }
     }
@@ -720,6 +736,84 @@ impl Router {
         }
         drop(state);
         self.cache.remove(cn).await;
+    }
+
+    /// Dynamically add a session to a group.
+    ///
+    /// Used by transports with explicit subscribe semantics (e.g. MQTT
+    /// SUBSCRIBE). The session must already be registered. Returns `true`
+    /// if the group was joined, `false` if the session is unknown, the
+    /// session ID is stale, or group limits are exceeded.
+    pub async fn join_group(&self, cn: &str, session_id: u64, group: &str) -> bool {
+        let mut state = self.state.write().await;
+
+        // Verify the session exists and the caller's session_id matches.
+        let Some(handle) = state.sessions.get(cn) else {
+            return false;
+        };
+        if handle.id != session_id {
+            return false;
+        }
+
+        // O(1) lookup via secondary index.
+        let current_count = state.cn_group_count.get(cn).copied().unwrap_or(0);
+        if current_count >= state.max_groups_per_cn {
+            warn!(
+                cn = %cn,
+                group = %group,
+                limit = state.max_groups_per_cn,
+                "dynamic join rejected: CN exceeded max groups per CN limit"
+            );
+            return false;
+        }
+
+        // Enforce total group limit for new groups.
+        if !state.groups.contains_key(group) && state.groups.len() >= state.max_total_groups {
+            warn!(
+                cn = %cn,
+                group = %group,
+                limit = state.max_total_groups,
+                "dynamic join rejected: router exceeded max total groups limit"
+            );
+            return false;
+        }
+
+        let members = state.groups.entry(group.to_owned()).or_default();
+        if members.insert(cn.to_owned()) {
+            *state.cn_group_count.entry(cn.to_owned()).or_insert(0) += 1;
+        }
+        true
+    }
+
+    /// Dynamically remove a session from a group.
+    ///
+    /// Used by transports with explicit unsubscribe semantics (e.g. MQTT
+    /// UNSUBSCRIBE). The session must already be registered. Returns `true`
+    /// if the session was removed from the group (or was not a member),
+    /// `false` if the session is unknown or the session ID is stale.
+    pub async fn leave_group(&self, cn: &str, session_id: u64, group: &str) -> bool {
+        let mut state = self.state.write().await;
+
+        let Some(handle) = state.sessions.get(cn) else {
+            return false;
+        };
+        if handle.id != session_id {
+            return false;
+        }
+
+        let mut removed = false;
+        let mut empty = false;
+        if let Some(members) = state.groups.get_mut(group) {
+            removed = members.remove(cn);
+            empty = members.is_empty();
+        }
+        if empty {
+            let _ = state.groups.remove(group);
+        }
+        if removed {
+            State::decrement_cn_count(&mut state.cn_group_count, cn);
+        }
+        true
     }
 
     pub async fn route(&self, msg: RoutableMessage) {
@@ -2471,5 +2565,122 @@ mod tests {
             format!("direct:{}", super::hash_cn(raw_cn)),
             "dst field must be the stable hashed token"
         );
+    }
+
+    // ── Dynamic group join/leave ────────────────────────────────────
+
+    #[tokio::test]
+    async fn join_group_adds_session_to_group() {
+        let router = Router::new();
+        let alice = make_identity("alice", &["alpha"]);
+
+        let (ptx, ntx, _prx, mut nrx) = make_channels(16, 16);
+        let handle = SessionHandle::new(alice.clone(), ptx, ntx);
+        let sid = handle.id;
+        router.register(handle).await;
+
+        // Alice is in "alpha" from cert. Dynamically join "bravo".
+        assert!(router.join_group("alice", sid, "bravo").await);
+
+        // Now route a message to "bravo" from a sender who is a member.
+        let bob = make_identity("bob", &["bravo"]);
+        let (ptx_b, ntx_b, _prx_b, _nrx_b) = make_channels(16, 16);
+        router
+            .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+            .await;
+
+        let msg = make_chat(&bob, Destination::Group("bravo".into()));
+        router.route(msg).await;
+
+        // Alice should receive it via the dynamic subscription.
+        let received = nrx.try_recv();
+        assert!(received.is_ok(), "alice should receive bravo group message");
+    }
+
+    #[tokio::test]
+    async fn leave_group_removes_session_from_group() {
+        let router = Router::new();
+        let alice = make_identity("alice", &["alpha"]);
+
+        let (ptx, ntx, _prx, mut nrx) = make_channels(16, 16);
+        let handle = SessionHandle::new(alice.clone(), ptx, ntx);
+        let sid = handle.id;
+        router.register(handle).await;
+
+        // Dynamically join then leave "bravo".
+        assert!(router.join_group("alice", sid, "bravo").await);
+        assert!(router.leave_group("alice", sid, "bravo").await);
+
+        // Route to "bravo" — alice should NOT receive it.
+        let bob = make_identity("bob", &["bravo"]);
+        let (ptx_b, ntx_b, _prx_b, _nrx_b) = make_channels(16, 16);
+        router
+            .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+            .await;
+
+        let msg = make_chat(&bob, Destination::Group("bravo".into()));
+        router.route(msg).await;
+
+        assert!(
+            nrx.try_recv().is_err(),
+            "alice should not receive bravo after leaving"
+        );
+    }
+
+    #[tokio::test]
+    async fn join_group_rejects_stale_session_id() {
+        let router = Router::new();
+        let alice = make_identity("alice", &["alpha"]);
+
+        let (ptx, ntx, _prx, _nrx) = make_channels(16, 16);
+        let handle = SessionHandle::new(alice.clone(), ptx, ntx);
+        let stale_id = handle.id;
+        router.register(handle).await;
+
+        // Re-register (simulates reconnect), gets a new session ID.
+        let (ptx2, ntx2, _prx2, _nrx2) = make_channels(16, 16);
+        let handle2 = SessionHandle::new(alice.clone(), ptx2, ntx2);
+        router.register(handle2).await;
+
+        // Old session ID should be rejected.
+        assert!(!router.join_group("alice", stale_id, "bravo").await);
+    }
+
+    #[tokio::test]
+    async fn join_group_respects_per_cn_limit() {
+        let router = Router::with_limits(2, 100);
+        let alice = make_identity("alice", &["alpha"]);
+
+        let (ptx, ntx, _prx, _nrx) = make_channels(16, 16);
+        let handle = SessionHandle::new(alice.clone(), ptx, ntx);
+        let sid = handle.id;
+        router.register(handle).await;
+
+        // "alpha" is already joined from cert (1/2). Join "bravo" (2/2).
+        assert!(router.join_group("alice", sid, "bravo").await);
+        // Third group should be rejected.
+        assert!(!router.join_group("alice", sid, "charlie").await);
+    }
+
+    #[tokio::test]
+    async fn join_group_respects_total_group_limit() {
+        let router = Router::with_limits(128, 2);
+        let alice = make_identity("alice", &["alpha"]);
+
+        let (ptx, ntx, _prx, _nrx) = make_channels(16, 16);
+        let handle = SessionHandle::new(alice.clone(), ptx, ntx);
+        let sid = handle.id;
+        router.register(handle).await;
+
+        // "alpha" exists (1/2). Add "bravo" (2/2).
+        assert!(router.join_group("alice", sid, "bravo").await);
+        // Third distinct group should be rejected.
+        assert!(!router.join_group("alice", sid, "charlie").await);
+    }
+
+    #[tokio::test]
+    async fn leave_group_returns_false_for_unknown_session() {
+        let router = Router::new();
+        assert!(!router.leave_group("nonexistent", 999, "alpha").await);
     }
 }
