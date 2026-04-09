@@ -12,8 +12,14 @@ use rustgate_core::identity::Identity;
 use serde::{Deserialize, Serialize};
 
 /// The action a subject is attempting to perform on a resource.
+///
+/// `#[non_exhaustive]` so that adding new actions (e.g. a future
+/// `Manage` or `Admin`) does not break downstream match statements.
+/// Consumers must include a wildcard `_` arm when matching on this enum
+/// from outside the defining crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Action {
     /// Send a message to a specific target or group.
     Send,
@@ -28,7 +34,12 @@ pub enum Action {
 }
 
 /// The core allow/deny verdict.
+///
+/// `#[non_exhaustive]` preserves future-proofing if the verdict space
+/// grows to include additional outcomes (e.g. `NotApplicable` for
+/// federated evaluation). Downstream matches must use a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Decision {
     /// Action is permitted.
     Allow,
@@ -37,8 +48,13 @@ pub enum Decision {
 }
 
 /// Side-effects that the dataplane must apply alongside an allow decision.
+///
+/// `#[non_exhaustive]` — new obligations are added over time (e.g. more
+/// masking flavours or audit tiers). Downstream matches must include a
+/// wildcard arm so the obligation set can grow without breaking the API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Obligation {
     /// Strip geographic coordinates from the outbound message.
     MaskGeo,
@@ -115,7 +131,13 @@ impl<'a> Subject<'a> {
 }
 
 /// The resource a subject is acting on.
+///
+/// `#[non_exhaustive]` keeps the door open for additional resource
+/// kinds (e.g. a future `Enrollment` or `Admin` variant) without
+/// breaking downstream match statements. External consumers must
+/// include a wildcard arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Resource<'a> {
     /// A direct unicast send to a specific CN.
     Direct {

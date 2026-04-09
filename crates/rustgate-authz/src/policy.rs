@@ -39,8 +39,14 @@ fn default_effect_deny() -> Effect {
 }
 
 /// Per-rule effect.
+///
+/// `#[non_exhaustive]` — even though `allow`/`deny` is the standard
+/// duality today, future additions such as `advise` or `indeterminate`
+/// are possible. Requiring downstream matches to include a wildcard
+/// arm keeps the wire-format open for backwards-compatible growth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Effect {
     /// Permit the action when this rule matches.
     Allow,
@@ -76,8 +82,12 @@ pub struct Rule {
 /// `deny_unknown_fields` guards against kind-tagged typos
 /// (`target_ccn`, `peerr_id`, etc.) that would otherwise be accepted
 /// as a no-op and silently widen the rule's reach.
+///
+/// `#[non_exhaustive]` mirrors [`crate::Resource`] — adding a new
+/// resource kind should not break downstream match statements.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[non_exhaustive]
 pub enum ResourceMatcher {
     /// Match a direct send. `target_cn = None` matches any target CN.
     Direct {
