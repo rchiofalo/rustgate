@@ -16,10 +16,9 @@ use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-#[cfg(feature = "nats")]
-use prometheus::Histogram;
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts, TextEncoder,
+    Encoder, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts,
+    TextEncoder,
 };
 use rustgate_core::constants::HTTP_CONNECTION_TIMEOUT;
 
@@ -111,6 +110,11 @@ static CLIENT_QUEUE_SKIPPED_UNSUPPORTED: OnceLock<IntCounter> = OnceLock::new();
 static FEDERATION_PEER_QUEUE_BYTES: OnceLock<prometheus::IntGaugeVec> = OnceLock::new();
 #[cfg(feature = "federation")]
 static FEDERATION_PEER_OLDEST_SECONDS: OnceLock<prometheus::IntGaugeVec> = OnceLock::new();
+
+static AUTHZ_DECISIONS: OnceLock<IntCounterVec> = OnceLock::new();
+static AUTHZ_EVAL_NANOS: OnceLock<Histogram> = OnceLock::new();
+static AUTHZ_RELOADS: OnceLock<IntCounterVec> = OnceLock::new();
+static AUTHZ_POLICY_RULES: OnceLock<IntGauge> = OnceLock::new();
 
 static ARCHIVE_BYTES: OnceLock<IntGauge> = OnceLock::new();
 static ENROLLMENT_RATE_LIMITED: OnceLock<IntCounter> = OnceLock::new();
@@ -459,7 +463,126 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(enrollment_rate_limited.clone()))?;
     let _ = ENROLLMENT_RATE_LIMITED.set(enrollment_rate_limited);
 
+    let authz_decisions = IntCounterVec::new(
+        Opts::new(
+            "rustgate_authz_decisions_total",
+            "Authz decisions emitted by the router PEP, labelled by action and decision",
+        ),
+        &["action", "decision"],
+    )?;
+    registry.register(Box::new(authz_decisions.clone()))?;
+    let _ = AUTHZ_DECISIONS.set(authz_decisions);
+
+    // Bucket floor is 50 ns: the native engine's measured P99 on a
+    // single rule is ~80 ns, and we need at least one bucket below
+    // that so the dashboards and the P99 SLO test are not all
+    // crammed into the first bucket. The ceiling stays at 100 µs to
+    // catch pathological slow decisions. 10 µs is the documented
+    // SLO — `histogram_quantile(0.99, …) <= 10_000` is the gate.
+    let authz_eval_nanos = Histogram::with_opts(
+        HistogramOpts::new(
+            "rustgate_authz_eval_nanos",
+            "Authz policy evaluation duration in nanoseconds",
+        )
+        .buckets(vec![
+            50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 10_000.0, 100_000.0,
+        ]),
+    )?;
+    registry.register(Box::new(authz_eval_nanos.clone()))?;
+    let _ = AUTHZ_EVAL_NANOS.set(authz_eval_nanos);
+
+    let authz_reloads = IntCounterVec::new(
+        Opts::new(
+            "rustgate_authz_reloads_total",
+            "Authz policy reload outcomes, labelled by result",
+        ),
+        &["result"],
+    )?;
+    registry.register(Box::new(authz_reloads.clone()))?;
+    let _ = AUTHZ_RELOADS.set(authz_reloads);
+
+    let authz_policy_rules = IntGauge::with_opts(Opts::new(
+        "rustgate_authz_policy_rules",
+        "Number of rules in the currently installed authz policy",
+    ))?;
+    registry.register(Box::new(authz_policy_rules.clone()))?;
+    let _ = AUTHZ_POLICY_RULES.set(authz_policy_rules);
+
     Ok(())
+}
+
+fn fallback_histogram(name: &str, help: &str) -> Histogram {
+    match Histogram::with_opts(HistogramOpts::new(name, help)) {
+        Ok(h) => h,
+        Err(_) => std::process::abort(),
+    }
+}
+
+/// Observe an authz evaluation event emitted by the router PEP.
+///
+/// Installed as the router's `AuthzObserver` at startup so every Allow
+/// and Deny decision increments the decisions counter and records the
+/// evaluation latency histogram.
+///
+/// Both match statements include a wildcard `_` arm to satisfy the
+/// `#[non_exhaustive]` contract on [`rustgate_authz::Action`] and
+/// [`rustgate_authz::Decision`]: the authz crate may add new variants
+/// in future releases without making this a breaking change, and we
+/// degrade to a neutral `"unknown"` label rather than failing the
+/// metric update so the decision counter never drops events.
+pub fn observe_authz_event(ev: &rustgate_transport::AuthzEvent<'_>) {
+    let action = match ev.action {
+        rustgate_authz::Action::Send => "send",
+        rustgate_authz::Action::Receive => "receive",
+        rustgate_authz::Action::Federate => "federate",
+        rustgate_authz::Action::Publish => "publish",
+        rustgate_authz::Action::Subscribe => "subscribe",
+        _ => "unknown",
+    };
+    let decision = match ev.decision {
+        rustgate_authz::Decision::Allow => "allow",
+        rustgate_authz::Decision::Deny => "deny",
+        _ => "unknown",
+    };
+    if let Ok(child) = authz_decisions().get_metric_with_label_values(&[action, decision]) {
+        child.inc();
+    }
+    authz_eval_nanos().observe(ev.eval_nanos as f64);
+}
+
+/// Record an authz policy reload outcome and update the rule-count gauge.
+pub fn record_authz_reload(success: bool, rule_count: Option<usize>) {
+    let label = if success { "success" } else { "failure" };
+    if let Ok(child) = authz_reloads().get_metric_with_label_values(&[label]) {
+        child.inc();
+    }
+    if let Some(n) = rule_count {
+        authz_policy_rules().set(i64::try_from(n).unwrap_or(i64::MAX));
+    }
+}
+
+pub fn authz_decisions() -> &'static IntCounterVec {
+    AUTHZ_DECISIONS.get_or_init(|| {
+        fallback_counter_vec(
+            "rustgate_authz_decisions_total",
+            "fallback",
+            &["action", "decision"],
+        )
+    })
+}
+
+pub fn authz_eval_nanos() -> &'static Histogram {
+    AUTHZ_EVAL_NANOS.get_or_init(|| fallback_histogram("rustgate_authz_eval_nanos", "fallback"))
+}
+
+pub fn authz_reloads() -> &'static IntCounterVec {
+    AUTHZ_RELOADS.get_or_init(|| {
+        fallback_counter_vec("rustgate_authz_reloads_total", "fallback", &["result"])
+    })
+}
+
+pub fn authz_policy_rules() -> &'static IntGauge {
+    AUTHZ_POLICY_RULES.get_or_init(|| fallback_gauge("rustgate_authz_policy_rules", "fallback"))
 }
 
 /// Returns the federation per-peer queue-bytes gauge vector.
