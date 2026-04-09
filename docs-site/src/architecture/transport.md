@@ -19,12 +19,22 @@ For the on-the-wire framing and message format see [Wire Protocol](./protocol.md
 
 ## Feature flags
 
-| Feature | Effect on transport |
+Features on the `rustgate-transport` crate itself:
+
+| Feature | Effect |
 |---|---|
 | `fips` | Swaps the default `ring` crypto provider for `aws-lc-rs` in FIPS mode. |
 | `post-quantum` | Enables X25519MLKEM768 hybrid key exchange. |
+| `proto` | Enables protobuf codec support via `rustgate-proto`. |
+| `ocsp` | Enables OCSP stapling validation. |
+| `spiffe` | Enables SPIFFE workload identity extraction from URI SANs. |
+
+Server-level features that add transport adapters (configured in `rustgate-server`):
+
+| Feature | Effect |
+|---|---|
 | `metrics` | Publishes per-listener and per-identity Prometheus gauges. |
-| `websocket` | Compiles in the WebSocket listener (`rustgate-websocket` re-exports). |
+| `websocket` | Compiles in the WebSocket listener (`rustgate-websocket`). |
 | `mqtt` | Compiles in the MQTT 5.0/3.1.1 transport adapter (`rustgate-mqtt`). |
 
 ## Additional Transport Layers

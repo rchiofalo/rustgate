@@ -1,10 +1,11 @@
 # Workspace Crates
 
-The rustgate workspace contains 12 crates. Each has a single responsibility and inherits all version, edition, and lint settings from the workspace root via `[lints] workspace = true`.
+The rustgate workspace contains 13 crates. Each has a single responsibility and inherits all version, edition, and lint settings from the workspace root via `[lints] workspace = true`.
 
 | Crate | Purpose |
 |---|---|
 | `rustgate-authz` | Per-message RBAC/ABAC authorization with JSON and Cedar policy backends, sharded LRU cache, hot-reload. |
+| `rustgate-client` | Reference client library for connecting to a rustgate server. Wraps the same transport codecs used by the server so consumers do not need to re-implement TLS, framing, or reconnection. |
 | `rustgate-core` | Shared types: `Identity`, `RoutableMessage`, error handling, hash-chained audit log, encrypted-at-rest archive. |
 | `rustgate-cot` | Cursor-on-Target XML parsing and validation. The protocol-specific layer is isolated here so other codecs can be added without touching transport. |
 | `rustgate-enrollment` | Certificate enrollment server: PKCS#12 bundle issuance and EST (RFC 7030) endpoints, with per-IP rate limiting. |
