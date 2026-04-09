@@ -6,7 +6,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
-use rustgate_core::identity::{GroupId, Identity, IdentityError};
+use rustgate_core::identity::{AttrValue, GroupId, Identity, IdentityError};
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
 use rustgate_core::peer_id::{PeerId, ServerName};
 use rustgate_core::protocol::{FramingStrategy, HeaderSize};
@@ -114,6 +114,64 @@ fn identity_rejects_control_chars_in_cn() {
         result.unwrap_err(),
         IdentityError::CnContainsControlChars
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Identity attribute / SPIFFE tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn identity_defaults_empty_attributes_and_no_spiffe() {
+    let id = make_identity("alice", "fp", &[]);
+    assert!(id.attributes.is_empty());
+    assert!(id.spiffe_id.is_none());
+}
+
+#[test]
+fn identity_builder_with_attributes_and_spiffe() {
+    let mut attrs = std::collections::BTreeMap::new();
+    let _ = attrs.insert("org".to_string(), AttrValue::Str("Acme".to_string()));
+    let _ = attrs.insert(
+        "san_dns".to_string(),
+        AttrValue::Set(vec!["a.example.com".to_string()]),
+    );
+    let id = make_identity("alice", "fp", &[])
+        .with_attributes(attrs.clone())
+        .with_spiffe_id("spiffe://example.org/svc/alice");
+
+    assert_eq!(
+        id.spiffe_id.as_deref(),
+        Some("spiffe://example.org/svc/alice")
+    );
+    assert_eq!(
+        id.attributes.get("org"),
+        Some(&AttrValue::Str("Acme".to_string()))
+    );
+}
+
+#[test]
+fn identity_equality_considers_attributes_and_spiffe() {
+    let a = make_identity("alice", "fp", &[]).with_spiffe_id("spiffe://ex/a");
+    let b = make_identity("alice", "fp", &[]).with_spiffe_id("spiffe://ex/b");
+    assert_ne!(a, b);
+    let c = make_identity("alice", "fp", &[]);
+    let d = make_identity("alice", "fp", &[]);
+    assert_eq!(c, d);
+}
+
+#[test]
+fn attr_value_serde_round_trip() {
+    let values = vec![
+        AttrValue::Str("hello".to_string()),
+        AttrValue::Int(42),
+        AttrValue::Bool(true),
+        AttrValue::Set(vec!["a".to_string(), "b".to_string()]),
+    ];
+    for v in values {
+        let json = serde_json::to_string(&v).unwrap();
+        let decoded: AttrValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(v, decoded);
+    }
 }
 
 // ---------------------------------------------------------------------------
