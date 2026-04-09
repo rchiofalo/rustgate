@@ -1326,6 +1326,11 @@ pub(crate) fn start_mqtt(
         None => return Ok(None),
     };
 
+    if let Some(prefix) = cli.mqtt_topic_prefix.as_deref() {
+        rustgate_mqtt::validate_topic_prefix(prefix)
+            .map_err(|e| anyhow::anyhow!("invalid --mqtt-topic-prefix: {e}"))?;
+    }
+
     let addr: std::net::SocketAddr = mqtt_bind.parse().context("parsing --mqtt-bind address")?;
     let mqtt_listener = rustgate_mqtt::MqttListener::bind(addr, tls_config)?;
     tracing::info!(addr = %mqtt_listener.local_addr()?, "MQTT listener bound");

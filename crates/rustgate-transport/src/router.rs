@@ -373,6 +373,10 @@ const DEFAULT_GROUP_CAPACITY: usize = 64;
 struct State {
     sessions: HashMap<String, SessionHandle>,
     groups: HashMap<GroupId, HashSet<String>>,
+    /// Secondary index: number of groups each CN belongs to.
+    /// Maintained by `join_group`, `leave_group`, `register`, and `unregister`
+    /// so that the per-CN group limit check is O(1) instead of O(G).
+    cn_group_count: HashMap<String, usize>,
     max_groups_per_cn: usize,
     max_total_groups: usize,
 }
@@ -382,6 +386,7 @@ impl Default for State {
         Self {
             sessions: HashMap::with_capacity(DEFAULT_SESSION_CAPACITY),
             groups: HashMap::with_capacity(DEFAULT_GROUP_CAPACITY),
+            cn_group_count: HashMap::with_capacity(DEFAULT_SESSION_CAPACITY),
             max_groups_per_cn: DEFAULT_MAX_GROUPS_PER_CN,
             max_total_groups: DEFAULT_MAX_TOTAL_GROUPS,
         }
@@ -392,10 +397,22 @@ impl State {
     fn remove_from_groups(&mut self, cn: &str, groups: &std::collections::BTreeSet<GroupId>) {
         for group in groups {
             if let Some(members) = self.groups.get_mut(group) {
-                let _ = members.remove(cn);
+                if members.remove(cn) {
+                    Self::decrement_cn_count(&mut self.cn_group_count, cn);
+                }
                 if members.is_empty() {
                     let _ = self.groups.remove(group);
                 }
+            }
+        }
+    }
+
+    /// Decrement the per-CN group count, removing the entry when it hits 0.
+    fn decrement_cn_count(cn_group_count: &mut HashMap<String, usize>, cn: &str) {
+        if let Some(count) = cn_group_count.get_mut(cn) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                let _ = cn_group_count.remove(cn);
             }
         }
     }
@@ -697,11 +714,10 @@ impl Router {
                 continue;
             }
 
-            let _ = state
-                .groups
-                .entry(group.clone())
-                .or_default()
-                .insert(cn.clone());
+            let members = state.groups.entry(group.clone()).or_default();
+            if members.insert(cn.clone()) {
+                *state.cn_group_count.entry(cn.clone()).or_insert(0) += 1;
+            }
             joined += 1;
         }
     }
@@ -739,12 +755,8 @@ impl Router {
             return false;
         }
 
-        // Count how many groups this CN already belongs to.
-        let current_count = state
-            .groups
-            .values()
-            .filter(|members| members.contains(cn))
-            .count();
+        // O(1) lookup via secondary index.
+        let current_count = state.cn_group_count.get(cn).copied().unwrap_or(0);
         if current_count >= state.max_groups_per_cn {
             warn!(
                 cn = %cn,
@@ -766,11 +778,10 @@ impl Router {
             return false;
         }
 
-        let _ = state
-            .groups
-            .entry(group.to_owned())
-            .or_default()
-            .insert(cn.to_owned());
+        let members = state.groups.entry(group.to_owned()).or_default();
+        if members.insert(cn.to_owned()) {
+            *state.cn_group_count.entry(cn.to_owned()).or_insert(0) += 1;
+        }
         true
     }
 
@@ -790,11 +801,17 @@ impl Router {
             return false;
         }
 
+        let mut removed = false;
+        let mut empty = false;
         if let Some(members) = state.groups.get_mut(group) {
-            let _ = members.remove(cn);
-            if members.is_empty() {
-                let _ = state.groups.remove(group);
-            }
+            removed = members.remove(cn);
+            empty = members.is_empty();
+        }
+        if empty {
+            let _ = state.groups.remove(group);
+        }
+        if removed {
+            State::decrement_cn_count(&mut state.cn_group_count, cn);
         }
         true
     }

@@ -4,6 +4,8 @@
 //! rustgate group names are restricted to printable ASCII without `/`.
 //! This module handles the translation and validates both sides.
 
+use std::borrow::Cow;
+
 use crate::error::MqttError;
 
 /// Maximum group name length after topic mapping.
@@ -15,8 +17,8 @@ const MAX_GROUP_LEN: usize = 255;
 /// is stripped and the remainder becomes the group name. If `prefix` is
 /// `None`, the topic is used as-is.
 ///
-/// The resulting group name is validated against rustgate's character rules.
-pub fn topic_to_group(topic: &str, prefix: Option<&str>) -> Result<String, MqttError> {
+/// Returns `Cow::Borrowed` when no prefix is configured (zero allocation).
+pub fn topic_to_group<'a>(topic: &'a str, prefix: Option<&str>) -> Result<Cow<'a, str>, MqttError> {
     let group = if let Some(pfx) = prefix {
         topic.strip_prefix(pfx).ok_or_else(|| {
             MqttError::InvalidTopic(format!("topic must start with prefix '{pfx}'"))
@@ -26,7 +28,25 @@ pub fn topic_to_group(topic: &str, prefix: Option<&str>) -> Result<String, MqttE
     };
 
     validate_group_name(group)?;
-    Ok(group.to_owned())
+
+    if prefix.is_some() {
+        Ok(Cow::Owned(group.to_owned()))
+    } else {
+        Ok(Cow::Borrowed(group))
+    }
+}
+
+/// Validate that a topic prefix is well-formed.
+///
+/// MQTT topic prefixes must end with `/` to ensure clean level-boundary
+/// stripping. An empty prefix is treated as no prefix.
+pub fn validate_topic_prefix(prefix: &str) -> Result<(), MqttError> {
+    if !prefix.is_empty() && !prefix.ends_with('/') {
+        return Err(MqttError::InvalidTopic(format!(
+            "topic prefix must end with '/': got '{prefix}'"
+        )));
+    }
+    Ok(())
 }
 
 /// Validate that an MQTT publish topic contains no wildcards.
@@ -101,15 +121,29 @@ mod tests {
 
     #[test]
     fn direct_topic_maps_to_group() {
-        assert_eq!(topic_to_group("alpha", None).unwrap(), "alpha");
+        assert_eq!(topic_to_group("alpha", None).unwrap().as_ref(), "alpha");
     }
 
     #[test]
     fn prefix_strip_maps_correctly() {
         assert_eq!(
-            topic_to_group("rustgate/alpha", Some("rustgate/")).unwrap(),
+            topic_to_group("rustgate/alpha", Some("rustgate/"))
+                .unwrap()
+                .as_ref(),
             "alpha"
         );
+    }
+
+    #[test]
+    fn no_prefix_returns_borrowed() {
+        let result = topic_to_group("alpha", None).unwrap();
+        assert!(matches!(result, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn prefix_returns_owned() {
+        let result = topic_to_group("rustgate/alpha", Some("rustgate/")).unwrap();
+        assert!(matches!(result, Cow::Owned(_)));
     }
 
     #[test]
@@ -159,5 +193,13 @@ mod tests {
     fn max_length_group_accepted() {
         let max = "a".repeat(255);
         assert!(topic_to_group(&max, None).is_ok());
+    }
+
+    #[test]
+    fn prefix_must_end_with_slash() {
+        assert!(validate_topic_prefix("rustgate/").is_ok());
+        assert!(validate_topic_prefix("").is_ok());
+        assert!(validate_topic_prefix("rustgate").is_err());
+        assert!(validate_topic_prefix("r").is_err());
     }
 }

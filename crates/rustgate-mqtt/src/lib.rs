@@ -34,4 +34,6 @@ pub use config::MqttServerConfig;
 pub use error::MqttError;
 pub use listener::MqttListener;
 pub use server::MqttServer;
-pub use topic::{topic_to_group, validate_publish_topic, validate_subscribe_filter};
+pub use topic::{
+    topic_to_group, validate_publish_topic, validate_subscribe_filter, validate_topic_prefix,
+};
