@@ -23,7 +23,12 @@ cargo build --features enrollment    # Certificate enrollment
 cargo build --features proto         # TAK protobuf translation
 cargo build --features federation    # Server-to-server federation
 cargo build --features websocket     # WebSocket transport
+cargo build --features mqtt          # MQTT 5.0/3.1.1 transport
 cargo build --features metrics       # Prometheus metrics + health endpoints
+cargo build --features est           # EST (RFC 7030) enrollment endpoints
+cargo build --features ocsp          # OCSP stapling and client checking
+cargo build --features spiffe        # SPIFFE/SPIRE workload identity
+cargo build --features cedar         # Cedar policy language for authz
 cargo build --features fips          # FIPS 140-3 crypto (requires Go + cmake)
 cargo build --features post-quantum  # Post-quantum key exchange (requires Go + cmake)
 cargo build --features otel          # OpenTelemetry tracing (requires protoc)
@@ -100,12 +105,15 @@ The workspace is organized as independent crates under `crates/`:
 |-------|---------|
 | `rustgate-core` | Shared types: Identity, RoutableMessage, FramingStrategy |
 | `rustgate-cot` | Cursor on Target XML parsing |
+| `rustgate-authz` | Policy engine for RBAC/ABAC authorization |
 | `rustgate-transport` | mTLS listener, codec, CRL, FIPS provider, session management, routing engine |
 | `rustgate-websocket` | WebSocket (wss://) listener with mTLS client authentication |
+| `rustgate-mqtt` | MQTT 5.0/3.1.1 transport adapter with mTLS |
 | `rustgate-nats` | NATS bridge for cross-instance messaging |
 | `rustgate-enrollment` | HTTPS certificate enrollment server (CSR signing, PKCS#12) |
 | `rustgate-proto` | Protobuf translation (XML / proto) |
 | `rustgate-federation` | Server-to-server federation: V1 (XML), V2 (gRPC), HA, REST API |
+| `rustgate-client` | Reference client library for connecting to a rustgate server |
 | `rustgate-server` | Binary entry point, wires everything together |
 | `rustgate-test-utils` | Shared test helpers (CA and cert generation) |
 

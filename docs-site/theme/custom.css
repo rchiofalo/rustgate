@@ -1,0 +1,28 @@
+/* rustgate docs — minor typography and table polish on top of mdBook navy theme. */
+
+:root {
+    --sidebar-width: 300px;
+    --content-max-width: 920px;
+}
+
+.content table {
+    border-collapse: collapse;
+    margin: 1rem 0;
+}
+
+.content table th,
+.content table td {
+    border: 1px solid var(--table-border-color);
+    padding: 0.5rem 0.75rem;
+    vertical-align: top;
+}
+
+.content h1,
+.content h2,
+.content h3 {
+    letter-spacing: -0.01em;
+}
+
+.content code {
+    font-size: 0.92em;
+}

@@ -100,6 +100,7 @@ curl http://localhost:9090/metrics
 | 4433 | Client connections (mTLS) | always |
 | 8443 | WebSocket connections (wss:// mTLS) | `websocket` |
 | 8446 | Certificate enrollment (HTTPS) | `enrollment` |
+| 8883 | MQTT connections (mqtts:// mTLS) | `mqtt` |
 | 9000 | Federation V1 (mTLS) | `federation` |
 | 9001 | Federation V2 gRPC (mTLS) | `federation` |
 | 9090 | Metrics and health (HTTP) | `metrics` |

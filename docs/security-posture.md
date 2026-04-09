@@ -48,7 +48,7 @@ This document maps rustgate's existing security controls to NIST SP 800-53 (Rev.
 
 | Control | Implementation |
 |---------|---------------|
-| SA-11 Developer Testing | 818+ tests across 10 crates. `cargo-nextest` in CI. Feature-gated test suites for FIPS, NATS, federation. |
+| SA-11 Developer Testing | 1400+ tests across 13 crates. `cargo-nextest` in CI. Feature-gated test suites for FIPS, post-quantum, NATS, federation, Cedar authz. |
 | SA-12 Supply Chain Protection | SBOM (SPDX) generated for both source and container on every release. `cargo-deny` enforces license allowlist and dependency bans. All CI action versions pinned to full SHA hashes. |
 
 ### CM — Configuration Management
@@ -95,7 +95,7 @@ This document maps rustgate's existing security controls to NIST SP 800-53 (Rev.
 
 | Control | Implementation |
 |---------|---------------|
-| CA-2 Control Assessments | CI pipeline runs 9 jobs on every push: lint, clippy, feature powerset, tests (818+), coverage, audit, Helm lint, Docker build. |
+| CA-2 Control Assessments | CI pipeline runs 12 jobs on every push: commit-lint, lint, clippy, feature powerset, tests (1400+), coverage, FIPS, post-quantum, dependency-review, audit, Helm lint, Docker build. |
 | CA-7 Continuous Monitoring | OpenSSF Scorecard runs weekly and on push to main. Dependabot monitors dependency vulnerabilities continuously. |
 | CA-8 Penetration Testing | Fuzz testing via `cargo-fuzz` targets for CoT parsing, XML stream codec, and TAK frame codec. |
 

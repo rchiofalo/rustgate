@@ -8,6 +8,7 @@ rustgate is a Rust-native secure message router built for tactical edge deployme
 crates/
   rustgate-core/          Shared types (Identity, RoutableMessage, Destination, framing)
   rustgate-cot/           Cursor on Target XML parsing, MessageBuilder
+  rustgate-authz/         Authorization engine (RBAC/ABAC policy evaluation, Cedar backend)
   rustgate-transport/     mTLS listener, codecs, session management, message router
   rustgate-websocket/     WebSocket (wss://) listener with mTLS, router integration
   rustgate-mqtt/          MQTT 5.0/3.1.1 transport with mTLS, dynamic group subscriptions
@@ -15,6 +16,7 @@ crates/
   rustgate-enrollment/    HTTPS certificate enrollment (Marti v2 CSR signing)
   rustgate-proto/         Protobuf translation (XML / proto) and negotiation
   rustgate-federation/    Server-to-server federation (V1 XML, V2 gRPC)
+  rustgate-client/        Lightweight client library for integration testing
   rustgate-server/        Binary entry point wiring all crates together
   rustgate-test-utils/    Ephemeral certificate generation for tests
 ```
@@ -23,9 +25,9 @@ crates/
 
 ```
 Clients
-  │                        │
-  │ mTLS (port 4433)       │ wss:// mTLS (port 8443)
-  ▼                        ▼
+  │                        │                      │
+  │ mTLS (port 4433)       │ wss:// (port 8443)   │ mqtts:// (port 8883)
+  ▼                        ▼                      ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │                         rustgate-server                          │
 │                                                                  │
@@ -35,14 +37,19 @@ Clients
 │  └─────────────┘   │ group/     │   └─────────────────────┘    │
 │                     │ direct     │                               │
 │  ┌─────────────┐   │            │   ┌─────────────────────┐    │
-│  │ WS Listener │──>│            │   │ Federation Manager  │    │
-│  │ (websocket) │   │            │<->│ (V1 XML / V2 gRPC)  │    │
+│  │ WS Listener │──>│   Authz    │   │ Federation Manager  │    │
+│  │ (websocket) │   │    PEP     │<->│ (V1 XML / V2 gRPC)  │    │
 │  └─────────────┘   │            │   └─────────────────────┘    │
 │                     │            │                               │
-│  ┌─────────────┐   │            │   ┌─────────────────────┐    │
-│  │ NATS Bridge │<->│            │   │  Position Cache     │    │
-│  │ (pub/sub)   │   │            │   │  (replay on connect) │    │
-│  └─────────────┘   └────────────┘   └─────────────────────┘    │
+│  ┌──────────────┐  │            │   ┌─────────────────────┐    │
+│  │MQTT Listener │─>│            │   │  Position Cache     │    │
+│  │ (mqtts://)   │  │            │   │  (replay on connect) │    │
+│  └──────────────┘  │            │   └─────────────────────┘    │
+│                     │            │                               │
+│  ┌─────────────┐   │            │                               │
+│  │ NATS Bridge │<->│            │                               │
+│  │ (pub/sub)   │   │            │                               │
+│  └─────────────┘   └────────────┘                               │
 │                                                                  │
 │  ┌─────────────┐   ┌────────────┐                               │
 │  │ Enrollment  │   │  Metrics   │                               │
@@ -52,7 +59,7 @@ Clients
   │                     │                    │
   │ NATS (4222)         │ HTTP (9090)        │ mTLS (9000/9001)
   ▼                     ▼                    ▼
-Other rustgate       Prometheus/         Remote TAK
+Other rustgate       Prometheus/         Remote
 instances            monitoring          servers (peers)
 ```
 
@@ -100,6 +107,16 @@ All optional features are compile-time feature gates, keeping the base binary mi
 | `proto` | rustgate-proto | TAK protobuf translation, protocol negotiation |
 | `metrics` | prometheus, hyper | Prometheus metrics, health endpoints |
 | `federation` | rustgate-federation | Server-to-server federation (V1/V2) |
+| `federation-ha` | rustgate-federation | High-availability federation with JWT and NATS KV |
+| `est` | rustgate-enrollment | EST (RFC 7030) enrollment endpoints |
+| `full-detail` | rustgate-nats | Extended CoT parsing for NATS bridge |
+| `fips` | rustgate-transport | FIPS 140-3 crypto via aws-lc-rs (requires Go + cmake) |
+| `post-quantum` | rustgate-transport | Post-quantum key exchange X25519MLKEM768 (requires Go + cmake) |
+| `otel` | opentelemetry | OpenTelemetry distributed tracing (OTLP export, requires protoc) |
+| `ocsp` | rustgate-transport | OCSP stapling and client OCSP checking |
+| `spiffe` | rustgate-transport | SPIFFE/SPIRE workload identity for server TLS |
+| `cedar` | rustgate-authz | Cedar policy language backend for authorization |
+| `peer-discovery` | rustgate-federation | Peer discovery backends (DNS-SD, Consul, etcd) |
 | `jemalloc` | tikv-jemallocator | jemalloc allocator for musl builds |
 
 Build with specific features:

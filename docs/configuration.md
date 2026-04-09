@@ -121,6 +121,34 @@ See [docs/authorization.md](authorization.md) for the policy format and
 |------|---------|---------|-------------|
 | `--websocket-bind` | `RUSTGATE_WEBSOCKET_BIND` | — | WebSocket (wss://) listen address |
 
+### MQTT (requires `--features mqtt`)
+
+| Flag | Env Var | Default | Description |
+|------|---------|---------|-------------|
+| `--mqtt-bind` | `RUSTGATE_MQTT_BIND` | — | MQTT (mqtts://) listen address (e.g., `0.0.0.0:8883`) |
+| `--mqtt-topic-prefix` | `RUSTGATE_MQTT_TOPIC_PREFIX` | — | Optional prefix stripped from MQTT topics before group mapping (e.g., `rustgate/`) |
+| `--mqtt-max-packet-size` | `RUSTGATE_MQTT_MAX_PACKET_SIZE` | `16777216` (16 MiB) | Maximum MQTT packet size in bytes |
+
+MQTT clients connect over mTLS (same CA as the core transport). Client identity is derived from the X.509 certificate. MQTT topics map to rustgate groups: a SUBSCRIBE to topic `alpha` joins the `alpha` group; a PUBLISH to topic `alpha` routes to the `alpha` group. MQTT 5.0 and 3.1.1 are both supported, with protocol version negotiated from the CONNECT packet. Only QoS 0 and QoS 1 are supported; QoS 2 is rejected. Clean sessions are required (persistent sessions are not supported).
+
+### OCSP (requires `--features ocsp`)
+
+| Flag | Env Var | Default | Description |
+|------|---------|---------|-------------|
+| `--ocsp-stapling` | `RUSTGATE_OCSP_STAPLING` | `false` | Enable OCSP stapling on the server certificate |
+| `--client-ocsp` | `RUSTGATE_CLIENT_OCSP` | `false` | Check OCSP status for client certificates during handshake |
+
+### SPIFFE (requires `--features spiffe`)
+
+| Flag | Env Var | Default | Description |
+|------|---------|---------|-------------|
+| `--spiffe` | `RUSTGATE_SPIFFE` | `false` | Enable SPIFFE workload identity |
+| `--spiffe-trust-domain` | `RUSTGATE_SPIFFE_TRUST_DOMAIN` | — | SPIFFE trust domain (e.g., `example.org`) |
+| `--spiffe-workload-api-socket` | `RUSTGATE_SPIFFE_WORKLOAD_API_SOCKET` | `unix:///tmp/spire-agent/public/api.sock` | Path to the SPIRE Workload API socket |
+| `--spiffe-refresh-interval` | `RUSTGATE_SPIFFE_REFRESH_INTERVAL` | `300` | Seconds between SVID refresh |
+
+When SPIFFE is enabled, the server obtains its TLS identity (X.509 SVID) from a SPIRE agent via the Workload API instead of reading static `--cert`/`--key` files. The SVID is refreshed periodically.
+
 ### Metrics (requires `--features metrics`)
 
 | Flag | Env Var | Default | Description |
@@ -150,6 +178,20 @@ See [docs/authorization.md](authorization.md) for the policy format and
 | `--federation-pod-id` | `RUSTGATE_FEDERATION_POD_ID` | — | Pod identifier for HA leader election |
 
 See the [Federation REST API](federation.md) documentation for the `/api/federation/` management endpoints (requires `--features metrics` for the HTTP server).
+
+### Peer Discovery (requires `--features peer-discovery`)
+
+| Flag | Env Var | Default | Description |
+|------|---------|---------|-------------|
+| `--federation-peer-discovery` | `RUSTGATE_FEDERATION_PEER_DISCOVERY` | `none` | Discovery backend: `none`, `dns-sd`, `consul`, or `etcd` |
+| `--federation-peer-discovery-interval` | `RUSTGATE_FEDERATION_PEER_DISCOVERY_INTERVAL` | `30` | Seconds between discovery polls |
+| `--federation-peer-discovery-dns-sd-service` | `RUSTGATE_FEDERATION_PEER_DISCOVERY_DNS_SD_SERVICE` | `_rustgate._tcp.local.` | DNS-SD service name |
+| `--federation-peer-discovery-consul-addr` | `RUSTGATE_FEDERATION_PEER_DISCOVERY_CONSUL_ADDR` | `http://127.0.0.1:8500` | Consul agent address |
+| `--federation-peer-discovery-consul-service` | `RUSTGATE_FEDERATION_PEER_DISCOVERY_CONSUL_SERVICE` | `rustgate` | Consul service name |
+| `--federation-peer-discovery-etcd-endpoints` | `RUSTGATE_FEDERATION_PEER_DISCOVERY_ETCD_ENDPOINTS` | `http://127.0.0.1:2379` | Comma-separated etcd endpoints |
+| `--federation-peer-discovery-etcd-prefix` | `RUSTGATE_FEDERATION_PEER_DISCOVERY_ETCD_PREFIX` | `rustgate/peers/` | etcd key prefix for peer registration |
+
+Individual backends can be enabled separately with `--features peer-discovery-dns-sd`, `--features peer-discovery-consul`, or `--features peer-discovery-etcd`. The umbrella `--features peer-discovery` enables all three.
 
 ### OpenTelemetry (requires `--features otel`)
 
@@ -302,6 +344,7 @@ export RUSTGATE_BIND=0.0.0.0:4433
 export RUSTGATE_FRAMING=tak-negotiate
 export RUSTGATE_MAX_CONNECTIONS=2048
 export RUSTGATE_WEBSOCKET_BIND=0.0.0.0:8443
+export RUSTGATE_MQTT_BIND=0.0.0.0:8883
 export RUSTGATE_NATS_URL=nats://nats:4222
 export RUSTGATE_METRICS_BIND=0.0.0.0:9090
 export RUSTGATE_FEDERATION_V1_BIND=0.0.0.0:9000

@@ -1,0 +1,95 @@
+name: docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs-site/**'
+      - 'CHANGELOG.md'
+      - '.github/workflows/docs.yml'
+  pull_request:
+    paths:
+      - 'docs-site/**'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  MDBOOK_VERSION: '0.4.40'
+  MDBOOK_MERMAID_VERSION: '0.14.0'
+  MDBOOK_ADMONISH_VERSION: '1.18.0'
+  MDBOOK_TOC_VERSION: '0.14.2'
+  MDBOOK_LINKCHECK_VERSION: '0.7.7'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mdBook toolchain
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          curl -sSL "https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz" | tar -xz -C "$HOME/.local/bin"
+          curl -sSL "https://github.com/badboy/mdbook-mermaid/releases/download/v${MDBOOK_MERMAID_VERSION}/mdbook-mermaid-v${MDBOOK_MERMAID_VERSION}-x86_64-unknown-linux-gnu.tar.gz" | tar -xz -C "$HOME/.local/bin"
+          curl -sSL "https://github.com/tommilligan/mdbook-admonish/releases/download/v${MDBOOK_ADMONISH_VERSION}/mdbook-admonish-v${MDBOOK_ADMONISH_VERSION}-x86_64-unknown-linux-gnu.tar.gz" | tar -xz -C "$HOME/.local/bin"
+          curl -sSL "https://github.com/badboy/mdbook-toc/releases/download/${MDBOOK_TOC_VERSION}/mdbook-toc-${MDBOOK_TOC_VERSION}-x86_64-unknown-linux-gnu.tar.gz" | tar -xz -C "$HOME/.local/bin"
+          curl -sSL "https://github.com/Michael-F-Bryan/mdbook-linkcheck/releases/download/v${MDBOOK_LINKCHECK_VERSION}/mdbook-linkcheck.x86_64-unknown-linux-gnu.zip" -o /tmp/linkcheck.zip
+          unzip -o /tmp/linkcheck.zip -d "$HOME/.local/bin"
+          chmod +x "$HOME/.local/bin/"*
+
+      - name: Install mdbook-mermaid assets
+        working-directory: docs-site
+        run: mdbook-mermaid install .
+
+      - name: Install mdbook-admonish assets
+        working-directory: docs-site
+        run: mdbook-admonish install .
+
+      - name: Build book
+        working-directory: docs-site
+        run: mdbook build
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Build rustdoc
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: '-D warnings'
+
+      - name: Assemble site
+        run: |
+          mkdir -p _site
+          cp -r docs-site/book/html/. _site/
+          mkdir -p _site/api/rustdoc
+          cp -r target/doc/. _site/api/rustdoc/
+
+      - name: Upload pages artifact
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

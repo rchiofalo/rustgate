@@ -1,0 +1,1 @@
+{{#include ../../../docs/fips.md}}
