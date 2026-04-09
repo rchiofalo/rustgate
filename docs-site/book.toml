@@ -6,9 +6,6 @@ language = "en"
 src = "src"
 multilingual = false
 
-[rust]
-edition = "2024"
-
 [preprocessor.mermaid]
 command = "mdbook-mermaid"
 
