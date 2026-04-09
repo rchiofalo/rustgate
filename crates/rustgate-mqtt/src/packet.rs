@@ -5,10 +5,6 @@
 //! 3.1.1 packet formats, selected per-session based on the CONNECT packet's
 //! protocol level byte.
 
-// This module is fully wired in the session commit; allow dead code in the
-// codec-only commit to keep the build green.
-#![allow(dead_code)]
-
 use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
