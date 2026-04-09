@@ -58,8 +58,4 @@ exclude = [
   "configuration\\.md",
   "\\.\\./crates/",
   "\\.\\./SECURITY\\.md",
-  # CHANGELOG uses Keep-a-Changelog [version] headers that look like
-  # incomplete reference links to the checker.
-  "^Unreleased$",
-  "^\\d+\\.\\d+\\.\\d+$",
 ]
