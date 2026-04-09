@@ -60,6 +60,11 @@ jobs:
         working-directory: docs-site
         run: mdbook build
 
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       - name: Build rustdoc
         run: cargo doc --workspace --no-deps
         env:
