@@ -523,6 +523,13 @@ fn fallback_histogram(name: &str, help: &str) -> Histogram {
 /// Installed as the router's `AuthzObserver` at startup so every Allow
 /// and Deny decision increments the decisions counter and records the
 /// evaluation latency histogram.
+///
+/// Both match statements include a wildcard `_` arm to satisfy the
+/// `#[non_exhaustive]` contract on [`rustgate_authz::Action`] and
+/// [`rustgate_authz::Decision`]: the authz crate may add new variants
+/// in future releases without making this a breaking change, and we
+/// degrade to a neutral `"unknown"` label rather than failing the
+/// metric update so the decision counter never drops events.
 pub fn observe_authz_event(ev: &rustgate_transport::AuthzEvent<'_>) {
     let action = match ev.action {
         rustgate_authz::Action::Send => "send",
@@ -530,10 +537,12 @@ pub fn observe_authz_event(ev: &rustgate_transport::AuthzEvent<'_>) {
         rustgate_authz::Action::Federate => "federate",
         rustgate_authz::Action::Publish => "publish",
         rustgate_authz::Action::Subscribe => "subscribe",
+        _ => "unknown",
     };
     let decision = match ev.decision {
         rustgate_authz::Decision::Allow => "allow",
         rustgate_authz::Decision::Deny => "deny",
+        _ => "unknown",
     };
     if let Ok(child) = authz_decisions().get_metric_with_label_values(&[action, decision]) {
         child.inc();
