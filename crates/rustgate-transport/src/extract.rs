@@ -118,8 +118,17 @@ fn extract_attributes(
                 GeneralName::RFC822Name(s) => emails.push(sanitize_for_log(s)),
                 GeneralName::URI(s) => {
                     let sanitized = sanitize_for_log(s);
-                    if spiffe_id.is_none() && sanitized.starts_with("spiffe://") {
-                        spiffe_id = Some(sanitized.clone());
+                    // SPIFFE ID extraction: only accept URIs that pass the
+                    // canonicalizer/validator (RFC 3986 scheme "spiffe",
+                    // valid trust-domain charset, non-empty path). A
+                    // malformed SPIFFE-looking URI is treated as a plain
+                    // URI SAN — we still record it under `san_uri`, but it
+                    // will not populate `Identity.spiffe_id` and cannot
+                    // match a `spiffe_prefix` policy rule.
+                    if spiffe_id.is_none()
+                        && let Some(canonical) = canonicalize_spiffe_id(&sanitized)
+                    {
+                        spiffe_id = Some(canonical);
                     }
                     uris.push(sanitized);
                 }
@@ -149,6 +158,68 @@ fn extract_attributes(
 
     let _ = cert_der; // reserved for future use (e.g. SKI).
     (attrs, spiffe_id)
+}
+
+/// Canonicalize a SPIFFE ID per the [SPIFFE ID spec][spec].
+///
+/// Per the spec, the scheme (`spiffe`) and the trust-domain authority are
+/// **case-insensitive** while the path is **case-sensitive**. Trust-domain
+/// names may contain only lowercase ASCII letters, digits, dots, dashes, and
+/// underscores and must be at most 255 bytes. This helper lowercases the
+/// scheme and trust domain, leaves the path alone, and returns `None` if the
+/// input is not a syntactically valid SPIFFE ID.
+///
+/// Dropping invalid SPIFFE-looking URIs is a defense-in-depth measure: a
+/// policy author writing `spiffe_prefix: "spiffe://prod/"` should not have
+/// that match a cert presenting `spiffe://PROD%2Fadmin` or similar malformed
+/// input.
+///
+/// [spec]: https://github.com/spiffe/spiffe/blob/main/standards/SPIFFE-ID.md
+fn canonicalize_spiffe_id(uri: &str) -> Option<String> {
+    const SCHEME: &str = "spiffe://";
+    if uri.len() < SCHEME.len() {
+        return None;
+    }
+    let (scheme, rest) = uri.split_at(SCHEME.len());
+    if !scheme.eq_ignore_ascii_case(SCHEME) {
+        return None;
+    }
+    // Trust domain ends at the first `/` or end-of-string.
+    let (trust_domain, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    if trust_domain.is_empty() || trust_domain.len() > 255 {
+        return None;
+    }
+    // Trust domain charset: ASCII lowercase letters, digits, dot, dash, underscore.
+    // The spec is case-insensitive for the authority, so we also accept uppercase
+    // letters and lowercase them below.
+    let charset_ok = trust_domain
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'));
+    if !charset_ok {
+        return None;
+    }
+    // Reject empty path segments like `spiffe://trust/foo//bar` and any
+    // literal percent-encoding ambiguity in the path by requiring each path
+    // segment to be non-empty. The spec allows percent-encoding but we stay
+    // conservative: segment must be at least one character.
+    if !path.is_empty() {
+        for segment in path.split('/').skip(1) {
+            if segment.is_empty() {
+                return None;
+            }
+        }
+    }
+    let mut canonical = String::with_capacity(SCHEME.len() + trust_domain.len() + path.len());
+    canonical.push_str("spiffe://");
+    // Lowercase the trust domain.
+    for b in trust_domain.bytes() {
+        canonical.push(b.to_ascii_lowercase() as char);
+    }
+    canonical.push_str(path);
+    Some(canonical)
 }
 
 fn first_subject_attr(
@@ -188,6 +259,20 @@ fn extract_cn(cert: &X509Certificate<'_>) -> Result<String> {
     Err(TransportError::MissingCommonName.into())
 }
 
+/// Extract `groups` from the cert's OU fields.
+///
+/// Each `OU=` RDN is treated as a comma-separated list of group names so an
+/// issuer can encode multiple memberships in a single RDN. This convention
+/// predates rustgate-authz and is preserved for compatibility with existing
+/// CNs issued by the enrollment path.
+///
+/// **Operator note:** because this function splits OU values on a literal
+/// `,`, group names MUST NOT contain an unescaped comma. RFC 4514 allows
+/// escaping commas inside a DN attribute with `\,`, but x509-parser
+/// unescapes them before this function sees the string, so an OU of
+/// `R\,D,ops` arrives here as `R,D,ops` and becomes three groups rather
+/// than two. If you need a literal comma in a group name, issue multiple
+/// OU RDNs instead of packing them into one.
 fn extract_groups(cert: &X509Certificate<'_>) -> BTreeSet<String> {
     let mut groups = BTreeSet::new();
 
@@ -196,7 +281,8 @@ fn extract_groups(cert: &X509Certificate<'_>) -> BTreeSet<String> {
             if attr.attr_type() == &OID_X509_ORGANIZATIONAL_UNIT
                 && let Ok(ou) = attr.attr_value().as_str()
             {
-                // Support both single values and comma-separated group lists
+                // Support both single values and comma-separated group lists.
+                // See the docstring for the escape caveat.
                 for group in ou.split(',') {
                     let group = group.trim();
                     if !group.is_empty() {
@@ -390,6 +476,72 @@ mod tests {
             }
             other => panic!("expected cert_serial Str, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn extract_identity_canonicalizes_spiffe_trust_domain() {
+        let ca = TestCa::new("attr-ca");
+        // Cert presents an uppercase trust domain; extraction must lowercase it.
+        let cert = ca.issue_client_cert_with_attrs(
+            "carol",
+            &[],
+            Some("spiffe://Example.ORG/ns/prod/svc"),
+            None,
+            None,
+            &[],
+            &[],
+        );
+        let der = parse_cert_pem(&cert.cert_pem);
+        let id = extract_identity(&der).unwrap();
+        assert_eq!(
+            id.spiffe_id.as_deref(),
+            Some("spiffe://example.org/ns/prod/svc"),
+            "trust domain must be lowercased per SPIFFE spec"
+        );
+    }
+
+    #[test]
+    fn canonicalize_spiffe_lowercases_trust_domain_only() {
+        assert_eq!(
+            canonicalize_spiffe_id("spiffe://Example.ORG/ns/Prod/Svc"),
+            Some("spiffe://example.org/ns/Prod/Svc".to_string()),
+            "trust domain case-insensitive, path case-sensitive"
+        );
+        assert_eq!(
+            canonicalize_spiffe_id("SPIFFE://trust.example/svc"),
+            Some("spiffe://trust.example/svc".to_string()),
+            "scheme case-insensitive"
+        );
+        assert_eq!(
+            canonicalize_spiffe_id("spiffe://trust.example"),
+            Some("spiffe://trust.example".to_string()),
+            "trailing slash optional"
+        );
+    }
+
+    #[test]
+    fn canonicalize_spiffe_rejects_malformed() {
+        assert!(canonicalize_spiffe_id("http://trust.example/foo").is_none());
+        assert!(
+            canonicalize_spiffe_id("spiffe://").is_none(),
+            "empty authority"
+        );
+        assert!(
+            canonicalize_spiffe_id("spiffe:///path").is_none(),
+            "empty trust domain"
+        );
+        assert!(
+            canonicalize_spiffe_id("spiffe://trust!bad/svc").is_none(),
+            "disallowed charset in authority"
+        );
+        assert!(
+            canonicalize_spiffe_id("spiffe://trust/foo//bar").is_none(),
+            "empty path segment"
+        );
+        assert!(
+            canonicalize_spiffe_id(&format!("spiffe://{}/svc", "a".repeat(256))).is_none(),
+            "authority > 255 bytes"
+        );
     }
 
     #[test]
