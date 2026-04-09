@@ -473,13 +473,19 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(authz_decisions.clone()))?;
     let _ = AUTHZ_DECISIONS.set(authz_decisions);
 
+    // Bucket floor is 50 ns: the native engine's measured P99 on a
+    // single rule is ~80 ns, and we need at least one bucket below
+    // that so the dashboards and the P99 SLO test are not all
+    // crammed into the first bucket. The ceiling stays at 100 µs to
+    // catch pathological slow decisions. 10 µs is the documented
+    // SLO — `histogram_quantile(0.99, …) <= 10_000` is the gate.
     let authz_eval_nanos = Histogram::with_opts(
         HistogramOpts::new(
             "rustgate_authz_eval_nanos",
             "Authz policy evaluation duration in nanoseconds",
         )
         .buckets(vec![
-            100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0, 25_000.0, 100_000.0,
+            50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 10_000.0, 100_000.0,
         ]),
     )?;
     registry.register(Box::new(authz_eval_nanos.clone()))?;

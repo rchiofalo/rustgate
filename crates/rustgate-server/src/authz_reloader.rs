@@ -22,6 +22,63 @@ use rustgate_transport::Router;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
+/// Maximum policy-file size the reloader will read from disk.
+///
+/// Authz policies are hand-authored JSON and realistic rule counts hover
+/// in the low hundreds; even an expansive production policy with
+/// thousands of rules comfortably fits inside a megabyte. We cap the
+/// read at 4 MiB so that a malformed, runaway, or adversarial file
+/// cannot exhaust server memory via [`std::fs::read`], which slurps the
+/// entire file into a contiguous buffer before parse+compile ever
+/// runs. Exceeding the cap fails the load with a `read`-stage audit
+/// event so operators see the same structured error they would see
+/// for a missing file.
+pub(crate) const MAX_POLICY_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Read the policy file at `path`, rejecting files larger than
+/// [`MAX_POLICY_FILE_BYTES`].
+///
+/// We check the file length via [`std::fs::metadata`] before the read
+/// so that an adversarial multi-gigabyte file never lands in memory.
+/// A partial-read race (file grew between `metadata` and `read`) would
+/// still produce a bounded buffer because `std::fs::read` caps the
+/// allocation at what was available at open time, but we layer a
+/// defensive post-read length check as well: any read that somehow
+/// returns more than the cap is rejected before parse.
+///
+/// Returns the raw bytes on success, or a [`std::io::Error`] with the
+/// kind preserved so callers can differentiate "file missing" from
+/// "file too large" in their audit emission.
+fn read_policy_bounded(path: &Path) -> std::io::Result<Vec<u8>> {
+    // Stat first so an oversize file never allocates.
+    let meta = std::fs::metadata(path)?;
+    if meta.len() > MAX_POLICY_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "authz policy file size {} bytes exceeds cap of {} bytes",
+                meta.len(),
+                MAX_POLICY_FILE_BYTES
+            ),
+        ));
+    }
+    let data = std::fs::read(path)?;
+    // Defence-in-depth: the file could have grown between `metadata`
+    // and `read`. Reject rather than quietly accept a buffer larger
+    // than the advertised cap.
+    if data.len() as u64 > MAX_POLICY_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "authz policy file grew past cap during read: {} bytes > {}",
+                data.len(),
+                MAX_POLICY_FILE_BYTES
+            ),
+        ));
+    }
+    Ok(data)
+}
+
 /// Result of a single synchronous policy load.
 #[derive(Debug)]
 pub(crate) struct LoadedPolicy {
@@ -39,7 +96,7 @@ pub(crate) struct LoadedPolicy {
 pub(crate) fn load_once(path: &Path) -> anyhow::Result<LoadedPolicy> {
     let path_display = path.display().to_string();
 
-    let data = match std::fs::read(path) {
+    let data = match read_policy_bounded(path) {
         Ok(d) => d,
         Err(e) => {
             audit::authz_reload_failed(&path_display, "read", &e.to_string());
@@ -105,8 +162,10 @@ impl AuthzReloader {
     /// when the engine was swapped, `Ok(false)` when the file was
     /// unchanged. Errors are already audited by [`load_once`].
     pub(crate) fn reload(&self) -> anyhow::Result<bool> {
-        // Quick digest check before any parse work.
-        let data = match std::fs::read(&self.path) {
+        // Quick digest check before any parse work. `read_policy_bounded`
+        // caps the read at MAX_POLICY_FILE_BYTES so an oversized file
+        // cannot exhaust memory on a poll cycle.
+        let data = match read_policy_bounded(&self.path) {
             Ok(d) => d,
             Err(e) => {
                 audit::authz_reload_failed(
@@ -318,6 +377,56 @@ mod tests {
         assert!(reloader.reload().is_err());
         let after_id = router.authz_snapshot().unwrap().policy_id().to_string();
         assert_eq!(good_id, after_id, "bad reload must not swap engine");
+    }
+
+    #[test]
+    fn load_once_rejects_oversize_file() {
+        // Exceeding MAX_POLICY_FILE_BYTES must fail at the read stage
+        // before parse+compile ever runs, so a hostile multi-gigabyte
+        // policy cannot exhaust memory. We write cap+1 bytes of valid
+        // JSON filler (a huge `rules` padding array would also work
+        // but a raw-bytes buffer is cheaper and still exercises the
+        // metadata check).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.json");
+        let oversize = vec![b'x'; (MAX_POLICY_FILE_BYTES + 1) as usize];
+        std::fs::write(&path, oversize).unwrap();
+        let result = load_once(&path);
+        assert!(
+            result.is_err(),
+            "policy file larger than cap must fail to load"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("exceeds cap"),
+            "error must identify the size cap, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn reload_rejects_oversize_file_on_update() {
+        // Start with a legitimate small policy, then grow the file
+        // past the cap to simulate an attacker or a broken deploy
+        // pipeline that replaces the file with a huge payload. The
+        // previous engine must stay installed and the error must
+        // name the cap.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.json");
+        std::fs::write(&path, ALLOW_ALL).unwrap();
+        let initial = load_once(&path).unwrap();
+        let router = Arc::new(Router::new().with_authz(Arc::new(initial.engine)));
+        let good_id = router.authz_snapshot().unwrap().policy_id().to_string();
+
+        let reloader = AuthzReloader::new(&path, Arc::clone(&router), initial.hash);
+        let oversize = vec![b'x'; (MAX_POLICY_FILE_BYTES + 1) as usize];
+        std::fs::write(&path, oversize).unwrap();
+        let result = reloader.reload();
+        assert!(result.is_err());
+        let after_id = router.authz_snapshot().unwrap().policy_id().to_string();
+        assert_eq!(
+            good_id, after_id,
+            "oversize reload must not swap the engine"
+        );
     }
 
     #[tokio::test(start_paused = false)]

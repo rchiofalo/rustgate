@@ -573,6 +573,29 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     error = %e,
                     "authz policy failed to load; continuing in fail-open mode (no engine installed)"
                 );
+
+                // Even in fail-open mode, spawn the watcher so that
+                // once the operator fixes the policy file on disk the
+                // next poll cycle parses, compiles, and installs it
+                // without requiring a server restart. The sentinel
+                // hash `[0u8; 32]` can never match a real SHA-256
+                // digest of any file the reloader successfully reads,
+                // so the first successful parse+compile will swap
+                // the engine in.
+                #[cfg(feature = "metrics")]
+                router.set_authz_observer(Some(Arc::new(metrics::observe_authz_event)));
+                let interval = Duration::from_secs(cli.authz_reload_interval);
+                let _reloader = authz_reloader::spawn_authz_reloader(
+                    Arc::clone(&router),
+                    path,
+                    [0u8; 32],
+                    interval,
+                );
+                tracing::info!(
+                    interval_secs = cli.authz_reload_interval,
+                    path = %authz_path,
+                    "authz hot-reload enabled (fail-open retry)"
+                );
             }
             Err(e) => {
                 #[cfg(feature = "metrics")]
