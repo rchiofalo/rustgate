@@ -270,3 +270,70 @@ async fn swap_authz_takes_effect_mid_flight() {
         .await;
     assert!(nrx_a.try_recv().is_ok());
 }
+
+/// Direct unicast must honour a per-recipient Receive deny. Without a
+/// Receive PEP in `send_to_session`, a rule that denies `charlie` from
+/// receiving any direct message would silently be ignored — the sender
+/// side Send PEP cannot know about recipient-side attributes.
+#[tokio::test]
+async fn deny_receive_blocks_direct_unicast() {
+    let router = Router::new().with_authz(deny_receive_for_cn("charlie"));
+    let alice = identity("alice", &["alpha"]);
+    let charlie = identity("charlie", &["alpha"]);
+
+    let (ptx_a, ntx_a, _pa, _na) = channels();
+    let (ptx_c, ntx_c, _pc, mut nrx_c) = channels();
+    router
+        .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
+        .await;
+    router
+        .register(SessionHandle::new(charlie.clone(), ptx_c, ntx_c))
+        .await;
+
+    // Alice sends a direct message to Charlie. The send PEP allows it
+    // (alice is not the denied subject), but the recipient-side Receive
+    // PEP must filter Charlie out.
+    router
+        .route(chat(&alice, Destination::Direct((*charlie).clone())))
+        .await;
+
+    assert!(
+        nrx_c.try_recv().is_err(),
+        "charlie is denied Receive on direct unicast and must not see the message"
+    );
+}
+
+/// Broadcast must honour a per-recipient Receive deny. Without a Receive
+/// PEP in `send_to_all`, a broadcast-specific deny rule for one CN would
+/// silently be ignored.
+#[tokio::test]
+async fn deny_receive_blocks_broadcast_per_recipient() {
+    let router = Router::new().with_authz(deny_receive_for_cn("charlie"));
+    let alice = identity("alice", &["alpha"]);
+    let bob = identity("bob", &["alpha"]);
+    let charlie = identity("charlie", &["alpha"]);
+
+    let (ptx_a, ntx_a, _pa, mut nrx_a) = channels();
+    let (ptx_b, ntx_b, _pb, _nb) = channels();
+    let (ptx_c, ntx_c, _pc, mut nrx_c) = channels();
+    router
+        .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
+        .await;
+    router
+        .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+        .await;
+    router
+        .register(SessionHandle::new(charlie.clone(), ptx_c, ntx_c))
+        .await;
+
+    router.route(chat(&bob, Destination::Broadcast)).await;
+
+    assert!(
+        nrx_a.try_recv().is_ok(),
+        "alice allowed: should receive broadcast"
+    );
+    assert!(
+        nrx_c.try_recv().is_err(),
+        "charlie is denied Receive and must not see the broadcast"
+    );
+}
