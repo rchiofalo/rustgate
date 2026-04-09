@@ -11,6 +11,7 @@ repository.workspace = true
 workspace = true
 
 [features]
+est = ["dep:cms", "dep:der", "dep:x509-cert"]
 fips = ["rcgen/fips"]
 
 [dependencies]
@@ -34,6 +35,9 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 subtle = { workspace = true }
 ring = { workspace = true }
+cms = { workspace = true, optional = true }
+der = { workspace = true, optional = true }
+x509-cert = { workspace = true, optional = true }
 
 [dev-dependencies]
 rustgate-test-utils = { workspace = true }

@@ -328,6 +328,13 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 7, env = "RUSTGATE_CRL_VALIDITY_DAYS")]
     pub(crate) crl_validity_days: u32,
 
+    /// Enable EST (RFC 7030) enrollment endpoints on the enrollment server.
+    /// Adds `/.well-known/est/` paths for CA certificate distribution and
+    /// CSR-based enrollment alongside the existing Marti-compatible endpoints.
+    /// Requires `--features est` and `--enrollment-bind`.
+    #[arg(long, default_value_t = false, env = "RUSTGATE_EST_ENABLED")]
+    pub(crate) est_enabled: bool,
+
     /// Bind address for the Prometheus metrics HTTP server (e.g. 0.0.0.0:9090).
     /// Requires --features metrics.
     #[arg(long, env = "RUSTGATE_METRICS_BIND", value_parser = parse_socket_addr)]
@@ -1061,6 +1068,7 @@ define_config_file! {
     package_strict_signatures: bool,
     revocation_db: Option<String>,
     crl_validity_days: u32,
+    est_enabled: bool,
     metrics_bind: Option<String>,
     metrics_per_identity: bool,
     metrics_identity_allowlist: Option<std::path::PathBuf>,
