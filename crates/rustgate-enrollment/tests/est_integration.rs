@@ -170,6 +170,10 @@ async fn est_cacerts_returns_pkcs7() {
         content_type.contains("application/pkcs7-mime"),
         "expected PKCS#7 content type, got: {content_type}"
     );
+    assert!(
+        content_type.contains("smime-type=certs-only"),
+        "RFC 7030 §4.1.2 requires smime-type=certs-only, got: {content_type}"
+    );
 
     // Body is base64-encoded DER; verify it decodes to valid PKCS#7.
     let body = resp.collect().await.expect("collect body").to_bytes();
