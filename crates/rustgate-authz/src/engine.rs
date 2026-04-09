@@ -3,17 +3,8 @@
 use crate::cache::{DecisionCache, DecisionKey};
 use crate::compile::{BucketKey, CompiledPolicy, CompiledRule};
 use crate::error::AuthzError;
-use crate::model::{Action, Decision, DecisionOutcome, Resource, Subject};
+use crate::model::{Action, CacheStats, Decision, DecisionOutcome, Resource, Subject};
 use crate::policy::{Effect, RuleSet};
-
-/// Snapshot of cache effectiveness counters for tests and observability.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CacheStats {
-    /// Number of evaluations that returned a cached outcome.
-    pub hits: u64,
-    /// Number of evaluations that ran the full scan and populated the cache.
-    pub misses: u64,
-}
 
 /// A policy engine evaluates a `(subject, resource, action)` tuple.
 ///
@@ -30,6 +21,14 @@ pub trait PolicyEngine: Send + Sync + 'static {
 
     /// Stable policy identifier (sha256 hex of the canonical rule set).
     fn policy_id(&self) -> &str;
+
+    /// Snapshot of the backend's decision-cache counters, if it has one.
+    ///
+    /// Backends without a cache (e.g. the optional Cedar backend) return
+    /// `None`; [`NativeEngine`] returns `Some(CacheStats { .. })`.
+    fn cache_stats(&self) -> Option<CacheStats> {
+        None
+    }
 }
 
 /// In-process policy engine backed by a [`CompiledPolicy`].
@@ -85,8 +84,13 @@ impl NativeEngine {
         }
     }
 
-    /// Snapshot of the decision cache hit/miss counters.
-    pub fn cache_stats(&self) -> CacheStats {
+    /// Snapshot of the decision cache hit/miss counters (inherent variant).
+    ///
+    /// Prefer the trait-object [`PolicyEngine::cache_stats`] entry point
+    /// from callers holding an `Arc<dyn PolicyEngine>`; this inherent
+    /// method exists so statically-typed callers (tests, benches) don't
+    /// have to pay the `Option` unwrap.
+    pub fn cache_stats_direct(&self) -> CacheStats {
         CacheStats {
             hits: self.cache.hits(),
             misses: self.cache.misses(),
@@ -132,6 +136,10 @@ impl PolicyEngine for NativeEngine {
 
     fn policy_id(&self) -> &str {
         self.compiled.policy_id.as_str()
+    }
+
+    fn cache_stats(&self) -> Option<CacheStats> {
+        Some(self.cache_stats_direct())
     }
 }
 

@@ -531,77 +531,177 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     // wire the metrics observer, and spawn the polling reloader.
     if let Some(ref authz_path) = cli.authz_policy_file {
         let path = std::path::PathBuf::from(authz_path);
-        match authz_reloader::load_once(&path) {
-            Ok(loaded) => {
-                let rule_count = loaded.rule_count;
-                let initial_hash = loaded.hash;
-                let arc_engine: Arc<dyn rustgate_authz::PolicyEngine> = Arc::new(loaded.engine);
-                let policy_id = arc_engine.policy_id().to_string();
-                router.swap_authz(arc_engine);
-                #[cfg(feature = "metrics")]
+
+        // Cedar backend selection is mutually exclusive with the native
+        // reloader path: the native polling watcher assumes a
+        // `NativeEngine`, so Cedar loads once at startup without
+        // hot-reload. Future follow-up can generalize the reloader.
+        match cli.authz_policy_format {
+            crate::cli::AuthzPolicyFormat::Cedar => {
+                #[cfg(feature = "cedar")]
                 {
-                    router.set_authz_observer(Some(Arc::new(metrics::observe_authz_event)));
-                    metrics::record_authz_reload(true, Some(rule_count));
+                    match rustgate_authz::CedarBackend::from_file(&path) {
+                        Ok(engine) => {
+                            let arc_engine: Arc<dyn rustgate_authz::PolicyEngine> =
+                                Arc::new(engine);
+                            let policy_id = arc_engine.policy_id().to_string();
+                            router.swap_authz(arc_engine);
+                            #[cfg(feature = "metrics")]
+                            {
+                                router.set_authz_observer(Some(Arc::new(
+                                    metrics::observe_authz_event,
+                                )));
+                                metrics::record_authz_reload(true, None);
+                            }
+                            rustgate_core::audit::authz_reload_success(authz_path, &policy_id, 0);
+                            tracing::info!(
+                                path = %authz_path,
+                                policy_id = %policy_id,
+                                backend = "cedar",
+                                "authz policy loaded"
+                            );
+                        }
+                        Err(e) if cli.authz_fail_open => {
+                            rustgate_core::audit::authz_reload_failed(
+                                authz_path,
+                                "startup",
+                                &e.to_string(),
+                            );
+                            #[cfg(feature = "metrics")]
+                            metrics::record_authz_reload(false, None);
+                            tracing::warn!(
+                                path = %authz_path,
+                                error = %e,
+                                "cedar authz policy failed to load; continuing in fail-open mode"
+                            );
+                        }
+                        Err(e) => {
+                            #[cfg(feature = "metrics")]
+                            metrics::record_authz_reload(false, None);
+                            return Err(anyhow::anyhow!(
+                                "failed to load cedar policy {authz_path}: {e}"
+                            ));
+                        }
+                    }
                 }
-                rustgate_core::audit::authz_reload_success(authz_path, &policy_id, rule_count);
-                tracing::info!(
-                    path = %authz_path,
-                    policy_id = %policy_id,
-                    rule_count,
-                    "authz policy loaded"
-                );
+                #[cfg(not(feature = "cedar"))]
+                {
+                    return Err(anyhow::anyhow!(
+                        "--authz-policy-format=cedar requires building rustgate with --features cedar"
+                    ));
+                }
+            }
+            crate::cli::AuthzPolicyFormat::Native => match authz_reloader::load_once(&path) {
+                Ok(loaded) => {
+                    let rule_count = loaded.rule_count;
+                    let initial_hash = loaded.hash;
+                    let arc_engine: Arc<dyn rustgate_authz::PolicyEngine> = Arc::new(loaded.engine);
+                    let policy_id = arc_engine.policy_id().to_string();
+                    router.swap_authz(arc_engine);
+                    #[cfg(feature = "metrics")]
+                    {
+                        router.set_authz_observer(Some(Arc::new(metrics::observe_authz_event)));
+                        metrics::record_authz_reload(true, Some(rule_count));
+                    }
+                    rustgate_core::audit::authz_reload_success(authz_path, &policy_id, rule_count);
+                    tracing::info!(
+                        path = %authz_path,
+                        policy_id = %policy_id,
+                        rule_count,
+                        "authz policy loaded"
+                    );
 
-                let interval = Duration::from_secs(cli.authz_reload_interval);
-                let _reloader = authz_reloader::spawn_authz_reloader(
-                    Arc::clone(&router),
-                    path,
-                    initial_hash,
-                    interval,
-                );
-                tracing::info!(
-                    interval_secs = cli.authz_reload_interval,
-                    path = %authz_path,
-                    "authz hot-reload enabled"
-                );
-            }
-            Err(e) if cli.authz_fail_open => {
-                rustgate_core::audit::authz_reload_failed(authz_path, "startup", &e.to_string());
-                #[cfg(feature = "metrics")]
-                metrics::record_authz_reload(false, None);
-                tracing::warn!(
-                    path = %authz_path,
-                    error = %e,
-                    "authz policy failed to load; continuing in fail-open mode (no engine installed)"
-                );
+                    let interval = Duration::from_secs(cli.authz_reload_interval);
+                    let _reloader = authz_reloader::spawn_authz_reloader(
+                        Arc::clone(&router),
+                        path,
+                        initial_hash,
+                        interval,
+                    );
 
-                // Even in fail-open mode, spawn the watcher so that
-                // once the operator fixes the policy file on disk the
-                // next poll cycle parses, compiles, and installs it
-                // without requiring a server restart. The sentinel
-                // hash `[0u8; 32]` can never match a real SHA-256
-                // digest of any file the reloader successfully reads,
-                // so the first successful parse+compile will swap
-                // the engine in.
-                #[cfg(feature = "metrics")]
-                router.set_authz_observer(Some(Arc::new(metrics::observe_authz_event)));
-                let interval = Duration::from_secs(cli.authz_reload_interval);
-                let _reloader = authz_reloader::spawn_authz_reloader(
-                    Arc::clone(&router),
-                    path,
-                    [0u8; 32],
-                    interval,
-                );
-                tracing::info!(
-                    interval_secs = cli.authz_reload_interval,
-                    path = %authz_path,
-                    "authz hot-reload enabled (fail-open retry)"
-                );
-            }
-            Err(e) => {
-                #[cfg(feature = "metrics")]
-                metrics::record_authz_reload(false, None);
-                return Err(e);
-            }
+                    // Background cache-stats scraper: every 10s, snapshot the
+                    // currently installed engine's decision-cache counters and
+                    // publish deltas to the Prometheus counters. Uses the
+                    // router's `authz_snapshot()` so a reload naturally picks
+                    // up the new engine on the next tick instead of pinning
+                    // the old `Arc`.
+                    #[cfg(feature = "metrics")]
+                    {
+                        let router_for_stats = Arc::clone(&router);
+                        drop(tokio::spawn(async move {
+                            let mut tick = tokio::time::interval(Duration::from_secs(10));
+                            let mut last_hits: u64 = 0;
+                            let mut last_misses: u64 = 0;
+                            let _ = tick.tick().await;
+                            loop {
+                                let _ = tick.tick().await;
+                                let Some(engine) = router_for_stats.authz_snapshot() else {
+                                    continue;
+                                };
+                                if let Some(stats) = engine.cache_stats() {
+                                    let hits = stats.hits;
+                                    let misses = stats.misses;
+                                    // Deltas vs last snapshot. A policy swap
+                                    // resets the counters on the new engine,
+                                    // so clamp to zero to avoid underflow.
+                                    let hd = hits.saturating_sub(last_hits);
+                                    let md = misses.saturating_sub(last_misses);
+                                    metrics::record_authz_cache_stats(hd, md);
+                                    last_hits = hits;
+                                    last_misses = misses;
+                                }
+                            }
+                        }));
+                    }
+                    tracing::info!(
+                        interval_secs = cli.authz_reload_interval,
+                        path = %authz_path,
+                        "authz hot-reload enabled"
+                    );
+                }
+                Err(e) if cli.authz_fail_open => {
+                    rustgate_core::audit::authz_reload_failed(
+                        authz_path,
+                        "startup",
+                        &e.to_string(),
+                    );
+                    #[cfg(feature = "metrics")]
+                    metrics::record_authz_reload(false, None);
+                    tracing::warn!(
+                        path = %authz_path,
+                        error = %e,
+                        "authz policy failed to load; continuing in fail-open mode (no engine installed)"
+                    );
+
+                    // Even in fail-open mode, spawn the watcher so that
+                    // once the operator fixes the policy file on disk the
+                    // next poll cycle parses, compiles, and installs it
+                    // without requiring a server restart. The sentinel
+                    // hash `[0u8; 32]` can never match a real SHA-256
+                    // digest of any file the reloader successfully reads,
+                    // so the first successful parse+compile will swap
+                    // the engine in.
+                    #[cfg(feature = "metrics")]
+                    router.set_authz_observer(Some(Arc::new(metrics::observe_authz_event)));
+                    let interval = Duration::from_secs(cli.authz_reload_interval);
+                    let _reloader = authz_reloader::spawn_authz_reloader(
+                        Arc::clone(&router),
+                        path,
+                        [0u8; 32],
+                        interval,
+                    );
+                    tracing::info!(
+                        interval_secs = cli.authz_reload_interval,
+                        path = %authz_path,
+                        "authz hot-reload enabled (fail-open retry)"
+                    );
+                }
+                Err(e) => {
+                    #[cfg(feature = "metrics")]
+                    metrics::record_authz_reload(false, None);
+                    return Err(e);
+                }
+            },
         }
     }
 

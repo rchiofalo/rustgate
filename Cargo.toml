@@ -101,6 +101,7 @@ chacha20poly1305 = { version = "0.10", default-features = false, features = ["al
 hex = "0.4"
 ahash = "0.8"
 smol_str = { version = "0.3", features = ["serde"] }
+cedar-policy = "4"
 spiffe = { version = "0.12", default-features = false, features = ["workload-api-x509"] }
 async-trait = "0.1.89"
 mdns-sd = { version = "0.19", default-features = false, features = ["async"] }

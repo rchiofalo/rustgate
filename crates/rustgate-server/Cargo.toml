@@ -42,6 +42,8 @@ post-quantum = ["rustgate-transport/post-quantum", "rustgate-federation?/post-qu
 jemalloc = ["dep:tikv-jemallocator"]
 ocsp = ["rustgate-transport/ocsp"]
 spiffe = ["rustgate-transport/spiffe"]
+# Enables the optional Cedar authz policy backend and `--authz-policy-format cedar`.
+cedar = ["rustgate-authz/cedar"]
 
 [dependencies]
 rustgate-authz = { workspace = true }

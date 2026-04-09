@@ -10,6 +10,13 @@ description = "Policy engine for rustgate RBAC/ABAC authorization"
 [lints]
 workspace = true
 
+[features]
+default = []
+# Optional Cedar policy backend. Enables the `CedarBackend` implementation
+# of [`PolicyEngine`] so operators with an existing Cedar policy corpus
+# can reuse it without rewriting rules in the native JSON format.
+cedar = ["dep:cedar-policy", "dep:tracing"]
+
 [dependencies]
 rustgate-core = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -19,6 +26,8 @@ ahash = { workspace = true }
 parking_lot = { workspace = true }
 smol_str = { workspace = true, features = ["serde"] }
 sha2 = { workspace = true }
+cedar-policy = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
