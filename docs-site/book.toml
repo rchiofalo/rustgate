@@ -23,8 +23,7 @@ preferred-dark-theme = "navy"
 git-repository-url = "https://github.com/rchiofalo/rustgate"
 edit-url-template = "https://github.com/rchiofalo/rustgate/edit/main/docs-site/{path}"
 mathjax-support = true
-additional-css = ["theme/custom.css", "mdbook-admonish.css"]
-additional-js = ["theme/mermaid.min.js", "theme/mermaid-init.js"]
+additional-css = ["theme/custom.css"]
 
 [output.html.search]
 enable = true
