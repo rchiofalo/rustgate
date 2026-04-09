@@ -34,6 +34,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
 subtle = { workspace = true }
+zeroize = { workspace = true }
 ring = { workspace = true }
 cms = { workspace = true, optional = true }
 der = { workspace = true, optional = true }
