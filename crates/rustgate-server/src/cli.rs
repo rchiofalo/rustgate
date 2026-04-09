@@ -1048,6 +1048,7 @@ define_config_file! {
     package_strict_signatures: bool,
     revocation_db: Option<String>,
     crl_validity_days: u32,
+    est_enabled: bool,
     metrics_bind: Option<String>,
     metrics_per_identity: bool,
     metrics_identity_allowlist: Option<std::path::PathBuf>,

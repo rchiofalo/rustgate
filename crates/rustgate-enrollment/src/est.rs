@@ -24,10 +24,7 @@ use crate::ratelimit::RateLimiter;
 use crate::server::RateLimitCallback;
 use crate::signing::CsrSigner;
 
-/// Content type for PKCS#7 certs-only responses (CA certs distribution).
-const CT_PKCS7: &str = "application/pkcs7-mime";
-
-/// Content type for PKCS#7 enrollment responses (issued cert + CA chain).
+/// Content type for PKCS#7 certs-only responses (RFC 7030 §4.1.2).
 const CT_PKCS7_CERTS_ONLY: &str = "application/pkcs7-mime; smime-type=certs-only";
 
 /// Content type for CSR attributes responses.
@@ -46,7 +43,7 @@ const CT_PKCS10: &str = "application/pkcs10";
 /// base64-encoded per RFC 7030. No authentication required.
 pub fn handle_cacerts(signer: &CsrSigner) -> Response<Full<Bytes>> {
     match cms_bag::build_certs_only_base64(&[signer.ca_cert_der()]) {
-        Ok(body) => build_response(StatusCode::OK, CT_PKCS7, Bytes::from(body)),
+        Ok(body) => build_response(StatusCode::OK, CT_PKCS7_CERTS_ONLY, Bytes::from(body)),
         Err(e) => {
             tracing::error!(error = %e, "EST /cacerts: failed to build PKCS#7 bag");
             build_response(
@@ -259,12 +256,16 @@ fn decode_pkcs10_to_pem(body: &[u8]) -> Result<String, EnrollmentError> {
     ))
 }
 
-/// Read the full request body as bytes.
-async fn read_body(req: Request<hyper::body::Incoming>) -> Result<Vec<u8>, EnrollmentError> {
-    use http_body_util::BodyExt as _;
+/// Maximum CSR body size (64 KiB). CSRs are typically < 4 KiB; this
+/// matches the limit used by the Marti `/signClient` endpoints.
+const MAX_CSR_BODY: usize = 65536;
 
-    let collected = req
-        .into_body()
+/// Read the full request body as bytes, enforcing a size limit.
+async fn read_body(req: Request<hyper::body::Incoming>) -> Result<Vec<u8>, EnrollmentError> {
+    use http_body_util::{BodyExt as _, Limited};
+
+    let limited = Limited::new(req.into_body(), MAX_CSR_BODY);
+    let collected = limited
         .collect()
         .await
         .map_err(|e| EnrollmentError::Io(std::io::Error::other(e)))?;
