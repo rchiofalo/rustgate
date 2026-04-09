@@ -1,0 +1,29 @@
+[package]
+name = "rustgate-authz"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Policy engine for rustgate RBAC/ABAC authorization"
+
+[lints]
+workspace = true
+
+[dependencies]
+rustgate-core = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+ahash = { workspace = true }
+smol_str = { workspace = true, features = ["serde"] }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest = { workspace = true }
+tempfile = { workspace = true }
+
+[[bench]]
+name = "eval"
+harness = false
