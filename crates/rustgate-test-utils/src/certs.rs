@@ -254,6 +254,73 @@ impl TestCa {
         crl.pem().expect("failed to encode expired CRL as PEM")
     }
 
+    /// Issue a client certificate with rich subject and SAN fields for
+    /// testing the ABAC attribute extraction pipeline.
+    ///
+    /// Populates:
+    /// - Subject CN, OU (joined groups), O, and C (if `country` is set)
+    /// - URI SANs (including a `spiffe://` entry when `spiffe_id` is set)
+    /// - DNS SANs from `san_dns`
+    /// - Email (RFC822) SANs from `san_email`
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue_client_cert_with_attrs(
+        &self,
+        cn: &str,
+        groups: &[&str],
+        spiffe_id: Option<&str>,
+        organization: Option<&str>,
+        country: Option<&str>,
+        san_dns: &[&str],
+        san_email: &[&str],
+    ) -> TestCert {
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::NoCa;
+        params
+            .extended_key_usages
+            .push(ExtendedKeyUsagePurpose::ClientAuth);
+
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, cn);
+        if !groups.is_empty() {
+            dn.push(DnType::OrganizationalUnitName, groups.join(","));
+        }
+        if let Some(org) = organization {
+            dn.push(DnType::OrganizationName, org);
+        }
+        if let Some(c) = country {
+            dn.push(DnType::CountryName, c);
+        }
+        params.distinguished_name = dn;
+
+        let mut sans: Vec<rcgen::SanType> = Vec::new();
+        if let Some(spiffe) = spiffe_id {
+            sans.push(rcgen::SanType::URI(
+                spiffe.try_into().expect("invalid spiffe URI"),
+            ));
+        }
+        for dns in san_dns {
+            sans.push(rcgen::SanType::DnsName(
+                (*dns).try_into().expect("invalid DNS name"),
+            ));
+        }
+        for email in san_email {
+            sans.push(rcgen::SanType::Rfc822Name(
+                (*email).try_into().expect("invalid email SAN"),
+            ));
+        }
+        params.subject_alt_names = sans;
+
+        let key_pair = KeyPair::generate().expect("failed to generate key pair");
+        let cert = params
+            .signed_by(&key_pair, &self.issuer)
+            .expect("failed to sign client cert");
+
+        TestCert {
+            cert_pem: cert.pem(),
+            key_pem: key_pair.serialize_pem(),
+        }
+    }
+
     /// Issue a client certificate with the given CN and OU fields.
     ///
     /// CN becomes the user identity, OU fields become group memberships.

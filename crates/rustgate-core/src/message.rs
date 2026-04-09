@@ -221,6 +221,8 @@ mod tests {
             cn: "alice".to_string(),
             fingerprint: "abc123".to_string(),
             groups: std::collections::BTreeSet::new(),
+            spiffe_id: None,
+            attributes: std::sync::Arc::new(std::collections::BTreeMap::new()),
         };
         assert_eq!(Destination::Direct(id).to_string(), "direct:alice");
     }

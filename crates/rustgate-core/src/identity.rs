@@ -5,10 +5,38 @@
 //! memberships. Constructors validate the CN to prevent empty, oversized,
 //! or control-character–laden values from propagating through the system.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 #[cfg(feature = "fuzz")]
 use arbitrary::Arbitrary;
+use serde::{Deserialize, Serialize};
+
+/// A single attribute value attached to an [`Identity`].
+///
+/// The `AttrValue` enum is the unit of authorization context used by the
+/// upcoming RBAC/ABAC engine. Values are derived from mTLS certificate
+/// fields (SANs, subject, issuer, serial) and, in later work, from external
+/// attribute providers.
+///
+/// `Set` is deliberately a `Vec<String>` rather than a `BTreeSet` to give
+/// callers deterministic JSON serialization order. Callers that need set
+/// semantics should sort and de-duplicate before construction.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum AttrValue {
+    /// A single string value (e.g. `org`, `country`, `spiffe_id`).
+    Str(String),
+    /// A signed 64-bit integer value.
+    Int(i64),
+    /// A boolean value.
+    Bool(bool),
+    /// An ordered collection of string values (e.g. `san_dns`, `san_email`).
+    ///
+    /// Contract: callers should pre-sort and de-duplicate so that two
+    /// equivalent sets compare equal and serialize identically.
+    Set(Vec<String>),
+}
 
 /// Unique group identifier.
 pub type GroupId = String;
@@ -48,9 +76,25 @@ pub enum IdentityError {
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct Identity {
+    /// Certificate Common Name (or synthetic CN for plaintext sessions).
     pub cn: String,
+    /// SHA-256 fingerprint of the presented certificate, or empty for plaintext.
     pub fingerprint: CertFingerprint,
+    /// Group memberships derived from OU fields.
     pub groups: BTreeSet<GroupId>,
+    /// SPIFFE ID extracted from a URI SAN (`spiffe://...`), if present.
+    ///
+    /// Foundation for SPIFFE/SPIRE workload identity routing. Defaults to
+    /// `None` on every existing constructor so there is no behavior change
+    /// for callers that have not been updated.
+    pub spiffe_id: Option<String>,
+    /// Extensible attribute bag used by the RBAC/ABAC authorization engine.
+    ///
+    /// Shared via `Arc` so clones are cheap on the hot path. Populated by
+    /// the transport layer from cert SANs (URI/DNS/email), subject fields
+    /// (O, C), issuer CN, and cert serial. Defaults to an empty map on
+    /// every existing constructor.
+    pub attributes: Arc<BTreeMap<String, AttrValue>>,
 }
 
 impl Identity {
@@ -74,6 +118,8 @@ impl Identity {
             cn,
             fingerprint,
             groups,
+            spiffe_id: None,
+            attributes: Arc::new(BTreeMap::new()),
         })
     }
 
@@ -89,11 +135,35 @@ impl Identity {
             cn,
             fingerprint: String::new(),
             groups,
+            spiffe_id: None,
+            attributes: Arc::new(BTreeMap::new()),
         })
     }
 
+    /// Return whether this identity is a member of the given group.
     pub fn is_member_of(&self, group: &str) -> bool {
         self.groups.contains(group)
+    }
+
+    /// Builder: attach an attribute bag to this identity.
+    ///
+    /// Intended for use at extraction time (e.g. TLS handshake) to seed
+    /// the attribute map from certificate fields. Existing call sites do
+    /// not need to use this — attributes default to empty.
+    #[must_use]
+    pub fn with_attributes(mut self, attributes: BTreeMap<String, AttrValue>) -> Self {
+        self.attributes = Arc::new(attributes);
+        self
+    }
+
+    /// Builder: attach a SPIFFE ID to this identity.
+    ///
+    /// The SPIFFE ID is expected to be a URI of the form `spiffe://<trust-domain>/<path>`
+    /// sourced from a URI SAN in the presented certificate.
+    #[must_use]
+    pub fn with_spiffe_id(mut self, spiffe_id: impl Into<String>) -> Self {
+        self.spiffe_id = Some(spiffe_id.into());
+        self
     }
 }
 
@@ -149,6 +219,8 @@ impl<'a> Arbitrary<'a> for Identity {
             cn,
             fingerprint,
             groups,
+            spiffe_id: None,
+            attributes: Arc::new(BTreeMap::new()),
         })
     }
 }

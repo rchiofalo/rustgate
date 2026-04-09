@@ -20,4 +20,5 @@ pub mod peer_id;
 pub mod protocol;
 pub mod sanitize;
 
+pub use identity::AttrValue;
 pub use peer_id::{PeerId, ServerName};
