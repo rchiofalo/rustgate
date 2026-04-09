@@ -141,6 +141,7 @@ pub(crate) async fn handle_mqtt_session(
             &mut writer,
             protocol,
             prefix,
+            &mut resp_rx,
             &mut priority_rx,
             &mut normal_rx,
         )
@@ -759,21 +760,32 @@ async fn write_routed_message(
     }
 }
 
-/// Flush any pending routed messages to the client as MQTT PUBLISH packets
-/// before disconnecting. Best-effort with bounded draining.
+/// Flush any pending response and routed messages to the client before
+/// disconnecting. Best-effort with bounded draining.
 async fn flush_pending(
     writer: &mut PacketWriter,
     protocol: ProtocolLevel,
     prefix: &str,
+    resp_rx: &mut mpsc::Receiver<ResponsePacket>,
     priority_rx: &mut mpsc::Receiver<rustgate_transport::RoutedMessage>,
     normal_rx: &mut mpsc::Receiver<rustgate_transport::RoutedMessage>,
 ) {
     let mut flushed = 0u32;
 
-    // Close channels and drain whatever is buffered.
+    // Close all channels and drain whatever is buffered.
+    resp_rx.close();
     priority_rx.close();
     normal_rx.close();
 
+    // Drain pending response packets first (PUBACK, SUBACK, etc.)
+    while let Ok(pkt) = resp_rx.try_recv() {
+        if writer.write_raw(&pkt.bytes).await.is_err() {
+            return;
+        }
+        flushed += 1;
+    }
+
+    // Drain routed messages (priority first, then normal).
     loop {
         let msg = match priority_rx.try_recv() {
             Ok(m) => m,
