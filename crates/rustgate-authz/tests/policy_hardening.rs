@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rustgate_authz::parser::parse_json;
-use rustgate_authz::{Action, NativeEngine, PolicyEngine, Resource, Subject};
+use rustgate_authz::{Action, Decision, NativeEngine, Obligation, PolicyEngine, Resource, Subject};
 use rustgate_core::identity::Identity;
 
 fn spiffe_subject(id: &str) -> Identity {
@@ -302,5 +302,158 @@ fn nats_subject_valid_patterns_still_compile() {
                 Action::Publish,
             )
             .is_allow()
+    );
+}
+
+// ---------- #621: ResourceMatcher::Any on allow rules ----------
+
+#[test]
+fn resource_any_allow_emits_compile_warning() {
+    let json = br#"{"version":1,"rules":[
+        {"id":"broad","effect":"allow","action":"send",
+         "resource":{"kind":"any"},
+         "subject":{"cn_eq":"admin"}}
+    ]}"#;
+    let engine = NativeEngine::new(parse_json(json).unwrap()).unwrap();
+    let warnings = engine.compile_warnings();
+    assert!(
+        warnings.iter().any(|w| w.contains("resource `any`")),
+        "expected a compile warning about resource `any`, got: {warnings:?}"
+    );
+}
+
+#[test]
+fn resource_any_deny_no_compile_warning() {
+    // Deny + any-resource is normal (deny-all fallback rules). No warning.
+    let json = br#"{"version":1,"rules":[
+        {"id":"deny-all","effect":"deny","action":"send",
+         "resource":{"kind":"any"},
+         "subject":{}}
+    ]}"#;
+    let engine = NativeEngine::new(parse_json(json).unwrap()).unwrap();
+    let warnings = engine.compile_warnings();
+    assert!(
+        warnings.iter().all(|w| !w.contains("resource `any`")),
+        "deny + any-resource should not emit a resource-any warning, got: {warnings:?}"
+    );
+}
+
+// ---------- #622: Empty SubjectMatcher on allow rules ----------
+
+#[test]
+fn empty_subject_allow_emits_compile_warning() {
+    let json = br#"{"version":1,"rules":[
+        {"id":"open","effect":"allow","action":"send",
+         "resource":{"kind":"broadcast"},
+         "subject":{}}
+    ]}"#;
+    let engine = NativeEngine::new(parse_json(json).unwrap()).unwrap();
+    let warnings = engine.compile_warnings();
+    assert!(
+        warnings.iter().any(|w| w.contains("empty subject matcher")),
+        "expected a compile warning about empty subject, got: {warnings:?}"
+    );
+}
+
+#[test]
+fn empty_subject_deny_no_compile_warning() {
+    // Deny + empty subject is normal (block everyone). No warning.
+    let json = br#"{"version":1,"rules":[
+        {"id":"block","effect":"deny","action":"send",
+         "resource":{"kind":"broadcast"},
+         "subject":{}}
+    ]}"#;
+    let engine = NativeEngine::new(parse_json(json).unwrap()).unwrap();
+    let warnings = engine.compile_warnings();
+    assert!(
+        warnings
+            .iter()
+            .all(|w| !w.contains("empty subject matcher")),
+        "deny + empty subject should not emit a subject warning, got: {warnings:?}"
+    );
+}
+
+#[test]
+fn constrained_subject_allow_no_compile_warning() {
+    // Allow rule with an explicit subject constraint → no warning.
+    let json = br#"{"version":1,"rules":[
+        {"id":"ops","effect":"allow","action":"send",
+         "resource":{"kind":"broadcast"},
+         "subject":{"groups_any_of":["ops"]}}
+    ]}"#;
+    let engine = NativeEngine::new(parse_json(json).unwrap()).unwrap();
+    assert!(
+        engine.compile_warnings().is_empty(),
+        "constrained subject should not emit warnings"
+    );
+}
+
+#[test]
+fn both_warnings_emitted_together() {
+    // A rule that is both resource-any AND empty-subject on allow should
+    // emit both warnings.
+    let json = br#"{"version":1,"rules":[
+        {"id":"god-mode","effect":"allow","action":"send",
+         "resource":{"kind":"any"},
+         "subject":{}}
+    ]}"#;
+    let engine = NativeEngine::new(parse_json(json).unwrap()).unwrap();
+    let warnings = engine.compile_warnings();
+    assert!(
+        warnings.iter().any(|w| w.contains("resource `any`")),
+        "expected resource-any warning, got: {warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("empty subject matcher")),
+        "expected empty-subject warning, got: {warnings:?}"
+    );
+}
+
+// ---------- #617: Obligation enforcement instrumentation ----------
+
+#[test]
+fn obligations_flow_through_allow_decision() {
+    let json = br#"{"version":1,"rules":[
+        {"id":"geo-mask","effect":"allow","action":"send",
+         "resource":{"kind":"broadcast"},
+         "subject":{"cn_eq":"restricted-user"},
+         "obligations":["mask_geo","audit_extended"]}
+    ]}"#;
+    let engine = NativeEngine::new(parse_json(json).unwrap()).unwrap();
+
+    let id = Identity::new(
+        "restricted-user".to_string(),
+        "fp".to_string(),
+        BTreeSet::new(),
+    )
+    .unwrap();
+    let subj = Subject::from_identity(&id);
+    let outcome = engine.evaluate(&subj, &Resource::Broadcast, Action::Send);
+
+    assert_eq!(outcome.decision, Decision::Allow);
+    assert_eq!(
+        outcome.obligations,
+        vec![Obligation::MaskGeo, Obligation::AuditExtended],
+        "obligations must be preserved in the allow outcome"
+    );
+}
+
+#[test]
+fn deny_decision_carries_no_obligations() {
+    let json = br#"{"version":1,"rules":[
+        {"id":"block","effect":"deny","action":"send",
+         "resource":{"kind":"broadcast"},
+         "subject":{"cn_eq":"blocked"}}
+    ]}"#;
+    let engine = NativeEngine::new(parse_json(json).unwrap()).unwrap();
+
+    let id = Identity::new("blocked".to_string(), "fp".to_string(), BTreeSet::new()).unwrap();
+    let subj = Subject::from_identity(&id);
+    let outcome = engine.evaluate(&subj, &Resource::Broadcast, Action::Send);
+
+    assert_eq!(outcome.decision, Decision::Deny);
+    assert!(
+        outcome.obligations.is_empty(),
+        "deny decisions must not carry obligations"
     );
 }

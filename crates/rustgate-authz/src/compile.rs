@@ -20,6 +20,8 @@ fn next_policy_epoch() -> u32 {
     POLICY_EPOCH_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
+use tracing::warn;
+
 use crate::error::AuthzError;
 use crate::model::{Action, Obligation, Resource, Subject};
 use crate::parser::validate;
@@ -104,6 +106,10 @@ pub struct CompiledPolicy {
     /// Rules with `ResourceMatcher::Any` must be evaluated for every action
     /// the rule targets, regardless of resource kind — tracked separately.
     pub(crate) any_resource: AHashMap<Action, Vec<CompiledRule>>,
+    /// Warnings emitted during compilation. Surfaced via
+    /// [`crate::NativeEngine::compile_warnings`] so operators (and tests)
+    /// can inspect them without capturing tracing output.
+    pub(crate) compile_warnings: Vec<SmolStr>,
 }
 
 impl RuleSet {
@@ -115,9 +121,38 @@ impl RuleSet {
 
         let mut buckets: AHashMap<BucketKey, Vec<CompiledRule>> = AHashMap::new();
         let mut any_resource: AHashMap<Action, Vec<CompiledRule>> = AHashMap::new();
+        let mut compile_warnings: Vec<SmolStr> = Vec::new();
 
         for rule in &self.rules {
             let compiled = compile_rule(rule)?;
+
+            // #621: ResourceMatcher::Any in allow rules matches every
+            // resource kind, which is almost always broader than intended.
+            // Warn so operators can confirm this is deliberate.
+            if matches!(rule.resource, ResourceMatcher::Any) && rule.effect == Effect::Allow {
+                let msg = SmolStr::new(format!(
+                    "rule `{}`: allow + resource `any` matches all resource types; \
+                     consider restricting to a specific resource kind",
+                    rule.id,
+                ));
+                warn!(rule_id = %rule.id, "{msg}");
+                compile_warnings.push(msg);
+            }
+
+            // #622: An empty SubjectMatcher vacuously matches every
+            // subject. On an allow rule this silently grants access to
+            // everyone, which is rarely intended. Deny rules with an
+            // empty subject are fine (they block everyone by design).
+            if rule.effect == Effect::Allow && compiled.subject_predicate.is_match_all() {
+                let msg = SmolStr::new(format!(
+                    "rule `{}`: allow rule with empty subject matcher matches all subjects; \
+                     consider adding explicit subject constraints",
+                    rule.id,
+                ));
+                warn!(rule_id = %rule.id, "{msg}");
+                compile_warnings.push(msg);
+            }
+
             match &rule.resource {
                 ResourceMatcher::Any => {
                     any_resource.entry(rule.action).or_default().push(compiled);
@@ -138,6 +173,7 @@ impl RuleSet {
             default_effect: self.default_effect,
             buckets,
             any_resource,
+            compile_warnings,
         })
     }
 }
@@ -424,6 +460,16 @@ impl CompiledResourcePred {
 }
 
 impl CompiledSubjectPred {
+    /// Returns `true` when every field is `None` / empty, meaning the
+    /// predicate vacuously matches all subjects.
+    pub(crate) fn is_match_all(&self) -> bool {
+        self.cn_eq.is_none()
+            && self.groups_any_of.is_empty()
+            && self.groups_all_of.is_empty()
+            && self.spiffe_prefix.is_none()
+            && self.attribute_eq.is_empty()
+    }
+
     pub(crate) fn matches(&self, subject: &Subject<'_>) -> bool {
         if let Some(want) = &self.cn_eq
             && want != subject.cn
