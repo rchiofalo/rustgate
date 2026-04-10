@@ -403,6 +403,66 @@ mod tests {
     }
 
     #[test]
+    fn control_char_in_subject_prefix_rejected() {
+        let config = NatsConfig {
+            subject_prefix: "points\x01bad".to_string(),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn del_in_subject_prefix_rejected() {
+        let config = NatsConfig {
+            subject_prefix: "points\x7Fbad".to_string(),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn space_in_subject_prefix_rejected() {
+        let config = NatsConfig {
+            subject_prefix: "points bad".to_string(),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn non_ascii_in_subject_prefix_rejected() {
+        let config = NatsConfig {
+            subject_prefix: "caf\u{00e9}".to_string(),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn tab_in_default_group_rejected() {
+        let config = NatsConfig {
+            default_group: "group\tname".to_string(),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn nats_config_validate_propagates_tls_error() {
+        let config = NatsConfig {
+            tls: NatsTlsConfig {
+                client_cert: Some(PathBuf::from("cert.pem")),
+                client_key: None,
+                ca_cert: None,
+                required: false,
+            },
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(matches!(err, NatsConfigError::Tls(_)));
+    }
+
+    #[test]
     fn default_subscription_capacity() {
         let config = NatsConfig::default();
         assert_eq!(config.subscription_capacity, 1024);
