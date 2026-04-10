@@ -278,4 +278,27 @@ mod tests {
             .expect("build verifier");
         assert!(!verifier.supported_verify_schemes().is_empty());
     }
+
+    #[test]
+    fn survives_panic_in_lock_scope() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let store = test_root_store();
+        let verifier = DynamicCertVerifier::new(Box::new(move || (0, store.clone())), Vec::new())
+            .expect("build verifier");
+
+        // Simulate a panic while holding the verifier lock.
+        let v = Arc::clone(&verifier);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = v.cached.lock();
+            panic!("simulated panic while holding verifier lock");
+        }));
+        assert!(result.is_err());
+
+        // With parking_lot::Mutex, the lock is not poisoned — subsequent
+        // calls succeed rather than permanently failing all TLS handshakes.
+        let inner = verifier
+            .current_verifier()
+            .expect("verifier must not be poisoned");
+        assert!(!inner.root_hint_subjects().is_empty());
+    }
 }
