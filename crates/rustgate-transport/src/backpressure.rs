@@ -133,7 +133,13 @@ impl BackpressureGate {
 
     /// Add `n` bytes to the counter. Trips the high-water mark if crossed.
     pub fn add(&self, n: usize) {
-        let prev = self.current_bytes.fetch_add(n, Ordering::Relaxed);
+        let prev = self
+            .current_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(n))
+            })
+            // Closure always returns Some, so fetch_update never fails.
+            .unwrap_or_else(|prev| prev);
         let now = prev.saturating_add(n);
         if let Some(cb) = self.on_bytes_changed.as_ref() {
             cb(now);
@@ -146,7 +152,12 @@ impl BackpressureGate {
     /// Subtract `n` bytes from the counter. Wakes the accept loop if the
     /// counter dropped below the low-water mark.
     pub fn sub(&self, n: usize) {
-        let prev = self.current_bytes.fetch_sub(n, Ordering::Relaxed);
+        let prev = self
+            .current_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(n))
+            })
+            .unwrap_or_else(|prev| prev);
         let now = prev.saturating_sub(n);
         if let Some(cb) = self.on_bytes_changed.as_ref() {
             cb(now);
@@ -363,6 +374,26 @@ mod tests {
             gate.current(),
             0,
             "final envelope drop must release the permit"
+        );
+    }
+
+    #[test]
+    fn add_saturates_instead_of_wrapping() {
+        let gate = BackpressureGate::new(usize::MAX);
+        gate.add(usize::MAX);
+        gate.add(1);
+        assert_eq!(gate.current(), usize::MAX, "add must saturate, not wrap");
+    }
+
+    #[test]
+    fn sub_saturates_instead_of_wrapping() {
+        let gate = BackpressureGate::new(1_000);
+        gate.add(10);
+        gate.sub(20);
+        assert_eq!(
+            gate.current(),
+            0,
+            "sub must saturate to zero, not underflow"
         );
     }
 
