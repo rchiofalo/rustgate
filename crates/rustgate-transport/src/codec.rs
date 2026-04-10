@@ -333,6 +333,11 @@ impl Decoder for XmlStreamCodec {
 
         let initial_depth = self.depth;
         if let Some(end) = self.find_element_end(src) {
+            // Explicitly reset depth after emitting a complete message.
+            // find_element_end returns Some only when depth reaches 0,
+            // but resetting defensively prevents any future parser change
+            // from leaking depth state into the next message.
+            self.depth = 0;
             Ok(Some(src.split_to(end)))
         } else {
             // Reject streams with pathological nesting depth
@@ -570,6 +575,31 @@ mod tests {
             .expect("should produce second frame");
         assert_eq!(frame2, "<second/>");
         assert!(buf.is_empty());
+    }
+
+    /// Depth counter must be zero after emitting a complete message, so
+    /// the next message in the stream is not rejected as "too deep."
+    #[test]
+    fn xml_depth_resets_between_messages() {
+        let mut codec = XmlStreamCodec::new();
+        // First message: deeply nested but valid.
+        let msg1 = "<a><b><c><d>x</d></c></b></a>";
+        // Second message: simple self-closing root.
+        let msg2 = "<event/>";
+        let mut buf = BytesMut::from(format!("{msg1}{msg2}").as_str());
+
+        let frame1 = codec
+            .decode(&mut buf)
+            .expect("decode first should succeed")
+            .expect("should produce first frame");
+        assert_eq!(frame1, msg1);
+
+        // If depth leaked from the first message, this would fail.
+        let frame2 = codec
+            .decode(&mut buf)
+            .expect("decode second should succeed")
+            .expect("should produce second frame");
+        assert_eq!(frame2, msg2);
     }
 
     #[test]
