@@ -410,8 +410,13 @@ mod tests {
         assert_eq!(key1.len(), 32);
     }
 
-    /// Two certs issued to the same CN with the same key pair (same SKI)
-    /// must produce different cache keys, preventing collision.
+    /// Two certs issued to the same CN must produce different cache keys.
+    /// Each call to `issue_client_cert` generates a fresh key pair, so the
+    /// certs differ in serial number, public key, and DER encoding. Under
+    /// the old SKI-based scheme, certs reissued with the *same* key pair
+    /// would have collided; SHA-256 of the full DER avoids this because
+    /// any difference in the encoding (serial, validity, key) produces a
+    /// distinct fingerprint.
     #[test]
     fn cache_key_differs_for_reissued_cert() {
         let ca = rustgate_test_utils::certs::TestCa::new("collision test");
