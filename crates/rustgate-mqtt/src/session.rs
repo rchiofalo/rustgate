@@ -166,6 +166,18 @@ pub(crate) async fn handle_mqtt_session(
         && let Err(e) = client_id_registry.try_claim(&client_id, &cn, session_id)
     {
         debug!(cn = %cn, peer = %peer_addr, error = %e, "client ID rejected");
+        // MQTT 5.0: send DISCONNECT with reason before closing so the client
+        // gets a meaningful error code instead of a bare TCP reset. MQTT 3.1.1
+        // has no server-initiated DISCONNECT packet, so we can only drop.
+        if protocol == ProtocolLevel::V50 {
+            let disconnect = mqttbytes::v5::Disconnect {
+                reason_code: mqttbytes::v5::DisconnectReasonCode::NotAuthorized,
+                properties: None,
+            };
+            let _ = writer
+                .write_v5(&mqttbytes::v5::Packet::Disconnect(disconnect))
+                .await;
+        }
         return;
     }
     // RAII guard ensures the client ID is released when the session ends.
@@ -1005,5 +1017,32 @@ mod tests {
         reg.try_claim("", "device-a", 1).unwrap();
         // Another session with empty client_id should also succeed.
         reg.try_claim("", "device-b", 2).unwrap();
+    }
+
+    #[test]
+    fn client_id_concurrent_claim_contention() {
+        let reg = ClientIdRegistry::new();
+        let barrier = std::sync::Barrier::new(10);
+
+        let results: Vec<_> = std::thread::scope(|s| {
+            (0..10u64)
+                .map(|i| {
+                    let reg = &reg;
+                    let barrier = &barrier;
+                    s.spawn(move || {
+                        let _ = barrier.wait();
+                        reg.try_claim("contested-id", &format!("cn-{i}"), i)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect()
+        });
+
+        let successes = results.iter().filter(|r| r.is_ok()).count();
+        let failures = results.iter().filter(|r| r.is_err()).count();
+        assert_eq!(successes, 1, "exactly one CN should claim the client ID");
+        assert_eq!(failures, 9, "all others should be rejected");
     }
 }
