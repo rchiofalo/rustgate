@@ -4,6 +4,10 @@
 //! entries on each check. No separate background prune task is needed —
 //! stale IPs are cleaned up inline when the entry count exceeds a threshold
 //! or enough time has passed since the last sweep.
+//!
+//! **NAT/proxy caveat:** rate limiting uses the raw TCP peer address. Behind
+//! NAT or a load balancer, all clients sharing one egress IP are rate-limited
+//! together. See the threat model (D8) for deployment guidance.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;

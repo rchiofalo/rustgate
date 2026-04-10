@@ -95,6 +95,11 @@ const CONN_RATE_SWEEP_THRESHOLD: usize = 512;
 ///
 /// Includes per-IP connection rate limiting to mitigate slow-handshake DoS
 /// attacks where an adversary repeatedly initiates and abandons TLS handshakes.
+///
+/// **NAT/proxy caveat:** rate limiting uses the raw TCP peer address. Behind
+/// NAT or a load balancer, all clients sharing one egress IP are rate-limited
+/// together, and an attacker with multiple IPs bypasses the limit entirely.
+/// See the threat model (D8) for deployment guidance.
 pub struct WsListener {
     tcp: TcpListener,
     tls: TlsAcceptor,
