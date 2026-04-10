@@ -1,5 +1,7 @@
 //! Policy engine trait and native in-process implementation.
 
+use smol_str::SmolStr;
+
 use crate::cache::{DecisionCache, DecisionKey};
 use crate::compile::{BucketKey, CompiledPolicy, CompiledRule};
 use crate::error::AuthzError;
@@ -76,12 +78,23 @@ impl NativeEngine {
                 default_effect: Effect::Deny,
                 buckets: ahash::AHashMap::new(),
                 any_resource: ahash::AHashMap::new(),
+                compile_warnings: Vec::new(),
             },
         };
         Self {
             compiled,
             cache: DecisionCache::default(),
         }
+    }
+
+    /// Warnings emitted during policy compilation.
+    ///
+    /// Returns messages about overly broad rules (e.g.
+    /// `ResourceMatcher::Any` on an allow rule, or an empty subject
+    /// matcher that matches all subjects). These are also emitted via
+    /// `tracing::warn!` during compilation.
+    pub fn compile_warnings(&self) -> &[SmolStr] {
+        &self.compiled.compile_warnings
     }
 
     /// Snapshot of the decision cache hit/miss counters (inherent variant).
@@ -179,10 +192,19 @@ impl NativeEngine {
         }
 
         if let Some(rule) = allow_hit {
+            let obligations = rule.obligations.clone();
+            if !obligations.is_empty() {
+                tracing::debug!(
+                    rule_id = %rule.id,
+                    obligation_count = obligations.len(),
+                    obligations = ?obligations,
+                    "allow decision carries obligations that the dataplane must enforce"
+                );
+            }
             return DecisionOutcome {
                 decision: Decision::Allow,
                 rule_id: Some(rule.id.clone()),
-                obligations: rule.obligations.clone(),
+                obligations,
             };
         }
 

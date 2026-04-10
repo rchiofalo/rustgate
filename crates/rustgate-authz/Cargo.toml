@@ -15,7 +15,7 @@ default = []
 # Optional Cedar policy backend. Enables the `CedarBackend` implementation
 # of [`PolicyEngine`] so operators with an existing Cedar policy corpus
 # can reuse it without rewriting rules in the native JSON format.
-cedar = ["dep:cedar-policy", "dep:tracing"]
+cedar = ["dep:cedar-policy"]
 
 [dependencies]
 rustgate-core = { workspace = true }
@@ -27,7 +27,7 @@ parking_lot = { workspace = true }
 smol_str = { workspace = true, features = ["serde"] }
 sha2 = { workspace = true }
 cedar-policy = { workspace = true, optional = true }
-tracing = { workspace = true, optional = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
