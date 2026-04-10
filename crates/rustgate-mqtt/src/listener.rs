@@ -10,15 +10,15 @@
 //! NAT or a load balancer, all clients sharing one egress IP are rate-limited
 //! together. See the threat model (D8) for deployment guidance.
 
-use std::collections::{HashMap, VecDeque};
-use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
 
 use rustgate_core::constants::HANDSHAKE_TIMEOUT;
 use rustgate_core::error::{Result, TransportError};
 use rustgate_core::identity::Identity;
 use rustgate_core::net::configure_tcp_keepalive;
+use rustgate_core::ratelimit::ConnRateLimiter;
 use rustgate_transport::{TlsConfig, extract_identity};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
@@ -44,16 +44,6 @@ const CONN_RATE_LIMIT: usize = 10;
 /// Sliding window duration for connection rate limiting.
 const CONN_RATE_WINDOW: Duration = Duration::from_secs(10);
 
-/// Number of tracked IPs that triggers an inline sweep of stale entries.
-const CONN_RATE_SWEEP_THRESHOLD: usize = 512;
-
-/// Per-IP connection attempt tracking for DoS mitigation.
-#[derive(Debug)]
-struct ConnRateState {
-    map: HashMap<IpAddr, VecDeque<Instant>>,
-    last_sweep: Instant,
-}
-
 /// MQTT TLS listener bound to a local address.
 ///
 /// Call [`accept`](MqttListener::accept) to wait for the next authenticated
@@ -66,14 +56,14 @@ struct ConnRateState {
 pub struct MqttListener {
     tcp: TcpListener,
     acceptor: TlsAcceptor,
-    conn_rate: Mutex<ConnRateState>,
+    conn_rate: ConnRateLimiter,
 }
 
 impl std::fmt::Debug for MqttListener {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MqttListener")
             .field("local_addr", &self.tcp.local_addr())
-            .field("conn_rate", &"<ConnRateState>")
+            .field("conn_rate", &self.conn_rate)
             .finish()
     }
 }
@@ -99,53 +89,8 @@ impl MqttListener {
         Ok(Self {
             tcp,
             acceptor,
-            conn_rate: Mutex::new(ConnRateState {
-                map: HashMap::new(),
-                last_sweep: Instant::now(),
-            }),
+            conn_rate: ConnRateLimiter::new(CONN_RATE_LIMIT, CONN_RATE_WINDOW),
         })
-    }
-
-    /// Check whether `ip` has exceeded the connection rate limit.
-    ///
-    /// Uses a sliding window of [`CONN_RATE_WINDOW`] seconds, rejecting IPs
-    /// with [`CONN_RATE_LIMIT`] or more attempts in the window. Records the
-    /// attempt timestamp when the IP is not rate-limited.
-    ///
-    /// Returns `true` if the IP is rate-limited, `false` otherwise.
-    fn is_conn_rate_limited(&self, ip: IpAddr) -> bool {
-        let now = Instant::now();
-        let cutoff = now - CONN_RATE_WINDOW;
-
-        let mut state = match self.conn_rate.lock() {
-            Ok(s) => s,
-            Err(e) => e.into_inner(),
-        };
-
-        if state.map.len() > CONN_RATE_SWEEP_THRESHOLD
-            || now.duration_since(state.last_sweep) >= CONN_RATE_WINDOW
-        {
-            state.map.retain(|_, timestamps| {
-                while timestamps.front().is_some_and(|t| *t <= cutoff) {
-                    let _ = timestamps.pop_front();
-                }
-                !timestamps.is_empty()
-            });
-            state.last_sweep = now;
-        }
-
-        let timestamps = state.map.entry(ip).or_default();
-
-        while timestamps.front().is_some_and(|t| *t <= cutoff) {
-            let _ = timestamps.pop_front();
-        }
-
-        if timestamps.len() >= CONN_RATE_LIMIT {
-            return true;
-        }
-
-        timestamps.push_back(now);
-        false
     }
 
     /// Return the local address this listener is bound to.
@@ -164,7 +109,7 @@ impl MqttListener {
         let (tcp_stream, peer_addr) = self.tcp.accept().await?;
 
         // Per-IP connection rate limiting to mitigate slow-handshake DoS.
-        if self.is_conn_rate_limited(peer_addr.ip()) {
+        if self.conn_rate.is_limited(peer_addr.ip()) {
             warn!(
                 peer = %peer_addr,
                 "MQTT connection rejected: rate limit exceeded for IP"

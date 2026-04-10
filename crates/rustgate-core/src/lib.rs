@@ -18,6 +18,7 @@ pub mod message;
 pub mod net;
 pub mod peer_id;
 pub mod protocol;
+pub mod ratelimit;
 pub mod sanitize;
 
 pub use identity::AttrValue;
