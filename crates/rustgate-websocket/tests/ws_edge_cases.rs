@@ -55,6 +55,7 @@ impl EdgeTestServer {
             ws_max_frames_per_sec: 0,
             ws_max_bytes_per_sec: 0,
             ws_max_violations: 0,
+            max_write_buffer_bytes: 0,
             shutdown: Arc::clone(&shutdown),
         };
 

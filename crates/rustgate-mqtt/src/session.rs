@@ -5,10 +5,12 @@
 //! the [`Router`](rustgate_transport::Router) and receives routed messages
 //! for delivery to the MQTT client.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use bytes::BytesMut;
+use parking_lot::Mutex;
 use rustgate_core::constants::WRITE_TIMEOUT;
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
@@ -16,7 +18,7 @@ use rustgate_transport::{
     NORMAL_CHANNEL_CAPACITY, PRIORITY_CHANNEL_CAPACITY, Router, SessionHandle,
 };
 use tokio::sync::{OwnedSemaphorePermit, mpsc};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::error::MqttError;
 use crate::listener::MqttPreSession;
@@ -37,6 +39,81 @@ const BROADCAST_TOPIC_SUFFIX: &str = "$broadcast";
 /// Channel capacity for response packets flowing from read loop to write loop.
 const RESPONSE_CHANNEL_CAPACITY: usize = 64;
 
+/// Shared registry tracking which MQTT client IDs are in use and by which CN.
+///
+/// Prevents client ID collision attacks where two different mTLS identities
+/// attempt to use the same MQTT client ID, which could cause session confusion
+/// or denial of service (mirrors CVE patterns in Eclipse Mosquitto).
+///
+/// The registry is shared across all MQTT sessions via `Arc`.
+#[derive(Debug, Default)]
+pub(crate) struct ClientIdRegistry {
+    /// Maps MQTT client_id → (CN, session_id).
+    inner: Mutex<HashMap<String, (String, u64)>>,
+}
+
+impl ClientIdRegistry {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Attempt to claim a client ID for the given CN and session.
+    ///
+    /// - If the client_id is not in use, registers it and returns `Ok`.
+    /// - If the client_id is already in use by the *same* CN, updates
+    ///   the session_id (reconnect) and returns `Ok`.
+    /// - If the client_id is in use by a *different* CN, returns `Err`.
+    pub(crate) fn try_claim(
+        &self,
+        client_id: &str,
+        cn: &str,
+        session_id: u64,
+    ) -> Result<(), MqttError> {
+        // Empty client IDs are allowed by MQTT spec (server may assign one).
+        // We skip tracking them since they cannot collide meaningfully.
+        if client_id.is_empty() {
+            return Ok(());
+        }
+        let mut map = self.inner.lock();
+        if let Some((existing_cn, _)) = map.get(client_id)
+            && existing_cn != cn
+        {
+            warn!(
+                client_id = %client_id,
+                existing_cn = %existing_cn,
+                new_cn = %cn,
+                "MQTT client ID collision: different identity attempted to reuse client ID"
+            );
+            return Err(MqttError::ClientIdInUse(client_id.to_string()));
+        }
+        let _ = map.insert(client_id.to_string(), (cn.to_string(), session_id));
+        Ok(())
+    }
+
+    /// Release a client ID, but only if it is still owned by the given session.
+    pub(crate) fn release(&self, client_id: &str, session_id: u64) {
+        let mut map = self.inner.lock();
+        if let Some((_, sid)) = map.get(client_id)
+            && *sid == session_id
+        {
+            let _ = map.remove(client_id);
+        }
+    }
+}
+
+/// RAII guard that releases the client ID from the registry on drop.
+struct ClientIdGuard {
+    registry: Arc<ClientIdRegistry>,
+    client_id: String,
+    session_id: u64,
+}
+
+impl Drop for ClientIdGuard {
+    fn drop(&mut self) {
+        self.registry.release(&self.client_id, self.session_id);
+    }
+}
+
 /// A serialized MQTT response packet ready to be written to the TLS stream.
 /// Produced by the read loop, consumed by the write loop.
 struct ResponsePacket {
@@ -52,6 +129,7 @@ pub(crate) async fn handle_mqtt_session(
     router: Arc<Router>,
     topic_prefix: Option<String>,
     max_packet_size: usize,
+    client_id_registry: Arc<ClientIdRegistry>,
     _permit: OwnedSemaphorePermit,
 ) {
     let identity = pre.identity;
@@ -61,8 +139,8 @@ pub(crate) async fn handle_mqtt_session(
     let mut codec = PacketCodec::new(pre.stream, max_packet_size);
 
     // --- CONNECT handshake ---
-    let keep_alive = match connect_handshake(&mut codec, &identity).await {
-        Ok(ka) => ka,
+    let (keep_alive, client_id) = match connect_handshake(&mut codec, &identity).await {
+        Ok(result) => result,
         Err(e) => {
             debug!(cn = %cn, peer = %peer_addr, error = %e, "CONNECT handshake failed");
             return;
@@ -70,15 +148,6 @@ pub(crate) async fn handle_mqtt_session(
     };
 
     let protocol = codec.protocol.unwrap_or(ProtocolLevel::V50);
-
-    info!(
-        peer = %peer_addr,
-        cn = %cn,
-        groups = ?identity.groups,
-        protocol = ?protocol,
-        keep_alive = keep_alive,
-        "MQTT session started"
-    );
 
     // --- Split codec into read/write halves for concurrent loops ---
     let (mut reader, mut writer) = codec.into_split();
@@ -90,6 +159,35 @@ pub(crate) async fn handle_mqtt_session(
         mpsc::channel::<rustgate_transport::RoutedMessage>(NORMAL_CHANNEL_CAPACITY);
     let handle = SessionHandle::new(Arc::clone(&identity), priority_tx, normal_tx);
     let session_id = handle.id;
+
+    // --- Client ID collision check ---
+    // Must happen after session_id is available but before router registration.
+    if !client_id.is_empty()
+        && let Err(e) = client_id_registry.try_claim(&client_id, &cn, session_id)
+    {
+        debug!(cn = %cn, peer = %peer_addr, error = %e, "client ID rejected");
+        return;
+    }
+    // RAII guard ensures the client ID is released when the session ends.
+    let _client_id_guard = if !client_id.is_empty() {
+        Some(ClientIdGuard {
+            registry: Arc::clone(&client_id_registry),
+            client_id: client_id.clone(),
+            session_id,
+        })
+    } else {
+        None
+    };
+
+    info!(
+        peer = %peer_addr,
+        cn = %cn,
+        groups = ?identity.groups,
+        protocol = ?protocol,
+        keep_alive = keep_alive,
+        client_id = %client_id,
+        "MQTT session started"
+    );
 
     // Response channel: read loop produces serialized response packets,
     // write loop consumes and writes them to the TLS stream.
@@ -161,7 +259,10 @@ pub(crate) async fn handle_mqtt_session(
 /// Reads the first packet (must be CONNECT), validates constraints
 /// (clean session, no will, QoS ≤ 1), and sends CONNACK. Returns the
 /// negotiated keep-alive value in seconds.
-async fn connect_handshake(codec: &mut PacketCodec, identity: &Identity) -> Result<u16, MqttError> {
+async fn connect_handshake(
+    codec: &mut PacketCodec,
+    identity: &Identity,
+) -> Result<(u16, String), MqttError> {
     let packet = codec.read_packet().await?;
 
     match packet {
@@ -179,9 +280,11 @@ async fn connect_handshake(codec: &mut PacketCodec, identity: &Identity) -> Resu
                 return Err(MqttError::WillUnsupported);
             }
 
+            let client_id = connect.client_id.clone();
+
             debug!(
                 cn = %identity.cn,
-                client_id = %connect.client_id,
+                client_id = %client_id,
                 keep_alive = connect.keep_alive,
                 "MQTT v3.1.1 CONNECT accepted"
             );
@@ -189,7 +292,7 @@ async fn connect_handshake(codec: &mut PacketCodec, identity: &Identity) -> Resu
             codec
                 .write_connack_v4(mqttbytes::v4::ConnectReturnCode::Success)
                 .await?;
-            Ok(connect.keep_alive)
+            Ok((connect.keep_alive, client_id))
         }
         MqttPacket::V5(boxed) => {
             if let mqttbytes::v5::Packet::Connect(connect) = *boxed {
@@ -210,9 +313,11 @@ async fn connect_handshake(codec: &mut PacketCodec, identity: &Identity) -> Resu
                     return Err(MqttError::WillUnsupported);
                 }
 
+                let client_id = connect.client_id.clone();
+
                 debug!(
                     cn = %identity.cn,
-                    client_id = %connect.client_id,
+                    client_id = %client_id,
                     keep_alive = connect.keep_alive,
                     "MQTT v5.0 CONNECT accepted"
                 );
@@ -220,7 +325,7 @@ async fn connect_handshake(codec: &mut PacketCodec, identity: &Identity) -> Resu
                 codec
                     .write_connack_v5(mqttbytes::v5::ConnectReturnCode::Success)
                     .await?;
-                Ok(connect.keep_alive)
+                Ok((connect.keep_alive, client_id))
             } else {
                 Err(MqttError::ConnectExpected)
             }
@@ -828,5 +933,77 @@ fn msg_to_topic(msg: &RoutableMessage, prefix: &str) -> String {
                 format!("{prefix}{BROADCAST_TOPIC_SUFFIX}")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::panic, clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn client_id_claim_same_cn_allowed() {
+        let reg = ClientIdRegistry::new();
+        reg.try_claim("sensor-1", "device-a", 1).unwrap();
+        // Same CN reconnecting with the same client_id is fine.
+        reg.try_claim("sensor-1", "device-a", 2).unwrap();
+    }
+
+    #[test]
+    fn client_id_claim_different_cn_rejected() {
+        let reg = ClientIdRegistry::new();
+        reg.try_claim("sensor-1", "device-a", 1).unwrap();
+        let err = reg.try_claim("sensor-1", "device-b", 2).unwrap_err();
+        assert!(
+            matches!(err, MqttError::ClientIdInUse(_)),
+            "expected ClientIdInUse, got: {err}"
+        );
+    }
+
+    #[test]
+    fn client_id_release_allows_reuse() {
+        let reg = ClientIdRegistry::new();
+        reg.try_claim("sensor-1", "device-a", 1).unwrap();
+        reg.release("sensor-1", 1);
+        // After release, a different CN can claim the same client_id.
+        reg.try_claim("sensor-1", "device-b", 2).unwrap();
+    }
+
+    #[test]
+    fn client_id_release_wrong_session_no_op() {
+        let reg = ClientIdRegistry::new();
+        reg.try_claim("sensor-1", "device-a", 1).unwrap();
+        // Release with wrong session_id should be a no-op.
+        reg.release("sensor-1", 999);
+        // Original claim should still hold — different CN rejected.
+        assert!(reg.try_claim("sensor-1", "device-b", 2).is_err());
+    }
+
+    #[test]
+    fn client_id_guard_releases_on_drop() {
+        let reg = ClientIdRegistry::new();
+        reg.try_claim("sensor-1", "device-a", 1).unwrap();
+        {
+            let _guard = ClientIdGuard {
+                registry: Arc::clone(&reg),
+                client_id: "sensor-1".to_string(),
+                session_id: 1,
+            };
+            // While guard is alive, different CN is rejected.
+            assert!(reg.try_claim("sensor-1", "device-b", 2).is_err());
+        }
+        // After guard drops, the client_id is released.
+        reg.try_claim("sensor-1", "device-b", 2).unwrap();
+    }
+
+    #[test]
+    fn empty_client_id_not_tracked() {
+        // Empty client IDs are allowed by MQTT spec (server-assigned).
+        // We skip registry tracking for them.
+        let reg = ClientIdRegistry::new();
+        reg.try_claim("", "device-a", 1).unwrap();
+        // Another session with empty client_id should also succeed.
+        reg.try_claim("", "device-b", 2).unwrap();
     }
 }
