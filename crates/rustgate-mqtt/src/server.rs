@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::config::MqttServerConfig;
-use crate::session::handle_mqtt_session;
+use crate::session::{ClientIdRegistry, handle_mqtt_session};
 
 /// The MQTT server that manages the accept loop and session lifecycle.
 #[derive(Debug)]
@@ -31,6 +31,8 @@ impl MqttServer {
             max_packet_size,
         } = config;
 
+        let client_id_registry = ClientIdRegistry::new();
+
         info!(addr = ?listener.local_addr().ok(), "MQTT server started");
 
         loop {
@@ -48,11 +50,13 @@ impl MqttServer {
 
                             let router = Arc::clone(&router);
                             let prefix = topic_prefix.clone();
+                            let registry = Arc::clone(&client_id_registry);
                             drop(tokio::spawn(handle_mqtt_session(
                                 pre_session,
                                 router,
                                 prefix,
                                 max_packet_size,
+                                registry,
                                 permit,
                             )));
                         }

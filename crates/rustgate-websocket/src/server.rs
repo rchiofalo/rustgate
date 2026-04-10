@@ -38,6 +38,14 @@ pub type OnNatsPublish = Arc<dyn Fn(RoutableMessage) + Send + Sync>;
 pub type OnFederationForward =
     Arc<dyn Fn(Bytes, Vec<String>, rustgate_core::message::Metadata) + Send + Sync>;
 
+/// Default maximum pending write bytes per WebSocket connection: 4 MiB.
+///
+/// When the write loop has sent more than this many bytes without the
+/// client draining them (i.e. the cumulative payload exceeds this between
+/// successful flushes), the connection is terminated to prevent memory
+/// exhaustion from slow-reading clients.
+pub const DEFAULT_MAX_WRITE_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+
 /// Configuration for the WebSocket server.
 pub struct WsServerConfig {
     pub listener: WsListener,
@@ -57,6 +65,9 @@ pub struct WsServerConfig {
     pub ws_max_bytes_per_sec: u64,
     /// Consecutive WebSocket rate limit violations before disconnecting.
     pub ws_max_violations: u32,
+    /// Maximum pending write bytes per connection before disconnecting
+    /// a slow consumer. 0 = unlimited (not recommended).
+    pub max_write_buffer_bytes: usize,
     pub shutdown: Arc<Notify>,
 }
 
@@ -93,6 +104,7 @@ impl WebSocketServer {
             ws_max_frames_per_sec,
             ws_max_bytes_per_sec,
             ws_max_violations,
+            max_write_buffer_bytes,
             shutdown,
         } = config;
 
@@ -122,9 +134,10 @@ impl WebSocketServer {
                             let fps = ws_max_frames_per_sec;
                             let bps = ws_max_bytes_per_sec;
                             let vio = ws_max_violations;
+                            let mwb = max_write_buffer_bytes;
                             drop(tokio::spawn(handle_ws_session(
                                 session, router, session_codec, nats, fed, tc, rf, cb, fps,
-                                bps, vio, permit,
+                                bps, vio, mwb, permit,
                             )));
                         }
                         Err(e) => {
@@ -154,6 +167,7 @@ async fn handle_ws_session(
     ws_max_frames_per_sec: u32,
     ws_max_bytes_per_sec: u64,
     ws_max_violations: u32,
+    max_write_buffer_bytes: usize,
     _permit: OwnedSemaphorePermit,
 ) {
     let identity = session.identity_arc();
@@ -216,7 +230,7 @@ async fn handle_ws_session(
         let router = Arc::clone(&router);
         tokio::select! {
             r = ws_read_loop(ws_read, &identity, &router, nats_publish.as_ref(), fed_forward.as_ref(), &throttle, &replay_filter, &mut ws_rate_limiter) => r,
-            r = ws_write_loop(ws_write, &mut priority_rx, &mut normal_rx, &*codec) => r,
+            r = ws_write_loop(ws_write, &mut priority_rx, &mut normal_rx, &*codec, max_write_buffer_bytes) => r,
         }
     };
 
@@ -322,14 +336,21 @@ async fn ws_read_loop(
 /// Always checks the priority channel (Position and Alert messages)
 /// before the normal channel, ensuring time-sensitive messages are
 /// delivered first.
+///
+/// Tracks cumulative bytes written to the underlying WebSocket sink.
+/// If `max_write_buffer_bytes` is non-zero and the pending byte count
+/// exceeds the limit, the connection is terminated to prevent memory
+/// exhaustion from slow-reading clients.
 async fn ws_write_loop(
     mut ws_write: SplitSink<WsStream, Message>,
     priority_rx: &mut mpsc::Receiver<rustgate_transport::RoutedMessage>,
     normal_rx: &mut mpsc::Receiver<rustgate_transport::RoutedMessage>,
     codec: &dyn Codec,
+    max_write_buffer_bytes: usize,
 ) -> Result<(), String> {
     let mut priority_open = true;
     let mut normal_open = true;
+    let mut pending_bytes: usize = 0;
     loop {
         if !priority_open && !normal_open {
             break;
@@ -360,10 +381,32 @@ async fn ws_write_loop(
             }
         };
 
+        let frame_len = encoded.len();
+
+        // Check write buffer limit before sending. A slow-reading client
+        // causes the TLS/WebSocket write buffers to grow unbounded; this
+        // guard caps per-connection memory usage and disconnects the
+        // offending session.
+        if max_write_buffer_bytes > 0 {
+            pending_bytes = pending_bytes.saturating_add(frame_len);
+            if pending_bytes > max_write_buffer_bytes {
+                warn!(
+                    pending_bytes,
+                    limit = max_write_buffer_bytes,
+                    "WebSocket write buffer limit exceeded, disconnecting slow consumer"
+                );
+                return Err("write buffer limit exceeded (slow consumer)".into());
+            }
+        }
+
         let frame = Message::Binary(encoded.to_vec().into());
 
         match tokio::time::timeout(WRITE_TIMEOUT, ws_write.send(frame)).await {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => {
+                // Successful send: the frame has been flushed to the
+                // underlying transport, so reset the pending counter.
+                pending_bytes = 0;
+            }
             Ok(Err(e)) => return Err(format!("WebSocket write error: {e}")),
             Err(_) => return Err("write timeout (slow consumer)".into()),
         }

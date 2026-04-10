@@ -16,6 +16,7 @@ rustgate-transport = { workspace = true }
 bytes = { workspace = true }
 mqttbytes = { version = "0.6", features = ["v5"] }
 tokio = { workspace = true, features = ["net", "time", "sync", "rt", "macros", "io-util"] }
+parking_lot = { workspace = true }
 tokio-rustls = { workspace = true }
 tracing = { workspace = true }
 socket2 = { workspace = true }

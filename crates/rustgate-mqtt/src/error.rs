@@ -39,6 +39,10 @@ pub enum MqttError {
     #[error("expected CONNECT as first packet")]
     ConnectExpected,
 
+    /// The MQTT client ID is already in use by a different mTLS identity.
+    #[error("client ID `{0}` is already in use by another identity")]
+    ClientIdInUse(String),
+
     /// The keep-alive timer expired without receiving any packet.
     #[error("keep-alive timeout ({0}s)")]
     KeepAliveTimeout(u16),
