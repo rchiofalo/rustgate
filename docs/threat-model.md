@@ -92,6 +92,7 @@ rustgate is an mTLS message router that accepts connections from clients over fo
 | D5 | Message replay attack | Anti-replay filter (`--replay-window`, default 300 seconds) | Mitigated |
 | D6 | Federation amplification | Hop count limit (`--federation-max-hops`); loop detection via provenance | Mitigated |
 | D7 | Metrics endpoint abuse | Connection limit (128), per-connection timeout, header read timeout (5s) | Mitigated |
+| D8 | Per-IP rate limit bypass via NAT/proxy | Per-IP rate limiters (WebSocket, MQTT, enrollment) use the raw TCP peer address. Behind NAT or a load balancer, all clients share one IP. See residual risks below | Partially mitigated |
 
 ### Elevation of Privilege
 
@@ -109,6 +110,7 @@ rustgate is an mTLS message router that accepts connections from clients over fo
 | I1 | Medium | Unauthenticated metrics endpoint exposes `rustgate_sessions_active`, `rustgate_connections_*`, routing stats | Firewall metrics port; bind to localhost or private interface |
 | S3 | Medium | Plaintext listeners accept unauthenticated traffic | Only enable on trusted networks; document security implications |
 | T3 | Low | NATS connection may be unencrypted | Enable NATS TLS in production (`--nats-tls-*` flags) |
+| D8 | Medium | Per-IP rate limiting uses raw TCP peer address; behind NAT/LB all clients share one IP and can starve each other, while attackers with multiple IPs bypass limits entirely | Use client-IP-preserving load balancers (DSR, IP passthrough); set per-IP limits above expected NAT fan-out; global handshake concurrency limit (`--max-concurrent-handshakes`) still applies regardless of IP |
 | T4/T5 | Low | On-disk config files could be tampered | Use read-only filesystem; External Secrets Operator in K8s |
 
 ## Relevant Documentation

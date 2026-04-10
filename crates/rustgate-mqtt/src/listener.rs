@@ -3,14 +3,22 @@
 //! Mirrors the pattern from [`rustgate_websocket`]: binds a TCP socket with
 //! `SO_REUSEADDR`, wraps it with a [`TlsAcceptor`], and extracts the client
 //! identity from the peer certificate.
+//!
+//! Includes per-IP connection rate limiting to mitigate slow-handshake DoS
+//! attacks where an adversary repeatedly initiates and abandons TLS
+//! handshakes. **Note:** rate limiting uses the raw TCP peer address. Behind
+//! NAT or a load balancer, all clients sharing one egress IP are rate-limited
+//! together. See the threat model (D8) for deployment guidance.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rustgate_core::constants::HANDSHAKE_TIMEOUT;
 use rustgate_core::error::{Result, TransportError};
 use rustgate_core::identity::Identity;
 use rustgate_core::net::configure_tcp_keepalive;
+use rustgate_core::ratelimit::ConnRateLimiter;
 use rustgate_transport::{TlsConfig, extract_identity};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
@@ -30,20 +38,32 @@ pub struct MqttPreSession {
     pub peer_addr: SocketAddr,
 }
 
+/// Maximum connection attempts per IP within the rate limit window.
+const CONN_RATE_LIMIT: usize = 10;
+
+/// Sliding window duration for connection rate limiting.
+const CONN_RATE_WINDOW: Duration = Duration::from_secs(10);
+
 /// MQTT TLS listener bound to a local address.
 ///
 /// Call [`accept`](MqttListener::accept) to wait for the next authenticated
 /// connection. Identity is derived from the client certificate; no MQTT-level
 /// authentication is performed here.
+///
+/// Includes per-IP connection rate limiting to mitigate slow-handshake DoS.
+/// Rate limiting uses the raw TCP peer address — see module docs for
+/// NAT/proxy caveats.
 pub struct MqttListener {
     tcp: TcpListener,
     acceptor: TlsAcceptor,
+    conn_rate: ConnRateLimiter,
 }
 
 impl std::fmt::Debug for MqttListener {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MqttListener")
             .field("local_addr", &self.tcp.local_addr())
+            .field("conn_rate", &self.conn_rate)
             .finish()
     }
 }
@@ -66,7 +86,11 @@ impl MqttListener {
 
         let tcp = TcpListener::from_std(socket.into())?;
 
-        Ok(Self { tcp, acceptor })
+        Ok(Self {
+            tcp,
+            acceptor,
+            conn_rate: ConnRateLimiter::new(CONN_RATE_LIMIT, CONN_RATE_WINDOW),
+        })
     }
 
     /// Return the local address this listener is bound to.
@@ -78,10 +102,22 @@ impl MqttListener {
 
     /// Accept the next mTLS-authenticated connection.
     ///
-    /// Returns `None` if the TLS handshake fails or the client certificate
-    /// cannot be validated. Callers should retry on `None`.
+    /// Returns `None` if the TLS handshake fails, the client certificate
+    /// cannot be validated, or the IP is rate-limited. Callers should
+    /// retry on `None`.
     pub async fn accept(&self) -> Result<Option<MqttPreSession>> {
         let (tcp_stream, peer_addr) = self.tcp.accept().await?;
+
+        // Per-IP connection rate limiting to mitigate slow-handshake DoS.
+        if self.conn_rate.is_limited(peer_addr.ip()) {
+            warn!(
+                peer = %peer_addr,
+                "MQTT connection rejected: rate limit exceeded for IP"
+            );
+            drop(tcp_stream);
+            return Ok(None);
+        }
+
         configure_tcp_keepalive(&tcp_stream);
 
         let tls_result =
