@@ -52,7 +52,7 @@ impl std::fmt::Debug for BackpressureGate {
             .field("current_bytes", &self.current())
             .field("high_water", &self.high_water)
             .field("low_water", &self.low_water)
-            .field("blocking", &self.blocking.load(Ordering::Relaxed))
+            .field("blocking", &self.blocking.load(Ordering::Acquire))
             .finish()
     }
 }
@@ -128,7 +128,7 @@ impl BackpressureGate {
     /// Returns `true` if the gate is currently admitting new connections
     /// (i.e. not parked over the high-water mark).
     pub fn is_admitting(&self) -> bool {
-        !self.blocking.load(Ordering::Relaxed)
+        !self.blocking.load(Ordering::Acquire)
     }
 
     /// Add `n` bytes to the counter. Trips the high-water mark if crossed.
@@ -139,7 +139,7 @@ impl BackpressureGate {
             cb(now);
         }
         if now >= self.high_water {
-            self.blocking.store(true, Ordering::Relaxed);
+            self.blocking.store(true, Ordering::Release);
         }
     }
 
@@ -151,7 +151,7 @@ impl BackpressureGate {
         if let Some(cb) = self.on_bytes_changed.as_ref() {
             cb(now);
         }
-        if now <= self.low_water && self.blocking.swap(false, Ordering::Relaxed) {
+        if now <= self.low_water && self.blocking.swap(false, Ordering::AcqRel) {
             self.notify.notify_waiters();
         }
     }
@@ -168,7 +168,7 @@ impl BackpressureGate {
     /// once admission resumes.
     pub async fn wait_for_capacity(&self) {
         // Fast path: gate is currently admitting.
-        if !self.blocking.load(Ordering::Relaxed) {
+        if !self.blocking.load(Ordering::Acquire) {
             return;
         }
         if let Some(cb) = self.on_deferred.as_ref() {
@@ -178,11 +178,11 @@ impl BackpressureGate {
             // Register for wakeup *before* re-checking the flag so we do
             // not miss a notify between the load and the await.
             let waiter = self.notify.notified();
-            if !self.blocking.load(Ordering::Relaxed) {
+            if !self.blocking.load(Ordering::Acquire) {
                 return;
             }
             waiter.await;
-            if !self.blocking.load(Ordering::Relaxed) {
+            if !self.blocking.load(Ordering::Acquire) {
                 return;
             }
         }

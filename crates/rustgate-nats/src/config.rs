@@ -124,6 +124,80 @@ pub struct NatsConfig {
     pub checkpoint_path: Option<PathBuf>,
 }
 
+impl NatsConfig {
+    /// Validate the NATS configuration.
+    ///
+    /// Checks that `subject_prefix`, `jetstream_subject_prefix`, and
+    /// `default_group` do not contain NATS wildcards (`*`, `>`) or
+    /// control characters that could cause subject injection.
+    pub fn validate(&self) -> Result<(), NatsConfigError> {
+        validate_nats_subject_prefix(&self.subject_prefix, "subject_prefix")?;
+        validate_nats_subject_prefix(&self.jetstream_subject_prefix, "jetstream_subject_prefix")?;
+        validate_nats_subject_token(&self.default_group, "default_group")?;
+        self.tls.validate().map_err(NatsConfigError::Tls)?;
+        Ok(())
+    }
+}
+
+/// Validate a NATS subject prefix (may contain `.` level separators).
+///
+/// Rejects wildcards (`*`, `>`), control characters, spaces, and
+/// non-ASCII bytes. The `.` separator is allowed since prefixes like
+/// `"TRACKS.HISTORY"` are valid multi-level subjects.
+fn validate_nats_subject_prefix(s: &str, field: &str) -> Result<(), NatsConfigError> {
+    if s.is_empty() {
+        return Err(NatsConfigError::InvalidSubject {
+            field: field.to_string(),
+            reason: "must not be empty".to_string(),
+        });
+    }
+    for b in s.bytes() {
+        if b <= 0x20 || b >= 0x7F || matches!(b, b'>' | b'*') {
+            return Err(NatsConfigError::InvalidSubject {
+                field: field.to_string(),
+                reason: format!(
+                    "contains invalid byte 0x{b:02X}; wildcards (*, >), \
+                     control characters, and non-ASCII are not allowed"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validate a single NATS subject token (no `.` separators allowed).
+fn validate_nats_subject_token(s: &str, field: &str) -> Result<(), NatsConfigError> {
+    if s.is_empty() {
+        return Err(NatsConfigError::InvalidSubject {
+            field: field.to_string(),
+            reason: "must not be empty".to_string(),
+        });
+    }
+    for b in s.bytes() {
+        if b <= 0x20 || b >= 0x7F || matches!(b, b'.' | b'>' | b'*') {
+            return Err(NatsConfigError::InvalidSubject {
+                field: field.to_string(),
+                reason: format!(
+                    "contains invalid byte 0x{b:02X}; wildcards (*, >), dots, \
+                     control characters, and non-ASCII are not allowed"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Errors from validating NATS configuration.
+#[derive(Debug, thiserror::Error)]
+pub enum NatsConfigError {
+    /// A subject prefix or token contains invalid characters.
+    #[error("NATS config `{field}`: {reason}")]
+    InvalidSubject { field: String, reason: String },
+    /// TLS configuration error.
+    #[error(transparent)]
+    Tls(#[from] NatsTlsConfigError),
+}
+
 impl Default for NatsConfig {
     fn default() -> Self {
         Self {
@@ -260,6 +334,132 @@ mod tests {
     fn has_client_auth_none() {
         let config = NatsTlsConfig::default();
         assert!(!config.has_client_auth());
+    }
+
+    #[test]
+    fn default_config_validates() {
+        NatsConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    fn wildcard_in_subject_prefix_rejected() {
+        let config = NatsConfig {
+            subject_prefix: "points.>".to_string(),
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, NatsConfigError::InvalidSubject { ref field, .. } if field == "subject_prefix"),
+            "expected InvalidSubject for subject_prefix, got: {err}"
+        );
+    }
+
+    #[test]
+    fn asterisk_in_subject_prefix_rejected() {
+        let config = NatsConfig {
+            subject_prefix: "points.*".to_string(),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn wildcard_in_jetstream_prefix_rejected() {
+        let config = NatsConfig {
+            jetstream_subject_prefix: "TRACKS.>".to_string(),
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, NatsConfigError::InvalidSubject { ref field, .. } if field == "jetstream_subject_prefix"),
+        );
+    }
+
+    #[test]
+    fn dot_in_subject_prefix_allowed() {
+        let config = NatsConfig {
+            subject_prefix: "my.prefix".to_string(),
+            ..Default::default()
+        };
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn dot_in_default_group_rejected() {
+        let config = NatsConfig {
+            default_group: "group.sub".to_string(),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn empty_subject_prefix_rejected() {
+        let config = NatsConfig {
+            subject_prefix: String::new(),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn control_char_in_subject_prefix_rejected() {
+        let config = NatsConfig {
+            subject_prefix: "points\x01bad".to_string(),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn del_in_subject_prefix_rejected() {
+        let config = NatsConfig {
+            subject_prefix: "points\x7Fbad".to_string(),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn space_in_subject_prefix_rejected() {
+        let config = NatsConfig {
+            subject_prefix: "points bad".to_string(),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn non_ascii_in_subject_prefix_rejected() {
+        let config = NatsConfig {
+            subject_prefix: "caf\u{00e9}".to_string(),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn tab_in_default_group_rejected() {
+        let config = NatsConfig {
+            default_group: "group\tname".to_string(),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn nats_config_validate_propagates_tls_error() {
+        let config = NatsConfig {
+            tls: NatsTlsConfig {
+                client_cert: Some(PathBuf::from("cert.pem")),
+                client_key: None,
+                ca_cert: None,
+                required: false,
+            },
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(matches!(err, NatsConfigError::Tls(_)));
     }
 
     #[test]
