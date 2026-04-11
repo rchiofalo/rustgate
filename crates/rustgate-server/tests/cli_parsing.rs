@@ -448,14 +448,26 @@ fn otlp_metrics_interval_accepts_positive_value() {
     // Parsing should succeed even without --otel-endpoint — the missing
     // endpoint is only checked at runtime when the exporter is actually
     // booted, not during pure CLI parsing for `validate-config`.
+    //
+    // Config validation checks TLS file existence, so create real temp
+    // files to satisfy that check.
+    let dir = std::env::temp_dir().join("rustgate-test-otlp-interval");
+    std::fs::create_dir_all(&dir).unwrap();
+    let cert = dir.join("c.pem");
+    let key = dir.join("k.pem");
+    let ca = dir.join("ca.pem");
+    std::fs::write(&cert, b"").unwrap();
+    std::fs::write(&key, b"").unwrap();
+    std::fs::write(&ca, b"").unwrap();
+
     let output = Command::new(rustgate_bin())
         .args([
             "--cert",
-            "c.pem",
+            cert.to_str().unwrap(),
             "--key",
-            "k.pem",
+            key.to_str().unwrap(),
             "--ca",
-            "ca.pem",
+            ca.to_str().unwrap(),
             "--otlp-metrics",
             "--otlp-metrics-interval",
             "30",
@@ -463,6 +475,8 @@ fn otlp_metrics_interval_accepts_positive_value() {
         ])
         .output()
         .expect("failed to execute binary");
+
+    let _ = std::fs::remove_dir_all(&dir);
 
     assert!(
         output.status.success(),
