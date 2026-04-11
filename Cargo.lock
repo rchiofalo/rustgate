@@ -3395,6 +3395,7 @@ dependencies = [
  "sha2",
  "smol_str",
  "spiffe",
+ "subtle",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

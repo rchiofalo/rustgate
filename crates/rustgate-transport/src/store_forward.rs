@@ -34,6 +34,7 @@ use redb::{Database, ReadableTable, TableDefinition};
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
 use sha2::Sha256;
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -134,6 +135,7 @@ struct Inner {
     enqueues: u64,
     writer_drops: u64,
     expired: u64,
+    tampered: u64,
     skipped_unsupported: u64,
 }
 
@@ -149,6 +151,7 @@ impl Inner {
             enqueues: 0,
             writer_drops: 0,
             expired: 0,
+            tampered: 0,
             skipped_unsupported: 0,
         }
     }
@@ -181,6 +184,16 @@ impl ClientQueue {
     /// scanned to rebuild the in-memory index so that [`Self::stats`] and
     /// eviction work correctly immediately after restart. Corrupt
     /// records are skipped with a warning rather than failing open.
+    ///
+    /// # Ephemeral HMAC key
+    ///
+    /// This method generates a fresh random HMAC key on each call.
+    /// Messages stored by a previous process instance will fail HMAC
+    /// verification and be **silently discarded** on drain, because the
+    /// new key cannot verify tags produced by the old key.
+    ///
+    /// If cross-restart integrity verification is required, use
+    /// [`Self::open_with_hmac_key()`] with an externally persisted key.
     pub fn open(dir: &Path, max_bytes: u64) -> Result<Self, StoreForwardError> {
         Self::open_with_hmac_key(dir, max_bytes, None)
     }
@@ -205,11 +218,14 @@ impl ClientQueue {
         let db = Database::create(&path).map_err(|e| StoreForwardError::Database(e.to_string()))?;
 
         // Derive or accept the HMAC key.
-        let hmac_key = Arc::new(hmac_key.unwrap_or_else(|| {
-            let mut key = Zeroizing::new([0u8; 32]);
-            fill_random(&mut *key);
-            key
-        }));
+        let hmac_key = Arc::new(match hmac_key {
+            Some(k) => k,
+            None => {
+                let mut key = Zeroizing::new([0u8; 32]);
+                fill_random(&mut *key)?;
+                key
+            }
+        });
 
         // Ensure both tables exist and rebuild in-memory index.
         let mut inner = Inner::new();
@@ -437,6 +453,12 @@ impl ClientQueue {
         self.inner.lock().expired
     }
 
+    /// Total messages discarded during drain because their HMAC tag
+    /// did not match, indicating tampering or a key mismatch.
+    pub fn tampered_total(&self) -> u64 {
+        self.inner.lock().tampered
+    }
+
     /// Total queue entries skipped on reopen because their destination
     /// was not a direct-addressed CN (broadcast/group).
     pub fn skipped_unsupported_total(&self) -> u64 {
@@ -534,6 +556,7 @@ impl ClientQueue {
         if expired_count > 0 || tampered_count > 0 {
             let mut inner = self.inner.lock();
             inner.expired = inner.expired.saturating_add(expired_count);
+            inner.tampered = inner.tampered.saturating_add(tampered_count);
         }
 
         debug!(
@@ -877,27 +900,29 @@ fn verify_hmac_envelope<'a>(
     }
     let (msg_data, tag) = stored.split_at(stored.len() - HMAC_LEN);
     let expected = compute_hmac(key, msg_data)?;
-    // Constant-time comparison via the subtle crate is not strictly
-    // required here (this is an at-rest integrity check, not a
-    // network-timing oracle), but we compare byte-by-byte via the
-    // standard equality operator which is sufficient.
-    if tag != expected {
+    // Constant-time comparison prevents timing side-channels even in
+    // the at-rest integrity case — defense-in-depth against local
+    // attackers measuring verification latency.
+    if tag.ct_eq(&expected).into() {
+        // Tag matches — fall through to return Ok.
+    } else {
         return Err(StoreForwardError::TamperedMessage);
     }
     Ok(msg_data)
 }
 
 /// Fill `dest` with cryptographically secure random bytes.
-fn fill_random(dest: &mut [u8]) {
+///
+/// Returns an error if the OS CSPRNG is unavailable. Callers must treat
+/// this as a fatal startup condition — a broken RNG means all
+/// cryptographic guarantees are void.
+fn fill_random(dest: &mut [u8]) -> Result<(), StoreForwardError> {
     use ring::rand::{SecureRandom, SystemRandom};
 
     let rng = SystemRandom::new();
-    // ring's SystemRandom uses OS-level CSPRNG and should not fail on
-    // any supported platform. If it does, we fall back to zero-fill
-    // which is detectable but avoids a panic in production.
-    if rng.fill(dest).is_err() {
-        warn!("CSPRNG fill failed; HMAC key may be weak");
-    }
+    rng.fill(dest).map_err(|_| {
+        StoreForwardError::Database("CSPRNG fill failed — OS random source unavailable".into())
+    })
 }
 
 /// Spawn the background writer task that services an async queue of
