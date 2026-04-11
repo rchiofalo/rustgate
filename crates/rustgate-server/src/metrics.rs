@@ -2302,6 +2302,7 @@ mod tests {
 
         let health = Arc::new(HealthState::new());
         health.set_ready(true);
+        let readiness = Arc::new(ReadinessState::new());
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -2310,14 +2311,17 @@ mod tests {
         drop(listener);
 
         let server_health = Arc::clone(&health);
+        let server_readiness = Arc::clone(&readiness);
         let server_router_slot = Arc::clone(&router_slot);
         drop(tokio::spawn(async move {
             let _ = serve(
                 addr,
                 server_health,
+                server_readiness,
                 #[cfg(feature = "federation")]
                 Arc::new(OnceLock::new()),
                 Arc::new(OnceLock::new()),
+                None,
                 server_router_slot,
             )
             .await;
@@ -2364,6 +2368,7 @@ mod tests {
 
         let health = Arc::new(HealthState::new());
         health.set_ready(true);
+        let readiness = Arc::new(ReadinessState::new());
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -2372,14 +2377,17 @@ mod tests {
         drop(listener);
 
         let server_health = Arc::clone(&health);
+        let server_readiness = Arc::clone(&readiness);
         let server_router_slot = Arc::clone(&router_slot);
         drop(tokio::spawn(async move {
             let _ = serve(
                 addr,
                 server_health,
+                server_readiness,
                 #[cfg(feature = "federation")]
                 Arc::new(OnceLock::new()),
                 Arc::new(OnceLock::new()),
+                None,
                 server_router_slot,
             )
             .await;
