@@ -1000,8 +1000,9 @@ impl Router {
     }
 
     /// Filter drained offline messages through the current ACL and authz
-    /// policies. Messages whose sender is no longer authorized are dropped
-    /// with a debug log. This re-checks authorization at delivery time,
+    /// policies. Messages whose sender is no longer authorized to send, or
+    /// whose recipient is no longer authorized to receive, are dropped with
+    /// a debug log. This re-checks authorization at delivery time,
     /// preventing stale permissions from the time of storage.
     ///
     /// Callers should invoke this on the output of
@@ -1009,11 +1010,20 @@ impl Router {
     /// session handle.
     pub fn filter_offline_messages(
         &self,
-        recipient_cn: &str,
+        recipient_identity: &Identity,
         messages: Vec<RoutableMessage>,
     ) -> Vec<RoutableMessage> {
+        if messages.len() > 1000 {
+            warn!(
+                cn = %recipient_identity.cn,
+                count = messages.len(),
+                "large offline message drain — filtering may be slow",
+            );
+        }
+
         let acl_guard = self.acl.load();
         let authz_guard = self.authz.load();
+        let recipient_cn = &recipient_identity.cn;
 
         messages
             .into_iter()
@@ -1042,6 +1052,7 @@ impl Router {
 
                 // Re-check authz engine for all message types.
                 if let Some(ref engine) = **authz_guard {
+                    // Sender Send check
                     let subject = AuthzSubject::from_identity(&msg.source);
                     let resource = match &msg.destination {
                         Destination::Direct(target) => AuthzResource::Direct {
@@ -1050,11 +1061,29 @@ impl Router {
                         Destination::Group(group) => AuthzResource::Group { group },
                         Destination::Broadcast => AuthzResource::Broadcast,
                     };
-                    let outcome = engine.evaluate(&subject, &resource, AuthzAction::Send);
+                    let outcome =
+                        self.authz_evaluate(engine, &subject, &resource, AuthzAction::Send);
                     if !outcome.is_allow() {
                         tracing::debug!(
                             sender = %msg.source.cn,
                             "dropping offline message: sender no longer authorized by policy"
+                        );
+                        return false;
+                    }
+
+                    // Recipient Receive check
+                    let recipient_subject = AuthzSubject::from_identity(recipient_identity);
+                    let outcome = self.authz_evaluate(
+                        engine,
+                        &recipient_subject,
+                        &resource,
+                        AuthzAction::Receive,
+                    );
+                    if !outcome.is_allow() {
+                        debug!(
+                            sender = %msg.source.cn,
+                            recipient = %recipient_identity.cn,
+                            "offline message filtered: recipient denied by authz",
                         );
                         return false;
                     }
@@ -1069,14 +1098,13 @@ impl Router {
     /// delivers them directly through a session handle. Kept for unit
     /// tests that exercise the drain path without a full session loop.
     ///
-    /// **Note:** this helper does NOT run [`Self::filter_offline_messages`].
-    /// Callers that need ACL/authz re-checking at delivery time should
-    /// use [`Self::drain_offline_messages`] followed by
-    /// [`Self::filter_offline_messages`] and flush the result manually.
+    /// # Warning
     ///
-    /// New code should use [`Self::drain_offline_messages`] and flush
-    /// the returned buffer explicitly BEFORE
-    /// [`Self::register`] to avoid live/queued ordering hazards.
+    /// This method does NOT apply ACL or authz filtering. Use
+    /// [`drain_offline_messages`](Self::drain_offline_messages) +
+    /// [`filter_offline_messages`](Self::filter_offline_messages) for
+    /// production drain paths.
+    #[cfg(test)]
     pub async fn drain_client_queue(&self, handle: &SessionHandle) -> u32 {
         let msgs = self.drain_offline_messages(&handle.identity.cn).await;
         let mut delivered = 0u32;
@@ -2780,10 +2808,11 @@ mod tests {
             .store(Arc::new(Some(crate::acl::GroupAclPolicy::new(groups))));
 
         let alice = make_identity("alice", &["ops"]);
+        let charlie = make_identity("charlie", &["ops"]);
         let msg = make_alert(&alice, Destination::Group("ops".to_string()));
 
         // alice is NOT authorized to send to "ops" → message should be filtered out.
-        let result = router.filter_offline_messages("charlie", vec![msg]);
+        let result = router.filter_offline_messages(&charlie, vec![msg]);
         assert!(
             result.is_empty(),
             "message from unauthorized sender should be filtered"
@@ -2808,10 +2837,11 @@ mod tests {
             .store(Arc::new(Some(crate::acl::GroupAclPolicy::new(groups))));
 
         let alice = make_identity("alice", &["ops"]);
+        let charlie = make_identity("charlie", &["ops"]);
         let msg = make_alert(&alice, Destination::Group("ops".to_string()));
 
         // "charlie" is NOT authorized to receive from "ops".
-        let result = router.filter_offline_messages("charlie", vec![msg]);
+        let result = router.filter_offline_messages(&charlie, vec![msg]);
         assert!(
             result.is_empty(),
             "message to unauthorized recipient should be filtered"
@@ -2836,10 +2866,11 @@ mod tests {
             .store(Arc::new(Some(crate::acl::GroupAclPolicy::new(groups))));
 
         let alice = make_identity("alice", &["ops"]);
+        let bob = make_identity("bob", &["ops"]);
         let msg = make_alert(&alice, Destination::Group("ops".to_string()));
 
         // Both sender and recipient are authorized → message passes through.
-        let result = router.filter_offline_messages("bob", vec![msg]);
+        let result = router.filter_offline_messages(&bob, vec![msg]);
         assert_eq!(result.len(), 1, "authorized message should pass through");
     }
 
@@ -2849,13 +2880,153 @@ mod tests {
 
         // No ACL policy loaded — backward compatible open mode.
         let alice = make_identity("alice", &["ops"]);
+        let bob = make_identity("bob", &["ops"]);
         let msg = make_alert(&alice, Destination::Group("ops".to_string()));
 
-        let result = router.filter_offline_messages("bob", vec![msg]);
+        let result = router.filter_offline_messages(&bob, vec![msg]);
         assert_eq!(
             result.len(),
             1,
             "all messages should pass when no policy is loaded"
+        );
+    }
+
+    // ── authz engine filter_offline_messages tests ─────────────────
+
+    /// Policy engine that denies all evaluations.
+    struct DenyAllEngine;
+
+    impl PolicyEngine for DenyAllEngine {
+        fn evaluate(
+            &self,
+            _subject: &AuthzSubject<'_>,
+            _resource: &AuthzResource<'_>,
+            _action: AuthzAction,
+        ) -> rustgate_authz::DecisionOutcome {
+            rustgate_authz::DecisionOutcome::deny()
+        }
+
+        fn policy_id(&self) -> &str {
+            "test-deny-all"
+        }
+    }
+
+    /// Policy engine that allows sends but denies receives.
+    struct DenySendFromCnEngine {
+        denied_cn: String,
+    }
+
+    impl PolicyEngine for DenySendFromCnEngine {
+        fn evaluate(
+            &self,
+            subject: &AuthzSubject<'_>,
+            _resource: &AuthzResource<'_>,
+            action: AuthzAction,
+        ) -> rustgate_authz::DecisionOutcome {
+            if action == AuthzAction::Send && subject.cn == self.denied_cn {
+                return rustgate_authz::DecisionOutcome::deny();
+            }
+            rustgate_authz::DecisionOutcome::allow()
+        }
+
+        fn policy_id(&self) -> &str {
+            "test-deny-send-cn"
+        }
+    }
+
+    #[test]
+    fn offline_messages_filtered_by_authz_deny_all() {
+        let router = Router::new().with_authz(Arc::new(DenyAllEngine));
+
+        let alice = make_identity("alice", &["ops"]);
+        let bob = make_identity("bob", &["ops"]);
+        let msg = make_alert(&alice, Destination::Group("ops".to_string()));
+
+        let result = router.filter_offline_messages(&bob, vec![msg]);
+        assert!(
+            result.is_empty(),
+            "deny-all engine should filter all offline messages"
+        );
+    }
+
+    #[test]
+    fn offline_messages_filtered_by_authz_sender_denied() {
+        let engine = DenySendFromCnEngine {
+            denied_cn: "alice".to_string(),
+        };
+        let router = Router::new().with_authz(Arc::new(engine));
+
+        let alice = make_identity("alice", &["ops"]);
+        let bob = make_identity("bob", &["ops"]);
+        let msg = make_alert(&alice, Destination::Group("ops".to_string()));
+
+        // alice is denied for Send → message should be filtered.
+        let result = router.filter_offline_messages(&bob, vec![msg]);
+        assert!(
+            result.is_empty(),
+            "message from authz-denied sender should be filtered"
+        );
+    }
+
+    #[test]
+    fn offline_messages_pass_authz_when_allowed() {
+        let engine = DenySendFromCnEngine {
+            denied_cn: "eve".to_string(),
+        };
+        let router = Router::new().with_authz(Arc::new(engine));
+
+        let alice = make_identity("alice", &["ops"]);
+        let bob = make_identity("bob", &["ops"]);
+        let msg = make_alert(&alice, Destination::Group("ops".to_string()));
+
+        // alice is NOT denied (only "eve" is) → message should pass.
+        let result = router.filter_offline_messages(&bob, vec![msg]);
+        assert_eq!(
+            result.len(),
+            1,
+            "message from allowed sender should pass authz filter"
+        );
+    }
+
+    #[test]
+    fn offline_messages_filtered_by_authz_recipient_denied() {
+        /// Engine that allows all sends but denies receive for a specific CN.
+        struct DenyReceiveEngine {
+            denied_cn: String,
+        }
+
+        impl PolicyEngine for DenyReceiveEngine {
+            fn evaluate(
+                &self,
+                subject: &AuthzSubject<'_>,
+                _resource: &AuthzResource<'_>,
+                action: AuthzAction,
+            ) -> rustgate_authz::DecisionOutcome {
+                if action == AuthzAction::Receive && subject.cn == self.denied_cn {
+                    return rustgate_authz::DecisionOutcome::deny();
+                }
+                rustgate_authz::DecisionOutcome::allow()
+            }
+
+            fn policy_id(&self) -> &str {
+                "test-deny-receive-cn"
+            }
+        }
+
+        let engine = DenyReceiveEngine {
+            denied_cn: "bob".to_string(),
+        };
+        let router = Router::new().with_authz(Arc::new(engine));
+
+        let alice = make_identity("alice", &["ops"]);
+        let bob = make_identity("bob", &["ops"]);
+        let msg = make_alert(&alice, Destination::Group("ops".to_string()));
+
+        // bob is denied for Receive → message should be filtered.
+        let result = router.filter_offline_messages(&bob, vec![msg]);
+        assert!(
+            result.is_empty(),
+            "message to authz-denied recipient should be filtered"
         );
     }
 }

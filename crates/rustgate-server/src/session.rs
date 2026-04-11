@@ -157,7 +157,9 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
     // messages, breaking FIFO across the reconnect boundary.
     let buffered_offline = deps.router.drain_offline_messages(&cn).await;
     let before = buffered_offline.len();
-    let buffered_offline = deps.router.filter_offline_messages(&cn, buffered_offline);
+    let buffered_offline = deps
+        .router
+        .filter_offline_messages(&identity, buffered_offline);
     let filtered = before - buffered_offline.len();
     if filtered > 0 {
         tracing::info!(
@@ -670,7 +672,7 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
                         // traffic cannot race ahead of queued entries.
                         let buffered_offline = router.drain_offline_messages(&cn).await;
                         let before = buffered_offline.len();
-                        let buffered_offline = router.filter_offline_messages(&cn, buffered_offline);
+                        let buffered_offline = router.filter_offline_messages(&identity, buffered_offline);
                         let filtered = before - buffered_offline.len();
                         if filtered > 0 {
                             tracing::info!(
