@@ -506,6 +506,9 @@ pub struct Router {
     dedup: ArcSwap<Option<DedupCache>>,
     /// Optional multicast routing configuration for SA events.
     multicast_config: ArcSwap<Option<MulticastConfig>>,
+    /// Optional per-tenant quota tracker. Hot-reloadable via `ArcSwap`.
+    /// When `None`, no tenant-level connection limits are enforced.
+    quota_tracker: ArcSwap<Option<Arc<crate::quota::TenantQuotaTracker>>>,
 }
 
 impl std::fmt::Debug for Router {
@@ -519,6 +522,10 @@ impl std::fmt::Debug for Router {
             .field("client_queue", &self.client_queue)
             .field("dedup", &self.dedup)
             .field("multicast_config", &self.multicast_config)
+            .field(
+                "quota_tracker_installed",
+                &(**self.quota_tracker.load()).is_some(),
+            )
             .finish()
     }
 }
@@ -535,6 +542,7 @@ impl Default for Router {
             client_queue: None,
             dedup: ArcSwap::from_pointee(None),
             multicast_config: ArcSwap::from_pointee(None),
+            quota_tracker: ArcSwap::from_pointee(None),
         }
     }
 }
@@ -564,6 +572,7 @@ impl Router {
             client_queue: None,
             dedup: ArcSwap::from_pointee(None),
             multicast_config: ArcSwap::from_pointee(None),
+            quota_tracker: ArcSwap::from_pointee(None),
         }
     }
 
@@ -599,6 +608,7 @@ impl Router {
             client_queue: None,
             dedup: ArcSwap::from_pointee(None),
             multicast_config: ArcSwap::from_pointee(None),
+            quota_tracker: ArcSwap::from_pointee(None),
         }
     }
 
@@ -637,6 +647,7 @@ impl Router {
             client_queue: None,
             dedup: ArcSwap::from_pointee(None),
             multicast_config: ArcSwap::from_pointee(None),
+            quota_tracker: ArcSwap::from_pointee(None),
         }
     }
 
@@ -763,15 +774,72 @@ impl Router {
         self.multicast_config.store(Arc::new(config));
     }
 
-    pub async fn register(&self, handle: SessionHandle) {
+    /// Attach a per-tenant quota tracker to the router.
+    ///
+    /// When installed, the router checks tenant connection limits during
+    /// [`register`](Self::register) and rejects sessions that exceed
+    /// the configured quota.
+    pub fn with_quota_tracker(self, tracker: Arc<crate::quota::TenantQuotaTracker>) -> Self {
+        self.quota_tracker.store(Arc::new(Some(tracker)));
+        self
+    }
+
+    /// Atomically replace the installed quota tracker.
+    pub fn swap_quota_tracker(&self, tracker: Option<Arc<crate::quota::TenantQuotaTracker>>) {
+        self.quota_tracker.store(Arc::new(tracker));
+    }
+
+    /// Snapshot the current quota tracker, if any.
+    pub fn quota_tracker(&self) -> Option<Arc<crate::quota::TenantQuotaTracker>> {
+        self.quota_tracker.load_full().as_ref().clone()
+    }
+
+    /// Register a session with the router.
+    ///
+    /// Returns `true` if the session was accepted, `false` if it was
+    /// rejected by a per-tenant quota limit. When rejected, the session
+    /// is not registered and a warning is emitted.
+    pub async fn register(&self, handle: SessionHandle) -> bool {
         let cn = handle.identity.cn.clone();
         let new_groups = handle.identity.groups.clone();
+
+        // Per-tenant quota check: reject early if tenant is over limit.
+        let tenant = handle.identity.tenant.clone();
+        if let Some(ref tenant_name) = tenant {
+            let guard = self.quota_tracker.load();
+            if let Some(ref tracker) = **guard {
+                if !tracker.check_connection(tenant_name) {
+                    warn!(
+                        cn = %cn,
+                        tenant = %tenant_name,
+                        "session rejected: tenant connection quota exceeded"
+                    );
+                    return false;
+                }
+            }
+        }
 
         let mut state = self.state.write().await;
 
         // Clean stale group entries if this CN was previously registered
+        let had_previous = state.sessions.contains_key(&cn);
         if let Some(old) = state.sessions.remove(&cn) {
             state.remove_from_groups(&cn, &old.identity.groups);
+            // Decrement quota counter for replaced session's tenant.
+            if let Some(ref old_tenant) = old.identity.tenant {
+                let guard = self.quota_tracker.load();
+                if let Some(ref tracker) = **guard {
+                    tracker.record_disconnect(old_tenant);
+                }
+            }
+        }
+
+        // Record the new connection in the quota tracker.
+        if let Some(ref tenant_name) = tenant {
+            let guard = self.quota_tracker.load();
+            if let Some(ref tracker) = **guard {
+                tracker.record_connect(tenant_name);
+            }
         }
 
         let _ = state.sessions.insert(cn.clone(), handle);
@@ -806,6 +874,9 @@ impl Router {
             }
             joined += 1;
         }
+
+        let _ = had_previous;
+        true
     }
 
     /// Remove a session only if its ID matches the currently registered one.
@@ -819,6 +890,13 @@ impl Router {
         }
         if let Some(handle) = state.sessions.remove(cn) {
             state.remove_from_groups(cn, &handle.identity.groups);
+            // Decrement quota counter for the disconnected tenant.
+            if let Some(ref tenant) = handle.identity.tenant {
+                let guard = self.quota_tracker.load();
+                if let Some(ref tracker) = **guard {
+                    tracker.record_disconnect(tenant);
+                }
+            }
         }
         drop(state);
         self.cache.remove(cn).await;
@@ -1949,7 +2027,7 @@ mod tests {
         let handle = SessionHandle::new(alice.clone(), ptx, ntx);
         let session_id = handle.id;
 
-        router.register(handle).await;
+        let _ = router.register(handle).await;
 
         // Cache a position
         let pos = make_position(&alice, Destination::Broadcast);
@@ -2658,7 +2736,7 @@ mod tests {
         // buffered message to his session channel.
         let (ptx_b, ntx_b, _prx_b, mut nrx_b) = make_channels(16, 16);
         let handle = SessionHandle::new(bob.clone(), ptx_b, ntx_b);
-        router.register(handle.clone()).await;
+        let _ = router.register(handle.clone()).await;
         let delivered = router.drain_client_queue(&handle).await;
         assert_eq!(delivered, 1);
 
@@ -2713,7 +2791,7 @@ mod tests {
         // the buffered messages, then route live traffic.
         let buffered = router.drain_offline_messages("bob").await;
         assert_eq!(buffered.len(), 3);
-        router.register(handle.clone()).await;
+        let _ = router.register(handle.clone()).await;
         for m in buffered {
             handle.send(Arc::new(m)).await.expect("flush offline");
         }
@@ -2996,7 +3074,7 @@ mod tests {
         let (ptx, ntx, _prx, mut nrx) = make_channels(16, 16);
         let handle = SessionHandle::new(alice.clone(), ptx, ntx);
         let sid = handle.id;
-        router.register(handle).await;
+        let _ = router.register(handle).await;
 
         // Alice is in "alpha" from cert. Dynamically join "bravo".
         assert!(router.join_group("alice", sid, "bravo").await);
@@ -3024,7 +3102,7 @@ mod tests {
         let (ptx, ntx, _prx, mut nrx) = make_channels(16, 16);
         let handle = SessionHandle::new(alice.clone(), ptx, ntx);
         let sid = handle.id;
-        router.register(handle).await;
+        let _ = router.register(handle).await;
 
         // Dynamically join then leave "bravo".
         assert!(router.join_group("alice", sid, "bravo").await);
@@ -3054,12 +3132,12 @@ mod tests {
         let (ptx, ntx, _prx, _nrx) = make_channels(16, 16);
         let handle = SessionHandle::new(alice.clone(), ptx, ntx);
         let stale_id = handle.id;
-        router.register(handle).await;
+        let _ = router.register(handle).await;
 
         // Re-register (simulates reconnect), gets a new session ID.
         let (ptx2, ntx2, _prx2, _nrx2) = make_channels(16, 16);
         let handle2 = SessionHandle::new(alice.clone(), ptx2, ntx2);
-        router.register(handle2).await;
+        let _ = router.register(handle2).await;
 
         // Old session ID should be rejected.
         assert!(!router.join_group("alice", stale_id, "bravo").await);
@@ -3073,7 +3151,7 @@ mod tests {
         let (ptx, ntx, _prx, _nrx) = make_channels(16, 16);
         let handle = SessionHandle::new(alice.clone(), ptx, ntx);
         let sid = handle.id;
-        router.register(handle).await;
+        let _ = router.register(handle).await;
 
         // "alpha" is already joined from cert (1/2). Join "bravo" (2/2).
         assert!(router.join_group("alice", sid, "bravo").await);
@@ -3089,7 +3167,7 @@ mod tests {
         let (ptx, ntx, _prx, _nrx) = make_channels(16, 16);
         let handle = SessionHandle::new(alice.clone(), ptx, ntx);
         let sid = handle.id;
-        router.register(handle).await;
+        let _ = router.register(handle).await;
 
         // "alpha" exists (1/2). Add "bravo" (2/2).
         assert!(router.join_group("alice", sid, "bravo").await);

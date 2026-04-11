@@ -169,7 +169,7 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
             "filtered offline messages through current ACL/authz policy"
         );
     }
-    deps.router.register(handle.clone()).await;
+    let _ = deps.router.register(handle.clone()).await;
     for m in buffered_offline {
         if handle.send(Arc::new(m)).await.is_err() {
             break;
@@ -683,7 +683,7 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
                                 "filtered offline messages through current ACL/authz policy"
                             );
                         }
-                        router.register(handle.clone()).await;
+                        let _ = router.register(handle.clone()).await;
                         for m in buffered_offline {
                             if handle.send(Arc::new(m)).await.is_err() {
                                 break;

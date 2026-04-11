@@ -215,7 +215,7 @@ async fn handle_ws_session(
             "filtered offline messages on WebSocket reconnect",
         );
     }
-    router.register(handle.clone()).await;
+    let _ = router.register(handle.clone()).await;
     for m in buffered_offline {
         if handle.send(Arc::new(m)).await.is_err() {
             break;

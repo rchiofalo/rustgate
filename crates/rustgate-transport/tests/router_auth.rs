@@ -247,7 +247,7 @@ async fn concurrent_register_unregister_no_races() {
             let (ptx, ntx, _prx, _nrx) = make_channels(16);
             let session = SessionHandle::new(identity, ptx, ntx);
             let session_id = session.id;
-            r.register(session).await;
+            let _ = r.register(session).await;
 
             // Small yield to interleave with other tasks
             tokio::task::yield_now().await;
@@ -277,7 +277,7 @@ async fn concurrent_register_same_group() {
             let cn = format!("member-{i}");
             let identity = make_identity(&cn, &["team"]);
             let (ptx, ntx, _prx, _nrx) = make_channels(16);
-            r.register(SessionHandle::new(identity, ptx, ntx)).await;
+            let _ = r.register(SessionHandle::new(identity, ptx, ntx)).await;
         }));
     }
 

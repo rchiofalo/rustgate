@@ -147,7 +147,7 @@ async fn disabled_equivalent_huge_cap_has_no_observable_effect() {
     let (pri_tx, mut pri_rx) = mpsc::channel(64);
     let (norm_tx, mut norm_rx) = mpsc::channel(64);
     let handle = SessionHandle::new(Arc::new(make_identity("fast")), pri_tx, norm_tx);
-    router.register(handle).await;
+    let _ = router.register(handle).await;
 
     // Drain receivers to allow immediate throughput.
     tokio::spawn(async move { while pri_rx.recv().await.is_some() {} });

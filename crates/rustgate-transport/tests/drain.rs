@@ -53,7 +53,7 @@ async fn drain_flushes_queued_messages_before_eof() {
     let (bob_p, mut bob_p_rx) = mpsc::channel(PRIORITY_CHANNEL_CAPACITY);
     let (bob_n, mut bob_n_rx) = mpsc::channel(NORMAL_CHANNEL_CAPACITY);
     let bob_handle = SessionHandle::new(bob.clone(), bob_p, bob_n);
-    router.register(bob_handle.clone()).await;
+    let _ = router.register(bob_handle.clone()).await;
 
     // Push a healthy batch of messages to bob via the router. Stay
     // under NORMAL_CHANNEL_CAPACITY so nothing is rejected before the
