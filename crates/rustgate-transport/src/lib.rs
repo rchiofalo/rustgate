@@ -75,4 +75,4 @@ mod plaintext;
 pub mod udp;
 
 pub use plaintext::{PlaintextIdentityConfig, PlaintextListener, PlaintextSession};
-pub use udp::{UdpInput, UdpInputConfig};
+pub use udp::{CidrPrefix, UdpInput, UdpInputConfig};

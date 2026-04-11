@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Delivery dedup for store-forward queue on restart** — drained messages are now recorded in a `delivered_seqs_v1` redb table before removal from the queue. On restart, `ClientQueue::open` skips and purges entries found in the delivered table, preventing duplicate delivery when the process crashes between drain and caller acknowledgement. (#661)
 - **RUSTSEC-2026-0002 — bump `lru` to 0.16.3** — the `lru` crate versions `>=0.9.0, <0.16.3` contained a soundness issue where `IterMut::next`/`next_back` temporarily created an exclusive reference to the key, invalidating the shared pointer held by the internal `HashMap` and violating Stacked Borrows. rustgate transitively pulled in `lru 0.12.5` via `rustgate-transport`. The workspace dependency has been bumped to `0.16.3`, which contains the upstream fix. (#582)
 - **CSR signature verification** — documented and tested that CSR self-signatures are verified before certificate issuance, preventing forged-subject attacks. rcgen's `CertificateSigningRequestParams::from_pem()` internally calls `x509_parser` signature verification, rejecting CSRs where the public key does not match the self-signature. (#654)
+- **UDP transport hardening** — add per-IP rate limiting, source CIDR allowlist, and identity cap to UDP transport to prevent flooding and spoofing attacks. All restrictions are opt-in for backward compatibility. (#662)
 
 ### Fixed
 

@@ -453,6 +453,22 @@ pub(crate) struct Cli {
     #[arg(long, env = "RUSTGATE_UDP_BIND", value_parser = parse_socket_addr)]
     pub(crate) udp_bind: Option<String>,
 
+    /// Per-IP rate limit in packets per second for UDP input.
+    /// Set to 0 (default) to disable rate limiting.
+    #[arg(long, default_value = "0", env = "RUSTGATE_UDP_RATE_LIMIT")]
+    pub(crate) udp_rate_limit: u32,
+
+    /// Comma-separated list of CIDR prefixes that are allowed to send UDP
+    /// datagrams (e.g. "10.0.0.0/8,192.168.0.0/16"). When unset, all
+    /// source IPs are accepted.
+    #[arg(long, env = "RUSTGATE_UDP_ALLOWED_CIDRS")]
+    pub(crate) udp_allowed_cidrs: Option<String>,
+
+    /// Maximum number of concurrent synthetic UDP identities tracked.
+    /// Packets from new source IPs are rejected when the cap is reached.
+    #[arg(long, default_value = "1024", env = "RUSTGATE_UDP_MAX_IDENTITIES", value_parser = parse_nonzero_usize)]
+    pub(crate) udp_max_identities: usize,
+
     /// Default CN for plaintext (TCP/UDP) clients.
     #[arg(long, default_value = "anonymous", env = "RUSTGATE_PLAINTEXT_CN")]
     pub(crate) plaintext_cn: String,
@@ -1096,6 +1112,9 @@ define_config_file! {
     mqtt_max_packet_size: usize,
     tcp_bind: Option<String>,
     udp_bind: Option<String>,
+    udp_rate_limit: u32,
+    udp_allowed_cidrs: Option<String>,
+    udp_max_identities: usize,
     plaintext_cn: String,
     plaintext_group: String,
     federation_v1_bind: Option<String>,
@@ -1369,6 +1388,9 @@ mod tests {
             "RUSTGATE_WS_MAX_VIOLATIONS",
             "RUSTGATE_TCP_BIND",
             "RUSTGATE_UDP_BIND",
+            "RUSTGATE_UDP_RATE_LIMIT",
+            "RUSTGATE_UDP_ALLOWED_CIDRS",
+            "RUSTGATE_UDP_MAX_IDENTITIES",
             "RUSTGATE_PLAINTEXT_CN",
             "RUSTGATE_PLAINTEXT_GROUP",
             "RUSTGATE_FEDERATION_V1_BIND",
