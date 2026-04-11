@@ -159,6 +159,38 @@ pub struct PeerSwapDiff {
     pub failed: Vec<(PeerId, String)>,
 }
 
+/// Sort peers for routing preference: same-region first, then by
+/// latency (ascending), then by priority (ascending).
+///
+/// Peers with zero latency (no RTT samples) sort after peers with data
+/// to avoid routing to unmeasured peers when measured alternatives exist.
+fn sort_peers_by_preference(
+    peers: &mut [(PeerId, Arc<FederationClient>, Arc<PeerHandle>)],
+    local_region: Option<&str>,
+) {
+    peers.sort_by(|a, b| {
+        let a_same_region = local_region.is_some_and(|r| a.2.config.region.as_deref() == Some(r));
+        let b_same_region = local_region.is_some_and(|r| b.2.config.region.as_deref() == Some(r));
+
+        let a_latency = a.2.latency_nanos();
+        let b_latency = b.2.latency_nanos();
+
+        // Peers with measured latency sort before peers with no data
+        let a_has_data = a_latency > 0;
+        let b_has_data = b_latency > 0;
+
+        // Same-region peers first
+        b_same_region
+            .cmp(&a_same_region)
+            // Peers with measured latency before unmeasured
+            .then(b_has_data.cmp(&a_has_data))
+            // Then lower latency
+            .then(a_latency.cmp(&b_latency))
+            // Then lower priority number (higher priority)
+            .then(a.2.config.priority.cmp(&b.2.config.priority))
+    });
+}
+
 /// Structural equality of two peer configurations for hot-reload diffing.
 fn peers_equal(a: &crate::config::PeerConfig, b: &crate::config::PeerConfig) -> bool {
     a.id == b.id
@@ -798,7 +830,7 @@ impl FederationManager {
 
         // Snapshot clients and peer handles so callers can release the outer
         // lock before we block on per-peer channel sends.
-        let snapshot: Vec<(PeerId, Arc<FederationClient>, Arc<PeerHandle>)> = self
+        let mut snapshot: Vec<(PeerId, Arc<FederationClient>, Arc<PeerHandle>)> = self
             .clients
             .iter()
             .filter_map(|(id, client)| {
@@ -807,6 +839,10 @@ impl FederationManager {
                     .map(|peer| (id.clone(), Arc::clone(client), Arc::clone(peer)))
             })
             .collect();
+
+        // Sort peers by routing preference: same-region first, then by
+        // measured latency (ascending), then by priority (ascending).
+        sort_peers_by_preference(&mut snapshot, self.config.local_region.as_deref());
 
         for (id, client, peer) in &snapshot {
             if !peer.is_available() {
@@ -864,6 +900,14 @@ impl FederationManager {
                         #[cfg(feature = "api")]
                         crate::metrics::circuit_breaker_recoveries().inc();
                         audit::federation_circuit_recovered(id);
+                    }
+                    // Track cross-region forwards for observability
+                    #[cfg(feature = "api")]
+                    if let Some(ref local) = self.config.local_region {
+                        let is_cross = peer.config.region.as_ref().is_none_or(|r| r != local);
+                        if is_cross {
+                            crate::metrics::cross_region_forwards().inc();
+                        }
                     }
                     sent += 1;
                 }
@@ -1179,6 +1223,16 @@ impl FederationManager {
                     p.oldest_queued_age_secs().unwrap_or(0.0),
                 )
             })
+            .collect()
+    }
+
+    /// Snapshot per-peer EWMA latency for metrics export.
+    ///
+    /// Returns a vector of `(peer_id, latency_nanos)` tuples.
+    pub fn peer_latency_snapshot(&self) -> Vec<(String, u64)> {
+        self.peers
+            .iter()
+            .map(|(id, p)| (id.to_string(), p.latency_nanos()))
             .collect()
     }
 
