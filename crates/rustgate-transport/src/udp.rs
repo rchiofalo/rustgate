@@ -8,7 +8,7 @@
 //!
 //! - **Per-IP rate limiting** — configurable packets-per-second threshold
 //!   prevents flooding from a single source. Uses the existing
-//!   [`ConnRateLimiter`](crate::ratelimit::ConnRateLimiter) keyed by IP.
+//!   `ConnRateLimiter` from `rustgate-core` keyed by IP.
 //! - **Source CIDR allowlist** — optional list of authorized source IP
 //!   prefixes. When configured, packets from unlisted IPs are silently
 //!   dropped.
