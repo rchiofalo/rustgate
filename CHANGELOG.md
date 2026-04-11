@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - **Federation TTL re-check at forward boundary** — the federation manager now re-evaluates each message's TTL immediately before queuing it to peer outbound channels via the new `FederationManager::forward_with_metadata` API. Messages whose `received_at + ttl` has elapsed between local routing and federation forwarding are dropped with a warning instead of consuming peer bandwidth. A new `rustgate_federation_forward_ttl_expired_total` Prometheus counter (under the `api` feature) tracks drops, and the `federation` snapshot endpoint exposes the same value as `forward_ttl_expired`. The legacy `forward(payload, groups)` entrypoint is preserved for callers that have no TTL context. (#554)
 
+### Changed
+
+- **Rust toolchain aligned to 1.94** — updated `rust-toolchain.toml`, CI workflows, and `Cargo.toml` MSRV to consistently target Rust 1.94.
+
 ### Added
 
 - **Documentation site scaffold (GitHub Pages)** — new `docs-site/` mdBook project and `.github/workflows/docs.yml` GitHub Actions workflow publish a structured public documentation site to GitHub Pages on every push to `main`. The site organizes getting-started guides, architecture, operations runbooks, API reference, security analysis, and a research section (why rustgate, comparison to alternatives, exploit resistance matrix, benchmarks, and downloadable papers). The workflow also builds `cargo doc --workspace --no-deps` and mounts it at `/api/rustdoc/` alongside the book. Preprocessors wired in: `mdbook-mermaid` (diagrams), `mdbook-admonish` (callouts), `mdbook-toc` (per-page TOC), and `mdbook-linkcheck` (CI link validation). MathJax is enabled for research pages. The initial commit seeds the exploit-resistance matrix and the "why rustgate" advocacy page with real content; remaining pages are stub placeholders to be filled in subsequent PRs.
