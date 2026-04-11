@@ -1,3 +1,4 @@
+#![allow(unused_results)]
 #![allow(clippy::panic, clippy::unwrap_used)]
 //! Integration tests for the rustgate-authz PolicyEngine wired into
 //! `Router::route`. Covers the acceptance scenarios:

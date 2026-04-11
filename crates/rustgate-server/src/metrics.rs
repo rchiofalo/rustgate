@@ -125,6 +125,7 @@ static AUTHZ_CACHE_MISSES: OnceLock<IntCounter> = OnceLock::new();
 
 static ARCHIVE_BYTES: OnceLock<IntGauge> = OnceLock::new();
 static ENROLLMENT_RATE_LIMITED: OnceLock<IntCounter> = OnceLock::new();
+static TENANT_QUOTA_REJECTIONS: OnceLock<IntCounterVec> = OnceLock::new();
 
 #[cfg(feature = "spiffe")]
 static SPIFFE_SVID_REFRESH_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
@@ -488,6 +489,16 @@ pub fn init() -> prometheus::Result<()> {
     ))?;
     registry.register(Box::new(enrollment_rate_limited.clone()))?;
     let _ = ENROLLMENT_RATE_LIMITED.set(enrollment_rate_limited);
+
+    let tenant_quota_rejections = IntCounterVec::new(
+        Opts::new(
+            "rustgate_tenant_quota_rejections_total",
+            "Sessions rejected because the tenant connection quota was exceeded",
+        ),
+        &["tenant"],
+    )?;
+    registry.register(Box::new(tenant_quota_rejections.clone()))?;
+    let _ = TENANT_QUOTA_REJECTIONS.set(tenant_quota_rejections);
 
     let authz_decisions = IntCounterVec::new(
         Opts::new(
@@ -978,6 +989,17 @@ pub fn client_ocsp_cache_misses() -> Option<&'static IntCounter> {
 pub fn enrollment_rate_limited() -> &'static IntCounter {
     ENROLLMENT_RATE_LIMITED
         .get_or_init(|| fallback_counter("rustgate_enrollment_rate_limited_total", "fallback"))
+}
+
+/// Per-tenant quota rejection counter, labelled by `tenant`.
+pub fn tenant_quota_rejections() -> &'static IntCounterVec {
+    TENANT_QUOTA_REJECTIONS.get_or_init(|| {
+        fallback_counter_vec(
+            "rustgate_tenant_quota_rejections_total",
+            "fallback",
+            &["tenant"],
+        )
+    })
 }
 
 /// Returns the client-queue depth gauge vector (Tier 1, registered

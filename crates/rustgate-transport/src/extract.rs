@@ -52,12 +52,18 @@ pub fn extract_identity(cert_der: &CertificateDer<'_>) -> Result<Identity> {
 
     let (attributes, spiffe_id) = extract_attributes(&cert, cert_der);
 
+    let tenant =
+        first_subject_attr(&cert, &OID_X509_ORGANIZATION_NAME).map(|o| sanitize_for_log(&o));
+
     let mut identity = Identity::new(cn, fingerprint, groups).map_err(|e| {
         RustgateError::from(TransportError::Other(format!(
             "invalid identity from certificate: {e}"
         )))
     })?;
     identity = identity.with_attributes(attributes);
+    if let Some(tenant) = tenant {
+        identity = identity.with_tenant(tenant);
+    }
     if let Some(spiffe) = spiffe_id {
         identity = identity.with_spiffe_id(spiffe);
     }

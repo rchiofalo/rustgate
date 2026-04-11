@@ -239,6 +239,7 @@ mod tests {
             cn: "alice".to_string(),
             fingerprint: "abc123".to_string(),
             groups: std::collections::BTreeSet::new(),
+            tenant: None,
             spiffe_id: None,
             attributes: std::sync::Arc::new(std::collections::BTreeMap::new()),
         };

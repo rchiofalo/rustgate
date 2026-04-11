@@ -805,6 +805,16 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = false, env = "RUSTGATE_AUTHZ_FAIL_OPEN")]
     pub(crate) authz_fail_open: bool,
 
+    /// Path to a JSON file defining per-tenant connection quotas.
+    ///
+    /// When set, the server loads the quota configuration at startup and
+    /// installs a `TenantQuotaTracker` on the router. Connections from
+    /// tenants that exceed their `max_connections` limit are rejected at
+    /// registration time. Tenants are identified by the certificate
+    /// Organization (O) subject field.
+    #[arg(long, env = "RUSTGATE_TENANT_QUOTA_FILE")]
+    pub(crate) tenant_quota_file: Option<std::path::PathBuf>,
+
     /// Path to a file containing the bearer token required to access the
     /// `/api/acl/` REST endpoints (both read and mutation routes).
     ///
@@ -1195,6 +1205,7 @@ define_config_file! {
     authz_policy_format: AuthzPolicyFormat,
     authz_reload_interval: u64,
     authz_fail_open: bool,
+    tenant_quota_file: Option<std::path::PathBuf>,
     acl_api_token_file: Option<String>,
     archive_dir: Option<String>,
     archive_key_file: Option<std::path::PathBuf>,

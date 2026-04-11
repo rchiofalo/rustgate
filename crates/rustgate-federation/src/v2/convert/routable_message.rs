@@ -242,6 +242,7 @@ mod tests {
                 cn: "test-peer".into(),
                 fingerprint: "abc123".into(),
                 groups: BTreeSet::new(),
+                tenant: None,
                 spiffe_id: None,
                 attributes: std::sync::Arc::new(std::collections::BTreeMap::new()),
             },

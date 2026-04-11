@@ -219,7 +219,10 @@ pub(crate) async fn handle_mqtt_session(
             "filtered offline messages on MQTT reconnect",
         );
     }
-    router.register(handle.clone()).await;
+    if !router.register(handle.clone()).await {
+        warn!(cn = %cn, "connection rejected: tenant quota exceeded");
+        return;
+    }
     for m in buffered {
         if handle.send(Arc::new(m)).await.is_err() {
             break;

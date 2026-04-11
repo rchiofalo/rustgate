@@ -3407,6 +3407,8 @@ dependencies = [
  "rustgate-test-utils",
  "rustls",
  "rustls-pki-types",
+ "serde",
+ "serde_json",
  "sha2",
  "smol_str",
  "spiffe",

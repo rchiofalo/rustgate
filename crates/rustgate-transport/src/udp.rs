@@ -299,7 +299,7 @@ impl UdpInput {
         let (ntx, _nrx) = mpsc::channel::<crate::RoutedMessage>(1);
         let handle = SessionHandle::new(Arc::clone(&identity), ptx, ntx);
         let session_id = handle.id;
-        router.register(handle).await;
+        let _ = router.register(handle).await;
 
         loop {
             tokio::select! {
@@ -559,7 +559,7 @@ mod tests {
         let (listener_ptx, mut listener_prx) = mpsc::channel::<crate::RoutedMessage>(16);
         let (listener_ntx, mut listener_nrx) = mpsc::channel::<crate::RoutedMessage>(16);
         let listener_handle = SessionHandle::new(listener_identity, listener_ptx, listener_ntx);
-        router.register(listener_handle).await;
+        let _ = router.register(listener_handle).await;
 
         let router_clone = Arc::clone(&router);
         let task = tokio::spawn(async move {
@@ -654,7 +654,7 @@ mod tests {
         let (ptx, mut prx) = mpsc::channel::<crate::RoutedMessage>(64);
         let (ntx, mut nrx) = mpsc::channel::<crate::RoutedMessage>(64);
         let handle = SessionHandle::new(listener_identity, ptx, ntx);
-        router.register(handle).await;
+        let _ = router.register(handle).await;
 
         let router_clone = Arc::clone(&router);
         let task = tokio::spawn(async move {
@@ -710,7 +710,7 @@ mod tests {
         let (ptx, mut prx) = mpsc::channel::<crate::RoutedMessage>(64);
         let (ntx, mut nrx) = mpsc::channel::<crate::RoutedMessage>(64);
         let handle = SessionHandle::new(listener_identity, ptx, ntx);
-        router.register(handle).await;
+        let _ = router.register(handle).await;
 
         let router_clone = Arc::clone(&router);
         let task = tokio::spawn(async move {
@@ -786,7 +786,7 @@ mod tests {
         let (ptx, mut prx) = mpsc::channel::<crate::RoutedMessage>(16);
         let (ntx, mut nrx) = mpsc::channel::<crate::RoutedMessage>(16);
         let handle = SessionHandle::new(listener_identity, ptx, ntx);
-        router.register(handle).await;
+        let _ = router.register(handle).await;
 
         let router_clone = Arc::clone(&router);
         let task = tokio::spawn(async move {
@@ -847,7 +847,7 @@ mod tests {
         let (ptx, mut prx) = mpsc::channel::<crate::RoutedMessage>(16);
         let (ntx, mut nrx) = mpsc::channel::<crate::RoutedMessage>(16);
         let handle = SessionHandle::new(listener_identity, ptx, ntx);
-        router.register(handle).await;
+        let _ = router.register(handle).await;
 
         let router_clone = Arc::clone(&router);
         let task = tokio::spawn(async move {
@@ -906,7 +906,7 @@ mod tests {
         let (ptx, mut prx) = mpsc::channel::<crate::RoutedMessage>(64);
         let (ntx, mut nrx) = mpsc::channel::<crate::RoutedMessage>(64);
         let handle = SessionHandle::new(listener_identity, ptx, ntx);
-        router.register(handle).await;
+        let _ = router.register(handle).await;
 
         let router_clone = Arc::clone(&router);
         let task = tokio::spawn(async move {

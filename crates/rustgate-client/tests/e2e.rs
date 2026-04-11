@@ -45,7 +45,7 @@ fn spawn_session(session: AuthenticatedSession, router: Arc<Router>) {
         let (ntx, mut nrx) = mpsc::channel::<rustgate_transport::RoutedMessage>(64);
         let handle = SessionHandle::new(Arc::clone(&identity), ptx, ntx);
         let session_id = handle.id;
-        router.register(handle).await;
+        let _ = router.register(handle).await;
         let (reader, writer) = session.split();
         let id_for_read = Arc::clone(&identity);
         let router_for_read = Arc::clone(&router);
@@ -181,7 +181,7 @@ async fn client_recovers_after_server_restart() {
             let (ptx, mut prx) = mpsc::channel::<rustgate_transport::RoutedMessage>(16);
             let (ntx, mut nrx) = mpsc::channel::<rustgate_transport::RoutedMessage>(64);
             let handle = SessionHandle::new(Arc::clone(&identity), ptx, ntx);
-            router.register(handle).await;
+            let _ = router.register(handle).await;
             let (reader, writer) = session.split();
             let mut framed_r = FramedRead::new(reader, LengthPrefixedCodec::new(HeaderSize::Four));
             let mut framed_w = FramedWrite::new(writer, LengthPrefixedCodec::new(HeaderSize::Four));

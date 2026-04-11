@@ -290,14 +290,14 @@ mod tests {
         let (ptx_b, _ntx_b) = tokio::sync::mpsc::channel(16);
         let (ptx_b2, _ntx_b2) = tokio::sync::mpsc::channel(16);
 
-        router
+        let _ = router
             .register(rustgate_transport::SessionHandle::new(
                 alice_id.clone(),
                 ptx_a,
                 ptx_a2,
             ))
             .await;
-        router
+        let _ = router
             .register(rustgate_transport::SessionHandle::new(
                 bob_id.clone(),
                 ptx_b,

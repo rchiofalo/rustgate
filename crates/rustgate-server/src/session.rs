@@ -169,7 +169,16 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
             "filtered offline messages through current ACL/authz policy"
         );
     }
-    deps.router.register(handle.clone()).await;
+    if !deps.router.register(handle.clone()).await {
+        #[cfg(feature = "metrics")]
+        if let Some(ref tenant) = identity.tenant {
+            crate::metrics::tenant_quota_rejections()
+                .with_label_values(&[tenant])
+                .inc();
+        }
+        tracing::warn!(cn = %cn, "session rejected by tenant quota");
+        return;
+    }
     for m in buffered_offline {
         if handle.send(Arc::new(m)).await.is_err() {
             break;
@@ -683,7 +692,10 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
                                 "filtered offline messages through current ACL/authz policy"
                             );
                         }
-                        router.register(handle.clone()).await;
+                        if !router.register(handle.clone()).await {
+                            tracing::warn!(cn = %cn, "connection rejected: tenant quota exceeded");
+                            continue;
+                        }
                         for m in buffered_offline {
                             if handle.send(Arc::new(m)).await.is_err() {
                                 break;

@@ -473,14 +473,38 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         } else {
             None
         };
+    // ── Per-tenant quota tracker ────────────────────────────────────
+    let quota_tracker: Option<Arc<rustgate_transport::TenantQuotaTracker>> =
+        if let Some(ref path) = cli.tenant_quota_file {
+            match rustgate_transport::TenantQuotaTracker::load_config(path) {
+                Ok(config) => {
+                    let tracker = Arc::new(rustgate_transport::TenantQuotaTracker::new(config));
+                    tracing::info!(
+                        path = %path.display(),
+                        "per-tenant quota tracker loaded"
+                    );
+                    Some(tracker)
+                }
+                Err(e) => {
+                    anyhow::bail!("failed to load tenant quota file {}: {e}", path.display());
+                }
+            }
+        } else {
+            None
+        };
+
     let router = Arc::new({
         let base = (match group_acl {
             Some(acl) => Router::with_acl(acl),
             None => Router::new(),
         })
         .with_backpressure(Arc::clone(&backpressure_gate));
-        match client_queue.as_ref() {
+        let base = match client_queue.as_ref() {
             Some(q) => base.with_client_queue(Arc::clone(q)),
+            None => base,
+        };
+        match quota_tracker {
+            Some(tracker) => base.with_quota_tracker(tracker),
             None => base,
         }
     });

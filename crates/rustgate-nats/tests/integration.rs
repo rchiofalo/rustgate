@@ -73,7 +73,7 @@ async fn register_session(
     let _ = groups.insert(group.to_string());
     let identity = Arc::new(Identity::plaintext(cn.to_string(), groups).expect("valid identity"));
     let handle = rustgate_transport::SessionHandle::new(identity, ptx, ntx);
-    router.register(handle).await;
+    let _ = router.register(handle).await;
     // Return priority receiver — NATS-bridged messages are typically
     // positions which route to the priority channel.
     prx

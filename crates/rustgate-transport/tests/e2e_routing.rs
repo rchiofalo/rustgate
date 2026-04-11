@@ -1,3 +1,4 @@
+#![allow(unused_results)]
 #![allow(clippy::panic, clippy::unwrap_used)]
 //! End-to-end routing tests: mTLS clients through a real server stack,
 //! plus direct router tests for group/direct delivery.
@@ -56,7 +57,7 @@ fn spawn_session(session: AuthenticatedSession, router: Arc<Router>) {
         let (ntx, normal_rx) = mpsc::channel::<rustgate_transport::RoutedMessage>(64);
         let handle = SessionHandle::new(Arc::clone(&identity), ptx, ntx);
         let session_id = handle.id;
-        router.register(handle).await;
+        let _ = router.register(handle).await;
 
         let (reader, writer) = session.split();
 
@@ -734,7 +735,7 @@ async fn position_cache_replay() {
 
     let (aptx, antx, _aprx, _anrx) = make_channels(16);
     let alice_handle = SessionHandle::new(alice.clone(), aptx, antx);
-    router.register(alice_handle.clone()).await;
+    let _ = router.register(alice_handle.clone()).await;
     router.replay_positions(&alice_handle).await;
 
     // Alice sends a position message (broadcast)
@@ -757,7 +758,7 @@ async fn position_cache_replay() {
     // Bob connects later — position goes to priority channel
     let (bptx, bntx, mut bprx, _bnrx) = make_channels(16);
     let bob_handle = SessionHandle::new(bob.clone(), bptx, bntx);
-    router.register(bob_handle.clone()).await;
+    let _ = router.register(bob_handle.clone()).await;
     router.replay_positions(&bob_handle).await;
 
     // Bob should receive Alice's cached position on priority channel
@@ -841,7 +842,7 @@ async fn position_cache_replaces_old() {
     let bob = Arc::new(make_identity("bob", &["team"]));
     let (bptx, bntx, mut bprx, _bnrx) = make_channels(16);
     let bob_handle = SessionHandle::new(bob.clone(), bptx, bntx);
-    router.register(bob_handle.clone()).await;
+    let _ = router.register(bob_handle.clone()).await;
     router.replay_positions(&bob_handle).await;
 
     let got = bprx.try_recv().expect("bob should receive cached position");
