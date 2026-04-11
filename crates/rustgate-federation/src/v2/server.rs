@@ -1380,4 +1380,36 @@ mod tests {
         let dbg = format!("{svc:?}");
         assert!(dbg.contains("allowed_peer_groups_configured: false"));
     }
+
+    /// Verify that an event claiming multiple groups is rejected when the peer
+    /// is only authorized for a subset. The security invariant is reject-on-any-
+    /// unauthorized: even one disallowed group in `federate_groups` causes the
+    /// entire event to be denied.
+    #[tokio::test]
+    async fn federation_rejects_partial_group_authorization() {
+        let (on_event, count) = counting_on_event();
+        let mut allowed = HashMap::new();
+        // Peer is only authorized for "alpha", not "bravo"
+        allowed.insert("unknown".to_string(), HashSet::from(["alpha".to_string()]));
+        let svc =
+            FederationService::new("s".into(), vec![], on_event).with_allowed_peer_groups(allowed);
+
+        // Event claims both "alpha" (authorized) and "bravo" (unauthorized)
+        let event = figpb::FederatedEvent {
+            federate_groups: vec!["alpha".into(), "bravo".into()],
+            ..Default::default()
+        };
+        let result = svc.send_one_event(Request::new(event)).await;
+        assert!(
+            result.is_err(),
+            "event must be rejected when any claimed group is unauthorized"
+        );
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "callback must not fire for partially authorized event"
+        );
+    }
 }
