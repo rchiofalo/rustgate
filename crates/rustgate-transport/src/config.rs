@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! TLS configuration for mTLS server.
 
 use std::sync::Arc;

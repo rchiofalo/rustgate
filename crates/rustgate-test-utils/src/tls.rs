@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Shared TLS helpers for integration tests.
 //!
 //! Provides PEM parsing and `rustls::ClientConfig` construction so that

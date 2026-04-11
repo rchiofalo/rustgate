@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! CLI argument parsing for the rustgate server binary.
 //!
 //! Defines the `Cli` struct (via `clap::Parser`), the `Framing` and `Encoding`

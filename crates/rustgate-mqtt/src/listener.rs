@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! MQTT TLS listener — accepts TCP connections and performs mTLS handshake.
 //!
 //! Mirrors the pattern from [`rustgate_websocket`]: binds a TCP socket with

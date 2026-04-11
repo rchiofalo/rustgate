@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 #![allow(clippy::panic, clippy::unwrap_used)]
 //! Integration tests for store-forward authorization re-evaluation.
 //!
@@ -158,7 +160,7 @@ async fn stored_message_delivered_when_policy_allows() {
     let (ntx_b, mut nrx_b) = mpsc::channel(16);
     let handle = SessionHandle::new(bob.clone(), ptx_b, ntx_b);
 
-    router.register(handle.clone()).await;
+    let _ = router.register(handle.clone()).await;
     for m in filtered {
         handle.send(Arc::new(m)).await.expect("deliver offline msg");
     }

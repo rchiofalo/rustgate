@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Dynamic CA certificate management for federation trust.
 //!
 //! Manages trusted CA certificates that can be added and removed at runtime

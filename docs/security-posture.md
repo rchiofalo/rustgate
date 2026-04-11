@@ -66,7 +66,7 @@ This document maps rustgate's existing security controls to NIST SP 800-53 (Rev.
 | Read-only filesystem | Recommended via `readOnlyRootFilesystem: true` in Helm chart (Pod Security Standards restricted profile) |
 | Graceful shutdown | `STOPSIGNAL SIGTERM` with connection draining |
 | Vulnerability scanning | Trivy (CRITICAL/HIGH) on container image at release, SARIF uploaded to GitHub Security tab |
-| Health monitoring | `/healthz` (liveness) and `/readyz` (readiness) endpoints |
+| Health monitoring | `/health/live` (liveness), `/health/ready` (readiness), and `/health/startup` (startup) endpoints |
 
 ### CP — Contingency Planning
 

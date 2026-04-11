@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Federation manager — orchestrates all federation peer connections.
 //!
 //! The manager owns the V1 and V2 inbound servers and outbound clients,

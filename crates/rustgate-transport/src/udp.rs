@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! UDP CoT input listener for connectionless message delivery.
 //!
 //! Receives UDP datagrams containing CoT XML and routes them through the

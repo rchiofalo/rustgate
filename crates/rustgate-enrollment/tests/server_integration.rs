@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Integration tests for the enrollment HTTPS server.
 //!
 //! Spins up a real enrollment server on localhost with ephemeral certs,

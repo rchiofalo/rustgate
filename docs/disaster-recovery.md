@@ -165,9 +165,9 @@ Kubernetes automatically restarts failed pods. The Helm chart configures:
 
 | Probe | Path | Behavior |
 |-------|------|----------|
-| Startup | `/healthz` | 30 retries, 2s apart. Pod is killed if startup takes > 60s. |
-| Liveness | `/healthz` | Pod is restarted if unresponsive. |
-| Readiness | `/readyz` | Pod is removed from Service during shutdown/drain. |
+| Startup | `/health/startup` | 30 retries, 2s apart. Pod is killed if startup takes > 60s. |
+| Liveness | `/health/live` | Pod is restarted if unresponsive. |
+| Readiness | `/health/ready` | Pod is removed from Service during shutdown/drain. |
 
 **Recovery is automatic.** The pod restarts, loads certificates from the mounted Secret, re-establishes NATS and federation connections, and becomes ready.
 
@@ -212,7 +212,7 @@ For a complete cluster recovery from backup:
 5. Verify health:
    ```bash
    kubectl rollout status deploy/rustgate
-   curl http://<metrics-endpoint>:9090/healthz
+   curl http://<metrics-endpoint>:9090/health/live
    ```
 6. Re-upload federation trust store certificates if not persisted on a PVC.
 7. Verify federation peer connectivity:

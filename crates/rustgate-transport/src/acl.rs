@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Group access control policy.
 //!
 //! Defines optional per-group send/receive permissions enforced by the

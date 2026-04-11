@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Request handlers for the federation REST API.
 //!
 //! Each handler corresponds to one or more API endpoints and operates

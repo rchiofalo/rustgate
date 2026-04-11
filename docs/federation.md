@@ -246,6 +246,14 @@ HA mode requires NATS with JetStream (for KV store).
 | `--federation-skip-hostname-verify` | `RUSTGATE_FEDERATION_SKIP_HOSTNAME_VERIFY` | `false` | Skip TLS hostname verification |
 | `--federation-max-hops` | `RUSTGATE_FEDERATION_MAX_HOPS` | `10` | Max hops before message drop |
 | `--federation-store-path` | `RUSTGATE_FEDERATION_STORE_PATH` | — | Persistent store path |
+| `--federation-v2-bind` | `RUSTGATE_FEDERATION_V2_BIND` | — | V2 gRPC listen address |
+| `--federation-trust-store-dir` | `RUSTGATE_FEDERATION_TRUST_STORE_DIR` | — | Directory for CA trust store certificates |
+| `--federation-circuit-breaker-threshold` | `RUSTGATE_FEDERATION_CIRCUIT_BREAKER_THRESHOLD` | `5` | Consecutive failures before circuit opens |
+| `--federation-circuit-breaker-timeout` | `RUSTGATE_FEDERATION_CIRCUIT_BREAKER_TIMEOUT` | `60` | Seconds before half-open probe |
+| `--federation-replay-buffer-size` | `RUSTGATE_FEDERATION_REPLAY_BUFFER_SIZE` | `1000` | In-memory replay ring buffer size |
+| `--federation-replay-dir` | `RUSTGATE_FEDERATION_REPLAY_DIR` | — | Directory for persistent replay store |
+| `--federation-peers-reload-interval` | `RUSTGATE_FEDERATION_PEERS_RELOAD_INTERVAL` | `0` | Seconds between peers file re-reads (0 = disabled) |
+| `--federation-region` | `RUSTGATE_FEDERATION_REGION` | — | Local region for latency-aware routing |
 
 ## Troubleshooting
 

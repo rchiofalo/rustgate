@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Streaming, append-friendly AEAD encryption for the CoT archive and audit
 //! log sinks.
 //!

@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Consul catalog peer discovery backend.
 //!
 //! Polls Consul's catalog HTTP API at

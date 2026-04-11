@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Optional Cedar policy backend.
 //!
 //! Implements [`PolicyEngine`] on top of the `cedar-policy` crate so

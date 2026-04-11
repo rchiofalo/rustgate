@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! NATS connection configuration.
 
 use std::hash::{BuildHasher, Hasher};

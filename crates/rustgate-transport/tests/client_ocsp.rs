@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Integration test for the [`ClientOcspVerifier`] wrapper.
 //!
 //! Spins up a real TLS listener whose client cert verifier is wrapped

@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Integration tests for the per-UID CoT delta encoder/decoder.
 //!
 //! These tests exercise the public API of `rustgate_cot::delta`, covering

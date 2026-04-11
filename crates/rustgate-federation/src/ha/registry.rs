@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Cross-pod connection registry for federation observability.
 //!
 //! Tracks active federation connections (both inbound and outbound) across

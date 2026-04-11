@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Federation peer handle with circuit breaker and connection state.
 //!
 //! Each configured federation peer gets a [`PeerHandle`] that tracks its

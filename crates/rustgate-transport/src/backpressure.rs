@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Global admission control / backpressure gate.
 //!
 //! Tracks the total number of in-flight "queued" bytes across all sessions

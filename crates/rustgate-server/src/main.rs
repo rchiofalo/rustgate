@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! rustgate server binary — secure tactical message router.
 //!
 //! This module contains the entrypoint, async runtime orchestration, and

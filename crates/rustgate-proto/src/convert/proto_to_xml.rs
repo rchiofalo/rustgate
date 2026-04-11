@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! TAK protobuf -> XML CoT conversion.
 
 use prost::Message;

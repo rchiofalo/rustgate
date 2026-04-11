@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! MQTT 5.0/3.1.1 transport adapter for rustgate.
 //!
 //! Provides an MQTT listener that accepts connections over mTLS, translates

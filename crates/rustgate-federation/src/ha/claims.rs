@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Distributed peer ownership via NATS KV claims.
 //!
 //! Ensures exactly one pod manages each outbound peer connection

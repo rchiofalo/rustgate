@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! REST API for federation management.
 //!
 //! Provides HTTP endpoints for managing federation peers, certificates,

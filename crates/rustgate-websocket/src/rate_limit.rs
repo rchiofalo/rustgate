@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Per-connection byte-rate and frame-rate limiting for WebSocket sessions.
 //!
 //! Uses a sliding window approach: tracks consumption over the last second

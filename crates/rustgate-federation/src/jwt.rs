@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! JWT token authentication for federation connections.
 //!
 //! Provides HMAC-SHA256 signed JWT tokens as an alternative to

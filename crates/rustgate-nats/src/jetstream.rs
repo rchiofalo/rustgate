@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! JetStream history replay for situational awareness bootstrap.
 //!
 //! On startup, fetches the latest position per track from the TRACKS_HISTORY

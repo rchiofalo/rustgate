@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Per-UID delta encoding for outbound CoT events.
 //!
 //! Many CoT event streams are dominated by periodic "track" updates that

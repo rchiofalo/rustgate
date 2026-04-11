@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Certificate revocation and CRL endpoint handlers.
 
 use bytes::Bytes;

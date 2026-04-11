@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Message filtering by CoT type prefix and geographic bounding box.
 //!
 //! Filters are applied before routing — messages that don't pass the

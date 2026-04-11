@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! V2 federation gRPC client with 5-stream handshake.
 //!
 //! Implements the outbound gRPC federation connection that follows the

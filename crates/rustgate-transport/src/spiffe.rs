@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! SPIFFE Workload API identity source.
 //!
 //! This module wires the [`spiffe`] crate's `WorkloadApiClient` into

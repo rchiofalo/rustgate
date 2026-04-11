@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 #![allow(clippy::panic, clippy::unwrap_used)]
 //! Security hardening integration tests: slow consumer isolation and
 //! circuit breaker disconnect.
@@ -67,10 +69,10 @@ async fn slow_consumer_cannot_block_other_sessions() {
     let (ptx_b, _prx_b) = mpsc::channel::<RoutedMessage>(16);
     let (ntx_b, mut nrx_b) = mpsc::channel::<RoutedMessage>(16);
 
-    router
+    let _ = router
         .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
         .await;
-    router
+    let _ = router
         .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
         .await;
 
@@ -122,7 +124,7 @@ async fn circuit_breaker_disconnects_persistently_slow_session() {
     let (ntx, mut nrx) = mpsc::channel::<RoutedMessage>(1);
 
     let handle = SessionHandle::with_drop_threshold(slow.clone(), ptx, ntx, 3);
-    router.register(handle.clone()).await;
+    let _ = router.register(handle.clone()).await;
 
     // First message fills the channel (capacity 1)
     router

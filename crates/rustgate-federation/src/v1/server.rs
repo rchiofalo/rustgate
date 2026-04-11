@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! V1 federation inbound server.
 //!
 //! Accepts mTLS connections from remote federation peers and runs

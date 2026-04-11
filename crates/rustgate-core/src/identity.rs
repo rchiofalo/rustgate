@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Client identity types and validation.
 //!
 //! Every authenticated connection has an associated `Identity` containing

@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! CSR signing request handlers (v1 and v2 endpoints).
 
 use std::net::SocketAddr;

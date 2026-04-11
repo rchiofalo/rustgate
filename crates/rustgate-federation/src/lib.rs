@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Server-to-server federation for cross-network message routing.
 //!
 //! This crate implements both the V1 (length-prefixed XML over mTLS) and

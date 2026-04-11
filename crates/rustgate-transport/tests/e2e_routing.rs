@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 #![allow(unused_results)]
 #![allow(clippy::panic, clippy::unwrap_used)]
 //! End-to-end routing tests: mTLS clients through a real server stack,

@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! MQTT server — accept loop, session spawning, and graceful shutdown.
 //!
 //! [`MqttServer::run`] is the main entry point. It accepts connections from

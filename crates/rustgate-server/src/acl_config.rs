@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! JSON deserialization for group ACL configuration files.
 //!
 //! Converts the human-friendly JSON format into the runtime

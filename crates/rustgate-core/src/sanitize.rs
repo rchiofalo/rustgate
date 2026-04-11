@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Input sanitization utilities for untrusted data.
 //!
 //! Provides functions that make user-controlled strings safe for

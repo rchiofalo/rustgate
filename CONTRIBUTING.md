@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- **Rust 1.93+** — install via [rustup](https://rustup.rs/). The pinned toolchain is defined in `rust-toolchain.toml`.
+- **Rust 1.94+** — install via [rustup](https://rustup.rs/). The pinned toolchain is defined in `rust-toolchain.toml`.
 - **protoc** — Protocol Buffers compiler, required for the `proto` feature. Install via your package manager (`apt install protobuf-compiler`, `brew install protobuf`, etc.).
 - **nats-server** — required to run NATS integration tests. Install from [nats.io](https://nats.io/download/) or via `go install github.com/nats-io/nats-server/v2@latest`.
 - **cargo-deny** — for license and advisory auditing. Install with `cargo install cargo-deny --locked`.

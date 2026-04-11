@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Integration tests for TLS listener with mTLS authentication.
 
 use std::sync::Arc;

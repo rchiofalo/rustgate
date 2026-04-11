@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! OCSP stapling support for the server certificate resolver.
 //!
 //! This module wraps any [`ResolvesServerCert`] implementation (such as

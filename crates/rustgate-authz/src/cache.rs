@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Sharded decision cache.
 //!
 //! A small, fixed-capacity FIFO-eviction cache keyed on

@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Shared utilities for building HTTP responses and parsing query parameters.
 
 use bytes::Bytes;

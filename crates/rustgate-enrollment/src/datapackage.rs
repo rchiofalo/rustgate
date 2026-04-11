@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Data package storage and retrieval.
 //!
 //! Implements the Marti-compatible data package API for TAK client

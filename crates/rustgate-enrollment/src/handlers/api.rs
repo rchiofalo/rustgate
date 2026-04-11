@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Marti API compatibility endpoint handlers.
 //!
 //! These handlers implement the subset of the Marti REST API that clients

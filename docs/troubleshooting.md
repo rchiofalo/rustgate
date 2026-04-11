@@ -539,8 +539,8 @@ When the `metrics` feature is enabled (`--metrics-bind`), Prometheus metrics are
 
 ```bash
 # Liveness check (returns 200 if the server is running)
-curl http://localhost:9090/healthz
+curl http://localhost:9090/health/live
 
 # Readiness check (returns 200 when ready, 503 during shutdown)
-curl http://localhost:9090/readyz
+curl http://localhost:9090/health/ready
 ```

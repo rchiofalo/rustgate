@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! NATS JetStream KV-backed federate store.
 //!
 //! Provides a distributed federate store that synchronizes across multiple

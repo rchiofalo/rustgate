@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! TLS listener for accepting mTLS connections.
 
 use std::net::SocketAddr;

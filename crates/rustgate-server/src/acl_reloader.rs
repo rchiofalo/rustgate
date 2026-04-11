@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! ACL file hot-reload via polling.
 //!
 //! [`AclReloader`] periodically checks the on-disk group ACL JSON file for

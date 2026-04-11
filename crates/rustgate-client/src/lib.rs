@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Reference client library for connecting to a rustgate server.
 //!
 //! `rustgate-client` provides a small, ergonomic API on top of the same

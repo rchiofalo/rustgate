@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! V2 federation gRPC integration tests.
 //!
 //! Spins up a real FederationService gRPC server on localhost and

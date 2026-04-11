@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Outbound mTLS connector for federation peer connections.
 //!
 //! Establishes TLS client connections to remote federation peers,

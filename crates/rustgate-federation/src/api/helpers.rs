@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! JSON response helpers and URL decoding utilities.
 
 use bytes::Bytes;

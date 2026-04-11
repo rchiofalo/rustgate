@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Pluggable protocol codec trait.
 //!
 //! The [`Codec`] trait unifies framing (message boundary detection) and

@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Integration tests for federation peer discovery backends (issue #571).
 //!
 //! Each test is gated behind the same sub-feature that gates its backend,

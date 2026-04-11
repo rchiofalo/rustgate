@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! TLS transport, session management, and message routing for rustgate.
 
 mod acl;

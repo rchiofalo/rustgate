@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Federation heartbeat generation and detection.
 //!
 //! Federation peers exchange periodic heartbeat messages (CoT type `t-x-c-t`)

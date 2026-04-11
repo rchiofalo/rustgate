@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Integration tests for Certificate Revocation List (CRL) support.
 //!
 //! Verifies that TLS handshakes reject revoked client certificates

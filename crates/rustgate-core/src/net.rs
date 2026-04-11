@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Network utilities shared across rustgate crates.
 
 use std::os::fd::AsFd;

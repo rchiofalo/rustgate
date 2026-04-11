@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Minimal PKCS#12 (PFX) builder for v1 enrollment.
 //!
 //! Builds a PKCS#12 bundle containing a signed client certificate and the

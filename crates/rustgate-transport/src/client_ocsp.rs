@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Client certificate OCSP verification (Tier 1).
 //!
 //! This module wraps any [`ClientCertVerifier`] with a layer that consults

@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Strongly-typed identifiers for federation peers and servers.
 //!
 //! Provides [`PeerId`] and [`ServerName`] newtypes that wrap `String` to prevent

@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! CoT XML ↔ `FederatedEvent` (proto) conversions.
 //!
 //! Converts between raw CoT XML bytes and the V2 gRPC `FederatedEvent`

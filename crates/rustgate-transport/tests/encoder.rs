@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Unit tests for Codec encode_payload implementations.
 
 #![allow(clippy::panic, clippy::unwrap_used)]

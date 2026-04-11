@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! X.509 certificate generation for tests.
 
 use std::fmt;

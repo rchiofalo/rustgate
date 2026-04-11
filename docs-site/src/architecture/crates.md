@@ -24,7 +24,7 @@ These constraints are enforced workspace-wide and apply to every crate:
 
 1. **`unsafe_code = "forbid"`** — no exceptions.
 2. **`clippy::panic = "deny"`** and **`clippy::unwrap_used = "deny"`** in production code. Use `Result`, `?`, `ok_or_else`, and `map_err`.
-3. **Edition 2024**, `rust-version = "1.93"`.
+3. **Edition 2024**, `rust-version = "1.94"`.
 4. **Workspace dependency inheritance** — every dependency is declared once in the root `Cargo.toml` and referenced as `{ workspace = true }` from each crate.
 5. **Conventional commits** with type + scope: `feat(transport): …`, `fix(federation): …`, `docs(...): …`, etc.
 

@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Publishes inbound CoT messages to NATS subjects.
 
 use std::borrow::Cow;

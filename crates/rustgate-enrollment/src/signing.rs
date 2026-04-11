@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! CSR signing logic.
 //!
 //! Loads a CA certificate and private key from PEM, parses incoming PKCS#10

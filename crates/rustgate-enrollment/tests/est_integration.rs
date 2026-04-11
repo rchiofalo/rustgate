@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Integration tests for EST (RFC 7030) enrollment endpoints.
 //!
 //! Spins up a real enrollment server with EST enabled, then exercises

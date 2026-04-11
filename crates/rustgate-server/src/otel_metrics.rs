@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! OpenTelemetry metrics export for rustgate.
 //!
 //! Exposes the existing Prometheus `prometheus::Registry` as OTLP metrics

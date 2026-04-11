@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Error types for the authz crate.
 
 use thiserror::Error;

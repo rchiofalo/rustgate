@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Federation peer persistence backends.
 //!
 //! The [`FederateStore`] trait abstracts peer configuration storage.

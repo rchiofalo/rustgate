@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! V2 federation protocol: gRPC over mTLS.
 //!
 //! This is the standard TAK Server federation wire format using

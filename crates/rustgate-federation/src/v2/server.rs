@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! V2 federation gRPC server implementing the FederatedChannel service.
 //!
 //! Handles inbound federation connections from remote peers over gRPC/mTLS.

@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Policy AST: `RuleSet`, `Rule`, and their matcher types.
 //!
 //! This module defines the serde-serializable surface of an authorization

@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Certificate enrollment for rustgate.
 //!
 //! HTTPS endpoint (no client cert required) that accepts a username/password

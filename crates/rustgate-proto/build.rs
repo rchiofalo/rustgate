@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let protos = &[
         "proto/takmessage.proto",

@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! etcd peer discovery backend.
 //!
 //! Scans an etcd v3 key prefix (default `rustgate/peers/`) and treats each

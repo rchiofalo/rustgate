@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! EST (RFC 7030) enrollment endpoint handlers.
 //!
 //! Implements the Enrollment over Secure Transport protocol endpoints:

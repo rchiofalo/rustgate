@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! HTTPS enrollment server.
 //!
 //! Runs a hyper HTTP/1.1 server over tokio-rustls (server-only TLS, no client

@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Framing protocol definitions for message boundary detection.
 //!
 //! rustgate supports multiple framing strategies to interoperate with

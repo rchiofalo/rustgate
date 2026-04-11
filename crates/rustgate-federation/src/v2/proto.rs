@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Generated protobuf types for V2 federation (gRPC FederatedChannel).
 //!
 //! These types are compiled from `proto/figpb/fig.proto` by tonic-build

@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Shared NATS test infrastructure.
 //!
 //! Provides [`TestNatsServer`] — a managed `nats-server` subprocess with

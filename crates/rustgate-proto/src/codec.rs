@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! TAK protocol buffer frame codec.
 //!
 //! # Wire Format (TCP streaming)

@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Integration tests for the NATS adapter.
 //!
 //! These tests spin up a real `nats-server` subprocess (with JetStream enabled)

@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! WebSocket (wss://) listener and session management for rustgate.
 //!
 //! Provides [`WsListener`] for accepting WebSocket connections over TLS,

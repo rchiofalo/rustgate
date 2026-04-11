@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Shared PEM parsing utilities for certificates, private keys, and CA stores.
 //!
 //! These functions consolidate duplicated PEM parsing logic used across

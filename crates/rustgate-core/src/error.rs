@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Error types for rustgate.
 //!
 //! Provides structured error enums for transport and configuration failures,

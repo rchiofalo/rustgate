@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Federation peer file hot-reload via SIGHUP and periodic polling.
 //!
 //! [`FederationPeerReloader`] watches the on-disk federation peers JSON file

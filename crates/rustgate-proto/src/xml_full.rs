@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Full CoT XML parser extracting all protobuf-mappable fields.
 //!
 //! # Security
@@ -50,29 +52,34 @@ pub struct FullCotEvent {
     pub xml_detail: String,
 }
 
+/// Parsed `<contact>` detail element from a CoT event.
 #[derive(Debug, Clone, Default)]
 pub struct ContactDetail {
     pub endpoint: String,
     pub callsign: String,
 }
 
+/// Parsed `<__group>` detail element carrying team color and role.
 #[derive(Debug, Clone, Default)]
 pub struct GroupDetail {
     pub name: String,
     pub role: String,
 }
 
+/// Parsed `<precisionlocation>` detail element with GPS metadata.
 #[derive(Debug, Clone, Default)]
 pub struct PrecisionLocationDetail {
     pub geopointsrc: String,
     pub altsrc: String,
 }
 
+/// Parsed `<status>` detail element with battery and device readiness.
 #[derive(Debug, Clone, Default)]
 pub struct StatusDetail {
     pub battery: u32,
 }
 
+/// Parsed `<takv>` detail element identifying the client software version.
 #[derive(Debug, Clone, Default)]
 pub struct TakvDetail {
     pub device: String,
@@ -81,6 +88,7 @@ pub struct TakvDetail {
     pub version: String,
 }
 
+/// Parsed `<track>` detail element with speed and course.
 #[derive(Debug, Clone, Default)]
 pub struct TrackDetail {
     pub speed: f64,

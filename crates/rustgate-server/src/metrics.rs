@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Prometheus metrics for rustgate.
 //!
 //! Exposes counters, gauges, and labels covering connection lifecycle,
