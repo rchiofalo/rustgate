@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Per-session non-blocking delivery** — direct and broadcast message delivery now uses non-blocking channel sends (`try_send`), preventing a single slow consumer from starving all other sessions. Messages to full channels are persisted for offline delivery (direct) or dropped (broadcast) instead of blocking the routing task. The global backpressure gate is retained for overall memory protection. (#656)
+
 - **Federation TTL re-check at forward boundary** — the federation manager now re-evaluates each message's TTL immediately before queuing it to peer outbound channels via the new `FederationManager::forward_with_metadata` API. Messages whose `received_at + ttl` has elapsed between local routing and federation forwarding are dropped with a warning instead of consuming peer bandwidth. A new `rustgate_federation_forward_ttl_expired_total` Prometheus counter (under the `api` feature) tracks drops, and the `federation` snapshot endpoint exposes the same value as `forward_ttl_expired`. The legacy `forward(payload, groups)` entrypoint is preserved for callers that have no TTL context. (#554)
 
 ### Added
