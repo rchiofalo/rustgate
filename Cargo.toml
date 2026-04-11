@@ -82,6 +82,7 @@ opentelemetry-otlp = { version = "0.31", default-features = false, features = ["
 tracing-opentelemetry = { version = "0.32", default-features = false }
 parking_lot = "0.12"
 tikv-jemallocator = "0.6"
+tikv-jemalloc-ctl = "0.6"
 tempfile = "3"
 criterion = { version = "0.8", features = ["html_reports"] }
 arbitrary = { version = "1", features = ["derive"] }

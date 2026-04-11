@@ -128,6 +128,15 @@ static SPIFFE_SVID_REFRESH_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 #[cfg(feature = "spiffe")]
 static SPIFFE_SVID_EXPIRY_SECONDS: OnceLock<IntGauge> = OnceLock::new();
 
+#[cfg(feature = "jemalloc")]
+static JEMALLOC_RESIDENT: OnceLock<IntGauge> = OnceLock::new();
+#[cfg(feature = "jemalloc")]
+static JEMALLOC_ACTIVE: OnceLock<IntGauge> = OnceLock::new();
+#[cfg(feature = "jemalloc")]
+static JEMALLOC_ALLOCATED: OnceLock<IntGauge> = OnceLock::new();
+#[cfg(feature = "jemalloc")]
+static JEMALLOC_MAPPED: OnceLock<IntGauge> = OnceLock::new();
+
 // ── Fallback constructors ───────────────────────────────────────────
 //
 // When `init()` has not been called, accessor functions lazily create
@@ -526,6 +535,37 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(authz_cache_misses.clone()))?;
     let _ = AUTHZ_CACHE_MISSES.set(authz_cache_misses);
 
+    #[cfg(feature = "jemalloc")]
+    {
+        let jemalloc_resident = IntGauge::with_opts(Opts::new(
+            "rustgate_jemalloc_resident_bytes",
+            "jemalloc resident memory in bytes (RSS attributed to the allocator)",
+        ))?;
+        registry.register(Box::new(jemalloc_resident.clone()))?;
+        let _ = JEMALLOC_RESIDENT.set(jemalloc_resident);
+
+        let jemalloc_active = IntGauge::with_opts(Opts::new(
+            "rustgate_jemalloc_active_bytes",
+            "jemalloc active memory in bytes (allocated pages that back application data)",
+        ))?;
+        registry.register(Box::new(jemalloc_active.clone()))?;
+        let _ = JEMALLOC_ACTIVE.set(jemalloc_active);
+
+        let jemalloc_allocated = IntGauge::with_opts(Opts::new(
+            "rustgate_jemalloc_allocated_bytes",
+            "jemalloc allocated memory in bytes (application-requested allocations)",
+        ))?;
+        registry.register(Box::new(jemalloc_allocated.clone()))?;
+        let _ = JEMALLOC_ALLOCATED.set(jemalloc_allocated);
+
+        let jemalloc_mapped = IntGauge::with_opts(Opts::new(
+            "rustgate_jemalloc_mapped_bytes",
+            "jemalloc mapped memory in bytes (total virtual memory mapped by the allocator)",
+        ))?;
+        registry.register(Box::new(jemalloc_mapped.clone()))?;
+        let _ = JEMALLOC_MAPPED.set(jemalloc_mapped);
+    }
+
     Ok(())
 }
 
@@ -858,6 +898,41 @@ pub fn spiffe_svid_expiry_seconds() -> &'static IntGauge {
             "Active SPIFFE SVID leaf notAfter (unix seconds)",
         )
     })
+}
+
+/// Refresh jemalloc memory statistics gauges.
+///
+/// Advances the jemalloc epoch (so cached stats become current) and then
+/// reads resident, active, allocated, and mapped byte counts via
+/// `tikv-jemalloc-ctl`'s safe API. Any individual stat that fails to read
+/// is silently skipped — partial updates are still useful.
+#[cfg(feature = "jemalloc")]
+pub fn refresh_jemalloc_stats() {
+    // Epoch must be advanced before reading; stale cached values are
+    // returned otherwise. Ignore errors — stats will be stale but not
+    // absent.
+    let _ = tikv_jemalloc_ctl::epoch::advance();
+
+    if let Some(g) = JEMALLOC_RESIDENT.get() {
+        if let Ok(v) = tikv_jemalloc_ctl::stats::resident::read() {
+            g.set(i64::try_from(v).unwrap_or(i64::MAX));
+        }
+    }
+    if let Some(g) = JEMALLOC_ACTIVE.get() {
+        if let Ok(v) = tikv_jemalloc_ctl::stats::active::read() {
+            g.set(i64::try_from(v).unwrap_or(i64::MAX));
+        }
+    }
+    if let Some(g) = JEMALLOC_ALLOCATED.get() {
+        if let Ok(v) = tikv_jemalloc_ctl::stats::allocated::read() {
+            g.set(i64::try_from(v).unwrap_or(i64::MAX));
+        }
+    }
+    if let Some(g) = JEMALLOC_MAPPED.get() {
+        if let Ok(v) = tikv_jemalloc_ctl::stats::mapped::read() {
+            g.set(i64::try_from(v).unwrap_or(i64::MAX));
+        }
+    }
 }
 
 /// Returns the client-cert OCSP cache hit counter.
@@ -1380,6 +1455,11 @@ fn handle_request(
                         .unwrap_or_else(|_| internal_error_response()));
                 }
             }
+
+            // Refresh jemalloc stats on every scrape so Prometheus sees
+            // current memory values rather than stale cached counters.
+            #[cfg(feature = "jemalloc")]
+            refresh_jemalloc_stats();
 
             let encoder = TextEncoder::new();
             let metric_families = prometheus::gather();
@@ -2135,5 +2215,46 @@ mod tests {
 
         let (status, _) = http_get_with_auth(addr, "/healthz", None).await;
         assert_eq!(status, 200);
+    }
+
+    /// Verify that `refresh_jemalloc_stats` runs without error and populates
+    /// the four gauges with non-negative values when the jemalloc allocator
+    /// is active.
+    #[cfg(feature = "jemalloc")]
+    #[test]
+    fn jemalloc_stats_are_populated() {
+        ensure_init();
+
+        refresh_jemalloc_stats();
+
+        // After a refresh the gauges must be set. jemalloc always reports
+        // at least some resident and allocated memory for the process
+        // itself, so all four values should be > 0.
+        let resident = JEMALLOC_RESIDENT.get().map(IntGauge::get);
+        let active = JEMALLOC_ACTIVE.get().map(IntGauge::get);
+        let allocated = JEMALLOC_ALLOCATED.get().map(IntGauge::get);
+        let mapped = JEMALLOC_MAPPED.get().map(IntGauge::get);
+
+        assert!(
+            resident.is_some_and(|v| v > 0),
+            "resident should be > 0, got {resident:?}",
+        );
+        assert!(
+            active.is_some_and(|v| v > 0),
+            "active should be > 0, got {active:?}",
+        );
+        assert!(
+            allocated.is_some_and(|v| v > 0),
+            "allocated should be > 0, got {allocated:?}",
+        );
+        assert!(
+            mapped.is_some_and(|v| v > 0),
+            "mapped should be > 0, got {mapped:?}",
+        );
+
+        // Sanity: allocated <= active (guaranteed by jemalloc design)
+        let a = allocated.unwrap();
+        let act = active.unwrap();
+        assert!(a <= act, "allocated ({a}) <= active ({act})");
     }
 }
