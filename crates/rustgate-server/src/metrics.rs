@@ -2044,6 +2044,62 @@ mod tests {
         );
     }
 
+    /// When a Router is present in the slot but has no authz engine
+    /// installed, the `/health/authz` endpoint must still return a
+    /// well-formed JSON response with `policy_id: null` and an empty
+    /// warnings list. This exercises a distinct code path from the
+    /// slot being empty (no Router at all).
+    #[tokio::test]
+    async fn authz_health_returns_empty_when_router_has_no_engine() {
+        ensure_init();
+
+        let router = Arc::new(rustgate_transport::Router::new());
+        // Confirm the router truly has no authz engine.
+        assert!(
+            router.authz_snapshot().is_none(),
+            "Router::new() should not have an authz engine"
+        );
+
+        let router_slot: RouterSlot = Arc::new(OnceLock::new());
+        let _ = router_slot.set(router);
+
+        let health = Arc::new(HealthState::new());
+        health.set_ready(true);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        drop(listener);
+
+        let server_health = Arc::clone(&health);
+        let server_router_slot = Arc::clone(&router_slot);
+        drop(tokio::spawn(async move {
+            let _ = serve(
+                addr,
+                server_health,
+                #[cfg(feature = "federation")]
+                Arc::new(OnceLock::new()),
+                Arc::new(OnceLock::new()),
+                server_router_slot,
+            )
+            .await;
+        }));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let (status, body) = http_get(addr, "/health/authz").await;
+        assert_eq!(status, 200);
+        assert!(
+            body.contains("\"policy_id\":null"),
+            "expected null policy_id: {body}"
+        );
+        assert!(
+            body.contains("\"compile_warnings\":[]"),
+            "expected empty warnings: {body}"
+        );
+    }
+
     /// Minimal HTTP GET using raw TCP. Returns (status_code, body).
     async fn http_get(addr: SocketAddr, path: &str) -> (u16, String) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
