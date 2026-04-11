@@ -505,12 +505,15 @@ async fn non_position_messages_published() {
     let wire: WireEvent = serde_json::from_slice(&nats_msg.payload).expect("valid JSON");
     assert_eq!(wire.uid, "chat-msg-1");
     assert_eq!(wire.event_type, "b-t-f");
-    // With full-detail, xml_detail should contain the remarks
+    // With full-detail, remarks are extracted as a typed field
     let detail = wire.detail.expect("detail should be populated");
     assert!(
-        detail.xml_detail.is_some(),
-        "xml_detail should contain remarks"
+        detail.remarks.is_some(),
+        "remarks should be populated as typed field"
     );
+    let notes = &detail.remarks.as_ref().unwrap().note;
+    assert!(!notes.is_empty(), "should have at least one note");
+    assert_eq!(notes[0].text, "hello world");
 }
 
 /// Verify that 0,0 position (unknown per CoT spec) is filtered by the publisher.

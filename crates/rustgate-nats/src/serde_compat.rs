@@ -256,7 +256,13 @@ impl WireEvent {
                     Some(c.endpoint.clone())
                 },
             }),
-            remarks: None,
+            remarks: cot.remarks.as_ref().map(|r| WireRemarks {
+                note: vec![WireNote {
+                    text: r.text.clone(),
+                    source: r.source.clone().unwrap_or_default(),
+                    ts: r.timestamp.clone().unwrap_or_default(),
+                }],
+            }),
             flow_tags: None,
             status: cot.status.as_ref().map(|s| WireStatus {
                 battery: i32::try_from(s.battery).unwrap_or(i32::MAX),
@@ -289,6 +295,7 @@ impl WireEvent {
 
         let has_any = detail.track.is_some()
             || detail.contact.is_some()
+            || detail.remarks.is_some()
             || detail.status.is_some()
             || detail.group.is_some()
             || detail.takv.is_some()
