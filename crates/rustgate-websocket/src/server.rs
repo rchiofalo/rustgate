@@ -201,8 +201,20 @@ async fn handle_ws_session(
 
     // Drain offline queue BEFORE register so queued messages are
     // delivered ahead of any live traffic routed to this CN after
-    // registration completes.
+    // registration completes. Filter through current ACL/authz policy
+    // to prevent stale permissions from the time of storage.
     let buffered_offline = router.drain_offline_messages(&identity.cn).await;
+    let before = buffered_offline.len();
+    let buffered_offline = router.filter_offline_messages(&identity, buffered_offline);
+    let filtered_count = before - buffered_offline.len();
+    if filtered_count > 0 {
+        info!(
+            cn = %identity.cn,
+            filtered = filtered_count,
+            delivered = buffered_offline.len(),
+            "filtered offline messages on WebSocket reconnect",
+        );
+    }
     router.register(handle.clone()).await;
     for m in buffered_offline {
         if handle.send(Arc::new(m)).await.is_err() {

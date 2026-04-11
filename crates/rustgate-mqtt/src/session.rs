@@ -206,7 +206,19 @@ pub(crate) async fn handle_mqtt_session(
     let (resp_tx, mut resp_rx) = mpsc::channel::<ResponsePacket>(RESPONSE_CHANNEL_CAPACITY);
 
     // Drain offline queue BEFORE register so queued messages arrive first.
+    // Filter through current ACL/authz policy to prevent stale permissions.
     let buffered = router.drain_offline_messages(&cn).await;
+    let before = buffered.len();
+    let buffered = router.filter_offline_messages(&identity, buffered);
+    let filtered_count = before - buffered.len();
+    if filtered_count > 0 {
+        info!(
+            cn = %cn,
+            filtered = filtered_count,
+            delivered = buffered.len(),
+            "filtered offline messages on MQTT reconnect",
+        );
+    }
     router.register(handle.clone()).await;
     for m in buffered {
         if handle.send(Arc::new(m)).await.is_err() {
