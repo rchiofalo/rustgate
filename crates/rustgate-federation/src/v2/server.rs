@@ -192,6 +192,27 @@ impl FederationService {
         }
     }
 
+    /// Validate that an inbound event's hop count is within limits.
+    ///
+    /// Returns `Ok(())` if the event should be processed, or `Err(peer_id)`
+    /// if the hop count is invalid (negative or at/above `MAX_FEDERATION_HOPS`).
+    /// Events without hop metadata are allowed (treated as first-hop for
+    /// backward compat with peers that predate hop tracking).
+    fn validate_hop_count(event: &figpb::FederatedEvent, peer_id: &str) -> bool {
+        if let Some(ref hops) = event.federate_hops
+            && (hops.current_hops < 0 || hops.current_hops >= MAX_FEDERATION_HOPS)
+        {
+            warn!(
+                peer = %peer_id,
+                current_hops = hops.current_hops,
+                max = MAX_FEDERATION_HOPS,
+                "rejecting federated event: hop count exceeded"
+            );
+            return false;
+        }
+        true
+    }
+
     /// Maximum length for a peer CN extracted from a certificate.
     ///
     /// Matches the validation in `rustgate_core::identity::Identity::new()`.
@@ -306,22 +327,9 @@ impl FederatedChannel for FederationService {
         let peer_id = Self::peer_id_from_request(&request);
         let event = request.into_inner();
 
-        // Validate hop count to prevent routing loops.
-        // Uses >= to align with FederationMetadata::should_drop() semantics.
-        if let Some(ref hops) = event.federate_hops
-            && (hops.current_hops < 0 || hops.current_hops >= MAX_FEDERATION_HOPS)
-        {
-            warn!(
-                peer = %peer_id,
-                current_hops = hops.current_hops,
-                max = MAX_FEDERATION_HOPS,
-                "rejecting federated event: hop count exceeded"
-            );
+        if !Self::validate_hop_count(&event, &peer_id) {
             return Ok(Response::new(figpb::Empty {}));
         }
-        // Events without hop metadata are treated as first-hop (backward
-        // compat with peers that predate hop tracking). This is safe because
-        // the downstream FederationMetadata::should_drop() also validates.
 
         debug!(peer = %peer_id, "received single event");
         (self.on_event)(event, peer_id);
@@ -393,22 +401,9 @@ impl FederatedChannel for FederationService {
 
         drop(tokio::spawn(async move {
             while let Ok(Some(event)) = stream.message().await {
-                // Validate hop count to prevent routing loops.
-                // Uses >= to align with FederationMetadata::should_drop() semantics.
-                if let Some(ref hops) = event.federate_hops
-                    && (hops.current_hops < 0 || hops.current_hops >= MAX_FEDERATION_HOPS)
-                {
-                    warn!(
-                        peer = %pid,
-                        current_hops = hops.current_hops,
-                        max = MAX_FEDERATION_HOPS,
-                        "rejecting streamed federated event: hop count exceeded"
-                    );
+                if !FederationService::validate_hop_count(&event, &pid) {
                     continue;
                 }
-                // Events without hop metadata are treated as first-hop (backward
-                // compat with peers that predate hop tracking). This is safe because
-                // the downstream FederationMetadata::should_drop() also validates.
                 on_event(event, pid.clone());
             }
             info!(peer = %pid, "server_event_stream closed");
