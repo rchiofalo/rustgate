@@ -224,6 +224,7 @@ mod tests {
             replay_max_bytes: crate::replay_persist::DEFAULT_REPLAY_MAX_BYTES,
             pod_id: None,
             ha_nats_url: None,
+            local_region: None,
         }
     }
 
@@ -240,6 +241,9 @@ mod tests {
             routing_mode: RoutingMode::default(),
             protocol_version: 2,
             jwt_token: None,
+            region: None,
+            zone: None,
+            priority: 100,
         }
     }
 

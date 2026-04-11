@@ -430,6 +430,7 @@ async fn run_streams(
     let _ = health_ticker.tick().await;
 
     // Initial health check (immediate, prevents inactivity disconnect)
+    let hc_start = tokio::time::Instant::now();
     let health_result = client
         .health_check(Request::new(figpb::ClientHealth {
             status: figpb::client_health::ServingStatus::Serving as i32,
@@ -440,7 +441,9 @@ async fn run_streams(
         warn!(peer = %peer.id, error = %e, "initial health check failed");
         return Err(anyhow::anyhow!("initial health check failed: {e}"));
     }
-    debug!(peer = %peer.id, "initial health check passed");
+    let rtt_nanos = hc_start.elapsed().as_nanos() as u64;
+    peer.record_rtt(rtt_nanos);
+    debug!(peer = %peer.id, rtt_ns = rtt_nanos, "initial health check passed");
 
     // Replay buffered messages after handshake completes
     for msg in &replay_messages {
@@ -525,8 +528,9 @@ async fn run_streams(
                 peer.record_sent();
             }
 
-            // Periodic health checks
+            // Periodic health checks (also measures RTT for latency-aware routing)
             _ = health_ticker.tick() => {
+                let hc_start = tokio::time::Instant::now();
                 let resp = client
                     .health_check(Request::new(figpb::ClientHealth {
                         status: figpb::client_health::ServingStatus::Serving as i32,
@@ -535,6 +539,8 @@ async fn run_streams(
 
                 match resp {
                     Ok(r) => {
+                        let rtt_nanos = hc_start.elapsed().as_nanos() as u64;
+                        peer.record_rtt(rtt_nanos);
                         let status = r.into_inner().status;
                         if status != figpb::server_health::ServingStatus::Serving as i32 {
                             warn!(peer = %peer.id, status, "remote not serving");
@@ -582,6 +588,9 @@ mod tests {
             routing_mode: RoutingMode::Broadcast,
             protocol_version: 2,
             jwt_token: None,
+            region: None,
+            zone: None,
+            priority: 100,
         }))
     }
 

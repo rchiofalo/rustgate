@@ -55,6 +55,7 @@ fn test_config() -> FederationConfig {
         replay_max_bytes: rustgate_federation::replay_persist::DEFAULT_REPLAY_MAX_BYTES,
         pod_id: None,
         ha_nats_url: None,
+        local_region: None,
     }
 }
 
@@ -71,6 +72,9 @@ fn peer(id: &str, addr: &str) -> PeerConfig {
         routing_mode: RoutingMode::default(),
         protocol_version: 2,
         jwt_token: None,
+        region: None,
+        zone: None,
+        priority: 100,
     }
 }
 

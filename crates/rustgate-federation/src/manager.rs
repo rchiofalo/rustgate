@@ -159,6 +159,18 @@ pub struct PeerSwapDiff {
     pub failed: Vec<(PeerId, String)>,
 }
 
+/// Sort peers for routing preference: same-region first, then by
+/// latency (ascending), then by priority (ascending).
+///
+/// Peers with zero latency (no RTT samples) sort after peers with data
+/// to avoid routing to unmeasured peers when measured alternatives exist.
+fn sort_peers_by_preference(
+    peers: &mut [(PeerId, Arc<FederationClient>, Arc<PeerHandle>)],
+    local_region: Option<&str>,
+) {
+    peers.sort_by(|a, b| crate::peer::compare_routing_preference(&a.2, &b.2, local_region));
+}
+
 /// Structural equality of two peer configurations for hot-reload diffing.
 fn peers_equal(a: &crate::config::PeerConfig, b: &crate::config::PeerConfig) -> bool {
     a.id == b.id
@@ -169,6 +181,9 @@ fn peers_equal(a: &crate::config::PeerConfig, b: &crate::config::PeerConfig) -> 
         && a.enabled == b.enabled
         && a.is_outbound == b.is_outbound
         && a.protocol_version == b.protocol_version
+        && a.region == b.region
+        && a.zone == b.zone
+        && a.priority == b.priority
 }
 
 impl FederationManager {
@@ -795,7 +810,7 @@ impl FederationManager {
 
         // Snapshot clients and peer handles so callers can release the outer
         // lock before we block on per-peer channel sends.
-        let snapshot: Vec<(PeerId, Arc<FederationClient>, Arc<PeerHandle>)> = self
+        let mut snapshot: Vec<(PeerId, Arc<FederationClient>, Arc<PeerHandle>)> = self
             .clients
             .iter()
             .filter_map(|(id, client)| {
@@ -804,6 +819,10 @@ impl FederationManager {
                     .map(|peer| (id.clone(), Arc::clone(client), Arc::clone(peer)))
             })
             .collect();
+
+        // Sort peers by routing preference: same-region first, then by
+        // measured latency (ascending), then by priority (ascending).
+        sort_peers_by_preference(&mut snapshot, self.config.local_region.as_deref());
 
         for (id, client, peer) in &snapshot {
             if !peer.is_available() {
@@ -861,6 +880,13 @@ impl FederationManager {
                         #[cfg(feature = "api")]
                         crate::metrics::circuit_breaker_recoveries().inc();
                         audit::federation_circuit_recovered(id);
+                    }
+                    // Track cross-region forwards for observability
+                    #[cfg(feature = "api")]
+                    if let Some(ref local) = self.config.local_region
+                        && peer.config.region.as_ref().is_some_and(|r| r != local)
+                    {
+                        crate::metrics::cross_region_forwards().inc();
                     }
                     sent += 1;
                 }
@@ -1176,6 +1202,16 @@ impl FederationManager {
                     p.oldest_queued_age_secs().unwrap_or(0.0),
                 )
             })
+            .collect()
+    }
+
+    /// Snapshot per-peer EWMA latency for metrics export.
+    ///
+    /// Returns a vector of `(peer_id, latency_nanos)` tuples.
+    pub fn peer_latency_snapshot(&self) -> Vec<(String, u64)> {
+        self.peers
+            .iter()
+            .map(|(id, p)| (id.to_string(), p.latency_nanos()))
             .collect()
     }
 
@@ -1760,6 +1796,7 @@ mod tests {
             replay_max_bytes: crate::replay_persist::DEFAULT_REPLAY_MAX_BYTES,
             pod_id: None,
             ha_nats_url: None,
+            local_region: None,
         }
     }
 
@@ -1776,6 +1813,9 @@ mod tests {
             routing_mode: RoutingMode::default(),
             protocol_version: 1,
             jwt_token: None,
+            region: None,
+            zone: None,
+            priority: 100,
         }
     }
 
@@ -2754,5 +2794,138 @@ mod tests {
         manager.add_peer(p).await.expect("add_peer");
         assert_eq!(manager.config().peers.len(), 1);
         assert_eq!(manager.config().peers[0].id.as_str(), "alpha");
+    }
+
+    // ── Latency-aware routing tests ─────────────────────────────────
+
+    fn test_peer_config_with_region(id: &str, region: Option<&str>, priority: u32) -> PeerConfig {
+        PeerConfig {
+            id: id.into(),
+            address: "127.0.0.1:9001".into(),
+            groups: vec!["Alpha".into()],
+            inbound_groups: None,
+            outbound_groups: None,
+            enabled: true,
+            is_outbound: true,
+            trust_cert_cn: None,
+            routing_mode: RoutingMode::default(),
+            protocol_version: 1,
+            jwt_token: None,
+            region: region.map(String::from),
+            zone: None,
+            priority,
+        }
+    }
+
+    /// Helper to sort PeerHandles and return their IDs in order.
+    fn sorted_peer_ids(handles: &mut [Arc<PeerHandle>], local_region: Option<&str>) -> Vec<String> {
+        handles.sort_by(|a, b| crate::peer::compare_routing_preference(a, b, local_region));
+        handles.iter().map(|h| h.id.to_string()).collect()
+    }
+
+    #[test]
+    fn sort_peers_same_region_preferred() {
+        let remote = Arc::new(PeerHandle::new(test_peer_config_with_region(
+            "remote",
+            Some("eu-west"),
+            100,
+        )));
+        let local = Arc::new(PeerHandle::new(test_peer_config_with_region(
+            "local",
+            Some("us-east"),
+            100,
+        )));
+        let mut handles = vec![remote, local];
+
+        let ids = sorted_peer_ids(&mut handles, Some("us-east"));
+
+        assert_eq!(ids, vec!["local", "remote"]);
+    }
+
+    #[test]
+    fn sort_peers_lower_latency_preferred() {
+        let slow = Arc::new(PeerHandle::new(test_peer_config_with_region(
+            "slow",
+            Some("us-east"),
+            100,
+        )));
+        let fast = Arc::new(PeerHandle::new(test_peer_config_with_region(
+            "fast",
+            Some("us-east"),
+            100,
+        )));
+
+        slow.record_rtt(50_000_000); // 50ms
+        fast.record_rtt(5_000_000); // 5ms
+
+        let mut handles = vec![slow, fast];
+        let ids = sorted_peer_ids(&mut handles, Some("us-east"));
+
+        assert_eq!(ids, vec!["fast", "slow"]);
+    }
+
+    #[test]
+    fn sort_peers_priority_breaks_ties() {
+        let low_pri = Arc::new(PeerHandle::new(test_peer_config_with_region(
+            "low-pri",
+            Some("us-east"),
+            200,
+        )));
+        let high_pri = Arc::new(PeerHandle::new(test_peer_config_with_region(
+            "high-pri",
+            Some("us-east"),
+            50,
+        )));
+
+        // Same latency
+        low_pri.record_rtt(10_000_000);
+        high_pri.record_rtt(10_000_000);
+
+        let mut handles = vec![low_pri, high_pri];
+        let ids = sorted_peer_ids(&mut handles, Some("us-east"));
+
+        assert_eq!(ids, vec!["high-pri", "low-pri"]);
+    }
+
+    #[test]
+    fn record_rtt_ewma_converges() {
+        let peer = PeerHandle::new(test_peer_config("test", vec![]));
+
+        // First sample initializes directly
+        peer.record_rtt(100_000);
+        assert_eq!(peer.latency_nanos(), 100_000);
+
+        // EWMA: new = (3 * sample + 7 * old) / 10
+        peer.record_rtt(200_000);
+        // expected: (3 * 200_000 + 7 * 100_000) / 10 = 130_000
+        assert_eq!(peer.latency_nanos(), 130_000);
+
+        peer.record_rtt(200_000);
+        // expected: (3 * 200_000 + 7 * 130_000) / 10 = 151_000
+        assert_eq!(peer.latency_nanos(), 151_000);
+    }
+
+    #[test]
+    fn zero_latency_treated_as_unknown() {
+        let unknown = Arc::new(PeerHandle::new(test_peer_config_with_region(
+            "unknown",
+            Some("us-east"),
+            100,
+        )));
+        let measured = Arc::new(PeerHandle::new(test_peer_config_with_region(
+            "measured",
+            Some("us-east"),
+            100,
+        )));
+
+        // Only one peer has measured latency
+        measured.record_rtt(10_000_000);
+        // unknown has latency_nanos == 0 (no samples)
+
+        let mut handles = vec![unknown, measured];
+        let ids = sorted_peer_ids(&mut handles, Some("us-east"));
+
+        // Measured peer should sort before unmeasured
+        assert_eq!(ids, vec!["measured", "unknown"]);
     }
 }

@@ -134,6 +134,9 @@ mod federation_gate {
             routing_mode: Default::default(),
             protocol_version: 2,
             jwt_token: None,
+            region: None,
+            zone: None,
+            priority: 100,
         };
         assert_eq!(peer.id.as_str(), "peer-1");
         assert!(peer.enabled);

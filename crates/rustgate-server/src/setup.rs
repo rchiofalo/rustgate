@@ -770,6 +770,9 @@ pub(crate) fn start_metrics(
 ) -> anyhow::Result<Arc<metrics::MetricsIdentity>> {
     metrics::init().context("registering metrics")?;
 
+    #[cfg(feature = "federation")]
+    rustgate_federation::metrics::init().context("registering federation metrics")?;
+
     // Load the optional CN allowlist for per-identity metric label
     // bucketing. When unset, all CNs collapse to the literal "other"
     // label, capping cardinality at 1.
@@ -928,6 +931,7 @@ async fn build_federation_config(
                 .map(|_| cli.federation_id.clone())
         }),
         ha_nats_url: cli.federation_ha_nats_url.clone(),
+        local_region: cli.federation_region.clone(),
         ..rustgate_federation::config::FederationConfig::default()
     })
 }

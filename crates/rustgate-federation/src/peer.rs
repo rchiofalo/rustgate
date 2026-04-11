@@ -149,6 +149,9 @@ pub struct PeerHandle {
     /// is the oldest message still queued. Used to compute "oldest message age"
     /// without scanning the actual mpsc channel.
     queue_ages: Mutex<VecDeque<(SystemTime, usize)>>,
+    /// EWMA round-trip latency to this peer in nanoseconds (from heartbeats).
+    /// Zero means no RTT samples have been recorded yet.
+    latency_nanos: AtomicU64,
 }
 
 impl PeerHandle {
@@ -175,6 +178,7 @@ impl PeerHandle {
             circuit_trips: AtomicU64::new(0),
             queue_bytes: AtomicU64::new(0),
             queue_ages: Mutex::new(VecDeque::new()),
+            latency_nanos: AtomicU64::new(0),
         }
     }
 
@@ -223,6 +227,35 @@ impl PeerHandle {
     pub fn oldest_queued_age_secs(&self) -> Option<f64> {
         let ts = self.queue_ages.lock().ok()?.front().map(|(t, _)| *t)?;
         ts.elapsed().ok().map(|d| d.as_secs_f64())
+    }
+
+    /// Record an observed round-trip time and update the EWMA.
+    ///
+    /// Uses integer EWMA with alpha=0.3: `new = (3 * sample + 7 * old) / 10`.
+    /// The first sample initializes the estimate directly (no smoothing).
+    /// The update uses a CAS loop to avoid a TOCTOU race where concurrent
+    /// calls could read the same `old` value and clobber each other's update.
+    pub fn record_rtt(&self, rtt_nanos: u64) {
+        loop {
+            let old = self.latency_nanos.load(Ordering::Relaxed);
+            let new = if old == 0 {
+                rtt_nanos
+            } else {
+                (3 * rtt_nanos + 7 * old) / 10
+            };
+            if self
+                .latency_nanos
+                .compare_exchange_weak(old, new, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+        }
+    }
+
+    /// Returns the current EWMA latency in nanoseconds, or 0 if no samples.
+    pub fn latency_nanos(&self) -> u64 {
+        self.latency_nanos.load(Ordering::Relaxed)
     }
 
     /// Create a new peer handle with explicit circuit breaker parameters.
@@ -434,6 +467,37 @@ impl PeerHandle {
     }
 }
 
+/// Compare two peers for routing preference ordering.
+///
+/// Returns `Ordering` suitable for `sort_by`: same-region peers first,
+/// then peers with measured latency before unmeasured, then lower latency
+/// before higher, then lower priority number (higher priority) first.
+pub fn compare_routing_preference(
+    a: &PeerHandle,
+    b: &PeerHandle,
+    local_region: Option<&str>,
+) -> std::cmp::Ordering {
+    let a_same_region = local_region.is_some_and(|r| a.config.region.as_deref() == Some(r));
+    let b_same_region = local_region.is_some_and(|r| b.config.region.as_deref() == Some(r));
+
+    let a_latency = a.latency_nanos();
+    let b_latency = b.latency_nanos();
+
+    // Peers with measured latency sort before peers with no data
+    let a_has_data = a_latency > 0;
+    let b_has_data = b_latency > 0;
+
+    // Same-region peers first
+    b_same_region
+        .cmp(&a_same_region)
+        // Peers with measured latency before unmeasured
+        .then(b_has_data.cmp(&a_has_data))
+        // Then lower latency
+        .then(a_latency.cmp(&b_latency))
+        // Then lower priority number (higher priority)
+        .then(a.config.priority.cmp(&b.config.priority))
+}
+
 /// Serializable snapshot of a peer's current status.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PeerStatus {
@@ -483,6 +547,9 @@ mod tests {
             routing_mode: RoutingMode::default(),
             protocol_version: 2,
             jwt_token: None,
+            region: None,
+            zone: None,
+            priority: 100,
         }
     }
 

@@ -113,6 +113,8 @@ static CLIENT_QUEUE_SKIPPED_UNSUPPORTED: OnceLock<IntCounter> = OnceLock::new();
 static FEDERATION_PEER_QUEUE_BYTES: OnceLock<prometheus::IntGaugeVec> = OnceLock::new();
 #[cfg(feature = "federation")]
 static FEDERATION_PEER_OLDEST_SECONDS: OnceLock<prometheus::IntGaugeVec> = OnceLock::new();
+#[cfg(feature = "federation")]
+static FEDERATION_PEER_LATENCY_NANOS: OnceLock<prometheus::IntGaugeVec> = OnceLock::new();
 
 static AUTHZ_DECISIONS: OnceLock<IntCounterVec> = OnceLock::new();
 static AUTHZ_EVAL_NANOS: OnceLock<Histogram> = OnceLock::new();
@@ -461,6 +463,16 @@ pub fn init() -> prometheus::Result<()> {
         )?;
         registry.register(Box::new(federation_peer_oldest_seconds.clone()))?;
         let _ = FEDERATION_PEER_OLDEST_SECONDS.set(federation_peer_oldest_seconds);
+
+        let federation_peer_latency_nanos = prometheus::IntGaugeVec::new(
+            Opts::new(
+                "rustgate_federation_peer_latency_nanos",
+                "EWMA round-trip latency to a federation peer in nanoseconds",
+            ),
+            &["peer"],
+        )?;
+        registry.register(Box::new(federation_peer_latency_nanos.clone()))?;
+        let _ = FEDERATION_PEER_LATENCY_NANOS.set(federation_peer_latency_nanos);
     }
 
     let archive_bytes = IntGauge::with_opts(Opts::new(
@@ -694,14 +706,15 @@ pub fn spawn_federation_lag_updater(
         let mut known_peers: std::collections::HashSet<String> = std::collections::HashSet::new();
         loop {
             let _ = ticker.tick().await;
-            let snapshot = {
+            let (lag_snapshot, latency_snapshot) = {
                 let guard = manager.read().await;
-                guard.peer_lag_snapshot()
+                (guard.peer_lag_snapshot(), guard.peer_latency_snapshot())
             };
             let bytes_vec = FEDERATION_PEER_QUEUE_BYTES.get();
             let oldest_vec = FEDERATION_PEER_OLDEST_SECONDS.get();
+            let latency_vec = FEDERATION_PEER_LATENCY_NANOS.get();
             let mut current: std::collections::HashSet<String> = std::collections::HashSet::new();
-            for (peer, bytes, oldest) in &snapshot {
+            for (peer, bytes, oldest) in &lag_snapshot {
                 let _ = current.insert(peer.clone());
                 if let Some(g) = bytes_vec
                     && let Ok(child) = g.get_metric_with_label_values(&[peer.as_str()])
@@ -714,11 +727,21 @@ pub fn spawn_federation_lag_updater(
                     child.set(oldest.round() as i64);
                 }
             }
+            for (peer, nanos) in &latency_snapshot {
+                if let Some(g) = latency_vec
+                    && let Ok(child) = g.get_metric_with_label_values(&[peer.as_str()])
+                {
+                    child.set(*nanos as i64);
+                }
+            }
             for stale in known_peers.difference(&current) {
                 if let Some(g) = bytes_vec {
                     let _ = g.remove_label_values(&[stale.as_str()]);
                 }
                 if let Some(g) = oldest_vec {
+                    let _ = g.remove_label_values(&[stale.as_str()]);
+                }
+                if let Some(g) = latency_vec {
                     let _ = g.remove_label_values(&[stale.as_str()]);
                 }
             }
