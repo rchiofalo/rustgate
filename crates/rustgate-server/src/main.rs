@@ -334,6 +334,17 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     // it shadows the readiness portion of `HealthState`.
     let ready = Arc::new(AtomicBool::new(true));
 
+    // Readiness dependency state — holds handles to subsystems so the
+    // `/readyz` endpoint can inspect their health.
+    #[cfg(feature = "metrics")]
+    let readiness = Arc::new(metrics::ReadinessState {
+        cert_reloader: cert_reloader.as_ref().map(Arc::clone),
+        #[cfg(feature = "nats")]
+        nats_client: std::sync::Mutex::new(None),
+        #[cfg(feature = "federation")]
+        federation_manager: std::sync::Mutex::new(None),
+    });
+
     // ── Metrics ─────────────────────────────────────────────────────
     #[cfg(all(feature = "metrics", feature = "federation"))]
     let fed_api_slot: Arc<std::sync::OnceLock<metrics::FedApiHandler>> =
@@ -350,6 +361,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let metrics_identity = setup::start_metrics(
         &cli,
         &health,
+        &readiness,
         #[cfg(feature = "federation")]
         &fed_api_slot,
         &acl_api_slot,
@@ -771,6 +783,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     #[cfg(feature = "nats")]
     let nats_publisher = setup::connect_nats(&cli, &router).await;
 
+    // Register NATS client with readiness state for health checks.
+    #[cfg(all(feature = "nats", feature = "metrics"))]
+    if let Some(ref publisher) = nats_publisher {
+        readiness.set_nats_client(publisher.client());
+    }
+
     #[cfg(not(feature = "nats"))]
     let nats_publisher: Option<()> = {
         setup::warn_nats_disabled(&cli);
@@ -796,6 +814,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         &fed_api_slot,
     )
     .await?;
+
+    // Register federation manager with readiness state for health checks.
+    #[cfg(all(feature = "federation", feature = "metrics"))]
+    if let Some(ref mgr) = fed_shutdown_handle {
+        readiness.set_federation_manager(Arc::clone(mgr));
+    }
 
     #[cfg(not(feature = "federation"))]
     let fed_forward: Option<FedForwardFn> = setup::warn_federation_disabled(&cli);

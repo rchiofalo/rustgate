@@ -28,6 +28,14 @@ impl NatsPublisher {
         Self { client, config }
     }
 
+    /// Return a clone of the underlying NATS client handle.
+    ///
+    /// Used by readiness checks to inspect connection state without
+    /// affecting the publisher's own operations.
+    pub fn client(&self) -> Client {
+        self.client.clone()
+    }
+
     /// Publish a routable message to NATS.
     ///
     /// With the `full-detail` feature, publishes all CoT types with full
