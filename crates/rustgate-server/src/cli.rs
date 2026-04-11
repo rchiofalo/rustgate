@@ -345,6 +345,7 @@ pub(crate) struct Cli {
     /// When set, requests to `/metrics` must present `Authorization: Bearer <token>`.
     /// When unset, `/metrics` is unauthenticated (backward compatible).
     /// The token is compared in constant time and stored in zeroizing memory.
+    /// The token is read once at startup; restart the server to rotate.
     #[arg(long, env = "RUSTGATE_METRICS_TOKEN_FILE")]
     pub(crate) metrics_token_file: Option<String>,
 

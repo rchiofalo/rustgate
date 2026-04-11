@@ -173,16 +173,19 @@ pub const MAX_TOKEN_LEN: usize = 256;
 /// Returns `Ok(())` when the token is between [`MIN_TOKEN_LEN`] and
 /// [`MAX_TOKEN_LEN`] bytes (inclusive). Called at startup to reject
 /// misconfigured token files before the API server binds.
-pub fn validate_token_length(token: &[u8]) -> Result<(), String> {
+///
+/// The `label` parameter is used in error messages to identify which
+/// token failed validation (e.g. "ACL API" or "metrics bearer").
+pub fn validate_bearer_token_length(token: &[u8], label: &str) -> Result<(), String> {
     let len = token.len();
     if len < MIN_TOKEN_LEN {
         return Err(format!(
-            "ACL API token too short ({len} bytes, minimum {MIN_TOKEN_LEN})"
+            "{label} token too short ({len} bytes, minimum {MIN_TOKEN_LEN})"
         ));
     }
     if len > MAX_TOKEN_LEN {
         return Err(format!(
-            "ACL API token too long ({len} bytes, maximum {MAX_TOKEN_LEN})"
+            "{label} token too long ({len} bytes, maximum {MAX_TOKEN_LEN})"
         ));
     }
     Ok(())
@@ -711,32 +714,40 @@ mod tests {
     #[test]
     fn token_length_rejects_too_short() {
         let short = vec![b'a'; MIN_TOKEN_LEN - 1];
-        let err = validate_token_length(&short).unwrap_err();
+        let err = validate_bearer_token_length(&short, "ACL API").unwrap_err();
         assert!(err.contains("too short"), "got: {err}");
+        assert!(err.contains("ACL API"), "got: {err}");
     }
 
     #[test]
     fn token_length_rejects_too_long() {
         let long = vec![b'a'; MAX_TOKEN_LEN + 1];
-        let err = validate_token_length(&long).unwrap_err();
+        let err = validate_bearer_token_length(&long, "ACL API").unwrap_err();
         assert!(err.contains("too long"), "got: {err}");
     }
 
     #[test]
     fn token_length_accepts_min_boundary() {
         let token = vec![b'a'; MIN_TOKEN_LEN];
-        assert!(validate_token_length(&token).is_ok());
+        assert!(validate_bearer_token_length(&token, "ACL API").is_ok());
     }
 
     #[test]
     fn token_length_accepts_max_boundary() {
         let token = vec![b'a'; MAX_TOKEN_LEN];
-        assert!(validate_token_length(&token).is_ok());
+        assert!(validate_bearer_token_length(&token, "ACL API").is_ok());
     }
 
     #[test]
     fn token_length_accepts_mid_range() {
         let token = vec![b'a'; 64];
-        assert!(validate_token_length(&token).is_ok());
+        assert!(validate_bearer_token_length(&token, "ACL API").is_ok());
+    }
+
+    #[test]
+    fn token_length_uses_custom_label() {
+        let short = vec![b'a'; MIN_TOKEN_LEN - 1];
+        let err = validate_bearer_token_length(&short, "metrics bearer").unwrap_err();
+        assert!(err.contains("metrics bearer"), "got: {err}");
     }
 }

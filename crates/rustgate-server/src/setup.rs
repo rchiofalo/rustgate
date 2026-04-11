@@ -806,7 +806,7 @@ pub(crate) fn start_metrics(
         if token.is_empty() {
             anyhow::bail!("metrics token file {token_file} is empty");
         }
-        crate::acl_api::validate_token_length(&token)
+        crate::acl_api::validate_bearer_token_length(&token, "metrics bearer")
             .map_err(|e| anyhow::anyhow!("{e} (from {token_file})"))?;
         tracing::info!("metrics endpoint authentication enabled via --metrics-token-file");
         Some(Arc::new(zeroize::Zeroizing::new(token)))

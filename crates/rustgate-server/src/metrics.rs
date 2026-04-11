@@ -1375,6 +1375,7 @@ fn handle_request(
                 if !metrics_auth_ok(auth, expected) {
                     return Ok(Response::builder()
                         .status(StatusCode::UNAUTHORIZED)
+                        .header(hyper::header::WWW_AUTHENTICATE, "Bearer")
                         .body(Full::new(Bytes::from("unauthorized")))
                         .unwrap_or_else(|_| internal_error_response()));
                 }
@@ -1983,6 +1984,44 @@ mod tests {
         (status, body)
     }
 
+    /// Minimal HTTP GET returning status, raw headers block, and body.
+    async fn http_get_raw(
+        addr: SocketAddr,
+        path: &str,
+        auth: Option<&str>,
+    ) -> (u16, String, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+
+        let auth_header = match auth {
+            Some(val) => format!("Authorization: {val}\r\n"),
+            None => String::new(),
+        };
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: {addr}\r\n{auth_header}Connection: close\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.expect("write");
+
+        let mut buf = Vec::new();
+        let _ = stream.read_to_end(&mut buf).await.expect("read");
+        let response = String::from_utf8_lossy(&buf);
+
+        let status_line = response.lines().next().unwrap_or("");
+        let status: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        let (headers_part, body) = response
+            .split_once("\r\n\r\n")
+            .map(|(h, b)| (h.to_string(), b.to_string()))
+            .unwrap_or_default();
+
+        (status, headers_part, body)
+    }
+
     /// Helper to start a metrics server with an optional auth token.
     async fn start_test_server(token: Option<&[u8]>) -> SocketAddr {
         let health = Arc::new(HealthState::new());
@@ -2052,6 +2091,22 @@ mod tests {
         .await;
         assert_eq!(status, 401);
         assert!(body.contains("unauthorized"));
+    }
+
+    #[tokio::test]
+    async fn metrics_401_includes_www_authenticate_header() {
+        ensure_init();
+        let addr = start_test_server(Some(b"test-metrics-token-abcdef1234567")).await;
+
+        // RFC 6750 Section 3: 401 responses for bearer auth must include
+        // a WWW-Authenticate: Bearer header.
+        let (status, headers, _body) = http_get_raw(addr, "/metrics", None).await;
+        assert_eq!(status, 401);
+        let lower = headers.to_ascii_lowercase();
+        assert!(
+            lower.contains("www-authenticate: bearer"),
+            "expected WWW-Authenticate: Bearer header, got: {headers}"
+        );
     }
 
     #[tokio::test]
