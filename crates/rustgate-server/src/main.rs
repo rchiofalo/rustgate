@@ -340,7 +340,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let readiness = Arc::new(metrics::ReadinessState {
         cert_reloader: cert_reloader.as_ref().map(Arc::clone),
         #[cfg(feature = "nats")]
-        nats_client: std::sync::Mutex::new(None),
+        nats_publisher: std::sync::Mutex::new(None),
         #[cfg(feature = "federation")]
         federation_manager: std::sync::Mutex::new(None),
     });
@@ -786,7 +786,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     // Register NATS client with readiness state for health checks.
     #[cfg(all(feature = "nats", feature = "metrics"))]
     if let Some(ref publisher) = nats_publisher {
-        readiness.set_nats_client(publisher.client());
+        readiness.set_nats_publisher(publisher.clone());
     }
 
     #[cfg(not(feature = "nats"))]

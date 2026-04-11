@@ -15,7 +15,7 @@ path = "src/main.rs"
 workspace = true
 
 [features]
-nats = ["dep:rustgate-nats", "dep:async-nats"]
+nats = ["dep:rustgate-nats"]
 enrollment = ["dep:rustgate-enrollment", "dep:rustls-pki-types"]
 est = ["enrollment", "rustgate-enrollment/est"]
 proto = ["dep:rustgate-proto", "rustgate-transport/proto"]
@@ -55,7 +55,6 @@ rustgate-transport = { workspace = true }
 rustgate-websocket = { workspace = true, optional = true }
 rustgate-mqtt = { workspace = true, optional = true }
 rustgate-nats = { workspace = true, optional = true }
-async-nats = { workspace = true, optional = true }
 rustgate-enrollment = { workspace = true, optional = true }
 rustgate-proto = { workspace = true, optional = true }
 rustgate-federation = { workspace = true, optional = true }

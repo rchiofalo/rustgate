@@ -1447,9 +1447,10 @@ pub struct ReadinessState {
     /// TLS certificate reloader — checked for cert existence and expiry.
     pub cert_reloader: Option<Arc<rustgate_transport::CertReloader>>,
 
-    /// NATS client handle — checked for connection state.
+    /// NATS publisher — checked for connection state via
+    /// [`rustgate_nats::NatsPublisher::is_connected`].
     #[cfg(feature = "nats")]
-    pub nats_client: std::sync::Mutex<Option<async_nats::Client>>,
+    pub nats_publisher: std::sync::Mutex<Option<rustgate_nats::NatsPublisher>>,
 
     /// Federation manager — checked for connected peer count.
     #[cfg(feature = "federation")]
@@ -1472,17 +1473,17 @@ impl ReadinessState {
         Self {
             cert_reloader: None,
             #[cfg(feature = "nats")]
-            nats_client: std::sync::Mutex::new(None),
+            nats_publisher: std::sync::Mutex::new(None),
             #[cfg(feature = "federation")]
             federation_manager: std::sync::Mutex::new(None),
         }
     }
 
-    /// Register a NATS client for readiness checking.
+    /// Register a NATS publisher for readiness checking.
     #[cfg(feature = "nats")]
-    pub fn set_nats_client(&self, client: async_nats::Client) {
-        if let Ok(mut guard) = self.nats_client.lock() {
-            *guard = Some(client);
+    pub fn set_nats_publisher(&self, publisher: rustgate_nats::NatsPublisher) {
+        if let Ok(mut guard) = self.nats_publisher.lock() {
+            *guard = Some(publisher);
         }
     }
 
@@ -1513,10 +1514,10 @@ impl ReadinessState {
 
         // NATS connection state
         #[cfg(feature = "nats")]
-        if let Ok(guard) = self.nats_client.lock()
-            && let Some(ref client) = *guard
+        if let Ok(guard) = self.nats_publisher.lock()
+            && let Some(ref publisher) = *guard
         {
-            let _ = checks.insert("nats".to_string(), check_nats(client));
+            let _ = checks.insert("nats".to_string(), check_nats(publisher));
         }
 
         // Federation peer connectivity
@@ -1576,17 +1577,16 @@ fn check_tls_cert(reloader: &rustgate_transport::CertReloader) -> DependencyChec
     DependencyCheck::ok()
 }
 
-/// Check NATS connection state via the `async_nats::Client` handle.
+/// Check NATS connection state via [`NatsPublisher`] helper methods,
+/// avoiding a direct dependency on `async-nats` in this crate.
 #[cfg(feature = "nats")]
-fn check_nats(client: &async_nats::Client) -> DependencyCheck {
-    match client.connection_state() {
-        async_nats::connection::State::Connected => DependencyCheck::ok(),
-        async_nats::connection::State::Pending => {
-            DependencyCheck::degraded("NATS connection pending")
-        }
-        async_nats::connection::State::Disconnected => {
-            DependencyCheck::unhealthy("NATS disconnected")
-        }
+fn check_nats(publisher: &rustgate_nats::NatsPublisher) -> DependencyCheck {
+    if publisher.is_connected() {
+        DependencyCheck::ok()
+    } else if publisher.is_pending() {
+        DependencyCheck::degraded("NATS connection pending")
+    } else {
+        DependencyCheck::unhealthy("NATS disconnected")
     }
 }
 
@@ -2910,6 +2910,36 @@ mod tests {
         let check = check_tls_cert(&reloader);
         assert_eq!(check.status, CheckStatus::Unhealthy);
         assert!(check.message.as_deref().unwrap_or("").contains("expired"));
+    }
+
+    #[test]
+    fn tls_check_degraded_for_near_expiry_cert() {
+        use rustgate_test_utils::certs::TestCa;
+
+        let ca = TestCa::new("test-ca");
+        // Certificate expires in 3 days — below the 7-day degraded threshold.
+        let near_expiry = ca.issue_near_expiry_server_cert("expiring-server", &["localhost"], 3);
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, &near_expiry.cert_pem).expect("write cert");
+        std::fs::write(&key_path, &near_expiry.key_pem).expect("write key");
+
+        let reloader =
+            rustgate_transport::CertReloader::new(&cert_path, &key_path).expect("reloader");
+        let check = check_tls_cert(&reloader);
+        assert_eq!(
+            check.status,
+            CheckStatus::Degraded,
+            "cert expiring in 3 days should be degraded, got: {:?}",
+            check
+        );
+        let msg = check.message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("expires"),
+            "message should mention expiry: {msg}"
+        );
     }
 
     #[test]

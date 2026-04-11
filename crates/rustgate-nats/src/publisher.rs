@@ -36,6 +36,26 @@ impl NatsPublisher {
         self.client.clone()
     }
 
+    /// Returns `true` when the NATS connection is fully established.
+    ///
+    /// This encapsulates the `async_nats::connection::State` check so
+    /// callers do not need a direct dependency on `async-nats`.
+    pub fn is_connected(&self) -> bool {
+        matches!(
+            self.client.connection_state(),
+            async_nats::connection::State::Connected
+        )
+    }
+
+    /// Returns `true` when the NATS client is in the process of
+    /// (re-)connecting but has not yet established a session.
+    pub fn is_pending(&self) -> bool {
+        matches!(
+            self.client.connection_state(),
+            async_nats::connection::State::Pending
+        )
+    }
+
     /// Publish a routable message to NATS.
     ///
     /// With the `full-detail` feature, publishes all CoT types with full
