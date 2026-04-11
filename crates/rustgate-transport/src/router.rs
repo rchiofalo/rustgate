@@ -1919,7 +1919,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acl_open_for_unconfigured_group() {
+    async fn acl_denies_unconfigured_group_when_policy_loaded() {
         let mut groups = std::collections::HashMap::new();
         groups.insert(
             "restricted".to_string(),
@@ -1944,13 +1944,13 @@ mod tests {
             .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
             .await;
 
-        // "open-group" is not in the policy — should allow freely
+        // "open-group" is not in the policy — default-deny when policy loaded.
         let msg = make_chat(&bob, Destination::Group("open-group".to_string()));
         router.route(msg).await;
 
         assert!(
-            nrx_a.try_recv().is_ok(),
-            "alice must receive: open-group has no ACL"
+            nrx_a.try_recv().is_err(),
+            "alice must NOT receive: unconfigured group denied when policy loaded"
         );
     }
 

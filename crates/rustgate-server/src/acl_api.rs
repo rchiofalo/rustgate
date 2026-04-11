@@ -95,16 +95,31 @@ fn json_error(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
 }
 
 /// Convert an in-memory [`GroupAclFile`] into a runtime [`rustgate_transport::GroupAclPolicy`].
+///
+/// CN strings are normalized to ASCII lowercase for case-insensitive
+/// matching per RFC 5280 §7.1.
 fn build_policy(file: &GroupAclFile) -> rustgate_transport::GroupAclPolicy {
     let mut groups = HashMap::with_capacity(file.groups.len());
     for (group_id, entry) in &file.groups {
         let _ = groups.insert(
             group_id.clone(),
             rustgate_transport::GroupAcl::with_deny(
-                entry.send.clone(),
-                entry.receive.clone(),
-                entry.deny_send.clone(),
-                entry.deny_receive.clone(),
+                entry.send.iter().map(|s| s.to_ascii_lowercase()).collect(),
+                entry
+                    .receive
+                    .iter()
+                    .map(|s| s.to_ascii_lowercase())
+                    .collect(),
+                entry
+                    .deny_send
+                    .iter()
+                    .map(|s| s.to_ascii_lowercase())
+                    .collect(),
+                entry
+                    .deny_receive
+                    .iter()
+                    .map(|s| s.to_ascii_lowercase())
+                    .collect(),
             ),
         );
     }

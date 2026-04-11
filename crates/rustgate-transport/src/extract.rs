@@ -353,6 +353,13 @@ fn first_subject_attr(
     None
 }
 
+/// Extract the Common Name (CN) from the certificate's subject.
+///
+/// NOTE: The CN is returned with its original casing from the certificate.
+/// Case-insensitive matching is enforced at the ACL lookup layer
+/// (`GroupAcl::can_send` / `can_receive`), not at extraction time.
+/// This preserves the original CN for logging and identity display
+/// while ensuring security checks are case-insensitive.
 fn extract_cn(cert: &X509Certificate<'_>) -> Result<String> {
     for rdn in cert.subject().iter_rdn() {
         for attr in rdn.iter() {
