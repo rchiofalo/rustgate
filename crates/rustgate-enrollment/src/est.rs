@@ -73,109 +73,21 @@ pub async fn handle_simpleenroll(
     sign_limiter: &RateLimiter,
     on_rate_limit: Option<&RateLimitCallback>,
 ) -> Response<Full<Bytes>> {
-    // Rate limit check (before auth to prevent work amplification).
-    if !sign_limiter.check(peer.ip()) {
-        if let Some(cb) = on_rate_limit {
-            cb();
-        }
-        return build_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            "text/plain",
-            Bytes::from("rate limit exceeded"),
-        );
-    }
-
-    // Authentication.
-    let auth_header = req
-        .headers()
-        .get(hyper::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
-    let username = match credentials.validate(auth_header) {
-        Some(u) => u,
-        None => {
-            return build_response_with_www_auth(
-                StatusCode::UNAUTHORIZED,
-                "text/plain",
-                Bytes::from("authentication required"),
-            );
-        }
+    let (body, username) = match validate_and_read_body(
+        req,
+        peer,
+        credentials,
+        sign_limiter,
+        on_rate_limit,
+        "simpleenroll",
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
     };
 
-    // Read and validate Content-Type.
-    let content_type = req
-        .headers()
-        .get(hyper::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if !content_type.starts_with(CT_PKCS10) {
-        return build_response(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "text/plain",
-            Bytes::from(format!(
-                "expected Content-Type: {CT_PKCS10}, got: {content_type}"
-            )),
-        );
-    }
-
-    // Read request body (base64-encoded DER CSR).
-    let body = match read_body(req).await {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::debug!(error = %e, "EST /simpleenroll: failed to read body");
-            return build_response(
-                StatusCode::BAD_REQUEST,
-                "text/plain",
-                Bytes::from("failed to read request body"),
-            );
-        }
-    };
-
-    // Decode base64 → DER, then wrap in PEM for CsrSigner.
-    let csr_pem = match decode_pkcs10_to_pem(&body) {
-        Ok(pem) => pem,
-        Err(e) => {
-            tracing::debug!(error = %e, "EST /simpleenroll: invalid CSR encoding");
-            return build_response(
-                StatusCode::BAD_REQUEST,
-                "text/plain",
-                Bytes::from("invalid CSR format"),
-            );
-        }
-    };
-
-    // Sign the CSR.
-    let signed_der = match signer.sign_csr(&csr_pem, username) {
-        Ok(der) => der,
-        Err(e) => {
-            tracing::warn!(error = %e, "EST /simpleenroll: CSR signing failed");
-            return build_response(
-                StatusCode::BAD_REQUEST,
-                "text/plain",
-                Bytes::from("unable to process CSR"),
-            );
-        }
-    };
-
-    let masked_peer = rustgate_core::masking::mask_ip(&peer.to_string());
-    rustgate_core::audit::enrollment_signed(username, &masked_peer);
-    tracing::info!(
-        username = %username,
-        peer = %masked_peer,
-        "EST certificate issued via /simpleenroll"
-    );
-
-    // Build PKCS#7 certs-only bag with [client cert, CA cert].
-    match cms_bag::build_certs_only_base64(&[&signed_der, signer.ca_cert_der()]) {
-        Ok(body) => build_response(StatusCode::OK, CT_PKCS7_CERTS_ONLY, Bytes::from(body)),
-        Err(e) => {
-            tracing::error!(error = %e, "EST /simpleenroll: failed to build response");
-            build_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "text/plain",
-                Bytes::from("internal error building enrollment response"),
-            )
-        }
-    }
+    sign_and_respond(&body, signer, username, &peer, "simpleenroll")
 }
 
 // ---------------------------------------------------------------------------
@@ -199,74 +111,18 @@ pub async fn handle_simplereenroll(
     sign_limiter: &RateLimiter,
     on_rate_limit: Option<&RateLimitCallback>,
 ) -> Response<Full<Bytes>> {
-    // Rate limit check (before auth to prevent work amplification).
-    if !sign_limiter.check(peer.ip()) {
-        if let Some(cb) = on_rate_limit {
-            cb();
-        }
-        return build_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            "text/plain",
-            Bytes::from("rate limit exceeded"),
-        );
-    }
-
-    // Authentication.
-    let auth_header = req
-        .headers()
-        .get(hyper::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
-    let username = match credentials.validate(auth_header) {
-        Some(u) => u,
-        None => {
-            return build_response_with_www_auth(
-                StatusCode::UNAUTHORIZED,
-                "text/plain",
-                Bytes::from("authentication required"),
-            );
-        }
-    };
-
-    // Read and validate Content-Type.
-    let content_type = req
-        .headers()
-        .get(hyper::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if !content_type.starts_with(CT_PKCS10) {
-        return build_response(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "text/plain",
-            Bytes::from(format!(
-                "expected Content-Type: {CT_PKCS10}, got: {content_type}"
-            )),
-        );
-    }
-
-    // Read request body (base64-encoded DER CSR).
-    let body = match read_body(req).await {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::debug!(error = %e, "EST /simplereenroll: failed to read body");
-            return build_response(
-                StatusCode::BAD_REQUEST,
-                "text/plain",
-                Bytes::from("failed to read request body"),
-            );
-        }
-    };
-
-    // Decode base64 → DER, then wrap in PEM for CsrSigner.
-    let csr_pem = match decode_pkcs10_to_pem(&body) {
-        Ok(pem) => pem,
-        Err(e) => {
-            tracing::debug!(error = %e, "EST /simplereenroll: invalid CSR encoding");
-            return build_response(
-                StatusCode::BAD_REQUEST,
-                "text/plain",
-                Bytes::from("invalid CSR format"),
-            );
-        }
+    let (body, username) = match validate_and_read_body(
+        req,
+        peer,
+        credentials,
+        sign_limiter,
+        on_rate_limit,
+        "simplereenroll",
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
     };
 
     // Verify identity continuity: the CSR's subject CN must match the
@@ -307,39 +163,7 @@ pub async fn handle_simplereenroll(
         }
     }
 
-    // Sign the CSR.
-    let signed_der = match signer.sign_csr(&csr_pem, username) {
-        Ok(der) => der,
-        Err(e) => {
-            tracing::warn!(error = %e, "EST /simplereenroll: CSR signing failed");
-            return build_response(
-                StatusCode::BAD_REQUEST,
-                "text/plain",
-                Bytes::from("unable to process CSR"),
-            );
-        }
-    };
-
-    let masked_peer = rustgate_core::masking::mask_ip(&peer.to_string());
-    rustgate_core::audit::enrollment_signed(username, &masked_peer);
-    tracing::info!(
-        username = %username,
-        peer = %masked_peer,
-        "EST certificate issued via /simplereenroll"
-    );
-
-    // Build PKCS#7 certs-only bag with [client cert, CA cert].
-    match cms_bag::build_certs_only_base64(&[&signed_der, signer.ca_cert_der()]) {
-        Ok(body) => build_response(StatusCode::OK, CT_PKCS7_CERTS_ONLY, Bytes::from(body)),
-        Err(e) => {
-            tracing::error!(error = %e, "EST /simplereenroll: failed to build response");
-            build_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "text/plain",
-                Bytes::from("internal error building enrollment response"),
-            )
-        }
-    }
+    sign_and_respond(&body, signer, username, &peer, "simplereenroll")
 }
 
 // ---------------------------------------------------------------------------
@@ -365,6 +189,138 @@ pub fn handle_csrattrs() -> Response<Full<Bytes>> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Common auth, content-type, and body-reading logic shared by both
+/// enrollment endpoints. Returns the raw body bytes and authenticated
+/// username, or an early-return HTTP error response.
+async fn validate_and_read_body<'a>(
+    req: Request<hyper::body::Incoming>,
+    peer: SocketAddr,
+    credentials: &'a Credentials,
+    sign_limiter: &RateLimiter,
+    on_rate_limit: Option<&RateLimitCallback>,
+    endpoint: &str,
+) -> Result<(Vec<u8>, &'a str), Response<Full<Bytes>>> {
+    // Rate limit check (before auth to prevent work amplification).
+    if !sign_limiter.check(peer.ip()) {
+        if let Some(cb) = on_rate_limit {
+            cb();
+        }
+        return Err(build_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "text/plain",
+            Bytes::from("rate limit exceeded"),
+        ));
+    }
+
+    // Authentication.
+    let auth_header = req
+        .headers()
+        .get(hyper::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    let username = match credentials.validate(auth_header) {
+        Some(u) => u,
+        None => {
+            return Err(build_response_with_www_auth(
+                StatusCode::UNAUTHORIZED,
+                "text/plain",
+                Bytes::from("authentication required"),
+            ));
+        }
+    };
+
+    // Read and validate Content-Type.
+    let content_type = req
+        .headers()
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !content_type.starts_with(CT_PKCS10) {
+        return Err(build_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "text/plain",
+            Bytes::from(format!(
+                "expected Content-Type: {CT_PKCS10}, got: {content_type}"
+            )),
+        ));
+    }
+
+    // Read request body (base64-encoded DER CSR).
+    let body = match read_body(req).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::debug!(error = %e, endpoint = %endpoint, "EST: failed to read body");
+            return Err(build_response(
+                StatusCode::BAD_REQUEST,
+                "text/plain",
+                Bytes::from("failed to read request body"),
+            ));
+        }
+    };
+
+    Ok((body, username))
+}
+
+/// Shared CSR signing and response-building logic for both enrollment endpoints.
+///
+/// Handles PEM decoding, CSR signing, audit logging, and PKCS#7 certs-only
+/// response construction. Called by both `handle_simpleenroll` and
+/// `handle_simplereenroll` after their respective validation steps.
+fn sign_and_respond(
+    body: &[u8],
+    signer: &CsrSigner,
+    username: &str,
+    peer: &SocketAddr,
+    endpoint: &str,
+) -> Response<Full<Bytes>> {
+    // Decode base64 → DER, then wrap in PEM for CsrSigner.
+    let csr_pem = match decode_pkcs10_to_pem(body) {
+        Ok(pem) => pem,
+        Err(e) => {
+            tracing::debug!(error = %e, endpoint = %endpoint, "EST: invalid CSR encoding");
+            return build_response(
+                StatusCode::BAD_REQUEST,
+                "text/plain",
+                Bytes::from("invalid CSR format"),
+            );
+        }
+    };
+
+    // Sign the CSR.
+    let signed_der = match signer.sign_csr(&csr_pem, username) {
+        Ok(der) => der,
+        Err(e) => {
+            tracing::warn!(error = %e, endpoint = %endpoint, "EST: CSR signing failed");
+            return build_response(
+                StatusCode::BAD_REQUEST,
+                "text/plain",
+                Bytes::from("unable to process CSR"),
+            );
+        }
+    };
+
+    let masked_peer = rustgate_core::masking::mask_ip(&peer.to_string());
+    rustgate_core::audit::enrollment_signed(username, &masked_peer);
+    tracing::info!(
+        username = %username,
+        peer = %masked_peer,
+        endpoint = %endpoint,
+        "EST certificate issued"
+    );
+
+    // Build PKCS#7 certs-only bag with [client cert, CA cert].
+    match cms_bag::build_certs_only_base64(&[&signed_der, signer.ca_cert_der()]) {
+        Ok(body) => build_response(StatusCode::OK, CT_PKCS7_CERTS_ONLY, Bytes::from(body)),
+        Err(e) => {
+            tracing::error!(error = %e, endpoint = %endpoint, "EST: failed to build response");
+            build_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "text/plain",
+                Bytes::from("internal error building enrollment response"),
+            )
+        }
+    }
+}
 
 /// OID for commonName (CN): 2.5.4.3 (RFC 4519).
 const OID_COMMON_NAME: der::asn1::ObjectIdentifier =
