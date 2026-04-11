@@ -526,3 +526,101 @@ fn attr_matches(want: &CompiledAttrValue, have: &rustgate_core::AttrValue) -> bo
         _ => false,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Exhaustive destructuring guard: adding a field to `CompiledSubjectPred`
+    /// will cause a compile error here, reminding the developer to update
+    /// `is_match_all()` and the per-field tests below.
+    #[test]
+    fn is_match_all_covers_all_fields() {
+        let pred = CompiledSubjectPred {
+            cn_eq: None,
+            groups_any_of: vec![],
+            groups_all_of: vec![],
+            spiffe_prefix: None,
+            attribute_eq: vec![],
+        };
+        assert!(pred.is_match_all(), "all-empty pred should match all");
+    }
+
+    #[test]
+    fn is_match_all_false_when_cn_eq_set() {
+        let pred = CompiledSubjectPred {
+            cn_eq: Some("alice".to_string()),
+            groups_any_of: vec![],
+            groups_all_of: vec![],
+            spiffe_prefix: None,
+            attribute_eq: vec![],
+        };
+        assert!(!pred.is_match_all(), "cn_eq present should not match all");
+    }
+
+    #[test]
+    fn is_match_all_false_when_groups_any_of_set() {
+        let pred = CompiledSubjectPred {
+            cn_eq: None,
+            groups_any_of: vec!["ops".to_string()],
+            groups_all_of: vec![],
+            spiffe_prefix: None,
+            attribute_eq: vec![],
+        };
+        assert!(
+            !pred.is_match_all(),
+            "groups_any_of present should not match all"
+        );
+    }
+
+    #[test]
+    fn is_match_all_false_when_groups_all_of_set() {
+        let pred = CompiledSubjectPred {
+            cn_eq: None,
+            groups_any_of: vec![],
+            groups_all_of: vec!["admins".to_string()],
+            spiffe_prefix: None,
+            attribute_eq: vec![],
+        };
+        assert!(
+            !pred.is_match_all(),
+            "groups_all_of present should not match all"
+        );
+    }
+
+    #[test]
+    fn is_match_all_false_when_spiffe_prefix_set() {
+        let pred = CompiledSubjectPred {
+            cn_eq: None,
+            groups_any_of: vec![],
+            groups_all_of: vec![],
+            spiffe_prefix: Some(SpiffePrefix {
+                exact: "spiffe://example.org".to_string(),
+                with_slash: "spiffe://example.org/".to_string(),
+            }),
+            attribute_eq: vec![],
+        };
+        assert!(
+            !pred.is_match_all(),
+            "spiffe_prefix present should not match all"
+        );
+    }
+
+    #[test]
+    fn is_match_all_false_when_attribute_eq_set() {
+        let pred = CompiledSubjectPred {
+            cn_eq: None,
+            groups_any_of: vec![],
+            groups_all_of: vec![],
+            spiffe_prefix: None,
+            attribute_eq: vec![(
+                "role".to_string(),
+                CompiledAttrValue::Str("admin".to_string()),
+            )],
+        };
+        assert!(
+            !pred.is_match_all(),
+            "attribute_eq present should not match all"
+        );
+    }
+}
