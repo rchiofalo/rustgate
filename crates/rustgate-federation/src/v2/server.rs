@@ -4,7 +4,7 @@
 //! Implements the TAK Server V2 federation protocol with group exchange,
 //! event streaming, health checks, and provenance tracking.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,6 +57,12 @@ pub struct FederationService {
     max_groups_per_peer: usize,
     /// Maximum length of a group name in bytes.
     max_group_name_length: usize,
+    /// Per-peer inbound group allowlist for validating event group claims.
+    ///
+    /// When configured, inbound events from a peer are rejected if they
+    /// claim groups not in the peer's allowlist. When `None`, all groups
+    /// are accepted (backward-compatible open mode).
+    allowed_peer_groups: Option<Arc<HashMap<String, HashSet<String>>>>,
 }
 
 impl std::fmt::Debug for FederationService {
@@ -67,6 +73,10 @@ impl std::fmt::Debug for FederationService {
             .field("groups", &self.groups)
             .field("max_groups_per_peer", &self.max_groups_per_peer)
             .field("max_group_name_length", &self.max_group_name_length)
+            .field(
+                "allowed_peer_groups_configured",
+                &self.allowed_peer_groups.is_some(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -104,7 +114,22 @@ impl FederationService {
             on_event,
             max_groups_per_peer,
             max_group_name_length,
+            allowed_peer_groups: None,
         }
+    }
+
+    /// Configure per-peer inbound group allowlists.
+    ///
+    /// When set, inbound events are validated against the peer's allowlist.
+    /// Events claiming groups the peer is not authorized for are rejected.
+    /// When not set (the default), all groups are accepted for backward
+    /// compatibility.
+    pub fn with_allowed_peer_groups(
+        mut self,
+        peer_groups: HashMap<String, HashSet<String>>,
+    ) -> Self {
+        self.allowed_peer_groups = Some(Arc::new(peer_groups));
+        self
     }
 
     /// Send a FederatedEvent to all connected peers.
@@ -211,6 +236,48 @@ impl FederationService {
             return false;
         }
         true
+    }
+
+    /// Check if a peer is authorized for the groups claimed in an event.
+    ///
+    /// Returns `Ok(())` when group validation passes, or `Err(Status)` when the
+    /// peer claims groups it is not authorized for. When no `allowed_peer_groups`
+    /// is configured, all events are accepted (open mode / backward compat).
+    fn validate_event_groups(
+        &self,
+        peer_id: &str,
+        event: &figpb::FederatedEvent,
+    ) -> Result<(), Status> {
+        let Some(ref allowed) = self.allowed_peer_groups else {
+            // No allowlist configured: open mode (backward compat)
+            return Ok(());
+        };
+
+        let Some(peer_allowed) = allowed.get(peer_id) else {
+            // Peer not in allowlist: deny by default
+            warn!(
+                peer = %peer_id,
+                "federation peer not in group allowlist, rejecting event"
+            );
+            return Err(Status::permission_denied(
+                "peer not authorized for any group",
+            ));
+        };
+
+        for group in &event.federate_groups {
+            if !peer_allowed.contains(group.as_str()) {
+                warn!(
+                    peer = %peer_id,
+                    group = %group,
+                    "federation peer not authorized for group"
+                );
+                return Err(Status::permission_denied(
+                    "peer not authorized for requested group",
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     /// Maximum length for a peer CN extracted from a certificate.
@@ -332,6 +399,7 @@ impl FederatedChannel for FederationService {
         }
 
         debug!(peer = %peer_id, "received single event");
+        self.validate_event_groups(&peer_id, &event)?;
         (self.on_event)(event, peer_id);
         Ok(Response::new(figpb::Empty {}))
     }
@@ -397,13 +465,53 @@ impl FederatedChannel for FederationService {
         info!(peer = %peer_id, "server_event_stream opened (receiving events)");
 
         let on_event = Arc::clone(&self.on_event);
+        let allowed = self.allowed_peer_groups.clone();
         let pid = peer_id.clone();
 
+        const MAX_CONSECUTIVE_VIOLATIONS: u32 = 10;
+
         drop(tokio::spawn(async move {
+            let mut consecutive_violations: u32 = 0;
+
             while let Ok(Some(event)) = stream.message().await {
                 if !FederationService::validate_hop_count(&event, &pid) {
                     continue;
                 }
+
+                // Validate group membership when an allowlist is configured
+                if let Some(ref allowed_map) = allowed {
+                    let authorized = if let Some(peer_allowed) = allowed_map.get(&pid) {
+                        event
+                            .federate_groups
+                            .iter()
+                            .all(|g| peer_allowed.contains(g.as_str()))
+                    } else {
+                        // Peer not in allowlist: deny
+                        false
+                    };
+
+                    if !authorized {
+                        consecutive_violations += 1;
+                        warn!(
+                            peer = %pid,
+                            groups = ?event.federate_groups,
+                            consecutive_violations = consecutive_violations,
+                            "federation peer not authorized for claimed groups, skipping event"
+                        );
+                        if consecutive_violations >= MAX_CONSECUTIVE_VIOLATIONS {
+                            warn!(
+                                peer = %pid,
+                                violations = consecutive_violations,
+                                "disconnecting federation peer: too many consecutive group violations"
+                            );
+                            break;
+                        }
+                        continue;
+                    }
+                }
+
+                // Valid event resets the violation counter
+                consecutive_violations = 0;
                 on_event(event, pid.clone());
             }
             info!(peer = %pid, "server_event_stream closed");
@@ -609,7 +717,7 @@ impl FederatedChannel for FederationService {
 }
 
 #[cfg(test)]
-#[allow(unused_results)]
+#[allow(unused_results, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1008,6 +1116,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn federation_rejects_unauthorized_group() {
+        let (on_event, count) = counting_on_event();
+        let mut allowed = HashMap::new();
+        allowed.insert("unknown".to_string(), HashSet::from(["Alpha".to_string()]));
+        let svc =
+            FederationService::new("s".into(), vec![], on_event).with_allowed_peer_groups(allowed);
+
+        // Peer sends to group "Beta" but is only authorized for "Alpha"
+        let event = figpb::FederatedEvent {
+            federate_groups: vec!["Beta".into()],
+            ..Default::default()
+        };
+        let result = svc.send_one_event(Request::new(event)).await;
+        assert!(result.is_err());
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert_eq!(count.load(Ordering::Relaxed), 0, "callback must not fire");
+    }
+
+    #[tokio::test]
+    async fn federation_allows_authorized_group() {
+        let (on_event, count) = counting_on_event();
+        let mut allowed = HashMap::new();
+        allowed.insert("unknown".to_string(), HashSet::from(["Alpha".to_string()]));
+        let svc =
+            FederationService::new("s".into(), vec![], on_event).with_allowed_peer_groups(allowed);
+
+        // Peer sends to "Alpha" which it is authorized for
+        let event = figpb::FederatedEvent {
+            federate_groups: vec!["Alpha".into()],
+            ..Default::default()
+        };
+        let result = svc.send_one_event(Request::new(event)).await;
+        assert!(result.is_ok());
+        assert_eq!(count.load(Ordering::Relaxed), 1, "callback should fire");
+    }
+
+    #[tokio::test]
+    async fn federation_allows_all_when_no_peer_groups() {
+        let (on_event, count) = counting_on_event();
+        // No allowed_peer_groups configured = open mode
+        let svc = FederationService::new("s".into(), vec![], on_event);
+
+        let event = figpb::FederatedEvent {
+            federate_groups: vec!["AnyGroup".into()],
+            ..Default::default()
+        };
+        let result = svc.send_one_event(Request::new(event)).await;
+        assert!(result.is_ok());
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "callback should fire in open mode"
+        );
+    }
+
+    #[tokio::test]
     async fn hop_count_none_is_accepted() {
         let (on_event, count) = counting_on_event();
         let svc = FederationService::new("s".into(), vec![], on_event);
@@ -1155,5 +1320,96 @@ mod tests {
             .filter(|c| !c.is_control())
             .collect();
         assert!(sanitized.is_empty());
+    }
+
+    #[tokio::test]
+    async fn federation_rejects_unknown_peer_with_allowlist() {
+        let (on_event, count) = counting_on_event();
+        // Allowlist configured but no entry for this peer
+        let allowed = HashMap::new();
+        let svc =
+            FederationService::new("s".into(), vec![], on_event).with_allowed_peer_groups(allowed);
+
+        let event = figpb::FederatedEvent {
+            federate_groups: vec!["Alpha".into()],
+            ..Default::default()
+        };
+        let result = svc.send_one_event(Request::new(event)).await;
+        assert!(result.is_err());
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert_eq!(count.load(Ordering::Relaxed), 0, "callback must not fire");
+    }
+
+    #[tokio::test]
+    async fn federation_allows_event_with_empty_groups() {
+        let (on_event, count) = counting_on_event();
+        let mut allowed = HashMap::new();
+        allowed.insert("unknown".to_string(), HashSet::from(["Alpha".to_string()]));
+        let svc =
+            FederationService::new("s".into(), vec![], on_event).with_allowed_peer_groups(allowed);
+
+        // Event with no groups claimed should pass (nothing to reject)
+        let event = figpb::FederatedEvent {
+            federate_groups: vec![],
+            ..Default::default()
+        };
+        let result = svc.send_one_event(Request::new(event)).await;
+        assert!(result.is_ok());
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn with_allowed_peer_groups_configures_allowlist() {
+        let mut allowed = HashMap::new();
+        allowed.insert(
+            "peer-1".to_string(),
+            HashSet::from(["Alpha".to_string(), "Bravo".to_string()]),
+        );
+        let svc = FederationService::new("s".into(), vec![], noop_on_event())
+            .with_allowed_peer_groups(allowed);
+        assert!(svc.allowed_peer_groups.is_some());
+        let dbg = format!("{svc:?}");
+        assert!(dbg.contains("allowed_peer_groups_configured: true"));
+    }
+
+    #[test]
+    fn default_service_has_no_peer_group_allowlist() {
+        let svc = FederationService::new("s".into(), vec![], noop_on_event());
+        assert!(svc.allowed_peer_groups.is_none());
+        let dbg = format!("{svc:?}");
+        assert!(dbg.contains("allowed_peer_groups_configured: false"));
+    }
+
+    /// Verify that an event claiming multiple groups is rejected when the peer
+    /// is only authorized for a subset. The security invariant is reject-on-any-
+    /// unauthorized: even one disallowed group in `federate_groups` causes the
+    /// entire event to be denied.
+    #[tokio::test]
+    async fn federation_rejects_partial_group_authorization() {
+        let (on_event, count) = counting_on_event();
+        let mut allowed = HashMap::new();
+        // Peer is only authorized for "alpha", not "bravo"
+        allowed.insert("unknown".to_string(), HashSet::from(["alpha".to_string()]));
+        let svc =
+            FederationService::new("s".into(), vec![], on_event).with_allowed_peer_groups(allowed);
+
+        // Event claims both "alpha" (authorized) and "bravo" (unauthorized)
+        let event = figpb::FederatedEvent {
+            federate_groups: vec!["alpha".into(), "bravo".into()],
+            ..Default::default()
+        };
+        let result = svc.send_one_event(Request::new(event)).await;
+        assert!(
+            result.is_err(),
+            "event must be rejected when any claimed group is unauthorized"
+        );
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "callback must not fire for partially authorized event"
+        );
     }
 }
