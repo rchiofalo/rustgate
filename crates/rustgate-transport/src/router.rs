@@ -1,4 +1,33 @@
 //! Message routing engine.
+//!
+//! # Authorization architecture (PEP integration)
+//!
+//! The router implements a two-layer Policy Enforcement Point (PEP) that
+//! evaluates an optional [`PolicyEngine`] on every routed message:
+//!
+//! 1. **Send PEP** (`route_inner`): evaluated once per message before any
+//!    state mutation (position cache, access log, dispatch). The subject is
+//!    the *sender's* identity, the resource is the destination (direct /
+//!    group / broadcast), and the action is [`AuthzAction::Send`]. A deny
+//!    verdict drops the message outright with no observable side effect
+//!    beyond the audit trail.
+//!
+//! 2. **Receive PEP** (`send_to_session`, `send_to_group`, `send_to_all`):
+//!    evaluated once per *recipient*. The subject is the *recipient's*
+//!    identity so that policies targeting a specific CN or attribute on the
+//!    receive side actually take effect. A deny filters that single
+//!    recipient out — other recipients in the same group or broadcast
+//!    still receive the message.
+//!
+//! 3. **Store-forward re-evaluation** (`filter_offline_messages`): when
+//!    offline messages are drained on reconnect, both the Send and Receive
+//!    PEPs are re-evaluated against the *current* policy snapshot. This
+//!    prevents messages stored under a previous (more permissive) policy
+//!    from being delivered after permissions have been tightened.
+//!
+//! The legacy [`GroupAclPolicy`] path operates independently and in
+//! addition to the authz engine — both must allow for a message to flow.
+//! This lets operators migrate incrementally from ACLs to full RBAC/ABAC.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
