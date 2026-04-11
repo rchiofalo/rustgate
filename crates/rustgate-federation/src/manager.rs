@@ -883,11 +883,10 @@ impl FederationManager {
                     }
                     // Track cross-region forwards for observability
                     #[cfg(feature = "api")]
-                    if let Some(ref local) = self.config.local_region {
-                        let is_cross = peer.config.region.as_ref().is_none_or(|r| r != local);
-                        if is_cross {
-                            crate::metrics::cross_region_forwards().inc();
-                        }
+                    if let Some(ref local) = self.config.local_region
+                        && peer.config.region.as_ref().is_some_and(|r| r != local)
+                    {
+                        crate::metrics::cross_region_forwards().inc();
                     }
                     sent += 1;
                 }

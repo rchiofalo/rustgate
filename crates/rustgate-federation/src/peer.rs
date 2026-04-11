@@ -233,14 +233,24 @@ impl PeerHandle {
     ///
     /// Uses integer EWMA with alpha=0.3: `new = (3 * sample + 7 * old) / 10`.
     /// The first sample initializes the estimate directly (no smoothing).
+    /// The update uses a CAS loop to avoid a TOCTOU race where concurrent
+    /// calls could read the same `old` value and clobber each other's update.
     pub fn record_rtt(&self, rtt_nanos: u64) {
-        let old = self.latency_nanos.load(Ordering::Relaxed);
-        let new = if old == 0 {
-            rtt_nanos
-        } else {
-            (3 * rtt_nanos + 7 * old) / 10
-        };
-        self.latency_nanos.store(new, Ordering::Relaxed);
+        loop {
+            let old = self.latency_nanos.load(Ordering::Relaxed);
+            let new = if old == 0 {
+                rtt_nanos
+            } else {
+                (3 * rtt_nanos + 7 * old) / 10
+            };
+            if self
+                .latency_nanos
+                .compare_exchange_weak(old, new, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+        }
     }
 
     /// Returns the current EWMA latency in nanoseconds, or 0 if no samples.

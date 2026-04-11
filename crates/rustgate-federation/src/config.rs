@@ -244,6 +244,7 @@ pub struct PeerConfig {
     /// Geographic region of this peer (e.g., "us-east", "eu-west").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
+    /// Reserved for future same-zone preference within same-region routing.
     /// Availability zone within the region (e.g., "az-1", "az-2").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zone: Option<String>,
