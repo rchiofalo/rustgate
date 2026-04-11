@@ -31,6 +31,15 @@ pub trait PolicyEngine: Send + Sync + 'static {
     fn cache_stats(&self) -> Option<CacheStats> {
         None
     }
+
+    /// Warnings emitted during policy compilation.
+    ///
+    /// Returns messages about overly broad rules (e.g. allow + resource
+    /// `any`, or an empty subject matcher). Backends that do not track
+    /// compile-time warnings return an empty slice.
+    fn compile_warnings(&self) -> &[SmolStr] {
+        &[]
+    }
 }
 
 /// In-process policy engine backed by a [`CompiledPolicy`].
@@ -153,6 +162,10 @@ impl PolicyEngine for NativeEngine {
 
     fn cache_stats(&self) -> Option<CacheStats> {
         Some(self.cache_stats_direct())
+    }
+
+    fn compile_warnings(&self) -> &[SmolStr] {
+        &self.compiled.compile_warnings
     }
 }
 
