@@ -1448,7 +1448,7 @@ pub struct ReadinessState {
     pub cert_reloader: Option<Arc<rustgate_transport::CertReloader>>,
 
     /// NATS publisher — checked for connection state via
-    /// [`rustgate_nats::NatsPublisher::is_connected`].
+    /// `NatsPublisher::is_connected`.
     #[cfg(feature = "nats")]
     pub nats_publisher: std::sync::Mutex<Option<rustgate_nats::NatsPublisher>>,
 
@@ -1577,7 +1577,7 @@ fn check_tls_cert(reloader: &rustgate_transport::CertReloader) -> DependencyChec
     DependencyCheck::ok()
 }
 
-/// Check NATS connection state via [`NatsPublisher`] helper methods,
+/// Check NATS connection state via `NatsPublisher` helper methods,
 /// avoiding a direct dependency on `async-nats` in this crate.
 #[cfg(feature = "nats")]
 fn check_nats(publisher: &rustgate_nats::NatsPublisher) -> DependencyCheck {
