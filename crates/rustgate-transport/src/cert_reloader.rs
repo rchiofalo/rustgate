@@ -108,6 +108,10 @@ impl CertReloader {
             .iter()
             .map(|c| CertificateDer::from(c.clone()))
             .collect();
+        // NOTE: `PrivateKeyDer::try_from` only accepts `Vec<u8>` by value;
+        // rustls does not provide a Zeroizing-aware alternative.  The
+        // intermediate copy lives only for the duration of the `try_from`
+        // call and is consumed immediately by `load_signing_key`.
         let key_der = PrivateKeyDer::try_from(private_key_der.to_vec()).map_err(|e| {
             RustgateError::from(ConfigError::Other(format!(
                 "failed to parse private key DER: {e}"
@@ -368,6 +372,10 @@ impl CertReloader {
             .into());
         }
 
+        // NOTE: `PrivateKeyDer::try_from` only accepts `Vec<u8>` by value;
+        // rustls does not provide a Zeroizing-aware alternative.  The
+        // intermediate copy lives only for the duration of the `try_from`
+        // call and is consumed immediately by `load_signing_key`.
         let key_der = PrivateKeyDer::try_from(private_key_der.to_vec()).map_err(|e| {
             RustgateError::from(ConfigError::Other(format!(
                 "failed to parse private key DER: {e}"

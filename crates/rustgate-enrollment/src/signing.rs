@@ -13,6 +13,7 @@ use rcgen::{
 };
 use rustls_pki_types::PrivateKeyDer;
 use rustls_pki_types::pem::PemObject;
+use zeroize::Zeroizing;
 
 use crate::error::EnrollmentError;
 
@@ -172,10 +173,12 @@ fn load_private_key(pem: &str) -> Result<KeyPair, EnrollmentError> {
     let pkcs8_der = match &key_der {
         PrivateKeyDer::Pkcs8(_) => key_der,
         PrivateKeyDer::Pkcs1(pkcs1) => {
-            PrivateKeyDer::Pkcs8(pkcs1_to_pkcs8(pkcs1.secret_pkcs1_der()).into())
+            let mut wrapped = pkcs1_to_pkcs8(pkcs1.secret_pkcs1_der());
+            PrivateKeyDer::Pkcs8(std::mem::take(&mut *wrapped).into())
         }
         PrivateKeyDer::Sec1(sec1) => {
-            PrivateKeyDer::Pkcs8(sec1_to_pkcs8(sec1.secret_sec1_der()).into())
+            let mut wrapped = sec1_to_pkcs8(sec1.secret_sec1_der());
+            PrivateKeyDer::Pkcs8(std::mem::take(&mut *wrapped).into())
         }
         _ => {
             return Err(EnrollmentError::Config(
@@ -201,7 +204,7 @@ fn load_private_key(pem: &str) -> Result<KeyPair, EnrollmentError> {
 ///   OCTET STRING { <pkcs1_der> }                  -- privateKey
 /// }
 /// ```
-fn pkcs1_to_pkcs8(pkcs1_der: &[u8]) -> Vec<u8> {
+fn pkcs1_to_pkcs8(pkcs1_der: &[u8]) -> Zeroizing<Vec<u8>> {
     // Version: INTEGER 0
     const VERSION: &[u8] = &[0x02, 0x01, 0x00];
     // AlgorithmIdentifier: SEQUENCE { OID rsaEncryption, NULL }
@@ -212,7 +215,7 @@ fn pkcs1_to_pkcs8(pkcs1_der: &[u8]) -> Vec<u8> {
         0x05, 0x00, // NULL
     ];
 
-    let octet_string = der_wrap(0x04, pkcs1_der);
+    let mut octet_string = Zeroizing::new(der_wrap(0x04, pkcs1_der));
     let inner_len = VERSION.len() + ALGO_ID.len() + octet_string.len();
 
     let mut out = Vec::with_capacity(4 + inner_len);
@@ -221,7 +224,11 @@ fn pkcs1_to_pkcs8(pkcs1_der: &[u8]) -> Vec<u8> {
     out.extend_from_slice(VERSION);
     out.extend_from_slice(ALGO_ID);
     out.extend_from_slice(&octet_string);
-    out
+
+    // Zeroize the intermediate buffer now that it has been copied.
+    zeroize::Zeroize::zeroize(&mut *octet_string);
+
+    Zeroizing::new(out)
 }
 
 /// Wrap SEC1 EC private key DER in a PKCS#8 envelope.
@@ -239,7 +246,7 @@ fn pkcs1_to_pkcs8(pkcs1_der: &[u8]) -> Vec<u8> {
 ///   OCTET STRING { <sec1_der> }                   -- privateKey
 /// }
 /// ```
-fn sec1_to_pkcs8(sec1_der: &[u8]) -> Vec<u8> {
+fn sec1_to_pkcs8(sec1_der: &[u8]) -> Zeroizing<Vec<u8>> {
     // Version: INTEGER 0
     const VERSION: &[u8] = &[0x02, 0x01, 0x00];
     // AlgorithmIdentifier: SEQUENCE { OID id-ecPublicKey }
@@ -249,7 +256,7 @@ fn sec1_to_pkcs8(sec1_der: &[u8]) -> Vec<u8> {
         0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, // OID 1.2.840.10045.2.1
     ];
 
-    let octet_string = der_wrap(0x04, sec1_der);
+    let mut octet_string = Zeroizing::new(der_wrap(0x04, sec1_der));
     let inner_len = VERSION.len() + ALGO_ID.len() + octet_string.len();
 
     let mut out = Vec::with_capacity(4 + inner_len);
@@ -258,7 +265,11 @@ fn sec1_to_pkcs8(sec1_der: &[u8]) -> Vec<u8> {
     out.extend_from_slice(VERSION);
     out.extend_from_slice(ALGO_ID);
     out.extend_from_slice(&octet_string);
-    out
+
+    // Zeroize the intermediate buffer now that it has been copied.
+    zeroize::Zeroize::zeroize(&mut *octet_string);
+
+    Zeroizing::new(out)
 }
 
 /// Wrap `data` in a DER TLV with the given `tag`.
@@ -542,11 +553,11 @@ cyOZxZiK
 
         match &key_der {
             PrivateKeyDer::Pkcs1(pkcs1) => {
-                let pkcs8 = super::pkcs1_to_pkcs8(pkcs1.secret_pkcs1_der());
+                let mut pkcs8 = super::pkcs1_to_pkcs8(pkcs1.secret_pkcs1_der());
                 // PKCS#8 starts with SEQUENCE tag
                 assert_eq!(pkcs8[0], 0x30, "should be a SEQUENCE");
                 // Should be parseable by rcgen
-                let wrapped = PrivateKeyDer::Pkcs8(pkcs8.into());
+                let wrapped = PrivateKeyDer::Pkcs8(std::mem::take(&mut *pkcs8).into());
                 let key = KeyPair::try_from(&wrapped);
                 assert!(
                     key.is_ok(),
