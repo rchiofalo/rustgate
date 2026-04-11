@@ -1341,7 +1341,7 @@ pub(crate) fn start_websocket<P: NatsPublish + Send + Sync + 'static>(
         ws_max_frames_per_sec: cli.ws_max_frames_per_sec,
         ws_max_bytes_per_sec: cli.ws_max_bytes_per_sec,
         ws_max_violations: cli.ws_max_violations,
-        max_write_buffer_bytes: rustgate_websocket::DEFAULT_MAX_WRITE_BUFFER_BYTES,
+        max_write_buffer_bytes: cli.ws_max_write_buffer_bytes,
         shutdown: Arc::clone(&shutdown),
     };
     let task = tokio::spawn(async move {
