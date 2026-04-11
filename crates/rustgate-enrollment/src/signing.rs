@@ -684,34 +684,55 @@ cyOZxZiK
         let pub_a = key_a.public_key_raw();
         let pub_b = key_b.public_key_raw();
 
-        // Only attempt substitution if both keys are the same length
-        // (they should be since both are default ECDSA P-256 keys).
-        if pub_a.len() == pub_b.len() {
-            // Find pub_a bytes in the CSR DER and replace with pub_b
-            if let Some(pos) = csr_der.windows(pub_a.len()).position(|w| w == pub_a) {
-                let mut modified_der = csr_der.clone();
-                modified_der[pos..pos + pub_a.len()].copy_from_slice(pub_b);
+        // Both keys are default ECDSA P-256, so they must be the same length.
+        assert_eq!(
+            pub_a.len(),
+            pub_b.len(),
+            "both default keys should be same algorithm"
+        );
 
-                // Wrap the modified DER back into PEM
-                let b64 = base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    &modified_der,
-                );
-                let pem = format!(
-                    "-----BEGIN CERTIFICATE REQUEST-----\n{}\n-----END CERTIFICATE REQUEST-----",
-                    b64.as_bytes()
-                        .chunks(64)
-                        .map(|c| std::str::from_utf8(c).expect("valid utf8"))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                );
+        // Find pub_a bytes in the CSR DER and replace with pub_b
+        let pos = csr_der
+            .windows(pub_a.len())
+            .position(|w| w == pub_a)
+            .expect("public key bytes must appear in CSR DER");
 
-                let result = signer.sign_csr(&pem, "mismatch-test");
-                assert!(
-                    result.is_err(),
-                    "sign_csr should reject a CSR whose public key does not match its signature"
-                );
-            }
-        }
+        let mut modified_der = csr_der.clone();
+        modified_der[pos..pos + pub_a.len()].copy_from_slice(pub_b);
+
+        // Wrap the modified DER back into PEM
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &modified_der);
+        let pem = format!(
+            "-----BEGIN CERTIFICATE REQUEST-----\n{}\n-----END CERTIFICATE REQUEST-----",
+            b64.as_bytes()
+                .chunks(64)
+                .map(|c| std::str::from_utf8(c).expect("valid utf8"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+
+        let result = signer.sign_csr(&pem, "mismatch-test");
+        assert!(
+            result.is_err(),
+            "sign_csr should reject a CSR whose public key does not match its signature"
+        );
+    }
+
+    #[test]
+    fn sign_csr_rejects_malformed_pem() {
+        let (cert_pem, key_pem) = test_ca();
+        let signer = CsrSigner::from_pem(&cert_pem, &key_pem, "TestOrg").expect("signer");
+
+        // Truncated base64 — structurally plausible but corrupt
+        let truncated = "-----BEGIN CERTIFICATE REQUEST-----\nMIIBkTCB+wIBAD\n-----END CERTIFICATE REQUEST-----\n";
+        assert!(signer.sign_csr(truncated, "test-user").is_err());
+
+        // Wrong PEM header type
+        let wrong_header = "-----BEGIN CERTIFICATE-----\nMIIBkTCB+wIBADAWMRQwEgYDVQQDDAt0ZXN0LWNsaWVudA==\n-----END CERTIFICATE-----\n";
+        assert!(signer.sign_csr(wrong_header, "test-user").is_err());
+
+        // Empty PEM body
+        let empty_body = "-----BEGIN CERTIFICATE REQUEST-----\n-----END CERTIFICATE REQUEST-----\n";
+        assert!(signer.sign_csr(empty_body, "test-user").is_err());
     }
 }
