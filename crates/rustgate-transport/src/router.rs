@@ -133,6 +133,7 @@ fn emit_access(msg: &RoutableMessage, outcome: &'static str) {
         Destination::Direct(target) => format!("direct:{}", hash_cn(&target.cn)),
         Destination::Group(group) => format!("group:{group}"),
         Destination::Broadcast => "broadcast".to_string(),
+        Destination::Multicast(groups) => format!("multicast:[{}]", groups.join(",")),
     };
     let uid = extract_cot_uid(&msg.payload);
     tracing::info!(
@@ -465,6 +466,17 @@ impl State {
     }
 }
 
+/// Configuration for SA multicast routing.
+///
+/// When enabled, SA events can be multicast to multiple groups
+/// simultaneously using the [`Destination::Multicast`] variant.
+#[derive(Debug, Clone)]
+pub struct MulticastConfig {
+    /// When true, SA events are automatically multicast to all groups
+    /// the sender belongs to, in addition to the explicit destination.
+    pub sa_auto_multicast: bool,
+}
+
 pub struct Router {
     state: RwLock<State>,
     cache: PositionCache,
@@ -486,6 +498,8 @@ pub struct Router {
     /// drained on reconnect.
     client_queue: Option<Arc<ClientQueue>>,
     dedup: ArcSwap<Option<DedupCache>>,
+    /// Optional multicast routing configuration for SA events.
+    multicast_config: ArcSwap<Option<MulticastConfig>>,
 }
 
 impl std::fmt::Debug for Router {
@@ -498,6 +512,7 @@ impl std::fmt::Debug for Router {
             .field("backpressure", &self.backpressure)
             .field("client_queue", &self.client_queue)
             .field("dedup", &self.dedup)
+            .field("multicast_config", &self.multicast_config)
             .finish()
     }
 }
@@ -513,6 +528,7 @@ impl Default for Router {
             backpressure: None,
             client_queue: None,
             dedup: ArcSwap::from_pointee(None),
+            multicast_config: ArcSwap::from_pointee(None),
         }
     }
 }
@@ -541,6 +557,7 @@ impl Router {
             backpressure: None,
             client_queue: None,
             dedup: ArcSwap::from_pointee(None),
+            multicast_config: ArcSwap::from_pointee(None),
         }
     }
 
@@ -575,6 +592,7 @@ impl Router {
             backpressure: None,
             client_queue: None,
             dedup: ArcSwap::from_pointee(None),
+            multicast_config: ArcSwap::from_pointee(None),
         }
     }
 
@@ -612,6 +630,7 @@ impl Router {
             backpressure: None,
             client_queue: None,
             dedup: ArcSwap::from_pointee(None),
+            multicast_config: ArcSwap::from_pointee(None),
         }
     }
 
@@ -722,6 +741,20 @@ impl Router {
     pub fn dedup_stats(&self) -> Option<(u64, usize)> {
         let guard = self.dedup.load();
         guard.as_ref().as_ref().map(|d| (d.hits(), d.len()))
+    }
+
+    /// Attach a multicast configuration for SA event routing.
+    ///
+    /// When configured, the router can send messages to multiple groups
+    /// simultaneously via [`Destination::Multicast`].
+    pub fn with_multicast_config(self, config: MulticastConfig) -> Self {
+        self.multicast_config.store(Arc::new(Some(config)));
+        self
+    }
+
+    /// Atomically replace the multicast configuration.
+    pub fn set_multicast_config(&self, config: Option<MulticastConfig>) {
+        self.multicast_config.store(Arc::new(config));
     }
 
     pub async fn register(&self, handle: SessionHandle) {
@@ -900,6 +933,7 @@ impl Router {
             Destination::Direct(target) => target.cn.as_str(),
             Destination::Group(group) => group.as_ref(),
             Destination::Broadcast => "broadcast",
+            Destination::Multicast(_) => "multicast",
         };
 
         let span = tracing::debug_span!(
@@ -974,14 +1008,14 @@ impl Router {
                 Destination::Group(group) => AuthzResource::Group {
                     group: group.as_ref(),
                 },
-                Destination::Broadcast => AuthzResource::Broadcast,
+                Destination::Broadcast | Destination::Multicast(_) => AuthzResource::Broadcast,
             };
             let outcome = self.authz_evaluate(engine, &subject, &resource, AuthzAction::Send);
             if !outcome.is_allow() {
                 let (kind, id) = match &msg.destination {
                     Destination::Direct(target) => ("direct", target.cn.as_str()),
                     Destination::Group(group) => ("group", group.as_ref()),
-                    Destination::Broadcast => ("broadcast", ""),
+                    Destination::Broadcast | Destination::Multicast(_) => ("broadcast", ""),
                 };
                 rustgate_core::audit::authz_denied(
                     msg.source.cn.as_str(),
@@ -1027,6 +1061,9 @@ impl Router {
             }
             Destination::Broadcast => {
                 self.send_to_all(envelope).await;
+            }
+            Destination::Multicast(groups) => {
+                self.send_to_multicast(&groups, envelope).await;
             }
         }
     }
@@ -1135,7 +1172,9 @@ impl Router {
                             target_cn: &target.cn,
                         },
                         Destination::Group(group) => AuthzResource::Group { group },
-                        Destination::Broadcast => AuthzResource::Broadcast,
+                        Destination::Broadcast | Destination::Multicast(_) => {
+                            AuthzResource::Broadcast
+                        }
                     };
                     let outcome =
                         self.authz_evaluate(engine, &subject, &resource, AuthzAction::Send);
@@ -1524,6 +1563,19 @@ impl Router {
                 total = targets.len(),
                 "broadcast recipients filtered by authz policy"
             );
+        }
+    }
+
+    /// Send a message to multiple groups simultaneously.
+    ///
+    /// Iterates over the provided group list and calls `send_to_group`
+    /// for each. An empty group list is a no-op.
+    async fn send_to_multicast(&self, groups: &[String], msg: RoutedMessage) {
+        if groups.is_empty() {
+            return;
+        }
+        for group in groups {
+            self.send_to_group(group, msg.clone()).await;
         }
     }
 }
@@ -2758,6 +2810,7 @@ mod tests {
             Destination::Direct(t) => format!("direct:{}", super::hash_cn(&t.cn)),
             Destination::Group(g) => format!("group:{g}"),
             Destination::Broadcast => "broadcast".to_string(),
+            Destination::Multicast(groups) => format!("multicast:[{}]", groups.join(",")),
         };
         assert!(
             !dst_field.contains(raw_cn),
@@ -3534,5 +3587,79 @@ mod tests {
 
         // Also verify the original handle (senders not tripped) is still open.
         assert!(!handle.is_closed(), "original handle should still be open");
+    }
+
+    // ── Multicast routing tests ────────────────────────────────────
+
+    #[tokio::test]
+    async fn multicast_delivers_to_multiple_groups() {
+        let router = Router::new();
+        let alice = make_identity("alice", &["alpha", "bravo"]);
+        let bob = make_identity("bob", &["alpha"]);
+        let charlie = make_identity("charlie", &["bravo"]);
+
+        let (_ptx_a, _ntx_a, _prx_a, _nrx_a) = make_channels(16, 64);
+        let (ptx_b, ntx_b, mut prx_b, _nrx_b) = make_channels(16, 64);
+        let (ptx_c, ntx_c, mut prx_c, _nrx_c) = make_channels(16, 64);
+
+        router
+            .register(SessionHandle::new(alice.clone(), _ptx_a, _ntx_a))
+            .await;
+        router
+            .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+            .await;
+        router
+            .register(SessionHandle::new(charlie.clone(), ptx_c, ntx_c))
+            .await;
+
+        let msg = make_position(
+            &alice,
+            Destination::Multicast(vec!["alpha".into(), "bravo".into()]),
+        );
+        router.route(msg).await;
+
+        // Bob is in alpha, should receive
+        let received_b = prx_b.try_recv();
+        assert!(received_b.is_ok(), "bob should receive via alpha group");
+
+        // Charlie is in bravo, should receive
+        let received_c = prx_c.try_recv();
+        assert!(received_c.is_ok(), "charlie should receive via bravo group");
+    }
+
+    #[tokio::test]
+    async fn multicast_empty_group_list_is_noop() {
+        let router = Router::new();
+        let alice = make_identity("alice", &["alpha"]);
+        let bob = make_identity("bob", &["alpha"]);
+
+        let (ptx_a, ntx_a, _prx_a, _nrx_a) = make_channels(16, 64);
+        let (ptx_b, ntx_b, mut prx_b, _nrx_b) = make_channels(16, 64);
+
+        router
+            .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
+            .await;
+        router
+            .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+            .await;
+
+        let msg = make_position(&alice, Destination::Multicast(vec![]));
+        router.route(msg).await;
+
+        // Nobody should receive anything
+        assert!(
+            prx_b.try_recv().is_err(),
+            "empty multicast should not deliver to anyone"
+        );
+    }
+
+    #[tokio::test]
+    async fn multicast_config_builder() {
+        let router = Router::new().with_multicast_config(MulticastConfig {
+            sa_auto_multicast: true,
+        });
+        let guard = router.multicast_config.load();
+        let config = guard.as_ref().as_ref().expect("config should be set");
+        assert!(config.sa_auto_multicast);
     }
 }
