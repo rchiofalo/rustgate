@@ -3443,4 +3443,67 @@ mod tests {
             "second broadcast must be dropped for slow session"
         );
     }
+
+    // ── SessionHandle::is_closed tests ─────────────────────────────
+
+    #[test]
+    fn is_closed_returns_false_when_receivers_alive() {
+        let alice = make_identity("alice", &["ops"]);
+        let (ptx, ntx, _prx, _nrx) = make_channels(4, 4);
+        let handle = SessionHandle::new(alice, ptx, ntx);
+
+        // Receivers still alive — session is open.
+        assert!(
+            !handle.is_closed(),
+            "is_closed must return false while receivers are alive"
+        );
+    }
+
+    #[test]
+    fn is_closed_returns_true_when_receivers_dropped() {
+        let alice = make_identity("alice", &["ops"]);
+        let (ptx, ntx, prx, nrx) = make_channels(4, 4);
+        let handle = SessionHandle::new(alice, ptx, ntx);
+
+        // Drop both receivers — simulates session write loop exiting.
+        drop(prx);
+        drop(nrx);
+
+        assert!(
+            handle.is_closed(),
+            "is_closed must return true after all receivers are dropped"
+        );
+    }
+
+    #[test]
+    fn is_closed_returns_true_when_senders_set_to_none() {
+        let alice = make_identity("alice", &["ops"]);
+        let (ptx, ntx, _prx, _nrx) = make_channels(4, 4);
+        // Threshold of 1: a single failed send trips the circuit breaker.
+        let handle = SessionHandle::with_drop_threshold(alice.clone(), ptx, ntx, 1);
+
+        // Use a capacity-1 channel so the second try_send fails and trips the breaker.
+        let (ptx2, ntx2, _prx2, _nrx2) = make_channels(1, 1);
+        let handle2 = SessionHandle::with_drop_threshold(alice, ptx2, ntx2, 1);
+
+        // Fill the channels (chat goes to normal channel).
+        let msg = Arc::new(make_chat(
+            &make_identity("sender", &[]),
+            Destination::Broadcast,
+        ));
+        let routed = RoutedMessage::new(Arc::clone(&msg));
+        handle2.try_send(routed);
+
+        // This send should trip the circuit breaker (consecutive_drops >= 1).
+        let routed2 = RoutedMessage::new(Arc::clone(&msg));
+        handle2.try_send(routed2);
+
+        assert!(
+            handle2.is_closed(),
+            "is_closed must return true after circuit breaker sets senders to None"
+        );
+
+        // Also verify the original handle (senders not tripped) is still open.
+        assert!(!handle.is_closed(), "original handle should still be open");
+    }
 }
