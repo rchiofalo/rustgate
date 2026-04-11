@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! JSON wire format for CoT events on NATS.
 //!
 //! Defines types that serialize/deserialize to the JSON schema used for
@@ -37,6 +39,7 @@ pub struct WireEvent {
     pub detail: Option<WireDetail>,
 }
 
+/// GPS position in the NATS JSON wire format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WirePoint {
     pub lat: f64,
@@ -46,6 +49,7 @@ pub struct WirePoint {
     pub le: f64,
 }
 
+/// Aggregated detail fields in the NATS JSON wire format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireDetail {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -80,6 +84,7 @@ pub struct WireDetail {
     pub xml_detail: Option<String>,
 }
 
+/// Speed and course in the NATS JSON wire format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireTrack {
     #[serde(default, skip_serializing_if = "is_zero_f64")]
@@ -94,6 +99,7 @@ pub struct WireTrack {
     pub track_valid: bool,
 }
 
+/// Per-UID metadata in the NATS JSON wire format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireUidDetail {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -102,6 +108,7 @@ pub struct WireUidDetail {
     pub droid: Option<String>,
 }
 
+/// Contact callsign and endpoint in the NATS JSON wire format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireContact {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -110,12 +117,14 @@ pub struct WireContact {
     pub endpoint: Option<String>,
 }
 
+/// Free-text remarks/notes in the NATS JSON wire format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireRemarks {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub note: Vec<WireNote>,
 }
 
+/// Single remark entry with text, source, and timestamp.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireNote {
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -126,12 +135,14 @@ pub struct WireNote {
     pub ts: String,
 }
 
+/// Flow control tags in the NATS JSON wire format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireFlowTags {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source: Vec<WireFlowSource>,
 }
 
+/// Source metadata for flow control.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireFlowSource {
     pub name: String,
@@ -142,6 +153,7 @@ pub struct WireFlowSource {
     pub uid: String,
 }
 
+/// Device status (battery, readiness) in the NATS JSON wire format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireStatus {
     #[serde(default, skip_serializing_if = "is_zero_i32")]
@@ -150,6 +162,7 @@ pub struct WireStatus {
     pub readiness: String,
 }
 
+/// Sensor metadata in the NATS JSON wire format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireSensor {
     #[serde(default, skip_serializing_if = "is_zero_f64")]
@@ -158,6 +171,7 @@ pub struct WireSensor {
     pub range: f64,
 }
 
+/// Team affiliation (name, role) in the NATS JSON wire format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireGroup {
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -166,6 +180,7 @@ pub struct WireGroup {
     pub role: String,
 }
 
+/// Client software version in the NATS JSON wire format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireTakv {
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -178,6 +193,7 @@ pub struct WireTakv {
     pub version: String,
 }
 
+/// GPS precision metadata in the NATS JSON wire format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WirePrecisionLocation {
     #[serde(default, skip_serializing_if = "String::is_empty")]

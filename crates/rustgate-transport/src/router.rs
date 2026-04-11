@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Message routing engine.
 //!
 //! # Authorization architecture (PEP integration)
@@ -483,6 +485,7 @@ pub struct MulticastConfig {
     pub sa_auto_multicast: bool,
 }
 
+/// The central message dispatch engine with ACL, authorization, backpressure, deduplication, and store-forward support.
 pub struct Router {
     state: RwLock<State>,
     cache: PositionCache,
@@ -1411,6 +1414,7 @@ impl Router {
         }
     }
 
+    /// Returns the number of currently registered sessions.
     pub async fn session_count(&self) -> usize {
         self.state.read().await.sessions.len()
     }

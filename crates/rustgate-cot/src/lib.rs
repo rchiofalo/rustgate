@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Cursor on Target (CoT) XML parsing and message building.
 //!
 //! # Security
@@ -19,6 +21,7 @@ use quick_xml::events::Event;
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
 
+/// A parsed Cursor-on-Target event with metadata, position, and destination.
 #[derive(Debug, Clone)]
 pub struct CotEvent {
     pub uid: String,
@@ -31,6 +34,7 @@ pub struct CotEvent {
     pub source_group: Option<String>,
 }
 
+/// Routing destination for a CoT event: broadcast, group, or direct.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "fuzz", derive(Arbitrary))]
 pub enum CotDestination {
@@ -39,6 +43,7 @@ pub enum CotDestination {
     Group(String),
 }
 
+/// Geographic position with latitude, longitude, and altitude.
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "fuzz", derive(Arbitrary))]
 pub struct Position {
@@ -47,6 +52,7 @@ pub struct Position {
     pub hae: f64,
 }
 
+/// Errors that can occur when parsing CoT XML.
 #[derive(Debug)]
 pub enum ParseError {
     Xml(quick_xml::Error),
@@ -133,6 +139,7 @@ pub fn sa_affiliation(event_type: &str) -> Option<SaAffiliation> {
     }
 }
 
+/// Parses a CoT XML byte slice into a [`CotEvent`].
 pub fn parse(xml: &[u8]) -> Result<CotEvent, ParseError> {
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(true);

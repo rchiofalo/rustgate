@@ -44,8 +44,11 @@ Kubernetes **readiness** probe. Returns 200 only when the listener is bound and 
 
 | Status | Body |
 |--------|------|
-| `200 OK` | `ok` |
-| `503 Service Unavailable` | `not ready` |
+| `200 OK` | `{"status":"ok","checks":{...}}` |
+| `200 OK` | `{"status":"degraded","checks":{...}}` |
+| `503 Service Unavailable` | `{"status":"unhealthy","checks":{...}}` |
+
+The response body is a JSON object with per-dependency health status. Dependency checks include TLS certificate expiry (warns at 7 days), NATS connection state (feature-gated on `nats`), and federation peer connectivity (feature-gated on `federation`).
 
 ```bash
 curl http://localhost:9090/health/ready
@@ -76,6 +79,23 @@ Backwards-compatible alias for `/health/live`. Prefer the new path.
 curl http://localhost:9090/healthz
 ```
 
+### GET /health/authz
+
+Returns the current authorization engine status, including the loaded policy ID and any compile warnings (e.g. overly broad rules). Only available when an authorization policy is loaded.
+
+**Authentication:** None
+
+**Response:**
+
+| Status | Body |
+|--------|------|
+| `200 OK` | `{"policy_id":"...","compile_warnings":[...]}` |
+| `404 Not Found` | No authorization engine loaded |
+
+```bash
+curl http://localhost:9090/health/authz
+```
+
 ### GET /readyz (deprecated alias)
 
 Backwards-compatible alias for `/health/ready`. Prefer the new path.
@@ -88,7 +108,7 @@ curl http://localhost:9090/readyz
 
 Prometheus metrics in text exposition format. Includes counters for connections, messages, NATS publishes, and protocol negotiations.
 
-**Authentication:** None
+**Authentication:** Optional bearer token via `--metrics-token-file` (env `RUSTGATE_METRICS_TOKEN_FILE`). When set, requests must include `Authorization: Bearer <token>`. The token is compared in constant time. When unset, the endpoint is unauthenticated. Health probe endpoints (`/health/*`, `/healthz`, `/readyz`) are never gated by the token.
 
 **Response:**
 
@@ -777,7 +797,7 @@ Server version information.
   "version": "3",
   "type": "ServerConfig",
   "data": {
-    "version": "0.7.0",
+    "version": "0.8.0",
     "api": "3",
     "hostname": "rustgate"
   },

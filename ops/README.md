@@ -14,7 +14,8 @@ ops/
 │       ├── rustgate-transport.json    # Per-session queues, dedup, drops, per-identity
 │       ├── rustgate-federation.json   # Peer queues, lag, circuit breaker, replay
 │       ├── rustgate-nats.json         # Consumer pending, redeliveries, info latency
-│       └── rustgate-enrollment.json   # CSR rate limiting, failures
+│       ├── rustgate-enrollment.json   # CSR rate limiting, failures
+│       └── rustgate-security.json    # Authz decisions, store-forward, backpressure, dedup
 └── prometheus/
     ├── alerts.yml                     # Alerting rules (warning / critical)
     └── recording-rules.yml            # Recording rules for SLO queries

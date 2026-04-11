@@ -7,7 +7,7 @@
   <a href="https://github.com/rchiofalo/rustgate/releases/latest"><img src="https://img.shields.io/github/v/release/rchiofalo/rustgate?color=green" alt="Release"></a>
   <a href="https://ghcr.io/rchiofalo/rustgate"><img src="https://img.shields.io/badge/docker-ghcr.io-blue?logo=docker" alt="Docker"></a>
   <a href="https://securityscorecards.dev/viewer/?uri=github.com/rchiofalo/rustgate"><img src="https://api.securityscorecards.dev/projects/github.com/rchiofalo/rustgate/badge" alt="OpenSSF Scorecard"></a>
-  <img src="https://img.shields.io/badge/rust-1.93%2B-orange.svg?logo=rust" alt="Rust 1.93+">
+  <img src="https://img.shields.io/badge/rust-1.94%2B-orange.svg?logo=rust" alt="Rust 1.94+">
   <img src="https://img.shields.io/badge/license-Proprietary-blue.svg" alt="License">
 </p>
 
@@ -72,15 +72,15 @@ For production certificate management see [docs/tls-certificates.md](docs/tls-ce
 ┌─────────────────────────────────────────────────────────────────────────────────────────┐
 │                                     rustgate-server                                     │
 │                                        (binary)                                         │
-├──────────┬──────────┬──────────┬──────────┬──────────┬──────────┬──────────────┤
-│ rustgate-│ rustgate-│ rustgate-│ rustgate-│ rustgate-│ rustgate-│  rustgate-   │
-│ transport│ websocket│ mqtt     │ nats     │enrollment│ proto    │  federation  │
-│ TLS·codec│ wss://   │ MQTT 5.0 │ NATS pub │ HTTPS·CSR│ protobuf │  V1·V2·gRPC  │
-│ router   │ mTLS WS  │ 3.1.1    │ JetStream│ Auth     │ XML/proto│  peer mgmt   │
-├──────────────┴──────────────┴──────────────┼──────────────┴──────────────┴──────────────┤
-│                rustgate-cot                │               rustgate-core                │
-│      CoT XML parsing · MessageBuilder      │    Codec trait · Identity · RoutableMessage│
-└────────────────────────────────────────────┴────────────────────────────────────────────┘
+├────────────┬────────────┬────────────┬────────────┬────────────┬────────────┬───────────┤
+│ rustgate-  │ rustgate-  │ rustgate-  │ rustgate-  │ rustgate-  │ rustgate-  │ rustgate- │
+│ transport  │ websocket  │ mqtt       │ nats       │ enrollment │ proto      │ federation│
+│ TLS·codec  │ wss://     │ MQTT 5.0   │ NATS pub   │ HTTPS·CSR  │ protobuf   │ V1·V2·gRPC│
+│ router     │ mTLS WS    │ 3.1.1      │ JetStream  │ Auth       │ XML/proto  │ peer mgmt │
+├────────────┴────────────┴────────────┼────────────┴────────────┴────────────┴───────────┤
+│             rustgate-cot             │                  rustgate-core                   │
+│   CoT XML parsing · MessageBuilder   │     Codec trait · Identity · RoutableMessage     │
+└──────────────────────────────────────┴──────────────────────────────────────────────────┘
 ```
 
 | Crate | Purpose |
@@ -93,7 +93,9 @@ For production certificate management see [docs/tls-certificates.md](docs/tls-ce
 | `rustgate-nats` | NATS/JetStream bridge for cross-instance message delivery |
 | `rustgate-enrollment` | HTTPS certificate enrollment server (CSR signing, PKCS#12) |
 | `rustgate-proto` | Protobuf message translation (XML ↔ proto) |
+| `rustgate-authz` | Authorization engine (RBAC/ABAC, Cedar backend) |
 | `rustgate-federation` | Server-to-server federation: V1 (XML), V2 (gRPC), HA, REST API |
+| `rustgate-client` | Lightweight client library for integration testing |
 | `rustgate-server` | Binary entry point, CLI, orchestration |
 | `rustgate-test-utils` | Test CA and certificate generation helpers |
 
@@ -164,7 +166,7 @@ For detailed architecture documentation see [docs/architecture.md](docs/architec
 
 | Dependency | Required | Notes |
 |------------|----------|-------|
-| Rust 1.93+ | Yes | Pinned in `rust-toolchain.toml` (edition 2024) |
+| Rust 1.94+ | Yes | Pinned in `rust-toolchain.toml` (edition 2024) |
 | Rust nightly | Yes | For `cargo +nightly fmt` (CI enforces nightly formatting) |
 | protoc | For `proto` / `federation` features | Protocol Buffers compiler |
 | Go 1.20+, cmake | For `fips` feature | Required by aws-lc-rs build system |
@@ -219,8 +221,10 @@ cargo build --release --all-features
 | `fips` | FIPS 140-3 crypto (aws-lc-rs) | Go 1.20+, cmake |
 | `post-quantum` | Post-quantum key exchange (X25519MLKEM768) | Go 1.20+, cmake |
 | `otel` | OpenTelemetry distributed tracing | `protoc` |
+| `cedar` | Cedar policy backend for authorization | — |
 | `ocsp` | OCSP stapling for server certificates | — |
 | `spiffe` | SPIFFE / SPIRE workload identity (server cert + trust bundle from the Workload API) | `protoc` |
+| `peer-discovery` | DNS-SD, Consul, etcd federation peer discovery | — |
 | `jemalloc` | jemalloc allocator | — |
 
 #### SPIFFE workload identity
@@ -299,6 +303,9 @@ rustgate --config /etc/rustgate/rustgate.toml print-config
 # Parse and validate a configuration file (cross-field checks). Exits 0 on
 # success, non-zero with a descriptive error on failure.
 rustgate --config /etc/rustgate/rustgate.toml validate-config
+
+# Verify the integrity of a hash-chained audit log.
+rustgate verify-audit --file /var/log/rustgate/audit.jsonl
 ```
 
 Running `rustgate` with no subcommand starts the server as before.
@@ -425,6 +432,28 @@ All flags support environment variables (CLI takes precedence):
 | `--otel-service-name` | `OTEL_SERVICE_NAME` | `rustgate` |
 | `--otlp-metrics` | `RUSTGATE_OTLP_METRICS` | `false` |
 | `--otlp-metrics-interval` | `RUSTGATE_OTLP_METRICS_INTERVAL` | `60` (seconds, min 1) |
+| `--authz-policy-file` | `RUSTGATE_AUTHZ_POLICY_FILE` | — |
+| `--authz-policy-format` | `RUSTGATE_AUTHZ_POLICY_FORMAT` | `native` |
+| `--authz-fail-open` | `RUSTGATE_AUTHZ_FAIL_OPEN` | `false` |
+| `--tenant-quota-file` | `RUSTGATE_TENANT_QUOTA_FILE` | — |
+| `--federation-region` | `RUSTGATE_FEDERATION_REGION` | — |
+| `--mqtt-bind` | `RUSTGATE_MQTT_BIND` | — |
+| `--mqtt-max-packet-size` | `RUSTGATE_MQTT_MAX_PACKET_SIZE` | `16777216` (16 MiB) |
+| `--spiffe` | `RUSTGATE_SPIFFE` | `false` |
+| `--spiffe-workload-api-socket` | `RUSTGATE_SPIFFE_WORKLOAD_API_SOCKET` | — |
+| `--ocsp-stapling` | `RUSTGATE_OCSP_STAPLING` | `false` |
+| `--client-ocsp` | `RUSTGATE_CLIENT_OCSP` | `false` |
+| `--metrics-token-file` | `RUSTGATE_METRICS_TOKEN_FILE` | — |
+| `--shutdown-drain-timeout` | `RUSTGATE_SHUTDOWN_DRAIN_TIMEOUT` | `10` (seconds) |
+| `--acl-reload-interval` | `RUSTGATE_ACL_RELOAD_INTERVAL` | `0` (disabled) |
+| `--udp-rate-limit` | `RUSTGATE_UDP_RATE_LIMIT` | `0` (disabled) |
+| `--udp-allowed-cidrs` | `RUSTGATE_UDP_ALLOWED_CIDRS` | — |
+| `--udp-max-identities` | `RUSTGATE_UDP_MAX_IDENTITIES` | `1024` |
+| `--ws-max-write-buffer-bytes` | `RUSTGATE_WS_MAX_WRITE_BUFFER_BYTES` | `4194304` (4 MiB) |
+| `--cot-delta-encoding` | `RUSTGATE_COT_DELTA_ENCODING` | `false` |
+| `--cot-delta-cache-size` | `RUSTGATE_COT_DELTA_CACHE_SIZE` | `512` |
+| `--cot-delta-epsilon-meters` | `RUSTGATE_COT_DELTA_EPSILON_METERS` | `1.0` |
+| `--acl-api-token-file` | `RUSTGATE_ACL_API_TOKEN_FILE` | — |
 
 </details>
 
@@ -691,6 +720,8 @@ cargo nextest run -p rustgate-nats --test integration  # NATS integration (needs
 | `rustgate-proto` | `codec_integration` | XML ↔ protobuf conversion |
 | `rustgate-server` | `cli_parsing`, `tls_config`, `feature_gates`, `archive_integration` | CLI validation, TLS setup, feature gating, CoT archival |
 | `rustgate-websocket` | `ws_listener`, `ws_server` | WebSocket mTLS, session routing |
+| `rustgate-authz` | `policy_engine`, `cedar_backend` | RBAC/ABAC policy evaluation, Cedar integration |
+| `rustgate-mqtt` | `session`, `codec` | MQTT transport, protocol negotiation, group subscriptions |
 
 All tests use ephemeral certificates generated at runtime via `rustgate-test-utils` — no fixture files.
 
@@ -709,6 +740,12 @@ All tests use ephemeral certificates generated at runtime via `rustgate-test-uti
 | [Graceful Degradation](docs/graceful-degradation.md) | Subsystem failure modes and recovery behavior |
 | [Post-Quantum Roadmap](docs/post-quantum.md) | Path to post-quantum cryptographic protection |
 | [Observability](docs/observability.md) | Structured logging, metrics, and distributed tracing |
+| [Federation](docs/federation.md) | Federation architecture, peer management, and HA mode |
+| [REST API](docs/rest-api.md) | Health, metrics, federation, ACL, and enrollment endpoints |
+| [Disaster Recovery](docs/disaster-recovery.md) | Backup, restore, and failover procedures |
+| [Performance Tuning](docs/performance-tuning.md) | Tuning guides for throughput, latency, and memory |
+| [Troubleshooting](docs/troubleshooting.md) | Common issues, diagnostics, and resolution steps |
+| [Crypto Agility](docs/crypto-agility.md) | Cryptographic algorithm selection and migration |
 | [Runbooks](docs/runbooks/) | Operational runbooks for federation, memory, NATS |
 | [CONTRIBUTING](CONTRIBUTING.md) | Build prerequisites, code quality, and PR guidelines |
 | [CHANGELOG](CHANGELOG.md) | Release history in Keep a Changelog format |
