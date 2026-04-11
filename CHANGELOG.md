@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+- **Case-insensitive CN matching in ACL** — `GroupAcl` now normalizes all certificate Common Name strings to ASCII lowercase at construction time and before lookup, matching the case-insensitive semantics required by RFC 5280 §7.1. Previously, an attacker with a differently-cased CN (e.g. `CN=Admin` vs. `admin`) could bypass ACL rules. (#652)
+- **Default-deny for unconfigured groups when ACL policy is loaded** — `GroupAclPolicy` now denies send and receive for groups that have no explicit ACL entry when at least one other group is configured. Previously, unconfigured groups defaulted to open, which could silently expose groups omitted from the policy file. When no policy is loaded at all (empty map), the router continues to operate in open mode for backward compatibility. (#653)
 - **RUSTSEC-2026-0002 — bump `lru` to 0.16.3** — the `lru` crate versions `>=0.9.0, <0.16.3` contained a soundness issue where `IterMut::next`/`next_back` temporarily created an exclusive reference to the key, invalidating the shared pointer held by the internal `HashMap` and violating Stacked Borrows. rustgate transitively pulled in `lru 0.12.5` via `rustgate-transport`. The workspace dependency has been bumped to `0.16.3`, which contains the upstream fix. (#582)
 
 ### Fixed

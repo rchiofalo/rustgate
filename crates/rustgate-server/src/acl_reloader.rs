@@ -82,10 +82,26 @@ impl AclReloader {
             let _ = groups.insert(
                 group_id,
                 rustgate_transport::GroupAcl::with_deny(
-                    entry.send,
-                    entry.receive,
-                    entry.deny_send,
-                    entry.deny_receive,
+                    entry
+                        .send
+                        .into_iter()
+                        .map(|s| s.to_ascii_lowercase())
+                        .collect(),
+                    entry
+                        .receive
+                        .into_iter()
+                        .map(|s| s.to_ascii_lowercase())
+                        .collect(),
+                    entry
+                        .deny_send
+                        .into_iter()
+                        .map(|s| s.to_ascii_lowercase())
+                        .collect(),
+                    entry
+                        .deny_receive
+                        .into_iter()
+                        .map(|s| s.to_ascii_lowercase())
+                        .collect(),
                 ),
             );
         }
