@@ -140,6 +140,39 @@ fn valid_group_id(group: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-'))
 }
 
+/// Minimum bearer token length in bytes.
+///
+/// Tokens shorter than this are rejected at configuration time to
+/// prevent weak credentials. 32 bytes provides 256 bits of entropy
+/// when the token is random, comfortably above brute-force thresholds.
+pub const MIN_TOKEN_LEN: usize = 32;
+
+/// Maximum bearer token length in bytes.
+///
+/// Prevents unbounded-length tokens that would waste memory in
+/// constant-time comparison and storage.
+pub const MAX_TOKEN_LEN: usize = 256;
+
+/// Validate that a bearer token's length is within acceptable bounds.
+///
+/// Returns `Ok(())` when the token is between [`MIN_TOKEN_LEN`] and
+/// [`MAX_TOKEN_LEN`] bytes (inclusive). Called at startup to reject
+/// misconfigured token files before the API server binds.
+pub fn validate_token_length(token: &[u8]) -> Result<(), String> {
+    let len = token.len();
+    if len < MIN_TOKEN_LEN {
+        return Err(format!(
+            "ACL API token too short ({len} bytes, minimum {MIN_TOKEN_LEN})"
+        ));
+    }
+    if len > MAX_TOKEN_LEN {
+        return Err(format!(
+            "ACL API token too long ({len} bytes, maximum {MAX_TOKEN_LEN})"
+        ));
+    }
+    Ok(())
+}
+
 /// Constant-time check of the supplied bearer token against the configured one.
 fn auth_ok(header: Option<&str>, expected: &[u8]) -> bool {
     let Some(raw) = header else {
@@ -658,5 +691,37 @@ mod tests {
         assert!(s.contains("delta"));
         assert!(s.contains("deny_send"));
         assert!(s.contains("\"z\""));
+    }
+
+    #[test]
+    fn token_length_rejects_too_short() {
+        let short = vec![b'a'; MIN_TOKEN_LEN - 1];
+        let err = validate_token_length(&short).unwrap_err();
+        assert!(err.contains("too short"), "got: {err}");
+    }
+
+    #[test]
+    fn token_length_rejects_too_long() {
+        let long = vec![b'a'; MAX_TOKEN_LEN + 1];
+        let err = validate_token_length(&long).unwrap_err();
+        assert!(err.contains("too long"), "got: {err}");
+    }
+
+    #[test]
+    fn token_length_accepts_min_boundary() {
+        let token = vec![b'a'; MIN_TOKEN_LEN];
+        assert!(validate_token_length(&token).is_ok());
+    }
+
+    #[test]
+    fn token_length_accepts_max_boundary() {
+        let token = vec![b'a'; MAX_TOKEN_LEN];
+        assert!(validate_token_length(&token).is_ok());
+    }
+
+    #[test]
+    fn token_length_accepts_mid_range() {
+        let token = vec![b'a'; 64];
+        assert!(validate_token_length(&token).is_ok());
     }
 }

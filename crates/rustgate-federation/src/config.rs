@@ -196,7 +196,12 @@ impl Default for FederationConfig {
 }
 
 /// Configuration for a single federation peer.
+///
+/// Uses `deny_unknown_fields` to reject peer config containing
+/// unexpected properties — a typo like `"adress"` produces a clear
+/// deserialization error instead of being silently ignored.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PeerConfig {
     /// Unique identifier for this peer.
     pub id: PeerId,
@@ -252,6 +257,7 @@ fn default_protocol_version() -> u32 {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -655,5 +661,17 @@ mod tests {
         assert_eq!(cfg2.max_message_size, cfg.max_message_size);
         assert_eq!(cfg2.health_check_interval, cfg.health_check_interval);
         assert_eq!(cfg2.client_timeout, cfg.client_timeout);
+    }
+
+    #[test]
+    fn peer_config_rejects_unknown_field() {
+        let json = r#"{"id":"p","address":"1.2.3.4:9001","groups":[],"enabled":true,"is_outbound":false,"trust_cert_cn":null,"bogus":42}"#;
+        let result = serde_json::from_str::<PeerConfig>(json);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown field"),
+            "error should mention unknown field: {err}"
+        );
     }
 }

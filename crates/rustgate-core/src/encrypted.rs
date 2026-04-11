@@ -121,7 +121,12 @@ pub enum EncryptError {
 ///
 /// Keys are stored as 64-character lowercase hex strings (32 raw bytes,
 /// the ChaCha20-Poly1305 key length).
+///
+/// Uses `deny_unknown_fields` to reject key files containing unexpected
+/// properties — a typo like `"actve_key_id"` produces a clear
+/// deserialization error instead of being silently ignored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KeyFile {
     /// Identifier of the key used for new writes. Must be present in `keys`.
     pub active_key_id: String,
@@ -823,5 +828,17 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0)
+    }
+
+    #[test]
+    fn key_file_rejects_unknown_field() {
+        let json = r#"{"active_key_id":"k1","keys":{},"extra":true}"#;
+        let result = serde_json::from_str::<KeyFile>(json);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown field"),
+            "error should mention unknown field: {err}"
+        );
     }
 }
