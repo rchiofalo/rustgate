@@ -13,6 +13,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use parking_lot::Mutex;
 use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, UnixTime};
 use rustls::server::WebPkiClientVerifier;
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
@@ -56,7 +57,7 @@ struct CachedVerifier {
 pub struct DynamicCertVerifier {
     provider: RootStoreProvider,
     crls: Vec<CertificateRevocationListDer<'static>>,
-    cached: std::sync::Mutex<CachedVerifier>,
+    cached: Mutex<CachedVerifier>,
     /// Subjects from the initial root store, used for `root_hint_subjects`.
     /// These are hints only — actual verification uses the live root store.
     initial_subjects: Vec<DistinguishedName>,
@@ -81,7 +82,7 @@ impl DynamicCertVerifier {
         Ok(Arc::new(Self {
             provider,
             crls,
-            cached: std::sync::Mutex::new(CachedVerifier {
+            cached: Mutex::new(CachedVerifier {
                 generation,
                 verifier,
             }),
@@ -108,10 +109,7 @@ impl DynamicCertVerifier {
     fn current_verifier(&self) -> Result<Arc<dyn ClientCertVerifier>, Error> {
         let (current_gen, root_store) = (self.provider)();
 
-        let mut cached = self
-            .cached
-            .lock()
-            .map_err(|_| Error::General("DynamicCertVerifier lock poisoned".to_string()))?;
+        let mut cached = self.cached.lock();
 
         if cached.generation == current_gen {
             return Ok(Arc::clone(&cached.verifier));
@@ -143,7 +141,7 @@ impl DynamicCertVerifier {
 
 impl fmt::Debug for DynamicCertVerifier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let generation = self.cached.lock().map(|c| c.generation).unwrap_or(u64::MAX);
+        let generation = self.cached.lock().generation;
         f.debug_struct("DynamicCertVerifier")
             .field("generation", &generation)
             .field("crls", &self.crls.len())
@@ -279,5 +277,28 @@ mod tests {
         let verifier = DynamicCertVerifier::new(Box::new(move || (0, store.clone())), Vec::new())
             .expect("build verifier");
         assert!(!verifier.supported_verify_schemes().is_empty());
+    }
+
+    #[test]
+    fn survives_panic_in_lock_scope() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let store = test_root_store();
+        let verifier = DynamicCertVerifier::new(Box::new(move || (0, store.clone())), Vec::new())
+            .expect("build verifier");
+
+        // Simulate a panic while holding the verifier lock.
+        let v = Arc::clone(&verifier);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = v.cached.lock();
+            panic!("simulated panic while holding verifier lock");
+        }));
+        assert!(result.is_err());
+
+        // With parking_lot::Mutex, the lock is not poisoned — subsequent
+        // calls succeed rather than permanently failing all TLS handshakes.
+        let inner = verifier
+            .current_verifier()
+            .expect("verifier must not be poisoned");
+        assert!(!inner.root_hint_subjects().is_empty());
     }
 }

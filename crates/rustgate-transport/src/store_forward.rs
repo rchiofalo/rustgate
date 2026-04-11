@@ -157,6 +157,7 @@ impl ClientQueue {
 
         // Ensure the table exists and rebuild in-memory index.
         let mut inner = Inner::new();
+        let mut malformed_seqs: Vec<u64> = Vec::new();
         {
             let write = db
                 .begin_write()
@@ -201,7 +202,7 @@ impl ClientQueue {
                         continue;
                     }
                     PeekDest::Malformed => {
-                        warn!(seq, "dropping malformed client-queue entry on open");
+                        malformed_seqs.push(seq);
                         continue;
                     }
                 };
@@ -214,6 +215,31 @@ impl ClientQueue {
                     inner.next_seq = seq + 1;
                 }
             }
+        }
+
+        // Purge corrupt entries from disk so they don't accumulate across
+        // restarts. The read transaction above identified them; now remove
+        // them in a separate write transaction.
+        if !malformed_seqs.is_empty() {
+            let purge_count = malformed_seqs.len();
+            let write = db
+                .begin_write()
+                .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+            {
+                let mut table = write
+                    .open_table(QUEUE_TABLE)
+                    .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+                for seq in &malformed_seqs {
+                    let _ = table.remove(seq);
+                }
+            }
+            write
+                .commit()
+                .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+            warn!(
+                count = purge_count,
+                "purged malformed entries from client queue on startup"
+            );
         }
 
         let db = Arc::new(db);
@@ -927,6 +953,52 @@ mod tests {
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].payload.as_ref(), b"fresh");
         assert_eq!(q.expired_total(), 1);
+    }
+
+    #[tokio::test]
+    async fn reopen_purges_malformed_entries() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let q = ClientQueue::open(tmp.path(), 1_000_000).unwrap();
+            q.enqueue("bob", &msg_for("alice", "bob", b"valid"))
+                .unwrap();
+            wait_for_depth(&q, "bob", 1).await;
+            drop(q);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Inject a corrupt entry directly into the redb table.
+        {
+            let db_path = tmp.path().join("client_queue.redb");
+            let db = Database::create(&db_path).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let mut table = write.open_table(QUEUE_TABLE).unwrap();
+                // Garbage bytes that will fail peek_dest_cn parsing.
+                table.insert(999_u64, &[0xFF, 0xFF][..]).unwrap();
+            }
+            write.commit().unwrap();
+            drop(db);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Reopen — corrupt entry should be purged from disk.
+        let q2 = ClientQueue::open(tmp.path(), 1_000_000).unwrap();
+        assert_eq!(q2.stats("bob").depth, 1, "valid entry should survive");
+
+        let drained = q2.drain("bob").unwrap();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].payload.as_ref(), b"valid");
+
+        // Verify the corrupt entry was removed from the database.
+        {
+            let read = q2.db.begin_read().unwrap();
+            let table = read.open_table(QUEUE_TABLE).unwrap();
+            assert!(
+                table.get(&999_u64).unwrap().is_none(),
+                "corrupt entry should have been purged on open"
+            );
+        }
     }
 
     #[tokio::test]
