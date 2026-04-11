@@ -335,10 +335,18 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = false, env = "RUSTGATE_EST_ENABLED")]
     pub(crate) est_enabled: bool,
 
-    /// Bind address for the Prometheus metrics HTTP server (e.g. 0.0.0.0:9090).
+    /// Bind address for the Prometheus metrics HTTP server (e.g. 127.0.0.1:9090).
+    /// Defaults to localhost to prevent accidental network exposure.
     /// Requires --features metrics.
     #[arg(long, env = "RUSTGATE_METRICS_BIND", value_parser = parse_socket_addr)]
     pub(crate) metrics_bind: Option<String>,
+
+    /// Path to a file containing a bearer token for the `/metrics` endpoint.
+    /// When set, requests to `/metrics` must present `Authorization: Bearer <token>`.
+    /// When unset, `/metrics` is unauthenticated (backward compatible).
+    /// The token is compared in constant time and stored in zeroizing memory.
+    #[arg(long, env = "RUSTGATE_METRICS_TOKEN_FILE")]
+    pub(crate) metrics_token_file: Option<String>,
 
     /// Enable Tier 2 per-identity Prometheus metrics (handshake failures,
     /// session duration, bytes sent/received) labelled by `identity_cn`.
@@ -1070,6 +1078,7 @@ define_config_file! {
     crl_validity_days: u32,
     est_enabled: bool,
     metrics_bind: Option<String>,
+    metrics_token_file: Option<String>,
     metrics_per_identity: bool,
     metrics_identity_allowlist: Option<std::path::PathBuf>,
     max_connections: usize,
