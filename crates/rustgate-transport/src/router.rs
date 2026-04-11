@@ -816,6 +816,16 @@ impl Router {
         true
     }
 
+    /// Route a message to its destination (direct, group, or broadcast).
+    ///
+    /// Acquires a byte-sized permit from the global backpressure gate
+    /// (if configured) for overall system memory protection, then
+    /// dispatches to the appropriate delivery method. All per-session
+    /// delivery is non-blocking: `try_send` is used for every recipient
+    /// so a single slow or full session channel never blocks delivery to
+    /// other sessions. Direct messages to full channels are persisted
+    /// for offline redelivery; group and broadcast messages to full
+    /// channels are dropped and counted.
     pub async fn route(&self, msg: RoutableMessage) {
         // Acquire a byte-sized permit from the global backpressure gate
         // for this message's payload. Wrap it in `Arc` so every
@@ -1209,6 +1219,14 @@ impl Router {
             .collect()
     }
 
+    /// Deliver a message to a specific session by CN.
+    ///
+    /// Uses non-blocking `try_send` so a slow or full session channel
+    /// never blocks the routing task. When the session channel is full
+    /// or closed, the message is persisted for offline delivery via the
+    /// store-and-forward queue (if attached) rather than blocking. The
+    /// per-session circuit breaker in `SessionHandle` will disconnect
+    /// truly slow sessions after N consecutive failures.
     async fn send_to_session(&self, cn: &str, msg: RoutedMessage) {
         let handle = {
             let state = self.state.read().await;
@@ -1242,15 +1260,14 @@ impl Router {
                         return;
                     }
                 }
-                if let Err(e) = handle.send(msg).await {
-                    // `tokio::mpsc::Sender::send().await` only returns
-                    // Err when the receiver has been closed — a full
-                    // channel awaits capacity rather than failing —
-                    // so this path strictly means the session writer
-                    // task has gone away. Persist for redelivery if
-                    // a store-and-forward queue is attached.
-                    warn!(session = %cn, "session channel closed");
-                    self.persist_for_offline(cn, &e.0);
+                if !handle.try_send(msg.clone()) {
+                    // Non-blocking: channel is full or closed. Persist
+                    // for offline redelivery so the message is not lost.
+                    // The circuit breaker inside `try_send` will
+                    // disconnect truly slow sessions after N consecutive
+                    // failures.
+                    debug!(session = %cn, "session channel full or closed, persisting for offline delivery");
+                    self.persist_for_offline(cn, &msg);
                 }
             }
             None => {
@@ -1377,10 +1394,17 @@ impl Router {
     }
 
     /// Broadcast to all connected sessions (except sender).
+    ///
     /// This is intentional for SA sharing — all authenticated clients
     /// receive broadcasts regardless of group membership. Per-recipient
     /// authz Receive PEP still applies: a policy rule denying broadcast
     /// receipt to a specific subject filters that recipient out here.
+    ///
+    /// Uses non-blocking `try_send` per session so a single slow
+    /// consumer cannot block delivery to all other recipients. Messages
+    /// that fail to enqueue (channel full or closed) are dropped and
+    /// counted — the per-session circuit breaker handles disconnecting
+    /// persistently slow sessions.
     async fn send_to_all(&self, msg: RoutedMessage) {
         let targets: Vec<SessionHandle> = {
             let state = self.state.read().await;
@@ -1416,7 +1440,7 @@ impl Router {
                     continue;
                 }
             }
-            if handle.send(msg.clone()).await.is_err() {
+            if !handle.try_send(msg.clone()) {
                 dropped += 1;
             }
         }
@@ -3119,6 +3143,165 @@ mod tests {
         assert!(
             result.is_empty(),
             "broadcast message should be blocked when authz denies"
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_session_does_not_block_other_groups() {
+        // Verify that a session with a full channel does not block
+        // message delivery to sessions in other groups.
+        let router = Router::new();
+
+        let alice = make_identity("alice", &["alpha"]);
+        let bob = make_identity("bob", &["bravo"]);
+        let sender_alpha = make_identity("sender-alpha", &["alpha"]);
+        let sender_bravo = make_identity("sender-bravo", &["bravo"]);
+
+        // Alice gets a capacity-1 normal channel (will be full after 1 msg)
+        let (ptx_a, ntx_a, _prx_a, _nrx_a) = make_channels(16, 1);
+        // Bob gets a normal channel
+        let (ptx_b, ntx_b, _prx_b, mut nrx_b) = make_channels(16, 16);
+        let (ptx_sa, ntx_sa, _prx_sa, _nrx_sa) = make_channels(16, 16);
+        let (ptx_sb, ntx_sb, _prx_sb, _nrx_sb) = make_channels(16, 16);
+
+        router
+            .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
+            .await;
+        router
+            .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+            .await;
+        router
+            .register(SessionHandle::new(sender_alpha.clone(), ptx_sa, ntx_sa))
+            .await;
+        router
+            .register(SessionHandle::new(sender_bravo.clone(), ptx_sb, ntx_sb))
+            .await;
+
+        // Fill alice's normal channel
+        let fill_msg = make_chat(&sender_alpha, Destination::Group("alpha".to_string()));
+        router.route(fill_msg).await;
+
+        // Now send more messages to alice's full group — these should
+        // be dropped/persisted, NOT block the routing task.
+        for _ in 0..5 {
+            let msg = make_chat(&sender_alpha, Destination::Group("alpha".to_string()));
+            router.route(msg).await;
+        }
+
+        // Send a message to bob in bravo — must arrive immediately
+        let msg = make_chat(&sender_bravo, Destination::Group("bravo".to_string()));
+        router.route(msg).await;
+
+        let received = nrx_b
+            .try_recv()
+            .expect("bob must receive: slow alice must not block bravo group");
+        assert_eq!(received.payload.as_ref(), b"<chat/>");
+    }
+
+    #[tokio::test]
+    async fn direct_message_persisted_when_channel_full() {
+        // When a direct message target's channel is full, the message
+        // should be persisted to the store-forward queue rather than
+        // blocking.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue = Arc::new(
+            crate::store_forward::ClientQueue::open(tmp.path(), 10 * 1024 * 1024)
+                .expect("client queue"),
+        );
+        let router = Router::new().with_client_queue(queue.clone());
+
+        let target = make_identity("target", &["alpha"]);
+        let sender = make_identity("sender", &["alpha"]);
+
+        // Capacity-1 normal channel for target
+        let (ptx, ntx, _prx, _nrx) = make_channels(16, 1);
+        let (ptx_s, ntx_s, _prx_s, _nrx_s) = make_channels(16, 16);
+        router
+            .register(SessionHandle::new(target.clone(), ptx, ntx))
+            .await;
+        router
+            .register(SessionHandle::new(sender.clone(), ptx_s, ntx_s))
+            .await;
+
+        // Fill the target's normal channel
+        let fill_msg = make_chat(&sender, Destination::Direct((*target).clone()));
+        router.route(fill_msg).await;
+
+        // Send another direct message — channel is full, should be
+        // persisted to store-forward rather than blocking.
+        let msg = make_chat(&sender, Destination::Direct((*target).clone()));
+        router.route(msg).await;
+
+        // Wait for the background writer to flush the message to the
+        // database. The enqueue call above puts the message into an
+        // async writer channel; we need to poll until it is persisted.
+        for _ in 0..200 {
+            if queue.stats("target").depth > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // Verify message was persisted to the offline queue
+        let queued = queue.drain("target").expect("drain");
+        assert!(
+            !queued.is_empty(),
+            "message must be persisted for offline delivery when channel is full"
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_drops_slow_session() {
+        // When broadcasting, a session with a full channel should have
+        // its message dropped, while fast sessions receive the message.
+        let router = Router::new();
+
+        let sender = make_identity("sender", &["alpha"]);
+        let fast = make_identity("fast", &["alpha"]);
+        let slow = make_identity("slow", &["alpha"]);
+
+        let (ptx_sender, ntx_sender, _prx_sender, _nrx_sender) = make_channels(16, 16);
+        let (ptx_fast, ntx_fast, _prx_fast, mut nrx_fast) = make_channels(16, 16);
+        // Slow session has capacity-1 normal channel
+        let (ptx_slow, ntx_slow, _prx_slow, mut nrx_slow) = make_channels(16, 1);
+
+        router
+            .register(SessionHandle::new(sender.clone(), ptx_sender, ntx_sender))
+            .await;
+        router
+            .register(SessionHandle::new(fast.clone(), ptx_fast, ntx_fast))
+            .await;
+        router
+            .register(SessionHandle::new(slow.clone(), ptx_slow, ntx_slow))
+            .await;
+
+        // Fill the slow session's normal channel
+        let fill_msg = make_chat(&sender, Destination::Broadcast);
+        router.route(fill_msg).await;
+
+        // Broadcast again — slow session channel is full
+        let msg = make_chat(&sender, Destination::Broadcast);
+        router.route(msg).await;
+
+        // Fast session should receive both broadcasts
+        let r1 = nrx_fast
+            .try_recv()
+            .expect("fast must receive first broadcast");
+        assert_eq!(r1.payload.as_ref(), b"<chat/>");
+        let r2 = nrx_fast
+            .try_recv()
+            .expect("fast must receive second broadcast");
+        assert_eq!(r2.payload.as_ref(), b"<chat/>");
+
+        // Slow session should have received only the first message
+        let r1 = nrx_slow
+            .try_recv()
+            .expect("slow must receive first broadcast");
+        assert_eq!(r1.payload.as_ref(), b"<chat/>");
+        // Second message should have been dropped
+        assert!(
+            nrx_slow.try_recv().is_err(),
+            "slow session's second broadcast must be dropped (channel full)"
         );
     }
 }
