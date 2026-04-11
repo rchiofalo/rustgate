@@ -156,6 +156,17 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
     // `register` and the drain would slip ahead of the queued
     // messages, breaking FIFO across the reconnect boundary.
     let buffered_offline = deps.router.drain_offline_messages(&cn).await;
+    let before = buffered_offline.len();
+    let buffered_offline = deps.router.filter_offline_messages(&cn, buffered_offline);
+    let filtered = before - buffered_offline.len();
+    if filtered > 0 {
+        tracing::info!(
+            cn = %cn,
+            filtered,
+            delivered = buffered_offline.len(),
+            "filtered offline messages through current ACL/authz policy"
+        );
+    }
     deps.router.register(handle.clone()).await;
     for m in buffered_offline {
         if handle.send(Arc::new(m)).await.is_err() {
@@ -658,6 +669,17 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
                         // Drain offline queue BEFORE register so live
                         // traffic cannot race ahead of queued entries.
                         let buffered_offline = router.drain_offline_messages(&cn).await;
+                        let before = buffered_offline.len();
+                        let buffered_offline = router.filter_offline_messages(&cn, buffered_offline);
+                        let filtered = before - buffered_offline.len();
+                        if filtered > 0 {
+                            tracing::info!(
+                                cn = %cn,
+                                filtered,
+                                delivered = buffered_offline.len(),
+                                "filtered offline messages through current ACL/authz policy"
+                            );
+                        }
                         router.register(handle.clone()).await;
                         for m in buffered_offline {
                             if handle.send(Arc::new(m)).await.is_err() {

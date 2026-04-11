@@ -970,6 +970,11 @@ impl Router {
     /// flushed to the session writer. This preserves strict FIFO across
     /// the reconnect boundary.
     ///
+    /// **Important:** callers should pass the returned messages through
+    /// [`Self::filter_offline_messages`] before delivery to re-check
+    /// ACL and authz policies that may have changed since the messages
+    /// were originally stored.
+    ///
     /// Returns an empty vec if no client queue is attached or the
     /// drain fails — the caller should proceed with registration
     /// either way.
@@ -994,9 +999,80 @@ impl Router {
         }
     }
 
+    /// Filter drained offline messages through the current ACL and authz
+    /// policies. Messages whose sender is no longer authorized are dropped
+    /// with a debug log. This re-checks authorization at delivery time,
+    /// preventing stale permissions from the time of storage.
+    ///
+    /// Callers should invoke this on the output of
+    /// [`Self::drain_offline_messages`] before forwarding messages to the
+    /// session handle.
+    pub fn filter_offline_messages(
+        &self,
+        recipient_cn: &str,
+        messages: Vec<RoutableMessage>,
+    ) -> Vec<RoutableMessage> {
+        let acl_guard = self.acl.load();
+        let authz_guard = self.authz.load();
+
+        messages
+            .into_iter()
+            .filter(|msg| {
+                // Re-check ACL for group-destined messages.
+                if let Destination::Group(ref group) = msg.destination
+                    && let Some(ref acl) = **acl_guard
+                {
+                    if !acl.is_send_authorized(group, &msg.source.cn) {
+                        tracing::debug!(
+                            sender = %msg.source.cn,
+                            group = %group,
+                            "dropping offline message: sender no longer authorized to send"
+                        );
+                        return false;
+                    }
+                    if !acl.is_receive_authorized(group, recipient_cn) {
+                        tracing::debug!(
+                            recipient = %recipient_cn,
+                            group = %group,
+                            "dropping offline message: recipient no longer authorized to receive"
+                        );
+                        return false;
+                    }
+                }
+
+                // Re-check authz engine for all message types.
+                if let Some(ref engine) = **authz_guard {
+                    let subject = AuthzSubject::from_identity(&msg.source);
+                    let resource = match &msg.destination {
+                        Destination::Direct(target) => AuthzResource::Direct {
+                            target_cn: &target.cn,
+                        },
+                        Destination::Group(group) => AuthzResource::Group { group },
+                        Destination::Broadcast => AuthzResource::Broadcast,
+                    };
+                    let outcome = engine.evaluate(&subject, &resource, AuthzAction::Send);
+                    if !outcome.is_allow() {
+                        tracing::debug!(
+                            sender = %msg.source.cn,
+                            "dropping offline message: sender no longer authorized by policy"
+                        );
+                        return false;
+                    }
+                }
+
+                true
+            })
+            .collect()
+    }
+
     /// Legacy/test helper that drains queued offline messages and
     /// delivers them directly through a session handle. Kept for unit
     /// tests that exercise the drain path without a full session loop.
+    ///
+    /// **Note:** this helper does NOT run [`Self::filter_offline_messages`].
+    /// Callers that need ACL/authz re-checking at delivery time should
+    /// use [`Self::drain_offline_messages`] followed by
+    /// [`Self::filter_offline_messages`] and flush the result manually.
     ///
     /// New code should use [`Self::drain_offline_messages`] and flush
     /// the returned buffer explicitly BEFORE
@@ -2682,5 +2758,104 @@ mod tests {
     async fn leave_group_returns_false_for_unknown_session() {
         let router = Router::new();
         assert!(!router.leave_group("nonexistent", 999, "alpha").await);
+    }
+
+    // ── filter_offline_messages tests ──────────────────────────────
+
+    #[test]
+    fn offline_messages_filtered_by_acl() {
+        let router = Router::new();
+
+        // ACL: only "bob" may send to "ops"; "charlie" may receive.
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "ops".to_string(),
+            crate::acl::GroupAcl::new(
+                HashSet::from(["bob".to_string()]),
+                HashSet::from(["charlie".to_string()]),
+            ),
+        );
+        router
+            .acl
+            .store(Arc::new(Some(crate::acl::GroupAclPolicy::new(groups))));
+
+        let alice = make_identity("alice", &["ops"]);
+        let msg = make_alert(&alice, Destination::Group("ops".to_string()));
+
+        // alice is NOT authorized to send to "ops" → message should be filtered out.
+        let result = router.filter_offline_messages("charlie", vec![msg]);
+        assert!(
+            result.is_empty(),
+            "message from unauthorized sender should be filtered"
+        );
+    }
+
+    #[test]
+    fn offline_messages_filtered_by_acl_receive() {
+        let router = Router::new();
+
+        // ACL: "alice" may send to "ops"; only "bob" may receive.
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "ops".to_string(),
+            crate::acl::GroupAcl::new(
+                HashSet::from(["alice".to_string()]),
+                HashSet::from(["bob".to_string()]),
+            ),
+        );
+        router
+            .acl
+            .store(Arc::new(Some(crate::acl::GroupAclPolicy::new(groups))));
+
+        let alice = make_identity("alice", &["ops"]);
+        let msg = make_alert(&alice, Destination::Group("ops".to_string()));
+
+        // "charlie" is NOT authorized to receive from "ops".
+        let result = router.filter_offline_messages("charlie", vec![msg]);
+        assert!(
+            result.is_empty(),
+            "message to unauthorized recipient should be filtered"
+        );
+    }
+
+    #[test]
+    fn offline_messages_pass_when_authorized() {
+        let router = Router::new();
+
+        // ACL: "alice" authorized to send, "bob" authorized to receive.
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "ops".to_string(),
+            crate::acl::GroupAcl::new(
+                HashSet::from(["alice".to_string()]),
+                HashSet::from(["bob".to_string()]),
+            ),
+        );
+        router
+            .acl
+            .store(Arc::new(Some(crate::acl::GroupAclPolicy::new(groups))));
+
+        let alice = make_identity("alice", &["ops"]);
+        let msg = make_alert(&alice, Destination::Group("ops".to_string()));
+
+        // Both sender and recipient are authorized → message passes through.
+        let result = router.filter_offline_messages("bob", vec![msg]);
+        assert_eq!(result.len(), 1, "authorized message should pass through");
+    }
+
+    #[test]
+    fn offline_messages_pass_when_no_policy() {
+        let router = Router::new();
+
+        // No ACL policy loaded — backward compatible open mode.
+        let alice = make_identity("alice", &["ops"]);
+        let msg = make_alert(&alice, Destination::Group("ops".to_string()));
+
+        let result = router.filter_offline_messages("bob", vec![msg]);
+        assert_eq!(
+            result.len(),
+            1,
+            "all messages should pass when no policy is loaded"
+        );
     }
 }
