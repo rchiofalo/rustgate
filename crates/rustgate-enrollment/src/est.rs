@@ -138,7 +138,7 @@ pub async fn handle_simpleenroll(
             return build_response(
                 StatusCode::BAD_REQUEST,
                 "text/plain",
-                Bytes::from(format!("invalid PKCS#10 CSR: {e}")),
+                Bytes::from("invalid CSR format"),
             );
         }
     };
@@ -151,7 +151,7 @@ pub async fn handle_simpleenroll(
             return build_response(
                 StatusCode::BAD_REQUEST,
                 "text/plain",
-                Bytes::from(format!("CSR signing failed: {e}")),
+                Bytes::from("unable to process CSR"),
             );
         }
     };
@@ -264,7 +264,7 @@ pub async fn handle_simplereenroll(
             return build_response(
                 StatusCode::BAD_REQUEST,
                 "text/plain",
-                Bytes::from(format!("invalid PKCS#10 CSR: {e}")),
+                Bytes::from("invalid CSR format"),
             );
         }
     };
@@ -302,7 +302,7 @@ pub async fn handle_simplereenroll(
             return build_response(
                 StatusCode::BAD_REQUEST,
                 "text/plain",
-                Bytes::from(format!("failed to parse CSR subject: {e}")),
+                Bytes::from("unable to extract identity from CSR"),
             );
         }
     }
@@ -315,7 +315,7 @@ pub async fn handle_simplereenroll(
             return build_response(
                 StatusCode::BAD_REQUEST,
                 "text/plain",
-                Bytes::from(format!("CSR signing failed: {e}")),
+                Bytes::from("unable to process CSR"),
             );
         }
     };
