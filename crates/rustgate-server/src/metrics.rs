@@ -2252,7 +2252,10 @@ mod tests {
             "mapped should be > 0, got {mapped:?}",
         );
 
-        // Sanity: allocated <= active (guaranteed by jemalloc design)
+        // Sanity-check the one invariant that jemalloc guarantees:
+        // allocated <= active. The resident-vs-active and mapped-vs-resident
+        // orderings can transiently invert during OS page reclaim, so we
+        // only assert positivity for those (already checked above).
         let a = allocated.unwrap();
         let act = active.unwrap();
         assert!(a <= act, "allocated ({a}) <= active ({act})");
