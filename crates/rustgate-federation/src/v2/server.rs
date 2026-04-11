@@ -472,6 +472,7 @@ impl FederatedChannel for FederationService {
 
         drop(tokio::spawn(async move {
             let mut consecutive_violations: u32 = 0;
+
             while let Ok(Some(event)) = stream.message().await {
                 if !FederationService::validate_hop_count(&event, &pid) {
                     continue;
@@ -490,22 +491,26 @@ impl FederatedChannel for FederationService {
                     };
 
                     if !authorized {
+                        consecutive_violations += 1;
                         warn!(
                             peer = %pid,
                             groups = ?event.federate_groups,
+                            consecutive_violations = consecutive_violations,
                             "federation peer not authorized for claimed groups, skipping event"
                         );
-                        consecutive_violations += 1;
                         if consecutive_violations >= MAX_CONSECUTIVE_VIOLATIONS {
                             warn!(
                                 peer = %pid,
-                                "disconnecting peer after {MAX_CONSECUTIVE_VIOLATIONS} consecutive group violations"
+                                violations = consecutive_violations,
+                                "disconnecting federation peer: too many consecutive group violations"
                             );
                             break;
                         }
                         continue;
                     }
                 }
+
+                // Valid event resets the violation counter
                 consecutive_violations = 0;
                 on_event(event, pid.clone());
             }
