@@ -82,6 +82,12 @@ pub struct Identity {
     pub fingerprint: CertFingerprint,
     /// Group memberships derived from OU fields.
     pub groups: BTreeSet<GroupId>,
+    /// Tenant identifier extracted from the certificate Organization (O) field.
+    ///
+    /// Used by the per-tenant quota tracker to enforce connection and
+    /// rate limits per organization. Defaults to `None` on plaintext and
+    /// test constructors.
+    pub tenant: Option<String>,
     /// SPIFFE ID extracted from a URI SAN (`spiffe://...`), if present.
     ///
     /// Foundation for SPIFFE/SPIRE workload identity routing. Defaults to
@@ -118,6 +124,7 @@ impl Identity {
             cn,
             fingerprint,
             groups,
+            tenant: None,
             spiffe_id: None,
             attributes: Arc::new(BTreeMap::new()),
         })
@@ -135,6 +142,7 @@ impl Identity {
             cn,
             fingerprint: String::new(),
             groups,
+            tenant: None,
             spiffe_id: None,
             attributes: Arc::new(BTreeMap::new()),
         })
@@ -153,6 +161,16 @@ impl Identity {
     #[must_use]
     pub fn with_attributes(mut self, attributes: BTreeMap<String, AttrValue>) -> Self {
         self.attributes = Arc::new(attributes);
+        self
+    }
+
+    /// Builder: attach a tenant identifier to this identity.
+    ///
+    /// The tenant is typically the Organization (O) field from the
+    /// certificate subject, used by the per-tenant quota tracker.
+    #[must_use]
+    pub fn with_tenant(mut self, tenant: impl Into<String>) -> Self {
+        self.tenant = Some(tenant.into());
         self
     }
 
@@ -219,6 +237,7 @@ impl<'a> Arbitrary<'a> for Identity {
             cn,
             fingerprint,
             groups,
+            tenant: None,
             spiffe_id: None,
             attributes: Arc::new(BTreeMap::new()),
         })
