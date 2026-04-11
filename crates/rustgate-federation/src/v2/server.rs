@@ -309,7 +309,7 @@ impl FederatedChannel for FederationService {
         // Validate hop count to prevent routing loops.
         // Uses >= to align with FederationMetadata::should_drop() semantics.
         if let Some(ref hops) = event.federate_hops
-            && hops.current_hops >= MAX_FEDERATION_HOPS
+            && (hops.current_hops < 0 || hops.current_hops >= MAX_FEDERATION_HOPS)
         {
             warn!(
                 peer = %peer_id,
@@ -396,7 +396,7 @@ impl FederatedChannel for FederationService {
                 // Validate hop count to prevent routing loops.
                 // Uses >= to align with FederationMetadata::should_drop() semantics.
                 if let Some(ref hops) = event.federate_hops
-                    && hops.current_hops >= MAX_FEDERATION_HOPS
+                    && (hops.current_hops < 0 || hops.current_hops >= MAX_FEDERATION_HOPS)
                 {
                     warn!(
                         peer = %pid,
@@ -1093,6 +1093,35 @@ mod tests {
             count.load(Ordering::Relaxed),
             1,
             "event one below the hop limit should be accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn negative_hop_count_is_rejected() {
+        let (on_event, count) = counting_on_event();
+        let svc = FederationService::new("s".into(), vec![], on_event);
+
+        let event = figpb::FederatedEvent {
+            event: Some(figpb::GeoEvent {
+                uid: "negative-hops".into(),
+                ..Default::default()
+            }),
+            federate_hops: Some(figpb::FederateHops {
+                current_hops: -1,
+                max_hops: 20,
+            }),
+            ..Default::default()
+        };
+
+        let _ = svc
+            .send_one_event(Request::new(event))
+            .await
+            .expect("send_one_event");
+
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "event with negative hop count should be rejected"
         );
     }
 
