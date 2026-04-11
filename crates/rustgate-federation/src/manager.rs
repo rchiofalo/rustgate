@@ -169,6 +169,9 @@ fn peers_equal(a: &crate::config::PeerConfig, b: &crate::config::PeerConfig) -> 
         && a.enabled == b.enabled
         && a.is_outbound == b.is_outbound
         && a.protocol_version == b.protocol_version
+        && a.region == b.region
+        && a.zone == b.zone
+        && a.priority == b.priority
 }
 
 impl FederationManager {
@@ -1760,6 +1763,7 @@ mod tests {
             replay_max_bytes: crate::replay_persist::DEFAULT_REPLAY_MAX_BYTES,
             pod_id: None,
             ha_nats_url: None,
+            local_region: None,
         }
     }
 
@@ -1776,6 +1780,9 @@ mod tests {
             routing_mode: RoutingMode::default(),
             protocol_version: 1,
             jwt_token: None,
+            region: None,
+            zone: None,
+            priority: 100,
         }
     }
 

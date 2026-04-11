@@ -632,6 +632,12 @@ pub(crate) struct Cli {
     #[arg(long, env = "RUSTGATE_FEDERATION_POD_ID")]
     pub(crate) federation_pod_id: Option<String>,
 
+    /// Geographic region for this federation server (e.g. "us-east", "eu-west").
+    /// When set, matrix-mode routing prefers peers in the same region before
+    /// falling back to cross-region peers sorted by latency and priority.
+    #[arg(long, env = "RUSTGATE_FEDERATION_REGION")]
+    pub(crate) federation_region: Option<String>,
+
     // -- Federation peer discovery (issue #571) --
     /// Dynamic federation peer discovery backend.
     ///
@@ -1171,6 +1177,7 @@ define_config_file! {
     federation_replay_max_bytes: u64,
     federation_ha_nats_url: Option<String>,
     federation_pod_id: Option<String>,
+    federation_region: Option<String>,
     federation_peer_discovery: PeerDiscoveryBackend,
     federation_peer_discovery_interval: u64,
     federation_peer_discovery_dns_sd_service: String,
@@ -1498,6 +1505,7 @@ mod tests {
             "RUSTGATE_FEDERATION_CIRCUIT_BREAKER_TIMEOUT",
             "RUSTGATE_FEDERATION_HA_NATS_URL",
             "RUSTGATE_FEDERATION_POD_ID",
+            "RUSTGATE_FEDERATION_REGION",
             "RUSTGATE_REPLAY_WINDOW",
             "RUSTGATE_CLIENT_MSG_RATE",
             "RUSTGATE_CLIENT_BURST",

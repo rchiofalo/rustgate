@@ -582,6 +582,9 @@ mod tests {
             routing_mode: RoutingMode::Broadcast,
             protocol_version: 2,
             jwt_token: None,
+            region: None,
+            zone: None,
+            priority: 100,
         }))
     }
 

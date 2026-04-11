@@ -928,6 +928,7 @@ async fn build_federation_config(
                 .map(|_| cli.federation_id.clone())
         }),
         ha_nats_url: cli.federation_ha_nats_url.clone(),
+        local_region: cli.federation_region.clone(),
         ..rustgate_federation::config::FederationConfig::default()
     })
 }

@@ -454,6 +454,9 @@ mod tests {
             routing_mode: RoutingMode::default(),
             protocol_version: 1,
             jwt_token: None,
+            region: None,
+            zone: None,
+            priority: 100,
         };
 
         let peer = Arc::new(PeerHandle::new(peer_config));
@@ -511,6 +514,9 @@ mod tests {
             routing_mode: RoutingMode::default(),
             protocol_version: 1,
             jwt_token: None,
+            region: None,
+            zone: None,
+            priority: 100,
         };
 
         let peer = Arc::new(PeerHandle::new(peer_config));
@@ -569,6 +575,9 @@ mod tests {
             routing_mode: RoutingMode::default(),
             protocol_version: 1,
             jwt_token: None,
+            region: None,
+            zone: None,
+            priority: 100,
         };
 
         let peer = Arc::new(PeerHandle::new(peer_config));
@@ -647,6 +656,9 @@ mod tests {
             routing_mode: RoutingMode::default(),
             protocol_version: 1,
             jwt_token: None,
+            region: None,
+            zone: None,
+            priority: 100,
         };
 
         let peer = Arc::new(PeerHandle::new(peer_config));
@@ -706,6 +718,9 @@ mod tests {
             routing_mode: RoutingMode::default(),
             protocol_version: 1,
             jwt_token: None,
+            region: None,
+            zone: None,
+            priority: 100,
         };
 
         let peer = Arc::new(PeerHandle::new(peer_config));

@@ -120,6 +120,9 @@ impl ConsulDiscovery {
             routing_mode: RoutingMode::default(),
             protocol_version: 2,
             jwt_token: None,
+            region: None,
+            zone: None,
+            priority: 100,
         }
     }
 }

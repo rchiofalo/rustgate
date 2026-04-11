@@ -156,6 +156,10 @@ pub struct FederationConfig {
     /// NATS URL for HA coordination (claim manager + connection registry).
     /// Requires the `ha` feature.
     pub ha_nats_url: Option<String>,
+
+    /// The region this server belongs to, for latency-aware routing.
+    /// When set, matrix-mode forwarding prefers peers in the same region.
+    pub local_region: Option<String>,
 }
 
 impl Default for FederationConfig {
@@ -191,6 +195,7 @@ impl Default for FederationConfig {
             replay_max_bytes: crate::replay_persist::DEFAULT_REPLAY_MAX_BYTES,
             pod_id: None,
             ha_nats_url: None,
+            local_region: None,
         }
     }
 }
@@ -236,6 +241,15 @@ pub struct PeerConfig {
     /// federation server has JWT authentication enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jwt_token: Option<String>,
+    /// Geographic region of this peer (e.g., "us-east", "eu-west").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// Availability zone within the region (e.g., "az-1", "az-2").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<String>,
+    /// Routing priority — lower values are preferred. Default: 100.
+    #[serde(default = "default_priority")]
+    pub priority: u32,
 }
 
 impl PeerConfig {
@@ -254,6 +268,10 @@ impl PeerConfig {
 
 fn default_protocol_version() -> u32 {
     2
+}
+
+fn default_priority() -> u32 {
+    100
 }
 
 #[cfg(test)]
@@ -324,6 +342,9 @@ mod tests {
             routing_mode: RoutingMode::Broadcast,
             protocol_version: 1,
             jwt_token: None,
+            region: None,
+            zone: None,
+            priority: 100,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
@@ -446,6 +467,9 @@ mod tests {
             routing_mode: RoutingMode::default(),
             protocol_version: 2,
             jwt_token: None,
+            region: None,
+            zone: None,
+            priority: 100,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
@@ -466,6 +490,9 @@ mod tests {
             routing_mode: RoutingMode::default(),
             protocol_version: 2,
             jwt_token: None,
+            region: None,
+            zone: None,
+            priority: 100,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
@@ -486,6 +513,9 @@ mod tests {
             routing_mode: RoutingMode::default(),
             protocol_version: 2,
             jwt_token: None,
+            region: None,
+            zone: None,
+            priority: 100,
         };
         assert!(!peer.enabled);
     }
@@ -510,6 +540,9 @@ mod tests {
             routing_mode: RoutingMode::default(),
             protocol_version: 2,
             jwt_token: None,
+            region: None,
+            zone: None,
+            priority: 100,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
@@ -537,6 +570,9 @@ mod tests {
             routing_mode: RoutingMode::default(),
             protocol_version: 1,
             jwt_token: None,
+            region: None,
+            zone: None,
+            priority: 100,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
@@ -557,6 +593,9 @@ mod tests {
             routing_mode: RoutingMode::default(),
             protocol_version: 2,
             jwt_token: None,
+            region: None,
+            zone: None,
+            priority: 100,
         };
         assert_eq!(peer.effective_inbound_groups(), &["Alpha", "Bravo"]);
         assert_eq!(peer.effective_outbound_groups(), &["Alpha", "Bravo"]);
@@ -576,6 +615,9 @@ mod tests {
             routing_mode: RoutingMode::default(),
             protocol_version: 2,
             jwt_token: None,
+            region: None,
+            zone: None,
+            priority: 100,
         };
         assert_eq!(peer.effective_inbound_groups(), &["Inbound1", "Inbound2"]);
         assert_eq!(peer.effective_outbound_groups(), &["Outbound1"]);
@@ -595,6 +637,9 @@ mod tests {
             routing_mode: RoutingMode::default(),
             protocol_version: 2,
             jwt_token: None,
+            region: None,
+            zone: None,
+            priority: 100,
         };
         assert_eq!(peer.effective_inbound_groups(), &["Inbound1"]);
         // outbound falls back to groups
@@ -615,6 +660,9 @@ mod tests {
             routing_mode: RoutingMode::default(),
             protocol_version: 2,
             jwt_token: None,
+            region: None,
+            zone: None,
+            priority: 100,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         assert!(json.contains("inbound_groups"));
@@ -642,6 +690,9 @@ mod tests {
             routing_mode: RoutingMode::default(),
             protocol_version: 2,
             jwt_token: None,
+            region: None,
+            zone: None,
+            priority: 100,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         assert!(!json.contains("inbound_groups"));
