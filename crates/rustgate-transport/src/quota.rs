@@ -12,13 +12,18 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use parking_lot::RwLock;
 use serde::Deserialize;
 
+/// Sentinel tenant key used when a connection has no explicit tenant
+/// (i.e. `Identity.tenant` is `None`). Mapped to `default_quota` if
+/// one is configured.
+pub const DEFAULT_TENANT_KEY: &str = "__default__";
+
 /// Resource limits for a single tenant.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TenantQuota {
     /// Maximum concurrent connections. 0 = unlimited.
     #[serde(default)]
     pub max_connections: u32,
-    /// Maximum messages per second. 0 = unlimited.
+    /// Reserved for future per-tenant message rate limiting. Not yet enforced.
     #[serde(default)]
     pub max_message_rate: u32,
 }
@@ -68,34 +73,60 @@ impl TenantQuotaTracker {
             .or(self.config.default_quota.as_ref())
     }
 
-    /// Check whether a new connection from `tenant` would be within quota.
+    /// Atomically check whether a new connection is within quota AND
+    /// increment the counter if so. Uses a compare-and-swap loop to
+    /// prevent the TOCTOU race between separate check + record calls.
     ///
-    /// Returns `true` if the connection is allowed, `false` if the
+    /// Returns `true` if the connection was admitted, `false` if the
     /// tenant is at or above its `max_connections` limit.
-    pub fn check_connection(&self, tenant: &str) -> bool {
+    pub fn check_and_record_connection(&self, tenant: &str) -> bool {
         let quota = match self.quota_for(tenant) {
             Some(q) => q,
             // No quota configured for this tenant and no default: allow.
             None => return true,
         };
 
-        // 0 means unlimited.
-        if quota.max_connections == 0 {
+        // 0 means unlimited -- still record the connection for tracking.
+        let max = quota.max_connections;
+        if max == 0 {
+            self.record_connect_inner(tenant);
             return true;
         }
 
-        let counters = self.counters.read();
-        let current = counters
-            .get(tenant)
-            .map(|c| c.active_connections.load(Ordering::Relaxed))
-            .unwrap_or(0);
+        // Fast path: counter already exists -- CAS loop.
+        {
+            let counters = self.counters.read();
+            if let Some(c) = counters.get(tenant) {
+                return Self::cas_increment(&c.active_connections, max);
+            }
+        }
+        // Slow path: create counter entry then CAS.
+        let mut counters = self.counters.write();
+        let entry = counters
+            .entry(tenant.to_owned())
+            .or_insert_with(|| Arc::new(TenantCounters::default()));
+        Self::cas_increment(&entry.active_connections, max)
+    }
 
-        current < quota.max_connections
+    /// CAS loop: atomically increment if below `max`.
+    fn cas_increment(counter: &AtomicU32, max: u32) -> bool {
+        loop {
+            let current = counter.load(Ordering::Relaxed);
+            if current >= max {
+                return false;
+            }
+            if counter
+                .compare_exchange_weak(current, current + 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return true;
+            }
+        }
     }
 
     /// Record a new connection for `tenant`. Increments the active
-    /// connection counter.
-    pub fn record_connect(&self, tenant: &str) {
+    /// connection counter unconditionally (used only for unlimited quotas).
+    fn record_connect_inner(&self, tenant: &str) {
         // Fast path: counter already exists.
         {
             let counters = self.counters.read();
@@ -113,11 +144,15 @@ impl TenantQuotaTracker {
     }
 
     /// Record a disconnection for `tenant`. Decrements the active
-    /// connection counter (saturating at 0).
+    /// connection counter with saturating subtract to prevent underflow.
     pub fn record_disconnect(&self, tenant: &str) {
         let counters = self.counters.read();
         if let Some(c) = counters.get(tenant) {
-            let _ = c.active_connections.fetch_sub(1, Ordering::Relaxed);
+            let _ = c
+                .active_connections
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(1))
+                });
         }
     }
 
@@ -165,30 +200,41 @@ mod tests {
     }
 
     #[test]
-    fn check_allows_under_limit() {
+    fn check_and_record_allows_under_limit() {
         let tracker = TenantQuotaTracker::new(config_with_tenant("acme", 3));
-        assert!(tracker.check_connection("acme"));
-        tracker.record_connect("acme");
-        assert!(tracker.check_connection("acme"));
-        tracker.record_connect("acme");
-        assert!(tracker.check_connection("acme"));
+        assert!(tracker.check_and_record_connection("acme"));
+        assert!(tracker.check_and_record_connection("acme"));
+        assert!(tracker.check_and_record_connection("acme"));
+        assert_eq!(tracker.active_connections("acme"), 3);
+        // At limit -- next should fail.
+        assert!(!tracker.check_and_record_connection("acme"));
     }
 
     #[test]
-    fn check_rejects_at_limit() {
+    fn check_and_record_rejects_at_limit() {
         let tracker = TenantQuotaTracker::new(config_with_tenant("acme", 2));
-        tracker.record_connect("acme");
-        tracker.record_connect("acme");
-        assert!(!tracker.check_connection("acme"));
+        assert!(tracker.check_and_record_connection("acme"));
+        assert!(tracker.check_and_record_connection("acme"));
+        assert!(!tracker.check_and_record_connection("acme"));
     }
 
     #[test]
     fn disconnect_frees_slot() {
         let tracker = TenantQuotaTracker::new(config_with_tenant("acme", 1));
-        tracker.record_connect("acme");
-        assert!(!tracker.check_connection("acme"));
+        assert!(tracker.check_and_record_connection("acme"));
+        assert!(!tracker.check_and_record_connection("acme"));
         tracker.record_disconnect("acme");
-        assert!(tracker.check_connection("acme"));
+        assert!(tracker.check_and_record_connection("acme"));
+    }
+
+    #[test]
+    fn disconnect_saturates_at_zero() {
+        let tracker = TenantQuotaTracker::new(config_with_tenant("acme", 10));
+        // Disconnect without any prior connect -- should not underflow.
+        tracker.record_disconnect("acme");
+        // If it wrapped to u32::MAX the next check would fail.
+        assert!(tracker.check_and_record_connection("acme"));
+        assert_eq!(tracker.active_connections("acme"), 1);
     }
 
     #[test]
@@ -197,7 +243,7 @@ mod tests {
             tenants: HashMap::new(),
             default_quota: None,
         });
-        assert!(tracker.check_connection("unknown-org"));
+        assert!(tracker.check_and_record_connection("unknown-org"));
     }
 
     #[test]
@@ -210,25 +256,40 @@ mod tests {
             }),
         };
         let tracker = TenantQuotaTracker::new(config);
-        tracker.record_connect("unknown");
-        assert!(!tracker.check_connection("unknown"));
+        assert!(tracker.check_and_record_connection("unknown"));
+        assert!(!tracker.check_and_record_connection("unknown"));
+    }
+
+    #[test]
+    fn default_tenant_key_applies_default_quota() {
+        let config = QuotaConfig {
+            tenants: HashMap::new(),
+            default_quota: Some(TenantQuota {
+                max_connections: 2,
+                max_message_rate: 0,
+            }),
+        };
+        let tracker = TenantQuotaTracker::new(config);
+        assert!(tracker.check_and_record_connection(DEFAULT_TENANT_KEY));
+        assert!(tracker.check_and_record_connection(DEFAULT_TENANT_KEY));
+        assert!(!tracker.check_and_record_connection(DEFAULT_TENANT_KEY));
     }
 
     #[test]
     fn zero_max_means_unlimited() {
         let tracker = TenantQuotaTracker::new(config_with_tenant("acme", 0));
         for _ in 0..100 {
-            tracker.record_connect("acme");
+            assert!(tracker.check_and_record_connection("acme"));
         }
-        assert!(tracker.check_connection("acme"));
+        assert!(tracker.check_and_record_connection("acme"));
     }
 
     #[test]
     fn active_connections_tracks_correctly() {
         let tracker = TenantQuotaTracker::new(config_with_tenant("acme", 10));
         assert_eq!(tracker.active_connections("acme"), 0);
-        tracker.record_connect("acme");
-        tracker.record_connect("acme");
+        assert!(tracker.check_and_record_connection("acme"));
+        assert!(tracker.check_and_record_connection("acme"));
         assert_eq!(tracker.active_connections("acme"), 2);
         tracker.record_disconnect("acme");
         assert_eq!(tracker.active_connections("acme"), 1);

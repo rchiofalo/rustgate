@@ -135,27 +135,31 @@ async fn disconnect_frees_slot() {
     assert_eq!(tracker.active_connections("acme"), 1);
 }
 
-/// Sessions without a tenant field bypass quota checks entirely.
+/// Sessions without a tenant field are mapped to the default quota key
+/// so they are subject to default_quota limits when configured.
 #[tokio::test]
-async fn no_tenant_bypasses_quota() {
+async fn no_tenant_uses_default_quota() {
     let config = QuotaConfig {
         tenants: HashMap::new(),
         default_quota: Some(TenantQuota {
-            max_connections: 1,
+            max_connections: 2,
             max_message_rate: 0,
         }),
     };
     let tracker = Arc::new(TenantQuotaTracker::new(config));
     let router = Router::new().with_quota_tracker(Arc::clone(&tracker));
 
-    // No tenant field: should always succeed.
-    for i in 0..5 {
-        let h = make_handle(make_identity(&format!("user-{i}"), None));
-        assert!(
-            router.register(h).await,
-            "session without tenant should bypass quota"
-        );
-    }
+    // No tenant field: mapped to __default__ key, subject to default_quota.
+    let h1 = make_handle(make_identity("user-0", None));
+    let h2 = make_handle(make_identity("user-1", None));
+    let h3 = make_handle(make_identity("user-2", None));
+
+    assert!(router.register(h1).await, "first should be accepted");
+    assert!(router.register(h2).await, "second should be accepted");
+    assert!(
+        !router.register(h3).await,
+        "third should be rejected by default quota"
+    );
 }
 
 /// Different tenants have independent quotas.

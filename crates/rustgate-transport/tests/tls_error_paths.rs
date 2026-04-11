@@ -1,3 +1,4 @@
+#![allow(unused_results)]
 #![allow(clippy::panic, clippy::unwrap_used)]
 //! Error path tests for TLS: expired certificates, wrong CA rejection,
 //! self-signed certificate rejection, and channel backpressure.

@@ -1,3 +1,4 @@
+#![allow(unused_results)]
 #![allow(clippy::panic, clippy::unwrap_used)]
 //! Verifies the per-message access log emitted by `Router::route`:
 //!

@@ -51,7 +51,7 @@ pub use dedup::{
 pub use extract::{ExpectedKeyUsage, extract_identity, validate_key_usage};
 pub use filter::{GeoBounds, MessageFilter};
 pub use listener::{DEFAULT_MAX_HANDSHAKES, OnHandshakeError, TlsListener};
-pub use quota::{QuotaConfig, TenantQuota, TenantQuotaTracker};
+pub use quota::{DEFAULT_TENANT_KEY, QuotaConfig, TenantQuota, TenantQuotaTracker};
 pub use repeater::EmergencyRepeater;
 pub use replay::ReplayFilter;
 pub use router::{

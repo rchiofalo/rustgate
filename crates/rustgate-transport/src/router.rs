@@ -803,42 +803,40 @@ impl Router {
         let cn = handle.identity.cn.clone();
         let new_groups = handle.identity.groups.clone();
 
-        // Per-tenant quota check: reject early if tenant is over limit.
-        let tenant = handle.identity.tenant.clone();
-        if let Some(ref tenant_name) = tenant {
-            let guard = self.quota_tracker.load();
-            if let Some(ref tracker) = **guard {
-                if !tracker.check_connection(tenant_name) {
-                    warn!(
-                        cn = %cn,
-                        tenant = %tenant_name,
-                        "session rejected: tenant connection quota exceeded"
-                    );
-                    return false;
-                }
+        let mut state = self.state.write().await;
+
+        // Per-tenant quota enforcement inside the write lock to
+        // prevent TOCTOU races between concurrent connections.
+        // Connections without a tenant use the default quota key.
+        let quota_guard = self.quota_tracker.load();
+        if let Some(ref tracker) = **quota_guard {
+            let tenant_key = handle
+                .identity
+                .tenant
+                .as_deref()
+                .unwrap_or(crate::quota::DEFAULT_TENANT_KEY);
+            if !tracker.check_and_record_connection(tenant_key) {
+                warn!(
+                    cn = %cn,
+                    tenant = %tenant_key,
+                    "connection rejected: tenant quota exceeded"
+                );
+                return false;
             }
         }
 
-        let mut state = self.state.write().await;
-
         // Clean stale group entries if this CN was previously registered
-        let had_previous = state.sessions.contains_key(&cn);
         if let Some(old) = state.sessions.remove(&cn) {
             state.remove_from_groups(&cn, &old.identity.groups);
             // Decrement quota counter for replaced session's tenant.
-            if let Some(ref old_tenant) = old.identity.tenant {
-                let guard = self.quota_tracker.load();
-                if let Some(ref tracker) = **guard {
-                    tracker.record_disconnect(old_tenant);
-                }
-            }
-        }
-
-        // Record the new connection in the quota tracker.
-        if let Some(ref tenant_name) = tenant {
-            let guard = self.quota_tracker.load();
-            if let Some(ref tracker) = **guard {
-                tracker.record_connect(tenant_name);
+            let q_guard = self.quota_tracker.load();
+            if let Some(ref tracker) = **q_guard {
+                let old_tenant_key = old
+                    .identity
+                    .tenant
+                    .as_deref()
+                    .unwrap_or(crate::quota::DEFAULT_TENANT_KEY);
+                tracker.record_disconnect(old_tenant_key);
             }
         }
 
@@ -874,8 +872,6 @@ impl Router {
             }
             joined += 1;
         }
-
-        let _ = had_previous;
         true
     }
 
@@ -891,11 +887,14 @@ impl Router {
         if let Some(handle) = state.sessions.remove(cn) {
             state.remove_from_groups(cn, &handle.identity.groups);
             // Decrement quota counter for the disconnected tenant.
-            if let Some(ref tenant) = handle.identity.tenant {
-                let guard = self.quota_tracker.load();
-                if let Some(ref tracker) = **guard {
-                    tracker.record_disconnect(tenant);
-                }
+            let quota_guard = self.quota_tracker.load();
+            if let Some(ref tracker) = **quota_guard {
+                let tenant_key = handle
+                    .identity
+                    .tenant
+                    .as_deref()
+                    .unwrap_or(crate::quota::DEFAULT_TENANT_KEY);
+                tracker.record_disconnect(tenant_key);
             }
         }
         drop(state);

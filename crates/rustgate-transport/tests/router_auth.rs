@@ -1,3 +1,4 @@
+#![allow(unused_results)]
 #![allow(clippy::panic, clippy::unwrap_used)]
 //! Negative tests for router authorization: cross-group isolation,
 //! unregistered session handling, group limits, concurrent registration,

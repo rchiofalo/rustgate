@@ -692,7 +692,10 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
                                 "filtered offline messages through current ACL/authz policy"
                             );
                         }
-                        let _ = router.register(handle.clone()).await;
+                        if !router.register(handle.clone()).await {
+                            tracing::warn!(cn = %cn, "connection rejected: tenant quota exceeded");
+                            continue;
+                        }
                         for m in buffered_offline {
                             if handle.send(Arc::new(m)).await.is_err() {
                                 break;

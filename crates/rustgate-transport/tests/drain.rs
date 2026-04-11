@@ -1,3 +1,4 @@
+#![allow(unused_results)]
 #![allow(clippy::panic, clippy::unwrap_used)]
 //! Graceful drain integration tests.
 //!
