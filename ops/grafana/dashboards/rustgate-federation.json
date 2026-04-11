@@ -112,6 +112,30 @@
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 28},
       "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
       "targets": [{"expr": "sum(rate(rustgate_federation_heartbeats_total[5m]))", "refId": "A", "legendFormat": "heartbeats"}]
+    },
+    {
+      "type": "row",
+      "title": "Peer Queue Health",
+      "id": 100,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 36},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "gauge",
+      "title": "Total peer queue bytes",
+      "id": 13,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 37},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum(rustgate_federation_peer_queue_bytes)", "refId": "A"}]
+    },
+    {
+      "type": "gauge",
+      "title": "Max peer oldest message age (s)",
+      "id": 14,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 37},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "max(rustgate_federation_peer_oldest_seconds)", "refId": "A"}]
     }
   ],
   "refresh": "30s",

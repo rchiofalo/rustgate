@@ -108,6 +108,42 @@
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 28},
       "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
       "targets": [{"expr": "sum(rate(rustgate_admission_deferred_total[5m]))", "refId": "A", "legendFormat": "deferred/s"}]
+    },
+    {
+      "type": "row",
+      "title": "Store-Forward Queue",
+      "id": 100,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 36},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "gauge",
+      "title": "Total store-forward queue depth",
+      "id": 13,
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 37},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum(rustgate_client_queue_depth)", "refId": "A"}]
+    },
+    {
+      "type": "gauge",
+      "title": "Total store-forward queue bytes",
+      "id": 14,
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 37},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum(rustgate_client_queue_bytes)", "refId": "A"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Store-forward drops & expired",
+      "id": 15,
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 37},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum(rate(rustgate_client_queue_drops_total[5m]))", "refId": "A", "legendFormat": "drops"},
+        {"expr": "sum(rate(rustgate_client_queue_expired_total[5m]))", "refId": "B", "legendFormat": "expired"},
+        {"expr": "sum(rate(rustgate_client_queue_writer_drops_total[5m]))", "refId": "C", "legendFormat": "writer_drops"}
+      ]
     }
   ],
   "refresh": "30s",
