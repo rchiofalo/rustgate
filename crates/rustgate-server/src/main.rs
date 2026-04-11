@@ -723,6 +723,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 if token.is_empty() {
                     anyhow::bail!("ACL API token file {token_file} is empty");
                 }
+                acl_api::validate_token_length(&token)
+                    .map_err(|e| anyhow::anyhow!("{e} (from {token_file})"))?;
                 let initial_file = acl_file_parsed.unwrap_or_default();
                 let api_state = Arc::new(acl_api::AclApiState {
                     current: Arc::new(std::sync::RwLock::new(initial_file)),

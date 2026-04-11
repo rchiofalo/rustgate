@@ -8,7 +8,12 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 /// Root structure of the group ACL JSON configuration file.
+///
+/// Uses `deny_unknown_fields` to reject configuration files containing
+/// unexpected top-level properties — a typo is surfaced as a
+/// deserialization error rather than silently ignored.
 #[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct GroupAclFile {
     /// Per-group access control rules.
     pub(crate) groups: HashMap<String, GroupAclEntry>,
@@ -19,7 +24,11 @@ pub(crate) struct GroupAclFile {
 /// Backward-compatible: legacy files using only `send` and `receive`
 /// continue to deserialize unchanged (the new `deny_*` fields default
 /// to empty sets via `#[serde(default)]`).
+///
+/// Uses `deny_unknown_fields` to reject entries containing unexpected
+/// properties — a typo like `"recieve"` produces a clear error.
 #[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct GroupAclEntry {
     /// Certificate CNs permitted to send messages to this group.
     #[serde(default)]
@@ -137,5 +146,36 @@ mod tests {
         let json = r#"not valid json"#;
         let result = serde_json::from_str::<GroupAclFile>(json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_top_level_field() {
+        let json = r#"{"groups": {}, "unknown_key": true}"#;
+        let result = serde_json::from_str::<GroupAclFile>(json);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown field"),
+            "error should mention unknown field: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_entry_field() {
+        let json = r#"{
+            "groups": {
+                "alpha": {
+                    "send": ["alice"],
+                    "recieve": ["bob"]
+                }
+            }
+        }"#;
+        let result = serde_json::from_str::<GroupAclFile>(json);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown field"),
+            "error should mention unknown field: {err}"
+        );
     }
 }
