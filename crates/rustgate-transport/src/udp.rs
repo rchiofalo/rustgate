@@ -57,8 +57,41 @@ pub struct CidrPrefix {
     prefix_len: u8,
 }
 
+/// Mask off host bits from an IP address given a prefix length.
+///
+/// This normalizes the address to a true network prefix so that
+/// `CidrPrefix::new("10.0.0.5".parse(), 8)` stores `10.0.0.0`.
+fn mask_addr(addr: IpAddr, prefix_len: u8) -> IpAddr {
+    match addr {
+        IpAddr::V4(v4) => {
+            if prefix_len == 0 {
+                IpAddr::V4(std::net::Ipv4Addr::from(0u32))
+            } else if prefix_len >= 32 {
+                addr
+            } else {
+                let mask = u32::MAX
+                    .checked_shl(32 - u32::from(prefix_len))
+                    .unwrap_or(0);
+                IpAddr::V4(std::net::Ipv4Addr::from(u32::from(v4) & mask))
+            }
+        }
+        IpAddr::V6(v6) => {
+            if prefix_len == 0 {
+                IpAddr::V6(std::net::Ipv6Addr::from(0u128))
+            } else if prefix_len >= 128 {
+                addr
+            } else {
+                let mask = u128::MAX
+                    .checked_shl(128 - u32::from(prefix_len))
+                    .unwrap_or(0);
+                IpAddr::V6(std::net::Ipv6Addr::from(u128::from(v6) & mask))
+            }
+        }
+    }
+}
+
 impl CidrPrefix {
-    /// Create a new CIDR prefix.
+    /// Create a new CIDR prefix, normalizing host bits to zero.
     ///
     /// Returns `None` if `prefix_len` exceeds the address width (32 for
     /// IPv4, 128 for IPv6).
@@ -70,7 +103,10 @@ impl CidrPrefix {
         if prefix_len > max_bits {
             return None;
         }
-        Some(Self { addr, prefix_len })
+        Some(Self {
+            addr: mask_addr(addr, prefix_len),
+            prefix_len,
+        })
     }
 
     /// Returns `true` if `ip` falls within this prefix.
@@ -932,5 +968,38 @@ mod tests {
         // Existing IPs should still be promotable.
         assert!(cache.get(&ip1).is_some(), "ip1 should still be present");
         assert!(cache.get(&ip2).is_some(), "ip2 should still be present");
+    }
+
+    #[test]
+    fn cidr_new_normalizes_host_bits_v4() {
+        // 10.0.0.5/8 should store 10.0.0.0 as the network address.
+        let cidr = CidrPrefix::new(IpAddr::from([10, 0, 0, 5]), 8).unwrap();
+        assert_eq!(cidr.addr, IpAddr::from([10, 0, 0, 0]));
+
+        // 192.168.1.130/25 should store 192.168.1.128.
+        let cidr = CidrPrefix::new(IpAddr::from([192, 168, 1, 130]), 25).unwrap();
+        assert_eq!(cidr.addr, IpAddr::from([192, 168, 1, 128]));
+
+        // /32 preserves the exact address.
+        let cidr = CidrPrefix::new(IpAddr::from([10, 0, 0, 5]), 32).unwrap();
+        assert_eq!(cidr.addr, IpAddr::from([10, 0, 0, 5]));
+
+        // /0 normalizes to 0.0.0.0.
+        let cidr = CidrPrefix::new(IpAddr::from([10, 0, 0, 5]), 0).unwrap();
+        assert_eq!(cidr.addr, IpAddr::from([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn cidr_new_normalizes_host_bits_v6() {
+        let addr: IpAddr = "fd00::5".parse().unwrap();
+        let cidr = CidrPrefix::new(addr, 64).unwrap();
+        let expected: IpAddr = "fd00::".parse().unwrap();
+        assert_eq!(cidr.addr, expected);
+    }
+
+    #[test]
+    fn cidr_from_str_normalizes_host_bits() {
+        let cidr: CidrPrefix = "10.0.0.5/8".parse().unwrap();
+        assert_eq!(cidr.addr, IpAddr::from([10, 0, 0, 0]));
     }
 }
