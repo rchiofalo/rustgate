@@ -37,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Changed
 
 - **Rust toolchain aligned to 1.94** — updated `rust-toolchain.toml`, CI workflows, and `Cargo.toml` MSRV to consistently target Rust 1.94.
+- **`/readyz` response format changed from plain text to JSON** — the `/readyz` (and `/health/ready`) endpoint now returns a structured JSON body `{"status": "ok"|"degraded"|"unhealthy", "checks": {...}}` with per-dependency health status instead of a bare `ok`/`not ready` string. Clients that previously parsed the plain-text body must be updated to consume the new JSON format. (#675)
 
 ### Added
 
