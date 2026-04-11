@@ -99,6 +99,11 @@ impl GroupAcl {
     /// The input `cn` is normalized to ASCII lowercase before comparison
     /// so matching is case-insensitive per RFC 5280 §7.1.
     ///
+    /// Case normalization uses `to_ascii_lowercase()`, which handles ASCII
+    /// characters only. Non-ASCII Unicode case folding (e.g., Turkish İ/ı,
+    /// German ß) is not performed. This is sufficient for typical X.509 CN
+    /// values which are ASCII-only in practice.
+    ///
     /// Deny is checked first — a CN in `deny_senders` is always rejected,
     /// regardless of whether it appears in `senders`.
     pub fn can_send(&self, cn: &str) -> bool {
@@ -118,6 +123,11 @@ impl GroupAcl {
     ///
     /// The input `cn` is normalized to ASCII lowercase before comparison
     /// so matching is case-insensitive per RFC 5280 §7.1.
+    ///
+    /// Case normalization uses `to_ascii_lowercase()`, which handles ASCII
+    /// characters only. Non-ASCII Unicode case folding (e.g., Turkish İ/ı,
+    /// German ß) is not performed. This is sufficient for typical X.509 CN
+    /// values which are ASCII-only in practice.
     ///
     /// Deny is checked first — a CN in `deny_receivers` is always rejected,
     /// regardless of whether it appears in `receivers`.
@@ -528,5 +538,36 @@ mod tests {
         assert!(policy.is_send_authorized("ops", "ALICE"));
         assert!(policy.is_receive_authorized("ops", "Alice"));
         assert!(policy.is_receive_authorized("ops", "ALICE"));
+    }
+
+    #[test]
+    fn case_insensitive_deny_construction() {
+        let acl = GroupAcl::with_deny(
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::from(["MALLORY".to_string()]),
+            HashSet::new(),
+        );
+        // "mallory" should be denied (normalized at construction).
+        assert!(!acl.can_send("mallory"));
+    }
+
+    #[test]
+    fn policy_allows_configured_group_denies_unconfigured() {
+        let mut groups = HashMap::new();
+        groups.insert(
+            "alpha".to_string(),
+            GroupAcl::new(
+                HashSet::from(["alice".to_string()]),
+                HashSet::from(["bob".to_string()]),
+            ),
+        );
+        let policy = GroupAclPolicy::new(groups);
+        // alpha is configured — authorized.
+        assert!(policy.is_send_authorized("alpha", "alice"));
+        assert!(policy.is_receive_authorized("alpha", "bob"));
+        // beta is NOT configured — denied when policy is non-empty.
+        assert!(!policy.is_send_authorized("beta", "alice"));
+        assert!(!policy.is_receive_authorized("beta", "bob"));
     }
 }
