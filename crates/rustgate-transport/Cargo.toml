@@ -31,6 +31,9 @@ rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
 x509-parser = { workspace = true }
 sha2 = { workspace = true }
+hmac = { workspace = true }
+ring = { workspace = true }
+subtle = { workspace = true }
 parking_lot = { workspace = true }
 lru = { workspace = true }
 tracing = { workspace = true }

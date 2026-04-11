@@ -22,19 +22,23 @@
 //! message type, source protocol, received-at timestamp, TTL, and raw
 //! payload bytes. See [`encode`] / [`decode`] for the wire layout.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use hmac::{Hmac, Mac};
 use parking_lot::Mutex;
 use redb::{Database, ReadableTable, TableDefinition};
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
+use sha2::Sha256;
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
+use zeroize::Zeroizing;
 
 /// Bounded capacity of the async writer channel. Enqueues submitted
 /// beyond this point are dropped and counted via
@@ -52,6 +56,27 @@ pub const DEFAULT_CLIENT_QUEUE_MAX_BYTES: u64 = 100 * 1024 * 1024;
 /// per-CN drains can filter by it.
 const QUEUE_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("client_queue_v1");
 
+/// redb table tracking sequence numbers that have been drained and
+/// delivered. Prevents duplicate delivery when the process crashes
+/// between drain and the caller's acknowledgement of receipt.
+const DELIVERED_TABLE: TableDefinition<u64, ()> = TableDefinition::new("delivered_seqs_v1");
+
+/// Length of the HMAC-SHA256 tag appended to each stored envelope.
+const HMAC_LEN: usize = 32;
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// Compute an HMAC-SHA256 tag over `data` using the given key.
+fn compute_hmac(key: &[u8; 32], data: &[u8]) -> Result<[u8; 32], StoreForwardError> {
+    let mut mac = HmacSha256::new_from_slice(key).map_err(|e| {
+        // Unreachable for a 32-byte key, but we handle it to satisfy the
+        // no-unwrap lint.
+        StoreForwardError::Database(format!("HMAC key init failed: {e}"))
+    })?;
+    mac.update(data);
+    Ok(mac.finalize().into_bytes().into())
+}
+
 /// Errors returned by [`ClientQueue`].
 #[derive(Debug, Error)]
 pub enum StoreForwardError {
@@ -63,6 +88,10 @@ pub enum StoreForwardError {
     /// router.
     #[error("malformed stored message envelope")]
     Decode,
+    /// A stored envelope's HMAC tag did not match — indicates tampering
+    /// by a filesystem-level attacker.
+    #[error("stored message HMAC verification failed")]
+    TamperedMessage,
 }
 
 /// Snapshot of queue depth / byte usage for a single CN. Returned by
@@ -106,6 +135,7 @@ struct Inner {
     enqueues: u64,
     writer_drops: u64,
     expired: u64,
+    tampered: u64,
     skipped_unsupported: u64,
 }
 
@@ -121,6 +151,7 @@ impl Inner {
             enqueues: 0,
             writer_drops: 0,
             expired: 0,
+            tampered: 0,
             skipped_unsupported: 0,
         }
     }
@@ -136,6 +167,9 @@ pub struct ClientQueue {
     inner: Arc<Mutex<Inner>>,
     max_bytes: u64,
     path: PathBuf,
+    /// HMAC-SHA256 key used to integrity-protect stored envelopes.
+    /// Wrapped in `Zeroizing` so it is wiped on drop.
+    hmac_key: Arc<Zeroizing<[u8; 32]>>,
     /// Bounded sender feeding a dedicated background writer task. Keeps
     /// `enqueue` non-blocking and off the async runtime's worker threads.
     writer_tx: mpsc::Sender<(String, RoutableMessage)>,
@@ -150,12 +184,50 @@ impl ClientQueue {
     /// scanned to rebuild the in-memory index so that [`Self::stats`] and
     /// eviction work correctly immediately after restart. Corrupt
     /// records are skipped with a warning rather than failing open.
+    ///
+    /// # Ephemeral HMAC key
+    ///
+    /// This method generates a fresh random HMAC key on each call.
+    /// Messages stored by a previous process instance will fail HMAC
+    /// verification and be **silently discarded** on drain, because the
+    /// new key cannot verify tags produced by the old key.
+    ///
+    /// If cross-restart integrity verification is required, use
+    /// [`Self::open_with_hmac_key()`] with an externally persisted key.
     pub fn open(dir: &Path, max_bytes: u64) -> Result<Self, StoreForwardError> {
+        Self::open_with_hmac_key(dir, max_bytes, None)
+    }
+
+    /// Open or create a client queue with an explicit HMAC key.
+    ///
+    /// When `hmac_key` is `None`, a fresh random key is generated. This
+    /// means HMAC tags written by a previous process instance are treated
+    /// as tampered on restart (correctly — a new key cannot verify old
+    /// tags). The HMAC protects against filesystem-level attackers
+    /// modifying stored envelopes while the *same* process is running.
+    ///
+    /// Callers that need integrity verification to survive restarts
+    /// should persist the key externally and pass it here.
+    pub fn open_with_hmac_key(
+        dir: &Path,
+        max_bytes: u64,
+        hmac_key: Option<Zeroizing<[u8; 32]>>,
+    ) -> Result<Self, StoreForwardError> {
         std::fs::create_dir_all(dir).map_err(|e| StoreForwardError::Database(e.to_string()))?;
         let path = dir.join("client_queue.redb");
         let db = Database::create(&path).map_err(|e| StoreForwardError::Database(e.to_string()))?;
 
-        // Ensure the table exists and rebuild in-memory index.
+        // Derive or accept the HMAC key.
+        let hmac_key = Arc::new(match hmac_key {
+            Some(k) => k,
+            None => {
+                let mut key = Zeroizing::new([0u8; 32]);
+                fill_random(&mut *key)?;
+                key
+            }
+        });
+
+        // Ensure both tables exist and rebuild in-memory index.
         let mut inner = Inner::new();
         let mut malformed_seqs: Vec<u64> = Vec::new();
         {
@@ -166,11 +238,35 @@ impl ClientQueue {
                 let _ = write
                     .open_table(QUEUE_TABLE)
                     .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+                let _ = write
+                    .open_table(DELIVERED_TABLE)
+                    .map_err(|e| StoreForwardError::Database(e.to_string()))?;
             }
             write
                 .commit()
                 .map_err(|e| StoreForwardError::Database(e.to_string()))?;
         }
+
+        // Collect already-delivered seq numbers so we can skip them
+        // during the index rebuild and purge them from both tables.
+        let delivered_seqs: HashSet<u64> = {
+            let read = db
+                .begin_read()
+                .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+            let table = read
+                .open_table(DELIVERED_TABLE)
+                .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+            let mut set = HashSet::new();
+            for kv in table
+                .iter()
+                .map_err(|e| StoreForwardError::Database(e.to_string()))?
+                .flatten()
+            {
+                let _ = set.insert(kv.0.value());
+            }
+            set
+        };
+
         {
             let read = db
                 .begin_read()
@@ -191,6 +287,14 @@ impl ClientQueue {
                 };
                 let seq = k.value();
                 let raw = v.value();
+
+                // Skip entries already marked as delivered from a
+                // previous drain — they will be purged below.
+                if delivered_seqs.contains(&seq) {
+                    debug!(seq, "skipping already-delivered queue entry on rebuild");
+                    continue;
+                }
+
                 let size = raw.len() as u64;
                 // We only need the destination CN — peek it without
                 // materializing the full RoutableMessage.
@@ -217,11 +321,13 @@ impl ClientQueue {
             }
         }
 
-        // Purge corrupt entries from disk so they don't accumulate across
-        // restarts. The read transaction above identified them; now remove
-        // them in a separate write transaction.
-        if !malformed_seqs.is_empty() {
+        // Purge corrupt and already-delivered entries from disk so they
+        // don't accumulate across restarts.
+        let purge_malformed = !malformed_seqs.is_empty();
+        let purge_delivered = !delivered_seqs.is_empty();
+        if purge_malformed || purge_delivered {
             let purge_count = malformed_seqs.len();
+            let delivered_count = delivered_seqs.len();
             let write = db
                 .begin_write()
                 .map_err(|e| StoreForwardError::Database(e.to_string()))?;
@@ -232,27 +338,55 @@ impl ClientQueue {
                 for seq in &malformed_seqs {
                     let _ = table.remove(seq);
                 }
+                for seq in &delivered_seqs {
+                    let _ = table.remove(seq);
+                }
+            }
+            {
+                // Clear the delivered table now that we have purged the
+                // corresponding queue entries.
+                let mut dtable = write
+                    .open_table(DELIVERED_TABLE)
+                    .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+                for seq in &delivered_seqs {
+                    let _ = dtable.remove(seq);
+                }
             }
             write
                 .commit()
                 .map_err(|e| StoreForwardError::Database(e.to_string()))?;
-            warn!(
-                count = purge_count,
-                "purged malformed entries from client queue on startup"
-            );
+            if purge_malformed {
+                warn!(
+                    count = purge_count,
+                    "purged malformed entries from client queue on startup"
+                );
+            }
+            if purge_delivered {
+                debug!(
+                    count = delivered_count,
+                    "purged already-delivered entries from client queue on startup"
+                );
+            }
         }
 
         let db = Arc::new(db);
         let inner = Arc::new(Mutex::new(inner));
         let (writer_tx, writer_rx) =
             mpsc::channel::<(String, RoutableMessage)>(CLIENT_QUEUE_WRITER_CHANNEL_CAPACITY);
-        spawn_writer_task(Arc::clone(&db), Arc::clone(&inner), max_bytes, writer_rx);
+        spawn_writer_task(
+            Arc::clone(&db),
+            Arc::clone(&inner),
+            max_bytes,
+            Arc::clone(&hmac_key),
+            writer_rx,
+        );
 
         Ok(Self {
             db,
             inner,
             max_bytes,
             path,
+            hmac_key,
             writer_tx,
         })
     }
@@ -319,6 +453,12 @@ impl ClientQueue {
         self.inner.lock().expired
     }
 
+    /// Total messages discarded during drain because their HMAC tag
+    /// did not match, indicating tampering or a key mismatch.
+    pub fn tampered_total(&self) -> u64 {
+        self.inner.lock().tampered
+    }
+
     /// Total queue entries skipped on reopen because their destination
     /// was not a direct-addressed CN (broadcast/group).
     pub fn skipped_unsupported_total(&self) -> u64 {
@@ -328,8 +468,13 @@ impl ClientQueue {
     /// Drain every queued message for `cn` in FIFO order, removing them
     /// from durable storage. Returns the decoded messages ready for
     /// re-routing. Entries whose TTL has elapsed are silently removed
-    /// and counted via [`Self::expired_total`]. Malformed entries are
-    /// skipped with a warning.
+    /// and counted via [`Self::expired_total`]. Malformed entries and
+    /// entries with invalid HMAC tags are skipped with a warning.
+    ///
+    /// Each successfully decoded message is recorded in `DELIVERED_TABLE`
+    /// before the queue entry is removed, so a crash between drain and
+    /// caller acknowledgement will not cause duplicate delivery on
+    /// restart — the next `open` will skip delivered entries.
     pub fn drain(&self, cn: &str) -> Result<Vec<RoutableMessage>, StoreForwardError> {
         let seqs: Vec<u64> = {
             let mut inner = self.inner.lock();
@@ -339,7 +484,7 @@ impl ClientQueue {
             let seqs: Vec<u64> = idx.seqs.into_iter().collect();
             let reclaim: u64 = idx.bytes;
             inner.total_bytes = inner.total_bytes.saturating_sub(reclaim);
-            let set: std::collections::HashSet<u64> = seqs.iter().copied().collect();
+            let set: HashSet<u64> = seqs.iter().copied().collect();
             inner.global.retain(|(s, _, _)| !set.contains(s));
             inner.drains = inner.drains.saturating_add(1);
             seqs
@@ -351,6 +496,7 @@ impl ClientQueue {
 
         let mut out: Vec<RoutableMessage> = Vec::with_capacity(seqs.len());
         let mut expired_count: u64 = 0;
+        let mut tampered_count: u64 = 0;
         let write = self
             .db
             .begin_write()
@@ -359,22 +505,45 @@ impl ClientQueue {
             let mut table = write
                 .open_table(QUEUE_TABLE)
                 .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+            let mut dtable = write
+                .open_table(DELIVERED_TABLE)
+                .map_err(|e| StoreForwardError::Database(e.to_string()))?;
             for seq in &seqs {
                 let removed = table
                     .remove(seq)
                     .map_err(|e| StoreForwardError::Database(e.to_string()))?;
                 if let Some(access) = removed {
-                    match decode(access.value()) {
-                        Ok(msg) => {
-                            if msg_expired(&msg) {
-                                expired_count = expired_count.saturating_add(1);
-                                debug!(seq, cn, "client queue: dropping expired entry on drain");
-                            } else {
-                                out.push(msg);
+                    let stored = access.value();
+
+                    // Verify HMAC integrity before decoding.
+                    match verify_hmac_envelope(&self.hmac_key, stored) {
+                        Ok(msg_data) => match decode(msg_data) {
+                            Ok(msg) => {
+                                if msg_expired(&msg) {
+                                    expired_count = expired_count.saturating_add(1);
+                                    debug!(
+                                        seq,
+                                        cn, "client queue: dropping expired entry on drain"
+                                    );
+                                } else {
+                                    // Mark as delivered before returning
+                                    // so a crash here won't re-deliver.
+                                    let _ = dtable
+                                        .insert(seq, ())
+                                        .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+                                    out.push(msg);
+                                }
                             }
-                        }
+                            Err(_) => {
+                                warn!(seq, cn, "client queue: dropping malformed entry on drain");
+                            }
+                        },
                         Err(_) => {
-                            warn!(seq, cn, "client queue: dropping malformed entry on drain");
+                            tampered_count = tampered_count.saturating_add(1);
+                            warn!(
+                                seq,
+                                cn, "client queue: HMAC verification failed, discarding"
+                            );
                         }
                     }
                 }
@@ -384,18 +553,49 @@ impl ClientQueue {
             .commit()
             .map_err(|e| StoreForwardError::Database(e.to_string()))?;
 
-        if expired_count > 0 {
+        if expired_count > 0 || tampered_count > 0 {
             let mut inner = self.inner.lock();
             inner.expired = inner.expired.saturating_add(expired_count);
+            inner.tampered = inner.tampered.saturating_add(tampered_count);
         }
 
         debug!(
             cn,
             drained = out.len(),
             expired = expired_count,
+            tampered = tampered_count,
             "client queue: drained"
         );
         Ok(out)
+    }
+
+    /// Mark a batch of sequence numbers as delivered, preventing them
+    /// from being re-delivered if the process restarts before the next
+    /// `open` purges them. Called by the caller after the drained
+    /// messages have been successfully forwarded.
+    #[cfg(test)]
+    pub fn confirm_delivered(&self, seqs: &[u64]) -> Result<(), StoreForwardError> {
+        if seqs.is_empty() {
+            return Ok(());
+        }
+        let write = self
+            .db
+            .begin_write()
+            .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+        {
+            let mut dtable = write
+                .open_table(DELIVERED_TABLE)
+                .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+            for seq in seqs {
+                let _ = dtable
+                    .insert(seq, ())
+                    .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+            }
+        }
+        write
+            .commit()
+            .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+        Ok(())
     }
 
     /// Return a stats snapshot for a single CN.
@@ -690,6 +890,42 @@ fn msg_expired(msg: &RoutableMessage) -> bool {
     SystemTime::now() > deadline
 }
 
+/// Verify the HMAC tag appended to a stored envelope and return the
+/// message bytes (without the trailing tag) on success.
+fn verify_hmac_envelope<'a>(
+    key: &[u8; 32],
+    stored: &'a [u8],
+) -> Result<&'a [u8], StoreForwardError> {
+    if stored.len() < HMAC_LEN {
+        return Err(StoreForwardError::TamperedMessage);
+    }
+    let (msg_data, tag) = stored.split_at(stored.len() - HMAC_LEN);
+    let expected = compute_hmac(key, msg_data)?;
+    // Constant-time comparison prevents timing side-channels even in
+    // the at-rest integrity case — defense-in-depth against local
+    // attackers measuring verification latency.
+    if tag.ct_eq(&expected).into() {
+        // Tag matches — fall through to return Ok.
+    } else {
+        return Err(StoreForwardError::TamperedMessage);
+    }
+    Ok(msg_data)
+}
+
+/// Fill `dest` with cryptographically secure random bytes.
+///
+/// Returns an error if the OS CSPRNG is unavailable. Callers must treat
+/// this as a fatal startup condition — a broken RNG means all
+/// cryptographic guarantees are void.
+fn fill_random(dest: &mut [u8]) -> Result<(), StoreForwardError> {
+    use ring::rand::{SecureRandom, SystemRandom};
+
+    let rng = SystemRandom::new();
+    rng.fill(dest).map_err(|_| {
+        StoreForwardError::Database("CSPRNG fill failed — OS random source unavailable".into())
+    })
+}
+
 /// Spawn the background writer task that services an async queue of
 /// pending enqueues. Each message is persisted via a synchronous
 /// redb transaction inside `spawn_blocking` so the runtime's async
@@ -698,15 +934,18 @@ fn spawn_writer_task(
     db: Arc<Database>,
     inner: Arc<Mutex<Inner>>,
     max_bytes: u64,
+    hmac_key: Arc<Zeroizing<[u8; 32]>>,
     mut rx: mpsc::Receiver<(String, RoutableMessage)>,
 ) {
     drop(tokio::spawn(async move {
         while let Some((cn, msg)) = rx.recv().await {
             let db = Arc::clone(&db);
             let inner = Arc::clone(&inner);
-            let join =
-                tokio::task::spawn_blocking(move || persist_one(&db, &inner, max_bytes, &cn, &msg))
-                    .await;
+            let key = Arc::clone(&hmac_key);
+            let join = tokio::task::spawn_blocking(move || {
+                persist_one(&db, &inner, max_bytes, &key, &cn, &msg)
+            })
+            .await;
             match join {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => warn!(error = %e, "client queue writer: persist failed"),
@@ -719,15 +958,26 @@ fn spawn_writer_task(
 /// Synchronous durable write path executed inside `spawn_blocking`.
 /// Holds the in-memory index lock briefly to reserve a sequence number
 /// and apply eviction bookkeeping, then commits the redb transaction.
+///
+/// The encoded message is followed by a 32-byte HMAC-SHA256 tag so
+/// that tampered envelopes can be detected on drain.
 fn persist_one(
     db: &Database,
     inner: &Mutex<Inner>,
     max_bytes: u64,
+    hmac_key: &[u8; 32],
     cn: &str,
     msg: &RoutableMessage,
 ) -> Result<(), StoreForwardError> {
     let encoded = encode(msg);
-    let size = encoded.len() as u64;
+
+    // Compute HMAC tag and append it to the stored data.
+    let tag = compute_hmac(hmac_key, &encoded)?;
+    let mut stored = Vec::with_capacity(encoded.len() + HMAC_LEN);
+    stored.extend_from_slice(&encoded);
+    stored.extend_from_slice(&tag);
+
+    let size = stored.len() as u64;
     if size > max_bytes {
         let mut guard = inner.lock();
         guard.drops = guard.drops.saturating_add(1);
@@ -792,7 +1042,7 @@ fn persist_one(
                 .map_err(|e| StoreForwardError::Database(e.to_string()))?;
         }
         let _ = table
-            .insert(seq, encoded.as_slice())
+            .insert(seq, stored.as_slice())
             .map_err(|e| StoreForwardError::Database(e.to_string()))?;
     }
     write
@@ -886,9 +1136,10 @@ mod tests {
     async fn byte_cap_drops_oldest() {
         let tmp = TempDir::new().unwrap();
         // Small cap forces eviction after a couple of messages.
+        // Account for HMAC tag appended to each stored envelope.
         let payload = vec![0u8; 256];
         let one = msg_for("alice", "bob", &payload);
-        let single_size = encode(&one).len() as u64;
+        let single_size = encode(&one).len() as u64 + HMAC_LEN as u64;
         let cap = single_size * 3 + 1;
         let q = ClientQueue::open(tmp.path(), cap).unwrap();
         for _ in 0..10 {
@@ -906,11 +1157,19 @@ mod tests {
         assert!(q.drops_total() >= 7);
     }
 
+    /// Helper to create a fixed HMAC key for tests that need to survive
+    /// reopen with the same key.
+    fn test_hmac_key() -> Zeroizing<[u8; 32]> {
+        Zeroizing::new([0xAB; 32])
+    }
+
     #[tokio::test]
     async fn survives_reopen() {
         let tmp = TempDir::new().unwrap();
+        let key = test_hmac_key();
         {
-            let q = ClientQueue::open(tmp.path(), 1_000_000).unwrap();
+            let q =
+                ClientQueue::open_with_hmac_key(tmp.path(), 1_000_000, Some(key.clone())).unwrap();
             q.enqueue("bob", &msg_for("alice", "bob", b"one")).unwrap();
             q.enqueue("bob", &msg_for("alice", "bob", b"two")).unwrap();
             wait_for_depth(&q, "bob", 2).await;
@@ -919,7 +1178,7 @@ mod tests {
         // Give the writer task a moment to observe the closed channel
         // and release its Arc<Database> so redb can unlock the file.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let q2 = ClientQueue::open(tmp.path(), 1_000_000).unwrap();
+        let q2 = ClientQueue::open_with_hmac_key(tmp.path(), 1_000_000, Some(key.clone())).unwrap();
         assert_eq!(q2.stats("bob").depth, 2);
         let drained = q2.drain("bob").unwrap();
         assert_eq!(drained.len(), 2);
@@ -958,8 +1217,10 @@ mod tests {
     #[tokio::test]
     async fn reopen_purges_malformed_entries() {
         let tmp = TempDir::new().unwrap();
+        let key = test_hmac_key();
         {
-            let q = ClientQueue::open(tmp.path(), 1_000_000).unwrap();
+            let q =
+                ClientQueue::open_with_hmac_key(tmp.path(), 1_000_000, Some(key.clone())).unwrap();
             q.enqueue("bob", &msg_for("alice", "bob", b"valid"))
                 .unwrap();
             wait_for_depth(&q, "bob", 1).await;
@@ -983,7 +1244,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Reopen — corrupt entry should be purged from disk.
-        let q2 = ClientQueue::open(tmp.path(), 1_000_000).unwrap();
+        let q2 = ClientQueue::open_with_hmac_key(tmp.path(), 1_000_000, Some(key.clone())).unwrap();
         assert_eq!(q2.stats("bob").depth, 1, "valid entry should survive");
 
         let drained = q2.drain("bob").unwrap();
@@ -1019,6 +1280,158 @@ mod tests {
             q.writer_drops_total() > 0,
             "expected writer overflow drops, got {}",
             q.writer_drops_total()
+        );
+    }
+
+    // ── HMAC integrity tests ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn store_forward_hmac_accepts_valid() {
+        let tmp = TempDir::new().unwrap();
+        let q = ClientQueue::open(tmp.path(), 1_000_000).unwrap();
+        q.enqueue("bob", &msg_for("alice", "bob", b"hello"))
+            .unwrap();
+        wait_for_depth(&q, "bob", 1).await;
+
+        let drained = q.drain("bob").unwrap();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].payload.as_ref(), b"hello");
+        assert_eq!(drained[0].source.cn, "alice");
+    }
+
+    #[tokio::test]
+    async fn store_forward_hmac_rejects_tampered() {
+        let tmp = TempDir::new().unwrap();
+        let key = test_hmac_key();
+        let q = ClientQueue::open_with_hmac_key(tmp.path(), 1_000_000, Some(key.clone())).unwrap();
+        q.enqueue("bob", &msg_for("alice", "bob", b"legit"))
+            .unwrap();
+        q.enqueue("bob", &msg_for("alice", "bob", b"also-legit"))
+            .unwrap();
+        wait_for_depth(&q, "bob", 2).await;
+
+        // Tamper with the first stored entry by flipping a byte in the
+        // redb table. The HMAC tag will no longer match.
+        let (tamper_seq, tamper_data) = {
+            let read = q.db.begin_read().unwrap();
+            let table = read.open_table(QUEUE_TABLE).unwrap();
+            let mut iter = table.iter().unwrap();
+            let first = iter.next().unwrap().unwrap();
+            let seq = first.0.value();
+            let data = first.1.value().to_vec();
+            (seq, data)
+        };
+        {
+            let mut data = tamper_data;
+            // Flip a byte in the message body (before the HMAC tag).
+            if data.len() > HMAC_LEN + 1 {
+                data[0] ^= 0xFF;
+            }
+            let write = q.db.begin_write().unwrap();
+            {
+                let mut table = write.open_table(QUEUE_TABLE).unwrap();
+                table.insert(tamper_seq, data.as_slice()).unwrap();
+            }
+            write.commit().unwrap();
+        }
+
+        // Drain should skip the tampered message and return only the
+        // valid one.
+        let drained = q.drain("bob").unwrap();
+        assert_eq!(
+            drained.len(),
+            1,
+            "tampered message should have been discarded"
+        );
+        assert_eq!(drained[0].payload.as_ref(), b"also-legit");
+    }
+
+    // ── Dedup tests ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn store_forward_no_duplicates_on_restart() {
+        let tmp = TempDir::new().unwrap();
+        let key = test_hmac_key();
+
+        // Phase 1: enqueue 3 messages, drain them (which marks them as
+        // delivered), then drop the queue without purging.
+        {
+            let q =
+                ClientQueue::open_with_hmac_key(tmp.path(), 1_000_000, Some(key.clone())).unwrap();
+            q.enqueue("bob", &msg_for("alice", "bob", b"msg-1"))
+                .unwrap();
+            q.enqueue("bob", &msg_for("alice", "bob", b"msg-2"))
+                .unwrap();
+            q.enqueue("bob", &msg_for("alice", "bob", b"msg-3"))
+                .unwrap();
+            wait_for_depth(&q, "bob", 3).await;
+
+            let drained = q.drain("bob").unwrap();
+            assert_eq!(drained.len(), 3);
+            // The drain already recorded delivered markers in the DB.
+            drop(q);
+        }
+
+        // Phase 2: reopen. The delivered markers should cause the
+        // already-delivered entries to be skipped during index rebuild.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let q2 = ClientQueue::open_with_hmac_key(tmp.path(), 1_000_000, Some(key.clone())).unwrap();
+
+        // No messages should be pending — they were all delivered.
+        assert_eq!(
+            q2.stats("bob").depth,
+            0,
+            "delivered messages should not reappear on restart"
+        );
+        let drained = q2.drain("bob").unwrap();
+        assert!(
+            drained.is_empty(),
+            "no duplicates should be delivered on restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_rotation_rejects_old_messages() {
+        let tmp = TempDir::new().unwrap();
+        let key_a = Zeroizing::new([0xAA; 32]);
+        let key_b = Zeroizing::new([0xBB; 32]);
+
+        // Phase 1: write messages with key A.
+        {
+            let q = ClientQueue::open_with_hmac_key(tmp.path(), 1_000_000, Some(key_a.clone()))
+                .unwrap();
+            q.enqueue("bob", &msg_for("alice", "bob", b"msg-a1"))
+                .unwrap();
+            q.enqueue("bob", &msg_for("alice", "bob", b"msg-a2"))
+                .unwrap();
+            q.enqueue("bob", &msg_for("alice", "bob", b"msg-a3"))
+                .unwrap();
+            wait_for_depth(&q, "bob", 3).await;
+            drop(q);
+        }
+
+        // Give the writer task time to flush and release the DB lock.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Phase 2: reopen with key B and drain.
+        // All messages written under key A should fail HMAC verification.
+        let q2 =
+            ClientQueue::open_with_hmac_key(tmp.path(), 1_000_000, Some(key_b.clone())).unwrap();
+        assert_eq!(
+            q2.stats("bob").depth,
+            3,
+            "messages should still appear in the index before drain"
+        );
+
+        let drained = q2.drain("bob").unwrap();
+        assert!(
+            drained.is_empty(),
+            "all key-A messages should be rejected under key B"
+        );
+        assert!(
+            q2.tampered_total() >= 3,
+            "tampered counter should reflect rejected messages, got {}",
+            q2.tampered_total()
         );
     }
 }
