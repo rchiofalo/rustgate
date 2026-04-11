@@ -1000,10 +1000,18 @@ impl Router {
     }
 
     /// Filter drained offline messages through the current ACL and authz
-    /// policies. Messages whose sender is no longer authorized to send, or
-    /// whose recipient is no longer authorized to receive, are dropped with
-    /// a debug log. This re-checks authorization at delivery time,
-    /// preventing stale permissions from the time of storage.
+    /// policies, re-checking authorization at delivery time to prevent stale
+    /// permissions from the time of storage.
+    ///
+    /// - **ACL filtering** applies only to [`Destination::Group`] messages
+    ///   (send and receive checks against the group ACL).
+    /// - **Authz filtering** applies to all destination types
+    ///   ([`Destination::Direct`], [`Destination::Group`], and
+    ///   [`Destination::Broadcast`]).
+    ///
+    /// Messages whose sender is no longer authorized to send, or whose
+    /// recipient is no longer authorized to receive, are dropped with a
+    /// debug log.
     ///
     /// Callers should invoke this on the output of
     /// [`Self::drain_offline_messages`] before forwarding messages to the
@@ -1033,7 +1041,7 @@ impl Router {
                     && let Some(ref acl) = **acl_guard
                 {
                     if !acl.is_send_authorized(group, &msg.source.cn) {
-                        tracing::debug!(
+                        debug!(
                             sender = %msg.source.cn,
                             group = %group,
                             "dropping offline message: sender no longer authorized to send"
@@ -1041,7 +1049,7 @@ impl Router {
                         return false;
                     }
                     if !acl.is_receive_authorized(group, recipient_cn) {
-                        tracing::debug!(
+                        debug!(
                             recipient = %recipient_cn,
                             group = %group,
                             "dropping offline message: recipient no longer authorized to receive"
@@ -1064,7 +1072,7 @@ impl Router {
                     let outcome =
                         self.authz_evaluate(engine, &subject, &resource, AuthzAction::Send);
                     if !outcome.is_allow() {
-                        tracing::debug!(
+                        debug!(
                             sender = %msg.source.cn,
                             "dropping offline message: sender no longer authorized by policy"
                         );
@@ -3027,6 +3035,90 @@ mod tests {
         assert!(
             result.is_empty(),
             "message to authz-denied recipient should be filtered"
+        );
+    }
+
+    // ── Destination::Direct offline message tests ──────────────────
+
+    /// Policy engine that allows all evaluations.
+    struct AllowAllEngine;
+
+    impl PolicyEngine for AllowAllEngine {
+        fn evaluate(
+            &self,
+            _subject: &AuthzSubject<'_>,
+            _resource: &AuthzResource<'_>,
+            _action: AuthzAction,
+        ) -> rustgate_authz::DecisionOutcome {
+            rustgate_authz::DecisionOutcome::allow()
+        }
+
+        fn policy_id(&self) -> &str {
+            "test-allow-all"
+        }
+    }
+
+    #[test]
+    fn offline_direct_messages_pass_when_authz_allows() {
+        let router = Router::new().with_authz(Arc::new(AllowAllEngine));
+
+        let alice = make_identity("alice", &["ops"]);
+        let bob = make_identity("bob", &["ops"]);
+        let msg = make_alert(&alice, Destination::Direct((*bob).clone()));
+
+        let result = router.filter_offline_messages(&bob, vec![msg]);
+        assert_eq!(
+            result.len(),
+            1,
+            "direct message should pass when authz allows"
+        );
+    }
+
+    #[test]
+    fn offline_direct_messages_blocked_when_authz_denies() {
+        let router = Router::new().with_authz(Arc::new(DenyAllEngine));
+
+        let alice = make_identity("alice", &["ops"]);
+        let bob = make_identity("bob", &["ops"]);
+        let msg = make_alert(&alice, Destination::Direct((*bob).clone()));
+
+        let result = router.filter_offline_messages(&bob, vec![msg]);
+        assert!(
+            result.is_empty(),
+            "direct message should be blocked when authz denies"
+        );
+    }
+
+    // ── Destination::Broadcast offline message tests ───────────────
+
+    #[test]
+    fn offline_broadcast_messages_pass_when_authz_allows() {
+        let router = Router::new().with_authz(Arc::new(AllowAllEngine));
+
+        let alice = make_identity("alice", &["ops"]);
+        let bob = make_identity("bob", &["ops"]);
+        let msg = make_alert(&alice, Destination::Broadcast);
+
+        let result = router.filter_offline_messages(&bob, vec![msg]);
+        assert_eq!(
+            result.len(),
+            1,
+            "broadcast message should pass when authz allows"
+        );
+    }
+
+    #[test]
+    fn offline_broadcast_messages_blocked_when_authz_denies() {
+        let router = Router::new().with_authz(Arc::new(DenyAllEngine));
+
+        let alice = make_identity("alice", &["ops"]);
+        let bob = make_identity("bob", &["ops"]);
+        let msg = make_alert(&alice, Destination::Broadcast);
+
+        let result = router.filter_offline_messages(&bob, vec![msg]);
+        assert!(
+            result.is_empty(),
+            "broadcast message should be blocked when authz denies"
         );
     }
 }
