@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - **TAK Protocol v2 negotiation** -- the protocol handshake now supports version range negotiation. The server advertises support for v1 and v2, and selects the highest mutually supported version with each client. Backward compatible with v1-only clients. (#665)
 - **SA multicast group routing** -- new `Destination::Multicast` variant enables sending messages to multiple groups simultaneously. SA (Situational Awareness) event type detection helpers (`is_sa_event`, `sa_affiliation`) identify friendly/hostile/neutral/unknown atoms from CoT event types. Configurable via `MulticastConfig` on the Router. (#666)
+- **Security integration tests** — end-to-end tests for TLS handshake rejection (expired certs, cross-CA certs), store-forward authorization re-evaluation on policy change, and non-blocking delivery guarantees (slow consumer isolation, circuit breaker disconnect). (#650)
 - **Jemalloc memory statistics** — when the `jemalloc` feature is enabled, the metrics endpoint now exposes four Prometheus gauges: `rustgate_jemalloc_resident_bytes`, `rustgate_jemalloc_active_bytes`, `rustgate_jemalloc_allocated_bytes`, and `rustgate_jemalloc_mapped_bytes`. Values are refreshed on every `/metrics` scrape via the safe `tikv-jemalloc-ctl` API (epoch advance + stat reads). Operators can use these to monitor allocator-level memory usage, detect fragmentation (allocated vs active), and set alerts on resident growth. Requires `--features jemalloc,metrics`. (#674)
 
 ### Security
