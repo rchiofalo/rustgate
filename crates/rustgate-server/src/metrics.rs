@@ -1510,6 +1510,14 @@ fn handle_request(
 fn authz_health_response(
     router: Option<&Arc<rustgate_transport::Router>>,
 ) -> Response<Full<Bytes>> {
+    /// Typed response for `/health/authz` — serialized via `serde_json`
+    /// to guarantee RFC 8259-compliant escaping of all string values.
+    #[derive(serde::Serialize)]
+    struct AuthzHealth<'a> {
+        policy_id: Option<&'a str>,
+        compile_warnings: &'a [String],
+    }
+
     let (policy_id, warnings): (Option<String>, Vec<String>) = match router {
         Some(r) => match r.authz_snapshot() {
             Some(engine) => {
@@ -1526,24 +1534,12 @@ fn authz_health_response(
         None => (None, Vec::new()),
     };
 
-    // Build JSON by hand to avoid pulling in serde for a single
-    // response. The fields are simple strings — no escaping beyond
-    // what SmolStr already guarantees (ASCII diagnostic messages).
-    let warnings_json: Vec<String> = warnings
-        .iter()
-        .map(|w| format!("\"{}\"", w.replace('\\', "\\\\").replace('"', "\\\"")))
-        .collect::<Vec<_>>();
-    let warnings_array = format!("[{}]", warnings_json.join(","));
-
-    let policy_id_json = match policy_id {
-        Some(id) => format!("\"{}\"", id.replace('\\', "\\\\").replace('"', "\\\"")),
-        None => "null".to_string(),
+    let resp = AuthzHealth {
+        policy_id: policy_id.as_deref(),
+        compile_warnings: &warnings,
     };
 
-    let body = format!(
-        "{{\"policy_id\":{},\"compile_warnings\":{}}}",
-        policy_id_json, warnings_array
-    );
+    let body = serde_json::to_string(&resp).unwrap_or_else(|_| String::from("{}"));
 
     Response::builder()
         .status(StatusCode::OK)
