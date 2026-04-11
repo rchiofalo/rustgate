@@ -54,16 +54,28 @@ fn parse_nonzero_usize(s: &str) -> Result<usize, String> {
     Ok(n)
 }
 
+/// Minimum write buffer size: 64 KiB.
+const WS_WRITE_BUFFER_MIN: usize = 65_536;
+/// Maximum write buffer size: 64 MiB.
+const WS_WRITE_BUFFER_MAX: usize = 67_108_864;
+/// Default write buffer size: 4 MiB (mirrors
+/// `rustgate_websocket::DEFAULT_MAX_WRITE_BUFFER_BYTES`).
+const WS_WRITE_BUFFER_DEFAULT: usize = 4_194_304;
+
 /// Validate write buffer size: 64 KiB .. 64 MiB inclusive.
 fn parse_write_buffer_bytes(s: &str) -> Result<usize, String> {
     let n: usize = s.parse().map_err(|e| format!("{e}"))?;
-    const MIN: usize = 65_536; // 64 KiB
-    const MAX: usize = 67_108_864; // 64 MiB
-    if n < MIN {
-        return Err(format!("must be at least {MIN} (64 KiB)"));
+    validate_write_buffer_range(n)
+}
+
+/// Range-check a write buffer size, usable from both the clap parser and
+/// post-merge config validation.
+fn validate_write_buffer_range(n: usize) -> Result<usize, String> {
+    if n < WS_WRITE_BUFFER_MIN {
+        return Err(format!("must be at least {WS_WRITE_BUFFER_MIN} (64 KiB)"));
     }
-    if n > MAX {
-        return Err(format!("must be at most {MAX} (64 MiB)"));
+    if n > WS_WRITE_BUFFER_MAX {
+        return Err(format!("must be at most {WS_WRITE_BUFFER_MAX} (64 MiB)"));
     }
     Ok(n)
 }
@@ -441,7 +453,7 @@ pub(crate) struct Cli {
     /// clients that read slower than the server writes.
     #[arg(
         long,
-        default_value_t = 4_194_304,
+        default_value_t = WS_WRITE_BUFFER_DEFAULT,
         env = "RUSTGATE_WS_MAX_WRITE_BUFFER_BYTES",
         value_parser = parse_write_buffer_bytes
     )]
@@ -1231,6 +1243,10 @@ impl Cli {
         if self.authz_policy_file.is_some() && self.authz_reload_interval == 0 {
             anyhow::bail!("--authz-reload-interval must be >= 1 when --authz-policy-file is set");
         }
+        // Validate ws buffer size — CLI args go through the clap value_parser,
+        // but TOML config values bypass it and need an explicit check here.
+        let _ = validate_write_buffer_range(self.ws_max_write_buffer_bytes)
+            .map_err(|e| anyhow::anyhow!("ws-max-write-buffer-bytes: {e}"))?;
         Ok(())
     }
 
@@ -1628,7 +1644,7 @@ mod tests {
             "rustgate", "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
         ])
         .expect("should parse");
-        assert_eq!(cli.ws_max_write_buffer_bytes, 4_194_304);
+        assert_eq!(cli.ws_max_write_buffer_bytes, WS_WRITE_BUFFER_DEFAULT);
     }
 
     #[test]
@@ -1712,5 +1728,63 @@ mod tests {
         ])
         .expect("should parse maximum (64 MiB)");
         assert_eq!(cli.ws_max_write_buffer_bytes, 67_108_864);
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn ws_write_buffer_default_matches_websocket_crate() {
+        assert_eq!(
+            WS_WRITE_BUFFER_DEFAULT,
+            rustgate_websocket::DEFAULT_MAX_WRITE_BUFFER_BYTES,
+            "cli.rs default must stay in sync with rustgate_websocket"
+        );
+    }
+
+    #[test]
+    fn config_file_rejects_ws_buffer_below_minimum() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let cfg = dir.path().join("bad.toml");
+        std::fs::write(
+            &cfg,
+            "cert = \"c.pem\"\nkey = \"k.pem\"\nca = \"ca.pem\"\nws-max-write-buffer-bytes = 1024\n",
+        )
+        .expect("write");
+
+        let file = load_config_file(cfg.to_str().unwrap()).expect("load");
+        let matches = Cli::command().get_matches_from([
+            "rustgate", "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
+        ]);
+        let mut cli = Cli::from_arg_matches(&matches).expect("parse");
+        file.apply_to(&mut cli, &matches);
+
+        let err = cli.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("at least"),
+            "expected range error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn config_file_rejects_ws_buffer_above_maximum() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let cfg = dir.path().join("bad.toml");
+        std::fs::write(
+            &cfg,
+            "cert = \"c.pem\"\nkey = \"k.pem\"\nca = \"ca.pem\"\nws-max-write-buffer-bytes = 134217728\n",
+        )
+        .expect("write");
+
+        let file = load_config_file(cfg.to_str().unwrap()).expect("load");
+        let matches = Cli::command().get_matches_from([
+            "rustgate", "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
+        ]);
+        let mut cli = Cli::from_arg_matches(&matches).expect("parse");
+        file.apply_to(&mut cli, &matches);
+
+        let err = cli.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("at most"),
+            "expected range error, got: {err}"
+        );
     }
 }
