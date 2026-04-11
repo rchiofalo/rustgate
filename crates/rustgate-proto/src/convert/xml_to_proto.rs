@@ -148,13 +148,109 @@ fn build_detail(full: &xml_full::FullCotEvent) -> tak_proto::Detail {
         course: t.course,
     });
 
+    // Typed detail elements without protobuf counterparts are serialized
+    // back into xml_detail so they survive the XML -> proto -> XML round-trip.
+    let mut xml_detail = full.xml_detail.clone();
+    serialize_typed_details_to_xml(full, &mut xml_detail);
+
     tak_proto::Detail {
-        xml_detail: full.xml_detail.clone(),
+        xml_detail,
         contact,
         group,
         precision_location,
         status,
         takv,
         track,
+    }
+}
+
+/// Serialize typed detail fields that have no protobuf counterpart back into
+/// the xml_detail string so they survive proto round-trips.
+fn serialize_typed_details_to_xml(full: &xml_full::FullCotEvent, buf: &mut String) {
+    for link in &full.link {
+        buf.push_str("<link");
+        push_xml_attr(buf, "relation", &link.relation);
+        push_xml_attr(buf, "type", &link.link_type);
+        push_xml_attr(buf, "uid", &link.uid);
+        if let Some(ref pc) = link.parent_callsign {
+            push_xml_attr(buf, "parent_callsign", pc);
+        }
+        if let Some(ref pt) = link.production_time {
+            push_xml_attr(buf, "production_time", pt);
+        }
+        buf.push_str("/>");
+    }
+
+    if let Some(ref remarks) = full.remarks {
+        buf.push_str("<remarks");
+        if let Some(ref src) = remarks.source {
+            push_xml_attr(buf, "source", src);
+        }
+        if let Some(ref ts) = remarks.timestamp {
+            push_xml_attr(buf, "time", ts);
+        }
+        if remarks.text.is_empty() {
+            buf.push_str("/>");
+        } else {
+            buf.push('>');
+            xml_escape_attr_into(buf, &remarks.text);
+            buf.push_str("</remarks>");
+        }
+    }
+
+    if let Some(ref color) = full.color {
+        buf.push_str("<color");
+        if let Some(argb) = color.argb {
+            push_xml_attr(buf, "argb", &argb.to_string());
+        }
+        buf.push_str("/>");
+    }
+
+    if let Some(ref labels) = full.labels {
+        buf.push_str("<labels");
+        push_xml_attr(buf, "value", &labels.value);
+        buf.push_str("/>");
+    }
+
+    if let Some(ref usericon) = full.usericon {
+        buf.push_str("<usericon");
+        push_xml_attr(buf, "iconsetpath", &usericon.iconsetpath);
+        buf.push_str("/>");
+    }
+
+    if let Some(ref marti) = full.marti {
+        if marti.dest_callsigns.is_empty() {
+            buf.push_str("<marti/>");
+        } else {
+            buf.push_str("<marti>");
+            for cs in &marti.dest_callsigns {
+                buf.push_str("<dest");
+                push_xml_attr(buf, "callsign", cs);
+                buf.push_str("/>");
+            }
+            buf.push_str("</marti>");
+        }
+    }
+}
+
+/// Append ` key="value"` to an XML buffer with proper escaping.
+fn push_xml_attr(buf: &mut String, key: &str, value: &str) {
+    buf.push(' ');
+    buf.push_str(key);
+    buf.push_str("=\"");
+    xml_escape_attr_into(buf, value);
+    buf.push('"');
+}
+
+/// Escape special XML characters in attribute values to prevent injection.
+fn xml_escape_attr_into(buf: &mut String, s: &str) {
+    for c in s.chars() {
+        match c {
+            '&' => buf.push_str("&amp;"),
+            '<' => buf.push_str("&lt;"),
+            '>' => buf.push_str("&gt;"),
+            '"' => buf.push_str("&quot;"),
+            _ => buf.push(c),
+        }
     }
 }
