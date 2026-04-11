@@ -1190,7 +1190,7 @@ impl Router {
                 });
             if shared || handle.identity.groups.is_empty() {
                 total += 1;
-                if handle.send(Arc::new(msg)).await.is_err() {
+                if !handle.try_send(Arc::new(msg)) {
                     dropped += 1;
                 }
             }
