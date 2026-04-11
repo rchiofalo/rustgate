@@ -97,6 +97,16 @@ impl CsrSigner {
     /// - KeyUsage: DigitalSignature
     /// - ExtKeyUsage: ClientAuth
     ///
+    /// # Security: CSR signature verification
+    ///
+    /// The CSR's self-signature is verified during parsing by
+    /// [`CertificateSigningRequestParams::from_pem()`], which internally calls
+    /// `x509_parser::certification_request::X509CertificationRequest::verify_signature()`.
+    /// If the requester's public key does not match the signature over the CSR
+    /// content, `from_pem()` returns an error and the request is rejected.
+    /// This proves the requester possesses the private key corresponding to the
+    /// public key embedded in the CSR, preventing forged-subject attacks.
+    ///
     /// # Security: allowlist approach
     ///
     /// Rather than starting from the CSR's parameters and stripping known-bad
@@ -599,5 +609,130 @@ cyOZxZiK
     fn ensure_pem_headers_preserves_existing() {
         let pem = "-----BEGIN CERTIFICATE REQUEST-----\ndata\n-----END CERTIFICATE REQUEST-----";
         assert_eq!(ensure_pem_headers(pem), pem);
+    }
+
+    #[test]
+    fn sign_csr_rejects_tampered_signature() {
+        let (cert_pem, key_pem) = test_ca();
+        let signer = CsrSigner::from_pem(&cert_pem, &key_pem, "TestOrg").expect("signer");
+
+        let csr_pem = generate_csr("tamper-test");
+
+        // Tamper with the signature by flipping bits in the base64-encoded
+        // body of the PEM. The signature occupies the last portion of the
+        // DER payload, so corrupting the final base64 lines reliably
+        // invalidates it.
+        let lines: Vec<&str> = csr_pem.lines().collect();
+        let mut tampered_lines: Vec<String> = Vec::with_capacity(lines.len());
+        for (i, line) in lines.iter().enumerate() {
+            if i == lines.len() - 2 && !line.starts_with("-----") {
+                // Flip bits in the last data line (signature bytes)
+                let mut chars: Vec<char> = line.chars().collect();
+                for c in &mut chars {
+                    *c = match *c {
+                        'A' => 'Z',
+                        'a' => 'z',
+                        '0' => '9',
+                        '+' => '/',
+                        other => {
+                            // Shift alphabetic characters
+                            if other.is_ascii_uppercase() {
+                                'A'
+                            } else if other.is_ascii_lowercase() {
+                                'a'
+                            } else {
+                                other
+                            }
+                        }
+                    };
+                }
+                tampered_lines.push(chars.into_iter().collect());
+            } else {
+                tampered_lines.push(line.to_string());
+            }
+        }
+        let tampered_pem = tampered_lines.join("\n");
+
+        let result = signer.sign_csr(&tampered_pem, "tamper-test");
+        assert!(
+            result.is_err(),
+            "sign_csr should reject a CSR with a tampered signature"
+        );
+    }
+
+    #[test]
+    fn sign_csr_rejects_mismatched_key() {
+        let (cert_pem, key_pem) = test_ca();
+        let signer = CsrSigner::from_pem(&cert_pem, &key_pem, "TestOrg").expect("signer");
+
+        // Generate two independent key pairs
+        let key_a = rcgen::KeyPair::generate().expect("keygen A");
+        let key_b = rcgen::KeyPair::generate().expect("keygen B");
+
+        // Create a CSR signed by key_a
+        let mut params = rcgen::CertificateParams::default();
+        let mut dn = rcgen::DistinguishedName::new();
+        dn.push(rcgen::DnType::CommonName, "mismatch-test");
+        params.distinguished_name = dn;
+        let csr = params.serialize_request(&key_a).expect("csr");
+        let csr_der = csr.der().to_vec();
+
+        // Replace the public key in the DER with key_b's public key.
+        // The CSR's self-signature was computed over key_a's public key, so
+        // substituting key_b's public key creates a proof-of-possession
+        // mismatch that verify_signature must reject.
+        let pub_a = key_a.public_key_raw();
+        let pub_b = key_b.public_key_raw();
+
+        // Both keys are default ECDSA P-256, so they must be the same length.
+        assert_eq!(
+            pub_a.len(),
+            pub_b.len(),
+            "both default keys should be same algorithm"
+        );
+
+        // Find pub_a bytes in the CSR DER and replace with pub_b
+        let pos = csr_der
+            .windows(pub_a.len())
+            .position(|w| w == pub_a)
+            .expect("public key bytes must appear in CSR DER");
+
+        let mut modified_der = csr_der.clone();
+        modified_der[pos..pos + pub_a.len()].copy_from_slice(pub_b);
+
+        // Wrap the modified DER back into PEM
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &modified_der);
+        let pem = format!(
+            "-----BEGIN CERTIFICATE REQUEST-----\n{}\n-----END CERTIFICATE REQUEST-----",
+            b64.as_bytes()
+                .chunks(64)
+                .map(|c| std::str::from_utf8(c).expect("valid utf8"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+
+        let result = signer.sign_csr(&pem, "mismatch-test");
+        assert!(
+            result.is_err(),
+            "sign_csr should reject a CSR whose public key does not match its signature"
+        );
+    }
+
+    #[test]
+    fn sign_csr_rejects_malformed_pem() {
+        let (cert_pem, key_pem) = test_ca();
+        let signer = CsrSigner::from_pem(&cert_pem, &key_pem, "TestOrg").expect("signer");
+
+        // Truncated base64 — structurally plausible but corrupt
+        let truncated = "-----BEGIN CERTIFICATE REQUEST-----\nMIIBkTCB+wIBAD\n-----END CERTIFICATE REQUEST-----\n";
+        assert!(signer.sign_csr(truncated, "test-user").is_err());
+
+        // Wrong PEM header type
+        let wrong_header = "-----BEGIN CERTIFICATE-----\nMIIBkTCB+wIBADAWMRQwEgYDVQQDDAt0ZXN0LWNsaWVudA==\n-----END CERTIFICATE-----\n";
+        assert!(signer.sign_csr(wrong_header, "test-user").is_err());
+
+        // Empty PEM body
+        let empty_body = "-----BEGIN CERTIFICATE REQUEST-----\n-----END CERTIFICATE REQUEST-----\n";
+        assert!(signer.sign_csr(empty_body, "test-user").is_err());
     }
 }
