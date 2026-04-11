@@ -54,6 +54,20 @@ fn parse_nonzero_usize(s: &str) -> Result<usize, String> {
     Ok(n)
 }
 
+/// Validate write buffer size: 64 KiB .. 64 MiB inclusive.
+fn parse_write_buffer_bytes(s: &str) -> Result<usize, String> {
+    let n: usize = s.parse().map_err(|e| format!("{e}"))?;
+    const MIN: usize = 65_536; // 64 KiB
+    const MAX: usize = 67_108_864; // 64 MiB
+    if n < MIN {
+        return Err(format!("must be at least {MIN} (64 KiB)"));
+    }
+    if n > MAX {
+        return Err(format!("must be at most {MAX} (64 MiB)"));
+    }
+    Ok(n)
+}
+
 #[derive(Parser, Serialize)]
 #[command(name = "rustgate", about = "Secure tactical message router")]
 #[serde(rename_all = "kebab-case")]
@@ -421,6 +435,17 @@ pub(crate) struct Cli {
     /// Consecutive WebSocket rate limit violations before disconnecting client.
     #[arg(long, default_value_t = 10, env = "RUSTGATE_WS_MAX_VIOLATIONS")]
     pub(crate) ws_max_violations: u32,
+
+    /// Maximum pending write bytes per WebSocket connection before
+    /// disconnecting a slow consumer. Prevents memory exhaustion from
+    /// clients that read slower than the server writes.
+    #[arg(
+        long,
+        default_value_t = 4_194_304,
+        env = "RUSTGATE_WS_MAX_WRITE_BUFFER_BYTES",
+        value_parser = parse_write_buffer_bytes
+    )]
+    pub(crate) ws_max_write_buffer_bytes: usize,
 
     // -- MQTT flags --
     /// Bind address for the MQTT (mqtts://) listener (e.g. 0.0.0.0:8883).
@@ -1107,6 +1132,7 @@ define_config_file! {
     ws_max_frames_per_sec: u32,
     ws_max_bytes_per_sec: u64,
     ws_max_violations: u32,
+    ws_max_write_buffer_bytes: usize,
     mqtt_bind: Option<String>,
     mqtt_topic_prefix: Option<String>,
     mqtt_max_packet_size: usize,
@@ -1386,6 +1412,7 @@ mod tests {
             "RUSTGATE_WS_MAX_FRAMES_PER_SEC",
             "RUSTGATE_WS_MAX_BYTES_PER_SEC",
             "RUSTGATE_WS_MAX_VIOLATIONS",
+            "RUSTGATE_WS_MAX_WRITE_BUFFER_BYTES",
             "RUSTGATE_TCP_BIND",
             "RUSTGATE_UDP_BIND",
             "RUSTGATE_UDP_RATE_LIMIT",
@@ -1593,5 +1620,97 @@ mod tests {
         // Encoding flag is irrelevant when framing is TakProtobuf
         let codec = build_codec(Framing::TakProtobuf, Encoding::Cot);
         assert_eq!(codec.protocol_id(), "tak-protobuf");
+    }
+
+    #[test]
+    fn cli_ws_max_write_buffer_bytes_default() {
+        let cli = Cli::try_parse_from([
+            "rustgate", "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
+        ])
+        .expect("should parse");
+        assert_eq!(cli.ws_max_write_buffer_bytes, 4_194_304);
+    }
+
+    #[test]
+    fn cli_ws_max_write_buffer_bytes_override() {
+        let cli = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--ws-max-write-buffer-bytes",
+            "1048576",
+        ])
+        .expect("should parse");
+        assert_eq!(cli.ws_max_write_buffer_bytes, 1_048_576);
+    }
+
+    #[test]
+    fn cli_ws_max_write_buffer_bytes_rejects_below_minimum() {
+        let result = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--ws-max-write-buffer-bytes",
+            "1024",
+        ]);
+        assert!(result.is_err(), "should reject values below 64 KiB");
+    }
+
+    #[test]
+    fn cli_ws_max_write_buffer_bytes_rejects_above_maximum() {
+        let result = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--ws-max-write-buffer-bytes",
+            "134217728",
+        ]);
+        assert!(result.is_err(), "should reject values above 64 MiB");
+    }
+
+    #[test]
+    fn cli_ws_max_write_buffer_bytes_accepts_minimum() {
+        let cli = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--ws-max-write-buffer-bytes",
+            "65536",
+        ])
+        .expect("should parse minimum (64 KiB)");
+        assert_eq!(cli.ws_max_write_buffer_bytes, 65_536);
+    }
+
+    #[test]
+    fn cli_ws_max_write_buffer_bytes_accepts_maximum() {
+        let cli = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--ws-max-write-buffer-bytes",
+            "67108864",
+        ])
+        .expect("should parse maximum (64 MiB)");
+        assert_eq!(cli.ws_max_write_buffer_bytes, 67_108_864);
     }
 }
