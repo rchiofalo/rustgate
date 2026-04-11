@@ -1,0 +1,328 @@
+{{- if .Values.storeForward.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "rustgate.fullname" . }}
+  labels:
+    {{- include "rustgate.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "rustgate.fullname" . }}-headless
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "rustgate.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "rustgate.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- if .Values.serviceAccount.create }}
+      serviceAccountName: {{ .Values.serviceAccount.name | default (include "rustgate.fullname" .) }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountToken | default false }}
+      {{- else }}
+      automountServiceAccountToken: false
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: rustgate
+          {{- if .Values.image.digest }}
+          image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+          {{- else }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          {{- end }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          ports:
+            - name: tak
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+            {{- if .Values.websocket.enabled }}
+            - name: websocket
+              containerPort: {{ .Values.websocket.port }}
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.federation.enabled }}
+            - name: federation-v1
+              containerPort: {{ .Values.federation.v1Port }}
+              protocol: TCP
+            {{- if .Values.federation.v2Bind }}
+            - name: federation-v2
+              containerPort: {{ .Values.federation.v2Port }}
+              protocol: TCP
+            {{- end }}
+            {{- end }}
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.plaintext.tcp.enabled }}
+            - name: tcp-plain
+              containerPort: {{ .Values.plaintext.tcp.port }}
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.plaintext.udp.enabled }}
+            - name: udp-input
+              containerPort: {{ .Values.plaintext.udp.port }}
+              protocol: UDP
+            {{- end }}
+          env:
+            - name: RUSTGATE_BIND
+              value: "0.0.0.0:{{ .Values.service.port }}"
+            - name: RUSTGATE_CERT
+              value: {{ .Values.tls.cert | quote }}
+            - name: RUSTGATE_KEY
+              value: {{ .Values.tls.key | quote }}
+            - name: RUSTGATE_CA
+              value: {{ .Values.tls.ca | quote }}
+            - name: RUSTGATE_FRAMING
+              value: {{ .Values.framing | quote }}
+            - name: RUSTGATE_ENCODING
+              value: {{ .Values.encoding | quote }}
+            - name: RUSTGATE_MAX_CONNECTIONS
+              value: {{ .Values.maxConnections | quote }}
+            - name: RUSTGATE_CLIENT_QUEUE_DIR
+              value: {{ .Values.storeForward.queueDir | quote }}
+            {{- if .Values.nats.enabled }}
+            - name: RUSTGATE_NATS_URL
+              value: {{ .Values.nats.url | quote }}
+            {{- if and .Values.externalSecrets.enabled .Values.externalSecrets.nats.enabled }}
+            - name: RUSTGATE_NATS_CREDENTIALS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.externalSecrets.nats.secretName }}
+                  key: RUSTGATE_NATS_CREDENTIALS
+            {{- else if .Values.nats.existingSecret }}
+            - name: RUSTGATE_NATS_CREDENTIALS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.nats.existingSecret }}
+                  key: RUSTGATE_NATS_CREDENTIALS
+            {{- else if .Values.nats.credentials }}
+            - name: RUSTGATE_NATS_CREDENTIALS
+              value: {{ .Values.nats.credentials | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.metrics.enabled }}
+            - name: RUSTGATE_METRICS_BIND
+              value: "0.0.0.0:{{ .Values.metrics.port }}"
+            {{- end }}
+            {{- if .Values.enrollment.enabled }}
+            - name: RUSTGATE_ENROLLMENT_BIND
+              value: {{ .Values.enrollment.bind | quote }}
+            {{- if .Values.enrollment.caKey }}
+            - name: RUSTGATE_CA_KEY
+              value: {{ .Values.enrollment.caKey | quote }}
+            {{- end }}
+            {{- if and .Values.externalSecrets.enabled .Values.externalSecrets.enrollment.enabled }}
+            - name: RUSTGATE_ENROLLMENT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.externalSecrets.enrollment.secretName }}
+                  key: RUSTGATE_ENROLLMENT_USER
+            - name: RUSTGATE_ENROLLMENT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.externalSecrets.enrollment.secretName }}
+                  key: RUSTGATE_ENROLLMENT_PASSWORD
+            {{- else if .Values.enrollment.existingSecret }}
+            - name: RUSTGATE_ENROLLMENT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.enrollment.existingSecret }}
+                  key: RUSTGATE_ENROLLMENT_USER
+            - name: RUSTGATE_ENROLLMENT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.enrollment.existingSecret }}
+                  key: RUSTGATE_ENROLLMENT_PASSWORD
+            {{- else }}
+            {{- if .Values.enrollment.user }}
+            - name: RUSTGATE_ENROLLMENT_USER
+              value: {{ .Values.enrollment.user | quote }}
+            {{- end }}
+            {{- if .Values.enrollment.password }}
+            - name: RUSTGATE_ENROLLMENT_PASSWORD
+              value: {{ .Values.enrollment.password | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.enrollment.caOrganization }}
+            - name: RUSTGATE_CA_ORG
+              value: {{ .Values.enrollment.caOrganization | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.websocket.enabled }}
+            - name: RUSTGATE_WEBSOCKET_BIND
+              value: {{ .Values.websocket.bind | quote }}
+            {{- end }}
+            {{- if .Values.federation.enabled }}
+            - name: RUSTGATE_FEDERATION_V1_BIND
+              value: {{ .Values.federation.v1Bind | quote }}
+            {{- if .Values.federation.v2Bind }}
+            - name: RUSTGATE_FEDERATION_V2_BIND
+              value: {{ .Values.federation.v2Bind | quote }}
+            {{- end }}
+            - name: RUSTGATE_FEDERATION_ID
+              value: {{ .Values.federation.id | quote }}
+            - name: RUSTGATE_FEDERATION_MAX_HOPS
+              value: {{ .Values.federation.maxHops | quote }}
+            {{- if .Values.federation.skipHostnameVerify }}
+            - name: RUSTGATE_FEDERATION_SKIP_HOSTNAME_VERIFY
+              value: "true"
+            {{- end }}
+            {{- if and .Values.persistence.enabled .Values.federation.enabled }}
+            - name: RUSTGATE_FEDERATION_STORE_PATH
+              value: /data/federation-store.json
+            {{- else if .Values.federation.storePath }}
+            - name: RUSTGATE_FEDERATION_STORE_PATH
+              value: {{ .Values.federation.storePath | quote }}
+            {{- end }}
+            {{- if (include "rustgate.federationSecretEnabled" .) }}
+            - name: RUSTGATE_FEDERATION_PEERS_FILE
+              value: /etc/federation/peers.json
+            {{- else if .Values.federation.peersFile }}
+            - name: RUSTGATE_FEDERATION_PEERS_FILE
+              value: {{ .Values.federation.peersFile | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.dataPackage.enabled }}
+            - name: RUSTGATE_DATA_PACKAGE_DIR
+              value: /data/packages
+            {{- end }}
+            {{- if .Values.plaintext.tcp.enabled }}
+            - name: RUSTGATE_TCP_BIND
+              value: {{ .Values.plaintext.tcp.bind | quote }}
+            {{- end }}
+            {{- if .Values.plaintext.udp.enabled }}
+            - name: RUSTGATE_UDP_BIND
+              value: {{ .Values.plaintext.udp.bind | quote }}
+            {{- end }}
+            {{- if or .Values.plaintext.tcp.enabled .Values.plaintext.udp.enabled }}
+            - name: RUSTGATE_PLAINTEXT_CN
+              value: {{ .Values.plaintext.cn | quote }}
+            - name: RUSTGATE_PLAINTEXT_GROUP
+              value: {{ .Values.plaintext.group | quote }}
+            {{- end }}
+          {{- if .Values.metrics.enabled }}
+          startupProbe:
+            httpGet:
+              path: /health/startup
+              port: metrics
+            failureThreshold: 30
+            periodSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: metrics
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 3
+          {{- else }}
+          startupProbe:
+            tcpSocket:
+              port: tak
+            failureThreshold: 30
+            periodSeconds: 2
+          livenessProbe:
+            tcpSocket:
+              port: tak
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: tak
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          {{- end }}
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"]
+          volumeMounts:
+            - name: client-queue
+              mountPath: {{ .Values.storeForward.queueDir }}
+            - name: tls-certs
+              mountPath: /certs
+              readOnly: true
+            {{- if and .Values.federation.enabled (include "rustgate.federationSecretEnabled" .) }}
+            - name: federation-peers
+              mountPath: /etc/federation
+              readOnly: true
+            {{- end }}
+            {{- if and .Values.persistence.enabled .Values.federation.enabled }}
+            - name: federation-data
+              mountPath: /data
+            {{- end }}
+            {{- if .Values.dataPackage.enabled }}
+            - name: data-packages
+              mountPath: /data/packages
+            {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- if .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml .Values.topologySpreadConstraints | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: tls-certs
+          secret:
+            secretName: {{ .Values.tls.secretName }}
+        {{- if and .Values.federation.enabled (include "rustgate.federationSecretEnabled" .) }}
+        - name: federation-peers
+          secret:
+            {{- if and .Values.externalSecrets.enabled .Values.externalSecrets.federation.enabled }}
+            secretName: {{ .Values.externalSecrets.federation.secretName }}
+            {{- else }}
+            secretName: {{ .Values.federation.existingSecret }}
+            {{- end }}
+            items:
+              - key: RUSTGATE_FEDERATION_PEERS_FILE
+                path: peers.json
+        {{- end }}
+        {{- if and .Values.persistence.enabled .Values.federation.enabled }}
+        - name: federation-data
+          persistentVolumeClaim:
+            claimName: {{ include "rustgate.fullname" . }}-federation
+        {{- end }}
+        {{- if .Values.dataPackage.enabled }}
+        - name: data-packages
+          persistentVolumeClaim:
+            claimName: {{ include "rustgate.fullname" . }}-data-packages
+        {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: client-queue
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.storeForward.storageClassName }}
+        storageClassName: {{ .Values.storeForward.storageClassName | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.storeForward.storageSize }}
+{{- end }}

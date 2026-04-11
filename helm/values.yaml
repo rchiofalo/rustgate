@@ -103,6 +103,17 @@ dataPackage:
   storageSize: 1Gi
   storageClassName: ""
 
+storeForward:
+  # Enable to switch from Deployment to StatefulSet with persistent client queue
+  # storage for the redb-backed store-forward system.
+  enabled: false
+  # Size of the PersistentVolumeClaim for the client queue database.
+  storageSize: 5Gi
+  # StorageClass name. Leave empty for the cluster default.
+  storageClassName: ""
+  # Mount path for the client queue directory inside the container.
+  queueDir: /data/client-queue
+
 plaintext:
   # Plaintext TCP/UDP inputs for trusted or air-gapped networks.
   # WARNING: Traffic is NOT encrypted. Use only behind VPN or on isolated networks.
