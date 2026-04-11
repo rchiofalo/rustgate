@@ -53,12 +53,23 @@ fn rustgate_without_cert_or_config_fails_at_clap_parse() {
 #[test]
 #[serial]
 fn validate_config_accepts_minimal_valid_file() {
-    let toml = r#"
-cert = "/tmp/cert.pem"
-key  = "/tmp/key.pem"
-ca   = "/tmp/ca.pem"
-"#;
-    let f = write_temp(toml);
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cert = dir.path().join("cert.pem");
+    let key = dir.path().join("key.pem");
+    let ca = dir.path().join("ca.pem");
+    std::fs::write(&cert, "").expect("write cert");
+    std::fs::write(&key, "").expect("write key");
+    std::fs::write(&ca, "").expect("write ca");
+    let toml = format!(
+        "cert = \"{}\"
+key  = \"{}\"
+ca   = \"{}\"
+",
+        cert.display(),
+        key.display(),
+        ca.display(),
+    );
+    let f = write_temp(&toml);
     let out = Command::new(rustgate_bin())
         .args(["--config", f.path().to_str().unwrap(), "validate-config"])
         .output()
@@ -119,14 +130,23 @@ fn validate_config_rejects_malformed_toml() {
 #[test]
 #[serial]
 fn print_config_emits_reparseable_toml() {
-    let toml = r#"
-bind = "127.0.0.1:14433"
-cert = "/tmp/cert.pem"
-key  = "/tmp/key.pem"
-ca   = "/tmp/ca.pem"
-max-connections = 256
-"#;
-    let f = write_temp(toml);
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cert = dir.path().join("cert.pem");
+    let key = dir.path().join("key.pem");
+    let ca = dir.path().join("ca.pem");
+    std::fs::write(&cert, "").expect("write cert");
+    std::fs::write(&key, "").expect("write key");
+    std::fs::write(&ca, "").expect("write ca");
+    let toml = format!(
+        "bind = \"127.0.0.1:14433\"\ncert = \"{}\"
+key  = \"{}\"
+ca   = \"{}\"
+max-connections = 256\n",
+        cert.display(),
+        key.display(),
+        ca.display(),
+    );
+    let f = write_temp(&toml);
     let out = Command::new(rustgate_bin())
         .args(["--config", f.path().to_str().unwrap(), "print-config"])
         .output()
