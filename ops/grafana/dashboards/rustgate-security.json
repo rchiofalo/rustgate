@@ -1,0 +1,281 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "type": "row",
+      "title": "Authorization",
+      "id": 100,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Authz decisions rate (by action & decision)",
+      "id": 1,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {
+        "defaults": {"custom": {"stacking": {"mode": "normal"}}},
+        "overrides": []
+      },
+      "targets": [
+        {"expr": "sum by (action, decision) (rate(rustgate_authz_decisions_total[5m]))", "refId": "A", "legendFormat": "{{action}} / {{decision}}"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Authz eval latency (p50 / p95 / p99)",
+      "id": 2,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, sum(rate(rustgate_authz_eval_nanos_bucket[5m])) by (le))", "refId": "A", "legendFormat": "p50"},
+        {"expr": "histogram_quantile(0.95, sum(rate(rustgate_authz_eval_nanos_bucket[5m])) by (le))", "refId": "B", "legendFormat": "p95"},
+        {"expr": "histogram_quantile(0.99, sum(rate(rustgate_authz_eval_nanos_bucket[5m])) by (le))", "refId": "C", "legendFormat": "p99"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Authz cache hit ratio",
+      "id": 3,
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 9},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum(rate(rustgate_authz_cache_hits_total[5m])) / (sum(rate(rustgate_authz_cache_hits_total[5m])) + sum(rate(rustgate_authz_cache_misses_total[5m])))", "refId": "A", "legendFormat": "hit ratio"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Authz policy reload events",
+      "id": 4,
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 9},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum by (result) (rate(rustgate_authz_reloads_total[5m]))", "refId": "A", "legendFormat": "{{result}}"}
+      ]
+    },
+    {
+      "type": "gauge",
+      "title": "Active policy rules",
+      "id": 5,
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 9},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "rustgate_authz_policy_rules", "refId": "A"}
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Store-Forward Queue",
+      "id": 101,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 17},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "gauge",
+      "title": "Client queue depth",
+      "id": 6,
+      "gridPos": {"h": 8, "w": 6, "x": 0, "y": 18},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum(rustgate_client_queue_depth)", "refId": "A"}
+      ]
+    },
+    {
+      "type": "gauge",
+      "title": "Client queue bytes",
+      "id": 7,
+      "gridPos": {"h": 8, "w": 6, "x": 6, "y": 18},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum(rustgate_client_queue_bytes)", "refId": "A"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Enqueue / drain / drop rates",
+      "id": 8,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 18},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum(rate(rustgate_client_queue_enqueues_total[5m]))", "refId": "A", "legendFormat": "enqueues"},
+        {"expr": "sum(rate(rustgate_client_queue_drains_total[5m]))", "refId": "B", "legendFormat": "drains"},
+        {"expr": "sum(rate(rustgate_client_queue_drops_total[5m]))", "refId": "C", "legendFormat": "drops"},
+        {"expr": "sum(rate(rustgate_client_queue_writer_drops_total[5m]))", "refId": "D", "legendFormat": "writer_drops"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Expired messages rate",
+      "id": 9,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 26},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum(rate(rustgate_client_queue_expired_total[5m]))", "refId": "A", "legendFormat": "expired/s"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Skipped unsupported entries",
+      "id": 10,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 26},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum(rate(rustgate_client_queue_skipped_unsupported_total[5m]))", "refId": "A", "legendFormat": "skipped/s"}
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Backpressure",
+      "id": 102,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 34},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "gauge",
+      "title": "Global queued bytes",
+      "id": 11,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 35},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "rustgate_queued_bytes", "refId": "A"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Admission deferrals rate",
+      "id": 12,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 35},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum(rate(rustgate_admission_deferred_total[5m]))", "refId": "A", "legendFormat": "deferred/s"}
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Deduplication",
+      "id": 103,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 43},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "gauge",
+      "title": "Dedup cache size",
+      "id": 13,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 44},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "rustgate_dedup_cache_size", "refId": "A"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Dedup hit rate",
+      "id": 14,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 44},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum(rate(rustgate_dedup_hits_total[5m]))", "refId": "A", "legendFormat": "hits/s"}
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Connection Security",
+      "id": 104,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 52},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Handshake failures by reason",
+      "id": 15,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 53},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum by (reason) (rate(rustgate_handshake_failures_total[5m]))", "refId": "A", "legendFormat": "{{reason}}"},
+        {"expr": "sum by (identity_cn) (rate(rustgate_per_identity_handshake_failures_total[5m]))", "refId": "B", "legendFormat": "identity: {{identity_cn}}"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "OCSP cache hit / miss ratio",
+      "id": 16,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 53},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum(rate(rustgate_client_ocsp_cache_hits_total[5m]))", "refId": "A", "legendFormat": "hits"},
+        {"expr": "sum(rate(rustgate_client_ocsp_cache_misses_total[5m]))", "refId": "B", "legendFormat": "misses"}
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Memory (JEmalloc)",
+      "id": 105,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 61},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "gauge",
+      "title": "Resident bytes",
+      "id": 17,
+      "gridPos": {"h": 8, "w": 6, "x": 0, "y": 62},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "rustgate_jemalloc_resident_bytes", "refId": "A"}
+      ]
+    },
+    {
+      "type": "gauge",
+      "title": "Active bytes",
+      "id": 18,
+      "gridPos": {"h": 8, "w": 6, "x": 6, "y": 62},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "rustgate_jemalloc_active_bytes", "refId": "A"}
+      ]
+    },
+    {
+      "type": "gauge",
+      "title": "Allocated bytes",
+      "id": 19,
+      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 62},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "rustgate_jemalloc_allocated_bytes", "refId": "A"}
+      ]
+    },
+    {
+      "type": "gauge",
+      "title": "Mapped bytes",
+      "id": 20,
+      "gridPos": {"h": 8, "w": 6, "x": 18, "y": 62},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "rustgate_jemalloc_mapped_bytes", "refId": "A"}
+      ]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "tags": ["rustgate", "security"],
+  "templating": {"list": []},
+  "time": {"from": "now-1h", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "Rustgate Security & Health",
+  "uid": "rustgate-security",
+  "version": 1,
+  "weekStart": ""
+}

@@ -110,6 +110,32 @@
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 28},
       "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
       "targets": [{"expr": "sum(rate(rustgate_nats_publishes_total[5m]))", "refId": "A", "legendFormat": "publishes/s"}]
+    },
+    {
+      "type": "row",
+      "title": "Security Summary",
+      "id": 100,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 36},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Authz decision rate (allow vs deny)",
+      "id": 13,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 37},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum by (decision) (rate(rustgate_authz_decisions_total[5m]))", "refId": "A", "legendFormat": "{{decision}}"}
+      ]
+    },
+    {
+      "type": "gauge",
+      "title": "Backpressure — queued bytes",
+      "id": 14,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 37},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "rustgate_queued_bytes", "refId": "A"}]
     }
   ],
   "refresh": "30s",
