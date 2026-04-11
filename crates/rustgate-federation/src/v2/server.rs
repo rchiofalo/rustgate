@@ -19,6 +19,14 @@ use super::proto::figpb;
 use super::proto::figpb::federated_channel_server::FederatedChannel;
 use crate::provenance;
 
+/// Maximum number of federation hops before an inbound message is dropped.
+///
+/// Prevents routing loops between misconfigured federation peers.
+/// Messages arriving with `current_hops` at or exceeding this limit are
+/// silently discarded with a warning log.
+// TODO: make configurable via FederationService builder (currently hardcoded)
+pub const MAX_FEDERATION_HOPS: i64 = 8;
+
 /// Default maximum number of groups a single federation peer can advertise.
 pub const DEFAULT_MAX_GROUPS_PER_PEER: usize = 1_000;
 
@@ -184,12 +192,85 @@ impl FederationService {
         }
     }
 
-    /// Extract peer ID from tonic request metadata (TLS CN or address).
+    /// Validate that an inbound event's hop count is within limits.
+    ///
+    /// Returns `Ok(())` if the event should be processed, or `Err(peer_id)`
+    /// if the hop count is invalid (negative or at/above `MAX_FEDERATION_HOPS`).
+    /// Events without hop metadata are allowed (treated as first-hop for
+    /// backward compat with peers that predate hop tracking).
+    fn validate_hop_count(event: &figpb::FederatedEvent, peer_id: &str) -> bool {
+        if let Some(ref hops) = event.federate_hops
+            && (hops.current_hops < 0 || hops.current_hops >= MAX_FEDERATION_HOPS)
+        {
+            warn!(
+                peer = %peer_id,
+                current_hops = hops.current_hops,
+                max = MAX_FEDERATION_HOPS,
+                "rejecting federated event: hop count exceeded"
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Maximum length for a peer CN extracted from a certificate.
+    ///
+    /// Matches the validation in `rustgate_core::identity::Identity::new()`.
+    const MAX_PEER_CN_LENGTH: usize = 256;
+
+    /// Extract peer ID from the mTLS client certificate CN.
+    ///
+    /// Prefers the Common Name (CN) from the peer's TLS certificate subject,
+    /// which is authenticated via mTLS and cannot be spoofed. Falls back to
+    /// the remote IP address with a warning if the certificate is unavailable
+    /// or cannot be parsed (e.g., non-mTLS connections during testing).
+    ///
+    /// The extracted CN is sanitized (length-capped, control characters
+    /// stripped) to prevent log-injection from malicious certificates.
     fn peer_id_from_request<T>(request: &Request<T>) -> String {
-        request
-            .remote_addr()
-            .map(|addr| addr.to_string())
-            .unwrap_or_else(|| "unknown".to_string())
+        // Try to extract CN from the mTLS peer certificate.
+        // Uses an iterator chain to avoid nested if-let that triggers
+        // clippy::collapsible_if.
+        let cn = request
+            .peer_certs()
+            .and_then(|certs| certs.first().cloned())
+            .and_then(|cert_der| {
+                x509_parser::parse_x509_certificate(cert_der.as_ref())
+                    .ok()
+                    .and_then(|(_, parsed)| {
+                        parsed
+                            .subject()
+                            .iter_common_name()
+                            .next()
+                            .and_then(|cn| cn.as_str().ok())
+                            .map(|raw| {
+                                // Sanitize: cap length and strip control characters
+                                // to prevent log-injection from malicious CNs.
+                                let sanitized: String = raw
+                                    .chars()
+                                    .take(Self::MAX_PEER_CN_LENGTH)
+                                    .filter(|c| !c.is_control())
+                                    .collect();
+                                sanitized
+                            })
+                            .filter(|s| !s.is_empty())
+                    })
+            });
+
+        if let Some(cn) = cn {
+            return cn;
+        }
+
+        // Fall back to remote address with a warning
+        if let Some(addr) = request.remote_addr() {
+            warn!(
+                remote_addr = %addr,
+                "federation peer identity falling back to IP address — mTLS peer certificate not available"
+            );
+            return addr.to_string();
+        }
+
+        "unknown".to_string()
     }
 
     /// Create a pre-configured `tonic::transport::Server` with federation
@@ -245,6 +326,11 @@ impl FederatedChannel for FederationService {
     ) -> Result<Response<figpb::Empty>, Status> {
         let peer_id = Self::peer_id_from_request(&request);
         let event = request.into_inner();
+
+        if !Self::validate_hop_count(&event, &peer_id) {
+            return Ok(Response::new(figpb::Empty {}));
+        }
+
         debug!(peer = %peer_id, "received single event");
         (self.on_event)(event, peer_id);
         Ok(Response::new(figpb::Empty {}))
@@ -315,6 +401,9 @@ impl FederatedChannel for FederationService {
 
         drop(tokio::spawn(async move {
             while let Ok(Some(event)) = stream.message().await {
+                if !FederationService::validate_hop_count(&event, &pid) {
+                    continue;
+                }
                 on_event(event, pid.clone());
             }
             info!(peer = %pid, "server_event_stream closed");
@@ -849,5 +938,222 @@ mod tests {
     fn test_configured_server_u32_max_clamp() {
         // max_frame_size uses .min(u32::MAX) so very large values are clamped
         let _server = FederationService::configured_server(usize::MAX);
+    }
+
+    #[test]
+    fn peer_id_falls_back_to_unknown_without_tls() {
+        // Without TLS extensions or remote_addr, peer_id_from_request
+        // should return "unknown" as a last resort.
+        let request = Request::new(figpb::Empty {});
+        let peer_id = FederationService::peer_id_from_request(&request);
+        assert_eq!(peer_id, "unknown");
+    }
+
+    #[tokio::test]
+    async fn hop_count_validation_rejects_exceeded() {
+        let (on_event, count) = counting_on_event();
+        let svc = FederationService::new("s".into(), vec![], on_event);
+
+        let event = figpb::FederatedEvent {
+            event: Some(figpb::GeoEvent {
+                uid: "over-limit".into(),
+                ..Default::default()
+            }),
+            federate_hops: Some(figpb::FederateHops {
+                current_hops: MAX_FEDERATION_HOPS + 1,
+                max_hops: 20,
+            }),
+            ..Default::default()
+        };
+
+        let _ = svc
+            .send_one_event(Request::new(event))
+            .await
+            .expect("send_one_event");
+
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "event exceeding max hops should not reach callback"
+        );
+    }
+
+    #[tokio::test]
+    async fn hop_count_validation_allows_valid() {
+        let (on_event, count) = counting_on_event();
+        let svc = FederationService::new("s".into(), vec![], on_event);
+
+        let event = figpb::FederatedEvent {
+            event: Some(figpb::GeoEvent {
+                uid: "within-limit".into(),
+                ..Default::default()
+            }),
+            federate_hops: Some(figpb::FederateHops {
+                current_hops: MAX_FEDERATION_HOPS - 1,
+                max_hops: 20,
+            }),
+            ..Default::default()
+        };
+
+        let _ = svc
+            .send_one_event(Request::new(event))
+            .await
+            .expect("send_one_event");
+
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "event within hop limit should reach callback"
+        );
+    }
+
+    #[tokio::test]
+    async fn hop_count_none_is_accepted() {
+        let (on_event, count) = counting_on_event();
+        let svc = FederationService::new("s".into(), vec![], on_event);
+
+        let event = figpb::FederatedEvent {
+            event: Some(figpb::GeoEvent {
+                uid: "no-hops".into(),
+                ..Default::default()
+            }),
+            federate_hops: None,
+            ..Default::default()
+        };
+
+        let _ = svc
+            .send_one_event(Request::new(event))
+            .await
+            .expect("send_one_event");
+
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "event with no hop count (backward compat) should reach callback"
+        );
+    }
+
+    #[tokio::test]
+    async fn hop_count_at_exact_limit_is_rejected() {
+        let (on_event, count) = counting_on_event();
+        let svc = FederationService::new("s".into(), vec![], on_event);
+
+        let event = figpb::FederatedEvent {
+            event: Some(figpb::GeoEvent {
+                uid: "at-limit".into(),
+                ..Default::default()
+            }),
+            federate_hops: Some(figpb::FederateHops {
+                current_hops: MAX_FEDERATION_HOPS,
+                max_hops: 20,
+            }),
+            ..Default::default()
+        };
+
+        let _ = svc
+            .send_one_event(Request::new(event))
+            .await
+            .expect("send_one_event");
+
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "event at exactly the hop limit should be rejected (>= boundary)"
+        );
+    }
+
+    #[tokio::test]
+    async fn hop_count_one_below_limit_is_accepted() {
+        let (on_event, count) = counting_on_event();
+        let svc = FederationService::new("s".into(), vec![], on_event);
+
+        let event = figpb::FederatedEvent {
+            event: Some(figpb::GeoEvent {
+                uid: "one-below".into(),
+                ..Default::default()
+            }),
+            federate_hops: Some(figpb::FederateHops {
+                current_hops: MAX_FEDERATION_HOPS - 1,
+                max_hops: 20,
+            }),
+            ..Default::default()
+        };
+
+        let _ = svc
+            .send_one_event(Request::new(event))
+            .await
+            .expect("send_one_event");
+
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "event one below the hop limit should be accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn negative_hop_count_is_rejected() {
+        let (on_event, count) = counting_on_event();
+        let svc = FederationService::new("s".into(), vec![], on_event);
+
+        let event = figpb::FederatedEvent {
+            event: Some(figpb::GeoEvent {
+                uid: "negative-hops".into(),
+                ..Default::default()
+            }),
+            federate_hops: Some(figpb::FederateHops {
+                current_hops: -1,
+                max_hops: 20,
+            }),
+            ..Default::default()
+        };
+
+        let _ = svc
+            .send_one_event(Request::new(event))
+            .await
+            .expect("send_one_event");
+
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "event with negative hop count should be rejected"
+        );
+    }
+
+    #[test]
+    fn peer_id_sanitizes_control_characters() {
+        // peer_id_from_request relies on TLS certs which we can't easily mock,
+        // so validate the sanitization logic directly: control chars are stripped,
+        // length is capped at MAX_PEER_CN_LENGTH.
+        let raw = "alice\n\rinjection\x00attempt";
+        let sanitized: String = raw
+            .chars()
+            .take(FederationService::MAX_PEER_CN_LENGTH)
+            .filter(|c| !c.is_control())
+            .collect();
+        assert_eq!(sanitized, "aliceinjectionattempt");
+    }
+
+    #[test]
+    fn peer_id_sanitization_caps_length() {
+        let raw = "a".repeat(300);
+        let sanitized: String = raw
+            .chars()
+            .take(FederationService::MAX_PEER_CN_LENGTH)
+            .filter(|c| !c.is_control())
+            .collect();
+        assert_eq!(sanitized.len(), FederationService::MAX_PEER_CN_LENGTH);
+    }
+
+    #[test]
+    fn peer_id_sanitization_empty_after_stripping() {
+        // A CN consisting entirely of control characters should be filtered to empty
+        let raw = "\n\r\x00\x01";
+        let sanitized: String = raw
+            .chars()
+            .take(FederationService::MAX_PEER_CN_LENGTH)
+            .filter(|c| !c.is_control())
+            .collect();
+        assert!(sanitized.is_empty());
     }
 }
