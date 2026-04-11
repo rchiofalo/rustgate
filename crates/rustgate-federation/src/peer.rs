@@ -149,6 +149,9 @@ pub struct PeerHandle {
     /// is the oldest message still queued. Used to compute "oldest message age"
     /// without scanning the actual mpsc channel.
     queue_ages: Mutex<VecDeque<(SystemTime, usize)>>,
+    /// EWMA round-trip latency to this peer in nanoseconds (from heartbeats).
+    /// Zero means no RTT samples have been recorded yet.
+    latency_nanos: AtomicU64,
 }
 
 impl PeerHandle {
@@ -175,6 +178,7 @@ impl PeerHandle {
             circuit_trips: AtomicU64::new(0),
             queue_bytes: AtomicU64::new(0),
             queue_ages: Mutex::new(VecDeque::new()),
+            latency_nanos: AtomicU64::new(0),
         }
     }
 
@@ -223,6 +227,25 @@ impl PeerHandle {
     pub fn oldest_queued_age_secs(&self) -> Option<f64> {
         let ts = self.queue_ages.lock().ok()?.front().map(|(t, _)| *t)?;
         ts.elapsed().ok().map(|d| d.as_secs_f64())
+    }
+
+    /// Record an observed round-trip time and update the EWMA.
+    ///
+    /// Uses integer EWMA with alpha=0.3: `new = (3 * sample + 7 * old) / 10`.
+    /// The first sample initializes the estimate directly (no smoothing).
+    pub fn record_rtt(&self, rtt_nanos: u64) {
+        let old = self.latency_nanos.load(Ordering::Relaxed);
+        let new = if old == 0 {
+            rtt_nanos
+        } else {
+            (3 * rtt_nanos + 7 * old) / 10
+        };
+        self.latency_nanos.store(new, Ordering::Relaxed);
+    }
+
+    /// Returns the current EWMA latency in nanoseconds, or 0 if no samples.
+    pub fn latency_nanos(&self) -> u64 {
+        self.latency_nanos.load(Ordering::Relaxed)
     }
 
     /// Create a new peer handle with explicit circuit breaker parameters.
