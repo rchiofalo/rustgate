@@ -1468,6 +1468,7 @@ pub(crate) async fn start_udp<P: NatsPublish + Send + Sync + 'static>(
     let config = rustgate_transport::UdpInputConfig {
         cn: cli.plaintext_cn.clone(),
         default_group: cli.plaintext_group.clone(),
+        ..Default::default()
     };
 
     let shutdown = Arc::new(tokio::sync::Notify::new());
