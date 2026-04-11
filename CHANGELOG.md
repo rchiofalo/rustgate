@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Helm StatefulSet for persistent store-forward** — new `storeForward.enabled` value switches the workload from a Deployment to a StatefulSet with a `volumeClaimTemplate` for the redb-backed client queue. A headless Service provides stable DNS for pod identity. Configurable via `storeForward.storageSize` (default 5Gi), `storeForward.storageClassName`, and `storeForward.queueDir` (default /data/client-queue). (#669)
 - **Jemalloc memory statistics** — when the `jemalloc` feature is enabled, the metrics endpoint now exposes four Prometheus gauges: `rustgate_jemalloc_resident_bytes`, `rustgate_jemalloc_active_bytes`, `rustgate_jemalloc_allocated_bytes`, and `rustgate_jemalloc_mapped_bytes`. Values are refreshed on every `/metrics` scrape via the safe `tikv-jemalloc-ctl` API (epoch advance + stat reads). Operators can use these to monitor allocator-level memory usage, detect fragmentation (allocated vs active), and set alerts on resident growth. Requires `--features jemalloc,metrics`. (#674)
 
 ### Security
