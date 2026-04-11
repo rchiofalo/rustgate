@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! TLS / plaintext dialing helpers.
 
 use std::sync::Arc;

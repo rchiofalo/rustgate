@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Conversion between CoT XML, RoutableMessage, and V2 FederatedEvent types.
 //!
 //! Provides bidirectional conversions for the V2 gRPC federation protocol:

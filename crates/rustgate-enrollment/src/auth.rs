@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! HTTP Basic Auth credential validation.
 
 use base64::Engine;

@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Prometheus metrics for federation.
 //!
 //! Provides counters and gauges tracking federation connections,

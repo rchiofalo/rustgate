@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Shared types and utilities for the rustgate workspace.
 //!
 //! This crate provides the foundational types used across all rustgate crates:

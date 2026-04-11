@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Message deduplication for V1 federation loop detection.
 //!
 //! V1 federation uses length-prefixed XML over mTLS without provenance

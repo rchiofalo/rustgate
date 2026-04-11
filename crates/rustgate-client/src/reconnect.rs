@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Background read/write loop with optional exponential-backoff reconnect.
 
 use std::sync::Arc;

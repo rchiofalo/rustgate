@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Plaintext TCP listener for trusted/air-gapped networks.
 //!
 //! Accepts TCP connections without TLS. Each connection is assigned a

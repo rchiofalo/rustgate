@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! WebSocket server with session lifecycle management.
 //!
 //! Bridges authenticated WebSocket connections into the message [`Router`]

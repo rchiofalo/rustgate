@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Protocol translation error types.
 
 /// Errors during TAK protocol buffer translation.

@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Session handling for connected clients.
 //!
 //! Contains the TLS session lifecycle (handshake, read/write loops, protocol

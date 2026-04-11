@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Bounded replay buffer for federation peer reconnection.
 //!
 //! Stores recent forwarded messages in a per-peer ring buffer so that

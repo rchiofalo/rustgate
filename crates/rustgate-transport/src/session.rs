@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Authenticated TLS session.
 
 use std::net::SocketAddr;

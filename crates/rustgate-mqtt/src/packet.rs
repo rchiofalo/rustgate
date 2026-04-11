@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! MQTT packet framing over TLS streams.
 //!
 //! Wraps [`mqttbytes`] for codec operations and provides async read/write

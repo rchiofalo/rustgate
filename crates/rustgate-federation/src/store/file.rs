@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! File-backed federation peer store.
 //!
 //! Persists [`FederateInfo`] entries as a JSON array on disk. When no

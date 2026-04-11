@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! REST API for managing the group access control policy at runtime.
 //!
 //! Mounted under `/api/acl/` on the metrics HTTP server (gated by the

@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Post-quantum key exchange integration tests.
 //!
 //! These tests verify that the aws-lc-rs post-quantum provider installs

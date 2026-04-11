@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 #![no_main]
 
 //! Fuzz target: JSON policy parsing + compilation must not panic on any

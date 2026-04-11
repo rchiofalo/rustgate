@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Configuration for the MQTT server.
 
 use std::sync::Arc;

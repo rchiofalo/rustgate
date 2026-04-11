@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Integration test proving the admission-control gate observes
 //! *downstream* memory pressure: the permit acquired in `Router::route`
 //! stays alive until the last session channel drains the message, so

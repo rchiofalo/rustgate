@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Reference echo client.
 //!
 //! Connects to a rustgate server, subscribes to inbound traffic, and echoes

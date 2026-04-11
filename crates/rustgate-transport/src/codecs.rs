@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Built-in codec implementations for common wire protocols.
 //!
 //! These codecs implement the [`Codec`] trait from `rustgate-core`, providing

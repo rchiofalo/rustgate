@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! PKCS#7 certs-only bag construction for EST responses.
 //!
 //! Builds a degenerate CMS [`SignedData`] (RFC 5652) containing only

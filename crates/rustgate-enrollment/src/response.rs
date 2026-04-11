@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Enrollment response formatters.
 //!
 //! Produces the JSON and XML response bodies for the Marti v2 enrollment API,

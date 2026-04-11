@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 #![allow(unused_results)]
 
 use std::hint::black_box;

@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! FIPS 140-3 crypto provider integration tests.
 //!
 //! These tests verify that the aws-lc-rs FIPS provider installs correctly

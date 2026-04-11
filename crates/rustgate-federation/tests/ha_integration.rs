@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! HA subsystem integration tests.
 //!
 //! These tests require a real `nats-server` binary with JetStream support

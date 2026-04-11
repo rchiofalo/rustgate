@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! MQTT topic ↔ rustgate group mapping and validation.
 //!
 //! MQTT topics are UTF-8 strings with `/` as a level separator.

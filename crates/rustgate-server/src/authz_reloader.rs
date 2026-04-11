@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Authz policy file hot-reload via polling.
 //!
 //! Mirrors [`crate::acl_reloader::AclReloader`]: compute a SHA-256 digest

@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Per-client message rate limiter.
 //!
 //! Uses a token-bucket algorithm to enforce a maximum message rate per

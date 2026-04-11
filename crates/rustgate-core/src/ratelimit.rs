@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Per-IP connection rate limiting shared across transport listeners.
 //!
 //! Provides [`ConnRateLimiter`], a sliding-window rate limiter keyed by IP

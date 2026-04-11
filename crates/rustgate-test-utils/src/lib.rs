@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Test utilities for rustgate.
 //!
 //! Provides X.509 certificate generation for integration tests.

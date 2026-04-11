@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Shared reconnection utilities for federation clients.
 //!
 //! Provides backoff calculation and reconnection limit checking used by

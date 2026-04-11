@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Pluggable codec implementation for TAK protobuf wire format.
 //!
 //! Combines the 0xBF+varint framing with bidirectional protobuf ↔ XML

@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 #![allow(clippy::panic, clippy::unwrap_used)]
 //! End-to-end tests using `rustgate-client` against a real `TlsListener`.
 //!

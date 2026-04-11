@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! rustgate-authz — RBAC/ABAC policy engine for rustgate.
 //!
 //! Provides a deny-by-default policy model evaluated on every routed message.

@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Latest-state cache for position reports.
 //!
 //! Clients expect to receive the current situational awareness (SA) picture

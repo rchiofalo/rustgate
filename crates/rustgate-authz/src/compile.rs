@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Compile a [`RuleSet`] into a bucketed decision table for fast evaluation.
 //!
 //! The compiled form groups rules by `(action, resource_kind)`. At evaluation

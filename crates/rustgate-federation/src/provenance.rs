@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Message provenance tracking for federation loop detection.
 //!
 //! Each federated message carries [`FederationMetadata`] recording the

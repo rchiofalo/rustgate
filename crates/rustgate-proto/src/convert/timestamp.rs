@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! ISO 8601 <-> epoch milliseconds conversion.
 //!
 //! Minimal hand-rolled parser matching the format TAK clients produce:

@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! DNS-SD / mDNS peer discovery backend.
 //!
 //! Uses the pure-Rust `mdns-sd` crate to browse a configured service type

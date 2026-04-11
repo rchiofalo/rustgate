@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Per-tenant resource quota tracking and enforcement.
 //!
 //! Tracks active connections per tenant (identified by the certificate

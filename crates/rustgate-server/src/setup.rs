@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Server startup and subsystem initialization.
 //!
 //! Extracts the setup logic from `run()` into focused functions for each

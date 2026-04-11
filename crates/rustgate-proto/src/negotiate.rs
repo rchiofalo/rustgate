@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! TAK protocol negotiation message builders.
 //!
 //! # Protocol Handshake

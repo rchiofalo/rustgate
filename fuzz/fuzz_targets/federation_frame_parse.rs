@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 #![no_main]
 #![allow(clippy::panic, clippy::unwrap_used)]
 

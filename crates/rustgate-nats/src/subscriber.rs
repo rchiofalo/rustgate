@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Subscribes to NATS for messages destined to locally connected clients.
 //!
 //! Uses a JetStream pull consumer for real backpressure — when processing

@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Size- and time-based retention for the CoT event archive.
 //!
 //! Operators previously had to use `cron` (or similar) to keep the

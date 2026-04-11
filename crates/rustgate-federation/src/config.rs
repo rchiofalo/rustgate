@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Federation configuration types and defaults.
 //!
 //! Defines [`FederationConfig`] (the top-level config struct) and

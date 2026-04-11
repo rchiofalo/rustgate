@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 #![allow(clippy::panic, clippy::unwrap_used)]
 //! Integration tests for WebSocket listener with mTLS authentication.
 

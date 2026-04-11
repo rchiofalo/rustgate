@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! X.509 certificate parsing and identity extraction.
 
 use std::collections::{BTreeMap, BTreeSet};

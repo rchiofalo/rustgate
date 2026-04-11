@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! TAK protocol buffer translation for rustgate.
 //!
 //! Provides bidirectional conversion between CoT XML and TAK protobuf

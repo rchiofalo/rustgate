@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Enrollment-specific error types.
 
 /// Errors that can occur during certificate enrollment.

@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Contacts provider for Marti API compatibility.
 //!
 //! Defines the callback type and data structures used by the

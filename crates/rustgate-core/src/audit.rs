@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Structured audit logging for security and compliance monitoring.
 //!
 //! Emits JSON-structured audit events via tracing at the `INFO` level

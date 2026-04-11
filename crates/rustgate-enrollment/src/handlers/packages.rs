@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Data package upload, download, and search handlers.
 
 use bytes::Bytes;

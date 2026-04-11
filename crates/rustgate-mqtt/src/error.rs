@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! MQTT-specific error types with protocol reason code mapping.
 
 /// Errors that can occur during MQTT session handling.

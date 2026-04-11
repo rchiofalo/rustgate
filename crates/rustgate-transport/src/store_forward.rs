@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Per-client store-and-forward disk queue.
 //!
 //! When a client disconnects, in-flight messages destined for that CN

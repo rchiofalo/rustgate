@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Structured CoT event archiver.
 //!
 //! When enabled, logs all received CoT events as JSONL to a rotatable

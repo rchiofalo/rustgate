@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! V1 federation outbound client.
 //!
 //! Connects to a remote federation peer over mTLS and runs read/write

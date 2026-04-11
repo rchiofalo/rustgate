@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Policy engine trait and native in-process implementation.
 
 use smol_str::SmolStr;

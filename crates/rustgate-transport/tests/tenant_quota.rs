@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Integration tests for per-tenant resource quota enforcement.
 #![allow(clippy::panic, clippy::unwrap_used)]
 

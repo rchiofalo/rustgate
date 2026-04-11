@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 #![no_main]
 
 //! Fuzz target: `NativeEngine::evaluate` against a small fixed policy.

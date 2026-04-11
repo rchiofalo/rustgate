@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Certificate revocation and CRL generation.
 //!
 //! Maintains a persistent list of revoked certificate serial numbers and

@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Dynamic client certificate verifier for runtime trust store changes.
 //!
 //! [`DynamicCertVerifier`] implements the rustls [`ClientCertVerifier`] trait

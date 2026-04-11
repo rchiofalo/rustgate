@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Request and response types for the federation REST API.
 
 use serde::{Deserialize, Serialize};

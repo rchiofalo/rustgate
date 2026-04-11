@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Server certificate hot-reload via polling.
 //!
 //! [`CertReloader`] implements [`ResolvesServerCert`] so that rustls can

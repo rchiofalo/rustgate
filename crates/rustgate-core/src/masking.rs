@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Sensitive data masking utilities for log output.
 //!
 //! Provides functions to partially redact certificate serials, IP addresses,

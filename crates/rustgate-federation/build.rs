@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Only build gRPC proto types when the v2 feature is enabled.
     #[cfg(feature = "v2")]

@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Sliding-window anti-replay filter for messages.
 //!
 //! Prevents duplicate messages from being routed by tracking recently-seen

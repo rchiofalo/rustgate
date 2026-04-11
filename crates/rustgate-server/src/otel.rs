@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! OpenTelemetry tracing setup for OTLP trace export.
 //!
 //! Initializes an OpenTelemetry [`SdkTracerProvider`] that exports spans to an

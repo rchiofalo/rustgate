@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Emergency event repeater.
 //!
 //! Caches active emergency/alert events and re-broadcasts them at a

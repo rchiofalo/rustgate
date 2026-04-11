@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 #![allow(clippy::panic, clippy::unwrap_used, unused_results)]
 
 use std::collections::{BTreeMap, BTreeSet};

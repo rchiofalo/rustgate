@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Runtime model types for authorization decisions.
 //!
 //! These types describe the inputs and outputs of policy evaluation. They are

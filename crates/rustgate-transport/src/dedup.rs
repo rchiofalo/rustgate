@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Cross-path message deduplication cache.
 //!
 //! When the same logical message arrives via multiple ingress paths

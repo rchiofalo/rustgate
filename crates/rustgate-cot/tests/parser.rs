@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 #![allow(clippy::unwrap_used)]
 
 use std::time::Duration;

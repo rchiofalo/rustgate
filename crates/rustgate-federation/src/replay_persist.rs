@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Disk persistence for the per-peer federation replay buffer.
 //!
 //! The in-memory [`crate::replay_buffer::ReplayBuffer`] is bounded and

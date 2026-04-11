@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! JSON parser for [`RuleSet`] policies.
 
 use std::collections::HashSet;

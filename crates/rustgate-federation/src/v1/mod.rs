@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! V1 federation protocol: length-prefixed XML over mTLS.
 //!
 //! This is the legacy TAK Server federation wire format where each message

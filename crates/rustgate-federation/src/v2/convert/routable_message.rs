@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! `RoutableMessage` ↔ `FederatedEvent` conversions.
 //!
 //! Bridges the internal routing layer (`RoutableMessage`) with the V2

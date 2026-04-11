@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Per-IP sliding-window rate limiting for enrollment endpoints.
 //!
 //! Tracks individual request timestamps per IP and lazily prunes expired

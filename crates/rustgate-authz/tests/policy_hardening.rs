@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 #![allow(clippy::panic, clippy::unwrap_used)]
 
 //! Regression tests for the policy-parse / compile hardening work:

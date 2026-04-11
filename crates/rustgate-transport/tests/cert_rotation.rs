@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Integration tests for server certificate hot-reload via `CertReloader`.
 
 #![allow(clippy::panic, clippy::unwrap_used)]

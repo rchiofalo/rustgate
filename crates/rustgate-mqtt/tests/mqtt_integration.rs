@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 #![allow(clippy::panic, clippy::unwrap_used, unused_results, dead_code)]
 
 //! Integration tests for the MQTT transport adapter.

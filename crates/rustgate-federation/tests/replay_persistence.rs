@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Integration tests for issue #557 — persistent federation replay buffer.
 //!
 //! These tests exercise the redb-backed [`ReplayStore`] together with

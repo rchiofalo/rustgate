@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! XML CoT to TAK protobuf conversion.
 //!
 //! ## Field Mapping

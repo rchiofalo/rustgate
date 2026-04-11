@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;

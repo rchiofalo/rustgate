@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Bidirectional XML CoT <-> TAK protobuf conversion.
 
 pub mod proto_to_xml;

@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Dynamic federation peer discovery (issue #571).
 //!
 //! This module exposes a pluggable [`PeerDiscovery`] trait together with a

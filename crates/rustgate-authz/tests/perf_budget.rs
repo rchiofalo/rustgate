@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! P99 budget gate for the authz evaluation hot path.
 //!
 //! The test iterates each documented evaluation pattern a fixed number

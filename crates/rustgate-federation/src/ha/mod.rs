@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! High-availability (HA) support for federation in multi-pod deployments.
 //!
 //! Provides distributed peer ownership via NATS KV claims and cross-pod

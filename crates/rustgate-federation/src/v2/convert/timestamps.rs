@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Timestamp parsing and formatting utilities for federation conversions.
 //!
 //! Wraps the low-level `rustgate-proto` timestamp helpers with

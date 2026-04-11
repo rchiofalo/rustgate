@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Core message types used throughout the routing engine.
 //!
 //! Every message entering rustgate — whether from a TLS client, WebSocket,

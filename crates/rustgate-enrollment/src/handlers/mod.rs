@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! HTTP request handlers for the enrollment server.
 //!
 //! Each sub-module groups related endpoint handlers by domain:

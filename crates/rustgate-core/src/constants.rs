@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Centralized constants for timeouts, buffer sizes, and capacity limits.
 //!
 //! These constants provide consistent defaults across all rustgate crates.

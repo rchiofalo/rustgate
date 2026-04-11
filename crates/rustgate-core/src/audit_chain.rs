@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! Hash-chained, tamper-evident audit log writer and verifier.
 //!
 //! Each audit record (a single JSON object on its own line) is augmented with

@@ -1,3 +1,5 @@
+// Copyright © 2026 Roberto Chiofalo.
+
 //! NATS adapter for rustgate.
 //!
 //! Bridges local sessions to a NATS event bus, enabling stateless
