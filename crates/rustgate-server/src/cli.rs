@@ -1228,8 +1228,11 @@ impl Cli {
     }
 
     /// Validate cross-field invariants on the merged configuration.
-    /// Currently checks that the mTLS material (cert/key/ca) is non-empty,
-    /// matching the original required-flag behaviour.
+    ///
+    /// Checks mTLS material presence, TLS file existence, federation
+    /// prerequisites, rate-limit sanity, authz fail-open guard, and
+    /// ACL reload interval bounds. All errors are actionable messages
+    /// so operators can fix configuration before the server starts.
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         if self.cert.is_empty() {
             anyhow::bail!("--cert (or [cert] in the config file) is required");
@@ -1240,9 +1243,53 @@ impl Cli {
         if self.ca.is_empty() {
             anyhow::bail!("--ca (or [ca] in the config file) is required");
         }
+
+        // TLS file existence — catch typos / missing mounts before the
+        // TLS stack produces a cryptic I/O error.
+        if !self.cert.is_empty() && !std::path::Path::new(&self.cert).exists() {
+            anyhow::bail!("TLS cert file not found: {}", self.cert);
+        }
+        if !self.key.is_empty() && !std::path::Path::new(&self.key).exists() {
+            anyhow::bail!("TLS key file not found: {}", self.key);
+        }
+        if !self.ca.is_empty() && !std::path::Path::new(&self.ca).exists() {
+            anyhow::bail!("TLS CA file not found: {}", self.ca);
+        }
+
+        // Federation requires an explicit identity.
+        let federation_enabled = self.federation_v1_bind.is_some()
+            || self.federation_v2_bind.is_some()
+            || self.federation_peers_file.is_some();
+        if federation_enabled && self.federation_id.is_empty() {
+            anyhow::bail!("--federation-id is required when federation is enabled");
+        }
+
+        // Rate-limit sanity — burst must absorb at least the steady-state rate.
+        if self.client_message_rate > 0 && self.client_burst < self.client_message_rate {
+            anyhow::bail!(
+                "--client-burst ({}) must be >= --client-message-rate ({})",
+                self.client_burst,
+                self.client_message_rate,
+            );
+        }
+
+        // Authz fail-open without a policy file is a no-op that misleads operators.
+        if self.authz_fail_open && self.authz_policy_file.is_none() {
+            anyhow::bail!("--authz-fail-open has no effect without --authz-policy-file");
+        }
+
         if self.authz_policy_file.is_some() && self.authz_reload_interval == 0 {
             anyhow::bail!("--authz-reload-interval must be >= 1 when --authz-policy-file is set");
         }
+
+        // ACL reload interval must be at least 1 second when active.
+        if self.group_acl_file.is_some()
+            && self.acl_reload_interval > 0
+            && self.acl_reload_interval < 1
+        {
+            anyhow::bail!("--acl-reload-interval must be >= 1 second");
+        }
+
         // Validate ws buffer size — CLI args go through the clap value_parser,
         // but TOML config values bypass it and need an explicit check here.
         let _ = validate_write_buffer_range(self.ws_max_write_buffer_bytes)
@@ -1743,17 +1790,27 @@ mod tests {
     #[test]
     fn config_file_rejects_ws_buffer_below_minimum() {
         let dir = tempfile::tempdir().expect("tmpdir");
+        let cert = dir.path().join("c.pem");
+        let key = dir.path().join("k.pem");
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&cert, "").expect("write cert");
+        std::fs::write(&key, "").expect("write key");
+        std::fs::write(&ca, "").expect("write ca");
+
+        let cert_s = cert.to_str().unwrap();
+        let key_s = key.to_str().unwrap();
+        let ca_s = ca.to_str().unwrap();
+
         let cfg = dir.path().join("bad.toml");
         std::fs::write(
             &cfg,
-            "cert = \"c.pem\"\nkey = \"k.pem\"\nca = \"ca.pem\"\nws-max-write-buffer-bytes = 1024\n",
+            format!("cert = \"{cert_s}\"\nkey = \"{key_s}\"\nca = \"{ca_s}\"\nws-max-write-buffer-bytes = 1024\n"),
         )
         .expect("write");
 
         let file = load_config_file(cfg.to_str().unwrap()).expect("load");
-        let matches = Cli::command().get_matches_from([
-            "rustgate", "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
-        ]);
+        let matches = Cli::command()
+            .get_matches_from(["rustgate", "--cert", cert_s, "--key", key_s, "--ca", ca_s]);
         let mut cli = Cli::from_arg_matches(&matches).expect("parse");
         file.apply_to(&mut cli, &matches);
 
@@ -1767,17 +1824,27 @@ mod tests {
     #[test]
     fn config_file_rejects_ws_buffer_above_maximum() {
         let dir = tempfile::tempdir().expect("tmpdir");
+        let cert = dir.path().join("c.pem");
+        let key = dir.path().join("k.pem");
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&cert, "").expect("write cert");
+        std::fs::write(&key, "").expect("write key");
+        std::fs::write(&ca, "").expect("write ca");
+
+        let cert_s = cert.to_str().unwrap();
+        let key_s = key.to_str().unwrap();
+        let ca_s = ca.to_str().unwrap();
+
         let cfg = dir.path().join("bad.toml");
         std::fs::write(
             &cfg,
-            "cert = \"c.pem\"\nkey = \"k.pem\"\nca = \"ca.pem\"\nws-max-write-buffer-bytes = 134217728\n",
+            format!("cert = \"{cert_s}\"\nkey = \"{key_s}\"\nca = \"{ca_s}\"\nws-max-write-buffer-bytes = 134217728\n"),
         )
         .expect("write");
 
         let file = load_config_file(cfg.to_str().unwrap()).expect("load");
-        let matches = Cli::command().get_matches_from([
-            "rustgate", "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
-        ]);
+        let matches = Cli::command()
+            .get_matches_from(["rustgate", "--cert", cert_s, "--key", key_s, "--ca", ca_s]);
         let mut cli = Cli::from_arg_matches(&matches).expect("parse");
         file.apply_to(&mut cli, &matches);
 
@@ -1786,5 +1853,180 @@ mod tests {
             err.to_string().contains("at most"),
             "expected range error, got: {err}"
         );
+    }
+
+    // ── config validation tests ───────────────────────────────────
+
+    /// Helper: create a `Cli` whose TLS paths point to real (empty)
+    /// temp-files so that the file-existence check passes. Callers can
+    /// then mutate individual fields before calling `validate()`.
+    fn cli_with_temp_tls(dir: &tempfile::TempDir) -> Cli {
+        let cert = dir.path().join("c.pem");
+        let key = dir.path().join("k.pem");
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&cert, "").expect("write cert");
+        std::fs::write(&key, "").expect("write key");
+        std::fs::write(&ca, "").expect("write ca");
+
+        Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            cert.to_str().unwrap(),
+            "--key",
+            key.to_str().unwrap(),
+            "--ca",
+            ca.to_str().unwrap(),
+        ])
+        .expect("should parse")
+    }
+
+    #[test]
+    fn validate_rejects_missing_cert_file() {
+        let cli = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "/tmp/nonexistent-rustgate-test.pem",
+            "--key",
+            "/tmp/nonexistent-rustgate-test.pem",
+            "--ca",
+            "/tmp/nonexistent-rustgate-test.pem",
+        ])
+        .expect("should parse");
+
+        let err = cli.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("TLS cert file not found"),
+            "expected cert-not-found error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_missing_key_file() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let cert = dir.path().join("c.pem");
+        std::fs::write(&cert, "").expect("write cert");
+
+        let cli = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            cert.to_str().unwrap(),
+            "--key",
+            "/tmp/nonexistent-rustgate-key.pem",
+            "--ca",
+            "/tmp/nonexistent-rustgate-ca.pem",
+        ])
+        .expect("should parse");
+
+        let err = cli.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("TLS key file not found"),
+            "expected key-not-found error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_missing_ca_file() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let cert = dir.path().join("c.pem");
+        let key = dir.path().join("k.pem");
+        std::fs::write(&cert, "").expect("write cert");
+        std::fs::write(&key, "").expect("write key");
+
+        let cli = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            cert.to_str().unwrap(),
+            "--key",
+            key.to_str().unwrap(),
+            "--ca",
+            "/tmp/nonexistent-rustgate-ca.pem",
+        ])
+        .expect("should parse");
+
+        let err = cli.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("TLS CA file not found"),
+            "expected ca-not-found error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_federation_without_id() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut cli = cli_with_temp_tls(&dir);
+        cli.federation_v1_bind = Some("0.0.0.0:9000".to_owned());
+        cli.federation_id = String::new();
+
+        let err = cli.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("--federation-id is required when federation is enabled"),
+            "expected federation-id error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_burst_below_rate() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut cli = cli_with_temp_tls(&dir);
+        cli.client_message_rate = 100;
+        cli.client_burst = 50;
+
+        let err = cli.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("--client-burst (50) must be >= --client-message-rate (100)"),
+            "expected burst error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_burst_equal_to_rate() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut cli = cli_with_temp_tls(&dir);
+        cli.client_message_rate = 100;
+        cli.client_burst = 100;
+        cli.validate().expect("burst == rate should be valid");
+    }
+
+    #[test]
+    fn validate_skips_rate_check_when_disabled() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut cli = cli_with_temp_tls(&dir);
+        cli.client_message_rate = 0;
+        cli.client_burst = 0;
+        cli.validate()
+            .expect("rate limiting disabled should be valid");
+    }
+
+    #[test]
+    fn validate_rejects_authz_fail_open_without_policy() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut cli = cli_with_temp_tls(&dir);
+        cli.authz_fail_open = true;
+        cli.authz_policy_file = None;
+
+        let err = cli.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("--authz-fail-open has no effect without --authz-policy-file"),
+            "expected fail-open error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_federation_with_id() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut cli = cli_with_temp_tls(&dir);
+        cli.federation_v1_bind = Some("0.0.0.0:9000".to_owned());
+        cli.federation_id = "my-server".to_owned();
+        cli.validate().expect("federation with ID should be valid");
+    }
+
+    #[test]
+    fn validate_accepts_valid_config() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let cli = cli_with_temp_tls(&dir);
+        cli.validate().expect("default config should be valid");
     }
 }
