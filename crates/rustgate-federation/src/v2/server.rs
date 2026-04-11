@@ -22,8 +22,9 @@ use crate::provenance;
 /// Maximum number of federation hops before an inbound message is dropped.
 ///
 /// Prevents routing loops between misconfigured federation peers.
-/// Messages arriving with `current_hops` exceeding this limit are
+/// Messages arriving with `current_hops` at or exceeding this limit are
 /// silently discarded with a warning log.
+// TODO: make configurable via FederationService builder (currently hardcoded)
 pub const MAX_FEDERATION_HOPS: i64 = 8;
 
 /// Default maximum number of groups a single federation peer can advertise.
@@ -191,12 +192,20 @@ impl FederationService {
         }
     }
 
+    /// Maximum length for a peer CN extracted from a certificate.
+    ///
+    /// Matches the validation in `rustgate_core::identity::Identity::new()`.
+    const MAX_PEER_CN_LENGTH: usize = 256;
+
     /// Extract peer ID from the mTLS client certificate CN.
     ///
     /// Prefers the Common Name (CN) from the peer's TLS certificate subject,
     /// which is authenticated via mTLS and cannot be spoofed. Falls back to
     /// the remote IP address with a warning if the certificate is unavailable
     /// or cannot be parsed (e.g., non-mTLS connections during testing).
+    ///
+    /// The extracted CN is sanitized (length-capped, control characters
+    /// stripped) to prevent log-injection from malicious certificates.
     fn peer_id_from_request<T>(request: &Request<T>) -> String {
         // Try to extract CN from the mTLS peer certificate.
         // Uses an iterator chain to avoid nested if-let that triggers
@@ -212,7 +221,18 @@ impl FederationService {
                             .subject()
                             .iter_common_name()
                             .next()
-                            .and_then(|cn| cn.as_str().ok().map(String::from))
+                            .and_then(|cn| cn.as_str().ok())
+                            .map(|raw| {
+                                // Sanitize: cap length and strip control characters
+                                // to prevent log-injection from malicious CNs.
+                                let sanitized: String = raw
+                                    .chars()
+                                    .take(Self::MAX_PEER_CN_LENGTH)
+                                    .filter(|c| !c.is_control())
+                                    .collect();
+                                sanitized
+                            })
+                            .filter(|s| !s.is_empty())
                     })
             });
 
@@ -286,9 +306,10 @@ impl FederatedChannel for FederationService {
         let peer_id = Self::peer_id_from_request(&request);
         let event = request.into_inner();
 
-        // Validate hop count to prevent routing loops
+        // Validate hop count to prevent routing loops.
+        // Uses >= to align with FederationMetadata::should_drop() semantics.
         if let Some(ref hops) = event.federate_hops
-            && hops.current_hops > MAX_FEDERATION_HOPS
+            && hops.current_hops >= MAX_FEDERATION_HOPS
         {
             warn!(
                 peer = %peer_id,
@@ -298,6 +319,9 @@ impl FederatedChannel for FederationService {
             );
             return Ok(Response::new(figpb::Empty {}));
         }
+        // Events without hop metadata are treated as first-hop (backward
+        // compat with peers that predate hop tracking). This is safe because
+        // the downstream FederationMetadata::should_drop() also validates.
 
         debug!(peer = %peer_id, "received single event");
         (self.on_event)(event, peer_id);
@@ -369,9 +393,10 @@ impl FederatedChannel for FederationService {
 
         drop(tokio::spawn(async move {
             while let Ok(Some(event)) = stream.message().await {
-                // Validate hop count to prevent routing loops
+                // Validate hop count to prevent routing loops.
+                // Uses >= to align with FederationMetadata::should_drop() semantics.
                 if let Some(ref hops) = event.federate_hops
-                    && hops.current_hops > MAX_FEDERATION_HOPS
+                    && hops.current_hops >= MAX_FEDERATION_HOPS
                 {
                     warn!(
                         peer = %pid,
@@ -381,6 +406,9 @@ impl FederatedChannel for FederationService {
                     );
                     continue;
                 }
+                // Events without hop metadata are treated as first-hop (backward
+                // compat with peers that predate hop tracking). This is safe because
+                // the downstream FederationMetadata::should_drop() also validates.
                 on_event(event, pid.clone());
             }
             info!(peer = %pid, "server_event_stream closed");
@@ -1011,7 +1039,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hop_count_at_exact_limit_is_accepted() {
+    async fn hop_count_at_exact_limit_is_rejected() {
         let (on_event, count) = counting_on_event();
         let svc = FederationService::new("s".into(), vec![], on_event);
 
@@ -1034,8 +1062,74 @@ mod tests {
 
         assert_eq!(
             count.load(Ordering::Relaxed),
-            1,
-            "event at exactly the hop limit should still be accepted"
+            0,
+            "event at exactly the hop limit should be rejected (>= boundary)"
         );
+    }
+
+    #[tokio::test]
+    async fn hop_count_one_below_limit_is_accepted() {
+        let (on_event, count) = counting_on_event();
+        let svc = FederationService::new("s".into(), vec![], on_event);
+
+        let event = figpb::FederatedEvent {
+            event: Some(figpb::GeoEvent {
+                uid: "one-below".into(),
+                ..Default::default()
+            }),
+            federate_hops: Some(figpb::FederateHops {
+                current_hops: MAX_FEDERATION_HOPS - 1,
+                max_hops: 20,
+            }),
+            ..Default::default()
+        };
+
+        let _ = svc
+            .send_one_event(Request::new(event))
+            .await
+            .expect("send_one_event");
+
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "event one below the hop limit should be accepted"
+        );
+    }
+
+    #[test]
+    fn peer_id_sanitizes_control_characters() {
+        // peer_id_from_request relies on TLS certs which we can't easily mock,
+        // so validate the sanitization logic directly: control chars are stripped,
+        // length is capped at MAX_PEER_CN_LENGTH.
+        let raw = "alice\n\rinjection\x00attempt";
+        let sanitized: String = raw
+            .chars()
+            .take(FederationService::MAX_PEER_CN_LENGTH)
+            .filter(|c| !c.is_control())
+            .collect();
+        assert_eq!(sanitized, "aliceinjectionattempt");
+    }
+
+    #[test]
+    fn peer_id_sanitization_caps_length() {
+        let raw = "a".repeat(300);
+        let sanitized: String = raw
+            .chars()
+            .take(FederationService::MAX_PEER_CN_LENGTH)
+            .filter(|c| !c.is_control())
+            .collect();
+        assert_eq!(sanitized.len(), FederationService::MAX_PEER_CN_LENGTH);
+    }
+
+    #[test]
+    fn peer_id_sanitization_empty_after_stripping() {
+        // A CN consisting entirely of control characters should be filtered to empty
+        let raw = "\n\r\x00\x01";
+        let sanitized: String = raw
+            .chars()
+            .take(FederationService::MAX_PEER_CN_LENGTH)
+            .filter(|c| !c.is_control())
+            .collect();
+        assert!(sanitized.is_empty());
     }
 }
