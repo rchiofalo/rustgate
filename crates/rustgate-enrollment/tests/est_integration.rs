@@ -300,7 +300,8 @@ async fn est_simplereenroll_issues_cert() {
     let _server = env.spawn_server();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    let csr_b64 = generate_est_csr("reenroll-client");
+    // CSR CN must match authenticated username for re-enrollment.
+    let csr_b64 = generate_est_csr("admin");
     let req = Request::builder()
         .method("POST")
         .uri(format!(
@@ -325,6 +326,103 @@ async fn est_simplereenroll_issues_cert() {
     assert!(
         content_type.contains("application/pkcs7-mime"),
         "expected PKCS#7 content type, got: {content_type}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// POST /.well-known/est/simplereenroll — identity verification
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn est_reenroll_rejects_cn_mismatch() {
+    let env = EstTestEnv::new();
+    let _server = env.spawn_server();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Authenticate as "admin" but request a CSR with CN="mallory".
+    // Re-enrollment must reject this identity mismatch.
+    let csr_b64 = generate_est_csr("mallory");
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "https://localhost:{}/.well-known/est/simplereenroll",
+            env.addr.port()
+        ))
+        .header("Authorization", encode_basic_auth("admin", "secret"))
+        .header("Content-Type", "application/pkcs10")
+        .header("Host", "localhost")
+        .body(Full::new(Bytes::from(csr_b64)))
+        .expect("build request");
+
+    let resp = env.send_request(req).await;
+    assert_eq!(
+        resp.status(),
+        403,
+        "re-enrollment with mismatched CN should be forbidden"
+    );
+}
+
+#[tokio::test]
+async fn est_reenroll_accepts_matching_cn() {
+    let env = EstTestEnv::new();
+    let _server = env.spawn_server();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Authenticate as "admin" and request a CSR with CN="admin".
+    let csr_b64 = generate_est_csr("admin");
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "https://localhost:{}/.well-known/est/simplereenroll",
+            env.addr.port()
+        ))
+        .header("Authorization", encode_basic_auth("admin", "secret"))
+        .header("Content-Type", "application/pkcs10")
+        .header("Host", "localhost")
+        .body(Full::new(Bytes::from(csr_b64)))
+        .expect("build request");
+
+    let resp = env.send_request(req).await;
+    assert_eq!(resp.status(), 200, "matching CN should succeed");
+
+    let content_type = resp
+        .headers()
+        .get("Content-Type")
+        .expect("Content-Type header")
+        .to_str()
+        .expect("header to str");
+    assert!(
+        content_type.contains("application/pkcs7-mime"),
+        "expected PKCS#7 content type, got: {content_type}"
+    );
+}
+
+#[tokio::test]
+async fn est_reenroll_case_insensitive_cn_match() {
+    let env = EstTestEnv::new();
+    let _server = env.spawn_server();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Authenticate as "admin" and request a CSR with CN="Admin" (different case).
+    // Case-insensitive comparison should accept this.
+    let csr_b64 = generate_est_csr("Admin");
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "https://localhost:{}/.well-known/est/simplereenroll",
+            env.addr.port()
+        ))
+        .header("Authorization", encode_basic_auth("admin", "secret"))
+        .header("Content-Type", "application/pkcs10")
+        .header("Host", "localhost")
+        .body(Full::new(Bytes::from(csr_b64)))
+        .expect("build request");
+
+    let resp = env.send_request(req).await;
+    assert_eq!(
+        resp.status(),
+        200,
+        "case-insensitive CN match should succeed"
     );
 }
 
