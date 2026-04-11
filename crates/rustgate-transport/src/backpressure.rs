@@ -11,6 +11,20 @@
 //! message work, and decrement via [`BackpressureGate::sub`] when the work
 //! completes. [`BackpressurePermit`] provides a panic-safe RAII wrapper
 //! that subs on drop.
+//!
+//! ## Per-session delivery strategy
+//!
+//! The global gate protects against overall system memory exhaustion, but
+//! per-session message delivery is always non-blocking. The router uses
+//! `try_send` for every recipient channel so a single slow consumer
+//! cannot block delivery to all other sessions:
+//!
+//! - **Direct** messages to full channels are persisted for offline
+//!   redelivery via the store-and-forward queue.
+//! - **Group** and **broadcast** messages to full channels are dropped
+//!   and counted.
+//! - The per-session circuit breaker disconnects persistently slow
+//!   sessions after N consecutive `try_send` failures.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
