@@ -70,7 +70,10 @@ impl TestEnv {
     ) -> tokio::task::JoinHandle<()> {
         let signer = CsrSigner::from_pem(&self.ca_cert_pem, &self.ca_key_pem, "TestOrg")
             .expect("build signer for server");
-        let credentials = Credentials::new("admin".to_string(), "secret".to_string());
+        let credentials = Credentials::new(
+            "admin".to_string(),
+            zeroize::Zeroizing::new("secret".to_string()),
+        );
         let mut server = EnrollmentServer::new(signer, credentials)
             .with_rate_limit(max_per_minute, std::time::Duration::from_secs(60));
         if let Some(cb) = on_rate_limit {

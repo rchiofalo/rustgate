@@ -58,7 +58,10 @@ impl EstTestEnv {
     fn spawn_server(&self) -> tokio::task::JoinHandle<()> {
         let signer = CsrSigner::from_pem(&self.ca_cert_pem, &self.ca_key_pem, "TestOrg")
             .expect("build signer");
-        let credentials = Credentials::new("admin".to_string(), "secret".to_string());
+        let credentials = Credentials::new(
+            "admin".to_string(),
+            zeroize::Zeroizing::new("secret".to_string()),
+        );
         let server = EnrollmentServer::new(signer, credentials)
             .with_rate_limit(10, std::time::Duration::from_secs(60))
             .with_est();
@@ -408,7 +411,10 @@ async fn est_disabled_returns_404() {
     // Spawn server WITHOUT .with_est() — EST paths should 404.
     let signer =
         CsrSigner::from_pem(&env.ca_cert_pem, &env.ca_key_pem, "TestOrg").expect("build signer");
-    let credentials = Credentials::new("admin".to_string(), "secret".to_string());
+    let credentials = Credentials::new(
+        "admin".to_string(),
+        zeroize::Zeroizing::new("secret".to_string()),
+    );
     let server = EnrollmentServer::new(signer, credentials); // no .with_est()
 
     let addr = env.addr;
@@ -447,7 +453,10 @@ async fn est_simpleenroll_rate_limited() {
 
     let signer =
         CsrSigner::from_pem(&env.ca_cert_pem, &env.ca_key_pem, "TestOrg").expect("build signer");
-    let credentials = Credentials::new("admin".to_string(), "secret".to_string());
+    let credentials = Credentials::new(
+        "admin".to_string(),
+        zeroize::Zeroizing::new("secret".to_string()),
+    );
     let server = EnrollmentServer::new(signer, credentials)
         .with_rate_limit(2, std::time::Duration::from_secs(60))
         .with_est();

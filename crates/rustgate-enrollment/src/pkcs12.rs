@@ -1,11 +1,29 @@
-//! Minimal PKCS#12 (PFX) builder for TAK v1 enrollment.
+//! Minimal PKCS#12 (PFX) builder for v1 enrollment.
 //!
-//! Builds a password-encrypted PKCS#12 bundle containing a signed client
-//! certificate and the CA certificate chain. The bundle uses PBE-SHA1-3DES
-//! encryption which is compatible with Java/Android TAK clients.
+//! Builds a PKCS#12 bundle containing a signed client certificate and the
+//! CA certificate chain. Certificate bags are stored **unencrypted**;
+//! integrity is provided by an HMAC-SHA1 MAC over the
+//! `AuthenticatedSafe` content using the standardized password.
+//!
+//! ## Security note — RC2-40 / unencrypted cert bags
+//!
+//! The PKCS#12 specification (RFC 7292) supports PBE-SHA1-RC2-40 for
+//! encrypting certificate bags, but RC2-40 provides only **40 bits** of
+//! effective key strength — far below modern brute-force thresholds.
+//! This implementation skips certificate-bag encryption entirely because:
+//!
+//! 1. The password is standardized and publicly known, so any
+//!    PBE layer is nominal — it provides no real confidentiality.
+//! 2. The bundle is delivered over an mTLS-protected channel, which is
+//!    the actual security boundary.
+//! 3. Omitting PBE avoids legacy cipher dependencies while maintaining
+//!    full compatibility with Java/Android clients.
+//!
+//! If a future client ecosystem requires encrypted cert bags, use
+//! PBE-SHA1-3DES (168-bit) at minimum — never RC2-40.
 //!
 //! This is a purpose-built implementation covering only the subset of
-//! PKCS#12 needed for TAK enrollment responses. For the full spec, see
+//! PKCS#12 needed for enrollment responses. For the full spec, see
 //! RFC 7292.
 
 use sha1::Sha1;
@@ -19,9 +37,9 @@ const TAK_P12_PASSWORD: &str = "atakatak";
 
 /// Build a PKCS#12 bundle containing the signed client cert and CA cert.
 ///
-/// The bundle is encrypted with the standard TAK password ("atakatak")
-/// and uses PBE-SHA1-RC2-40 for the cert bag (compatible with legacy
-/// Java clients). Returns the raw PFX bytes.
+/// Certificate bags are stored unencrypted (see module-level security
+/// note). Integrity is verified via HMAC-SHA1 MAC using the standard
+/// password. Returns the raw PFX bytes.
 pub fn build_p12_bundle(
     signed_cert_der: &[u8],
     ca_cert_der: &[u8],

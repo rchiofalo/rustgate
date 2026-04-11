@@ -21,11 +21,13 @@ impl std::fmt::Debug for Credentials {
 }
 
 impl Credentials {
-    pub fn new(username: String, password: String) -> Self {
-        Self {
-            username,
-            password: Zeroizing::new(password),
-        }
+    /// Create a new set of credentials.
+    ///
+    /// Accepts the password already wrapped in [`Zeroizing`] so the caller
+    /// never holds an unzeroized copy. Use `Zeroizing::new(password)` at
+    /// the point closest to the original source (CLI arg, env var, file).
+    pub fn new(username: String, password: Zeroizing<String>) -> Self {
+        Self { username, password }
     }
 
     /// Validate a Basic Auth header value. Returns the username on success.
@@ -58,7 +60,7 @@ mod tests {
     use super::*;
 
     fn creds() -> Credentials {
-        Credentials::new("admin".to_string(), "secret".to_string())
+        Credentials::new("admin".to_string(), Zeroizing::new("secret".to_string()))
     }
 
     fn encode_basic(user: &str, pass: &str) -> String {
@@ -117,14 +119,17 @@ mod tests {
 
     #[test]
     fn password_with_colons() {
-        let c = Credentials::new("admin".to_string(), "pass:with:colons".to_string());
+        let c = Credentials::new(
+            "admin".to_string(),
+            Zeroizing::new("pass:with:colons".to_string()),
+        );
         let header = encode_basic("admin", "pass:with:colons");
         assert_eq!(c.validate(Some(&header)), Some("admin"));
     }
 
     #[test]
     fn empty_password() {
-        let c = Credentials::new("admin".to_string(), String::new());
+        let c = Credentials::new("admin".to_string(), Zeroizing::new(String::new()));
         let header = encode_basic("admin", "");
         assert_eq!(c.validate(Some(&header)), Some("admin"));
     }

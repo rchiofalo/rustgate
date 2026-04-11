@@ -261,13 +261,16 @@ async fn refresh_once(
 
 /// Convert an [`X509Svid`] into the DER-encoded cert chain + PKCS#8 private
 /// key bytes expected by [`CertReloader::update_from_der`].
-fn svid_to_der(svid: &X509Svid) -> (Vec<Vec<u8>>, Vec<u8>) {
+///
+/// The private key is wrapped in [`Zeroizing`] so it is wiped from memory
+/// once the caller is done with it.
+fn svid_to_der(svid: &X509Svid) -> (Vec<Vec<u8>>, Zeroizing<Vec<u8>>) {
     let chain: Vec<Vec<u8>> = svid
         .cert_chain()
         .iter()
         .map(|c: &Certificate| c.as_bytes().to_vec())
         .collect();
-    let key = svid.private_key().as_bytes().to_vec();
+    let key = Zeroizing::new(svid.private_key().as_bytes().to_vec());
     (chain, key)
 }
 

@@ -604,7 +604,7 @@ pub(crate) async fn start_enrollment(
             .context("building CSR signer for enrollment")?;
     let credentials = rustgate_enrollment::Credentials::new(
         enrollment_user.to_string(),
-        enrollment_password.to_string(),
+        zeroize::Zeroizing::new(enrollment_password.to_string()),
     );
     let enrollment_router = Arc::clone(router);
     let contacts_provider: rustgate_enrollment::ContactsProvider = Arc::new(move || {

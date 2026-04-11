@@ -250,8 +250,10 @@ impl FederationManager {
         // Read TLS certificate material
         let cert_pem = std::fs::read_to_string(&self.config.cert_file)
             .map_err(|e| anyhow::anyhow!("read cert file: {e}"))?;
-        let key_pem = std::fs::read_to_string(&self.config.key_file)
-            .map_err(|e| anyhow::anyhow!("read key file: {e}"))?;
+        let key_pem = zeroize::Zeroizing::new(
+            std::fs::read_to_string(&self.config.key_file)
+                .map_err(|e| anyhow::anyhow!("read key file: {e}"))?,
+        );
         let ca_pem = std::fs::read_to_string(&self.config.ca_file)
             .map_err(|e| anyhow::anyhow!("read CA file: {e}"))?;
 

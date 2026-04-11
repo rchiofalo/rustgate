@@ -80,8 +80,10 @@ impl PeerConnector {
     ) -> anyhow::Result<Self> {
         let cert_pem = std::fs::read_to_string(cert)
             .with_context(|| format!("reading federation cert from {}", cert.display()))?;
-        let key_pem = std::fs::read_to_string(key)
-            .with_context(|| format!("reading federation key from {}", key.display()))?;
+        let key_pem = Zeroizing::new(
+            std::fs::read_to_string(key)
+                .with_context(|| format!("reading federation key from {}", key.display()))?,
+        );
         let ca_pem = std::fs::read_to_string(ca)
             .with_context(|| format!("reading federation CA from {}", ca.display()))?;
 
