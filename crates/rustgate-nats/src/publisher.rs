@@ -164,7 +164,6 @@ const MAX_TOKEN_LENGTH: usize = 256;
 /// - ASCII control characters (0x00-0x1F, 0x7F) are stripped
 /// - Non-ASCII characters are stripped (NATS subjects must be ASCII-safe)
 /// - Whitespace (space, tab, etc.) is stripped
-/// - Leading/trailing whitespace in the result is trimmed
 /// - Empty results return `None`
 /// - Result is capped at [`MAX_TOKEN_LENGTH`] bytes
 ///
@@ -192,14 +191,16 @@ fn sanitize_nats_token(s: &str) -> Option<Cow<'_, str>> {
         .filter(|c| !c.is_ascii_whitespace()) // strip whitespace
         .filter(|c| *c != '*' && *c != '>') // strip NATS wildcards
         .map(|c| if c == '.' { '_' } else { c }) // replace separator
+        // `.take()` counts chars, but at this point only ASCII survives
+        // (non-ASCII was stripped above), so chars == bytes. Reordering the
+        // filter chain would break this invariant.
         .take(MAX_TOKEN_LENGTH) // cap length
         .collect();
 
-    let trimmed = sanitized.trim();
-    if trimmed.is_empty() {
+    if sanitized.is_empty() {
         None
     } else {
-        Some(Cow::Owned(trimmed.to_string()))
+        Some(Cow::Owned(sanitized))
     }
 }
 
