@@ -1234,26 +1234,30 @@ impl Cli {
     /// ACL reload interval bounds. All errors are actionable messages
     /// so operators can fix configuration before the server starts.
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
-        if self.cert.is_empty() {
-            anyhow::bail!("--cert (or [cert] in the config file) is required");
-        }
-        if self.key.is_empty() {
-            anyhow::bail!("--key (or [key] in the config file) is required");
-        }
-        if self.ca.is_empty() {
-            anyhow::bail!("--ca (or [ca] in the config file) is required");
-        }
+        // SPIFFE mode obtains cert/key/ca from the Workload API, so
+        // file-based TLS checks do not apply.
+        if !self.spiffe {
+            if self.cert.is_empty() {
+                anyhow::bail!("--cert (or [cert] in the config file) is required");
+            }
+            if self.key.is_empty() {
+                anyhow::bail!("--key (or [key] in the config file) is required");
+            }
+            if self.ca.is_empty() {
+                anyhow::bail!("--ca (or [ca] in the config file) is required");
+            }
 
-        // TLS file existence — catch typos / missing mounts before the
-        // TLS stack produces a cryptic I/O error.
-        if !self.cert.is_empty() && !std::path::Path::new(&self.cert).exists() {
-            anyhow::bail!("TLS cert file not found: {}", self.cert);
-        }
-        if !self.key.is_empty() && !std::path::Path::new(&self.key).exists() {
-            anyhow::bail!("TLS key file not found: {}", self.key);
-        }
-        if !self.ca.is_empty() && !std::path::Path::new(&self.ca).exists() {
-            anyhow::bail!("TLS CA file not found: {}", self.ca);
+            // TLS file existence — catch typos / missing mounts before the
+            // TLS stack produces a cryptic I/O error.
+            if !self.cert.is_empty() && !std::path::Path::new(&self.cert).exists() {
+                anyhow::bail!("TLS cert file not found: {}", self.cert);
+            }
+            if !self.key.is_empty() && !std::path::Path::new(&self.key).exists() {
+                anyhow::bail!("TLS key file not found: {}", self.key);
+            }
+            if !self.ca.is_empty() && !std::path::Path::new(&self.ca).exists() {
+                anyhow::bail!("TLS CA file not found: {}", self.ca);
+            }
         }
 
         // Federation requires an explicit identity.
@@ -1273,21 +1277,20 @@ impl Cli {
             );
         }
 
-        // Authz fail-open without a policy file is a no-op that misleads operators.
+        // Authz fail-open without a policy file is a no-op; warn rather
+        // than bail so the server still starts (harmless misconfiguration).
         if self.authz_fail_open && self.authz_policy_file.is_none() {
-            anyhow::bail!("--authz-fail-open has no effect without --authz-policy-file");
+            tracing::warn!("--authz-fail-open has no effect without --authz-policy-file");
         }
 
         if self.authz_policy_file.is_some() && self.authz_reload_interval == 0 {
             anyhow::bail!("--authz-reload-interval must be >= 1 when --authz-policy-file is set");
         }
 
-        // ACL reload interval must be at least 1 second when active.
-        if self.group_acl_file.is_some()
-            && self.acl_reload_interval > 0
-            && self.acl_reload_interval < 1
-        {
-            anyhow::bail!("--acl-reload-interval must be >= 1 second");
+        // ACL reload interval must be non-zero when an ACL file is set,
+        // matching the authz_reload_interval check above.
+        if self.group_acl_file.is_some() && self.acl_reload_interval == 0 {
+            anyhow::bail!("--acl-reload-interval must be >= 1 when --group-acl-file is set");
         }
 
         // Validate ws buffer size — CLI args go through the clap value_parser,
@@ -2000,17 +2003,29 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_authz_fail_open_without_policy() {
+    fn validate_warns_authz_fail_open_without_policy() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let mut cli = cli_with_temp_tls(&dir);
         cli.authz_fail_open = true;
         cli.authz_policy_file = None;
 
+        // Should succeed (warn, not bail).
+        cli.validate()
+            .expect("authz-fail-open without policy should warn, not error");
+    }
+
+    #[test]
+    fn validate_rejects_acl_reload_interval_zero_with_acl_file() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut cli = cli_with_temp_tls(&dir);
+        cli.group_acl_file = Some("/tmp/acl.json".to_owned());
+        cli.acl_reload_interval = 0;
+
         let err = cli.validate().unwrap_err();
         assert!(
             err.to_string()
-                .contains("--authz-fail-open has no effect without --authz-policy-file"),
-            "expected fail-open error, got: {err}"
+                .contains("--acl-reload-interval must be >= 1 when --group-acl-file is set"),
+            "expected acl-reload-interval error, got: {err}"
         );
     }
 
