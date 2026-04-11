@@ -1,6 +1,6 @@
 #![allow(clippy::panic, clippy::unwrap_used)]
 //! Integration tests for the rustgate-authz PolicyEngine wired into
-//! `Router::route`. Covers the five PR 3 acceptance scenarios:
+//! `Router::route`. Covers the acceptance scenarios:
 //!
 //! 1. no engine installed → routing behaves as before
 //! 2. engine that allows everything → all messages flow
@@ -8,6 +8,10 @@
 //! 4. engine that denies one recipient on Receive → other recipients
 //!    still get the message
 //! 5. `swap_authz` mid-flight → the new engine takes effect atomically
+//! 6. direct unicast honours per-recipient Receive deny
+//! 7. broadcast honours per-recipient Receive deny
+//! 8. store-forward drain re-evaluates authz after policy change
+//! 9. store-forward drain allows delivery when policy permits
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -335,5 +339,91 @@ async fn deny_receive_blocks_broadcast_per_recipient() {
     assert!(
         nrx_c.try_recv().is_err(),
         "charlie is denied Receive and must not see the broadcast"
+    );
+}
+
+/// Messages queued via store-forward while no policy was active must be
+/// filtered out when a deny policy is installed before the drain runs.
+/// This proves that `filter_offline_messages` re-evaluates the *current*
+/// engine, not the one in effect at storage time.
+#[tokio::test]
+async fn store_forward_drain_re_evaluates_authz_after_policy_change() {
+    use rustgate_transport::ClientQueue;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let queue = std::sync::Arc::new(ClientQueue::open(tmp.path(), 1_000_000).unwrap());
+
+    // Start with NO authz engine so the message is accepted by the Send PEP.
+    let router = Router::new().with_client_queue(std::sync::Arc::clone(&queue));
+    let alice = identity("alice", &["alpha"]);
+    let bob = identity("bob", &["alpha"]);
+
+    // Route a direct message to bob while bob is offline. The router
+    // persists it to the store-forward queue.
+    router
+        .route(chat(&alice, Destination::Direct((*bob).clone())))
+        .await;
+
+    // Wait for the async writer task to persist the message.
+    for _ in 0..200 {
+        if queue.stats("bob").depth == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(queue.stats("bob").depth, 1, "message must be queued");
+
+    // Now install a deny-all policy BEFORE draining.
+    router.swap_authz(Arc::new(DenyAllEngine));
+
+    // Drain and filter: the deny-all engine must block the stored message
+    // even though it was accepted at storage time.
+    let drained = router.drain_offline_messages("bob").await;
+    assert_eq!(drained.len(), 1, "drain returns the raw stored message");
+
+    let filtered = router.filter_offline_messages(&bob, drained);
+    assert!(
+        filtered.is_empty(),
+        "policy change after storage must block delivery on drain"
+    );
+}
+
+/// Complement of the deny test: messages queued while a deny policy was
+/// active and then drained after clearing the policy must be delivered.
+/// This confirms that `filter_offline_messages` uses the *current*
+/// engine snapshot, not a stale one.
+#[tokio::test]
+async fn store_forward_drain_allows_delivery_when_policy_permits() {
+    use rustgate_transport::ClientQueue;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let queue = std::sync::Arc::new(ClientQueue::open(tmp.path(), 1_000_000).unwrap());
+
+    // Start with allow-all so the Send PEP lets the message through.
+    let router = Router::new()
+        .with_authz(allow_all_engine())
+        .with_client_queue(std::sync::Arc::clone(&queue));
+    let alice = identity("alice", &["alpha"]);
+    let bob = identity("bob", &["alpha"]);
+
+    router
+        .route(chat(&alice, Destination::Direct((*bob).clone())))
+        .await;
+
+    for _ in 0..200 {
+        if queue.stats("bob").depth == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(queue.stats("bob").depth, 1);
+
+    // Policy stays allow-all — drain should pass the filter.
+    let drained = router.drain_offline_messages("bob").await;
+    let filtered = router.filter_offline_messages(&bob, drained);
+    assert_eq!(
+        filtered.len(),
+        1,
+        "allow-all policy must permit delivery of queued messages"
     );
 }
