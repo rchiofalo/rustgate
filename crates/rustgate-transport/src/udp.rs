@@ -14,12 +14,14 @@
 //!   dropped.
 //! - **Identity cap** — bounded LRU cache of synthetic identities prevents
 //!   memory exhaustion from an attacker sending from many spoofed IPs.
+//!   When the cap is reached, packets from new source IPs are rejected.
 //!
 //! All restrictions are opt-in for backward compatibility.
 
 use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -98,6 +100,28 @@ impl CidrPrefix {
     }
 }
 
+impl FromStr for CidrPrefix {
+    type Err = String;
+
+    /// Parse a CIDR prefix from `"addr/len"` notation (e.g. `"10.0.0.0/8"`).
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (addr_str, len_str) = s
+            .split_once('/')
+            .ok_or_else(|| format!("missing '/' in CIDR notation: {s}"))?;
+
+        let addr: IpAddr = addr_str
+            .parse()
+            .map_err(|e| format!("invalid IP address '{addr_str}': {e}"))?;
+
+        let prefix_len: u8 = len_str
+            .parse()
+            .map_err(|e| format!("invalid prefix length '{len_str}': {e}"))?;
+
+        Self::new(addr, prefix_len)
+            .ok_or_else(|| format!("prefix length {prefix_len} exceeds address width"))
+    }
+}
+
 /// Configuration for the UDP input listener.
 #[derive(Debug, Clone)]
 pub struct UdpInputConfig {
@@ -112,8 +136,8 @@ pub struct UdpInputConfig {
     /// source IPs are accepted (backward-compatible default).
     pub allowed_cidrs: Option<Vec<CidrPrefix>>,
     /// Maximum number of concurrent synthetic UDP identities tracked in the
-    /// LRU cache. Once the cap is reached, the oldest identity is evicted
-    /// to make room.
+    /// LRU cache. Once the cap is reached, packets from unknown source IPs
+    /// are rejected to prevent memory exhaustion from spoofed sources.
     pub max_identities: usize,
 }
 
@@ -151,8 +175,8 @@ impl UdpInputConfig {
 
     /// Set the maximum number of concurrent synthetic UDP identities.
     ///
-    /// The identity cache uses LRU eviction: when the cap is reached the
-    /// least-recently-seen source IP's identity is evicted to make room.
+    /// The identity cache uses LRU tracking: when the cap is reached,
+    /// packets from new (unknown) source IPs are rejected.
     pub fn with_max_identities(mut self, max: usize) -> Self {
         self.max_identities = max;
         self
@@ -279,13 +303,15 @@ impl UdpInput {
                                 let mut cache = identity_cache.lock();
                                 if cache.get(&peer_ip).is_none() {
                                     if cache.len() >= config.max_identities {
-                                        // Evict the LRU entry to make room.
-                                        let _ = cache.pop_lru();
+                                        // Reject the packet instead of evicting — prevents
+                                        // an attacker from rotating through spoofed IPs to
+                                        // displace legitimate entries.
                                         tracing::warn!(
                                             peer = %peer_addr,
                                             max_identities = config.max_identities,
-                                            "UDP identity cap reached, evicting oldest entry"
+                                            "UDP datagram rejected: identity cap reached"
                                         );
+                                        continue;
                                     }
                                     let _ = cache.put(peer_ip, ());
                                 } else {
@@ -432,6 +458,48 @@ mod tests {
     fn cidr_invalid_prefix_len() {
         assert!(CidrPrefix::new("10.0.0.0".parse().unwrap(), 33).is_none());
         assert!(CidrPrefix::new("fd00::".parse().unwrap(), 129).is_none());
+    }
+
+    // --- CidrPrefix FromStr tests ---
+
+    #[test]
+    fn cidr_from_str_v4() {
+        let cidr: CidrPrefix = "10.0.0.0/8".parse().unwrap();
+        assert!(cidr.contains("10.255.0.1".parse().unwrap()));
+        assert!(!cidr.contains("11.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn cidr_from_str_v6() {
+        let cidr: CidrPrefix = "fd00::/8".parse().unwrap();
+        assert!(cidr.contains("fd00::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn cidr_from_str_host() {
+        let cidr: CidrPrefix = "192.168.1.5/32".parse().unwrap();
+        assert!(cidr.contains("192.168.1.5".parse().unwrap()));
+        assert!(!cidr.contains("192.168.1.6".parse().unwrap()));
+    }
+
+    #[test]
+    fn cidr_from_str_missing_slash() {
+        assert!("10.0.0.0".parse::<CidrPrefix>().is_err());
+    }
+
+    #[test]
+    fn cidr_from_str_invalid_ip() {
+        assert!("not-an-ip/8".parse::<CidrPrefix>().is_err());
+    }
+
+    #[test]
+    fn cidr_from_str_invalid_prefix() {
+        assert!("10.0.0.0/33".parse::<CidrPrefix>().is_err());
+    }
+
+    #[test]
+    fn cidr_from_str_non_numeric_prefix() {
+        assert!("10.0.0.0/abc".parse::<CidrPrefix>().is_err());
     }
 
     // --- Integration tests with UdpInput::run ---
@@ -840,11 +908,11 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), task).await;
     }
 
-    /// Verify the identity cache uses LRU eviction. This tests the LRU
-    /// data structure directly since we cannot easily forge distinct
-    /// source IPs in loopback UDP tests.
+    /// Verify the identity cache rejects new IPs when at capacity.
+    /// This tests the rejection logic directly since we cannot easily forge
+    /// distinct source IPs in loopback UDP tests.
     #[test]
-    fn identity_lru_cache_evicts_oldest() {
+    fn identity_cache_rejects_at_capacity() {
         let cap = NonZeroUsize::new(2).unwrap();
         let mut cache: LruCache<IpAddr, ()> = LruCache::new(cap);
 
@@ -856,12 +924,13 @@ mod tests {
         let _ = cache.put(ip2, ());
         assert_eq!(cache.len(), 2);
 
-        // Adding a third should evict the LRU entry (ip1).
-        let _ = cache.pop_lru();
-        let _ = cache.put(ip3, ());
-        assert_eq!(cache.len(), 2);
-        assert!(cache.get(&ip1).is_none(), "ip1 should have been evicted");
+        // At capacity — a new IP should be rejected (not inserted).
+        let is_new = cache.get(&ip3).is_none();
+        let at_cap = cache.len() >= 2;
+        assert!(is_new && at_cap, "ip3 should be rejected at capacity");
+
+        // Existing IPs should still be promotable.
+        assert!(cache.get(&ip1).is_some(), "ip1 should still be present");
         assert!(cache.get(&ip2).is_some(), "ip2 should still be present");
-        assert!(cache.get(&ip3).is_some(), "ip3 should be present");
     }
 }

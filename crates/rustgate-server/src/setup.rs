@@ -1465,11 +1465,36 @@ pub(crate) async fn start_udp<P: NatsPublish + Send + Sync + 'static>(
         .await
         .context("binding UDP socket")?;
 
-    let config = rustgate_transport::UdpInputConfig {
+    let mut config = rustgate_transport::UdpInputConfig {
         cn: cli.plaintext_cn.clone(),
         default_group: cli.plaintext_group.clone(),
         ..Default::default()
     };
+
+    // Apply CLI rate-limit flag (0 = disabled).
+    if cli.udp_rate_limit > 0 {
+        config.max_pps = Some(cli.udp_rate_limit as usize);
+    }
+
+    // Parse and apply CIDR allowlist from comma-separated string.
+    if let Some(ref cidrs_str) = cli.udp_allowed_cidrs {
+        let mut cidrs = Vec::new();
+        for entry in cidrs_str.split(',') {
+            let trimmed = entry.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let cidr: rustgate_transport::CidrPrefix = trimmed.parse().map_err(|e| {
+                anyhow::anyhow!("invalid --udp-allowed-cidrs entry '{trimmed}': {e}")
+            })?;
+            cidrs.push(cidr);
+        }
+        if !cidrs.is_empty() {
+            config.allowed_cidrs = Some(cidrs);
+        }
+    }
+
+    config.max_identities = cli.udp_max_identities;
 
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let shutdown_clone = Arc::clone(&shutdown);
