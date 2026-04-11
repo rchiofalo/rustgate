@@ -21,6 +21,8 @@ use prometheus::{
     TextEncoder,
 };
 use rustgate_core::constants::HTTP_CONNECTION_TIMEOUT;
+use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
 /// Type-erased federation API handler.
 ///
@@ -1324,9 +1326,24 @@ fn probe_response(
     }
 }
 
+/// Constant-time check of a supplied bearer token against the expected value.
+///
+/// Returns `true` when the `Authorization` header is present, starts with
+/// `Bearer `, and the remainder matches `expected` in constant time.
+fn metrics_auth_ok(header: Option<&str>, expected: &[u8]) -> bool {
+    let Some(raw) = header else {
+        return false;
+    };
+    let Some(token) = raw.strip_prefix("Bearer ") else {
+        return false;
+    };
+    token.as_bytes().ct_eq(expected).into()
+}
+
 fn handle_request(
     req: Request<hyper::body::Incoming>,
     health: Arc<HealthState>,
+    metrics_token: Option<Arc<Zeroizing<Vec<u8>>>>,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
     match req.uri().path() {
         // Liveness: process loop is reachable. Returns 200 once the
@@ -1349,6 +1366,21 @@ fn handle_request(
         "/readyz" => Ok(probe_response(health.is_ready(), "ok", "not ready")),
 
         "/metrics" => {
+            // When a metrics token is configured, require valid auth.
+            if let Some(ref expected) = metrics_token {
+                let auth = req
+                    .headers()
+                    .get(hyper::header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok());
+                if !metrics_auth_ok(auth, expected) {
+                    return Ok(Response::builder()
+                        .status(StatusCode::UNAUTHORIZED)
+                        .header(hyper::header::WWW_AUTHENTICATE, "Bearer")
+                        .body(Full::new(Bytes::from("unauthorized")))
+                        .unwrap_or_else(|_| internal_error_response()));
+                }
+            }
+
             let encoder = TextEncoder::new();
             let metric_families = prometheus::gather();
             let mut buffer = Vec::new();
@@ -1375,12 +1407,17 @@ fn handle_request(
 /// Serve Prometheus metrics and health endpoints at the given address.
 ///
 /// Routes:
-/// - `GET /metrics`        — Prometheus text format
+/// - `GET /metrics`        — Prometheus text format (optionally authenticated)
 /// - `GET /health/live`    — Kubernetes liveness probe
 /// - `GET /health/ready`   — Kubernetes readiness probe
 /// - `GET /health/startup` — Kubernetes startup probe
 /// - `GET /healthz`        — Deprecated alias for `/health/live`
 /// - `GET /readyz`         — Deprecated alias for `/health/ready`
+///
+/// When `metrics_token` is `Some`, requests to `/metrics` must present a
+/// valid `Authorization: Bearer <token>` header; missing or mismatched
+/// tokens yield a 401 response. When `None`, `/metrics` is served without
+/// authentication for backward compatibility.
 ///
 /// The server is hardened against unauthenticated abuse:
 /// - Connection count bounded by [`MAX_HTTP_CONNECTIONS`]
@@ -1391,6 +1428,7 @@ pub async fn serve(
     health: Arc<HealthState>,
     #[cfg(feature = "federation")] fed_api: Arc<OnceLock<FedApiHandler>>,
     acl_api: Arc<OnceLock<AclApiHandler>>,
+    metrics_token: Option<Arc<Zeroizing<Vec<u8>>>>,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let conn_limit = Arc::new(tokio::sync::Semaphore::new(MAX_HTTP_CONNECTIONS));
@@ -1416,6 +1454,7 @@ pub async fn serve(
         #[cfg(feature = "federation")]
         let fed_api = Arc::clone(&fed_api);
         let acl_api = Arc::clone(&acl_api);
+        let metrics_token = metrics_token.clone();
         drop(tokio::spawn(async move {
             let _permit = permit;
             let conn = hyper::server::conn::http1::Builder::new()
@@ -1428,6 +1467,7 @@ pub async fn serve(
                         #[cfg(feature = "federation")]
                         let fed_api = Arc::clone(&fed_api);
                         let acl_api = Arc::clone(&acl_api);
+                        let metrics_token = metrics_token.clone();
                         async move {
                             // Delegate /api/federation/ paths to the federation handler
                             #[cfg(feature = "federation")]
@@ -1475,7 +1515,7 @@ pub async fn serve(
                             // If no ACL handler is registered, fall
                             // through to the generic request handler,
                             // which returns 404 for unknown paths.
-                            handle_request(req, health)
+                            handle_request(req, health, metrics_token)
                         }
                     }),
                 );
@@ -1490,6 +1530,8 @@ pub async fn serve(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::panic, clippy::unwrap_used)]
+
     use std::sync::Once;
 
     use super::*;
@@ -1667,6 +1709,7 @@ mod tests {
                 #[cfg(feature = "federation")]
                 Arc::new(OnceLock::new()),
                 Arc::new(OnceLock::new()),
+                None, // no metrics token — backward compatible unauthenticated
             )
             .await;
         }));
@@ -1874,5 +1917,223 @@ mod tests {
                 .get(),
             before + 1
         );
+    }
+
+    // ── Metrics authentication tests ───────────────────────────────
+
+    #[test]
+    fn metrics_auth_ok_rejects_missing_header() {
+        assert!(!metrics_auth_ok(None, b"s3cret-token-for-metrics-test1"));
+    }
+
+    #[test]
+    fn metrics_auth_ok_rejects_wrong_scheme() {
+        assert!(!metrics_auth_ok(
+            Some("Basic s3cret-token-for-metrics-test1"),
+            b"s3cret-token-for-metrics-test1"
+        ));
+    }
+
+    #[test]
+    fn metrics_auth_ok_rejects_wrong_token() {
+        assert!(!metrics_auth_ok(
+            Some("Bearer wrong-token-value-padding-xxxx"),
+            b"s3cret-token-for-metrics-test1"
+        ));
+    }
+
+    #[test]
+    fn metrics_auth_ok_accepts_correct_token() {
+        assert!(metrics_auth_ok(
+            Some("Bearer s3cret-token-for-metrics-test1"),
+            b"s3cret-token-for-metrics-test1"
+        ));
+    }
+
+    /// Minimal HTTP GET with an optional Authorization header.
+    async fn http_get_with_auth(addr: SocketAddr, path: &str, auth: Option<&str>) -> (u16, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+
+        let auth_header = match auth {
+            Some(val) => format!("Authorization: {val}\r\n"),
+            None => String::new(),
+        };
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: {addr}\r\n{auth_header}Connection: close\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.expect("write");
+
+        let mut buf = Vec::new();
+        let _ = stream.read_to_end(&mut buf).await.expect("read");
+        let response = String::from_utf8_lossy(&buf);
+
+        let status_line = response.lines().next().unwrap_or("");
+        let status: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b.to_string())
+            .unwrap_or_default();
+
+        (status, body)
+    }
+
+    /// Minimal HTTP GET returning status, raw headers block, and body.
+    async fn http_get_raw(
+        addr: SocketAddr,
+        path: &str,
+        auth: Option<&str>,
+    ) -> (u16, String, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+
+        let auth_header = match auth {
+            Some(val) => format!("Authorization: {val}\r\n"),
+            None => String::new(),
+        };
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: {addr}\r\n{auth_header}Connection: close\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.expect("write");
+
+        let mut buf = Vec::new();
+        let _ = stream.read_to_end(&mut buf).await.expect("read");
+        let response = String::from_utf8_lossy(&buf);
+
+        let status_line = response.lines().next().unwrap_or("");
+        let status: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        let (headers_part, body) = response
+            .split_once("\r\n\r\n")
+            .map(|(h, b)| (h.to_string(), b.to_string()))
+            .unwrap_or_default();
+
+        (status, headers_part, body)
+    }
+
+    /// Helper to start a metrics server with an optional auth token.
+    async fn start_test_server(token: Option<&[u8]>) -> SocketAddr {
+        let health = Arc::new(HealthState::new());
+        health.set_ready(true);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        drop(listener);
+
+        let metrics_token = token.map(|t| Arc::new(Zeroizing::new(t.to_vec())));
+
+        drop(tokio::spawn(async move {
+            let _ = serve(
+                addr,
+                health,
+                #[cfg(feature = "federation")]
+                Arc::new(OnceLock::new()),
+                Arc::new(OnceLock::new()),
+                metrics_token,
+            )
+            .await;
+        }));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        addr
+    }
+
+    #[tokio::test]
+    async fn metrics_requires_auth_when_token_configured() {
+        ensure_init();
+        let addr = start_test_server(Some(b"test-metrics-token-abcdef1234567")).await;
+
+        // No auth header -> 401
+        let (status, body) = http_get_with_auth(addr, "/metrics", None).await;
+        assert_eq!(status, 401);
+        assert!(body.contains("unauthorized"));
+    }
+
+    #[tokio::test]
+    async fn metrics_accepts_valid_token() {
+        ensure_init();
+        let token = b"test-metrics-token-abcdef1234567";
+        let addr = start_test_server(Some(token)).await;
+
+        let (status, body) = http_get_with_auth(
+            addr,
+            "/metrics",
+            Some("Bearer test-metrics-token-abcdef1234567"),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(body.contains("rustgate_connections_accepted_total"));
+    }
+
+    #[tokio::test]
+    async fn metrics_rejects_invalid_token() {
+        ensure_init();
+        let addr = start_test_server(Some(b"test-metrics-token-abcdef1234567")).await;
+
+        let (status, body) = http_get_with_auth(
+            addr,
+            "/metrics",
+            Some("Bearer wrong-metrics-token-padding-here"),
+        )
+        .await;
+        assert_eq!(status, 401);
+        assert!(body.contains("unauthorized"));
+    }
+
+    #[tokio::test]
+    async fn metrics_401_includes_www_authenticate_header() {
+        ensure_init();
+        let addr = start_test_server(Some(b"test-metrics-token-abcdef1234567")).await;
+
+        // RFC 6750 Section 3: 401 responses for bearer auth must include
+        // a WWW-Authenticate: Bearer header.
+        let (status, headers, _body) = http_get_raw(addr, "/metrics", None).await;
+        assert_eq!(status, 401);
+        let lower = headers.to_ascii_lowercase();
+        assert!(
+            lower.contains("www-authenticate: bearer"),
+            "expected WWW-Authenticate: Bearer header, got: {headers}"
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_unauthenticated_when_no_token() {
+        ensure_init();
+        let addr = start_test_server(None).await;
+
+        // No token configured -> /metrics is open (backward compat)
+        let (status, body) = http_get_with_auth(addr, "/metrics", None).await;
+        assert_eq!(status, 200);
+        assert!(body.contains("rustgate_connections_accepted_total"));
+    }
+
+    #[tokio::test]
+    async fn health_endpoints_bypass_metrics_auth() {
+        ensure_init();
+        let addr = start_test_server(Some(b"test-metrics-token-abcdef1234567")).await;
+
+        // Health endpoints should remain accessible without auth even
+        // when a metrics token is configured.
+        let (status, _) = http_get_with_auth(addr, "/health/live", None).await;
+        assert_eq!(status, 200);
+
+        let (status, _) = http_get_with_auth(addr, "/health/ready", None).await;
+        assert_eq!(status, 200);
+
+        let (status, _) = http_get_with_auth(addr, "/healthz", None).await;
+        assert_eq!(status, 200);
     }
 }

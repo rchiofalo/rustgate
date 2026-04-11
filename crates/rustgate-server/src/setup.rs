@@ -794,6 +794,26 @@ pub(crate) fn start_metrics(
         cli.metrics_per_identity,
     ));
 
+    // Load the optional metrics bearer token from file. When set,
+    // requests to `/metrics` must present this token; when unset the
+    // endpoint remains unauthenticated for backward compatibility.
+    let metrics_token: Option<Arc<zeroize::Zeroizing<Vec<u8>>>> = if let Some(ref token_file) =
+        cli.metrics_token_file
+    {
+        let raw = std::fs::read_to_string(token_file)
+            .map_err(|e| anyhow::anyhow!("failed to read metrics token file {token_file}: {e}"))?;
+        let token = raw.trim().as_bytes().to_vec();
+        if token.is_empty() {
+            anyhow::bail!("metrics token file {token_file} is empty");
+        }
+        crate::acl_api::validate_bearer_token_length(&token, "metrics bearer")
+            .map_err(|e| anyhow::anyhow!("{e} (from {token_file})"))?;
+        tracing::info!("metrics endpoint authentication enabled via --metrics-token-file");
+        Some(Arc::new(zeroize::Zeroizing::new(token)))
+    } else {
+        None
+    };
+
     if let Some(ref metrics_bind) = cli.metrics_bind {
         let bind_addr: std::net::SocketAddr = metrics_bind
             .parse()
@@ -803,6 +823,7 @@ pub(crate) fn start_metrics(
         #[cfg(feature = "federation")]
         let fed_api_for_metrics = Arc::clone(fed_api_slot);
         let acl_api_for_metrics = Arc::clone(acl_api_slot);
+        let metrics_token_for_server = metrics_token.clone();
         spawn_background("metrics-server", async move {
             if let Err(e) = metrics::serve(
                 bind_addr,
@@ -810,6 +831,7 @@ pub(crate) fn start_metrics(
                 #[cfg(feature = "federation")]
                 fed_api_for_metrics,
                 acl_api_for_metrics,
+                metrics_token_for_server,
             )
             .await
             {
@@ -826,6 +848,9 @@ pub(crate) fn start_metrics(
 pub(crate) fn warn_metrics_disabled(cli: &Cli) {
     if cli.metrics_bind.is_some() {
         tracing::warn!("--metrics-bind requires --features metrics; ignoring");
+    }
+    if cli.metrics_token_file.is_some() {
+        tracing::warn!("--metrics-token-file requires --features metrics; ignoring");
     }
     if cli.metrics_per_identity {
         tracing::warn!("--metrics-per-identity requires --features metrics; ignoring");
