@@ -167,7 +167,7 @@ fn build_detail(full: &xml_full::FullCotEvent) -> tak_proto::Detail {
 /// Serialize typed detail fields that have no protobuf counterpart back into
 /// the xml_detail string so they survive proto round-trips.
 fn serialize_typed_details_to_xml(full: &xml_full::FullCotEvent, buf: &mut String) {
-    if let Some(ref link) = full.link {
+    for link in &full.link {
         buf.push_str("<link");
         push_xml_attr(buf, "relation", &link.relation);
         push_xml_attr(buf, "type", &link.link_type);
@@ -193,7 +193,7 @@ fn serialize_typed_details_to_xml(full: &xml_full::FullCotEvent, buf: &mut Strin
             buf.push_str("/>");
         } else {
             buf.push('>');
-            buf.push_str(&remarks.text);
+            xml_escape_attr_into(buf, &remarks.text);
             buf.push_str("</remarks>");
         }
     }
@@ -233,11 +233,24 @@ fn serialize_typed_details_to_xml(full: &xml_full::FullCotEvent, buf: &mut Strin
     }
 }
 
-/// Append ` key="value"` to an XML buffer.
+/// Append ` key="value"` to an XML buffer with proper escaping.
 fn push_xml_attr(buf: &mut String, key: &str, value: &str) {
     buf.push(' ');
     buf.push_str(key);
     buf.push_str("=\"");
-    buf.push_str(value);
+    xml_escape_attr_into(buf, value);
     buf.push('"');
+}
+
+/// Escape special XML characters in attribute values to prevent injection.
+fn xml_escape_attr_into(buf: &mut String, s: &str) {
+    for c in s.chars() {
+        match c {
+            '&' => buf.push_str("&amp;"),
+            '<' => buf.push_str("&lt;"),
+            '>' => buf.push_str("&gt;"),
+            '"' => buf.push_str("&quot;"),
+            _ => buf.push(c),
+        }
+    }
 }

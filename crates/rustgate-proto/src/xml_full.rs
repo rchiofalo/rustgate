@@ -38,7 +38,7 @@ pub struct FullCotEvent {
     pub status: Option<StatusDetail>,
     pub takv: Option<TakvDetail>,
     pub track: Option<TrackDetail>,
-    pub link: Option<LinkDetail>,
+    pub link: Vec<LinkDetail>,
     pub remarks: Option<RemarksDetail>,
     pub color: Option<ColorDetail>,
     pub labels: Option<LabelsDetail>,
@@ -132,6 +132,10 @@ pub struct MartiDetail {
 /// Maximum bytes for residual xmlDetail to prevent unbounded memory growth
 /// from crafted input. 64 KiB is generous for legitimate CoT detail sections.
 const MAX_XML_DETAIL_BYTES: usize = 64 * 1024;
+
+/// Maximum number of `<dest>` entries in a `<marti>` element to prevent
+/// unbounded memory growth from crafted input.
+const MAX_MARTI_DESTINATIONS: usize = 1000;
 
 /// Parse CoT XML into a [`FullCotEvent`] with all protobuf-mappable fields.
 pub fn parse_full(xml: &[u8]) -> Result<FullCotEvent, ProtoError> {
@@ -314,7 +318,7 @@ fn parse_known_start(
             let _ = reader.read_to_end_into(e.to_end().name(), &mut skip_buf)?;
         }
         b"link" => {
-            event.link = Some(parse_link(e));
+            event.link.push(parse_link(e));
             let mut skip_buf = Vec::new();
             let _ = reader.read_to_end_into(e.to_end().name(), &mut skip_buf)?;
         }
@@ -356,13 +360,9 @@ fn parse_known_empty(tag: &[u8], e: &quick_xml::events::BytesStart<'_>, event: &
         b"status" => event.status = Some(parse_status(e)),
         b"takv" => event.takv = Some(parse_takv(e)),
         b"track" => event.track = Some(parse_track(e)),
-        b"link" => event.link = Some(parse_link(e)),
+        b"link" => event.link.push(parse_link(e)),
         b"remarks" => {
-            event.remarks = Some(RemarksDetail {
-                source: None,
-                timestamp: None,
-                text: String::new(),
-            });
+            event.remarks = Some(parse_remarks_empty(e));
         }
         b"color" => event.color = Some(parse_color(e)),
         b"labels" => event.labels = Some(parse_labels(e)),
@@ -502,7 +502,15 @@ fn parse_remarks_start(
     loop {
         inner_buf.clear();
         match reader.read_event_into(&mut inner_buf)? {
-            Event::Text(ref t) => text_buf.extend_from_slice(t.as_ref()),
+            Event::Text(ref t) => {
+                if text_buf.len() + t.len() > MAX_XML_DETAIL_BYTES {
+                    return Err(ProtoError::FrameTooLarge {
+                        size: text_buf.len() + t.len(),
+                        max: MAX_XML_DETAIL_BYTES,
+                    });
+                }
+                text_buf.extend_from_slice(t.as_ref());
+            }
             Event::End(ref end) if end.name().as_ref() == b"remarks" => break,
             Event::Eof => break,
             _ => {}
@@ -515,6 +523,25 @@ fn parse_remarks_start(
         timestamp,
         text,
     })
+}
+
+/// Parse attributes from a self-closing `<remarks/>` element.
+fn parse_remarks_empty(e: &quick_xml::events::BytesStart<'_>) -> RemarksDetail {
+    let mut source = None;
+    let mut timestamp = None;
+    for attr in e.attributes().flatten() {
+        let value = String::from_utf8_lossy(&attr.value).into_owned();
+        match attr.key.as_ref() {
+            b"source" => source = Some(value),
+            b"time" => timestamp = Some(value),
+            _ => {}
+        }
+    }
+    RemarksDetail {
+        source,
+        timestamp,
+        text: String::new(),
+    }
 }
 
 fn parse_color(e: &quick_xml::events::BytesStart<'_>) -> ColorDetail {
@@ -560,6 +587,9 @@ fn parse_marti_start(
         inner_buf.clear();
         match reader.read_event_into(&mut inner_buf)? {
             Event::Empty(ref child) if child.name().as_ref() == b"dest" => {
+                if dest_callsigns.len() >= MAX_MARTI_DESTINATIONS {
+                    continue;
+                }
                 for attr in child.attributes().flatten() {
                     if attr.key.as_ref() == b"callsign" {
                         dest_callsigns.push(String::from_utf8_lossy(&attr.value).into_owned());
@@ -748,7 +778,7 @@ mod tests {
         let color = evt.color.as_ref().expect("color");
         assert_eq!(color.argb, Some(-16_711_936));
 
-        let link = evt.link.as_ref().expect("link");
+        let link = evt.link.first().expect("link");
         assert_eq!(link.uid, "SENDER-1");
         assert_eq!(link.link_type, "a-f-G");
         assert_eq!(link.relation, "p-p");
@@ -823,7 +853,7 @@ mod tests {
         assert!(evt.xml_detail.contains("senderCallsign"));
 
         // link and remarks are now typed
-        let link = evt.link.as_ref().expect("link");
+        let link = evt.link.first().expect("link");
         assert_eq!(link.uid, "SENDER");
         assert_eq!(link.link_type, "a-f-G-U-C");
         assert_eq!(link.relation, "p-p");
@@ -906,7 +936,7 @@ mod tests {
         </event>"#;
 
         let evt = parse_full(xml).expect("parse");
-        let link = evt.link.expect("link");
+        let link = evt.link.into_iter().next().expect("link");
         assert_eq!(link.uid, "SENDER-1");
         assert_eq!(link.link_type, "a-f-G-U-C");
         assert_eq!(link.relation, "p-p");
@@ -1081,7 +1111,7 @@ mod tests {
         assert_eq!(evt.contact.as_ref().unwrap().callsign, "ALPHA");
 
         // New typed fields
-        let link = evt.link.as_ref().expect("link");
+        let link = evt.link.first().expect("link");
         assert_eq!(link.uid, "SENDER-1");
         assert_eq!(link.relation, "p-p");
 
@@ -1130,5 +1160,37 @@ mod tests {
 
         let marti = evt.marti.expect("marti");
         assert!(marti.dest_callsigns.is_empty());
+    }
+
+    #[test]
+    fn parse_self_closing_remarks_preserves_attributes() {
+        let xml = br#"<event uid="REM-EMPTY-1" type="a-f-G">
+            <detail>
+                <remarks source="BAO.F.ATAK.SENDER" time="2021-01-01T00:00:00Z"/>
+            </detail>
+        </event>"#;
+
+        let evt = parse_full(xml).expect("parse");
+        let remarks = evt.remarks.expect("remarks");
+        assert!(remarks.text.is_empty());
+        assert_eq!(remarks.source.as_deref(), Some("BAO.F.ATAK.SENDER"));
+        assert_eq!(remarks.timestamp.as_deref(), Some("2021-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn parse_multiple_link_elements() {
+        let xml = br#"<event uid="MULTI-LINK" type="a-f-G">
+            <detail>
+                <link uid="A" type="a-f-G" relation="p-p"/>
+                <link uid="B" type="a-f-G" relation="p-s"/>
+            </detail>
+        </event>"#;
+
+        let evt = parse_full(xml).expect("parse");
+        assert_eq!(evt.link.len(), 2);
+        assert_eq!(evt.link[0].uid, "A");
+        assert_eq!(evt.link[0].relation, "p-p");
+        assert_eq!(evt.link[1].uid, "B");
+        assert_eq!(evt.link[1].relation, "p-s");
     }
 }
