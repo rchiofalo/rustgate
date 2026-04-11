@@ -1419,6 +1419,7 @@ fn handle_request(
     req: Request<hyper::body::Incoming>,
     health: Arc<HealthState>,
     metrics_token: Option<Arc<Zeroizing<Vec<u8>>>>,
+    router_slot: RouterSlot,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
     match req.uri().path() {
         // Liveness: process loop is reachable. Returns 200 once the
@@ -1433,6 +1434,11 @@ fn handle_request(
         // Startup: initial warmup complete. Allows slow-starting pods to
         // delay liveness/readiness checks during boot.
         "/health/startup" => Ok(probe_response(health.is_started(), "ok", "starting")),
+
+        // Authz health: compile warnings from the installed policy
+        // engine, if any. Returns a JSON object so operators can
+        // inspect warnings without scraping logs.
+        "/health/authz" => Ok(authz_health_response(router_slot.get())),
 
         // Legacy aliases — kept for backwards compatibility. `/healthz`
         // mirrors `/health/live` and `/readyz` mirrors `/health/ready`.
@@ -1484,6 +1490,75 @@ fn handle_request(
     }
 }
 
+/// Build a JSON response for the `/health/authz` endpoint.
+///
+/// When a policy engine is installed, returns:
+/// ```json
+/// {
+///     "policy_id": "<sha256>",
+///     "compile_warnings": ["warning 1", "warning 2"]
+/// }
+/// ```
+///
+/// When no engine is installed, returns:
+/// ```json
+/// {
+///     "policy_id": null,
+///     "compile_warnings": []
+/// }
+/// ```
+fn authz_health_response(
+    router: Option<&Arc<rustgate_transport::Router>>,
+) -> Response<Full<Bytes>> {
+    let (policy_id, warnings): (Option<String>, Vec<String>) = match router {
+        Some(r) => match r.authz_snapshot() {
+            Some(engine) => {
+                let id = engine.policy_id().to_string();
+                let w = engine
+                    .compile_warnings()
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                (Some(id), w)
+            }
+            None => (None, Vec::new()),
+        },
+        None => (None, Vec::new()),
+    };
+
+    // Build JSON by hand to avoid pulling in serde for a single
+    // response. The fields are simple strings — no escaping beyond
+    // what SmolStr already guarantees (ASCII diagnostic messages).
+    let warnings_json: Vec<String> = warnings
+        .iter()
+        .map(|w| format!("\"{}\"", w.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect::<Vec<_>>();
+    let warnings_array = format!("[{}]", warnings_json.join(","));
+
+    let policy_id_json = match policy_id {
+        Some(id) => format!("\"{}\"", id.replace('\\', "\\\\").replace('"', "\\\"")),
+        None => "null".to_string(),
+    };
+
+    let body = format!(
+        "{{\"policy_id\":{},\"compile_warnings\":{}}}",
+        policy_id_json, warnings_array
+    );
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(body)))
+        .unwrap_or_else(|_| internal_error_response())
+}
+
+/// Type alias for the router reference shared with the metrics server.
+///
+/// Populated via `OnceLock` after the router is constructed (which happens
+/// after `start_metrics` spawns the HTTP server). Requests that arrive
+/// before the slot is filled return an empty warnings list.
+pub type RouterSlot = Arc<OnceLock<Arc<rustgate_transport::Router>>>;
+
 /// Serve Prometheus metrics and health endpoints at the given address.
 ///
 /// Routes:
@@ -1491,6 +1566,7 @@ fn handle_request(
 /// - `GET /health/live`    — Kubernetes liveness probe
 /// - `GET /health/ready`   — Kubernetes readiness probe
 /// - `GET /health/startup` — Kubernetes startup probe
+/// - `GET /health/authz`   — Authz engine compile warnings (JSON)
 /// - `GET /healthz`        — Deprecated alias for `/health/live`
 /// - `GET /readyz`         — Deprecated alias for `/health/ready`
 ///
@@ -1509,6 +1585,7 @@ pub async fn serve(
     #[cfg(feature = "federation")] fed_api: Arc<OnceLock<FedApiHandler>>,
     acl_api: Arc<OnceLock<AclApiHandler>>,
     metrics_token: Option<Arc<Zeroizing<Vec<u8>>>>,
+    router_slot: RouterSlot,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let conn_limit = Arc::new(tokio::sync::Semaphore::new(MAX_HTTP_CONNECTIONS));
@@ -1535,6 +1612,7 @@ pub async fn serve(
         let fed_api = Arc::clone(&fed_api);
         let acl_api = Arc::clone(&acl_api);
         let metrics_token = metrics_token.clone();
+        let router_slot = Arc::clone(&router_slot);
         drop(tokio::spawn(async move {
             let _permit = permit;
             let conn = hyper::server::conn::http1::Builder::new()
@@ -1548,6 +1626,7 @@ pub async fn serve(
                         let fed_api = Arc::clone(&fed_api);
                         let acl_api = Arc::clone(&acl_api);
                         let metrics_token = metrics_token.clone();
+                        let router_slot = Arc::clone(&router_slot);
                         async move {
                             // Delegate /api/federation/ paths to the federation handler
                             #[cfg(feature = "federation")]
@@ -1595,7 +1674,7 @@ pub async fn serve(
                             // If no ACL handler is registered, fall
                             // through to the generic request handler,
                             // which returns 404 for unknown paths.
-                            handle_request(req, health, metrics_token)
+                            handle_request(req, health, metrics_token, router_slot)
                         }
                     }),
                 );
@@ -1781,7 +1860,11 @@ mod tests {
         let addr = listener.local_addr().expect("local_addr");
         drop(listener);
 
+        let router_slot: RouterSlot = Arc::new(OnceLock::new());
+        let _ = router_slot.set(Arc::new(rustgate_transport::Router::new()));
+
         let server_health = Arc::clone(&health);
+        let server_router_slot = Arc::clone(&router_slot);
         drop(tokio::spawn(async move {
             let _ = serve(
                 addr,
@@ -1790,6 +1873,7 @@ mod tests {
                 Arc::new(OnceLock::new()),
                 Arc::new(OnceLock::new()),
                 None, // no metrics token — backward compatible unauthenticated
+                server_router_slot,
             )
             .await;
         }));
@@ -1837,6 +1921,12 @@ mod tests {
         assert_eq!(status, 200);
         assert!(body.contains("rustgate_connections_accepted_total"));
 
+        // /health/authz returns JSON with no engine installed
+        let (status, body) = http_get(addr, "/health/authz").await;
+        assert_eq!(status, 200);
+        assert!(body.contains("\"policy_id\":null"));
+        assert!(body.contains("\"compile_warnings\":[]"));
+
         // Unknown path returns 404
         let (status, _) = http_get(addr, "/unknown").await;
         assert_eq!(status, 404);
@@ -1881,6 +1971,81 @@ mod tests {
         assert!(h.is_started());
         assert!(!h.mark_started());
         assert!(h.is_started());
+    }
+
+    #[tokio::test]
+    async fn authz_health_endpoint_surfaces_compile_warnings() {
+        ensure_init();
+
+        // Build a policy with an overly broad allow+any rule that
+        // triggers a compile warning.
+        let rules = rustgate_authz::RuleSet {
+            version: 1,
+            default_effect: rustgate_authz::Effect::Deny,
+            rules: vec![rustgate_authz::Rule {
+                id: smol_str::SmolStr::new("broad-rule"),
+                effect: rustgate_authz::Effect::Allow,
+                action: rustgate_authz::Action::Send,
+                resource: rustgate_authz::ResourceMatcher::Any,
+                subject: rustgate_authz::SubjectMatcher::default(),
+                obligations: Vec::new(),
+            }],
+        };
+        let engine = rustgate_authz::NativeEngine::new(rules).expect("compile");
+        assert!(
+            !engine.compile_warnings().is_empty(),
+            "test policy should emit at least one compile warning"
+        );
+
+        let router = Arc::new(
+            rustgate_transport::Router::new()
+                .with_authz(Arc::new(engine) as Arc<dyn rustgate_authz::PolicyEngine>),
+        );
+
+        let router_slot: RouterSlot = Arc::new(OnceLock::new());
+        let _ = router_slot.set(router);
+
+        let health = Arc::new(HealthState::new());
+        health.set_ready(true);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        drop(listener);
+
+        let server_health = Arc::clone(&health);
+        let server_router_slot = Arc::clone(&router_slot);
+        drop(tokio::spawn(async move {
+            let _ = serve(
+                addr,
+                server_health,
+                #[cfg(feature = "federation")]
+                Arc::new(OnceLock::new()),
+                Arc::new(OnceLock::new()),
+                server_router_slot,
+            )
+            .await;
+        }));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let (status, body) = http_get(addr, "/health/authz").await;
+        assert_eq!(status, 200);
+
+        // The response must contain a policy_id and at least one warning.
+        assert!(
+            body.contains("\"policy_id\":\""),
+            "expected policy_id in response: {body}"
+        );
+        assert!(
+            body.contains("broad-rule"),
+            "expected warning mentioning the rule id: {body}"
+        );
+        assert!(
+            !body.contains("\"compile_warnings\":[]"),
+            "warnings list should not be empty: {body}"
+        );
     }
 
     /// Minimal HTTP GET using raw TCP. Returns (status_code, body).

@@ -344,12 +344,16 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Arc::new(std::sync::OnceLock::new());
 
     #[cfg(feature = "metrics")]
+    let router_slot: metrics::RouterSlot = Arc::new(std::sync::OnceLock::new());
+
+    #[cfg(feature = "metrics")]
     let metrics_identity = setup::start_metrics(
         &cli,
         &health,
         #[cfg(feature = "federation")]
         &fed_api_slot,
         &acl_api_slot,
+        &router_slot,
     )?;
 
     #[cfg(not(feature = "metrics"))]
@@ -468,6 +472,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             None => base,
         }
     });
+
+    // Populate the router slot so the metrics server can serve
+    // /health/authz responses.
+    #[cfg(feature = "metrics")]
+    let _ = router_slot.set(Arc::clone(&router));
 
     #[cfg(feature = "metrics")]
     if let Some(ref q) = client_queue {
