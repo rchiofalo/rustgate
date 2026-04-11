@@ -160,6 +160,46 @@ impl TestCa {
         }
     }
 
+    /// Issue a server certificate that expires in `days_remaining` days.
+    ///
+    /// Useful for testing the "degraded" health check threshold (e.g. a cert
+    /// expiring within 7 days should trigger a degraded status).
+    pub fn issue_near_expiry_server_cert(
+        &self,
+        cn: &str,
+        san_dns: &[&str],
+        days_remaining: i64,
+    ) -> TestCert {
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::NoCa;
+        params
+            .extended_key_usages
+            .push(ExtendedKeyUsagePurpose::ServerAuth);
+
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, cn);
+        params.distinguished_name = dn;
+
+        params.subject_alt_names = san_dns
+            .iter()
+            .map(|s| rcgen::SanType::DnsName((*s).try_into().expect("invalid DNS name")))
+            .collect();
+
+        let now = OffsetDateTime::now_utc();
+        params.not_before = now - TimeDuration::days(1);
+        params.not_after = now + TimeDuration::days(days_remaining);
+
+        let key_pair = KeyPair::generate().expect("failed to generate key pair");
+        let cert = params
+            .signed_by(&key_pair, &self.issuer)
+            .expect("failed to sign near-expiry server cert");
+
+        TestCert {
+            cert_pem: cert.pem(),
+            key_pem: key_pair.serialize_pem(),
+        }
+    }
+
     /// Generate a Certificate Revocation List (CRL) revoking the given certificates.
     ///
     /// Parses each PEM to extract its serial number, builds a CRL signed by

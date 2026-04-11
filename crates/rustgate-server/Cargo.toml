@@ -20,7 +20,7 @@ enrollment = ["dep:rustgate-enrollment", "dep:rustls-pki-types"]
 est = ["enrollment", "rustgate-enrollment/est"]
 proto = ["dep:rustgate-proto", "rustgate-transport/proto"]
 full-detail = ["nats", "rustgate-nats/full-detail"]
-metrics = ["dep:prometheus", "dep:hyper", "dep:hyper-util", "dep:http-body-util"]
+metrics = ["dep:prometheus", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:x509-parser"]
 federation = ["dep:rustgate-federation", "rustgate-federation/v2", "rustgate-federation/api"]
 federation-ha = ["federation", "rustgate-federation/ha"]
 # Sub-features selecting which dynamic peer-discovery backends the server
@@ -83,6 +83,7 @@ figment = { workspace = true }
 toml = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
+x509-parser = { workspace = true, optional = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]

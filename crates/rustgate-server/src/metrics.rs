@@ -21,6 +21,7 @@ use prometheus::{
     TextEncoder,
 };
 use rustgate_core::constants::HTTP_CONNECTION_TIMEOUT;
+use serde::Serialize;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
@@ -1383,6 +1384,253 @@ impl Default for HealthState {
     }
 }
 
+// ── Readiness dependency checks ────────────────────────────────────
+
+/// Status of an individual dependency check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckStatus {
+    /// Dependency is healthy.
+    Ok,
+    /// Dependency is reachable but in a degraded state.
+    Degraded,
+    /// Dependency is unreachable or broken.
+    Unhealthy,
+}
+
+/// Result of a single readiness dependency check.
+#[derive(Debug, Clone, Serialize)]
+pub struct DependencyCheck {
+    pub status: CheckStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl DependencyCheck {
+    fn ok() -> Self {
+        Self {
+            status: CheckStatus::Ok,
+            message: None,
+        }
+    }
+
+    fn degraded(msg: impl Into<String>) -> Self {
+        Self {
+            status: CheckStatus::Degraded,
+            message: Some(msg.into()),
+        }
+    }
+
+    fn unhealthy(msg: impl Into<String>) -> Self {
+        Self {
+            status: CheckStatus::Unhealthy,
+            message: Some(msg.into()),
+        }
+    }
+}
+
+/// Aggregate readiness report returned as structured JSON from the
+/// `/readyz` and `/health/ready` endpoints.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReadinessReport {
+    pub status: CheckStatus,
+    pub checks: std::collections::BTreeMap<String, DependencyCheck>,
+}
+
+/// Optional dependency handles used by readiness checks.
+///
+/// The metrics server holds an `Arc<ReadinessState>` and inspects each
+/// registered dependency when `/readyz` or `/health/ready` is hit.
+/// Fields that are `None` are skipped — the corresponding check is not
+/// included in the report.
+pub struct ReadinessState {
+    /// TLS certificate reloader — checked for cert existence and expiry.
+    pub cert_reloader: Option<Arc<rustgate_transport::CertReloader>>,
+
+    /// NATS publisher — checked for connection state via
+    /// `NatsPublisher::is_connected`.
+    #[cfg(feature = "nats")]
+    pub nats_publisher: std::sync::Mutex<Option<rustgate_nats::NatsPublisher>>,
+
+    /// Federation manager — checked for connected peer count.
+    #[cfg(feature = "federation")]
+    pub federation_manager: std::sync::Mutex<
+        Option<Arc<tokio::sync::RwLock<rustgate_federation::manager::FederationManager>>>,
+    >,
+}
+
+impl std::fmt::Debug for ReadinessState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadinessState")
+            .field("cert_reloader", &self.cert_reloader.is_some())
+            .finish()
+    }
+}
+
+impl ReadinessState {
+    /// Create a new empty readiness state with no dependencies registered.
+    pub fn new() -> Self {
+        Self {
+            cert_reloader: None,
+            #[cfg(feature = "nats")]
+            nats_publisher: std::sync::Mutex::new(None),
+            #[cfg(feature = "federation")]
+            federation_manager: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Register a NATS publisher for readiness checking.
+    #[cfg(feature = "nats")]
+    pub fn set_nats_publisher(&self, publisher: rustgate_nats::NatsPublisher) {
+        if let Ok(mut guard) = self.nats_publisher.lock() {
+            *guard = Some(publisher);
+        }
+    }
+
+    /// Register a federation manager for readiness checking.
+    #[cfg(feature = "federation")]
+    pub fn set_federation_manager(
+        &self,
+        mgr: Arc<tokio::sync::RwLock<rustgate_federation::manager::FederationManager>>,
+    ) {
+        if let Ok(mut guard) = self.federation_manager.lock() {
+            *guard = Some(mgr);
+        }
+    }
+
+    /// Run all registered dependency checks and return a structured report.
+    ///
+    /// The aggregate status is the worst individual status:
+    /// - All `Ok` -> `Ok`
+    /// - Any `Degraded` (no `Unhealthy`) -> `Degraded`
+    /// - Any `Unhealthy` -> `Unhealthy`
+    pub fn check(&self) -> ReadinessReport {
+        let mut checks = std::collections::BTreeMap::new();
+
+        // TLS certificate validity
+        if let Some(ref reloader) = self.cert_reloader {
+            let _ = checks.insert("tls".to_string(), check_tls_cert(reloader));
+        }
+
+        // NATS connection state
+        #[cfg(feature = "nats")]
+        if let Ok(guard) = self.nats_publisher.lock()
+            && let Some(ref publisher) = *guard
+        {
+            let _ = checks.insert("nats".to_string(), check_nats(publisher));
+        }
+
+        // Federation peer connectivity
+        #[cfg(feature = "federation")]
+        if let Ok(guard) = self.federation_manager.lock()
+            && let Some(ref mgr) = *guard
+        {
+            let _ = checks.insert("federation".to_string(), check_federation(mgr));
+        }
+
+        let status = aggregate_status(checks.values());
+        ReadinessReport { status, checks }
+    }
+}
+
+impl Default for ReadinessState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Check TLS certificate validity by parsing the end-entity cert and
+/// comparing its `notBefore`/`notAfter` fields against the current time.
+fn check_tls_cert(reloader: &rustgate_transport::CertReloader) -> DependencyCheck {
+    let Some(certified_key) = reloader.certified_key() else {
+        return DependencyCheck::unhealthy("certificate not loaded");
+    };
+
+    let Some(ee_cert_der) = certified_key.cert.first() else {
+        return DependencyCheck::unhealthy("certificate chain is empty");
+    };
+
+    let Ok((_rem, cert)) = x509_parser::parse_x509_certificate(ee_cert_der.as_ref()) else {
+        return DependencyCheck::unhealthy("failed to parse certificate");
+    };
+
+    let validity = cert.validity();
+    let now = x509_parser::time::ASN1Time::now();
+
+    if now < validity.not_before {
+        return DependencyCheck::unhealthy("certificate not yet valid");
+    }
+    if now > validity.not_after {
+        return DependencyCheck::unhealthy("certificate has expired");
+    }
+
+    // Warn if the certificate expires within 7 days.
+    let not_after_ts = validity.not_after.timestamp();
+    let now_ts = now.timestamp();
+    let remaining_secs = not_after_ts - now_ts;
+    let seven_days_secs: i64 = 7 * 24 * 60 * 60;
+    if remaining_secs < seven_days_secs {
+        let days = remaining_secs / (24 * 60 * 60);
+        return DependencyCheck::degraded(format!("certificate expires in {days} day(s)"));
+    }
+
+    DependencyCheck::ok()
+}
+
+/// Check NATS connection state via `NatsPublisher` helper methods,
+/// avoiding a direct dependency on `async-nats` in this crate.
+#[cfg(feature = "nats")]
+fn check_nats(publisher: &rustgate_nats::NatsPublisher) -> DependencyCheck {
+    if publisher.is_connected() {
+        DependencyCheck::ok()
+    } else if publisher.is_pending() {
+        DependencyCheck::degraded("NATS connection pending")
+    } else {
+        DependencyCheck::unhealthy("NATS disconnected")
+    }
+}
+
+/// Check federation peer connectivity.
+#[cfg(feature = "federation")]
+fn check_federation(
+    mgr: &Arc<tokio::sync::RwLock<rustgate_federation::manager::FederationManager>>,
+) -> DependencyCheck {
+    let Ok(guard) = mgr.try_read() else {
+        // Lock contention during reconfiguration; report degraded rather
+        // than blocking the health endpoint.
+        return DependencyCheck::degraded("federation manager busy");
+    };
+    let total = guard.peer_count();
+    let connected = guard.connected_peer_count();
+
+    if total == 0 {
+        // No peers configured — federation is effectively idle; this is not
+        // an error condition.
+        return DependencyCheck::ok();
+    }
+
+    if connected == 0 {
+        return DependencyCheck::unhealthy(format!("0/{total} peers connected"));
+    }
+    if connected < total {
+        return DependencyCheck::degraded(format!("{connected}/{total} peers connected"));
+    }
+    DependencyCheck::ok()
+}
+
+/// Aggregate individual check statuses into the worst-case overall status.
+fn aggregate_status<'a>(checks: impl Iterator<Item = &'a DependencyCheck>) -> CheckStatus {
+    let mut worst = CheckStatus::Ok;
+    for c in checks {
+        match c.status {
+            CheckStatus::Unhealthy => return CheckStatus::Unhealthy,
+            CheckStatus::Degraded => worst = CheckStatus::Degraded,
+            CheckStatus::Ok => {}
+        }
+    }
+    worst
+}
+
 fn probe_response(
     ok: bool,
     ok_body: &'static str,
@@ -1415,9 +1663,43 @@ fn metrics_auth_ok(header: Option<&str>, expected: &[u8]) -> bool {
     token.as_bytes().ct_eq(expected).into()
 }
 
+/// Build a structured JSON readiness response that includes dependency
+/// check results alongside the base `ready` flag from `HealthState`.
+///
+/// When `HealthState::is_ready()` is `false` (e.g. during graceful
+/// shutdown), the overall status is forced to `unhealthy` regardless of
+/// individual check outcomes. Otherwise the aggregate status reflects
+/// the worst individual check.
+///
+/// Returns HTTP 200 for `ok` or `degraded`, 503 for `unhealthy`.
+fn readiness_response(health: &HealthState, readiness: &ReadinessState) -> Response<Full<Bytes>> {
+    let mut report = readiness.check();
+
+    // Override aggregate status when the base readiness flag is off
+    // (graceful shutdown or not yet ready).
+    if !health.is_ready() {
+        report.status = CheckStatus::Unhealthy;
+    }
+
+    let status_code = match report.status {
+        CheckStatus::Ok | CheckStatus::Degraded => StatusCode::OK,
+        CheckStatus::Unhealthy => StatusCode::SERVICE_UNAVAILABLE,
+    };
+
+    match serde_json::to_string(&report) {
+        Ok(body) => Response::builder()
+            .status(status_code)
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from(body)))
+            .unwrap_or_else(|_| internal_error_response()),
+        Err(_) => internal_error_response(),
+    }
+}
+
 fn handle_request(
     req: Request<hyper::body::Incoming>,
     health: Arc<HealthState>,
+    readiness: Arc<ReadinessState>,
     metrics_token: Option<Arc<Zeroizing<Vec<u8>>>>,
     router_slot: RouterSlot,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
@@ -1427,9 +1709,9 @@ fn handle_request(
         // "restart the pod".
         "/health/live" => Ok(probe_response(health.is_live(), "ok", "not live")),
 
-        // Readiness: instance can accept traffic. Flips to 503 during
-        // graceful shutdown so load balancers stop sending new requests.
-        "/health/ready" => Ok(probe_response(health.is_ready(), "ok", "not ready")),
+        // Readiness: returns structured JSON with dependency checks.
+        // HTTP 200 for ok/degraded, 503 for unhealthy.
+        "/health/ready" => Ok(readiness_response(&health, &readiness)),
 
         // Startup: initial warmup complete. Allows slow-starting pods to
         // delay liveness/readiness checks during boot.
@@ -1444,7 +1726,9 @@ fn handle_request(
         // mirrors `/health/live` and `/readyz` mirrors `/health/ready`.
         "/healthz" => Ok(probe_response(health.is_live(), "ok", "not live")),
 
-        "/readyz" => Ok(probe_response(health.is_ready(), "ok", "not ready")),
+        // Legacy alias — `/readyz` mirrors `/health/ready` (structured
+        // readiness with dependency checks).
+        "/readyz" => Ok(readiness_response(&health, &readiness)),
 
         "/metrics" => {
             // When a metrics token is configured, require valid auth.
@@ -1560,7 +1844,8 @@ pub type RouterSlot = Arc<OnceLock<Arc<rustgate_transport::Router>>>;
 /// Routes:
 /// - `GET /metrics`        — Prometheus text format (optionally authenticated)
 /// - `GET /health/live`    — Kubernetes liveness probe
-/// - `GET /health/ready`   — Kubernetes readiness probe
+/// - `GET /health/ready`   — Kubernetes readiness probe (structured JSON
+///   with dependency checks)
 /// - `GET /health/startup` — Kubernetes startup probe
 /// - `GET /health/authz`   — Authz engine compile warnings (JSON)
 /// - `GET /healthz`        — Deprecated alias for `/health/live`
@@ -1578,6 +1863,7 @@ pub type RouterSlot = Arc<OnceLock<Arc<rustgate_transport::Router>>>;
 pub async fn serve(
     bind: SocketAddr,
     health: Arc<HealthState>,
+    readiness: Arc<ReadinessState>,
     #[cfg(feature = "federation")] fed_api: Arc<OnceLock<FedApiHandler>>,
     acl_api: Arc<OnceLock<AclApiHandler>>,
     metrics_token: Option<Arc<Zeroizing<Vec<u8>>>>,
@@ -1604,6 +1890,7 @@ pub async fn serve(
 
         let io = hyper_util::rt::TokioIo::new(stream);
         let health = Arc::clone(&health);
+        let readiness = Arc::clone(&readiness);
         #[cfg(feature = "federation")]
         let fed_api = Arc::clone(&fed_api);
         let acl_api = Arc::clone(&acl_api);
@@ -1618,6 +1905,7 @@ pub async fn serve(
                     io,
                     service_fn(move |req: Request<hyper::body::Incoming>| {
                         let health = Arc::clone(&health);
+                        let readiness = Arc::clone(&readiness);
                         #[cfg(feature = "federation")]
                         let fed_api = Arc::clone(&fed_api);
                         let acl_api = Arc::clone(&acl_api);
@@ -1670,7 +1958,7 @@ pub async fn serve(
                             // If no ACL handler is registered, fall
                             // through to the generic request handler,
                             // which returns 404 for unknown paths.
-                            handle_request(req, health, metrics_token, router_slot)
+                            handle_request(req, health, readiness, metrics_token, router_slot)
                         }
                     }),
                 );
@@ -1847,6 +2135,7 @@ mod tests {
         ensure_init();
 
         let health = Arc::new(HealthState::new());
+        let readiness = Arc::new(ReadinessState::new());
         // Mark ready for the bulk of the test; serve() flips live=true.
         health.set_ready(true);
 
@@ -1861,10 +2150,12 @@ mod tests {
 
         let server_health = Arc::clone(&health);
         let server_router_slot = Arc::clone(&router_slot);
+        let server_readiness = Arc::clone(&readiness);
         drop(tokio::spawn(async move {
             let _ = serve(
                 addr,
                 server_health,
+                server_readiness,
                 #[cfg(feature = "federation")]
                 Arc::new(OnceLock::new()),
                 Arc::new(OnceLock::new()),
@@ -1885,14 +2176,18 @@ mod tests {
         let (status, _) = http_get(addr, "/healthz").await;
         assert_eq!(status, 200);
 
-        // /health/ready returns 200 when ready.
+        // /health/ready returns structured JSON when ready (no deps
+        // registered, so the report has an empty checks map and status "ok").
         let (status, body) = http_get(addr, "/health/ready").await;
         assert_eq!(status, 200);
-        assert_eq!(body, "ok");
+        let report: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(report["status"], "ok");
 
         // Legacy alias /readyz mirrors /health/ready.
-        let (status, _) = http_get(addr, "/readyz").await;
+        let (status, body) = http_get(addr, "/readyz").await;
         assert_eq!(status, 200);
+        let report: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(report["status"], "ok");
 
         // /health/startup is 503 until startup is marked complete.
         let (status, body) = http_get(addr, "/health/startup").await;
@@ -1908,9 +2203,13 @@ mod tests {
         health.set_ready(false);
         let (status, body) = http_get(addr, "/health/ready").await;
         assert_eq!(status, 503);
-        assert_eq!(body, "not ready");
-        let (status, _) = http_get(addr, "/readyz").await;
+        let report: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(report["status"], "unhealthy");
+
+        let (status, body) = http_get(addr, "/readyz").await;
         assert_eq!(status, 503);
+        let report: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(report["status"], "unhealthy");
 
         // /metrics returns Prometheus text
         let (status, body) = http_get(addr, "/metrics").await;
@@ -2331,15 +2630,20 @@ mod tests {
         drop(listener);
 
         let metrics_token = token.map(|t| Arc::new(Zeroizing::new(t.to_vec())));
+        let readiness = Arc::new(ReadinessState::new());
+        let router_slot: RouterSlot = Arc::new(OnceLock::new());
+        let _ = router_slot.set(Arc::new(rustgate_transport::Router::new()));
 
         drop(tokio::spawn(async move {
             let _ = serve(
                 addr,
                 health,
+                readiness,
                 #[cfg(feature = "federation")]
                 Arc::new(OnceLock::new()),
                 Arc::new(OnceLock::new()),
                 metrics_token,
+                router_slot,
             )
             .await;
         }));
@@ -2476,5 +2780,183 @@ mod tests {
         let a = allocated.unwrap();
         let act = active.unwrap();
         assert!(a <= act, "allocated ({a}) <= active ({act})");
+    }
+
+    // ── Readiness check unit tests ─────────────────────────────────
+
+    #[test]
+    fn readiness_state_no_deps_returns_ok() {
+        let state = ReadinessState::new();
+        let report = state.check();
+        assert_eq!(report.status, CheckStatus::Ok);
+        assert!(report.checks.is_empty());
+    }
+
+    #[test]
+    fn readiness_report_serializes_to_json() {
+        let state = ReadinessState::new();
+        let report = state.check();
+        let json = serde_json::to_string(&report).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(parsed["status"], "ok");
+        assert!(parsed["checks"].is_object());
+    }
+
+    #[test]
+    fn aggregate_status_all_ok() {
+        let checks = [DependencyCheck::ok(), DependencyCheck::ok()];
+        assert_eq!(aggregate_status(checks.iter()), CheckStatus::Ok);
+    }
+
+    #[test]
+    fn aggregate_status_degraded_wins_over_ok() {
+        let checks = [DependencyCheck::ok(), DependencyCheck::degraded("slow")];
+        assert_eq!(aggregate_status(checks.iter()), CheckStatus::Degraded);
+    }
+
+    #[test]
+    fn aggregate_status_unhealthy_wins_over_degraded() {
+        let checks = [
+            DependencyCheck::degraded("slow"),
+            DependencyCheck::unhealthy("down"),
+            DependencyCheck::ok(),
+        ];
+        assert_eq!(aggregate_status(checks.iter()), CheckStatus::Unhealthy);
+    }
+
+    #[test]
+    fn aggregate_status_empty_is_ok() {
+        let checks: [DependencyCheck; 0] = [];
+        assert_eq!(aggregate_status(checks.iter()), CheckStatus::Ok);
+    }
+
+    #[test]
+    fn check_status_json_variants() {
+        assert_eq!(
+            serde_json::to_string(&CheckStatus::Ok).expect("ser"),
+            "\"ok\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CheckStatus::Degraded).expect("ser"),
+            "\"degraded\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CheckStatus::Unhealthy).expect("ser"),
+            "\"unhealthy\""
+        );
+    }
+
+    #[test]
+    fn dependency_check_ok_omits_message() {
+        let check = DependencyCheck::ok();
+        let json = serde_json::to_string(&check).expect("ser");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(v["status"], "ok");
+        assert!(v.get("message").is_none());
+    }
+
+    #[test]
+    fn dependency_check_degraded_includes_message() {
+        let check = DependencyCheck::degraded("expiring soon");
+        let json = serde_json::to_string(&check).expect("ser");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(v["status"], "degraded");
+        assert_eq!(v["message"], "expiring soon");
+    }
+
+    #[test]
+    fn dependency_check_unhealthy_includes_message() {
+        let check = DependencyCheck::unhealthy("cert expired");
+        let json = serde_json::to_string(&check).expect("ser");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(v["status"], "unhealthy");
+        assert_eq!(v["message"], "cert expired");
+    }
+
+    #[test]
+    fn tls_check_with_valid_cert() {
+        use rustgate_test_utils::certs::TestCa;
+
+        let ca = TestCa::new("test-ca");
+        let server = ca.issue_server_cert("test-server", &["localhost"]);
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, &server.cert_pem).expect("write cert");
+        std::fs::write(&key_path, &server.key_pem).expect("write key");
+
+        let reloader =
+            rustgate_transport::CertReloader::new(&cert_path, &key_path).expect("reloader");
+        let check = check_tls_cert(&reloader);
+        assert_eq!(check.status, CheckStatus::Ok);
+    }
+
+    #[test]
+    fn tls_check_with_expired_cert() {
+        use rustgate_test_utils::certs::TestCa;
+
+        let ca = TestCa::new("test-ca");
+        let expired = ca.issue_expired_client_cert("expired-server", &[]);
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, &expired.cert_pem).expect("write cert");
+        std::fs::write(&key_path, &expired.key_pem).expect("write key");
+
+        let reloader =
+            rustgate_transport::CertReloader::new(&cert_path, &key_path).expect("reloader");
+        let check = check_tls_cert(&reloader);
+        assert_eq!(check.status, CheckStatus::Unhealthy);
+        assert!(check.message.as_deref().unwrap_or("").contains("expired"));
+    }
+
+    #[test]
+    fn tls_check_degraded_for_near_expiry_cert() {
+        use rustgate_test_utils::certs::TestCa;
+
+        let ca = TestCa::new("test-ca");
+        // Certificate expires in 3 days — below the 7-day degraded threshold.
+        let near_expiry = ca.issue_near_expiry_server_cert("expiring-server", &["localhost"], 3);
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, &near_expiry.cert_pem).expect("write cert");
+        std::fs::write(&key_path, &near_expiry.key_pem).expect("write key");
+
+        let reloader =
+            rustgate_transport::CertReloader::new(&cert_path, &key_path).expect("reloader");
+        let check = check_tls_cert(&reloader);
+        assert_eq!(
+            check.status,
+            CheckStatus::Degraded,
+            "cert expiring in 3 days should be degraded, got: {:?}",
+            check
+        );
+        let msg = check.message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("expires"),
+            "message should mention expiry: {msg}"
+        );
+    }
+
+    #[test]
+    fn readiness_response_unhealthy_when_not_ready() {
+        let health = HealthState::new();
+        let readiness = ReadinessState::new();
+        // health.is_ready() defaults to false, so readiness should be unhealthy.
+        let resp = readiness_response(&health, &readiness);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn readiness_response_ok_when_ready_no_deps() {
+        let health = HealthState::new();
+        health.set_ready(true);
+        let readiness = ReadinessState::new();
+        let resp = readiness_response(&health, &readiness);
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

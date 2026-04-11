@@ -763,6 +763,7 @@ pub(crate) fn warn_enrollment_disabled(cli: &Cli) {
 pub(crate) fn start_metrics(
     cli: &Cli,
     health: &Arc<metrics::HealthState>,
+    readiness: &Arc<metrics::ReadinessState>,
     #[cfg(feature = "federation")] fed_api_slot: &Arc<std::sync::OnceLock<metrics::FedApiHandler>>,
     acl_api_slot: &Arc<std::sync::OnceLock<metrics::AclApiHandler>>,
     router_slot: &metrics::RouterSlot,
@@ -821,6 +822,7 @@ pub(crate) fn start_metrics(
             .context("parsing --metrics-bind address")?;
 
         let health_for_metrics = Arc::clone(health);
+        let readiness_for_metrics = Arc::clone(readiness);
         #[cfg(feature = "federation")]
         let fed_api_for_metrics = Arc::clone(fed_api_slot);
         let acl_api_for_metrics = Arc::clone(acl_api_slot);
@@ -830,6 +832,7 @@ pub(crate) fn start_metrics(
             if let Err(e) = metrics::serve(
                 bind_addr,
                 health_for_metrics,
+                readiness_for_metrics,
                 #[cfg(feature = "federation")]
                 fed_api_for_metrics,
                 acl_api_for_metrics,
