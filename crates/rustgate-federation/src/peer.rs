@@ -457,6 +457,37 @@ impl PeerHandle {
     }
 }
 
+/// Compare two peers for routing preference ordering.
+///
+/// Returns `Ordering` suitable for `sort_by`: same-region peers first,
+/// then peers with measured latency before unmeasured, then lower latency
+/// before higher, then lower priority number (higher priority) first.
+pub fn compare_routing_preference(
+    a: &PeerHandle,
+    b: &PeerHandle,
+    local_region: Option<&str>,
+) -> std::cmp::Ordering {
+    let a_same_region = local_region.is_some_and(|r| a.config.region.as_deref() == Some(r));
+    let b_same_region = local_region.is_some_and(|r| b.config.region.as_deref() == Some(r));
+
+    let a_latency = a.latency_nanos();
+    let b_latency = b.latency_nanos();
+
+    // Peers with measured latency sort before peers with no data
+    let a_has_data = a_latency > 0;
+    let b_has_data = b_latency > 0;
+
+    // Same-region peers first
+    b_same_region
+        .cmp(&a_same_region)
+        // Peers with measured latency before unmeasured
+        .then(b_has_data.cmp(&a_has_data))
+        // Then lower latency
+        .then(a_latency.cmp(&b_latency))
+        // Then lower priority number (higher priority)
+        .then(a.config.priority.cmp(&b.config.priority))
+}
+
 /// Serializable snapshot of a peer's current status.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PeerStatus {
