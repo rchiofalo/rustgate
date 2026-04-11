@@ -573,6 +573,7 @@ impl ClientQueue {
     /// from being re-delivered if the process restarts before the next
     /// `open` purges them. Called by the caller after the drained
     /// messages have been successfully forwarded.
+    #[cfg(test)]
     pub fn confirm_delivered(&self, seqs: &[u64]) -> Result<(), StoreForwardError> {
         if seqs.is_empty() {
             return Ok(());
@@ -1386,6 +1387,51 @@ mod tests {
         assert!(
             drained.is_empty(),
             "no duplicates should be delivered on restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_rotation_rejects_old_messages() {
+        let tmp = TempDir::new().unwrap();
+        let key_a = Zeroizing::new([0xAA; 32]);
+        let key_b = Zeroizing::new([0xBB; 32]);
+
+        // Phase 1: write messages with key A.
+        {
+            let q = ClientQueue::open_with_hmac_key(tmp.path(), 1_000_000, Some(key_a.clone()))
+                .unwrap();
+            q.enqueue("bob", &msg_for("alice", "bob", b"msg-a1"))
+                .unwrap();
+            q.enqueue("bob", &msg_for("alice", "bob", b"msg-a2"))
+                .unwrap();
+            q.enqueue("bob", &msg_for("alice", "bob", b"msg-a3"))
+                .unwrap();
+            wait_for_depth(&q, "bob", 3).await;
+            drop(q);
+        }
+
+        // Give the writer task time to flush and release the DB lock.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Phase 2: reopen with key B and drain.
+        // All messages written under key A should fail HMAC verification.
+        let q2 =
+            ClientQueue::open_with_hmac_key(tmp.path(), 1_000_000, Some(key_b.clone())).unwrap();
+        assert_eq!(
+            q2.stats("bob").depth,
+            3,
+            "messages should still appear in the index before drain"
+        );
+
+        let drained = q2.drain("bob").unwrap();
+        assert!(
+            drained.is_empty(),
+            "all key-A messages should be rejected under key B"
+        );
+        assert!(
+            q2.tampered_total() >= 3,
+            "tampered counter should reflect rejected messages, got {}",
+            q2.tampered_total()
         );
     }
 }
