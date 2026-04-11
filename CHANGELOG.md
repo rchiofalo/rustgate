@@ -52,6 +52,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+- **Harden NATS subject sanitization** — `sanitize_nats_token()` now replaces `.` (NATS subject separator) with `_` to prevent subject injection, strips non-ASCII characters instead of rejecting the entire input, strips whitespace and control characters, and caps token length at 256 bytes. Inputs that sanitize to empty strings return `None`. (#663)
+
 - **Audit log integrity** — operators can now prove that their audit log has not been silently edited or truncated by running `rustgate verify-audit --file <path>` against the configured `--audit-log` file. (#559)
 
 - **Global admission control / backpressure** — new `--max-queued-bytes` CLI flag (env `RUSTGATE_MAX_QUEUED_BYTES`, default 512 MiB) caps the total in-flight routed bytes tracked across all sessions. When the counter crosses the high-water mark, the TLS accept loop is **deferred** (not errored) until the counter drops back below the low-water mark, which defaults to 90% of the high-water value and is overridable via `--max-queued-bytes-low-water`. Implemented as a shared `BackpressureGate` (AtomicUsize + `tokio::sync::Notify`) wired into `Router::route` via an RAII permit that releases its byte reservation on drop, making accounting panic-safe. Two new Prometheus metrics track the gate: `rustgate_queued_bytes` (gauge) and `rustgate_admission_deferred_total` (counter). Prevents a flood of slow readers from exhausting server memory on top of the existing per-session circuit breakers. (#551)

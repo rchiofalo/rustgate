@@ -146,86 +146,81 @@ impl NatsPublisher {
 /// Maximum length in bytes for a single NATS subject token.
 ///
 /// NATS does not mandate a per-token limit, but excessively long tokens
-/// waste memory and can indicate malicious input. 255 bytes is generous
+/// waste memory and can indicate malicious input. 256 bytes is generous
 /// enough for legitimate identifiers while bounding resource usage.
-const MAX_TOKEN_LENGTH: usize = 255;
+const MAX_TOKEN_LENGTH: usize = 256;
 
-/// Validate a string for safe use as a single NATS subject token.
+/// Sanitize a string into a valid single NATS subject token.
 ///
-/// NATS subjects require printable ASCII (0x21..=0x7E) excluding the
-/// reserved characters `.` (level separator), `>` (full wildcard),
-/// and `*` (partial wildcard). Rejects control chars, space, DEL,
-/// non-ASCII bytes, and tokens longer than [`MAX_TOKEN_LENGTH`] bytes.
+/// Returns `None` if the input cannot be sanitized into a valid token
+/// (i.e. the result is empty after all transformations).
 ///
-/// Returns `Cow::Borrowed` on the fast path (already valid ASCII) and
-/// `Cow::Owned` when NFC normalization produces a valid ASCII result.
+/// # Rules
+/// - NFC normalization is applied first for consistent handling of
+///   equivalent Unicode representations
+/// - NATS wildcards (`*`, `>`) are stripped
+/// - NATS subject separator (`.`) is replaced with `_` to prevent
+///   subject injection
+/// - ASCII control characters (0x00-0x1F, 0x7F) are stripped
+/// - Non-ASCII characters are stripped (NATS subjects must be ASCII-safe)
+/// - Whitespace (space, tab, etc.) is stripped
+/// - Empty results return `None`
+/// - Result is capped at [`MAX_TOKEN_LENGTH`] bytes
+///
+/// Returns `Cow::Borrowed` on the fast path (input already valid) and
+/// `Cow::Owned` when any transformation was needed.
 fn sanitize_nats_token(s: &str) -> Option<Cow<'_, str>> {
     if s.is_empty() {
         return None;
     }
-    if s.len() > MAX_TOKEN_LENGTH {
-        return None;
-    }
-    // Fast path: already valid ASCII
-    if s.bytes()
-        .all(|b| b > 0x20 && b < 0x7F && !matches!(b, b'.' | b'>' | b'*'))
+
+    // Fast path: already valid printable ASCII with no reserved characters.
+    // Valid bytes are 0x21..=0x7E excluding '.', '>', '*'.
+    if s.len() <= MAX_TOKEN_LENGTH
+        && s.bytes()
+            .all(|b| b > 0x20 && b < 0x7F && !matches!(b, b'.' | b'>' | b'*'))
     {
         return Some(Cow::Borrowed(s));
     }
-    // Slow path: apply NFC normalization, then re-check
-    let normalized: String = s.nfc().collect();
-    if normalized.is_empty() || normalized.len() > MAX_TOKEN_LENGTH {
-        return None;
+
+    // Slow path: NFC-normalize then strip/replace character-by-character.
+    let sanitized: String = s
+        .nfc()
+        .filter(|c| c.is_ascii()) // strip non-ASCII
+        .filter(|c| !c.is_ascii_control()) // strip control chars (0x00-0x1F, 0x7F)
+        .filter(|c| !c.is_ascii_whitespace()) // strip whitespace
+        .filter(|c| *c != '*' && *c != '>') // strip NATS wildcards
+        .map(|c| if c == '.' { '_' } else { c }) // replace separator
+        // `.take()` counts chars, but at this point only ASCII survives
+        // (non-ASCII was stripped above), so chars == bytes. Reordering the
+        // filter chain would break this invariant.
+        .take(MAX_TOKEN_LENGTH) // cap length
+        .collect();
+
+    if sanitized.is_empty() {
+        None
+    } else {
+        Some(Cow::Owned(sanitized))
     }
-    if normalized
-        .bytes()
-        .any(|b| b <= 0x20 || b >= 0x7F || matches!(b, b'.' | b'>' | b'*'))
-    {
-        return None;
-    }
-    Some(Cow::Owned(normalized))
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::panic, clippy::unwrap_used)]
     use super::*;
 
     #[test]
-    fn sanitize_valid_tokens() {
+    fn sanitize_normal_input_unchanged() {
         assert_eq!(sanitize_nats_token("Cyan").as_deref(), Some("Cyan"));
         assert_eq!(sanitize_nats_token("__ANON__").as_deref(), Some("__ANON__"));
         assert_eq!(
             sanitize_nats_token("track-uid-123").as_deref(),
             Some("track-uid-123")
         );
-    }
-
-    #[test]
-    fn sanitize_accepts_max_length_token() {
-        let token = "a".repeat(MAX_TOKEN_LENGTH);
-        assert_eq!(sanitize_nats_token(&token).as_deref(), Some(token.as_str()));
-    }
-
-    #[test]
-    fn sanitize_rejects_overlength_token() {
-        let token = "a".repeat(MAX_TOKEN_LENGTH + 1);
-        assert_eq!(sanitize_nats_token(&token).as_deref(), None);
-    }
-
-    #[test]
-    fn sanitize_rejects_invalid() {
-        assert_eq!(sanitize_nats_token("").as_deref(), None);
-        assert_eq!(sanitize_nats_token("a.b").as_deref(), None);
-        assert_eq!(sanitize_nats_token("a>b").as_deref(), None);
-        assert_eq!(sanitize_nats_token("a*b").as_deref(), None);
-        assert_eq!(sanitize_nats_token("a b").as_deref(), None);
-        assert_eq!(sanitize_nats_token("a\tb").as_deref(), None);
-        assert_eq!(sanitize_nats_token("a\0b").as_deref(), None);
-        // Control characters and DEL
-        assert_eq!(sanitize_nats_token("a\x01b").as_deref(), None);
-        assert_eq!(sanitize_nats_token("a\x7Fb").as_deref(), None);
-        // Non-ASCII (NATS subjects are ASCII-only)
-        assert_eq!(sanitize_nats_token("caf\u{00e9}").as_deref(), None);
+        assert_eq!(
+            sanitize_nats_token("alpha-team").as_deref(),
+            Some("alpha-team")
+        );
     }
 
     #[test]
@@ -235,18 +230,103 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_nfc_normalization_applied() {
-        // U+00E9 (é) is already NFC but still non-ASCII → rejected
-        assert_eq!(sanitize_nats_token("caf\u{00e9}").as_deref(), None);
-        // U+0065 U+0301 (e + combining accent) normalizes to U+00E9, still non-ASCII → rejected
-        assert_eq!(sanitize_nats_token("caf\u{0065}\u{0301}").as_deref(), None);
+    fn sanitize_strips_nats_separator() {
+        // Dots are replaced with underscores to prevent subject injection
+        assert_eq!(
+            sanitize_nats_token("group.subgroup").as_deref(),
+            Some("group_subgroup")
+        );
+        assert_eq!(sanitize_nats_token("a.b.c.d").as_deref(), Some("a_b_c_d"));
+    }
+
+    #[test]
+    fn sanitize_strips_wildcards() {
+        assert_eq!(sanitize_nats_token("group*").as_deref(), Some("group"));
+        assert_eq!(sanitize_nats_token("a>b").as_deref(), Some("ab"));
+        assert_eq!(sanitize_nats_token("a*b").as_deref(), Some("ab"));
+        // Pure wildcards sanitize to empty → None
+        assert_eq!(sanitize_nats_token(">").as_deref(), None);
+        assert_eq!(sanitize_nats_token("*").as_deref(), None);
+        assert_eq!(sanitize_nats_token(">*").as_deref(), None);
+    }
+
+    #[test]
+    fn sanitize_strips_control_chars() {
+        assert_eq!(sanitize_nats_token("a\nb").as_deref(), Some("ab"));
+        assert_eq!(sanitize_nats_token("a\0b").as_deref(), Some("ab"));
+        assert_eq!(sanitize_nats_token("a\x01b").as_deref(), Some("ab"));
+        assert_eq!(sanitize_nats_token("a\x7Fb").as_deref(), Some("ab"));
+        assert_eq!(sanitize_nats_token("a\tb").as_deref(), Some("ab"));
+    }
+
+    #[test]
+    fn sanitize_strips_non_ascii() {
+        // Non-ASCII characters are stripped, ASCII remainder is preserved
+        assert_eq!(sanitize_nats_token("caf\u{00e9}").as_deref(), Some("caf"));
+        assert_eq!(
+            sanitize_nats_token("\u{1F600}hello").as_deref(),
+            Some("hello")
+        );
+        // Pure non-ASCII → empty → None
+        assert_eq!(sanitize_nats_token("\u{00e9}\u{00e9}").as_deref(), None);
+    }
+
+    #[test]
+    fn sanitize_rejects_empty() {
+        assert_eq!(sanitize_nats_token("").as_deref(), None);
+        // Dots only → all replaced with underscores, so this is valid
+        assert_eq!(sanitize_nats_token("...").as_deref(), Some("___"));
+    }
+
+    #[test]
+    fn sanitize_rejects_whitespace_only() {
+        assert_eq!(sanitize_nats_token("   ").as_deref(), None);
+        assert_eq!(sanitize_nats_token("\t\t").as_deref(), None);
+    }
+
+    #[test]
+    fn sanitize_strips_whitespace() {
+        // Whitespace is stripped entirely (not just trimmed)
+        assert_eq!(sanitize_nats_token("a b").as_deref(), Some("ab"));
+        assert_eq!(sanitize_nats_token("  group  ").as_deref(), Some("group"));
+    }
+
+    #[test]
+    fn sanitize_caps_length() {
+        let long_input = "a".repeat(MAX_TOKEN_LENGTH + 100);
+        let result = sanitize_nats_token(&long_input);
+        assert!(result.is_some());
+        assert_eq!(result.as_deref().map(str::len), Some(MAX_TOKEN_LENGTH));
+    }
+
+    #[test]
+    fn sanitize_accepts_max_length_token() {
+        let token = "a".repeat(MAX_TOKEN_LENGTH);
+        assert_eq!(sanitize_nats_token(&token).as_deref(), Some(token.as_str()));
+    }
+
+    #[test]
+    fn sanitize_unicode_confusable() {
+        // Cyrillic 'а' (U+0430) looks like Latin 'a' but is non-ASCII → stripped
+        assert_eq!(sanitize_nats_token("te\u{0430}m").as_deref(), Some("tem"));
+        // Mixed: Latin 'a' stays, Cyrillic 'а' stripped
+        assert_eq!(sanitize_nats_token("a\u{0430}b").as_deref(), Some("ab"));
     }
 
     #[test]
     fn sanitize_nfc_consistent_for_equivalent_inputs() {
-        // Both representations of "é" should produce the same result
+        // Both representations of "é" are non-ASCII and stripped, leaving "caf"
         let nfc = sanitize_nats_token("caf\u{00e9}");
         let nfd = sanitize_nats_token("caf\u{0065}\u{0301}");
         assert_eq!(nfc, nfd);
+    }
+
+    #[test]
+    fn sanitize_combined_attack_vector() {
+        // A crafted input combining multiple injection vectors
+        assert_eq!(
+            sanitize_nats_token("admin.*.>\x00\u{0430}team").as_deref(),
+            Some("admin__team")
+        );
     }
 }
