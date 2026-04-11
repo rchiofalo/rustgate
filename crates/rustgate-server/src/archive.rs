@@ -93,6 +93,9 @@ impl CotArchiver {
             rustgate_core::message::Destination::Direct(d) => {
                 format!("direct:{}", escape_json(&d.cn))
             }
+            rustgate_core::message::Destination::Multicast(groups) => {
+                format!("multicast:[{}]", groups.join(","))
+            }
         };
 
         let line = format!(

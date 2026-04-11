@@ -88,6 +88,51 @@ impl<'a> Arbitrary<'a> for CotEvent {
     }
 }
 
+/// CoT Situational Awareness affiliation derived from the event type hierarchy.
+///
+/// The affiliation is encoded in the second segment of an "atom" event type
+/// string (e.g., `a-f-G-U-C` -> `Friendly`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaAffiliation {
+    /// Friendly force (`a-f-*`).
+    Friendly,
+    /// Hostile force (`a-h-*`).
+    Hostile,
+    /// Neutral force (`a-n-*`).
+    Neutral,
+    /// Unknown affiliation (`a-u-*`).
+    Unknown,
+}
+
+/// Returns `true` if the CoT event type represents a Situational Awareness atom.
+///
+/// SA atoms are event types starting with `a-` followed by an affiliation
+/// character (`f`, `h`, `n`, or `u`) and a dash separator.
+pub fn is_sa_event(event_type: &str) -> bool {
+    event_type.starts_with("a-f-")
+        || event_type.starts_with("a-h-")
+        || event_type.starts_with("a-n-")
+        || event_type.starts_with("a-u-")
+}
+
+/// Extracts the SA affiliation from a CoT event type, if it is an SA atom.
+///
+/// Returns `None` for non-SA event types (e.g., `"b-t-f"`, `"t-x-d"`).
+pub fn sa_affiliation(event_type: &str) -> Option<SaAffiliation> {
+    // SA atoms have the form "a-X-..." where X is the affiliation character
+    let bytes = event_type.as_bytes();
+    if bytes.len() < 4 || bytes[0] != b'a' || bytes[1] != b'-' || bytes[3] != b'-' {
+        return None;
+    }
+    match bytes[2] {
+        b'f' => Some(SaAffiliation::Friendly),
+        b'h' => Some(SaAffiliation::Hostile),
+        b'n' => Some(SaAffiliation::Neutral),
+        b'u' => Some(SaAffiliation::Unknown),
+        _ => None,
+    }
+}
+
 pub fn parse(xml: &[u8]) -> Result<CotEvent, ParseError> {
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(true);
@@ -541,5 +586,66 @@ mod tests {
         assert!(parse_iso8601("2021-01-01T24:00:00Z").is_none());
         assert!(parse_iso8601("2021-01-01T00:60:00Z").is_none());
         assert!(parse_iso8601("2021-01-01T00:00:60Z").is_none());
+    }
+
+    // ── SA event type detection tests ────────────────────────────────
+
+    #[test]
+    fn is_sa_event_friendly() {
+        assert!(is_sa_event("a-f-G-U-C"));
+        assert!(is_sa_event("a-f-A"));
+        assert!(is_sa_event("a-f-G"));
+    }
+
+    #[test]
+    fn is_sa_event_hostile() {
+        assert!(is_sa_event("a-h-G"));
+        assert!(is_sa_event("a-h-A-M-F"));
+    }
+
+    #[test]
+    fn is_sa_event_neutral() {
+        assert!(is_sa_event("a-n-G"));
+    }
+
+    #[test]
+    fn is_sa_event_unknown() {
+        assert!(is_sa_event("a-u-G"));
+    }
+
+    #[test]
+    fn is_sa_event_rejects_non_sa() {
+        assert!(!is_sa_event("b-t-f"));
+        assert!(!is_sa_event("t-x-d"));
+        assert!(!is_sa_event("b-a-o-tbl"));
+        assert!(!is_sa_event("a-"));
+        assert!(!is_sa_event("a-x-G"));
+        assert!(!is_sa_event(""));
+    }
+
+    #[test]
+    fn sa_affiliation_correct() {
+        assert_eq!(sa_affiliation("a-f-G-U-C"), Some(SaAffiliation::Friendly));
+        assert_eq!(sa_affiliation("a-h-G"), Some(SaAffiliation::Hostile));
+        assert_eq!(sa_affiliation("a-n-G"), Some(SaAffiliation::Neutral));
+        assert_eq!(sa_affiliation("a-u-G"), Some(SaAffiliation::Unknown));
+    }
+
+    #[test]
+    fn sa_affiliation_none_for_non_sa() {
+        assert_eq!(sa_affiliation("b-t-f"), None);
+        assert_eq!(sa_affiliation("t-x-d"), None);
+        assert_eq!(sa_affiliation(""), None);
+        assert_eq!(sa_affiliation("a-"), None);
+        assert_eq!(sa_affiliation("a-x-G"), None);
+    }
+
+    #[test]
+    fn sa_affiliation_edge_cases() {
+        // Too short to contain a valid affiliation
+        assert_eq!(sa_affiliation("a"), None);
+        assert_eq!(sa_affiliation("a-f"), None);
+        // Missing trailing dash (not a valid SA atom)
+        assert_eq!(sa_affiliation("a-fx"), None);
     }
 }

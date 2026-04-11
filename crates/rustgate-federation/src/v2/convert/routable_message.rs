@@ -40,10 +40,18 @@ pub fn routable_to_federated_event(
     }
 
     // If destination is a specific group, ensure it's in federate_groups
-    if let Destination::Group(ref group_id) = msg.destination
-        && !event.federate_groups.contains(group_id)
-    {
-        event.federate_groups.push(group_id.clone());
+    match &msg.destination {
+        Destination::Group(group_id) if !event.federate_groups.contains(group_id) => {
+            event.federate_groups.push(group_id.clone());
+        }
+        Destination::Multicast(groups) => {
+            for group_id in groups {
+                if !event.federate_groups.contains(group_id) {
+                    event.federate_groups.push(group_id.clone());
+                }
+            }
+        }
+        _ => {}
     }
 
     Ok(event)

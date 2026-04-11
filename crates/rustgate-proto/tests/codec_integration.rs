@@ -4,7 +4,8 @@
 use prost::Message;
 use rustgate_core::constants::MAX_FRAME_SIZE;
 use rustgate_proto::{
-    TakFrameCodec, build_protocol_support_xml, build_tak_response, parse_tak_request, tak_proto,
+    NegotiatedVersion, TakFrameCodec, build_protocol_support_xml, build_tak_response,
+    parse_tak_request, tak_proto,
 };
 use tokio_util::bytes::{BufMut, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
@@ -304,7 +305,7 @@ fn build_protocol_support_xml_contains_required_elements() {
     assert!(xml_str.contains("type=\"t-x-takp-v\""));
     assert!(xml_str.contains("uid=\"test-server\""));
     assert!(xml_str.contains("<TakControl>"));
-    assert!(xml_str.contains("<TakProtocolSupport version=\"1\""));
+    assert!(xml_str.contains("<TakProtocolSupport version=\"2\""));
     assert!(xml_str.contains("<point"));
     assert!(xml_str.contains("<detail>"));
 }
@@ -344,13 +345,13 @@ fn build_protocol_support_xml_is_parseable() {
 
 #[test]
 fn build_tak_response_starts_with_magic_byte() {
-    let response = build_tak_response();
+    let response = build_tak_response(NegotiatedVersion::V1);
     assert_eq!(response[0], 0xBF);
 }
 
 #[test]
 fn build_tak_response_is_decodeable_as_tak_message() {
-    let response = build_tak_response();
+    let response = build_tak_response(NegotiatedVersion::V1);
 
     // Parse: magic + varint + payload
     let (payload_len, varint_bytes) = decode_varint(&response[1..]).unwrap();
@@ -366,7 +367,7 @@ fn build_tak_response_is_decodeable_as_tak_message() {
 
 #[test]
 fn build_tak_response_total_length_matches() {
-    let response = build_tak_response();
+    let response = build_tak_response(NegotiatedVersion::V1);
 
     let (payload_len, varint_bytes) = decode_varint(&response[1..]).unwrap();
     let expected_total = 1 + varint_bytes + payload_len;
@@ -387,7 +388,8 @@ fn parse_tak_request_accepts_valid_v1() {
         }),
         cot_event: None,
     };
-    parse_tak_request(&msg.encode_to_vec()).unwrap();
+    let version = parse_tak_request(&msg.encode_to_vec()).unwrap();
+    assert_eq!(version, NegotiatedVersion::V1);
 }
 
 #[test]
@@ -400,15 +402,17 @@ fn parse_tak_request_accepts_empty_versions() {
         }),
         cot_event: None,
     };
-    parse_tak_request(&msg.encode_to_vec()).unwrap();
+    let version = parse_tak_request(&msg.encode_to_vec()).unwrap();
+    assert_eq!(version, NegotiatedVersion::V2);
 }
 
 #[test]
 fn parse_tak_request_rejects_unsupported_version() {
+    // min=3,max=4 has no overlap with server's [1..2]
     let msg = tak_proto::TakMessage {
         tak_control: Some(tak_proto::TakControl {
-            min_proto_version: "2".into(),
-            max_proto_version: "3".into(),
+            min_proto_version: "3".into(),
+            max_proto_version: "4".into(),
             contact_uid: String::new(),
         }),
         cot_event: None,
@@ -466,7 +470,8 @@ async fn read_tak_request_accepts_valid_frame() {
     // Build the wire frame without the magic byte (read_tak_request assumes it's consumed)
     let frame = encode_varint_frame(&proto_bytes);
     let mut cursor = std::io::Cursor::new(frame);
-    read_tak_request(&mut cursor).await.unwrap();
+    let version = read_tak_request(&mut cursor).await.unwrap();
+    assert_eq!(version, NegotiatedVersion::V1);
 }
 
 #[tokio::test]

@@ -71,6 +71,11 @@ pub enum Destination {
     Direct(Identity),
     /// Deliver to all connected sessions (except the sender).
     Broadcast,
+    /// Deliver to multiple groups simultaneously.
+    ///
+    /// Used by SA multicast routing to fan a single message out to
+    /// several groups in one routing pass.
+    Multicast(Vec<GroupId>),
 }
 
 /// Classified message type.
@@ -117,7 +122,7 @@ impl<'a> Arbitrary<'a> for MessageType {
 #[cfg(feature = "fuzz")]
 impl<'a> Arbitrary<'a> for Destination {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        match u.int_in_range(0..=2)? {
+        match u.int_in_range(0..=3)? {
             0 => Ok(Self::Broadcast),
             1 => {
                 let len = u.int_in_range(1..=16)?;
@@ -126,7 +131,19 @@ impl<'a> Arbitrary<'a> for Destination {
                     .collect::<arbitrary::Result<_>>()?;
                 Ok(Self::Group(group))
             }
-            _ => Ok(Self::Direct(u.arbitrary()?)),
+            2 => Ok(Self::Direct(u.arbitrary()?)),
+            _ => {
+                let count = u.int_in_range(0..=4)?;
+                let groups: Vec<String> = (0..count)
+                    .map(|_| {
+                        let len = u.int_in_range(1..=16)?;
+                        (0..len)
+                            .map(|_| u.int_in_range(b'a'..=b'z').map(|b| b as char))
+                            .collect::<arbitrary::Result<String>>()
+                    })
+                    .collect::<arbitrary::Result<_>>()?;
+                Ok(Self::Multicast(groups))
+            }
         }
     }
 }
@@ -186,6 +203,7 @@ impl std::fmt::Display for Destination {
             Self::Broadcast => f.write_str("broadcast"),
             Self::Group(g) => write!(f, "group:{g}"),
             Self::Direct(id) => write!(f, "direct:{}", id.cn),
+            Self::Multicast(groups) => write!(f, "multicast:[{}]", groups.join(",")),
         }
     }
 }

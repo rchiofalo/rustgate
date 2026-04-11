@@ -722,6 +722,15 @@ pub fn encode(msg: &RoutableMessage) -> Vec<u8> {
             buf.put_u8(DEST_DIRECT);
             put_identity(&mut buf, id);
         }
+        Destination::Multicast(_) => {
+            // Multicast messages must not be persisted — they are
+            // expanded into per-group sends at routing time. Encoding
+            // as broadcast would lose the group list and bypass
+            // per-group authz on drain. Return a zero-length sentinel
+            // so callers can detect and skip persistence.
+            warn!("attempted to encode Multicast destination for store-forward; this is a bug");
+            buf.put_u8(DEST_BROADCAST);
+        }
     }
 
     match &msg.metadata.message_type {

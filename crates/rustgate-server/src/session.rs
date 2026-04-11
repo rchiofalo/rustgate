@@ -306,16 +306,16 @@ async fn negotiate_tak_protocol(
     if peek[0] == 0xBF {
         // Client is requesting protobuf upgrade.
         // Magic byte already consumed; read_tak_request handles varint + payload + validation.
-        rustgate_proto::read_tak_request(reader).await?;
+        let version = rustgate_proto::read_tak_request(reader).await?;
 
-        tracing::info!(cn = %cn, "client requested protobuf upgrade");
+        tracing::info!(cn = %cn, ?version, "client requested protobuf upgrade");
 
         // Step 3: Send TakResponse (0xBF-framed TakControl acknowledgement)
-        let response = rustgate_proto::build_tak_response();
+        let response = rustgate_proto::build_tak_response(version);
         writer.write_all(&response).await?;
         writer.flush().await?;
 
-        tracing::info!(cn = %cn, "protobuf negotiation complete");
+        tracing::info!(cn = %cn, ?version, "protobuf negotiation complete");
 
         Ok((
             Arc::new(rustgate_proto::TakProtobufCodec),
@@ -449,6 +449,7 @@ async fn read_loop(
                 Destination::Broadcast => "broadcast",
                 Destination::Group(_) => "group",
                 Destination::Direct(_) => "direct",
+                Destination::Multicast(_) => "multicast",
             };
             let bucket = ctx.metrics_identity.bucket(&ctx.identity.cn);
             metrics::messages_routed()

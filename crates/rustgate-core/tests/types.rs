@@ -331,19 +331,21 @@ fn destination_direct_identity_equality() {
 
 #[test]
 fn destination_pattern_matching_all_variants() {
-    let variants: [Destination; 3] = [
+    let variants: [Destination; 4] = [
         Destination::Broadcast,
         Destination::Group("g".to_string()),
         Destination::Direct(make_identity("x", "fp", &[])),
+        Destination::Multicast(vec!["a".to_string(), "b".to_string()]),
     ];
     for dest in &variants {
         match dest {
             Destination::Broadcast => {}
             Destination::Group(_) => {}
             Destination::Direct(_) => {}
+            Destination::Multicast(_) => {}
         }
     }
-    assert_eq!(variants.len(), 3);
+    assert_eq!(variants.len(), 4);
 }
 
 #[test]

@@ -950,7 +950,7 @@ fn msg_to_topic(msg: &RoutableMessage, prefix: &str) -> String {
             }
         }
         Destination::Direct(target) => format!("{prefix}direct/{}", target.cn),
-        Destination::Broadcast => {
+        Destination::Broadcast | Destination::Multicast(_) => {
             if prefix.is_empty() {
                 BROADCAST_TOPIC_SUFFIX.to_owned()
             } else {
