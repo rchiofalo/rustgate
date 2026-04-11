@@ -129,9 +129,9 @@ mod tests {
         let xml_back = proto_to_xml(&proto_bytes).expect("decode");
         let restored = crate::xml_full::parse_full(&xml_back).expect("parse");
 
-        // The xmlDetail should contain the marti element
-        assert!(restored.xml_detail.contains("marti"));
-        assert!(restored.xml_detail.contains("BRAVO"));
+        // marti is now a typed detail field, preserved through round-trip
+        let marti = restored.marti.expect("marti");
+        assert_eq!(marti.dest_callsigns, vec!["BRAVO"]);
     }
 
     /// Shape detail elements survive XML → protobuf → XML round-trip via xmlDetail.
@@ -156,7 +156,8 @@ mod tests {
         assert!(restored.xml_detail.contains("fillColor"));
     }
 
-    /// GeoChat detail elements survive XML → protobuf → XML round-trip via xmlDetail.
+    /// GeoChat detail elements survive XML -> protobuf -> XML round-trip.
+    /// __chat stays in xml_detail residual, remarks is now a typed field.
     #[test]
     fn round_trip_preserves_chat_xml_detail() {
         let xml = br#"<event uid="GeoChat.A.B.1" type="b-t-f" how="h-g-i-g-o" time="2021-01-01T00:00:00.000Z" start="2021-01-01T00:00:00.000Z" stale="2021-01-01T00:05:00.000Z">
@@ -170,11 +171,15 @@ mod tests {
         let xml_back = proto_to_xml(&proto_bytes).expect("decode");
         let restored = crate::xml_full::parse_full(&xml_back).expect("parse");
 
+        // __chat is not a typed element, stays in xml_detail
         assert!(restored.xml_detail.contains("__chat"));
         assert!(restored.xml_detail.contains("chatgrp"));
         assert!(restored.xml_detail.contains("senderCallsign"));
-        assert!(restored.xml_detail.contains("remarks"));
-        assert!(restored.xml_detail.contains("hello world"));
+
+        // remarks is now a typed field, preserved through round-trip
+        let remarks = restored.remarks.expect("remarks");
+        assert_eq!(remarks.source.as_deref(), Some("BAO.F.ATAK.A"));
+        assert_eq!(remarks.text, "hello world");
     }
 
     #[test]
