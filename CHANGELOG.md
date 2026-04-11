@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Jemalloc memory statistics** — when the `jemalloc` feature is enabled, the metrics endpoint now exposes four Prometheus gauges: `rustgate_jemalloc_resident_bytes`, `rustgate_jemalloc_active_bytes`, `rustgate_jemalloc_allocated_bytes`, and `rustgate_jemalloc_mapped_bytes`. Values are refreshed on every `/metrics` scrape via the safe `tikv-jemalloc-ctl` API (epoch advance + stat reads). Operators can use these to monitor allocator-level memory usage, detect fragmentation (allocated vs active), and set alerts on resident growth. Requires `--features jemalloc,metrics`. (#674)
+
 ### Security
 
 - **Case-insensitive CN matching in ACL** — `GroupAcl` now normalizes all certificate Common Name strings to ASCII lowercase at construction time and before lookup, matching the case-insensitive semantics required by RFC 5280 §7.1. Previously, an attacker with a differently-cased CN (e.g. `CN=Admin` vs. `admin`) could bypass ACL rules. (#652)

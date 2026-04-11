@@ -41,7 +41,7 @@ mqtt = ["dep:rustgate-mqtt"]
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
 fips = ["rustgate-transport/fips", "rustgate-federation?/fips", "rustgate-enrollment?/fips"]
 post-quantum = ["rustgate-transport/post-quantum", "rustgate-federation?/post-quantum"]
-jemalloc = ["dep:tikv-jemallocator"]
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 ocsp = ["rustgate-transport/ocsp"]
 spiffe = ["rustgate-transport/spiffe"]
 # Enables the optional Cedar authz policy backend and `--authz-policy-format cedar`.
@@ -67,6 +67,7 @@ opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 tikv-jemallocator = { workspace = true, optional = true }
+tikv-jemalloc-ctl = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "signal", "fs", "macros", "time", "net"] }
 tokio-util = { workspace = true }
