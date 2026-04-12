@@ -24,6 +24,8 @@ pub(crate) mod circuit;
 pub mod config;
 pub mod error;
 pub(crate) mod filter;
+#[cfg(feature = "metrics")]
+pub mod metrics;
 pub(crate) mod payload;
 mod publisher;
 pub(crate) mod retry;
