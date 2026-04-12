@@ -25,16 +25,9 @@ pub mod config;
 pub mod error;
 pub(crate) mod filter;
 pub(crate) mod payload;
+mod publisher;
 pub(crate) mod retry;
 
 pub use config::HttpConfig;
 pub use error::HttpError;
-
-// Placeholder — publisher, auth, circuit, retry, metrics modules
-// will be added in subsequent commits.
-
-/// Placeholder publisher type for early compilation checks.
-///
-/// Will be replaced with the full implementation in a later commit.
-#[derive(Debug, Clone)]
-pub struct HttpPublisher;
+pub use publisher::HttpPublisher;

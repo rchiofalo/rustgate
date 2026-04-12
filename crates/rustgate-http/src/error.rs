@@ -37,6 +37,14 @@ pub enum HttpError {
         source: std::io::Error,
     },
 
+    /// Failed to read a TLS certificate or key file.
+    #[error("failed to read TLS file `{path}` for target `{target}`: {source}")]
+    TlsFile {
+        target: String,
+        path: String,
+        source: std::io::Error,
+    },
+
     /// Payload serialization to JSON failed.
     #[error("payload serialization failed: {source}")]
     Serialize { source: serde_json::Error },
