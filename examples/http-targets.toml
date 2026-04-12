@@ -1,0 +1,86 @@
+# Rustgate HTTP egress configuration.
+#
+# Each [[targets]] block defines an independent HTTP endpoint that receives
+# forwarded messages. Pass this file to rustgate via:
+#
+#   rustgate --http-config-file http-targets.toml
+#
+# See docs/http-egress.md for the full configuration reference.
+
+# Instance identifier included in the X-Rustgate-Instance header on every
+# request. Auto-generated from the process ID if omitted.
+instance-id = "rustgate-prod-01"
+
+# ── SIEM collector (Bearer token + mTLS) ────────────────────────────
+
+[[targets]]
+name = "siem-collector"
+url = "https://siem.internal:8443/api/v1/events"
+method = "post"
+format = "json"
+timeout-secs = 10
+enabled = true
+
+[targets.auth]
+type = "bearer"
+token-file = "/etc/rustgate/secrets/siem-token"
+
+[targets.tls]
+ca-cert = "/etc/rustgate/tls/siem-ca.pem"
+client-cert = "/etc/rustgate/tls/client.pem"
+client-key = "/etc/rustgate/tls/client-key.pem"
+
+[targets.filter]
+groups = ["team-alpha", "team-bravo"]
+message-types = ["position", "alert"]
+
+[targets.retry]
+max-attempts = 3
+backoff-base-secs = 1
+circuit-breaker-threshold = 5
+circuit-breaker-cooldown-secs = 30
+
+# ── C2 dashboard (HMAC-SHA256 signing, raw XML) ────────────────────
+
+[[targets]]
+name = "c2-dashboard"
+url = "https://dashboard.internal/webhook"
+format = "raw_xml"
+timeout-secs = 5
+
+[targets.auth]
+type = "hmac"
+secret-file = "/etc/rustgate/secrets/hmac-key"
+header = "X-Signature-256"
+
+[targets.retry]
+max-attempts = 2
+circuit-breaker-threshold = 3
+circuit-breaker-cooldown-secs = 60
+
+# ── Analytics API (Basic auth, custom headers) ─────────────────────
+
+[[targets]]
+name = "analytics-api"
+url = "https://analytics.internal/api/v2/ingest"
+method = "put"
+format = "json"
+timeout-secs = 15
+
+[targets.auth]
+type = "basic"
+username = "rustgate-ingest"
+password-file = "/etc/rustgate/secrets/analytics-password"
+
+[targets.filter]
+groups = ["hq-ops"]
+message-types = ["position"]
+source-cns = ["command-post-1", "command-post-2"]
+
+[[targets.headers]]
+name = "X-API-Version"
+value = "2"
+
+[[targets.headers]]
+name = "X-Tenant"
+value = "division-alpha"

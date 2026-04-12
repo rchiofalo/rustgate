@@ -74,9 +74,9 @@ For production certificate management see [docs/tls-certificates.md](docs/tls-ce
 │                                        (binary)                                         │
 ├────────────┬────────────┬────────────┬────────────┬────────────┬────────────┬───────────┤
 │ rustgate-  │ rustgate-  │ rustgate-  │ rustgate-  │ rustgate-  │ rustgate-  │ rustgate- │
-│ transport  │ websocket  │ mqtt       │ nats       │ enrollment │ proto      │ federation│
-│ TLS·codec  │ wss://     │ MQTT 5.0   │ NATS pub   │ HTTPS·CSR  │ protobuf   │ V1·V2·gRPC│
-│ router     │ mTLS WS    │ 3.1.1      │ JetStream  │ Auth       │ XML/proto  │ peer mgmt │
+│ transport  │ websocket  │ mqtt       │ nats       │ http       │ enrollment │ federation│
+│ TLS·codec  │ wss://     │ MQTT 5.0   │ NATS pub   │ HTTP/REST  │ HTTPS·CSR  │ V1·V2·gRPC│
+│ router     │ mTLS WS    │ 3.1.1      │ JetStream  │ egress     │ Auth       │ peer mgmt │
 ├────────────┴────────────┴────────────┼────────────┴────────────┴────────────┴───────────┤
 │             rustgate-cot             │                  rustgate-core                   │
 │   CoT XML parsing · MessageBuilder   │     Codec trait · Identity · RoutableMessage     │
@@ -94,6 +94,7 @@ For production certificate management see [docs/tls-certificates.md](docs/tls-ce
 | `rustgate-enrollment` | HTTPS certificate enrollment server (CSR signing, PKCS#12) |
 | `rustgate-proto` | Protobuf message translation (XML ↔ proto) |
 | `rustgate-authz` | Authorization engine (RBAC/ABAC, Cedar backend) |
+| `rustgate-http` | HTTP/webhook egress bridge with auth, retry, circuit breaking |
 | `rustgate-federation` | Server-to-server federation: V1 (XML), V2 (gRPC), HA, REST API |
 | `rustgate-client` | Lightweight client library for integration testing |
 | `rustgate-server` | Binary entry point, CLI, orchestration |
@@ -147,6 +148,7 @@ For detailed architecture documentation see [docs/architecture.md](docs/architec
 | Loop detection | Provenance-based with configurable hop limits |
 | HA mode | NATS KV distributed claims for multi-pod peer ownership |
 | NATS bridge | Publish/subscribe for stateless horizontal scaling with JetStream replay |
+| HTTP egress | Webhook/REST forwarding with Bearer/Basic/HMAC auth, retry, circuit breaking ([details](docs/http-egress.md)) |
 | REST API | Peer CRUD and certificate management endpoints |
 
 ### Operations

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **HTTP egress bridge** (`rustgate-http` crate): configurable webhook/REST forwarding with Bearer/Basic/HMAC-SHA256 auth, outbound mTLS, per-target filtering, exponential backoff with jitter, circuit breaking, and Prometheus metrics. Configure via `--http-config-file` TOML file. See [docs/http-egress.md](docs/http-egress.md).
+
 ## [0.8.0] — 2026-04-11
 
 ### Added
