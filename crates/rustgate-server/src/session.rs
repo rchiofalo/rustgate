@@ -41,6 +41,13 @@ use crate::metrics;
 pub(crate) type FedForwardFn =
     Arc<dyn Fn(Bytes, Vec<String>, rustgate_core::message::Metadata) + Send + Sync>;
 
+/// Callback for forwarding messages to HTTP targets (fire-and-forget).
+///
+/// Uses `Fn` (not `AsyncFn`) because `dyn AsyncFn` is not object-safe
+/// as of Rust 1.94. Async work is dispatched via `spawn_background()`.
+#[cfg(feature = "http")]
+pub(crate) type HttpForwardFn = Arc<dyn Fn(rustgate_core::message::RoutableMessage) + Send + Sync>;
+
 /// Configuration for the per-session CoT delta encoder.
 ///
 /// When `enabled`, each writer task constructs a [`DeltaEncoder`] with
@@ -75,6 +82,8 @@ pub(crate) struct SessionDeps<P: NatsPublish> {
     pub(crate) codec: Arc<dyn Codec>,
     pub(crate) nats_publisher: Option<P>,
     pub(crate) fed_forward: Option<FedForwardFn>,
+    #[cfg(feature = "http")]
+    pub(crate) http_forward: Option<HttpForwardFn>,
     pub(crate) throttle_config: Option<ThrottleConfig>,
     pub(crate) archiver: Option<Arc<archive::CotArchiver>>,
     pub(crate) replay_filter: Option<Arc<ReplayFilter>>,
@@ -94,6 +103,8 @@ struct SessionContext<'a, P: NatsPublish> {
     codec: &'a dyn Codec,
     nats_publisher: &'a Option<P>,
     fed_forward: &'a Option<FedForwardFn>,
+    #[cfg(feature = "http")]
+    http_forward: &'a Option<HttpForwardFn>,
     throttle: Option<rustgate_transport::ClientThrottle>,
     archiver: &'a Option<Arc<archive::CotArchiver>>,
     replay_filter: &'a Option<Arc<ReplayFilter>>,
@@ -240,6 +251,8 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
         codec: final_codec.as_ref(),
         nats_publisher: &deps.nats_publisher,
         fed_forward: &deps.fed_forward,
+        #[cfg(feature = "http")]
+        http_forward: &deps.http_forward,
         throttle,
         archiver: &deps.archiver,
         replay_filter: &deps.replay_filter,
@@ -487,6 +500,12 @@ async fn read_loop(
             let groups: Vec<String> = msg.source.groups.iter().cloned().collect();
             fwd(msg.payload.clone(), groups, msg.metadata.clone());
         }
+
+        // Forward to HTTP targets (fire-and-forget)
+        #[cfg(feature = "http")]
+        if let Some(fwd) = ctx.http_forward {
+            fwd(msg.clone());
+        }
     }
 
     Ok(())
@@ -614,6 +633,8 @@ pub(crate) struct PlaintextTcpConfig<P: NatsPublish> {
     pub(crate) codec: Arc<dyn Codec>,
     pub(crate) nats_publisher: Option<P>,
     pub(crate) fed_forward: Option<FedForwardFn>,
+    #[cfg(feature = "http")]
+    pub(crate) http_forward: Option<HttpForwardFn>,
     pub(crate) throttle_config: Option<ThrottleConfig>,
     pub(crate) archiver: Option<Arc<archive::CotArchiver>>,
     pub(crate) replay_filter: Option<Arc<ReplayFilter>>,
@@ -639,6 +660,8 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
         codec,
         nats_publisher,
         fed_forward,
+        #[cfg(feature = "http")]
+        http_forward,
         throttle_config,
         archiver,
         replay_filter,
@@ -712,6 +735,8 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
                         #[allow(clippy::clone_on_copy)]
                         let session_nats = nats_publisher.clone();
                         let session_fed = fed_forward.clone();
+                        #[cfg(feature = "http")]
+                        let session_http = http_forward.clone();
                         let session_throttle = throttle_config.map(|tc| tc.build());
                         let session_arch = archiver.clone();
                         let session_rf = replay_filter.clone();
@@ -731,6 +756,8 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
                                 codec: session_codec.as_ref(),
                                 nats_publisher: &session_nats,
                                 fed_forward: &session_fed,
+                                #[cfg(feature = "http")]
+                                http_forward: &session_http,
                                 throttle: session_throttle,
                                 archiver: &session_arch,
                                 replay_filter: &session_rf,
@@ -771,6 +798,8 @@ struct PlaintextSessionContext<'a, P: NatsPublish> {
     codec: &'a dyn Codec,
     nats_publisher: &'a Option<P>,
     fed_forward: &'a Option<FedForwardFn>,
+    #[cfg(feature = "http")]
+    http_forward: &'a Option<HttpForwardFn>,
     throttle: Option<rustgate_transport::ClientThrottle>,
     archiver: &'a Option<Arc<archive::CotArchiver>>,
     replay_filter: &'a Option<Arc<ReplayFilter>>,
@@ -796,6 +825,8 @@ async fn run_plaintext_session_loops<P: NatsPublish>(
         codec,
         nats_publisher,
         fed_forward,
+        #[cfg(feature = "http")]
+        http_forward,
         throttle,
         archiver,
         replay_filter,
@@ -872,6 +903,11 @@ async fn run_plaintext_session_loops<P: NatsPublish>(
                 if let Some(fwd) = fed_forward {
                     let groups: Vec<String> = msg.source.groups.iter().cloned().collect();
                     fwd(msg.payload.clone(), groups, msg.metadata.clone());
+                }
+
+                #[cfg(feature = "http")]
+                if let Some(fwd) = http_forward {
+                    fwd(msg.clone());
                 }
             }
             Ok(())

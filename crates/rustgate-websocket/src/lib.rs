@@ -23,8 +23,8 @@ use rustgate_core::net::configure_tcp_keepalive;
 use rustgate_core::ratelimit::ConnRateLimiter;
 use rustgate_transport::{TlsConfig, extract_identity};
 pub use server::{
-    DEFAULT_MAX_WRITE_BUFFER_BYTES, OnFederationForward, OnNatsPublish, WebSocketServer,
-    WsServerConfig,
+    DEFAULT_MAX_WRITE_BUFFER_BYTES, OnFederationForward, OnHttpForward, OnNatsPublish,
+    WebSocketServer, WsServerConfig,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;

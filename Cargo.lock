@@ -3370,6 +3370,7 @@ dependencies = [
  "rustgate-cot",
  "rustgate-enrollment",
  "rustgate-federation",
+ "rustgate-http",
  "rustgate-mqtt",
  "rustgate-nats",
  "rustgate-proto",

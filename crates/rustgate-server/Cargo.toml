@@ -46,6 +46,7 @@ ocsp = ["rustgate-transport/ocsp"]
 spiffe = ["rustgate-transport/spiffe"]
 # Enables the optional Cedar authz policy backend and `--authz-policy-format cedar`.
 cedar = ["rustgate-authz/cedar"]
+http = ["dep:rustgate-http"]
 
 [dependencies]
 rustgate-authz = { workspace = true }
@@ -58,6 +59,7 @@ rustgate-nats = { workspace = true, optional = true }
 rustgate-enrollment = { workspace = true, optional = true }
 rustgate-proto = { workspace = true, optional = true }
 rustgate-federation = { workspace = true, optional = true }
+rustgate-http = { workspace = true, optional = true }
 prometheus = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
