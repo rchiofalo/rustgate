@@ -14,6 +14,7 @@ members = [
     "crates/rustgate-client",
     "crates/rustgate-authz",
     "crates/rustgate-mqtt",
+    "crates/rustgate-http",
 ]
 exclude = ["fuzz"]
 
@@ -127,6 +128,7 @@ rustgate-test-utils = { path = "crates/rustgate-test-utils" }
 rustgate-client = { path = "crates/rustgate-client" }
 rustgate-authz = { path = "crates/rustgate-authz" }
 rustgate-mqtt = { path = "crates/rustgate-mqtt" }
+rustgate-http = { path = "crates/rustgate-http" }
 
 [profile.release]
 lto = true
