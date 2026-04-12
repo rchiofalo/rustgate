@@ -1,0 +1,398 @@
+// Copyright © 2026 Roberto Chiofalo.
+
+//! Integration tests for the HTTP egress publisher using wiremock.
+
+#![allow(clippy::panic, clippy::unwrap_used)]
+
+use std::collections::BTreeSet;
+use std::sync::Arc;
+use std::time::SystemTime;
+
+use bytes::Bytes;
+use rustgate_core::identity::Identity;
+use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
+use rustgate_http::HttpPublisher;
+use rustgate_http::config::{HttpConfig, TargetConfig};
+use wiremock::matchers::{header, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+fn make_msg(cn: &str, protocol: &str, msg_type: MessageType) -> RoutableMessage {
+    RoutableMessage {
+        source: Identity {
+            cn: cn.to_string(),
+            fingerprint: Default::default(),
+            groups: {
+                let mut s = BTreeSet::new();
+                let _ = s.insert("alpha".to_string());
+                s
+            },
+            tenant: None,
+            spiffe_id: None,
+            attributes: Arc::new(Default::default()),
+        },
+        destination: Destination::Broadcast,
+        payload: Bytes::from_static(b"<event uid='test-1'/>"),
+        metadata: Metadata {
+            received_at: SystemTime::now(),
+            source_protocol: protocol.to_string(),
+            message_type: msg_type,
+            ttl: None,
+        },
+    }
+}
+
+fn target_config(name: &str, url: &str) -> TargetConfig {
+    TargetConfig {
+        name: name.to_string(),
+        url: url.to_string(),
+        method: None,
+        auth: None,
+        tls: None,
+        timeout_secs: Some(5),
+        format: None,
+        filter: None,
+        retry: None,
+        enabled: None,
+        headers: None,
+    }
+}
+
+fn http_config(targets: Vec<TargetConfig>) -> HttpConfig {
+    HttpConfig {
+        instance_id: Some("test-instance".to_string()),
+        targets,
+    }
+}
+
+#[tokio::test]
+async fn publish_to_single_target() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let config = http_config(vec![target_config(
+        "test",
+        &format!("{}/webhook", server.uri()),
+    )]);
+    let publisher = HttpPublisher::new(config).unwrap();
+
+    let msg = make_msg("alice", "tcp", MessageType::Position);
+    publisher.publish(&msg);
+
+    // Allow time for async dispatch
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    publisher.shutdown();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn publish_json_format() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(header("content-type", "application/json"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let config = http_config(vec![target_config(
+        "json-test",
+        &format!("{}/api", server.uri()),
+    )]);
+    let publisher = HttpPublisher::new(config).unwrap();
+
+    let msg = make_msg("bob", "tcp", MessageType::Alert);
+    publisher.publish(&msg);
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    publisher.shutdown();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn publish_raw_xml_format() {
+    use rustgate_http::config::PayloadFormat;
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(header("content-type", "application/xml"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut tc = target_config("xml-test", &format!("{}/xml", server.uri()));
+    tc.format = Some(PayloadFormat::RawXml);
+    let config = http_config(vec![tc]);
+    let publisher = HttpPublisher::new(config).unwrap();
+
+    let msg = make_msg("carol", "tcp", MessageType::Position);
+    publisher.publish(&msg);
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    publisher.shutdown();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn echo_prevention_blocks_http_protocol() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0) // Should NOT receive anything
+        .mount(&server)
+        .await;
+
+    let config = http_config(vec![target_config(
+        "echo-test",
+        &format!("{}/hook", server.uri()),
+    )]);
+    let publisher = HttpPublisher::new(config).unwrap();
+
+    // Message from HTTP protocol should be echo-prevented
+    let msg = make_msg("alice", "http", MessageType::Position);
+    publisher.publish(&msg);
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    publisher.shutdown();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn filter_excludes_non_matching_groups() {
+    use rustgate_http::config::FilterConfig;
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0) // Filtered out
+        .mount(&server)
+        .await;
+
+    let mut tc = target_config("filtered", &format!("{}/hook", server.uri()));
+    tc.filter = Some(FilterConfig {
+        groups: Some(vec!["bravo".to_string()]),
+        message_types: None,
+        source_cns: None,
+        exclude_protocols: None,
+    });
+    let config = http_config(vec![tc]);
+    let publisher = HttpPublisher::new(config).unwrap();
+
+    // Sender is in "alpha" group, filter requires "bravo"
+    let msg = make_msg("alice", "tcp", MessageType::Position);
+    publisher.publish(&msg);
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    publisher.shutdown();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn retry_on_5xx() {
+    let server = MockServer::start().await;
+
+    // First two requests return 503, third succeeds
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(2)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let mut tc = target_config("retry-test", &format!("{}/api", server.uri()));
+    tc.retry = Some(rustgate_http::config::RetryConfig {
+        max_attempts: Some(3),
+        backoff_base_secs: Some(0), // No delay in tests
+        circuit_breaker_threshold: Some(10),
+        circuit_breaker_cooldown_secs: Some(60),
+    });
+    let config = http_config(vec![tc]);
+    let publisher = HttpPublisher::new(config).unwrap();
+
+    let msg = make_msg("alice", "tcp", MessageType::Position);
+    publisher.publish(&msg);
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    publisher.shutdown();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn no_retry_on_4xx() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1) // Only one attempt — no retry on 4xx
+        .mount(&server)
+        .await;
+
+    let mut tc = target_config("no-retry", &format!("{}/api", server.uri()));
+    tc.retry = Some(rustgate_http::config::RetryConfig {
+        max_attempts: Some(3),
+        backoff_base_secs: Some(0),
+        circuit_breaker_threshold: Some(10),
+        circuit_breaker_cooldown_secs: Some(60),
+    });
+    let config = http_config(vec![tc]);
+    let publisher = HttpPublisher::new(config).unwrap();
+
+    let msg = make_msg("alice", "tcp", MessageType::Position);
+    publisher.publish(&msg);
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    publisher.shutdown();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn disabled_target_skipped() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1) // Only enabled target should receive
+        .mount(&server)
+        .await;
+
+    let enabled = target_config("enabled", &format!("{}/hook", server.uri()));
+    let mut disabled = target_config("disabled", &format!("{}/hook", server.uri()));
+    disabled.enabled = Some(false);
+
+    let config = http_config(vec![enabled, disabled]);
+    let publisher = HttpPublisher::new(config).unwrap();
+
+    let msg = make_msg("alice", "tcp", MessageType::Position);
+    publisher.publish(&msg);
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    publisher.shutdown();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn multiple_targets_fan_out() {
+    let server1 = MockServer::start().await;
+    let server2 = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server1)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server2)
+        .await;
+
+    let config = http_config(vec![
+        target_config("target-a", &format!("{}/hook", server1.uri())),
+        target_config("target-b", &format!("{}/hook", server2.uri())),
+    ]);
+    let publisher = HttpPublisher::new(config).unwrap();
+
+    let msg = make_msg("alice", "tcp", MessageType::Position);
+    publisher.publish(&msg);
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    publisher.shutdown();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn custom_headers_sent() {
+    use rustgate_http::config::HeaderEntry;
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(header("x-api-version", "2"))
+        .and(header("x-tenant", "alpha"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut tc = target_config("headers-test", &format!("{}/api", server.uri()));
+    tc.headers = Some(vec![
+        HeaderEntry {
+            name: "X-API-Version".to_string(),
+            value: "2".to_string(),
+        },
+        HeaderEntry {
+            name: "X-Tenant".to_string(),
+            value: "alpha".to_string(),
+        },
+    ]);
+    let config = http_config(vec![tc]);
+    let publisher = HttpPublisher::new(config).unwrap();
+
+    let msg = make_msg("alice", "tcp", MessageType::Position);
+    publisher.publish(&msg);
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    publisher.shutdown();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn instance_id_header_present() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(header("x-rustgate-instance", "test-instance"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let config = http_config(vec![target_config(
+        "instance-test",
+        &format!("{}/hook", server.uri()),
+    )]);
+    let publisher = HttpPublisher::new(config).unwrap();
+
+    let msg = make_msg("alice", "tcp", MessageType::Position);
+    publisher.publish(&msg);
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    publisher.shutdown();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn is_healthy_reflects_circuit_state() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let config = http_config(vec![target_config(
+        "health-test",
+        &format!("{}/hook", server.uri()),
+    )]);
+    let publisher = HttpPublisher::new(config).unwrap();
+
+    // Initially healthy (all circuits closed)
+    assert!(publisher.is_healthy());
+
+    publisher.shutdown();
+}
