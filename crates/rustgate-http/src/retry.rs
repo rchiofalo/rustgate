@@ -49,12 +49,16 @@ pub(crate) fn backoff_with_jitter(base: Duration, attempt: u32) -> Duration {
     if total.is_zero() { MIN_DELAY } else { total }
 }
 
-/// Returns `true` if the HTTP status code is retryable (5xx server error).
+/// Returns `true` if the HTTP status code is retryable.
 ///
-/// 4xx client errors are never retried — they indicate a configuration
-/// problem that won't resolve on its own.
+/// Retryable statuses:
+/// - **429** (Too Many Requests) — rate-limiting; back off and retry.
+/// - **5xx** (Server Error) — transient server-side failures.
+///
+/// 4xx client errors (except 429) are never retried — they indicate a
+/// configuration problem that won't resolve on its own.
 pub(crate) fn is_retryable_status(status: u16) -> bool {
-    (500..600).contains(&status)
+    status == 429 || (500..600).contains(&status)
 }
 
 #[cfg(test)]
@@ -175,11 +179,16 @@ mod tests {
     }
 
     #[test]
+    fn retryable_429() {
+        assert!(is_retryable_status(429));
+    }
+
+    #[test]
     fn not_retryable_4xx() {
         assert!(!is_retryable_status(400));
         assert!(!is_retryable_status(401));
         assert!(!is_retryable_status(404));
-        assert!(!is_retryable_status(429));
+        assert!(!is_retryable_status(422));
     }
 
     #[test]

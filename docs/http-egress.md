@@ -146,16 +146,24 @@ exclude-protocols = ["nats"]            # also exclude NATS-sourced messages
 
 ```toml
 [targets.retry]
-max-attempts = 3                    # total attempts (including initial)
-backoff-base-secs = 1               # base delay for exponential backoff
-circuit-breaker-threshold = 5       # consecutive failures before circuit opens
-circuit-breaker-cooldown-secs = 30  # seconds before half-open probe
+max-attempts = 3                       # total attempts (including initial)
+backoff-base-secs = 1                  # base delay for exponential backoff
+circuit-breaker-threshold = 5          # consecutive failures before circuit opens
+circuit-breaker-cooldown-secs = 30     # seconds before half-open probe
+half-open-max-probes = 3               # max concurrent probes in half-open state
+half-open-success-threshold = 2        # successes needed to close from half-open
 ```
 
 **Retry behavior:**
-- Only 5xx responses and network errors are retried. 4xx responses are never retried (they indicate a client/config error).
+- Only 5xx responses, 429 (rate-limited), and network errors are retried. 4xx responses are never retried (they indicate a client/config error).
 - Backoff: `base * 2^min(attempt, 5)` with 0-25% random jitter, capped at 5 minutes.
-- The circuit breaker has three states: **Closed** (normal) → **Open** (after threshold consecutive failures) → **Half-Open** (after cooldown, probes with one request) → **Closed** (on success) or back to **Open** (on failure).
+- 429 responses with a `Retry-After` header use the server-specified delay (capped at 5 minutes).
+
+**Circuit breaker:**
+- Three states: **Closed** (normal) → **Open** (after threshold consecutive failures) → **Half-Open** (after cooldown) → **Closed** (after success threshold met) or back to **Open** (on any probe failure).
+- Only server errors (5xx), rate limits (429), and network failures count toward the circuit breaker. 4xx client errors do not trip the breaker.
+- In Half-Open state, at most `half-open-max-probes` concurrent requests are allowed. Additional requests are rejected until probes complete.
+- Recovery requires `half-open-success-threshold` consecutive successful probes (default 2) to prevent flapping on a single lucky request.
 
 When the circuit is open, messages to that target are logged at WARN level with structured fields for forensic analysis.
 

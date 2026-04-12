@@ -23,6 +23,7 @@ use crate::circuit::CircuitBreaker;
 use crate::config::{HttpConfig, PayloadFormat, TargetConfig};
 use crate::error::HttpError;
 use crate::filter::CompiledFilter;
+use crate::resolver::SsrfSafeResolver;
 use crate::{payload, retry};
 
 /// Channel buffer size for the dispatch queue.
@@ -83,6 +84,7 @@ impl HttpPublisher {
     pub fn new(config: HttpConfig) -> Result<Self, HttpError> {
         config.validate()?;
 
+        let resolver = Arc::new(SsrfSafeResolver::new(config.allow_private_urls));
         let instance_id = config.instance_id.unwrap_or_else(generate_instance_id);
 
         let mut targets = Vec::with_capacity(config.targets.len());
@@ -93,7 +95,7 @@ impl HttpPublisher {
                 continue;
             }
 
-            let target = build_target(tc, &instance_id)?;
+            let target = build_target(tc, &instance_id, Arc::clone(&resolver))?;
             targets.push(target);
         }
 
@@ -165,8 +167,12 @@ impl HttpPublisher {
 }
 
 /// Build a single target's runtime state from config.
-fn build_target(tc: &TargetConfig, instance_id: &str) -> Result<TargetState, HttpError> {
-    let client = build_client(tc)?;
+fn build_target(
+    tc: &TargetConfig,
+    instance_id: &str,
+    resolver: Arc<SsrfSafeResolver>,
+) -> Result<TargetState, HttpError> {
+    let client = build_client(tc, resolver)?;
 
     let method = match tc.method.unwrap_or_default() {
         crate::config::HttpMethod::Post => reqwest::Method::POST,
@@ -190,6 +196,10 @@ fn build_target(tc: &TargetConfig, instance_id: &str) -> Result<TargetState, Htt
                 .and_then(|r| r.circuit_breaker_cooldown_secs)
                 .unwrap_or(30),
         ),
+        retry.and_then(|r| r.half_open_max_probes).unwrap_or(3),
+        retry
+            .and_then(|r| r.half_open_success_threshold)
+            .unwrap_or(2),
     );
 
     let custom_headers = tc
@@ -227,16 +237,21 @@ fn build_target(tc: &TargetConfig, instance_id: &str) -> Result<TargetState, Htt
 /// Build a reqwest::Client for a target with timeout and optional TLS.
 ///
 /// Security hardening:
+/// - SSRF-safe DNS resolver validates resolved IPs at connect time (DNS rebinding defense).
 /// - Redirects disabled to prevent SSRF via 3xx to internal endpoints.
 /// - Separate connect timeout prevents slow-connect DoS.
 /// - Minimum TLS 1.2 enforced for outbound connections.
-fn build_client(tc: &TargetConfig) -> Result<reqwest::Client, HttpError> {
+fn build_client(
+    tc: &TargetConfig,
+    resolver: Arc<SsrfSafeResolver>,
+) -> Result<reqwest::Client, HttpError> {
     let timeout = Duration::from_secs(tc.effective_timeout_secs());
     let mut builder = reqwest::Client::builder()
         .timeout(timeout)
         .connect_timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
-        .min_tls_version(reqwest::tls::Version::TLS_1_2);
+        .min_tls_version(reqwest::tls::Version::TLS_1_2)
+        .dns_resolver(resolver);
 
     // Apply TLS configuration
     if let Some(tls) = &tc.tls {
@@ -391,10 +406,16 @@ async fn dispatch_to_target(target: &TargetState, msg: &RoutableMessage) {
         }
     };
 
-    // Retry loop
+    // Retry loop with optional Retry-After from 429 responses
+    let mut retry_after_hint: Option<Duration> = None;
     for attempt in 0..target.max_attempts {
         if attempt > 0 {
-            let delay = retry::backoff_with_jitter(target.backoff_base, attempt);
+            let delay = if let Some(server_delay) = retry_after_hint.take() {
+                // Respect server's Retry-After header, capped at 5 minutes
+                server_delay.min(Duration::from_secs(300))
+            } else {
+                retry::backoff_with_jitter(target.backoff_base, attempt)
+            };
             tokio::time::sleep(delay).await;
         }
 
@@ -408,23 +429,33 @@ async fn dispatch_to_target(target: &TargetState, msg: &RoutableMessage) {
                 );
                 return;
             }
-            Err((status, err)) => {
+            Err((status, err, retry_after)) => {
                 let is_last = attempt + 1 >= target.max_attempts;
                 let retryable = status.is_some_and(retry::is_retryable_status);
 
                 if is_last || !retryable {
-                    target.circuit.record_failure();
+                    // Only server errors (5xx), rate limits (429), and network
+                    // failures (status=None) count toward the circuit breaker.
+                    // 4xx client errors indicate config issues, not endpoint
+                    // health problems — tripping on them would mask the real fix.
+                    let affects_circuit =
+                        status.is_none_or(|s| s == 429 || (500..600).contains(&s));
+                    if affects_circuit {
+                        target.circuit.record_failure();
+                    }
                     tracing::warn!(
                         target = %target.name,
                         attempt = attempt + 1,
                         error = %err,
                         status = ?status,
                         retryable,
+                        affects_circuit,
                         "HTTP publish failed (final)"
                     );
                     return;
                 }
 
+                retry_after_hint = retry_after;
                 tracing::debug!(
                     target = %target.name,
                     attempt = attempt + 1,
@@ -439,12 +470,14 @@ async fn dispatch_to_target(target: &TargetState, msg: &RoutableMessage) {
 
 /// Send a single HTTP request to the target.
 ///
-/// Returns `Ok(())` on 2xx, or `Err((optional_status, error_string))`.
+/// Returns `Ok(())` on 2xx, or `Err((optional_status, error_string, retry_after))`.
+/// The `retry_after` field is populated from the `Retry-After` header on 429
+/// responses, allowing the retry loop to respect server-specified backoff.
 async fn send_request(
     target: &TargetState,
     body: &[u8],
     content_type: &str,
-) -> Result<(), (Option<u16>, String)> {
+) -> Result<(), (Option<u16>, String, Option<Duration>)> {
     // Per-request delivery ID for receiver-side idempotency and audit.
     // 16 random bytes → 32-char hex string (128-bit collision resistance).
     let delivery_id = generate_delivery_id();
@@ -465,21 +498,33 @@ async fn send_request(
     if let Some(auth) = &target.auth {
         builder = auth
             .apply(builder, body)
-            .map_err(|e| (None, e.to_string()))?;
+            .map_err(|e| (None, e.to_string(), None))?;
     }
 
     builder = builder.body(body.to_vec());
 
     let response = builder.send().await.map_err(|e| {
         let status = e.status().map(|s| s.as_u16());
-        (status, e.to_string())
+        (status, e.to_string(), None)
     })?;
 
     let status = response.status().as_u16();
     if (200..300).contains(&status) {
         Ok(())
     } else {
-        Err((Some(status), format!("HTTP {status}")))
+        // Parse Retry-After header on 429 (rate-limited) responses so the
+        // retry loop can respect the server's requested backoff interval.
+        let retry_after = if status == 429 {
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(Duration::from_secs)
+        } else {
+            None
+        };
+        Err((Some(status), format!("HTTP {status}"), retry_after))
     }
 }
 

@@ -41,6 +41,8 @@ max-attempts = 3
 backoff-base-secs = 1
 circuit-breaker-threshold = 5
 circuit-breaker-cooldown-secs = 30
+half-open-max-probes = 3            # max concurrent probes in half-open state
+half-open-success-threshold = 2     # successes needed to close from half-open
 
 # ── C2 dashboard (HMAC-SHA256 signing, raw XML) ────────────────────
 

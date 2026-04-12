@@ -190,6 +190,12 @@ pub struct RetryConfig {
     pub circuit_breaker_threshold: Option<u32>,
     /// Seconds to wait before a half-open probe (default: 30).
     pub circuit_breaker_cooldown_secs: Option<u64>,
+    /// Maximum concurrent probe requests in half-open state (default: 3).
+    /// Prevents thundering-herd against a recovering endpoint.
+    pub half_open_max_probes: Option<u32>,
+    /// Consecutive successful probes required to close the circuit (default: 2).
+    /// Avoids flapping on a single lucky request.
+    pub half_open_success_threshold: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -402,15 +408,23 @@ impl HttpConfig {
 
         // Validate custom header names
         if let Some(headers) = &target.headers {
-            // Headers that must not be overridden by custom config
+            // Headers that must not be overridden by custom config.
+            // Includes protocol-sensitive headers that could influence
+            // connection behavior or leak credentials to proxies.
             const RESERVED_HEADERS: &[&str] = &[
                 "host",
                 "content-type",
                 "content-length",
                 "transfer-encoding",
                 "authorization",
+                "connection",
+                "proxy-authorization",
+                "cookie",
+                "te",
+                "upgrade",
                 "x-rustgate-instance",
                 "x-rustgate-delivery-id",
+                "x-rustgate-timestamp",
             ];
 
             for entry in headers {
@@ -447,20 +461,39 @@ impl HttpConfig {
 
 /// Returns `true` if the IP address is in a private, loopback, link-local,
 /// or cloud-metadata range that should be blocked for SSRF prevention.
-fn is_private_ip(ip: std::net::IpAddr) -> bool {
+///
+/// Covers:
+/// - **IPv4**: loopback, RFC 1918 private, link-local (incl. AWS IMDS), broadcast, unspecified
+/// - **IPv6**: loopback, unspecified, IPv4-mapped (e.g. `::ffff:127.0.0.1`),
+///   unique-local (`fc00::/7`), link-local (`fe80::/10`)
+///
+/// The IPv4-mapped check prevents a common SSRF bypass where attackers use
+/// `::ffff:127.0.0.1` to evade IPv4-only blocklists (CVE-2023-26431 pattern).
+pub(crate) fn is_private_ip(ip: std::net::IpAddr) -> bool {
     match ip {
-        std::net::IpAddr::V4(v4) => {
-            v4.is_loopback()               // 127.0.0.0/8
-                || v4.is_private()          // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-                || v4.is_link_local()       // 169.254.0.0/16 (includes AWS IMDS 169.254.169.254)
-                || v4.is_broadcast()        // 255.255.255.255
-                || v4.is_unspecified() // 0.0.0.0
-        }
+        std::net::IpAddr::V4(v4) => is_private_ipv4(v4),
         std::net::IpAddr::V6(v6) => {
             v6.is_loopback()               // ::1
-                || v6.is_unspecified() // ::
+                || v6.is_unspecified()      // ::
+                // IPv4-mapped IPv6 (::ffff:x.x.x.x) — extract embedded v4 and re-check.
+                // Without this, ::ffff:127.0.0.1 bypasses the IPv4 blocklist.
+                || v6.to_ipv4_mapped().is_some_and(is_private_ipv4)
+                // Unique-local (fc00::/7) — IPv6 equivalent of RFC 1918
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                // Link-local (fe80::/10)
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
         }
     }
+}
+
+/// IPv4-specific private/reserved IP check, factored out so it can be
+/// reused for IPv4-mapped IPv6 addresses.
+fn is_private_ipv4(v4: std::net::Ipv4Addr) -> bool {
+    v4.is_loopback()           // 127.0.0.0/8
+        || v4.is_private()     // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+        || v4.is_link_local()  // 169.254.0.0/16 (includes AWS IMDS 169.254.169.254)
+        || v4.is_broadcast()   // 255.255.255.255
+        || v4.is_unspecified() // 0.0.0.0
 }
 
 #[cfg(test)]
@@ -766,6 +799,50 @@ mod tests {
     }
 
     #[test]
+    fn rejects_ipv4_mapped_v6_loopback() {
+        let cfg = config_with_targets(vec![minimal_target(
+            "t1",
+            "http://[::ffff:127.0.0.1]:8080/api",
+        )]);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("SSRF"));
+    }
+
+    #[test]
+    fn rejects_ipv4_mapped_v6_private() {
+        let cfg = config_with_targets(vec![minimal_target(
+            "t1",
+            "http://[::ffff:10.0.0.1]:8080/api",
+        )]);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("SSRF"));
+    }
+
+    #[test]
+    fn rejects_ipv4_mapped_v6_link_local() {
+        let cfg = config_with_targets(vec![minimal_target(
+            "t1",
+            "http://[::ffff:169.254.169.254]/metadata",
+        )]);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("SSRF"));
+    }
+
+    #[test]
+    fn rejects_v6_unique_local() {
+        let cfg = config_with_targets(vec![minimal_target("t1", "http://[fc00::1]:8080/api")]);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("SSRF"));
+    }
+
+    #[test]
+    fn rejects_v6_link_local() {
+        let cfg = config_with_targets(vec![minimal_target("t1", "http://[fe80::1]:8080/api")]);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("SSRF"));
+    }
+
+    #[test]
     fn allows_public_ip() {
         let cfg = config_with_targets(vec![minimal_target("t1", "https://8.8.8.8:443/webhook")]);
         assert!(cfg.validate().is_ok());
@@ -789,6 +866,42 @@ mod tests {
         target.headers = Some(vec![HeaderEntry {
             name: "Content-Type".to_string(),
             value: "text/plain".to_string(),
+        }]);
+        let cfg = config_with_targets(vec![target]);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("reserved"));
+    }
+
+    #[test]
+    fn rejects_connection_header_override() {
+        let mut target = minimal_target("t1", "https://example.com");
+        target.headers = Some(vec![HeaderEntry {
+            name: "Connection".to_string(),
+            value: "keep-alive".to_string(),
+        }]);
+        let cfg = config_with_targets(vec![target]);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("reserved"));
+    }
+
+    #[test]
+    fn rejects_cookie_header_override() {
+        let mut target = minimal_target("t1", "https://example.com");
+        target.headers = Some(vec![HeaderEntry {
+            name: "Cookie".to_string(),
+            value: "session=abc".to_string(),
+        }]);
+        let cfg = config_with_targets(vec![target]);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("reserved"));
+    }
+
+    #[test]
+    fn rejects_proxy_authorization_header_override() {
+        let mut target = minimal_target("t1", "https://example.com");
+        target.headers = Some(vec![HeaderEntry {
+            name: "Proxy-Authorization".to_string(),
+            value: "Basic creds".to_string(),
         }]);
         let cfg = config_with_targets(vec![target]);
         let err = cfg.validate().unwrap_err();

@@ -81,8 +81,10 @@ impl AuthState {
                 secret_file,
                 header,
             } => {
-                let secret_str = read_secret_file(secret_file)?;
+                let mut secret_str = read_secret_file(secret_file)?;
                 let secret = Zeroizing::new(secret_str.as_bytes().to_vec());
+                // Wipe the string form now that we have the byte copy
+                zeroize::Zeroize::zeroize(&mut *secret_str);
                 let header_name = header
                     .clone()
                     .unwrap_or_else(|| "X-Signature-256".to_string());
@@ -113,8 +115,18 @@ impl AuthState {
                 secret,
                 header_name,
             } => {
-                let signature = compute_hmac_signature(secret, body)?;
-                Ok(builder.header(header_name, signature))
+                // Include a timestamp in the signed payload to enable replay
+                // prevention on the receiver side. The receiver reconstructs
+                // the signed payload as "<timestamp>.<body>" and rejects
+                // signatures older than an acceptable window.
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let signature = compute_hmac_signature(secret, body, timestamp)?;
+                Ok(builder
+                    .header("X-Rustgate-Timestamp", timestamp.to_string())
+                    .header(header_name, signature))
             }
         }
     }
@@ -131,6 +143,24 @@ const MAX_SECRET_FILE_BYTES: usize = 8 * 1024;
 ///
 /// Rejects empty secrets (after trimming) and files larger than 8 KiB.
 fn read_secret_file(path: &str) -> Result<Zeroizing<String>, HttpError> {
+    // Reject group/world-readable secret files on Unix. Secrets should
+    // only be readable by their owner (mode 0600 or 0400).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = std::fs::metadata(path).map_err(|e| HttpError::SecretRead {
+            path: path.to_string(),
+            source: e,
+        })?;
+        let mode = metadata.permissions().mode();
+        if mode & 0o077 != 0 {
+            return Err(HttpError::Config(format!(
+                "secret file `{path}` has insecure permissions {mode:#o} \
+                 (group/world-accessible); set to 0600 or 0400"
+            )));
+        }
+    }
+
     // Wrap in Zeroizing immediately so raw content is wiped on all exit paths
     let mut content =
         Zeroizing::new(
@@ -160,12 +190,17 @@ fn read_secret_file(path: &str) -> Result<Zeroizing<String>, HttpError> {
     Ok(trimmed)
 }
 
-/// Compute HMAC-SHA256 over `data` and return `sha256=<hex>` string.
+/// Compute HMAC-SHA256 over `"<timestamp>.<data>"` and return `sha256=<hex>`.
 ///
-/// Follows the GitHub webhook signature format (de facto standard).
-fn compute_hmac_signature(secret: &[u8], data: &[u8]) -> Result<String, HttpError> {
+/// The timestamp is bound into the signed payload so that captured
+/// signatures cannot be replayed at a later time. Receivers verify by
+/// reconstructing the same `"<timestamp>.<body>"` payload and checking
+/// that the timestamp falls within an acceptable freshness window.
+fn compute_hmac_signature(secret: &[u8], data: &[u8], timestamp: u64) -> Result<String, HttpError> {
     let mut mac = HmacSha256::new_from_slice(secret)
         .map_err(|e| HttpError::Config(format!("HMAC key initialization failed: {e}")))?;
+    mac.update(timestamp.to_string().as_bytes());
+    mac.update(b".");
     mac.update(data);
     let result = mac.finalize();
     let hex_digest = hex::encode(result.into_bytes());
@@ -180,12 +215,17 @@ mod tests {
 
     use super::*;
 
-    /// Write content to a temp file, returning the path. Caller must clean up.
+    /// Write content to a temp file with owner-only permissions, returning the path.
     fn write_temp_secret(name: &str, content: &str) -> String {
         let dir = std::env::temp_dir().join("rustgate-http-test");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(name);
         std::fs::write(&path, content).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         path.to_str().unwrap().to_string()
     }
 
@@ -271,14 +311,16 @@ mod tests {
 
     #[test]
     fn hmac_signature_known_vector() {
-        // Known HMAC-SHA256 test vector
         let secret = b"supersecretkey";
         let data = b"Hello, World!";
-        let sig = compute_hmac_signature(secret, data).unwrap();
+        let timestamp = 1700000000u64;
+        let sig = compute_hmac_signature(secret, data, timestamp).unwrap();
         assert!(sig.starts_with("sha256="), "got: {sig}");
 
-        // Verify independently
+        // Verify independently: signed payload is "<timestamp>.<body>"
         let mut mac = HmacSha256::new_from_slice(secret).unwrap();
+        mac.update(timestamp.to_string().as_bytes());
+        mac.update(b".");
         mac.update(data);
         let expected = hex::encode(mac.finalize().into_bytes());
         assert_eq!(sig, format!("sha256={expected}"));
@@ -287,9 +329,8 @@ mod tests {
     #[test]
     fn hmac_signature_empty_body() {
         let secret = b"key";
-        let sig = compute_hmac_signature(secret, b"").unwrap();
+        let sig = compute_hmac_signature(secret, b"", 1700000000).unwrap();
         assert!(sig.starts_with("sha256="));
-        // Empty body should still produce a valid MAC
         assert!(sig.len() > "sha256=".len());
     }
 
@@ -297,16 +338,27 @@ mod tests {
     fn hmac_signature_deterministic() {
         let secret = b"test-key";
         let data = b"test-data";
-        let sig1 = compute_hmac_signature(secret, data).unwrap();
-        let sig2 = compute_hmac_signature(secret, data).unwrap();
+        let timestamp = 1700000000u64;
+        let sig1 = compute_hmac_signature(secret, data, timestamp).unwrap();
+        let sig2 = compute_hmac_signature(secret, data, timestamp).unwrap();
         assert_eq!(sig1, sig2);
     }
 
     #[test]
     fn hmac_different_data_different_signature() {
         let secret = b"key";
-        let sig1 = compute_hmac_signature(secret, b"data1").unwrap();
-        let sig2 = compute_hmac_signature(secret, b"data2").unwrap();
+        let timestamp = 1700000000u64;
+        let sig1 = compute_hmac_signature(secret, b"data1", timestamp).unwrap();
+        let sig2 = compute_hmac_signature(secret, b"data2", timestamp).unwrap();
+        assert_ne!(sig1, sig2);
+    }
+
+    #[test]
+    fn hmac_different_timestamp_different_signature() {
+        let secret = b"key";
+        let data = b"same-data";
+        let sig1 = compute_hmac_signature(secret, data, 1000).unwrap();
+        let sig2 = compute_hmac_signature(secret, data, 2000).unwrap();
         assert_ne!(sig1, sig2);
     }
 
@@ -350,8 +402,31 @@ mod tests {
         // Write 9 KiB (over 8 KiB limit)
         let content = "x".repeat(9 * 1024);
         std::fs::write(&path, &content).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let err = read_secret_file(path.to_str().unwrap()).unwrap_err();
         assert!(err.to_string().contains("too large"), "got: {err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_world_readable_secret_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join("rustgate-http-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("insecure-secret");
+        std::fs::write(&path, "secret-value").unwrap();
+        // Set world-readable permissions (0644)
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = read_secret_file(path.to_str().unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("insecure permissions"),
+            "got: {err}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -404,7 +479,7 @@ mod tests {
     }
 
     #[test]
-    fn hmac_apply_sets_signature_header() {
+    fn hmac_apply_sets_signature_and_timestamp() {
         let state = AuthState::Hmac {
             secret: Zeroizing::new(b"secret".to_vec()),
             header_name: "X-Signature-256".to_string(),
@@ -414,6 +489,8 @@ mod tests {
         let builder = client.post("http://localhost/test");
         let result = state.apply(builder, body).unwrap();
         let request = result.build().unwrap();
+
+        // Signature header present with sha256= prefix
         let sig = request
             .headers()
             .get("X-Signature-256")
@@ -422,8 +499,20 @@ mod tests {
             .unwrap();
         assert!(sig.starts_with("sha256="));
 
-        // Verify independently
+        // Timestamp header present and is a valid unix timestamp
+        let ts_str = request
+            .headers()
+            .get("X-Rustgate-Timestamp")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let ts: u64 = ts_str.parse().unwrap();
+        assert!(ts > 0);
+
+        // Verify signature independently using the timestamp
         let mut mac = HmacSha256::new_from_slice(b"secret").unwrap();
+        mac.update(ts_str.as_bytes());
+        mac.update(b".");
         mac.update(body);
         let expected = hex::encode(mac.finalize().into_bytes());
         assert_eq!(sig, format!("sha256={expected}"));

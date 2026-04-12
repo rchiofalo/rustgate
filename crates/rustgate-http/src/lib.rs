@@ -28,6 +28,7 @@ pub(crate) mod filter;
 pub mod metrics;
 pub(crate) mod payload;
 mod publisher;
+pub(crate) mod resolver;
 pub(crate) mod retry;
 
 pub use config::HttpConfig;

@@ -221,6 +221,8 @@ async fn retry_on_5xx() {
         backoff_base_secs: Some(0), // No delay in tests
         circuit_breaker_threshold: Some(10),
         circuit_breaker_cooldown_secs: Some(60),
+        half_open_max_probes: None,
+        half_open_success_threshold: None,
     });
     let config = http_config(vec![tc]);
     let publisher = HttpPublisher::new(config).unwrap();
@@ -249,6 +251,8 @@ async fn no_retry_on_4xx() {
         backoff_base_secs: Some(0),
         circuit_breaker_threshold: Some(10),
         circuit_breaker_cooldown_secs: Some(60),
+        half_open_max_probes: None,
+        half_open_success_threshold: None,
     });
     let config = http_config(vec![tc]);
     let publisher = HttpPublisher::new(config).unwrap();
@@ -391,11 +395,16 @@ async fn bearer_auth_header_present() {
         .mount(&server)
         .await;
 
-    // Write a temp token file
+    // Write a temp token file with owner-only permissions
     let dir = std::env::temp_dir().join("rustgate-http-integ");
     std::fs::create_dir_all(&dir).unwrap();
     let token_path = dir.join("bearer-token");
     std::fs::write(&token_path, "test-token-123\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
 
     let mut tc = target_config("bearer-test", &format!("{}/api", server.uri()));
     tc.auth = Some(AuthConfig::Bearer {
@@ -419,9 +428,10 @@ async fn hmac_signature_present() {
 
     let server = MockServer::start().await;
 
-    // Just verify the header exists and has the sha256= prefix
+    // Verify both the signature and the replay-prevention timestamp header
     Mock::given(method("POST"))
         .and(wiremock::matchers::header_exists("x-signature-256"))
+        .and(wiremock::matchers::header_exists("x-rustgate-timestamp"))
         .respond_with(ResponseTemplate::new(200))
         .expect(1)
         .mount(&server)
@@ -431,6 +441,11 @@ async fn hmac_signature_present() {
     std::fs::create_dir_all(&dir).unwrap();
     let secret_path = dir.join("hmac-secret");
     std::fs::write(&secret_path, "test-hmac-key").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
 
     let mut tc = target_config("hmac-test", &format!("{}/webhook", server.uri()));
     tc.auth = Some(AuthConfig::Hmac {
@@ -465,6 +480,8 @@ async fn circuit_breaker_opens_after_threshold() {
         backoff_base_secs: Some(0),
         circuit_breaker_threshold: Some(2), // Open after 2 failures
         circuit_breaker_cooldown_secs: Some(300),
+        half_open_max_probes: None,
+        half_open_success_threshold: None,
     });
     let config = http_config(vec![tc]);
     let publisher = HttpPublisher::new(config).unwrap();
