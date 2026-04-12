@@ -7,10 +7,13 @@
 //! The router implements a two-layer Policy Enforcement Point (PEP) that
 //! evaluates an optional [`PolicyEngine`] on every routed message:
 //!
-//! 1. **Send PEP** (`route_inner`): evaluated once per message before any
-//!    state mutation (position cache, access log, dispatch). The subject is
-//!    the *sender's* identity, the resource is the destination (direct /
-//!    group / broadcast), and the action is [`AuthzAction::Send`]. A deny
+//! 1. **Send PEP** (`route_inner`, `send_to_group_excluding`): evaluated once
+//!    per message for direct / group / broadcast destinations in `route_inner`
+//!    before any state mutation (position cache, access log, dispatch).
+//!    For multicast, the Send PEP runs per-group inside
+//!    `send_to_group_excluding` so that per-group policy granularity is
+//!    preserved. The subject is the *sender's* identity, the resource is
+//!    the destination, and the action is [`AuthzAction::Send`]. A deny
 //!    verdict drops the message outright with no observable side effect
 //!    beyond the audit trail.
 //!
@@ -1119,9 +1122,10 @@ impl Router {
         if let Some(engine) = (**authz_guard).as_ref() {
             match &msg.destination {
                 Destination::Multicast(_) => {
-                    // Per-group authz runs inside send_to_group; skip
-                    // top-level PEP to avoid misrepresenting multicast
-                    // as broadcast.
+                    // Per-group Send PEP and Receive PEP both run inside
+                    // send_to_group_excluding — evaluating a single
+                    // top-level PEP here would incorrectly map multicast
+                    // to Broadcast, bypassing per-group granularity.
                 }
                 dest => {
                     let subject = AuthzSubject::from_identity(&msg.source);
@@ -1385,6 +1389,8 @@ impl Router {
     pub async fn replay_positions(&self, handle: &SessionHandle) {
         let acl_guard = self.acl.load();
         let acl_ref: &Option<GroupAclPolicy> = &acl_guard;
+        let authz_guard = self.authz.load();
+        let authz: Option<&Arc<dyn PolicyEngine>> = (**authz_guard).as_ref();
         let mut dropped = 0u32;
         let mut total = 0u32;
         for msg in self.cache.get_all().await {
@@ -1397,11 +1403,26 @@ impl Router {
                         .as_ref()
                         .is_none_or(|acl| acl.is_receive_authorized(g, &handle.identity.cn))
                 });
-            if shared || handle.identity.groups.is_empty() {
-                total += 1;
-                if !handle.try_send(Arc::new(msg)) {
-                    dropped += 1;
+            if !(shared || handle.identity.groups.is_empty()) {
+                continue;
+            }
+
+            // Authz Receive PEP: re-evaluate the recipient against the
+            // current policy. Position replay runs on connect, and the
+            // policy may have changed since the position was cached.
+            if let Some(engine) = authz {
+                let subject = AuthzSubject::with_hash(&handle.identity, handle.subject_hash);
+                let resource = AuthzResource::Broadcast;
+                let outcome =
+                    self.authz_evaluate(engine, &subject, &resource, AuthzAction::Receive);
+                if !outcome.is_allow() {
+                    continue;
                 }
+            }
+
+            total += 1;
+            if !handle.try_send(Arc::new(msg)) {
+                dropped += 1;
             }
         }
         if dropped > 0 {
@@ -1487,14 +1508,17 @@ impl Router {
                 if let Some(engine) = (**authz_guard).as_ref() {
                     let subject = AuthzSubject::from_identity(&handle.identity);
                     let resource = AuthzResource::Direct { target_cn: cn };
-                    let outcome = engine.evaluate(&subject, &resource, AuthzAction::Receive);
+                    let outcome =
+                        self.authz_evaluate(engine, &subject, &resource, AuthzAction::Receive);
                     if !outcome.is_allow() {
-                        tracing::debug!(
-                            target: "authz",
-                            recipient_cn = %cn,
-                            rule_id = ?outcome.rule_id,
-                            policy_id = %engine.policy_id(),
-                            "authz deny on direct receive"
+                        rustgate_core::audit::authz_denied(
+                            handle.identity.cn.as_str(),
+                            handle.identity.fingerprint.as_str(),
+                            "receive",
+                            "direct",
+                            cn,
+                            outcome.rule_id.as_deref(),
+                            engine.policy_id(),
                         );
                         return;
                     }
@@ -1675,14 +1699,17 @@ impl Router {
             if let Some(engine) = authz {
                 let subject = AuthzSubject::from_identity(&handle.identity);
                 let resource = AuthzResource::Broadcast;
-                let outcome = engine.evaluate(&subject, &resource, AuthzAction::Receive);
+                let outcome =
+                    self.authz_evaluate(engine, &subject, &resource, AuthzAction::Receive);
                 if !outcome.is_allow() {
-                    tracing::debug!(
-                        target: "authz",
-                        recipient_cn = %handle.identity.cn,
-                        rule_id = ?outcome.rule_id,
-                        policy_id = %engine.policy_id(),
-                        "authz deny on broadcast receive"
+                    rustgate_core::audit::authz_denied(
+                        handle.identity.cn.as_str(),
+                        handle.identity.fingerprint.as_str(),
+                        "receive",
+                        "broadcast",
+                        "",
+                        outcome.rule_id.as_deref(),
+                        engine.policy_id(),
                     );
                     filtered += 1;
                     continue;
@@ -1760,6 +1787,28 @@ impl Router {
 
         let authz_guard = self.authz.load();
         let authz: Option<&Arc<dyn PolicyEngine>> = (**authz_guard).as_ref();
+
+        // Per-group Send PEP for multicast. The top-level Send PEP in
+        // route_inner intentionally skips Multicast (it cannot represent
+        // per-group granularity), so each group in the multicast fan-out
+        // must evaluate the Send action independently.
+        if let Some(engine) = authz {
+            let subject = AuthzSubject::from_identity(&msg.source);
+            let resource = AuthzResource::Group { group };
+            let outcome = self.authz_evaluate(engine, &subject, &resource, AuthzAction::Send);
+            if !outcome.is_allow() {
+                rustgate_core::audit::authz_denied(
+                    msg.source.cn.as_str(),
+                    msg.source.fingerprint.as_str(),
+                    "send",
+                    "group",
+                    group,
+                    outcome.rule_id.as_deref(),
+                    engine.policy_id(),
+                );
+                return;
+            }
+        }
 
         let mut dropped = 0u32;
         let mut total = 0u32;
