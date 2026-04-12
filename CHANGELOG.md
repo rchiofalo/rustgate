@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-04-11
+
 ### Added
 
 - **Helm StatefulSet for persistent store-forward** — new `storeForward.enabled` value switches the workload from a Deployment to a StatefulSet with a `volumeClaimTemplate` for the redb-backed client queue. A headless Service provides stable DNS for pod identity. Configurable via `storeForward.storageSize` (default 5Gi), `storeForward.storageClassName`, and `storeForward.queueDir` (default /data/client-queue). (#669)
