@@ -3267,6 +3267,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustgate-http"
+version = "0.8.0"
+dependencies = [
+ "base64",
+ "bytes",
+ "fastrand",
+ "hex",
+ "hmac",
+ "prometheus",
+ "reqwest",
+ "rustgate-core",
+ "rustgate-test-utils",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "toml",
+ "tracing",
+ "wiremock",
+ "zeroize",
+]
+
+[[package]]
 name = "rustgate-mqtt"
 version = "0.8.0"
 dependencies = [
