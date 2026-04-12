@@ -19,6 +19,7 @@
 //! - `metrics` — Enables Prometheus metric collection for publish
 //!   counts, error rates, request latency, and circuit breaker state.
 
+pub(crate) mod auth;
 pub(crate) mod circuit;
 pub mod config;
 pub mod error;
