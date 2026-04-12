@@ -11,6 +11,12 @@ use std::time::Duration;
 /// Maximum backoff delay (5 minutes).
 const MAX_DELAY: Duration = Duration::from_secs(300);
 
+/// Minimum backoff delay (100 ms).
+///
+/// Prevents tight retry loops when `backoff_base_secs` is set to 0 in
+/// config, which would otherwise hammer a failing target with no delay.
+const MIN_DELAY: Duration = Duration::from_millis(100);
+
 /// Maximum exponent for backoff calculation.
 ///
 /// Capping the exponent prevents overflow and keeps the delay growth
@@ -38,7 +44,9 @@ pub(crate) fn backoff_with_jitter(base: Duration, attempt: u32) -> Duration {
         Duration::ZERO
     };
 
-    (delay + jitter_micros).min(MAX_DELAY)
+    // Floor at MIN_DELAY to prevent tight retry loops from zero-base config
+    let total = (delay + jitter_micros).min(MAX_DELAY);
+    if total.is_zero() { MIN_DELAY } else { total }
 }
 
 /// Returns `true` if the HTTP status code is retryable (5xx server error).
@@ -106,9 +114,9 @@ mod tests {
     }
 
     #[test]
-    fn zero_base_returns_zero() {
+    fn zero_base_returns_minimum_floor() {
         let delay = backoff_with_jitter(Duration::from_secs(0), 5);
-        assert_eq!(delay, Duration::ZERO);
+        assert_eq!(delay, MIN_DELAY);
     }
 
     #[test]

@@ -120,16 +120,37 @@ impl AuthState {
     }
 }
 
+/// Maximum secret file size (8 KiB) — prevents accidentally loading a log
+/// file or binary blob as a secret.
+const MAX_SECRET_FILE_BYTES: usize = 8 * 1024;
+
 /// Read a secret file, trim whitespace, wrap in [`Zeroizing`].
 ///
 /// Uses blocking I/O because secret loading only happens at startup
 /// during publisher initialization, not on the hot path.
+///
+/// Rejects empty secrets (after trimming) and files larger than 8 KiB.
 fn read_secret_file(path: &str) -> Result<Zeroizing<String>, HttpError> {
     let content = std::fs::read_to_string(path).map_err(|e| HttpError::SecretRead {
         path: path.to_string(),
         source: e,
     })?;
-    Ok(Zeroizing::new(content.trim().to_string()))
+
+    if content.len() > MAX_SECRET_FILE_BYTES {
+        return Err(HttpError::Config(format!(
+            "secret file `{path}` is too large ({} bytes, max {MAX_SECRET_FILE_BYTES})",
+            content.len()
+        )));
+    }
+
+    let trimmed = content.trim().to_string();
+    if trimmed.is_empty() {
+        return Err(HttpError::Config(format!(
+            "secret file `{path}` is empty after trimming whitespace"
+        )));
+    }
+
+    Ok(Zeroizing::new(trimmed))
 }
 
 /// Compute HMAC-SHA256 over `data` and return `sha256=<hex>` string.

@@ -16,7 +16,7 @@ use crate::error::HttpError;
 /// Contains a list of named targets, each representing an independent
 /// HTTP endpoint that receives forwarded messages.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct HttpConfig {
     /// Instance identifier included in the `X-Rustgate-Instance` header.
     /// When absent, defaults to the system hostname.
@@ -24,6 +24,12 @@ pub struct HttpConfig {
 
     /// Named targets. Each is an independent HTTP endpoint.
     pub targets: Vec<TargetConfig>,
+
+    /// Allow localhost/private IPs as target URLs. **Testing only** —
+    /// production configs should leave this unset (defaults to `false`).
+    /// Deserialization ignores this field; it can only be set programmatically.
+    #[serde(skip)]
+    pub allow_private_urls: bool,
 }
 
 /// Per-target endpoint configuration.
@@ -31,7 +37,7 @@ pub struct HttpConfig {
 /// Each target is fully independent: its own URL, authentication,
 /// TLS settings, payload format, message filter, and retry policy.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct TargetConfig {
     /// Unique name used in metrics labels and structured logging.
     pub name: String,
@@ -66,11 +72,15 @@ pub struct TargetConfig {
 
     /// Custom static headers included on every request.
     pub headers: Option<Vec<HeaderEntry>>,
+
+    /// Maximum payload size in bytes before a message is rejected.
+    /// Prevents memory exhaustion from oversized messages. Default: 1 MiB.
+    pub max_payload_bytes: Option<usize>,
 }
 
 /// Custom HTTP header entry.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct HeaderEntry {
     /// Header name (must be a valid HTTP header name).
     pub name: String,
@@ -107,7 +117,7 @@ pub enum PayloadFormat {
 /// Secrets are always read from files (never inline in config) to prevent
 /// accidental exposure via config dumps or structured logging.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AuthConfig {
     /// Bearer token read from a file.
     Bearer {
@@ -138,7 +148,7 @@ pub enum AuthConfig {
 /// When `client_cert` and `client_key` are both set, the publisher
 /// presents a client certificate for mutual TLS authentication.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct TlsConfig {
     /// Custom CA certificate PEM for server verification.
     pub ca_cert: Option<String>,
@@ -155,7 +165,7 @@ pub struct TlsConfig {
 /// values are OR-combined: matching *any* value in the list passes.
 /// `None` for a dimension means "accept all" for that dimension.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct FilterConfig {
     /// Only forward messages from senders in at least one of these groups.
     pub groups: Option<Vec<String>>,
@@ -170,7 +180,7 @@ pub struct FilterConfig {
 
 /// Retry and circuit breaker configuration.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct RetryConfig {
     /// Maximum retry attempts per request (default: 3).
     pub max_attempts: Option<u32>,
@@ -195,6 +205,11 @@ impl TargetConfig {
     /// Effective request timeout (default: 10 seconds).
     pub fn effective_timeout_secs(&self) -> u64 {
         self.timeout_secs.unwrap_or(10)
+    }
+
+    /// Effective max payload size in bytes (default: 1 MiB).
+    pub fn effective_max_payload_bytes(&self) -> usize {
+        self.max_payload_bytes.unwrap_or(1024 * 1024)
     }
 
     /// Effective payload format (default: JSON).
@@ -268,7 +283,7 @@ impl HttpConfig {
                 ));
             }
 
-            Self::validate_target(target, &mut errors);
+            Self::validate_target(target, self.allow_private_urls, &mut errors);
         }
 
         if errors.is_empty() {
@@ -278,7 +293,7 @@ impl HttpConfig {
         }
     }
 
-    fn validate_target(target: &TargetConfig, errors: &mut Vec<String>) {
+    fn validate_target(target: &TargetConfig, allow_private_urls: bool, errors: &mut Vec<String>) {
         // Validate URL
         if target.url.is_empty() {
             errors.push(format!("target `{}`: URL must not be empty", target.name));
@@ -291,6 +306,30 @@ impl HttpConfig {
                             "target `{}`: URL scheme must be http or https, got `{scheme}`",
                             target.name
                         ));
+                    }
+
+                    // SSRF protection: reject URLs pointing to private/reserved
+                    // IP addresses (RFC 1918, loopback, link-local, IMDS).
+                    // Note: host_str() wraps IPv6 in brackets (e.g. "[::1]"),
+                    // so we strip them before parsing as IpAddr.
+                    if !allow_private_urls && let Some(host) = url.host_str() {
+                        let bare = host
+                            .strip_prefix('[')
+                            .and_then(|s| s.strip_suffix(']'))
+                            .unwrap_or(host);
+                        if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+                            if is_private_ip(ip) {
+                                errors.push(format!(
+                                    "target `{}`: URL host `{bare}` is a private/reserved IP address (SSRF protection)",
+                                    target.name
+                                ));
+                            }
+                        } else if bare == "localhost" {
+                            errors.push(format!(
+                                "target `{}`: URL host `localhost` is not allowed (SSRF protection)",
+                                target.name
+                            ));
+                        }
                     }
                 }
                 Err(e) => {
@@ -363,6 +402,17 @@ impl HttpConfig {
 
         // Validate custom header names
         if let Some(headers) = &target.headers {
+            // Headers that must not be overridden by custom config
+            const RESERVED_HEADERS: &[&str] = &[
+                "host",
+                "content-type",
+                "content-length",
+                "transfer-encoding",
+                "authorization",
+                "x-rustgate-instance",
+                "x-rustgate-delivery-id",
+            ];
+
             for entry in headers {
                 if entry.name.is_empty() {
                     errors.push(format!(
@@ -372,6 +422,11 @@ impl HttpConfig {
                 } else if reqwest::header::HeaderName::try_from(&entry.name).is_err() {
                     errors.push(format!(
                         "target `{}`: invalid HTTP header name `{}`",
+                        target.name, entry.name
+                    ));
+                } else if RESERVED_HEADERS.contains(&entry.name.to_ascii_lowercase().as_str()) {
+                    errors.push(format!(
+                        "target `{}`: custom header `{}` is reserved and cannot be overridden",
                         target.name, entry.name
                     ));
                 }
@@ -386,6 +441,24 @@ impl HttpConfig {
                 "target `{}`: timeout-secs must be greater than 0",
                 target.name
             ));
+        }
+    }
+}
+
+/// Returns `true` if the IP address is in a private, loopback, link-local,
+/// or cloud-metadata range that should be blocked for SSRF prevention.
+fn is_private_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()               // 127.0.0.0/8
+                || v4.is_private()          // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+                || v4.is_link_local()       // 169.254.0.0/16 (includes AWS IMDS 169.254.169.254)
+                || v4.is_broadcast()        // 255.255.255.255
+                || v4.is_unspecified() // 0.0.0.0
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()               // ::1
+                || v6.is_unspecified() // ::
         }
     }
 }
@@ -409,6 +482,7 @@ mod tests {
             retry: None,
             enabled: None,
             headers: None,
+            max_payload_bytes: None,
         }
     }
 
@@ -416,6 +490,7 @@ mod tests {
         HttpConfig {
             instance_id: None,
             targets,
+            allow_private_urls: false,
         }
     }
 
@@ -649,6 +724,90 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("timeout-secs must be greater than 0")
+        );
+    }
+
+    #[test]
+    fn rejects_loopback_ip() {
+        let cfg = config_with_targets(vec![minimal_target("t1", "http://127.0.0.1:8080/webhook")]);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("SSRF"));
+    }
+
+    #[test]
+    fn rejects_private_rfc1918_ip() {
+        let cfg = config_with_targets(vec![minimal_target("t1", "https://10.0.0.1:443/api")]);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("SSRF"));
+    }
+
+    #[test]
+    fn rejects_link_local_ip() {
+        let cfg = config_with_targets(vec![minimal_target(
+            "t1",
+            "http://169.254.169.254/latest/meta-data/",
+        )]);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("SSRF"));
+    }
+
+    #[test]
+    fn rejects_localhost_hostname() {
+        let cfg = config_with_targets(vec![minimal_target("t1", "http://localhost:8080/api")]);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("SSRF"));
+    }
+
+    #[test]
+    fn rejects_ipv6_loopback() {
+        let cfg = config_with_targets(vec![minimal_target("t1", "http://[::1]:8080/api")]);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("SSRF"));
+    }
+
+    #[test]
+    fn allows_public_ip() {
+        let cfg = config_with_targets(vec![minimal_target("t1", "https://8.8.8.8:443/webhook")]);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_reserved_custom_header() {
+        let mut target = minimal_target("t1", "https://example.com");
+        target.headers = Some(vec![HeaderEntry {
+            name: "Authorization".to_string(),
+            value: "Bearer hack".to_string(),
+        }]);
+        let cfg = config_with_targets(vec![target]);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("reserved"));
+    }
+
+    #[test]
+    fn rejects_content_type_override() {
+        let mut target = minimal_target("t1", "https://example.com");
+        target.headers = Some(vec![HeaderEntry {
+            name: "Content-Type".to_string(),
+            value: "text/plain".to_string(),
+        }]);
+        let cfg = config_with_targets(vec![target]);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("reserved"));
+    }
+
+    #[test]
+    fn rejects_unknown_config_fields() {
+        // deny_unknown_fields should reject typos
+        let toml_str = r#"
+[[targets]]
+name = "t1"
+url = "https://example.com"
+tiemout-secs = 10
+"#;
+        let result: Result<HttpConfig, _> = toml::from_str(toml_str);
+        assert!(
+            result.is_err(),
+            "should reject unknown field 'tiemout-secs'"
         );
     }
 

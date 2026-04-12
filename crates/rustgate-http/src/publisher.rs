@@ -61,6 +61,7 @@ struct TargetState {
     backoff_base: Duration,
     instance_id: String,
     custom_headers: Vec<(HeaderName, String)>,
+    max_payload_bytes: usize,
 }
 
 impl fmt::Debug for TargetState {
@@ -130,8 +131,9 @@ impl HttpPublisher {
 
     /// Fire-and-forget publish. Non-blocking — drops on channel full.
     pub fn publish(&self, msg: &RoutableMessage) {
-        // Echo prevention at the publisher level
-        if msg.metadata.source_protocol == "http" {
+        // Echo prevention at the publisher level (case-insensitive to
+        // defend against inconsistent casing across transport adapters)
+        if msg.metadata.source_protocol.eq_ignore_ascii_case("http") {
             return;
         }
 
@@ -217,13 +219,23 @@ fn build_target(tc: &TargetConfig, instance_id: &str) -> Result<TargetState, Htt
         backoff_base: Duration::from_secs(retry.and_then(|r| r.backoff_base_secs).unwrap_or(1)),
         instance_id: instance_id.to_string(),
         custom_headers,
+        max_payload_bytes: tc.effective_max_payload_bytes(),
     })
 }
 
 /// Build a reqwest::Client for a target with timeout and optional TLS.
+///
+/// Security hardening:
+/// - Redirects disabled to prevent SSRF via 3xx to internal endpoints.
+/// - Separate connect timeout prevents slow-connect DoS.
+/// - Minimum TLS 1.2 enforced for outbound connections.
 fn build_client(tc: &TargetConfig) -> Result<reqwest::Client, HttpError> {
     let timeout = Duration::from_secs(tc.effective_timeout_secs());
-    let mut builder = reqwest::Client::builder().timeout(timeout);
+    let mut builder = reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .min_tls_version(reqwest::tls::Version::TLS_1_2);
 
     // Apply TLS configuration
     if let Some(tls) = &tc.tls {
@@ -345,6 +357,17 @@ async fn dispatch_to_target(target: &TargetState, msg: &RoutableMessage) {
         return;
     }
 
+    // Reject oversized payloads before serialization (memory DoS prevention)
+    if msg.payload.len() > target.max_payload_bytes {
+        tracing::warn!(
+            target = %target.name,
+            payload_size = msg.payload.len(),
+            max_payload_bytes = target.max_payload_bytes,
+            "message payload exceeds size limit, dropping"
+        );
+        return;
+    }
+
     // Serialize payload
     let (body, content_type) = match payload::serialize(msg, target.format, &target.instance_id) {
         Ok(result) => result,
@@ -412,11 +435,16 @@ async fn send_request(
     body: &[u8],
     content_type: &str,
 ) -> Result<(), (Option<u16>, String)> {
+    // Per-request delivery ID for receiver-side idempotency and audit.
+    // 16 random bytes → 32-char hex string (128-bit collision resistance).
+    let delivery_id = generate_delivery_id();
+
     let mut builder = target
         .client
         .request(target.method.clone(), &target.url)
         .header("Content-Type", content_type)
-        .header("X-Rustgate-Instance", &target.instance_id);
+        .header("X-Rustgate-Instance", &target.instance_id)
+        .header("X-Rustgate-Delivery-Id", &delivery_id);
 
     // Apply custom headers
     for (name, value) in &target.custom_headers {
@@ -451,6 +479,16 @@ async fn send_request(
 /// stable for the lifetime of the process.
 fn generate_instance_id() -> String {
     format!("rustgate-{}", std::process::id())
+}
+
+/// Generate a unique per-request delivery ID for receiver-side idempotency.
+///
+/// Produces a 32-character hex string from 16 random bytes, giving 128 bits
+/// of collision resistance without requiring the `uuid` crate.
+fn generate_delivery_id() -> String {
+    let mut buf = [0u8; 16];
+    fastrand::fill(&mut buf);
+    hex::encode(buf)
 }
 
 #[cfg(test)]

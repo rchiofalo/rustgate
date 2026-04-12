@@ -97,6 +97,8 @@ impl CircuitBreaker {
 
     /// Current state as a numeric value for metrics gauges.
     /// 0 = closed, 1 = open, 2 = half-open.
+    #[cfg(any(test, feature = "metrics"))]
+    #[allow(dead_code)] // Used in tests; metrics reporting will call this
     pub(crate) fn state_value(&self) -> u8 {
         self.state.load(Ordering::Acquire)
     }

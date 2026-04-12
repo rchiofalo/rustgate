@@ -54,6 +54,7 @@ fn target_config(name: &str, url: &str) -> TargetConfig {
         retry: None,
         enabled: None,
         headers: None,
+        max_payload_bytes: None,
     }
 }
 
@@ -61,6 +62,7 @@ fn http_config(targets: Vec<TargetConfig>) -> HttpConfig {
     HttpConfig {
         instance_id: Some("test-instance".to_string()),
         targets,
+        allow_private_urls: true, // wiremock binds to 127.0.0.1
     }
 }
 

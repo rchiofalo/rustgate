@@ -46,11 +46,16 @@ impl CompiledFilter {
             .as_ref()
             .map(|c| c.iter().map(|s| s.to_ascii_lowercase()).collect());
 
-        // Always include "http" in excluded protocols
+        // Always include "http" in excluded protocols.
+        // Lowercase all entries for case-insensitive matching.
         let mut exclude = config
             .exclude_protocols
             .as_ref()
-            .map(|p| p.iter().cloned().collect::<HashSet<_>>())
+            .map(|p| {
+                p.iter()
+                    .map(|s| s.to_ascii_lowercase())
+                    .collect::<HashSet<_>>()
+            })
             .unwrap_or_default();
         let _ = exclude.insert("http".to_string());
 
@@ -77,9 +82,10 @@ impl CompiledFilter {
     /// Returns `true` if the message should be forwarded to this target.
     pub(crate) fn matches(&self, msg: &RoutableMessage) -> bool {
         // Echo prevention: skip messages from excluded protocols
+        // (case-insensitive to defend against inconsistent casing)
         if self
             .exclude_protocols
-            .contains(&msg.metadata.source_protocol)
+            .contains(&msg.metadata.source_protocol.to_ascii_lowercase())
         {
             return false;
         }
