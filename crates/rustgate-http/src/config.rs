@@ -299,6 +299,25 @@ impl HttpConfig {
         }
     }
 
+    /// Headers that must not be used by custom config or HMAC signature headers.
+    /// Includes protocol-sensitive headers that could influence connection
+    /// behavior, enable request smuggling, or leak credentials to proxies.
+    const RESERVED_HMAC_HEADERS: &[&str] = &[
+        "host",
+        "content-type",
+        "content-length",
+        "transfer-encoding",
+        "authorization",
+        "connection",
+        "proxy-authorization",
+        "cookie",
+        "te",
+        "upgrade",
+        "x-rustgate-instance",
+        "x-rustgate-delivery-id",
+        "x-rustgate-timestamp",
+    ];
+
     fn validate_target(target: &TargetConfig, allow_private_urls: bool, errors: &mut Vec<String>) {
         // Validate URL
         if target.url.is_empty() {
@@ -394,13 +413,25 @@ impl HttpConfig {
                             target.name
                         ));
                     }
-                    if let Some(h) = header
-                        && h.is_empty()
-                    {
-                        errors.push(format!(
-                            "target `{}`: HMAC header name must not be empty when specified",
-                            target.name
-                        ));
+                    if let Some(h) = header {
+                        if h.is_empty() {
+                            errors.push(format!(
+                                "target `{}`: HMAC header name must not be empty when specified",
+                                target.name
+                            ));
+                        } else if reqwest::header::HeaderName::try_from(h.as_str()).is_err() {
+                            errors.push(format!(
+                                "target `{}`: HMAC header `{}` is not a valid HTTP header name",
+                                target.name, h
+                            ));
+                        } else if Self::RESERVED_HMAC_HEADERS
+                            .contains(&h.to_ascii_lowercase().as_str())
+                        {
+                            errors.push(format!(
+                                "target `{}`: HMAC header `{}` collides with a reserved header",
+                                target.name, h
+                            ));
+                        }
                     }
                 }
             }
@@ -408,25 +439,6 @@ impl HttpConfig {
 
         // Validate custom header names
         if let Some(headers) = &target.headers {
-            // Headers that must not be overridden by custom config.
-            // Includes protocol-sensitive headers that could influence
-            // connection behavior or leak credentials to proxies.
-            const RESERVED_HEADERS: &[&str] = &[
-                "host",
-                "content-type",
-                "content-length",
-                "transfer-encoding",
-                "authorization",
-                "connection",
-                "proxy-authorization",
-                "cookie",
-                "te",
-                "upgrade",
-                "x-rustgate-instance",
-                "x-rustgate-delivery-id",
-                "x-rustgate-timestamp",
-            ];
-
             for entry in headers {
                 if entry.name.is_empty() {
                     errors.push(format!(
@@ -438,7 +450,9 @@ impl HttpConfig {
                         "target `{}`: invalid HTTP header name `{}`",
                         target.name, entry.name
                     ));
-                } else if RESERVED_HEADERS.contains(&entry.name.to_ascii_lowercase().as_str()) {
+                } else if Self::RESERVED_HMAC_HEADERS
+                    .contains(&entry.name.to_ascii_lowercase().as_str())
+                {
                     errors.push(format!(
                         "target `{}`: custom header `{}` is reserved and cannot be overridden",
                         target.name, entry.name
@@ -906,6 +920,64 @@ mod tests {
         let cfg = config_with_targets(vec![target]);
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("reserved"));
+    }
+
+    #[test]
+    fn rejects_hmac_header_colliding_with_reserved() {
+        let mut target = minimal_target("t1", "https://example.com");
+        target.auth = Some(AuthConfig::Hmac {
+            secret_file: "/tmp/fake-secret".to_string(),
+            header: Some("Authorization".to_string()),
+        });
+        let cfg = config_with_targets(vec![target]);
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("collides with a reserved header"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_hmac_header_transfer_encoding() {
+        let mut target = minimal_target("t1", "https://example.com");
+        target.auth = Some(AuthConfig::Hmac {
+            secret_file: "/tmp/fake-secret".to_string(),
+            header: Some("Transfer-Encoding".to_string()),
+        });
+        let cfg = config_with_targets(vec![target]);
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("collides with a reserved header"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_hmac_header_invalid_name() {
+        let mut target = minimal_target("t1", "https://example.com");
+        target.auth = Some(AuthConfig::Hmac {
+            secret_file: "/tmp/fake-secret".to_string(),
+            header: Some("Invalid Header!".to_string()),
+        });
+        let cfg = config_with_targets(vec![target]);
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("not a valid HTTP header name"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_valid_custom_hmac_header() {
+        let mut target = minimal_target("t1", "https://example.com");
+        target.auth = Some(AuthConfig::Hmac {
+            secret_file: "/tmp/fake-secret".to_string(),
+            header: Some("X-Custom-Signature".to_string()),
+        });
+        let cfg = config_with_targets(vec![target]);
+        // Should pass validation (secret file won't exist but validation
+        // doesn't read files — only from_config does)
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

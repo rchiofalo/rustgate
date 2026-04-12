@@ -143,15 +143,19 @@ const MAX_SECRET_FILE_BYTES: usize = 8 * 1024;
 ///
 /// Rejects empty secrets (after trimming) and files larger than 8 KiB.
 fn read_secret_file(path: &str) -> Result<Zeroizing<String>, HttpError> {
+    // Read metadata once — used for size pre-check and (on Unix) permission
+    // validation. This avoids loading a multi-GB file into memory before
+    // discovering it exceeds the 8 KiB limit.
+    let metadata = std::fs::metadata(path).map_err(|e| HttpError::SecretRead {
+        path: path.to_string(),
+        source: e,
+    })?;
+
     // Reject group/world-readable secret files on Unix. Secrets should
     // only be readable by their owner (mode 0600 or 0400).
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let metadata = std::fs::metadata(path).map_err(|e| HttpError::SecretRead {
-            path: path.to_string(),
-            source: e,
-        })?;
         let mode = metadata.permissions().mode();
         if mode & 0o077 != 0 {
             return Err(HttpError::Config(format!(
@@ -159,6 +163,15 @@ fn read_secret_file(path: &str) -> Result<Zeroizing<String>, HttpError> {
                  (group/world-accessible); set to 0600 or 0400"
             )));
         }
+    }
+
+    // Pre-check file size via metadata before reading. Prevents loading a
+    // multi-GB log file into memory if the operator mis-pointed the path.
+    let file_size = metadata.len();
+    if file_size > MAX_SECRET_FILE_BYTES as u64 {
+        return Err(HttpError::Config(format!(
+            "secret file `{path}` is too large ({file_size} bytes, max {MAX_SECRET_FILE_BYTES})"
+        )));
     }
 
     // Wrap in Zeroizing immediately so raw content is wiped on all exit paths
@@ -169,13 +182,6 @@ fn read_secret_file(path: &str) -> Result<Zeroizing<String>, HttpError> {
                 source: e,
             })?,
         );
-
-    if content.len() > MAX_SECRET_FILE_BYTES {
-        return Err(HttpError::Config(format!(
-            "secret file `{path}` is too large ({} bytes, max {MAX_SECRET_FILE_BYTES})",
-            content.len()
-        )));
-    }
 
     let trimmed = Zeroizing::new(content.trim().to_string());
     // Wipe raw content now that we have the trimmed version
