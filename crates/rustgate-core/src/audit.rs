@@ -369,6 +369,40 @@ pub fn server_started(bind: &str, version: &str) {
     );
 }
 
+// ── HTTP egress audit events ───────────────────────────────────────
+
+/// Record an HTTP publish failure for a target.
+pub fn http_publish_failed(target: &str, status: u16, error: &str) {
+    audit!(
+        "http.publish_failed",
+        target = %target,
+        status = status,
+        error = %error,
+        action = "publish",
+        result = "failure"
+    );
+}
+
+/// Record a circuit breaker tripping for an HTTP target.
+pub fn http_circuit_tripped(target: &str) {
+    audit!(
+        "http.circuit_tripped",
+        target = %target,
+        action = "circuit_breaker",
+        result = "tripped"
+    );
+}
+
+/// Record a circuit breaker recovering for an HTTP target.
+pub fn http_circuit_recovered(target: &str) {
+    audit!(
+        "http.circuit_recovered",
+        target = %target,
+        action = "circuit_breaker",
+        result = "recovered"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -532,6 +566,28 @@ mod tests {
             tls_handshake_failed("10.0.0.***:4433", "certificate expired", "verification");
             tls_handshake_failed("192.168.1.***:9443", "timeout", "negotiation");
             tls_handshake_failed("[::1]:443", "unknown CA", "chain_validation");
+        }
+    }
+
+    mod http_egress {
+        use super::*;
+
+        #[test]
+        fn test_http_publish_failed() {
+            http_publish_failed("siem-collector", 503, "service unavailable");
+            http_publish_failed("dashboard", 0, "connection refused");
+        }
+
+        #[test]
+        fn test_http_circuit_tripped() {
+            http_circuit_tripped("siem-collector");
+            http_circuit_tripped("analytics-api");
+        }
+
+        #[test]
+        fn test_http_circuit_recovered() {
+            http_circuit_recovered("siem-collector");
+            http_circuit_recovered("analytics-api");
         }
     }
 }
