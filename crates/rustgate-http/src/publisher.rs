@@ -148,6 +148,10 @@ impl HttpPublisher {
                     target_count = self.targets.len(),
                     "HTTP dispatch channel full, dropping message"
                 );
+                #[cfg(feature = "metrics")]
+                crate::metrics::errors()
+                    .with_label_values(&["_all", "channel_full"])
+                    .inc();
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 tracing::warn!("HTTP dispatch channel closed");
@@ -356,6 +360,10 @@ async fn fan_out(msg: &RoutableMessage, targets: &[TargetState]) {
                 source_protocol = %msg.metadata.source_protocol,
                 "message filtered out for target"
             );
+            #[cfg(feature = "metrics")]
+            crate::metrics::filtered()
+                .with_label_values(&[target.name.as_str()])
+                .inc();
             continue;
         }
 
@@ -379,6 +387,10 @@ async fn dispatch_to_target(target: &TargetState, msg: &RoutableMessage) {
             payload_size = msg.payload.len(),
             "circuit open, dead-lettering message"
         );
+        #[cfg(feature = "metrics")]
+        crate::metrics::errors()
+            .with_label_values(&[target.name.as_str(), "circuit_open"])
+            .inc();
         return;
     }
 
@@ -390,6 +402,10 @@ async fn dispatch_to_target(target: &TargetState, msg: &RoutableMessage) {
             max_payload_bytes = target.max_payload_bytes,
             "message payload exceeds size limit, dropping"
         );
+        #[cfg(feature = "metrics")]
+        crate::metrics::errors()
+            .with_label_values(&[target.name.as_str(), "payload_too_large"])
+            .inc();
         return;
     }
 
@@ -402,6 +418,10 @@ async fn dispatch_to_target(target: &TargetState, msg: &RoutableMessage) {
                 error = %e,
                 "payload serialization failed"
             );
+            #[cfg(feature = "metrics")]
+            crate::metrics::errors()
+                .with_label_values(&[target.name.as_str(), "serialize"])
+                .inc();
             return;
         }
     };
@@ -421,7 +441,13 @@ async fn dispatch_to_target(target: &TargetState, msg: &RoutableMessage) {
 
         match send_request(target, &body, content_type).await {
             Ok(()) => {
-                target.circuit.record_success();
+                if target.circuit.record_success() {
+                    rustgate_core::audit::http_circuit_recovered(&target.name);
+                }
+                #[cfg(feature = "metrics")]
+                crate::metrics::publishes()
+                    .with_label_values(&[target.name.as_str()])
+                    .inc();
                 tracing::debug!(
                     target = %target.name,
                     attempt = attempt + 1,
@@ -440,9 +466,29 @@ async fn dispatch_to_target(target: &TargetState, msg: &RoutableMessage) {
                     // health problems — tripping on them would mask the real fix.
                     let affects_circuit =
                         status.is_none_or(|s| s == 429 || (500..600).contains(&s));
-                    if affects_circuit {
-                        target.circuit.record_failure();
+                    if affects_circuit && target.circuit.record_failure() {
+                        rustgate_core::audit::http_circuit_tripped(&target.name);
                     }
+
+                    rustgate_core::audit::http_publish_failed(
+                        &target.name,
+                        status.unwrap_or(0),
+                        &err,
+                    );
+
+                    #[cfg(feature = "metrics")]
+                    {
+                        let reason = match status {
+                            Some(s) if (400..500).contains(&s) => "status_4xx",
+                            Some(s) if (500..600).contains(&s) => "status_5xx",
+                            Some(_) => "status_other",
+                            None => "network",
+                        };
+                        crate::metrics::errors()
+                            .with_label_values(&[target.name.as_str(), reason])
+                            .inc();
+                    }
+
                     tracing::warn!(
                         target = %target.name,
                         attempt = attempt + 1,
@@ -454,6 +500,11 @@ async fn dispatch_to_target(target: &TargetState, msg: &RoutableMessage) {
                     );
                     return;
                 }
+
+                #[cfg(feature = "metrics")]
+                crate::metrics::retries()
+                    .with_label_values(&[target.name.as_str()])
+                    .inc();
 
                 retry_after_hint = retry_after;
                 tracing::debug!(

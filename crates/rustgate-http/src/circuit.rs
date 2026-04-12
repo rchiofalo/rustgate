@@ -112,7 +112,9 @@ impl CircuitBreaker {
     /// In Closed state, resets the failure counter. In HalfOpen state,
     /// increments the success counter and closes the circuit once the
     /// `success_threshold` is reached.
-    pub(crate) fn record_success(&self) {
+    ///
+    /// Returns `true` if the circuit recovered (HalfOpen → Closed).
+    pub(crate) fn record_success(&self) -> bool {
         let current = self.state.load(Ordering::Acquire);
         self.consecutive_failures.store(0, Ordering::Release);
 
@@ -120,8 +122,10 @@ impl CircuitBreaker {
             let count = self.half_open_successes.fetch_add(1, Ordering::AcqRel) + 1;
             if count >= self.success_threshold {
                 self.close();
+                return true;
             }
         }
+        false
     }
 
     /// Record a failed request. May trip the circuit to Open.
@@ -129,13 +133,15 @@ impl CircuitBreaker {
     /// In HalfOpen state, any failure immediately re-opens the circuit
     /// (the probe failed). In Closed state, the circuit trips after
     /// `threshold` consecutive failures.
-    pub(crate) fn record_failure(&self) {
+    ///
+    /// Returns `true` if the circuit tripped (Closed/HalfOpen → Open).
+    pub(crate) fn record_failure(&self) -> bool {
         let current_state = self.state.load(Ordering::Acquire);
 
         // HalfOpen probe failed — immediately re-open
         if current_state == STATE_HALF_OPEN {
             self.trip();
-            return;
+            return true;
         }
 
         let prev = self.consecutive_failures.fetch_add(1, Ordering::AcqRel);
@@ -143,7 +149,9 @@ impl CircuitBreaker {
 
         if new_count >= self.threshold {
             self.trip();
+            return true;
         }
+        false
     }
 
     /// Current state as a numeric value for metrics gauges.
