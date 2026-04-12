@@ -70,7 +70,10 @@ impl CircuitBreaker {
     /// Record a successful request. Resets the circuit to Closed.
     pub(crate) fn record_success(&self) {
         self.consecutive_failures.store(0, Ordering::Release);
-        self.state.store(STATE_CLOSED, Ordering::Release);
+        let prev = self.state.swap(STATE_CLOSED, Ordering::AcqRel);
+        if prev != STATE_CLOSED {
+            tracing::info!("circuit breaker recovered to closed");
+        }
     }
 
     /// Record a failed request. May trip the circuit to Open.
@@ -110,9 +113,12 @@ impl CircuitBreaker {
 
     /// Transition to Open state, recording the current timestamp.
     fn trip(&self) {
-        self.state.store(STATE_OPEN, Ordering::Release);
+        let prev = self.state.swap(STATE_OPEN, Ordering::AcqRel);
         if let Ok(mut guard) = self.opened_at.lock() {
             *guard = Some(Instant::now());
+        }
+        if prev != STATE_OPEN {
+            tracing::warn!("circuit breaker tripped to open");
         }
     }
 

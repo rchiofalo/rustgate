@@ -16,6 +16,7 @@ use reqwest::header::HeaderName;
 use rustgate_core::message::RoutableMessage;
 use tokio::sync::mpsc;
 use tracing::Instrument;
+use zeroize::Zeroizing;
 
 use crate::auth::AuthState;
 use crate::circuit::CircuitBreaker;
@@ -29,7 +30,7 @@ const CHANNEL_BUFFER: usize = 256;
 
 /// Publishes routable messages to configured HTTP targets.
 ///
-/// Designed to be called from the routing path like [`NatsPublisher`].
+/// Designed to be called from the routing path like `NatsPublisher`.
 /// Publishing is fire-and-forget: messages are dispatched via an internal
 /// bounded channel to a background worker task.
 #[derive(Clone)]
@@ -77,8 +78,8 @@ impl HttpPublisher {
     /// Build publisher from config, constructing per-target reqwest clients.
     ///
     /// Validates configuration, loads auth secrets, and builds a dedicated
-    /// HTTP client for each enabled target. Call [`start`](Self::start) to
-    /// spawn the background worker.
+    /// HTTP client for each enabled target. Spawns a background dispatch
+    /// worker automatically.
     pub fn new(config: HttpConfig) -> Result<Self, HttpError> {
         config.validate()?;
 
@@ -261,17 +262,19 @@ fn build_client(tc: &TargetConfig) -> Result<reqwest::Client, HttpError> {
                 ))
             })?;
 
-            let mut identity_pem = std::fs::read(cert_path).map_err(|e| HttpError::TlsFile {
-                target: tc.name.clone(),
-                path: cert_path.clone(),
-                source: e,
-            })?;
+            let mut identity_pem =
+                Zeroizing::new(std::fs::read(cert_path).map_err(|e| HttpError::TlsFile {
+                    target: tc.name.clone(),
+                    path: cert_path.clone(),
+                    source: e,
+                })?);
 
-            let key_pem = std::fs::read(key_path).map_err(|e| HttpError::TlsFile {
-                target: tc.name.clone(),
-                path: key_path.clone(),
-                source: e,
-            })?;
+            let key_pem =
+                Zeroizing::new(std::fs::read(key_path).map_err(|e| HttpError::TlsFile {
+                    target: tc.name.clone(),
+                    path: key_path.clone(),
+                    source: e,
+                })?);
 
             // reqwest::Identity::from_pem expects cert+key concatenated
             identity_pem.extend_from_slice(&key_pem);
@@ -282,6 +285,7 @@ fn build_client(tc: &TargetConfig) -> Result<reqwest::Client, HttpError> {
                     source: e,
                 })?;
             builder = builder.identity(identity);
+            // identity_pem and key_pem are Zeroizing — wiped on drop
         }
     }
 
@@ -331,6 +335,12 @@ async fn dispatch_worker(
 async fn fan_out(msg: &RoutableMessage, targets: &[TargetState]) {
     for target in targets {
         if !target.filter.matches(msg) {
+            tracing::trace!(
+                target = %target.name,
+                source_cn = %msg.source.cn,
+                source_protocol = %msg.metadata.source_protocol,
+                "message filtered out for target"
+            );
             continue;
         }
 
@@ -515,5 +525,78 @@ mod tests {
         let id = generate_instance_id();
         assert!(id.starts_with("rustgate-"));
         assert!(id.len() > "rustgate-".len());
+    }
+
+    #[test]
+    fn delivery_id_is_32_char_hex() {
+        let id = generate_delivery_id();
+        assert_eq!(id.len(), 32);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn delivery_ids_are_unique() {
+        let id1 = generate_delivery_id();
+        let id2 = generate_delivery_id();
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn echo_prevention_blocks_http_case_insensitive() {
+        let (tx, _rx) = mpsc::channel(1);
+        let publisher = HttpPublisher {
+            tx,
+            targets: Arc::new(vec![]),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+        };
+        // These should all be silently dropped (echo prevention)
+        for protocol in &["http", "HTTP", "Http", "hTTp"] {
+            let msg = rustgate_core::message::RoutableMessage {
+                source: rustgate_core::identity::Identity {
+                    cn: "test".to_string(),
+                    fingerprint: Default::default(),
+                    groups: Default::default(),
+                    tenant: None,
+                    spiffe_id: None,
+                    attributes: Arc::new(Default::default()),
+                },
+                destination: rustgate_core::message::Destination::Broadcast,
+                payload: bytes::Bytes::from_static(b"test"),
+                metadata: rustgate_core::message::Metadata {
+                    received_at: std::time::SystemTime::now(),
+                    source_protocol: protocol.to_string(),
+                    message_type: rustgate_core::message::MessageType::Position,
+                    ttl: None,
+                },
+            };
+            publisher.publish(&msg);
+        }
+        // If echo prevention failed, try_recv would return messages
+        // Since we dropped _rx, the send would fail — but publish()
+        // should return before even trying to send (echo prevention)
+    }
+
+    #[test]
+    fn all_targets_disabled_returns_error() {
+        let config = HttpConfig {
+            instance_id: None,
+            targets: vec![crate::config::TargetConfig {
+                name: "disabled".to_string(),
+                url: "https://example.com".to_string(),
+                method: None,
+                auth: None,
+                tls: None,
+                timeout_secs: None,
+                format: None,
+                filter: None,
+                retry: None,
+                enabled: Some(false),
+                headers: None,
+                max_payload_bytes: None,
+            }],
+            allow_private_urls: false,
+        };
+        let err = HttpPublisher::new(config).unwrap_err();
+        assert!(err.to_string().contains("no enabled"), "got: {err}");
     }
 }

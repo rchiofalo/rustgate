@@ -20,6 +20,7 @@ method = "post"
 format = "json"
 timeout-secs = 10
 enabled = true
+max-payload-bytes = 1048576    # 1 MiB (default)
 
 [targets.auth]
 type = "bearer"
@@ -33,6 +34,7 @@ client-key = "/etc/rustgate/tls/client-key.pem"
 [targets.filter]
 groups = ["team-alpha", "team-bravo"]
 message-types = ["position", "alert"]
+# exclude-protocols = ["nats"]  # also exclude NATS-sourced messages (http always excluded)
 
 [targets.retry]
 max-attempts = 3

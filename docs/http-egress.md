@@ -54,6 +54,7 @@ The HTTP egress config is a standalone TOML file passed via `--http-config-file`
 | `filter` | table | none | Message filter (see below) |
 | `retry` | table | none | Retry and circuit breaker settings (see below) |
 | `headers` | array | none | Custom static headers (see below) |
+| `max-payload-bytes` | integer | `1048576` | Maximum payload size in bytes (1 MiB default) |
 
 ### Authentication
 
@@ -136,9 +137,10 @@ Filters control which messages are forwarded to each target. All dimensions are 
 groups = ["team-alpha", "hq-ops"]       # only these source groups
 message-types = ["position", "alert"]   # only these message types
 source-cns = ["sensor-1", "sensor-2"]   # only from these clients
+exclude-protocols = ["nats"]            # also exclude NATS-sourced messages
 ```
 
-**Echo prevention:** messages originating from the HTTP egress bridge (source protocol `"http"`) are always excluded to prevent infinite forwarding loops. This is enforced even if `exclude-protocols` is not configured.
+**Echo prevention:** messages originating from the HTTP egress bridge (source protocol `"http"`) are always excluded to prevent infinite forwarding loops, even if `exclude-protocols` is not configured. Use `exclude-protocols` to additionally block messages from other protocols (e.g., `"nats"`).
 
 ### Retry and Circuit Breaker
 
@@ -215,6 +217,21 @@ Error reasons: `network`, `status_4xx`, `status_5xx`, `circuit_open`, `serialize
 - Alert on `rate(rustgate_http_errors_total[5m]) > 0` with `reason="circuit_open"` to detect targets that are down.
 - Alert on `rustgate_http_circuit_state > 0` to detect open circuit breakers.
 - Alert on `rustgate_http_queue_depth > 200` to detect channel backpressure.
+
+## Security Considerations
+
+The HTTP egress bridge includes several security hardening measures:
+
+- **SSRF protection**: Target URLs pointing to private/reserved IP addresses (loopback `127.0.0.0/8`, RFC 1918 `10.0.0.0/8 / 172.16.0.0/12 / 192.168.0.0/16`, link-local `169.254.0.0/16` including AWS IMDS, and `localhost`) are rejected at config validation time. This prevents an attacker from using the egress bridge to probe internal services.
+- **Redirect following disabled**: HTTP 3xx redirects are not followed, preventing SSRF via redirect chains to internal endpoints.
+- **Minimum TLS 1.2**: Outbound connections enforce TLS 1.2 or higher.
+- **Connect timeout**: A 5-second connect timeout prevents slow-connect denial-of-service.
+- **Secret zeroization**: All secret material (tokens, passwords, HMAC keys, TLS private keys) is wrapped in `Zeroizing<T>` for automatic memory wiping on drop. Intermediate buffers are explicitly zeroized.
+- **File-based secrets**: Secrets are always read from files, never inline config values. This prevents exposure via config dumps, debug output, or structured logging.
+- **Secret file limits**: Secret files larger than 8 KiB or empty after trimming are rejected.
+- **Reserved header protection**: Custom headers cannot override security-relevant headers (`Host`, `Content-Type`, `Authorization`, `X-Rustgate-Instance`, `X-Rustgate-Delivery-Id`).
+- **Payload size limits**: The `max-payload-bytes` setting (default 1 MiB) prevents memory exhaustion from oversized messages.
+- **Config typo detection**: All config structs use `deny_unknown_fields` to reject misspelled field names.
 
 ## Troubleshooting
 

@@ -131,10 +131,14 @@ const MAX_SECRET_FILE_BYTES: usize = 8 * 1024;
 ///
 /// Rejects empty secrets (after trimming) and files larger than 8 KiB.
 fn read_secret_file(path: &str) -> Result<Zeroizing<String>, HttpError> {
-    let content = std::fs::read_to_string(path).map_err(|e| HttpError::SecretRead {
-        path: path.to_string(),
-        source: e,
-    })?;
+    // Wrap in Zeroizing immediately so raw content is wiped on all exit paths
+    let mut content =
+        Zeroizing::new(
+            std::fs::read_to_string(path).map_err(|e| HttpError::SecretRead {
+                path: path.to_string(),
+                source: e,
+            })?,
+        );
 
     if content.len() > MAX_SECRET_FILE_BYTES {
         return Err(HttpError::Config(format!(
@@ -143,14 +147,17 @@ fn read_secret_file(path: &str) -> Result<Zeroizing<String>, HttpError> {
         )));
     }
 
-    let trimmed = content.trim().to_string();
+    let trimmed = Zeroizing::new(content.trim().to_string());
+    // Wipe raw content now that we have the trimmed version
+    zeroize::Zeroize::zeroize(&mut *content);
+
     if trimmed.is_empty() {
         return Err(HttpError::Config(format!(
             "secret file `{path}` is empty after trimming whitespace"
         )));
     }
 
-    Ok(Zeroizing::new(trimmed))
+    Ok(trimmed)
 }
 
 /// Compute HMAC-SHA256 over `data` and return `sha256=<hex>` string.
@@ -333,6 +340,30 @@ mod tests {
         assert!(debug.contains("X-Signature-256"));
         assert!(!debug.contains("my-hmac-secret"));
         assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn rejects_oversized_secret_file() {
+        let dir = std::env::temp_dir().join("rustgate-http-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("oversized-secret");
+        // Write 9 KiB (over 8 KiB limit)
+        let content = "x".repeat(9 * 1024);
+        std::fs::write(&path, &content).unwrap();
+        let err = read_secret_file(path.to_str().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("too large"), "got: {err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rejects_empty_secret_file() {
+        let path = write_temp_secret("empty-secret", "   \n\t  ");
+        let err = read_secret_file(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("empty after trimming"),
+            "got: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

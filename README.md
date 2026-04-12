@@ -200,6 +200,7 @@ cargo build --release --features metrics        # Prometheus + health endpoints
 cargo build --release --features jemalloc       # jemalloc allocator (musl)
 cargo build --release --features fips           # FIPS 140-3 crypto (needs Go + cmake)
 cargo build --release --features post-quantum  # PQ key exchange (needs Go + cmake)
+cargo build --release --features http            # HTTP/webhook egress
 cargo build --release --features otel           # OpenTelemetry tracing (needs protoc)
 
 # All features
@@ -223,6 +224,7 @@ cargo build --release --all-features
 | `fips` | FIPS 140-3 crypto (aws-lc-rs) | Go 1.20+, cmake |
 | `post-quantum` | Post-quantum key exchange (X25519MLKEM768) | Go 1.20+, cmake |
 | `otel` | OpenTelemetry distributed tracing | `protoc` |
+| `http` | HTTP/webhook egress bridge | — |
 | `cedar` | Cedar policy backend for authorization | — |
 | `ocsp` | OCSP stapling for server certificates | — |
 | `spiffe` | SPIFFE / SPIRE workload identity (server cert + trust bundle from the Workload API) | `protoc` |

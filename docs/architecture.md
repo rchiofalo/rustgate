@@ -117,6 +117,7 @@ All optional features are compile-time feature gates, keeping the base binary mi
 | `ocsp` | rustgate-transport | OCSP stapling and client OCSP checking |
 | `spiffe` | rustgate-transport | SPIFFE/SPIRE workload identity for server TLS |
 | `cedar` | rustgate-authz | Cedar policy language backend for authorization |
+| `http` | rustgate-http | HTTP/webhook egress with auth, retry, circuit breaking |
 | `peer-discovery` | rustgate-federation | Peer discovery backends (DNS-SD, Consul, etcd) |
 | `jemalloc` | tikv-jemallocator | jemalloc allocator for musl builds |
 

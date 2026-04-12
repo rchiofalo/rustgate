@@ -379,6 +379,138 @@ async fn instance_id_header_present() {
 }
 
 #[tokio::test]
+async fn bearer_auth_header_present() {
+    use rustgate_http::config::AuthConfig;
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(header("authorization", "Bearer test-token-123"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Write a temp token file
+    let dir = std::env::temp_dir().join("rustgate-http-integ");
+    std::fs::create_dir_all(&dir).unwrap();
+    let token_path = dir.join("bearer-token");
+    std::fs::write(&token_path, "test-token-123\n").unwrap();
+
+    let mut tc = target_config("bearer-test", &format!("{}/api", server.uri()));
+    tc.auth = Some(AuthConfig::Bearer {
+        token_file: token_path.to_str().unwrap().to_string(),
+    });
+    let config = http_config(vec![tc]);
+    let publisher = HttpPublisher::new(config).unwrap();
+
+    let msg = make_msg("alice", "tcp", MessageType::Position);
+    publisher.publish(&msg);
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    publisher.shutdown();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let _ = std::fs::remove_file(&token_path);
+}
+
+#[tokio::test]
+async fn hmac_signature_present() {
+    use rustgate_http::config::AuthConfig;
+
+    let server = MockServer::start().await;
+
+    // Just verify the header exists and has the sha256= prefix
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::header_exists("x-signature-256"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = std::env::temp_dir().join("rustgate-http-integ");
+    std::fs::create_dir_all(&dir).unwrap();
+    let secret_path = dir.join("hmac-secret");
+    std::fs::write(&secret_path, "test-hmac-key").unwrap();
+
+    let mut tc = target_config("hmac-test", &format!("{}/webhook", server.uri()));
+    tc.auth = Some(AuthConfig::Hmac {
+        secret_file: secret_path.to_str().unwrap().to_string(),
+        header: None,
+    });
+    let config = http_config(vec![tc]);
+    let publisher = HttpPublisher::new(config).unwrap();
+
+    let msg = make_msg("alice", "tcp", MessageType::Position);
+    publisher.publish(&msg);
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    publisher.shutdown();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let _ = std::fs::remove_file(&secret_path);
+}
+
+#[tokio::test]
+async fn circuit_breaker_opens_after_threshold() {
+    let server = MockServer::start().await;
+
+    // All requests return 500
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let mut tc = target_config("circuit-test", &format!("{}/api", server.uri()));
+    tc.retry = Some(rustgate_http::config::RetryConfig {
+        max_attempts: Some(1), // No retries — fail immediately
+        backoff_base_secs: Some(0),
+        circuit_breaker_threshold: Some(2), // Open after 2 failures
+        circuit_breaker_cooldown_secs: Some(300),
+    });
+    let config = http_config(vec![tc]);
+    let publisher = HttpPublisher::new(config).unwrap();
+
+    assert!(publisher.is_healthy());
+
+    // Send 2 messages to trip the circuit breaker
+    for _ in 0..2 {
+        let msg = make_msg("alice", "tcp", MessageType::Position);
+        publisher.publish(&msg);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    // Circuit should now be open
+    assert!(!publisher.is_healthy());
+
+    publisher.shutdown();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn graceful_shutdown_drains_queue() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let config = http_config(vec![target_config(
+        "drain-test",
+        &format!("{}/hook", server.uri()),
+    )]);
+    let publisher = HttpPublisher::new(config).unwrap();
+
+    let msg = make_msg("alice", "tcp", MessageType::Position);
+    publisher.publish(&msg);
+
+    // Immediately shut down — pending messages should still be delivered
+    publisher.shutdown();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // wiremock expect(1) will panic on drop if the request wasn't received
+}
+
+#[tokio::test]
 async fn is_healthy_reflects_circuit_state() {
     let server = MockServer::start().await;
 
