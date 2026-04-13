@@ -76,6 +76,11 @@ pub struct TargetConfig {
     /// Maximum payload size in bytes before a message is rejected.
     /// Prevents memory exhaustion from oversized messages. Default: 1 MiB.
     pub max_payload_bytes: Option<usize>,
+
+    /// Maximum outbound requests per second to this target.
+    /// When unset, requests are unlimited (subject only to circuit breaking).
+    /// Prevents overwhelming downstream endpoints with burst traffic.
+    pub rate_limit_per_sec: Option<f64>,
 }
 
 /// Custom HTTP header entry.
@@ -306,6 +311,7 @@ impl HttpConfig {
         "host",
         "content-type",
         "content-length",
+        "content-digest",
         "transfer-encoding",
         "authorization",
         "connection",
@@ -530,6 +536,7 @@ mod tests {
             enabled: None,
             headers: None,
             max_payload_bytes: None,
+            rate_limit_per_sec: None,
         }
     }
 

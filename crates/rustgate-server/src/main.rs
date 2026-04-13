@@ -916,6 +916,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let (http_forward, _http_publisher): (Option<session::HttpForwardFn>, _) = {
         match setup::connect_http(&cli) {
             Some((fwd, publisher)) => {
+                #[cfg(feature = "metrics")]
                 readiness.set_http_publisher(publisher.clone());
                 (Some(fwd), Some(publisher))
             }

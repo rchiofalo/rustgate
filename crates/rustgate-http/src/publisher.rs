@@ -12,8 +12,10 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine;
 use reqwest::header::HeaderName;
 use rustgate_core::message::RoutableMessage;
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tracing::Instrument;
 use zeroize::Zeroizing;
@@ -23,6 +25,7 @@ use crate::circuit::CircuitBreaker;
 use crate::config::{HttpConfig, PayloadFormat, TargetConfig};
 use crate::error::HttpError;
 use crate::filter::CompiledFilter;
+use crate::ratelimit::TokenBucket;
 use crate::resolver::SsrfSafeResolver;
 use crate::{payload, retry};
 
@@ -64,6 +67,8 @@ struct TargetState {
     instance_id: String,
     custom_headers: Vec<(HeaderName, String)>,
     max_payload_bytes: usize,
+    /// Per-target rate limiter. `None` means unlimited.
+    rate_limiter: Option<TokenBucket>,
 }
 
 impl fmt::Debug for TargetState {
@@ -221,6 +226,10 @@ fn build_target(
         })
         .unwrap_or_default();
 
+    let rate_limiter = tc
+        .rate_limit_per_sec
+        .map(|rate| TokenBucket::new(rate, None));
+
     Ok(TargetState {
         name: tc.name.clone(),
         client,
@@ -235,6 +244,7 @@ fn build_target(
         instance_id: instance_id.to_string(),
         custom_headers,
         max_payload_bytes: tc.effective_max_payload_bytes(),
+        rate_limiter,
     })
 }
 
@@ -378,6 +388,22 @@ async fn fan_out(msg: &RoutableMessage, targets: &[TargetState]) {
 
 /// Dispatch a single message to a target with retry and circuit breaking.
 async fn dispatch_to_target(target: &TargetState, msg: &RoutableMessage) {
+    // Per-target rate limiting — shed excess traffic before any work.
+    if let Some(ref limiter) = target.rate_limiter
+        && !limiter.try_acquire()
+    {
+        tracing::debug!(
+            target = %target.name,
+            source_cn = %msg.source.cn,
+            "rate limited, dropping message"
+        );
+        #[cfg(feature = "metrics")]
+        crate::metrics::errors()
+            .with_label_values(&[target.name.as_str(), "rate_limited"])
+            .inc();
+        return;
+    }
+
     // Circuit breaker check
     if !target.circuit.allow_request() {
         tracing::warn!(
@@ -426,6 +452,14 @@ async fn dispatch_to_target(target: &TargetState, msg: &RoutableMessage) {
         }
     };
 
+    // Stable delivery ID: generated once per message-target pair so retries
+    // carry the same ID, enabling receiver-side deduplication.
+    let delivery_id = generate_delivery_id();
+
+    // Content-Digest (RFC 9530): SHA-256 hash of the serialized body for
+    // end-to-end integrity verification by the receiver.
+    let content_digest = compute_content_digest(&body);
+
     // Retry loop with optional Retry-After from 429 responses
     let mut retry_after_hint: Option<Duration> = None;
     for attempt in 0..target.max_attempts {
@@ -439,7 +473,7 @@ async fn dispatch_to_target(target: &TargetState, msg: &RoutableMessage) {
             tokio::time::sleep(delay).await;
         }
 
-        match send_request(target, &body, content_type).await {
+        match send_request(target, &body, content_type, &delivery_id, &content_digest).await {
             Ok(()) => {
                 if target.circuit.record_success() {
                     rustgate_core::audit::http_circuit_recovered(&target.name);
@@ -451,6 +485,7 @@ async fn dispatch_to_target(target: &TargetState, msg: &RoutableMessage) {
                 tracing::debug!(
                     target = %target.name,
                     attempt = attempt + 1,
+                    delivery_id = %delivery_id,
                     "HTTP publish succeeded"
                 );
                 return;
@@ -492,6 +527,7 @@ async fn dispatch_to_target(target: &TargetState, msg: &RoutableMessage) {
                     tracing::warn!(
                         target = %target.name,
                         attempt = attempt + 1,
+                        delivery_id = %delivery_id,
                         error = %err,
                         status = ?status,
                         retryable,
@@ -510,6 +546,7 @@ async fn dispatch_to_target(target: &TargetState, msg: &RoutableMessage) {
                 tracing::debug!(
                     target = %target.name,
                     attempt = attempt + 1,
+                    delivery_id = %delivery_id,
                     error = %err,
                     status = ?status,
                     "HTTP publish failed, will retry"
@@ -521,6 +558,10 @@ async fn dispatch_to_target(target: &TargetState, msg: &RoutableMessage) {
 
 /// Send a single HTTP request to the target.
 ///
+/// The `delivery_id` is stable across retry attempts for the same message,
+/// enabling receiver-side deduplication. The `content_digest` is the
+/// RFC 9530 `Content-Digest` header value (SHA-256).
+///
 /// Returns `Ok(())` on 2xx, or `Err((optional_status, error_string, retry_after))`.
 /// The `retry_after` field is populated from the `Retry-After` header on 429
 /// responses, allowing the retry loop to respect server-specified backoff.
@@ -528,17 +569,16 @@ async fn send_request(
     target: &TargetState,
     body: &[u8],
     content_type: &str,
+    delivery_id: &str,
+    content_digest: &str,
 ) -> Result<(), (Option<u16>, String, Option<Duration>)> {
-    // Per-request delivery ID for receiver-side idempotency and audit.
-    // 16 random bytes → 32-char hex string (128-bit collision resistance).
-    let delivery_id = generate_delivery_id();
-
     let mut builder = target
         .client
         .request(target.method.clone(), &target.url)
         .header("Content-Type", content_type)
+        .header("Content-Digest", content_digest)
         .header("X-Rustgate-Instance", &target.instance_id)
-        .header("X-Rustgate-Delivery-Id", &delivery_id);
+        .header("X-Rustgate-Delivery-Id", delivery_id);
 
     // Apply custom headers
     for (name, value) in &target.custom_headers {
@@ -577,6 +617,17 @@ async fn send_request(
         };
         Err((Some(status), format!("HTTP {status}"), retry_after))
     }
+}
+
+/// Compute the RFC 9530 Content-Digest header value for body integrity.
+///
+/// Format: `sha-256=:<base64>:` (structured field sf-binary encoding).
+/// Receivers can verify the digest to detect in-transit corruption or
+/// proxy tampering, complementing TLS transport-level encryption.
+fn compute_content_digest(body: &[u8]) -> String {
+    let hash = Sha256::digest(body);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(hash);
+    format!("sha-256=:{encoded}:")
 }
 
 /// Generate a unique instance ID based on process ID and timestamp.
@@ -638,6 +689,34 @@ mod tests {
     }
 
     #[test]
+    fn content_digest_is_rfc9530_format() {
+        let body = b"hello world";
+        let digest = compute_content_digest(body);
+        // RFC 9530 format: sha-256=:<base64>:
+        assert!(digest.starts_with("sha-256=:"), "got: {digest}");
+        assert!(digest.ends_with(':'), "got: {digest}");
+        // Verify correct SHA-256 of "hello world"
+        let expected_hash = sha2::Sha256::digest(body);
+        let expected_b64 = base64::engine::general_purpose::STANDARD.encode(expected_hash);
+        assert_eq!(digest, format!("sha-256=:{expected_b64}:"));
+    }
+
+    #[test]
+    fn content_digest_deterministic() {
+        let body = b"test payload";
+        let d1 = compute_content_digest(body);
+        let d2 = compute_content_digest(body);
+        assert_eq!(d1, d2);
+    }
+
+    #[test]
+    fn content_digest_differs_for_different_bodies() {
+        let d1 = compute_content_digest(b"payload A");
+        let d2 = compute_content_digest(b"payload B");
+        assert_ne!(d1, d2);
+    }
+
+    #[test]
     fn echo_prevention_blocks_http_case_insensitive() {
         let (tx, _rx) = mpsc::channel(1);
         let publisher = HttpPublisher {
@@ -689,6 +768,7 @@ mod tests {
                 enabled: Some(false),
                 headers: None,
                 max_payload_bytes: None,
+                rate_limit_per_sec: None,
             }],
             allow_private_urls: false,
         };

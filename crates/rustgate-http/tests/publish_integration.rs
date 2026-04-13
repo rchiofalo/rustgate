@@ -13,7 +13,7 @@ use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
 use rustgate_http::HttpPublisher;
 use rustgate_http::config::{HttpConfig, TargetConfig};
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{header, header_exists, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn make_msg(cn: &str, protocol: &str, msg_type: MessageType) -> RoutableMessage {
@@ -55,6 +55,7 @@ fn target_config(name: &str, url: &str) -> TargetConfig {
         enabled: None,
         headers: None,
         max_payload_bytes: None,
+        rate_limit_per_sec: None,
     }
 }
 
@@ -546,4 +547,136 @@ async fn is_healthy_reflects_circuit_state() {
     assert!(publisher.is_healthy());
 
     publisher.shutdown();
+}
+
+#[tokio::test]
+async fn content_digest_header_present() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(header_exists("content-digest"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let config = http_config(vec![target_config(
+        "digest-test",
+        &format!("{}/hook", server.uri()),
+    )]);
+    let publisher = HttpPublisher::new(config).unwrap();
+
+    let msg = make_msg("alice", "tcp", MessageType::Position);
+    publisher.publish(&msg);
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    publisher.shutdown();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn delivery_id_stable_across_retries() {
+    let server = MockServer::start().await;
+
+    // First request fails with 503, second succeeds — both should carry
+    // the same X-Rustgate-Delivery-Id (stable idempotency key).
+    let delivery_ids = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let ids_clone = delivery_ids.clone();
+
+    Mock::given(method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut tc = target_config("retry-id-test", &format!("{}/hook", server.uri()));
+    tc.retry = Some(rustgate_http::config::RetryConfig {
+        max_attempts: Some(3),
+        backoff_base_secs: Some(0),
+        ..Default::default()
+    });
+    let config = http_config(vec![tc]);
+    let publisher = HttpPublisher::new(config).unwrap();
+
+    let msg = make_msg("alice", "tcp", MessageType::Position);
+    publisher.publish(&msg);
+
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    publisher.shutdown();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Verify both requests were received (wiremock expect guards handle this)
+    let received = server.received_requests().await.unwrap();
+    assert_eq!(
+        received.len(),
+        2,
+        "expected 2 requests (1 retry + 1 success)"
+    );
+
+    // Both should have the same delivery ID
+    let id1 = received[0]
+        .headers
+        .get("x-rustgate-delivery-id")
+        .expect("missing delivery ID on request 1")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let id2 = received[1]
+        .headers
+        .get("x-rustgate-delivery-id")
+        .expect("missing delivery ID on request 2")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    drop(ids_clone);
+
+    assert_eq!(id1, id2, "delivery ID should be stable across retries");
+    assert_eq!(id1.len(), 32, "delivery ID should be 32-char hex");
+}
+
+#[tokio::test]
+async fn rate_limiting_sheds_excess_traffic() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let mut tc = target_config("rate-test", &format!("{}/hook", server.uri()));
+    // Very low rate: 1 request/sec with burst of 1
+    tc.rate_limit_per_sec = Some(1.0);
+    let config = http_config(vec![tc]);
+    let publisher = HttpPublisher::new(config).unwrap();
+
+    // Fire 10 messages rapidly — only 1 (the initial burst token) should get through
+    for _ in 0..10 {
+        let msg = make_msg("alice", "tcp", MessageType::Position);
+        publisher.publish(&msg);
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    publisher.shutdown();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let received = server.received_requests().await.unwrap();
+    // With rate_limit=1.0 and burst=1, only the first should get through immediately.
+    // Over 500ms, ~0.5 more tokens refill, so we might get 1-2 through.
+    assert!(
+        received.len() <= 3,
+        "rate limiter should shed most traffic, got {} requests",
+        received.len()
+    );
+    assert!(
+        !received.is_empty(),
+        "at least 1 request should have been allowed"
+    );
 }
