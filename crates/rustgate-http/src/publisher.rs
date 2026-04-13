@@ -15,6 +15,7 @@ use std::time::Duration;
 use base64::Engine;
 use reqwest::header::HeaderName;
 use rustgate_core::message::RoutableMessage;
+use rustgate_core::sanitize::sanitize_for_log;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tracing::Instrument;
@@ -23,6 +24,7 @@ use zeroize::Zeroizing;
 use crate::auth::AuthState;
 use crate::circuit::CircuitBreaker;
 use crate::config::{HttpConfig, PayloadFormat, TargetConfig};
+use crate::dlq::DeadLetterQueue;
 use crate::error::HttpError;
 use crate::filter::CompiledFilter;
 use crate::ratelimit::TokenBucket;
@@ -31,6 +33,15 @@ use crate::{payload, retry};
 
 /// Channel buffer size for the dispatch queue.
 const CHANNEL_BUFFER: usize = 256;
+
+/// Non-revealing User-Agent to prevent version fingerprinting.
+const RUSTGATE_USER_AGENT: &str = "Rustgate";
+
+/// Maximum response body to drain on error responses (1 MiB).
+///
+/// Prevents memory exhaustion from malicious servers while still draining
+/// enough to keep HTTP connection pools healthy.
+const MAX_ERROR_RESPONSE_BYTES: usize = 1024 * 1024;
 
 /// Publishes routable messages to configured HTTP targets.
 ///
@@ -42,6 +53,10 @@ pub struct HttpPublisher {
     tx: mpsc::Sender<Arc<RoutableMessage>>,
     targets: Arc<Vec<TargetState>>,
     shutdown: Arc<tokio::sync::Notify>,
+    /// Encrypted dead-letter queue for circuit-breaker-shed messages.
+    dlq: Option<Arc<DeadLetterQueue>>,
+    /// Worker task handle for panic detection during shutdown.
+    worker_handle: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl fmt::Debug for HttpPublisher {
@@ -110,9 +125,39 @@ impl HttpPublisher {
             ));
         }
 
+        // Initialize encrypted dead-letter queue if configured
+        let dlq = match (&config.dlq_dir, &config.dlq_key_file) {
+            (Some(dir), Some(key_file)) => {
+                let key_ring =
+                    rustgate_core::encrypted::KeyRing::load(std::path::Path::new(key_file))
+                        .map_err(|e| HttpError::Dlq {
+                            target: "_global".to_string(),
+                            message: format!("failed to load DLQ key ring: {e}"),
+                        })?;
+
+                // Create DLQ directory if it doesn't exist
+                std::fs::create_dir_all(dir).map_err(|e| HttpError::Dlq {
+                    target: "_global".to_string(),
+                    message: format!("failed to create DLQ directory `{dir}`: {e}"),
+                })?;
+
+                tracing::info!(
+                    dlq_dir = %dir,
+                    "encrypted dead-letter queue enabled"
+                );
+                Some(Arc::new(DeadLetterQueue::new(
+                    std::path::PathBuf::from(dir),
+                    key_ring,
+                    config.dlq_max_bytes,
+                )))
+            }
+            _ => None,
+        };
+
         tracing::info!(
             target_count = targets.len(),
             instance_id = %instance_id,
+            dlq_enabled = dlq.is_some(),
             "HTTP publisher initialized"
         );
 
@@ -120,20 +165,23 @@ impl HttpPublisher {
         let shutdown = Arc::new(tokio::sync::Notify::new());
         let targets = Arc::new(targets);
 
-        // Spawn background worker
+        // Spawn background worker — handle stored for panic detection
         let worker_targets = Arc::clone(&targets);
         let worker_shutdown = Arc::clone(&shutdown);
-        // Worker runs independently — JoinHandle intentionally dropped
-        drop(tokio::spawn(dispatch_worker(
+        let worker_dlq = dlq.clone();
+        let handle = tokio::spawn(dispatch_worker(
             rx,
             worker_targets,
             worker_shutdown,
-        )));
+            worker_dlq,
+        ));
 
         Ok(Self {
             tx,
             targets,
             shutdown,
+            dlq,
+            worker_handle: Arc::new(std::sync::Mutex::new(Some(handle))),
         })
     }
 
@@ -149,7 +197,7 @@ impl HttpPublisher {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
                 tracing::warn!(
-                    source_cn = %msg.source.cn,
+                    source_cn = %sanitize_for_log(&msg.source.cn),
                     target_count = self.targets.len(),
                     "HTTP dispatch channel full, dropping message"
                 );
@@ -169,9 +217,35 @@ impl HttpPublisher {
         self.targets.iter().all(|t| t.circuit.is_closed())
     }
 
-    /// Signal the background worker to shut down.
-    pub fn shutdown(&self) {
+    /// Signal the background worker to shut down, await drain, and seal DLQ.
+    ///
+    /// Logs a warning if the worker panicked. Seals DLQ writers to ensure
+    /// encrypted terminators are written (readers reject unterminated files).
+    pub async fn shutdown(&self) {
         self.shutdown.notify_one();
+
+        // Take the handle out of the lock, then await it — avoids holding
+        // a std::sync::Mutex guard across an .await point.
+        let handle = self
+            .worker_handle
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+        if let Some(handle) = handle {
+            match handle.await {
+                Ok(()) => {}
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "HTTP dispatch worker panicked during shutdown"
+                    );
+                }
+            }
+        }
+
+        if let Some(ref dlq) = self.dlq {
+            dlq.finish();
+        }
     }
 }
 
@@ -255,7 +329,26 @@ fn build_target(
 /// - Redirects disabled to prevent SSRF via 3xx to internal endpoints.
 /// - Separate connect timeout prevents slow-connect DoS.
 /// - Minimum TLS 1.2 enforced for outbound connections.
+/// - Certificate pinning via custom rustls verifier when `pin-sha256` is configured.
 fn build_client(
+    tc: &TargetConfig,
+    resolver: Arc<SsrfSafeResolver>,
+) -> Result<reqwest::Client, HttpError> {
+    let has_pins = tc
+        .tls
+        .as_ref()
+        .and_then(|t| t.pin_sha256.as_ref())
+        .is_some_and(|pins| !pins.is_empty());
+
+    if has_pins {
+        build_pinned_client(tc, resolver)
+    } else {
+        build_standard_client(tc, resolver)
+    }
+}
+
+/// Build a reqwest client using reqwest's native TLS configuration (no pinning).
+fn build_standard_client(
     tc: &TargetConfig,
     resolver: Arc<SsrfSafeResolver>,
 ) -> Result<reqwest::Client, HttpError> {
@@ -265,9 +358,9 @@ fn build_client(
         .connect_timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
         .min_tls_version(reqwest::tls::Version::TLS_1_2)
+        .user_agent(RUSTGATE_USER_AGENT)
         .dns_resolver(resolver);
 
-    // Apply TLS configuration
     if let Some(tls) = &tc.tls {
         if let Some(ca_path) = &tls.ca_cert {
             let ca_pem = std::fs::read(ca_path).map_err(|e| HttpError::TlsFile {
@@ -314,7 +407,6 @@ fn build_client(
                     source: e,
                 })?;
             builder = builder.identity(identity);
-            // identity_pem and key_pem are Zeroizing — wiped on drop
         }
     }
 
@@ -324,28 +416,146 @@ fn build_client(
     })
 }
 
+/// Build a reqwest client with certificate pinning via a custom rustls verifier.
+///
+/// When pin-sha256 is configured, we build the entire rustls ClientConfig
+/// manually so we can wrap the standard WebPKI verifier with our pinning
+/// check. This overrides reqwest's native TLS configuration.
+fn build_pinned_client(
+    tc: &TargetConfig,
+    resolver: Arc<SsrfSafeResolver>,
+) -> Result<reqwest::Client, HttpError> {
+    let tls = tc.tls.as_ref().ok_or_else(|| {
+        HttpError::Config(format!(
+            "target `{}`: certificate pinning requires TLS configuration",
+            tc.name
+        ))
+    })?;
+
+    // Config validation ensures ca-cert is set when pins are configured
+    let ca_path = tls.ca_cert.as_ref().ok_or_else(|| {
+        HttpError::Config(format!("target `{}`: pin-sha256 requires ca-cert", tc.name))
+    })?;
+
+    let ca_pem = std::fs::read(ca_path).map_err(|e| HttpError::TlsFile {
+        target: tc.name.clone(),
+        path: ca_path.clone(),
+        source: e,
+    })?;
+
+    let root_store = crate::pinning::build_root_store(&ca_pem).map_err(|e| {
+        HttpError::Config(format!(
+            "target `{}`: failed to build root store: {e}",
+            tc.name
+        ))
+    })?;
+
+    let pins_config = tls.pin_sha256.as_ref().ok_or_else(|| {
+        HttpError::Config(format!(
+            "target `{}`: expected pin-sha256 in TLS config",
+            tc.name
+        ))
+    })?;
+    let parsed_pins = crate::pinning::parse_pins(pins_config)?;
+
+    // Build the standard WebPKI verifier as the inner chain validator
+    let inner_verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
+        .build()
+        .map_err(|e| {
+            HttpError::Config(format!(
+                "target `{}`: failed to build WebPKI verifier: {e}",
+                tc.name
+            ))
+        })?;
+
+    let pinned_verifier = Arc::new(crate::pinning::PinnedCertVerifier::new(
+        inner_verifier,
+        parsed_pins,
+    ));
+
+    // Build rustls ClientConfig with the pinning verifier
+    let tls_config = if let Some(cert_path) = &tls.client_cert {
+        let key_path = tls.client_key.as_ref().ok_or_else(|| {
+            HttpError::Config(format!(
+                "target `{}`: client-cert requires client-key",
+                tc.name
+            ))
+        })?;
+
+        let cert_pem =
+            Zeroizing::new(std::fs::read(cert_path).map_err(|e| HttpError::TlsFile {
+                target: tc.name.clone(),
+                path: cert_path.clone(),
+                source: e,
+            })?);
+        let key_pem = Zeroizing::new(std::fs::read(key_path).map_err(|e| HttpError::TlsFile {
+            target: tc.name.clone(),
+            path: key_path.clone(),
+            source: e,
+        })?);
+
+        let certs = crate::pinning::parse_pem_certs(&cert_pem);
+        let key = crate::pinning::parse_pem_private_key(&key_pem).ok_or_else(|| {
+            HttpError::Config(format!(
+                "target `{}`: failed to parse client private key PEM",
+                tc.name
+            ))
+        })?;
+
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(pinned_verifier)
+            .with_client_auth_cert(certs, key)
+            .map_err(|e| {
+                HttpError::Config(format!(
+                    "target `{}`: failed to build TLS config with client cert: {e}",
+                    tc.name
+                ))
+            })?
+    } else {
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(pinned_verifier)
+            .with_no_client_auth()
+    };
+
+    let timeout = Duration::from_secs(tc.effective_timeout_secs());
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(RUSTGATE_USER_AGENT)
+        .dns_resolver(resolver)
+        .use_preconfigured_tls(tls_config)
+        .build()
+        .map_err(|e| HttpError::ClientBuild {
+            target: tc.name.clone(),
+            source: e,
+        })
+}
+
 /// Background worker that drains the channel and fans out to targets.
 async fn dispatch_worker(
     mut rx: mpsc::Receiver<Arc<RoutableMessage>>,
     targets: Arc<Vec<TargetState>>,
     shutdown: Arc<tokio::sync::Notify>,
+    dlq: Option<Arc<DeadLetterQueue>>,
 ) {
     loop {
         tokio::select! {
             biased;
             () = shutdown.notified() => {
                 tracing::info!("HTTP dispatch worker shutting down, draining queue");
-                // Drain remaining messages
                 rx.close();
                 while let Some(msg) = rx.recv().await {
-                    fan_out(&msg, &targets).await;
+                    fan_out(&msg, &targets, dlq.as_deref()).await;
                 }
                 tracing::info!("HTTP dispatch worker stopped");
                 return;
             }
             msg = rx.recv() => {
                 match msg {
-                    Some(msg) => fan_out(&msg, &targets).await,
+                    Some(msg) => fan_out(&msg, &targets, dlq.as_deref()).await,
                     None => {
                         tracing::info!("HTTP dispatch channel closed");
                         return;
@@ -356,17 +566,23 @@ async fn dispatch_worker(
     }
 }
 
-/// Fan out a message to all matching targets sequentially.
+/// Fan out a message to all matching targets concurrently.
 ///
-/// Targets are dispatched one at a time to avoid requiring `Send` bounds
-/// on borrowed references. Each target dispatch is independent and logged
-/// with its own tracing span.
-async fn fan_out(msg: &RoutableMessage, targets: &[TargetState]) {
-    for target in targets {
-        if !target.filter.matches(msg) {
+/// Dispatches are independent — a slow or failing target does not block
+/// delivery to other targets. Uses `join_all` within the current task
+/// (no spawn) so borrowed references remain valid.
+async fn fan_out(msg: &RoutableMessage, targets: &[TargetState], dlq: Option<&DeadLetterQueue>) {
+    let sanitized_cn = sanitize_for_log(&msg.source.cn);
+
+    let futures: Vec<_> = targets
+        .iter()
+        .filter(|target| {
+            if target.filter.matches(msg) {
+                return true;
+            }
             tracing::trace!(
                 target = %target.name,
-                source_cn = %msg.source.cn,
+                source_cn = %sanitized_cn,
                 source_protocol = %msg.metadata.source_protocol,
                 "message filtered out for target"
             );
@@ -374,29 +590,37 @@ async fn fan_out(msg: &RoutableMessage, targets: &[TargetState]) {
             crate::metrics::filtered()
                 .with_label_values(&[target.name.as_str()])
                 .inc();
-            continue;
-        }
+            false
+        })
+        .map(|target| {
+            let span = tracing::debug_span!(
+                "http_dispatch",
+                target = %target.name,
+                source_cn = %sanitized_cn,
+            );
+            dispatch_to_target(target, msg, dlq).instrument(span)
+        })
+        .collect();
 
-        let span = tracing::debug_span!(
-            "http_dispatch",
-            target = %target.name,
-            source_cn = %msg.source.cn,
-        );
-        dispatch_to_target(target, msg).instrument(span).await;
-    }
+    let _ = futures::future::join_all(futures).await;
 }
 
 /// Dispatch a single message to a target with retry and circuit breaking.
-async fn dispatch_to_target(target: &TargetState, msg: &RoutableMessage) {
+async fn dispatch_to_target(
+    target: &TargetState,
+    msg: &RoutableMessage,
+    dlq: Option<&DeadLetterQueue>,
+) {
     // Per-target rate limiting — shed excess traffic before any work.
     if let Some(ref limiter) = target.rate_limiter
         && !limiter.try_acquire()
     {
         tracing::debug!(
             target = %target.name,
-            source_cn = %msg.source.cn,
+            source_cn = %sanitize_for_log(&msg.source.cn),
             "rate limited, dropping message"
         );
+        rustgate_core::audit::http_rate_limited(&target.name, &sanitize_for_log(&msg.source.cn));
         #[cfg(feature = "metrics")]
         crate::metrics::errors()
             .with_label_values(&[target.name.as_str(), "rate_limited"])
@@ -404,15 +628,18 @@ async fn dispatch_to_target(target: &TargetState, msg: &RoutableMessage) {
         return;
     }
 
-    // Circuit breaker check
+    // Circuit breaker check — persist to DLQ if configured
     if !target.circuit.allow_request() {
         tracing::warn!(
             target = %target.name,
-            source_cn = %msg.source.cn,
+            source_cn = %sanitize_for_log(&msg.source.cn),
             message_type = %msg.metadata.message_type,
             payload_size = msg.payload.len(),
             "circuit open, dead-lettering message"
         );
+        if let Some(dlq) = dlq {
+            dlq.dead_letter(&target.name, msg, "circuit_open");
+        }
         #[cfg(feature = "metrics")]
         crate::metrics::errors()
             .with_label_values(&[target.name.as_str(), "circuit_open"])
@@ -436,7 +663,8 @@ async fn dispatch_to_target(target: &TargetState, msg: &RoutableMessage) {
     }
 
     // Serialize payload
-    let (body, content_type) = match payload::serialize(msg, target.format, &target.instance_id) {
+    let (body_vec, content_type) = match payload::serialize(msg, target.format, &target.instance_id)
+    {
         Ok(result) => result,
         Err(e) => {
             tracing::warn!(
@@ -458,7 +686,11 @@ async fn dispatch_to_target(target: &TargetState, msg: &RoutableMessage) {
 
     // Content-Digest (RFC 9530): SHA-256 hash of the serialized body for
     // end-to-end integrity verification by the receiver.
-    let content_digest = compute_content_digest(&body);
+    let content_digest = compute_content_digest(&body_vec);
+
+    // Convert to Bytes once — Bytes::clone() is a ref-count bump, not a memcpy,
+    // so retries and auth signing can share the same allocation.
+    let body = bytes::Bytes::from(body_vec);
 
     // Retry loop with optional Retry-After from 429 responses
     let mut retry_after_hint: Option<Duration> = None;
@@ -473,10 +705,28 @@ async fn dispatch_to_target(target: &TargetState, msg: &RoutableMessage) {
             tokio::time::sleep(delay).await;
         }
 
-        match send_request(target, &body, content_type, &delivery_id, &content_digest).await {
+        #[cfg(feature = "metrics")]
+        let request_start = std::time::Instant::now();
+
+        match send_request(
+            target,
+            body.clone(),
+            content_type,
+            &delivery_id,
+            &content_digest,
+        )
+        .await
+        {
             Ok(()) => {
+                #[cfg(feature = "metrics")]
+                crate::metrics::request_duration().observe(request_start.elapsed().as_secs_f64());
+
                 if target.circuit.record_success() {
                     rustgate_core::audit::http_circuit_recovered(&target.name);
+                    #[cfg(feature = "metrics")]
+                    crate::metrics::circuit_state()
+                        .with_label_values(&[target.name.as_str()])
+                        .set(0);
                 }
                 #[cfg(feature = "metrics")]
                 crate::metrics::publishes()
@@ -491,6 +741,9 @@ async fn dispatch_to_target(target: &TargetState, msg: &RoutableMessage) {
                 return;
             }
             Err((status, err, retry_after)) => {
+                #[cfg(feature = "metrics")]
+                crate::metrics::request_duration().observe(request_start.elapsed().as_secs_f64());
+
                 let is_last = attempt + 1 >= target.max_attempts;
                 let retryable = status.is_some_and(retry::is_retryable_status);
 
@@ -503,6 +756,10 @@ async fn dispatch_to_target(target: &TargetState, msg: &RoutableMessage) {
                         status.is_none_or(|s| s == 429 || (500..600).contains(&s));
                     if affects_circuit && target.circuit.record_failure() {
                         rustgate_core::audit::http_circuit_tripped(&target.name);
+                        #[cfg(feature = "metrics")]
+                        crate::metrics::circuit_state()
+                            .with_label_values(&[target.name.as_str()])
+                            .set(1);
                     }
 
                     rustgate_core::audit::http_publish_failed(
@@ -567,7 +824,7 @@ async fn dispatch_to_target(target: &TargetState, msg: &RoutableMessage) {
 /// responses, allowing the retry loop to respect server-specified backoff.
 async fn send_request(
     target: &TargetState,
-    body: &[u8],
+    body: bytes::Bytes,
     content_type: &str,
     delivery_id: &str,
     content_digest: &str,
@@ -585,14 +842,24 @@ async fn send_request(
         builder = builder.header(name.clone(), value);
     }
 
-    // Apply authentication
+    // Apply authentication (needs a byte slice for HMAC computation)
     if let Some(auth) = &target.auth {
         builder = auth
-            .apply(builder, body)
+            .apply(builder, &body)
             .map_err(|e| (None, e.to_string(), None))?;
     }
 
-    builder = builder.body(body.to_vec());
+    // OpenTelemetry trace context propagation: inject W3C traceparent
+    // header so the receiving service can correlate this request with
+    // the originating trace. Noop when the otel feature is disabled or
+    // no active trace context exists.
+    #[cfg(feature = "otel")]
+    {
+        builder = inject_trace_context(builder);
+    }
+
+    // Bytes::clone() is a ref-count bump, not a memcpy — free across retries.
+    builder = builder.body(body);
 
     let response = builder.send().await.map_err(|e| {
         let status = e.status().map(|s| s.as_u16());
@@ -601,6 +868,9 @@ async fn send_request(
 
     let status = response.status().as_u16();
     if (200..300).contains(&status) {
+        // Drain the success response body so the connection returns to the
+        // pool in a clean state (prevents connection leaks with keep-alive).
+        drain_response_body(response).await;
         Ok(())
     } else {
         // Parse Retry-After header on 429 (rate-limited) responses so the
@@ -615,8 +885,35 @@ async fn send_request(
         } else {
             None
         };
+        // Drain the error response body so the connection returns to the
+        // pool in a clean state — prevents connection pool poisoning when
+        // the server sends a body with 4xx/5xx responses.
+        drain_response_body(response).await;
         Err((Some(status), format!("HTTP {status}"), retry_after))
     }
+}
+
+/// Drain a response body up to [`MAX_ERROR_RESPONSE_BYTES`] to keep the
+/// connection pool healthy.
+///
+/// HTTP/1.1 persistent connections require the full response body to be
+/// consumed before the connection can be reused. If we skip this, the
+/// connection is dropped and must be re-established (TCP + TLS handshake),
+/// which adds latency on subsequent requests.
+///
+/// The size cap prevents memory exhaustion from a malicious server
+/// returning an unbounded response body.
+async fn drain_response_body(response: reqwest::Response) {
+    // Check Content-Length first — if the server advertises a body larger
+    // than our cap, just drop the connection instead of reading into memory.
+    if let Some(len) = response.content_length()
+        && len > MAX_ERROR_RESPONSE_BYTES as u64
+    {
+        return;
+    }
+    // Drain up to the limit. Errors (timeout, connection reset) are
+    // ignored — the connection will be dropped and a new one established.
+    let _ = response.bytes().await;
 }
 
 /// Compute the RFC 9530 Content-Digest header value for body integrity.
@@ -648,6 +945,43 @@ fn generate_delivery_id() -> String {
     hex::encode(buf)
 }
 
+/// Inject W3C Trace Context (`traceparent`) header into an outbound request.
+///
+/// Extracts the current OpenTelemetry span context from the tracing span
+/// and formats it as a W3C traceparent header value. If no valid trace
+/// context exists (OTel not configured or no active span), the request
+/// is returned unmodified — graceful degradation.
+#[cfg(feature = "otel")]
+fn inject_trace_context(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    use opentelemetry::trace::TraceContextExt;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+    let cx = tracing::Span::current().context();
+    let sc = cx.span().span_context().clone();
+
+    if sc.is_valid() {
+        // W3C Trace Context flags: bit 0 = sampled
+        let flags: u8 = if sc.trace_flags().is_sampled() {
+            0x01
+        } else {
+            0x00
+        };
+        let traceparent = format!("00-{}-{}-{flags:02x}", sc.trace_id(), sc.span_id(),);
+        let builder = builder.header("traceparent", traceparent);
+
+        // W3C tracestate: forward vendor-specific trace data from the
+        // upstream context so downstream services retain full baggage.
+        let ts = sc.trace_state();
+        if !ts.header().is_empty() {
+            builder.header("tracestate", ts.header())
+        } else {
+            builder
+        }
+    } else {
+        builder
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::panic, clippy::unwrap_used)]
@@ -661,6 +995,8 @@ mod tests {
             tx,
             targets: Arc::new(vec![]),
             shutdown: Arc::new(tokio::sync::Notify::new()),
+            dlq: None,
+            worker_handle: Arc::new(std::sync::Mutex::new(None)),
         };
         let debug = format!("{publisher:?}");
         assert!(debug.contains("target_count"));
@@ -723,6 +1059,8 @@ mod tests {
             tx,
             targets: Arc::new(vec![]),
             shutdown: Arc::new(tokio::sync::Notify::new()),
+            dlq: None,
+            worker_handle: Arc::new(std::sync::Mutex::new(None)),
         };
         // These should all be silently dropped (echo prevention)
         for protocol in &["http", "HTTP", "Http", "hTTp"] {
@@ -770,6 +1108,9 @@ mod tests {
                 max_payload_bytes: None,
                 rate_limit_per_sec: None,
             }],
+            dlq_dir: None,
+            dlq_key_file: None,
+            dlq_max_bytes: None,
             allow_private_urls: false,
         };
         let err = HttpPublisher::new(config).unwrap_err();

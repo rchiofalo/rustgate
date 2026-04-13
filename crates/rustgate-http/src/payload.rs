@@ -41,6 +41,33 @@ pub(crate) fn serialize(
     match format {
         PayloadFormat::Json => serialize_json(msg, instance_id),
         PayloadFormat::RawXml => Ok((msg.payload.to_vec(), "application/xml")),
+        PayloadFormat::Protobuf => serialize_protobuf(msg),
+    }
+}
+
+/// Serialize a routable message as protobuf-encoded CoT event.
+///
+/// Uses `rustgate_proto::xml_to_proto` to convert the CoT XML payload
+/// into a protobuf-encoded binary representation suitable for tactical
+/// system interop (Palantir, Anduril, TAK Server peers).
+///
+/// When the `proto` feature is disabled, returns a config error — the
+/// format should have been rejected at validation time.
+#[allow(unused_variables)] // `msg` unused when proto feature is off
+fn serialize_protobuf(msg: &RoutableMessage) -> Result<(Vec<u8>, &'static str), HttpError> {
+    #[cfg(feature = "proto")]
+    {
+        let proto_bytes =
+            rustgate_proto::xml_to_proto(&msg.payload).map_err(|e| HttpError::ProtoConvert {
+                message: e.to_string(),
+            })?;
+        Ok((proto_bytes, "application/x-protobuf"))
+    }
+    #[cfg(not(feature = "proto"))]
+    {
+        Err(HttpError::Config(
+            "protobuf format requires the `proto` feature to be enabled".to_string(),
+        ))
     }
 }
 
@@ -69,7 +96,7 @@ fn serialize_json(
     Ok((body, "application/json"))
 }
 
-fn format_destination(dest: &Destination) -> String {
+pub(crate) fn format_destination(dest: &Destination) -> String {
     match dest {
         Destination::Group(g) => format!("group:{g}"),
         Destination::Direct(id) => format!("direct:{}", id.cn),
@@ -214,6 +241,31 @@ mod tests {
         let (body, _) = serialize(&msg, PayloadFormat::Json, "inst").unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["destination"], "multicast:alpha,bravo");
+    }
+
+    #[test]
+    fn protobuf_without_feature_returns_error() {
+        #[cfg(not(feature = "proto"))]
+        {
+            let msg = make_msg(b"<event/>");
+            let err = serialize(&msg, PayloadFormat::Protobuf, "inst").unwrap_err();
+            assert!(err.to_string().contains("proto"), "got: {err}");
+        }
+    }
+
+    #[cfg(feature = "proto")]
+    #[test]
+    fn protobuf_serialization_content_type() {
+        // Minimal valid CoT event XML for proto conversion
+        let xml = b"<event version='2.0' uid='test-1' type='a-f-G' \
+            time='2026-01-01T00:00:00Z' start='2026-01-01T00:00:00Z' \
+            stale='2026-01-01T01:00:00Z' how='m-g'>\
+            <point lat='38.0' lon='-77.0' hae='0' ce='10' le='10'/>\
+            <detail/></event>";
+        let msg = make_msg(xml);
+        let (body, content_type) = serialize(&msg, PayloadFormat::Protobuf, "inst").unwrap();
+        assert_eq!(content_type, "application/x-protobuf");
+        assert!(!body.is_empty(), "protobuf body should not be empty");
     }
 
     #[test]

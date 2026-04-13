@@ -49,7 +49,20 @@ pub enum HttpError {
     #[error("payload serialization failed: {source}")]
     Serialize { source: serde_json::Error },
 
+    /// Protobuf conversion failed (requires `proto` feature).
+    #[error("protobuf conversion failed: {message}")]
+    ProtoConvert { message: String },
+
     /// The target's circuit breaker is open — requests are being shed.
     #[error("circuit breaker open for target `{target}`")]
     CircuitOpen { target: String },
+
+    /// TLS certificate pin mismatch — the server's certificate hash does
+    /// not match any of the configured SHA-256 pins.
+    #[error("certificate pin mismatch for target `{target}`: none of {pin_count} pins matched")]
+    PinMismatch { target: String, pin_count: usize },
+
+    /// Dead-letter queue I/O or encryption error.
+    #[error("DLQ error for target `{target}`: {message}")]
+    Dlq { target: String, message: String },
 }

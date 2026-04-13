@@ -403,6 +403,28 @@ pub fn http_circuit_recovered(target: &str) {
     );
 }
 
+/// Record a message being shed by per-target rate limiting.
+pub fn http_rate_limited(target: &str, source_cn: &str) {
+    audit!(
+        "http.rate_limited",
+        target = %target,
+        source_cn = %source_cn,
+        action = "rate_limit",
+        result = "shed"
+    );
+}
+
+/// Record a dead-letter queue write failure.
+pub fn http_dlq_failed(target: &str, error: &str) {
+    audit!(
+        "http.dlq_failed",
+        target = %target,
+        error = %error,
+        action = "dead_letter",
+        result = "failure"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};

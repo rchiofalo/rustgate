@@ -7,6 +7,7 @@
 //! circuit breaker settings. All config structs use kebab-case field
 //! names to match the workspace TOML convention.
 
+use base64::Engine;
 use serde::Deserialize;
 
 use crate::error::HttpError;
@@ -24,6 +25,20 @@ pub struct HttpConfig {
 
     /// Named targets. Each is an independent HTTP endpoint.
     pub targets: Vec<TargetConfig>,
+
+    /// Directory for encrypted dead-letter queue files. When set, messages
+    /// that cannot be delivered (circuit open) are persisted as encrypted
+    /// ChaCha20-Poly1305 chunks for later forensic recovery.
+    pub dlq_dir: Option<String>,
+
+    /// Path to the JSON key file for dead-letter queue encryption.
+    /// Required when `dlq-dir` is set. Uses the same `KeyRing` format
+    /// as `rustgate-core::encrypted`.
+    pub dlq_key_file: Option<String>,
+
+    /// Maximum size in bytes per DLQ file before rotation. Prevents
+    /// unbounded disk growth when a target stays down. Default: 256 MiB.
+    pub dlq_max_bytes: Option<u64>,
 
     /// Allow localhost/private IPs as target URLs. **Testing only** —
     /// production configs should leave this unset (defaults to `false`).
@@ -115,6 +130,9 @@ pub enum PayloadFormat {
     Json,
     /// Raw XML payload bytes sent as `application/xml`.
     RawXml,
+    /// Protobuf-encoded CoT event via `rustgate-proto` (requires `proto` feature).
+    /// Content-Type: `application/x-protobuf`.
+    Protobuf,
 }
 
 /// Authentication for outbound requests.
@@ -152,6 +170,8 @@ pub enum AuthConfig {
 ///
 /// When `client_cert` and `client_key` are both set, the publisher
 /// presents a client certificate for mutual TLS authentication.
+/// When `pin_sha256` is set, the server's certificate DER is hashed
+/// with SHA-256 and compared against the configured pins (TOFU/HPKP).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct TlsConfig {
@@ -161,6 +181,10 @@ pub struct TlsConfig {
     pub client_cert: Option<String>,
     /// Client private key PEM for mutual TLS.
     pub client_key: Option<String>,
+    /// SHA-256 certificate pins (base64-encoded). When set, the server's
+    /// leaf certificate DER hash must match at least one pin.
+    /// Requires `ca-cert` to also be set (explicit trust anchor).
+    pub pin_sha256: Option<Vec<String>>,
 }
 
 /// Per-target message filter.
@@ -297,6 +321,17 @@ impl HttpConfig {
             Self::validate_target(target, self.allow_private_urls, &mut errors);
         }
 
+        // DLQ validation: dir and key file must both be present
+        match (&self.dlq_dir, &self.dlq_key_file) {
+            (Some(_), None) => {
+                errors.push("dlq-dir requires dlq-key-file to be set".to_string());
+            }
+            (None, Some(_)) => {
+                errors.push("dlq-key-file requires dlq-dir to be set".to_string());
+            }
+            _ => {}
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -369,6 +404,17 @@ impl HttpConfig {
             }
         }
 
+        // Warn when auth credentials would be sent over plaintext HTTP.
+        // This is a security misconfiguration — bearer tokens, passwords, and
+        // HMAC signatures will be visible to any network observer.
+        if target.auth.is_some() && target.url.starts_with("http://") && !allow_private_urls {
+            errors.push(format!(
+                "target `{}`: auth credentials configured with plaintext http:// URL; \
+                 use https:// to protect secrets in transit",
+                target.name
+            ));
+        }
+
         // Validate TLS consistency
         if let Some(tls) = &target.tls {
             let has_cert = tls.client_cert.is_some();
@@ -379,6 +425,43 @@ impl HttpConfig {
                     target.name
                 ));
             }
+
+            // Certificate pinning requires an explicit CA trust anchor.
+            // Using the Mozilla root store with pins is insecure because
+            // any public CA could issue a cert matching the hostname.
+            if let Some(pins) = &tls.pin_sha256 {
+                if !pins.is_empty() && tls.ca_cert.is_none() {
+                    errors.push(format!(
+                        "target `{}`: pin-sha256 requires ca-cert to be set (explicit trust anchor)",
+                        target.name
+                    ));
+                }
+                for (i, pin) in pins.iter().enumerate() {
+                    if pin.is_empty() {
+                        errors.push(format!(
+                            "target `{}`: pin-sha256[{i}] must not be empty",
+                            target.name
+                        ));
+                    } else if base64::engine::general_purpose::STANDARD
+                        .decode(pin)
+                        .is_err()
+                    {
+                        errors.push(format!(
+                            "target `{}`: pin-sha256[{i}] is not valid base64",
+                            target.name
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Protobuf format requires the `proto` feature at compile time
+        #[cfg(not(feature = "proto"))]
+        if target.format == Some(PayloadFormat::Protobuf) {
+            errors.push(format!(
+                "target `{}`: protobuf format requires the `proto` feature",
+                target.name
+            ));
         }
 
         // Validate auth file paths
@@ -443,7 +526,7 @@ impl HttpConfig {
             }
         }
 
-        // Validate custom header names
+        // Validate custom header names and values
         if let Some(headers) = &target.headers {
             for entry in headers {
                 if entry.name.is_empty() {
@@ -461,6 +544,19 @@ impl HttpConfig {
                 {
                     errors.push(format!(
                         "target `{}`: custom header `{}` is reserved and cannot be overridden",
+                        target.name, entry.name
+                    ));
+                }
+
+                // Validate header values: reject control characters that could
+                // enable header injection (CRLF injection, null byte smuggling).
+                // reqwest rejects these at request time, but validating at config
+                // parse gives operators a clear startup error instead of silent
+                // per-request failures.
+                if reqwest::header::HeaderValue::from_str(&entry.value).is_err() {
+                    errors.push(format!(
+                        "target `{}`: custom header `{}` has an invalid value \
+                         (contains control characters or non-ASCII bytes)",
                         target.name, entry.name
                     ));
                 }
@@ -502,6 +598,8 @@ pub(crate) fn is_private_ip(ip: std::net::IpAddr) -> bool {
                 || (v6.segments()[0] & 0xfe00) == 0xfc00
                 // Link-local (fe80::/10)
                 || (v6.segments()[0] & 0xffc0) == 0xfe80
+                // Multicast (ff00::/8)
+                || v6.is_multicast()
         }
     }
 }
@@ -514,6 +612,7 @@ fn is_private_ipv4(v4: std::net::Ipv4Addr) -> bool {
         || v4.is_link_local()  // 169.254.0.0/16 (includes AWS IMDS 169.254.169.254)
         || v4.is_broadcast()   // 255.255.255.255
         || v4.is_unspecified() // 0.0.0.0
+        || v4.is_multicast() // 224.0.0.0/4
 }
 
 #[cfg(test)]
@@ -544,6 +643,9 @@ mod tests {
         HttpConfig {
             instance_id: None,
             targets,
+            dlq_dir: None,
+            dlq_key_file: None,
+            dlq_max_bytes: None,
             allow_private_urls: false,
         }
     }
@@ -632,6 +734,7 @@ mod tests {
             ca_cert: None,
             client_cert: Some("/path/cert.pem".to_string()),
             client_key: None,
+            pin_sha256: None,
         });
         let cfg = config_with_targets(vec![target]);
         let err = cfg.validate().unwrap_err();
@@ -645,6 +748,7 @@ mod tests {
             ca_cert: None,
             client_cert: None,
             client_key: Some("/path/key.pem".to_string()),
+            pin_sha256: None,
         });
         let cfg = config_with_targets(vec![target]);
         let err = cfg.validate().unwrap_err();
@@ -658,6 +762,7 @@ mod tests {
             ca_cert: Some("/path/ca.pem".to_string()),
             client_cert: Some("/path/cert.pem".to_string()),
             client_key: Some("/path/key.pem".to_string()),
+            pin_sha256: None,
         });
         let cfg = config_with_targets(vec![target]);
         assert!(cfg.validate().is_ok());
@@ -1171,5 +1276,159 @@ method = "put"
 "#;
         let config: HttpConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.targets[0].effective_method(), HttpMethod::Put);
+    }
+
+    #[test]
+    fn rejects_pin_without_ca_cert() {
+        let mut target = minimal_target("t1", "https://example.com");
+        target.tls = Some(TlsConfig {
+            ca_cert: None,
+            client_cert: None,
+            client_key: None,
+            pin_sha256: Some(vec!["dGVzdA==".to_string()]),
+        });
+        let cfg = config_with_targets(vec![target]);
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("pin-sha256 requires ca-cert"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_base64_pin() {
+        let mut target = minimal_target("t1", "https://example.com");
+        target.tls = Some(TlsConfig {
+            ca_cert: Some("/path/ca.pem".to_string()),
+            client_cert: None,
+            client_key: None,
+            pin_sha256: Some(vec!["not-valid-base64!!!".to_string()]),
+        });
+        let cfg = config_with_targets(vec![target]);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("not valid base64"), "got: {err}");
+    }
+
+    #[test]
+    fn accepts_valid_pin_with_ca_cert() {
+        let mut target = minimal_target("t1", "https://example.com");
+        // Valid base64-encoded SHA-256 hash (32 bytes → 44 base64 chars)
+        target.tls = Some(TlsConfig {
+            ca_cert: Some("/path/ca.pem".to_string()),
+            client_cert: None,
+            client_key: None,
+            pin_sha256: Some(vec![
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
+            ]),
+        });
+        let cfg = config_with_targets(vec![target]);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_dlq_dir_without_key_file() {
+        let cfg = HttpConfig {
+            instance_id: None,
+            targets: vec![minimal_target("t1", "https://example.com")],
+            dlq_dir: Some("/tmp/dlq".to_string()),
+            dlq_key_file: None,
+            dlq_max_bytes: None,
+            allow_private_urls: false,
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("dlq-dir requires dlq-key-file"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_dlq_key_file_without_dir() {
+        let cfg = HttpConfig {
+            instance_id: None,
+            targets: vec![minimal_target("t1", "https://example.com")],
+            dlq_dir: None,
+            dlq_key_file: Some("/path/keys.json".to_string()),
+            dlq_max_bytes: None,
+            allow_private_urls: false,
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("dlq-key-file requires dlq-dir"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn toml_protobuf_format() {
+        let toml_str = r#"
+[[targets]]
+name = "proto-test"
+url = "https://example.com/api"
+format = "protobuf"
+"#;
+        let config: HttpConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.targets[0].effective_format(),
+            PayloadFormat::Protobuf
+        );
+    }
+
+    #[test]
+    fn toml_pin_sha256() {
+        let toml_str = r#"
+[[targets]]
+name = "pinned"
+url = "https://example.com/api"
+
+[targets.tls]
+ca-cert = "/path/ca.pem"
+pin-sha256 = ["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="]
+"#;
+        let config: HttpConfig = toml::from_str(toml_str).unwrap();
+        let tls = config.targets[0].tls.as_ref().unwrap();
+        assert_eq!(tls.pin_sha256.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rejects_header_value_with_newline() {
+        let mut target = minimal_target("t1", "https://example.com");
+        target.headers = Some(vec![HeaderEntry {
+            name: "X-Custom".to_string(),
+            value: "value\r\nInjected: header".to_string(),
+        }]);
+        let cfg = config_with_targets(vec![target]);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("invalid value"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_header_value_with_null_byte() {
+        let mut target = minimal_target("t1", "https://example.com");
+        target.headers = Some(vec![HeaderEntry {
+            name: "X-Custom".to_string(),
+            value: "before\0after".to_string(),
+        }]);
+        let cfg = config_with_targets(vec![target]);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("invalid value"), "got: {err}");
+    }
+
+    #[test]
+    fn toml_dlq_config() {
+        let toml_str = r#"
+dlq-dir = "/var/lib/rustgate/dlq"
+dlq-key-file = "/etc/rustgate/keys/dlq.json"
+
+[[targets]]
+name = "t1"
+url = "https://example.com"
+"#;
+        let config: HttpConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.dlq_dir.as_deref(), Some("/var/lib/rustgate/dlq"));
+        assert_eq!(
+            config.dlq_key_file.as_deref(),
+            Some("/etc/rustgate/keys/dlq.json")
+        );
     }
 }

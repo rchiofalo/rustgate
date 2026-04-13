@@ -81,11 +81,13 @@ impl CompiledFilter {
 
     /// Returns `true` if the message should be forwarded to this target.
     pub(crate) fn matches(&self, msg: &RoutableMessage) -> bool {
-        // Echo prevention: skip messages from excluded protocols
-        // (case-insensitive to defend against inconsistent casing)
+        // Echo prevention: skip messages from excluded protocols.
+        // Uses eq_ignore_ascii_case to avoid allocating a lowercased copy
+        // on every hot-path evaluation.
         if self
             .exclude_protocols
-            .contains(&msg.metadata.source_protocol.to_ascii_lowercase())
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(&msg.metadata.source_protocol))
         {
             return false;
         }

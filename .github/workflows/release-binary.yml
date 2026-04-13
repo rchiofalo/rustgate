@@ -15,7 +15,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  RELEASE_FEATURES: nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket,otel
+  RELEASE_FEATURES: nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket,otel,http
 
 jobs:
   build:
@@ -34,17 +34,30 @@ jobs:
           - target: x86_64-unknown-linux-musl
             cc: musl-gcc
             fips: false
+            pq: false
           - target: aarch64-unknown-linux-musl
             cc: aarch64-linux-gnu-gcc
             linker: aarch64-linux-gnu-gcc
             fips: false
+            pq: false
           - target: x86_64-unknown-linux-musl
             cc: musl-gcc
             fips: true
+            pq: false
           - target: aarch64-unknown-linux-gnu
             cc: aarch64-linux-gnu-gcc
             linker: aarch64-linux-gnu-gcc
             fips: true
+            pq: false
+          - target: x86_64-unknown-linux-musl
+            cc: musl-gcc
+            fips: false
+            pq: true
+          - target: aarch64-unknown-linux-gnu
+            cc: aarch64-linux-gnu-gcc
+            linker: aarch64-linux-gnu-gcc
+            fips: false
+            pq: true
 
     runs-on: ubuntu-latest
 
@@ -76,8 +89,8 @@ jobs:
         if: contains(matrix.target, 'aarch64')
         run: sudo apt-get install -y gcc-aarch64-linux-gnu
 
-      - name: Install FIPS build dependencies
-        if: matrix.fips
+      - name: Install aws-lc-rs build dependencies (FIPS / post-quantum)
+        if: matrix.fips || matrix.pq
         run: sudo apt-get install -y cmake golang-go
 
       - name: Add Rust target
@@ -104,12 +117,17 @@ jobs:
           if [ "${{ matrix.fips }}" = "true" ]; then
             FEATURES="${FEATURES},fips"
           fi
+          if [ "${{ matrix.pq }}" = "true" ]; then
+            FEATURES="${FEATURES},post-quantum"
+          fi
           cargo auditable build --locked --release --features "$FEATURES" --target ${{ matrix.target }}
 
       - name: Package binary
         run: |
           if [ "${{ matrix.fips }}" = "true" ]; then
             ARCHIVE="rustgate-fips-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz"
+          elif [ "${{ matrix.pq }}" = "true" ]; then
+            ARCHIVE="rustgate-pq-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz"
           else
             ARCHIVE="rustgate-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz"
           fi

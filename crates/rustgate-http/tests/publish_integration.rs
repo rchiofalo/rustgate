@@ -63,6 +63,9 @@ fn http_config(targets: Vec<TargetConfig>) -> HttpConfig {
     HttpConfig {
         instance_id: Some("test-instance".to_string()),
         targets,
+        dlq_dir: None,
+        dlq_key_file: None,
+        dlq_max_bytes: None,
         allow_private_urls: true, // wiremock binds to 127.0.0.1
     }
 }
@@ -89,7 +92,7 @@ async fn publish_to_single_target() {
 
     // Allow time for async dispatch
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    publisher.shutdown();
+    publisher.shutdown().await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 }
 
@@ -114,7 +117,7 @@ async fn publish_json_format() {
     publisher.publish(&msg);
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    publisher.shutdown();
+    publisher.shutdown().await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 }
 
@@ -140,7 +143,7 @@ async fn publish_raw_xml_format() {
     publisher.publish(&msg);
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    publisher.shutdown();
+    publisher.shutdown().await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 }
 
@@ -165,7 +168,7 @@ async fn echo_prevention_blocks_http_protocol() {
     publisher.publish(&msg);
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    publisher.shutdown();
+    publisher.shutdown().await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 }
 
@@ -196,7 +199,7 @@ async fn filter_excludes_non_matching_groups() {
     publisher.publish(&msg);
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    publisher.shutdown();
+    publisher.shutdown().await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 }
 
@@ -232,7 +235,7 @@ async fn retry_on_5xx() {
     publisher.publish(&msg);
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    publisher.shutdown();
+    publisher.shutdown().await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 }
 
@@ -262,7 +265,7 @@ async fn no_retry_on_4xx() {
     publisher.publish(&msg);
 
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    publisher.shutdown();
+    publisher.shutdown().await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 }
 
@@ -287,7 +290,7 @@ async fn disabled_target_skipped() {
     publisher.publish(&msg);
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    publisher.shutdown();
+    publisher.shutdown().await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 }
 
@@ -318,7 +321,7 @@ async fn multiple_targets_fan_out() {
     publisher.publish(&msg);
 
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    publisher.shutdown();
+    publisher.shutdown().await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 }
 
@@ -354,7 +357,7 @@ async fn custom_headers_sent() {
     publisher.publish(&msg);
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    publisher.shutdown();
+    publisher.shutdown().await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 }
 
@@ -379,7 +382,7 @@ async fn instance_id_header_present() {
     publisher.publish(&msg);
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    publisher.shutdown();
+    publisher.shutdown().await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 }
 
@@ -418,7 +421,7 @@ async fn bearer_auth_header_present() {
     publisher.publish(&msg);
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    publisher.shutdown();
+    publisher.shutdown().await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let _ = std::fs::remove_file(&token_path);
 }
@@ -460,7 +463,7 @@ async fn hmac_signature_present() {
     publisher.publish(&msg);
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    publisher.shutdown();
+    publisher.shutdown().await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let _ = std::fs::remove_file(&secret_path);
 }
@@ -499,7 +502,7 @@ async fn circuit_breaker_opens_after_threshold() {
     // Circuit should now be open
     assert!(!publisher.is_healthy());
 
-    publisher.shutdown();
+    publisher.shutdown().await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 }
 
@@ -523,7 +526,7 @@ async fn graceful_shutdown_drains_queue() {
     publisher.publish(&msg);
 
     // Immediately shut down — pending messages should still be delivered
-    publisher.shutdown();
+    publisher.shutdown().await;
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     // wiremock expect(1) will panic on drop if the request wasn't received
 }
@@ -546,7 +549,7 @@ async fn is_healthy_reflects_circuit_state() {
     // Initially healthy (all circuits closed)
     assert!(publisher.is_healthy());
 
-    publisher.shutdown();
+    publisher.shutdown().await;
 }
 
 #[tokio::test]
@@ -570,7 +573,7 @@ async fn content_digest_header_present() {
     publisher.publish(&msg);
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    publisher.shutdown();
+    publisher.shutdown().await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 }
 
@@ -580,9 +583,6 @@ async fn delivery_id_stable_across_retries() {
 
     // First request fails with 503, second succeeds — both should carry
     // the same X-Rustgate-Delivery-Id (stable idempotency key).
-    let delivery_ids = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let ids_clone = delivery_ids.clone();
-
     Mock::given(method("POST"))
         .respond_with(wiremock::ResponseTemplate::new(503))
         .up_to_n_times(1)
@@ -609,7 +609,7 @@ async fn delivery_id_stable_across_retries() {
     publisher.publish(&msg);
 
     tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-    publisher.shutdown();
+    publisher.shutdown().await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // Verify both requests were received (wiremock expect guards handle this)
@@ -635,8 +635,6 @@ async fn delivery_id_stable_across_retries() {
         .to_str()
         .unwrap()
         .to_string();
-
-    drop(ids_clone);
 
     assert_eq!(id1, id2, "delivery ID should be stable across retries");
     assert_eq!(id1.len(), 32, "delivery ID should be 32-char hex");
@@ -664,7 +662,7 @@ async fn rate_limiting_sheds_excess_traffic() {
     }
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    publisher.shutdown();
+    publisher.shutdown().await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     let received = server.received_requests().await.unwrap();

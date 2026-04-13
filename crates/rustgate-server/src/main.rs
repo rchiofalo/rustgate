@@ -1203,7 +1203,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     #[cfg(feature = "http")]
     if let Some(ref publisher) = _http_publisher {
-        publisher.shutdown();
+        publisher.shutdown().await;
         tracing::info!("HTTP egress shut down");
     }
 
