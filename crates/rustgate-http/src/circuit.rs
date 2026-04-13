@@ -232,7 +232,7 @@ impl CircuitBreaker {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::panic, clippy::unwrap_used)]
+    #![allow(clippy::panic, clippy::unwrap_used, unused_results)]
 
     use super::*;
 

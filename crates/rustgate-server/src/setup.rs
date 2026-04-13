@@ -829,6 +829,9 @@ pub(crate) fn start_metrics(
     #[cfg(feature = "federation")]
     rustgate_federation::metrics::init().context("registering federation metrics")?;
 
+    #[cfg(all(feature = "http", feature = "metrics"))]
+    rustgate_http::metrics::init().context("registering HTTP egress metrics")?;
+
     // Load the optional CN allowlist for per-identity metric label
     // bucketing. When unset, all CNs collapse to the literal "other"
     // label, capping cardinality at 1.

@@ -345,6 +345,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         nats_publisher: std::sync::Mutex::new(None),
         #[cfg(feature = "federation")]
         federation_manager: std::sync::Mutex::new(None),
+        #[cfg(feature = "http")]
+        http_publisher: std::sync::Mutex::new(None),
     });
 
     // ── Metrics ─────────────────────────────────────────────────────
@@ -913,7 +915,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     #[cfg(feature = "http")]
     let (http_forward, _http_publisher): (Option<session::HttpForwardFn>, _) = {
         match setup::connect_http(&cli) {
-            Some((fwd, publisher)) => (Some(fwd), Some(publisher)),
+            Some((fwd, publisher)) => {
+                readiness.set_http_publisher(publisher.clone());
+                (Some(fwd), Some(publisher))
+            }
             None => (None, None),
         }
     };

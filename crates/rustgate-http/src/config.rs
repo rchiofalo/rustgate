@@ -168,7 +168,7 @@ pub struct TlsConfig {
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct FilterConfig {
     /// Only forward messages from senders in at least one of these groups.
-    pub groups: Option<Vec<String>>,
+    pub groups: Option<Vec<rustgate_core::identity::GroupId>>,
     /// Only forward messages of these types.
     pub message_types: Option<Vec<String>>,
     /// Only forward messages from these source CNs.
