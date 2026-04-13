@@ -141,7 +141,7 @@ jobs:
 
       - name: Cache nats-server binary
         id: cache-nats
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: /usr/local/bin/nats-server
           key: nats-server-v2.10.24-linux-amd64-ee6500f364e3a741b496ae0296c04f2a9d53bbaabac457104ac74596b4a59d85
@@ -191,7 +191,7 @@ jobs:
 
       - name: Cache nats-server binary
         id: cache-nats
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: /usr/local/bin/nats-server
           key: nats-server-v2.10.24-linux-amd64-ee6500f364e3a741b496ae0296c04f2a9d53bbaabac457104ac74596b4a59d85
