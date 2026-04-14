@@ -102,7 +102,7 @@ fastrand = "2"
 figment = { version = "0.10", features = ["toml"] }
 toml = "1.1"
 serial_test = "3"
-redb = "2"
+redb = "4"
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc", "getrandom"] }
 hex = "0.4"
 ahash = "0.8"
