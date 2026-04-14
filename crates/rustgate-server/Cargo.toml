@@ -18,9 +18,9 @@ workspace = true
 nats = ["dep:rustgate-nats"]
 enrollment = ["dep:rustgate-enrollment", "dep:rustls-pki-types"]
 est = ["enrollment", "rustgate-enrollment/est"]
-proto = ["dep:rustgate-proto", "rustgate-transport/proto"]
+proto = ["dep:rustgate-proto", "rustgate-transport/proto", "rustgate-http?/proto"]
 full-detail = ["nats", "rustgate-nats/full-detail"]
-metrics = ["dep:prometheus", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:x509-parser"]
+metrics = ["dep:prometheus", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:x509-parser", "rustgate-http?/metrics"]
 federation = ["dep:rustgate-federation", "rustgate-federation/v2", "rustgate-federation/api"]
 federation-ha = ["federation", "rustgate-federation/ha"]
 # Sub-features selecting which dynamic peer-discovery backends the server
@@ -38,14 +38,15 @@ peer-discovery-consul = ["federation", "rustgate-federation/peer-discovery-consu
 peer-discovery-etcd = ["federation", "rustgate-federation/peer-discovery-etcd"]
 websocket = ["dep:rustgate-websocket"]
 mqtt = ["dep:rustgate-mqtt"]
-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
-fips = ["rustgate-transport/fips", "rustgate-federation?/fips", "rustgate-enrollment?/fips"]
-post-quantum = ["rustgate-transport/post-quantum", "rustgate-federation?/post-quantum"]
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry", "rustgate-http?/otel"]
+fips = ["rustgate-transport/fips", "rustgate-federation?/fips", "rustgate-enrollment?/fips", "rustgate-http?/fips"]
+post-quantum = ["rustgate-transport/post-quantum", "rustgate-federation?/post-quantum", "rustgate-http?/post-quantum"]
 jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 ocsp = ["rustgate-transport/ocsp"]
 spiffe = ["rustgate-transport/spiffe"]
 # Enables the optional Cedar authz policy backend and `--authz-policy-format cedar`.
 cedar = ["rustgate-authz/cedar"]
+http = ["dep:rustgate-http"]
 
 [dependencies]
 rustgate-authz = { workspace = true }
@@ -58,6 +59,7 @@ rustgate-nats = { workspace = true, optional = true }
 rustgate-enrollment = { workspace = true, optional = true }
 rustgate-proto = { workspace = true, optional = true }
 rustgate-federation = { workspace = true, optional = true }
+rustgate-http = { workspace = true, optional = true }
 prometheus = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }

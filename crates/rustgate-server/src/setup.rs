@@ -27,6 +27,8 @@ use tokio::sync::Semaphore;
 use crate::cli::{Cli, Encoding, Framing};
 #[cfg(feature = "metrics")]
 use crate::metrics;
+#[cfg(feature = "http")]
+use crate::session::HttpForwardFn;
 use crate::session::{FedForwardFn, NatsPublish, PlaintextTcpConfig};
 
 /// Load group access control policy from a JSON configuration file.
@@ -579,6 +581,58 @@ pub(crate) fn warn_nats_disabled(cli: &Cli) {
 }
 
 // ---------------------------------------------------------------------------
+// HTTP Egress
+// ---------------------------------------------------------------------------
+
+/// Build and start the HTTP egress publisher.
+///
+/// Reads the TOML config file, validates, constructs the publisher with
+/// per-target clients, and returns the forward callback plus the publisher
+/// handle for shutdown.
+#[cfg(feature = "http")]
+pub(crate) fn connect_http(
+    cli: &Cli,
+) -> Option<(crate::session::HttpForwardFn, rustgate_http::HttpPublisher)> {
+    let config_path = cli.http_config_file.as_ref()?;
+    let config_str = match std::fs::read_to_string(config_path) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(path = %config_path, error = %e, "failed to read HTTP config");
+            return None;
+        }
+    };
+    let config: rustgate_http::HttpConfig = match toml::from_str(&config_str) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to parse HTTP config");
+            return None;
+        }
+    };
+    match rustgate_http::HttpPublisher::new(config) {
+        Ok(publisher) => {
+            let p = publisher.clone();
+            let fwd: crate::session::HttpForwardFn = std::sync::Arc::new(move |msg| {
+                p.publish(&msg);
+            });
+            tracing::info!("HTTP egress bridge started");
+            Some((fwd, publisher))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to initialize HTTP publisher");
+            None
+        }
+    }
+}
+
+/// Warn when --http-config is set but the `http` feature is disabled.
+#[cfg(not(feature = "http"))]
+pub(crate) fn warn_http_disabled(cli: &Cli) {
+    if cli.http_config_file.is_some() {
+        tracing::warn!("--http-config requires --features http; ignoring");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Enrollment
 // ---------------------------------------------------------------------------
 
@@ -774,6 +828,9 @@ pub(crate) fn start_metrics(
 
     #[cfg(feature = "federation")]
     rustgate_federation::metrics::init().context("registering federation metrics")?;
+
+    #[cfg(all(feature = "http", feature = "metrics"))]
+    rustgate_http::metrics::init().context("registering HTTP egress metrics")?;
 
     // Load the optional CN allowlist for per-identity metric label
     // bucketing. When unset, all CNs collapse to the literal "other"
@@ -1286,6 +1343,8 @@ pub(crate) struct WebSocketSetup<'a, P: NatsPublish> {
     pub(crate) codec: &'a Arc<dyn rustgate_core::codec::Codec>,
     pub(crate) nats_publisher: &'a Option<P>,
     pub(crate) fed_forward: &'a Option<FedForwardFn>,
+    #[cfg(feature = "http")]
+    pub(crate) http_forward: &'a Option<HttpForwardFn>,
     pub(crate) throttle_config: Option<ThrottleConfig>,
     pub(crate) replay_filter: &'a Option<Arc<rustgate_transport::ReplayFilter>>,
 }
@@ -1303,6 +1362,8 @@ pub(crate) fn start_websocket<P: NatsPublish + Send + Sync + 'static>(
         codec,
         nats_publisher,
         fed_forward,
+        #[cfg(feature = "http")]
+        http_forward,
         throttle_config,
         replay_filter,
     } = setup;
@@ -1347,6 +1408,18 @@ pub(crate) fn start_websocket<P: NatsPublish + Send + Sync + 'static>(
         codec: Arc::clone(codec),
         nats_publish: nats_cb,
         fed_forward: fed_forward.clone(),
+        http_forward: {
+            #[cfg(feature = "http")]
+            {
+                http_forward
+                    .clone()
+                    .map(|fwd| -> rustgate_websocket::OnHttpForward { fwd })
+            }
+            #[cfg(not(feature = "http"))]
+            {
+                None
+            }
+        },
         throttle_config,
         replay_filter: replay_filter.clone(),
         circuit_breaker_threshold: cli.circuit_breaker_threshold,
@@ -1433,6 +1506,7 @@ pub(crate) async fn start_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
     codec: &Arc<dyn rustgate_core::codec::Codec>,
     nats_publisher: &Option<P>,
     fed_forward: &Option<FedForwardFn>,
+    #[cfg(feature = "http")] http_forward: &Option<HttpForwardFn>,
     throttle_config: Option<ThrottleConfig>,
     archiver: &Option<Arc<crate::archive::CotArchiver>>,
     replay_filter: &Option<Arc<rustgate_transport::ReplayFilter>>,
@@ -1468,6 +1542,8 @@ pub(crate) async fn start_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
         codec: Arc::clone(codec),
         nats_publisher: pt_nats,
         fed_forward: fed_forward.clone(),
+        #[cfg(feature = "http")]
+        http_forward: http_forward.clone(),
         throttle_config,
         archiver: archiver.clone(),
         replay_filter: replay_filter.clone(),

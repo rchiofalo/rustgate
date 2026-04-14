@@ -13,6 +13,7 @@ crates/
   rustgate-websocket/     WebSocket (wss://) listener with mTLS, router integration
   rustgate-mqtt/          MQTT 5.0/3.1.1 transport with mTLS, dynamic group subscriptions
   rustgate-nats/          NATS pub/sub bridge with JetStream history replay
+  rustgate-http/          HTTP/webhook egress bridge (auth, retry, circuit breaking)
   rustgate-enrollment/    HTTPS certificate enrollment (Marti v2 CSR signing)
   rustgate-proto/         Protobuf translation (XML / proto) and negotiation
   rustgate-federation/    Server-to-server federation (V1 XML, V2 gRPC)
@@ -51,16 +52,16 @@ Clients
 │  │ (pub/sub)   │   │            │                                │
 │  └─────────────┘   └────────────┘                                │
 │                                                                  │
-│  ┌─────────────┐   ┌────────────┐                                │
-│  │ Enrollment  │   │  Metrics   │                                │
-│  │ (HTTPS CSR) │   │ Prometheus │                                │
-│  └─────────────┘   └────────────┘                                │
+│  ┌─────────────┐   ┌────────────┐   ┌─────────────────────┐      │
+│  │ Enrollment  │   │  Metrics   │   │  HTTP Egress        │      │
+│  │ (HTTPS CSR) │   │ Prometheus │   │  (webhook/REST)     │      │
+│  └─────────────┘   └────────────┘   └─────────────────────┘      │
 └──────────────────────────────────────────────────────────────────┘
-  │                     │                    │
-  │ NATS (4222)         │ HTTP (9090)        │ mTLS (9000/9001)
-  ▼                     ▼                    ▼
-Other rustgate       Prometheus/         Remote
-instances            monitoring          servers (peers)
+  │                     │                    │                  │
+  │ NATS (4222)         │ HTTP (9090)        │ mTLS (9000/9001)│ HTTPS (targets)
+  ▼                     ▼                    ▼                 ▼
+Other rustgate       Prometheus/         Remote            SIEM, dashboards,
+instances            monitoring          servers (peers)   webhook receivers
 ```
 
 ## Core Types
@@ -116,6 +117,7 @@ All optional features are compile-time feature gates, keeping the base binary mi
 | `ocsp` | rustgate-transport | OCSP stapling and client OCSP checking |
 | `spiffe` | rustgate-transport | SPIFFE/SPIRE workload identity for server TLS |
 | `cedar` | rustgate-authz | Cedar policy language backend for authorization |
+| `http` | rustgate-http | HTTP/webhook egress with auth, retry, circuit breaking |
 | `peer-discovery` | rustgate-federation | Peer discovery backends (DNS-SD, Consul, etcd) |
 | `jemalloc` | tikv-jemallocator | jemalloc allocator for musl builds |
 

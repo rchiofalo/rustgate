@@ -1504,6 +1504,10 @@ pub struct ReadinessState {
     pub federation_manager: std::sync::Mutex<
         Option<Arc<tokio::sync::RwLock<rustgate_federation::manager::FederationManager>>>,
     >,
+
+    /// HTTP egress publisher — checked for circuit breaker health.
+    #[cfg(feature = "http")]
+    pub http_publisher: std::sync::Mutex<Option<rustgate_http::HttpPublisher>>,
 }
 
 impl std::fmt::Debug for ReadinessState {
@@ -1523,6 +1527,8 @@ impl ReadinessState {
             nats_publisher: std::sync::Mutex::new(None),
             #[cfg(feature = "federation")]
             federation_manager: std::sync::Mutex::new(None),
+            #[cfg(feature = "http")]
+            http_publisher: std::sync::Mutex::new(None),
         }
     }
 
@@ -1542,6 +1548,14 @@ impl ReadinessState {
     ) {
         if let Ok(mut guard) = self.federation_manager.lock() {
             *guard = Some(mgr);
+        }
+    }
+
+    /// Register an HTTP publisher for readiness checking.
+    #[cfg(feature = "http")]
+    pub fn set_http_publisher(&self, publisher: rustgate_http::HttpPublisher) {
+        if let Ok(mut guard) = self.http_publisher.lock() {
+            *guard = Some(publisher);
         }
     }
 
@@ -1573,6 +1587,14 @@ impl ReadinessState {
             && let Some(ref mgr) = *guard
         {
             let _ = checks.insert("federation".to_string(), check_federation(mgr));
+        }
+
+        // HTTP egress circuit breaker health
+        #[cfg(feature = "http")]
+        if let Ok(guard) = self.http_publisher.lock()
+            && let Some(ref publisher) = *guard
+        {
+            let _ = checks.insert("http".to_string(), check_http(publisher));
         }
 
         let status = aggregate_status(checks.values());
@@ -1663,6 +1685,19 @@ fn check_federation(
         return DependencyCheck::degraded(format!("{connected}/{total} peers connected"));
     }
     DependencyCheck::ok()
+}
+
+/// Check HTTP egress circuit breaker health.
+///
+/// Reports degraded when any target has an open circuit breaker,
+/// and unhealthy only when ALL circuits are open.
+#[cfg(feature = "http")]
+fn check_http(publisher: &rustgate_http::HttpPublisher) -> DependencyCheck {
+    if publisher.is_healthy() {
+        DependencyCheck::ok()
+    } else {
+        DependencyCheck::degraded("one or more HTTP target circuits open")
+    }
 }
 
 /// Aggregate individual check statuses into the worst-case overall status.

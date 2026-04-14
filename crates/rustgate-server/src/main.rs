@@ -345,6 +345,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         nats_publisher: std::sync::Mutex::new(None),
         #[cfg(feature = "federation")]
         federation_manager: std::sync::Mutex::new(None),
+        #[cfg(feature = "http")]
+        http_publisher: std::sync::Mutex::new(None),
     });
 
     // ── Metrics ─────────────────────────────────────────────────────
@@ -909,6 +911,22 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     #[cfg(not(feature = "federation"))]
     setup::warn_federation_peer_discovery_disabled(&cli);
 
+    // ── HTTP egress ─────────────────────────────────────────────────
+    #[cfg(feature = "http")]
+    let (http_forward, _http_publisher): (Option<session::HttpForwardFn>, _) = {
+        match setup::connect_http(&cli) {
+            Some((fwd, publisher)) => {
+                #[cfg(feature = "metrics")]
+                readiness.set_http_publisher(publisher.clone());
+                (Some(fwd), Some(publisher))
+            }
+            None => (None, None),
+        }
+    };
+
+    #[cfg(not(feature = "http"))]
+    setup::warn_http_disabled(&cli);
+
     // ── Per-client rate limiting ────────────────────────────────────
     let throttle_config = setup::build_throttle_config(&cli);
 
@@ -932,6 +950,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         codec: &codec,
         nats_publisher: &nats_publisher,
         fed_forward: &fed_forward,
+        #[cfg(feature = "http")]
+        http_forward: &http_forward,
         throttle_config,
         replay_filter: &replay_filter,
     })?;
@@ -1007,6 +1027,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         &codec,
         &nats_publisher,
         &fed_forward,
+        #[cfg(feature = "http")]
+        &http_forward,
         throttle_config,
         &archiver,
         &replay_filter,
@@ -1103,6 +1125,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                         #[allow(clippy::clone_on_copy)] // Type varies by feature flag
                         let publisher = nats_publisher.clone();
                         let fed = fed_forward.clone();
+                        #[cfg(feature = "http")]
+                        let http = http_forward.clone();
                         let tc = throttle_config;
                         let arch = archiver.clone();
                         let rf = replay_filter.clone();
@@ -1112,6 +1136,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                             codec: codec.clone(),
                             nats_publisher: publisher,
                             fed_forward: fed,
+                            #[cfg(feature = "http")]
+                            http_forward: http,
                             throttle_config: tc,
                             archiver: arch,
                             replay_filter: rf,
@@ -1173,6 +1199,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         let mut mgr = rwlock.write().await;
         mgr.shutdown().await;
         tracing::info!("federation shut down");
+    }
+
+    #[cfg(feature = "http")]
+    if let Some(ref publisher) = _http_publisher {
+        publisher.shutdown().await;
+        tracing::info!("HTTP egress shut down");
     }
 
     #[cfg(feature = "websocket")]

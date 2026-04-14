@@ -3,7 +3,13 @@ targets = []
 all-features = true
 
 [advisories]
-ignore = []
+ignore = [
+    # tikv-jemallocator 0.6.1 depends on paste, which is archived/unmaintained.
+    # paste is a proc-macro with no runtime code and no security surface; the
+    # advisory is informational, not a vulnerability. tikv-jemallocator has no
+    # newer release that drops paste. Remove this ignore when they do.
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
 allow = [
@@ -87,6 +93,9 @@ crate = "rustgate-authz"
 [[licenses.exceptions]]
 allow = ["LicenseRef-Proprietary"]
 crate = "rustgate-mqtt"
+[[licenses.exceptions]]
+allow = ["LicenseRef-Proprietary"]
+crate = "rustgate-http"
 
 [bans]
 multiple-versions = "warn"

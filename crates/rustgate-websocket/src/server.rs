@@ -40,6 +40,12 @@ pub type OnNatsPublish = Arc<dyn Fn(RoutableMessage) + Send + Sync>;
 pub type OnFederationForward =
     Arc<dyn Fn(Bytes, Vec<String>, rustgate_core::message::Metadata) + Send + Sync>;
 
+/// Callback for HTTP egress forwarding (fire-and-forget).
+///
+/// Uses `Fn` (not `AsyncFn`) because `dyn AsyncFn` is not object-safe
+/// as of Rust 1.94. Async work is dispatched via the publisher's internal channel.
+pub type OnHttpForward = Arc<dyn Fn(RoutableMessage) + Send + Sync>;
+
 /// Default maximum pending write bytes per WebSocket connection: 4 MiB.
 ///
 /// When the write loop has sent more than this many bytes without the
@@ -56,6 +62,7 @@ pub struct WsServerConfig {
     pub codec: Arc<dyn Codec>,
     pub nats_publish: Option<OnNatsPublish>,
     pub fed_forward: Option<OnFederationForward>,
+    pub http_forward: Option<OnHttpForward>,
     pub throttle_config: Option<ThrottleConfig>,
     pub replay_filter: Option<Arc<ReplayFilter>>,
     /// Consecutive send failures before the circuit breaker disconnects a session.
@@ -100,6 +107,7 @@ impl WebSocketServer {
             codec,
             nats_publish,
             fed_forward,
+            http_forward,
             throttle_config,
             replay_filter,
             circuit_breaker_threshold,
@@ -129,6 +137,7 @@ impl WebSocketServer {
                             let session_codec = Arc::clone(&codec);
                             let nats = nats_publish.clone();
                             let fed = fed_forward.clone();
+                            let http = http_forward.clone();
                             let tc = throttle_config;
                             let rf = replay_filter.clone();
 
@@ -138,8 +147,8 @@ impl WebSocketServer {
                             let vio = ws_max_violations;
                             let mwb = max_write_buffer_bytes;
                             drop(tokio::spawn(handle_ws_session(
-                                session, router, session_codec, nats, fed, tc, rf, cb, fps,
-                                bps, vio, mwb, permit,
+                                session, router, session_codec, nats, fed, http, tc, rf,
+                                cb, fps, bps, vio, mwb, permit,
                             )));
                         }
                         Err(e) => {
@@ -163,6 +172,7 @@ async fn handle_ws_session(
     codec: Arc<dyn Codec>,
     nats_publish: Option<OnNatsPublish>,
     fed_forward: Option<OnFederationForward>,
+    http_forward: Option<OnHttpForward>,
     throttle_config: Option<ThrottleConfig>,
     replay_filter: Option<Arc<ReplayFilter>>,
     circuit_breaker_threshold: u32,
@@ -246,7 +256,7 @@ async fn handle_ws_session(
     let read_result = {
         let router = Arc::clone(&router);
         tokio::select! {
-            r = ws_read_loop(ws_read, &identity, &router, nats_publish.as_ref(), fed_forward.as_ref(), &throttle, &replay_filter, &mut ws_rate_limiter) => r,
+            r = ws_read_loop(ws_read, &identity, &router, nats_publish.as_ref(), fed_forward.as_ref(), http_forward.as_ref(), &throttle, &replay_filter, &mut ws_rate_limiter) => r,
             r = ws_write_loop(ws_write, &mut priority_rx, &mut normal_rx, &*codec, max_write_buffer_bytes) => r,
         }
     };
@@ -271,6 +281,7 @@ async fn ws_read_loop(
     router: &Router,
     nats_publish: Option<&OnNatsPublish>,
     fed_forward: Option<&OnFederationForward>,
+    http_forward: Option<&OnHttpForward>,
     throttle: &Option<ClientThrottle>,
     replay_filter: &Option<Arc<ReplayFilter>>,
     ws_rate_limiter: &mut Option<crate::rate_limit::WsRateLimiter>,
@@ -344,6 +355,9 @@ async fn ws_read_loop(
         if let Some(fwd) = fed_forward {
             let groups: Vec<String> = msg.source.groups.iter().cloned().collect();
             fwd(msg.payload.clone(), groups, msg.metadata.clone());
+        }
+        if let Some(fwd) = http_forward {
+            fwd(msg.clone());
         }
     }
 }

@@ -90,10 +90,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       - name: Clippy (all features)
-        run: cargo clippy --locked --workspace --all-targets --features nats,enrollment,est,proto,full-detail,metrics,federation,federation-ha,websocket,mqtt,otel
+        run: cargo clippy --locked --workspace --all-targets --features nats,enrollment,est,proto,full-detail,metrics,federation,federation-ha,websocket,mqtt,otel,http
 
       - name: Build documentation
-        run: cargo doc --workspace --no-deps --features nats,enrollment,est,proto,full-detail,metrics,federation,federation-ha,websocket,mqtt,otel
+        run: cargo doc --workspace --no-deps --features nats,enrollment,est,proto,full-detail,metrics,federation,federation-ha,websocket,mqtt,otel,http
 
   check-features:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
@@ -165,13 +165,13 @@ jobs:
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Run tests
-        run: cargo nextest run --locked --workspace --features nats,enrollment,est,proto,full-detail,metrics,federation,federation-ha,websocket,mqtt,otel
+        run: cargo nextest run --locked --workspace --features nats,enrollment,est,proto,full-detail,metrics,federation,federation-ha,websocket,mqtt,otel,http
 
       - name: Authz P99 budget gate (release)
         run: cargo nextest run --locked --release -p rustgate-authz --run-ignored all perf_budget
 
       - name: Run doc tests
-        run: cargo test --locked --workspace --doc --features nats,enrollment,est,proto,full-detail,metrics,federation,federation-ha,websocket,mqtt,otel
+        run: cargo test --locked --workspace --doc --features nats,enrollment,est,proto,full-detail,metrics,federation,federation-ha,websocket,mqtt,otel,http
 
   coverage:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
@@ -214,7 +214,7 @@ jobs:
           tool: cargo-tarpaulin
 
       - name: Generate coverage report
-        run: cargo tarpaulin --locked --engine llvm --features nats,enrollment,est,proto,full-detail,metrics,federation,federation-ha,websocket,mqtt,otel --out xml --output-dir coverage/
+        run: cargo tarpaulin --locked --engine llvm --features nats,enrollment,est,proto,full-detail,metrics,federation,federation-ha,websocket,mqtt,otel,http --out xml --output-dir coverage/
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
@@ -264,18 +264,22 @@ jobs:
 
       - name: Clippy (FIPS)
         if: matrix.run_tests
-        run: cargo clippy --locked -p rustgate-transport -p rustgate-server -p rustgate-enrollment --features fips --all-targets
+        run: |
+          cargo clippy --locked -p rustgate-transport -p rustgate-server -p rustgate-enrollment -p rustgate-http --features fips --all-targets
+          cargo clippy --locked -p rustgate-federation --features fips,v2 --all-targets
 
       - name: Build server with FIPS
         env:
           CC_${{ matrix.target }}: ${{ matrix.cc }}
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
           C_INCLUDE_PATH: ${{ contains(matrix.target, 'musl') && '/usr/include:/usr/include/x86_64-linux-gnu' || '' }}
-        run: cargo build --locked -p rustgate-server --features fips,federation,enrollment --target ${{ matrix.target }}
+        run: cargo build --locked -p rustgate-server --features fips,federation,enrollment,http --target ${{ matrix.target }}
 
       - name: Run FIPS tests
         if: matrix.run_tests
-        run: cargo nextest run --locked -p rustgate-transport --features fips
+        run: |
+          cargo nextest run --locked -p rustgate-transport --features fips
+          cargo nextest run --locked -p rustgate-http --features fips
 
   post-quantum:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
@@ -299,13 +303,18 @@ jobs:
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Clippy (post-quantum)
-        run: cargo clippy --locked -p rustgate-transport -p rustgate-server --features post-quantum --all-targets
+        run: |
+          cargo clippy --locked -p rustgate-transport -p rustgate-server -p rustgate-http --features post-quantum --all-targets
+          cargo clippy --locked -p rustgate-federation --features post-quantum,v2 --all-targets
 
       - name: Build server with post-quantum
-        run: cargo build --locked -p rustgate-server --features post-quantum,federation,enrollment
+        run: cargo build --locked -p rustgate-server --features post-quantum,federation,enrollment,http
 
-      - name: Run PQ tests
+      - name: Run PQ transport tests
         run: cargo nextest run --locked -p rustgate-transport --features post-quantum
+
+      - name: Run PQ HTTP tests
+        run: cargo nextest run --locked -p rustgate-http --features post-quantum
 
   dependency-review:
     if: github.event_name == 'pull_request'

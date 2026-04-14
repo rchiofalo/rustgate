@@ -55,6 +55,7 @@ impl EdgeTestServer {
             codec: Arc::new(TakXmlCodec),
             nats_publish: None,
             fed_forward: None,
+            http_forward: None,
             throttle_config: None,
             replay_filter: None,
             circuit_breaker_threshold: 0,
