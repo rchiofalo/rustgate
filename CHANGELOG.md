@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Bump `redb` from 2.6.3 to 4.0.0** — adopts the redb 4.x API. `begin_read` now lives on the `ReadableDatabase` trait (imported in `rustgate-transport::store_forward` and `rustgate-federation::replay_persist`). **File format note:** redb 3.0 dropped support for the v2 on-disk format. Existing store-and-forward and federation-replay databases written by redb 2.x may need to be cleared on upgrade; both are ephemeral queues that can be safely rebuilt.
+
 ### Added
 
 - **HTTP egress bridge** (`rustgate-http` crate): configurable webhook/REST forwarding to multiple independent HTTP endpoints. Features include:
