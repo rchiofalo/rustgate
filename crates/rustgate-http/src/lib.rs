@@ -14,10 +14,30 @@
 //! them through a bounded internal channel to a background worker task
 //! that fans out to all matching targets.
 //!
+//! # Security
+//!
+//! - **Authentication**: Bearer token, HTTP Basic, or HMAC-SHA256 request
+//!   signing (with timestamp binding for replay prevention). All secrets
+//!   loaded from files, wrapped in [`Zeroizing`](zeroize::Zeroizing).
+//! - **TLS**: Per-target custom CA, mTLS client certificates, and
+//!   optional SHA-256 certificate pinning (defense against CA compromise).
+//! - **SSRF protection**: Private/loopback IP addresses are rejected at
+//!   both config validation time and DNS resolution time (rebinding defense).
+//! - **Rate limiting**: Per-target token-bucket rate limiter prevents
+//!   upstream flooding.
+//! - **Dead-letter queue**: Undeliverable messages are encrypted with
+//!   ChaCha20-Poly1305 and persisted for forensic recovery.
+//!
 //! # Feature Flags
 //!
 //! - `metrics` — Enables Prometheus metric collection for publish
 //!   counts, error rates, request latency, and circuit breaker state.
+//! - `proto` — Enables protobuf payload serialization via `rustgate-proto`.
+//! - `otel` — Enables OpenTelemetry trace context propagation (`traceparent`
+//!   / `tracestate` headers) on outbound requests.
+//! - `fips` — Uses aws-lc-rs in FIPS mode for outbound TLS.
+//! - `post-quantum` — Enables post-quantum key exchange (X25519MLKEM768)
+//!   for outbound TLS connections.
 
 pub(crate) mod auth;
 pub(crate) mod circuit;

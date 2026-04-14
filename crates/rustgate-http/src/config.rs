@@ -20,7 +20,7 @@ use crate::error::HttpError;
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct HttpConfig {
     /// Instance identifier included in the `X-Rustgate-Instance` header.
-    /// When absent, defaults to the system hostname.
+    /// When absent, defaults to `rustgate-{pid}` using the process ID.
     pub instance_id: Option<String>,
 
     /// Named targets. Each is an independent HTTP endpoint.

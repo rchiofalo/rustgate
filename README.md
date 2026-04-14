@@ -376,6 +376,7 @@ All flags support environment variables (CLI takes precedence):
 | `--nats-live-stream` | `RUSTGATE_NATS_LIVE_STREAM` | `RUSTGATE_LIVE` |
 | `--nats-max-ack-pending` | `RUSTGATE_NATS_MAX_ACK_PENDING` | `1000` |
 | `--nats-checkpoint-path` | `RUSTGATE_NATS_CHECKPOINT_PATH` | — |
+| `--http-config-file` | `RUSTGATE_HTTP_CONFIG` | — |
 | `--websocket-bind` | `RUSTGATE_WEBSOCKET_BIND` | — |
 | `--ws-max-frames-per-sec` | `RUSTGATE_WS_MAX_FRAMES_PER_SEC` | `0` (disabled) |
 | `--ws-max-bytes-per-sec` | `RUSTGATE_WS_MAX_BYTES_PER_SEC` | `0` (disabled) |

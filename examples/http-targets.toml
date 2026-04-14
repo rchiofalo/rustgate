@@ -88,3 +88,46 @@ value = "2"
 [[targets.headers]]
 name = "X-Tenant"
 value = "division-alpha"
+
+# ── TAK Server peer (Protobuf format, certificate pinning) ────────
+
+[[targets]]
+name = "tak-peer"
+url = "https://tak-server.mil:8443/api/v1/cot"
+format = "protobuf"
+timeout-secs = 5
+rate-limit-per-sec = 500
+
+[targets.tls]
+ca-cert = "/etc/rustgate/tls/tak-ca.pem"
+client-cert = "/etc/rustgate/tls/client.pem"
+client-key = "/etc/rustgate/tls/client-key.pem"
+# Pin the server's certificate to prevent CA compromise/misissuance.
+# Generate with: openssl x509 -in server.pem -pubkey -noout | \
+#   openssl ec -pubin -outform DER | openssl dgst -sha256 -binary | base64
+pin-sha256 = "YLh1dUR9y6Kja30RrAn7JKnbQG/uEtLMkBgFF2Fuihg="
+
+[targets.filter]
+message-types = ["position"]
+
+[targets.retry]
+max-attempts = 3
+circuit-breaker-threshold = 5
+circuit-breaker-cooldown-secs = 30
+
+# ── Dead-Letter Queue (global) ────────────────────────────────────
+#
+# When a target's circuit breaker opens, messages are encrypted and
+# persisted to disk for later forensic recovery or replay.
+#
+# dlq-dir = "/var/lib/rustgate/dlq"
+# dlq-key-file = "/etc/rustgate/secrets/dlq-keys.json"
+# dlq-max-bytes = 268435456   # 256 MiB per target (default)
+#
+# Key file format (same as rustgate-core KeyRing):
+# {
+#   "active_key_id": "key-2026",
+#   "keys": {
+#     "key-2026": "<64 hex chars = 32 bytes>"
+#   }
+# }

@@ -9,7 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- **HTTP egress bridge** (`rustgate-http` crate): configurable webhook/REST forwarding with Bearer/Basic/HMAC-SHA256 auth, outbound mTLS, per-target filtering, exponential backoff with jitter, circuit breaking, and Prometheus metrics. Configure via `--http-config-file` TOML file. See [docs/http-egress.md](docs/http-egress.md).
+- **HTTP egress bridge** (`rustgate-http` crate): configurable webhook/REST forwarding to multiple independent HTTP endpoints. Features include:
+  - **Authentication**: Bearer token, HTTP Basic, and HMAC-SHA256 request signing with timestamp binding for replay prevention. All secrets loaded from files with `Zeroizing` memory.
+  - **Outbound mTLS**: Per-target custom CA, client certificates, and optional SHA-256 certificate pinning (defense against CA compromise/misissuance).
+  - **SSRF protection**: Dual-layer defense — private/loopback IP rejection at config validation time and DNS-time resolution checks (prevents DNS rebinding attacks).
+  - **Payload formats**: JSON envelope with base64 payload, raw XML passthrough, and protobuf via `rustgate-proto` (feature-gated behind `proto`).
+  - **Per-target filtering**: AND-combined filters across groups, message types, and source CNs. HTTP echo prevention is always active.
+  - **Resilience**: Exponential backoff with jitter, three-state circuit breaker (closed/open/half-open) with configurable probes and success thresholds, and per-target token-bucket rate limiting.
+  - **Dead-letter queue**: Messages shed by open circuit breakers are persisted to ChaCha20-Poly1305 encrypted files for forensic recovery, with per-target file rotation at configurable size limits.
+  - **Observability**: 7 Prometheus metrics (feature-gated behind `metrics`), OpenTelemetry trace context propagation (feature-gated behind `otel`), structured audit events, and Content-Digest / delivery-ID request headers.
+  - Configure via `--http-config-file` TOML file. See [docs/http-egress.md](docs/http-egress.md).
 
 ## [0.8.0] — 2026-04-11
 
