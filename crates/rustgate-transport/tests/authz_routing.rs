@@ -432,7 +432,7 @@ async fn store_forward_drain_allows_delivery_when_policy_permits() {
 }
 
 // ---------------------------------------------------------------------------
-// Obligation actuation (MaskGeo / MaskPayload / TagClassified)
+// Obligation actuation (MaskPoint / MaskPayload / TagClassified)
 // ---------------------------------------------------------------------------
 
 const SAMPLE_COT: &[u8] = br#"<event uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><point lat="38.8977" lon="-77.0365" hae="125.4"/></event>"#;
@@ -485,13 +485,15 @@ fn allow_with_obligation(action: Action, obligation: Obligation) -> Arc<dyn Poli
     })
 }
 
-/// Recipient-side `MaskGeo` on a group message must zero the CoT `<point>`
-/// coordinates before delivery. The sender is unaffected because the
-/// router fans out a per-recipient copy.
+/// Recipient-side `MaskPoint` on a group message must zero the CoT
+/// `<point>` coordinates before delivery. The sender is unaffected
+/// because the router fans out a per-recipient copy.
 #[tokio::test]
-async fn allow_with_mask_geo_for_receive_masks_group_payload() {
-    let router =
-        Router::new().with_authz(allow_with_obligation(Action::Receive, Obligation::MaskGeo));
+async fn allow_with_mask_point_for_receive_masks_group_payload() {
+    let router = Router::new().with_authz(allow_with_obligation(
+        Action::Receive,
+        Obligation::MaskPoint,
+    ));
     let alice = identity("alice", &["alpha"]);
     let bob = identity("bob", &["alpha"]);
 
@@ -565,13 +567,15 @@ async fn allow_with_mask_payload_for_receive_strips_direct_body() {
     assert_eq!(got.source.cn, "alice");
 }
 
-/// Broadcast must apply `MaskGeo` on Receive per-recipient without
+/// Broadcast must apply `MaskPoint` on Receive per-recipient without
 /// mutating the sender's in-flight copy (each recipient gets an
 /// independently-masked envelope).
 #[tokio::test]
-async fn allow_with_mask_geo_on_broadcast_masks_each_recipient() {
-    let router =
-        Router::new().with_authz(allow_with_obligation(Action::Receive, Obligation::MaskGeo));
+async fn allow_with_mask_point_on_broadcast_masks_each_recipient() {
+    let router = Router::new().with_authz(allow_with_obligation(
+        Action::Receive,
+        Obligation::MaskPoint,
+    ));
     let alice = identity("alice", &["alpha"]);
     let bob = identity("bob", &["alpha"]);
     let charlie = identity("charlie", &["alpha"]);
@@ -604,7 +608,7 @@ async fn allow_with_mask_geo_on_broadcast_masks_each_recipient() {
 /// obligations — a recipient who can no longer see raw coordinates in
 /// the live stream must not receive them via SA replay either.
 #[tokio::test]
-async fn position_replay_applies_mask_geo_obligation() {
+async fn position_replay_applies_mask_point_obligation() {
     // Step 1: cache a position with no authz engine (so cache.store fires).
     let router = Router::new();
     let alice = identity("alice", &["alpha"]);
@@ -616,8 +620,11 @@ async fn position_replay_applies_mask_geo_obligation() {
         .await;
     router.route(position(&alice, Destination::Broadcast)).await;
 
-    // Step 2: install a MaskGeo-on-Receive policy, then replay to bob.
-    router.swap_authz(allow_with_obligation(Action::Receive, Obligation::MaskGeo));
+    // Step 2: install a MaskPoint-on-Receive policy, then replay to bob.
+    router.swap_authz(allow_with_obligation(
+        Action::Receive,
+        Obligation::MaskPoint,
+    ));
     let (ptx_b, ntx_b, mut prx_b, _nb) = channels();
     let bob_handle = SessionHandle::new(bob.clone(), ptx_b, ntx_b);
     router.replay_positions(&bob_handle).await;
@@ -708,11 +715,12 @@ async fn tag_classified_does_not_mutate_payload() {
     assert_eq!(got.metadata.message_type, MessageType::Position);
 }
 
-/// Send-side `MaskGeo` is applied once on the envelope before fan-out,
+/// Send-side `MaskPoint` is applied once on the envelope before fan-out,
 /// so every recipient on a broadcast sees the same masked copy.
 #[tokio::test]
-async fn send_side_mask_geo_masks_before_fanout() {
-    let router = Router::new().with_authz(allow_with_obligation(Action::Send, Obligation::MaskGeo));
+async fn send_side_mask_point_masks_before_fanout() {
+    let router =
+        Router::new().with_authz(allow_with_obligation(Action::Send, Obligation::MaskPoint));
     let alice = identity("alice", &["alpha"]);
     let bob = identity("bob", &["alpha"]);
     let charlie = identity("charlie", &["alpha"]);

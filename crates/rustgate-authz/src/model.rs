@@ -71,8 +71,13 @@ pub enum Decision {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Obligation {
-    /// Strip geographic coordinates from the outbound message.
-    MaskGeo,
+    /// Zero the CoT `<point>` coordinates (`lat`, `lon`, `hae`) in the
+    /// outbound message. The name intentionally reflects the scope: only
+    /// the `<point>` element is touched, not `<detail>` children, not
+    /// envelope metadata, and not free-form geographic references inside
+    /// the payload. Non-CoT payloads pass through unmodified — masking
+    /// is a best-effort leak-prevention obligation, not a hard gate.
+    MaskPoint,
     /// Strip the payload body, leaving only envelope metadata.
     MaskPayload,
     /// Tag the outbound message as classified.

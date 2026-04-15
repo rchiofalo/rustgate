@@ -14,8 +14,9 @@
 //!
 //! Only obligations with data-plane side effects are handled here:
 //!
-//! - [`Obligation::MaskGeo`] — CoT `<point>` coordinates are zeroed via
-//!   [`rustgate_cot::mask::strip_coordinates`].
+//! - [`Obligation::MaskPoint`] — CoT `<point>` coordinates (`lat`, `lon`,
+//!   `hae`) are zeroed via [`rustgate_cot::mask::strip_coordinates`].
+//!   Non-CoT payloads pass through unmodified.
 //! - [`Obligation::MaskPayload`] — the payload body is replaced with an
 //!   empty [`Bytes`] and the classified message type is coerced to
 //!   [`MessageType::Other`] with a `"masked"` tag so downstream caches
@@ -29,17 +30,17 @@
 //!
 //! # Failure mode
 //!
-//! [`Obligation::MaskGeo`] on a non-CoT payload returns an error from the
-//! parser. The dispatcher logs at DEBUG and passes the payload through
+//! [`Obligation::MaskPoint`] on a non-CoT payload returns an error from
+//! the parser. The dispatcher logs at DEBUG and passes the payload through
 //! unchanged — masking is a best-effort leak-prevention mechanism, not a
 //! hard security gate. An operator whose policy predates a payload-type
 //! change must not see messages dropped wholesale because the masker
 //! refuses to parse them.
 //!
 //! DEBUG (not WARN) is deliberate: a high-rate stream of non-CoT payloads
-//! under a `MaskGeo` policy must not amplify into a logging DoS. Operators
-//! who need visibility should rely on metrics and audit events, not the
-//! operational log stream.
+//! under a `MaskPoint` policy must not amplify into a logging DoS.
+//! Operators who need visibility should rely on metrics and audit events,
+//! not the operational log stream.
 
 use bytes::Bytes;
 use rustgate_authz::Obligation;
@@ -49,9 +50,9 @@ use rustgate_core::message::{MessageType, RoutableMessage};
 ///
 /// Obligations are applied in the order they appear in the slice. The
 /// order only matters when two obligations could interact — in practice
-/// [`Obligation::MaskPayload`] supersedes [`Obligation::MaskGeo`] because
-/// it replaces the payload entirely, so callers should tolerate either
-/// ordering.
+/// [`Obligation::MaskPayload`] supersedes [`Obligation::MaskPoint`]
+/// because it replaces the payload entirely, so callers should tolerate
+/// either ordering.
 ///
 /// Obligations without a data-plane side effect
 /// ([`Obligation::TagClassified`], [`Obligation::AuditExtended`]) are
@@ -60,7 +61,7 @@ use rustgate_core::message::{MessageType, RoutableMessage};
 pub fn apply_obligations(msg: &mut RoutableMessage, obligations: &[Obligation]) {
     for obligation in obligations {
         match obligation {
-            Obligation::MaskGeo => apply_mask_geo(msg),
+            Obligation::MaskPoint => apply_mask_point(msg),
             Obligation::MaskPayload => apply_mask_payload(msg),
             // Audit-only obligations handled at the call site.
             Obligation::TagClassified | Obligation::AuditExtended => {}
@@ -86,14 +87,14 @@ pub fn apply_obligations(msg: &mut RoutableMessage, obligations: &[Obligation]) 
 /// exceeded the masker's attribute budget), the payload is passed through
 /// unchanged and the failure is logged at DEBUG. Callers that care about
 /// strict leak prevention should gate delivery via the policy `Deny`
-/// path, not via [`Obligation::MaskGeo`].
+/// path, not via [`Obligation::MaskPoint`].
 ///
 /// The log level is DEBUG (not WARN) on purpose: a hostile or
-/// mis-configured sender under a `MaskGeo` policy could otherwise
+/// mis-configured sender under a `MaskPoint` policy could otherwise
 /// amplify a single bad payload into thousands of WARN records per
 /// second. Operational visibility for mask failures belongs in metrics
 /// and audit, not the default log stream.
-fn apply_mask_geo(msg: &mut RoutableMessage) {
+fn apply_mask_point(msg: &mut RoutableMessage) {
     match rustgate_cot::mask::strip_coordinates(&msg.payload) {
         Ok(masked) => {
             msg.payload = masked;
@@ -103,7 +104,7 @@ fn apply_mask_geo(msg: &mut RoutableMessage) {
                 error = %e,
                 source_protocol = %msg.metadata.source_protocol,
                 message_type = %msg.metadata.message_type,
-                "mask_geo obligation: payload not CoT-maskable, forwarding unmasked"
+                "mask_point obligation: payload not CoT-maskable, forwarding unmasked"
             );
         }
     }
@@ -152,9 +153,9 @@ mod tests {
     }
 
     #[test]
-    fn mask_geo_zeroes_point_coordinates() {
+    fn mask_point_zeroes_point_coordinates() {
         let mut msg = sample_msg(SAMPLE_COT, MessageType::Position);
-        apply_obligations(&mut msg, &[Obligation::MaskGeo]);
+        apply_obligations(&mut msg, &[Obligation::MaskPoint]);
 
         let s = std::str::from_utf8(&msg.payload).unwrap();
         assert!(s.contains(r#"lat="0.0""#), "lat not zeroed: {s}");
@@ -164,11 +165,11 @@ mod tests {
     }
 
     #[test]
-    fn mask_geo_on_non_cot_passes_through_unchanged() {
-        // Not XML at all. MaskGeo is best-effort — the payload should be
-        // forwarded intact rather than dropped.
+    fn mask_point_on_non_cot_passes_through_unchanged() {
+        // Not XML at all. MaskPoint is best-effort — the payload should
+        // be forwarded intact rather than dropped.
         let mut msg = sample_msg(b"not xml at all", MessageType::Chat);
-        apply_obligations(&mut msg, &[Obligation::MaskGeo]);
+        apply_obligations(&mut msg, &[Obligation::MaskPoint]);
         assert_eq!(msg.payload.as_ref(), b"not xml at all");
         // Message type unchanged: masking is a payload-level op.
         assert_eq!(msg.metadata.message_type, MessageType::Chat);
@@ -229,10 +230,10 @@ mod tests {
 
     #[test]
     fn multiple_obligations_compose() {
-        // MaskGeo then MaskPayload — payload gets cleared regardless of
+        // MaskPoint then MaskPayload — payload gets cleared regardless of
         // whether the initial mask succeeded. Final state: empty body.
         let mut msg = sample_msg(SAMPLE_COT, MessageType::Position);
-        apply_obligations(&mut msg, &[Obligation::MaskGeo, Obligation::MaskPayload]);
+        apply_obligations(&mut msg, &[Obligation::MaskPoint, Obligation::MaskPayload]);
         assert!(msg.payload.is_empty());
         assert_eq!(
             msg.metadata.message_type,
@@ -241,12 +242,12 @@ mod tests {
     }
 
     #[test]
-    fn mask_payload_then_mask_geo_does_not_error() {
+    fn mask_payload_then_mask_point_does_not_error() {
         // Opposite order — after MaskPayload the body is empty, so
-        // MaskGeo sees a non-CoT payload and passes through (staying
+        // MaskPoint sees a non-CoT payload and passes through (staying
         // empty). The dispatcher must not panic or error on this path.
         let mut msg = sample_msg(SAMPLE_COT, MessageType::Position);
-        apply_obligations(&mut msg, &[Obligation::MaskPayload, Obligation::MaskGeo]);
+        apply_obligations(&mut msg, &[Obligation::MaskPayload, Obligation::MaskPoint]);
         assert!(msg.payload.is_empty());
     }
 }

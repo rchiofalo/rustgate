@@ -1556,7 +1556,7 @@ impl Router {
                     // TagClassified obligation is present: that is the
                     // single obligation that produces an
                     // `authz.classified_delivery` record. Other
-                    // obligations (MaskGeo, MaskPayload, AuditExtended)
+                    // obligations (MaskPoint, MaskPayload, AuditExtended)
                     // do not consume this path. Gating here means the
                     // common untagged drain pays zero allocations for
                     // the audit envelope.
@@ -1659,7 +1659,7 @@ impl Router {
             // replay path:
             //
             // 1. Send PEP from the cached *sender's* identity. A policy
-            //    tightening (e.g. adding `MaskGeo` on Send after the
+            //    tightening (e.g. adding `MaskPoint` on Send after the
             //    position was cached with raw coordinates) must take
             //    effect on replay — otherwise a newly connected session
             //    observes pre-tightening coordinates that were never
@@ -1669,7 +1669,7 @@ impl Router {
             //
             // Send obligations are applied before Receive obligations so
             // sender-side masking is composed with per-recipient masking
-            // (MaskPayload over MaskGeo = empty body; either order works
+            // (MaskPayload over MaskPoint = empty body; either order works
             // since the dispatcher is idempotent).
             //
             // The audit event is deferred until after a successful
@@ -2192,7 +2192,7 @@ impl Router {
         // Send obligations are applied to the envelope up-front so the
         // Receive PEP loop below dispatches the Send-masked form to every
         // recipient — cheaper than rewrapping per-recipient when the
-        // group's Send rule produces a `MaskGeo` or `MaskPayload`.
+        // group's Send rule produces a `MaskPoint` or `MaskPayload`.
         let msg = if let Some(engine) = authz {
             let subject = AuthzSubject::from_identity(&msg.source);
             let resource = AuthzResource::Group { group };

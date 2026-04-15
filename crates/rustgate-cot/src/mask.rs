@@ -2,12 +2,19 @@
 
 //! Authorization obligation helpers for CoT XML payloads.
 //!
-//! Implements the data-plane side of the `MaskGeo` authz obligation
+//! Implements the data-plane side of the `MaskPoint` authz obligation
 //! defined in `rustgate_authz::Obligation`. The router calls
 //! [`strip_coordinates`] on a per-recipient basis when the policy engine
-//! returns an allow decision carrying `MaskGeo`, so analysts who are
+//! returns an allow decision carrying `MaskPoint`, so analysts who are
 //! cleared to see the event metadata but not its geography receive a copy
 //! with the `<point>` element's `lat`, `lon`, and `hae` attributes zeroed.
+//!
+//! The obligation is named `MaskPoint` (not `MaskGeo`) to reflect its
+//! actual scope: only the `<point>` element is touched. Free-form
+//! geographic references inside `<detail>` children, the event `uid`,
+//! or envelope metadata are NOT scrubbed by this obligation. Policy
+//! authors who need stronger leak prevention should use `MaskPayload`
+//! (which empties the body entirely) or deny delivery outright.
 //!
 //! # Design
 //!
@@ -26,7 +33,7 @@
 //! Malformed XML returns [`MaskError::Xml`]; the caller is expected to
 //! log once and pass the original payload through. Valid XML that simply
 //! lacks a `<point>` element is passed through byte-for-byte without
-//! error. `MaskGeo` is a best-effort leak-prevention obligation, not a
+//! error. `MaskPoint` is a best-effort leak-prevention obligation, not a
 //! hard security boundary — denying delivery entirely because the payload
 //! happens not to be CoT would surprise operators whose policies predate
 //! a payload-type change.

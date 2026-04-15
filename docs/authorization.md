@@ -129,16 +129,47 @@ replay cache.
 
 | Obligation | Effect |
 |---|---|
-| `mask_geo` | CoT `<point>` coordinates are zeroed via `rustgate_cot::mask::strip_coordinates`. Non-CoT payloads are logged once at WARN and forwarded unmodified — masking is best-effort leak prevention, not a hard gate. |
+| `mask_point` | CoT `<point>` coordinates (`lat`, `lon`, `hae`) are zeroed via `rustgate_cot::mask::strip_coordinates`. Only the `<point>` element is touched. Non-CoT payloads are logged once at DEBUG and forwarded unmodified — masking is best-effort leak prevention, not a hard gate. |
 | `mask_payload` | Payload body replaced with empty `Bytes`; classified message type coerced to `other:masked`. Envelope fields (source identity, destination, timestamps) are preserved so downstream UIs can render a placeholder. |
 | `tag_classified` | Audit-only. Emits `audit.classified_delivery` at the Receive PEP with subject/recipient CNs, resource kind/id, rule id, and policy id. Wire payload is unchanged. |
 | `audit_extended` | Audit-only. Reserved for future expanded audit records; no dataplane side effect today. |
 
 Obligations compose: Send-side obligations mutate the envelope before
 it is wrapped in `Arc` and fanned out; Receive-side obligations stack
-on each per-recipient copy. `MaskPayload` supersedes `MaskGeo` because
+on each per-recipient copy. `MaskPayload` supersedes `MaskPoint` because
 it replaces the payload entirely — either ordering produces the same
 final (empty) body.
+
+### Metadata residue: what the maskers do NOT scrub
+
+`MaskPoint` and `MaskPayload` are payload-body mutations. The surrounding
+envelope and non-`<point>` XML regions are passed through untouched.
+Policy authors should treat the following as leak vectors when modelling
+a classification boundary:
+
+- **`msg.source.groups`, `msg.source.attributes`, `msg.source.tenant`** —
+  the sender's identity and group memberships ride with every delivered
+  copy. A recipient who should not learn that "a member of `team-alpha`
+  was broadcasting" cannot be shielded with masking alone.
+- **`msg.destination`** — a `Destination::Direct(target)` still discloses
+  the intended recipient CN to any Receive-side handler that observes the
+  envelope, even if the payload is masked.
+- **`msg.metadata.received_at`, `msg.metadata.source_protocol`,
+  `msg.metadata.ttl`** — forensic envelope fields are preserved for
+  audit. Timing correlation across a classified broadcast remains
+  possible.
+- **`<detail>` children, event `uid`, event `type`** under `MaskPoint` —
+  only the `<point>` element is scrubbed. A free-form geographic
+  reference inside `<detail><remarks>` or a callsign embedded in
+  `<__group name="...">` is NOT masked. For payloads where any
+  byte of the body is sensitive, use `MaskPayload`.
+- **`msg.metadata.message_type`** — under `MaskPayload` this is coerced
+  to `other:masked`, but under `MaskPoint` the original type (Position,
+  Alert, etc.) is preserved and discloses the event category.
+
+When a policy requires stronger redaction than either masker provides,
+the correct tool is an explicit `Deny` rule — the dispatcher does not
+attempt to sanitize metadata.
 
 ## Subject attributes
 
