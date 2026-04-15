@@ -96,6 +96,9 @@ crate = "rustgate-mqtt"
 [[licenses.exceptions]]
 allow = ["LicenseRef-Proprietary"]
 crate = "rustgate-http"
+[[licenses.exceptions]]
+allow = ["LicenseRef-Proprietary"]
+crate = "rustgate-mavlink"
 
 [bans]
 multiple-versions = "warn"

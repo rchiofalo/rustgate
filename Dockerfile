@@ -17,6 +17,7 @@ COPY crates/rustgate-cot/Cargo.toml         crates/rustgate-cot/Cargo.toml
 COPY crates/rustgate-enrollment/Cargo.toml  crates/rustgate-enrollment/Cargo.toml
 COPY crates/rustgate-federation/Cargo.toml  crates/rustgate-federation/Cargo.toml
 COPY crates/rustgate-http/Cargo.toml       crates/rustgate-http/Cargo.toml
+COPY crates/rustgate-mavlink/Cargo.toml    crates/rustgate-mavlink/Cargo.toml
 COPY crates/rustgate-nats/Cargo.toml        crates/rustgate-nats/Cargo.toml
 COPY crates/rustgate-proto/Cargo.toml       crates/rustgate-proto/Cargo.toml
 COPY crates/rustgate-transport/Cargo.toml   crates/rustgate-transport/Cargo.toml

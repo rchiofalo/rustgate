@@ -3300,6 +3300,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustgate-mavlink"
+version = "0.8.0"
+dependencies = [
+ "bytes",
+ "rustgate-core",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "rustgate-mqtt"
 version = "0.8.0"
 dependencies = [
@@ -3437,6 +3449,7 @@ dependencies = [
  "rustgate-authz",
  "rustgate-core",
  "rustgate-cot",
+ "rustgate-mavlink",
  "rustgate-proto",
  "rustgate-test-utils",
  "rustls",
