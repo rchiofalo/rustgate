@@ -129,7 +129,7 @@ replay cache.
 
 | Obligation | Effect |
 |---|---|
-| `mask_point` | CoT `<point>` coordinates (`lat`, `lon`, `hae`) are zeroed via `rustgate_cot::mask::strip_coordinates`. Only the `<point>` element is touched. Non-CoT payloads are logged once at DEBUG and forwarded unmodified — masking is best-effort leak prevention, not a hard gate. |
+| `mask_point` | CoT `<point>` coordinates (`lat`, `lon`, `hae`) are zeroed via `rustgate_cot::mask::strip_coordinates`. Only the `<point>` element is touched (case-insensitive, namespace-tolerant — `<POINT>`, `<cot:point>` are matched). Recovery rules: non-XML payloads forward unmodified with `recovery = "forwarded_unmasked"` in the audit trail; XML-intent payloads that fail parsing or trip the attribute budget are erased (`recovery = "dropped"`) — a crafted sender cannot leak coordinates by aborting the document after `<point>` was already copied. |
 | `mask_payload` | Payload body replaced with empty `Bytes`; classified message type coerced to `other:masked`. Envelope fields (source identity, destination, timestamps) are preserved so downstream UIs can render a placeholder. |
 | `tag_classified` | Audit-only. Emits `audit.classified_delivery` at the Receive PEP with subject/recipient CNs, resource kind/id, rule id, and policy id. Wire payload is unchanged. |
 | `audit_extended` | Audit-only. Reserved for future expanded audit records; no dataplane side effect today. |
@@ -139,6 +139,24 @@ it is wrapped in `Arc` and fanned out; Receive-side obligations stack
 on each per-recipient copy. `MaskPayload` supersedes `MaskPoint` because
 it replaces the payload entirely — either ordering produces the same
 final (empty) body.
+
+#### Audit events emitted by the obligation dispatcher
+
+| Event | When | Fields |
+|---|---|---|
+| `authz.classified_delivery` | `TagClassified` fires **after** a successful `try_send` on the Receive PEP. Never emitted from the persistence path — a backpressure drop does not produce a phantom delivery record. | `subject_cn`, `recipient_cn`, `action`, `resource_kind`, `resource_id`, `rule_id`, `policy_id`, `result = "tagged"` |
+| `authz.obligation_failed` | `MaskPoint` failed to mask the payload. The dispatcher chose a recovery (`"dropped"` for XML-intent parse failure / attribute-budget trip, `"forwarded_unmasked"` for non-XML payloads where no `<point>` could exist). | `subject_cn`, `obligation`, `error`, `recovery`, `source_protocol`, `destination_kind`, `action = "actuate_obligation"`, `result = "failure"` |
+| `authz.obligation_unknown` | The authz engine emitted an `Obligation` variant unknown to this transport build. The `Obligation` enum is `#[non_exhaustive]`; this event surfaces transport↔authz version skew on operators' dashboards. | `subject_cn`, `obligation` (Debug-formatted variant), `source_protocol`, `destination_kind`, `action = "actuate_obligation"`, `result = "skipped"` |
+
+All three events use `target = "audit"` and are hash-chained when the
+audit log writer is configured for tamper evidence
+(`rustgate_core::audit_chain::HashChainWriter`). `destination_kind` is
+one of `"direct"`, `"group"`, `"broadcast"`, `"multicast"` — stable
+across releases for SIEM rules. `subject_cn` is recorded in plaintext
+by design: the classified-delivery audit is the forensic trail that
+ties a specific user to a specific artefact. See the doc comment on
+`rustgate_core::audit::authz_classified_delivery` for the full PII
+policy rationale.
 
 ### Metadata residue: what the maskers do NOT scrub
 

@@ -80,6 +80,28 @@ pub enum Destination {
     Multicast(Vec<GroupId>),
 }
 
+impl Destination {
+    /// Short ASCII tag naming the destination variant.
+    ///
+    /// Stable across releases — used as a label value in Prometheus
+    /// metrics (where low cardinality matters) and as a field value in
+    /// audit/structured-log records (where SIEM rules grep for the
+    /// exact string). Returns one of:
+    ///
+    /// - `"group"` — unicast to one group
+    /// - `"direct"` — unicast to one CN
+    /// - `"broadcast"` — fan-out to all sessions
+    /// - `"multicast"` — fan-out to multiple groups
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            Self::Group(_) => "group",
+            Self::Direct(_) => "direct",
+            Self::Broadcast => "broadcast",
+            Self::Multicast(_) => "multicast",
+        }
+    }
+}
+
 /// Classified message type.
 ///
 /// The router uses this to make routing decisions — for example, only

@@ -387,13 +387,17 @@ pub fn authz_classified_delivery(
 ///
 /// `obligation` is the unqualified variant name (e.g. `"MaskPoint"`) and
 /// `recovery` is one of `"dropped"` or `"forwarded_unmasked"` describing
-/// what the dispatcher did in response.
+/// what the dispatcher did in response. `destination_kind` is a stable
+/// tag produced by [`crate::message::Destination::kind_str`] so SIEM
+/// rules can distinguish a failure on a unicast direct send from one on
+/// a fan-out broadcast without inspecting the payload.
 pub fn authz_obligation_failed(
     subject_cn: &str,
     obligation: &str,
     error: &str,
     recovery: &str,
     source_protocol: &str,
+    destination_kind: &str,
 ) {
     audit!(
         "authz.obligation_failed",
@@ -402,6 +406,7 @@ pub fn authz_obligation_failed(
         error = %error,
         recovery = %recovery,
         source_protocol = %source_protocol,
+        destination_kind = %destination_kind,
         action = "actuate_obligation",
         result = "failure"
     );
@@ -417,13 +422,23 @@ pub fn authz_obligation_failed(
 /// once per (obligation, subject) tuple per router instance in practice
 /// because unknown variants can only appear if the policy mentions them.
 ///
+/// `destination_kind` mirrors the field on
+/// [`authz_obligation_failed`] so a SIEM can pivot between the two
+/// events without custom mapping.
+///
 /// [`Obligation`]: https://docs.rs/rustgate-authz
-pub fn authz_obligation_unknown(subject_cn: &str, obligation: &str, source_protocol: &str) {
+pub fn authz_obligation_unknown(
+    subject_cn: &str,
+    obligation: &str,
+    source_protocol: &str,
+    destination_kind: &str,
+) {
     audit!(
         "authz.obligation_unknown",
         subject_cn = %subject_cn,
         obligation = %obligation,
         source_protocol = %source_protocol,
+        destination_kind = %destination_kind,
         action = "actuate_obligation",
         result = "skipped"
     );
@@ -728,20 +743,22 @@ mod tests {
                 "<point> attribute count exceeded masking budget of 64",
                 "dropped",
                 "tcp",
+                "broadcast",
             );
             authz_obligation_failed(
                 "alice",
                 "MaskPoint",
-                "not xml",
+                "payload is not XML",
                 "forwarded_unmasked",
                 "mqtt",
+                "direct",
             );
         }
 
         #[test]
         fn test_authz_obligation_unknown() {
-            authz_obligation_unknown("alice", "Quarantine", "tcp");
-            authz_obligation_unknown("", "", "");
+            authz_obligation_unknown("alice", "Quarantine", "tcp", "group");
+            authz_obligation_unknown("", "", "", "");
         }
     }
 

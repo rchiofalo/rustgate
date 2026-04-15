@@ -133,6 +133,7 @@ pub fn apply_obligations(msg: &mut RoutableMessage, obligations: &[Obligation]) 
                     &msg.source.cn,
                     &format!("{other:?}"),
                     &msg.metadata.source_protocol,
+                    msg.destination.kind_str(),
                 );
             }
         }
@@ -187,6 +188,7 @@ fn apply_mask_point(msg: &mut RoutableMessage) {
             "payload is not XML",
             "forwarded_unmasked",
             &msg.metadata.source_protocol,
+            msg.destination.kind_str(),
         );
         return;
     }
@@ -214,6 +216,7 @@ fn apply_mask_point(msg: &mut RoutableMessage) {
                 &format!("{e}"),
                 "dropped",
                 &msg.metadata.source_protocol,
+                msg.destination.kind_str(),
             );
             apply_mask_payload(msg);
         }

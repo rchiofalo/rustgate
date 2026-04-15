@@ -1896,15 +1896,25 @@ impl Router {
                     }
                 } else {
                     // Non-blocking: channel is full or closed. Persist
-                    // the pre-Receive form so the drain path re-evaluates
-                    // the PEP from the original payload — policy may
-                    // change while the client is offline, and re-applying
-                    // an already-applied obligation on drain would bake
-                    // in stale masking. The circuit breaker inside
-                    // `try_send` will disconnect truly slow sessions
-                    // after N consecutive failures. No audit here — the
-                    // drain path re-runs the PEP and audits on actual
-                    // live delivery.
+                    // the pre-Receive form (before `with_obligations`
+                    // rewrapped the payload for this specific recipient)
+                    // so the drain path sees the same bytes it would have
+                    // seen if the client were online. Send-side
+                    // obligations are already baked into `msg` by
+                    // `route_inner`; those are idempotent under re-apply.
+                    // What we must NOT persist is the Receive-side
+                    // actuation, because:
+                    //   1. `TagClassified` would emit `authz.classified_delivery`
+                    //      for a recipient who never saw the wire message,
+                    //      producing a forensic lie on replay.
+                    //   2. On drain, `filter_offline_messages` re-runs
+                    //      the Receive PEP against the *current* policy
+                    //      snapshot — the correct point at which to
+                    //      actuate and audit. Double-actuating `MaskPoint`
+                    //      is harmless (already-zero coords stay zero),
+                    //      but double-auditing TagClassified is not.
+                    // The circuit breaker inside `try_send` disconnects
+                    // truly slow sessions after N consecutive failures.
                     if handle.is_closed() {
                         warn!(session = %cn, "session channel closed, persisting for offline");
                     } else {

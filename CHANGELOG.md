@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- **Harden authz obligation actuation** — closes nine gaps surfaced by a post-merge security audit of the obligation data-plane feature (#717): (1) `MaskPoint` bypass via case variation, namespace prefix, or attribute-budget trip — the matcher in `rustgate_cot::mask` now strips optional `ns:` prefixes, does ASCII-case-insensitive comparison, and propagates attribute-budget errors so the caller fails closed instead of leaking coordinates; (2) `apply_mask_point` ignored `strip_coordinates` errors — now splits on payload intent (non-XML passes through with `recovery = "forwarded_unmasked"`, XML-intent parse failure erases the payload with `recovery = "dropped"`) and emits a new `authz.obligation_failed` audit record on every recovery path; (3) `send_to_session` persisted the *post-Receive* form of the payload to the store-forward queue, causing `TagClassified` audit records to fire for messages that never went over the wire and double-actuating Receive-side obligations on drain — now persists the pre-Receive form so `filter_offline_messages` re-evaluates the Receive PEP against the current policy snapshot; (4) unknown `Obligation` variants (the enum is `#[non_exhaustive]`) now emit an `authz.obligation_unknown` audit record so operators running a stale transport against a newer authz engine detect the skew via the audit trail. Both new audit events carry `destination_kind` (direct/group/broadcast/multicast) so SIEM rules can distinguish unicast from fan-out failures. (#734)
+
 ### Changed
 
 - **Bump `redb` from 2.6.3 to 4.0.0** — adopts the redb 4.x API. `begin_read` now lives on the `ReadableDatabase` trait (imported in `rustgate-transport::store_forward` and `rustgate-federation::replay_persist`). **File format note:** redb 3.0 dropped support for the v2 on-disk format. Existing store-and-forward and federation-replay databases written by redb 2.x may need to be cleared on upgrade; both are ephemeral queues that can be safely rebuilt.
