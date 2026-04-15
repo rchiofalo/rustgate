@@ -41,9 +41,11 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use rustgate_authz::{
-    Action as AuthzAction, Decision as AuthzDecision, PolicyEngine, Resource as AuthzResource,
-    Subject as AuthzSubject,
+    Action as AuthzAction, Decision as AuthzDecision, Obligation, PolicyEngine,
+    Resource as AuthzResource, Subject as AuthzSubject,
 };
+
+use crate::obligations::apply_obligations;
 
 /// Callback invoked after every authz evaluation so operators can wire
 /// the engine into metrics and audit without making `rustgate-transport`
@@ -183,6 +185,28 @@ impl RoutedMessage {
     /// Borrow the underlying `Arc<RoutableMessage>`.
     pub fn inner(&self) -> &Arc<RoutableMessage> {
         &self.msg
+    }
+
+    /// Return a copy of this envelope with authz obligations applied to
+    /// its payload. When `obligations` is empty this is a cheap
+    /// [`Clone`] that reuses the same `Arc<RoutableMessage>`; otherwise
+    /// the payload is cloned out of the `Arc`, mutated via
+    /// [`apply_obligations`], and re-wrapped so other recipients whose
+    /// decisions produced different obligations are not affected.
+    ///
+    /// The backpressure permit is preserved across the rewrap so the
+    /// global admission-control counter continues to reflect the
+    /// message's lifetime.
+    pub(crate) fn with_obligations(&self, obligations: &[Obligation]) -> Self {
+        if obligations.is_empty() {
+            return self.clone();
+        }
+        let mut msg = (*self.msg).clone();
+        apply_obligations(&mut msg, obligations);
+        Self {
+            msg: Arc::new(msg),
+            _permit: self._permit.clone(),
+        }
     }
 }
 
@@ -745,6 +769,40 @@ impl Router {
         outcome
     }
 
+    /// Emit one `authz.classified_delivery` audit record when the
+    /// recipient's Receive decision carried a [`Obligation::TagClassified`].
+    ///
+    /// Kept as a helper so every Receive PEP site (direct, group,
+    /// broadcast, multicast, offline-drain, position replay) emits the
+    /// same fields in the same shape, and so future audit-shaped
+    /// obligations slot in without touching each site individually.
+    #[allow(clippy::too_many_arguments)]
+    fn audit_classified_receive(
+        &self,
+        obligations: &[Obligation],
+        engine: &Arc<dyn PolicyEngine>,
+        subject_cn: &str,
+        recipient_cn: &str,
+        resource_kind: &'static str,
+        resource_id: &str,
+        rule_id: Option<&str>,
+    ) {
+        if obligations
+            .iter()
+            .any(|o| matches!(o, Obligation::TagClassified))
+        {
+            rustgate_core::audit::authz_classified_delivery(
+                subject_cn,
+                recipient_cn,
+                "receive",
+                resource_kind,
+                resource_id,
+                rule_id,
+                engine.policy_id(),
+            );
+        }
+    }
+
     /// Access the position cache for SA replay.
     pub fn cache(&self) -> &PositionCache {
         &self.cache
@@ -1077,7 +1135,7 @@ impl Router {
         // position events to Multicast targeting all groups the sender
         // belongs to. This runs before authz so per-group policy still
         // applies to the expanded destination.
-        let msg = {
+        let mut msg = {
             let mc_guard = self.multicast_config.load();
             if let Some(ref config) = **mc_guard
                 && config.sa_auto_multicast
@@ -1159,6 +1217,15 @@ impl Router {
                         );
                         emit_access(&msg, "authz_deny");
                         return;
+                    }
+                    // Apply data-plane Send obligations to the owned `msg`
+                    // before it is wrapped in Arc and fanned out. Audit-
+                    // shaped obligations (TagClassified, AuditExtended)
+                    // are intentionally *not* emitted at Send time: the
+                    // Receive PEP knows the specific recipient and emits
+                    // `authz.classified_delivery` per delivered copy.
+                    if !outcome.obligations.is_empty() {
+                        apply_obligations(&mut msg, &outcome.obligations);
                     }
                 }
             }
@@ -1281,7 +1348,7 @@ impl Router {
 
         messages
             .into_iter()
-            .filter(|msg| {
+            .filter_map(|mut msg| {
                 // Re-check ACL for group-destined messages.
                 if let Destination::Group(ref group) = msg.destination
                     && let Some(ref acl) = **acl_guard
@@ -1292,7 +1359,7 @@ impl Router {
                             group = %group,
                             "dropping offline message: sender no longer authorized to send"
                         );
-                        return false;
+                        return None;
                     }
                     if !acl.is_receive_authorized(group, recipient_cn) {
                         debug!(
@@ -1300,7 +1367,7 @@ impl Router {
                             group = %group,
                             "dropping offline message: recipient no longer authorized to receive"
                         );
-                        return false;
+                        return None;
                     }
                 }
 
@@ -1321,35 +1388,64 @@ impl Router {
                             AuthzResource::Broadcast
                         }
                     };
-                    let outcome =
+                    let send_outcome =
                         self.authz_evaluate(engine, &subject, &resource, AuthzAction::Send);
-                    if !outcome.is_allow() {
+                    if !send_outcome.is_allow() {
                         debug!(
                             sender = %msg.source.cn,
                             "dropping offline message: sender no longer authorized by policy"
                         );
-                        return false;
+                        return None;
                     }
 
                     // Recipient Receive check
                     let recipient_subject = AuthzSubject::from_identity(recipient_identity);
-                    let outcome = self.authz_evaluate(
+                    let recv_outcome = self.authz_evaluate(
                         engine,
                         &recipient_subject,
                         &resource,
                         AuthzAction::Receive,
                     );
-                    if !outcome.is_allow() {
+                    if !recv_outcome.is_allow() {
                         debug!(
                             sender = %msg.source.cn,
                             recipient = %recipient_identity.cn,
                             "offline message filtered: recipient denied by authz",
                         );
-                        return false;
+                        return None;
                     }
+
+                    // Apply Send obligations first (envelope-level), then
+                    // stack Receive obligations on the already-adjusted
+                    // copy so per-recipient masking composes with
+                    // sender-side policy.
+                    if !send_outcome.obligations.is_empty() {
+                        apply_obligations(&mut msg, &send_outcome.obligations);
+                    }
+                    if !recv_outcome.obligations.is_empty() {
+                        apply_obligations(&mut msg, &recv_outcome.obligations);
+                    }
+
+                    // Audit classified delivery on drain: this is a
+                    // distinct delivery event from the original send
+                    // (policy and obligations are re-evaluated here).
+                    let (resource_kind, resource_id) = match &msg.destination {
+                        Destination::Direct(target) => ("direct", target.cn.as_str()),
+                        Destination::Group(group) => ("group", group.as_ref()),
+                        Destination::Broadcast | Destination::Multicast(_) => ("broadcast", ""),
+                    };
+                    self.audit_classified_receive(
+                        &recv_outcome.obligations,
+                        engine,
+                        msg.source.cn.as_str(),
+                        recipient_identity.cn.as_str(),
+                        resource_kind,
+                        resource_id,
+                        recv_outcome.rule_id.as_deref(),
+                    );
                 }
 
-                true
+                Some(msg)
             })
             .collect()
     }
@@ -1393,7 +1489,7 @@ impl Router {
         let authz: Option<&Arc<dyn PolicyEngine>> = (**authz_guard).as_ref();
         let mut dropped = 0u32;
         let mut total = 0u32;
-        for msg in self.cache.get_all().await {
+        for mut msg in self.cache.get_all().await {
             let shared = msg
                 .source
                 .groups
@@ -1407,21 +1503,79 @@ impl Router {
                 continue;
             }
 
-            // Authz Receive PEP: re-evaluate the recipient against the
-            // current policy. Position replay runs on connect, and the
-            // policy may have changed since the position was cached.
-            if let Some(engine) = authz {
-                let subject = AuthzSubject::with_hash(&handle.identity, handle.subject_hash);
+            // Authz re-evaluation on replay. Positions enter the cache
+            // at ingress time; by the time a new session connects, the
+            // policy may have changed. Two PEPs run here to defend the
+            // replay path:
+            //
+            // 1. Send PEP from the cached *sender's* identity. A policy
+            //    tightening (e.g. adding `MaskGeo` on Send after the
+            //    position was cached with raw coordinates) must take
+            //    effect on replay — otherwise a newly connected session
+            //    observes pre-tightening coordinates that were never
+            //    re-masked in the cache.
+            // 2. Receive PEP from the *recipient's* identity, so rules
+            //    that restrict specific subscribers still apply.
+            //
+            // Send obligations are applied before Receive obligations so
+            // sender-side masking is composed with per-recipient masking
+            // (MaskPayload over MaskGeo = empty body; either order works
+            // since the dispatcher is idempotent).
+            //
+            // The audit event is deferred until after a successful
+            // `try_send` so the record reflects an actual delivery, not
+            // just a policy decision for a message that got dropped on a
+            // full channel.
+            let (recv_obligations, recv_rule_id, engine_for_audit) = if let Some(engine) = authz {
+                let sender_subject = AuthzSubject::from_identity(&msg.source);
                 let resource = AuthzResource::Broadcast;
-                let outcome =
-                    self.authz_evaluate(engine, &subject, &resource, AuthzAction::Receive);
-                if !outcome.is_allow() {
+                let send_outcome =
+                    self.authz_evaluate(engine, &sender_subject, &resource, AuthzAction::Send);
+                if !send_outcome.is_allow() {
+                    // Sender is no longer allowed to send to this
+                    // resource class under the current policy; drop
+                    // the cached position entirely rather than
+                    // replaying pre-deny coordinates.
                     continue;
                 }
-            }
+                if !send_outcome.obligations.is_empty() {
+                    apply_obligations(&mut msg, &send_outcome.obligations);
+                }
+
+                let recipient_subject =
+                    AuthzSubject::with_hash(&handle.identity, handle.subject_hash);
+                let recv_outcome = self.authz_evaluate(
+                    engine,
+                    &recipient_subject,
+                    &resource,
+                    AuthzAction::Receive,
+                );
+                if !recv_outcome.is_allow() {
+                    continue;
+                }
+                if !recv_outcome.obligations.is_empty() {
+                    apply_obligations(&mut msg, &recv_outcome.obligations);
+                }
+                (recv_outcome.obligations, recv_outcome.rule_id, Some(engine))
+            } else {
+                (Vec::new(), None, None)
+            };
 
             total += 1;
-            if !handle.try_send(Arc::new(msg)) {
+            let sender_cn = msg.source.cn.clone();
+            if handle.try_send(Arc::new(msg)) {
+                if let Some(engine) = engine_for_audit {
+                    self.audit_classified_receive(
+                        &recv_obligations,
+                        engine,
+                        sender_cn.as_str(),
+                        handle.identity.cn.as_str(),
+                        "broadcast",
+                        "",
+                        recv_rule_id.as_deref(),
+                    );
+                }
+            } else {
                 dropped += 1;
             }
         }
@@ -1505,7 +1659,13 @@ impl Router {
                 // after drain), which is the correct behavior: policy
                 // may have changed in the interim.
                 let authz_guard = self.authz.load();
-                if let Some(engine) = (**authz_guard).as_ref() {
+                // Capture the obligations + rule_id for deferred audit so
+                // a TagClassified / AuditExtended audit record is only
+                // emitted when delivery actually lands on the wire. If
+                // `try_send` fails and the message falls through to
+                // `persist_for_offline`, the drain path re-evaluates the
+                // PEP at live-delivery time and emits audit then.
+                let (msg, audit_ctx) = if let Some(engine) = (**authz_guard).as_ref() {
                     let subject = AuthzSubject::from_identity(&handle.identity);
                     let resource = AuthzResource::Direct { target_cn: cn };
                     let outcome =
@@ -1522,13 +1682,33 @@ impl Router {
                         );
                         return;
                     }
-                }
-                if !handle.try_send(msg.clone()) {
+                    let sender_cn = msg.source.cn.clone();
+                    let rule_id = outcome.rule_id.as_ref().map(|s| s.to_string());
+                    let msg = msg.with_obligations(&outcome.obligations);
+                    let ctx = Some((Arc::clone(engine), outcome.obligations, rule_id, sender_cn));
+                    (msg, ctx)
+                } else {
+                    (msg, None)
+                };
+                if handle.try_send(msg.clone()) {
+                    if let Some((engine, obligations, rule_id, sender_cn)) = audit_ctx {
+                        self.audit_classified_receive(
+                            &obligations,
+                            &engine,
+                            sender_cn.as_str(),
+                            handle.identity.cn.as_str(),
+                            "direct",
+                            cn,
+                            rule_id.as_deref(),
+                        );
+                    }
+                } else {
                     // Non-blocking: channel is full or closed. Persist
                     // for offline redelivery so the message is not lost.
                     // The circuit breaker inside `try_send` will
                     // disconnect truly slow sessions after N consecutive
-                    // failures.
+                    // failures. No audit here — the drain path re-runs
+                    // the PEP and audits on actual live delivery.
                     if handle.is_closed() {
                         warn!(session = %cn, "session channel closed, persisting for offline");
                     } else {
@@ -1604,13 +1784,18 @@ impl Router {
 
         let mut dropped = 0u32;
         let mut total = 0u32;
-        {
+        // Collect eligible (handle, obligations, rule_id) tuples so the
+        // dispatch loop can fire `audit_classified_receive` only after a
+        // successful `try_send`. Emitting audit inside the filter_map
+        // would record "tagged delivered" for recipients whose channel
+        // later rejects the enqueue — a forensic lie under backpressure.
+        let eligible: Vec<(SessionHandle, Vec<Obligation>, Option<String>)> = {
             let state = self.state.read().await;
             let members = match state.groups.get(group) {
                 Some(m) => m,
                 None => return,
             };
-            for handle in members
+            members
                 .iter()
                 .filter(|cn| *cn != &msg.source.cn)
                 .filter(|cn| {
@@ -1618,14 +1803,17 @@ impl Router {
                         .as_ref()
                         .is_none_or(|acl| acl.is_receive_authorized(group, cn))
                 })
-                .filter_map(|cn| state.sessions.get(cn))
-                .filter(|handle| {
-                    // Per-recipient authz Receive check. The Subject is
-                    // built from the *recipient's* identity so policies
-                    // that deny a specific CN or attribute on receive
-                    // actually take effect.
+                .filter_map(|cn| state.sessions.get(cn).cloned())
+                // Per-recipient authz Receive check. The Subject is built
+                // from the *recipient's* identity so policies that deny a
+                // specific CN or attribute on receive actually take effect.
+                // We yield the obligation vec + rule_id alongside the
+                // handle so the dispatch loop can audit on successful
+                // delivery and rewrap the envelope only when the
+                // recipient's rule produced obligations.
+                .filter_map(|handle| {
                     let Some(engine) = authz else {
-                        return true;
+                        return Some((handle, Vec::new(), None));
                     };
                     let subject = AuthzSubject::with_hash(&handle.identity, handle.subject_hash);
                     let resource = AuthzResource::Group { group };
@@ -1641,19 +1829,31 @@ impl Router {
                             outcome.rule_id.as_deref(),
                             engine.policy_id(),
                         );
+                        return None;
                     }
-                    outcome.is_allow()
+                    let rule_id = outcome.rule_id.as_ref().map(|s| s.to_string());
+                    Some((handle, outcome.obligations, rule_id))
                 })
-            {
-                total += 1;
-                if !handle.try_send(msg.clone()) {
-                    dropped += 1;
+                .collect()
+        };
+        for (handle, obligations, rule_id) in &eligible {
+            total += 1;
+            let delivery = msg.with_obligations(obligations);
+            if handle.try_send(delivery) {
+                if let Some(engine) = authz {
+                    self.audit_classified_receive(
+                        obligations,
+                        engine,
+                        msg.source.cn.as_str(),
+                        handle.identity.cn.as_str(),
+                        "group",
+                        group,
+                        rule_id.as_deref(),
+                    );
                 }
+            } else {
+                dropped += 1;
             }
-            // `msg` is dropped at end of scope: the original envelope
-            // clone held by `route_inner` is released here so the permit
-            // count reflects only the surviving recipient clones that
-            // now live inside the session mpsc channels.
         }
         if dropped > 0 {
             warn!(
@@ -1696,7 +1896,11 @@ impl Router {
         let mut dropped = 0u32;
         let mut filtered = 0u32;
         for handle in &targets {
-            if let Some(engine) = authz {
+            // Stash the per-recipient audit context so the audit record
+            // is only emitted after a successful try_send — otherwise a
+            // channel-full delivery would produce a false-positive
+            // "tagged delivered" forensic record.
+            let (delivery, audit_ctx) = if let Some(engine) = authz {
                 let subject = AuthzSubject::from_identity(&handle.identity);
                 let resource = AuthzResource::Broadcast;
                 let outcome =
@@ -1714,8 +1918,24 @@ impl Router {
                     filtered += 1;
                     continue;
                 }
-            }
-            if !handle.try_send(msg.clone()) {
+                let delivery = msg.with_obligations(&outcome.obligations);
+                (delivery, Some((outcome.obligations, outcome.rule_id)))
+            } else {
+                (msg.clone(), None)
+            };
+            if handle.try_send(delivery) {
+                if let (Some(engine), Some((obligations, rule_id))) = (authz, audit_ctx) {
+                    self.audit_classified_receive(
+                        &obligations,
+                        engine,
+                        msg.source.cn.as_str(),
+                        handle.identity.cn.as_str(),
+                        "broadcast",
+                        "",
+                        rule_id.as_deref(),
+                    );
+                }
+            } else {
                 dropped += 1;
             }
         }
@@ -1792,7 +2012,12 @@ impl Router {
         // route_inner intentionally skips Multicast (it cannot represent
         // per-group granularity), so each group in the multicast fan-out
         // must evaluate the Send action independently.
-        if let Some(engine) = authz {
+        //
+        // Send obligations are applied to the envelope up-front so the
+        // Receive PEP loop below dispatches the Send-masked form to every
+        // recipient — cheaper than rewrapping per-recipient when the
+        // group's Send rule produces a `MaskGeo` or `MaskPayload`.
+        let msg = if let Some(engine) = authz {
             let subject = AuthzSubject::from_identity(&msg.source);
             let resource = AuthzResource::Group { group };
             let outcome = self.authz_evaluate(engine, &subject, &resource, AuthzAction::Send);
@@ -1808,14 +2033,19 @@ impl Router {
                 );
                 return;
             }
-        }
+            msg.with_obligations(&outcome.obligations)
+        } else {
+            msg
+        };
 
         let mut dropped = 0u32;
         let mut total = 0u32;
         // Collect eligible handles so the borrow on `delivered` from
         // the filter chain does not overlap with the mutable insert
-        // below.
-        let eligible: Vec<SessionHandle> = {
+        // below. We carry the rule_id alongside the obligations so the
+        // dispatch loop can fire `audit_classified_receive` only after a
+        // successful `try_send`.
+        let eligible: Vec<(SessionHandle, Vec<Obligation>, Option<String>)> = {
             let state = self.state.read().await;
             let members = match state.groups.get(group) {
                 Some(m) => m,
@@ -1831,9 +2061,9 @@ impl Router {
                         .is_none_or(|acl| acl.is_receive_authorized(group, cn))
                 })
                 .filter_map(|cn| state.sessions.get(cn).cloned())
-                .filter(|handle| {
+                .filter_map(|handle| {
                     let Some(engine) = authz else {
-                        return true;
+                        return Some((handle, Vec::new(), None));
                     };
                     let subject = AuthzSubject::with_hash(&handle.identity, handle.subject_hash);
                     let resource = AuthzResource::Group { group };
@@ -1849,15 +2079,29 @@ impl Router {
                             outcome.rule_id.as_deref(),
                             engine.policy_id(),
                         );
+                        return None;
                     }
-                    outcome.is_allow()
+                    let rule_id = outcome.rule_id.as_ref().map(|s| s.to_string());
+                    Some((handle, outcome.obligations, rule_id))
                 })
                 .collect()
         };
-        for handle in &eligible {
+        for (handle, obligations, rule_id) in &eligible {
             total += 1;
-            if handle.try_send(msg.clone()) {
+            let delivery = msg.with_obligations(obligations);
+            if handle.try_send(delivery) {
                 let _ = delivered.insert(handle.identity.cn.to_string());
+                if let Some(engine) = authz {
+                    self.audit_classified_receive(
+                        obligations,
+                        engine,
+                        msg.source.cn.as_str(),
+                        handle.identity.cn.as_str(),
+                        "group",
+                        group,
+                        rule_id.as_deref(),
+                    );
+                }
             } else {
                 dropped += 1;
             }

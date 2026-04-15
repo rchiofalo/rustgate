@@ -24,8 +24,8 @@ use bytes::Bytes;
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
 use rustgate_transport::rustgate_authz::{
-    Action, DecisionOutcome, Effect, NativeEngine, PolicyEngine, Resource, ResourceMatcher, Rule,
-    RuleSet, Subject, SubjectMatcher,
+    Action, Decision, DecisionOutcome, Effect, NativeEngine, Obligation, PolicyEngine, Resource,
+    ResourceMatcher, Rule, RuleSet, Subject, SubjectMatcher,
 };
 use rustgate_transport::{Router, SessionHandle};
 use tokio::sync::mpsc;
@@ -428,5 +428,498 @@ async fn store_forward_drain_allows_delivery_when_policy_permits() {
         filtered.len(),
         1,
         "allow-all policy must permit delivery of queued messages"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Obligation actuation (MaskGeo / MaskPayload / TagClassified)
+// ---------------------------------------------------------------------------
+
+const SAMPLE_COT: &[u8] = br#"<event uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><point lat="38.8977" lon="-77.0365" hae="125.4"/></event>"#;
+
+fn position(source: &Arc<Identity>, dest: Destination) -> RoutableMessage {
+    RoutableMessage {
+        source: (**source).clone(),
+        destination: dest,
+        payload: Bytes::from_static(SAMPLE_COT),
+        metadata: Metadata {
+            received_at: SystemTime::now(),
+            source_protocol: "cot".to_string(),
+            message_type: MessageType::Position,
+            ttl: None,
+        },
+    }
+}
+
+/// Allow every decision, attaching `obligations` on the given `action` only.
+/// Other actions return a plain allow so Send and Receive can be shaped
+/// independently (e.g. receive-side masking without affecting the sender's
+/// Send PEP outcome).
+struct AllowWithObligationEngine {
+    target_action: Action,
+    obligations: Vec<Obligation>,
+}
+
+impl PolicyEngine for AllowWithObligationEngine {
+    fn evaluate(&self, _s: &Subject<'_>, _r: &Resource<'_>, a: Action) -> DecisionOutcome {
+        let obligations = if a == self.target_action {
+            self.obligations.clone()
+        } else {
+            Vec::new()
+        };
+        DecisionOutcome {
+            decision: Decision::Allow,
+            rule_id: Some(smol_str::SmolStr::new("test-obligation")),
+            obligations,
+        }
+    }
+    fn policy_id(&self) -> &str {
+        "test-obligation"
+    }
+}
+
+fn allow_with_obligation(action: Action, obligation: Obligation) -> Arc<dyn PolicyEngine> {
+    Arc::new(AllowWithObligationEngine {
+        target_action: action,
+        obligations: vec![obligation],
+    })
+}
+
+/// Recipient-side `MaskGeo` on a group message must zero the CoT `<point>`
+/// coordinates before delivery. The sender is unaffected because the
+/// router fans out a per-recipient copy.
+#[tokio::test]
+async fn allow_with_mask_geo_for_receive_masks_group_payload() {
+    let router =
+        Router::new().with_authz(allow_with_obligation(Action::Receive, Obligation::MaskGeo));
+    let alice = identity("alice", &["alpha"]);
+    let bob = identity("bob", &["alpha"]);
+
+    let (ptx_a, ntx_a, mut prx_a, _na) = channels();
+    let (ptx_b, ntx_b, _pb, _nb) = channels();
+    router
+        .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
+        .await;
+    router
+        .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+        .await;
+
+    router
+        .route(position(&bob, Destination::Group("alpha".into())))
+        .await;
+
+    let got = prx_a.try_recv().expect("alice should receive");
+    let s = std::str::from_utf8(&got.payload).expect("masked payload is valid UTF-8");
+    assert!(s.contains(r#"lat="0.0""#), "lat not zeroed: {s}");
+    assert!(s.contains(r#"lon="0.0""#), "lon not zeroed: {s}");
+    assert!(!s.contains("38.8977"), "raw lat leaked: {s}");
+}
+
+/// Recipient-side `MaskPayload` on a direct unicast must strip the body
+/// and coerce the classified message type to `other:masked`, but still
+/// deliver the envelope so downstream UIs can render a placeholder.
+#[tokio::test]
+async fn allow_with_mask_payload_for_receive_strips_direct_body() {
+    let router = Router::new().with_authz(allow_with_obligation(
+        Action::Receive,
+        Obligation::MaskPayload,
+    ));
+    let alice = identity("alice", &["alpha"]);
+    let charlie = identity("charlie", &["alpha"]);
+
+    let (ptx_a, ntx_a, _pa, _na) = channels();
+    // MaskPayload coerces message_type to `other:masked`, so the message
+    // is routed on the *normal* channel even though the source was a
+    // position. The coercion happens inside the router's Receive PEP
+    // per-recipient; the classification at try_send time reflects the
+    // masked type.
+    let (ptx_c, ntx_c, mut prx_c, mut nrx_c) = channels();
+    router
+        .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
+        .await;
+    router
+        .register(SessionHandle::new(charlie.clone(), ptx_c, ntx_c))
+        .await;
+
+    router
+        .route(position(&alice, Destination::Direct((*charlie).clone())))
+        .await;
+
+    // The router classifies priority based on the pre-obligation message
+    // type (Position), so the delivery still lands on the priority
+    // channel — but the copy carries an emptied body with coerced type.
+    let got = prx_c
+        .try_recv()
+        .or_else(|_| nrx_c.try_recv())
+        .expect("charlie should receive on priority or normal channel");
+    assert!(
+        got.payload.is_empty(),
+        "payload must be wiped by MaskPayload"
+    );
+    assert_eq!(
+        got.metadata.message_type,
+        MessageType::Other("masked".into()),
+        "message type must be coerced to other:masked"
+    );
+    // Envelope fields preserved for downstream rendering.
+    assert_eq!(got.source.cn, "alice");
+}
+
+/// Broadcast must apply `MaskGeo` on Receive per-recipient without
+/// mutating the sender's in-flight copy (each recipient gets an
+/// independently-masked envelope).
+#[tokio::test]
+async fn allow_with_mask_geo_on_broadcast_masks_each_recipient() {
+    let router =
+        Router::new().with_authz(allow_with_obligation(Action::Receive, Obligation::MaskGeo));
+    let alice = identity("alice", &["alpha"]);
+    let bob = identity("bob", &["alpha"]);
+    let charlie = identity("charlie", &["alpha"]);
+
+    let (ptx_a, ntx_a, mut prx_a, _na) = channels();
+    let (ptx_b, ntx_b, _pb, _nb) = channels();
+    let (ptx_c, ntx_c, mut prx_c, _nc) = channels();
+    router
+        .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
+        .await;
+    router
+        .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+        .await;
+    router
+        .register(SessionHandle::new(charlie.clone(), ptx_c, ntx_c))
+        .await;
+
+    router.route(position(&bob, Destination::Broadcast)).await;
+
+    let got_a = prx_a.try_recv().expect("alice should receive");
+    let got_c = prx_c.try_recv().expect("charlie should receive");
+    for (who, got) in [("alice", &got_a), ("charlie", &got_c)] {
+        let s = std::str::from_utf8(&got.payload).expect("masked payload is valid UTF-8");
+        assert!(s.contains(r#"lat="0.0""#), "{who}: lat not zeroed: {s}");
+        assert!(!s.contains("38.8977"), "{who}: raw lat leaked: {s}");
+    }
+}
+
+/// Position replay on reconnect must re-apply the current Receive
+/// obligations — a recipient who can no longer see raw coordinates in
+/// the live stream must not receive them via SA replay either.
+#[tokio::test]
+async fn position_replay_applies_mask_geo_obligation() {
+    // Step 1: cache a position with no authz engine (so cache.store fires).
+    let router = Router::new();
+    let alice = identity("alice", &["alpha"]);
+    let bob = identity("bob", &["alpha"]);
+
+    let (ptx_a, ntx_a, _pa, _na) = channels();
+    router
+        .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
+        .await;
+    router.route(position(&alice, Destination::Broadcast)).await;
+
+    // Step 2: install a MaskGeo-on-Receive policy, then replay to bob.
+    router.swap_authz(allow_with_obligation(Action::Receive, Obligation::MaskGeo));
+    let (ptx_b, ntx_b, mut prx_b, _nb) = channels();
+    let bob_handle = SessionHandle::new(bob.clone(), ptx_b, ntx_b);
+    router.replay_positions(&bob_handle).await;
+
+    let got = prx_b.try_recv().expect("bob should receive replay");
+    let s = std::str::from_utf8(&got.payload).expect("masked payload is valid UTF-8");
+    assert!(s.contains(r#"lat="0.0""#), "replay not masked: {s}");
+    assert!(!s.contains("38.8977"), "raw lat leaked through replay: {s}");
+}
+
+/// Store-forward drain must apply per-recipient obligations when
+/// delivering queued messages. A policy change while the client was
+/// offline — adding `MaskPayload` on Receive — must take effect on
+/// drain, not just on live fan-out.
+#[tokio::test]
+async fn store_forward_drain_applies_mask_payload_obligation() {
+    use rustgate_transport::ClientQueue;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let queue = std::sync::Arc::new(ClientQueue::open(tmp.path(), 1_000_000).unwrap());
+
+    // Queue a direct message with no authz engine active.
+    let router = Router::new().with_client_queue(std::sync::Arc::clone(&queue));
+    let alice = identity("alice", &["alpha"]);
+    let bob = identity("bob", &["alpha"]);
+
+    router
+        .route(position(&alice, Destination::Direct((*bob).clone())))
+        .await;
+
+    for _ in 0..200 {
+        if queue.stats("bob").depth == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(queue.stats("bob").depth, 1);
+
+    // Install MaskPayload-on-Receive and drain.
+    router.swap_authz(allow_with_obligation(
+        Action::Receive,
+        Obligation::MaskPayload,
+    ));
+    let drained = router.drain_offline_messages("bob").await;
+    let filtered = router.filter_offline_messages(&bob, drained);
+
+    assert_eq!(filtered.len(), 1, "message must survive allow decision");
+    let msg = &filtered[0];
+    assert!(msg.payload.is_empty(), "drain must apply MaskPayload");
+    assert_eq!(
+        msg.metadata.message_type,
+        MessageType::Other("masked".into())
+    );
+}
+
+/// `TagClassified` is an audit-only obligation: the dispatcher must not
+/// touch the payload or metadata. The audit record emission itself is
+/// verified indirectly through the router's `audit_classified_receive`
+/// helper; here we prove the wire payload passes through unchanged.
+#[tokio::test]
+async fn tag_classified_does_not_mutate_payload() {
+    let router = Router::new().with_authz(allow_with_obligation(
+        Action::Receive,
+        Obligation::TagClassified,
+    ));
+    let alice = identity("alice", &["alpha"]);
+    let bob = identity("bob", &["alpha"]);
+
+    let (ptx_a, ntx_a, mut prx_a, _na) = channels();
+    let (ptx_b, ntx_b, _pb, _nb) = channels();
+    router
+        .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
+        .await;
+    router
+        .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+        .await;
+
+    router
+        .route(position(&bob, Destination::Group("alpha".into())))
+        .await;
+
+    let got = prx_a.try_recv().expect("alice should receive");
+    assert_eq!(
+        got.payload.as_ref(),
+        SAMPLE_COT,
+        "payload must be untouched"
+    );
+    assert_eq!(got.metadata.message_type, MessageType::Position);
+}
+
+/// Send-side `MaskGeo` is applied once on the envelope before fan-out,
+/// so every recipient on a broadcast sees the same masked copy.
+#[tokio::test]
+async fn send_side_mask_geo_masks_before_fanout() {
+    let router = Router::new().with_authz(allow_with_obligation(Action::Send, Obligation::MaskGeo));
+    let alice = identity("alice", &["alpha"]);
+    let bob = identity("bob", &["alpha"]);
+    let charlie = identity("charlie", &["alpha"]);
+
+    let (ptx_a, ntx_a, mut prx_a, _na) = channels();
+    let (ptx_b, ntx_b, _pb, _nb) = channels();
+    let (ptx_c, ntx_c, mut prx_c, _nc) = channels();
+    router
+        .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
+        .await;
+    router
+        .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+        .await;
+    router
+        .register(SessionHandle::new(charlie.clone(), ptx_c, ntx_c))
+        .await;
+
+    router.route(position(&bob, Destination::Broadcast)).await;
+
+    for (who, rx) in [("alice", &mut prx_a), ("charlie", &mut prx_c)] {
+        let got = rx
+            .try_recv()
+            .unwrap_or_else(|_| panic!("{who} should receive"));
+        let s = std::str::from_utf8(&got.payload).expect("masked payload is valid UTF-8");
+        assert!(
+            s.contains(r#"lat="0.0""#),
+            "{who}: send-side mask not applied: {s}"
+        );
+        assert!(!s.contains("38.8977"), "{who}: raw lat leaked: {s}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Audit fidelity: classified_delivery must only fire on successful delivery
+// ---------------------------------------------------------------------------
+
+/// When `try_send` fails (channel full or session closed), the router must
+/// NOT emit an `authz.classified_delivery` audit record. Emitting one
+/// anyway would misrepresent a dropped message as a delivered tagged copy
+/// — forensically worse than a missing record because a compliance
+/// reviewer would see a tag for material the recipient never observed.
+///
+/// The drain path (`filter_offline_messages`) owns the audit record for
+/// store-forward redelivery at live-delivery time, so a channel-full
+/// persistence path that later drains + delivers still produces exactly
+/// one classified_delivery record per actual on-the-wire delivery.
+#[tokio::test(flavor = "current_thread")]
+async fn classified_delivery_audit_skipped_when_try_send_fails() {
+    use std::io::Write;
+    use std::sync::Mutex;
+
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::filter::Targets;
+    use tracing_subscriber::fmt::MakeWriter;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+    impl SharedBuf {
+        fn snapshot(&self) -> String {
+            let g = self.0.lock().unwrap();
+            String::from_utf8_lossy(&g).into_owned()
+        }
+    }
+    impl Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> MakeWriter<'a> for SharedBuf {
+        type Writer = SharedBuf;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    let buf = SharedBuf::default();
+    let layer = tracing_subscriber::fmt::layer()
+        .json()
+        .with_writer(buf.clone())
+        .with_filter(Targets::new().with_target("audit", tracing::Level::INFO));
+    let subscriber = tracing_subscriber::registry().with(layer);
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    // TagClassified on Receive: a successful delivery emits exactly one
+    // `authz.classified_delivery` audit record per recipient. A failed
+    // delivery must emit none — that is the invariant under test.
+    let router = Router::new().with_authz(allow_with_obligation(
+        Action::Receive,
+        Obligation::TagClassified,
+    ));
+    let alice = identity("alice", &["alpha"]);
+    let bob = identity("bob", &["alpha"]);
+
+    // Recipient channels sized 1 and pre-filled, so the next `try_send`
+    // by the router into either channel fails with "full".
+    let (ptx_b, ntx_b, _prx_b, _nrx_b) = {
+        let (ptx, prx) = mpsc::channel(1);
+        let (ntx, nrx) = mpsc::channel(1);
+        // Saturate the normal channel. Chat is non-priority, so
+        // `send_to_session` routes into this one.
+        ntx.try_send(rustgate_transport::RoutedMessage::from(Arc::new(chat(
+            &alice,
+            Destination::Direct((*bob).clone()),
+        ))))
+        .expect("pre-fill should succeed");
+        // Also saturate the priority channel so the classification path
+        // cannot fall back to it for any message variant.
+        ptx.try_send(rustgate_transport::RoutedMessage::from(Arc::new(chat(
+            &alice,
+            Destination::Direct((*bob).clone()),
+        ))))
+        .expect("pre-fill should succeed");
+        (ptx, ntx, prx, nrx)
+    };
+    router
+        .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+        .await;
+
+    // Route a direct message — delivery must fail with both bob channels
+    // already at capacity. The audit emission is deferred until after a
+    // successful `try_send`, so no classified_delivery line should land
+    // in the buffer.
+    router
+        .route(chat(&alice, Destination::Direct((*bob).clone())))
+        .await;
+
+    let captured = buf.snapshot();
+    assert!(
+        !captured.contains("\"event_type\":\"authz.classified_delivery\""),
+        "classified_delivery audit must not fire when try_send drops the \
+         message; captured: {captured}"
+    );
+}
+
+/// Converse of the above: a successful delivery DOES emit exactly one
+/// `authz.classified_delivery` audit record per on-the-wire recipient.
+/// Paired with the "skipped when try_send fails" test, this pins the
+/// invariant: audit fidelity = delivery count, not policy-decision count.
+#[tokio::test(flavor = "current_thread")]
+async fn classified_delivery_audit_fires_on_successful_delivery() {
+    use std::io::Write;
+    use std::sync::Mutex;
+
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::filter::Targets;
+    use tracing_subscriber::fmt::MakeWriter;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+    impl SharedBuf {
+        fn snapshot(&self) -> String {
+            let g = self.0.lock().unwrap();
+            String::from_utf8_lossy(&g).into_owned()
+        }
+    }
+    impl Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> MakeWriter<'a> for SharedBuf {
+        type Writer = SharedBuf;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    let buf = SharedBuf::default();
+    let layer = tracing_subscriber::fmt::layer()
+        .json()
+        .with_writer(buf.clone())
+        .with_filter(Targets::new().with_target("audit", tracing::Level::INFO));
+    let subscriber = tracing_subscriber::registry().with(layer);
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let router = Router::new().with_authz(allow_with_obligation(
+        Action::Receive,
+        Obligation::TagClassified,
+    ));
+    let alice = identity("alice", &["alpha"]);
+    let bob = identity("bob", &["alpha"]);
+
+    let (ptx_b, ntx_b, _pb, mut nrx_b) = channels();
+    router
+        .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+        .await;
+
+    router
+        .route(chat(&alice, Destination::Direct((*bob).clone())))
+        .await;
+
+    // Drain the delivery so the assertion cannot race the emit.
+    let _ = nrx_b.recv().await.expect("bob should receive");
+
+    let captured = buf.snapshot();
+    assert!(
+        captured.contains("\"event_type\":\"authz.classified_delivery\""),
+        "successful delivery must emit classified_delivery audit; captured: {captured}"
     );
 }

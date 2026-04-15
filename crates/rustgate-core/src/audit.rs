@@ -327,6 +327,41 @@ pub fn authz_denied(
     );
 }
 
+/// Record delivery of a message carrying a `TagClassified` obligation.
+///
+/// Emitted once per recipient by the router's policy enforcement point
+/// when the authz engine returns an allow decision whose obligation list
+/// contains the `TagClassified` obligation
+/// (see `rustgate_authz::Obligation`).
+///
+/// The event captures enough provenance to reconstruct which subject
+/// sent which classified artefact to which recipient under which policy
+/// rule — the downstream hash-chained audit log turns those records into
+/// a tamper-evident delivery trail. This is the mechanism by which
+/// `TagClassified` graduates from a policy hint to an operator-visible
+/// compliance artefact without modifying the wire payload.
+pub fn authz_classified_delivery(
+    subject_cn: &str,
+    recipient_cn: &str,
+    action: &str,
+    resource_kind: &str,
+    resource_id: &str,
+    rule_id: Option<&str>,
+    policy_id: &str,
+) {
+    audit!(
+        "authz.classified_delivery",
+        subject_cn = %subject_cn,
+        recipient_cn = %recipient_cn,
+        action = %action,
+        resource_kind = %resource_kind,
+        resource_id = %resource_id,
+        rule_id = rule_id.unwrap_or(""),
+        policy_id = %policy_id,
+        result = "tagged"
+    );
+}
+
 /// Record a successful authz policy reload.
 pub fn authz_reload_success(path: &str, policy_id: &str, rule_count: usize) {
     audit!(
@@ -588,6 +623,34 @@ mod tests {
             tls_handshake_failed("10.0.0.***:4433", "certificate expired", "verification");
             tls_handshake_failed("192.168.1.***:9443", "timeout", "negotiation");
             tls_handshake_failed("[::1]:443", "unknown CA", "chain_validation");
+        }
+    }
+
+    mod authz {
+        use super::*;
+
+        #[test]
+        fn test_authz_classified_delivery() {
+            authz_classified_delivery(
+                "alice",
+                "bob",
+                "send",
+                "group",
+                "team-alpha",
+                Some("rule-classified-1"),
+                "policy-v1",
+            );
+            // No rule_id path: the audit helper must tolerate an absent
+            // rule identifier (e.g. default-effect allow).
+            authz_classified_delivery(
+                "alice",
+                "bob",
+                "receive",
+                "direct",
+                "bob",
+                None,
+                "policy-v1",
+            );
         }
     }
 
