@@ -340,12 +340,21 @@ struct ClassifiedAuditCtx {
 // the derive would fail. Projecting to `policy_id()` is also safer —
 // a future engine impl could accidentally `{:?}` log sensitive rule
 // contents if we leaned on a blanket debug derive.
+//
+// CN fields are hashed via [`hash_cn`] (defense-in-depth): the audit
+// path that legitimately records plaintext CNs goes through
+// [`rustgate_core::audit::authz_classified_delivery`] with a dedicated
+// `"audit"` tracing target. A stray `{:?}` of this struct elsewhere —
+// in an operator-facing DEBUG stream, an error chain, or a future
+// diagnostic — must not leak the classified-delivery identity pair.
+// `resource_id` is not hashed because it is already a caller-supplied
+// group name or broadcast tag, not a PII-carrying subject.
 impl std::fmt::Debug for ClassifiedAuditCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClassifiedAuditCtx")
             .field("engine_policy_id", &self.engine.policy_id())
-            .field("sender_cn", &self.sender_cn)
-            .field("recipient_cn", &self.recipient_cn)
+            .field("sender_cn_hash", &hash_cn(&self.sender_cn))
+            .field("recipient_cn_hash", &hash_cn(&self.recipient_cn))
             .field("resource_kind", &self.resource_kind)
             .field("resource_id", &self.resource_id)
             .field("rule_id", &self.rule_id)
@@ -1213,9 +1222,9 @@ impl Router {
     /// - `None` — the message was dropped by the router. Specifically:
     ///   cross-path dedup matched, the TTL expired before dispatch, the
     ///   Send PEP denied (audit record emitted), or a multicast fanout
-    ///   exceeded [`MAX_MULTICAST_GROUPS`]. Callers MUST skip all egress
-    ///   dispatch in this case so no external sink observes a locally-
-    ///   dropped message.
+    ///   exceeded the internal `MAX_MULTICAST_GROUPS` cap. Callers MUST
+    ///   skip all egress dispatch in this case so no external sink
+    ///   observes a locally-dropped message.
     ///
     /// **Multicast caveat** — the Send PEP runs per-group inside the
     /// multicast fanout (see `send_to_group_excluding`), so the returned

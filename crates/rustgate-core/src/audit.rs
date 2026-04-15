@@ -365,7 +365,7 @@ pub fn authz_denied(
 /// same material. Concretely:
 ///
 /// - Prefer a dedicated hash-chained audit file
-///   ([`rustgate_core::audit_chain::HashChainWriter`]) on an encrypted
+///   ([`crate::audit_chain::HashChainWriter`]) on an encrypted
 ///   volume over a shared syslog/journald stream.
 /// - If using a SIEM, confirm its ingest channel and retention store
 ///   both satisfy the handling caveat that applies to the classified
