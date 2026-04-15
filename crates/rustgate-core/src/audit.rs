@@ -343,11 +343,11 @@ pub fn authz_denied(
 ///
 /// # Identity fields
 ///
-/// Unlike `access`-targeted logs (which hash CNs via
-/// [`crate::masking::hash_cn`] for PII safety on routine traffic), this
-/// audit event records the plaintext `subject_cn` and `recipient_cn` **by
-/// design**. Classified-delivery audit is the forensic trail that ties a
-/// specific user to a specific classified artefact at a specific time —
+/// Unlike `access`-targeted logs (which hash CNs for PII safety on
+/// routine traffic), this audit event records the plaintext `subject_cn`
+/// and `recipient_cn` **by design**. Classified-delivery audit is the
+/// forensic trail that ties a specific user to a specific classified
+/// artefact at a specific time —
 /// the record is useless without clear-text identity attribution. This
 /// asymmetry is intentional: the audit sink is expected to carry the same
 /// or stricter access controls as the classified traffic itself, so a

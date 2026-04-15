@@ -45,8 +45,7 @@
 //! CoT uses lowercase `<point>` without a namespace, but accepting the
 //! common variants closes the obvious bypass where a sender wraps the
 //! element in a prefix to dodge a byte-exact match. See
-//! [`strip_coordinates`] for the behaviour and [`is_point_tag`] for the
-//! matcher.
+//! [`strip_coordinates`] for the behaviour.
 
 use std::{fmt, io};
 
@@ -166,7 +165,7 @@ fn is_point_tag(name: &[u8]) -> bool {
 /// same element. Elements other than `<point>` are passed through
 /// unchanged. Comments, processing instructions, CDATA sections, and
 /// whitespace are all preserved. Matching is case-insensitive and
-/// tolerant of a namespace prefix — see [`is_point_tag`].
+/// tolerant of a namespace prefix (e.g. `<cot:Point>` also matches).
 ///
 /// Payloads whose first non-whitespace byte is not `<` are treated as
 /// non-XML and returned verbatim without invoking the parser. This is a
