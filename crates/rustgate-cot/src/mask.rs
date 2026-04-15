@@ -3,7 +3,7 @@
 //! Authorization obligation helpers for CoT XML payloads.
 //!
 //! Implements the data-plane side of the `MaskGeo` authz obligation
-//! defined in [`rustgate_authz::Obligation`]. The router calls
+//! defined in `rustgate_authz::Obligation`. The router calls
 //! [`strip_coordinates`] on a per-recipient basis when the policy engine
 //! returns an allow decision carrying `MaskGeo`, so analysts who are
 //! cleared to see the event metadata but not its geography receive a copy
@@ -23,11 +23,13 @@
 //! - All other XML (event metadata, detail children, source group) is
 //!   passed through byte-for-byte.
 //!
-//! Non-CoT payloads cause [`MaskError::NotCot`]; the caller is expected
-//! to log once and pass the original payload through. `MaskGeo` is a
-//! best-effort leak-prevention obligation, not a hard security boundary —
-//! denying delivery entirely because the payload happens not to be CoT
-//! would surprise operators whose policies predate a payload-type change.
+//! Malformed XML returns [`MaskError::Xml`]; the caller is expected to
+//! log once and pass the original payload through. Valid XML that simply
+//! lacks a `<point>` element is passed through byte-for-byte without
+//! error. `MaskGeo` is a best-effort leak-prevention obligation, not a
+//! hard security boundary — denying delivery entirely because the payload
+//! happens not to be CoT would surprise operators whose policies predate
+//! a payload-type change.
 
 use std::{fmt, io};
 

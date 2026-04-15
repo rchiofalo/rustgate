@@ -18,8 +18,8 @@
 //!   [`rustgate_cot::mask::strip_coordinates`].
 //! - [`Obligation::MaskPayload`] — the payload body is replaced with an
 //!   empty [`Bytes`] and the classified message type is coerced to
-//!   [`MessageType::Other("masked")`] so downstream caches and dedup do
-//!   not mistake it for the real event.
+//!   [`MessageType::Other`] with a `"masked"` tag so downstream caches
+//!   and dedup do not mistake it for the real event.
 //!
 //! [`Obligation::TagClassified`] and [`Obligation::AuditExtended`] are
 //! audit-only obligations. They are handled at the call site via
