@@ -1184,6 +1184,47 @@ impl Router {
     /// for offline redelivery; group and broadcast messages to full
     /// channels are dropped and counted.
     pub async fn route(&self, msg: RoutableMessage) {
+        // Thin wrapper around [`Self::route_for_egress`] for callers that
+        // do not forward messages to external sinks (NATS bridge,
+        // federation, HTTP webhooks). Internal-only delivery discards the
+        // post-Send-PEP form because all data-plane obligations have
+        // already been baked into the per-session fanout.
+        let _ = self.route_for_egress(msg).await;
+    }
+
+    /// Route a message and return the post-Send-PEP form suitable for
+    /// fire-and-forget egress forwarding (NATS, federation, HTTP).
+    ///
+    /// Egress forwarders MUST call this method (not [`Self::route`]) and
+    /// dispatch using the returned `Arc` — otherwise Send-PEP obligations
+    /// such as [`rustgate_authz::Obligation::MaskPoint`] and
+    /// [`rustgate_authz::Obligation::MaskPayload`] are applied to the
+    /// local-fanout copy only, and the raw pre-mutation payload leaks to
+    /// external sinks (e.g. unmasked coordinates reach a SIEM).
+    ///
+    /// Return values:
+    ///
+    /// - `Some(arc)` — the message was admitted, Send PEP passed, any
+    ///   data-plane obligations have been applied, and local fanout has
+    ///   been triggered. The returned `Arc` wraps the same mutated
+    ///   [`RoutableMessage`] that was delivered to local sessions. Egress
+    ///   forwarders receive exactly the same wire form as the in-process
+    ///   recipients.
+    /// - `None` — the message was dropped by the router. Specifically:
+    ///   cross-path dedup matched, the TTL expired before dispatch, the
+    ///   Send PEP denied (audit record emitted), or a multicast fanout
+    ///   exceeded [`MAX_MULTICAST_GROUPS`]. Callers MUST skip all egress
+    ///   dispatch in this case so no external sink observes a locally-
+    ///   dropped message.
+    ///
+    /// **Multicast caveat** — the Send PEP runs per-group inside the
+    /// multicast fanout (see `send_to_group_excluding`), so the returned
+    /// `Arc` for a `Destination::Multicast` message has NOT had any Send
+    /// obligations applied. External egress of multicast messages
+    /// therefore carries the pre-obligation payload. Closing that gap
+    /// requires a first-class `Action::Federate`/`Publish` PEP and is
+    /// tracked as a separate hardening task.
+    pub async fn route_for_egress(&self, msg: RoutableMessage) -> Option<Arc<RoutableMessage>> {
         // Two-layer flow control:
         // 1. BackpressureGate (global): limits total in-flight bytes across
         //    all sessions. Protects system memory by parking the accept loop
@@ -1219,12 +1260,21 @@ impl Router {
             destination = %destination_label,
         );
 
-        self.route_inner(msg, permit).instrument(span).await;
+        self.route_inner(msg, permit).instrument(span).await
     }
 
     /// Inner routing logic, separated so the caller can `.instrument()` a span
     /// around this future without holding an `EnteredSpan` across `.await`.
-    async fn route_inner(&self, msg: RoutableMessage, permit: Option<Arc<BackpressurePermit>>) {
+    ///
+    /// Returns `Some(arc_msg)` when the message was admitted and fanned
+    /// out locally (the returned `Arc` is the same form every local
+    /// recipient received), or `None` when the message was dropped —
+    /// dedup, TTL expiry, Send-PEP deny, or oversize multicast.
+    async fn route_inner(
+        &self,
+        msg: RoutableMessage,
+        permit: Option<Arc<BackpressurePermit>>,
+    ) -> Option<Arc<RoutableMessage>> {
         // Cross-path deduplication: drop the message before any
         // dispatch work if it has already been delivered via another
         // ingress path within the configured window.
@@ -1246,7 +1296,7 @@ impl Router {
                     "duplicate message suppressed by cross-path dedup",
                 );
                 emit_access(&msg, "dedup");
-                return;
+                return None;
             }
         }
 
@@ -1258,7 +1308,7 @@ impl Router {
                 "message expired before delivery — dropping",
             );
             emit_access(&msg, "expired");
-            return;
+            return None;
         }
 
         // SA auto-multicast: when enabled, upgrade Group-destination SA
@@ -1306,74 +1356,89 @@ impl Router {
         // which already checks group membership, ACL, and per-recipient
         // authz. Evaluating a single top-level PEP here would incorrectly
         // map multicast to Broadcast, bypassing per-group policy.
-        let authz_guard = self.authz.load();
-        if let Some(engine) = (**authz_guard).as_ref() {
-            match &msg.destination {
-                Destination::Multicast(_) => {
-                    // Per-group Send PEP and Receive PEP both run inside
-                    // send_to_group_excluding — evaluating a single
-                    // top-level PEP here would incorrectly map multicast
-                    // to Broadcast, bypassing per-group granularity.
-                }
-                dest => {
-                    let subject = AuthzSubject::from_identity(&msg.source);
-                    let resource = match dest {
-                        Destination::Direct(target) => AuthzResource::Direct {
-                            target_cn: target.cn.as_str(),
-                        },
-                        Destination::Group(group) => AuthzResource::Group {
-                            group: group.as_ref(),
-                        },
-                        // Broadcast is the only remaining variant here;
-                        // Multicast is handled above.
-                        _ => AuthzResource::Broadcast,
-                    };
-                    let outcome =
-                        self.authz_evaluate(engine, &subject, &resource, AuthzAction::Send);
-                    if !outcome.is_allow() {
-                        let (kind, id) = match dest {
-                            Destination::Direct(target) => ("direct", target.cn.as_str()),
-                            Destination::Group(group) => ("group", group.as_ref()),
-                            _ => ("broadcast", ""),
-                        };
-                        rustgate_core::audit::authz_denied(
-                            msg.source.cn.as_str(),
-                            msg.source.fingerprint.as_str(),
-                            "send",
-                            kind,
-                            id,
-                            outcome.rule_id.as_deref(),
-                            engine.policy_id(),
-                        );
-                        emit_access(&msg, "authz_deny");
-                        return;
+        //
+        // The Send obligations are collected into an outer `Vec` so the
+        // cache.store below can run on the *pre-obligation* `msg` form.
+        // `replay_positions` re-evaluates the Send PEP on delivery and
+        // re-applies any current-policy obligations, so caching the
+        // pre-mutation form gives late joiners the obligation set that
+        // matches policy at replay time, not the one frozen at ingest.
+        let mut send_obligations: Vec<Obligation> = Vec::new();
+        {
+            let authz_guard = self.authz.load();
+            if let Some(engine) = (**authz_guard).as_ref() {
+                match &msg.destination {
+                    Destination::Multicast(_) => {
+                        // Per-group Send PEP and Receive PEP both run inside
+                        // send_to_group_excluding — evaluating a single
+                        // top-level PEP here would incorrectly map multicast
+                        // to Broadcast, bypassing per-group granularity.
                     }
-                    // Apply data-plane Send obligations to the owned `msg`
-                    // before it is wrapped in Arc and fanned out. Audit-
-                    // shaped obligations (TagClassified, AuditExtended)
-                    // are intentionally *not* emitted at Send time: the
-                    // Receive PEP knows the specific recipient and emits
-                    // `authz.classified_delivery` per delivered copy.
-                    if !outcome.obligations.is_empty() {
-                        apply_obligations(&mut msg, &outcome.obligations);
+                    dest => {
+                        let subject = AuthzSubject::from_identity(&msg.source);
+                        let resource = match dest {
+                            Destination::Direct(target) => AuthzResource::Direct {
+                                target_cn: target.cn.as_str(),
+                            },
+                            Destination::Group(group) => AuthzResource::Group {
+                                group: group.as_ref(),
+                            },
+                            // Broadcast is the only remaining variant here;
+                            // Multicast is handled above.
+                            _ => AuthzResource::Broadcast,
+                        };
+                        let outcome =
+                            self.authz_evaluate(engine, &subject, &resource, AuthzAction::Send);
+                        if !outcome.is_allow() {
+                            let (kind, id) = match dest {
+                                Destination::Direct(target) => ("direct", target.cn.as_str()),
+                                Destination::Group(group) => ("group", group.as_ref()),
+                                _ => ("broadcast", ""),
+                            };
+                            rustgate_core::audit::authz_denied(
+                                msg.source.cn.as_str(),
+                                msg.source.fingerprint.as_str(),
+                                "send",
+                                kind,
+                                id,
+                                outcome.rule_id.as_deref(),
+                                engine.policy_id(),
+                            );
+                            emit_access(&msg, "authz_deny");
+                            return None;
+                        }
+                        // Defer application until after cache.store so the
+                        // replay cache holds the pre-obligation payload.
+                        send_obligations = outcome.obligations;
                     }
                 }
             }
         }
 
-        // Cache position reports for SA replay to new sessions. Two
-        // ordering invariants MUST hold:
+        // Cache position reports for SA replay to new sessions. Ordering
+        // invariants:
         //
-        // 1. This runs *after* the Send-PEP deny path above, so a
-        //    denied position never enters the replay cache.
-        // 2. This runs *after* `apply_obligations` on the Send-PEP
-        //    allow path, so Send-side masking (e.g. `MaskPoint`) is
-        //    already baked into the cached copy. `replay_positions`
-        //    delivers the cached bytes as-is (after a Receive PEP
-        //    check), so a Send-obligation that isn't in the cache
-        //    would leak unmasked coordinates to late joiners.
+        // 1. Runs *after* the Send-PEP deny path above, so a denied
+        //    position never enters the replay cache.
+        // 2. Runs *before* `apply_obligations` (see block below) so the
+        //    cached copy is the pre-mutation form. `replay_positions`
+        //    re-evaluates the Send PEP at delivery time and re-applies
+        //    any obligations from the *current* policy. Caching the
+        //    post-Send-PEP form would bake in the ingest-time policy
+        //    snapshot and deny operators the ability to tighten masking
+        //    rules after the fact.
         if msg.metadata.message_type == MessageType::Position {
             self.cache.store(msg.clone()).await;
+        }
+
+        // Apply data-plane Send obligations to the owned `msg` *after*
+        // the cache store so the replay cache keeps the pre-mutation
+        // form. Audit-shaped obligations (TagClassified, AuditExtended)
+        // are intentionally not emitted at Send time: the Receive PEP
+        // knows the specific recipient and emits
+        // `authz.classified_delivery` per delivered copy.
+        if !send_obligations.is_empty() {
+            apply_obligations(&mut msg, &send_obligations);
         }
 
         // Successful path: emit one access-log event per routed message.
@@ -1383,11 +1448,14 @@ impl Router {
         emit_access(&msg, "delivered");
 
         // Wrap in Arc once so broadcast/group sends share one allocation
-        // instead of cloning the full RoutableMessage per recipient.
+        // instead of cloning the full RoutableMessage per recipient. A
+        // second `Arc::clone` is retained for the `route_for_egress`
+        // return path so NATS/federation/HTTP forwarders dispatch the
+        // *same* post-Send-PEP form that local sessions received.
         let arc_msg = Arc::new(msg);
         let envelope = match permit {
-            Some(p) => RoutedMessage::with_permit(arc_msg, p),
-            None => RoutedMessage::new(arc_msg),
+            Some(p) => RoutedMessage::with_permit(Arc::clone(&arc_msg), p),
+            None => RoutedMessage::new(Arc::clone(&arc_msg)),
         };
 
         match envelope.destination.clone() {
@@ -1407,11 +1475,16 @@ impl Router {
                     source = %envelope.source.cn,
                     "multicast group list exceeds limit, dropping message",
                 );
+                // Oversize multicast is a drop: suppress egress fan-out so
+                // external sinks do not observe a message that never made
+                // it to any local recipient.
+                return None;
             }
             Destination::Multicast(groups) => {
                 self.send_to_multicast(&groups, envelope).await;
             }
         }
+        Some(arc_msg)
     }
 
     /// Drain any messages persisted for this CN while it was
@@ -1440,11 +1513,18 @@ impl Router {
         match drained {
             Ok(Ok(m)) => m,
             Ok(Err(e)) => {
-                warn!(session = %cn, error = %e, "client queue drain failed");
+                // Hash the session CN before logging — the drain path is
+                // invoked on every reconnect and an operator-facing log
+                // stream must not accumulate plaintext client identities.
+                warn!(session = %hash_cn(cn), error = %e, "client queue drain failed");
                 Vec::new()
             }
             Err(e) => {
-                warn!(session = %cn, error = %e, "client queue drain task join failed");
+                warn!(
+                    session = %hash_cn(cn),
+                    error = %e,
+                    "client queue drain task join failed"
+                );
                 Vec::new()
             }
         }
@@ -1478,7 +1558,7 @@ impl Router {
     ) -> Vec<PendingDelivery> {
         if messages.len() > 1000 {
             warn!(
-                cn = %recipient_identity.cn,
+                cn = %hash_cn(&recipient_identity.cn),
                 count = messages.len(),
                 "large offline message drain — filtering may be slow",
             );
@@ -1496,8 +1576,11 @@ impl Router {
                     && let Some(ref acl) = **acl_guard
                 {
                     if !acl.is_send_authorized(group, &msg.source.cn) {
+                        // Hash sender CN: the drain path fires on every
+                        // reconnect and must not accumulate plaintext
+                        // identities in operator-facing debug streams.
                         debug!(
-                            sender = %msg.source.cn,
+                            sender = %hash_cn(&msg.source.cn),
                             group = %group,
                             "dropping offline message: sender no longer authorized to send"
                         );
@@ -1505,7 +1588,7 @@ impl Router {
                     }
                     if !acl.is_receive_authorized(group, recipient_cn) {
                         debug!(
-                            recipient = %recipient_cn,
+                            recipient = %hash_cn(recipient_cn),
                             group = %group,
                             "dropping offline message: recipient no longer authorized to receive"
                         );
@@ -1535,7 +1618,7 @@ impl Router {
                         self.authz_evaluate(engine, &subject, &resource, AuthzAction::Send);
                     if !send_outcome.is_allow() {
                         debug!(
-                            sender = %msg.source.cn,
+                            sender = %hash_cn(&msg.source.cn),
                             "dropping offline message: sender no longer authorized by policy"
                         );
                         return None;
@@ -1551,8 +1634,8 @@ impl Router {
                     );
                     if !recv_outcome.is_allow() {
                         debug!(
-                            sender = %msg.source.cn,
-                            recipient = %recipient_identity.cn,
+                            sender = %hash_cn(&msg.source.cn),
+                            recipient = %hash_cn(&recipient_identity.cn),
                             "offline message filtered: recipient denied by authz",
                         );
                         return None;
@@ -1638,7 +1721,7 @@ impl Router {
         }
         if delivered > 0 {
             debug!(
-                session = %handle.identity.cn,
+                session = %hash_cn(&handle.identity.cn),
                 delivered,
                 "drained client queue on reconnect"
             );
@@ -1748,7 +1831,7 @@ impl Router {
         }
         if dropped > 0 {
             warn!(
-                session = %handle.identity.cn,
+                session = %hash_cn(&handle.identity.cn),
                 dropped = dropped,
                 total = total,
                 "messages dropped during position replay: channel full or disconnected"

@@ -353,6 +353,34 @@ pub fn authz_denied(
 /// or stricter access controls as the classified traffic itself, so a
 /// reviewer who can already read the audit trail is already cleared for
 /// the CNs it names.
+///
+/// # Operator requirements
+///
+/// Because this record contains plaintext CNs of recipients of
+/// classified artefacts, operators MUST route the `"audit"` tracing
+/// target to a sink whose access controls are at least as strict as the
+/// classification of the traffic being tagged. The record also MUST NOT
+/// be forwarded to general-purpose log aggregation (Loki, Elasticsearch,
+/// CloudWatch, etc.) unless those systems are already cleared for the
+/// same material. Concretely:
+///
+/// - Prefer a dedicated hash-chained audit file
+///   ([`rustgate_core::audit_chain::HashChainWriter`]) on an encrypted
+///   volume over a shared syslog/journald stream.
+/// - If using a SIEM, confirm its ingest channel and retention store
+///   both satisfy the handling caveat that applies to the classified
+///   artefact. A `TagClassified` obligation on a SECRET broadcast
+///   routed to an UNCLASSIFIED SIEM is a cross-domain leak of the
+///   subject-recipient relationship even though the payload body itself
+///   was `MaskPayload`-emptied.
+/// - Never stream this record to stdout in an environment where the
+///   container log driver forwards to an unaccredited collector.
+///
+/// The fingerprint field deliberately is NOT included: fingerprints are
+/// low-cardinality identifiers that reappear across many benign audit
+/// records; exposing them here would provide no additional forensic
+/// value but would broaden the correlation surface in the event the
+/// audit sink is compromised.
 pub fn authz_classified_delivery(
     subject_cn: &str,
     recipient_cn: &str,

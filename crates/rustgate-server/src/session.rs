@@ -491,25 +491,35 @@ async fn read_loop(
             }
         }
 
-        ctx.router.route(msg.clone()).await;
+        // Route and capture the post-Send-PEP form so NATS / federation /
+        // HTTP egress forwarders receive the same mutated payload that
+        // local sessions did. Dispatching `msg` pre-route would bypass
+        // data-plane obligations such as `MaskPoint` / `MaskPayload` and
+        // leak the raw payload to external sinks (SIEM, federation peers).
+        // `None` means the router dropped the message (dedup, TTL expired,
+        // Send-PEP deny, oversize multicast) and all egress MUST be
+        // skipped so external sinks stay consistent with local delivery.
+        let Some(routed) = ctx.router.route_for_egress(msg).await else {
+            continue;
+        };
 
         // Publish to NATS after local routing (fire-and-forget)
         if let Some(publisher) = ctx.nats_publisher {
             #[cfg(feature = "metrics")]
             metrics::nats_publishes().inc();
-            publisher.publish(&msg).await;
+            publisher.publish(&routed).await;
         }
 
         // Forward to federation peers (fire-and-forget)
         if let Some(fwd) = ctx.fed_forward {
-            let groups: Vec<String> = msg.source.groups.iter().cloned().collect();
-            fwd(msg.payload.clone(), groups, msg.metadata.clone());
+            let groups: Vec<String> = routed.source.groups.iter().cloned().collect();
+            fwd(routed.payload.clone(), groups, routed.metadata.clone());
         }
 
         // Forward to HTTP targets (fire-and-forget)
         #[cfg(feature = "http")]
         if let Some(fwd) = ctx.http_forward {
-            fwd(msg.clone());
+            fwd((*routed).clone());
         }
     }
 
@@ -904,20 +914,26 @@ async fn run_plaintext_session_loops<P: NatsPublish>(
                     arch.record(&msg).await;
                 }
 
-                router.route(msg.clone()).await;
+                // Capture the post-Send-PEP form so NATS / federation /
+                // HTTP egress dispatch the same mutated payload local
+                // sessions received. `None` means the router dropped the
+                // message and all egress MUST be skipped.
+                let Some(routed) = router.route_for_egress(msg).await else {
+                    continue;
+                };
 
                 if let Some(publisher) = nats_publisher {
-                    publisher.publish(&msg).await;
+                    publisher.publish(&routed).await;
                 }
 
                 if let Some(fwd) = fed_forward {
-                    let groups: Vec<String> = msg.source.groups.iter().cloned().collect();
-                    fwd(msg.payload.clone(), groups, msg.metadata.clone());
+                    let groups: Vec<String> = routed.source.groups.iter().cloned().collect();
+                    fwd(routed.payload.clone(), groups, routed.metadata.clone());
                 }
 
                 #[cfg(feature = "http")]
                 if let Some(fwd) = http_forward {
-                    fwd(msg.clone());
+                    fwd((*routed).clone());
                 }
             }
             Ok(())

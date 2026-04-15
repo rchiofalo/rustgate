@@ -204,8 +204,19 @@ fn apply_mask_point(msg: &mut RoutableMessage) {
             // otherwise emit `<event><point lat="…"…/>` and cut the
             // document so quick_xml errors after `<point>` was
             // already copied to the writer.
+            //
+            // The log record carries [`MaskError::kind`] rather than the
+            // full `Display` form: `quick_xml::Error`'s own `Display`
+            // may echo payload-derived tag names (e.g.
+            // `EndEventMismatch`), and a hostile sender could otherwise
+            // leak fragments of a classified payload through an
+            // operator-facing DEBUG stream by deliberately malforming
+            // the XML. The same kind label is used for the audit
+            // `reason` field so the forensic trail retains enough
+            // detail for triage without persisting payload bytes.
+            let error_kind = e.kind();
             tracing::debug!(
-                error = %e,
+                error_kind = %error_kind,
                 source_protocol = %msg.metadata.source_protocol,
                 message_type = %msg.metadata.message_type,
                 "mask_point obligation: XML-intent parse failed, erasing payload"
@@ -213,7 +224,7 @@ fn apply_mask_point(msg: &mut RoutableMessage) {
             audit::authz_obligation_failed(
                 &msg.source.cn,
                 "MaskPoint",
-                &format!("{e}"),
+                error_kind,
                 "dropped",
                 &msg.metadata.source_protocol,
                 msg.destination.kind_str(),
