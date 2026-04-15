@@ -665,6 +665,7 @@ const MT_ALERT: u8 = 2;
 const MT_STATUS: u8 = 3;
 const MT_FILE: u8 = 4;
 const MT_OTHER: u8 = 5;
+const MT_MAVLINK: u8 = 6;
 
 fn put_str(buf: &mut BytesMut, s: &str) {
     let bytes = s.as_bytes();
@@ -741,6 +742,7 @@ pub fn encode(msg: &RoutableMessage) -> Vec<u8> {
         MessageType::Alert => buf.put_u8(MT_ALERT),
         MessageType::Status => buf.put_u8(MT_STATUS),
         MessageType::File => buf.put_u8(MT_FILE),
+        MessageType::Mavlink => buf.put_u8(MT_MAVLINK),
         MessageType::Other(s) => {
             buf.put_u8(MT_OTHER);
             put_str(&mut buf, s);
@@ -802,6 +804,7 @@ pub fn decode(raw: &[u8]) -> Result<RoutableMessage, StoreForwardError> {
         MT_ALERT => MessageType::Alert,
         MT_STATUS => MessageType::Status,
         MT_FILE => MessageType::File,
+        MT_MAVLINK => MessageType::Mavlink,
         MT_OTHER => MessageType::Other(get_str(&mut buf).ok_or(StoreForwardError::Decode)?),
         _ => return Err(StoreForwardError::Decode),
     };

@@ -498,6 +498,12 @@ fn framing_strategy_tak_protobuf() {
 }
 
 #[test]
+fn framing_strategy_mavlink() {
+    let fs = FramingStrategy::Mavlink;
+    assert!(matches!(fs, FramingStrategy::Mavlink));
+}
+
+#[test]
 fn framing_strategy_clone_and_debug() {
     let fs = FramingStrategy::XmlStream;
     let cloned = fs.clone();

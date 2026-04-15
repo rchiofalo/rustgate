@@ -21,6 +21,8 @@ pub enum FramedCodec {
     LineDelimited(LineDelimitedCodec),
     #[cfg(feature = "proto")]
     TakProtobuf(rustgate_proto::TakFrameCodec),
+    #[cfg(feature = "mavlink")]
+    Mavlink(rustgate_mavlink::MavlinkFrameCodec),
 }
 
 impl FramedCodec {
@@ -39,6 +41,18 @@ impl FramedCodec {
                 // If we reach here, it indicates a logic error in the caller.
                 unreachable!("TakProtobuf framing requires building with --features proto")
             }
+            #[cfg(feature = "mavlink")]
+            FramingStrategy::Mavlink => Self::Mavlink(rustgate_mavlink::MavlinkFrameCodec::new()),
+            #[cfg(not(feature = "mavlink"))]
+            FramingStrategy::Mavlink => {
+                // Startup validation in main.rs rejects this configuration early.
+                // MAVLink sessions use a dedicated UDP listener (see the
+                // parent epic's PR 2) rather than the generic TLS/TCP
+                // session pipeline, so reaching this branch in practice
+                // means a codec selector was pointed at an endpoint that
+                // does not speak MAVLink.
+                unreachable!("Mavlink framing requires building with --features mavlink")
+            }
         }
     }
 }
@@ -54,6 +68,8 @@ impl Decoder for FramedCodec {
             Self::LineDelimited(c) => c.decode(src),
             #[cfg(feature = "proto")]
             Self::TakProtobuf(c) => c.decode(src),
+            #[cfg(feature = "mavlink")]
+            Self::Mavlink(c) => c.decode(src),
         }
     }
 }
@@ -68,6 +84,8 @@ impl Encoder<BytesMut> for FramedCodec {
             Self::LineDelimited(c) => c.encode(item, dst),
             #[cfg(feature = "proto")]
             Self::TakProtobuf(c) => c.encode(item, dst),
+            #[cfg(feature = "mavlink")]
+            Self::Mavlink(c) => c.encode(item, dst),
         }
     }
 }

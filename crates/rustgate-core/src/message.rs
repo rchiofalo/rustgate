@@ -17,6 +17,14 @@ use crate::identity::{GroupId, Identity};
 /// Source protocol identifier for messages originating from federation peers.
 pub const SOURCE_FEDERATION: &str = "federation";
 
+/// Source protocol identifier for messages ingested from a MAVLink transport.
+///
+/// Used by the router to tag messages that arrived over MAVLink UDP/TCP so
+/// downstream consumers (audit logs, echo-prevention filters) can
+/// distinguish MAVLink traffic from CoT/XML traffic without re-parsing the
+/// payload.
+pub const SOURCE_MAVLINK: &str = "mavlink";
+
 /// The internal message envelope for all routed messages.
 ///
 /// Every inbound message is wrapped in this type before entering the router.
@@ -97,6 +105,14 @@ pub enum MessageType {
     Status,
     /// File transfer metadata.
     File,
+    /// MAVLink frame (autonomous vehicle telemetry / command).
+    ///
+    /// Routed opaquely — the payload is a complete MAVLink v1 or v2 frame
+    /// including magic, header, payload, CRC, and (for v2) optional
+    /// signature. The router does not interpret MAVLink message IDs; that
+    /// is the responsibility of obligation actuators and per-link signing
+    /// verifiers in the `rustgate-mavlink` crate.
+    Mavlink,
     /// Any other CoT event type not classified above.
     Other(String),
 }
@@ -104,12 +120,13 @@ pub enum MessageType {
 #[cfg(feature = "fuzz")]
 impl<'a> Arbitrary<'a> for MessageType {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        match u.int_in_range(0..=5)? {
+        match u.int_in_range(0..=6)? {
             0 => Ok(Self::Position),
             1 => Ok(Self::Chat),
             2 => Ok(Self::Alert),
             3 => Ok(Self::Status),
             4 => Ok(Self::File),
+            5 => Ok(Self::Mavlink),
             _ => {
                 let len = u.int_in_range(1..=32)?;
                 let s: String = (0..len)
@@ -194,6 +211,7 @@ impl std::fmt::Display for MessageType {
             Self::Alert => f.write_str("alert"),
             Self::Status => f.write_str("status"),
             Self::File => f.write_str("file"),
+            Self::Mavlink => f.write_str("mavlink"),
             Self::Other(s) => write!(f, "other:{s}"),
         }
     }
@@ -223,10 +241,20 @@ mod tests {
         assert_eq!(MessageType::Alert.to_string(), "alert");
         assert_eq!(MessageType::Status.to_string(), "status");
         assert_eq!(MessageType::File.to_string(), "file");
+        assert_eq!(MessageType::Mavlink.to_string(), "mavlink");
         assert_eq!(
             MessageType::Other("custom".to_string()).to_string(),
             "other:custom"
         );
+    }
+
+    #[test]
+    fn source_mavlink_constant() {
+        // Pin the on-the-wire source-protocol tag for MAVLink traffic.
+        // Other crates (audit, echo-prevention filters) key off this
+        // string; changing it is a breaking change for operators who
+        // grep their logs.
+        assert_eq!(SOURCE_MAVLINK, "mavlink");
     }
 
     #[test]

@@ -17,6 +17,14 @@ pub enum FramingStrategy {
     LineDelimited,
     /// TAK protobuf: 0xBF magic + varint length + protobuf payload.
     TakProtobuf,
+    /// MAVLink v1 (0xFE) or v2 (0xFD) frame.
+    ///
+    /// The frame length is encoded in a single `LEN` header byte; total
+    /// frame size is derived from a fixed header size plus `LEN` plus a
+    /// 2-byte CRC plus (for v2 signed frames) a 13-byte signature.
+    /// Unlike length-prefixed framing, MAVLink can carry both v1 and v2
+    /// frames on the same link, disambiguated by magic byte.
+    Mavlink,
 }
 
 /// Valid header sizes for length-prefixed framing.
