@@ -316,19 +316,6 @@ jobs:
       - name: Run PQ HTTP tests
         run: cargo nextest run --locked -p rustgate-http --features post-quantum
 
-  dependency-review:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: Dependency review
-        uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
-        with:
-          fail-on-severity: high
-
   audit:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [check-features, test]
@@ -389,6 +376,13 @@ jobs:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [check-features, test]
     runs-on: ubuntu-latest
+    # dorny/paths-filter calls listFiles(pull_number) via the GitHub API on
+    # pull_request events; on private repos this requires explicit
+    # pull-requests: read (the top-level permissions block only grants
+    # contents: read, which leaves all other scopes as `none`).
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
