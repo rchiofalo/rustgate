@@ -182,9 +182,17 @@ pub fn strip_coordinates(xml: &[u8]) -> Result<Bytes, MaskError> {
 /// Returns [`MaskError::AttrBudgetExceeded`] if more than
 /// [`MAX_POINT_ATTRIBUTES`] attributes are present — this bounds the CPU
 /// and allocation cost of per-recipient masking under hostile input.
-fn mask_point_attrs<'a>(src: &BytesStart<'a>) -> Result<BytesStart<'a>, MaskError> {
-    let name = String::from_utf8_lossy(src.name().as_ref()).into_owned();
-    let mut masked = BytesStart::new(name);
+///
+/// The tag name is hardcoded to `"point"` because the two call sites
+/// in [`strip_coordinates`] both guard on `e.name().as_ref() == b"point"`
+/// — there is no path that reaches this helper with a different name.
+/// Hardcoding both avoids a per-invocation UTF-8 transcoding and
+/// allocation on the per-recipient masking hot path and removes a
+/// would-be `from_utf8_lossy` silent-byte-mutation concern. If the
+/// caller's match arms are ever broadened (see the lockstep note on
+/// [`strip_coordinates`]) this literal must follow in lockstep.
+fn mask_point_attrs(src: &BytesStart<'_>) -> Result<BytesStart<'static>, MaskError> {
+    let mut masked = BytesStart::new("point");
     let mut count = 0usize;
     for attr in src.attributes() {
         let attr = attr?;
