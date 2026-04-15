@@ -90,6 +90,7 @@ For production certificate management see [docs/tls-certificates.md](docs/tls-ce
 | `rustgate-transport` | mTLS listener, codec, session management, CRL, FIPS provider, routing engine |
 | `rustgate-websocket` | WebSocket (wss://) listener with mTLS client authentication |
 | `rustgate-mqtt` | MQTT 5.0/3.1.1 transport adapter with mTLS and dynamic subscriptions |
+| `rustgate-mavlink` | MAVLink v1/v2 wire-frame codec (listeners and signing land in follow-up PRs) |
 | `rustgate-nats` | NATS/JetStream bridge for cross-instance message delivery |
 | `rustgate-enrollment` | HTTPS certificate enrollment server (CSR signing, PKCS#12) |
 | `rustgate-proto` | Protobuf message translation (XML ↔ proto) |
@@ -124,6 +125,7 @@ For detailed architecture documentation see [docs/architecture.md](docs/architec
 | WebSocket | wss:// listener with mTLS, interoperable with TCP clients |
 | Protobuf | Bidirectional XML ↔ protobuf translation |
 | Protocol negotiation | Automatic upgrade from XML to protobuf framing |
+| MAVLink v1/v2 | Wire-frame codec with resync (listeners and v2 signing in follow-up PRs) |
 | CoT delta encoding | Opt-in per-UID delta + epsilon suppression on XML sessions ([details](docs/cot-delta-encoding.md)) |
 | CoT archival | Structured JSONL logging of all received events |
 | Data packages | Upload, download, and search via Marti sync API |
@@ -219,6 +221,7 @@ cargo build --release --all-features
 | `federation-ha` | HA federation with JWT | `protoc` |
 | `websocket` | WebSocket transport | — |
 | `mqtt` | MQTT 5.0/3.1.1 transport | — |
+| `mavlink` | MAVLink v1/v2 framing (rustgate-transport dep, listeners in follow-up) | — |
 | `metrics` | Prometheus metrics | — |
 | `full-detail` | Extended CoT parsing | — |
 | `fips` | FIPS 140-3 crypto (aws-lc-rs) | Go 1.20+, cmake |
