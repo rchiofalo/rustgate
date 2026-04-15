@@ -384,9 +384,16 @@ jobs:
       contents: read
       pull-requests: read
     steps:
+      # dorny/paths-filter uses the GitHub API on pull_request events, but
+      # shells out to `git` for push events. With `persist-credentials:
+      # false` (our workspace-wide hardening), a shallow clone leaves the
+      # action unable to authenticate when it tries to fetch the base SHA,
+      # so we ask for full history up front and let paths-filter do all
+      # its diffing locally.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Validate Dockerfile COPY matches workspace members
         run: |
