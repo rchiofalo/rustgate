@@ -9,6 +9,7 @@
 //! XXE (XML External Entity) injection attacks by default.
 
 pub mod delta;
+pub mod mask;
 
 use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};

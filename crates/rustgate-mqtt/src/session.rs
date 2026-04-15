@@ -225,10 +225,14 @@ pub(crate) async fn handle_mqtt_session(
         warn!(cn = %cn, "connection rejected: tenant quota exceeded");
         return;
     }
-    for m in buffered {
-        if handle.send(Arc::new(m)).await.is_err() {
+    for pending in buffered {
+        let (msg, audit) = pending.into_parts();
+        if handle.send(Arc::new(msg)).await.is_err() {
+            // Drop `audit` without emitting: the drain-path
+            // classified_delivery record fires only on actual delivery.
             break;
         }
+        audit.emit_on_delivered();
     }
     router.replay_positions(&handle).await;
 

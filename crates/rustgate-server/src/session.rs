@@ -192,10 +192,15 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
         tracing::warn!(cn = %cn, "session rejected by tenant quota");
         return;
     }
-    for m in buffered_offline {
-        if handle.send(Arc::new(m)).await.is_err() {
+    for pending in buffered_offline {
+        let (msg, audit) = pending.into_parts();
+        if handle.send(Arc::new(msg)).await.is_err() {
+            // Send failed — drop `audit` without emitting so the
+            // drain-path `authz.classified_delivery` count matches
+            // on-the-wire deliveries exactly.
             break;
         }
+        audit.emit_on_delivered();
     }
     deps.router.replay_positions(&handle).await;
 
@@ -721,10 +726,15 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
                             tracing::warn!(cn = %cn, "connection rejected: tenant quota exceeded");
                             continue;
                         }
-                        for m in buffered_offline {
-                            if handle.send(Arc::new(m)).await.is_err() {
+                        for pending in buffered_offline {
+                            let (msg, audit) = pending.into_parts();
+                            if handle.send(Arc::new(msg)).await.is_err() {
+                                // Drop `audit` without emitting: the
+                                // drain-path classified_delivery record
+                                // fires only on actual delivery.
                                 break;
                             }
+                            audit.emit_on_delivered();
                         }
                         router.replay_positions(&handle).await;
 

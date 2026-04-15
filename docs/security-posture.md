@@ -95,7 +95,7 @@ This document maps rustgate's existing security controls to NIST SP 800-53 (Rev.
 
 | Control | Implementation |
 |---------|---------------|
-| CA-2 Control Assessments | CI pipeline runs 12 jobs on every push: commit-lint, lint, clippy, feature powerset, tests (1400+), coverage, FIPS, post-quantum, dependency-review, audit, Helm lint, Docker build. |
+| CA-2 Control Assessments | CI pipeline runs 11 jobs on every push: commit-lint, lint, clippy, feature powerset, tests (1400+), coverage, FIPS, post-quantum, audit, Helm lint, Docker build. |
 | CA-7 Continuous Monitoring | OpenSSF Scorecard runs weekly and on push to main. Dependabot monitors dependency vulnerabilities continuously. |
 | CA-8 Penetration Testing | Fuzz testing via `cargo-fuzz` targets for CoT parsing, XML stream codec, and TAK frame codec. |
 

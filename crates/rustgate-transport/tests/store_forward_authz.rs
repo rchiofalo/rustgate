@@ -161,8 +161,13 @@ async fn stored_message_delivered_when_policy_allows() {
     let handle = SessionHandle::new(bob.clone(), ptx_b, ntx_b);
 
     let _ = router.register(handle.clone()).await;
-    for m in filtered {
-        handle.send(Arc::new(m)).await.expect("deliver offline msg");
+    for pending in filtered {
+        let (msg, audit) = pending.into_parts();
+        handle
+            .send(Arc::new(msg))
+            .await
+            .expect("deliver offline msg");
+        audit.emit_on_delivered();
     }
 
     let received = nrx_b.try_recv().expect("bob should receive the message");

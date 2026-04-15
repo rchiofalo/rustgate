@@ -419,7 +419,7 @@ fn obligations_flow_through_allow_decision() {
         {"id":"geo-mask","effect":"allow","action":"send",
          "resource":{"kind":"broadcast"},
          "subject":{"cn_eq":"restricted-user"},
-         "obligations":["mask_geo","audit_extended"]}
+         "obligations":["mask_point","audit_extended"]}
     ]}"#;
     let engine = NativeEngine::new(parse_json(json).unwrap()).unwrap();
 
@@ -435,7 +435,7 @@ fn obligations_flow_through_allow_decision() {
     assert_eq!(outcome.decision, Decision::Allow);
     assert_eq!(
         outcome.obligations,
-        vec![Obligation::MaskGeo, Obligation::AuditExtended],
+        vec![Obligation::MaskPoint, Obligation::AuditExtended],
         "obligations must be preserved in the allow outcome"
     );
 }
