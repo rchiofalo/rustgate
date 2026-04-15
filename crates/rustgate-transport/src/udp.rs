@@ -390,16 +390,26 @@ impl UdpInput {
                             }
 
                             let msg = msg_builder.build(&dgram_identity, payload, "udp");
-                            router.route(msg.clone()).await;
+                            // Capture the post-Send-PEP form so NATS /
+                            // federation egress forwarders receive the
+                            // mutated payload (obligations such as
+                            // `MaskPoint` applied). `None` means the router
+                            // dropped the message (dedup, TTL, Send-PEP
+                            // deny, oversize multicast) and all egress MUST
+                            // be skipped so external sinks stay consistent
+                            // with local delivery.
+                            let Some(routed) = router.route_for_egress(msg).await else {
+                                continue;
+                            };
 
                             if let Some(nats_cb) = &nats_publish {
-                                nats_cb(msg.clone());
+                                nats_cb((*routed).clone());
                             }
 
                             if let Some(fwd) = &fed_forward {
                                 let groups: Vec<String> =
-                                    msg.source.groups.iter().cloned().collect();
-                                fwd(msg.payload.clone(), groups, msg.metadata.clone());
+                                    routed.source.groups.iter().cloned().collect();
+                                fwd(routed.payload.clone(), groups, routed.metadata.clone());
                             }
                         }
                         Err(e) => {

@@ -351,17 +351,25 @@ async fn ws_read_loop(
 
         let msg = msg_builder.build(identity, payload, "websocket");
 
-        router.route(msg.clone()).await;
+        // Capture the post-Send-PEP form so NATS / federation / HTTP
+        // egress forwarders receive the mutated payload (obligations
+        // such as `MaskPoint` applied). `None` means the router dropped
+        // the message — dedup, TTL, Send-PEP deny, oversize multicast —
+        // and all egress MUST be skipped to keep external sinks
+        // consistent with local delivery.
+        let Some(routed) = router.route_for_egress(msg).await else {
+            continue;
+        };
 
         if let Some(cb) = nats_publish {
-            cb(msg.clone());
+            cb((*routed).clone());
         }
         if let Some(fwd) = fed_forward {
-            let groups: Vec<String> = msg.source.groups.iter().cloned().collect();
-            fwd(msg.payload.clone(), groups, msg.metadata.clone());
+            let groups: Vec<String> = routed.source.groups.iter().cloned().collect();
+            fwd(routed.payload.clone(), groups, routed.metadata.clone());
         }
         if let Some(fwd) = http_forward {
-            fwd(msg.clone());
+            fwd((*routed).clone());
         }
     }
 }

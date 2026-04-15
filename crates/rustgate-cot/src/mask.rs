@@ -91,6 +91,27 @@ pub enum MaskError {
     },
 }
 
+impl MaskError {
+    /// Return a short discriminant label suitable for structured logs and
+    /// audit `reason` fields.
+    ///
+    /// Unlike the [`fmt::Display`] impl, this method never embeds content
+    /// derived from the input payload. [`quick_xml::Error`]'s own
+    /// `Display` can echo payload-derived tag names (e.g.
+    /// `EndEventMismatch { expected, found }`); a DEBUG log that prints
+    /// the full error chain therefore risks leaking fragments of a
+    /// classified payload that failed to parse. Emitting `e.kind()`
+    /// instead of `e` keeps the operational log free of payload bytes
+    /// while still naming the failure class for triage.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Xml(_) => "xml_parse_error",
+            Self::Io(_) => "io_error",
+            Self::AttrBudgetExceeded { .. } => "attr_budget_exceeded",
+        }
+    }
+}
+
 impl fmt::Display for MaskError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

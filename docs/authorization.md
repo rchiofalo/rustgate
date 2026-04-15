@@ -51,18 +51,18 @@ A policy is a JSON document:
       "action": "send",
       "subject": { "groups_any_of": ["test"] },
       "resource": { "kind": "broadcast" }
-    },
-    {
-      "id": "allow-command-nats-publish",
-      "effect": "allow",
-      "action": "publish",
-      "subject": { "groups_all_of": ["command", "operator"] },
-      "resource": { "kind": "nats_subject", "subject_pattern": "cot.*" },
-      "obligations": ["audit_extended"]
     }
   ]
 }
 ```
+
+> **Note:** Only the `send` and `receive` actions reach the data-plane PEPs
+> today. Rules whose `action` is `federate`, `publish`, or `subscribe` —
+> and rules whose resource kind is `federation` or `nats_subject` — parse
+> and compile, but no production call site evaluates them. They are
+> reserved syntax for a future Phase 2 that wires federation/NATS egress
+> through its own PEPs. Authoring such a rule today has no runtime
+> effect.
 
 ### Top-level fields
 
@@ -78,7 +78,7 @@ A policy is a JSON document:
 |---|---|---|
 | `id` | string | Stable identifier. Must be non-empty and unique across the set. Appears in decision outcomes and audit records. |
 | `effect` | string | `"allow"` or `"deny"`. |
-| `action` | string | One of `send`, `receive`, `federate`, `publish`, `subscribe`. |
+| `action` | string | One of `send`, `receive`, `federate`, `publish`, `subscribe`. Only `send` and `receive` are wired to data-plane PEPs today — see the note under [Actions](#actions). |
 | `subject` | object | See [`SubjectMatcher`](#subjectmatcher). An empty object matches every subject. |
 | `resource` | object | See [`ResourceMatcher`](#resourcematcher). |
 | `obligations` | array | Optional side-effects to apply on allow outcomes. |
@@ -104,19 +104,26 @@ Tagged by `"kind"`:
 | `direct` | `target_cn` (optional) | Unicast send to the CN. `null`/omitted matches any target. |
 | `group` | `group` | Group-scoped send. |
 | `broadcast` | — | Broadcast to all connected peers. |
-| `federation` | `peer_id` (optional) | Federation link to a peer server. `null`/omitted matches any peer. |
-| `nats_subject` | `subject_pattern` | NATS subject; literal or trailing-`*` wildcard. |
+| `federation` | `peer_id` (optional) | **Not yet evaluated at runtime.** Reserved for a future federation PEP — see the note under [Actions](#actions). |
+| `nats_subject` | `subject_pattern` | **Not yet evaluated at runtime.** Reserved for a future NATS publish/subscribe PEP — see the note under [Actions](#actions). |
 | `any` | — | Matches any resource kind. Useful for broad deny rules. |
 
 ### Actions
 
-| Action | When it fires |
-|---|---|
-| `send` | Client-originated unicast, group, or broadcast dispatch. |
-| `receive` | Router delivery path toward a specific subscriber. |
-| `federate` | Forwarding across a federation peer link. |
-| `publish` | NATS publish. |
-| `subscribe` | NATS subscribe. |
+| Action | Status | When it fires |
+|---|---|---|
+| `send` | **Active** | Client-originated unicast, group, or broadcast dispatch — evaluated at the router Send PEP before fanout and on every store-forward drain / SA replay. |
+| `receive` | **Active** | Router delivery path toward a specific subscriber — evaluated at the router Receive PEP on every per-recipient try_send. |
+| `federate` | *Reserved* | Intended for federation peer forwarding. No production call site evaluates this action today. Federation egress currently uses the same post-`send`-PEP payload that local sessions receive (via [`Router::route_for_egress`](../crates/rustgate-transport/src/router.rs)); a first-class federation PEP is Phase 2 work. |
+| `publish` | *Reserved* | Intended for NATS publish. No production call site evaluates this action today. NATS egress currently uses the same post-`send`-PEP payload. |
+| `subscribe` | *Reserved* | Intended for NATS subscribe. Not evaluated today. |
+
+Rules whose `action` is `federate`, `publish`, or `subscribe` parse and
+compile without error, but are never matched by a data-plane decision.
+They do not produce `authz_denied` or `authz_allowed` records. Until the
+corresponding PEPs land, the only enforcement point for egress to
+external sinks is the `send`-action PEP at the router — authors should
+express egress-scoped restrictions there.
 
 ### Obligations
 
@@ -134,11 +141,42 @@ replay cache.
 | `tag_classified` | Audit-only. Emits `audit.classified_delivery` at the Receive PEP with subject/recipient CNs, resource kind/id, rule id, and policy id. Wire payload is unchanged. |
 | `audit_extended` | Audit-only. Reserved for future expanded audit records; no dataplane side effect today. |
 
-Obligations compose: Send-side obligations mutate the envelope before
-it is wrapped in `Arc` and fanned out; Receive-side obligations stack
-on each per-recipient copy. `MaskPayload` supersedes `MaskPoint` because
-it replaces the payload entirely — either ordering produces the same
-final (empty) body.
+Obligations compose across the routing pipeline in a specific order:
+
+1. **Send PEP (router ingress).** The engine evaluates the `send` action
+   once per message against the sender's identity and the destination
+   resource. On allow, any data-plane obligations (`MaskPoint`,
+   `MaskPayload`) are applied in place to the owned envelope *after* the
+   SA position cache has stored the pre-obligation form — so replay to
+   late joiners re-evaluates the current policy rather than replaying a
+   cached mutation from whatever policy was active at ingest time. The
+   mutated envelope is then wrapped in `Arc` for local fan-out.
+2. **Egress forwarding (NATS / federation / HTTP).** The `Arc` returned
+   by [`Router::route_for_egress`](../crates/rustgate-transport/src/router.rs)
+   is the exact post-Send-PEP form that local sessions received, so
+   external sinks see the same mutated payload — a `MaskPoint`
+   obligation zeroes coordinates for SIEM collectors and federation
+   peers as well as in-process recipients.
+3. **Receive PEP (per-recipient).** On each per-session `try_send`, the
+   Receive PEP runs against the recipient's identity. `TagClassified` /
+   `AuditExtended` are audit-shaped and do not mutate the payload;
+   `MaskPoint` / `MaskPayload` from the Receive PEP stack on top of any
+   Send-side mutation by cloning the shared `Arc` and re-applying (see
+   [`RoutedMessage::with_obligations`](../crates/rustgate-transport/src/router.rs)).
+4. **Re-evaluation paths.** Store-forward drain, SA position replay, and
+   any other offline-redelivery path re-run both PEPs against the
+   *current* policy so stored messages never bypass a tightening policy
+   change.
+
+`MaskPayload` supersedes `MaskPoint` because it replaces the payload
+entirely — either ordering produces the same final (empty) body.
+
+**Multicast caveat.** A `Destination::Multicast` message does not run a
+top-level Send PEP — the PEP runs per-group inside
+`send_to_group_excluding`. External egress of a multicast message
+therefore carries the pre-obligation payload; closing that gap requires
+the Phase 2 `federate` / `publish` PEPs referenced in the [Actions](#actions)
+table.
 
 #### Audit events emitted by the obligation dispatcher
 
@@ -257,8 +295,13 @@ The Cedar backend maps rustgate types into Cedar entity UIDs as follows:
 | Direct resource | `Direct::"<cn>"` |
 | Group resource | `Group::"<name>"` |
 | Broadcast resource | `Broadcast::"all"` |
-| Federation resource | `Federation::"<peer>"` |
-| NATS subject | `NatsSubject::"<subject>"` |
+| Federation resource | `Federation::"<peer>"` — *reserved; not evaluated at runtime.* |
+| NATS subject | `NatsSubject::"<subject>"` — *reserved; not evaluated at runtime.* |
+
+As with the native backend, only the `send` and `receive` actions reach
+production call sites today. Cedar rules targeting `Federation::` or
+`NatsSubject::` entities are accepted by the parser/translator but are
+never matched by a live decision request.
 
 Example Cedar rule:
 

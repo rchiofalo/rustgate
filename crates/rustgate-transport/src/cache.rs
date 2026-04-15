@@ -32,6 +32,32 @@
 //! with a 5-second TTL will not be removed until the next 15-second sweep runs,
 //! but it will be excluded from [`PositionCache::get_all`] results
 //! immediately (the `is_expired` check runs on read).
+//!
+//! ## Security Invariant — Pre-Obligation Storage
+//!
+//! Entries in this cache are the **pre-obligation** form of each
+//! position event. The router stores positions *before* applying
+//! data-plane authz obligations (`MaskPoint`, `MaskPayload`) so that
+//! replay to newly connected sessions can re-evaluate the Send PEP
+//! against the current policy and apply whatever masking rules are in
+//! force at replay time. See `route_inner`'s cache-store ordering
+//! comment in `router.rs` and the re-evaluation loop in
+//! [`Router::replay_positions`].
+//!
+//! This design keeps the replay path responsive to post-ingest policy
+//! tightening, but it means cached entries may contain classified
+//! coordinates even when policy mandates they be masked on the wire.
+//! Callers MUST:
+//!
+//! - Never serialize [`PositionCache`] contents to disk, forward them
+//!   to federation / NATS / HTTP egress, or dump them via any
+//!   diagnostic interface. Only [`Router::replay_positions`] is an
+//!   authorized reader; it re-evaluates both Send and Receive PEPs and
+//!   applies current-policy obligations before delivery.
+//! - Treat the in-memory footprint as equivalent to the classification
+//!   of the highest-classified traffic the process handles.
+//!
+//! [`Router::replay_positions`]: crate::Router::replay_positions
 
 use std::collections::HashMap;
 use std::time::Duration;
