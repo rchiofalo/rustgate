@@ -340,6 +340,19 @@ pub fn authz_denied(
 /// a tamper-evident delivery trail. This is the mechanism by which
 /// `TagClassified` graduates from a policy hint to an operator-visible
 /// compliance artefact without modifying the wire payload.
+///
+/// # Identity fields
+///
+/// Unlike `access`-targeted logs (which hash CNs via
+/// [`crate::masking::hash_cn`] for PII safety on routine traffic), this
+/// audit event records the plaintext `subject_cn` and `recipient_cn` **by
+/// design**. Classified-delivery audit is the forensic trail that ties a
+/// specific user to a specific classified artefact at a specific time —
+/// the record is useless without clear-text identity attribution. This
+/// asymmetry is intentional: the audit sink is expected to carry the same
+/// or stricter access controls as the classified traffic itself, so a
+/// reviewer who can already read the audit trail is already cleared for
+/// the CNs it names.
 pub fn authz_classified_delivery(
     subject_cn: &str,
     recipient_cn: &str,
@@ -359,6 +372,60 @@ pub fn authz_classified_delivery(
         rule_id = rule_id.unwrap_or(""),
         policy_id = %policy_id,
         result = "tagged"
+    );
+}
+
+/// Record a failure to actuate an authz obligation.
+///
+/// Emitted by the router's obligation dispatcher when an obligation with
+/// data-plane side effects cannot be applied (for example, `MaskPoint` on
+/// a payload that parses as XML but trips the masker's attribute budget,
+/// or returns a parse error partway through). The dispatcher chooses the
+/// caller-appropriate recovery (fail-closed for XML-intent payloads,
+/// pass-through for non-XML) but always emits this record so operators
+/// can see the policy hint was not honoured.
+///
+/// `obligation` is the unqualified variant name (e.g. `"MaskPoint"`) and
+/// `recovery` is one of `"dropped"` or `"forwarded_unmasked"` describing
+/// what the dispatcher did in response.
+pub fn authz_obligation_failed(
+    subject_cn: &str,
+    obligation: &str,
+    error: &str,
+    recovery: &str,
+    source_protocol: &str,
+) {
+    audit!(
+        "authz.obligation_failed",
+        subject_cn = %subject_cn,
+        obligation = %obligation,
+        error = %error,
+        recovery = %recovery,
+        source_protocol = %source_protocol,
+        action = "actuate_obligation",
+        result = "failure"
+    );
+}
+
+/// Record encountering an unknown [`Obligation`] variant at the PEP.
+///
+/// `rustgate_authz::Obligation` is `#[non_exhaustive]` — a future authz
+/// upgrade may add variants before the transport crate catches up. The
+/// dispatcher forwards messages unmodified in that case (no silent drop)
+/// but emits this audit event so operators running a stale build against
+/// a newer authz engine can detect the skew. The event fires at most
+/// once per (obligation, subject) tuple per router instance in practice
+/// because unknown variants can only appear if the policy mentions them.
+///
+/// [`Obligation`]: https://docs.rs/rustgate-authz
+pub fn authz_obligation_unknown(subject_cn: &str, obligation: &str, source_protocol: &str) {
+    audit!(
+        "authz.obligation_unknown",
+        subject_cn = %subject_cn,
+        obligation = %obligation,
+        source_protocol = %source_protocol,
+        action = "actuate_obligation",
+        result = "skipped"
     );
 }
 
@@ -651,6 +718,30 @@ mod tests {
                 None,
                 "policy-v1",
             );
+        }
+
+        #[test]
+        fn test_authz_obligation_failed() {
+            authz_obligation_failed(
+                "alice",
+                "MaskPoint",
+                "<point> attribute count exceeded masking budget of 64",
+                "dropped",
+                "tcp",
+            );
+            authz_obligation_failed(
+                "alice",
+                "MaskPoint",
+                "not xml",
+                "forwarded_unmasked",
+                "mqtt",
+            );
+        }
+
+        #[test]
+        fn test_authz_obligation_unknown() {
+            authz_obligation_unknown("alice", "Quarantine", "tcp");
+            authz_obligation_unknown("", "", "");
         }
     }
 
