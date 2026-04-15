@@ -39,7 +39,7 @@
 
 use std::io;
 
-use tokio_util::bytes::{Buf, BytesMut};
+use bytes::{Buf, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
 use crate::error::MavlinkError;
@@ -81,7 +81,12 @@ pub const MAX_MAVLINK_FRAME_SIZE: usize =
 /// Callers that care about version (signing, message-ID parsing,
 /// obligation actuators) can match on this to branch without re-reading
 /// the magic byte.
+///
+/// Marked `#[non_exhaustive]` so a future MAVLink v3 (or a private
+/// variant) can be added without a breaking API change: downstream
+/// callers must use a wildcard arm when matching on this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MavlinkVersion {
     /// MAVLink v1 (`0xFE`).
     V1,
@@ -153,7 +158,10 @@ impl MavlinkFrameCodec {
             dropped += 1;
         }
         if dropped > 0 {
-            tracing::debug!(bytes = dropped, "mavlink resync discarded bytes");
+            // `trace` (not `debug`) — a hostile or misconfigured link
+            // can produce this on every byte, and users running
+            // `RUST_LOG=debug` would otherwise see the log flooded.
+            tracing::trace!(bytes = dropped, "mavlink resync discarded bytes");
         }
         if src.is_empty() {
             return Ok(None);
@@ -179,6 +187,13 @@ impl MavlinkFrameCodec {
                 // implementation knows; anything else changes wire
                 // parsing we can't perform.
                 if incompat & !MAVLINK_IFLAG_SIGNED != 0 {
+                    // Advance past the bad magic byte so the next decode
+                    // call cannot re-read the same header and loop
+                    // forever on an attacker-supplied stream. Dropping
+                    // only the magic (not the whole header) preserves
+                    // the chance that the following byte happens to
+                    // start a real frame.
+                    src.advance(1);
                     return Err(MavlinkError::InvalidIncompatFlags { flags: incompat });
                 }
                 let sig_len = if incompat & MAVLINK_IFLAG_SIGNED != 0 {
@@ -235,6 +250,15 @@ impl Decoder for MavlinkFrameCodec {
     }
 }
 
+/// Encode a prepared MAVLink frame into the outbound buffer.
+///
+/// The encoder validates only the wire-level framing invariants it can
+/// check cheaply: non-empty, recognised magic byte, under the 280-byte
+/// cap. Internal field consistency — the `LEN` byte matches the real
+/// payload length, the CRC covers the correct slice, the signature is
+/// well-formed — is the caller's responsibility. MAVLink frames that
+/// originate on the wire are already validated upstream; frames built
+/// by application code must use a MAVLink message library.
 impl Encoder<BytesMut> for MavlinkFrameCodec {
     type Error = io::Error;
 
@@ -265,7 +289,7 @@ impl Encoder<BytesMut> for MavlinkFrameCodec {
 mod tests {
     #![allow(clippy::panic, clippy::unwrap_used)]
 
-    use tokio_util::bytes::BufMut;
+    use bytes::BufMut;
 
     use super::*;
 
@@ -447,6 +471,42 @@ mod tests {
         let mut buf = BytesMut::from(&[MAVLINK_V2_MAGIC, 0, 0x02][..]);
         let err = codec.decode(&mut buf).expect_err("should reject");
         assert!(err.to_string().contains("INCOMPAT"), "got: {err}");
+    }
+
+    #[test]
+    fn decode_recovers_after_invalid_incompat_flags() {
+        // Regression guard: an earlier revision returned the INCOMPAT
+        // error WITHOUT consuming the bad magic byte, so the very next
+        // decode() would re-read the same header and loop forever on an
+        // attacker-supplied stream. After the fix, the bad magic byte
+        // must be consumed and a following valid frame must decode.
+        let mut codec = MavlinkFrameCodec::new();
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&[MAVLINK_V2_MAGIC, 0, 0x02]); // bad INCOMPAT
+        let follow = v1_frame(3, 0x55);
+        buf.extend_from_slice(&follow);
+
+        let err = codec.decode(&mut buf).expect_err("first decode rejects");
+        assert!(err.to_string().contains("INCOMPAT"), "got: {err}");
+        // No buffered header remains: the next decode starts fresh.
+        assert!(codec.pending_total_len.is_none());
+
+        let decoded = codec
+            .decode(&mut buf)
+            .unwrap()
+            .expect("follow-on frame decodes");
+        assert_eq!(decoded, follow);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn max_frame_size_matches_spec() {
+        // Invariant guard: MAVLink v2 hard cap is 280 bytes (10 header
+        // + 255 payload + 2 CRC + 13 signature). If this test breaks,
+        // either the MAVLink spec changed or one of the layout
+        // constants was edited incorrectly — both cases require
+        // deliberate review of every consumer of MAX_MAVLINK_FRAME_SIZE.
+        assert_eq!(MAX_MAVLINK_FRAME_SIZE, 280);
     }
 
     #[test]

@@ -19,7 +19,7 @@ use rustgate_core::codec::Codec;
 use rustgate_core::message::RoutableMessage;
 use rustgate_core::protocol::FramingStrategy;
 
-use crate::frame::{MAVLINK_V1_MAGIC, MAVLINK_V2_MAGIC, MavlinkVersion};
+use crate::frame::{MAVLINK_V1_MAGIC, MAVLINK_V2_MAGIC};
 
 /// Codec for MAVLink wire frames.
 ///
@@ -71,14 +71,6 @@ impl Codec for MavlinkCodec {
     }
 }
 
-// Confirm we can classify the magic even from the public re-export —
-// anchors the protocol_id contract used by audit logs.
-#[doc(hidden)]
-#[must_use]
-pub fn detect_version(prefix: &[u8]) -> Option<MavlinkVersion> {
-    prefix.first().copied().and_then(MavlinkVersion::from_magic)
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::panic, clippy::unwrap_used)]
@@ -91,6 +83,14 @@ mod tests {
     use rustgate_core::message::{Destination, MessageType, Metadata, SOURCE_MAVLINK};
 
     use super::*;
+    use crate::frame::MavlinkVersion;
+
+    /// Tests-only helper that anchors the protocol-id contract used by
+    /// audit logs: the magic byte is enough to classify a frame version
+    /// even when the rest of the header is not yet available.
+    fn detect_version(prefix: &[u8]) -> Option<MavlinkVersion> {
+        prefix.first().copied().and_then(MavlinkVersion::from_magic)
+    }
 
     fn sample_msg(payload: &[u8]) -> RoutableMessage {
         RoutableMessage {
