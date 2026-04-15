@@ -16,35 +16,84 @@
 //!
 //! - [`Obligation::MaskPoint`] — CoT `<point>` coordinates (`lat`, `lon`,
 //!   `hae`) are zeroed via [`rustgate_cot::mask::strip_coordinates`].
-//!   Non-CoT payloads pass through unmodified.
+//!   Non-XML payloads pass through unmodified; XML-intent payloads that
+//!   fail to parse fall back to [`Obligation::MaskPayload`]-equivalent
+//!   erasure so malformed input cannot leak coordinates.
 //! - [`Obligation::MaskPayload`] — the payload body is replaced with an
 //!   empty [`Bytes`] and the classified message type is coerced to
 //!   [`MessageType::Other`] with a `"masked"` tag so downstream caches
 //!   and dedup do not mistake it for the real event.
 //!
 //! [`Obligation::TagClassified`] and [`Obligation::AuditExtended`] are
-//! audit-only obligations. They are handled at the call site via
-//! `audit::authz_classified_delivery` / `audit::authz_extended` rather
-//! than mutating the wire payload, so [`apply_obligations`] intentionally
-//! ignores them.
+//! audit-shaped obligations that do not mutate the wire payload:
+//!
+//! - `TagClassified` — emitted at the PEP call site via
+//!   [`rustgate_core::audit::authz_classified_delivery`] so each
+//!   delivery of a classified artefact produces one hash-chained audit
+//!   record.
+//! - `AuditExtended` — reserved for future expanded audit records; no
+//!   data-plane side effect today. See `docs/authorization.md`.
+//!
+//! [`apply_obligations`] therefore skips both variants. Unknown
+//! variants (the [`Obligation`] enum is `#[non_exhaustive]`) also
+//! fall through to no-op delivery but emit
+//! [`rustgate_core::audit::authz_obligation_unknown`] so operators
+//! running a stale transport build against a newer authz policy can
+//! detect the skew via the audit trail.
 //!
 //! # Failure mode
 //!
-//! [`Obligation::MaskPoint`] on a non-CoT payload returns an error from
-//! the parser. The dispatcher logs at DEBUG and passes the payload through
-//! unchanged — masking is a best-effort leak-prevention mechanism, not a
-//! hard security gate. An operator whose policy predates a payload-type
-//! change must not see messages dropped wholesale because the masker
-//! refuses to parse them.
+//! [`Obligation::MaskPoint`] distinguishes two recovery modes:
 //!
-//! DEBUG (not WARN) is deliberate: a high-rate stream of non-CoT payloads
-//! under a `MaskPoint` policy must not amplify into a logging DoS.
-//! Operators who need visibility should rely on metrics and audit events,
-//! not the operational log stream.
+//! - Payload does not announce itself as XML (first non-whitespace byte
+//!   is not `<`) → forward unmodified. The masker is named for CoT; a
+//!   policy that attaches it to a MAVLink or protobuf stream is a
+//!   mis-configuration, not a leak.
+//! - Payload starts with `<` but fails to parse or trips the attribute
+//!   budget → **fail-closed**: empty the body and coerce the message
+//!   type to `Other("masked")`, the same state [`Obligation::MaskPayload`]
+//!   would have produced. A crafted payload that aborts parsing
+//!   immediately after its `<point>` element was emitted must not leak
+//!   coordinates via pass-through recovery.
+//!
+//! Both recovery paths emit
+//! [`rustgate_core::audit::authz_obligation_failed`] so operators see
+//! the policy hint was not honoured. The operational log stays at
+//! DEBUG so a high-rate stream of bad payloads cannot amplify into a
+//! logging DoS.
 
 use bytes::Bytes;
 use rustgate_authz::Obligation;
+use rustgate_core::audit;
 use rustgate_core::message::{MessageType, RoutableMessage};
+
+/// Return `true` when the obligation slice contains at least one
+/// variant that mutates the wire payload.
+///
+/// Callers use this to skip the clone-out-of-`Arc` performed by
+/// [`crate::router::RoutedMessage::with_obligations`] when the authz
+/// decision carries only audit-shaped obligations like
+/// [`Obligation::TagClassified`] or [`Obligation::AuditExtended`]. On a
+/// broadcast to N recipients with a policy that only requires
+/// classified-delivery audit (not masking), this turns N `clone() +
+/// Arc::new()` into N cheap `Arc::clone()`.
+///
+/// Unknown variants are treated as payload-mutating out of caution —
+/// if a future authz upgrade adds `Obligation::TransformPayload`, the
+/// transport crate's stale build should NOT short-circuit the
+/// payload-clone path and deliver the unmodified original. The audit
+/// record emitted by [`apply_obligations`] for unknown variants still
+/// fires on delivery.
+pub(crate) fn obligations_mutate_payload(obligations: &[Obligation]) -> bool {
+    obligations.iter().any(|o| match o {
+        Obligation::MaskPoint | Obligation::MaskPayload => true,
+        Obligation::TagClassified | Obligation::AuditExtended => false,
+        // `#[non_exhaustive]` — unknown variants default to "mutates"
+        // so the clone-out path runs and `apply_obligations` gets a
+        // chance to emit the unknown-variant audit event.
+        _ => true,
+    })
+}
 
 /// Apply every data-plane obligation in `obligations` to `msg` in place.
 ///
@@ -57,7 +106,9 @@ use rustgate_core::message::{MessageType, RoutableMessage};
 /// Obligations without a data-plane side effect
 /// ([`Obligation::TagClassified`], [`Obligation::AuditExtended`]) are
 /// skipped silently. The caller handles those via audit events at the
-/// PEP site.
+/// PEP site. Unknown variants emit
+/// [`audit::authz_obligation_unknown`] so stale-transport / new-policy
+/// skew is visible in the audit stream.
 pub fn apply_obligations(msg: &mut RoutableMessage, obligations: &[Obligation]) {
     for obligation in obligations {
         match obligation {
@@ -66,46 +117,105 @@ pub fn apply_obligations(msg: &mut RoutableMessage, obligations: &[Obligation]) 
             // Audit-only obligations handled at the call site.
             Obligation::TagClassified | Obligation::AuditExtended => {}
             // `#[non_exhaustive]` Obligation — future variants fall
-            // through to no-op so a stale dispatcher never silently drops
-            // a payload. Emit a DEBUG so operators running a stale build
-            // against a newer authz engine can detect the skew via log
-            // correlation, without amplifying under hostile traffic.
+            // through to no-op delivery but emit an audit record so
+            // operators running a stale transport build against a
+            // newer authz policy can detect the skew. DEBUG-level
+            // operational log (not WARN) to prevent a hostile sender
+            // under a misconfigured policy from amplifying into a
+            // logging DoS; audit has its own sink with stricter
+            // retention.
             other => {
                 tracing::debug!(
                     obligation = ?other,
                     "unknown obligation variant, no data-plane action taken"
+                );
+                audit::authz_obligation_unknown(
+                    &msg.source.cn,
+                    &format!("{other:?}"),
+                    &msg.metadata.source_protocol,
                 );
             }
         }
     }
 }
 
-/// Zero CoT `<point>` coordinates on `msg.payload`.
+/// Zero CoT `<point>` coordinates on `msg.payload` with fail-closed
+/// recovery on XML-intent parse errors.
 ///
-/// If the payload is not well-formed CoT XML (most often because policy
-/// was written for a non-CoT transport, or because the `<point>` element
-/// exceeded the masker's attribute budget), the payload is passed through
-/// unchanged and the failure is logged at DEBUG. Callers that care about
-/// strict leak prevention should gate delivery via the policy `Deny`
-/// path, not via [`Obligation::MaskPoint`].
+/// Recovery rules:
 ///
-/// The log level is DEBUG (not WARN) on purpose: a hostile or
-/// mis-configured sender under a `MaskPoint` policy could otherwise
-/// amplify a single bad payload into thousands of WARN records per
-/// second. Operational visibility for mask failures belongs in metrics
-/// and audit, not the default log stream.
+/// 1. **Non-XML payload** (first non-whitespace byte is not `<`) — pass
+///    through unmodified. `MaskPoint` is a CoT-specific control; a
+///    policy attached to a MAVLink/protobuf stream is a
+///    mis-configuration and the dispatcher must not silently drop the
+///    traffic. An audit record is still emitted with
+///    `recovery = "forwarded_unmasked"`.
+///
+/// 2. **XML-intent parse failure** (payload starts with `<` but
+///    quick_xml errors, or the `<point>` attribute budget is exceeded)
+///    — **fail-closed**: empty the body and coerce the message type to
+///    `Other("masked")`, the same state [`Obligation::MaskPayload`]
+///    would produce. This is the security boundary: a crafted payload
+///    that aborts parsing immediately after `<point>` was already
+///    copied to the writer must NOT leak coordinates via pass-through.
+///    Audit emitted with `recovery = "dropped"`.
+///
+/// The operational log stays at DEBUG for both recovery paths so a
+/// hostile or mis-configured sender cannot amplify a single bad
+/// payload into thousands of WARN records per second. Audit records
+/// carry the forensic detail.
 fn apply_mask_point(msg: &mut RoutableMessage) {
+    // XML-intent is decided from the payload itself: first
+    // non-whitespace byte is `<`. Non-XML payloads cannot host a
+    // `<point>` element — forward unmodified but still audit so
+    // operators see the policy hint landed on traffic it cannot mask.
+    let is_xml_intent = msg
+        .payload
+        .iter()
+        .find(|b| !b.is_ascii_whitespace())
+        .is_some_and(|b| *b == b'<');
+
+    if !is_xml_intent {
+        tracing::debug!(
+            source_protocol = %msg.metadata.source_protocol,
+            message_type = %msg.metadata.message_type,
+            "mask_point obligation: non-XML payload, forwarding unmasked"
+        );
+        audit::authz_obligation_failed(
+            &msg.source.cn,
+            "MaskPoint",
+            "payload is not XML",
+            "forwarded_unmasked",
+            &msg.metadata.source_protocol,
+        );
+        return;
+    }
+
     match rustgate_cot::mask::strip_coordinates(&msg.payload) {
         Ok(masked) => {
             msg.payload = masked;
         }
         Err(e) => {
+            // Fail-closed: XML-intent payload whose parse failed (or
+            // attribute-budget trip). Drop the payload rather than
+            // leaking unmasked coordinates — a crafted sender could
+            // otherwise emit `<event><point lat="…"…/>` and cut the
+            // document so quick_xml errors after `<point>` was
+            // already copied to the writer.
             tracing::debug!(
                 error = %e,
                 source_protocol = %msg.metadata.source_protocol,
                 message_type = %msg.metadata.message_type,
-                "mask_point obligation: payload not CoT-maskable, forwarding unmasked"
+                "mask_point obligation: XML-intent parse failed, erasing payload"
             );
+            audit::authz_obligation_failed(
+                &msg.source.cn,
+                "MaskPoint",
+                &format!("{e}"),
+                "dropped",
+                &msg.metadata.source_protocol,
+            );
+            apply_mask_payload(msg);
         }
     }
 }
@@ -249,5 +359,104 @@ mod tests {
         let mut msg = sample_msg(SAMPLE_COT, MessageType::Position);
         apply_obligations(&mut msg, &[Obligation::MaskPayload, Obligation::MaskPoint]);
         assert!(msg.payload.is_empty());
+    }
+
+    #[test]
+    fn mask_point_xml_intent_malformed_payload_is_fail_closed() {
+        // Security-critical: an XML-intent payload that trips the parser
+        // partway through must NOT fall back to pass-through. A sender
+        // could otherwise leak coordinates by terminating the document
+        // mid-element after `<point>` was already emitted.
+        let malformed: &'static [u8] =
+            br#"<event><point lat="38.8977" lon="-77.0365" hae="125.4"/><unterminated"#;
+        let mut msg = sample_msg(malformed, MessageType::Position);
+        apply_obligations(&mut msg, &[Obligation::MaskPoint]);
+        // Fail-closed: payload erased, message type coerced.
+        assert!(
+            msg.payload.is_empty(),
+            "payload not erased: {:?}",
+            msg.payload
+        );
+        assert_eq!(
+            msg.metadata.message_type,
+            MessageType::Other("masked".into())
+        );
+    }
+
+    #[test]
+    fn mask_point_on_attribute_budget_trip_is_fail_closed() {
+        // Crafted `<point>` with more than MAX_POINT_ATTRIBUTES — the
+        // masker returns AttrBudgetExceeded. Because the payload is
+        // XML-intent, the dispatcher must erase it rather than forward
+        // unmasked.
+        use rustgate_cot::mask::MAX_POINT_ATTRIBUTES;
+        let mut xml = String::from(
+            r#"<event uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><point lat="38.8977" lon="-77.0365" hae="125.4""#,
+        );
+        for i in 0..=MAX_POINT_ATTRIBUTES {
+            xml.push_str(&format!(r#" x{i}="v""#));
+        }
+        xml.push_str("/></event>");
+
+        // Leak the String to a &'static [u8] so sample_msg (which is
+        // static-bound for convenience in the rest of the suite) works.
+        let leaked: &'static [u8] = Box::leak(xml.into_bytes().into_boxed_slice());
+        let mut msg = sample_msg(leaked, MessageType::Position);
+        apply_obligations(&mut msg, &[Obligation::MaskPoint]);
+        assert!(
+            msg.payload.is_empty(),
+            "attribute-budget trip must erase payload"
+        );
+        assert_eq!(
+            msg.metadata.message_type,
+            MessageType::Other("masked".into())
+        );
+    }
+
+    #[test]
+    fn mask_point_on_uppercase_element_masks_coordinates() {
+        // Case-variant: <Point> must be masked even though the byte
+        // sequence is not `b"point"`. Earlier implementations bypassed
+        // this case.
+        let xml: &'static [u8] = br#"<event uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><Point lat="38.8977" lon="-77.0365" hae="125.4"/></event>"#;
+        let mut msg = sample_msg(xml, MessageType::Position);
+        apply_obligations(&mut msg, &[Obligation::MaskPoint]);
+        let s = std::str::from_utf8(&msg.payload).unwrap();
+        assert!(s.contains(r#"lat="0.0""#), "case-variant not masked: {s}");
+        assert!(!s.contains("38.8977"), "raw lat leaked: {s}");
+    }
+
+    #[test]
+    fn mask_point_on_namespaced_element_masks_coordinates() {
+        let xml: &'static [u8] = br#"<event xmlns:cot="urn:cot" uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><cot:point lat="38.8977" lon="-77.0365" hae="125.4"/></event>"#;
+        let mut msg = sample_msg(xml, MessageType::Position);
+        apply_obligations(&mut msg, &[Obligation::MaskPoint]);
+        let s = std::str::from_utf8(&msg.payload).unwrap();
+        assert!(
+            s.contains(r#"lat="0.0""#),
+            "namespaced element not masked: {s}"
+        );
+        assert!(!s.contains("38.8977"), "raw lat leaked: {s}");
+    }
+
+    #[test]
+    fn obligations_mutate_payload_reports_mask_variants_true() {
+        assert!(obligations_mutate_payload(&[Obligation::MaskPoint]));
+        assert!(obligations_mutate_payload(&[Obligation::MaskPayload]));
+        assert!(obligations_mutate_payload(&[
+            Obligation::MaskPoint,
+            Obligation::TagClassified
+        ]));
+    }
+
+    #[test]
+    fn obligations_mutate_payload_reports_audit_only_variants_false() {
+        assert!(!obligations_mutate_payload(&[]));
+        assert!(!obligations_mutate_payload(&[Obligation::TagClassified]));
+        assert!(!obligations_mutate_payload(&[Obligation::AuditExtended]));
+        assert!(!obligations_mutate_payload(&[
+            Obligation::TagClassified,
+            Obligation::AuditExtended
+        ]));
     }
 }

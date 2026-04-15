@@ -44,8 +44,9 @@ use rustgate_authz::{
     Action as AuthzAction, Decision as AuthzDecision, Obligation, PolicyEngine,
     Resource as AuthzResource, Subject as AuthzSubject,
 };
+use smol_str::SmolStr;
 
-use crate::obligations::apply_obligations;
+use crate::obligations::{apply_obligations, obligations_mutate_payload};
 
 /// Callback invoked after every authz evaluation so operators can wire
 /// the engine into metrics and audit without making `rustgate-transport`
@@ -188,17 +189,25 @@ impl RoutedMessage {
     }
 
     /// Return a copy of this envelope with authz obligations applied to
-    /// its payload. When `obligations` is empty this is a cheap
-    /// [`Clone`] that reuses the same `Arc<RoutableMessage>`; otherwise
-    /// the payload is cloned out of the `Arc`, mutated via
-    /// [`apply_obligations`], and re-wrapped so other recipients whose
-    /// decisions produced different obligations are not affected.
+    /// its payload. When `obligations` is empty OR contains only
+    /// audit-shaped obligations (via
+    /// [`obligations_mutate_payload`]) this is a cheap [`Clone`] that
+    /// reuses the same `Arc<RoutableMessage>`; otherwise the payload
+    /// is cloned out of the `Arc`, mutated via [`apply_obligations`],
+    /// and re-wrapped so other recipients whose decisions produced
+    /// different obligations are not affected.
+    ///
+    /// Short-circuiting on audit-only obligations matters for
+    /// broadcast fan-out: a policy that tags every classified delivery
+    /// via `TagClassified` (but does not mask the payload) would
+    /// otherwise clone the `RoutableMessage` once per recipient on a
+    /// large group send, amplifying latency and allocator pressure.
     ///
     /// The backpressure permit is preserved across the rewrap so the
     /// global admission-control counter continues to reflect the
     /// message's lifetime.
     pub(crate) fn with_obligations(&self, obligations: &[Obligation]) -> Self {
-        if obligations.is_empty() {
+        if !obligations_mutate_payload(obligations) {
             return self.clone();
         }
         let mut msg = (*self.msg).clone();
@@ -1352,9 +1361,17 @@ impl Router {
             }
         }
 
-        // Cache position reports for SA replay to new sessions. This
-        // MUST run after the authz PEP above: a denied position must
-        // not enter the replay cache.
+        // Cache position reports for SA replay to new sessions. Two
+        // ordering invariants MUST hold:
+        //
+        // 1. This runs *after* the Send-PEP deny path above, so a
+        //    denied position never enters the replay cache.
+        // 2. This runs *after* `apply_obligations` on the Send-PEP
+        //    allow path, so Send-side masking (e.g. `MaskPoint`) is
+        //    already baked into the cached copy. `replay_positions`
+        //    delivers the cached bytes as-is (after a Receive PEP
+        //    check), so a Send-obligation that isn't in the cache
+        //    would leak unmasked coordinates to late joiners.
         if msg.metadata.message_type == MessageType::Position {
             self.cache.store(msg.clone()).await;
         }
@@ -1815,6 +1832,16 @@ impl Router {
                 // `try_send` fails and the message falls through to
                 // `persist_for_offline`, the drain path re-evaluates the
                 // PEP at live-delivery time and emits audit then.
+                //
+                // `pre_receive` holds the envelope *before* Receive-side
+                // obligation mutation. If delivery fails and we fall
+                // through to store-forward, we persist `pre_receive` so
+                // the drain path re-evaluates the PEP from the original
+                // payload — if policy has changed while the client was
+                // offline (e.g. MaskPoint no longer required), drain
+                // delivers the un-masked original rather than a stale
+                // pre-masked copy.
+                let pre_receive = msg.clone();
                 let (msg, audit_ctx) = if let Some(engine) = (**authz_guard).as_ref() {
                     let subject = AuthzSubject::from_identity(&handle.identity);
                     let resource = AuthzResource::Direct { target_cn: cn };
@@ -1835,16 +1862,17 @@ impl Router {
                     let sender_cn = msg.source.cn.clone();
                     // `rule_id` is only used by `audit_classified_receive`,
                     // which fires only when `TagClassified` is present.
-                    // Skip the String allocation on the common untagged
-                    // path — a hot PEP site should not allocate per
-                    // recipient for audit metadata that is about to be
-                    // discarded.
+                    // Skip cloning on the common untagged path — a hot
+                    // PEP site should not allocate per recipient for
+                    // audit metadata that is about to be discarded.
+                    // SmolStr kept through to avoid a redundant
+                    // alloc-then-drop.
                     let rule_id = if outcome
                         .obligations
                         .iter()
                         .any(|o| matches!(o, Obligation::TagClassified))
                     {
-                        outcome.rule_id.as_ref().map(|s| s.to_string())
+                        outcome.rule_id.clone()
                     } else {
                         None
                     };
@@ -1854,7 +1882,7 @@ impl Router {
                 } else {
                     (msg, None)
                 };
-                if handle.try_send(msg.clone()) {
+                if handle.try_send(msg) {
                     if let Some((engine, obligations, rule_id, sender_cn)) = audit_ctx {
                         self.audit_classified_receive(
                             &obligations,
@@ -1868,17 +1896,21 @@ impl Router {
                     }
                 } else {
                     // Non-blocking: channel is full or closed. Persist
-                    // for offline redelivery so the message is not lost.
-                    // The circuit breaker inside `try_send` will
-                    // disconnect truly slow sessions after N consecutive
-                    // failures. No audit here — the drain path re-runs
-                    // the PEP and audits on actual live delivery.
+                    // the pre-Receive form so the drain path re-evaluates
+                    // the PEP from the original payload — policy may
+                    // change while the client is offline, and re-applying
+                    // an already-applied obligation on drain would bake
+                    // in stale masking. The circuit breaker inside
+                    // `try_send` will disconnect truly slow sessions
+                    // after N consecutive failures. No audit here — the
+                    // drain path re-runs the PEP and audits on actual
+                    // live delivery.
                     if handle.is_closed() {
                         warn!(session = %cn, "session channel closed, persisting for offline");
                     } else {
                         debug!(session = %cn, "session channel full, persisting for offline");
                     }
-                    self.persist_for_offline(cn, &msg);
+                    self.persist_for_offline(cn, &pre_receive);
                 }
             }
             None => {
@@ -1953,7 +1985,7 @@ impl Router {
         // successful `try_send`. Emitting audit inside the filter_map
         // would record "tagged delivered" for recipients whose channel
         // later rejects the enqueue — a forensic lie under backpressure.
-        let eligible: Vec<(SessionHandle, Vec<Obligation>, Option<String>)> = {
+        let eligible: Vec<(SessionHandle, Vec<Obligation>, Option<SmolStr>)> = {
             let state = self.state.read().await;
             let members = match state.groups.get(group) {
                 Some(m) => m,
@@ -1995,16 +2027,18 @@ impl Router {
                         );
                         return None;
                     }
-                    // Only allocate `rule_id` when the recipient will
+                    // Only capture `rule_id` when the recipient will
                     // actually consume it — `audit_classified_receive`
                     // emits only on `TagClassified`. On the untagged
-                    // common path we skip the per-recipient allocation.
+                    // common path we skip the per-recipient clone.
+                    // SmolStr kept through so the emission does not
+                    // burn a String allocation on the audit hot path.
                     let rule_id = if outcome
                         .obligations
                         .iter()
                         .any(|o| matches!(o, Obligation::TagClassified))
                     {
-                        outcome.rule_id.as_ref().map(|s| s.to_string())
+                        outcome.rule_id.clone()
                     } else {
                         None
                     };
@@ -2221,7 +2255,7 @@ impl Router {
         // below. We carry the rule_id alongside the obligations so the
         // dispatch loop can fire `audit_classified_receive` only after a
         // successful `try_send`.
-        let eligible: Vec<(SessionHandle, Vec<Obligation>, Option<String>)> = {
+        let eligible: Vec<(SessionHandle, Vec<Obligation>, Option<SmolStr>)> = {
             let state = self.state.read().await;
             let members = match state.groups.get(group) {
                 Some(m) => m,
@@ -2257,16 +2291,17 @@ impl Router {
                         );
                         return None;
                     }
-                    // See send_to_group: skip rule_id allocation unless
+                    // See send_to_group: skip rule_id capture unless
                     // TagClassified is present so the fan-out loop does
-                    // not allocate per recipient for metadata that will
+                    // not clone per recipient for metadata that will
                     // be discarded by `audit_classified_receive`.
+                    // SmolStr kept through to avoid allocating a String.
                     let rule_id = if outcome
                         .obligations
                         .iter()
                         .any(|o| matches!(o, Obligation::TagClassified))
                     {
-                        outcome.rule_id.as_ref().map(|s| s.to_string())
+                        outcome.rule_id.clone()
                     } else {
                         None
                     };
