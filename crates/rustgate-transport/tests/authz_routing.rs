@@ -665,7 +665,7 @@ async fn store_forward_drain_applies_mask_payload_obligation() {
     let filtered = router.filter_offline_messages(&bob, drained);
 
     assert_eq!(filtered.len(), 1, "message must survive allow decision");
-    let msg = &filtered[0];
+    let msg = filtered[0].message();
     assert!(msg.payload.is_empty(), "drain must apply MaskPayload");
     assert_eq!(
         msg.metadata.message_type,
@@ -921,5 +921,318 @@ async fn classified_delivery_audit_fires_on_successful_delivery() {
     assert!(
         captured.contains("\"event_type\":\"authz.classified_delivery\""),
         "successful delivery must emit classified_delivery audit; captured: {captured}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Audit fidelity regression tests for every Receive PEP fan-out site.
+//
+// The invariant under test is identical at every site:
+//
+//     audit.classified_delivery fires iff try_send succeeded.
+//
+// A failed try_send (channel full or session closed) must NOT produce an
+// `authz.classified_delivery` record, because that record documents an
+// actual on-the-wire classified delivery — forensically worse to log a
+// delivery that never happened than to omit one that did.
+//
+// Each of the four tests below saturates the recipient's channels before
+// routing a classified-tagged copy and asserts the audit buffer remains
+// empty of any classified_delivery line. They cover the four live Receive
+// PEP sites plus the offline drain path:
+//
+//   1. `send_to_group`            (Destination::Group)
+//   2. `send_to_all`              (Destination::Broadcast)
+//   3. `send_to_group_excluding`  (Destination::Multicast)
+//   4. `filter_offline_messages`  (store-forward drain)
+// ---------------------------------------------------------------------------
+
+/// Shared audit-capture helper. Installed as a thread-local tracing
+/// subscriber filtered to the `audit` target so tests can assert on
+/// exactly the audit records that fired during the test body.
+mod audit_capture {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::filter::Targets;
+    use tracing_subscriber::fmt::MakeWriter;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[derive(Clone, Default)]
+    pub(super) struct SharedBuf(pub Arc<Mutex<Vec<u8>>>);
+    impl SharedBuf {
+        pub(super) fn snapshot(&self) -> String {
+            let g = self.0.lock().expect("buf lock");
+            String::from_utf8_lossy(&g).into_owned()
+        }
+    }
+    impl Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("buf lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> MakeWriter<'a> for SharedBuf {
+        type Writer = SharedBuf;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Install a JSON-formatted audit-only subscriber on the current
+    /// thread. The returned guard must outlive the test body.
+    pub(super) fn install() -> (SharedBuf, tracing::subscriber::DefaultGuard) {
+        let buf = SharedBuf::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(buf.clone())
+            .with_filter(Targets::new().with_target("audit", tracing::Level::INFO));
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let guard = tracing::subscriber::set_default(subscriber);
+        (buf, guard)
+    }
+}
+
+/// `send_to_group` must not emit `authz.classified_delivery` when the
+/// per-recipient `try_send` fails. A saturated recipient channel is a
+/// drop, not a delivery, and the audit trail must reflect that.
+#[tokio::test(flavor = "current_thread")]
+async fn group_send_classified_delivery_audit_skipped_when_try_send_fails() {
+    let (buf, _guard) = audit_capture::install();
+
+    let router = Router::new().with_authz(allow_with_obligation(
+        Action::Receive,
+        Obligation::TagClassified,
+    ));
+    let alice = identity("alice", &["alpha"]);
+    let bob = identity("bob", &["alpha"]);
+
+    // Bob's recipient channels sized 1 and pre-filled so the next
+    // `try_send` by the router into either will fail.
+    let (ptx_b, prx_b) = mpsc::channel(1);
+    let (ntx_b, nrx_b) = mpsc::channel(1);
+    ntx_b
+        .try_send(rustgate_transport::RoutedMessage::from(Arc::new(chat(
+            &alice,
+            Destination::Group("alpha".into()),
+        ))))
+        .expect("pre-fill normal");
+    ptx_b
+        .try_send(rustgate_transport::RoutedMessage::from(Arc::new(chat(
+            &alice,
+            Destination::Group("alpha".into()),
+        ))))
+        .expect("pre-fill priority");
+    // Keep receivers alive so the senders stay open — the router needs
+    // the channel to be full, not closed, to exercise the drop path.
+    let _prx_b = prx_b;
+    let _nrx_b = nrx_b;
+    router
+        .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+        .await;
+
+    router
+        .route(chat(&alice, Destination::Group("alpha".into())))
+        .await;
+
+    let captured = buf.snapshot();
+    assert!(
+        !captured.contains("\"event_type\":\"authz.classified_delivery\""),
+        "group send must not audit classified_delivery on saturated try_send; \
+         captured: {captured}"
+    );
+}
+
+/// `send_to_all` (broadcast) must not emit `authz.classified_delivery`
+/// when a recipient's `try_send` fails. Broadcast fan-out with a slow
+/// consumer would otherwise produce phantom classified-delivery records
+/// for every dropped recipient.
+#[tokio::test(flavor = "current_thread")]
+async fn broadcast_classified_delivery_audit_skipped_when_try_send_fails() {
+    let (buf, _guard) = audit_capture::install();
+
+    let router = Router::new().with_authz(allow_with_obligation(
+        Action::Receive,
+        Obligation::TagClassified,
+    ));
+    let alice = identity("alice", &["alpha"]);
+    let bob = identity("bob", &["alpha"]);
+
+    let (ptx_b, prx_b) = mpsc::channel(1);
+    let (ntx_b, nrx_b) = mpsc::channel(1);
+    ntx_b
+        .try_send(rustgate_transport::RoutedMessage::from(Arc::new(chat(
+            &alice,
+            Destination::Broadcast,
+        ))))
+        .expect("pre-fill normal");
+    ptx_b
+        .try_send(rustgate_transport::RoutedMessage::from(Arc::new(chat(
+            &alice,
+            Destination::Broadcast,
+        ))))
+        .expect("pre-fill priority");
+    let _prx_b = prx_b;
+    let _nrx_b = nrx_b;
+    router
+        .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+        .await;
+
+    router.route(chat(&alice, Destination::Broadcast)).await;
+
+    let captured = buf.snapshot();
+    assert!(
+        !captured.contains("\"event_type\":\"authz.classified_delivery\""),
+        "broadcast must not audit classified_delivery on saturated try_send; \
+         captured: {captured}"
+    );
+}
+
+/// `send_to_group_excluding` (multicast fan-out) must not emit
+/// `authz.classified_delivery` when the per-recipient `try_send` fails.
+/// Multicast walks each target group in turn; a saturated recipient in
+/// the first group must not be tagged as delivered, and a subsequent
+/// group delivery attempt must also not tag a failed drop.
+#[tokio::test(flavor = "current_thread")]
+async fn multicast_classified_delivery_audit_skipped_when_try_send_fails() {
+    let (buf, _guard) = audit_capture::install();
+
+    let router = Router::new().with_authz(allow_with_obligation(
+        Action::Receive,
+        Obligation::TagClassified,
+    ));
+    // Both identities are members of both groups so the cross-group
+    // multicast sender check (`msg.source.is_member_of(group)`) passes
+    // on both hops without the router short-circuiting before the
+    // try_send under test.
+    let alice = identity("alice", &["alpha", "bravo"]);
+    let bob = identity("bob", &["alpha", "bravo"]);
+
+    let (ptx_b, prx_b) = mpsc::channel(1);
+    let (ntx_b, nrx_b) = mpsc::channel(1);
+    ntx_b
+        .try_send(rustgate_transport::RoutedMessage::from(Arc::new(chat(
+            &alice,
+            Destination::Multicast(vec!["alpha".into(), "bravo".into()]),
+        ))))
+        .expect("pre-fill normal");
+    ptx_b
+        .try_send(rustgate_transport::RoutedMessage::from(Arc::new(chat(
+            &alice,
+            Destination::Multicast(vec!["alpha".into(), "bravo".into()]),
+        ))))
+        .expect("pre-fill priority");
+    let _prx_b = prx_b;
+    let _nrx_b = nrx_b;
+    router
+        .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+        .await;
+
+    router
+        .route(chat(
+            &alice,
+            Destination::Multicast(vec!["alpha".into(), "bravo".into()]),
+        ))
+        .await;
+
+    let captured = buf.snapshot();
+    assert!(
+        !captured.contains("\"event_type\":\"authz.classified_delivery\""),
+        "multicast must not audit classified_delivery on saturated try_send; \
+         captured: {captured}"
+    );
+}
+
+/// Store-forward drain must not emit `authz.classified_delivery` until
+/// the caller explicitly calls [`PendingAudit::emit_on_delivered`]. If
+/// the caller drops the `PendingAudit` (e.g. because `SessionHandle::send`
+/// returned an error), no audit record may fire — the on-the-wire
+/// delivery never happened.
+///
+/// This test also pins the positive half of the contract: when the
+/// caller does call `emit_on_delivered`, exactly one classified_delivery
+/// audit record lands in the buffer.
+#[tokio::test(flavor = "current_thread")]
+async fn drain_classified_delivery_audit_driven_by_emit_on_delivered() {
+    use rustgate_transport::ClientQueue;
+
+    let (buf, _guard) = audit_capture::install();
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let queue = Arc::new(ClientQueue::open(tmp.path(), 1_000_000).expect("open queue"));
+    let router = Router::new()
+        .with_client_queue(Arc::clone(&queue))
+        .with_authz(allow_with_obligation(
+            Action::Receive,
+            Obligation::TagClassified,
+        ));
+
+    let alice = identity("alice", &["alpha"]);
+    let bob = identity("bob", &["alpha"]);
+
+    router
+        .route(chat(&alice, Destination::Direct((*bob).clone())))
+        .await;
+    for _ in 0..200 {
+        if queue.stats("bob").depth == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(queue.stats("bob").depth, 1, "message must be queued");
+
+    // Negative half: drain + filter, then drop the PendingAudit without
+    // calling emit_on_delivered. Simulates the caller's send failing and
+    // the pending audit falling out of scope.
+    let drained = router.drain_offline_messages("bob").await;
+    let filtered = router.filter_offline_messages(&bob, drained);
+    assert_eq!(filtered.len(), 1, "drain must yield one pending delivery");
+    {
+        let (_msg, _audit) = filtered
+            .into_iter()
+            .next()
+            .expect("one pending")
+            .into_parts();
+        // `_audit` (PendingAudit) drops here without emit_on_delivered —
+        // exactly the code path that must NOT fire an audit record.
+    }
+    let captured_after_drop = buf.snapshot();
+    assert!(
+        !captured_after_drop.contains("\"event_type\":\"authz.classified_delivery\""),
+        "dropping PendingAudit without emit_on_delivered must not audit; \
+         captured: {captured_after_drop}"
+    );
+
+    // Positive half: re-persist the same message (first drain popped it
+    // off the queue), drain again, and this time call emit_on_delivered.
+    // Exactly one classified_delivery record must land.
+    router
+        .route(chat(&alice, Destination::Direct((*bob).clone())))
+        .await;
+    for _ in 0..200 {
+        if queue.stats("bob").depth == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let drained = router.drain_offline_messages("bob").await;
+    let filtered = router.filter_offline_messages(&bob, drained);
+    assert_eq!(filtered.len(), 1, "second drain must yield one pending");
+    for pending in filtered {
+        let (_msg, audit) = pending.into_parts();
+        audit.emit_on_delivered();
+    }
+    let captured_after_emit = buf.snapshot();
+    let emit_hits = captured_after_emit
+        .matches("\"event_type\":\"authz.classified_delivery\"")
+        .count();
+    assert_eq!(
+        emit_hits, 1,
+        "emit_on_delivered must fire exactly one classified_delivery audit; \
+         captured: {captured_after_emit}"
     );
 }

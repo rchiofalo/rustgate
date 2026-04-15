@@ -59,7 +59,7 @@ pub use repeater::EmergencyRepeater;
 pub use replay::ReplayFilter;
 pub use router::{
     ACCESS_LOG_TARGET, AuthzEvent, AuthzObserver, NORMAL_CHANNEL_CAPACITY,
-    PRIORITY_CHANNEL_CAPACITY, RoutedMessage, Router, SessionHandle,
+    PRIORITY_CHANNEL_CAPACITY, PendingAudit, PendingDelivery, RoutedMessage, Router, SessionHandle,
 };
 pub use rustgate_authz;
 #[cfg(feature = "proto")]

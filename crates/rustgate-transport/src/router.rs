@@ -223,6 +223,127 @@ impl From<Arc<RoutableMessage>> for RoutedMessage {
     }
 }
 
+/// A message pending live delivery on the store-forward drain path.
+///
+/// Produced by [`Router::filter_offline_messages`] for every stored
+/// message that survives the current ACL + authz re-evaluation.
+///
+/// The drain path has the same audit invariant as the live PEPs: an
+/// `authz.classified_delivery` record must only be emitted when the
+/// recipient actually receives the message on the wire. Emitting the
+/// record from inside `filter_offline_messages` itself would lie under
+/// backpressure — the caller's send loop can still fail partway
+/// through, and a pre-emitted audit would falsely report delivery for
+/// messages the recipient never observed.
+///
+/// Callers decompose this via [`into_parts`] after authorizing delivery:
+///
+/// ```ignore
+/// for pending in router.filter_offline_messages(&identity, drained) {
+///     let (msg, audit) = pending.into_parts();
+///     if handle.send(Arc::new(msg)).await.is_err() {
+///         break; // drop `audit` without emitting — send failed
+///     }
+///     audit.emit_on_delivered();
+/// }
+/// ```
+///
+/// [`into_parts`]: PendingDelivery::into_parts
+#[derive(Debug)]
+pub struct PendingDelivery {
+    message: RoutableMessage,
+    audit: Option<ClassifiedAuditCtx>,
+}
+
+impl PendingDelivery {
+    /// Borrow the underlying [`RoutableMessage`] without consuming.
+    pub fn message(&self) -> &RoutableMessage {
+        &self.message
+    }
+
+    /// Consume the pending delivery, returning the envelope and a
+    /// deferred-audit handle. The caller must invoke
+    /// [`PendingAudit::emit_on_delivered`] only after a successful
+    /// recipient-channel send; on failure, drop the handle without
+    /// calling it so the drain-path audit trail matches on-the-wire
+    /// delivery exactly.
+    pub fn into_parts(self) -> (RoutableMessage, PendingAudit) {
+        (self.message, PendingAudit { ctx: self.audit })
+    }
+}
+
+/// Deferred audit handle paired with a [`PendingDelivery`] envelope.
+///
+/// Holds a snapshot of the authz engine that authorized the delivery
+/// plus the fields needed to emit
+/// [`rustgate_core::audit::authz_classified_delivery`]. Snapshotting the
+/// engine as an `Arc<dyn PolicyEngine>` preserves the original
+/// `policy_id()` across any concurrent `swap_authz` between decision
+/// and delivery — the audit record must reflect the policy that
+/// authorized the delivery, not whatever is current now.
+///
+/// `ctx` is `None` when the authorizing rule produced no
+/// `TagClassified` obligation. In that case [`emit_on_delivered`] is a
+/// no-op and no allocation or audit write happens on the drain path.
+///
+/// [`emit_on_delivered`]: PendingAudit::emit_on_delivered
+#[derive(Debug)]
+pub struct PendingAudit {
+    ctx: Option<ClassifiedAuditCtx>,
+}
+
+impl PendingAudit {
+    /// Emit the `authz.classified_delivery` audit record. Must be
+    /// called exactly once after a successful send to the recipient
+    /// channel; otherwise drop without calling.
+    pub fn emit_on_delivered(self) {
+        if let Some(ctx) = self.ctx {
+            rustgate_core::audit::authz_classified_delivery(
+                &ctx.sender_cn,
+                &ctx.recipient_cn,
+                "receive",
+                ctx.resource_kind,
+                &ctx.resource_id,
+                ctx.rule_id.as_deref(),
+                ctx.engine.policy_id(),
+            );
+        }
+    }
+}
+
+/// Snapshot of the PEP decision context needed to emit
+/// `authz.classified_delivery` after successful delivery.
+///
+/// The engine handle is cloned from `self.authz.load()` so the
+/// audit record reflects the engine that authorized delivery even
+/// if the router hot-swaps the engine between decision and send.
+#[derive(Clone)]
+struct ClassifiedAuditCtx {
+    engine: Arc<dyn PolicyEngine>,
+    sender_cn: String,
+    recipient_cn: String,
+    resource_kind: &'static str,
+    resource_id: String,
+    rule_id: Option<smol_str::SmolStr>,
+}
+
+// Manual Debug impl: `dyn PolicyEngine` does not derive `Debug`, so
+// the derive would fail. Projecting to `policy_id()` is also safer —
+// a future engine impl could accidentally `{:?}` log sensitive rule
+// contents if we leaned on a blanket debug derive.
+impl std::fmt::Debug for ClassifiedAuditCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClassifiedAuditCtx")
+            .field("engine_policy_id", &self.engine.policy_id())
+            .field("sender_cn", &self.sender_cn)
+            .field("recipient_cn", &self.recipient_cn)
+            .field("resource_kind", &self.resource_kind)
+            .field("resource_id", &self.resource_id)
+            .field("rule_id", &self.rule_id)
+            .finish()
+    }
+}
+
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Default number of consecutive send failures before the circuit breaker
@@ -1327,13 +1448,17 @@ impl Router {
     /// debug log.
     ///
     /// Callers should invoke this on the output of
-    /// [`Self::drain_offline_messages`] before forwarding messages to the
-    /// session handle.
+    /// [`Self::drain_offline_messages`] and iterate the returned
+    /// [`PendingDelivery`] values: for each, call
+    /// [`PendingDelivery::into_parts`], attempt delivery via the session
+    /// handle, and only on success invoke
+    /// [`PendingAudit::emit_on_delivered`]. Emitting audit inline here
+    /// would misrepresent drops under backpressure as tagged deliveries.
     pub fn filter_offline_messages(
         &self,
         recipient_identity: &Identity,
         messages: Vec<RoutableMessage>,
-    ) -> Vec<RoutableMessage> {
+    ) -> Vec<PendingDelivery> {
         if messages.len() > 1000 {
             warn!(
                 cn = %recipient_identity.cn,
@@ -1372,6 +1497,7 @@ impl Router {
                 }
 
                 // Re-check authz engine for all message types.
+                let mut audit_ctx: Option<ClassifiedAuditCtx> = None;
                 if let Some(ref engine) = **authz_guard {
                     // Sender Send check
                     let subject = AuthzSubject::from_identity(&msg.source);
@@ -1426,26 +1552,50 @@ impl Router {
                         apply_obligations(&mut msg, &recv_outcome.obligations);
                     }
 
-                    // Audit classified delivery on drain: this is a
-                    // distinct delivery event from the original send
-                    // (policy and obligations are re-evaluated here).
-                    let (resource_kind, resource_id) = match &msg.destination {
-                        Destination::Direct(target) => ("direct", target.cn.as_str()),
-                        Destination::Group(group) => ("group", group.as_ref()),
-                        Destination::Broadcast | Destination::Multicast(_) => ("broadcast", ""),
-                    };
-                    self.audit_classified_receive(
-                        &recv_outcome.obligations,
-                        engine,
-                        msg.source.cn.as_str(),
-                        recipient_identity.cn.as_str(),
-                        resource_kind,
-                        resource_id,
-                        recv_outcome.rule_id.as_deref(),
-                    );
+                    // Build deferred-audit context ONLY when a
+                    // TagClassified obligation is present: that is the
+                    // single obligation that produces an
+                    // `authz.classified_delivery` record. Other
+                    // obligations (MaskGeo, MaskPayload, AuditExtended)
+                    // do not consume this path. Gating here means the
+                    // common untagged drain pays zero allocations for
+                    // the audit envelope.
+                    //
+                    // The record itself is *not* emitted here — it
+                    // fires from [`PendingAudit::emit_on_delivered`]
+                    // once the caller successfully hands the message
+                    // off to the recipient session channel. Emitting
+                    // inline would misrepresent a drain-time drop
+                    // (channel full, session already gone) as a
+                    // delivered tagged copy, which is forensically
+                    // worse than a missing record.
+                    if recv_outcome
+                        .obligations
+                        .iter()
+                        .any(|o| matches!(o, Obligation::TagClassified))
+                    {
+                        let (resource_kind, resource_id) = match &msg.destination {
+                            Destination::Direct(target) => ("direct", target.cn.clone()),
+                            Destination::Group(group) => ("group", group.to_string()),
+                            Destination::Broadcast | Destination::Multicast(_) => {
+                                ("broadcast", String::new())
+                            }
+                        };
+                        audit_ctx = Some(ClassifiedAuditCtx {
+                            engine: Arc::clone(engine),
+                            sender_cn: msg.source.cn.clone(),
+                            recipient_cn: recipient_identity.cn.clone(),
+                            resource_kind,
+                            resource_id,
+                            rule_id: recv_outcome.rule_id.clone(),
+                        });
+                    }
                 }
 
-                Some(msg)
+                Some(PendingDelivery {
+                    message: msg,
+                    audit: audit_ctx,
+                })
             })
             .collect()
     }
@@ -1683,7 +1833,21 @@ impl Router {
                         return;
                     }
                     let sender_cn = msg.source.cn.clone();
-                    let rule_id = outcome.rule_id.as_ref().map(|s| s.to_string());
+                    // `rule_id` is only used by `audit_classified_receive`,
+                    // which fires only when `TagClassified` is present.
+                    // Skip the String allocation on the common untagged
+                    // path — a hot PEP site should not allocate per
+                    // recipient for audit metadata that is about to be
+                    // discarded.
+                    let rule_id = if outcome
+                        .obligations
+                        .iter()
+                        .any(|o| matches!(o, Obligation::TagClassified))
+                    {
+                        outcome.rule_id.as_ref().map(|s| s.to_string())
+                    } else {
+                        None
+                    };
                     let msg = msg.with_obligations(&outcome.obligations);
                     let ctx = Some((Arc::clone(engine), outcome.obligations, rule_id, sender_cn));
                     (msg, ctx)
@@ -1831,7 +1995,19 @@ impl Router {
                         );
                         return None;
                     }
-                    let rule_id = outcome.rule_id.as_ref().map(|s| s.to_string());
+                    // Only allocate `rule_id` when the recipient will
+                    // actually consume it — `audit_classified_receive`
+                    // emits only on `TagClassified`. On the untagged
+                    // common path we skip the per-recipient allocation.
+                    let rule_id = if outcome
+                        .obligations
+                        .iter()
+                        .any(|o| matches!(o, Obligation::TagClassified))
+                    {
+                        outcome.rule_id.as_ref().map(|s| s.to_string())
+                    } else {
+                        None
+                    };
                     Some((handle, outcome.obligations, rule_id))
                 })
                 .collect()
@@ -2081,7 +2257,19 @@ impl Router {
                         );
                         return None;
                     }
-                    let rule_id = outcome.rule_id.as_ref().map(|s| s.to_string());
+                    // See send_to_group: skip rule_id allocation unless
+                    // TagClassified is present so the fan-out loop does
+                    // not allocate per recipient for metadata that will
+                    // be discarded by `audit_classified_receive`.
+                    let rule_id = if outcome
+                        .obligations
+                        .iter()
+                        .any(|o| matches!(o, Obligation::TagClassified))
+                    {
+                        outcome.rule_id.as_ref().map(|s| s.to_string())
+                    } else {
+                        None
+                    };
                     Some((handle, outcome.obligations, rule_id))
                 })
                 .collect()
