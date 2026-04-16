@@ -30,10 +30,14 @@ use crate::provenance;
 pub const MAX_FEDERATION_HOPS: i64 = 8;
 
 /// Default maximum number of groups a single federation peer can advertise.
-pub const DEFAULT_MAX_GROUPS_PER_PEER: usize = 1_000;
+///
+/// Re-exported from [`crate::config`] for backward compatibility.
+pub const DEFAULT_MAX_GROUPS_PER_PEER: usize = crate::config::DEFAULT_MAX_GROUPS_PER_PEER;
 
 /// Default maximum length of a federation group name in bytes.
-pub const DEFAULT_MAX_GROUP_NAME_LENGTH: usize = 256;
+///
+/// Re-exported from [`crate::config`] for backward compatibility.
+pub const DEFAULT_MAX_GROUP_NAME_LENGTH: usize = crate::config::DEFAULT_MAX_GROUP_NAME_LENGTH;
 
 /// Callback invoked when a FederatedEvent is received from a remote peer.
 pub type OnEvent = Arc<dyn Fn(figpb::FederatedEvent, String) + Send + Sync>;

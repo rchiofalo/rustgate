@@ -31,6 +31,8 @@ impl MqttServer {
             shutdown,
             topic_prefix,
             max_packet_size,
+            min_keep_alive_secs,
+            response_channel_capacity,
         } = config;
 
         let client_id_registry = ClientIdRegistry::new();
@@ -58,6 +60,8 @@ impl MqttServer {
                                 router,
                                 prefix,
                                 max_packet_size,
+                                min_keep_alive_secs,
+                                response_channel_capacity,
                                 registry,
                                 permit,
                             )));

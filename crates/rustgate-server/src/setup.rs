@@ -890,6 +890,7 @@ pub(crate) async fn start_metrics(
         let acl_api_for_metrics = Arc::clone(acl_api_slot);
         let metrics_token_for_server = metrics_token.clone();
         let router_for_metrics = Arc::clone(router_slot);
+        let max_http_connections = cli.metrics_max_connections;
         spawn_background("metrics-server", async move {
             if let Err(e) = metrics::serve(
                 bind_addr,
@@ -900,6 +901,7 @@ pub(crate) async fn start_metrics(
                 acl_api_for_metrics,
                 metrics_token_for_server,
                 router_for_metrics,
+                max_http_connections,
             )
             .await
             {
@@ -991,6 +993,8 @@ async fn build_federation_config(
         }),
         ha_nats_url: cli.federation_ha_nats_url.clone(),
         local_region: cli.federation_region.clone(),
+        max_groups_per_peer: cli.federation_max_groups_per_peer,
+        max_group_name_length: cli.federation_max_group_name_length,
         ..rustgate_federation::config::FederationConfig::default()
     })
 }
@@ -1377,7 +1381,14 @@ pub(crate) fn start_websocket<P: NatsPublish + Send + Sync + 'static>(
     let addr: std::net::SocketAddr = ws_bind
         .parse()
         .context("parsing --websocket-bind address")?;
-    let ws_listener = rustgate_websocket::WsListener::bind(addr, tls_config)?;
+    let ws_config = rustgate_websocket::WsListenerConfig {
+        conn_rate_limit: cli.ws_conn_rate_limit,
+        conn_rate_window: std::time::Duration::from_secs(cli.ws_conn_rate_window_secs),
+        max_frame_size: cli.ws_max_frame_size,
+        max_message_size: cli.ws_max_message_size,
+    };
+    let ws_listener =
+        rustgate_websocket::WsListener::bind_with_config(addr, tls_config, ws_config)?;
     tracing::info!(addr = %ws_listener.local_addr()?, "WebSocket listener bound");
 
     let shutdown = Arc::new(tokio::sync::Notify::new());
@@ -1480,6 +1491,8 @@ pub(crate) fn start_mqtt(
         shutdown: Arc::clone(&shutdown),
         topic_prefix: cli.mqtt_topic_prefix.clone(),
         max_packet_size: cli.mqtt_max_packet_size,
+        min_keep_alive_secs: cli.mqtt_min_keep_alive_secs,
+        response_channel_capacity: cli.mqtt_response_channel_capacity,
     };
     let task = tokio::spawn(async move {
         rustgate_mqtt::MqttServer::run(config).await;

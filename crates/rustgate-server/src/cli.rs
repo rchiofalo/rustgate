@@ -397,6 +397,10 @@ pub(crate) struct Cli {
     #[arg(long, env = "RUSTGATE_METRICS_IDENTITY_ALLOWLIST")]
     pub(crate) metrics_identity_allowlist: Option<std::path::PathBuf>,
 
+    /// Maximum concurrent connections to the metrics HTTP server.
+    #[arg(long, default_value_t = 128, env = "RUSTGATE_METRICS_MAX_CONNECTIONS")]
+    pub(crate) metrics_max_connections: usize,
+
     /// Maximum concurrent TLS sessions. Prevents resource exhaustion
     /// from connection floods.
     #[arg(long, default_value_t = 1024, env = "RUSTGATE_MAX_CONNECTIONS", value_parser = parse_max_connections)]
@@ -466,6 +470,30 @@ pub(crate) struct Cli {
     )]
     pub(crate) ws_max_write_buffer_bytes: usize,
 
+    /// Maximum WebSocket frame size in bytes (default: 16 MiB).
+    #[arg(
+        long,
+        default_value_t = 16 * 1024 * 1024,
+        env = "RUSTGATE_WS_MAX_FRAME_SIZE"
+    )]
+    pub(crate) ws_max_frame_size: usize,
+
+    /// Maximum WebSocket message size in bytes (default: 64 MiB).
+    #[arg(
+        long,
+        default_value_t = 64 * 1024 * 1024,
+        env = "RUSTGATE_WS_MAX_MESSAGE_SIZE"
+    )]
+    pub(crate) ws_max_message_size: usize,
+
+    /// WebSocket connection rate limit: max connections per window.
+    #[arg(long, default_value_t = 10, env = "RUSTGATE_WS_CONN_RATE_LIMIT")]
+    pub(crate) ws_conn_rate_limit: usize,
+
+    /// WebSocket connection rate limit window in seconds.
+    #[arg(long, default_value_t = 10, env = "RUSTGATE_WS_CONN_RATE_WINDOW_SECS")]
+    pub(crate) ws_conn_rate_window_secs: u64,
+
     // -- MQTT flags --
     /// Bind address for the MQTT (mqtts://) listener (e.g. 0.0.0.0:8883).
     /// Requires --features mqtt.
@@ -485,6 +513,19 @@ pub(crate) struct Cli {
         env = "RUSTGATE_MQTT_MAX_PACKET_SIZE"
     )]
     pub(crate) mqtt_max_packet_size: usize,
+
+    /// Minimum MQTT keep-alive interval in seconds. Clients requesting 0
+    /// (disabled) or a value below this floor get this value imposed.
+    #[arg(long, default_value_t = 30, env = "RUSTGATE_MQTT_MIN_KEEP_ALIVE_SECS")]
+    pub(crate) mqtt_min_keep_alive_secs: u16,
+
+    /// MQTT response channel capacity (per-session).
+    #[arg(
+        long,
+        default_value_t = 64,
+        env = "RUSTGATE_MQTT_RESPONSE_CHANNEL_CAPACITY"
+    )]
+    pub(crate) mqtt_response_channel_capacity: usize,
 
     // -- Plaintext input flags --
     /// Bind address for plaintext TCP input (e.g. 0.0.0.0:8087).
@@ -627,6 +668,22 @@ pub(crate) struct Cli {
         env = "RUSTGATE_FEDERATION_REPLAY_MAX_BYTES"
     )]
     pub(crate) federation_replay_max_bytes: u64,
+
+    /// Maximum groups a single federation V2 peer can advertise.
+    #[arg(
+        long,
+        default_value_t = 1000,
+        env = "RUSTGATE_FEDERATION_MAX_GROUPS_PER_PEER"
+    )]
+    pub(crate) federation_max_groups_per_peer: usize,
+
+    /// Maximum federation V2 group name length in bytes.
+    #[arg(
+        long,
+        default_value_t = 256,
+        env = "RUSTGATE_FEDERATION_MAX_GROUP_NAME_LENGTH"
+    )]
+    pub(crate) federation_max_group_name_length: usize,
 
     /// NATS URL for federation HA coordination (enables distributed peer ownership).
     /// When set, only one pod manages each outbound peer in a multi-pod deployment.
@@ -1159,6 +1216,7 @@ define_config_file! {
     metrics_token_file: Option<String>,
     metrics_per_identity: bool,
     metrics_identity_allowlist: Option<std::path::PathBuf>,
+    metrics_max_connections: usize,
     max_connections: usize,
     shutdown_drain_timeout: u64,
     max_concurrent_handshakes: usize,
@@ -1169,9 +1227,15 @@ define_config_file! {
     ws_max_bytes_per_sec: u64,
     ws_max_violations: u32,
     ws_max_write_buffer_bytes: usize,
+    ws_max_frame_size: usize,
+    ws_max_message_size: usize,
+    ws_conn_rate_limit: usize,
+    ws_conn_rate_window_secs: u64,
     mqtt_bind: Option<String>,
     mqtt_topic_prefix: Option<String>,
     mqtt_max_packet_size: usize,
+    mqtt_min_keep_alive_secs: u16,
+    mqtt_response_channel_capacity: usize,
     tcp_bind: Option<String>,
     udp_bind: Option<String>,
     udp_rate_limit: u32,
@@ -1193,6 +1257,8 @@ define_config_file! {
     federation_replay_buffer_size: usize,
     federation_replay_dir: Option<std::path::PathBuf>,
     federation_replay_max_bytes: u64,
+    federation_max_groups_per_peer: usize,
+    federation_max_group_name_length: usize,
     federation_ha_nats_url: Option<String>,
     federation_pod_id: Option<String>,
     federation_region: Option<String>,
