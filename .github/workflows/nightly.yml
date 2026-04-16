@@ -14,7 +14,7 @@ env:
 
 jobs:
   security-audit:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     permissions:
       contents: read
       issues: write # required for actions-rust-lang/audit to create issues
@@ -45,7 +45,7 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
   container-scan:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     permissions:
       contents: read
       issues: write
@@ -87,7 +87,7 @@ jobs:
         run: docker rmi rustgate:nightly-scan 2>/dev/null || true
 
   fuzz:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:

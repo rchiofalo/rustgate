@@ -23,7 +23,7 @@ env:
 jobs:
   commit-lint:
     if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     steps:
       - name: Validate PR title follows Conventional Commits
         env:
@@ -42,7 +42,7 @@ jobs:
 
   lint:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -71,7 +71,7 @@ jobs:
 
   clippy:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     env:
       RUSTDOCFLAGS: -Dwarnings
     steps:
@@ -98,7 +98,7 @@ jobs:
   check-features:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [lint, clippy]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -126,7 +126,7 @@ jobs:
   test:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [lint, clippy]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -176,7 +176,7 @@ jobs:
   coverage:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [lint, clippy]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -225,7 +225,7 @@ jobs:
   fips:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [lint, clippy]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
 
     strategy:
       fail-fast: false
@@ -284,7 +284,7 @@ jobs:
   post-quantum:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [lint, clippy]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -319,7 +319,7 @@ jobs:
   audit:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [check-features, test]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     steps:
       - name: Harden runner
         uses: step-security/harden-runner@f808768d1510423e83855289c910610ca9b43176 # v2.17.0
@@ -357,7 +357,7 @@ jobs:
 
   helm:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -375,7 +375,7 @@ jobs:
   docker:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [check-features, test]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     # dorny/paths-filter calls listFiles(pull_number) via the GitHub API on
     # pull_request events; on private repos this requires explicit
     # pull-requests: read (the top-level permissions block only grants
