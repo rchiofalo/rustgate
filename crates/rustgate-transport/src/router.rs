@@ -497,37 +497,38 @@ impl SessionHandle {
         } else {
             &self.normal_sender
         };
-        let mut guard = source.lock();
-        let sender = match guard.as_ref() {
-            Some(s) => s,
-            None => return false,
+
+        // Hold the lock only for the try_send call, then release it
+        // before the circuit breaker path to prevent AB/BA deadlock
+        // with a concurrent try_send on the other channel.
+        let send_ok = {
+            let guard = source.lock();
+            match guard.as_ref() {
+                Some(s) => s.try_send(msg).is_ok(),
+                None => return false,
+            }
         };
-        match sender.try_send(msg) {
-            Ok(()) => {
-                self.consecutive_drops.store(0, Ordering::Relaxed);
-                true
+
+        if send_ok {
+            self.consecutive_drops.store(0, Ordering::Relaxed);
+            true
+        } else {
+            let count = self.consecutive_drops.fetch_add(1, Ordering::Relaxed) + 1;
+            if count >= self.max_consecutive_drops {
+                warn!(
+                    session = %self.identity.cn,
+                    consecutive_drops = count,
+                    threshold = self.max_consecutive_drops,
+                    "circuit breaker tripped: disconnecting slow session"
+                );
+                // Always lock priority → normal to match record_failure()
+                // ordering and prevent AB/BA deadlock.
+                let mut priority_guard = self.priority_sender.lock();
+                let mut normal_guard = self.normal_sender.lock();
+                *priority_guard = None;
+                *normal_guard = None;
             }
-            Err(_) => {
-                let count = self.consecutive_drops.fetch_add(1, Ordering::Relaxed) + 1;
-                if count >= self.max_consecutive_drops {
-                    warn!(
-                        session = %self.identity.cn,
-                        consecutive_drops = count,
-                        threshold = self.max_consecutive_drops,
-                        "circuit breaker tripped: disconnecting slow session"
-                    );
-                    *guard = None;
-                    // Also close the other channel
-                    let other = if Arc::ptr_eq(source, &self.priority_sender) {
-                        &self.normal_sender
-                    } else {
-                        &self.priority_sender
-                    };
-                    let mut other_guard = other.lock();
-                    *other_guard = None;
-                }
-                false
-            }
+            false
         }
     }
 
