@@ -202,7 +202,9 @@ impl FederateStore for KvStore {
     }
 
     fn add(&mut self, info: FederateInfo) {
-        let _ = self.put_kv(&info);
+        if let Err(e) = self.put_kv(&info) {
+            warn!(error = %e, id = %info.id, "federation KV write failed");
+        }
         let mut federates = match self.federates.write() {
             Ok(f) => f,
             Err(_) => return,
@@ -289,7 +291,9 @@ impl FederateStore for KvStore {
 
         let info_clone = info.clone();
         drop(federates);
-        let _ = self.put_kv(&info_clone);
+        if let Err(e) = self.put_kv(&info_clone) {
+            warn!(error = %e, id = %info_clone.id, "federation KV write failed");
+        }
 
         Ok(old_address)
     }
@@ -307,7 +311,9 @@ impl FederateStore for KvStore {
         info.enabled = enabled;
         let info_clone = info.clone();
         drop(federates);
-        let _ = self.put_kv(&info_clone);
+        if let Err(e) = self.put_kv(&info_clone) {
+            warn!(error = %e, id = %info_clone.id, "federation KV write failed");
+        }
 
         Ok(())
     }
@@ -325,7 +331,9 @@ impl FederateStore for KvStore {
         info.routing_mode = mode;
         let info_clone = info.clone();
         drop(federates);
-        let _ = self.put_kv(&info_clone);
+        if let Err(e) = self.put_kv(&info_clone) {
+            warn!(error = %e, id = %info_clone.id, "federation KV write failed");
+        }
 
         Ok(())
     }
