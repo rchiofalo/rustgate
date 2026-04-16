@@ -203,10 +203,14 @@ impl MavlinkFrameCodec {
                 };
                 MAVLINK_V2_HEADER_LEN + len + MAVLINK_CRC_LEN + sig_len
             }
-            // The resync loop above drops every non-magic byte, so at
-            // this point `src[0]` is guaranteed to be either `0xFE` or
-            // `0xFD`. Any branch here is unreachable by construction.
-            _ => unreachable!("resync loop above ensures src[0] is a MAVLink magic byte"),
+            // Defense-in-depth: the resync loop above should guarantee
+            // only magic bytes reach here, but return an error instead
+            // of panicking.
+            _ => {
+                let byte = src[0];
+                src.advance(1);
+                return Err(MavlinkError::InvalidMagic { byte });
+            }
         };
 
         if total > MAX_MAVLINK_FRAME_SIZE {

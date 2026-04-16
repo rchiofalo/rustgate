@@ -1228,7 +1228,9 @@ pub(crate) fn start_federation_peer_discovery(
         use rustgate_federation::discovery::PeerDiscovery;
 
         let source: Arc<dyn PeerDiscovery> = match cli.federation_peer_discovery {
-            PeerDiscoveryBackend::None => unreachable!(),
+            PeerDiscoveryBackend::None => {
+                anyhow::bail!("peer discovery backend is None (should have been handled above)");
+            }
             #[cfg(feature = "peer-discovery-dns-sd")]
             PeerDiscoveryBackend::DnsSd => {
                 let svc = cli.federation_peer_discovery_dns_sd_service.clone();

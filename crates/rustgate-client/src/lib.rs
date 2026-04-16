@@ -172,6 +172,7 @@ pub struct ClientConfig {
     pub(crate) tls: Option<TlsMaterial>,
     pub(crate) codec: Codec,
     pub(crate) plaintext: bool,
+    /// Maximum time to wait for TCP connect + TLS handshake (default: 30 s).
     pub(crate) connect_timeout: Option<Duration>,
     pub(crate) reconnect: Option<ReconnectPolicy>,
 }
@@ -262,6 +263,8 @@ impl ClientConfigBuilder {
     }
 
     /// Cap how long [`Client::connect`] will wait before erroring out.
+    ///
+    /// Defaults to 30 seconds if not set.
     pub fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = Some(timeout);
         self
@@ -294,7 +297,7 @@ impl ClientConfigBuilder {
             tls: self.tls,
             codec: self.codec.unwrap_or(Codec::LengthPrefixed4),
             plaintext: self.plaintext,
-            connect_timeout: self.connect_timeout,
+            connect_timeout: self.connect_timeout.or(Some(Duration::from_secs(30))),
             reconnect: self.reconnect,
         })
     }
