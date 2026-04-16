@@ -44,7 +44,7 @@ RUN find crates -name "*.rs" -exec touch {} +
 RUN cargo build --release --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket,otel,mqtt,http
 
 # ── Runtime stage ────────────────────────────────────────────────────────
-FROM alpine:3.23@sha256:25109184c71bdad752c8312a8623239686a9a2071e8825f20acb8f2198c3f659
+FROM alpine:3.23@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11
 
 LABEL org.opencontainers.image.source="https://github.com/rchiofalo/rustgate" \
       org.opencontainers.image.description="Secure tactical message router with mTLS and NATS bridge" \
