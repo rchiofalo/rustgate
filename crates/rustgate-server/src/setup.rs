@@ -590,11 +590,11 @@ pub(crate) fn warn_nats_disabled(cli: &Cli) {
 /// per-target clients, and returns the forward callback plus the publisher
 /// handle for shutdown.
 #[cfg(feature = "http")]
-pub(crate) fn connect_http(
+pub(crate) async fn connect_http(
     cli: &Cli,
 ) -> Option<(crate::session::HttpForwardFn, rustgate_http::HttpPublisher)> {
     let config_path = cli.http_config_file.as_ref()?;
-    let config_str = match std::fs::read_to_string(config_path) {
+    let config_str = match tokio::fs::read_to_string(config_path).await {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(path = %config_path, error = %e, "failed to read HTTP config");
@@ -816,7 +816,7 @@ pub(crate) fn warn_enrollment_disabled(cli: &Cli) {
 /// per-identity metrics. Returns the identity wrapped in an `Arc` so it
 /// can be cheaply shared across spawned session tasks.
 #[cfg(feature = "metrics")]
-pub(crate) fn start_metrics(
+pub(crate) async fn start_metrics(
     cli: &Cli,
     health: &Arc<metrics::HealthState>,
     readiness: &Arc<metrics::ReadinessState>,
@@ -861,22 +861,22 @@ pub(crate) fn start_metrics(
     // Load the optional metrics bearer token from file. When set,
     // requests to `/metrics` must present this token; when unset the
     // endpoint remains unauthenticated for backward compatibility.
-    let metrics_token: Option<Arc<zeroize::Zeroizing<Vec<u8>>>> = if let Some(ref token_file) =
-        cli.metrics_token_file
-    {
-        let raw = std::fs::read_to_string(token_file)
-            .map_err(|e| anyhow::anyhow!("failed to read metrics token file {token_file}: {e}"))?;
-        let token = raw.trim().as_bytes().to_vec();
-        if token.is_empty() {
-            anyhow::bail!("metrics token file {token_file} is empty");
-        }
-        crate::acl_api::validate_bearer_token_length(&token, "metrics bearer")
-            .map_err(|e| anyhow::anyhow!("{e} (from {token_file})"))?;
-        tracing::info!("metrics endpoint authentication enabled via --metrics-token-file");
-        Some(Arc::new(zeroize::Zeroizing::new(token)))
-    } else {
-        None
-    };
+    let metrics_token: Option<Arc<zeroize::Zeroizing<Vec<u8>>>> =
+        if let Some(ref token_file) = cli.metrics_token_file {
+            let raw = tokio::fs::read_to_string(token_file).await.map_err(|e| {
+                anyhow::anyhow!("failed to read metrics token file {token_file}: {e}")
+            })?;
+            let token = raw.trim().as_bytes().to_vec();
+            if token.is_empty() {
+                anyhow::bail!("metrics token file {token_file} is empty");
+            }
+            crate::acl_api::validate_bearer_token_length(&token, "metrics bearer")
+                .map_err(|e| anyhow::anyhow!("{e} (from {token_file})"))?;
+            tracing::info!("metrics endpoint authentication enabled via --metrics-token-file");
+            Some(Arc::new(zeroize::Zeroizing::new(token)))
+        } else {
+            None
+        };
 
     if let Some(ref metrics_bind) = cli.metrics_bind {
         let bind_addr: std::net::SocketAddr = metrics_bind

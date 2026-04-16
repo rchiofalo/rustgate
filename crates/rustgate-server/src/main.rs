@@ -370,7 +370,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         &fed_api_slot,
         &acl_api_slot,
         &router_slot,
-    )?;
+    )
+    .await?;
 
     #[cfg(not(feature = "metrics"))]
     setup::warn_metrics_disabled(&cli);
@@ -914,7 +915,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     // ── HTTP egress ─────────────────────────────────────────────────
     #[cfg(feature = "http")]
     let (http_forward, _http_publisher): (Option<session::HttpForwardFn>, _) = {
-        match setup::connect_http(&cli) {
+        match setup::connect_http(&cli).await {
             Some((fwd, publisher)) => {
                 #[cfg(feature = "metrics")]
                 readiness.set_http_publisher(publisher.clone());
