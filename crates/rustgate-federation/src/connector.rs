@@ -10,6 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
+use rustgate_core::constants::HANDSHAKE_TIMEOUT;
 use rustgate_core::identity::Identity;
 use rustgate_core::net::configure_tcp_keepalive;
 use rustgate_transport::extract_identity;
@@ -17,6 +18,7 @@ use rustgate_transport::pem::{parse_ca_store, parse_certs, parse_key};
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use tokio::net::TcpStream;
+use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use tracing::debug;
 use zeroize::Zeroizing;
@@ -132,8 +134,11 @@ impl PeerConnector {
     ) -> anyhow::Result<(tokio_rustls::client::TlsStream<TcpStream>, Arc<Identity>)> {
         debug!(peer_addr = %addr, server_name = %server_name, "connecting to federation peer");
 
-        let tcp = TcpStream::connect(addr)
+        let tcp = timeout(HANDSHAKE_TIMEOUT, TcpStream::connect(addr))
             .await
+            .map_err(|_| {
+                anyhow::anyhow!("TCP connect to {addr} timed out after {HANDSHAKE_TIMEOUT:?}")
+            })?
             .map_err(|e| anyhow::anyhow!("TCP connect to {addr}: {e}"))?;
 
         configure_tcp_keepalive(&tcp);
@@ -144,9 +149,11 @@ impl PeerConnector {
             .map_err(|_| anyhow::anyhow!("invalid server name: {server_name}"))?;
 
         let connector = TlsConnector::from(Arc::clone(&self.client_config));
-        let tls_stream = connector
-            .connect(sni, tcp)
+        let tls_stream = timeout(HANDSHAKE_TIMEOUT, connector.connect(sni, tcp))
             .await
+            .map_err(|_| {
+                anyhow::anyhow!("TLS handshake with {addr} timed out after {HANDSHAKE_TIMEOUT:?}")
+            })?
             .map_err(|e| anyhow::anyhow!("TLS handshake with {addr}: {e}"))?;
 
         let kx_group = tls_stream
@@ -282,8 +289,11 @@ impl DynamicPeerConnector {
 
         debug!(peer_addr = %addr, server_name = %server_name, "connecting to federation peer (dynamic)");
 
-        let tcp = TcpStream::connect(addr)
+        let tcp = timeout(HANDSHAKE_TIMEOUT, TcpStream::connect(addr))
             .await
+            .map_err(|_| {
+                anyhow::anyhow!("TCP connect to {addr} timed out after {HANDSHAKE_TIMEOUT:?}")
+            })?
             .map_err(|e| anyhow::anyhow!("TCP connect to {addr}: {e}"))?;
 
         configure_tcp_keepalive(&tcp);
@@ -294,9 +304,11 @@ impl DynamicPeerConnector {
             .map_err(|_| anyhow::anyhow!("invalid server name: {server_name}"))?;
 
         let connector = TlsConnector::from(config);
-        let tls_stream = connector
-            .connect(sni, tcp)
+        let tls_stream = timeout(HANDSHAKE_TIMEOUT, connector.connect(sni, tcp))
             .await
+            .map_err(|_| {
+                anyhow::anyhow!("TLS handshake with {addr} timed out after {HANDSHAKE_TIMEOUT:?}")
+            })?
             .map_err(|e| anyhow::anyhow!("TLS handshake with {addr}: {e}"))?;
 
         let kx_group = tls_stream
