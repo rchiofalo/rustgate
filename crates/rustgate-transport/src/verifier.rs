@@ -131,6 +131,7 @@ impl DynamicCertVerifier {
                 Ok(verifier)
             }
             Err(e) => {
+                rustgate_core::audit::verifier_rebuild_failed(&e.to_string());
                 warn!(
                     error = %e,
                     "failed to rebuild verifier after trust store change, using cached"
