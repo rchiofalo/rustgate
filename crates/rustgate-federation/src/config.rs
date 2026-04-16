@@ -162,6 +162,12 @@ pub struct FederationConfig {
     /// The region this server belongs to, for latency-aware routing.
     /// When set, matrix-mode forwarding prefers peers in the same region.
     pub local_region: Option<String>,
+
+    /// Maximum groups a single V2 federation peer can advertise.
+    pub max_groups_per_peer: usize,
+
+    /// Maximum length of a V2 federation group name in bytes.
+    pub max_group_name_length: usize,
 }
 
 impl Default for FederationConfig {
@@ -198,6 +204,8 @@ impl Default for FederationConfig {
             pod_id: None,
             ha_nats_url: None,
             local_region: None,
+            max_groups_per_peer: crate::v2::server::DEFAULT_MAX_GROUPS_PER_PEER,
+            max_group_name_length: crate::v2::server::DEFAULT_MAX_GROUP_NAME_LENGTH,
         }
     }
 }

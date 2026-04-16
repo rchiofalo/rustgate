@@ -31,15 +31,8 @@ use crate::topic;
 /// client's requested keep-alive before considering the connection dead.
 const KEEP_ALIVE_FACTOR: f64 = 1.5;
 
-/// Minimum keep-alive in seconds. Clients requesting 0 (disabled) get
-/// this value imposed to prevent idle connections from lingering.
-const MIN_KEEP_ALIVE_SECS: u16 = 30;
-
 /// Topic prefix for broadcast messages routed to MQTT subscribers.
 const BROADCAST_TOPIC_SUFFIX: &str = "$broadcast";
-
-/// Channel capacity for response packets flowing from read loop to write loop.
-const RESPONSE_CHANNEL_CAPACITY: usize = 64;
 
 /// Shared registry tracking which MQTT client IDs are in use and by which CN.
 ///
@@ -126,11 +119,14 @@ struct ResponsePacket {
 ///
 /// Performs the CONNECT handshake, registers with the router, runs the
 /// read/write loops concurrently, and unregisters on exit.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_mqtt_session(
     pre: MqttPreSession,
     router: Arc<Router>,
     topic_prefix: Option<String>,
     max_packet_size: usize,
+    min_keep_alive_secs: u16,
+    response_channel_capacity: usize,
     client_id_registry: Arc<ClientIdRegistry>,
     _permit: OwnedSemaphorePermit,
 ) {
@@ -205,7 +201,7 @@ pub(crate) async fn handle_mqtt_session(
 
     // Response channel: read loop produces serialized response packets,
     // write loop consumes and writes them to the TLS stream.
-    let (resp_tx, mut resp_rx) = mpsc::channel::<ResponsePacket>(RESPONSE_CHANNEL_CAPACITY);
+    let (resp_tx, mut resp_rx) = mpsc::channel::<ResponsePacket>(response_channel_capacity);
 
     // Drain offline queue BEFORE register so queued messages arrive first.
     // Filter through current ACL/authz policy to prevent stale permissions.
@@ -238,7 +234,7 @@ pub(crate) async fn handle_mqtt_session(
 
     // --- Concurrent read/write loops ---
     let keep_alive_duration = std::time::Duration::from_secs_f64(
-        f64::from(keep_alive.max(MIN_KEEP_ALIVE_SECS)) * KEEP_ALIVE_FACTOR,
+        f64::from(keep_alive.max(min_keep_alive_secs)) * KEEP_ALIVE_FACTOR,
     );
 
     let prefix = topic_prefix.as_deref().unwrap_or("");

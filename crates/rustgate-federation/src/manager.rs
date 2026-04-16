@@ -486,7 +486,7 @@ impl FederationManager {
 
             let on_event = Self::create_v2_event_handler(&on_inbound, &self.config.federate_id);
 
-            let service = crate::v2::server::FederationService::new(
+            let service = crate::v2::server::FederationService::with_limits(
                 self.config.federate_id.clone(),
                 self.config
                     .peers
@@ -496,6 +496,8 @@ impl FederationManager {
                     .into_iter()
                     .collect(),
                 on_event,
+                self.config.max_groups_per_peer,
+                self.config.max_group_name_length,
             );
 
             let handle = crate::v2::server::FederationService::start(
@@ -1799,6 +1801,8 @@ mod tests {
             pod_id: None,
             ha_nats_url: None,
             local_region: None,
+            max_groups_per_peer: crate::v2::server::DEFAULT_MAX_GROUPS_PER_PEER,
+            max_group_name_length: crate::v2::server::DEFAULT_MAX_GROUP_NAME_LENGTH,
         }
     }
 

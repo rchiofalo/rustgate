@@ -47,10 +47,14 @@ pub type AclApiHandler = Arc<
         + Sync,
 >;
 
-/// Maximum concurrent connections to the metrics HTTP server.
+/// Default maximum concurrent connections to the metrics HTTP server.
 /// Bounds memory usage from connection floods against the unauthenticated
 /// HTTP endpoint (the TLS listener has its own separate limit).
-const MAX_HTTP_CONNECTIONS: usize = 128;
+///
+/// Used as the default value for `--metrics-max-connections` in the CLI
+/// and by test helpers.
+#[allow(dead_code)]
+pub(crate) const DEFAULT_MAX_HTTP_CONNECTIONS: usize = 128;
 
 // ── Metric statics ──────────────────────────────────────────────────
 
@@ -1939,9 +1943,10 @@ pub type RouterSlot = Arc<OnceLock<Arc<rustgate_transport::Router>>>;
 /// authentication for backward compatibility.
 ///
 /// The server is hardened against unauthenticated abuse:
-/// - Connection count bounded by [`MAX_HTTP_CONNECTIONS`]
+/// - Connection count bounded by `max_http_connections`
 /// - Per-connection timeout of [`HTTP_CONNECTION_TIMEOUT`]
 /// - Header read timeout of 5 seconds
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     bind: SocketAddr,
     health: Arc<HealthState>,
@@ -1950,9 +1955,10 @@ pub async fn serve(
     acl_api: Arc<OnceLock<AclApiHandler>>,
     metrics_token: Option<Arc<Zeroizing<Vec<u8>>>>,
     router_slot: RouterSlot,
+    max_http_connections: usize,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    let conn_limit = Arc::new(tokio::sync::Semaphore::new(MAX_HTTP_CONNECTIONS));
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(max_http_connections));
     // The metrics server is up — the process loop is reachable, so the
     // liveness flag may flip on. Readiness/startup remain controlled by
     // the main server lifecycle.
@@ -2243,6 +2249,7 @@ mod tests {
                 Arc::new(OnceLock::new()),
                 None, // no metrics token — backward compatible unauthenticated
                 server_router_slot,
+                DEFAULT_MAX_HTTP_CONNECTIONS,
             )
             .await;
         }));
@@ -2405,6 +2412,7 @@ mod tests {
                 Arc::new(OnceLock::new()),
                 None,
                 server_router_slot,
+                DEFAULT_MAX_HTTP_CONNECTIONS,
             )
             .await;
         }));
@@ -2471,6 +2479,7 @@ mod tests {
                 Arc::new(OnceLock::new()),
                 None,
                 server_router_slot,
+                DEFAULT_MAX_HTTP_CONNECTIONS,
             )
             .await;
         }));
@@ -2734,6 +2743,7 @@ mod tests {
                 Arc::new(OnceLock::new()),
                 metrics_token,
                 router_slot,
+                DEFAULT_MAX_HTTP_CONNECTIONS,
             )
             .await;
         }));

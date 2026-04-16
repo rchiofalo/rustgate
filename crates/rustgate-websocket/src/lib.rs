@@ -79,11 +79,17 @@ impl std::fmt::Debug for WsSession {
     }
 }
 
-/// Maximum connection attempts per IP within the rate limit window.
-const CONN_RATE_LIMIT: usize = 10;
+/// Default maximum connection attempts per IP within the rate limit window.
+pub const DEFAULT_CONN_RATE_LIMIT: usize = 10;
 
-/// Sliding window duration for connection rate limiting.
-const CONN_RATE_WINDOW: Duration = Duration::from_secs(10);
+/// Default sliding window duration for connection rate limiting.
+pub const DEFAULT_CONN_RATE_WINDOW: Duration = Duration::from_secs(10);
+
+/// Default maximum WebSocket frame size: 16 MiB.
+pub const DEFAULT_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+
+/// Default maximum WebSocket message size: 64 MiB.
+pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 
 /// WebSocket listener with mandatory mTLS.
 ///
@@ -103,6 +109,8 @@ pub struct WsListener {
     tcp: TcpListener,
     tls: TlsAcceptor,
     conn_rate: ConnRateLimiter,
+    max_frame_size: usize,
+    max_message_size: usize,
 }
 
 impl std::fmt::Debug for WsListener {
@@ -111,13 +119,48 @@ impl std::fmt::Debug for WsListener {
             .field("tcp", &self.tcp)
             .field("tls", &"<TlsAcceptor>")
             .field("conn_rate", &self.conn_rate)
+            .field("max_frame_size", &self.max_frame_size)
+            .field("max_message_size", &self.max_message_size)
             .finish()
+    }
+}
+
+/// Configuration for constructing a [`WsListener`].
+#[derive(Debug)]
+pub struct WsListenerConfig {
+    /// Maximum connection attempts per IP within the rate limit window.
+    pub conn_rate_limit: usize,
+    /// Sliding window duration for connection rate limiting.
+    pub conn_rate_window: Duration,
+    /// Maximum WebSocket frame size in bytes.
+    pub max_frame_size: usize,
+    /// Maximum WebSocket message size in bytes.
+    pub max_message_size: usize,
+}
+
+impl Default for WsListenerConfig {
+    fn default() -> Self {
+        Self {
+            conn_rate_limit: DEFAULT_CONN_RATE_LIMIT,
+            conn_rate_window: DEFAULT_CONN_RATE_WINDOW,
+            max_frame_size: DEFAULT_MAX_FRAME_SIZE,
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        }
     }
 }
 
 impl WsListener {
     /// Bind to the given address with SO_REUSEADDR for clean restarts.
     pub fn bind(addr: SocketAddr, tls_config: &TlsConfig) -> Result<Self> {
+        Self::bind_with_config(addr, tls_config, WsListenerConfig::default())
+    }
+
+    /// Bind to the given address with custom protocol limits.
+    pub fn bind_with_config(
+        addr: SocketAddr,
+        tls_config: &TlsConfig,
+        config: WsListenerConfig,
+    ) -> Result<Self> {
         let server_config = tls_config.build_server_config()?;
         let tls = TlsAcceptor::from(Arc::new(server_config));
 
@@ -155,7 +198,9 @@ impl WsListener {
         Ok(Self {
             tcp,
             tls,
-            conn_rate: ConnRateLimiter::new(CONN_RATE_LIMIT, CONN_RATE_WINDOW),
+            conn_rate: ConnRateLimiter::new(config.conn_rate_limit, config.conn_rate_window),
+            max_frame_size: config.max_frame_size,
+            max_message_size: config.max_message_size,
         })
     }
 
@@ -229,8 +274,8 @@ impl WsListener {
 
             let mut ws_config =
                 tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
-            ws_config.max_frame_size = Some(16 * 1024 * 1024);
-            ws_config.max_message_size = Some(64 * 1024 * 1024);
+            ws_config.max_frame_size = Some(self.max_frame_size);
+            ws_config.max_message_size = Some(self.max_message_size);
 
             let ws_stream = match tokio::time::timeout(
                 HANDSHAKE_TIMEOUT,
@@ -283,20 +328,20 @@ mod tests {
 
     #[test]
     fn rate_limit_allows_under_threshold() {
-        let limiter = ConnRateLimiter::new(CONN_RATE_LIMIT, CONN_RATE_WINDOW);
+        let limiter = ConnRateLimiter::new(DEFAULT_CONN_RATE_LIMIT, DEFAULT_CONN_RATE_WINDOW);
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
-        for _ in 0..CONN_RATE_LIMIT - 1 {
+        for _ in 0..DEFAULT_CONN_RATE_LIMIT - 1 {
             assert!(!limiter.is_limited(ip));
         }
     }
 
     #[test]
     fn rate_limit_blocks_at_threshold() {
-        let limiter = ConnRateLimiter::new(CONN_RATE_LIMIT, CONN_RATE_WINDOW);
+        let limiter = ConnRateLimiter::new(DEFAULT_CONN_RATE_LIMIT, DEFAULT_CONN_RATE_WINDOW);
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
-        for _ in 0..CONN_RATE_LIMIT {
+        for _ in 0..DEFAULT_CONN_RATE_LIMIT {
             assert!(!limiter.is_limited(ip));
         }
 
@@ -306,12 +351,12 @@ mod tests {
 
     #[test]
     fn rate_limit_isolates_ips() {
-        let limiter = ConnRateLimiter::new(CONN_RATE_LIMIT, CONN_RATE_WINDOW);
+        let limiter = ConnRateLimiter::new(DEFAULT_CONN_RATE_LIMIT, DEFAULT_CONN_RATE_WINDOW);
         let ip_a: IpAddr = "10.0.0.1".parse().unwrap();
         let ip_b: IpAddr = "10.0.0.2".parse().unwrap();
 
         // Exhaust limit for ip_a.
-        for _ in 0..CONN_RATE_LIMIT {
+        for _ in 0..DEFAULT_CONN_RATE_LIMIT {
             assert!(!limiter.is_limited(ip_a));
         }
         assert!(limiter.is_limited(ip_a));

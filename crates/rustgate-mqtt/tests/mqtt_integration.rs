@@ -49,6 +49,8 @@ impl TestServer {
             shutdown: Arc::clone(&shutdown),
             topic_prefix,
             max_packet_size: 1024 * 1024,
+            min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
+            response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
         };
 
         drop(tokio::spawn(MqttServer::run(config)));
@@ -411,6 +413,8 @@ async fn connection_limit_rejects_excess() {
         shutdown: Arc::clone(&shutdown),
         topic_prefix: None,
         max_packet_size: 1024 * 1024,
+        min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
+        response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
     };
 
     drop(tokio::spawn(MqttServer::run(config)));
@@ -614,6 +618,8 @@ async fn max_packet_size_rejects_oversized_publish() {
         shutdown: Arc::clone(&shutdown),
         topic_prefix: None,
         max_packet_size: 64, // Very small — CONNECT is ~30-40 bytes, PUBLISH will exceed
+        min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
+        response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
     };
 
     drop(tokio::spawn(MqttServer::run(config)));

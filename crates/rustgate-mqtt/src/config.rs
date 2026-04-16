@@ -33,9 +33,23 @@ pub struct MqttServerConfig {
 
     /// Maximum MQTT packet size in bytes (default: 16 MiB).
     pub max_packet_size: usize,
+
+    /// Minimum keep-alive interval in seconds. Clients requesting 0
+    /// (disabled) or a value below this floor get this value imposed.
+    pub min_keep_alive_secs: u16,
+
+    /// Channel capacity for response packets flowing from read loop to
+    /// write loop (per session).
+    pub response_channel_capacity: usize,
 }
 
 impl MqttServerConfig {
     /// Default maximum packet size: 16 MiB (matches websocket frame cap).
     pub const DEFAULT_MAX_PACKET_SIZE: usize = 16 * 1024 * 1024;
+
+    /// Default minimum keep-alive in seconds.
+    pub const DEFAULT_MIN_KEEP_ALIVE_SECS: u16 = 30;
+
+    /// Default response channel capacity per session.
+    pub const DEFAULT_RESPONSE_CHANNEL_CAPACITY: usize = 64;
 }
