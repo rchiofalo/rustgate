@@ -83,7 +83,7 @@ fn validate_write_buffer_range(n: usize) -> Result<usize, String> {
 }
 
 #[derive(Parser, Serialize)]
-#[command(name = "rustgate", about = "Secure tactical message router")]
+#[command(name = "rustgate", about = "Secure tactical message router", version)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) struct Cli {
     /// Subcommand. When omitted, the server runs normally with the supplied flags.
