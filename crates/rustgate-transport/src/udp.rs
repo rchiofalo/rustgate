@@ -10,7 +10,7 @@
 //!
 //! - **Per-IP rate limiting** — configurable packets-per-second threshold
 //!   prevents flooding from a single source. Uses the existing
-//!   `ConnRateLimiter` from `rustgate-core` keyed by IP.
+//!   `ConnRateLimiter` from `rustgate-resilience` keyed by IP.
 //! - **Source CIDR allowlist** — optional list of authorized source IP
 //!   prefixes. When configured, packets from unlisted IPs are silently
 //!   dropped.
@@ -32,8 +32,8 @@ use parking_lot::Mutex;
 use rustgate_core::constants::PLAINTEXT_GROUP;
 use rustgate_core::identity::Identity;
 use rustgate_core::message::RoutableMessage;
-use rustgate_core::ratelimit::ConnRateLimiter;
 use rustgate_cot::MessageBuilder;
+use rustgate_resilience::conn_rate_limiter::ConnRateLimiter;
 use rustgate_transport_types::{Router, SessionHandle};
 use tokio::net::UdpSocket;
 use tokio::sync::{Notify, mpsc};

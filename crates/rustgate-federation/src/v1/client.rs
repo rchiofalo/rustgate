@@ -13,6 +13,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use rustgate_core::protocol::HeaderSize;
+use rustgate_resilience::reconnect::{backoff_delay, should_stop_reconnecting};
 use rustgate_transport::LengthPrefixedCodec;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -23,7 +24,6 @@ use tracing::{debug, error, info, warn};
 use crate::connector::OutboundConnector;
 use crate::heartbeat::{create_heartbeat, is_heartbeat};
 use crate::peer::{PeerHandle, PeerState};
-use crate::reconnect::{backoff_delay, should_stop_reconnecting};
 use crate::replay_buffer::BufferedMessage;
 
 /// Callback invoked for each non-heartbeat message received from the peer.

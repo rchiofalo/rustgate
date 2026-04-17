@@ -11,6 +11,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rustgate_resilience::reconnect::{backoff_delay, should_stop_reconnecting};
 use tokio::sync::{mpsc, watch};
 use tonic::Request;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint, Uri};
@@ -20,7 +21,6 @@ use super::proto::figpb;
 use super::proto::figpb::federated_channel_client::FederatedChannelClient;
 use crate::peer::{PeerHandle, PeerState};
 use crate::provenance;
-use crate::reconnect::{backoff_delay, should_stop_reconnecting};
 use crate::replay_buffer::BufferedMessage;
 
 /// Callback invoked when a FederatedEvent is received from the remote peer.

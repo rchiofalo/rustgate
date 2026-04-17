@@ -3246,6 +3246,7 @@ dependencies = [
  "reqwest",
  "rustgate-core",
  "rustgate-proto",
+ "rustgate-resilience",
  "rustgate-test-utils",
  "rustgate-transport",
  "rustls",
@@ -3286,6 +3287,7 @@ dependencies = [
  "reqwest",
  "rustgate-core",
  "rustgate-proto",
+ "rustgate-resilience",
  "rustgate-test-utils",
  "rustls",
  "rustls-pki-types",
@@ -3323,6 +3325,7 @@ dependencies = [
  "mqttbytes",
  "parking_lot",
  "rustgate-core",
+ "rustgate-resilience",
  "rustgate-test-utils",
  "rustgate-transport",
  "rustls",
@@ -3369,6 +3372,15 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "rustgate-resilience"
+version = "0.8.0"
+dependencies = [
+ "fastrand",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3455,6 +3467,7 @@ dependencies = [
  "rustgate-cot",
  "rustgate-mavlink",
  "rustgate-proto",
+ "rustgate-resilience",
  "rustgate-test-utils",
  "rustls",
  "rustls-pki-types",
@@ -3483,6 +3496,7 @@ dependencies = [
  "futures",
  "rustgate-core",
  "rustgate-cot",
+ "rustgate-resilience",
  "rustgate-test-utils",
  "rustgate-transport",
  "rustls",

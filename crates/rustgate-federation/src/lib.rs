@@ -24,7 +24,6 @@ pub mod jwt;
 pub mod manager;
 pub mod peer;
 pub mod provenance;
-mod reconnect;
 pub mod replay_buffer;
 pub mod replay_persist;
 pub mod store;
