@@ -417,6 +417,33 @@ jobs:
           fi
           echo "All workspace members have corresponding COPY in Dockerfile."
 
+      - name: Validate Dockerfile FROM digest pinning
+        run: |
+          # Every FROM line must pin a @sha256 digest — defends against
+          # tag-hijack and makes builds reproducible (issue #779).
+          # Dependabot's `docker` ecosystem (see .github/dependabot.yml)
+          # rotates these weekly. `FROM scratch` is allowed since it
+          # is a zero-byte fixed base image.
+          set -euo pipefail
+          bad=0
+          while IFS= read -r file; do
+            awk -v f="$file" '
+              /^[[:space:]]*FROM[[:space:]]/ && !/^[[:space:]]*#/ {
+                if ($0 ~ /^[[:space:]]*FROM[[:space:]]+scratch([[:space:]]|$)/) next
+                if ($0 !~ /@sha256:[0-9a-f]{64}/) {
+                  printf "::error file=%s,line=%d::FROM is not pinned to @sha256 digest: %s\n", f, NR, $0
+                  exit 2
+                }
+              }
+            ' "$file" || bad=$((bad+1))
+          done < <(git ls-files '*Dockerfile*' | grep -v '^\.claude/')
+          if [ "$bad" -gt 0 ]; then
+            echo "::error::${bad} Dockerfile(s) contain FROM lines without @sha256 digest pinning."
+            echo "::error::Resolve with: docker buildx imagetools inspect <image>:<tag>  → copy the top-level Digest, then pin as 'FROM <image>:<tag>@sha256:<digest>'."
+            exit 1
+          fi
+          echo "All FROM lines are pinned to @sha256 digests."
+
       - name: Check for Docker-relevant changes
         uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
         id: filter
