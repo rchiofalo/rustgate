@@ -548,6 +548,27 @@ pub fn http_circuit_recovered(target: &str) {
     );
 }
 
+/// Record a failed TLS verifier rebuild after trust store change.
+pub fn verifier_rebuild_failed(error: &str) {
+    audit!(
+        "verifier.rebuild_failed",
+        error = %error,
+        action = "rebuild_verifier",
+        result = "failed"
+    );
+}
+
+/// Record a store-forward message drop due to writer channel overflow.
+pub fn store_forward_dropped(cn: &str, reason: &str) {
+    audit!(
+        "store_forward.dropped",
+        cn = %cn,
+        reason = %reason,
+        action = "enqueue",
+        result = "dropped"
+    );
+}
+
 /// Record a message being shed by per-target rate limiting.
 pub fn http_rate_limited(target: &str, source_cn: &str) {
     audit!(
@@ -787,6 +808,27 @@ mod tests {
         fn test_authz_obligation_unknown() {
             authz_obligation_unknown("alice", "Quarantine", "tcp", "group");
             authz_obligation_unknown("", "", "", "");
+        }
+    }
+
+    mod store_forward {
+        use super::*;
+
+        #[test]
+        fn test_store_forward_dropped() {
+            store_forward_dropped("client-cn", "writer_channel_full");
+            store_forward_dropped("client-cn", "writer_task_gone");
+            store_forward_dropped("", "");
+        }
+    }
+
+    mod verifier {
+        use super::*;
+
+        #[test]
+        fn test_verifier_rebuild_failed() {
+            verifier_rebuild_failed("root store build error: invalid cert");
+            verifier_rebuild_failed("");
         }
     }
 

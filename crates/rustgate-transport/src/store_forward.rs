@@ -427,12 +427,14 @@ impl ClientQueue {
                     cap = CLIENT_QUEUE_WRITER_CHANNEL_CAPACITY,
                     "client queue: writer channel full; dropping message"
                 );
+                rustgate_core::audit::store_forward_dropped(cn, "writer_channel_full");
                 Ok(0)
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 let mut inner = self.inner.lock();
                 inner.writer_drops = inner.writer_drops.saturating_add(1);
                 warn!(cn, "client queue: writer task gone; dropping message");
+                rustgate_core::audit::store_forward_dropped(cn, "writer_task_gone");
                 Ok(0)
             }
         }
