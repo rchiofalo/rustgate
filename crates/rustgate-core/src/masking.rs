@@ -89,6 +89,38 @@ pub fn mask_ip(ip: &str) -> String {
     }
 }
 
+/// Hash a client CN to a stable opaque token for PII-safe logging.
+///
+/// Uses SHA-256 truncated to the first 12 hex chars (48 bits). This is a
+/// correlation token, not a cryptographic identifier — the truncation
+/// collision risk is acceptable for an audit trail, and the token remains
+/// stable so operators can follow a single identity across log events
+/// without the raw CN ever appearing in log storage.
+///
+/// Use this for the access-log target and any other structured log field
+/// that would otherwise carry a raw client identity.
+///
+/// # Examples
+///
+/// ```
+/// # use rustgate_core::masking::hash_cn;
+/// let h = hash_cn("alice");
+/// assert_eq!(h.len(), 12);
+/// assert_eq!(hash_cn("alice"), h);        // stable across calls
+/// assert_ne!(hash_cn("alice"), hash_cn("bob"));
+/// ```
+pub fn hash_cn(cn: &str) -> String {
+    use std::fmt::Write;
+
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(cn.as_bytes());
+    let mut out = String::with_capacity(12);
+    for b in &digest[..6] {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 /// Mask a credential string, showing only the first 2 characters.
 ///
 /// The remainder is replaced with `"********"`. Strings shorter than 3
@@ -197,5 +229,23 @@ mod tests {
     #[test]
     fn credential_single_char() {
         assert_eq!(mask_credential("x"), "********");
+    }
+
+    // ── hash_cn ─────────────────────────────────────────────────────
+
+    #[test]
+    fn hash_cn_is_stable_and_truncated() {
+        let h = hash_cn("alice");
+        assert_eq!(h.len(), 12);
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(hash_cn("alice"), h);
+        assert_ne!(hash_cn("alice"), hash_cn("bob"));
+    }
+
+    #[test]
+    fn hash_cn_empty_input() {
+        // Empty string still hashes to a valid 12-char token.
+        let h = hash_cn("");
+        assert_eq!(h.len(), 12);
     }
 }

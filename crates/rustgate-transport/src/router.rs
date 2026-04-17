@@ -69,6 +69,7 @@ pub struct AuthzEvent<'a> {
     pub policy_id: &'a str,
 }
 use rustgate_core::identity::{GroupId, Identity};
+use rustgate_core::masking::hash_cn;
 use rustgate_core::message::{Destination, MessageType, RoutableMessage};
 use tokio::sync::{RwLock, mpsc};
 use tracing::{Instrument, debug, warn};
@@ -84,21 +85,6 @@ use crate::store_forward::ClientQueue;
 /// (file or stdout). The target is a constant so emission sites and the
 /// subscriber filter cannot drift.
 pub const ACCESS_LOG_TARGET: &str = "access";
-
-/// Hash a unicast destination CN to a stable opaque token so the access
-/// log does not leak raw client identities (PII). Uses SHA-256 truncated
-/// to the first 12 hex chars (48 bits) — collision risk is acceptable
-/// for an audit trail and the token remains stable for correlation.
-fn hash_cn(cn: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(cn.as_bytes());
-    let mut out = String::with_capacity(12);
-    for b in &digest[..6] {
-        use std::fmt::Write;
-        let _ = write!(out, "{b:02x}");
-    }
-    out
-}
 
 /// Maximum number of leading payload bytes scanned when looking for a
 /// CoT `uid="..."` attribute. Acts as a DoS guard against pathological

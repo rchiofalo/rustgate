@@ -1,0 +1,19 @@
+# Workspace-wide clippy configuration.
+#
+# Augments the `[workspace.lints.clippy]` block in the root Cargo.toml with
+# extra lint configuration that cannot be expressed there — specifically
+# `disallowed-types` / `disallowed-methods` allowlists, which are only
+# readable from a clippy.toml file.
+#
+# Keep this file small and targeted: the shell script at
+# `scripts/check-playbook-drift.sh` handles the structural checks that
+# clippy cannot express (e.g. "missing audit::* next to refusal logs").
+
+# Types that must not appear anywhere in the workspace.
+#
+# The `reason` fields are surfaced in the clippy diagnostic so a reviewer
+# who hits a lint failure can fix it without reading this file.
+disallowed-types = [
+    { path = "once_cell::sync::Lazy", reason = "use std::sync::OnceLock — see rules/shared-infrastructure.md metrics pattern" },
+    { path = "once_cell::sync::OnceCell", reason = "use std::sync::OnceLock — see rules/shared-infrastructure.md metrics pattern" },
+]

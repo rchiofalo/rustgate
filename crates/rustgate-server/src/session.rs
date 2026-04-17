@@ -693,10 +693,15 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok(session) => {
+                        let peer_addr = session.peer_addr();
                         let permit = match Arc::clone(&connection_limit).try_acquire_owned() {
                             Ok(p) => p,
                             Err(_) => {
-                                tracing::warn!("plaintext TCP: connection limit reached, rejecting");
+                                tracing::warn!(peer = %peer_addr, "plaintext TCP: connection limit reached, rejecting");
+                                crate::audit::connection_rejected(
+                                    peer_addr,
+                                    "plaintext TCP connection limit reached",
+                                );
                                 continue;
                             }
                         };
