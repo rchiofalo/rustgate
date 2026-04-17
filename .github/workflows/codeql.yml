@@ -28,7 +28,7 @@ jobs:
           persist-credentials: false
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@c10b8064de6f491fea524254123dbe5e09572f13 # v4.35.1
+        uses: github/codeql-action/init@95e58e9a2cdfd71adc6e0353d5c52f41a045d225 # v4.35.2
         with:
           languages: actions
           # actions: scans GitHub Actions workflows for misconfigurations
@@ -38,7 +38,7 @@ jobs:
           # (clippy, cargo-audit, cargo-deny, fuzzing).
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@c10b8064de6f491fea524254123dbe5e09572f13 # v4.35.1
+        uses: github/codeql-action/analyze@95e58e9a2cdfd71adc6e0353d5c52f41a045d225 # v4.35.2
         # SARIF upload requires GitHub Advanced Security, which is not available
         # on private repos without a GHAS license. Allow this step to fail
         # gracefully so the workflow does not block PRs.
