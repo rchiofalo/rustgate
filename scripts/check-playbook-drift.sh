@@ -104,7 +104,9 @@ check_tcp_keepalive() {
     while IFS= read -r file; do
         [[ -z "$file" ]] && continue
         [[ "$file" =~ $allow ]] && continue
-        if ! rg -q 'configure_tcp_keepalive' "$file"; then
+        # Require an actual call site (`\(`) so a comment that merely
+        # mentions the helper can't silence the check.
+        if ! rg -q 'configure_tcp_keepalive\(' "$file"; then
             local line
             line=$(rg -n 'TcpListener' "$file" | head -1 | cut -d: -f1)
             report "$file" "${line:-1}" \
@@ -122,7 +124,11 @@ check_rejection_audit() {
     echo "• rejection → audit co-location"
     # Rejection keywords the warn message must contain.
     local keywords='reject|denied|refused|unauthorized|quota|limit exceeded|blocked|forbidden'
-    # Match both `tracing::warn!(…)` and `warn!(…)` (when `use tracing::warn` is in scope).
+    # Match single-line `warn!(…rejected…)` / `tracing::warn!(…)` calls.
+    # Multi-line warn! invocations (keyword on a later arg line) are out
+    # of scope for this heuristic — tracking that statically triggers too
+    # many false positives on descriptive messages like "may be rejected"
+    # or backpressure "limit exceeded" that are not security events.
     local warn_pattern="(tracing::)?warn!\\([^)]*(${keywords})"
     local hits
     hits=$(
@@ -138,9 +144,12 @@ check_rejection_audit() {
         file=${row%%:*}
         line=${row#*:}
         line=${line%%:*}
-        # Look for any `audit::` within the 10 lines following the warn.
+        # Look for an actual audit-module call within the 10 lines
+        # following the warn. Require a `\(` or `!\(` so a comment that
+        # merely mentions `audit::` cannot silence the check.
         local window_end=$((line + 10))
-        if ! sed -n "${line},${window_end}p" "$file" | grep -q 'audit::'; then
+        if ! sed -n "${line},${window_end}p" "$file" |
+            grep -qE 'audit::[a-z_]+\(|audit!\('; then
             report "$file" "$line" \
                 "rejection-themed warn! without a companion \`audit::*\` call within 10 lines — see .claude/rules/shared-infrastructure.md (Audit System)."
         fi
