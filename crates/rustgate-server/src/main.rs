@@ -40,6 +40,7 @@ mod session;
 mod setup;
 
 use cli::{Cli, Command};
+use rustgate_core::tasks::{spawn_background, stop_subsystem};
 use rustgate_transport::{BackpressureGate, Router};
 use session::{FedForwardFn, SessionDeps};
 
@@ -1059,7 +1060,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         let fed_peers_for_hup = fed_peer_reloader.clone();
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
             Ok(mut sighup) => {
-                setup::spawn_background("sighup-reloader", async move {
+                spawn_background("sighup-reloader", async move {
                     while sighup.recv().await.is_some() {
                         tracing::info!("SIGHUP received, reloading config");
                         reload_all_configs(
@@ -1151,7 +1152,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                             #[cfg(feature = "metrics")]
                             metrics_identity: Arc::clone(&metrics_identity),
                         };
-                        setup::spawn_background("tls-session", session::handle_session(session, deps, permit));
+                        spawn_background("tls-session", session::handle_session(session, deps, permit));
                     }
                     Err(e) => {
                         #[cfg(feature = "metrics")]
@@ -1210,19 +1211,19 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     #[cfg(feature = "websocket")]
     if let Some(handle) = ws_shutdown {
-        setup::stop_subsystem("websocket", handle).await;
+        stop_subsystem("websocket", handle).await;
     }
 
     #[cfg(feature = "mqtt")]
     if let Some(handle) = mqtt_shutdown {
-        setup::stop_subsystem("mqtt", handle).await;
+        stop_subsystem("mqtt", handle).await;
     }
 
     if let Some(handle) = tcp_plaintext_shutdown {
-        setup::stop_subsystem("plaintext-tcp", handle).await;
+        stop_subsystem("plaintext-tcp", handle).await;
     }
     if let Some(handle) = udp_shutdown {
-        setup::stop_subsystem("udp", handle).await;
+        stop_subsystem("udp", handle).await;
     }
     if let Some(handle) = archive_rotation_handle {
         handle.abort();

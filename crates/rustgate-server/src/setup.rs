@@ -19,6 +19,20 @@ use rustgate_core::identity::Identity;
 use rustgate_core::message::RoutableMessage;
 #[cfg(feature = "federation")]
 use rustgate_core::message::{Destination, Metadata};
+use rustgate_core::tasks::SubsystemHandle;
+// Used only inside feature-gated subsystem setup functions (nats,
+// enrollment, metrics, federation*). The websocket and UDP setup paths
+// also call `spawn_background`, but only inside nested
+// `#[cfg(feature = "nats")]` blocks — so `nats` alone covers those.
+// Gated to keep the no-features and nats-less builds warning-clean.
+#[cfg(any(
+    feature = "nats",
+    feature = "enrollment",
+    feature = "metrics",
+    feature = "federation",
+    feature = "federation-ha",
+))]
+use rustgate_core::tasks::spawn_background;
 use rustgate_transport::{
     CertReloader, Router, ThrottleConfig, TlsConfig, TlsListener, TlsMinVersion,
 };
@@ -84,43 +98,6 @@ pub(crate) async fn load_group_acl(
     let policy = rustgate_transport::GroupAclPolicy::new(groups);
     tracing::info!(groups = policy.len(), "loaded group access control policy");
     Ok((Some(policy), Some(hash), Some(config)))
-}
-
-/// Spawn a tokio task whose `JoinHandle` is intentionally not tracked.
-///
-/// Logs a warning if the task panics. Prefer this over bare `drop(tokio::spawn(...))`
-/// so that panics in background tasks are observable.
-pub(crate) fn spawn_background(
-    name: &'static str,
-    fut: impl std::future::Future<Output = ()> + Send + 'static,
-) {
-    let handle = tokio::spawn(fut);
-    drop(tokio::spawn(async move {
-        if let Err(e) = handle.await {
-            tracing::error!(task = name, error = %e, "background task panicked");
-        }
-    }));
-}
-
-/// Handle for a subsystem that can be gracefully stopped.
-///
-/// Unlike `spawn_background`, subsystem handles allow the caller to signal
-/// shutdown and then await the task's completion. Used for listener tasks
-/// (WebSocket, plaintext TCP, UDP) so they stop accepting before connection
-/// draining begins.
-pub(crate) struct SubsystemHandle {
-    pub(crate) shutdown: Arc<tokio::sync::Notify>,
-    task: tokio::task::JoinHandle<()>,
-}
-
-/// Signal a subsystem to stop and await its completion with a timeout.
-pub(crate) async fn stop_subsystem(name: &str, handle: SubsystemHandle) {
-    handle.shutdown.notify_one();
-    match tokio::time::timeout(std::time::Duration::from_secs(5), handle.task).await {
-        Ok(Ok(())) => tracing::info!(subsystem = name, "stopped"),
-        Ok(Err(e)) => tracing::error!(subsystem = name, error = %e, "panicked during shutdown"),
-        Err(_) => tracing::warn!(subsystem = name, "did not stop within 5s timeout"),
-    }
 }
 
 /// Build the TLS configuration from CLI flags.
@@ -1445,7 +1422,7 @@ pub(crate) fn start_websocket<P: NatsPublish + Send + Sync + 'static>(
     let task = tokio::spawn(async move {
         rustgate_websocket::WebSocketServer::run(config).await;
     });
-    Ok(Some(SubsystemHandle { shutdown, task }))
+    Ok(Some(SubsystemHandle::new(shutdown, task)))
 }
 
 /// Warn when websocket is requested without the feature.
@@ -1497,7 +1474,7 @@ pub(crate) fn start_mqtt(
     let task = tokio::spawn(async move {
         rustgate_mqtt::MqttServer::run(config).await;
     });
-    Ok(Some(SubsystemHandle { shutdown, task }))
+    Ok(Some(SubsystemHandle::new(shutdown, task)))
 }
 
 /// Warn when MQTT is requested without the feature.
@@ -1577,7 +1554,7 @@ pub(crate) async fn start_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
         crate::session::run_plaintext_tcp(config).await;
     });
 
-    Ok(Some(SubsystemHandle { shutdown, task }))
+    Ok(Some(SubsystemHandle::new(shutdown, task)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1684,5 +1661,5 @@ pub(crate) async fn start_udp<P: NatsPublish + Send + Sync + 'static>(
         .await;
     });
 
-    Ok(Some(SubsystemHandle { shutdown, task }))
+    Ok(Some(SubsystemHandle::new(shutdown, task)))
 }

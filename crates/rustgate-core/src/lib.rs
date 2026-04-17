@@ -22,6 +22,7 @@ pub mod peer_id;
 pub mod protocol;
 pub mod ratelimit;
 pub mod sanitize;
+pub mod tasks;
 
 pub use identity::AttrValue;
 pub use peer_id::{PeerId, ServerName};
