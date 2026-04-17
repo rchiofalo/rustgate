@@ -16,6 +16,7 @@ use parking_lot::Mutex;
 use rustgate_core::constants::WRITE_TIMEOUT;
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
+use rustgate_core::sanitize::sanitize_for_log;
 use rustgate_transport::{
     NORMAL_CHANNEL_CAPACITY, PRIORITY_CHANNEL_CAPACITY, Router, SessionHandle,
 };
@@ -74,7 +75,7 @@ impl ClientIdRegistry {
             && existing_cn != cn
         {
             warn!(
-                client_id = %client_id,
+                client_id = %sanitize_for_log(client_id),
                 existing_cn = %existing_cn,
                 new_cn = %cn,
                 "MQTT client ID collision: different identity attempted to reuse client ID"
@@ -195,7 +196,7 @@ pub(crate) async fn handle_mqtt_session(
         groups = ?identity.groups,
         protocol = ?protocol,
         keep_alive = keep_alive,
-        client_id = %client_id,
+        client_id = %sanitize_for_log(&client_id),
         "MQTT session started"
     );
 
@@ -219,6 +220,7 @@ pub(crate) async fn handle_mqtt_session(
     }
     if !router.register(handle.clone()).await {
         warn!(cn = %cn, "connection rejected: tenant quota exceeded");
+        rustgate_core::audit::connection_rejected(peer_addr, "tenant quota exceeded");
         return;
     }
     for pending in buffered {
@@ -313,7 +315,7 @@ async fn connect_handshake(
 
             debug!(
                 cn = %identity.cn,
-                client_id = %client_id,
+                client_id = %sanitize_for_log(&client_id),
                 keep_alive = connect.keep_alive,
                 "MQTT v3.1.1 CONNECT accepted"
             );
@@ -346,7 +348,7 @@ async fn connect_handshake(
 
                 debug!(
                     cn = %identity.cn,
-                    client_id = %client_id,
+                    client_id = %sanitize_for_log(&client_id),
                     keep_alive = connect.keep_alive,
                     "MQTT v5.0 CONNECT accepted"
                 );

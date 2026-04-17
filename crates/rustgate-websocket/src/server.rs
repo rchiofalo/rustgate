@@ -229,6 +229,7 @@ async fn handle_ws_session(
     }
     if !router.register(handle.clone()).await {
         warn!(cn = %identity.cn, "connection rejected: tenant quota exceeded");
+        rustgate_core::audit::connection_rejected(peer_addr, "tenant quota exceeded");
         return;
     }
     for pending in buffered_offline {
@@ -338,6 +339,11 @@ async fn ws_read_loop(
             && !t.allow()
         {
             warn!(cn = %identity.cn, "message dropped: rate limit exceeded");
+            rustgate_core::audit::rate_limit_triggered(
+                &identity.cn,
+                "websocket/inbound",
+                t.rate() as usize,
+            );
             continue;
         }
 

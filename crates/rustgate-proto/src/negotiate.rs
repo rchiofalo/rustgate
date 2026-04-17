@@ -14,6 +14,7 @@
 use std::io;
 
 use prost::Message;
+use rustgate_core::constants::MAX_FRAME_SIZE;
 use tokio::io::AsyncReadExt;
 use tokio::time::{Duration, timeout};
 use tokio_util::bytes::BufMut;
@@ -196,7 +197,6 @@ async fn read_tak_request_inner(
     reader: &mut (impl tokio::io::AsyncRead + Unpin),
 ) -> io::Result<NegotiatedVersion> {
     const MAX_VARINT_BYTES: usize = 5;
-    const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
     // Read varint length, one byte at a time
     let mut header_buf = [0u8; MAX_VARINT_BYTES];

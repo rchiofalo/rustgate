@@ -23,6 +23,7 @@ use prometheus::{
     TextEncoder,
 };
 use rustgate_core::constants::HTTP_CONNECTION_TIMEOUT;
+use rustgate_core::net::configure_tcp_keepalive;
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
@@ -1967,6 +1968,10 @@ pub async fn serve(
 
     loop {
         let (stream, _) = listener.accept().await?;
+
+        // Apply shared TCP keepalive so dead NAT middleboxes and half-open
+        // scrapers are detected instead of hanging the connection semaphore.
+        configure_tcp_keepalive(&stream);
 
         let permit = match Arc::clone(&conn_limit).try_acquire_owned() {
             Ok(p) => p,

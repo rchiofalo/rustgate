@@ -102,6 +102,15 @@ impl ClientThrottle {
         let (tokens_x100, _) = unpack(self.state.load(Ordering::Relaxed));
         tokens_x100 / 100
     }
+
+    /// Configured refill rate in messages per second.
+    ///
+    /// Exposed so audit sinks can record the configured limit when a drop
+    /// event is emitted; the value is the rate the throttle was constructed
+    /// with (no precision loss from `f64` since the constructor takes `u32`).
+    pub fn rate(&self) -> u32 {
+        self.refill_rate as u32
+    }
 }
 
 /// Configuration for per-client rate limiting.

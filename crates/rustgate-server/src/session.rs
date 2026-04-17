@@ -190,6 +190,7 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
                 .inc();
         }
         tracing::warn!(cn = %cn, "session rejected by tenant quota");
+        crate::audit::connection_rejected(peer_addr, "tenant quota exceeded");
         return;
     }
     for pending in buffered_offline {
@@ -734,6 +735,10 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
                         }
                         if !router.register(handle.clone()).await {
                             tracing::warn!(cn = %cn, "connection rejected: tenant quota exceeded");
+                            crate::audit::connection_rejected(
+                                peer_addr,
+                                "tenant quota exceeded",
+                            );
                             continue;
                         }
                         for pending in buffered_offline {
