@@ -19,7 +19,7 @@ ocsp = ["dep:ocsp-stapler"]
 spiffe = ["dep:spiffe", "dep:base64"]
 
 [dependencies]
-rustgate-core = { workspace = true }
+rustgate-core = { workspace = true, features = ["pem"] }
 rustgate-cot = { workspace = true }
 rustgate-authz = { workspace = true }
 rustgate-proto = { workspace = true, optional = true }

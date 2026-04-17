@@ -14,7 +14,6 @@ use rcgen::{
     CertificateRevocationListParams, Issuer, KeyPair, RevocationReason, RevokedCertParams,
     SerialNumber,
 };
-use rustls_pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
@@ -263,10 +262,14 @@ fn build_crl_issuer(
     ca_cert_pem: &str,
     ca_key_pem: &str,
 ) -> Result<Issuer<'static, KeyPair>, EnrollmentError> {
-    let ca_cert_der = rustls_pki_types::CertificateDer::from_pem_slice(ca_cert_pem.as_bytes())
+    // Shared PEM helpers from `rustgate_core::pem` for consistent
+    // error mapping (`ConfigError::PemParse`).
+    let mut ca_certs = rustgate_core::pem::parse_certs(ca_cert_pem.as_bytes())
         .map_err(|e| EnrollmentError::Config(format!("failed to parse CA cert PEM: {e}")))?;
+    // `parse_certs` guarantees non-empty.
+    let ca_cert_der = ca_certs.remove(0);
 
-    let key_der = rustls_pki_types::PrivateKeyDer::from_pem_slice(ca_key_pem.as_bytes())
+    let key_der = rustgate_core::pem::parse_key(ca_key_pem.as_bytes())
         .map_err(|e| EnrollmentError::Config(format!("failed to parse CA key PEM: {e}")))?;
 
     let key_pair = KeyPair::try_from(&key_der)

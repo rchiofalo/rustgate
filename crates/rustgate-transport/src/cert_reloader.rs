@@ -267,21 +267,12 @@ impl CertReloader {
 
     /// Build a [`CertifiedKey`] from raw PEM file bytes.
     fn build_certified_key(cert_bytes: &[u8], key_bytes: &[u8]) -> Result<CertifiedKey> {
-        let cert_pem = std::str::from_utf8(cert_bytes).map_err(|e| {
-            RustgateError::from(ConfigError::PemParse {
-                kind: "certificate".to_string(),
-                reason: format!("invalid UTF-8: {e}"),
-            })
-        })?;
-        let key_pem = std::str::from_utf8(key_bytes).map_err(|e| {
-            RustgateError::from(ConfigError::PemParse {
-                kind: "private key".to_string(),
-                reason: format!("invalid UTF-8: {e}"),
-            })
-        })?;
-
-        let certs = crate::pem::parse_certs(cert_pem)?;
-        let key_der = crate::pem::parse_key(key_pem)?;
+        // PEM readers are byte-oriented: `rustgate_core::pem::parse_*` accepts
+        // `&[u8]` directly, so we skip the prior UTF-8 pre-check — non-textual
+        // input surfaces the same `ConfigError::PemParse` diagnostic via the
+        // underlying parser.
+        let certs = crate::pem::parse_certs(cert_bytes)?;
+        let key_der = crate::pem::parse_key(key_bytes)?;
 
         let signing_key = Self::load_signing_key(key_der)?;
 

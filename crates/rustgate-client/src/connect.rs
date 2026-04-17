@@ -4,9 +4,7 @@
 
 use std::sync::Arc;
 
-use rustls::RootCertStore;
-use rustls_pki_types::pem::PemObject;
-use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls_pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
@@ -118,19 +116,15 @@ fn build_tls_config(material: &TlsMaterial) -> Result<rustls::ClientConfig> {
         ),
     };
 
-    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_pem)
-        .collect::<std::result::Result<Vec<_>, _>>()
+    // Shared PEM helpers (`rustgate_core::pem`) give us uniform error
+    // mapping — every parse failure carries `kind` + `reason` fields via
+    // `ConfigError::PemParse`, which we project into `ClientError::CertParse`.
+    let certs = rustgate_core::pem::parse_certs(&cert_pem)
         .map_err(|e| ClientError::CertParse(format!("client cert: {e}")))?;
-    let key = PrivateKeyDer::from_pem_slice(&key_pem)
+    let key = rustgate_core::pem::parse_key(&key_pem)
         .map_err(|e| ClientError::CertParse(format!("client key: {e}")))?;
-
-    let mut roots = RootCertStore::empty();
-    for ca in CertificateDer::pem_slice_iter(&ca_pem) {
-        let ca = ca.map_err(|e| ClientError::CertParse(format!("ca cert: {e}")))?;
-        roots
-            .add(ca)
-            .map_err(|e| ClientError::CertParse(format!("add ca: {e}")))?;
-    }
+    let roots = rustgate_core::pem::parse_ca_store(&ca_pem)
+        .map_err(|e| ClientError::CertParse(format!("ca cert: {e}")))?;
 
     rustls::ClientConfig::builder()
         .with_root_certificates(roots)

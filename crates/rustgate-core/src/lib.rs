@@ -19,6 +19,8 @@ pub mod masking;
 pub mod message;
 pub mod net;
 pub mod peer_id;
+#[cfg(feature = "pem")]
+pub mod pem;
 pub mod protocol;
 pub mod ratelimit;
 pub mod sanitize;

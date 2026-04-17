@@ -14,7 +14,6 @@ use rcgen::{
     KeyUsagePurpose,
 };
 use rustls_pki_types::PrivateKeyDer;
-use rustls_pki_types::pem::PemObject;
 use zeroize::Zeroizing;
 
 use crate::error::EnrollmentError;
@@ -43,7 +42,7 @@ impl CsrSigner {
     /// Create a signer from PEM-encoded CA certificate and private key.
     ///
     /// The CA cert PEM is parsed twice:
-    /// 1. Via `rustls_pki_types::pem::PemObject` to extract the original DER bytes (for responses).
+    /// 1. Via [`rustgate_core::pem::parse_certs`] to extract the original DER bytes (for responses).
     /// 2. Via `rcgen::CertificateParams::from_ca_cert_der()` to reconstruct
     ///    signing parameters. The params are then re-self-signed with the key
     ///    to produce a `Certificate` handle that `signed_by()` requires.
@@ -52,19 +51,12 @@ impl CsrSigner {
         ca_key_pem: &str,
         organization: &str,
     ) -> Result<Self, EnrollmentError> {
-        // Extract original DER for enrollment responses
-        let certs: Vec<rustls_pki_types::CertificateDer<'static>> =
-            rustls_pki_types::CertificateDer::pem_slice_iter(ca_cert_pem.as_bytes())
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| {
-                    EnrollmentError::Config(format!("failed to parse CA cert PEM: {e}"))
-                })?;
-
-        let ca_cert_der = certs
-            .into_iter()
-            .next()
-            .ok_or_else(|| EnrollmentError::Config("no certificate found in CA PEM".to_string()))?
-            .to_vec();
+        // Extract original DER for enrollment responses via the shared
+        // PEM helper (uniform `ConfigError::PemParse` / `EmptyPem` mapping).
+        let mut certs = rustgate_core::pem::parse_certs(ca_cert_pem.as_bytes())
+            .map_err(|e| EnrollmentError::Config(format!("failed to parse CA cert PEM: {e}")))?;
+        // `parse_certs` guarantees non-empty — index 0 is safe.
+        let ca_cert_der = certs.remove(0).to_vec();
 
         // Load CA key — supports PKCS#8, PKCS#1 (RSA), and SEC1 (EC) PEM formats.
         let ca_key = load_private_key(ca_key_pem)?;
@@ -212,7 +204,7 @@ fn validate_public_key_strength(public_key: &rcgen::PublicKey) -> Result<(), Enr
 /// (RSA) keys, we wrap the DER in a PKCS#8 envelope before handing it
 /// to rcgen.
 fn load_private_key(pem: &str) -> Result<KeyPair, EnrollmentError> {
-    let key_der = PrivateKeyDer::from_pem_slice(pem.as_bytes())
+    let key_der = rustgate_core::pem::parse_key(pem.as_bytes())
         .map_err(|e| EnrollmentError::Config(format!("failed to parse CA key PEM: {e}")))?;
 
     let pkcs8_der = match &key_der {
@@ -594,7 +586,7 @@ cyOZxZiK
     #[test]
     fn pkcs1_to_pkcs8_produces_valid_der() {
         // Parse the PKCS#1 key and convert to PKCS#8
-        let key_der = PrivateKeyDer::from_pem_slice(RSA_CA_KEY_PKCS1.as_bytes()).expect("parse");
+        let key_der = rustgate_core::pem::parse_key(RSA_CA_KEY_PKCS1.as_bytes()).expect("parse");
 
         match &key_der {
             PrivateKeyDer::Pkcs1(pkcs1) => {

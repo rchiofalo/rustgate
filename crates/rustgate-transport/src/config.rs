@@ -69,9 +69,9 @@ impl TlsConfig {
         server_key_pem: &str,
         client_ca_pem: &str,
     ) -> Result<Self> {
-        let server_certs = crate::pem::parse_certs(server_cert_pem)?;
-        let server_key = crate::pem::parse_key(server_key_pem)?;
-        let client_ca_store = crate::pem::parse_ca_store(client_ca_pem)?;
+        let server_certs = crate::pem::parse_certs(server_cert_pem.as_bytes())?;
+        let server_key = crate::pem::parse_key(server_key_pem.as_bytes())?;
+        let client_ca_store = crate::pem::parse_ca_store(client_ca_pem.as_bytes())?;
 
         Ok(Self {
             server_certs,

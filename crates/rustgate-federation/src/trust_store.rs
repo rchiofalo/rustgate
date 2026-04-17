@@ -15,10 +15,9 @@ use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use rustls::RootCertStore;
 use rustls_pki_types::CertificateDer;
-use rustls_pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
@@ -151,19 +150,13 @@ impl TrustStore {
     /// The certificate is stored in memory and optionally persisted to disk.
     /// Returns metadata about the added certificate.
     pub fn add_certificate_from_pem(&self, pem_data: &[u8]) -> Result<CertInfo> {
-        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(pem_data)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context("failed to parse PEM data")?;
+        // Shared helper — `parse_certs` already rejects empty inputs via
+        // `ConfigError::EmptyPem`, so we lose the separate empty-check.
+        let mut certs = rustgate_core::pem::parse_certs(pem_data)
+            .map_err(|e| anyhow::anyhow!("failed to parse PEM data: {e}"))?;
 
-        if certs.is_empty() {
-            bail!("no certificates found in PEM data");
-        }
-
-        // Take the first certificate (safe: checked non-empty above)
-        let der = certs
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("no certificates found in PEM data"))?;
+        // Take the first certificate (safe: parse_certs guarantees non-empty).
+        let der = certs.remove(0);
 
         let cert_info = extract_cert_info(&der)?;
         let cn = cert_info.common_name.clone();
@@ -315,24 +308,11 @@ impl TrustStore {
     /// Build a [`RootCertStore`] starting from a base CA PEM, then adding
     /// all certificates from the trust store.
     pub fn build_root_cert_store_with_base(&self, base_pem: &[u8]) -> Result<RootCertStore> {
-        let mut store = RootCertStore::empty();
+        // Build the store from the base CA PEM via the shared helper; then
+        // layer in per-peer certs tracked by this trust store.
+        let mut store = rustgate_core::pem::parse_ca_store(base_pem)
+            .map_err(|e| anyhow::anyhow!("failed to parse base CA PEM: {e}"))?;
 
-        // Add base CA
-        let base_certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(base_pem)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context("failed to parse base CA PEM")?;
-
-        if base_certs.is_empty() {
-            bail!("no certificates found in base CA PEM data");
-        }
-
-        for cert in base_certs {
-            store
-                .add(cert)
-                .context("failed to add base CA to root store")?;
-        }
-
-        // Add trust store certs
         let certs = self
             .certs
             .read()

@@ -11,7 +11,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-rustgate-core = { workspace = true }
+rustgate-core = { workspace = true, features = ["pem"] }
 rustgate-transport = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
