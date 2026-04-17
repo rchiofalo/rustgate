@@ -125,10 +125,15 @@ impl WebSocketServer {
                 accept_result = listener.accept() => {
                     match accept_result {
                         Ok(session) => {
+                            let peer_addr = session.peer_addr();
                             let permit = match Arc::clone(&connection_limit).try_acquire_owned() {
                                 Ok(p) => p,
                                 Err(_) => {
-                                    warn!("connection limit reached, rejecting WebSocket client");
+                                    warn!(peer = %peer_addr, "connection limit reached, rejecting WebSocket client");
+                                    rustgate_core::audit::connection_rejected(
+                                        peer_addr,
+                                        "WebSocket connection limit reached",
+                                    );
                                     continue;
                                 }
                             };
