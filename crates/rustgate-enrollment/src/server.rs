@@ -24,11 +24,15 @@ use tokio_rustls::TlsAcceptor;
 const MAX_ENROLLMENT_CONNECTIONS: usize = 64;
 
 use rustgate_core::constants::HANDSHAKE_TIMEOUT;
+use rustgate_core::net::configure_tcp_keepalive;
 
-/// Maximum time for an HTTP connection (from handshake complete to response sent).
-/// Higher than the default `HTTP_CONNECTION_TIMEOUT` (15s) because enrollment
-/// involves CSR signing and PKCS#12 generation which can be slow.
-const HTTP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum time for an HTTP connection on the enrollment server.
+///
+/// Intentionally higher than the workspace default
+/// [`rustgate_core::constants::HTTP_CONNECTION_TIMEOUT`] (15s) because enrollment
+/// involves CSR signing and PKCS#12 generation which can be slow. Named
+/// distinctly from the core constant to avoid shadowing ambiguity.
+const ENROLLMENT_HTTP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 use crate::auth::Credentials;
 use crate::contacts::ContactsProvider;
@@ -176,10 +180,23 @@ impl EnrollmentServer {
                 }
             };
 
+            // Shared TCP keepalive — applied before the TLS handshake so
+            // dead NAT middleboxes do not hold slots in the connection
+            // semaphore.
+            configure_tcp_keepalive(&stream);
+
             let permit = match Arc::clone(&conn_limit).try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
-                    tracing::warn!(peer = %peer, "enrollment connection rejected: limit reached");
+                    let masked_peer = rustgate_core::masking::mask_ip(&peer.to_string());
+                    tracing::warn!(
+                        peer = %masked_peer,
+                        "enrollment connection rejected: limit reached"
+                    );
+                    rustgate_core::audit::connection_rejected(
+                        peer,
+                        "enrollment connection limit reached",
+                    );
                     drop(stream);
                     continue;
                 }
@@ -256,7 +273,8 @@ impl EnrollmentServer {
                 });
 
                 let conn = http1::Builder::new().serve_connection(io, service);
-                if let Err(e) = tokio::time::timeout(HTTP_CONNECTION_TIMEOUT, conn).await {
+                if let Err(e) = tokio::time::timeout(ENROLLMENT_HTTP_CONNECTION_TIMEOUT, conn).await
+                {
                     tracing::debug!(peer = %peer, error = %e, "HTTP connection timed out");
                 }
             }));

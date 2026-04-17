@@ -86,11 +86,23 @@ fn xml_escape_into(buf: &mut Vec<u8>, s: &str) {
 }
 
 /// Return a string with XML-escaped attribute characters.
+///
+/// Pushes directly into a `String` (not a `Vec<u8>`) to keep the UTF-8
+/// invariant type-enforced — no runtime conversion, no `.expect()`, no
+/// panic path. Mirrors `rustgate_enrollment::response::xml_escape`.
 fn xml_escape(s: &str) -> String {
-    let mut buf = Vec::with_capacity(s.len());
-    xml_escape_into(&mut buf, s);
-    // xml_escape_into only emits valid UTF-8 (ASCII replacements for ASCII bytes)
-    String::from_utf8(buf).expect("xml_escape_into produces valid UTF-8")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
