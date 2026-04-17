@@ -13,8 +13,8 @@ use anyhow::Context;
 use rustgate_core::constants::HANDSHAKE_TIMEOUT;
 use rustgate_core::identity::Identity;
 use rustgate_core::net::configure_tcp_keepalive;
+use rustgate_core::pem::{parse_ca_store, parse_certs, parse_key};
 use rustgate_transport::extract_identity;
-use rustgate_transport::pem::{parse_ca_store, parse_certs, parse_key};
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use tokio::net::TcpStream;
@@ -104,9 +104,11 @@ impl PeerConnector {
         ca_pem: &str,
         skip_hostname_verify: bool,
     ) -> anyhow::Result<Self> {
-        let certs = parse_certs(cert_pem).context("loading federation client certificate")?;
-        let key = parse_key(key_pem).context("loading federation client key")?;
-        let root_store = parse_ca_store(ca_pem).context("loading federation CA store")?;
+        let certs =
+            parse_certs(cert_pem.as_bytes()).context("loading federation client certificate")?;
+        let key = parse_key(key_pem.as_bytes()).context("loading federation client key")?;
+        let root_store =
+            parse_ca_store(ca_pem.as_bytes()).context("loading federation CA store")?;
 
         let config = if skip_hostname_verify {
             build_config_no_hostname_verify(root_store, certs, key)?
@@ -223,8 +225,9 @@ impl DynamicPeerConnector {
         provider: OutboundRootStoreProvider,
         skip_hostname_verify: bool,
     ) -> anyhow::Result<Self> {
-        let certs = parse_certs(cert_pem).context("loading federation client certificate")?;
-        let key = parse_key(key_pem).context("loading federation client key")?;
+        let certs =
+            parse_certs(cert_pem.as_bytes()).context("loading federation client certificate")?;
+        let key = parse_key(key_pem.as_bytes()).context("loading federation client key")?;
         let key_der = Zeroizing::new(key.secret_der().to_vec());
 
         let (initial_gen, root_store) = provider();
@@ -728,19 +731,19 @@ mod tests {
 
     #[test]
     fn parse_certs_empty_pem() {
-        let result = parse_certs("");
+        let result = parse_certs(b"");
         assert!(result.is_err());
     }
 
     #[test]
     fn parse_key_empty_pem() {
-        let result = parse_key("");
+        let result = parse_key(b"");
         assert!(result.is_err());
     }
 
     #[test]
     fn parse_ca_store_empty_pem() {
-        let result = parse_ca_store("");
+        let result = parse_ca_store(b"");
         assert!(result.is_err());
     }
 
@@ -748,7 +751,7 @@ mod tests {
     fn parse_certs_valid() {
         let ca = TestCa::new("Test CA");
         let cert = ca.issue_client_cert("test", &[]);
-        let result = parse_certs(&cert.cert_pem);
+        let result = parse_certs(cert.cert_pem.as_bytes());
         assert!(result.is_ok());
         assert_eq!(result.expect("certs").len(), 1);
     }
@@ -757,14 +760,14 @@ mod tests {
     fn parse_key_valid() {
         let ca = TestCa::new("Test CA");
         let cert = ca.issue_client_cert("test", &[]);
-        let result = parse_key(&cert.key_pem);
+        let result = parse_key(cert.key_pem.as_bytes());
         assert!(result.is_ok());
     }
 
     #[test]
     fn parse_ca_store_valid() {
         let ca = TestCa::new("Test CA");
-        let result = parse_ca_store(&ca.cert_pem);
+        let result = parse_ca_store(ca.cert_pem.as_bytes());
         assert!(result.is_ok());
     }
 
@@ -854,7 +857,7 @@ mod tests {
         let ca_pem = ca.cert_pem.clone();
         let provider: OutboundRootStoreProvider = Arc::new(move || {
             let current_gen = generation.load(std::sync::atomic::Ordering::Acquire);
-            let store = parse_ca_store(&ca_pem).expect("parse ca store in provider");
+            let store = parse_ca_store(ca_pem.as_bytes()).expect("parse ca store in provider");
             (current_gen, store)
         });
         DynamicPeerConnector::new(&client_cert.cert_pem, &client_cert.key_pem, provider, false)
@@ -924,7 +927,7 @@ mod tests {
         let gen_clone = Arc::clone(&generation);
         let provider: OutboundRootStoreProvider = Arc::new(move || {
             let current_gen = gen_clone.load(std::sync::atomic::Ordering::Acquire);
-            let store = parse_ca_store(&ca_pem).expect("parse ca");
+            let store = parse_ca_store(ca_pem.as_bytes()).expect("parse ca");
             (current_gen, store)
         });
         let connector =

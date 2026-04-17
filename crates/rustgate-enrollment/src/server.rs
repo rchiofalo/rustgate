@@ -447,22 +447,11 @@ fn build_server_tls_config(
     cert_pem: &str,
     key_pem: &str,
 ) -> Result<rustls::ServerConfig, EnrollmentError> {
-    use rustls_pki_types::pem::PemObject;
-
-    // Parse server certs
-    let certs: Vec<rustls_pki_types::CertificateDer<'static>> =
-        rustls_pki_types::CertificateDer::pem_slice_iter(cert_pem.as_bytes())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| EnrollmentError::Tls(format!("failed to parse server certs: {e}")))?;
-
-    if certs.is_empty() {
-        return Err(EnrollmentError::Tls(
-            "no certificates found in server PEM".to_string(),
-        ));
-    }
-
-    // Parse server key
-    let key = rustls_pki_types::PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
+    // Shared PEM helpers from `rustgate_core::pem` — `parse_certs`
+    // rejects empty inputs for us, so we skip the extra is_empty check.
+    let certs = rustgate_core::pem::parse_certs(cert_pem.as_bytes())
+        .map_err(|e| EnrollmentError::Tls(format!("failed to parse server certs: {e}")))?;
+    let key = rustgate_core::pem::parse_key(key_pem.as_bytes())
         .map_err(|e| EnrollmentError::Tls(format!("failed to parse server key: {e}")))?;
 
     // Server-only TLS (no client cert requirement)

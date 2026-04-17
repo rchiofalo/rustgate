@@ -15,7 +15,7 @@ est = ["dep:cms", "dep:der", "dep:x509-cert"]
 fips = ["rcgen/fips"]
 
 [dependencies]
-rustgate-core = { workspace = true }
+rustgate-core = { workspace = true, features = ["pem"] }
 rcgen = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }

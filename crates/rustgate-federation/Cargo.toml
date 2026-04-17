@@ -28,7 +28,7 @@ peer-discovery-consul = ["dep:async-trait", "dep:reqwest"]
 peer-discovery-etcd = ["dep:async-trait", "dep:etcd-client"]
 
 [dependencies]
-rustgate-core = { workspace = true }
+rustgate-core = { workspace = true, features = ["pem"] }
 rustgate-proto = { workspace = true, optional = true }
 rustgate-transport = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "net", "macros", "io-util"] }

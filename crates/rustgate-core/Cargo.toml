@@ -12,10 +12,16 @@ workspace = true
 
 [features]
 fuzz = ["dep:arbitrary"]
+# PEM parsing helpers (certificates, private keys, CA trust stores). Enable
+# this feature in crates that previously rolled their own PEM parsing so
+# they share a single error mapping via `rustgate_core::pem`.
+pem = ["dep:rustls", "dep:rustls-pki-types"]
 
 [dependencies]
 arbitrary = { workspace = true, optional = true }
 bytes = { workspace = true }
+rustls = { workspace = true, optional = true }
+rustls-pki-types = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -28,4 +34,5 @@ hex = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+rcgen = { workspace = true }
 tempfile = { workspace = true }
