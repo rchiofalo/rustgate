@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 rustgate-core = { workspace = true }
+rustgate-resilience = { workspace = true }
 rustgate-transport = { workspace = true }
 bytes = { workspace = true }
 mqttbytes = { version = "0.6", features = ["v5"] }

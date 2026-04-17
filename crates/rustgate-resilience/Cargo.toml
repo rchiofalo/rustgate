@@ -1,0 +1,24 @@
+[package]
+name = "rustgate-resilience"
+description = "Shared resilience primitives for rustgate: circuit breakers, backoff, rate limiters"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Exposes internal state accessors required by `metrics` integrations in
+# downstream crates (e.g. gauge for current circuit-breaker state).
+metrics = []
+
+[dependencies]
+tokio = { workspace = true, features = ["sync", "rt", "time"] }
+fastrand = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time", "test-util"] }

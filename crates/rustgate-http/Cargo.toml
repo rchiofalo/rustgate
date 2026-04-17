@@ -11,7 +11,7 @@ repository.workspace = true
 workspace = true
 
 [features]
-metrics = ["dep:prometheus"]
+metrics = ["dep:prometheus", "rustgate-resilience/metrics"]
 proto = ["dep:prost", "dep:rustgate-proto"]
 otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
 fips = ["rustls/aws_lc_rs", "rustls/fips"]
@@ -19,6 +19,7 @@ post-quantum = ["rustls/aws_lc_rs", "rustls/prefer-post-quantum"]
 
 [dependencies]
 rustgate-core = { workspace = true }
+rustgate-resilience = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }

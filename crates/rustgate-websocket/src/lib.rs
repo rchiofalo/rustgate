@@ -20,7 +20,7 @@ use rustgate_core::constants::HANDSHAKE_TIMEOUT;
 use rustgate_core::error::{Result, TransportError};
 use rustgate_core::identity::Identity;
 use rustgate_core::net::configure_tcp_keepalive;
-use rustgate_core::ratelimit::ConnRateLimiter;
+use rustgate_resilience::conn_rate_limiter::ConnRateLimiter;
 use rustgate_transport::{TlsConfig, extract_identity};
 pub use server::{
     DEFAULT_MAX_WRITE_BUFFER_BYTES, OnFederationForward, OnHttpForward, OnNatsPublish,

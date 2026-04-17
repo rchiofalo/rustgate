@@ -16,20 +16,21 @@ use base64::Engine;
 use reqwest::header::HeaderName;
 use rustgate_core::message::RoutableMessage;
 use rustgate_core::sanitize::sanitize_for_log;
+use rustgate_resilience::circuit::CircuitBreaker;
+use rustgate_resilience::retry;
+use rustgate_resilience::token_bucket::TokenBucket;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tracing::Instrument;
 use zeroize::Zeroizing;
 
 use crate::auth::AuthState;
-use crate::circuit::CircuitBreaker;
 use crate::config::{HttpConfig, PayloadFormat, TargetConfig};
 use crate::dlq::DeadLetterQueue;
 use crate::error::HttpError;
 use crate::filter::CompiledFilter;
-use crate::ratelimit::TokenBucket;
+use crate::payload;
 use crate::resolver::SsrfSafeResolver;
-use crate::{payload, retry};
 
 /// Channel buffer size for the dispatch queue.
 const CHANNEL_BUFFER: usize = 256;

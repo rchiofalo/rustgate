@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 rustgate-core = { workspace = true }
 rustgate-cot = { workspace = true }
+rustgate-resilience = { workspace = true }
 rustgate-transport = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }

@@ -1,23 +1,23 @@
 // Copyright © 2026 Roberto Chiofalo.
 
-//! Per-target token bucket rate limiter for outbound HTTP requests.
+//! Per-target token bucket rate limiter for outbound requests.
 //!
 //! Prevents overwhelming target endpoints with burst traffic by enforcing
 //! a configurable maximum request rate per second. Tokens refill lazily
 //! based on elapsed wall-clock time — no background task required.
 //!
 //! Follows the workspace fail-open pattern: on mutex poisoning, requests
-//! are allowed rather than blocked (matching `rustgate-core::ratelimit`).
+//! are allowed rather than blocked (matching [`super::conn_rate_limiter`]).
 
 use tokio::time::Instant;
 
-/// Token bucket rate limiter for outbound HTTP requests.
+/// Token bucket rate limiter for outbound requests.
 ///
 /// Each target can have an independent rate limiter. Tokens are refilled
 /// lazily on each [`try_acquire`](Self::try_acquire) call based on elapsed
 /// time since the last refill. Thread-safe via `Mutex` with poison recovery.
 #[derive(Debug)]
-pub(crate) struct TokenBucket {
+pub struct TokenBucket {
     max_tokens: f64,
     refill_rate: f64,
     state: std::sync::Mutex<BucketState>,
@@ -39,7 +39,7 @@ impl TokenBucket {
     ///
     /// The bucket starts full, so the first burst of requests up to
     /// `max_tokens` is always allowed immediately.
-    pub(crate) fn new(rate_per_sec: f64, burst: Option<f64>) -> Self {
+    pub fn new(rate_per_sec: f64, burst: Option<f64>) -> Self {
         let max_tokens = burst.unwrap_or(rate_per_sec).max(1.0);
         let refill_rate = rate_per_sec.max(0.0);
         Self {
@@ -56,8 +56,8 @@ impl TokenBucket {
     ///
     /// Refills tokens based on elapsed time before checking availability.
     /// On mutex poisoning, allows the request (fail-open — matching the
-    /// workspace pattern in `rustgate-core::ratelimit`).
-    pub(crate) fn try_acquire(&self) -> bool {
+    /// workspace pattern in [`super::conn_rate_limiter`]).
+    pub fn try_acquire(&self) -> bool {
         let Ok(mut guard) = self.state.lock() else {
             // Fail-open on mutex poison — don't block traffic on internal error
             return true;

@@ -1,9 +1,13 @@
 // Copyright © 2026 Roberto Chiofalo.
 
-//! Shared reconnection utilities for federation clients.
+//! Shared reconnection utilities for long-lived clients.
 //!
 //! Provides backoff calculation and reconnection limit checking used by
-//! both V1 and V2 federation outbound clients.
+//! federation outbound clients (V1 and V2) and other long-lived connection
+//! loops. Unlike [`super::retry::backoff_with_jitter`], this variant is
+//! deterministic — no random jitter — because reconnecting a single
+//! long-lived client does not benefit from jitter the way concurrent
+//! request-level retries do.
 
 use std::time::Duration;
 
@@ -20,7 +24,7 @@ const MAX_EXPONENT: u32 = 5;
 ///
 /// Computes `base * 2^min(attempt, 5)`, capped at 5 minutes.
 /// A zero base always returns zero regardless of the attempt count.
-pub(crate) fn backoff_delay(base: Duration, attempt: u32) -> Duration {
+pub fn backoff_delay(base: Duration, attempt: u32) -> Duration {
     let exp = attempt.min(MAX_EXPONENT);
     let delay = base.saturating_mul(2u32.pow(exp));
     delay.min(MAX_DELAY)
@@ -30,7 +34,7 @@ pub(crate) fn backoff_delay(base: Duration, attempt: u32) -> Duration {
 ///
 /// Returns `true` when `count` has reached or exceeded `max_reconnects`.
 /// A negative `max_reconnects` means unlimited retries (always returns `false`).
-pub(crate) fn should_stop_reconnecting(max_reconnects: i32, count: u32) -> bool {
+pub fn should_stop_reconnecting(max_reconnects: i32, count: u32) -> bool {
     max_reconnects >= 0 && count >= max_reconnects as u32
 }
 

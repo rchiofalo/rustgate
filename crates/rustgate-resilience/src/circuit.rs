@@ -1,11 +1,12 @@
 // Copyright © 2026 Roberto Chiofalo.
 
-//! Per-target circuit breaker for HTTP egress.
+//! Per-target circuit breaker.
 //!
 //! Implements a three-state circuit breaker (Closed → Open → HalfOpen)
 //! modeled after resilience4j and Polly, with probe limiting and a
-//! configurable success threshold for recovery. When open, messages are
-//! logged as dead-letters rather than queued or retried.
+//! configurable success threshold for recovery. Transport-agnostic:
+//! consumers decide how to handle rejected requests (drop, dead-letter,
+//! fall back to a secondary endpoint, etc.).
 //!
 //! State transitions:
 //! - **Closed → Open**: after `threshold` consecutive failures.
@@ -35,7 +36,7 @@ const STATE_HALF_OPEN: u8 = 2;
 /// is protected by the state machine invariant: only one thread
 /// transitions Open → HalfOpen via compare-exchange.
 #[derive(Debug)]
-pub(crate) struct CircuitBreaker {
+pub struct CircuitBreaker {
     state: AtomicU8,
     consecutive_failures: AtomicU32,
     threshold: u32,
@@ -62,7 +63,7 @@ impl CircuitBreaker {
     /// - `cooldown`: duration to wait in Open before probing.
     /// - `max_half_open_probes`: max concurrent probes in HalfOpen (default 3).
     /// - `success_threshold`: consecutive successes to close from HalfOpen (default 2).
-    pub(crate) fn new(
+    pub fn new(
         threshold: u32,
         cooldown: Duration,
         max_half_open_probes: u32,
@@ -88,7 +89,7 @@ impl CircuitBreaker {
     ///   HalfOpen and allows one probe request.
     /// - **HalfOpen**: allows up to `max_half_open_probes` concurrent probes,
     ///   then rejects further requests until a probe completes.
-    pub(crate) fn allow_request(&self) -> bool {
+    pub fn allow_request(&self) -> bool {
         match self.state.load(Ordering::Acquire) {
             STATE_CLOSED => true,
             STATE_OPEN => self.try_half_open(),
@@ -114,7 +115,7 @@ impl CircuitBreaker {
     /// `success_threshold` is reached.
     ///
     /// Returns `true` if the circuit recovered (HalfOpen → Closed).
-    pub(crate) fn record_success(&self) -> bool {
+    pub fn record_success(&self) -> bool {
         let current = self.state.load(Ordering::Acquire);
         self.consecutive_failures.store(0, Ordering::Release);
 
@@ -135,7 +136,7 @@ impl CircuitBreaker {
     /// `threshold` consecutive failures.
     ///
     /// Returns `true` if the circuit tripped (Closed/HalfOpen → Open).
-    pub(crate) fn record_failure(&self) -> bool {
+    pub fn record_failure(&self) -> bool {
         let current_state = self.state.load(Ordering::Acquire);
 
         // HalfOpen probe failed — immediately re-open
@@ -158,12 +159,12 @@ impl CircuitBreaker {
     /// 0 = closed, 1 = open, 2 = half-open.
     #[cfg(any(test, feature = "metrics"))]
     #[allow(dead_code)] // Used in tests; metrics reporting will call this
-    pub(crate) fn state_value(&self) -> u8 {
+    pub fn state_value(&self) -> u8 {
         self.state.load(Ordering::Acquire)
     }
 
     /// Returns `true` if the circuit is currently closed (healthy).
-    pub(crate) fn is_closed(&self) -> bool {
+    pub fn is_closed(&self) -> bool {
         self.state.load(Ordering::Acquire) == STATE_CLOSED
     }
 

@@ -40,7 +40,6 @@
 //!   for outbound TLS connections.
 
 pub(crate) mod auth;
-pub(crate) mod circuit;
 pub mod config;
 pub(crate) mod dlq;
 pub mod error;
@@ -50,9 +49,7 @@ pub mod metrics;
 pub(crate) mod payload;
 pub(crate) mod pinning;
 mod publisher;
-pub(crate) mod ratelimit;
 pub(crate) mod resolver;
-pub(crate) mod retry;
 
 pub use config::HttpConfig;
 pub use error::HttpError;

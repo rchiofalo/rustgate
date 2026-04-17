@@ -1,10 +1,13 @@
 // Copyright © 2026 Roberto Chiofalo.
 
-//! Exponential backoff with jitter for HTTP retry logic.
+//! Exponential backoff with jitter for retry logic.
 //!
-//! Extends the federation reconnect backoff pattern with random jitter
-//! to prevent thundering-herd effects when multiple targets retry against
-//! the same upstream endpoint simultaneously.
+//! Extends the basic reconnect backoff (see `super::reconnect`) with
+//! random jitter to prevent thundering-herd effects when multiple
+//! targets retry against the same upstream endpoint simultaneously.
+//! Used by request-level retry loops (where multiple concurrent failures
+//! would otherwise synchronize retries); the non-jittered variant suits
+//! single-client long-lived reconnections better.
 
 use std::time::Duration;
 
@@ -28,7 +31,7 @@ const MAX_EXPONENT: u32 = 5;
 /// Computes `base * 2^min(attempt, 5)`, capped at 5 minutes, then adds
 /// 0–25% random jitter via `fastrand`. The jitter prevents synchronized
 /// retries across targets sharing the same upstream.
-pub(crate) fn backoff_with_jitter(base: Duration, attempt: u32) -> Duration {
+pub fn backoff_with_jitter(base: Duration, attempt: u32) -> Duration {
     let exp = attempt.min(MAX_EXPONENT);
     let delay = base.saturating_mul(2u32.pow(exp)).min(MAX_DELAY);
 
@@ -57,7 +60,7 @@ pub(crate) fn backoff_with_jitter(base: Duration, attempt: u32) -> Duration {
 ///
 /// 4xx client errors (except 429) are never retried — they indicate a
 /// configuration problem that won't resolve on its own.
-pub(crate) fn is_retryable_status(status: u16) -> bool {
+pub fn is_retryable_status(status: u16) -> bool {
     status == 429 || (500..600).contains(&status)
 }
 
