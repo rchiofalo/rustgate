@@ -36,11 +36,19 @@ fn test_config(url: &str, instance_id: &str) -> NatsConfig {
 
 /// Build a valid CoT XML position message.
 fn cot_position_xml(uid: &str, lat: f64, lon: f64) -> Bytes {
+    cot_position_xml_with_error(uid, lat, lon, 50.0, 30.0)
+}
+
+/// CoT position XML with explicit circular/linear error fields.
+///
+/// Use `ce=9_999_999, le=9_999_999` to produce the CoT "position
+/// unknown" sentinel; other values represent a valid fix.
+fn cot_position_xml_with_error(uid: &str, lat: f64, lon: f64, ce: f64, le: f64) -> Bytes {
     Bytes::from(format!(
         "<event version=\"2.0\" uid=\"{uid}\" type=\"a-f-G-U-C\" \
          time=\"2026-01-01T00:00:00Z\" start=\"2026-01-01T00:00:00Z\" \
          stale=\"2026-01-01T00:05:00Z\" how=\"m-g\">\
-         <point lat=\"{lat}\" lon=\"{lon}\" hae=\"0\" ce=\"50\" le=\"30\"/>\
+         <point lat=\"{lat}\" lon=\"{lon}\" hae=\"0\" ce=\"{ce}\" le=\"{le}\"/>\
          <detail/></event>"
     ))
 }
@@ -518,15 +526,18 @@ async fn non_position_messages_published() {
     assert_eq!(notes[0].text, "hello world");
 }
 
-/// Verify that 0,0 position (unknown per CoT spec) is filtered by the publisher.
+/// Verify that a position flagged "unknown" via the CoT ce/le sentinel
+/// is filtered by the publisher.
 ///
-/// Raw NATS subscription verifies nothing was emitted — bypasses the subscriber's
-/// own is_position_unknown() check so only the publisher's guard is tested.
+/// The CoT spec defines `ce=9999999 && le=9999999` as "position
+/// unknown" — reports with this sentinel indicate the reporter could
+/// not determine a fix. Raw NATS subscription verifies nothing was
+/// emitted.
 #[tokio::test]
-async fn zero_position_filtered() {
+async fn unknown_position_filtered() {
     let server = require_nats!();
 
-    let config = test_config(server.url(), "zero-pub");
+    let config = test_config(server.url(), "unknown-pub");
     let adapter = NatsAdapter::connect(config).await.expect("connect");
 
     // Raw subscription — observe the wire directly
@@ -537,15 +548,62 @@ async fn zero_position_filtered() {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Position at 0,0 (unknown per CoT spec)
-    let msg = position_message("track-zero", "Cyan", 0.0, 0.0);
+    // Position flagged unknown via the ce/le sentinel.
+    let mut groups = BTreeSet::new();
+    let _ = groups.insert("Cyan".to_string());
+    let msg = RoutableMessage {
+        source: Identity::plaintext("track-unknown".to_string(), groups).expect("valid identity"),
+        destination: Destination::Broadcast,
+        payload: cot_position_xml_with_error(
+            "track-unknown",
+            37.0,
+            -122.0,
+            9_999_999.0,
+            9_999_999.0,
+        ),
+        metadata: Metadata {
+            received_at: SystemTime::now(),
+            source_protocol: "tak".to_string(),
+            message_type: MessageType::Position,
+            ttl: None,
+        },
+    };
     adapter.publisher().publish(&msg).await;
 
-    // Nothing should appear on NATS — publisher drops 0,0 positions
+    // Nothing should appear on NATS — publisher drops unknown-position reports
     let result = timeout(Duration::from_secs(2), raw_sub.next()).await;
     assert!(
         result.is_err(),
-        "0,0 position should not be published to NATS"
+        "position-unknown sentinel should not be published to NATS"
+    );
+}
+
+/// Verify that a report at lat=0, lon=0 with a *valid* ce/le is NOT
+/// filtered. The Gulf of Guinea and other equatorial ocean zones are
+/// legitimate operating areas; an earlier heuristic dropped them by
+/// treating 0,0 as "position unknown", which loses real data.
+#[tokio::test]
+async fn zero_position_with_valid_error_is_published() {
+    let server = require_nats!();
+
+    let config = test_config(server.url(), "zero-ok-pub");
+    let adapter = NatsAdapter::connect(config).await.expect("connect");
+
+    let raw_client = async_nats::connect(server.url())
+        .await
+        .expect("raw connect");
+    let mut raw_sub = raw_client.subscribe("points.>").await.expect("subscribe");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // 0,0 with a normal ce/le — Gulf of Guinea ocean water, valid fix.
+    let msg = position_message("track-zero", "Cyan", 0.0, 0.0);
+    adapter.publisher().publish(&msg).await;
+
+    let result = timeout(Duration::from_secs(5), raw_sub.next()).await;
+    assert!(
+        result.is_ok(),
+        "0,0 with valid ce/le must be published (equatorial ocean is valid)"
     );
 }
 

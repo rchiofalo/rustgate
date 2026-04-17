@@ -3289,6 +3289,7 @@ dependencies = [
  "rustgate-proto",
  "rustgate-resilience",
  "rustgate-test-utils",
+ "rustix",
  "rustls",
  "rustls-pki-types",
  "serde",

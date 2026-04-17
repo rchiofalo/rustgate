@@ -103,8 +103,13 @@ impl NatsPublisher {
             None => return,
         };
 
-        // Filter 0,0 positions (CoT spec: position unknown)
-        if wire_event.point.lat == 0.0 && wire_event.point.lon == 0.0 {
+        // Drop reports whose position is marked unknown via the
+        // ce/le large-magic-value convention (see
+        // `WireEvent::is_position_unknown`). Historically the filter
+        // matched `lat == 0 && lon == 0`, which dropped legitimate
+        // equatorial reports from the Gulf of Guinea and similar
+        // ocean tracks.
+        if wire_event.is_position_unknown() {
             return;
         }
 

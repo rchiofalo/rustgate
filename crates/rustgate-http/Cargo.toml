@@ -43,6 +43,9 @@ rustgate-proto = { workspace = true, optional = true }
 opentelemetry = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
 [package.metadata.cargo-machete]
 ignored = ["prost", "rustls-pki-types"]
 

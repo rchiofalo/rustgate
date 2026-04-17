@@ -144,9 +144,42 @@ fn install_current(state: &AclApiState) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Human-readable description of the [`valid_group_id`] rules, reused
+/// as the error body returned to clients that submit a malformed group
+/// name. Embedded in the API response so operators can self-correct
+/// without consulting the source.
+const GROUP_ID_RULES: &str =
+    "group id must be 1–128 bytes and contain only ASCII alphanumeric or `_`, `.`, `:`, `-`";
+
 /// Validate a group identifier against a strict allow list of characters.
 ///
-/// Permitted: ASCII alphanumeric plus `_ . : -`. Length must be 1..=128.
+/// Permitted: ASCII alphanumeric (`a-z`, `A-Z`, `0-9`) plus the
+/// punctuation characters `_`, `.`, `:`, `-`. Length must be in
+/// `1..=128` bytes.
+///
+/// The ASCII-only restriction is deliberate defense-in-depth, not an
+/// arbitrary simplification. ACL group names flow through several
+/// downstream consumers that each assume an ASCII byte representation:
+///
+/// * Router ACL lookup in [`rustgate_transport::GroupAclPolicy`] is a
+///   case-insensitive ASCII comparison.
+/// * Client-certificate OU extraction parses comma-separated ASCII
+///   strings out of X.509 RDNs.
+/// * NATS subject tokens strip non-ASCII in
+///   `rustgate_nats::publisher::sanitize_nats_token`, so a non-ASCII
+///   group name accepted here would lose characters there and land in
+///   a different subject.
+/// * Structured-logging field values render inconsistently across log
+///   collectors when non-ASCII bytes are present.
+///
+/// Rejecting non-ASCII at ingress guarantees a single canonical byte
+/// form, which blocks Unicode-equivalence spoofing (e.g. submitting
+/// Cyrillic `а` (U+0430) where a Latin `a` is expected to impersonate
+/// another group).
+///
+/// The 128-byte cap matches the `MAX_CN_LENGTH` convention in
+/// `rustgate_transport::extract` and bounds the worst-case memory
+/// footprint of the in-memory ACL map.
 fn valid_group_id(group: &str) -> bool {
     let len = group.len();
     if !(1..=128).contains(&len) {
@@ -238,14 +271,14 @@ fn route(
         (&Method::PUT, path) if path.starts_with("groups/") => {
             let group = &path["groups/".len()..];
             if !valid_group_id(group) {
-                return json_error(StatusCode::BAD_REQUEST, "invalid group id");
+                return json_error(StatusCode::BAD_REQUEST, GROUP_ID_RULES);
             }
             put_group(state, group, body)
         }
         (&Method::DELETE, path) if path.starts_with("groups/") => {
             let group = &path["groups/".len()..];
             if !valid_group_id(group) {
-                return json_error(StatusCode::BAD_REQUEST, "invalid group id");
+                return json_error(StatusCode::BAD_REQUEST, GROUP_ID_RULES);
             }
             delete_group(state, group)
         }
