@@ -768,7 +768,7 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
                         #[cfg(feature = "metrics")]
                         let session_metrics_id = Arc::clone(&metrics_identity);
 
-                        crate::setup::spawn_background("plaintext-tcp-session", async move {
+                        rustgate_core::tasks::spawn_background("plaintext-tcp-session", async move {
                             let _permit = permit;
 
                             let result = run_plaintext_session_loops(PlaintextSessionContext {
