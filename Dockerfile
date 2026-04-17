@@ -1,7 +1,11 @@
 # syntax=docker/dockerfile:1
 
 # ── Builder stage ────────────────────────────────────────────────────────
-FROM rust:1.94-alpine AS builder
+# Pinned to the multi-arch manifest digest for rust:1.94-alpine. Rotated
+# by dependabot (see .github/dependabot.yml, ecosystem: docker). The
+# @sha256 digest is mandatory — the CI "Validate Dockerfile FROM digest
+# pinning" step fails any FROM line without it.
+FROM rust:1.94-alpine@sha256:77237dd363a0b127bb5ef532c2d64c0deb380b738e43a9c4bdac73398d6d0a08 AS builder
 
 RUN apk add --no-cache musl-dev protobuf-dev make
 
