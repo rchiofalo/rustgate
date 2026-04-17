@@ -21,15 +21,16 @@ use rustgate_core::message::RoutableMessage;
 use rustgate_core::message::{Destination, Metadata};
 use rustgate_core::tasks::SubsystemHandle;
 // Used only inside feature-gated subsystem setup functions (nats,
-// enrollment, metrics, federation*, websocket). Gated to keep the
-// no-features build warning-clean.
+// enrollment, metrics, federation*). The websocket and UDP setup paths
+// also call `spawn_background`, but only inside nested
+// `#[cfg(feature = "nats")]` blocks — so `nats` alone covers those.
+// Gated to keep the no-features and nats-less builds warning-clean.
 #[cfg(any(
     feature = "nats",
     feature = "enrollment",
     feature = "metrics",
     feature = "federation",
     feature = "federation-ha",
-    feature = "websocket",
 ))]
 use rustgate_core::tasks::spawn_background;
 use rustgate_transport::{
