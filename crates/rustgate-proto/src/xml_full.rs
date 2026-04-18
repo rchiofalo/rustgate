@@ -10,6 +10,7 @@
 use quick_xml::Reader;
 use quick_xml::events::Event;
 
+use crate::convert::timestamp::iso8601_to_millis;
 use crate::error::ProtoError;
 
 /// Complete CoT event with all fields needed for protobuf conversion.
@@ -262,9 +263,18 @@ fn parse_event_attrs(
             b"uid" => event.uid = value,
             b"type" => event.event_type = value,
             b"how" => event.how = value,
-            b"time" => event.time = value,
-            b"start" => event.start = value,
-            b"stale" => event.stale = value,
+            b"time" => {
+                validate_timestamp("time", &value)?;
+                event.time = value;
+            }
+            b"start" => {
+                validate_timestamp("start", &value)?;
+                event.start = value;
+            }
+            b"stale" => {
+                validate_timestamp("stale", &value)?;
+                event.stale = value;
+            }
             b"access" => event.access = value,
             b"qos" => event.qos = value,
             b"opex" => event.opex = value,
@@ -272,6 +282,30 @@ fn parse_event_attrs(
         }
     }
     Ok(())
+}
+
+/// Validate that a CoT timestamp attribute parses as ISO 8601.
+///
+/// MITRE CoT Message Router User's Guide (MP090284) Table 2-1 specifies
+/// `time`, `start`, and `stale` as ISO 8601 / RFC 3339 UTC timestamps
+/// (`YYYY-MM-DDThh:mm:ss[.SSS]Z`). We reject malformed values at parse
+/// time so downstream consumers (NATS JSON wire, federation relay,
+/// protobuf conversion) never have to re-validate — the proto conversion
+/// path already fails closed via `iso8601_to_millis`, so this matches
+/// that behavior at the XML entry point.
+///
+/// Empty strings are allowed (upstream may omit an optional attribute);
+/// the "is this attribute present" check is separate.
+fn validate_timestamp(field: &'static str, value: &str) -> Result<(), ProtoError> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    iso8601_to_millis(value).map(|_| ()).map_err(|e| match e {
+        ProtoError::InvalidTimestamp(msg) => {
+            ProtoError::InvalidTimestamp(format!("{field}: {msg}"))
+        }
+        other => other,
+    })
 }
 
 fn parse_point_attrs(
@@ -723,7 +757,7 @@ fn write_event_to_buf(ev: &Event<'_>, buf: &mut Vec<u8>) {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -1291,5 +1325,61 @@ mod tests {
 
         let evt = parse_full(xml).expect("parse");
         assert!(evt.version.is_empty());
+    }
+
+    // ── MITRE MP090284 Table 2-1 RFC 3339 timestamp validation ──────
+
+    #[test]
+    fn parse_full_accepts_rfc3339_timestamp_with_fractional_seconds() {
+        let xml = br#"<event uid="TS-1" type="a-f-G" time="2026-02-26T12:00:00.500Z" start="2026-02-26T12:00:00.000Z" stale="2026-02-26T12:05:00.000Z"/>"#;
+        let evt = parse_full(xml).expect("parse");
+        assert_eq!(evt.time, "2026-02-26T12:00:00.500Z");
+    }
+
+    #[test]
+    fn parse_full_accepts_rfc3339_timestamp_without_fractional_seconds() {
+        let xml = br#"<event uid="TS-2" type="a-f-G" time="2026-02-26T12:00:00Z" start="2026-02-26T12:00:00Z" stale="2026-02-26T12:05:00Z"/>"#;
+        let evt = parse_full(xml).expect("parse");
+        assert_eq!(evt.stale, "2026-02-26T12:05:00Z");
+    }
+
+    #[test]
+    fn parse_full_rejects_malformed_time_attribute() {
+        // Missing `T` separator — not an RFC 3339 timestamp.
+        let xml =
+            br#"<event uid="TS-BAD-TIME" type="a-f-G" time="not-a-timestamp" stale="2026-02-26T12:05:00Z"/>"#;
+        match parse_full(xml) {
+            Err(ProtoError::InvalidTimestamp(msg)) => assert!(msg.starts_with("time:")),
+            other => panic!("expected InvalidTimestamp for time, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_full_rejects_malformed_start_attribute() {
+        let xml = br#"<event uid="TS-BAD-START" type="a-f-G" start="2026-13-99T99:99:99Z" stale="2026-02-26T12:05:00Z"/>"#;
+        match parse_full(xml) {
+            Err(ProtoError::InvalidTimestamp(msg)) => assert!(msg.starts_with("start:")),
+            other => panic!("expected InvalidTimestamp for start, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_full_rejects_malformed_stale_attribute() {
+        let xml = br#"<event uid="TS-BAD-STALE" type="a-f-G" stale="garbage"/>"#;
+        match parse_full(xml) {
+            Err(ProtoError::InvalidTimestamp(msg)) => assert!(msg.starts_with("stale:")),
+            other => panic!("expected InvalidTimestamp for stale, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_full_allows_omitted_timestamp_attributes() {
+        // Omitting the attribute should not trip the validator (the
+        // attribute simply never enters `parse_event_attrs`).
+        let xml = br#"<event uid="TS-MISSING" type="a-f-G"/>"#;
+        let evt = parse_full(xml).expect("parse");
+        assert!(evt.time.is_empty());
+        assert!(evt.start.is_empty());
+        assert!(evt.stale.is_empty());
     }
 }
