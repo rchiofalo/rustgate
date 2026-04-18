@@ -128,14 +128,6 @@ pub enum SaAffiliation {
     Other,
 }
 
-/// Historical alias: the original enum exposed `Friendly` for `a-f-*`.
-///
-/// Renamed to `Friend` to match the MITRE Appendix A / MIL-STD-2525 term.
-/// The alias keeps existing callers compiling.
-#[deprecated(note = "renamed to SaAffiliation::Friend — matches MITRE Appendix A terminology")]
-#[allow(non_upper_case_globals)]
-pub const Friendly: SaAffiliation = SaAffiliation::Friend;
-
 /// Returns `true` if the CoT event type represents a Situational Awareness atom.
 ///
 /// SA atoms take the form `a-X-…` where `X` is one of the 11 Appendix A

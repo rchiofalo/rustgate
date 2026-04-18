@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- **Expand SA affiliation coverage to full MITRE Appendix A set** — `rustgate_cot::SaAffiliation` now recognizes all 11 affiliation codes defined in MITRE CoT Message Router User's Guide (MP090284) Appendix A / Figure 2-3, aligned with MIL-STD-2525 standard identity: `Pending` (`a-p-*`), `AssumedFriend` (`a-a-*`), `Friend` (`a-f-*`, renamed from `Friendly`), `Neutral` (`a-n-*`), `Suspect` (`a-s-*`), `Hostile` (`a-h-*`), `Joker` (`a-j-*`), `Faker` (`a-k-*`), `Unknown` (`a-u-*`), `NoneSpecified` (`a-o-*`), `Other` (`a-x-*`). Previously only `f/h/n/u` were recognized, so `a-s-…` (suspect), `a-j-…` (joker), and `a-k-…` (faker) events were misclassified as non-atoms by `is_sa_event` / `sa_affiliation`. A deprecated `Friendly` const alias preserves source compatibility for downstream crate users. (#932)
+- **Expand SA affiliation coverage to full MITRE Appendix A set** — `rustgate_cot::SaAffiliation` now recognizes all 11 affiliation codes defined in MITRE CoT Message Router User's Guide (MP090284) Appendix A / Figure 2-3, aligned with MIL-STD-2525 standard identity: `Pending` (`a-p-*`), `AssumedFriend` (`a-a-*`), `Friend` (`a-f-*`, renamed from `Friendly`), `Neutral` (`a-n-*`), `Suspect` (`a-s-*`), `Hostile` (`a-h-*`), `Joker` (`a-j-*`), `Faker` (`a-k-*`), `Unknown` (`a-u-*`), `NoneSpecified` (`a-o-*`), `Other` (`a-x-*`). Previously only `f/h/n/u` were recognized, so `a-s-…` (suspect), `a-j-…` (joker), and `a-k-…` (faker) events were misclassified as non-atoms by `is_sa_event` / `sa_affiliation`. (#932)
 
 ### Security
 
