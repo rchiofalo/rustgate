@@ -59,6 +59,16 @@ pub enum ParseError {
     Xml(quick_xml::Error),
     MissingAttribute(&'static str),
     InvalidFloat(&'static str),
+    /// A numeric field was out of its spec-defined range.
+    ///
+    /// MITRE CoT Message Router User's Guide (MP090284) Table 2-1 defines
+    /// `lat` and `lon` in WGS-84 decimal degrees: latitude -90..=90,
+    /// longitude -180..=180. Values outside these ranges are rejected
+    /// rather than propagated to downstream geofilter / multicast logic.
+    OutOfRange {
+        field: &'static str,
+        value: f64,
+    },
 }
 
 impl From<quick_xml::Error> for ParseError {
@@ -204,8 +214,16 @@ pub fn parse(xml: &[u8]) -> Result<CotEvent, ParseError> {
                     let mut hae = None;
                     for attr in e.attributes().flatten() {
                         match attr.key.as_ref() {
-                            b"lat" => lat = Some(parse_f64(&attr.value, "lat")?),
-                            b"lon" => lon = Some(parse_f64(&attr.value, "lon")?),
+                            b"lat" => {
+                                let v = parse_f64(&attr.value, "lat")?;
+                                check_range("lat", v, -90.0, 90.0)?;
+                                lat = Some(v);
+                            }
+                            b"lon" => {
+                                let v = parse_f64(&attr.value, "lon")?;
+                                check_range("lon", v, -180.0, 180.0)?;
+                                lon = Some(v);
+                            }
                             b"hae" => hae = Some(parse_f64(&attr.value, "hae")?),
                             _ => {}
                         }
@@ -270,6 +288,18 @@ fn parse_f64(value: &[u8], field: &'static str) -> Result<f64, ParseError> {
         .ok()
         .and_then(|s| s.parse().ok())
         .ok_or(ParseError::InvalidFloat(field))
+}
+
+/// Reject values outside `[min, max]` (inclusive).
+///
+/// Non-finite values (NaN, ±∞) are also rejected — `f64::parse` normally
+/// returns `Err` for `"NaN"` / `"inf"` but checks here make the invariant
+/// explicit and future-proof the parser against permissive float grammars.
+fn check_range(field: &'static str, value: f64, min: f64, max: f64) -> Result<(), ParseError> {
+    if !value.is_finite() || !(min..=max).contains(&value) {
+        return Err(ParseError::OutOfRange { field, value });
+    }
+    Ok(())
 }
 
 fn map_event_type(cot_type: &str) -> MessageType {
@@ -616,6 +646,60 @@ mod tests {
         assert!(parse_iso8601("2021-01-01T24:00:00Z").is_none());
         assert!(parse_iso8601("2021-01-01T00:60:00Z").is_none());
         assert!(parse_iso8601("2021-01-01T00:00:60Z").is_none());
+    }
+
+    // ── WGS-84 lat/lon range tests ──────────────────────────────────
+
+    fn point_xml(lat: &str, lon: &str) -> Vec<u8> {
+        format!(
+            r#"<event uid="u" type="a-f-G" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><point lat="{lat}" lon="{lon}" hae="0"/></event>"#,
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn parse_accepts_boundary_lat_lon() {
+        // Exact WGS-84 extremes per MP090284 Table 2-1 must parse.
+        for (lat, lon) in [("-90", "-180"), ("90", "180"), ("0", "0")] {
+            assert!(
+                parse(&point_xml(lat, lon)).is_ok(),
+                "boundary ({lat}, {lon})"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_rejects_out_of_range_lat() {
+        let err = parse(&point_xml("90.0001", "0")).expect_err("lat > 90");
+        assert!(matches!(err, ParseError::OutOfRange { field: "lat", .. }));
+
+        let err = parse(&point_xml("-90.5", "0")).expect_err("lat < -90");
+        assert!(matches!(err, ParseError::OutOfRange { field: "lat", .. }));
+    }
+
+    #[test]
+    fn parse_rejects_out_of_range_lon() {
+        let err = parse(&point_xml("0", "180.1")).expect_err("lon > 180");
+        assert!(matches!(err, ParseError::OutOfRange { field: "lon", .. }));
+
+        let err = parse(&point_xml("0", "-273.5")).expect_err("lon < -180");
+        assert!(matches!(err, ParseError::OutOfRange { field: "lon", .. }));
+    }
+
+    #[test]
+    fn check_range_rejects_non_finite() {
+        assert!(matches!(
+            check_range("lat", f64::NAN, -90.0, 90.0),
+            Err(ParseError::OutOfRange { field: "lat", .. })
+        ));
+        assert!(matches!(
+            check_range("lon", f64::INFINITY, -180.0, 180.0),
+            Err(ParseError::OutOfRange { field: "lon", .. })
+        ));
+        assert!(matches!(
+            check_range("lon", f64::NEG_INFINITY, -180.0, 180.0),
+            Err(ParseError::OutOfRange { field: "lon", .. })
+        ));
     }
 
     // ── SA event type detection tests ────────────────────────────────

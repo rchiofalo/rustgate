@@ -271,8 +271,16 @@ fn parse_point_attrs(
     for attr in e.attributes().flatten() {
         let value_str = String::from_utf8_lossy(&attr.value);
         match attr.key.as_ref() {
-            b"lat" => event.lat = parse_f64(&value_str)?,
-            b"lon" => event.lon = parse_f64(&value_str)?,
+            b"lat" => {
+                let v = parse_f64(&value_str)?;
+                check_range("lat", v, -90.0, 90.0)?;
+                event.lat = v;
+            }
+            b"lon" => {
+                let v = parse_f64(&value_str)?;
+                check_range("lon", v, -180.0, 180.0)?;
+                event.lon = v;
+            }
             b"hae" => event.hae = parse_f64(&value_str)?,
             b"ce" => event.ce = parse_f64(&value_str)?,
             b"le" => event.le = parse_f64(&value_str)?,
@@ -285,6 +293,16 @@ fn parse_point_attrs(
 fn parse_f64(s: &str) -> Result<f64, ProtoError> {
     s.parse()
         .map_err(|_| ProtoError::InvalidTimestamp(format!("bad float: {s}")))
+}
+
+/// Reject values outside `[min, max]` (inclusive) or non-finite.
+///
+/// Used for WGS-84 lat/lon range enforcement per MP090284 Table 2-1.
+fn check_range(field: &'static str, value: f64, min: f64, max: f64) -> Result<(), ProtoError> {
+    if !value.is_finite() || !(min..=max).contains(&value) {
+        return Err(ProtoError::OutOfRange { field, value });
+    }
+    Ok(())
 }
 
 /// Parse a known detail child element that was a Start event (has children).
@@ -1183,6 +1201,42 @@ mod tests {
         assert!(remarks.text.is_empty());
         assert_eq!(remarks.source.as_deref(), Some("BAO.F.ATAK.SENDER"));
         assert_eq!(remarks.timestamp.as_deref(), Some("2021-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn parse_full_accepts_wgs84_boundary_lat_lon() {
+        // MP090284 Table 2-1: lat -90..=90, lon -180..=180. Exact extremes must parse.
+        for (lat, lon) in [("-90", "-180"), ("90", "180"), ("0", "0")] {
+            let xml = format!(
+                r#"<event uid="U" type="a-f-G"><point lat="{lat}" lon="{lon}" hae="0" ce="1" le="1"/></event>"#
+            );
+            assert!(
+                parse_full(xml.as_bytes()).is_ok(),
+                "boundary ({lat}, {lon})"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_full_rejects_lat_out_of_range() {
+        let xml = br#"<event uid="U" type="a-f-G"><point lat="90.5" lon="0" hae="0" ce="1" le="1"/></event>"#;
+        let err = parse_full(xml).expect_err("lat > 90");
+        assert!(matches!(err, ProtoError::OutOfRange { field: "lat", .. }));
+
+        let xml = br#"<event uid="U" type="a-f-G"><point lat="-273.15" lon="0" hae="0" ce="1" le="1"/></event>"#;
+        let err = parse_full(xml).expect_err("lat < -90");
+        assert!(matches!(err, ProtoError::OutOfRange { field: "lat", .. }));
+    }
+
+    #[test]
+    fn parse_full_rejects_lon_out_of_range() {
+        let xml = br#"<event uid="U" type="a-f-G"><point lat="0" lon="180.1" hae="0" ce="1" le="1"/></event>"#;
+        let err = parse_full(xml).expect_err("lon > 180");
+        assert!(matches!(err, ProtoError::OutOfRange { field: "lon", .. }));
+
+        let xml = br#"<event uid="U" type="a-f-G"><point lat="0" lon="-200" hae="0" ce="1" le="1"/></event>"#;
+        let err = parse_full(xml).expect_err("lon < -180");
+        assert!(matches!(err, ProtoError::OutOfRange { field: "lon", .. }));
     }
 
     #[test]
