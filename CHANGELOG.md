@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Expand SA affiliation coverage to full MITRE Appendix A set** — `rustgate_cot::SaAffiliation` now recognizes all 11 affiliation codes defined in MITRE CoT Message Router User's Guide (MP090284) Appendix A / Figure 2-3, aligned with MIL-STD-2525 standard identity: `Pending` (`a-p-*`), `AssumedFriend` (`a-a-*`), `Friend` (`a-f-*`, renamed from `Friendly`), `Neutral` (`a-n-*`), `Suspect` (`a-s-*`), `Hostile` (`a-h-*`), `Joker` (`a-j-*`), `Faker` (`a-k-*`), `Unknown` (`a-u-*`), `NoneSpecified` (`a-o-*`), `Other` (`a-x-*`). Previously only `f/h/n/u` were recognized, so `a-s-…` (suspect), `a-j-…` (joker), and `a-k-…` (faker) events were misclassified as non-atoms by `is_sa_event` / `sa_affiliation`. (#932)
+
 ### Security
 
 - **Owner check on HTTP egress secret files** — `rustgate_http::auth::read_secret_file` now verifies that the secret file's owning UID matches the running process's effective UID on Unix, in addition to the existing `mode & 0o077 == 0` permission-bit gate. Catches the misconfiguration where a secret is dropped by `root` with correct 0600 permissions but the service runs as a different user — the read would previously succeed silently, leaving operators unaware that the file is outside the service account's lifecycle. (#829)
