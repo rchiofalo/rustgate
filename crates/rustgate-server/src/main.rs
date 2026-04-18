@@ -458,24 +458,39 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     let client_queue: Option<Arc<rustgate_transport::ClientQueue>> =
         if let Some(ref dir) = cli.client_queue_dir {
-            match rustgate_transport::ClientQueue::open(dir, cli.client_queue_max_bytes) {
-                Ok(q) => {
-                    tracing::info!(
-                        dir = %dir.display(),
-                        max_bytes = cli.client_queue_max_bytes,
-                        "per-client store-and-forward queue enabled"
-                    );
-                    Some(Arc::new(q))
-                }
-                Err(e) => {
-                    tracing::error!(
-                        dir = %dir.display(),
-                        error = %e,
-                        "failed to open client store-and-forward queue; continuing without it"
-                    );
-                    None
-                }
-            }
+            // Choose the open mode: persistent-key > explicit-wipe > plain.
+            // The plain `open` now fails closed if the on-disk queue has
+            // entries and no persistent key was supplied (F-49 / #740).
+            let open_result = if let Some(ref key_path) = cli.client_queue_key_file {
+                let key = read_queue_key_file(key_path)
+                    .map_err(|e| anyhow::anyhow!("--client-queue-key-file: {e}"))?;
+                rustgate_transport::ClientQueue::open_with_hmac_key(
+                    dir,
+                    cli.client_queue_max_bytes,
+                    Some(key),
+                )
+            } else if cli.client_queue_wipe_on_start {
+                rustgate_transport::ClientQueue::open_with_wipe(dir, cli.client_queue_max_bytes)
+            } else {
+                rustgate_transport::ClientQueue::open(dir, cli.client_queue_max_bytes)
+            };
+
+            let q = open_result.map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to open client store-and-forward queue at {}: {e}. \
+                     Supply --client-queue-key-file to preserve stored messages, \
+                     or --client-queue-wipe-on-start to explicitly discard them.",
+                    dir.display()
+                )
+            })?;
+            tracing::info!(
+                dir = %dir.display(),
+                max_bytes = cli.client_queue_max_bytes,
+                persistent_key = cli.client_queue_key_file.is_some(),
+                wipe_on_start = cli.client_queue_wipe_on_start,
+                "per-client store-and-forward queue enabled"
+            );
+            Some(Arc::new(q))
         } else {
             None
         };
@@ -1491,6 +1506,76 @@ async fn reload_all_configs(
 /// touching the live TLS listener.
 fn reload_crl_file(path: &str) -> anyhow::Result<usize> {
     rustgate_transport::TlsConfig::validate_crl_file(path).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Maximum size of a client-queue HMAC key file (128 bytes — well above
+/// the 65 bytes a 32-byte hex key + trailing newline needs). Prevents
+/// mis-pointed paths from loading a log file as a key.
+const MAX_QUEUE_KEY_FILE_BYTES: u64 = 128;
+
+/// Read a client-queue HMAC key file and return the decoded 32-byte key
+/// wrapped in [`zeroize::Zeroizing`]. The file must contain exactly
+/// 64 hex characters (case-insensitive) with optional trailing
+/// whitespace. On Unix, the file must be mode 0600/0400 and owned by
+/// the running process's effective UID.
+///
+/// Mirrors the pattern in `rustgate-http::auth::read_secret_file`.
+fn read_queue_key_file(path: &std::path::Path) -> anyhow::Result<zeroize::Zeroizing<[u8; 32]>> {
+    let display = path.display().to_string();
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| anyhow::anyhow!("client-queue key file `{display}`: {e}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mode = metadata.permissions().mode();
+        if mode & 0o077 != 0 {
+            anyhow::bail!(
+                "client-queue key file `{display}` has insecure permissions {mode:#o} \
+                 (group/world-accessible); set to 0600 or 0400"
+            );
+        }
+        let file_uid = metadata.uid();
+        let proc_uid = rustix::process::geteuid().as_raw();
+        if file_uid != proc_uid {
+            anyhow::bail!(
+                "client-queue key file `{display}` is owned by uid {file_uid}, but the \
+                 running process has effective uid {proc_uid}; chown the file to the \
+                 service account"
+            );
+        }
+    }
+
+    let file_size = metadata.len();
+    if file_size > MAX_QUEUE_KEY_FILE_BYTES {
+        anyhow::bail!(
+            "client-queue key file `{display}` is too large ({file_size} bytes, \
+             max {MAX_QUEUE_KEY_FILE_BYTES})"
+        );
+    }
+
+    // Read and immediately wrap in Zeroizing so the raw hex bytes are
+    // wiped on every exit path.
+    let mut raw = zeroize::Zeroizing::new(
+        std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("client-queue key file `{display}`: {e}"))?,
+    );
+    let trimmed = zeroize::Zeroizing::new(raw.trim().to_string());
+    zeroize::Zeroize::zeroize(&mut *raw);
+
+    if trimmed.len() != 64 {
+        anyhow::bail!(
+            "client-queue key file `{display}` must contain exactly 64 hex \
+             characters (got {})",
+            trimmed.len()
+        );
+    }
+
+    // Allocate the 32-byte output buffer zeroized; decode into it.
+    let mut key = zeroize::Zeroizing::new([0u8; 32]);
+    hex::decode_to_slice(trimmed.as_bytes(), &mut *key)
+        .map_err(|e| anyhow::anyhow!("client-queue key file `{display}` is not valid hex: {e}"))?;
+    Ok(key)
 }
 
 #[cfg(test)]
