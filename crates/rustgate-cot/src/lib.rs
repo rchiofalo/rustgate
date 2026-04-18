@@ -172,6 +172,78 @@ pub fn sa_affiliation(event_type: &str) -> Option<SaAffiliation> {
     }
 }
 
+/// Origin category of a CoT `<event how>` attribute per MP090284.
+///
+/// The first segment of the `how` string distinguishes the origin:
+/// `m-*` for machine-generated data (GPS, radar, IR, fused sensors) and
+/// `h-*` for human-supplied data (estimated, transcribed, manually plotted).
+/// Anything else is [`HowOrigin::Other`] — the TAK ecosystem is loose here
+/// and field devices emit vendor-specific values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HowOrigin {
+    /// Machine-generated (`m-*`).
+    Machine,
+    /// Human-supplied (`h-*`).
+    Human,
+    /// Neither prefix — non-conforming to the MP090284 taxonomy.
+    Other,
+}
+
+/// Canonical `how` values defined by MITRE MP090284 Appendix C.
+///
+/// This is the strict set used by [`how_is_spec_conformant`]. Keep sorted
+/// by origin (machine then human) and by sub-segment for readability.
+const SPEC_HOW_VALUES: &[&str] = &[
+    // Machine origin
+    "m-g",   // GPS
+    "m-g-a", // GPS with attitude (heading/pitch/roll)
+    "m-g-n", // GPS, no altitude
+    "m-f",   // fused sensor
+    "m-n",   // inertial navigation
+    "m-r",   // radar
+    "m-i",   // infrared
+    // Human origin
+    "h-e",       // estimated
+    "h-g-i-g-o", // geocoded, other
+    "h-t",       // transcribed
+    "h-s",       // sensor (human-operated)
+    "h-p",       // portrayed (manual plot)
+    "h-c",       // calculated
+];
+
+/// Classifies a CoT `<event how>` attribute by origin.
+///
+/// Inspects only the first segment — `m-*` returns [`HowOrigin::Machine`],
+/// `h-*` returns [`HowOrigin::Human`], everything else returns
+/// [`HowOrigin::Other`]. Use [`how_is_spec_conformant`] for strict
+/// conformance against the MP090284 value list.
+///
+/// This is an opt-in classifier for observability (metrics, filtering,
+/// dashboards). It does not validate the full value and never rejects
+/// input — field devices emit non-canonical `how` strings and rustgate
+/// forwards them unchanged to preserve interop.
+pub fn how_origin(how: &str) -> HowOrigin {
+    let bytes = how.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b'-' {
+        match bytes[0] {
+            b'm' => return HowOrigin::Machine,
+            b'h' => return HowOrigin::Human,
+            _ => {}
+        }
+    }
+    HowOrigin::Other
+}
+
+/// Returns `true` if `how` matches one of the values defined by MP090284.
+///
+/// The check is exact and case-sensitive. Callers that want to emit a
+/// metric or structured warning when encountering non-canonical `how`
+/// values (common in practice) can guard on this helper. It is not used
+/// to reject traffic — see [`how_origin`] for the rationale.
+pub fn how_is_spec_conformant(how: &str) -> bool {
+    SPEC_HOW_VALUES.contains(&how)
+}
+
 /// Parses a CoT XML byte slice into a [`CotEvent`].
 pub fn parse(xml: &[u8]) -> Result<CotEvent, ParseError> {
     let mut reader = Reader::from_reader(xml);
@@ -782,5 +854,87 @@ mod tests {
         assert_eq!(sa_affiliation("a-f"), None);
         // Missing trailing dash (not a valid SA atom)
         assert_eq!(sa_affiliation("a-fx"), None);
+    }
+
+    // ── how= taxonomy tests (MP090284 §C) ────────────────────────────
+
+    #[test]
+    fn how_origin_classifies_machine() {
+        assert_eq!(how_origin("m-g"), HowOrigin::Machine);
+        assert_eq!(how_origin("m-g-a"), HowOrigin::Machine);
+        assert_eq!(how_origin("m-g-n"), HowOrigin::Machine);
+        assert_eq!(how_origin("m-r"), HowOrigin::Machine);
+        // Unknown sub-type is still machine-origin — classifier is permissive.
+        assert_eq!(how_origin("m-zzz"), HowOrigin::Machine);
+    }
+
+    #[test]
+    fn how_origin_classifies_human() {
+        assert_eq!(how_origin("h-e"), HowOrigin::Human);
+        assert_eq!(how_origin("h-g-i-g-o"), HowOrigin::Human);
+        assert_eq!(how_origin("h-p"), HowOrigin::Human);
+        // Unknown sub-type is still human-origin.
+        assert_eq!(how_origin("h-zzz"), HowOrigin::Human);
+    }
+
+    #[test]
+    fn how_origin_other_for_non_conforming() {
+        assert_eq!(how_origin(""), HowOrigin::Other);
+        assert_eq!(how_origin("unknown"), HowOrigin::Other);
+        assert_eq!(how_origin("x-y-z"), HowOrigin::Other);
+        // Missing dash separator after the origin character.
+        assert_eq!(how_origin("mg"), HowOrigin::Other);
+        assert_eq!(how_origin("he"), HowOrigin::Other);
+        // Bare single-char origin is not enough.
+        assert_eq!(how_origin("m"), HowOrigin::Other);
+        assert_eq!(how_origin("h"), HowOrigin::Other);
+    }
+
+    #[test]
+    fn how_origin_is_case_sensitive() {
+        // TAK `how` values are lowercase by convention; uppercase is non-conforming.
+        assert_eq!(how_origin("M-G"), HowOrigin::Other);
+        assert_eq!(how_origin("H-E"), HowOrigin::Other);
+    }
+
+    #[test]
+    fn how_is_spec_conformant_accepts_all_machine_values() {
+        for value in ["m-g", "m-g-a", "m-g-n", "m-f", "m-n", "m-r", "m-i"] {
+            assert!(
+                how_is_spec_conformant(value),
+                "expected {value} to be spec-conformant"
+            );
+        }
+    }
+
+    #[test]
+    fn how_is_spec_conformant_accepts_all_human_values() {
+        for value in ["h-e", "h-g-i-g-o", "h-t", "h-s", "h-p", "h-c"] {
+            assert!(
+                how_is_spec_conformant(value),
+                "expected {value} to be spec-conformant"
+            );
+        }
+    }
+
+    #[test]
+    fn how_is_spec_conformant_rejects_unknown_subtypes() {
+        // Correct origin prefix but sub-type not in the MP090284 list.
+        assert!(!how_is_spec_conformant("m-zzz"));
+        assert!(!how_is_spec_conformant("h-zzz"));
+        assert!(!how_is_spec_conformant("m-g-x"));
+    }
+
+    #[test]
+    fn how_is_spec_conformant_rejects_non_origin_strings() {
+        assert!(!how_is_spec_conformant(""));
+        assert!(!how_is_spec_conformant("unknown"));
+        assert!(!how_is_spec_conformant("x-y-z"));
+    }
+
+    #[test]
+    fn how_is_spec_conformant_is_case_sensitive() {
+        assert!(!how_is_spec_conformant("M-G"));
+        assert!(!how_is_spec_conformant("H-E"));
     }
 }
