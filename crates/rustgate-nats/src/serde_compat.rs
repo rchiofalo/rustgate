@@ -318,8 +318,18 @@ impl WireEvent {
             || detail.precision_location.is_some()
             || detail.xml_detail.is_some();
 
+        // Preserve the source `<event version="…">` attribute per MITRE CoT
+        // Message Router User's Guide (MP090284) Table 2-1; fall back to
+        // "2.0" only when the source XML omitted the attribute so JSON
+        // consumers always see a valid schema version.
+        let version = if cot.version.is_empty() {
+            "2.0".to_string()
+        } else {
+            cot.version.clone()
+        };
+
         Self {
-            version: "2.0".to_string(),
+            version,
             uid: cot.uid.clone(),
             event_type: cot.event_type.clone(),
             time: cot.time.clone(),
@@ -780,6 +790,38 @@ mod tests {
 
             let wire = WireEvent::from_full_cot(&full);
             assert!(wire.detail.is_none());
+        }
+
+        #[test]
+        fn from_full_cot_preserves_version_attribute() {
+            // Source XML advertises a non-"2.0" schema version — a compliant
+            // translator must echo it back on the JSON wire per MITRE
+            // MP090284 Table 2-1, not silently rewrite it to "2.0".
+            let full = FullCotEvent {
+                version: "2.1".to_string(),
+                uid: "VER-1".to_string(),
+                event_type: "a-f-G".to_string(),
+                ..Default::default()
+            };
+
+            let wire = WireEvent::from_full_cot(&full);
+            assert_eq!(wire.version, "2.1");
+        }
+
+        #[test]
+        fn from_full_cot_defaults_version_when_source_omits_it() {
+            // Backward-compat fallback: if upstream parser produced an empty
+            // version (e.g. the source XML omitted the attribute), we emit
+            // "2.0" rather than a blank string so JSON consumers always see a
+            // conforming version token.
+            let full = FullCotEvent {
+                uid: "VER-MISSING".to_string(),
+                event_type: "a-f-G".to_string(),
+                ..Default::default()
+            };
+
+            let wire = WireEvent::from_full_cot(&full);
+            assert_eq!(wire.version, "2.0");
         }
     }
 }
