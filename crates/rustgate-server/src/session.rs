@@ -627,6 +627,14 @@ fn apply_delta(enc: &mut DeltaEncoder, encoded: &Bytes) -> DeltaDispatch {
         if bytes_delta > 0 {
             metrics::cot_delta_bytes_saved().inc_by(bytes_delta);
         }
+        let evicted_delta = stats.evicted.saturating_sub(prior.evicted);
+        if evicted_delta > 0 {
+            metrics::cot_delta_evicted().inc_by(evicted_delta);
+        }
+        let oversized_delta = stats.oversized.saturating_sub(prior.oversized);
+        if oversized_delta > 0 {
+            metrics::cot_delta_oversized().inc_by(oversized_delta);
+        }
     }
     #[cfg(not(feature = "metrics"))]
     let _ = (prior, stats);

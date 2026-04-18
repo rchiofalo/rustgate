@@ -79,6 +79,8 @@ static COT_DELTA_FULL: OnceLock<IntCounter> = OnceLock::new();
 static COT_DELTA_DELTA: OnceLock<IntCounter> = OnceLock::new();
 static COT_DELTA_SUPPRESSED: OnceLock<IntCounter> = OnceLock::new();
 static COT_DELTA_BYTES_SAVED: OnceLock<IntCounter> = OnceLock::new();
+static COT_DELTA_EVICTED: OnceLock<IntCounter> = OnceLock::new();
+static COT_DELTA_OVERSIZED: OnceLock<IntCounter> = OnceLock::new();
 
 // Tier 2 (per-identity) metrics. Registered only when
 // `--metrics-per-identity` is enabled; remain `None` otherwise so they
@@ -298,6 +300,20 @@ pub fn init() -> prometheus::Result<()> {
     ))?;
     registry.register(Box::new(cot_delta_bytes_saved.clone()))?;
     let _ = COT_DELTA_BYTES_SAVED.set(cot_delta_bytes_saved);
+
+    let cot_delta_evicted = IntCounter::with_opts(Opts::new(
+        "rustgate_cot_delta_evicted_total",
+        "UIDs evicted from the per-session delta encoder cache under capacity pressure — sustained non-zero rate indicates cache_size is undersized",
+    ))?;
+    registry.register(Box::new(cot_delta_evicted.clone()))?;
+    let _ = COT_DELTA_EVICTED.set(cot_delta_evicted);
+
+    let cot_delta_oversized = IntCounter::with_opts(Opts::new(
+        "rustgate_cot_delta_oversized_total",
+        "Outbound CoT events whose payload exceeded the delta encoder scan limit and were forcibly emitted as full — alert on sustained rate (indicates legitimate large events OR hostile padding to defeat delta compression)",
+    ))?;
+    registry.register(Box::new(cot_delta_oversized.clone()))?;
+    let _ = COT_DELTA_OVERSIZED.set(cot_delta_oversized);
 
     let messages_routed = IntCounterVec::new(
         Opts::new(
@@ -858,6 +874,16 @@ pub fn cot_delta_suppressed() -> &'static IntCounter {
 pub fn cot_delta_bytes_saved() -> &'static IntCounter {
     COT_DELTA_BYTES_SAVED
         .get_or_init(|| fallback_counter("rustgate_cot_delta_bytes_saved_total", "fallback"))
+}
+
+pub fn cot_delta_evicted() -> &'static IntCounter {
+    COT_DELTA_EVICTED
+        .get_or_init(|| fallback_counter("rustgate_cot_delta_evicted_total", "fallback"))
+}
+
+pub fn cot_delta_oversized() -> &'static IntCounter {
+    COT_DELTA_OVERSIZED
+        .get_or_init(|| fallback_counter("rustgate_cot_delta_oversized_total", "fallback"))
 }
 
 pub fn messages_routed() -> &'static IntCounterVec {
