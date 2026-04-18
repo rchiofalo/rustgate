@@ -2,7 +2,7 @@
 
 //! HTTP Basic Auth credential validation.
 
-use base64::Engine;
+use rustgate_core::b64;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
@@ -39,9 +39,7 @@ impl Credentials {
         let header = authorization?;
         let encoded = header.strip_prefix("Basic ")?;
 
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .ok()?;
+        let decoded = b64::decode(encoded).ok()?;
         let text = std::str::from_utf8(&decoded).ok()?;
         let (user, pass) = text.split_once(':')?;
 
@@ -66,8 +64,7 @@ mod tests {
     }
 
     fn encode_basic(user: &str, pass: &str) -> String {
-        use base64::Engine;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+        let encoded = b64::encode(format!("{user}:{pass}"));
         format!("Basic {encoded}")
     }
 
@@ -112,8 +109,7 @@ mod tests {
 
     #[test]
     fn no_colon_separator() {
-        use base64::Engine;
-        let encoded = base64::engine::general_purpose::STANDARD.encode("nocolon");
+        let encoded = b64::encode("nocolon");
         let header = format!("Basic {encoded}");
         let c = creds();
         assert_eq!(c.validate(Some(&header)), None);

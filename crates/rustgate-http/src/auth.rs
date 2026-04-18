@@ -230,7 +230,7 @@ fn compute_hmac_signature(secret: &[u8], data: &[u8], timestamp: u64) -> Result<
 mod tests {
     #![allow(clippy::panic, clippy::unwrap_used)]
 
-    use base64::Engine;
+    use rustgate_core::b64;
 
     use super::*;
 
@@ -493,7 +493,7 @@ mod tests {
             .to_str()
             .unwrap();
         // Basic auth is base64("user:pass")
-        let expected = base64::engine::general_purpose::STANDARD.encode("user:pass");
+        let expected = b64::encode("user:pass");
         assert_eq!(auth, format!("Basic {expected}"));
     }
 

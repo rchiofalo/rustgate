@@ -10,6 +10,7 @@
 
 pub mod audit;
 pub mod audit_chain;
+pub mod b64;
 pub mod codec;
 pub mod constants;
 pub mod encrypted;

@@ -11,11 +11,11 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use base64::Engine;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
 use hyper_util::rt::TokioIo;
+use rustgate_core::b64;
 use rustgate_enrollment::{Credentials, CsrSigner, EnrollmentServer};
 use rustgate_test_utils::certs::TestCa;
 use rustls_pki_types::pem::PemObject;
@@ -123,7 +123,7 @@ impl EstTestEnv {
 }
 
 fn encode_basic_auth(user: &str, pass: &str) -> String {
-    let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+    let encoded = b64::encode(format!("{user}:{pass}"));
     format!("Basic {encoded}")
 }
 
@@ -139,7 +139,7 @@ fn generate_est_csr(cn: &str) -> String {
 
     let csr = params.serialize_request(&key).expect("csr");
     // EST sends base64 of DER (no PEM headers).
-    base64::engine::general_purpose::STANDARD.encode(csr.der())
+    b64::encode(csr.der())
 }
 
 // ---------------------------------------------------------------------------
@@ -182,9 +182,7 @@ async fn est_cacerts_returns_pkcs7() {
 
     // Body is base64-encoded DER; verify it decodes to valid PKCS#7.
     let body = resp.collect().await.expect("collect body").to_bytes();
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(&body)
-        .expect("base64 decode");
+    let decoded = b64::decode(&body).expect("base64 decode");
     assert!(
         !decoded.is_empty(),
         "decoded PKCS#7 bag should not be empty"
@@ -230,9 +228,7 @@ async fn est_simpleenroll_issues_cert() {
 
     // Body should be base64-encoded PKCS#7 containing issued cert + CA cert.
     let body = resp.collect().await.expect("collect body").to_bytes();
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(&body)
-        .expect("base64 decode response");
+    let decoded = b64::decode(&body).expect("base64 decode response");
     assert!(
         !decoded.is_empty(),
         "enrollment response should contain certificate data"

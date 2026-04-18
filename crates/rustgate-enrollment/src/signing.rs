@@ -728,10 +728,11 @@ cyOZxZiK
         modified_der[pos..pos + pub_a.len()].copy_from_slice(pub_b);
 
         // Wrap the modified DER back into PEM
-        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &modified_der);
+        let encoded = rustgate_core::b64::encode(&modified_der);
         let pem = format!(
             "-----BEGIN CERTIFICATE REQUEST-----\n{}\n-----END CERTIFICATE REQUEST-----",
-            b64.as_bytes()
+            encoded
+                .as_bytes()
                 .chunks(64)
                 .map(|c| std::str::from_utf8(c).expect("valid utf8"))
                 .collect::<Vec<_>>()

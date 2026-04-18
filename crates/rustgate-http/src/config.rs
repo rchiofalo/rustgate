@@ -7,7 +7,7 @@
 //! circuit breaker settings. All config structs use kebab-case field
 //! names to match the workspace TOML convention.
 
-use base64::Engine;
+use rustgate_core::b64;
 use serde::Deserialize;
 
 use crate::error::HttpError;
@@ -442,10 +442,7 @@ impl HttpConfig {
                             "target `{}`: pin-sha256[{i}] must not be empty",
                             target.name
                         ));
-                    } else if base64::engine::general_purpose::STANDARD
-                        .decode(pin)
-                        .is_err()
-                    {
+                    } else if b64::decode(pin).is_err() {
                         errors.push(format!(
                             "target `{}`: pin-sha256[{i}] is not valid base64",
                             target.name

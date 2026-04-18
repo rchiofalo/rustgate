@@ -19,7 +19,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use base64::Engine;
+use rustgate_core::b64;
 use rustgate_core::encrypted::{KeyRing, SharedEncryptedWriter};
 use rustgate_core::message::RoutableMessage;
 use rustgate_core::sanitize::sanitize_for_log;
@@ -110,7 +110,7 @@ impl DeadLetterQueue {
             destination: crate::payload::format_destination(&msg.destination),
             message_type: msg.metadata.message_type.to_string(),
             source_protocol: &msg.metadata.source_protocol,
-            payload_b64: base64::engine::general_purpose::STANDARD.encode(&msg.payload),
+            payload_b64: b64::encode(&msg.payload),
             payload_size: msg.payload.len(),
         };
 
@@ -327,7 +327,7 @@ mod tests {
             destination: crate::payload::format_destination(&msg.destination),
             message_type: msg.metadata.message_type.to_string(),
             source_protocol: &msg.metadata.source_protocol,
-            payload_b64: base64::engine::general_purpose::STANDARD.encode(&msg.payload),
+            payload_b64: b64::encode(&msg.payload),
             payload_size: msg.payload.len(),
         };
         let json = serde_json::to_string(&entry).unwrap();

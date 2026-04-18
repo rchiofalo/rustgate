@@ -10,7 +10,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use base64::Engine;
+use rustgate_core::b64;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
@@ -108,8 +108,7 @@ impl ServerCertVerifier for PinnedCertVerifier {
 pub(crate) fn parse_pins(pins: &[String]) -> Result<Vec<[u8; 32]>, HttpError> {
     let mut parsed = Vec::with_capacity(pins.len());
     for (i, pin) in pins.iter().enumerate() {
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(pin)
+        let bytes = b64::decode(pin)
             .map_err(|e| HttpError::Config(format!("pin-sha256[{i}] is not valid base64: {e}")))?;
         let hash: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
             HttpError::Config(format!(
@@ -151,20 +150,20 @@ pub(crate) fn parse_pem_certs(pem: &[u8]) -> Vec<CertificateDer<'static>> {
 
     let mut certs = Vec::new();
     let mut in_cert = false;
-    let mut b64 = String::new();
+    let mut encoded = String::new();
 
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed == "-----BEGIN CERTIFICATE-----" {
             in_cert = true;
-            b64.clear();
+            encoded.clear();
         } else if trimmed == "-----END CERTIFICATE-----" {
             in_cert = false;
-            if let Ok(der) = base64::engine::general_purpose::STANDARD.decode(&b64) {
+            if let Ok(der) = b64::decode(&encoded) {
                 certs.push(CertificateDer::from(der));
             }
         } else if in_cert {
-            b64.push_str(trimmed);
+            encoded.push_str(trimmed);
         }
     }
     certs
@@ -204,15 +203,15 @@ pub(crate) fn parse_pem_private_key(
             let content = &text[start + begin_marker.len()..];
             if let Some(end_idx) = content.find(end_marker) {
                 // Accumulate base64 in a zeroizable buffer
-                let mut b64 = zeroize::Zeroizing::new(
+                let mut encoded = zeroize::Zeroizing::new(
                     content[..end_idx]
                         .lines()
                         .map(str::trim)
                         .collect::<String>(),
                 );
-                if let Ok(der_bytes) = base64::engine::general_purpose::STANDARD.decode(&*b64) {
+                if let Ok(der_bytes) = b64::decode(&*encoded) {
                     // Wipe intermediate buffers immediately — don't wait for drop
-                    b64.zeroize();
+                    encoded.zeroize();
                     text.zeroize();
 
                     // Wrap decoded DER in Zeroizing, extract via take, convert
@@ -224,7 +223,7 @@ pub(crate) fn parse_pem_private_key(
                         _ => rustls::pki_types::PrivateKeyDer::Pkcs8(raw.into()),
                     });
                 }
-                b64.zeroize();
+                encoded.zeroize();
             }
         }
     }
@@ -241,8 +240,8 @@ mod tests {
     #[test]
     fn parse_valid_base64_pins() {
         // Two valid 32-byte (SHA-256) pins
-        let pin1 = base64::engine::general_purpose::STANDARD.encode([0xAA; 32]);
-        let pin2 = base64::engine::general_purpose::STANDARD.encode([0xBB; 32]);
+        let pin1 = b64::encode([0xAA; 32]);
+        let pin2 = b64::encode([0xBB; 32]);
         let pins = parse_pins(&[pin1, pin2]).unwrap();
         assert_eq!(pins.len(), 2);
         assert_eq!(pins[0], [0xAA; 32]);
@@ -258,7 +257,7 @@ mod tests {
     #[test]
     fn parse_pins_rejects_wrong_length() {
         // 16 bytes instead of 32
-        let pin = base64::engine::general_purpose::STANDARD.encode([0xCC; 16]);
+        let pin = b64::encode([0xCC; 16]);
         let err = parse_pins(&[pin]).unwrap_err();
         assert!(err.to_string().contains("expected 32"), "got: {err}");
     }
@@ -268,8 +267,8 @@ mod tests {
         // Generate a self-signed cert using rustgate-test-utils would be ideal,
         // but for unit tests we just verify PEM parsing mechanics.
         let fake_der = [0x30, 0x82, 0x01, 0x00]; // Minimal ASN.1 SEQUENCE
-        let b64 = base64::engine::general_purpose::STANDARD.encode(fake_der);
-        let pem = format!("-----BEGIN CERTIFICATE-----\n{b64}\n-----END CERTIFICATE-----\n");
+        let encoded = b64::encode(fake_der);
+        let pem = format!("-----BEGIN CERTIFICATE-----\n{encoded}\n-----END CERTIFICATE-----\n");
         let certs = parse_pem_certs(pem.as_bytes());
         assert_eq!(certs.len(), 1);
         assert_eq!(certs[0].as_ref(), &fake_der);
@@ -279,11 +278,11 @@ mod tests {
     fn parse_pem_certs_handles_multiple() {
         let der1 = [0x01, 0x02, 0x03];
         let der2 = [0x04, 0x05, 0x06];
-        let b64_1 = base64::engine::general_purpose::STANDARD.encode(der1);
-        let b64_2 = base64::engine::general_purpose::STANDARD.encode(der2);
+        let encoded_1 = b64::encode(der1);
+        let encoded_2 = b64::encode(der2);
         let pem = format!(
-            "-----BEGIN CERTIFICATE-----\n{b64_1}\n-----END CERTIFICATE-----\n\
-             -----BEGIN CERTIFICATE-----\n{b64_2}\n-----END CERTIFICATE-----\n"
+            "-----BEGIN CERTIFICATE-----\n{encoded_1}\n-----END CERTIFICATE-----\n\
+             -----BEGIN CERTIFICATE-----\n{encoded_2}\n-----END CERTIFICATE-----\n"
         );
         let certs = parse_pem_certs(pem.as_bytes());
         assert_eq!(certs.len(), 2);
@@ -298,8 +297,8 @@ mod tests {
     #[test]
     fn parse_pem_private_key_pkcs8() {
         let fake_der = [0x30, 0x82, 0x01, 0x00];
-        let b64 = base64::engine::general_purpose::STANDARD.encode(fake_der);
-        let pem = format!("-----BEGIN PRIVATE KEY-----\n{b64}\n-----END PRIVATE KEY-----\n");
+        let encoded = b64::encode(fake_der);
+        let pem = format!("-----BEGIN PRIVATE KEY-----\n{encoded}\n-----END PRIVATE KEY-----\n");
         let key = parse_pem_private_key(pem.as_bytes());
         assert!(key.is_some());
         assert!(matches!(
@@ -311,9 +310,9 @@ mod tests {
     #[test]
     fn parse_pem_private_key_rsa() {
         let fake_der = [0x30, 0x82, 0x01, 0x00];
-        let b64 = base64::engine::general_purpose::STANDARD.encode(fake_der);
+        let encoded = b64::encode(fake_der);
         let pem =
-            format!("-----BEGIN RSA PRIVATE KEY-----\n{b64}\n-----END RSA PRIVATE KEY-----\n");
+            format!("-----BEGIN RSA PRIVATE KEY-----\n{encoded}\n-----END RSA PRIVATE KEY-----\n");
         let key = parse_pem_private_key(pem.as_bytes());
         assert!(key.is_some());
         assert!(matches!(
@@ -325,8 +324,9 @@ mod tests {
     #[test]
     fn parse_pem_private_key_ec() {
         let fake_der = [0x30, 0x82, 0x01, 0x00];
-        let b64 = base64::engine::general_purpose::STANDARD.encode(fake_der);
-        let pem = format!("-----BEGIN EC PRIVATE KEY-----\n{b64}\n-----END EC PRIVATE KEY-----\n");
+        let encoded = b64::encode(fake_der);
+        let pem =
+            format!("-----BEGIN EC PRIVATE KEY-----\n{encoded}\n-----END EC PRIVATE KEY-----\n");
         let key = parse_pem_private_key(pem.as_bytes());
         assert!(key.is_some());
         assert!(matches!(
