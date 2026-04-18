@@ -22,6 +22,14 @@ pub enum ProtoError {
 
     #[error("frame too large: {size} bytes (max {max})")]
     FrameTooLarge { size: usize, max: usize },
+
+    /// A numeric field was outside its spec-defined range.
+    ///
+    /// MITRE CoT Message Router User's Guide (MP090284) Table 2-1 defines
+    /// `lat` and `lon` in WGS-84 decimal degrees: latitude -90..=90,
+    /// longitude -180..=180.
+    #[error("field `{field}` out of range: {value}")]
+    OutOfRange { field: &'static str, value: f64 },
 }
 
 impl From<ProtoError> for std::io::Error {
