@@ -97,45 +97,75 @@ impl<'a> Arbitrary<'a> for CotEvent {
 
 /// CoT Situational Awareness affiliation derived from the event type hierarchy.
 ///
-/// The affiliation is encoded in the second segment of an "atom" event type
-/// string (e.g., `a-f-G-U-C` -> `Friendly`).
+/// The affiliation is encoded as the second segment of an "atom" event type
+/// string (e.g., `a-f-G-U-C` → `Friend`). The 11 codes below are the full set
+/// defined by MITRE CoT Message Router User's Guide (MP090284) Appendix A
+/// "Is Predicate Tests" and Figure 2-3, aligned with MIL-STD-2525 standard
+/// identity codes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaAffiliation {
-    /// Friendly force (`a-f-*`).
-    Friendly,
-    /// Hostile force (`a-h-*`).
-    Hostile,
-    /// Neutral force (`a-n-*`).
+    /// Pending (`a-p-*`).
+    Pending,
+    /// Assumed friend (`a-a-*`).
+    AssumedFriend,
+    /// Friend (`a-f-*`).
+    Friend,
+    /// Neutral (`a-n-*`).
     Neutral,
-    /// Unknown affiliation (`a-u-*`).
+    /// Suspect (`a-s-*`).
+    Suspect,
+    /// Hostile (`a-h-*`).
+    Hostile,
+    /// Joker (`a-j-*`).
+    Joker,
+    /// Faker (`a-k-*`).
+    Faker,
+    /// Unknown (`a-u-*`).
     Unknown,
+    /// None specified (`a-o-*`).
+    NoneSpecified,
+    /// Other (`a-x-*`).
+    Other,
 }
+
+/// Historical alias: the original enum exposed `Friendly` for `a-f-*`.
+///
+/// Renamed to `Friend` to match the MITRE Appendix A / MIL-STD-2525 term.
+/// The alias keeps existing callers compiling.
+#[deprecated(note = "renamed to SaAffiliation::Friend — matches MITRE Appendix A terminology")]
+#[allow(non_upper_case_globals)]
+pub const Friendly: SaAffiliation = SaAffiliation::Friend;
 
 /// Returns `true` if the CoT event type represents a Situational Awareness atom.
 ///
-/// SA atoms are event types starting with `a-` followed by an affiliation
-/// character (`f`, `h`, `n`, or `u`) and a dash separator.
+/// SA atoms take the form `a-X-…` where `X` is one of the 11 Appendix A
+/// affiliation codes (`p/a/f/n/s/h/j/k/u/o/x`).
 pub fn is_sa_event(event_type: &str) -> bool {
-    event_type.starts_with("a-f-")
-        || event_type.starts_with("a-h-")
-        || event_type.starts_with("a-n-")
-        || event_type.starts_with("a-u-")
+    sa_affiliation(event_type).is_some()
 }
 
 /// Extracts the SA affiliation from a CoT event type, if it is an SA atom.
 ///
-/// Returns `None` for non-SA event types (e.g., `"b-t-f"`, `"t-x-d"`).
+/// Returns `None` for non-SA event types (e.g., `"b-t-f"`, `"t-x-d"`) or
+/// for atoms with an unrecognized affiliation character.
 pub fn sa_affiliation(event_type: &str) -> Option<SaAffiliation> {
-    // SA atoms have the form "a-X-..." where X is the affiliation character
+    // SA atoms have the form "a-X-..." where X is the affiliation character.
     let bytes = event_type.as_bytes();
     if bytes.len() < 4 || bytes[0] != b'a' || bytes[1] != b'-' || bytes[3] != b'-' {
         return None;
     }
     match bytes[2] {
-        b'f' => Some(SaAffiliation::Friendly),
-        b'h' => Some(SaAffiliation::Hostile),
+        b'p' => Some(SaAffiliation::Pending),
+        b'a' => Some(SaAffiliation::AssumedFriend),
+        b'f' => Some(SaAffiliation::Friend),
         b'n' => Some(SaAffiliation::Neutral),
+        b's' => Some(SaAffiliation::Suspect),
+        b'h' => Some(SaAffiliation::Hostile),
+        b'j' => Some(SaAffiliation::Joker),
+        b'k' => Some(SaAffiliation::Faker),
         b'u' => Some(SaAffiliation::Unknown),
+        b'o' => Some(SaAffiliation::NoneSpecified),
+        b'x' => Some(SaAffiliation::Other),
         _ => None,
     }
 }
@@ -627,16 +657,35 @@ mod tests {
         assert!(!is_sa_event("t-x-d"));
         assert!(!is_sa_event("b-a-o-tbl"));
         assert!(!is_sa_event("a-"));
-        assert!(!is_sa_event("a-x-G"));
         assert!(!is_sa_event(""));
+        // Unknown affiliation character (not one of p/a/f/n/s/h/j/k/u/o/x).
+        assert!(!is_sa_event("a-z-G"));
+        assert!(!is_sa_event("a-q-G"));
     }
 
     #[test]
-    fn sa_affiliation_correct() {
-        assert_eq!(sa_affiliation("a-f-G-U-C"), Some(SaAffiliation::Friendly));
-        assert_eq!(sa_affiliation("a-h-G"), Some(SaAffiliation::Hostile));
+    fn sa_affiliation_covers_full_appendix_a() {
+        // MITRE MP090284 Appendix A / Figure 2-3 affiliation codes, aligned
+        // with MIL-STD-2525 standard identity.
+        assert_eq!(sa_affiliation("a-p-G"), Some(SaAffiliation::Pending));
+        assert_eq!(sa_affiliation("a-a-G"), Some(SaAffiliation::AssumedFriend));
+        assert_eq!(sa_affiliation("a-f-G-U-C"), Some(SaAffiliation::Friend));
         assert_eq!(sa_affiliation("a-n-G"), Some(SaAffiliation::Neutral));
+        assert_eq!(sa_affiliation("a-s-G"), Some(SaAffiliation::Suspect));
+        assert_eq!(sa_affiliation("a-h-G"), Some(SaAffiliation::Hostile));
+        assert_eq!(sa_affiliation("a-j-G"), Some(SaAffiliation::Joker));
+        assert_eq!(sa_affiliation("a-k-G"), Some(SaAffiliation::Faker));
         assert_eq!(sa_affiliation("a-u-G"), Some(SaAffiliation::Unknown));
+        assert_eq!(sa_affiliation("a-o-G"), Some(SaAffiliation::NoneSpecified));
+        assert_eq!(sa_affiliation("a-x-G"), Some(SaAffiliation::Other));
+    }
+
+    #[test]
+    fn is_sa_event_accepts_all_appendix_a_affiliations() {
+        for code in ['p', 'a', 'f', 'n', 's', 'h', 'j', 'k', 'u', 'o', 'x'] {
+            let t = format!("a-{code}-G");
+            assert!(is_sa_event(&t), "expected SA atom for {t}");
+        }
     }
 
     #[test]
@@ -645,7 +694,9 @@ mod tests {
         assert_eq!(sa_affiliation("t-x-d"), None);
         assert_eq!(sa_affiliation(""), None);
         assert_eq!(sa_affiliation("a-"), None);
-        assert_eq!(sa_affiliation("a-x-G"), None);
+        // Outside the Appendix A character set.
+        assert_eq!(sa_affiliation("a-z-G"), None);
+        assert_eq!(sa_affiliation("a-q-G"), None);
     }
 
     #[test]
