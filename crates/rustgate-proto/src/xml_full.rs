@@ -16,6 +16,15 @@ use crate::error::ProtoError;
 #[derive(Debug, Clone, Default)]
 pub struct FullCotEvent {
     // <event> attributes
+    /// CoT XML schema version (the `version` attribute on `<event>`).
+    ///
+    /// Per MITRE CoT Message Router User's Guide (MP090284) Table 2-1 this
+    /// attribute is required. We capture it verbatim rather than normalizing
+    /// to a numeric type so downstream consumers see the same value the
+    /// source emitter produced (e.g. `"2.0"`). Empty when the source XML
+    /// omits the attribute; callers that require a value should substitute
+    /// their own default.
+    pub version: String,
     pub uid: String,
     pub event_type: String,
     pub how: String,
@@ -249,6 +258,7 @@ fn parse_event_attrs(
     for attr in e.attributes().flatten() {
         let value = String::from_utf8_lossy(&attr.value).into_owned();
         match attr.key.as_ref() {
+            b"version" => event.version = value,
             b"uid" => event.uid = value,
             b"type" => event.event_type = value,
             b"how" => event.how = value,
@@ -1254,5 +1264,32 @@ mod tests {
         assert_eq!(evt.link[0].relation, "p-p");
         assert_eq!(evt.link[1].uid, "B");
         assert_eq!(evt.link[1].relation, "p-s");
+    }
+
+    #[test]
+    fn parse_full_captures_version_attribute() {
+        // MITRE MP090284 Table 2-1 requires the `version` attribute on
+        // `<event>`. The parser stores it verbatim so downstream wire
+        // formats can round-trip the source schema version.
+        let xml = br#"<event version="2.1" uid="VER-1" type="a-f-G" how="m-g" time="2021-02-27T20:32:24Z" start="2021-02-27T20:32:24Z" stale="2021-02-27T20:37:24Z">
+            <point lat="0.0" lon="0.0" hae="0.0" ce="0.0" le="0.0"/>
+        </event>"#;
+
+        let evt = parse_full(xml).expect("parse");
+        assert_eq!(evt.version, "2.1");
+    }
+
+    #[test]
+    fn parse_full_version_empty_when_attribute_missing() {
+        // Some non-conforming emitters omit the `version` attribute. The
+        // parser tolerates this — the `FullCotEvent::version` field stays
+        // empty, and downstream wire-format builders apply their own
+        // default (e.g., "2.0") if a value is mandatory on their side.
+        let xml = br#"<event uid="NO-VER" type="a-f-G">
+            <point lat="0.0" lon="0.0" hae="0.0" ce="0.0" le="0.0"/>
+        </event>"#;
+
+        let evt = parse_full(xml).expect("parse");
+        assert!(evt.version.is_empty());
     }
 }
