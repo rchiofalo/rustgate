@@ -373,11 +373,44 @@ impl WireEvent {
         })
     }
 
-    /// Check if position is unknown (0,0 per CoT spec).
+    /// Check if the reported position should be treated as unknown.
+    ///
+    /// The base CoT specification (MITRE MP090284, Table 2-1) defines
+    /// `ce` and `le` as 1-sigma error bounds in meters and does not
+    /// reserve a formal "position unknown" sentinel. In practice,
+    /// reporters signal an unknown fix by stuffing the error fields
+    /// with a large magic value:
+    ///
+    /// * TAK ecosystem clients commonly emit `9999999` (seven 9s).
+    /// * The MITRE reference routing GUI (Figure 6-5) uses `999999999`
+    ///   (nine 9s) as an "effectively infinite error" convention.
+    ///
+    /// Rather than hard-code either sentinel, we treat any ce/le at or
+    /// above `UNKNOWN_POSITION_ERROR` (1,000 km) as "unknown". Earth's
+    /// equatorial radius is ~6,371 km; no realistic GPS/INS report has
+    /// a 1-sigma error approaching 1,000 km, so the threshold catches
+    /// every known sentinel convention without false positives.
+    ///
+    /// Both `ce` and `le` must exceed the threshold. A reporter with a
+    /// valid 2-D fix but unknown altitude error is still usable.
+    ///
+    /// The earlier implementation treated `lat == 0.0 && lon == 0.0` as
+    /// unknown, which silently dropped legitimate reports from the
+    /// Gulf of Guinea and other equatorial waters.
     pub fn is_position_unknown(&self) -> bool {
-        self.point.lat == 0.0 && self.point.lon == 0.0
+        self.point.ce >= UNKNOWN_POSITION_ERROR && self.point.le >= UNKNOWN_POSITION_ERROR
     }
 }
+
+/// Threshold (meters) above which `ce`/`le` are treated as "position unknown".
+///
+/// The CoT base spec does not define a sentinel, but all known reporter
+/// implementations use a large magic value (`9999999` for TAK,
+/// `999999999` for the MITRE reference GUI). 1,000 km is below every
+/// observed sentinel and well above any legitimate GPS/INS 1-sigma
+/// error, so matching "ce ≥ threshold AND le ≥ threshold" is a robust
+/// cross-implementation test.
+pub const UNKNOWN_POSITION_ERROR: f64 = 1_000_000.0;
 
 fn map_event_type(cot_type: &str) -> MessageType {
     if cot_type.starts_with("a-") {
@@ -522,28 +555,91 @@ mod tests {
     }
 
     #[test]
-    fn position_unknown_check() {
-        let event = WireEvent {
-            version: "2.0".to_string(),
-            uid: "test".to_string(),
-            event_type: "a-f-G".to_string(),
-            time: String::new(),
-            start: String::new(),
-            stale: String::new(),
-            how: String::new(),
-            access: String::new(),
-            qos: String::new(),
-            opex: String::new(),
-            point: WirePoint {
+    fn position_unknown_requires_ce_le_sentinel() {
+        // Helper to build a WireEvent with a given point — the non-point
+        // fields are irrelevant to the position-unknown predicate.
+        fn event_with_point(point: WirePoint) -> WireEvent {
+            WireEvent {
+                version: "2.0".to_string(),
+                uid: "test".to_string(),
+                event_type: "a-f-G".to_string(),
+                time: String::new(),
+                start: String::new(),
+                stale: String::new(),
+                how: String::new(),
+                access: String::new(),
+                qos: String::new(),
+                opex: String::new(),
+                point,
+                detail: None,
+            }
+        }
+
+        // TAK convention: both ce and le at 9_999_999 (seven 9s) → unknown.
+        assert!(
+            event_with_point(WirePoint {
+                lat: 37.0,
+                lon: -122.0,
+                hae: 0.0,
+                ce: 9_999_999.0,
+                le: 9_999_999.0,
+            })
+            .is_position_unknown(),
+            "TAK sentinel ce=le=9999999 must be treated as position unknown"
+        );
+
+        // MITRE reference-GUI convention: both at 999_999_999 (nine 9s) → unknown.
+        assert!(
+            event_with_point(WirePoint {
+                lat: 37.0,
+                lon: -122.0,
+                hae: 0.0,
+                ce: 999_999_999.0,
+                le: 999_999_999.0,
+            })
+            .is_position_unknown(),
+            "MITRE reference sentinel ce=le=999999999 must be treated as position unknown"
+        );
+
+        // 0,0 with a valid fix is NOT unknown (equatorial ocean).
+        assert!(
+            !event_with_point(WirePoint {
                 lat: 0.0,
                 lon: 0.0,
                 hae: 0.0,
-                ce: 0.0,
-                le: 0.0,
-            },
-            detail: None,
-        };
-        assert!(event.is_position_unknown());
+                ce: 50.0,
+                le: 30.0,
+            })
+            .is_position_unknown(),
+            "0,0 with valid ce/le is a legitimate equatorial fix"
+        );
+
+        // Realistic large-but-not-sentinel error (500 m) → known.
+        assert!(
+            !event_with_point(WirePoint {
+                lat: 37.0,
+                lon: -122.0,
+                hae: 0.0,
+                ce: 500.0,
+                le: 500.0,
+            })
+            .is_position_unknown(),
+            "realistic GPS-degraded error must not trip the unknown threshold"
+        );
+
+        // Only one of ce/le at the sentinel is NOT unknown — a valid
+        // 2-D fix with unknown altitude error is still a fix.
+        assert!(
+            !event_with_point(WirePoint {
+                lat: 37.0,
+                lon: -122.0,
+                hae: 0.0,
+                ce: 50.0,
+                le: UNKNOWN_POSITION_ERROR,
+            })
+            .is_position_unknown(),
+            "ce-valid, le-unknown should be treated as known"
+        );
     }
 
     #[test]

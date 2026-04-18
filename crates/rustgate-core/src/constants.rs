@@ -43,6 +43,18 @@ pub const FEDERATION_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// Maximum reconnection backoff for federation clients.
 pub const FEDERATION_MAX_RECONNECT_DELAY: Duration = Duration::from_secs(300);
 
+// ── Client ─────────────────────────────────────────────────────────
+
+/// Maximum reconnection backoff for long-lived client connections.
+///
+/// Caps the exponential-backoff schedule in
+/// `rustgate_client::ReconnectPolicy::default()`. 30 seconds keeps
+/// recovery snappy after a brief server restart while still shedding
+/// load from an overloaded backend — noticeably tighter than the 5-min
+/// federation ceiling because interactive clients are more sensitive
+/// to reconnect latency than server-to-server links.
+pub const CLIENT_MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
+
 // ── Identity / Plaintext ──────────────────────────────────────────
 
 /// Default group assigned to plaintext (TCP/UDP) connections.

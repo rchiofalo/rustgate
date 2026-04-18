@@ -218,8 +218,34 @@ impl ClientConfigBuilder {
     }
 
     /// Override the SNI / server name presented during the TLS handshake.
-    /// Defaults to the hostname portion of `server_addr`, falling back to
-    /// `"localhost"` for IP addresses.
+    ///
+    /// By default the client derives the server name from `server_addr`:
+    ///
+    /// * For hostnames, the host portion is used verbatim.
+    /// * For IP literals (v4 or v6), the fallback is `"localhost"`,
+    ///   because rustls refuses to emit an SNI extension for an IP
+    ///   literal and the certificate's Common Name / SubjectAltName is
+    ///   validated against this string.
+    ///
+    /// Call this method when the default derivation is wrong for your
+    /// deployment. Common cases:
+    ///
+    /// * **Host-based routing**: the TCP endpoint is a load balancer
+    ///   address (`10.0.0.5:9443`) but the backend certificate is
+    ///   issued for a logical name (`tak.example.com`). Passing the
+    ///   logical name here makes cert validation succeed.
+    /// * **Multi-tenant SNI routing**: a single listener fronts several
+    ///   logical services and selects the backend from the SNI hint.
+    /// * **Test harnesses** that issue a certificate with a specific
+    ///   SubjectAltName that does not match the dial address (e.g. the
+    ///   fixtures in `rustgate-test-utils`).
+    /// * **Wildcard certificates**: pin the client to one specific name
+    ///   rather than whatever the TCP address resolves to.
+    ///
+    /// Passing a value that does not match any CN / SubjectAltName on
+    /// the server certificate causes the TLS handshake to fail. The
+    /// name must be a valid DNS name — rustls rejects IP literals
+    /// through this channel.
     pub fn server_name(mut self, name: impl Into<String>) -> Self {
         self.server_name = Some(name.into());
         self

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
+use rustgate_core::constants::CLIENT_MAX_RECONNECT_DELAY;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Notify, broadcast, mpsc};
 use tokio_util::bytes::BytesMut;
@@ -31,7 +32,7 @@ impl Default for ReconnectPolicy {
     fn default() -> Self {
         Self {
             initial_backoff: Duration::from_millis(100),
-            max_backoff: Duration::from_secs(30),
+            max_backoff: CLIENT_MAX_RECONNECT_DELAY,
             max_attempts: 10,
         }
     }

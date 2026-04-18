@@ -391,18 +391,26 @@ fn extract_cn(cert: &X509Certificate<'_>) -> Result<String> {
 
 /// Extract `groups` from the cert's OU fields.
 ///
-/// Each `OU=` RDN is treated as a comma-separated list of group names so an
-/// issuer can encode multiple memberships in a single RDN. This convention
-/// predates rustgate-authz and is preserved for compatibility with existing
-/// CNs issued by the enrollment path.
+/// Each `OU=` RDN contributes one or more group names to the identity.
+/// Two encodings are accepted per RDN, in priority order:
 ///
-/// **Operator note:** because this function splits OU values on a literal
-/// `,`, group names MUST NOT contain an unescaped comma. RFC 4514 allows
-/// escaping commas inside a DN attribute with `\,`, but x509-parser
-/// unescapes them before this function sees the string, so an OU of
-/// `R\,D,ops` arrives here as `R,D,ops` and becomes three groups rather
-/// than two. If you need a literal comma in a group name, issue multiple
-/// OU RDNs instead of packing them into one.
+/// 1. **JSON array of strings** — if the OU value parses as a JSON array
+///    of strings (e.g. `["R,D", "ops"]`), each element becomes one group
+///    verbatim. This is the recommended form when any group name contains
+///    characters that collide with the comma-separated fallback (commas
+///    most notably, but also leading/trailing whitespace).
+///
+/// 2. **Comma-separated list** — otherwise, the value is split on `,` and
+///    each trimmed non-empty fragment becomes one group. This preserves
+///    the historical convention of packing multiple memberships into a
+///    single RDN (e.g. `OU=operators,analysts`).
+///
+/// **Operator note on comma-separated form:** RFC 4514 allows escaping
+/// commas inside a DN attribute with `\,`, but x509-parser unescapes them
+/// before this function sees the string, so an OU of `R\,D,ops` arrives
+/// here as `R,D,ops` and becomes three groups rather than two. If any
+/// group name must contain a literal comma, use the JSON array form or
+/// issue multiple OU RDNs instead.
 fn extract_groups(cert: &X509Certificate<'_>) -> BTreeSet<String> {
     let mut groups = BTreeSet::new();
 
@@ -411,8 +419,24 @@ fn extract_groups(cert: &X509Certificate<'_>) -> BTreeSet<String> {
             if attr.attr_type() == &OID_X509_ORGANIZATIONAL_UNIT
                 && let Ok(ou) = attr.attr_value().as_str()
             {
-                // Support both single values and comma-separated group lists.
-                // See the docstring for the escape caveat.
+                // Try JSON array form first. Only attempt the parse when
+                // the value looks like an array (`[...]`) so malformed
+                // JSON in an ordinary comma-list like `[stale` doesn't
+                // silently fall through — that would have been rejected
+                // by valid_group_id downstream anyway.
+                let trimmed = ou.trim();
+                if trimmed.starts_with('[')
+                    && let Ok(array) = serde_json::from_str::<Vec<String>>(trimmed)
+                {
+                    for name in array {
+                        let name = name.trim();
+                        if !name.is_empty() {
+                            let _ = groups.insert(name.to_string());
+                        }
+                    }
+                    continue;
+                }
+                // Fall back to comma-separated list.
                 for group in ou.split(',') {
                     let group = group.trim();
                     if !group.is_empty() {
@@ -724,5 +748,54 @@ mod tests {
         // cert_serial and issuer_cn always present
         assert!(id.attributes.contains_key("cert_serial"));
         assert!(id.attributes.contains_key("issuer_cn"));
+    }
+
+    #[test]
+    fn ou_comma_separated_splits_into_groups() {
+        // Backward-compatible form: `OU=analysts,operators` yields two
+        // groups. Exercises the fallback branch when the OU value is
+        // not a JSON array.
+        let ca = TestCa::new("ou-ca");
+        let cert = ca.issue_client_cert("user", &["analysts", "operators"]);
+        let der = parse_cert_pem(&cert.cert_pem);
+        let id = extract_identity(&der).unwrap();
+        assert!(id.groups.contains("analysts"));
+        assert!(id.groups.contains("operators"));
+        assert_eq!(id.groups.len(), 2);
+    }
+
+    #[test]
+    fn ou_json_array_preserves_commas_in_group_names() {
+        // JSON array form carries commas through unchanged. The single
+        // element passed to the test helper becomes the entire OU
+        // value (single-element `join(",")` is a no-op), so the OU is
+        // literally `["R,D","ops"]` and must parse into two groups.
+        let ca = TestCa::new("ou-ca");
+        let cert = ca.issue_client_cert("user", &[r#"["R,D","ops"]"#]);
+        let der = parse_cert_pem(&cert.cert_pem);
+        let id = extract_identity(&der).unwrap();
+        assert!(
+            id.groups.contains("R,D"),
+            "expected literal comma preserved, got {:?}",
+            id.groups
+        );
+        assert!(id.groups.contains("ops"));
+        assert_eq!(id.groups.len(), 2);
+    }
+
+    #[test]
+    fn ou_malformed_json_array_falls_back_to_comma_split() {
+        // An OU that looks like a JSON array prefix but fails to parse
+        // falls through to the comma-separated path. `[stale,foo` is
+        // not a valid JSON array; the comma splitter then yields
+        // `[stale` and `foo` — neither would pass downstream group-id
+        // validation, but this test pins the extractor's behaviour so
+        // callers can rely on a single well-defined fallback.
+        let ca = TestCa::new("ou-ca");
+        let cert = ca.issue_client_cert("user", &["[stale,foo"]);
+        let der = parse_cert_pem(&cert.cert_pem);
+        let id = extract_identity(&der).unwrap();
+        assert!(id.groups.contains("[stale"));
+        assert!(id.groups.contains("foo"));
     }
 }

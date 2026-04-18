@@ -152,15 +152,28 @@ fn read_secret_file(path: &str) -> Result<Zeroizing<String>, HttpError> {
     })?;
 
     // Reject group/world-readable secret files on Unix. Secrets should
-    // only be readable by their owner (mode 0600 or 0400).
+    // only be readable by their owner (mode 0600 or 0400). Also verify
+    // the file is owned by the running process — a file with tight
+    // permissions but a different owner is a misconfiguration (e.g.
+    // secret dropped by `root` but the service runs as `rustgate`),
+    // and the read would still succeed silently without the check.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let mode = metadata.permissions().mode();
         if mode & 0o077 != 0 {
             return Err(HttpError::Config(format!(
                 "secret file `{path}` has insecure permissions {mode:#o} \
                  (group/world-accessible); set to 0600 or 0400"
+            )));
+        }
+        let file_uid = metadata.uid();
+        let proc_uid = rustix::process::geteuid().as_raw();
+        if file_uid != proc_uid {
+            return Err(HttpError::Config(format!(
+                "secret file `{path}` is owned by uid {file_uid}, but the \
+                 running process has effective uid {proc_uid}; chown the \
+                 file to the service account"
             )));
         }
     }
