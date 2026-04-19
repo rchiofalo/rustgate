@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::BytesMut;
-use rustgate_mqtt::{MqttListener, MqttServer, MqttServerConfig};
+use rustgate_mqtt::{MqttListener, MqttServer, MqttServerConfig, WildcardPolicy};
 use rustgate_test_utils::certs::TestCa;
 use rustgate_test_utils::tls::build_client_tls_config;
 use rustgate_transport::{Router, TlsConfig};
@@ -32,6 +32,15 @@ struct TestServer {
 
 impl TestServer {
     fn new(ca: &TestCa, router: Arc<Router>, topic_prefix: Option<String>) -> Self {
+        Self::new_with_policy(ca, router, topic_prefix, WildcardPolicy::default())
+    }
+
+    fn new_with_policy(
+        ca: &TestCa,
+        router: Arc<Router>,
+        topic_prefix: Option<String>,
+        wildcard_policy: WildcardPolicy,
+    ) -> Self {
         let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
         let tls_config =
             TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
@@ -51,6 +60,7 @@ impl TestServer {
             max_packet_size: 1024 * 1024,
             min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
             response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
+            wildcard_policy,
         };
 
         drop(tokio::spawn(MqttServer::run(config)));
@@ -415,6 +425,7 @@ async fn connection_limit_rejects_excess() {
         max_packet_size: 1024 * 1024,
         min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
         response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
+        wildcard_policy: WildcardPolicy::default(),
     };
 
     drop(tokio::spawn(MqttServer::run(config)));
@@ -620,6 +631,7 @@ async fn max_packet_size_rejects_oversized_publish() {
         max_packet_size: 64, // Very small — CONNECT is ~30-40 bytes, PUBLISH will exceed
         min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
         response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
+        wildcard_policy: WildcardPolicy::default(),
     };
 
     drop(tokio::spawn(MqttServer::run(config)));
@@ -733,6 +745,313 @@ async fn concurrent_multi_client_publish_and_receive() {
         .collect();
     expected.sort();
     assert_eq!(received, expected);
+
+    server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Wildcard SUBSCRIBE coverage (F-57 / #755)
+//
+// Wildcard filters are expanded at SUBSCRIBE time against the client's own
+// certificate-derived `Identity.groups` set. The router itself never
+// synthesises new groups from a wildcard; group membership remains the
+// single authorisation boundary.
+// ---------------------------------------------------------------------------
+
+/// Assert that reading the next packet times out — used to prove that a
+/// subscription has been effectively removed (unsubscribe_wildcard_stops_delivery).
+async fn assert_no_packet(
+    stream: &mut tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+    buf: &mut BytesMut,
+    wait: Duration,
+) {
+    match tokio::time::timeout(wait, read_v5_packet(stream, buf)).await {
+        Ok(packet) => panic!("expected no packet, got {packet:?}"),
+        Err(_) => { /* timed out as expected */ }
+    }
+}
+
+#[tokio::test]
+async fn subscribe_plus_wildcard_delivers_from_multiple_groups() {
+    let ca = TestCa::new("MQTT Test CA");
+    // alice and bob both live in two hierarchical telemetry groups that
+    // the `+` wildcard spans.
+    let alice_cert = ca.issue_client_cert("alice", &["fleet/a/position", "fleet/b/position"]);
+    let bob_cert = ca.issue_client_cert("bob", &["fleet/a/position", "fleet/b/position"]);
+    let router = Arc::new(Router::new());
+
+    let server = TestServer::new(&ca, Arc::clone(&router), None);
+
+    let alice_tls =
+        build_client_tls_config(&alice_cert.cert_pem, &alice_cert.key_pem, &ca.cert_pem);
+    let mut alice = mqtt_connect(server.addr, &alice_tls).await;
+    let mut alice_buf = BytesMut::new();
+
+    write_v5_packet(
+        &mut alice,
+        &mqttbytes::v5::Packet::Connect(mqttbytes::v5::Connect::new("alice")),
+    )
+    .await;
+    let _ = read_v5_packet(&mut alice, &mut alice_buf).await; // CONNACK
+
+    // `fleet/+/position` expands to {fleet/a/position, fleet/b/position}.
+    let sub = mqttbytes::v5::Subscribe::new("fleet/+/position", mqttbytes::QoS::AtMostOnce);
+    write_v5_packet(&mut alice, &mqttbytes::v5::Packet::Subscribe(sub)).await;
+    match read_v5_packet(&mut alice, &mut alice_buf).await {
+        mqttbytes::v5::Packet::SubAck(suback) => {
+            assert_eq!(
+                suback.return_codes,
+                vec![mqttbytes::v5::SubscribeReasonCode::QoS0],
+                "wildcard filter with matching groups should succeed"
+            );
+        }
+        other => panic!("expected SubAck, got {other:?}"),
+    }
+
+    // Bob publishes to each matching group in turn; alice should receive both.
+    let bob_tls = build_client_tls_config(&bob_cert.cert_pem, &bob_cert.key_pem, &ca.cert_pem);
+    let mut bob = mqtt_connect(server.addr, &bob_tls).await;
+    let mut bob_buf = BytesMut::new();
+    write_v5_packet(
+        &mut bob,
+        &mqttbytes::v5::Packet::Connect(mqttbytes::v5::Connect::new("bob")),
+    )
+    .await;
+    let _ = read_v5_packet(&mut bob, &mut bob_buf).await; // CONNACK
+
+    for topic in ["fleet/a/position", "fleet/b/position"] {
+        let publish = mqttbytes::v5::Publish::new(topic, mqttbytes::QoS::AtMostOnce, b"pos");
+        write_v5_packet(&mut bob, &mqttbytes::v5::Packet::Publish(publish)).await;
+    }
+
+    let mut seen_topics = Vec::new();
+    for _ in 0..2 {
+        let packet = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_v5_packet(&mut alice, &mut alice_buf),
+        )
+        .await
+        .expect("alice should receive both wildcard-matched messages");
+        match packet {
+            mqttbytes::v5::Packet::Publish(pub_msg) => {
+                seen_topics.push(pub_msg.topic.clone());
+            }
+            other => panic!("expected Publish, got {other:?}"),
+        }
+    }
+    seen_topics.sort();
+    assert_eq!(
+        seen_topics,
+        vec![
+            "fleet/a/position".to_string(),
+            "fleet/b/position".to_string(),
+        ]
+    );
+
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn subscribe_hash_wildcard_rejected_under_default_policy() {
+    let ca = TestCa::new("MQTT Test CA");
+    let alice_cert = ca.issue_client_cert("alice", &["fleet/a/position"]);
+    let router = Arc::new(Router::new());
+
+    // Default policy = SingleLevelOnly: `#` must be rejected.
+    let server = TestServer::new(&ca, router, None);
+
+    let alice_tls =
+        build_client_tls_config(&alice_cert.cert_pem, &alice_cert.key_pem, &ca.cert_pem);
+    let mut alice = mqtt_connect(server.addr, &alice_tls).await;
+    let mut buf = BytesMut::new();
+
+    write_v5_packet(
+        &mut alice,
+        &mqttbytes::v5::Packet::Connect(mqttbytes::v5::Connect::new("alice")),
+    )
+    .await;
+    let _ = read_v5_packet(&mut alice, &mut buf).await; // CONNACK
+
+    let sub = mqttbytes::v5::Subscribe::new("fleet/#", mqttbytes::QoS::AtMostOnce);
+    write_v5_packet(&mut alice, &mqttbytes::v5::Packet::Subscribe(sub)).await;
+    match read_v5_packet(&mut alice, &mut buf).await {
+        mqttbytes::v5::Packet::SubAck(suback) => {
+            assert_eq!(
+                suback.return_codes,
+                vec![mqttbytes::v5::SubscribeReasonCode::TopicFilterInvalid],
+                "`#` should return TopicFilterInvalid under SingleLevelOnly policy"
+            );
+        }
+        other => panic!("expected SubAck, got {other:?}"),
+    }
+
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn subscribe_hash_wildcard_accepted_under_full_policy() {
+    let ca = TestCa::new("MQTT Test CA");
+    let alice_cert = ca.issue_client_cert("alice", &["fleet/a/position", "fleet/b/tel"]);
+    let bob_cert = ca.issue_client_cert("bob", &["fleet/a/position"]);
+    let router = Arc::new(Router::new());
+
+    let server = TestServer::new_with_policy(&ca, Arc::clone(&router), None, WildcardPolicy::Full);
+
+    let alice_tls =
+        build_client_tls_config(&alice_cert.cert_pem, &alice_cert.key_pem, &ca.cert_pem);
+    let mut alice = mqtt_connect(server.addr, &alice_tls).await;
+    let mut alice_buf = BytesMut::new();
+
+    write_v5_packet(
+        &mut alice,
+        &mqttbytes::v5::Packet::Connect(mqttbytes::v5::Connect::new("alice")),
+    )
+    .await;
+    let _ = read_v5_packet(&mut alice, &mut alice_buf).await;
+
+    // `fleet/#` expands to the full fleet subtree in alice's identity.
+    let sub = mqttbytes::v5::Subscribe::new("fleet/#", mqttbytes::QoS::AtMostOnce);
+    write_v5_packet(&mut alice, &mqttbytes::v5::Packet::Subscribe(sub)).await;
+    match read_v5_packet(&mut alice, &mut alice_buf).await {
+        mqttbytes::v5::Packet::SubAck(suback) => {
+            assert_eq!(
+                suback.return_codes,
+                vec![mqttbytes::v5::SubscribeReasonCode::QoS0]
+            );
+        }
+        other => panic!("expected SubAck, got {other:?}"),
+    }
+
+    // bob publishes to `fleet/a/position` — alice receives via `fleet/#`.
+    let bob_tls = build_client_tls_config(&bob_cert.cert_pem, &bob_cert.key_pem, &ca.cert_pem);
+    let mut bob = mqtt_connect(server.addr, &bob_tls).await;
+    let mut bob_buf = BytesMut::new();
+    write_v5_packet(
+        &mut bob,
+        &mqttbytes::v5::Packet::Connect(mqttbytes::v5::Connect::new("bob")),
+    )
+    .await;
+    let _ = read_v5_packet(&mut bob, &mut bob_buf).await;
+
+    let publish =
+        mqttbytes::v5::Publish::new("fleet/a/position", mqttbytes::QoS::AtMostOnce, b"hello");
+    write_v5_packet(&mut bob, &mqttbytes::v5::Packet::Publish(publish)).await;
+
+    let packet = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_v5_packet(&mut alice, &mut alice_buf),
+    )
+    .await
+    .expect("alice should receive via fleet/# wildcard");
+    match packet {
+        mqttbytes::v5::Packet::Publish(pub_msg) => {
+            assert_eq!(pub_msg.topic, "fleet/a/position");
+            assert_eq!(pub_msg.payload.as_ref(), b"hello");
+        }
+        other => panic!("expected Publish, got {other:?}"),
+    }
+
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn subscribe_wildcard_with_no_matching_groups_denied() {
+    let ca = TestCa::new("MQTT Test CA");
+    // alice only has groups outside the `fleet/...` subtree.
+    let alice_cert = ca.issue_client_cert("alice", &["other/data", "chat/global"]);
+    let router = Arc::new(Router::new());
+
+    let server = TestServer::new(&ca, router, None);
+
+    let alice_tls =
+        build_client_tls_config(&alice_cert.cert_pem, &alice_cert.key_pem, &ca.cert_pem);
+    let mut alice = mqtt_connect(server.addr, &alice_tls).await;
+    let mut buf = BytesMut::new();
+
+    write_v5_packet(
+        &mut alice,
+        &mqttbytes::v5::Packet::Connect(mqttbytes::v5::Connect::new("alice")),
+    )
+    .await;
+    let _ = read_v5_packet(&mut alice, &mut buf).await;
+
+    // `fleet/+/position` matches zero groups in alice's identity → reject.
+    let sub = mqttbytes::v5::Subscribe::new("fleet/+/position", mqttbytes::QoS::AtMostOnce);
+    write_v5_packet(&mut alice, &mqttbytes::v5::Packet::Subscribe(sub)).await;
+    match read_v5_packet(&mut alice, &mut buf).await {
+        mqttbytes::v5::Packet::SubAck(suback) => {
+            assert_eq!(
+                suback.return_codes,
+                vec![mqttbytes::v5::SubscribeReasonCode::NotAuthorized],
+                "wildcard with zero matching groups must deny — keeps the cert the authz boundary"
+            );
+        }
+        other => panic!("expected SubAck, got {other:?}"),
+    }
+
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn unsubscribe_wildcard_stops_delivery() {
+    let ca = TestCa::new("MQTT Test CA");
+    let alice_cert = ca.issue_client_cert("alice", &["fleet/a/position", "fleet/b/position"]);
+    let bob_cert = ca.issue_client_cert("bob", &["fleet/a/position", "fleet/b/position"]);
+    let router = Arc::new(Router::new());
+
+    let server = TestServer::new(&ca, Arc::clone(&router), None);
+
+    let alice_tls =
+        build_client_tls_config(&alice_cert.cert_pem, &alice_cert.key_pem, &ca.cert_pem);
+    let mut alice = mqtt_connect(server.addr, &alice_tls).await;
+    let mut alice_buf = BytesMut::new();
+    write_v5_packet(
+        &mut alice,
+        &mqttbytes::v5::Packet::Connect(mqttbytes::v5::Connect::new("alice")),
+    )
+    .await;
+    let _ = read_v5_packet(&mut alice, &mut alice_buf).await;
+
+    let sub = mqttbytes::v5::Subscribe::new("fleet/+/position", mqttbytes::QoS::AtMostOnce);
+    write_v5_packet(&mut alice, &mqttbytes::v5::Packet::Subscribe(sub)).await;
+    let _ = read_v5_packet(&mut alice, &mut alice_buf).await; // SUBACK
+
+    // Confirm delivery works before unsubscribe.
+    let bob_tls = build_client_tls_config(&bob_cert.cert_pem, &bob_cert.key_pem, &ca.cert_pem);
+    let mut bob = mqtt_connect(server.addr, &bob_tls).await;
+    let mut bob_buf = BytesMut::new();
+    write_v5_packet(
+        &mut bob,
+        &mqttbytes::v5::Packet::Connect(mqttbytes::v5::Connect::new("bob")),
+    )
+    .await;
+    let _ = read_v5_packet(&mut bob, &mut bob_buf).await;
+
+    let publish =
+        mqttbytes::v5::Publish::new("fleet/a/position", mqttbytes::QoS::AtMostOnce, b"pre");
+    write_v5_packet(&mut bob, &mqttbytes::v5::Packet::Publish(publish)).await;
+    let packet = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_v5_packet(&mut alice, &mut alice_buf),
+    )
+    .await
+    .expect("alice should receive before unsubscribe");
+    assert!(matches!(packet, mqttbytes::v5::Packet::Publish(_)));
+
+    // UNSUBSCRIBE the same wildcard — alice must leave both fleet/a and fleet/b.
+    let unsub = mqttbytes::v5::Unsubscribe::new("fleet/+/position");
+    write_v5_packet(&mut alice, &mqttbytes::v5::Packet::Unsubscribe(unsub)).await;
+    match read_v5_packet(&mut alice, &mut alice_buf).await {
+        mqttbytes::v5::Packet::UnsubAck(_) => { /* ok */ }
+        other => panic!("expected UnsubAck, got {other:?}"),
+    }
+
+    // Publish to both groups — neither should land on alice.
+    for topic in ["fleet/a/position", "fleet/b/position"] {
+        let publish = mqttbytes::v5::Publish::new(topic, mqttbytes::QoS::AtMostOnce, b"post");
+        write_v5_packet(&mut bob, &mqttbytes::v5::Packet::Publish(publish)).await;
+    }
+    assert_no_packet(&mut alice, &mut alice_buf, Duration::from_millis(300)).await;
 
     server.shutdown();
 }

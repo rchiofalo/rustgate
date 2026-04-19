@@ -33,6 +33,7 @@ impl MqttServer {
             max_packet_size,
             min_keep_alive_secs,
             response_channel_capacity,
+            wildcard_policy,
         } = config;
 
         let client_id_registry = ClientIdRegistry::new();
@@ -67,6 +68,7 @@ impl MqttServer {
                                 max_packet_size,
                                 min_keep_alive_secs,
                                 response_channel_capacity,
+                                wildcard_policy,
                                 registry,
                                 permit,
                             )));

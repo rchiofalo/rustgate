@@ -339,4 +339,72 @@ mod tests {
     fn parse_pem_private_key_none_on_garbage() {
         assert!(parse_pem_private_key(b"not a key").is_none());
     }
+
+    /// Codifies the current pin semantic: `pin_sha256` hashes the **entire
+    /// leaf certificate DER**, not the SubjectPublicKeyInfo (SPKI). Any
+    /// cert reissue — even with identical subject, SAN list, and issuer —
+    /// produces a new DER encoding (new serial, new validity window, new
+    /// signature) and therefore a new pin hash.
+    ///
+    /// Regression guard for #813: if we ever migrate to RFC 7469 SPKI
+    /// pinning, this test must be updated (not deleted) to reflect the new
+    /// semantic, because the config-file format stays named `pin_sha256`.
+    #[test]
+    fn pin_is_full_leaf_der_not_spki_or_subject() {
+        use rustgate_test_utils::certs::TestCa;
+
+        let ca = TestCa::new("pin-regression-ca");
+        let cert_a = ca.issue_server_cert("edge.example", &["edge.example"]);
+        let cert_b = ca.issue_server_cert("edge.example", &["edge.example"]);
+
+        let der_a = parse_pem_certs(cert_a.cert_pem.as_bytes())
+            .into_iter()
+            .next()
+            .expect("cert A DER");
+        let der_b = parse_pem_certs(cert_b.cert_pem.as_bytes())
+            .into_iter()
+            .next()
+            .expect("cert B DER");
+
+        // Full DER bytes must differ across reissues (serial/validity change).
+        assert_ne!(
+            der_a.as_ref(),
+            der_b.as_ref(),
+            "reissued certs should have distinct DER encodings"
+        );
+
+        // SHA-256 over the full DER — the exact operation verifier performs.
+        let hash_a = Sha256::digest(der_a.as_ref());
+        let hash_b = Sha256::digest(der_b.as_ref());
+        assert_ne!(
+            hash_a.as_slice(),
+            hash_b.as_slice(),
+            "pin semantic: full-DER hashing — a reissued cert MUST NOT \
+             match the pin of its predecessor. Rotating certs requires \
+             also rotating the pin list (configure both pins during the \
+             overlap window). See `TlsConfig::pin_sha256` docs."
+        );
+    }
+
+    #[test]
+    fn verifier_accepts_matching_pin_from_real_cert() {
+        // Happy-path: the verifier's hashing matches our parse_pem pipeline,
+        // so a pin computed from the same DER the server will present is a hit.
+        use rustgate_test_utils::certs::TestCa;
+
+        let ca = TestCa::new("pin-ok-ca");
+        let cert = ca.issue_server_cert("ok.example", &["ok.example"]);
+        let der = parse_pem_certs(cert.cert_pem.as_bytes())
+            .into_iter()
+            .next()
+            .expect("server cert DER");
+
+        // Compute the expected pin exactly as the verifier would.
+        let expected_pin: [u8; 32] = Sha256::digest(der.as_ref()).into();
+
+        // Round-trip through base64 parse to mirror config-file ingestion.
+        let b64_pin = b64::encode(expected_pin);
+        let parsed = parse_pins(&[b64_pin]).expect("pin parses");
+        assert_eq!(parsed, vec![expected_pin]);
+    }
 }

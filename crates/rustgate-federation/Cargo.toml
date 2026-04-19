@@ -50,6 +50,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
+ring = { workspace = true }
 time = { workspace = true }
 x509-parser = { workspace = true }
 async-nats = { workspace = true, features = ["kv"], optional = true }
@@ -59,6 +60,7 @@ prometheus = { workspace = true, optional = true }
 zeroize = { workspace = true }
 redb = { workspace = true }
 parking_lot = { workspace = true }
+lru = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true, optional = true }
 mdns-sd = { workspace = true, optional = true }
