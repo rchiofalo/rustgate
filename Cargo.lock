@@ -3475,6 +3475,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "smol_str",
+ "socket2",
  "spiffe",
  "subtle",
  "tempfile",

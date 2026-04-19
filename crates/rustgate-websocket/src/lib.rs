@@ -19,7 +19,7 @@ use std::time::Duration;
 use rustgate_core::constants::HANDSHAKE_TIMEOUT;
 use rustgate_core::error::{Result, TransportError};
 use rustgate_core::identity::Identity;
-use rustgate_core::net::configure_tcp_keepalive;
+use rustgate_core::net::configure_tactical_socket;
 use rustgate_resilience::conn_rate_limiter::ConnRateLimiter;
 use rustgate_transport::{TlsConfig, extract_identity};
 pub use server::{
@@ -239,7 +239,7 @@ impl WsListener {
                 continue;
             }
 
-            configure_tcp_keepalive(&tcp_stream);
+            configure_tactical_socket(&tcp_stream);
             debug!(peer_addr = %peer_addr, "TCP connection accepted");
 
             let tls_stream = match self.tls.accept(tcp_stream).await {

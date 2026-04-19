@@ -24,7 +24,7 @@ use tokio_rustls::TlsAcceptor;
 const MAX_ENROLLMENT_CONNECTIONS: usize = 64;
 
 use rustgate_core::constants::HANDSHAKE_TIMEOUT;
-use rustgate_core::net::configure_tcp_keepalive;
+use rustgate_core::net::configure_tactical_socket;
 
 /// Maximum time for an HTTP connection on the enrollment server.
 ///
@@ -180,10 +180,11 @@ impl EnrollmentServer {
                 }
             };
 
-            // Shared TCP keepalive — applied before the TLS handshake so
-            // dead NAT middleboxes do not hold slots in the connection
-            // semaphore.
-            configure_tcp_keepalive(&stream);
+            // Shared TCP tactical-socket tuning — keepalive kills dead
+            // NAT middleboxes so they do not hold slots in the connection
+            // semaphore, and `TCP_NODELAY` avoids the 40 ms Nagle+DELACK
+            // penalty on small enrollment request/response exchanges.
+            configure_tactical_socket(&stream);
 
             let permit = match Arc::clone(&conn_limit).try_acquire_owned() {
                 Ok(p) => p,
