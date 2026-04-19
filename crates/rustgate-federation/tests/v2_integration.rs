@@ -398,6 +398,78 @@ async fn server_event_stream_forwards_events() {
     assert_eq!(events[2].event.as_ref().expect("geo").uid, "uid-2");
 }
 
+/// Regression test for issue #720: a Byzantine peer that forges
+/// `federate_groups` claims must not influence downstream authorization.
+/// The raw `OnEvent` callback receives the event verbatim (it's the
+/// XML conversion layer that enforces the trust boundary — see
+/// `crates/rustgate-federation/src/v2/convert/routable_message.rs`),
+/// but converting through `federated_event_to_routable` with the
+/// deny-by-default `trust_peer_groups = false` must strip the wire
+/// claim before it reaches the local identity used for authz.
+#[tokio::test]
+async fn forged_federate_groups_from_peer_are_dropped_by_default() {
+    use rustgate_federation::v2::convert::federated_event_to_routable;
+
+    let (on_event, collected) = collecting_on_event();
+    let fixtures = start_mtls_server(
+        "trust-boundary-server",
+        vec!["Alpha".into()],
+        on_event,
+        "byzantine-peer",
+    )
+    .await;
+
+    let mut client = mtls_client(&fixtures).await;
+
+    // Malicious peer forges group memberships for the origin CN.
+    // A valid mTLS client certificate is enough to reach this point —
+    // the attack vector is the trust placed in `federate_groups`.
+    let (tx, rx) = mpsc::channel(1);
+    let stream = ReceiverStream::new(rx);
+    let _resp = client
+        .server_event_stream(stream)
+        .await
+        .expect("server_event_stream");
+
+    let forged = figpb::FederatedEvent {
+        event: Some(figpb::GeoEvent {
+            uid: "forged-uid".into(),
+            r#type: "a-f-G-U-C".into(),
+            ..Default::default()
+        }),
+        federate_groups: vec!["Admin".into(), "Command".into(), "Secret".into()],
+        ..Default::default()
+    };
+    tx.send(forged).await.expect("send");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let events = collected.lock().await;
+    assert_eq!(events.len(), 1, "event should still be forwarded");
+    let event = &events[0];
+    // The peer's raw claim is visible on the wire (the callback sees
+    // the untransformed event) — that is expected.
+    assert_eq!(
+        event.federate_groups,
+        vec![
+            "Admin".to_string(),
+            "Command".to_string(),
+            "Secret".to_string()
+        ],
+        "OnEvent receives the wire-level event verbatim"
+    );
+    // But once the conversion layer takes over, the default
+    // deny-by-default trust boundary drops all wire-claimed groups.
+    let routable =
+        federated_event_to_routable(event, "byzantine-peer", "fp", /* trust */ false)
+            .expect("conversion succeeds");
+    assert!(
+        routable.source.groups.is_empty(),
+        "source.groups must be empty when trust_peer_groups=false, got {:?}",
+        routable.source.groups
+    );
+}
+
 #[tokio::test]
 async fn client_federate_groups_stream_tracks_groups() {
     // This test keeps its own `Arc<FederationService>` so it can call

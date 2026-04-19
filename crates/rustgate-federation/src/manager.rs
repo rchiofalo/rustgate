@@ -484,7 +484,11 @@ impl FederationManager {
                 .identity(server_cert)
                 .client_ca_root(server_ca);
 
-            let on_event = Self::create_v2_event_handler(&on_inbound, &self.config.federate_id);
+            let on_event = Self::create_v2_event_handler(
+                &on_inbound,
+                &self.config.federate_id,
+                self.config.trust_peer_groups,
+            );
 
             let service = crate::v2::server::FederationService::with_limits(
                 self.config.federate_id.clone(),
@@ -657,8 +661,11 @@ impl FederationManager {
                 }
                 #[cfg(feature = "v2")]
                 2 => {
-                    let on_event =
-                        Self::create_v2_event_handler(&on_inbound, &self.config.federate_id);
+                    let on_event = Self::create_v2_event_handler(
+                        &on_inbound,
+                        &self.config.federate_id,
+                        self.config.trust_peer_groups,
+                    );
                     let replay_drain = Self::create_v2_replay_drain(&self.replay_buffers);
 
                     let client = crate::v2::client::V2Client::start(
@@ -1345,10 +1352,26 @@ impl FederationManager {
     /// Returns a callback that checks provenance metadata (loop detection and
     /// hop limits), then converts `FederatedEvent` payloads to XML before
     /// forwarding to the inbound handler.
+    ///
+    /// # Trust boundary
+    ///
+    /// The inbound event's `federate_groups` field represents the peer's
+    /// claim about the origin CN's group memberships. When
+    /// `trust_peer_groups == false` (default, see issue #720), any
+    /// non-empty `federate_groups` on the wire is treated as an
+    /// unverified claim: the handler emits
+    /// [`rustgate_core::audit::federation_group_claim_rejected`] for the
+    /// forensic trail. The XML the handler forwards to `on_inbound`
+    /// never carries `federate_groups` (the field does not round-trip
+    /// through `federated_event_to_xml`), so dropping the claim here is
+    /// purely observational — the claim is already silently discarded
+    /// by the conversion layer. When `trust_peer_groups == true`
+    /// (explicit opt-in) the handler skips the audit emission.
     #[cfg(feature = "v2")]
     fn create_v2_event_handler(
         on_inbound: &OnInbound,
         federate_id: &str,
+        trust_peer_groups: bool,
     ) -> crate::v2::client::OnEvent {
         let on_event_inbound = Arc::clone(on_inbound);
         let federate_id = federate_id.to_owned();
@@ -1364,6 +1387,18 @@ impl FederationManager {
                     "dropped inbound V2 event (loop or hop limit)"
                 );
                 return;
+            }
+
+            // Trust-boundary audit for wire-claimed groups. The claim
+            // is always dropped by the XML conversion below — this
+            // block only records the attempt for the forensic trail
+            // when the operator has NOT opted into peer-group trust.
+            if !trust_peer_groups && !event.federate_groups.is_empty() {
+                rustgate_core::audit::federation_group_claim_rejected(
+                    &peer_id,
+                    &peer_id,
+                    &event.federate_groups,
+                );
             }
 
             // Try GeoEvent first, then fall back to ContactListEntry
@@ -1467,7 +1502,11 @@ impl FederationManager {
                     .ok_or_else(|| anyhow::anyhow!("v2_tls_config not set"))?
                     .clone();
 
-                let on_event = Self::create_v2_event_handler(&on_inbound, &self.config.federate_id);
+                let on_event = Self::create_v2_event_handler(
+                    &on_inbound,
+                    &self.config.federate_id,
+                    self.config.trust_peer_groups,
+                );
                 let replay_drain = Self::create_v2_replay_drain(&self.replay_buffers);
 
                 let client = crate::v2::client::V2Client::start(
@@ -1803,6 +1842,7 @@ mod tests {
             local_region: None,
             max_groups_per_peer: crate::config::DEFAULT_MAX_GROUPS_PER_PEER,
             max_group_name_length: crate::config::DEFAULT_MAX_GROUP_NAME_LENGTH,
+            trust_peer_groups: false,
         }
     }
 
@@ -2933,5 +2973,97 @@ mod tests {
 
         // Measured peer should sort before unmeasured
         assert_eq!(ids, vec!["measured", "unknown"]);
+    }
+
+    // --- create_v2_event_handler: trust_peer_groups boundary (#720) ---
+
+    /// `create_v2_event_handler` must still forward events when the
+    /// peer claims groups but `trust_peer_groups = false`. The wire
+    /// `federate_groups` field does not round-trip through
+    /// `federated_event_to_xml`, so the XML forwarded to `on_inbound`
+    /// carries no group claims — the audit event is the only artifact
+    /// of the rejected claim.
+    #[cfg(feature = "v2")]
+    #[tokio::test]
+    async fn v2_handler_forwards_even_with_untrusted_wire_groups() {
+        use bytes::Bytes;
+
+        let forwarded: Arc<std::sync::Mutex<Vec<(String, Bytes)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let forwarded_clone = Arc::clone(&forwarded);
+        let on_inbound: OnInbound = Arc::new(move |cn, data| {
+            let _ = forwarded_clone.lock().map(|mut v| v.push((cn, data)));
+        });
+
+        let handler = FederationManager::create_v2_event_handler(
+            &on_inbound,
+            "local-federate",
+            /* trust_peer_groups */ false,
+        );
+
+        let event = crate::v2::proto::figpb::FederatedEvent {
+            event: Some(crate::v2::proto::figpb::GeoEvent {
+                uid: "forged-uid".into(),
+                r#type: "a-f-G".into(),
+                ..Default::default()
+            }),
+            federate_groups: vec!["Admin".into(), "Command".into()],
+            ..Default::default()
+        };
+
+        handler(event, "malicious-peer".into());
+
+        // Event was forwarded. The XML produced by `federated_event_to_xml`
+        // does not embed `federate_groups`, so the forged claim is
+        // already gone by the time `on_inbound` sees the payload.
+        let entries = forwarded.lock().expect("lock").clone();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "malicious-peer");
+        let xml = String::from_utf8(entries[0].1.to_vec()).expect("utf8");
+        assert!(
+            !xml.contains("Admin"),
+            "forwarded XML must not leak wire-claimed group: {xml}"
+        );
+        assert!(
+            !xml.contains("Command"),
+            "forwarded XML must not leak wire-claimed group: {xml}"
+        );
+    }
+
+    /// When `trust_peer_groups = true` the handler still produces the
+    /// same XML (groups never round-trip through the XML codec), but
+    /// skips the audit emission. This test pins the "still forwards"
+    /// guarantee so any future change to the conversion layer is caught.
+    #[cfg(feature = "v2")]
+    #[tokio::test]
+    async fn v2_handler_forwards_when_peer_groups_trusted() {
+        use bytes::Bytes;
+
+        let forwarded: Arc<std::sync::Mutex<Vec<(String, Bytes)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let forwarded_clone = Arc::clone(&forwarded);
+        let on_inbound: OnInbound = Arc::new(move |cn, data| {
+            let _ = forwarded_clone.lock().map(|mut v| v.push((cn, data)));
+        });
+
+        let handler = FederationManager::create_v2_event_handler(
+            &on_inbound,
+            "local-federate",
+            /* trust_peer_groups */ true,
+        );
+
+        let event = crate::v2::proto::figpb::FederatedEvent {
+            event: Some(crate::v2::proto::figpb::GeoEvent {
+                uid: "legit-uid".into(),
+                r#type: "a-f-G".into(),
+                ..Default::default()
+            }),
+            federate_groups: vec!["Alpha".into()],
+            ..Default::default()
+        };
+
+        handler(event, "trusted-peer".into());
+        let entries = forwarded.lock().expect("lock").clone();
+        assert_eq!(entries.len(), 1);
     }
 }

@@ -160,6 +160,35 @@ pub fn federation_peer_rejected(remote_addr: &str, reason: &str) {
     );
 }
 
+/// Record a rejection of wire-claimed federation group memberships.
+///
+/// Emitted when a federation peer forwards an event whose
+/// `federate_groups` field claims origin-CN group memberships that the
+/// receiving server does not independently verify. The receiving server
+/// drops the wire-claimed groups and either (a) substitutes its own
+/// locally-known groups for the origin CN or (b) assigns the empty set
+/// (deny-by-default). See `FederationConfig::trust_peer_groups` for the
+/// opt-in escape hatch.
+///
+/// A Byzantine peer with a valid mTLS client certificate can otherwise
+/// forge arbitrary group memberships for any origin CN, effectively
+/// elevating that origin's privileges across the federation boundary.
+/// The audit event captures the peer CN (authenticated via mTLS),
+/// the origin CN the peer claimed to speak for, and the claimed
+/// group set — giving operators a forensic trail of peers attempting
+/// to assert cross-origin group claims.
+pub fn federation_group_claim_rejected(peer_cn: &str, origin_cn: &str, claimed_groups: &[String]) {
+    audit!(
+        "federation.group_claim_rejected",
+        peer_cn = %peer_cn,
+        origin_cn = %origin_cn,
+        claimed_count = claimed_groups.len(),
+        claimed_groups = ?claimed_groups,
+        action = "drop_claims",
+        result = "success"
+    );
+}
+
 /// Record an enrollment CSR signing event.
 pub fn enrollment_signed(username: &str, client_uid: &str) {
     audit!(

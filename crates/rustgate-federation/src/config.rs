@@ -174,6 +174,30 @@ pub struct FederationConfig {
 
     /// Maximum length of a V2 federation group name in bytes.
     pub max_group_name_length: usize,
+
+    /// Whether to trust the `federate_groups` field on inbound federated
+    /// events as the authoritative group set for the originating client.
+    ///
+    /// **Default: `false` (deny-by-default).** A Byzantine peer with a
+    /// valid mTLS client certificate can otherwise forge arbitrary group
+    /// memberships for any origin CN — effectively elevating that
+    /// origin's privileges across the federation boundary. See the
+    /// threat model in `docs/federation.md`.
+    ///
+    /// When `false`, wire-claimed `federate_groups` are dropped and the
+    /// receiving server treats the origin CN's group membership as
+    /// empty (subject to local authz policy). Any claim that is dropped
+    /// emits a [`rustgate_core::audit::federation_group_claim_rejected`]
+    /// audit event for observability.
+    ///
+    /// When `true` (explicit opt-in), the receiving server accepts the
+    /// wire-claimed groups verbatim. This is only appropriate when every
+    /// federation peer is fully trusted to speak for every origin CN on
+    /// its side of the federation — for example, a single-operator
+    /// multi-region deployment where every peer shares the same ACL and
+    /// identity-management authority. Setting this flag on a federation
+    /// that spans multiple trust domains is insecure.
+    pub trust_peer_groups: bool,
 }
 
 impl Default for FederationConfig {
@@ -212,6 +236,7 @@ impl Default for FederationConfig {
             local_region: None,
             max_groups_per_peer: DEFAULT_MAX_GROUPS_PER_PEER,
             max_group_name_length: DEFAULT_MAX_GROUP_NAME_LENGTH,
+            trust_peer_groups: false,
         }
     }
 }

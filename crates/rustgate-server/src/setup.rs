@@ -972,6 +972,7 @@ async fn build_federation_config(
         local_region: cli.federation_region.clone(),
         max_groups_per_peer: cli.federation_max_groups_per_peer,
         max_group_name_length: cli.federation_max_group_name_length,
+        trust_peer_groups: cli.federation_trust_peer_groups,
         ..rustgate_federation::config::FederationConfig::default()
     })
 }
