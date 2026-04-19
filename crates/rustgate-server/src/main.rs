@@ -1159,7 +1159,10 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
             dir: std::path::PathBuf::from(dir),
             max_bytes: cli.archive_max_size,
             max_age: std::time::Duration::from_secs(cli.archive_max_age),
-            interval: std::time::Duration::from_secs(cli.archive_rotate_interval.max(1)),
+            // `cli.validate()` enforces `archive_rotate_interval >= 60` when
+            // rotation is enabled (F-69), so the `.max(1)` defense here is
+            // redundant — the value is already safe at this point.
+            interval: std::time::Duration::from_secs(cli.archive_rotate_interval),
             archiver: archiver.clone(),
         };
         tracing::info!(
