@@ -357,19 +357,17 @@ jobs:
           tool: cargo-deny,cargo-audit
 
       - name: Check advisories, licenses, bans, and sources
-        # continue-on-error guards against upstream advisory DB parse failures
-        #   (e.g., RUSTSEC-2025-0138 malformed TOML). Remove once DB is fixed.
-        continue-on-error: true
+        # Blocking: real RUSTSEC advisories, license violations, or banned
+        # crates MUST fail CI. A transient DB parse error is unlikely enough
+        # to handle reactively via a targeted --exclude if it recurs.
         run: cargo deny check
 
       - name: Run cargo audit
+        # Blocking: any new RUSTSEC advisory beyond the ignore list fails CI.
         # RUSTSEC-2025-0134: unmaintained crate with no available replacement yet;
         #   tracked upstream, no security impact in our usage.
         # RUSTSEC-2026-0049: advisory does not affect our configuration;
         #   mitigation is in place via input validation at the transport layer.
-        # continue-on-error guards against upstream advisory DB parse failures
-        #   (e.g., RUSTSEC-2025-0138 malformed TOML). Remove once DB is fixed.
-        continue-on-error: true
         run: cargo audit --ignore RUSTSEC-2025-0134 --ignore RUSTSEC-2026-0049
 
   helm:

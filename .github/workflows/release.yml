@@ -87,12 +87,30 @@ jobs:
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
 
+      # ── Blocking vulnerability gate ──────────────────────────────
+      # Runs BEFORE `cosign sign` so a CRITICAL CVE in the pushed image
+      # short-circuits the job and leaves the image unsigned. The push
+      # itself is not rolled back (we'd need a registry delete) but an
+      # unsigned image cannot pass `cosign verify` downstream, which is
+      # what consumers MUST check.
+      - name: Run Trivy vulnerability scanner (blocking gate on CRITICAL)
+        id: trivy-gate
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+
       - name: Sign image with cosign
+        # Reached only when the blocking Trivy gate returned 0.
         run: cosign sign --yes ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
 
-      # ── Post-push security & metadata steps ──────────────────────
+      # ── Post-sign security & metadata steps ──────────────────────
       # These steps are best-effort: individual failures must not cascade
-      # or fail the overall job. The image is already pushed and signed.
+      # or fail the overall job. The image is already pushed, gated on
+      # CRITICAL CVEs, and signed.
 
       - name: Attest build provenance
         if: github.repository_visibility == 'public'
@@ -102,10 +120,14 @@ jobs:
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
 
-      - name: Run Trivy vulnerability scanner
-        if: ${{ !cancelled() && steps.push.conclusion == 'success' }}
+      - name: Run Trivy scan for Security tab (CRITICAL + HIGH, reporting only)
+        # Reporting scan: broader severity filter to populate the GitHub
+        # Security tab with HIGH findings as well. The blocking gate
+        # above already guaranteed no CRITICAL issues reached sign time;
+        # HIGH findings are surfaced for triage, not as release blockers.
+        if: ${{ !cancelled() }}
         continue-on-error: true
-        id: trivy
+        id: trivy-report
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
         with:
           image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
