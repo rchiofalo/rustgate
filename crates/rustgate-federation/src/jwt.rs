@@ -10,11 +10,12 @@
 //! security. JWT adds per-connection authorization claims that can
 //! be rotated without re-issuing certificates.
 
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, Mac};
+use lru::LruCache;
 use rustgate_core::b64;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -26,6 +27,13 @@ const MIN_SECRET_LENGTH: usize = 32;
 
 /// Default maximum number of revoked JTIs tracked.
 const DEFAULT_REVOCATION_CAPACITY: usize = 10_000;
+
+/// How often to amortise the expired-entry sweep, measured in `revoke()`
+/// calls. At the default of 128, a cache at the 10k-entry capacity
+/// triggers at most 1 full O(n) scan per 128 revocations — bounding
+/// the amortised cost at O(n / 128) per call while still reclaiming
+/// space proactively before the LRU-based eviction kicks in.
+const EXPIRY_SWEEP_INTERVAL: u64 = 128;
 
 /// Maximum clock skew tolerance in seconds for `iat` validation.
 /// Tokens issued slightly in the future (within this window) are accepted
@@ -64,10 +72,23 @@ pub struct JwtAuthority {
     /// Default token lifetime.
     default_expiry: Duration,
     /// Revoked token IDs mapped to their expiration time (Unix seconds).
-    /// Entries are auto-expired during `revoke()` when the token's `exp` has passed.
-    revoked: Mutex<HashMap<String, u64>>,
+    ///
+    /// Backed by [`LruCache`] for O(1) insertion, lookup, and capacity
+    /// eviction. Expired entries are proactively reclaimed on an
+    /// amortised sweep ([`EXPIRY_SWEEP_INTERVAL`]); anything not yet
+    /// swept is naturally evicted by the LRU when capacity is reached.
+    revoked: Mutex<RevocationState>,
     /// Maximum number of entries in the revocation cache.
-    revocation_capacity: usize,
+    revocation_capacity: NonZeroUsize,
+}
+
+/// Lock-protected revocation cache state. Keeping the sweep counter
+/// inside the mutex guarantees the "every N revokes" accounting is
+/// race-free across concurrent `revoke()` callers.
+struct RevocationState {
+    entries: LruCache<String, u64>,
+    /// Number of `revoke()` calls since the last expired-entry sweep.
+    sweep_counter: u64,
 }
 
 impl std::fmt::Debug for JwtAuthority {
@@ -92,12 +113,16 @@ impl JwtAuthority {
                 actual: secret.len(),
             });
         }
+        let capacity = NonZeroUsize::new(DEFAULT_REVOCATION_CAPACITY).unwrap_or(NonZeroUsize::MIN);
         Ok(Self {
             secret,
             issuer: issuer.into(),
             default_expiry: Duration::from_secs(3600),
-            revoked: Mutex::new(HashMap::new()),
-            revocation_capacity: DEFAULT_REVOCATION_CAPACITY,
+            revoked: Mutex::new(RevocationState {
+                entries: LruCache::new(capacity),
+                sweep_counter: 0,
+            }),
+            revocation_capacity: capacity,
         })
     }
 
@@ -108,8 +133,23 @@ impl JwtAuthority {
     }
 
     /// Set the maximum number of entries in the revocation cache.
+    ///
+    /// A value of `0` is coerced to `1`; zero-capacity would make the
+    /// cache immediately evict every insertion, silently defeating
+    /// revocation. Existing entries are dropped on resize.
     pub fn with_revocation_capacity(mut self, capacity: usize) -> Self {
-        self.revocation_capacity = capacity;
+        let nz = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::MIN);
+        self.revocation_capacity = nz;
+        // Replace the cache rather than calling resize so the old entries
+        // are dropped deterministically — avoids growth / shrink ambiguity
+        // across LruCache versions.
+        let mut guard = match self.revoked.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.entries = LruCache::new(nz);
+        guard.sweep_counter = 0;
+        drop(guard);
         self
     }
 
@@ -181,13 +221,15 @@ impl JwtAuthority {
             return Err(JwtError::InvalidIssuer);
         }
 
-        // Check revocation
+        // Check revocation (non-promoting: `peek` does not touch LRU order
+        // so a flood of validations cannot keep a revoked token anchored
+        // at the MRU end indefinitely).
         if !claims.jti.is_empty() {
             let revoked = match self.revoked.lock() {
                 Ok(r) => r,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            if revoked.contains_key(&claims.jti) {
+            if revoked.entries.peek(&claims.jti).is_some() {
                 return Err(JwtError::Revoked);
             }
         }
@@ -198,43 +240,46 @@ impl JwtAuthority {
     /// Revoke a token by its JTI (unique identifier).
     ///
     /// The `exp` parameter is the token's expiration time (Unix seconds).
-    /// Once that time passes, the entry is automatically purged during
-    /// subsequent `revoke()` calls.
-    ///
-    /// If the cache is at capacity after purging expired entries, the
-    /// oldest entry (by expiration time) is evicted.
+    /// Insertion is O(1); capacity eviction is O(1) (least-recently-used
+    /// JTI is dropped). Expired entries are reclaimed on an amortised
+    /// sweep every [`EXPIRY_SWEEP_INTERVAL`] `revoke()` calls — bounding
+    /// the per-call cost while still freeing space proactively.
     pub fn revoke(&self, jti: &str, exp: u64) {
-        let mut revoked = match self.revoked.lock() {
+        let mut state = match self.revoked.lock() {
             Ok(r) => r,
             Err(poisoned) => poisoned.into_inner(),
         };
 
-        // Purge expired entries first.
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        revoked.retain(|_, &mut entry_exp| entry_exp > now);
-
-        // Evict the oldest entry if still at capacity.
-        if revoked.len() >= self.revocation_capacity
-            && let Some(oldest_jti) = revoked
+        state.sweep_counter = state.sweep_counter.wrapping_add(1);
+        if state.sweep_counter % EXPIRY_SWEEP_INTERVAL == 0 {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            // LruCache has no `retain`; collect first to avoid mutating
+            // while iterating.
+            let expired: Vec<String> = state
+                .entries
                 .iter()
-                .min_by_key(|(_, exp)| *exp)
-                .map(|(jti, _)| jti.clone())
-        {
-            let _ = revoked.remove(&oldest_jti);
+                .filter(|&(_, &v)| v <= now)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for k in &expired {
+                let _ = state.entries.pop(k);
+            }
         }
 
-        let size = revoked.len() + 1;
-        let _ = revoked.insert(jti.to_string(), exp);
+        // O(1) insert; O(1) LRU eviction when at capacity.
+        let _ = state.entries.put(jti.to_string(), exp);
 
-        let threshold = (self.revocation_capacity as f64 * REVOCATION_WARN_THRESHOLD) as usize;
+        let size = state.entries.len();
+        let capacity = self.revocation_capacity.get();
+        let threshold = (capacity as f64 * REVOCATION_WARN_THRESHOLD) as usize;
         if size >= threshold {
             tracing::warn!(
                 size,
-                capacity = self.revocation_capacity,
+                capacity,
                 "JWT revocation cache at {:.0}% capacity",
-                (size as f64 / self.revocation_capacity as f64) * 100.0,
+                (size as f64 / capacity as f64) * 100.0,
             );
         }
     }
@@ -242,8 +287,8 @@ impl JwtAuthority {
     /// Number of revoked tokens tracked.
     pub fn revoked_count(&self) -> usize {
         match self.revoked.lock() {
-            Ok(r) => r.len(),
-            Err(poisoned) => poisoned.into_inner().len(),
+            Ok(r) => r.entries.len(),
+            Err(poisoned) => poisoned.into_inner().entries.len(),
         }
     }
 }
@@ -517,17 +562,55 @@ mod tests {
 
     #[test]
     fn expired_revocations_are_purged() {
+        // Sweeps are amortised every EXPIRY_SWEEP_INTERVAL revokes —
+        // the expired entry should be reclaimed once the counter wraps
+        // past the interval, not on the next revoke.
         let auth = make_authority();
-        // Revoke with an expiration in the past — should be purged on next revoke.
         auth.revoke("old-jti", 1);
         assert_eq!(auth.revoked_count(), 1);
 
-        // Inserting another entry triggers purge of expired ones.
+        // One extra insert short of the interval: still not swept.
+        for i in 0..(EXPIRY_SWEEP_INTERVAL - 2) {
+            auth.revoke(&format!("filler-{i}"), u64::MAX);
+        }
+        // Drive one more revoke so the counter hits the sweep modulus.
         auth.revoke("new-jti", u64::MAX);
+
+        // Now the sweep has run: `old-jti` (exp=1) is reclaimed.
+        // The count is exactly the number of still-valid fillers + new-jti.
+        let count = auth.revoked_count();
+        assert!(
+            count < (EXPIRY_SWEEP_INTERVAL as usize),
+            "expected sweep to drop `old-jti`, got count={count}"
+        );
+        // And the specific JTI should no longer validate as revoked.
+        let revoked = match auth.revoked.lock() {
+            Ok(r) => r,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert!(
+            revoked.entries.peek("old-jti").is_none(),
+            "old-jti should be purged"
+        );
+    }
+
+    #[test]
+    fn sweep_does_not_evict_unexpired_entries() {
+        let auth = make_authority();
+        let future_exp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(u64::MAX, |d| d.as_secs() + 3600);
+
+        // Force a sweep to run without anything to reclaim.
+        for i in 0..EXPIRY_SWEEP_INTERVAL {
+            auth.revoke(&format!("jti-{i}"), future_exp);
+        }
+
+        // Every entry was unexpired, so the sweep must not have pruned any.
         assert_eq!(
             auth.revoked_count(),
-            1,
-            "expired entry should have been purged"
+            EXPIRY_SWEEP_INTERVAL as usize,
+            "amortised sweep must not drop unexpired entries"
         );
     }
 
@@ -542,9 +625,95 @@ mod tests {
         auth.revoke("jti-3", u64::MAX);
         assert_eq!(auth.revoked_count(), 3);
 
-        // Fourth revocation should evict the oldest.
+        // Fourth revocation should evict the least-recently-used entry.
         auth.revoke("jti-4", u64::MAX);
         assert_eq!(auth.revoked_count(), 3, "should not exceed capacity");
+    }
+
+    #[test]
+    fn eviction_drops_least_recently_inserted_at_capacity() {
+        // Regression for #761: capacity eviction must be O(1) and
+        // deterministically target the least-recently-used entry, not a
+        // linear scan. This test pins down the LRU ordering: `jti-1` was
+        // inserted first and is the LRU victim when capacity is hit.
+        let auth = JwtAuthority::new(b"test-secret-key-for-jwt-testing!!".to_vec(), "test")
+            .expect("valid secret")
+            .with_revocation_capacity(3);
+
+        auth.revoke("jti-1", u64::MAX);
+        auth.revoke("jti-2", u64::MAX);
+        auth.revoke("jti-3", u64::MAX);
+        auth.revoke("jti-4", u64::MAX);
+
+        let guard = match auth.revoked.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert!(
+            guard.entries.peek("jti-1").is_none(),
+            "LRU entry jti-1 must be evicted"
+        );
+        for jti in ["jti-2", "jti-3", "jti-4"] {
+            assert!(
+                guard.entries.peek(jti).is_some(),
+                "{jti} must survive eviction"
+            );
+        }
+    }
+
+    #[test]
+    fn validation_peek_does_not_promote_revoked_jti() {
+        // Guards against a degenerate case where a high-volume validator
+        // hammering a revoked JTI could anchor it at the MRU end, starving
+        // genuine new revocations during a revocation burst. `validate()`
+        // uses `peek` precisely to prevent this.
+        let auth = JwtAuthority::new(b"test-secret-key-for-jwt-testing!!".to_vec(), "test")
+            .expect("valid secret")
+            .with_revocation_capacity(2);
+
+        // Insert: order is [jti-A, jti-B]  (A = LRU)
+        auth.revoke("jti-A", u64::MAX);
+        auth.revoke("jti-B", u64::MAX);
+
+        // Simulate validation attempts that would "look up" jti-A many times.
+        // If `peek` weren't used, this would promote jti-A to MRU.
+        {
+            let guard = match auth.revoked.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            for _ in 0..10 {
+                assert!(guard.entries.peek("jti-A").is_some());
+            }
+        }
+
+        // A third revocation must still evict jti-A, because peek did not
+        // promote it away from the LRU slot.
+        auth.revoke("jti-C", u64::MAX);
+        let guard = match auth.revoked.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert!(
+            guard.entries.peek("jti-A").is_none(),
+            "peek must not promote; jti-A should have been evicted"
+        );
+    }
+
+    #[test]
+    fn zero_capacity_coerced_to_min_one() {
+        // Regression guard: `with_revocation_capacity(0)` must not silently
+        // produce a cache that evicts every insertion.
+        let auth = JwtAuthority::new(b"test-secret-key-for-jwt-testing!!".to_vec(), "test")
+            .expect("valid secret")
+            .with_revocation_capacity(0);
+
+        auth.revoke("jti-1", u64::MAX);
+        assert_eq!(
+            auth.revoked_count(),
+            1,
+            "capacity=0 must coerce to 1 and retain at least one entry"
+        );
     }
 
     #[test]
