@@ -49,6 +49,7 @@ cedar = ["rustgate-authz/cedar"]
 http = ["dep:rustgate-http"]
 
 [dependencies]
+arc-swap = { workspace = true }
 rustgate-authz = { workspace = true }
 rustgate-core = { workspace = true }
 rustgate-cot = { workspace = true }

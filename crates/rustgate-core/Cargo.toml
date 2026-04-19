@@ -19,6 +19,7 @@ pem = ["dep:rustls", "dep:rustls-pki-types"]
 
 [dependencies]
 arbitrary = { workspace = true, optional = true }
+arc-swap = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
 rustls = { workspace = true, optional = true }

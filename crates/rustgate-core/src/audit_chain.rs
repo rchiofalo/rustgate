@@ -30,8 +30,10 @@
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use sha2::{Digest, Sha256};
 
 /// Genesis previous-hash value: 64 zero hex characters.
@@ -74,6 +76,12 @@ pub struct HashChainWriter<W: Write> {
     buf: Vec<u8>,
     prev: String,
     line_number: usize,
+    /// Optional external observer of the current chain tip. Updated atomically
+    /// on every chain advance so a shutdown path can snapshot the latest tip
+    /// without needing access to the writer itself — the writer typically
+    /// lives inside a `Mutex<Box<dyn Write>>` that the tracing subscriber
+    /// owns. See [`HashChainWriter::with_tip_observer`] and [`write_anchor`].
+    tip_observer: Option<Arc<ArcSwap<String>>>,
 }
 
 impl<W: Write> HashChainWriter<W> {
@@ -86,7 +94,20 @@ impl<W: Write> HashChainWriter<W> {
             buf: Vec::with_capacity(1024),
             prev,
             line_number: 0,
+            tip_observer: None,
         }
+    }
+
+    /// Attach an [`ArcSwap`] that the writer will update on every chain
+    /// advance. The observer always contains the last `sha256` written (or
+    /// the initial `prev` until the first record lands), so a shutdown hook
+    /// can read it without reaching into the tracing subscriber to find the
+    /// writer behind its mutex. `observer` is seeded with the current tip on
+    /// attachment so no separate priming step is required.
+    pub fn with_tip_observer(mut self, observer: Arc<ArcSwap<String>>) -> Self {
+        observer.store(Arc::new(self.prev.clone()));
+        self.tip_observer = Some(observer);
+        self
     }
 
     /// Return the current chain tip (last `sha256` written, or the initial
@@ -143,6 +164,9 @@ impl<W: Write> HashChainWriter<W> {
         self.inner.write_all(&out)?;
         self.inner.write_all(b"\n")?;
         self.prev = digest;
+        if let Some(ref observer) = self.tip_observer {
+            observer.store(Arc::new(self.prev.clone()));
+        }
         Ok(())
     }
 }
@@ -358,19 +382,105 @@ pub fn read_chain_tip(path: &Path) -> io::Result<String> {
     }
 }
 
+/// Compute the anchor-file path for a given audit-log path. Kept as a
+/// standalone helper so every caller (writer, reader, continuity checker)
+/// agrees on the naming convention.
+pub fn anchor_path(audit_path: &Path) -> PathBuf {
+    let mut anchor = audit_path.as_os_str().to_os_string();
+    anchor.push(".anchor");
+    PathBuf::from(anchor)
+}
+
 /// Write `tip` to `<path>.anchor` so external systems can pin the chain on
 /// rotation. The anchor file is currently unsigned; signing can be layered on
 /// top later without changing the on-disk format of the chain itself.
 pub fn write_anchor(audit_path: &Path, tip: &str) -> io::Result<()> {
-    let mut anchor = audit_path.as_os_str().to_os_string();
-    anchor.push(".anchor");
+    let target = anchor_path(audit_path);
     let mut f = OpenOptions::new()
         .create(true)
         .truncate(true)
         .write(true)
-        .open(Path::new(&anchor))?;
+        .open(&target)?;
     writeln!(f, "{tip}")?;
     f.flush()
+}
+
+/// Read a previously-persisted chain tip from `<path>.anchor`. Returns
+/// `Ok(None)` when no anchor exists (fresh install, or audit log enabled for
+/// the first time), `Ok(Some(tip))` on success, and an I/O error on any
+/// other failure. The on-disk format is a single hex string followed by
+/// optional whitespace; surrounding whitespace is trimmed. A non-64-char or
+/// non-hex payload is rejected with [`io::ErrorKind::InvalidData`] so a
+/// hand-edited or truncated anchor cannot masquerade as a valid tip.
+pub fn read_anchor(audit_path: &Path) -> io::Result<Option<String>> {
+    let target = anchor_path(audit_path);
+    let bytes = match std::fs::read(&target) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let s = std::str::from_utf8(&bytes)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.len() != 64 || !trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "audit log anchor file does not contain a 64-char hex SHA-256",
+        ));
+    }
+    Ok(Some(trimmed.to_ascii_lowercase()))
+}
+
+/// Outcome of comparing a persisted anchor tip with the live chain tip
+/// recovered from the audit log on disk. Used by startup logic to decide
+/// whether the chain continued across the last shutdown or whether the log
+/// was tampered with, rotated without carrying the anchor forward, or
+/// truncated.
+///
+/// See [`check_chain_continuity`] for the comparison.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainContinuity {
+    /// No anchor file exists yet. Happens on fresh installs and on the
+    /// first startup after the audit-log feature is enabled. Callers
+    /// should treat this as benign but persist the anchor on the next
+    /// graceful shutdown so subsequent starts can detect tampering.
+    NoAnchor,
+    /// Anchor matches the current live tip. Chain is continuous across
+    /// the last shutdown.
+    Match { tip: String },
+    /// Anchor does not match the current live tip. Either the audit log
+    /// was tampered with (rewritten, truncated, or replaced) while the
+    /// process was down, or the log was rotated without carrying the
+    /// anchor forward. Callers should refuse to start by default and
+    /// require an explicit operator opt-in (e.g.
+    /// `--audit-allow-chain-break`) to continue.
+    Mismatch {
+        anchor_tip: String,
+        live_tip: String,
+    },
+}
+
+/// Compare the persisted anchor tip (from `<path>.anchor`) with the live
+/// tip recovered from the audit log itself. Returns a [`ChainContinuity`]
+/// verdict without side effects — the caller owns the policy decision.
+pub fn check_chain_continuity(audit_path: &Path) -> io::Result<ChainContinuity> {
+    let live_tip = read_chain_tip(audit_path)?;
+    match read_anchor(audit_path)? {
+        None => Ok(ChainContinuity::NoAnchor),
+        Some(anchor_tip) => {
+            if anchor_tip == live_tip {
+                Ok(ChainContinuity::Match { tip: live_tip })
+            } else {
+                Ok(ChainContinuity::Mismatch {
+                    anchor_tip,
+                    live_tip,
+                })
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -547,5 +657,199 @@ mod tests {
         std::fs::write(f.path(), b"{\"event\":\"a\"}\n").unwrap();
         let err = read_chain_tip(f.path()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn tip_observer_reflects_chain_advance() {
+        let f = NamedTempFile::new().unwrap();
+        let observer = Arc::new(ArcSwap::from_pointee(GENESIS_PREV.to_string()));
+
+        // Seed + first record advance.
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(f.path())
+            .unwrap();
+        let mut w = HashChainWriter::new(file, GENESIS_PREV.to_string())
+            .with_tip_observer(Arc::clone(&observer));
+        assert_eq!(&**observer.load(), GENESIS_PREV);
+
+        w.write_all(br#"{"event":"a"}"#).unwrap();
+        w.write_all(b"\n").unwrap();
+        w.flush().unwrap();
+
+        let after_first: String = (**observer.load()).clone();
+        assert_ne!(after_first, GENESIS_PREV);
+
+        w.write_all(br#"{"event":"b"}"#).unwrap();
+        w.write_all(b"\n").unwrap();
+        w.flush().unwrap();
+
+        let after_second: String = (**observer.load()).clone();
+        assert_ne!(after_second, after_first);
+        // Observer must expose the authoritative writer tip.
+        assert_eq!(after_second, w.tip());
+    }
+
+    #[test]
+    fn read_anchor_returns_none_when_missing() {
+        let f = NamedTempFile::new().unwrap();
+        assert!(read_anchor(f.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn read_anchor_round_trips_write_anchor() {
+        let f = NamedTempFile::new().unwrap();
+        write_records(f.path(), &[r#"{"event":"a"}"#]);
+        let tip = read_chain_tip(f.path()).unwrap();
+        write_anchor(f.path(), &tip).unwrap();
+
+        let back = read_anchor(f.path()).unwrap();
+        assert_eq!(back.as_deref(), Some(tip.as_str()));
+
+        let _ = std::fs::remove_file(anchor_path(f.path()));
+    }
+
+    #[test]
+    fn read_anchor_rejects_malformed_payload() {
+        let f = NamedTempFile::new().unwrap();
+        let anchor = anchor_path(f.path());
+        std::fs::write(&anchor, b"not-a-hex-sha256\n").unwrap();
+        let err = read_anchor(f.path()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_file(&anchor);
+    }
+
+    #[test]
+    fn read_anchor_rejects_wrong_length_payload() {
+        let f = NamedTempFile::new().unwrap();
+        let anchor = anchor_path(f.path());
+        // 32 hex chars (128-bit), not the 64 chars (256-bit) a valid SHA-256 tip produces.
+        std::fs::write(&anchor, b"0123456789abcdef0123456789abcdef\n").unwrap();
+        let err = read_anchor(f.path()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_file(&anchor);
+    }
+
+    #[test]
+    fn read_anchor_treats_whitespace_only_as_missing() {
+        let f = NamedTempFile::new().unwrap();
+        let anchor = anchor_path(f.path());
+        std::fs::write(&anchor, b"   \n\n").unwrap();
+        assert!(read_anchor(f.path()).unwrap().is_none());
+        let _ = std::fs::remove_file(&anchor);
+    }
+
+    #[test]
+    fn check_chain_continuity_no_anchor_when_none_persisted() {
+        let f = NamedTempFile::new().unwrap();
+        write_records(f.path(), &[r#"{"event":"a"}"#]);
+        let verdict = check_chain_continuity(f.path()).unwrap();
+        assert!(matches!(verdict, ChainContinuity::NoAnchor));
+    }
+
+    #[test]
+    fn check_chain_continuity_match_when_anchor_aligns_with_live_tip() {
+        let f = NamedTempFile::new().unwrap();
+        write_records(f.path(), &[r#"{"event":"a"}"#, r#"{"event":"b"}"#]);
+        let tip = read_chain_tip(f.path()).unwrap();
+        write_anchor(f.path(), &tip).unwrap();
+
+        let verdict = check_chain_continuity(f.path()).unwrap();
+        match verdict {
+            ChainContinuity::Match { tip: got } => assert_eq!(got, tip),
+            other => panic!("expected Match, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(anchor_path(f.path()));
+    }
+
+    #[test]
+    fn check_chain_continuity_mismatch_detects_post_anchor_truncation() {
+        // Attack model: attacker truncates the tail of the audit log after
+        // the operator persisted an anchor. The live tip now reflects the
+        // earlier state, but the anchor still names the authoritative tip.
+        let f = NamedTempFile::new().unwrap();
+        write_records(
+            f.path(),
+            &[r#"{"event":"a"}"#, r#"{"event":"b"}"#, r#"{"event":"c"}"#],
+        );
+        let real_tip = read_chain_tip(f.path()).unwrap();
+        write_anchor(f.path(), &real_tip).unwrap();
+
+        // Simulate truncation: drop the last record.
+        let contents = std::fs::read_to_string(f.path()).unwrap();
+        let mut lines: Vec<&str> = contents.lines().collect();
+        let _ = lines.pop();
+        let truncated = lines.join("\n") + "\n";
+        std::fs::write(f.path(), truncated).unwrap();
+
+        let live_after_truncate = read_chain_tip(f.path()).unwrap();
+        assert_ne!(live_after_truncate, real_tip);
+
+        let verdict = check_chain_continuity(f.path()).unwrap();
+        match verdict {
+            ChainContinuity::Mismatch {
+                anchor_tip,
+                live_tip,
+            } => {
+                assert_eq!(anchor_tip, real_tip);
+                assert_eq!(live_tip, live_after_truncate);
+            }
+            other => panic!("expected Mismatch, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(anchor_path(f.path()));
+    }
+
+    #[test]
+    fn check_chain_continuity_no_anchor_when_audit_log_missing() {
+        // Fresh install: neither log nor anchor. Must be benign so the
+        // first startup is not blocked.
+        let dir = tempfile::tempdir().unwrap();
+        let audit = dir.path().join("audit.jsonl");
+        assert!(!audit.exists());
+        let verdict = check_chain_continuity(&audit).unwrap();
+        assert!(matches!(verdict, ChainContinuity::NoAnchor));
+    }
+
+    #[test]
+    fn observer_plus_anchor_matches_live_tip_end_to_end() {
+        // Models the full production lifecycle used by rustgate-server:
+        //   1. HashChainWriter is constructed with an external tip observer.
+        //   2. Records are written during the server's lifetime.
+        //   3. On shutdown the observer is snapshotted to persist an anchor.
+        //   4. On next startup, check_chain_continuity confirms the live tip
+        //      matches the persisted anchor (no tampering between boots).
+        let f = NamedTempFile::new().unwrap();
+        let observer = Arc::new(ArcSwap::from_pointee(GENESIS_PREV.to_string()));
+        {
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(f.path())
+                .unwrap();
+            let mut w = HashChainWriter::new(file, GENESIS_PREV.to_string())
+                .with_tip_observer(Arc::clone(&observer));
+            for rec in [r#"{"event":"a"}"#, r#"{"event":"b"}"#, r#"{"event":"c"}"#] {
+                w.write_all(rec.as_bytes()).unwrap();
+                w.write_all(b"\n").unwrap();
+            }
+            w.flush().unwrap();
+        }
+        // Simulate shutdown: snapshot observer → write anchor.
+        let final_tip: String = (**observer.load()).clone();
+        write_anchor(f.path(), &final_tip).unwrap();
+        // Simulate next startup: continuity check reads both live log and anchor.
+        let verdict = check_chain_continuity(f.path()).unwrap();
+        match verdict {
+            ChainContinuity::Match { tip } => assert_eq!(tip, final_tip),
+            other => panic!("expected Match, got {other:?}"),
+        }
+        // Full-chain verification must agree on the same tip and record count.
+        let report = verify_audit_log(f.path()).unwrap();
+        assert_eq!(report.tip, final_tip);
+        assert_eq!(report.records, 3);
+        let _ = std::fs::remove_file(anchor_path(f.path()));
     }
 }

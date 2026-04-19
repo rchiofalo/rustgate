@@ -990,6 +990,26 @@ pub(crate) struct Cli {
     #[arg(long, env = "RUSTGATE_AUDIT_LOG")]
     pub(crate) audit_log: Option<String>,
 
+    /// Override the fail-closed continuity check that compares the persisted
+    /// anchor (`<audit-log>.anchor`) with the live chain tip at startup. When
+    /// the two disagree — which happens after log rotation without carrying
+    /// the anchor forward, after a disk restore from backup, or after an
+    /// attacker truncates the audit log — the server refuses to start by
+    /// default and emits an `audit.chain_discontinuity` record. Setting this
+    /// flag demotes the refusal to a warning so the new process can continue
+    /// from the current (live) tip. Only use this after manually verifying
+    /// the audit log is intact; the `audit.chain_discontinuity` record is
+    /// still emitted so the operational skip is preserved in the audit
+    /// trail. Has no effect when the audit log is `"-"` (stdout) or when
+    /// an archive key file is configured (encrypted audit logs do not
+    /// support tip recovery).
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "RUSTGATE_AUDIT_ALLOW_CHAIN_BREAK"
+    )]
+    pub(crate) audit_allow_chain_break: bool,
+
     /// Write per-message access events as JSON lines to a dedicated
     /// file. When set, every routed message produces one access-log
     /// entry (target="access") with src_cn, dst, msg_uid, size, and
@@ -1402,6 +1422,7 @@ define_config_file! {
     archive_rotate_interval: u64,
     package_max_age_hours: u64,
     audit_log: Option<String>,
+    audit_allow_chain_break: bool,
     access_log: Option<String>,
     client_queue_dir: Option<std::path::PathBuf>,
     client_queue_max_bytes: u64,
@@ -1848,6 +1869,31 @@ mod tests {
         ])
         .expect("should parse");
         assert_eq!(cli.audit_log.as_deref(), Some("-"));
+    }
+
+    #[test]
+    fn cli_audit_allow_chain_break_defaults_false() {
+        let cli = Cli::try_parse_from([
+            "rustgate", "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
+        ])
+        .expect("should parse");
+        assert!(!cli.audit_allow_chain_break);
+    }
+
+    #[test]
+    fn cli_audit_allow_chain_break_opt_in() {
+        let cli = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--audit-allow-chain-break",
+        ])
+        .expect("should parse");
+        assert!(cli.audit_allow_chain_break);
     }
 
     // ── build_codec tests ──────────────────────────────────────────
