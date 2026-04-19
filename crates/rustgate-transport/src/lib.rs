@@ -39,7 +39,9 @@ pub use cert_reloader::CertReloader;
 #[cfg(feature = "ocsp")]
 pub use client_ocsp::OcspStaplerFetcher;
 pub use client_ocsp::{ClientOcspVerifier, FetchFuture, OcspFetcher, OnCacheHit, OnCacheMiss};
-pub use codec::{FramedCodec, LengthPrefixedCodec, LineDelimitedCodec, XmlStreamCodec};
+pub use codec::{
+    FramedCodec, FramedCodecError, LengthPrefixedCodec, LineDelimitedCodec, XmlStreamCodec,
+};
 pub use codecs::{RawLengthPrefixedCodec, RawLineCodec, TakXmlCodec};
 #[cfg(feature = "fips")]
 pub use config::install_fips_provider;

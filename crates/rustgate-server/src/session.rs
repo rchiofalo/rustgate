@@ -408,7 +408,7 @@ async fn read_loop(
     ctx: &SessionContext<'_, impl NatsPublish>,
     prefix: tokio_util::bytes::BytesMut,
 ) -> std::io::Result<()> {
-    let framed_codec = FramedCodec::from_strategy(&ctx.codec.framing());
+    let framed_codec = FramedCodec::try_from_strategy(&ctx.codec.framing())?;
 
     // When negotiation consumed a peek byte and fell back to XML,
     // we need to feed that byte to the codec before reading from the socket.
@@ -539,7 +539,7 @@ async fn write_loop(
     mut delta_encoder: Option<DeltaEncoder>,
     #[cfg(feature = "metrics")] bucket: String,
 ) -> std::io::Result<()> {
-    let mut framed = FramedWrite::new(writer, FramedCodec::from_strategy(&codec.framing()));
+    let mut framed = FramedWrite::new(writer, FramedCodec::try_from_strategy(&codec.framing())?);
 
     let mut priority_open = true;
     let mut normal_open = true;
@@ -877,11 +877,11 @@ async fn run_plaintext_session_loops<P: NatsPublish>(
     } else {
         None
     };
-    let framed_codec = FramedCodec::from_strategy(&codec.framing());
+    let framed_codec = FramedCodec::try_from_strategy(&codec.framing())?;
     let mut framed_read = FramedRead::new(reader, framed_codec);
     let mut msg_builder = MessageBuilder::new();
 
-    let write_framed_codec = FramedCodec::from_strategy(&codec.framing());
+    let write_framed_codec = FramedCodec::try_from_strategy(&codec.framing())?;
     let mut framed_write = FramedWrite::new(writer, write_framed_codec);
 
     tokio::select! {

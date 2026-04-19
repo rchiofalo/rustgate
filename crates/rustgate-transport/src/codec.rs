@@ -25,9 +25,53 @@ pub enum FramedCodec {
     Mavlink(rustgate_mavlink::MavlinkFrameCodec),
 }
 
+/// Reasons [`FramedCodec::try_from_strategy`] can fail.
+///
+/// The only failure mode today is a request for a strategy whose crate
+/// feature is not enabled in the current build. Startup validation in
+/// `rustgate-server` is expected to reject those configurations early,
+/// so in practice the error path is hit only if a SIGHUP-reloaded
+/// config or a logic bug lets an unsupported strategy reach the
+/// session pipeline. Returning an error instead of panicking keeps the
+/// process alive and lets the caller respond with a structured close
+/// — important under `panic = "abort"` release profiles where a
+/// panic would take down every in-flight connection.
+#[derive(Debug, thiserror::Error)]
+pub enum FramedCodecError {
+    /// The requested framing strategy is not available in this build
+    /// because its cargo feature is disabled. The field is the feature
+    /// name, e.g. `"proto"` or `"mavlink"`.
+    #[error(
+        "framing strategy not available in this build: missing cargo feature `{feature}`; \
+         rebuild with `--features {feature}` or reconfigure the listener"
+    )]
+    FeatureNotEnabled {
+        /// The cargo feature name the strategy requires.
+        feature: &'static str,
+    },
+}
+
+impl From<FramedCodecError> for io::Error {
+    fn from(err: FramedCodecError) -> Self {
+        // `InvalidInput` is the correct kind for "configuration requests
+        // something we do not support" — the data on the wire is fine,
+        // the caller handed us an unsupported selector.
+        io::Error::new(io::ErrorKind::InvalidInput, err.to_string())
+    }
+}
+
 impl FramedCodec {
-    pub fn from_strategy(strategy: &FramingStrategy) -> Self {
-        match strategy {
+    /// Construct a codec for the given framing strategy, returning
+    /// `Err(FramedCodecError::FeatureNotEnabled { .. })` if the
+    /// strategy requires a crate feature that was not built in.
+    ///
+    /// This replaces the pre-#750 infallible `from_strategy` that
+    /// used `unreachable!()` on the disabled-feature branch — which,
+    /// with the workspace-wide `panic = "abort"` release profile,
+    /// would have aborted the process if a mis-routed SIGHUP reload
+    /// ever pointed a listener at a disabled codec.
+    pub fn try_from_strategy(strategy: &FramingStrategy) -> Result<Self, FramedCodecError> {
+        Ok(match strategy {
             FramingStrategy::LengthPrefixed { header_size } => {
                 Self::LengthPrefixed(LengthPrefixedCodec::new(*header_size))
             }
@@ -37,23 +81,15 @@ impl FramedCodec {
             FramingStrategy::TakProtobuf => Self::TakProtobuf(rustgate_proto::TakFrameCodec::new()),
             #[cfg(not(feature = "proto"))]
             FramingStrategy::TakProtobuf => {
-                // Startup validation in main.rs rejects this configuration early.
-                // If we reach here, it indicates a logic error in the caller.
-                unreachable!("TakProtobuf framing requires building with --features proto")
+                return Err(FramedCodecError::FeatureNotEnabled { feature: "proto" });
             }
             #[cfg(feature = "mavlink")]
             FramingStrategy::Mavlink => Self::Mavlink(rustgate_mavlink::MavlinkFrameCodec::new()),
             #[cfg(not(feature = "mavlink"))]
             FramingStrategy::Mavlink => {
-                // Startup validation in main.rs rejects this configuration early.
-                // MAVLink sessions use a dedicated UDP listener (see the
-                // parent epic's PR 2) rather than the generic TLS/TCP
-                // session pipeline, so reaching this branch in practice
-                // means a codec selector was pointed at an endpoint that
-                // does not speak MAVLink.
-                unreachable!("Mavlink framing requires building with --features mavlink")
+                return Err(FramedCodecError::FeatureNotEnabled { feature: "mavlink" });
             }
-        }
+        })
     }
 }
 
@@ -739,5 +775,74 @@ mod tests {
             .expect("decode should succeed")
             .expect("should produce a frame");
         assert!(frame.is_empty());
+    }
+
+    // ── FramedCodec::try_from_strategy ──────────────────────────────
+
+    /// Strategies that do not depend on a cargo feature must always
+    /// construct successfully, regardless of how the crate was built.
+    #[test]
+    fn try_from_strategy_always_available_variants_succeed() {
+        for strategy in [
+            FramingStrategy::LengthPrefixed {
+                header_size: HeaderSize::One,
+            },
+            FramingStrategy::LengthPrefixed {
+                header_size: HeaderSize::Two,
+            },
+            FramingStrategy::LengthPrefixed {
+                header_size: HeaderSize::Four,
+            },
+            FramingStrategy::XmlStream,
+            FramingStrategy::LineDelimited,
+        ] {
+            assert!(
+                FramedCodec::try_from_strategy(&strategy).is_ok(),
+                "unconditional strategy {strategy:?} must always construct"
+            );
+        }
+    }
+
+    /// When built without the `proto` feature, asking for the TAK
+    /// protobuf strategy returns `FeatureNotEnabled { feature: "proto" }`
+    /// rather than panicking / aborting (release profile is `panic = "abort"`).
+    #[cfg(not(feature = "proto"))]
+    #[test]
+    fn try_from_strategy_rejects_protobuf_without_feature() {
+        let err = FramedCodec::try_from_strategy(&FramingStrategy::TakProtobuf)
+            .expect_err("TakProtobuf without `proto` feature must be a structured error");
+        match err {
+            FramedCodecError::FeatureNotEnabled { feature } => {
+                assert_eq!(feature, "proto");
+            }
+        }
+    }
+
+    /// When built without the `mavlink` feature, asking for the
+    /// MAVLink strategy returns `FeatureNotEnabled { feature: "mavlink" }`.
+    #[cfg(not(feature = "mavlink"))]
+    #[test]
+    fn try_from_strategy_rejects_mavlink_without_feature() {
+        let err = FramedCodec::try_from_strategy(&FramingStrategy::Mavlink)
+            .expect_err("Mavlink without `mavlink` feature must be a structured error");
+        match err {
+            FramedCodecError::FeatureNotEnabled { feature } => {
+                assert_eq!(feature, "mavlink");
+            }
+        }
+    }
+
+    /// `FramedCodecError` converts into `io::Error` with
+    /// `ErrorKind::InvalidInput` so call sites can propagate via `?`.
+    #[test]
+    fn framed_codec_error_is_invalid_input_io_error() {
+        let err = FramedCodecError::FeatureNotEnabled { feature: "proto" };
+        let io_err: io::Error = err.into();
+        assert_eq!(io_err.kind(), io::ErrorKind::InvalidInput);
+        let rendered = io_err.to_string();
+        assert!(
+            rendered.contains("proto"),
+            "io::Error message must name the disabled feature, got: {rendered}"
+        );
     }
 }

@@ -137,7 +137,8 @@ impl Codec {
             Self::XmlStream => FramingStrategy::XmlStream,
             Self::LineDelimited => FramingStrategy::LineDelimited,
         };
-        rustgate_transport::FramedCodec::from_strategy(&strategy)
+        rustgate_transport::FramedCodec::try_from_strategy(&strategy)
+            .expect("rustgate-client Codec enum only exposes always-available strategies")
     }
 }
 
