@@ -882,6 +882,24 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = false, env = "RUSTGATE_AUTHZ_FAIL_OPEN")]
     pub(crate) authz_fail_open: bool,
 
+    /// Allow the router to continue delivery when the authz engine
+    /// returns an `Obligation` variant the transport build cannot
+    /// actuate (e.g. a deliberately skewed rolling upgrade where new
+    /// policy uses a future obligation the running binary does not
+    /// understand yet).
+    ///
+    /// Default (`false`) is fail-closed per issue #728: the outbound
+    /// copy is dropped and an audit record is emitted. Setting this
+    /// to `true` reverts to the legacy fail-open behaviour (apply
+    /// every known obligation, skip the unknown, continue delivery)
+    /// and is intended solely as a short-lived operational opt-out.
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "RUSTGATE_AUTHZ_ALLOW_UNKNOWN_OBLIGATIONS"
+    )]
+    pub(crate) authz_allow_unknown_obligations: bool,
+
     /// Path to a JSON file defining per-tenant connection quotas.
     ///
     /// When set, the server loads the quota configuration at startup and
@@ -1107,11 +1125,15 @@ pub(crate) enum AuthzPolicyFormat {
 
 /// MQTT SUBSCRIBE wildcard policy selector for the CLI / config file.
 ///
-/// Mirrors [`rustgate_mqtt::WildcardPolicy`] but is owned by the server
-/// crate so `rustgate-mqtt` does not need a clap dependency. The
-/// defaulting behaviour (`single-level-only`) matches the MQTT adapter's
-/// own default so operators who omit the flag get spec-conformant
-/// single-level (`+`) wildcards without the `#` firehose.
+/// Mirrors `rustgate_mqtt::WildcardPolicy` but is owned by the server
+/// crate so `rustgate-mqtt` does not need a clap dependency. A plain
+/// code reference is used instead of an intra-doc link because the
+/// `rustgate-mqtt` crate is an optional dependency that is absent from
+/// the default feature set used by `cargo doc --workspace --no-deps`
+/// on the docs-site build. The defaulting behaviour
+/// (`single-level-only`) matches the MQTT adapter's own default so
+/// operators who omit the flag get spec-conformant single-level (`+`)
+/// wildcards without the `#` firehose.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum MqttWildcardPolicy {
@@ -1351,6 +1373,7 @@ define_config_file! {
     authz_policy_format: AuthzPolicyFormat,
     authz_reload_interval: u64,
     authz_fail_open: bool,
+    authz_allow_unknown_obligations: bool,
     tenant_quota_file: Option<std::path::PathBuf>,
     acl_api_token_file: Option<String>,
     archive_dir: Option<String>,
