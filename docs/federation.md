@@ -298,6 +298,51 @@ deployment where every peer shares one identity authority and one
 operational team. Enabling this flag on a federation that spans
 multiple trust domains is insecure.
 
+### Cross-origin authz obligations (issue #719)
+
+The V2 wire protocol does **not** carry authz `Obligation` metadata. When an
+upstream peer's Send-PEP returns `MaskPoint`, `MaskPayload`, or any other
+data-plane obligation, the payload is mutated in place *before* forwarding
+(e.g. `<point>` coordinates zeroed for `MaskPoint`; body replaced with empty
+bytes for `MaskPayload`). The obligation list itself is discarded.
+
+On the receive side, the federation inbound handler builds a
+`RoutableMessage` with `source_protocol = "federation"` and hands it to
+the local router, which re-runs the full PEP chain:
+
+1. **Send-PEP** with subject = the federation peer's CN. This admits or
+   denies the message as a whole based on local policy applied to the
+   peer's identity (not the origin client's identity on the other side
+   of the federation).
+2. **Per-recipient Receive-PEP** with subject = each local recipient's CN.
+   Any obligations returned here are applied to a per-recipient copy of
+   the envelope via the same dispatcher used for locally-originated
+   traffic.
+
+**Obligations produced by the local Receive-PEP are always applied**,
+regardless of the message's upstream origin. Upstream obligations are
+advisory only — the local receiver MUST NOT trust them, because:
+
+- A less-strict upstream may deliver an unmasked payload, and the local
+  policy still gets to say "`MaskPoint` required for group Y on Receive".
+- A Byzantine upstream could otherwise elevate a message past local
+  policy by claiming it was already "properly handled upstream".
+- Bidirectional federation with asymmetric policies must not silently
+  degrade to the less-strict peer.
+
+This is the same defense-in-depth principle as `trust_peer_groups`:
+wire-claimed metadata is untrusted, local policy is authoritative. The
+guarantee is pinned by integration tests in
+`crates/rustgate-transport/tests/authz_routing.rs` (`federated_broadcast_*`).
+
+**Multicast caveat.** `Destination::Multicast` runs per-group Send-PEP
+and Receive-PEP inside `send_to_group_excluding`. Federated messages
+always arrive as `Destination::Broadcast` (the inbound handler never
+constructs a multicast destination), so this caveat does not apply to
+federation — but operators building custom ingestion paths that route
+multicast should be aware that the top-level `route_for_egress` skips
+the multicast Send-PEP in favour of per-group evaluation further down.
+
 ### Hop-count limits
 
 Each event carries a `federate_hops.current_hops` counter incremented
