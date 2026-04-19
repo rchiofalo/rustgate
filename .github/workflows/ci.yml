@@ -19,12 +19,22 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_PROFILE_DEV_DEBUG: 0
   RUSTFLAGS: -Dwarnings
+  # Pinned nats-server release used by the `test` and `coverage` jobs.
+  # Bumping the version requires updating NATS_SERVER_SHA256 — check
+  # https://github.com/nats-io/nats-server/releases for the tarball checksum.
+  NATS_SERVER_VERSION: "2.10.24"
+  NATS_SERVER_SHA256: "ee6500f364e3a741b496ae0296c04f2a9d53bbaabac457104ac74596b4a59d85"
 
 jobs:
   commit-lint:
     if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
     runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@6c3c2f2c1c457b00c10c4848d6f5491db3b629df # v2.18.0
+        with:
+          egress-policy: audit
+
       - name: Validate PR title follows Conventional Commits
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
@@ -44,6 +54,11 @@ jobs:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@6c3c2f2c1c457b00c10c4848d6f5491db3b629df # v2.18.0
+        with:
+          egress-policy: audit
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
@@ -61,6 +76,11 @@ jobs:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@6c3c2f2c1c457b00c10c4848d6f5491db3b629df # v2.18.0
+        with:
+          egress-policy: audit
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
@@ -92,6 +112,11 @@ jobs:
     env:
       RUSTDOCFLAGS: -Dwarnings
     steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@6c3c2f2c1c457b00c10c4848d6f5491db3b629df # v2.18.0
+        with:
+          egress-policy: audit
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
@@ -117,6 +142,11 @@ jobs:
     needs: [lint, clippy]
     runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@6c3c2f2c1c457b00c10c4848d6f5491db3b629df # v2.18.0
+        with:
+          egress-policy: audit
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
@@ -145,6 +175,11 @@ jobs:
     needs: [lint, clippy]
     runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@6c3c2f2c1c457b00c10c4848d6f5491db3b629df # v2.18.0
+        with:
+          egress-policy: audit
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
@@ -161,17 +196,15 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: /usr/local/bin/nats-server
-          key: nats-server-v2.10.24-linux-amd64-ee6500f364e3a741b496ae0296c04f2a9d53bbaabac457104ac74596b4a59d85
+          key: nats-server-v${{ env.NATS_SERVER_VERSION }}-linux-amd64-${{ env.NATS_SERVER_SHA256 }}
 
       - name: Install nats-server
         if: steps.cache-nats.outputs.cache-hit != 'true'
-        env:
-          NATS_SHA256: ee6500f364e3a741b496ae0296c04f2a9d53bbaabac457104ac74596b4a59d85
         run: |
-          curl -fsSL https://github.com/nats-io/nats-server/releases/download/v2.10.24/nats-server-v2.10.24-linux-amd64.tar.gz -o /tmp/nats.tar.gz
-          echo "${NATS_SHA256}  /tmp/nats.tar.gz" | sha256sum -c -
+          curl -fsSL "https://github.com/nats-io/nats-server/releases/download/v${NATS_SERVER_VERSION}/nats-server-v${NATS_SERVER_VERSION}-linux-amd64.tar.gz" -o /tmp/nats.tar.gz
+          echo "${NATS_SERVER_SHA256}  /tmp/nats.tar.gz" | sha256sum -c -
           tar xzf /tmp/nats.tar.gz -C /tmp
-          sudo mv /tmp/nats-server-v2.10.24-linux-amd64/nats-server /usr/local/bin/
+          sudo mv "/tmp/nats-server-v${NATS_SERVER_VERSION}-linux-amd64/nats-server" /usr/local/bin/
 
       - name: Verify nats-server
         run: nats-server --version
@@ -195,6 +228,11 @@ jobs:
     needs: [lint, clippy]
     runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@6c3c2f2c1c457b00c10c4848d6f5491db3b629df # v2.18.0
+        with:
+          egress-policy: audit
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
@@ -211,17 +249,15 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: /usr/local/bin/nats-server
-          key: nats-server-v2.10.24-linux-amd64-ee6500f364e3a741b496ae0296c04f2a9d53bbaabac457104ac74596b4a59d85
+          key: nats-server-v${{ env.NATS_SERVER_VERSION }}-linux-amd64-${{ env.NATS_SERVER_SHA256 }}
 
       - name: Install nats-server
         if: steps.cache-nats.outputs.cache-hit != 'true'
-        env:
-          NATS_SHA256: ee6500f364e3a741b496ae0296c04f2a9d53bbaabac457104ac74596b4a59d85
         run: |
-          curl -fsSL https://github.com/nats-io/nats-server/releases/download/v2.10.24/nats-server-v2.10.24-linux-amd64.tar.gz -o /tmp/nats.tar.gz
-          echo "${NATS_SHA256}  /tmp/nats.tar.gz" | sha256sum -c -
+          curl -fsSL "https://github.com/nats-io/nats-server/releases/download/v${NATS_SERVER_VERSION}/nats-server-v${NATS_SERVER_VERSION}-linux-amd64.tar.gz" -o /tmp/nats.tar.gz
+          echo "${NATS_SERVER_SHA256}  /tmp/nats.tar.gz" | sha256sum -c -
           tar xzf /tmp/nats.tar.gz -C /tmp
-          sudo mv /tmp/nats-server-v2.10.24-linux-amd64/nats-server /usr/local/bin/
+          sudo mv "/tmp/nats-server-v${NATS_SERVER_VERSION}-linux-amd64/nats-server" /usr/local/bin/
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
@@ -257,6 +293,11 @@ jobs:
             run_tests: false # cannot run aarch64 binaries on x86 runner
 
     steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@6c3c2f2c1c457b00c10c4848d6f5491db3b629df # v2.18.0
+        with:
+          egress-policy: audit
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
@@ -304,6 +345,11 @@ jobs:
     runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
 
     steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@6c3c2f2c1c457b00c10c4848d6f5491db3b629df # v2.18.0
+        with:
+          egress-policy: audit
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
@@ -379,6 +425,11 @@ jobs:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@6c3c2f2c1c457b00c10c4848d6f5491db3b629df # v2.18.0
+        with:
+          egress-policy: audit
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
@@ -404,6 +455,11 @@ jobs:
       contents: read
       pull-requests: read
     steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@6c3c2f2c1c457b00c10c4848d6f5491db3b629df # v2.18.0
+        with:
+          egress-policy: audit
+
       # dorny/paths-filter uses the GitHub API on pull_request events, but
       # shells out to `git` for push events. With `persist-credentials:
       # false` (our workspace-wide hardening), a shallow clone leaves the
