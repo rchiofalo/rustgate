@@ -61,7 +61,22 @@ fn pq_provider_reports_active() {
 }
 
 /// Verify the installed PQ provider includes X25519MLKEM768 in its
-/// key exchange groups.
+/// key exchange groups and at least one classical group for fallback
+/// to legacy peers that do not speak a hybrid.
+///
+/// The "classical" set varies by backend feature combination:
+///   * `post-quantum` alone (non-FIPS) — `aws_lc_rs::default_provider()`
+///     exposes `X25519` plus the NIST curves.
+///   * `post-quantum + fips` — the provider is restricted to
+///     FIPS-approved groups, which excludes `X25519` but retains
+///     `secp256r1` / `secp384r1` as classical fallbacks.
+///
+/// The invariant we care about is "hybrid PQ is offered *and* at
+/// least one classical group remains negotiable" — not the exact
+/// identity of the classical group. Asserting the specific name
+/// breaks the moment FIPS is added to the build, which is what
+/// issue #957 observed (misreported as a race — it is actually a
+/// deterministic feature-combination mismatch).
 #[test]
 fn pq_provider_includes_mlkem_groups() {
     ensure_pq();
@@ -75,10 +90,23 @@ fn pq_provider_includes_mlkem_groups() {
         group_names.contains(&rustls::NamedGroup::X25519MLKEM768),
         "PQ provider must include X25519MLKEM768, got: {group_names:?}"
     );
-    // Classical groups must still be present for fallback
+    // At least one classical group must remain for fallback to
+    // non-PQ peers. Exact identity depends on whether FIPS is also
+    // enabled: non-FIPS has X25519, FIPS has secp256r1/secp384r1.
+    let has_classical_fallback = group_names.iter().any(|n| {
+        matches!(
+            n,
+            rustls::NamedGroup::X25519
+                | rustls::NamedGroup::secp256r1
+                | rustls::NamedGroup::secp384r1
+                | rustls::NamedGroup::secp521r1
+        )
+    });
     assert!(
-        group_names.contains(&rustls::NamedGroup::X25519),
-        "PQ provider must include X25519 for fallback, got: {group_names:?}"
+        has_classical_fallback,
+        "PQ provider must include at least one classical group (X25519, \
+         secp256r1, secp384r1, or secp521r1) for fallback, got: \
+         {group_names:?}"
     );
 }
 
@@ -253,8 +281,18 @@ async fn pq_with_crl_rejects_revoked() {
     );
 }
 
-/// When a client only supports classical key exchange (X25519 via ring),
-/// the PQ-enabled server must gracefully fall back to X25519.
+/// When a client only supports classical key exchange (ring), the
+/// PQ-enabled server must gracefully fall back to *some* classical
+/// group that both sides support.
+///
+/// In non-FIPS builds the server's PQ provider exposes X25519 and
+/// ring prefers it, so negotiation lands on X25519. In FIPS builds
+/// the server's group list is restricted to FIPS-approved options
+/// (no X25519), so both sides meet on `secp256r1` instead. Either
+/// outcome is a correct graceful fallback; asserting a specific
+/// group name is what regressed into a false failure under the
+/// CI feature combo `proto,fips,post-quantum,ocsp,spiffe` (see
+/// issue #957).
 #[tokio::test]
 async fn pq_classical_client_falls_back_to_x25519() {
     ensure_pq();
@@ -309,11 +347,23 @@ async fn pq_classical_client_falls_back_to_x25519() {
         .negotiated_key_exchange_group()
         .expect("should have negotiated a key exchange group");
 
-    assert_eq!(
-        kx_group.name(),
-        rustls::NamedGroup::X25519,
-        "classical-only client should negotiate X25519, got {:?}",
-        kx_group.name()
+    // The fallback group must be classical (the client has no PQ
+    // support), but we do not pin a specific name because FIPS mode
+    // drops X25519 from the server's advertised list and forces the
+    // pair onto a NIST curve instead. Any non-PQ group here is proof
+    // the PQ server gracefully fell back.
+    let negotiated = kx_group.name();
+    let is_classical_fallback = matches!(
+        negotiated,
+        rustls::NamedGroup::X25519
+            | rustls::NamedGroup::secp256r1
+            | rustls::NamedGroup::secp384r1
+            | rustls::NamedGroup::secp521r1
+    );
+    assert!(
+        is_classical_fallback,
+        "classical-only client should negotiate a classical (non-PQ) \
+         group (X25519 or secp256r1/secp384r1/secp521r1), got {negotiated:?}"
     );
 
     server_handle.abort();
