@@ -389,8 +389,147 @@ jobs:
       - name: Lint Helm chart
         run: helm lint helm/
 
-      - name: Validate template rendering with production values
-        run: helm template rustgate helm/ -f helm/values-production.yaml > /dev/null
+      - name: Render manifests with production values
+        run: |
+          mkdir -p /tmp/helm-render
+          helm template rustgate helm/ -f helm/values-production.yaml \
+            > /tmp/helm-render/rendered.yaml
+
+      - name: Validate rendered template is non-empty
+        run: test -s /tmp/helm-render/rendered.yaml
+
+      - name: Scan RBAC and ServiceAccount posture (least-privilege)
+        # Enforces the claims the helm chart makes about its own security
+        # posture. Fails the job on any of:
+        #   - wildcard verbs / resources / apiGroups / resourceNames in
+        #     Role or ClusterRole objects (RBAC least-privilege)
+        #   - Role/ClusterRole permissions targeting cluster-level
+        #     resources that are typically dangerous (secrets across all
+        #     namespaces, node objects, CRD management)
+        #   - ClusterRoleBinding whose subject is a `default` SA
+        #   - ServiceAccount objects that mount API tokens by default
+        #     (automountServiceAccountToken missing or true)
+        #   - PodSpec (Pod, Deployment, StatefulSet, DaemonSet, Job,
+        #     CronJob, ReplicaSet) that omits automountServiceAccountToken
+        #     without naming a non-default ServiceAccount
+        #
+        # Intentionally implemented as a pure-Python scanner rather than
+        # kubeaudit or polaris: kubeaudit is deprecated upstream (Oct 2024)
+        # and polaris pulls in a large Go binary for broader hardening
+        # checks that are out of scope for this PR. The checks below are
+        # the direct asks of issue #782 (RBAC least-privilege on the helm
+        # chart); broader pod-security hardening can be layered in a
+        # follow-up PR if desired.
+        run: |
+          python3 <<'PY'
+          import sys
+          import yaml
+
+          WORKLOAD_KINDS = {
+              "Pod", "Deployment", "StatefulSet", "DaemonSet",
+              "Job", "CronJob", "ReplicaSet",
+          }
+          RBAC_RULE_KINDS = {"Role", "ClusterRole"}
+          RBAC_BINDING_KINDS = {"RoleBinding", "ClusterRoleBinding"}
+
+          with open("/tmp/helm-render/rendered.yaml") as f:
+              docs = [d for d in yaml.safe_load_all(f) if isinstance(d, dict)]
+
+          violations = []
+          summary = {"rbac_rules": 0, "rbac_bindings": 0, "service_accounts": 0, "pod_specs": 0}
+
+          def pod_spec(doc):
+              """Return the PodSpec for a workload document, or None."""
+              kind = doc.get("kind", "")
+              if kind == "Pod":
+                  return doc.get("spec")
+              if kind == "CronJob":
+                  return (
+                      doc.get("spec", {})
+                         .get("jobTemplate", {})
+                         .get("spec", {})
+                         .get("template", {})
+                         .get("spec")
+                  )
+              if kind in WORKLOAD_KINDS:
+                  return (
+                      doc.get("spec", {})
+                         .get("template", {})
+                         .get("spec")
+                  )
+              return None
+
+          for doc in docs:
+              kind = doc.get("kind", "")
+              name = doc.get("metadata", {}).get("name", "?")
+              ref = f"{kind}/{name}"
+
+              # --- RBAC rule documents: reject wildcards and dangerous combos ---
+              if kind in RBAC_RULE_KINDS:
+                  summary["rbac_rules"] += 1
+                  for rule in doc.get("rules") or []:
+                      verbs = rule.get("verbs") or []
+                      resources = rule.get("resources") or []
+                      api_groups = rule.get("apiGroups") or []
+                      resource_names = rule.get("resourceNames") or []
+                      for field, values in (
+                          ("verbs", verbs),
+                          ("resources", resources),
+                          ("apiGroups", api_groups),
+                          ("resourceNames", resource_names),
+                      ):
+                          if "*" in values:
+                              violations.append(f"{ref}: wildcard in .rules[].{field}")
+                      # Dangerous cluster-scope combos even without wildcards
+                      if "secrets" in resources and "list" in verbs and kind == "ClusterRole":
+                          violations.append(f"{ref}: ClusterRole lists secrets cluster-wide")
+                      if "nodes" in resources and any(v in verbs for v in ("create", "delete", "patch", "update")):
+                          violations.append(f"{ref}: grants mutating verbs on nodes")
+                      if "customresourcedefinitions" in resources and any(v in verbs for v in ("create", "delete", "patch", "update")):
+                          violations.append(f"{ref}: grants CRD mutation")
+
+              # --- Binding documents: reject default-SA subjects ---
+              if kind in RBAC_BINDING_KINDS:
+                  summary["rbac_bindings"] += 1
+                  for subject in doc.get("subjects") or []:
+                      s_kind = subject.get("kind", "")
+                      s_name = subject.get("name", "")
+                      if s_kind == "ServiceAccount" and s_name == "default":
+                          violations.append(f"{ref}: binds to default ServiceAccount")
+
+              # --- ServiceAccount: must explicitly disable token automount ---
+              if kind == "ServiceAccount":
+                  summary["service_accounts"] += 1
+                  automount = doc.get("automountServiceAccountToken")
+                  if automount is not False:
+                      violations.append(
+                          f"{ref}: automountServiceAccountToken must be explicitly false "
+                          f"(got {automount!r})"
+                      )
+
+              # --- PodSpec: must either name a non-default SA or disable automount ---
+              spec = pod_spec(doc)
+              if spec is not None:
+                  summary["pod_specs"] += 1
+                  automount = spec.get("automountServiceAccountToken")
+                  sa_name = spec.get("serviceAccountName") or spec.get("serviceAccount")
+                  if automount is not False and (not sa_name or sa_name == "default"):
+                      violations.append(
+                          f"{ref}: PodSpec uses default SA without automountServiceAccountToken=false "
+                          f"(sa={sa_name!r}, automount={automount!r})"
+                      )
+
+          print("Helm RBAC/SA scan summary:")
+          for key, count in summary.items():
+              print(f"  {key}: {count}")
+
+          if violations:
+              print("\nRBAC/SA least-privilege violations:")
+              for v in violations:
+                  print(f"  - {v}")
+              sys.exit(1)
+          print("\nRBAC/SA check passed: no wildcard permissions or default-SA leaks.")
+          PY
 
   docker:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
