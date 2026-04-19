@@ -519,7 +519,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             Some(acl) => Router::with_acl(acl),
             None => Router::new(),
         })
-        .with_backpressure(Arc::clone(&backpressure_gate));
+        .with_backpressure(Arc::clone(&backpressure_gate))
+        // Issue #728: apply the unknown-obligation policy at
+        // construction time. Default (`false`) keeps the router in
+        // fail-closed mode; operators opt into fail-open via
+        // `--authz-allow-unknown-obligations` /
+        // `RUSTGATE_AUTHZ_ALLOW_UNKNOWN_OBLIGATIONS`.
+        .with_allow_unknown_obligations(cli.authz_allow_unknown_obligations);
         let base = match client_queue.as_ref() {
             Some(q) => base.with_client_queue(Arc::clone(q)),
             None => base,

@@ -46,7 +46,7 @@ use rustgate_authz::{
 };
 use smol_str::SmolStr;
 
-use crate::obligations::{apply_obligations, obligations_mutate_payload};
+use crate::obligations::{UnknownObligationPolicy, apply_obligations, obligations_mutate_payload};
 
 /// Callback invoked after every authz evaluation so operators can wire
 /// the engine into metrics and audit without making `rustgate-transport`
@@ -192,16 +192,30 @@ impl RoutedMessage {
     /// The backpressure permit is preserved across the rewrap so the
     /// global admission-control counter continues to reflect the
     /// message's lifetime.
-    pub(crate) fn with_obligations(&self, obligations: &[Obligation]) -> Self {
+    ///
+    /// # Unknown obligations
+    ///
+    /// `unknown_policy` is forwarded to [`apply_obligations`]. Under
+    /// [`UnknownObligationPolicy::FailClosed`] an unknown variant
+    /// produces [`crate::obligations::ObligationError::Unknown`] and
+    /// the caller must drop this delivery rather than fall back to
+    /// the unmutated payload — a stale transport against a newer
+    /// policy would otherwise silently deliver bytes the policy
+    /// author believed were being masked. See issue #728.
+    pub(crate) fn with_obligations(
+        &self,
+        obligations: &[Obligation],
+        unknown_policy: UnknownObligationPolicy,
+    ) -> Result<Self, crate::obligations::ObligationError> {
         if !obligations_mutate_payload(obligations) {
-            return self.clone();
+            return Ok(self.clone());
         }
         let mut msg = (*self.msg).clone();
-        apply_obligations(&mut msg, obligations);
-        Self {
+        apply_obligations(&mut msg, obligations, unknown_policy)?;
+        Ok(Self {
             msg: Arc::new(msg),
             _permit: self._permit.clone(),
-        }
+        })
     }
 }
 
@@ -665,6 +679,17 @@ pub struct Router {
     /// Optional per-tenant quota tracker. Hot-reloadable via `ArcSwap`.
     /// When `None`, no tenant-level connection limits are enforced.
     quota_tracker: ArcSwap<Option<Arc<crate::quota::TenantQuotaTracker>>>,
+    /// Policy for handling authz obligations this transport build
+    /// cannot actuate. Defaults to
+    /// [`UnknownObligationPolicy::FailClosed`] (issue #728). The
+    /// server CLI exposes an opt-out
+    /// (`--authz-allow-unknown-obligations`) that flips this to
+    /// [`UnknownObligationPolicy::SkipAndContinue`] for operators
+    /// who need to tolerate deliberate version skew during a rolling
+    /// upgrade. Plain `bool` (not `ArcSwap`) because this is a
+    /// deployment decision fixed at startup, not a runtime-reloadable
+    /// policy.
+    unknown_obligation_policy: UnknownObligationPolicy,
 }
 
 impl std::fmt::Debug for Router {
@@ -682,6 +707,7 @@ impl std::fmt::Debug for Router {
                 "quota_tracker_installed",
                 &(**self.quota_tracker.load()).is_some(),
             )
+            .field("unknown_obligation_policy", &self.unknown_obligation_policy)
             .finish()
     }
 }
@@ -699,6 +725,7 @@ impl Default for Router {
             dedup: ArcSwap::from_pointee(None),
             multicast_config: ArcSwap::from_pointee(None),
             quota_tracker: ArcSwap::from_pointee(None),
+            unknown_obligation_policy: UnknownObligationPolicy::default(),
         }
     }
 }
@@ -729,6 +756,7 @@ impl Router {
             dedup: ArcSwap::from_pointee(None),
             multicast_config: ArcSwap::from_pointee(None),
             quota_tracker: ArcSwap::from_pointee(None),
+            unknown_obligation_policy: UnknownObligationPolicy::default(),
         }
     }
 
@@ -765,6 +793,7 @@ impl Router {
             dedup: ArcSwap::from_pointee(None),
             multicast_config: ArcSwap::from_pointee(None),
             quota_tracker: ArcSwap::from_pointee(None),
+            unknown_obligation_policy: UnknownObligationPolicy::default(),
         }
     }
 
@@ -804,6 +833,7 @@ impl Router {
             dedup: ArcSwap::from_pointee(None),
             multicast_config: ArcSwap::from_pointee(None),
             quota_tracker: ArcSwap::from_pointee(None),
+            unknown_obligation_policy: UnknownObligationPolicy::default(),
         }
     }
 
@@ -977,6 +1007,32 @@ impl Router {
     /// Atomically replace the installed quota tracker.
     pub fn swap_quota_tracker(&self, tracker: Option<Arc<crate::quota::TenantQuotaTracker>>) {
         self.quota_tracker.store(Arc::new(tracker));
+    }
+
+    /// Override the router's [`UnknownObligationPolicy`] at
+    /// construction time.
+    ///
+    /// Defaults to [`UnknownObligationPolicy::FailClosed`] (issue
+    /// #728). Pass `true` to opt into the legacy
+    /// [`UnknownObligationPolicy::SkipAndContinue`] behaviour: known
+    /// obligations still run but an unknown variant is skipped with
+    /// an audit record and delivery continues. This is the correct
+    /// choice **only** when the operator has accepted the
+    /// consequences of deliberate version skew (e.g. a rolling
+    /// upgrade where new authz policy is deployed ahead of the
+    /// transport build).
+    pub fn with_allow_unknown_obligations(mut self, allow: bool) -> Self {
+        self.unknown_obligation_policy = if allow {
+            UnknownObligationPolicy::SkipAndContinue
+        } else {
+            UnknownObligationPolicy::FailClosed
+        };
+        self
+    }
+
+    /// Return the router's configured [`UnknownObligationPolicy`].
+    pub fn unknown_obligation_policy(&self) -> UnknownObligationPolicy {
+        self.unknown_obligation_policy
     }
 
     /// Snapshot the current quota tracker, if any.
@@ -1433,8 +1489,23 @@ impl Router {
         // are intentionally not emitted at Send time: the Receive PEP
         // knows the specific recipient and emits
         // `authz.classified_delivery` per delivered copy.
-        if !send_obligations.is_empty() {
-            apply_obligations(&mut msg, &send_obligations);
+        //
+        // On an unknown obligation variant under
+        // [`UnknownObligationPolicy::FailClosed`] (the default — see
+        // issue #728) `apply_obligations` returns Err and we drop the
+        // message entirely: no local sessions receive it and no
+        // egress forwarders are invoked. Preserving access logs as
+        // `authz_obligation_failed` keeps the forensic trail.
+        if !send_obligations.is_empty()
+            && let Err(e) =
+                apply_obligations(&mut msg, &send_obligations, self.unknown_obligation_policy)
+        {
+            debug!(
+                err = %e,
+                "send-side obligation actuation failed; dropping message"
+            );
+            emit_access(&msg, "authz_obligation_failed");
+            return None;
         }
 
         // Successful path: emit one access-log event per routed message.
@@ -1641,11 +1712,41 @@ impl Router {
                     // stack Receive obligations on the already-adjusted
                     // copy so per-recipient masking composes with
                     // sender-side policy.
-                    if !send_outcome.obligations.is_empty() {
-                        apply_obligations(&mut msg, &send_outcome.obligations);
+                    //
+                    // Fail-closed on unknown obligation (issue #728):
+                    // drop this drained record rather than deliver a
+                    // partially-mutated payload. The store-forward
+                    // queue is not re-updated — the message is simply
+                    // removed from the pending delivery set.
+                    if !send_outcome.obligations.is_empty()
+                        && let Err(e) = apply_obligations(
+                            &mut msg,
+                            &send_outcome.obligations,
+                            self.unknown_obligation_policy,
+                        )
+                    {
+                        debug!(
+                            err = %e,
+                            sender = %hash_cn(&msg.source.cn),
+                            recipient = %hash_cn(&recipient_identity.cn),
+                            "offline message filtered: send obligation actuation failed"
+                        );
+                        return None;
                     }
-                    if !recv_outcome.obligations.is_empty() {
-                        apply_obligations(&mut msg, &recv_outcome.obligations);
+                    if !recv_outcome.obligations.is_empty()
+                        && let Err(e) = apply_obligations(
+                            &mut msg,
+                            &recv_outcome.obligations,
+                            self.unknown_obligation_policy,
+                        )
+                    {
+                        debug!(
+                            err = %e,
+                            sender = %hash_cn(&msg.source.cn),
+                            recipient = %hash_cn(&recipient_identity.cn),
+                            "offline message filtered: receive obligation actuation failed"
+                        );
+                        return None;
                     }
 
                     // Build deferred-audit context ONLY when a
@@ -1784,8 +1885,22 @@ impl Router {
                     // replaying pre-deny coordinates.
                     continue;
                 }
-                if !send_outcome.obligations.is_empty() {
-                    apply_obligations(&mut msg, &send_outcome.obligations);
+                // Fail-closed on unknown obligation (issue #728):
+                // skip this cached position for this recipient
+                // rather than replay a partially-mutated payload.
+                if !send_outcome.obligations.is_empty()
+                    && let Err(e) = apply_obligations(
+                        &mut msg,
+                        &send_outcome.obligations,
+                        self.unknown_obligation_policy,
+                    )
+                {
+                    debug!(
+                        err = %e,
+                        session = %hash_cn(&handle.identity.cn),
+                        "position replay skipped: send obligation actuation failed"
+                    );
+                    continue;
                 }
 
                 let recipient_subject =
@@ -1799,8 +1914,19 @@ impl Router {
                 if !recv_outcome.is_allow() {
                     continue;
                 }
-                if !recv_outcome.obligations.is_empty() {
-                    apply_obligations(&mut msg, &recv_outcome.obligations);
+                if !recv_outcome.obligations.is_empty()
+                    && let Err(e) = apply_obligations(
+                        &mut msg,
+                        &recv_outcome.obligations,
+                        self.unknown_obligation_policy,
+                    )
+                {
+                    debug!(
+                        err = %e,
+                        session = %hash_cn(&handle.identity.cn),
+                        "position replay skipped: receive obligation actuation failed"
+                    );
+                    continue;
                 }
                 (recv_outcome.obligations, recv_outcome.rule_id, Some(engine))
             } else {
@@ -1955,7 +2081,25 @@ impl Router {
                     } else {
                         None
                     };
-                    let msg = msg.with_obligations(&outcome.obligations);
+                    // Fail-closed on unknown obligation (issue #728):
+                    // drop the delivery and do NOT persist for
+                    // offline replay. A stale transport cannot
+                    // actuate the policy now, and it will not be
+                    // able to actuate it on drain either — persisting
+                    // would only defer the same fail-closed decision.
+                    let msg = match msg
+                        .with_obligations(&outcome.obligations, self.unknown_obligation_policy)
+                    {
+                        Ok(m) => m,
+                        Err(e) => {
+                            debug!(
+                                err = %e,
+                                session = %cn,
+                                "direct send dropped: receive obligation actuation failed"
+                            );
+                            return;
+                        }
+                    };
                     let ctx = Some((Arc::clone(engine), outcome.obligations, rule_id, sender_cn));
                     (msg, ctx)
                 } else {
@@ -2137,7 +2281,23 @@ impl Router {
         };
         for (handle, obligations, rule_id) in &eligible {
             total += 1;
-            let delivery = msg.with_obligations(obligations);
+            // Fail-closed on unknown obligation (issue #728): skip
+            // this recipient. The audit event is emitted inside
+            // `apply_obligations`; the dropped counter catches the
+            // operational signal.
+            let delivery = match msg.with_obligations(obligations, self.unknown_obligation_policy) {
+                Ok(d) => d,
+                Err(e) => {
+                    debug!(
+                        err = %e,
+                        group = %group,
+                        recipient = %hash_cn(&handle.identity.cn),
+                        "group send skipped for recipient: obligation actuation failed"
+                    );
+                    dropped += 1;
+                    continue;
+                }
+            };
             if handle.try_send(delivery) {
                 if let Some(engine) = authz {
                     self.audit_classified_receive(
@@ -2159,7 +2319,7 @@ impl Router {
                 group = %group,
                 dropped = dropped,
                 total = total,
-                "messages dropped during group send: channel full or disconnected"
+                "messages dropped during group send: channel full, disconnected, or obligation fail-closed"
             );
         }
     }
@@ -2217,7 +2377,24 @@ impl Router {
                     filtered += 1;
                     continue;
                 }
-                let delivery = msg.with_obligations(&outcome.obligations);
+                // Fail-closed on unknown obligation (issue #728):
+                // skip this recipient. Count as dropped rather than
+                // filtered because filtered is authz-denied and this
+                // is post-authz.
+                let delivery = match msg
+                    .with_obligations(&outcome.obligations, self.unknown_obligation_policy)
+                {
+                    Ok(d) => d,
+                    Err(e) => {
+                        debug!(
+                            err = %e,
+                            recipient = %hash_cn(&handle.identity.cn),
+                            "broadcast send skipped for recipient: obligation actuation failed"
+                        );
+                        dropped += 1;
+                        continue;
+                    }
+                };
                 (delivery, Some((outcome.obligations, outcome.rule_id)))
             } else {
                 (msg.clone(), None)
@@ -2332,7 +2509,23 @@ impl Router {
                 );
                 return;
             }
-            msg.with_obligations(&outcome.obligations)
+            // Fail-closed on unknown obligation (issue #728): abort
+            // the whole group delivery. No recipients see the
+            // message — the sender-side obligation must be actuated
+            // uniformly per the policy author's intent, so fanning
+            // out partial bytes would defeat the policy.
+            match msg.with_obligations(&outcome.obligations, self.unknown_obligation_policy) {
+                Ok(m) => m,
+                Err(e) => {
+                    debug!(
+                        err = %e,
+                        sender = %hash_cn(&msg.source.cn),
+                        group = %group,
+                        "group send aborted: send obligation actuation failed"
+                    );
+                    return;
+                }
+            }
         } else {
             msg
         };
@@ -2400,7 +2593,25 @@ impl Router {
         };
         for (handle, obligations, rule_id) in &eligible {
             total += 1;
-            let delivery = msg.with_obligations(obligations);
+            // Fail-closed on unknown obligation (issue #728): skip
+            // this recipient. `delivered` is deliberately not
+            // populated so a subsequent group in the multicast
+            // fan-out may still attempt this CN under its own
+            // per-group Receive rules — on the off chance its
+            // obligation list is actuable on this transport build.
+            let delivery = match msg.with_obligations(obligations, self.unknown_obligation_policy) {
+                Ok(d) => d,
+                Err(e) => {
+                    debug!(
+                        err = %e,
+                        group = %group,
+                        recipient = %hash_cn(&handle.identity.cn),
+                        "multicast group send skipped for recipient: obligation actuation failed"
+                    );
+                    dropped += 1;
+                    continue;
+                }
+            };
             if handle.try_send(delivery) {
                 let _ = delivered.insert(handle.identity.cn.to_string());
                 if let Some(engine) = authz {
@@ -2423,7 +2634,7 @@ impl Router {
                 group = %group,
                 dropped = dropped,
                 total = total,
-                "messages dropped during multicast group send: channel full or disconnected"
+                "messages dropped during multicast group send: channel full, disconnected, or obligation fail-closed"
             );
         }
     }

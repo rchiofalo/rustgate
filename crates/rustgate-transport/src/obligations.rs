@@ -35,8 +35,17 @@
 //!   data-plane side effect today. See `docs/authorization.md`.
 //!
 //! [`apply_obligations`] therefore skips both variants. Unknown
-//! variants (the [`Obligation`] enum is `#[non_exhaustive]`) also
-//! fall through to no-op delivery but emit
+//! variants (the [`Obligation`] enum is `#[non_exhaustive]`) trigger
+//! [`UnknownObligationPolicy`]: the default
+//! [`UnknownObligationPolicy::FailClosed`] returns
+//! [`ObligationError::Unknown`] so the caller drops the outbound copy
+//! rather than delivering unmodified bytes a newer policy believed
+//! were about to be transformed. The opt-out
+//! [`UnknownObligationPolicy::SkipAndContinue`] restores the legacy
+//! pre-issue-#728 fail-open behaviour (apply every known obligation
+//! in the list, skip the unknown, continue delivery) and exists
+//! solely for rolling-upgrade windows where policy and transport
+//! versions deliberately skew. Either path emits
 //! [`rustgate_core::audit::authz_obligation_unknown`] so operators
 //! running a stale transport build against a newer authz policy can
 //! detect the skew via the audit trail.
@@ -65,7 +74,73 @@
 use bytes::Bytes;
 use rustgate_authz::Obligation;
 use rustgate_core::audit;
+use rustgate_core::masking::hash_cn;
 use rustgate_core::message::{MessageType, RoutableMessage};
+
+/// Policy for handling an [`Obligation`] variant this transport build
+/// cannot actuate.
+///
+/// The authz crate's [`Obligation`] enum is `#[non_exhaustive]` — a
+/// newer authz deployment may return a variant (e.g. a future
+/// `Obligation::TransformPayload`) the transport build was not
+/// compiled against. Without an explicit policy the pre-#728
+/// dispatcher silently delivered such payloads unmodified. A policy
+/// author who added a masking / classification / redaction
+/// obligation "after the fact" to tighten leak prevention would then
+/// be mistaken about whether the data plane was honouring it until
+/// the transport was rebuilt — the classic fail-open security hole
+/// XACML §7.2 calls out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UnknownObligationPolicy {
+    /// Drop the outbound copy and return
+    /// [`ObligationError::Unknown`] when an unknown variant is
+    /// encountered. The caller decides the blast radius: at a
+    /// sender-side PEP the message is never dispatched, at a
+    /// per-recipient fan-out only this hop is skipped.
+    ///
+    /// This is the correct default for production deployments and
+    /// matches the XACML recommendation to treat an obligation the
+    /// PEP cannot honour as a fail-closed signal.
+    #[default]
+    FailClosed,
+    /// Apply every known obligation in the list, emit an audit
+    /// record for each unknown variant, and return `Ok`. Equivalent
+    /// to the legacy pre-#728 fail-open behaviour. Not the default —
+    /// exists solely as an operational opt-out for deployments where
+    /// policy and transport versions deliberately skew during a
+    /// rolling upgrade and the operator has accepted the risk.
+    SkipAndContinue,
+}
+
+/// Error returned by [`apply_obligations`] on an obligation actuation
+/// failure the caller must handle explicitly.
+///
+/// Today this is only emitted when the configured
+/// [`UnknownObligationPolicy`] is
+/// [`UnknownObligationPolicy::FailClosed`] and an unknown variant is
+/// encountered. Additional variants may be added for future data-
+/// plane actuation failures that cannot be recovered from inline.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ObligationError {
+    /// The policy returned an [`Obligation`] variant the transport
+    /// cannot actuate, and
+    /// [`UnknownObligationPolicy::FailClosed`] is in effect.
+    ///
+    /// Callers MUST drop the outbound copy rather than delivering it
+    /// with the obligation silently skipped. The `variant` field
+    /// captures the `{:?}` rendering of the unknown variant for
+    /// logs and audit — the audit record is emitted by
+    /// [`apply_obligations`] before returning.
+    #[error(
+        "unknown authz obligation variant `{variant}` — transport build older than authz policy"
+    )]
+    Unknown {
+        /// `{:?}` rendering of the unknown variant captured at the
+        /// fail-closed site.
+        variant: String,
+    },
+}
 
 /// Return `true` when the obligation slice contains at least one
 /// variant that mutates the wire payload.
@@ -106,38 +181,82 @@ pub(crate) fn obligations_mutate_payload(obligations: &[Obligation]) -> bool {
 /// Obligations without a data-plane side effect
 /// ([`Obligation::TagClassified`], [`Obligation::AuditExtended`]) are
 /// skipped silently. The caller handles those via audit events at the
-/// PEP site. Unknown variants emit
-/// [`audit::authz_obligation_unknown`] so stale-transport / new-policy
-/// skew is visible in the audit stream.
-pub fn apply_obligations(msg: &mut RoutableMessage, obligations: &[Obligation]) {
+/// PEP site.
+///
+/// # Unknown variants
+///
+/// The authz crate's [`Obligation`] enum is `#[non_exhaustive]`.
+/// `unknown_policy` decides what happens when the policy engine
+/// returns a variant this transport build does not recognise.
+///
+/// With [`UnknownObligationPolicy::FailClosed`] (the default) the
+/// function emits the audit event plus a WARN log and returns
+/// [`ObligationError::Unknown`]. Obligations earlier in the slice
+/// have already been applied to `msg`; the caller must drop the
+/// outbound copy rather than delivering a partially-mutated payload.
+///
+/// With [`UnknownObligationPolicy::SkipAndContinue`] the function
+/// emits the audit event plus a DEBUG log and continues with the
+/// remaining obligations (if any), returning `Ok(())`. This matches
+/// the legacy pre-issue #728 fail-open behaviour and is kept only as
+/// an operational opt-out for deliberate version skew during rolling
+/// upgrades.
+pub fn apply_obligations(
+    msg: &mut RoutableMessage,
+    obligations: &[Obligation],
+    unknown_policy: UnknownObligationPolicy,
+) -> Result<(), ObligationError> {
     for obligation in obligations {
         match obligation {
             Obligation::MaskPoint => apply_mask_point(msg),
             Obligation::MaskPayload => apply_mask_payload(msg),
             // Audit-only obligations handled at the call site.
             Obligation::TagClassified | Obligation::AuditExtended => {}
-            // `#[non_exhaustive]` Obligation — future variants fall
-            // through to no-op delivery but emit an audit record so
-            // operators running a stale transport build against a
-            // newer authz policy can detect the skew. DEBUG-level
-            // operational log (not WARN) to prevent a hostile sender
-            // under a misconfigured policy from amplifying into a
-            // logging DoS; audit has its own sink with stricter
-            // retention.
+            // `#[non_exhaustive]` Obligation — future variants land
+            // here. The audit event fires regardless of policy so the
+            // stale-transport / new-policy skew is always visible in
+            // the forensic trail.
             other => {
-                tracing::debug!(
-                    obligation = ?other,
-                    "unknown obligation variant, no data-plane action taken"
-                );
+                let variant_repr = format!("{other:?}");
                 audit::authz_obligation_unknown(
                     &msg.source.cn,
-                    &format!("{other:?}"),
+                    &variant_repr,
                     &msg.metadata.source_protocol,
                     msg.destination.kind_str(),
                 );
+                match unknown_policy {
+                    UnknownObligationPolicy::FailClosed => {
+                        // WARN-level operational log: the policy
+                        // author intended a side effect this build
+                        // cannot honour and the message is about to
+                        // be dropped. Operators need to see this
+                        // even under steady state because the
+                        // remediation (rebuild transport, or accept
+                        // the risk via SkipAndContinue) is a
+                        // human-in-the-loop action. CN is hashed so
+                        // the log remains PII-safe even at volume.
+                        tracing::warn!(
+                            obligation = ?other,
+                            src_cn_hash = %hash_cn(&msg.source.cn),
+                            source_protocol = %msg.metadata.source_protocol,
+                            dst = msg.destination.kind_str(),
+                            "unknown authz obligation variant: failing closed, dropping message"
+                        );
+                        return Err(ObligationError::Unknown {
+                            variant: variant_repr,
+                        });
+                    }
+                    UnknownObligationPolicy::SkipAndContinue => {
+                        tracing::debug!(
+                            obligation = ?other,
+                            "unknown authz obligation variant: policy is SkipAndContinue, delivering with known obligations only"
+                        );
+                    }
+                }
             }
         }
     }
+    Ok(())
 }
 
 /// Zero CoT `<point>` coordinates on `msg.payload` with fail-closed
@@ -276,10 +395,20 @@ mod tests {
         }
     }
 
+    /// Apply obligations under the default fail-closed policy.
+    ///
+    /// All existing tests exercise known obligation variants only,
+    /// so the call always returns `Ok(())`. Unwrapping here keeps
+    /// the test bodies readable; the dedicated unknown-variant
+    /// tests assert the `Err` shape directly.
+    fn apply(msg: &mut RoutableMessage, obligations: &[Obligation]) {
+        apply_obligations(msg, obligations, UnknownObligationPolicy::FailClosed).unwrap();
+    }
+
     #[test]
     fn mask_point_zeroes_point_coordinates() {
         let mut msg = sample_msg(SAMPLE_COT, MessageType::Position);
-        apply_obligations(&mut msg, &[Obligation::MaskPoint]);
+        apply(&mut msg, &[Obligation::MaskPoint]);
 
         let s = std::str::from_utf8(&msg.payload).unwrap();
         assert!(s.contains(r#"lat="0.0""#), "lat not zeroed: {s}");
@@ -293,7 +422,7 @@ mod tests {
         // Not XML at all. MaskPoint is best-effort — the payload should
         // be forwarded intact rather than dropped.
         let mut msg = sample_msg(b"not xml at all", MessageType::Chat);
-        apply_obligations(&mut msg, &[Obligation::MaskPoint]);
+        apply(&mut msg, &[Obligation::MaskPoint]);
         assert_eq!(msg.payload.as_ref(), b"not xml at all");
         // Message type unchanged: masking is a payload-level op.
         assert_eq!(msg.metadata.message_type, MessageType::Chat);
@@ -302,7 +431,7 @@ mod tests {
     #[test]
     fn mask_payload_replaces_body_and_message_type() {
         let mut msg = sample_msg(SAMPLE_COT, MessageType::Position);
-        apply_obligations(&mut msg, &[Obligation::MaskPayload]);
+        apply(&mut msg, &[Obligation::MaskPayload]);
         assert!(msg.payload.is_empty(), "payload should be empty");
         assert_eq!(
             msg.metadata.message_type,
@@ -316,7 +445,7 @@ mod tests {
         let original_source_cn = msg.source.cn.clone();
         let original_proto = msg.metadata.source_protocol.clone();
 
-        apply_obligations(&mut msg, &[Obligation::MaskPayload]);
+        apply(&mut msg, &[Obligation::MaskPayload]);
 
         // Envelope survives — only payload + classified type were touched.
         assert_eq!(msg.source.cn, original_source_cn);
@@ -330,7 +459,7 @@ mod tests {
         // tracking is handled at the PEP call site. Verify no mutation.
         let mut msg = sample_msg(SAMPLE_COT, MessageType::Position);
         let before = msg.payload.clone();
-        apply_obligations(&mut msg, &[Obligation::TagClassified]);
+        apply(&mut msg, &[Obligation::TagClassified]);
         assert_eq!(msg.payload, before);
         assert_eq!(msg.metadata.message_type, MessageType::Position);
     }
@@ -339,7 +468,7 @@ mod tests {
     fn audit_extended_is_noop_on_payload() {
         let mut msg = sample_msg(SAMPLE_COT, MessageType::Position);
         let before = msg.payload.clone();
-        apply_obligations(&mut msg, &[Obligation::AuditExtended]);
+        apply(&mut msg, &[Obligation::AuditExtended]);
         assert_eq!(msg.payload, before);
     }
 
@@ -347,7 +476,7 @@ mod tests {
     fn empty_obligation_list_is_noop() {
         let mut msg = sample_msg(SAMPLE_COT, MessageType::Position);
         let before = msg.payload.clone();
-        apply_obligations(&mut msg, &[]);
+        apply(&mut msg, &[]);
         assert_eq!(msg.payload, before);
         assert_eq!(msg.metadata.message_type, MessageType::Position);
     }
@@ -357,7 +486,7 @@ mod tests {
         // MaskPoint then MaskPayload — payload gets cleared regardless of
         // whether the initial mask succeeded. Final state: empty body.
         let mut msg = sample_msg(SAMPLE_COT, MessageType::Position);
-        apply_obligations(&mut msg, &[Obligation::MaskPoint, Obligation::MaskPayload]);
+        apply(&mut msg, &[Obligation::MaskPoint, Obligation::MaskPayload]);
         assert!(msg.payload.is_empty());
         assert_eq!(
             msg.metadata.message_type,
@@ -371,7 +500,7 @@ mod tests {
         // MaskPoint sees a non-CoT payload and passes through (staying
         // empty). The dispatcher must not panic or error on this path.
         let mut msg = sample_msg(SAMPLE_COT, MessageType::Position);
-        apply_obligations(&mut msg, &[Obligation::MaskPayload, Obligation::MaskPoint]);
+        apply(&mut msg, &[Obligation::MaskPayload, Obligation::MaskPoint]);
         assert!(msg.payload.is_empty());
     }
 
@@ -384,7 +513,7 @@ mod tests {
         let malformed: &'static [u8] =
             br#"<event><point lat="38.8977" lon="-77.0365" hae="125.4"/><unterminated"#;
         let mut msg = sample_msg(malformed, MessageType::Position);
-        apply_obligations(&mut msg, &[Obligation::MaskPoint]);
+        apply(&mut msg, &[Obligation::MaskPoint]);
         // Fail-closed: payload erased, message type coerced.
         assert!(
             msg.payload.is_empty(),
@@ -416,7 +545,7 @@ mod tests {
         // static-bound for convenience in the rest of the suite) works.
         let leaked: &'static [u8] = Box::leak(xml.into_bytes().into_boxed_slice());
         let mut msg = sample_msg(leaked, MessageType::Position);
-        apply_obligations(&mut msg, &[Obligation::MaskPoint]);
+        apply(&mut msg, &[Obligation::MaskPoint]);
         assert!(
             msg.payload.is_empty(),
             "attribute-budget trip must erase payload"
@@ -434,7 +563,7 @@ mod tests {
         // this case.
         let xml: &'static [u8] = br#"<event uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><Point lat="38.8977" lon="-77.0365" hae="125.4"/></event>"#;
         let mut msg = sample_msg(xml, MessageType::Position);
-        apply_obligations(&mut msg, &[Obligation::MaskPoint]);
+        apply(&mut msg, &[Obligation::MaskPoint]);
         let s = std::str::from_utf8(&msg.payload).unwrap();
         assert!(s.contains(r#"lat="0.0""#), "case-variant not masked: {s}");
         assert!(!s.contains("38.8977"), "raw lat leaked: {s}");
@@ -444,7 +573,7 @@ mod tests {
     fn mask_point_on_namespaced_element_masks_coordinates() {
         let xml: &'static [u8] = br#"<event xmlns:cot="urn:cot" uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><cot:point lat="38.8977" lon="-77.0365" hae="125.4"/></event>"#;
         let mut msg = sample_msg(xml, MessageType::Position);
-        apply_obligations(&mut msg, &[Obligation::MaskPoint]);
+        apply(&mut msg, &[Obligation::MaskPoint]);
         let s = std::str::from_utf8(&msg.payload).unwrap();
         assert!(
             s.contains(r#"lat="0.0""#),
@@ -472,5 +601,72 @@ mod tests {
             Obligation::TagClassified,
             Obligation::AuditExtended
         ]));
+    }
+
+    #[test]
+    fn unknown_obligation_policy_defaults_to_fail_closed() {
+        // Regression guard for issue #728. The default must be
+        // FailClosed — a deployment that forgets to configure
+        // `--authz-allow-unknown-obligations` gets secure-by-default
+        // behaviour, matching XACML §7.2.
+        assert_eq!(
+            UnknownObligationPolicy::default(),
+            UnknownObligationPolicy::FailClosed
+        );
+    }
+
+    #[test]
+    fn fail_closed_policy_returns_ok_for_known_variants() {
+        // Every known variant must return Ok under FailClosed so
+        // the happy path is unaffected by the #728 change. The
+        // mutation assertions are covered by the dedicated per-
+        // variant tests; this test asserts only the Result shape.
+        let mut msg = sample_msg(SAMPLE_COT, MessageType::Position);
+        let all_known = &[
+            Obligation::MaskPoint,
+            Obligation::MaskPayload,
+            Obligation::TagClassified,
+            Obligation::AuditExtended,
+        ];
+        assert!(
+            apply_obligations(&mut msg, all_known, UnknownObligationPolicy::FailClosed).is_ok()
+        );
+    }
+
+    #[test]
+    fn skip_and_continue_policy_returns_ok_for_known_variants() {
+        // The opt-out path must not accidentally return Err on
+        // known variants — that would flip the semantics from
+        // "apply everything, skip unknowns" to "fail on any
+        // actuation error", which is not what SkipAndContinue
+        // advertises.
+        let mut msg = sample_msg(SAMPLE_COT, MessageType::Position);
+        let all_known = &[
+            Obligation::MaskPoint,
+            Obligation::MaskPayload,
+            Obligation::TagClassified,
+            Obligation::AuditExtended,
+        ];
+        assert!(
+            apply_obligations(
+                &mut msg,
+                all_known,
+                UnknownObligationPolicy::SkipAndContinue
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn obligation_error_display_includes_variant_repr() {
+        // Format shape is part of the audit contract — operators
+        // grep for `unknown authz obligation variant` in alert
+        // rules. Changing the prefix is a breaking change.
+        let err = ObligationError::Unknown {
+            variant: "TransformPayload".into(),
+        };
+        let s = format!("{err}");
+        assert!(s.contains("unknown authz obligation variant"));
+        assert!(s.contains("TransformPayload"));
     }
 }

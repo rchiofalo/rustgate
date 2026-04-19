@@ -41,7 +41,7 @@ use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use rustgate_authz::Obligation;
 use rustgate_core::message::RoutableMessage;
-use rustgate_transport::obligations::apply_obligations;
+use rustgate_transport::obligations::{UnknownObligationPolicy, apply_obligations};
 
 /// Fuzz input envelope: a `RoutableMessage` plus raw bytes that are
 /// mapped to an obligation list. Using `Vec<u8>` (rather than
@@ -85,7 +85,20 @@ fuzz_target!(|input: Input| {
 
     let has_mask_payload = obligations.contains(&Obligation::MaskPayload);
 
-    apply_obligations(&mut msg, &obligations);
+    // The fuzzer can only map onto the four known variants (see
+    // `map_obligation`), so the return value is always `Ok(())` —
+    // but the policy argument is threaded through to exercise the
+    // issue-#728 signature and to guard against future regressions
+    // where a known variant accidentally returns Err.
+    let result = apply_obligations(
+        &mut msg,
+        &obligations,
+        UnknownObligationPolicy::FailClosed,
+    );
+    assert!(
+        result.is_ok(),
+        "apply_obligations returned Err for a known-variant-only list: {result:?}"
+    );
 
     // Invariant: `MaskPayload` is the strongest masking obligation.
     // If it appears anywhere in the list, the delivered payload must
