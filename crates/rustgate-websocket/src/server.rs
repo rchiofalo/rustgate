@@ -14,6 +14,7 @@ use futures::{SinkExt, StreamExt};
 use rustgate_core::codec::Codec;
 use rustgate_core::constants::{READ_TIMEOUT, WRITE_TIMEOUT};
 use rustgate_core::identity::Identity;
+use rustgate_core::masking::hash_cn;
 use rustgate_core::message::RoutableMessage;
 use rustgate_cot::MessageBuilder;
 use rustgate_transport::{ClientThrottle, ReplayFilter, Router, SessionHandle, ThrottleConfig};
@@ -193,7 +194,7 @@ async fn handle_ws_session(
 
     info!(
         peer_addr = %peer_addr,
-        cn = %cn,
+        cn = %hash_cn(&cn),
         groups = ?identity.groups,
         "WebSocket session started"
     );
@@ -226,14 +227,16 @@ async fn handle_ws_session(
     let filtered_count = before - buffered_offline.len();
     if filtered_count > 0 {
         info!(
-            cn = %identity.cn,
+            cn = %hash_cn(&identity.cn),
             filtered = filtered_count,
             delivered = buffered_offline.len(),
             "filtered offline messages on WebSocket reconnect",
         );
     }
     if !router.register(handle.clone()).await {
-        warn!(cn = %identity.cn, "connection rejected: tenant quota exceeded");
+        // F-153: hash CN before logging — the audit call retains the raw
+        // CN for compliance, but the structured log field is PII-safe.
+        warn!(cn = %hash_cn(&identity.cn), "connection rejected: tenant quota exceeded");
         rustgate_core::audit::connection_rejected(peer_addr, "tenant quota exceeded");
         return;
     }
@@ -272,14 +275,14 @@ async fn handle_ws_session(
     };
 
     if let Err(ref e) = read_result {
-        debug!(cn = %cn, error = %e, "WebSocket session ended with error");
+        debug!(cn = %hash_cn(&cn), error = %e, "WebSocket session ended with error");
     }
 
     router.unregister(&cn, session_id).await;
 
     info!(
         peer_addr = %peer_addr,
-        cn = %cn,
+        cn = %hash_cn(&cn),
         "WebSocket session ended"
     );
 }
@@ -318,8 +321,11 @@ async fn ws_read_loop(
             && let Err(exceeded) = limiter.check(payload.len())
         {
             if exceeded.frame_exceeded {
+                // F-153: `identity.cn` is control-char-validated at
+                // `Identity::new()`, but we still hash it so production logs
+                // never carry raw client CNs (PII hygiene).
                 warn!(
-                    cn = %identity.cn,
+                    cn = %hash_cn(&identity.cn),
                     frames = limiter.frame_count(),
                     limit = limiter.max_frames_per_sec(),
                     "WebSocket frame dropped: frame rate exceeded",
@@ -327,7 +333,7 @@ async fn ws_read_loop(
             }
             if exceeded.byte_exceeded {
                 warn!(
-                    cn = %identity.cn,
+                    cn = %hash_cn(&identity.cn),
                     bytes = limiter.byte_count(),
                     limit = limiter.max_bytes_per_sec(),
                     "WebSocket frame dropped: byte rate exceeded",
@@ -343,7 +349,7 @@ async fn ws_read_loop(
         if let Some(t) = throttle
             && !t.allow()
         {
-            warn!(cn = %identity.cn, "message dropped: rate limit exceeded");
+            warn!(cn = %hash_cn(&identity.cn), "message dropped: rate limit exceeded");
             rustgate_core::audit::rate_limit_triggered(
                 &identity.cn,
                 "websocket/inbound",
@@ -356,7 +362,7 @@ async fn ws_read_loop(
         if let Some(filter) = replay_filter
             && filter.is_replay(&payload)
         {
-            debug!(cn = %identity.cn, "message dropped: replay detected");
+            debug!(cn = %hash_cn(&identity.cn), "message dropped: replay detected");
             continue;
         }
 

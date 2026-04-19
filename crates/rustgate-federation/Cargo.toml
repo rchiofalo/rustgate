@@ -80,6 +80,7 @@ rustgate-test-utils = { workspace = true, features = ["nats"] }
 criterion = { workspace = true }
 http-body = { workspace = true }
 wiremock = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [[bench]]
 name = "convert"

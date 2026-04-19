@@ -11,6 +11,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rustgate_core::sanitize::sanitize_for_log;
 use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
@@ -272,9 +273,12 @@ impl FederationService {
 
         for group in &event.federate_groups {
             if !peer_allowed.contains(group.as_str()) {
+                // F-153: `group` is peer-controlled — sanitize before
+                // logging so a malicious peer cannot inject `\r\n` into
+                // text-mode log output and forge audit records.
                 warn!(
                     peer = %peer_id,
-                    group = %group,
+                    group = %sanitize_for_log(group),
                     "federation peer not authorized for group"
                 );
                 return Err(Status::permission_denied(
@@ -533,9 +537,17 @@ impl FederatedChannel for FederationService {
 
                     if !authorized {
                         consecutive_violations += 1;
+                        // F-153: `event.federate_groups` is peer-controlled;
+                        // sanitize each element before logging so `\r\n` in a
+                        // group name can't forge log lines in text-mode output.
+                        let sanitized_groups: Vec<String> = event
+                            .federate_groups
+                            .iter()
+                            .map(|g| sanitize_for_log(g))
+                            .collect();
                         warn!(
                             peer = %pid,
-                            groups = ?event.federate_groups,
+                            groups = ?sanitized_groups,
                             consecutive_violations = consecutive_violations,
                             "federation peer not authorized for claimed groups, skipping event"
                         );
@@ -1489,5 +1501,104 @@ mod tests {
             0,
             "callback must not fire for partially authorized event"
         );
+    }
+
+    /// Regression test for F-153: peer-supplied group names containing
+    /// CR/LF must not be able to forge log lines. `validate_event_groups`
+    /// emits a `warn!` when a group is not authorized; the `group` field
+    /// is peer-controlled. We attach a capturing subscriber in both
+    /// text-mode and JSON-mode, push an event with an attacker-crafted
+    /// group containing `\r\n`, and assert the captured bytes do not
+    /// contain a bare `\r` or `\n` inside the formatted `group=` field.
+    #[tokio::test]
+    async fn federation_sanitizes_crlf_in_unauthorized_group_log() {
+        use std::io::Write;
+        use std::sync::Mutex as StdMutex;
+
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::filter::Targets;
+        use tracing_subscriber::fmt::MakeWriter;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct SharedBuf(Arc<StdMutex<Vec<u8>>>);
+
+        impl SharedBuf {
+            fn snapshot(&self) -> Vec<u8> {
+                self.0.lock().unwrap().clone()
+            }
+        }
+
+        impl Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> MakeWriter<'a> for SharedBuf {
+            type Writer = SharedBuf;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        // Build a federation service that only authorizes peer "unknown"
+        // for "alpha". A distinct attacker-controlled group name with
+        // embedded CR/LF will be rejected and logged — that log line
+        // must not be forgeable.
+        let mut allowed = HashMap::new();
+        allowed.insert("unknown".to_string(), HashSet::from(["alpha".to_string()]));
+        let svc = FederationService::new("s".into(), vec![], noop_on_event())
+            .with_allowed_peer_groups(allowed);
+
+        // Attacker-crafted group: CR/LF followed by a fake audit record.
+        // A naive log formatter would emit two lines; `sanitize_for_log`
+        // replaces control chars with U+FFFD so the string stays a
+        // single field value.
+        let malicious = "bravo\r\n[audit] forged=true\r\nend";
+        let event = figpb::FederatedEvent {
+            federate_groups: vec!["alpha".into(), malicious.into()],
+            ..Default::default()
+        };
+
+        // Text formatter — the vulnerable case without sanitize_for_log.
+        let text_buf = SharedBuf::default();
+        let text_layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(text_buf.clone())
+            .with_filter(
+                Targets::new().with_target("rustgate_federation::v2::server", tracing::Level::WARN),
+            );
+        let text_sub = tracing_subscriber::registry().with(text_layer);
+
+        {
+            let _guard = tracing::subscriber::set_default(text_sub);
+            let _ = svc.send_one_event(Request::new(event.clone())).await;
+        }
+
+        let captured = text_buf.snapshot();
+        assert!(!captured.is_empty(), "text layer captured no log output");
+        // The malicious payload must not appear unescaped anywhere in the
+        // captured bytes — the sanitizer replaces CR and LF with U+FFFD
+        // (EF BF BD) so a raw `\r\n` sequence cannot survive.
+        assert!(
+            !captured.windows(2).any(|w| w == b"\r\n"),
+            "raw CR/LF survived into text log output: forgeable log line\ncaptured = {:?}",
+            String::from_utf8_lossy(&captured)
+        );
+        // Defense in depth: the forged-record marker must not appear
+        // at the start of a line (which would indicate successful log
+        // injection).
+        let s = String::from_utf8_lossy(&captured);
+        for line in s.lines() {
+            assert!(
+                !line.starts_with("[audit] forged=true"),
+                "attacker-controlled record began a new log line: {line}"
+            );
+        }
     }
 }
