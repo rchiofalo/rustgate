@@ -1099,7 +1099,26 @@ pub(crate) async fn start_federation(
     let config = build_federation_config(cli, bind_addr).await?;
     let mut manager = rustgate_federation::manager::FederationManager::new(config);
 
-    // on_inbound: route messages from federation peers to local clients
+    // on_inbound: route messages from federation peers to local clients.
+    //
+    // Security note (issue #719): federated messages are handed to
+    // `router.route()`, which re-runs the full PEP chain — Send-PEP with
+    // the peer CN as subject, then per-recipient Receive-PEP with each
+    // recipient's CN as subject. Obligations returned by the local
+    // Receive-PEP are always applied on a per-recipient copy of the
+    // envelope, regardless of what the upstream peer did.
+    //
+    // The V2 wire protocol does NOT carry the upstream peer's obligation
+    // list: data-plane obligations (MaskPoint, MaskPayload) are baked
+    // into the payload before forwarding, and audit-shaped obligations
+    // are not serialized at all. Upstream obligations are therefore
+    // advisory only — the local policy is authoritative. This defends
+    // against a permissive upstream silently delivering coordinates
+    // that the local policy would have masked.
+    //
+    // See `docs/federation.md` → "Cross-origin authz obligations" and
+    // `crates/rustgate-transport/tests/authz_routing.rs`
+    // (`federated_broadcast_*`) for the pinned guarantees.
     let router_for_fed = Arc::clone(router);
     let on_inbound: rustgate_federation::manager::OnInbound = Arc::new(move |peer_cn, payload| {
         let router = Arc::clone(&router_for_fed);

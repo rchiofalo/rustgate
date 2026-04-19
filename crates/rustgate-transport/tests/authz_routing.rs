@@ -1244,3 +1244,153 @@ async fn drain_classified_delivery_audit_driven_by_emit_on_delivered() {
          captured: {captured_after_emit}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Federation defense-in-depth (issue #719)
+//
+// Messages received from a federation peer enter the router via the
+// `on_inbound` callback in `rustgate-server::setup`, which constructs a
+// `RoutableMessage` with `source_protocol = "federation"` and hands it to
+// `router.route()`. The wire protocol does NOT carry authz obligations, so
+// obligation actuation depends entirely on the local PEP chain re-running.
+//
+// These tests pin the guarantee documented in `docs/federation.md` — that
+// the local Receive-PEP is authoritative for every federated message,
+// regardless of what the upstream peer did. Asymmetric policies between
+// federation peers (stricter local policy, permissive upstream) must not
+// degrade to the less-strict peer.
+// ---------------------------------------------------------------------------
+
+/// Build a RoutableMessage that looks like it arrived via the federation
+/// inbound path: `source_protocol = "federation"` and a broadcast
+/// destination (the shape produced by `on_inbound` in
+/// `rustgate-server::setup`). The source CN is the federation peer's CN.
+fn federated_position(peer_source: &Arc<Identity>) -> RoutableMessage {
+    RoutableMessage {
+        source: (**peer_source).clone(),
+        destination: Destination::Broadcast,
+        payload: Bytes::from_static(SAMPLE_COT),
+        metadata: Metadata {
+            received_at: SystemTime::now(),
+            source_protocol: "federation".to_string(),
+            message_type: MessageType::Position,
+            ttl: None,
+        },
+    }
+}
+
+/// A federated broadcast must have the local `MaskPoint` Receive
+/// obligation applied per recipient — even though the upstream peer
+/// may have allowed delivery without masking.
+///
+/// This is the core defense-in-depth guarantee of issue #719: the
+/// federation wire protocol does not carry obligations, so the local
+/// PEP is the only line of defense against a permissive upstream.
+#[tokio::test]
+async fn federated_broadcast_applies_local_mask_point_receive() {
+    let router = Router::new().with_authz(allow_with_obligation(
+        Action::Receive,
+        Obligation::MaskPoint,
+    ));
+    // Simulate a federation peer identity — what `on_inbound` constructs
+    // from the peer certificate CN via `Identity::plaintext`.
+    let peer = identity("federation-peer-1", &[]);
+    let alice = identity("alice", &["alpha"]);
+
+    let (ptx_a, ntx_a, mut prx_a, _na) = channels();
+    router
+        .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
+        .await;
+
+    router.route(federated_position(&peer)).await;
+
+    let got = prx_a
+        .try_recv()
+        .expect("alice should receive the federated broadcast");
+    let s = std::str::from_utf8(&got.payload).expect("masked payload is valid UTF-8");
+    assert!(
+        s.contains(r#"lat="0.0""#),
+        "local MaskPoint Receive obligation must apply to federated message: {s}"
+    );
+    assert!(
+        !s.contains("38.8977"),
+        "raw lat from upstream leaked despite local MaskPoint: {s}"
+    );
+    assert_eq!(
+        got.metadata.source_protocol, "federation",
+        "source_protocol must be preserved — downstream sinks still need to know the origin"
+    );
+}
+
+/// A federated broadcast must have the local `MaskPayload` Receive
+/// obligation applied per recipient. This is stricter than MaskPoint —
+/// it zeros the entire payload — and must take effect even when the
+/// upstream peer forwarded an unmasked body.
+#[tokio::test]
+async fn federated_broadcast_applies_local_mask_payload_receive() {
+    let router = Router::new().with_authz(allow_with_obligation(
+        Action::Receive,
+        Obligation::MaskPayload,
+    ));
+    let peer = identity("federation-peer-1", &[]);
+    let alice = identity("alice", &["alpha"]);
+
+    // MaskPayload coerces message type to `other:masked`, so the
+    // classifier routes the copy to the normal channel rather than the
+    // priority channel that Position normally takes.
+    let (ptx_a, ntx_a, mut prx_a, mut nrx_a) = channels();
+    router
+        .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
+        .await;
+
+    router.route(federated_position(&peer)).await;
+
+    let got = prx_a
+        .try_recv()
+        .or_else(|_| nrx_a.try_recv())
+        .expect("alice should receive the federated broadcast on priority or normal channel");
+    assert!(
+        got.payload.is_empty(),
+        "local MaskPayload Receive obligation must zero the federated payload"
+    );
+    assert_eq!(
+        got.metadata.message_type,
+        MessageType::Other("masked".into()),
+        "MaskPayload must coerce message type even on federated messages"
+    );
+}
+
+/// A federated broadcast must honour per-recipient Receive deny rules.
+/// A denied recipient gets no delivery; an allowed peer on the same
+/// broadcast still receives it. This verifies the PEP runs per
+/// recipient with the recipient's identity as subject — the upstream
+/// peer's identity does not override local per-recipient rules.
+#[tokio::test]
+async fn federated_broadcast_respects_per_recipient_receive_deny() {
+    let router = Router::new().with_authz(deny_receive_for_cn("charlie"));
+    let peer = identity("federation-peer-1", &[]);
+    let alice = identity("alice", &["alpha"]);
+    let charlie = identity("charlie", &["alpha"]);
+
+    let (ptx_a, ntx_a, mut prx_a, _na) = channels();
+    let (ptx_c, ntx_c, mut prx_c, _nc) = channels();
+    router
+        .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
+        .await;
+    router
+        .register(SessionHandle::new(charlie.clone(), ptx_c, ntx_c))
+        .await;
+
+    router.route(federated_position(&peer)).await;
+
+    // Alice is allowed, Charlie is denied — regardless of what the
+    // upstream federation peer's policy said.
+    assert!(
+        prx_a.try_recv().is_ok(),
+        "alice should receive the federated broadcast"
+    );
+    assert!(
+        prx_c.try_recv().is_err(),
+        "charlie must be filtered by local Receive deny, even for federated messages"
+    );
+}
