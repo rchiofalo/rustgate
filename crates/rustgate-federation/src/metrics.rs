@@ -37,6 +37,7 @@ static REPLAY_RESTORED: OnceLock<IntCounter> = OnceLock::new();
 static REPLAY_RESTORED_SKIPPED_TTL: OnceLock<IntCounter> = OnceLock::new();
 
 static PEER_LATENCY_NANOS: OnceLock<prometheus::IntGaugeVec> = OnceLock::new();
+static PEER_QUEUE_BYTES: OnceLock<prometheus::IntGaugeVec> = OnceLock::new();
 static CROSS_REGION_FORWARDS: OnceLock<IntCounter> = OnceLock::new();
 
 // ── Registration ────────────────────────────────────────────────────
@@ -166,6 +167,16 @@ pub fn init() -> prometheus::Result<()> {
     )?;
     registry.register(Box::new(peer_latency_nanos.clone()))?;
     let _ = PEER_LATENCY_NANOS.set(peer_latency_nanos);
+
+    let peer_queue_bytes = prometheus::IntGaugeVec::new(
+        Opts::new(
+            "rustgate_federation_peer_queue_bytes",
+            "Bytes currently sitting in the outbound queue to a federation peer",
+        ),
+        &["peer"],
+    )?;
+    registry.register(Box::new(peer_queue_bytes.clone()))?;
+    let _ = PEER_QUEUE_BYTES.set(peer_queue_bytes);
 
     let cross_region_forwards = IntCounter::with_opts(Opts::new(
         "rustgate_federation_cross_region_forwards_total",
@@ -330,6 +341,23 @@ pub fn peer_latency_nanos() -> &'static prometheus::IntGaugeVec {
     PEER_LATENCY_NANOS.get_or_init(|| {
         fallback_gauge_vec(
             "rustgate_federation_peer_latency_nanos",
+            "fallback",
+            &["peer"],
+        )
+    })
+}
+
+/// Outbound queue bytes per federation peer (gauge vec, label: peer).
+///
+/// Feeds from [`crate::peer::PeerHandle::record_enqueue`],
+/// [`crate::peer::PeerHandle::record_dequeue`], and
+/// [`crate::peer::PeerHandle::reset_queue`]. Alert on high or rising
+/// values to detect federation pipeline stalls before they propagate
+/// to upstream producers via global backpressure.
+pub fn peer_queue_bytes() -> &'static prometheus::IntGaugeVec {
+    PEER_QUEUE_BYTES.get_or_init(|| {
+        fallback_gauge_vec(
+            "rustgate_federation_peer_queue_bytes",
             "fallback",
             &["peer"],
         )

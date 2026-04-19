@@ -195,7 +195,12 @@ impl HttpPublisher {
         }
 
         match self.tx.try_send(Arc::new(msg.clone())) {
-            Ok(()) => {}
+            Ok(()) => {
+                // The worker decrements this gauge on recv — see
+                // `dispatch_worker`.
+                #[cfg(feature = "metrics")]
+                crate::metrics::queue_depth().inc();
+            }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 tracing::warn!(
                     source_cn = %sanitize_for_log(&msg.source.cn),
@@ -549,6 +554,8 @@ async fn dispatch_worker(
                 tracing::info!("HTTP dispatch worker shutting down, draining queue");
                 rx.close();
                 while let Some(msg) = rx.recv().await {
+                    #[cfg(feature = "metrics")]
+                    crate::metrics::queue_depth().dec();
                     fan_out(&msg, &targets, dlq.as_deref()).await;
                 }
                 tracing::info!("HTTP dispatch worker stopped");
@@ -556,7 +563,12 @@ async fn dispatch_worker(
             }
             msg = rx.recv() => {
                 match msg {
-                    Some(msg) => fan_out(&msg, &targets, dlq.as_deref()).await,
+                    Some(msg) => {
+                        // Paired with the inc() in `HttpPublisher::publish`.
+                        #[cfg(feature = "metrics")]
+                        crate::metrics::queue_depth().dec();
+                        fan_out(&msg, &targets, dlq.as_deref()).await;
+                    }
                     None => {
                         tracing::info!("HTTP dispatch channel closed");
                         return;

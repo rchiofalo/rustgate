@@ -192,6 +192,8 @@ impl PeerHandle {
         if let Ok(mut guard) = self.queue_ages.lock() {
             guard.push_back((SystemTime::now(), bytes));
         }
+        #[cfg(feature = "api")]
+        self.refresh_queue_bytes_metric();
     }
 
     /// Record that a previously enqueued message has been delivered or
@@ -205,6 +207,8 @@ impl PeerHandle {
         if let Some(bytes) = popped_bytes {
             let _ = self.queue_bytes.fetch_sub(bytes as u64, Ordering::Relaxed);
         }
+        #[cfg(feature = "api")]
+        self.refresh_queue_bytes_metric();
     }
 
     /// Reset the queue accounting to empty. Used when a send loop terminates
@@ -217,6 +221,29 @@ impl PeerHandle {
         if let Ok(mut guard) = self.queue_ages.lock() {
             guard.clear();
         }
+        #[cfg(feature = "api")]
+        self.refresh_queue_bytes_metric();
+    }
+
+    /// Publish the current `queue_bytes` value to the Prometheus gauge.
+    /// Called from every enqueue/dequeue/reset site so the gauge always
+    /// reflects the canonical atomic counter, avoiding divergence caused
+    /// by missed updates under contention.
+    ///
+    /// Gated behind `feature = "api"` because the federation `metrics`
+    /// module is only compiled when the REST management API (which owns
+    /// the Prometheus registry wiring) is enabled. When the feature is
+    /// off this method is elided entirely.
+    #[cfg(feature = "api")]
+    fn refresh_queue_bytes_metric(&self) {
+        let current = self.queue_bytes.load(Ordering::Relaxed);
+        // i64::try_from can only fail when queue_bytes > i64::MAX, which
+        // would represent >8 exabytes — clamp to the gauge's max value
+        // instead of silently dropping the sample.
+        let value = i64::try_from(current).unwrap_or(i64::MAX);
+        crate::metrics::peer_queue_bytes()
+            .with_label_values(&[self.id.as_ref()])
+            .set(value);
     }
 
     /// Current queued bytes for this peer.
