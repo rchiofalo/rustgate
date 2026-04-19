@@ -35,6 +35,7 @@ static FORWARD_TTL_EXPIRED: OnceLock<IntCounter> = OnceLock::new();
 static REPLAY_PERSISTED: OnceLock<IntCounter> = OnceLock::new();
 static REPLAY_RESTORED: OnceLock<IntCounter> = OnceLock::new();
 static REPLAY_RESTORED_SKIPPED_TTL: OnceLock<IntCounter> = OnceLock::new();
+static REPLAY_BUFFER_BYTES: OnceLock<IntGauge> = OnceLock::new();
 
 static PEER_LATENCY_NANOS: OnceLock<prometheus::IntGaugeVec> = OnceLock::new();
 static PEER_QUEUE_BYTES: OnceLock<prometheus::IntGaugeVec> = OnceLock::new();
@@ -157,6 +158,13 @@ pub fn init() -> prometheus::Result<()> {
     ))?;
     registry.register(Box::new(replay_restored_skipped_ttl.clone()))?;
     let _ = REPLAY_RESTORED_SKIPPED_TTL.set(replay_restored_skipped_ttl);
+
+    let replay_buffer_bytes = IntGauge::with_opts(Opts::new(
+        "rustgate_federation_replay_buffer_bytes",
+        "Accounted on-disk size of the redb-backed federation replay buffer across all peers, including per-record overhead",
+    ))?;
+    registry.register(Box::new(replay_buffer_bytes.clone()))?;
+    let _ = REPLAY_BUFFER_BYTES.set(replay_buffer_bytes);
 
     let peer_latency_nanos = prometheus::IntGaugeVec::new(
         Opts::new(
@@ -334,6 +342,20 @@ pub fn replay_restored_skipped_ttl() -> &'static IntCounter {
             "fallback",
         )
     })
+}
+
+/// Accounted on-disk size of the redb-backed federation replay buffer,
+/// summed across all peers and including per-record overhead (gauge).
+///
+/// Updated by [`crate::replay_persist::ReplayStore`] at every mutation
+/// site (rehydrate, put, delete, clear). Provides visibility into the
+/// persistent buffer's occupancy so operators can alert before it
+/// saturates its configured byte cap. The value is clamped to
+/// [`i64::MAX`] on improbable overflow to satisfy the `IntGauge` signed
+/// contract — the same convention used by `peer_queue_bytes` (#744).
+pub fn replay_buffer_bytes() -> &'static IntGauge {
+    REPLAY_BUFFER_BYTES
+        .get_or_init(|| fallback_gauge("rustgate_federation_replay_buffer_bytes", "fallback"))
 }
 
 /// EWMA latency per federation peer in nanoseconds (gauge vec, label: peer).

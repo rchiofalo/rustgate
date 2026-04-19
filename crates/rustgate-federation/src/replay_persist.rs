@@ -208,6 +208,11 @@ impl ReplayStore {
                 .sort_by_key(|e| e.enqueued_at_unix_ms);
         }
 
+        // Seed the gauge with the rehydrated total so dashboards reflect
+        // the persisted footprint immediately on startup, before any new
+        // put/delete traffic arrives.
+        publish_total_bytes(inner.total_bytes);
+
         Ok(Self {
             db: Arc::new(db),
             inner: Arc::new(Mutex::new(inner)),
@@ -237,7 +242,7 @@ impl ReplayStore {
         // The deque is kept ordered by `enqueued_at_unix_ms` so the
         // front is always the globally-oldest record across peers,
         // even when peers drain at different rates.
-        let to_delete: Vec<(String, u64)> = {
+        let (to_delete, new_total_bytes): (Vec<(String, u64)>, u64) = {
             let mut inner = self.inner.lock();
             let mut victims = Vec::new();
             while inner.total_bytes.saturating_add(accounted) > self.max_bytes
@@ -264,8 +269,9 @@ impl ReplayStore {
                 .unwrap_or(0);
             inner.global.insert(pos, new_entry);
             inner.total_bytes = inner.total_bytes.saturating_add(accounted);
-            victims
+            (victims, inner.total_bytes)
         };
+        publish_total_bytes(new_total_bytes);
 
         let write = self
             .db
@@ -295,7 +301,7 @@ impl ReplayStore {
     /// evicts the oldest message after exceeding its capacity.
     pub fn delete(&self, peer_id: &str, seq: u64) -> Result<(), ReplayStoreError> {
         let key = encode_key(peer_id, seq);
-        {
+        let new_total_bytes = {
             let mut inner = self.inner.lock();
             if let Some(pos) = inner
                 .global
@@ -305,7 +311,9 @@ impl ReplayStore {
             {
                 inner.total_bytes = inner.total_bytes.saturating_sub(entry.bytes);
             }
-        }
+            inner.total_bytes
+        };
+        publish_total_bytes(new_total_bytes);
         let write = self
             .db
             .begin_write()
@@ -328,7 +336,7 @@ impl ReplayStore {
     /// [`crate::manager::FederationManager::clear_replay_buffer`] and
     /// [`crate::manager::FederationManager::remove_replay_buffer`].
     pub fn clear_peer(&self, peer_id: &str) -> Result<(), ReplayStoreError> {
-        let victims: Vec<u64> = {
+        let (victims, new_total_bytes): (Vec<u64>, u64) = {
             let mut inner = self.inner.lock();
             let mut seqs = Vec::new();
             let mut bytes_freed: u64 = 0;
@@ -342,8 +350,9 @@ impl ReplayStore {
                 }
             });
             inner.total_bytes = inner.total_bytes.saturating_sub(bytes_freed);
-            seqs
+            (seqs, inner.total_bytes)
         };
+        publish_total_bytes(new_total_bytes);
         if victims.is_empty() {
             return Ok(());
         }
@@ -513,6 +522,25 @@ fn accounted_size(key_len: usize, value_len: usize) -> u64 {
         .saturating_add(REDB_PER_RECORD_OVERHEAD)
 }
 
+/// Publish the current accounted total bytes to the
+/// `rustgate_federation_replay_buffer_bytes` Prometheus gauge.
+///
+/// Compiles to a no-op when the `api` feature (which gates the
+/// [`crate::metrics`] module) is disabled, so production builds without
+/// the management API pay no overhead. Clamps to [`i64::MAX`] on
+/// improbable overflow because Prometheus's `IntGauge` is signed — at
+/// the default [`DEFAULT_REPLAY_MAX_BYTES`] cap of 64 MiB this clamp is
+/// unreachable, but the saturation keeps the type boundary panic-free
+/// under any operator-chosen cap.
+#[cfg(feature = "api")]
+fn publish_total_bytes(total_bytes: u64) {
+    let clamped = i64::try_from(total_bytes).unwrap_or(i64::MAX);
+    crate::metrics::replay_buffer_bytes().set(clamped);
+}
+
+#[cfg(not(feature = "api"))]
+fn publish_total_bytes(_total_bytes: u64) {}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::panic, clippy::unwrap_used)]
@@ -668,6 +696,78 @@ mod tests {
             "expected peer A's oldest record to be evicted first, got a_seqs={a_seqs:?} b_seqs={b_seqs:?}"
         );
         assert!(b_seqs.contains(&3));
+    }
+
+    // The Prometheus-gauge test is only meaningful with the `api`
+    // feature (which gates `crate::metrics`). Under the default
+    // no-`api` build, `publish_total_bytes` is a compile-time no-op and
+    // there is no gauge to read back.
+    #[cfg(feature = "api")]
+    #[test]
+    fn replay_buffer_bytes_gauge_tracks_mutations() {
+        use std::sync::Once;
+        static METRICS_INIT: Once = Once::new();
+        // `crate::metrics::init()` fails on double-register; gate behind
+        // a Once so parallel tests sharing the default Prometheus
+        // registry do not race.
+        METRICS_INIT.call_once(|| {
+            let _ = crate::metrics::init();
+        });
+
+        let gauge = crate::metrics::replay_buffer_bytes();
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ReplayStore::open(dir.path(), 1024 * 1024).unwrap();
+        // Empty open: accounted total is 0, gauge reflects it.
+        assert_eq!(
+            gauge.get(),
+            i64::try_from(store.total_bytes()).unwrap_or(i64::MAX),
+        );
+
+        // After a put, the gauge must match the store's own accounting
+        // to prove we are reading and publishing the same field.
+        put(&store, "peer-a", 1, 100, b"hello");
+        assert_eq!(
+            gauge.get(),
+            i64::try_from(store.total_bytes()).unwrap_or(i64::MAX),
+        );
+        assert!(gauge.get() > 0, "expected gauge to grow after put");
+
+        put(&store, "peer-a", 2, 200, b"world");
+        put(&store, "peer-b", 1, 300, b"solo");
+        let after_three_puts = gauge.get();
+        assert_eq!(
+            after_three_puts,
+            i64::try_from(store.total_bytes()).unwrap_or(i64::MAX),
+        );
+
+        // Delete: gauge drops to match the new accounted total.
+        store.delete("peer-a", 1).unwrap();
+        assert!(
+            gauge.get() < after_three_puts,
+            "expected gauge to shrink after delete: before={after_three_puts}, after={}",
+            gauge.get(),
+        );
+        assert_eq!(
+            gauge.get(),
+            i64::try_from(store.total_bytes()).unwrap_or(i64::MAX),
+        );
+
+        // clear_peer: removes every peer-a record; gauge tracks.
+        store.clear_peer("peer-a").unwrap();
+        assert_eq!(
+            gauge.get(),
+            i64::try_from(store.total_bytes()).unwrap_or(i64::MAX),
+        );
+
+        // Drop and reopen: rehydrate path must re-seed the gauge from
+        // the on-disk footprint, not leave it at the mid-test value.
+        drop(store);
+        let store = ReplayStore::open(dir.path(), 1024 * 1024).unwrap();
+        assert_eq!(
+            gauge.get(),
+            i64::try_from(store.total_bytes()).unwrap_or(i64::MAX),
+        );
     }
 
     #[test]
