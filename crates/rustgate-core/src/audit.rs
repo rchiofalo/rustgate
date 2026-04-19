@@ -569,6 +569,25 @@ pub fn store_forward_dropped(cn: &str, reason: &str) {
     );
 }
 
+/// Record an explicit operator-initiated wipe of the store-forward queue
+/// on startup. `depth` is the count of queue entries discarded by the
+/// wipe. Emitted once per `ClientQueue::open_with_wipe` invocation — the
+/// counterpart to the fail-closed behavior that refuses to start when
+/// stored entries exist without a persistent HMAC key. This event
+/// provides the audit trail the store-forward contract requires when
+/// previously-queued messages are deliberately dropped rather than
+/// delivered.
+pub fn store_forward_key_rotated(path: &str, depth: u64, reason: &str) {
+    audit!(
+        "store_forward.key_rotated",
+        path = %path,
+        depth = depth,
+        reason = %reason,
+        action = "wipe_queue",
+        result = "rotated"
+    );
+}
+
 /// Record a message being shed by per-target rate limiting.
 pub fn http_rate_limited(target: &str, source_cn: &str) {
     audit!(
@@ -588,6 +607,54 @@ pub fn http_dlq_failed(target: &str, error: &str) {
         error = %error,
         action = "dead_letter",
         result = "failure"
+    );
+}
+
+// ── MAVLink framing audit events ────────────────────────────────────
+
+/// Record a MAVLink v2 frame rejected because its `INCOMPAT & SIGNED`
+/// bit was clear on a codec configured to require signatures.
+///
+/// Emitted by the session layer that drives the MAVLink frame codec in
+/// `rustgate-mavlink` (arriving in a follow-up PR with the listener).
+/// Operators route this event to their SIEM to detect firmware
+/// downgrade attempts and misconfigured fleet members that skipped the
+/// signing rollout.
+///
+/// Kept as a plain-text reference rather than a rustdoc intra-doc link
+/// because `rustgate-core` deliberately does not depend on
+/// `rustgate-mavlink` (the dependency direction is the other way).
+///
+/// `peer` is the socket address of the link that produced the frame;
+/// omit or pass `"unknown"` when the transport cannot supply one
+/// (e.g. a UDP datagram whose source we deliberately ignore).
+pub fn mavlink_unsigned_rejected(peer: &str) {
+    audit!(
+        "mavlink.unsigned_rejected",
+        peer = %peer,
+        action = "frame_decode",
+        result = "rejected",
+        reason = "unsigned_v2"
+    );
+}
+
+/// Record a MAVLink v1 frame rejected because the codec was configured
+/// to disallow the pre-signing wire format.
+///
+/// Paired with [`mavlink_unsigned_rejected`] so a SIEM can distinguish
+/// "sender failed to sign v2" from "sender is speaking the unsigned
+/// legacy protocol" — the operational responses differ (firmware fix
+/// vs. dataplane opt-in). Both events fire at most once per frame, not
+/// once per packet, so a hostile link cannot amplify them into a log
+/// DoS: rejection discards the magic byte and the session layer will
+/// close the link after a small number of errors.
+pub fn mavlink_v1_rejected(peer: &str) {
+    audit!(
+        "mavlink.v1_rejected",
+        peer = %peer,
+        action = "frame_decode",
+        result = "rejected",
+        reason = "v1_not_allowed"
     );
 }
 
@@ -851,6 +918,28 @@ mod tests {
         fn test_http_circuit_recovered() {
             http_circuit_recovered("siem-collector");
             http_circuit_recovered("analytics-api");
+        }
+    }
+
+    mod mavlink {
+        use super::*;
+
+        #[test]
+        fn test_mavlink_unsigned_rejected() {
+            // Exercise common and edge shapes of the peer field so the
+            // macro doesn't choke on zero-length or IPv6-bracketed
+            // addresses. The helper is intentionally fmt-agnostic.
+            mavlink_unsigned_rejected("10.0.0.1:14550");
+            mavlink_unsigned_rejected("[::1]:14550");
+            mavlink_unsigned_rejected("unknown");
+            mavlink_unsigned_rejected("");
+        }
+
+        #[test]
+        fn test_mavlink_v1_rejected() {
+            mavlink_v1_rejected("192.168.1.42:14550");
+            mavlink_v1_rejected("unknown");
+            mavlink_v1_rejected("");
         }
     }
 }

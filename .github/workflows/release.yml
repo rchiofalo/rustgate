@@ -87,12 +87,33 @@ jobs:
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
 
+      - name: Run Trivy vulnerability scanner
+        # Trivy gates the signature: a CRITICAL or HIGH finding fails this
+        # step, which short-circuits the job before `cosign sign` runs, so
+        # we never attach a cosign signature to a vulnerable image. The
+        # image is already pushed at this point — consumers who rely on
+        # the signature for admission control will correctly reject it.
+        # To ship an image despite a known finding, add a dated entry to
+        # `.trivyignore` with reviewer rationale rather than relaxing the
+        # exit-code or re-introducing continue-on-error here.
+        if: ${{ !cancelled() && steps.push.conclusion == 'success' }}
+        id: trivy
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+
       - name: Sign image with cosign
+        # Only reached when Trivy finds no CRITICAL/HIGH vulnerabilities.
         run: cosign sign --yes ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
 
-      # ── Post-push security & metadata steps ──────────────────────
+      # ── Post-sign metadata steps ────────────────────────────────
       # These steps are best-effort: individual failures must not cascade
-      # or fail the overall job. The image is already pushed and signed.
+      # or fail the overall job. The image is already pushed and signed;
+      # SARIF upload and SBOM generation are informational artefacts.
 
       - name: Attest build provenance
         if: github.repository_visibility == 'public'
@@ -102,18 +123,10 @@ jobs:
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
 
-      - name: Run Trivy vulnerability scanner
-        if: ${{ !cancelled() && steps.push.conclusion == 'success' }}
-        continue-on-error: true
-        id: trivy
-        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
-        with:
-          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
-          format: sarif
-          output: trivy-results.sarif
-          severity: CRITICAL,HIGH
-
       - name: Upload Trivy scan results to GitHub Security tab
+        # Runs with `!cancelled()` so SARIF is uploaded even when Trivy
+        # failed the job — findings appear in the Security tab regardless
+        # of whether the release was signed, aiding triage.
         uses: github/codeql-action/upload-sarif@95e58e9a2cdfd71adc6e0353d5c52f41a045d225 # v4.35.2
         if: ${{ !cancelled() && hashFiles('trivy-results.sarif') != '' && github.repository_visibility == 'public' }}
         continue-on-error: true

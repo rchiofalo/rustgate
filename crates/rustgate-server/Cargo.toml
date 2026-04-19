@@ -87,6 +87,8 @@ sha2 = { workspace = true }
 subtle = { workspace = true }
 x509-parser = { workspace = true, optional = true }
 zeroize = { workspace = true }
+hex = { workspace = true }
+rustix = { workspace = true }
 
 [dev-dependencies]
 rustgate-test-utils = { workspace = true }
