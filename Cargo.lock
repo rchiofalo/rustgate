@@ -3243,6 +3243,7 @@ dependencies = [
  "prost-types",
  "redb",
  "reqwest",
+ "ring",
  "rustgate-core",
  "rustgate-proto",
  "rustgate-resilience",
