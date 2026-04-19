@@ -60,6 +60,7 @@ prometheus = { workspace = true, optional = true }
 zeroize = { workspace = true }
 redb = { workspace = true }
 parking_lot = { workspace = true }
+lru = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true, optional = true }
 mdns-sd = { workspace = true, optional = true }
