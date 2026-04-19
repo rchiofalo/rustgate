@@ -596,11 +596,15 @@ pub fn http_dlq_failed(target: &str, error: &str) {
 /// Record a MAVLink v2 frame rejected because its `INCOMPAT & SIGNED`
 /// bit was clear on a codec configured to require signatures.
 ///
-/// Emitted by the session layer that drives
-/// [`rustgate_mavlink::MavlinkFrameCodec`] (arriving in a follow-up PR
-/// with the listener). Operators route this event to their SIEM to
-/// detect firmware downgrade attempts and misconfigured fleet members
-/// that skipped the signing rollout.
+/// Emitted by the session layer that drives the MAVLink frame codec in
+/// `rustgate-mavlink` (arriving in a follow-up PR with the listener).
+/// Operators route this event to their SIEM to detect firmware
+/// downgrade attempts and misconfigured fleet members that skipped the
+/// signing rollout.
+///
+/// Kept as a plain-text reference rather than a rustdoc intra-doc link
+/// because `rustgate-core` deliberately does not depend on
+/// `rustgate-mavlink` (the dependency direction is the other way).
 ///
 /// `peer` is the socket address of the link that produced the frame;
 /// omit or pass `"unknown"` when the transport cannot supply one
