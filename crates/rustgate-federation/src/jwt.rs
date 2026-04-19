@@ -2,19 +2,34 @@
 
 //! JWT token authentication for federation connections.
 //!
-//! Provides HMAC-SHA256 signed JWT tokens as an alternative to
-//! certificate-only federation authentication. Tokens carry peer
-//! identity, group claims, and expiration.
+//! Supports HMAC-SHA256 (HS256) and ECDSA P-256 SHA-256 (ES256, RFC 7518)
+//! signed tokens. Tokens carry peer identity, group claims, and
+//! expiration.
 //!
 //! This is an opt-in layer — mTLS remains the default transport
 //! security. JWT adds per-connection authorization claims that can
 //! be rotated without re-issuing certificates.
+//!
+//! # Algorithm selection
+//!
+//! - [`JwtAuthority::new`] creates an HS256 authority. The same secret
+//!   signs and verifies tokens. Every verifier holds the ability to
+//!   forge tokens, so a compromised peer leaks the issuing key for the
+//!   entire federation.
+//! - [`JwtAuthority::new_es256`] creates an ES256 authority. Signing uses
+//!   the operator-supplied private key; verification uses per-peer public
+//!   keys registered via [`JwtAuthority::with_es256_verifier`]. A
+//!   compromised verifier cannot forge tokens. Tokens carry a `kid`
+//!   header that routes verification to the right public key, so
+//!   operators can stage key rotation by pre-distributing the next
+//!   `kid`'s public key before flipping the issuer.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, Mac};
+use ring::signature::{self as ring_sig, KeyPair};
 use rustgate_core::b64;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -23,6 +38,11 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Minimum secret length in bytes for HMAC-SHA256 security.
 const MIN_SECRET_LENGTH: usize = 32;
+
+/// Maximum permitted length for a `kid` (key identifier) header field.
+/// Keeps header JSON bounded and guards against hostile peers trying to
+/// inflate tokens via pathological identifiers.
+const MAX_KID_LENGTH: usize = 64;
 
 /// Default maximum number of revoked JTIs tracked.
 const DEFAULT_REVOCATION_CAPACITY: usize = 10_000;
@@ -54,11 +74,145 @@ pub struct FederationClaims {
     pub groups: Vec<String>,
 }
 
+/// JWT signing/verification algorithm per RFC 7518.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Algorithm {
+    /// HMAC-SHA256 — symmetric, a single secret signs and verifies.
+    Hs256,
+    /// ECDSA P-256 with SHA-256 — asymmetric, fixed 64-byte signature
+    /// `(r || s)` per RFC 7518 §3.4.
+    Es256,
+}
+
+impl Algorithm {
+    fn as_str(self) -> &'static str {
+        match self {
+            Algorithm::Hs256 => "HS256",
+            Algorithm::Es256 => "ES256",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "HS256" => Some(Algorithm::Hs256),
+            "ES256" => Some(Algorithm::Es256),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Algorithm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Active signing key used to issue tokens.
+///
+/// The `Es256` variant boxes the [`ring_sig::EcdsaKeyPair`] because it
+/// is ~264 bytes (vs ~48 bytes for the HS256 variant), and we don't
+/// want every `SigningKey` value to pay that cost when the authority
+/// is HS256. The clippy `large_enum_variant` lint flags the disparity.
+enum SigningKey {
+    Hs256 {
+        secret: Zeroizing<Vec<u8>>,
+        kid: Option<String>,
+    },
+    Es256 {
+        key_pair: Box<ring_sig::EcdsaKeyPair>,
+        kid: String,
+    },
+}
+
+impl SigningKey {
+    fn algorithm(&self) -> Algorithm {
+        match self {
+            SigningKey::Hs256 { .. } => Algorithm::Hs256,
+            SigningKey::Es256 { .. } => Algorithm::Es256,
+        }
+    }
+
+    fn kid(&self) -> Option<&str> {
+        match self {
+            SigningKey::Hs256 { kid, .. } => kid.as_deref(),
+            SigningKey::Es256 { kid, .. } => Some(kid.as_str()),
+        }
+    }
+
+    fn sign(&self, signing_input: &[u8]) -> Result<Vec<u8>, JwtError> {
+        match self {
+            SigningKey::Hs256 { secret, .. } => {
+                let mut mac =
+                    HmacSha256::new_from_slice(secret).map_err(|_| JwtError::InvalidSignature)?;
+                mac.update(signing_input);
+                Ok(mac.finalize().into_bytes().to_vec())
+            }
+            SigningKey::Es256 { key_pair, .. } => {
+                // A fresh SystemRandom is effectively free — ring keeps the
+                // per-thread entropy handle internally.
+                let rng = ring::rand::SystemRandom::new();
+                let sig = key_pair
+                    .sign(&rng, signing_input)
+                    .map_err(|_| JwtError::InvalidSignature)?;
+                Ok(sig.as_ref().to_vec())
+            }
+        }
+    }
+}
+
+/// Public verifier key for validating received tokens.
+///
+/// Verifiers are indexed by `kid` inside [`JwtAuthority`] so a single
+/// authority can validate tokens from many peers, each with its own
+/// key material, without a shared secret.
+enum VerificationKey {
+    Hs256(Zeroizing<Vec<u8>>),
+    /// ECDSA P-256 public key in SEC1 uncompressed form
+    /// (`0x04 || x(32) || y(32)` = 65 bytes).
+    Es256(Vec<u8>),
+}
+
+impl VerificationKey {
+    fn algorithm(&self) -> Algorithm {
+        match self {
+            VerificationKey::Hs256(_) => Algorithm::Hs256,
+            VerificationKey::Es256(_) => Algorithm::Es256,
+        }
+    }
+
+    fn verify(&self, signing_input: &[u8], sig: &[u8]) -> Result<(), JwtError> {
+        match self {
+            VerificationKey::Hs256(secret) => {
+                let mut mac =
+                    HmacSha256::new_from_slice(secret).map_err(|_| JwtError::InvalidSignature)?;
+                mac.update(signing_input);
+                // Constant-time verification via the hmac crate.
+                mac.verify_slice(sig)
+                    .map_err(|_| JwtError::InvalidSignature)
+            }
+            VerificationKey::Es256(pub_key) => {
+                ring_sig::UnparsedPublicKey::new(&ring_sig::ECDSA_P256_SHA256_FIXED, pub_key)
+                    .verify(signing_input, sig)
+                    .map_err(|_| JwtError::InvalidSignature)
+            }
+        }
+    }
+}
+
 /// Manages JWT issuance, validation, and revocation for federation.
 pub struct JwtAuthority {
-    /// HMAC-SHA256 signing key. Wrapped in [`Zeroizing`] so the key
-    /// material is wiped from memory when the authority is dropped.
-    secret: Zeroizing<Vec<u8>>,
+    /// Active signing key — used by `issue()` / `issue_with_expiry()`.
+    signing: SigningKey,
+    /// Per-peer verifier keys, indexed by the JWT header `kid` field.
+    /// Incoming tokens route verification here. An ES256 authority
+    /// pre-populates this with its own local public key (so it can
+    /// verify tokens it issued itself).
+    verifiers: HashMap<String, VerificationKey>,
+    /// Fallback verifier for tokens whose header has no `kid`.
+    /// Present only when [`JwtAuthority::new`] (HS256) was used, so
+    /// legacy tokens without a `kid` header still validate. ES256
+    /// authorities always emit a `kid`, so no fallback is needed.
+    legacy_verifier: Option<VerificationKey>,
     /// Issuer name stamped into tokens.
     issuer: String,
     /// Default token lifetime.
@@ -80,10 +234,14 @@ impl std::fmt::Debug for JwtAuthority {
 }
 
 impl JwtAuthority {
-    /// Create a new JWT authority with the given signing secret.
+    /// Create a new HS256 JWT authority.
     ///
     /// The secret must be at least 32 bytes (`MIN_SECRET_LENGTH`) to
-    /// provide full HMAC-SHA256 security.
+    /// provide full HMAC-SHA256 security. Tokens issued by this
+    /// authority omit the `kid` header (backward compatible with
+    /// earlier versions of this crate). A matching HS256 verifier is
+    /// installed as the `legacy_verifier` so the same authority can
+    /// validate tokens it issued itself.
     pub fn new(secret: impl Into<Vec<u8>>, issuer: impl Into<String>) -> Result<Self, JwtError> {
         let secret = Zeroizing::new(secret.into());
         if secret.len() < MIN_SECRET_LENGTH {
@@ -92,13 +250,118 @@ impl JwtAuthority {
                 actual: secret.len(),
             });
         }
+        // Dedicated copy for the verifier side — dropped when the
+        // authority is dropped (so both wipes fire deterministically).
+        let legacy = Zeroizing::new(secret.to_vec());
         Ok(Self {
-            secret,
+            signing: SigningKey::Hs256 { secret, kid: None },
+            verifiers: HashMap::new(),
+            legacy_verifier: Some(VerificationKey::Hs256(legacy)),
             issuer: issuer.into(),
             default_expiry: Duration::from_secs(3600),
             revoked: Mutex::new(HashMap::new()),
             revocation_capacity: DEFAULT_REVOCATION_CAPACITY,
         })
+    }
+
+    /// Create a new ES256 JWT authority.
+    ///
+    /// `pkcs8_der` must be a PKCS#8 v1 DER-encoded ECDSA P-256 private
+    /// key. `kid` uniquely identifies this signing key; every issued
+    /// token carries it in the header so remote verifiers can route to
+    /// the correct public key.
+    ///
+    /// The local public key is registered as a verifier under the same
+    /// `kid`, so this authority can validate tokens it issued itself.
+    pub fn new_es256(
+        pkcs8_der: impl AsRef<[u8]>,
+        kid: impl Into<String>,
+        issuer: impl Into<String>,
+    ) -> Result<Self, JwtError> {
+        let kid = validate_kid(kid.into())?;
+        let rng = ring::rand::SystemRandom::new();
+        let key_pair = ring_sig::EcdsaKeyPair::from_pkcs8(
+            &ring_sig::ECDSA_P256_SHA256_FIXED_SIGNING,
+            pkcs8_der.as_ref(),
+            &rng,
+        )
+        .map_err(|_| JwtError::InvalidKey)?;
+        let local_public_key = key_pair.public_key().as_ref().to_vec();
+
+        let mut verifiers = HashMap::new();
+        let _ = verifiers.insert(kid.clone(), VerificationKey::Es256(local_public_key));
+
+        Ok(Self {
+            signing: SigningKey::Es256 {
+                key_pair: Box::new(key_pair),
+                kid,
+            },
+            verifiers,
+            legacy_verifier: None,
+            issuer: issuer.into(),
+            default_expiry: Duration::from_secs(3600),
+            revoked: Mutex::new(HashMap::new()),
+            revocation_capacity: DEFAULT_REVOCATION_CAPACITY,
+        })
+    }
+
+    /// The algorithm this authority uses to sign issued tokens.
+    pub fn signing_algorithm(&self) -> Algorithm {
+        self.signing.algorithm()
+    }
+
+    /// The `kid` this authority stamps on issued tokens, if any.
+    /// [`Self::new`] (HS256) returns `None`; [`Self::new_es256`]
+    /// always returns `Some`.
+    pub fn signing_kid(&self) -> Option<&str> {
+        self.signing.kid()
+    }
+
+    /// Register an HS256 verifier key for a peer identified by `kid`.
+    ///
+    /// The secret must be at least 32 bytes (`MIN_SECRET_LENGTH`). Used to
+    /// validate tokens issued by a remote HS256 peer; bootstraps the
+    /// verifier registry alongside or instead of the fallback
+    /// `legacy_verifier`.
+    pub fn with_hs256_verifier(
+        mut self,
+        kid: impl Into<String>,
+        secret: impl Into<Vec<u8>>,
+    ) -> Result<Self, JwtError> {
+        let kid = validate_kid(kid.into())?;
+        let secret = Zeroizing::new(secret.into());
+        if secret.len() < MIN_SECRET_LENGTH {
+            return Err(JwtError::SecretTooShort {
+                min: MIN_SECRET_LENGTH,
+                actual: secret.len(),
+            });
+        }
+        let _ = self.verifiers.insert(kid, VerificationKey::Hs256(secret));
+        Ok(self)
+    }
+
+    /// Register an ES256 verifier key for a peer identified by `kid`.
+    ///
+    /// `public_key_sec1` must be a raw ECDSA P-256 uncompressed public
+    /// key in SEC1 form: `0x04 || x(32) || y(32)`, 65 bytes total.
+    /// No PEM or SPKI wrapping — unwrap at the call site. Extract
+    /// directly from a `ring::signature::EcdsaKeyPair::public_key()` or
+    /// from the raw `x`/`y` fields of a JWK.
+    pub fn with_es256_verifier(
+        mut self,
+        kid: impl Into<String>,
+        public_key_sec1: impl Into<Vec<u8>>,
+    ) -> Result<Self, JwtError> {
+        let kid = validate_kid(kid.into())?;
+        let public_key = public_key_sec1.into();
+        // SEC1 uncompressed P-256: leading 0x04 + 32 bytes X + 32 bytes Y.
+        if public_key.len() != 65 || public_key.first() != Some(&0x04) {
+            return Err(JwtError::InvalidKey);
+        }
+        let _ = self
+            .verifiers
+            .insert(kid, VerificationKey::Es256(public_key));
+        Ok(self)
     }
 
     /// Set the default token lifetime.
@@ -130,7 +393,7 @@ impl JwtAuthority {
             groups,
         };
 
-        encode(&self.secret, &claims)
+        encode(&self.signing, &claims)
     }
 
     /// Issue a token with a custom expiration duration.
@@ -155,12 +418,22 @@ impl JwtAuthority {
             groups,
         };
 
-        encode(&self.secret, &claims)
+        encode(&self.signing, &claims)
     }
 
     /// Validate a JWT token and return the claims if valid.
+    ///
+    /// Verification selects a key by inspecting the token's header:
+    /// - If a `kid` field is present, looks it up in the peer verifier
+    ///   registry (populated by `with_*_verifier` or the ES256 local
+    ///   self-verifier).
+    /// - If no `kid`, falls back to the `legacy_verifier` (populated
+    ///   only by HS256 authorities). ES256 authorities never fall back:
+    ///   tokens without a `kid` are rejected as [`JwtError::UnknownKid`].
+    /// - The header's `alg` must match the selected verifier's
+    ///   algorithm, or [`JwtError::AlgorithmMismatch`] is returned.
     pub fn validate(&self, token: &str) -> Result<FederationClaims, JwtError> {
-        let claims = decode(&self.secret, token)?;
+        let claims = decode(self, token)?;
 
         // Check expiration
         let now = SystemTime::now()
@@ -274,6 +547,29 @@ pub enum JwtError {
         /// Actual length provided.
         actual: usize,
     },
+    /// Provided key material (PKCS#8 DER private key or SEC1 public key)
+    /// could not be parsed.
+    InvalidKey,
+    /// Token header advertises an algorithm this authority does not
+    /// support (only `HS256` and `ES256` are recognised).
+    UnsupportedAlgorithm(String),
+    /// Token header carries a `kid` that is not in the verifier registry
+    /// (or no `kid` was present and no legacy verifier is configured).
+    UnknownKid(String),
+    /// Token header's `alg` does not match the verifier's algorithm for
+    /// the selected `kid`. This catches algorithm-confusion attacks
+    /// (e.g. a signed-with-HS256 token presented with an `alg: ES256`
+    /// header hoping a public-key verifier treats the public key as an
+    /// HMAC secret).
+    AlgorithmMismatch {
+        /// Algorithm declared in the token header.
+        header: Algorithm,
+        /// Algorithm configured on the verifier selected by `kid`.
+        key: Algorithm,
+    },
+    /// Provided `kid` is empty, exceeds 64 bytes (`MAX_KID_LENGTH`), or
+    /// contains non-printable / control characters.
+    InvalidKid,
 }
 
 impl std::fmt::Display for JwtError {
@@ -290,6 +586,27 @@ impl std::fmt::Display for JwtError {
             JwtError::SecretTooShort { min, actual } => {
                 write!(f, "secret too short: need {min} bytes, got {actual}")
             }
+            JwtError::InvalidKey => write!(f, "invalid key material"),
+            JwtError::UnsupportedAlgorithm(alg) => {
+                write!(f, "unsupported algorithm: {alg}")
+            }
+            JwtError::UnknownKid(kid) => {
+                if kid.is_empty() {
+                    write!(f, "token has no kid and no legacy verifier is configured")
+                } else {
+                    write!(f, "unknown kid: {kid}")
+                }
+            }
+            JwtError::AlgorithmMismatch { header, key } => {
+                write!(
+                    f,
+                    "token alg {header} does not match key alg {key} for selected kid"
+                )
+            }
+            JwtError::InvalidKid => write!(
+                f,
+                "kid must be non-empty, <= {MAX_KID_LENGTH} bytes, and printable ASCII"
+            ),
         }
     }
 }
@@ -298,46 +615,113 @@ impl std::error::Error for JwtError {}
 
 // ── JWT encoding/decoding ───────────────────────────────────────────
 
+/// JOSE header serialised into the first segment of every JWT.
+///
+/// `kid` is omitted when the signer has no key identifier (HS256 path
+/// used by [`JwtAuthority::new`]) so the on-wire format is identical
+/// to what older versions of this crate produced.
+#[derive(serde::Serialize)]
+struct EncodedHeader<'a> {
+    alg: &'a str,
+    typ: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kid: Option<&'a str>,
+}
+
+/// JOSE header as parsed from an incoming token.
+#[derive(serde::Deserialize)]
+struct DecodedHeader {
+    alg: String,
+    #[serde(default)]
+    kid: Option<String>,
+    // `typ` is not validated — RFC 7519 allows it to be absent and
+    // many issuers omit it.
+}
+
 /// Encode claims into a signed JWT string.
-fn encode(secret: &[u8], claims: &FederationClaims) -> Result<String, JwtError> {
-    let header = r#"{"alg":"HS256","typ":"JWT"}"#;
-    let header_b64 = b64::encode_url_safe(header.as_bytes());
+fn encode(signing: &SigningKey, claims: &FederationClaims) -> Result<String, JwtError> {
+    let header = EncodedHeader {
+        alg: signing.algorithm().as_str(),
+        typ: "JWT",
+        kid: signing.kid(),
+    };
+    let header_json =
+        serde_json::to_string(&header).map_err(|e| JwtError::SerializationError(e.to_string()))?;
+    let header_b64 = b64::encode_url_safe(header_json.as_bytes());
 
     let payload_json =
         serde_json::to_string(claims).map_err(|e| JwtError::SerializationError(e.to_string()))?;
     let payload_b64 = b64::encode_url_safe(payload_json.as_bytes());
 
     let signing_input = format!("{header_b64}.{payload_b64}");
-
-    let mut mac = HmacSha256::new_from_slice(secret).map_err(|_| JwtError::InvalidSignature)?;
-    mac.update(signing_input.as_bytes());
-    let signature = mac.finalize().into_bytes();
+    let signature = signing.sign(signing_input.as_bytes())?;
     let signature_b64 = b64::encode_url_safe(signature);
 
     Ok(format!("{signing_input}.{signature_b64}"))
 }
 
 /// Decode and verify a JWT token, returning the claims.
-fn decode(secret: &[u8], token: &str) -> Result<FederationClaims, JwtError> {
+///
+/// The verifier is selected by the header's `kid` (with fallback to
+/// the authority's `legacy_verifier` when `kid` is absent). The
+/// header's `alg` must match the verifier's algorithm — this is the
+/// defence against the classic "`alg: HS256` + RSA public key as HMAC
+/// secret" algorithm-confusion attack.
+fn decode(auth: &JwtAuthority, token: &str) -> Result<FederationClaims, JwtError> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         return Err(JwtError::Malformed);
     }
 
+    let header_bytes = b64::decode_url_safe(parts[0]).map_err(|_| JwtError::Malformed)?;
+    let header: DecodedHeader =
+        serde_json::from_slice(&header_bytes).map_err(|_| JwtError::Malformed)?;
+
+    let alg = Algorithm::parse(&header.alg)
+        .ok_or_else(|| JwtError::UnsupportedAlgorithm(header.alg.clone()))?;
+
+    let verifier: &VerificationKey = match header.kid.as_deref() {
+        Some(kid) => auth
+            .verifiers
+            .get(kid)
+            .ok_or_else(|| JwtError::UnknownKid(kid.to_string()))?,
+        None => auth
+            .legacy_verifier
+            .as_ref()
+            .ok_or_else(|| JwtError::UnknownKid(String::new()))?,
+    };
+
+    if verifier.algorithm() != alg {
+        return Err(JwtError::AlgorithmMismatch {
+            header: alg,
+            key: verifier.algorithm(),
+        });
+    }
+
     let signing_input = format!("{}.{}", parts[0], parts[1]);
     let actual_sig = b64::decode_url_safe(parts[2]).map_err(|_| JwtError::Malformed)?;
-
-    let mut mac = HmacSha256::new_from_slice(secret).map_err(|_| JwtError::InvalidSignature)?;
-    mac.update(signing_input.as_bytes());
-    // Constant-time verification via the hmac crate.
-    mac.verify_slice(&actual_sig)
-        .map_err(|_| JwtError::InvalidSignature)?;
+    verifier.verify(signing_input.as_bytes(), &actual_sig)?;
 
     let payload_bytes = b64::decode_url_safe(parts[1]).map_err(|_| JwtError::Malformed)?;
     let claims: FederationClaims = serde_json::from_slice(&payload_bytes)
         .map_err(|e| JwtError::SerializationError(e.to_string()))?;
 
     Ok(claims)
+}
+
+/// Validate a `kid` string. Rejects empty values, anything longer than
+/// [`MAX_KID_LENGTH`], and anything that isn't printable ASCII. The
+/// latter catches control-character injection that would corrupt the
+/// header JSON even through serde escaping (e.g. an attacker trying
+/// to smuggle a second JSON field via a quoted string).
+fn validate_kid(kid: String) -> Result<String, JwtError> {
+    if kid.is_empty() || kid.len() > MAX_KID_LENGTH {
+        return Err(JwtError::InvalidKid);
+    }
+    if !kid.chars().all(|c| c.is_ascii() && !c.is_ascii_control()) {
+        return Err(JwtError::InvalidKid);
+    }
+    Ok(kid)
 }
 
 /// Generate a unique token identifier from peer ID and timestamp.
@@ -411,7 +795,7 @@ mod tests {
             groups: vec![],
         };
 
-        let token = encode(&auth.secret, &claims).expect("encode");
+        let token = encode(&auth.signing, &claims).expect("encode");
         let result = auth.validate(&token);
         assert_eq!(result, Err(JwtError::IssuedInFuture));
     }
@@ -435,7 +819,7 @@ mod tests {
             groups: vec![],
         };
 
-        let token = encode(&auth.secret, &claims).expect("encode");
+        let token = encode(&auth.signing, &claims).expect("encode");
         let result = auth.validate(&token);
         assert!(result.is_ok(), "iat within skew should be accepted");
     }
@@ -592,5 +976,305 @@ mod tests {
         assert_eq!(JwtError::Expired.to_string(), "token expired");
         assert_eq!(JwtError::InvalidSignature.to_string(), "invalid signature");
         assert_eq!(JwtError::Revoked.to_string(), "token revoked");
+    }
+
+    // ── ES256 / multi-key tests (#760) ──────────────────────────────
+
+    /// Generate a fresh ECDSA P-256 key pair. Returns (pkcs8 DER, SEC1 public key).
+    fn es256_test_keypair() -> (Vec<u8>, Vec<u8>) {
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring_sig::EcdsaKeyPair::generate_pkcs8(
+            &ring_sig::ECDSA_P256_SHA256_FIXED_SIGNING,
+            &rng,
+        )
+        .expect("keygen");
+        let key_pair = ring_sig::EcdsaKeyPair::from_pkcs8(
+            &ring_sig::ECDSA_P256_SHA256_FIXED_SIGNING,
+            pkcs8.as_ref(),
+            &rng,
+        )
+        .expect("parse pkcs8");
+        let public_key = key_pair.public_key().as_ref().to_vec();
+        (pkcs8.as_ref().to_vec(), public_key)
+    }
+
+    #[test]
+    fn es256_issue_and_validate_round_trip() {
+        let (pkcs8, _pub) = es256_test_keypair();
+        let auth = JwtAuthority::new_es256(pkcs8, "peer-alpha", "rustgate-test").expect("es256");
+
+        assert_eq!(auth.signing_algorithm(), Algorithm::Es256);
+        assert_eq!(auth.signing_kid(), Some("peer-alpha"));
+
+        let token = auth
+            .issue("peer-alpha", vec!["Alpha".into()])
+            .expect("issue");
+        let claims = auth.validate(&token).expect("validate");
+        assert_eq!(claims.sub, "peer-alpha");
+        assert_eq!(claims.groups, vec!["Alpha"]);
+    }
+
+    #[test]
+    fn es256_cross_authority_validate_via_registered_verifier() {
+        // Authority A issues with a private key it holds.
+        let (pkcs8_a, pub_a) = es256_test_keypair();
+        let authority_a =
+            JwtAuthority::new_es256(pkcs8_a, "peer-a", "rustgate-test").expect("es256 a");
+
+        // Authority B holds a DIFFERENT signing key but carries A's
+        // public key as a verifier. This is the whole asymmetric-crypto
+        // rationale from #760: B never sees A's signing key yet can
+        // still verify tokens A issued.
+        let (pkcs8_b, _pub_b) = es256_test_keypair();
+        let authority_b = JwtAuthority::new_es256(pkcs8_b, "peer-b", "rustgate-test")
+            .expect("es256 b")
+            .with_es256_verifier("peer-a", pub_a)
+            .expect("register a's public key");
+
+        let token = authority_a.issue("peer-a", vec![]).expect("issue");
+        let claims = authority_b.validate(&token).expect("validate");
+        assert_eq!(claims.sub, "peer-a");
+    }
+
+    #[test]
+    fn es256_emits_alg_and_kid_in_header() {
+        let (pkcs8, _) = es256_test_keypair();
+        let auth = JwtAuthority::new_es256(pkcs8, "peer-kid-xyz", "rustgate-test").expect("es256");
+        let token = auth.issue("peer-kid-xyz", vec![]).expect("issue");
+
+        let header_b64 = token.split('.').next().expect("has header");
+        let header_bytes = b64::decode_url_safe(header_b64).expect("decode header");
+        let header: serde_json::Value = serde_json::from_slice(&header_bytes).expect("json");
+        assert_eq!(header.get("alg").and_then(|v| v.as_str()), Some("ES256"));
+        assert_eq!(
+            header.get("kid").and_then(|v| v.as_str()),
+            Some("peer-kid-xyz")
+        );
+        assert_eq!(header.get("typ").and_then(|v| v.as_str()), Some("JWT"));
+    }
+
+    #[test]
+    fn hs256_authority_omits_kid_from_header_for_backward_compat() {
+        // Regression: HS256 authority built via `new()` must continue to
+        // emit the legacy `{"alg":"HS256","typ":"JWT"}` header shape
+        // with no `kid` field, so tokens verify against older peers.
+        let auth = make_authority();
+        let token = auth.issue("peer-1", vec![]).expect("issue");
+        let header_b64 = token.split('.').next().expect("has header");
+        let header_bytes = b64::decode_url_safe(header_b64).expect("decode header");
+        let header: serde_json::Value = serde_json::from_slice(&header_bytes).expect("json");
+        assert_eq!(header.get("alg").and_then(|v| v.as_str()), Some("HS256"));
+        assert!(
+            header.get("kid").is_none(),
+            "legacy HS256 header must omit kid"
+        );
+    }
+
+    #[test]
+    fn es256_unknown_kid_rejected() {
+        let (pkcs8_a, _) = es256_test_keypair();
+        let authority_a =
+            JwtAuthority::new_es256(pkcs8_a, "peer-a", "rustgate-test").expect("es256 a");
+
+        // Authority B has no record of peer-a's public key.
+        let (pkcs8_b, _) = es256_test_keypair();
+        let authority_b =
+            JwtAuthority::new_es256(pkcs8_b, "peer-b", "rustgate-test").expect("es256 b");
+
+        let token = authority_a.issue("peer-a", vec![]).expect("issue");
+        let err = authority_b
+            .validate(&token)
+            .expect_err("should reject unknown kid");
+        assert!(matches!(err, JwtError::UnknownKid(ref k) if k == "peer-a"));
+    }
+
+    #[test]
+    fn es256_authority_rejects_token_without_kid() {
+        // An ES256 authority has `legacy_verifier: None`, so a token
+        // whose header has no `kid` cannot fall back — it's rejected.
+        let (pkcs8, _) = es256_test_keypair();
+        let auth = JwtAuthority::new_es256(pkcs8, "peer-a", "rustgate-test").expect("es256");
+
+        // Craft a no-kid token by signing with a separate HS256 authority.
+        let hs_auth = make_authority();
+        let token = hs_auth.issue("peer-1", vec![]).expect("issue hs");
+
+        let err = auth.validate(&token).expect_err("must reject");
+        assert!(matches!(err, JwtError::UnknownKid(ref k) if k.is_empty()));
+    }
+
+    #[test]
+    fn algorithm_mismatch_header_vs_key_rejected() {
+        // Security defence: an attacker crafts a token header claiming
+        // `alg: HS256` but presents a `kid` that points to an ES256
+        // verifier. A naive implementation might treat the ES256 public
+        // key bytes as an HS256 secret — classic alg-confusion. We
+        // reject with AlgorithmMismatch before any signature check.
+
+        let (pkcs8, pub_a) = es256_test_keypair();
+        let _authority_a =
+            JwtAuthority::new_es256(pkcs8, "peer-a", "rustgate-test").expect("es256 a");
+
+        let hs_secret = b"test-secret-key-for-jwt-testing!!".to_vec();
+        let authority_b = JwtAuthority::new(hs_secret.clone(), "rustgate-test")
+            .expect("hs256")
+            .with_es256_verifier("peer-a", pub_a)
+            .expect("register es256 verifier");
+
+        // Build a token signed with HS256 under authority_b's key, but
+        // stamp peer-a's kid into the header so the verifier selects the
+        // ES256 entry. This simulates an attacker's crafted token.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_secs();
+        let claims = FederationClaims {
+            sub: "peer-a".to_string(),
+            iss: "rustgate-test".to_string(),
+            exp: now + 3600,
+            iat: now,
+            jti: "attack".to_string(),
+            groups: vec![],
+        };
+        // Uses HS256 with a kid so the verifier routes to the ES256 entry.
+        let forged_signing = SigningKey::Hs256 {
+            secret: Zeroizing::new(hs_secret),
+            kid: Some("peer-a".to_string()),
+        };
+        let forged_token = encode(&forged_signing, &claims).expect("encode");
+
+        let err = authority_b
+            .validate(&forged_token)
+            .expect_err("must reject");
+        assert!(
+            matches!(
+                err,
+                JwtError::AlgorithmMismatch {
+                    header: Algorithm::Hs256,
+                    key: Algorithm::Es256,
+                }
+            ),
+            "expected AlgorithmMismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn es256_tampered_signature_rejected() {
+        let (pkcs8, _) = es256_test_keypair();
+        let auth = JwtAuthority::new_es256(pkcs8, "peer-a", "rustgate-test").expect("es256");
+        let token = auth.issue("peer-a", vec![]).expect("issue");
+
+        let parts: Vec<&str> = token.split('.').collect();
+        // Corrupt the signature by swapping in 64 zero bytes (valid length
+        // for ES256 fixed format, but won't satisfy verification).
+        let bad_sig = b64::encode_url_safe([0u8; 64]);
+        let tampered = format!("{}.{}.{}", parts[0], parts[1], bad_sig);
+        assert_eq!(auth.validate(&tampered), Err(JwtError::InvalidSignature));
+    }
+
+    #[test]
+    fn new_es256_rejects_malformed_pkcs8() {
+        // 64 bytes of 0xFF is not a valid PKCS#8 DER blob.
+        let garbage = vec![0xFFu8; 64];
+        let err =
+            JwtAuthority::new_es256(garbage, "peer-a", "rustgate-test").expect_err("must reject");
+        assert_eq!(err, JwtError::InvalidKey);
+    }
+
+    #[test]
+    fn with_es256_verifier_rejects_malformed_public_key() {
+        let (pkcs8, _) = es256_test_keypair();
+        let auth = JwtAuthority::new_es256(pkcs8, "peer-a", "rustgate-test").expect("es256");
+
+        // Too short (SEC1 uncompressed P-256 requires exactly 65 bytes).
+        let short = vec![0x04u8; 32];
+        let err = auth
+            .with_es256_verifier("peer-b", short)
+            .expect_err("must reject");
+        assert_eq!(err, JwtError::InvalidKey);
+    }
+
+    #[test]
+    fn with_es256_verifier_rejects_wrong_sec1_tag() {
+        let (pkcs8, _) = es256_test_keypair();
+        let auth = JwtAuthority::new_es256(pkcs8, "peer-a", "rustgate-test").expect("es256");
+
+        // 65 bytes but leading byte is 0x05 instead of 0x04 (uncompressed).
+        let wrong_tag: Vec<u8> = std::iter::once(0x05u8)
+            .chain(std::iter::repeat_n(0, 64))
+            .collect();
+        let err = auth
+            .with_es256_verifier("peer-b", wrong_tag)
+            .expect_err("must reject");
+        assert_eq!(err, JwtError::InvalidKey);
+    }
+
+    #[test]
+    fn invalid_kid_rejected_on_builders() {
+        let (pkcs8, _) = es256_test_keypair();
+        // Empty kid.
+        let err = JwtAuthority::new_es256(&pkcs8[..], "", "rustgate-test").expect_err("empty kid");
+        assert_eq!(err, JwtError::InvalidKid);
+
+        // Oversized kid.
+        let long_kid = "a".repeat(MAX_KID_LENGTH + 1);
+        let err = JwtAuthority::new_es256(&pkcs8[..], long_kid, "rustgate-test")
+            .expect_err("oversized kid");
+        assert_eq!(err, JwtError::InvalidKid);
+
+        // Control character.
+        let err = JwtAuthority::new_es256(&pkcs8[..], "peer\x07a", "rustgate-test")
+            .expect_err("control char kid");
+        assert_eq!(err, JwtError::InvalidKid);
+
+        // Non-ASCII.
+        let err = JwtAuthority::new_es256(&pkcs8[..], "peer-α", "rustgate-test")
+            .expect_err("non-ascii kid");
+        assert_eq!(err, JwtError::InvalidKid);
+    }
+
+    #[test]
+    fn with_hs256_verifier_validates_remote_peer_token() {
+        // Two HS256 authorities with different secrets. A registers B's
+        // secret under B's kid and can validate tokens B issues when
+        // those tokens carry B's kid in the header.
+        let secret_a = b"test-secret-key-for-jwt-peer-a!!".to_vec();
+        let secret_b = b"test-secret-key-for-jwt-peer-b!!".to_vec();
+
+        // Peer B signs tokens with a kid (built manually since `new` doesn't set one).
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_secs();
+        let claims = FederationClaims {
+            sub: "peer-b".to_string(),
+            iss: "rustgate-test".to_string(),
+            exp: now + 3600,
+            iat: now,
+            jti: "b-jti".to_string(),
+            groups: vec![],
+        };
+        let signing_b = SigningKey::Hs256 {
+            secret: Zeroizing::new(secret_b.clone()),
+            kid: Some("peer-b".to_string()),
+        };
+        let token = encode(&signing_b, &claims).expect("encode");
+
+        let authority_a = JwtAuthority::new(secret_a, "rustgate-test")
+            .expect("hs256 a")
+            .with_hs256_verifier("peer-b", secret_b)
+            .expect("register peer-b verifier");
+
+        let claims = authority_a.validate(&token).expect("validate");
+        assert_eq!(claims.sub, "peer-b");
+    }
+
+    #[test]
+    fn with_hs256_verifier_rejects_short_secret() {
+        let auth = make_authority();
+        let err = auth
+            .with_hs256_verifier("peer-b", b"too-short".to_vec())
+            .expect_err("must reject short");
+        assert!(matches!(err, JwtError::SecretTooShort { .. }));
     }
 }
