@@ -3267,6 +3267,7 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "tracing",
+ "tracing-subscriber",
  "wiremock",
  "x509-parser",
  "zeroize",

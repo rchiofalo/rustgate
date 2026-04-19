@@ -15,6 +15,7 @@ use bytes::BytesMut;
 use parking_lot::Mutex;
 use rustgate_core::constants::WRITE_TIMEOUT;
 use rustgate_core::identity::Identity;
+use rustgate_core::masking::hash_cn;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
 use rustgate_core::sanitize::sanitize_for_log;
 use rustgate_transport::{
@@ -74,10 +75,13 @@ impl ClientIdRegistry {
         if let Some((existing_cn, _)) = map.get(client_id)
             && existing_cn != cn
         {
+            // F-153: both CNs are validated by `Identity::new()` (no control
+            // chars) but we still hash them for PII-safe production logs.
+            // `client_id` is untrusted — keep the CR/LF-safe sanitizer.
             warn!(
                 client_id = %sanitize_for_log(client_id),
-                existing_cn = %existing_cn,
-                new_cn = %cn,
+                existing_cn = %hash_cn(existing_cn),
+                new_cn = %hash_cn(cn),
                 "MQTT client ID collision: different identity attempted to reuse client ID"
             );
             return Err(MqttError::ClientIdInUse(client_id.to_string()));
@@ -142,7 +146,7 @@ pub(crate) async fn handle_mqtt_session(
     let (keep_alive, client_id) = match connect_handshake(&mut codec, &identity).await {
         Ok(result) => result,
         Err(e) => {
-            debug!(cn = %cn, peer = %peer_addr, error = %e, "CONNECT handshake failed");
+            debug!(cn = %hash_cn(&cn), peer = %peer_addr, error = %e, "CONNECT handshake failed");
             return;
         }
     };
@@ -165,7 +169,7 @@ pub(crate) async fn handle_mqtt_session(
     if !client_id.is_empty()
         && let Err(e) = client_id_registry.try_claim(&client_id, &cn, session_id)
     {
-        debug!(cn = %cn, peer = %peer_addr, error = %e, "client ID rejected");
+        debug!(cn = %hash_cn(&cn), peer = %peer_addr, error = %e, "client ID rejected");
         // MQTT 5.0: send DISCONNECT with reason before closing so the client
         // gets a meaningful error code instead of a bare TCP reset. MQTT 3.1.1
         // has no server-initiated DISCONNECT packet, so we can only drop.
@@ -193,7 +197,7 @@ pub(crate) async fn handle_mqtt_session(
 
     info!(
         peer = %peer_addr,
-        cn = %cn,
+        cn = %hash_cn(&cn),
         groups = ?identity.groups,
         protocol = ?protocol,
         keep_alive = keep_alive,
@@ -213,14 +217,14 @@ pub(crate) async fn handle_mqtt_session(
     let filtered_count = before - buffered.len();
     if filtered_count > 0 {
         info!(
-            cn = %cn,
+            cn = %hash_cn(&cn),
             filtered = filtered_count,
             delivered = buffered.len(),
             "filtered offline messages on MQTT reconnect",
         );
     }
     if !router.register(handle.clone()).await {
-        warn!(cn = %cn, "connection rejected: tenant quota exceeded");
+        warn!(cn = %hash_cn(&cn), "connection rejected: tenant quota exceeded");
         rustgate_core::audit::connection_rejected(peer_addr, "tenant quota exceeded");
         return;
     }
@@ -280,11 +284,11 @@ pub(crate) async fn handle_mqtt_session(
     }
 
     if let Err(ref e) = read_result {
-        debug!(cn = %cn, error = %e, "MQTT session ended with error");
+        debug!(cn = %hash_cn(&cn), error = %e, "MQTT session ended with error");
     }
 
     router.unregister(&cn, session_id).await;
-    info!(cn = %cn, peer = %peer_addr, "MQTT session ended");
+    info!(cn = %hash_cn(&cn), peer = %peer_addr, "MQTT session ended");
 }
 
 /// Perform the MQTT CONNECT handshake.
@@ -316,7 +320,7 @@ async fn connect_handshake(
             let client_id = connect.client_id.clone();
 
             debug!(
-                cn = %identity.cn,
+                cn = %hash_cn(&identity.cn),
                 client_id = %sanitize_for_log(&client_id),
                 keep_alive = connect.keep_alive,
                 "MQTT v3.1.1 CONNECT accepted"
@@ -349,7 +353,7 @@ async fn connect_handshake(
                 let client_id = connect.client_id.clone();
 
                 debug!(
-                    cn = %identity.cn,
+                    cn = %hash_cn(&identity.cn),
                     client_id = %sanitize_for_log(&client_id),
                     keep_alive = connect.keep_alive,
                     "MQTT v5.0 CONNECT accepted"
@@ -485,11 +489,11 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<(), MqttError
                     send_response(resp_tx, serialize_pingresp(protocol)?).await?;
                 }
                 mqttbytes::v5::Packet::Disconnect(_) => {
-                    debug!(cn = %identity.cn, "MQTT v5 DISCONNECT received");
+                    debug!(cn = %hash_cn(&identity.cn), "MQTT v5 DISCONNECT received");
                     return Ok(());
                 }
                 other => {
-                    debug!(cn = %identity.cn, packet = ?other, "ignoring unexpected v5 packet");
+                    debug!(cn = %hash_cn(&identity.cn), packet = ?other, "ignoring unexpected v5 packet");
                 }
             },
             // --- v4 packets ---
@@ -525,11 +529,11 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<(), MqttError
                     send_response(resp_tx, serialize_pingresp(protocol)?).await?;
                 }
                 mqttbytes::v4::Packet::Disconnect => {
-                    debug!(cn = %identity.cn, "MQTT v4 DISCONNECT received");
+                    debug!(cn = %hash_cn(&identity.cn), "MQTT v4 DISCONNECT received");
                     return Ok(());
                 }
                 other => {
-                    debug!(cn = %identity.cn, packet = ?other, "ignoring unexpected v4 packet");
+                    debug!(cn = %hash_cn(&identity.cn), packet = ?other, "ignoring unexpected v4 packet");
                 }
             },
         }
@@ -777,7 +781,7 @@ async fn try_join_filter(
                 "failed to join group '{group}' (limit exceeded)"
             )));
         }
-        debug!(cn = %identity.cn, group = %group, "MQTT subscribed to group");
+        debug!(cn = %hash_cn(&identity.cn), group = %group, "MQTT subscribed to group");
         return Ok(());
     }
 
@@ -799,7 +803,7 @@ async fn try_join_filter(
         if router.join_group(&identity.cn, session_id, group).await {
             joined += 1;
             debug!(
-                cn = %identity.cn,
+                cn = %hash_cn(&identity.cn),
                 group = %group,
                 filter = %filter,
                 "MQTT wildcard expanded subscription"
@@ -911,7 +915,7 @@ async fn leave_filter(
     if !topic::filter_has_wildcards(filter) {
         let group = topic::topic_to_group(filter, topic_prefix)?;
         let _ = router.leave_group(&identity.cn, session_id, &group).await;
-        debug!(cn = %identity.cn, group = %group, "MQTT unsubscribed from group");
+        debug!(cn = %hash_cn(&identity.cn), group = %group, "MQTT unsubscribed from group");
         return Ok(());
     }
 
@@ -928,7 +932,7 @@ async fn leave_filter(
         }
         let _ = router.leave_group(&identity.cn, session_id, group).await;
         debug!(
-            cn = %identity.cn,
+            cn = %hash_cn(&identity.cn),
             group = %group,
             filter = %filter,
             "MQTT wildcard expanded unsubscription"
