@@ -170,8 +170,9 @@ pub enum AuthConfig {
 ///
 /// When `client_cert` and `client_key` are both set, the publisher
 /// presents a client certificate for mutual TLS authentication.
-/// When `pin_sha256` is set, the server's certificate DER is hashed
-/// with SHA-256 and compared against the configured pins (TOFU/HPKP).
+/// When `pin_sha256` is set, the server's **entire leaf certificate DER**
+/// is hashed with SHA-256 and compared against the configured pins
+/// (TOFU-style).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct TlsConfig {
@@ -181,8 +182,19 @@ pub struct TlsConfig {
     pub client_cert: Option<String>,
     /// Client private key PEM for mutual TLS.
     pub client_key: Option<String>,
-    /// SHA-256 certificate pins (base64-encoded). When set, the server's
-    /// leaf certificate DER hash must match at least one pin.
+    /// SHA-256 certificate pins (base64-encoded).
+    ///
+    /// **Semantic:** each pin is `SHA-256(leaf cert DER)` — the full leaf
+    /// certificate, NOT the SubjectPublicKeyInfo. This is **not** RFC 7469
+    /// HPKP format (which pins SPKI). Implications:
+    ///
+    /// - A rotated certificate with the **same key** but different serial,
+    ///   validity window, or SAN list will **not** match the pin and the
+    ///   connection will fail until the pin is updated.
+    /// - Configure multiple pins during a rotation window to cover both
+    ///   the outgoing and incoming certificate hashes.
+    /// - Pins survive intermediate CA changes (only the leaf DER is hashed).
+    ///
     /// Requires `ca-cert` to also be set (explicit trust anchor).
     pub pin_sha256: Option<Vec<String>>,
 }
