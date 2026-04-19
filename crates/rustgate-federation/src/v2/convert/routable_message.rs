@@ -67,15 +67,48 @@ pub fn routable_to_federated_event(
 ///
 /// Creates an identity from the peer's certificate information and determines
 /// the destination from the event's `federate_groups`.
+///
+/// # Trust boundary
+///
+/// `trust_peer_groups` controls whether the wire-claimed `federate_groups`
+/// field is accepted as the authoritative group set for the origin CN.
+/// A Byzantine peer with a valid mTLS client certificate can forge
+/// arbitrary group memberships for any origin CN in that field, so the
+/// default is `false` (deny-by-default). When `false`, the source
+/// identity is constructed with the empty group set and any wire-claimed
+/// groups are reported via [`rustgate_core::audit::federation_group_claim_rejected`].
+/// The destination is derived from the wire-claimed groups regardless —
+/// those merely express the sender's routing intent, not a trust claim.
+///
+/// Set `trust_peer_groups = true` only when every federation peer is
+/// fully trusted to speak for every origin CN on its side of the
+/// federation (e.g. single-operator multi-region deployments with a
+/// single shared identity authority).
 pub fn federated_event_to_routable(
     event: &figpb::FederatedEvent,
     peer_cn: &str,
     peer_fingerprint: &str,
+    trust_peer_groups: bool,
 ) -> Result<RoutableMessage, ConvertError> {
     let xml = federated_event_to_xml(event)?;
 
-    // Build source identity from peer cert info + event groups
-    let groups: BTreeSet<GroupId> = event.federate_groups.iter().cloned().collect();
+    // Trust-boundary decision: wire-claimed `federate_groups` are
+    // advisory metadata. Without `trust_peer_groups=true`, drop them
+    // and build the source identity with the empty group set (the
+    // receiver should substitute its own locally-known membership for
+    // the origin CN if it has any; absent that, deny-by-default).
+    let groups: BTreeSet<GroupId> = if trust_peer_groups {
+        event.federate_groups.iter().cloned().collect()
+    } else {
+        if !event.federate_groups.is_empty() {
+            rustgate_core::audit::federation_group_claim_rejected(
+                peer_cn,
+                peer_cn,
+                &event.federate_groups,
+            );
+        }
+        BTreeSet::new()
+    };
 
     let source = if peer_fingerprint.is_empty() {
         Identity::plaintext(peer_cn.to_string(), groups)
@@ -85,7 +118,10 @@ pub fn federated_event_to_routable(
     .map_err(|e| ConvertError::InvalidField(format!("invalid peer identity: {e}")))?;
 
     // Determine destination: if exactly one group, route to that group;
-    // otherwise broadcast to all
+    // otherwise broadcast to all. `federate_groups` expresses routing
+    // intent (where the sender wants the event delivered), not an
+    // authorization claim — the local ACL/authz layer re-evaluates
+    // delivery on the receive side.
     let destination = if event.federate_groups.len() == 1 {
         Destination::Group(event.federate_groups[0].clone())
     } else {
@@ -267,8 +303,8 @@ mod tests {
     #[test]
     fn event_to_routable_source_identity() {
         let event = xml_to_federated_event(sample_xml(), &empty_metadata()).expect("conversion");
-        let msg =
-            federated_event_to_routable(&event, "peer-1", "fingerprint-abc").expect("conversion");
+        let msg = federated_event_to_routable(&event, "peer-1", "fingerprint-abc", false)
+            .expect("conversion");
         assert_eq!(msg.source.cn, "peer-1");
         assert_eq!(msg.source.fingerprint, "fingerprint-abc");
     }
@@ -276,14 +312,14 @@ mod tests {
     #[test]
     fn event_to_routable_source_protocol() {
         let event = xml_to_federated_event(sample_xml(), &empty_metadata()).expect("conversion");
-        let msg = federated_event_to_routable(&event, "peer-1", "fp").expect("conversion");
+        let msg = federated_event_to_routable(&event, "peer-1", "fp", false).expect("conversion");
         assert_eq!(msg.metadata.source_protocol, SOURCE_FEDERATION);
     }
 
     #[test]
     fn event_to_routable_message_type_position() {
         let event = xml_to_federated_event(sample_xml(), &empty_metadata()).expect("conversion");
-        let msg = federated_event_to_routable(&event, "peer-1", "fp").expect("conversion");
+        let msg = federated_event_to_routable(&event, "peer-1", "fp", false).expect("conversion");
         assert_eq!(msg.metadata.message_type, MessageType::Position);
     }
 
@@ -298,7 +334,7 @@ mod tests {
             federate_groups: vec!["OnlyGroup".into()],
             ..Default::default()
         };
-        let msg = federated_event_to_routable(&event, "peer", "fp").expect("conversion");
+        let msg = federated_event_to_routable(&event, "peer", "fp", false).expect("conversion");
         assert!(
             matches!(&msg.destination, Destination::Group(g) if g == "OnlyGroup"),
             "expected Group(OnlyGroup) destination"
@@ -316,7 +352,7 @@ mod tests {
             federate_groups: vec!["A".into(), "B".into()],
             ..Default::default()
         };
-        let msg = federated_event_to_routable(&event, "peer", "fp").expect("conversion");
+        let msg = federated_event_to_routable(&event, "peer", "fp", false).expect("conversion");
         assert!(matches!(msg.destination, Destination::Broadcast));
     }
 
@@ -332,7 +368,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let msg = federated_event_to_routable(&event, "peer", "fp").expect("conversion");
+        let msg = federated_event_to_routable(&event, "peer", "fp", false).expect("conversion");
         let ttl = msg.metadata.ttl.expect("should have ttl");
         assert_eq!(ttl, Duration::from_millis(300000));
     }
@@ -347,12 +383,12 @@ mod tests {
             }),
             ..Default::default()
         };
-        let msg = federated_event_to_routable(&event, "peer", "fp").expect("conversion");
+        let msg = federated_event_to_routable(&event, "peer", "fp", false).expect("conversion");
         assert!(msg.metadata.ttl.is_none());
     }
 
     #[test]
-    fn event_to_routable_groups_in_identity() {
+    fn event_to_routable_trusted_groups_populate_identity() {
         let event = figpb::FederatedEvent {
             event: Some(figpb::GeoEvent {
                 uid: "test".into(),
@@ -362,9 +398,37 @@ mod tests {
             federate_groups: vec!["X".into(), "Y".into()],
             ..Default::default()
         };
-        let msg = federated_event_to_routable(&event, "peer", "fp").expect("conversion");
+        // trust_peer_groups = true: wire groups become source identity groups
+        let msg = federated_event_to_routable(&event, "peer", "fp", true).expect("conversion");
         assert!(msg.source.groups.contains("X"));
         assert!(msg.source.groups.contains("Y"));
+    }
+
+    #[test]
+    fn event_to_routable_untrusted_groups_are_dropped() {
+        // Issue #720: default path must NOT trust wire-claimed groups.
+        // A Byzantine peer with a valid mTLS cert could otherwise forge
+        // arbitrary group memberships for any origin CN.
+        let event = figpb::FederatedEvent {
+            event: Some(figpb::GeoEvent {
+                uid: "test".into(),
+                r#type: "a-f-G".into(),
+                ..Default::default()
+            }),
+            federate_groups: vec!["Admin".into(), "Command".into()],
+            ..Default::default()
+        };
+        // trust_peer_groups = false: source identity has empty groups
+        // regardless of what the wire claimed.
+        let msg = federated_event_to_routable(&event, "peer", "fp", false).expect("conversion");
+        assert!(
+            msg.source.groups.is_empty(),
+            "source groups must be empty when trust_peer_groups=false, got {:?}",
+            msg.source.groups
+        );
+        // Destination still honors wire routing intent (ACL re-checks on
+        // the receive side).
+        assert!(matches!(msg.destination, Destination::Broadcast));
     }
 
     // --- extract_metadata tests ---
@@ -456,9 +520,12 @@ mod tests {
         assert!(event.federate_groups.contains(&"Cyan".to_string()));
         assert!(event.federate_groups.contains(&"Alpha".to_string()));
 
-        // Convert back
+        // Convert back. trust_peer_groups = true preserves the wire
+        // group claims so this end-to-end test can validate the
+        // destination and identity plumbing; the security default
+        // (`false`) is exercised by `event_to_routable_untrusted_groups_are_dropped`.
         let msg_back =
-            federated_event_to_routable(&event, "peer-x", "fp-xyz").expect("to routable");
+            federated_event_to_routable(&event, "peer-x", "fp-xyz", true).expect("to routable");
 
         assert_eq!(msg_back.source.cn, "peer-x");
         assert_eq!(msg_back.metadata.source_protocol, SOURCE_FEDERATION);

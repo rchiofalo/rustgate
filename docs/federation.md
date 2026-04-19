@@ -254,6 +254,71 @@ HA mode requires NATS with JetStream (for KV store).
 | `--federation-replay-dir` | `RUSTGATE_FEDERATION_REPLAY_DIR` | — | Directory for persistent replay store |
 | `--federation-peers-reload-interval` | `RUSTGATE_FEDERATION_PEERS_RELOAD_INTERVAL` | `0` | Seconds between peers file re-reads (0 = disabled) |
 | `--federation-region` | `RUSTGATE_FEDERATION_REGION` | — | Local region for latency-aware routing |
+| `--federation-trust-peer-groups` | `RUSTGATE_FEDERATION_TRUST_PEER_GROUPS` | `false` | Trust the peer's wire-claimed `federate_groups` field — **insecure default, see Threat Model** |
+
+## Threat Model
+
+### Peer authentication
+
+Every federation peer authenticates via **mTLS client certificate**. The
+peer's identity is the CN of that certificate; rustgate never falls back
+to the remote IP address when CN extraction fails (see issue #759). An
+attacker without a certificate signed by a trusted CA cannot reach any
+federation RPC.
+
+### Cross-origin group claims (issue #720)
+
+The V2 wire protocol carries a `federate_groups` field on every federated
+event, intended as the originating client's group memberships as seen by
+the forwarding peer. The field is **advisory metadata** — it is not
+covered by the federation JWT authority and cannot be independently
+verified by the receiving server.
+
+A Byzantine peer with a valid mTLS client certificate can forge any
+`federate_groups` value for any origin CN. Absent defense, the
+receiving server's authz engine would evaluate the forged claim,
+allowing the Byzantine peer to elevate arbitrary origin CNs into
+restricted groups and reach recipients that should otherwise be
+inaccessible.
+
+**Defense (default behavior):** `trust_peer_groups = false`. The
+receiving server drops all wire-claimed groups, builds source
+identities with the empty group set, and emits
+`federation.group_claim_rejected` audit events for forensic traceability.
+The XML payload forwarded to local clients does not carry
+`federate_groups` — the CoT codec discards the field. Routing intent
+expressed by a single-group destination is preserved, but the local
+ACL/authz layer re-evaluates delivery.
+
+**Opt-in trust:** `--federation-trust-peer-groups` (or
+`RUSTGATE_FEDERATION_TRUST_PEER_GROUPS=true`). Only enable this flag
+when every federation peer is fully trusted to speak for every origin
+CN on its side of the federation — e.g. a single-operator multi-region
+deployment where every peer shares one identity authority and one
+operational team. Enabling this flag on a federation that spans
+multiple trust domains is insecure.
+
+### Hop-count limits
+
+Each event carries a `federate_hops.current_hops` counter incremented
+by each forwarder. Events exceeding `--federation-max-hops` (default
+`10`) are dropped on receive. Events at exactly the limit are
+accepted; events over the limit are rejected. The streaming path
+uses `continue` (not `break`) on rejection so a single bad event does
+not tear down the stream (bounded by `MAX_CONSECUTIVE_VIOLATIONS`).
+
+### Loop detection
+
+Provenance metadata records every server that handled an event. If the
+receiving server's own `federate_id` appears in the provenance chain,
+the event is dropped at the receive side — preventing cycles and
+amplification loops between federated peers.
+
+### Replay prevention
+
+Events have message UIDs and timestamps; a sliding-window replay
+filter plus a persistent replay buffer (redb) prevents duplicate
+delivery across reconnects.
 
 ## Troubleshooting
 

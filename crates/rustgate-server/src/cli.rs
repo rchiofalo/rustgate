@@ -698,6 +698,24 @@ pub(crate) struct Cli {
     )]
     pub(crate) federation_max_group_name_length: usize,
 
+    /// Trust wire-claimed `federate_groups` on inbound federated events
+    /// as the authoritative group set for the originating client.
+    ///
+    /// **Default: off (deny-by-default).** A Byzantine federation peer
+    /// with a valid mTLS client certificate can otherwise forge
+    /// arbitrary group memberships for any origin CN, elevating that
+    /// client's privileges across the federation boundary (issue #720).
+    /// Only enable this flag when every peer is fully trusted to speak
+    /// for every origin CN on its side of the federation — e.g. a
+    /// single-operator multi-region deployment sharing one identity
+    /// authority. See `docs/federation.md` for the threat model.
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "RUSTGATE_FEDERATION_TRUST_PEER_GROUPS"
+    )]
+    pub(crate) federation_trust_peer_groups: bool,
+
     /// NATS URL for federation HA coordination (enables distributed peer ownership).
     /// When set, only one pod manages each outbound peer in a multi-pod deployment.
     /// Requires --features federation-ha.
@@ -1353,6 +1371,7 @@ define_config_file! {
     federation_replay_max_bytes: u64,
     federation_max_groups_per_peer: usize,
     federation_max_group_name_length: usize,
+    federation_trust_peer_groups: bool,
     federation_ha_nats_url: Option<String>,
     federation_pod_id: Option<String>,
     federation_region: Option<String>,
