@@ -242,7 +242,7 @@ impl JwtAuthority {
     /// The `exp` parameter is the token's expiration time (Unix seconds).
     /// Insertion is O(1); capacity eviction is O(1) (least-recently-used
     /// JTI is dropped). Expired entries are reclaimed on an amortised
-    /// sweep every [`EXPIRY_SWEEP_INTERVAL`] `revoke()` calls — bounding
+    /// sweep every `EXPIRY_SWEEP_INTERVAL` `revoke()` calls — bounding
     /// the per-call cost while still freeing space proactively.
     pub fn revoke(&self, jti: &str, exp: u64) {
         let mut state = match self.revoked.lock() {
