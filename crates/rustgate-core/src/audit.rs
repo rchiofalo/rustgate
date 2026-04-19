@@ -569,6 +569,25 @@ pub fn store_forward_dropped(cn: &str, reason: &str) {
     );
 }
 
+/// Record an explicit operator-initiated wipe of the store-forward queue
+/// on startup. `depth` is the count of queue entries discarded by the
+/// wipe. Emitted once per `ClientQueue::open_with_wipe` invocation — the
+/// counterpart to the fail-closed behavior that refuses to start when
+/// stored entries exist without a persistent HMAC key. This event
+/// provides the audit trail the store-forward contract requires when
+/// previously-queued messages are deliberately dropped rather than
+/// delivered.
+pub fn store_forward_key_rotated(path: &str, depth: u64, reason: &str) {
+    audit!(
+        "store_forward.key_rotated",
+        path = %path,
+        depth = depth,
+        reason = %reason,
+        action = "wipe_queue",
+        result = "rotated"
+    );
+}
+
 /// Record a message being shed by per-target rate limiting.
 pub fn http_rate_limited(target: &str, source_cn: &str) {
     audit!(
