@@ -17,6 +17,7 @@ use std::net::SocketAddr;
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::{Request, Response, StatusCode};
+use rustgate_core::b64;
 
 use crate::auth::Credentials;
 use crate::cms_bag;
@@ -343,8 +344,8 @@ fn extract_csr_cn(body: &[u8]) -> Result<Option<String>, EnrollmentError> {
         .map(|b| *b as char)
         .collect();
 
-    let der_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &cleaned)
-        .map_err(|e| EnrollmentError::Csr(format!("invalid base64: {e}")))?;
+    let der_bytes =
+        b64::decode(&cleaned).map_err(|e| EnrollmentError::Csr(format!("invalid base64: {e}")))?;
 
     let csr = x509_cert::request::CertReq::from_der(&der_bytes)
         .map_err(|e| EnrollmentError::Csr(format!("failed to parse CSR: {e}")))?;
@@ -402,10 +403,8 @@ fn decode_pkcs10_to_pem(body: &[u8]) -> Result<String, EnrollmentError> {
     }
 
     // Validate the base64 decodes (catch malformed input early).
-    use base64::Engine as _;
-    let _ = base64::engine::general_purpose::STANDARD
-        .decode(&cleaned)
-        .map_err(|e| EnrollmentError::Csr(format!("invalid base64: {e}")))?;
+    let _ =
+        b64::decode(&cleaned).map_err(|e| EnrollmentError::Csr(format!("invalid base64: {e}")))?;
 
     // Wrap in PEM headers for CsrSigner (which expects PEM or raw base64).
     Ok(format!(
@@ -461,7 +460,7 @@ mod tests {
         params.distinguished_name = dn;
 
         let csr = params.serialize_request(&key).unwrap();
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, csr.der())
+        b64::encode(csr.der())
     }
 
     #[test]
@@ -488,8 +487,8 @@ mod tests {
         params.distinguished_name = DistinguishedName::new();
 
         let csr = params.serialize_request(&key).unwrap();
-        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, csr.der());
-        let cn = extract_csr_cn(b64.as_bytes()).unwrap();
+        let encoded = b64::encode(csr.der());
+        let cn = extract_csr_cn(encoded.as_bytes()).unwrap();
         assert_eq!(cn, None);
     }
 
@@ -501,11 +500,8 @@ mod tests {
 
     #[test]
     fn extract_cn_rejects_invalid_der() {
-        let b64 = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            b"not a valid CSR",
-        );
-        let result = extract_csr_cn(b64.as_bytes());
+        let encoded = b64::encode(b"not a valid CSR");
+        let result = extract_csr_cn(encoded.as_bytes());
         assert!(result.is_err());
     }
 

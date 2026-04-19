@@ -5,7 +5,7 @@
 //! Produces the JSON and XML response bodies for the Marti v2 enrollment API,
 //! and the certificate configuration XML for `/Marti/api/tls/config`.
 
-use base64::Engine;
+use rustgate_core::b64;
 
 /// Encode raw DER bytes as base64 with 64-character line wrapping.
 ///
@@ -13,7 +13,7 @@ use base64::Engine;
 /// with newline-separated 64-character lines. TAK clients strip newlines
 /// before decoding.
 pub fn base64_wrap(der: &[u8]) -> String {
-    let encoded = base64::engine::general_purpose::STANDARD.encode(der);
+    let encoded = b64::encode(der);
     let mut wrapped = String::with_capacity(encoded.len() + encoded.len() / 64 + 1);
     for (i, chunk) in encoded.as_bytes().chunks(64).enumerate() {
         if i > 0 {
@@ -107,9 +107,7 @@ mod tests {
         let data = b"test certificate DER bytes here";
         let wrapped = base64_wrap(data);
         let stripped: String = wrapped.chars().filter(|c| *c != '\n').collect();
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(&stripped)
-            .expect("decode");
+        let decoded = b64::decode(&stripped).expect("decode");
         assert_eq!(decoded, data);
     }
 
@@ -145,9 +143,7 @@ mod tests {
 
         let signed_b64 = parsed["signedCert"].as_str().expect("string");
         let stripped: String = signed_b64.chars().filter(|c| *c != '\n').collect();
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(&stripped)
-            .expect("decode");
+        let decoded = b64::decode(&stripped).expect("decode");
         assert_eq!(decoded, cert);
     }
 

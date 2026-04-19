@@ -12,8 +12,8 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::Engine;
 use reqwest::header::HeaderName;
+use rustgate_core::b64;
 use rustgate_core::message::RoutableMessage;
 use rustgate_core::sanitize::sanitize_for_log;
 use rustgate_resilience::circuit::CircuitBreaker;
@@ -924,7 +924,7 @@ async fn drain_response_body(response: reqwest::Response) {
 /// proxy tampering, complementing TLS transport-level encryption.
 fn compute_content_digest(body: &[u8]) -> String {
     let hash = Sha256::digest(body);
-    let encoded = base64::engine::general_purpose::STANDARD.encode(hash);
+    let encoded = b64::encode(hash);
     format!("sha-256=:{encoded}:")
 }
 
@@ -1034,7 +1034,7 @@ mod tests {
         assert!(digest.ends_with(':'), "got: {digest}");
         // Verify correct SHA-256 of "hello world"
         let expected_hash = sha2::Sha256::digest(body);
-        let expected_b64 = base64::engine::general_purpose::STANDARD.encode(expected_hash);
+        let expected_b64 = b64::encode(expected_hash);
         assert_eq!(digest, format!("sha-256=:{expected_b64}:"));
     }
 

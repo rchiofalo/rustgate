@@ -94,6 +94,26 @@ pub enum StoreForwardError {
     /// by a filesystem-level attacker.
     #[error("stored message HMAC verification failed")]
     TamperedMessage,
+    /// The on-disk queue contains entries from a previous run but the
+    /// caller requested an ephemeral key (no persistent key supplied).
+    /// Returned by [`ClientQueue::open`] and
+    /// [`ClientQueue::open_with_hmac_key`] when `hmac_key` is `None`.
+    ///
+    /// Under the previous fail-open behavior a fresh random key was
+    /// generated on every restart, silently discarding every queued
+    /// message on the next drain — a direct violation of the
+    /// store-forward contract. Callers must now either (a) supply a
+    /// persistent key via [`ClientQueue::open_with_hmac_key`] to preserve
+    /// the queue across restarts, or (b) explicitly acknowledge the data
+    /// loss via [`ClientQueue::open_with_wipe`] which wipes the queue and
+    /// emits a `store_forward.key_rotated` audit event.
+    #[error(
+        "client queue at {path} has {depth} stored entries from a previous run \
+         but no persistent HMAC key was supplied; either provide \
+         `--client-queue-key-file` to preserve them across restart or \
+         `--client-queue-wipe-on-start` to explicitly discard them"
+    )]
+    StaleQueueWithoutKey { path: String, depth: u64 },
 }
 
 /// Snapshot of queue depth / byte usage for a single CN. Returned by
@@ -187,29 +207,41 @@ impl ClientQueue {
     /// eviction work correctly immediately after restart. Corrupt
     /// records are skipped with a warning rather than failing open.
     ///
-    /// # Ephemeral HMAC key
+    /// # Ephemeral HMAC key — fail-closed on stale queue
     ///
-    /// This method generates a fresh random HMAC key on each call.
-    /// Messages stored by a previous process instance will fail HMAC
-    /// verification and be **silently discarded** on drain, because the
-    /// new key cannot verify tags produced by the old key.
+    /// This convenience wrapper generates a fresh random HMAC key on
+    /// each call. Because the new key cannot verify tags produced by a
+    /// previous process instance, any messages persisted from a prior
+    /// run would be silently dropped on drain — a direct violation of
+    /// the store-forward contract.
     ///
-    /// If cross-restart integrity verification is required, use
-    /// [`Self::open_with_hmac_key()`] with an externally persisted key.
+    /// To prevent that silent data loss, this method returns
+    /// [`StoreForwardError::StaleQueueWithoutKey`] when the on-disk
+    /// database contains entries from a previous run. Callers must
+    /// either:
+    ///
+    /// 1. Use [`Self::open_with_hmac_key`] with an externally persisted
+    ///    key to preserve the queue across restarts, or
+    /// 2. Use [`Self::open_with_wipe`] to explicitly discard the stored
+    ///    entries and emit a `store_forward.key_rotated` audit event.
     pub fn open(dir: &Path, max_bytes: u64) -> Result<Self, StoreForwardError> {
         Self::open_with_hmac_key(dir, max_bytes, None)
     }
 
     /// Open or create a client queue with an explicit HMAC key.
     ///
-    /// When `hmac_key` is `None`, a fresh random key is generated. This
-    /// means HMAC tags written by a previous process instance are treated
-    /// as tampered on restart (correctly — a new key cannot verify old
-    /// tags). The HMAC protects against filesystem-level attackers
-    /// modifying stored envelopes while the *same* process is running.
+    /// When `hmac_key` is `Some`, the supplied key is used verbatim.
+    /// This is the correct mode for production deployments that must
+    /// preserve the queue across restarts — persist the key externally
+    /// (e.g. via `--client-queue-key-file`) and pass it here.
     ///
-    /// Callers that need integrity verification to survive restarts
-    /// should persist the key externally and pass it here.
+    /// When `hmac_key` is `None`, a fresh random key is generated — but
+    /// only if the on-disk database is empty. If the database contains
+    /// entries from a previous run, the open fails with
+    /// [`StoreForwardError::StaleQueueWithoutKey`] rather than silently
+    /// losing them on the next drain (the generated key cannot verify
+    /// tags written under the previous process's key). To explicitly
+    /// discard the stored entries, use [`Self::open_with_wipe`] instead.
     pub fn open_with_hmac_key(
         dir: &Path,
         max_bytes: u64,
@@ -218,16 +250,6 @@ impl ClientQueue {
         std::fs::create_dir_all(dir).map_err(|e| StoreForwardError::Database(e.to_string()))?;
         let path = dir.join("client_queue.redb");
         let db = Database::create(&path).map_err(|e| StoreForwardError::Database(e.to_string()))?;
-
-        // Derive or accept the HMAC key.
-        let hmac_key = Arc::new(match hmac_key {
-            Some(k) => k,
-            None => {
-                let mut key = Zeroizing::new([0u8; 32]);
-                fill_random(&mut *key)?;
-                key
-            }
-        });
 
         // Ensure both tables exist and rebuild in-memory index.
         let mut inner = Inner::new();
@@ -371,6 +393,32 @@ impl ClientQueue {
             }
         }
 
+        // Fail-closed: if the caller supplied no persistent key but the
+        // on-disk queue contains entries from a prior run, refuse to
+        // start. A freshly generated key cannot verify the stored HMAC
+        // tags, so those entries would be silently discarded on drain —
+        // a direct violation of the store-forward contract. The
+        // operator must either provide a persistent key (to preserve
+        // the queue) or call `open_with_wipe` (to explicitly acknowledge
+        // the data loss, with an audit event recording the depth).
+        if hmac_key.is_none() && !inner.global.is_empty() {
+            return Err(StoreForwardError::StaleQueueWithoutKey {
+                path: path.to_string_lossy().into_owned(),
+                depth: inner.global.len() as u64,
+            });
+        }
+
+        // Derive or accept the HMAC key. Safe to generate randomly now
+        // that we have established the queue is empty in the None case.
+        let hmac_key = Arc::new(match hmac_key {
+            Some(k) => k,
+            None => {
+                let mut key = Zeroizing::new([0u8; 32]);
+                fill_random(&mut *key)?;
+                key
+            }
+        });
+
         let db = Arc::new(db);
         let inner = Arc::new(Mutex::new(inner));
         let (writer_tx, writer_rx) =
@@ -391,6 +439,107 @@ impl ClientQueue {
             hmac_key,
             writer_tx,
         })
+    }
+
+    /// Open a client queue, wiping any pre-existing on-disk entries
+    /// before continuing with the regular [`Self::open`] flow.
+    ///
+    /// This is the **explicit opt-in** counterpart to the fail-closed
+    /// behavior of [`Self::open`]. When the operator knows that no
+    /// persistent HMAC key is available — but still wants to start the
+    /// server on a directory that already contains stored entries from
+    /// a previous run — this method acknowledges that those entries
+    /// will never be delivered and discards them.
+    ///
+    /// A `store_forward.key_rotated` audit event is emitted before the
+    /// regular open resumes, recording the path, the number of
+    /// discarded entries, and the reason (`explicit_wipe_on_start`) so
+    /// that the data loss is visible in the compliance audit trail.
+    ///
+    /// After the wipe, an ephemeral random HMAC key is generated as
+    /// usual. Subsequent enqueues/drains are protected by that key
+    /// until the process exits.
+    pub fn open_with_wipe(dir: &Path, max_bytes: u64) -> Result<Self, StoreForwardError> {
+        std::fs::create_dir_all(dir).map_err(|e| StoreForwardError::Database(e.to_string()))?;
+        let path = dir.join("client_queue.redb");
+
+        // Open the database in an inner scope so its exclusive file
+        // lock is released before `open_with_hmac_key` re-opens below.
+        let pre_wipe_depth = {
+            let db =
+                Database::create(&path).map_err(|e| StoreForwardError::Database(e.to_string()))?;
+
+            // Collect every key from both tables under a read txn, then
+            // drop the txn so the write txn below has exclusive access.
+            // `open_table` returns a table-does-not-exist error on a
+            // fresh directory — that's treated as "no entries to wipe"
+            // (empty Vec), not a failure. An early return here would
+            // leak the `db` handle past its scope and deadlock the
+            // subsequent `open_with_hmac_key` call on the redb file lock.
+            let (queue_keys, delivered_keys): (Vec<u64>, Vec<u64>) = {
+                let read = db
+                    .begin_read()
+                    .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+                let queue_keys: Vec<u64> = match read.open_table(QUEUE_TABLE) {
+                    Ok(table) => table
+                        .iter()
+                        .map_err(|e| StoreForwardError::Database(e.to_string()))?
+                        .flatten()
+                        .map(|kv| kv.0.value())
+                        .collect(),
+                    Err(_) => Vec::new(),
+                };
+                let delivered_keys: Vec<u64> = match read.open_table(DELIVERED_TABLE) {
+                    Ok(table) => table
+                        .iter()
+                        .map_err(|e| StoreForwardError::Database(e.to_string()))?
+                        .flatten()
+                        .map(|kv| kv.0.value())
+                        .collect(),
+                    Err(_) => Vec::new(),
+                };
+                (queue_keys, delivered_keys)
+            };
+
+            let depth = queue_keys.len() as u64;
+            if !queue_keys.is_empty() || !delivered_keys.is_empty() {
+                let write = db
+                    .begin_write()
+                    .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+                {
+                    let mut table = write
+                        .open_table(QUEUE_TABLE)
+                        .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+                    for k in &queue_keys {
+                        let _ = table
+                            .remove(k)
+                            .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+                    }
+                }
+                {
+                    let mut dtable = write
+                        .open_table(DELIVERED_TABLE)
+                        .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+                    for k in &delivered_keys {
+                        let _ = dtable
+                            .remove(k)
+                            .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+                    }
+                }
+                write
+                    .commit()
+                    .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+            }
+            depth
+        };
+
+        rustgate_core::audit::store_forward_key_rotated(
+            &path.to_string_lossy(),
+            pre_wipe_depth,
+            "explicit_wipe_on_start",
+        );
+
+        Self::open_with_hmac_key(dir, max_bytes, None)
     }
 
     /// Path of the backing database file.
@@ -1449,5 +1598,114 @@ mod tests {
             "tampered counter should reflect rejected messages, got {}",
             q2.tampered_total()
         );
+    }
+
+    // ── Fail-closed on stale queue without persistent key ──────────
+
+    /// When a previous process left messages on disk and the operator
+    /// restarts without supplying a persistent HMAC key, `open` must
+    /// refuse to start rather than silently discarding those messages
+    /// on the first drain. This is the F-49 / #740 contract.
+    #[tokio::test]
+    async fn open_fails_on_stale_queue_without_key() {
+        let tmp = TempDir::new().unwrap();
+        let key = test_hmac_key();
+
+        // Phase 1: write two messages under a persistent key so the
+        // queue file contains real unread entries after drop.
+        {
+            let q =
+                ClientQueue::open_with_hmac_key(tmp.path(), 1_000_000, Some(key.clone())).unwrap();
+            q.enqueue("bob", &msg_for("alice", "bob", b"one")).unwrap();
+            q.enqueue("bob", &msg_for("alice", "bob", b"two")).unwrap();
+            wait_for_depth(&q, "bob", 2).await;
+            drop(q);
+        }
+        // Allow the writer task to release the exclusive DB lock.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Phase 2: try to reopen without a persistent key. This is the
+        // old fail-open code path; it must now fail closed.
+        let err = ClientQueue::open(tmp.path(), 1_000_000).expect_err(
+            "open must fail when the queue contains entries but no persistent key was supplied",
+        );
+        match err {
+            StoreForwardError::StaleQueueWithoutKey { path, depth } => {
+                assert_eq!(depth, 2, "error must report the stale entry depth");
+                assert!(
+                    path.ends_with("client_queue.redb"),
+                    "error path should reference the redb file: {path}"
+                );
+            }
+            other => panic!("expected StaleQueueWithoutKey, got {other:?}"),
+        }
+
+        // Supplying the original key should still succeed and let the
+        // operator drain the queue.
+        let q2 = ClientQueue::open_with_hmac_key(tmp.path(), 1_000_000, Some(key.clone())).unwrap();
+        assert_eq!(q2.stats("bob").depth, 2);
+        let drained = q2.drain("bob").unwrap();
+        assert_eq!(drained.len(), 2);
+    }
+
+    /// `open_with_wipe` is the explicit opt-in that discards the stored
+    /// queue and emits a `store_forward.key_rotated` audit event. After
+    /// the wipe, `open` succeeds and subsequent enqueue/drain round-trips
+    /// cleanly under the fresh ephemeral key.
+    #[tokio::test]
+    async fn open_with_wipe_clears_stale_queue() {
+        let tmp = TempDir::new().unwrap();
+        let key = test_hmac_key();
+
+        // Seed the queue under a persistent key.
+        {
+            let q =
+                ClientQueue::open_with_hmac_key(tmp.path(), 1_000_000, Some(key.clone())).unwrap();
+            q.enqueue("bob", &msg_for("alice", "bob", b"doomed-1"))
+                .unwrap();
+            q.enqueue("bob", &msg_for("alice", "bob", b"doomed-2"))
+                .unwrap();
+            q.enqueue("bob", &msg_for("alice", "bob", b"doomed-3"))
+                .unwrap();
+            wait_for_depth(&q, "bob", 3).await;
+            drop(q);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Wipe-and-open: the stale entries are discarded, the key is
+        // regenerated as ephemeral, and the queue is ready for new work.
+        let q = ClientQueue::open_with_wipe(tmp.path(), 1_000_000).unwrap();
+        assert_eq!(
+            q.stats("bob").depth,
+            0,
+            "wipe must clear every entry for every CN"
+        );
+        assert_eq!(
+            q.total_bytes(),
+            0,
+            "wipe must clear the total_bytes accounting"
+        );
+
+        // The queue must be fully functional post-wipe.
+        q.enqueue("carol", &msg_for("alice", "carol", b"fresh"))
+            .unwrap();
+        wait_for_depth(&q, "carol", 1).await;
+        let drained = q.drain("carol").unwrap();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].payload.as_ref(), b"fresh");
+    }
+
+    /// Calling `open_with_wipe` on an empty directory is idempotent —
+    /// no stale entries to discard, audit event records depth 0, and
+    /// the returned queue behaves identically to a fresh `open`.
+    #[tokio::test]
+    async fn open_with_wipe_on_empty_dir_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let q = ClientQueue::open_with_wipe(tmp.path(), 1_000_000).unwrap();
+        assert_eq!(q.stats("bob").depth, 0);
+        q.enqueue("bob", &msg_for("alice", "bob", b"hi")).unwrap();
+        wait_for_depth(&q, "bob", 1).await;
+        let drained = q.drain("bob").unwrap();
+        assert_eq!(drained.len(), 1);
     }
 }

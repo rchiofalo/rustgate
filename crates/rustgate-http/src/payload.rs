@@ -6,7 +6,7 @@
 //! metadata, and base64-encoded payload; and raw XML passthrough for
 //! consumers that expect CoT XML directly.
 
-use base64::Engine;
+use rustgate_core::b64;
 use rustgate_core::message::{Destination, RoutableMessage};
 use serde::Serialize;
 
@@ -78,7 +78,7 @@ fn serialize_json(
     let destination = format_destination(&msg.destination);
     let message_type = msg.metadata.message_type.to_string();
     let received_at = format_timestamp(msg.metadata.received_at);
-    let payload_b64 = base64::engine::general_purpose::STANDARD.encode(&msg.payload);
+    let payload_b64 = b64::encode(&msg.payload);
 
     let wire = HttpWireMessage {
         source_cn: &msg.source.cn,
@@ -174,9 +174,7 @@ mod tests {
         assert_eq!(parsed["instance_id"], "inst-01");
         assert_eq!(parsed["payload_size"], 8);
         // Payload is base64
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(parsed["payload"].as_str().unwrap())
-            .unwrap();
+        let decoded = b64::decode(parsed["payload"].as_str().unwrap()).unwrap();
         assert_eq!(decoded, b"<event/>");
     }
 
@@ -274,9 +272,7 @@ mod tests {
         let msg = make_msg(&binary_data);
         let (body, _) = serialize(&msg, PayloadFormat::Json, "inst").unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(parsed["payload"].as_str().unwrap())
-            .unwrap();
+        let decoded = b64::decode(parsed["payload"].as_str().unwrap()).unwrap();
         assert_eq!(decoded, binary_data);
     }
 }

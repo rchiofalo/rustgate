@@ -12,6 +12,7 @@
 
 use std::path::PathBuf;
 
+use rustgate_core::b64;
 use sha2::{Digest, Sha256};
 use tokio::fs;
 
@@ -137,11 +138,9 @@ impl DataPackageStore {
         let verified_sig = match (signature_b64, &self.signing_ca, self.strict_signatures) {
             // Signature provided and CA configured — verify it
             (Some(sig_b64), Some(ca), _) => {
-                let sig_bytes =
-                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, sig_b64)
-                        .map_err(|e| {
-                            EnrollmentError::Config(format!("invalid base64 signature: {e}"))
-                        })?;
+                let sig_bytes = b64::decode(sig_b64).map_err(|e| {
+                    EnrollmentError::Config(format!("invalid base64 signature: {e}"))
+                })?;
 
                 verify_signature(&ca.spki_bytes, data, &sig_bytes)?;
                 tracing::debug!(name = %name, "package signature verified");
@@ -213,11 +212,9 @@ impl DataPackageStore {
 
         // Re-verify signature at download time to detect on-disk tampering
         if let (Some(sig_b64), Some(ca)) = (&meta.signature, &self.signing_ca) {
-            let sig_bytes =
-                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, sig_b64)
-                    .map_err(|e| {
-                        EnrollmentError::Config(format!("stored signature is invalid base64: {e}"))
-                    })?;
+            let sig_bytes = b64::decode(sig_b64).map_err(|e| {
+                EnrollmentError::Config(format!("stored signature is invalid base64: {e}"))
+            })?;
             verify_signature(&ca.spki_bytes, &data, &sig_bytes).map_err(|_| {
                 tracing::error!(hash = %hash, "download-time signature verification failed — possible tampering");
                 EnrollmentError::Config(
@@ -543,7 +540,7 @@ mod tests {
     fn sign_data(key_pair: &ring::signature::EcdsaKeyPair, data: &[u8]) -> String {
         let rng = ring::rand::SystemRandom::new();
         let sig = key_pair.sign(&rng, data).expect("sign");
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, sig.as_ref())
+        b64::encode(sig.as_ref())
     }
 
     #[test]
@@ -825,10 +822,7 @@ mod tests {
 
         let data = b"PK\x03\x04some content";
         // Use a bogus signature
-        let bad_sig = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            b"not-a-real-signature",
-        );
+        let bad_sig = b64::encode(b"not-a-real-signature");
 
         let result = store
             .upload_with_signature(data, "bad.zip", "user-1", Some(&bad_sig))

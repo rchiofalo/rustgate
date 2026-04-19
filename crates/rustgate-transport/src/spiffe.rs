@@ -287,11 +287,10 @@ fn append_cert_pem(out: &mut String, cert: &Certificate) {
 /// string slicing (char boundaries == byte boundaries for ASCII) instead
 /// of a `from_utf8` round-trip with a silent fallback.
 fn append_der_as_pem(out: &mut String, label: &str, der: &[u8]) {
-    use base64::Engine;
     out.push_str("-----BEGIN ");
     out.push_str(label);
     out.push_str("-----\n");
-    let encoded = base64::engine::general_purpose::STANDARD.encode(der);
+    let encoded = rustgate_core::b64::encode(der);
     let mut idx = 0;
     while idx < encoded.len() {
         let end = (idx + 64).min(encoded.len());

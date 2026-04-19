@@ -75,7 +75,10 @@ use lru::LruCache;
 /// children almost always fit inside this window; streams that exceed it
 /// are encoded opportunistically as full events rather than risking an
 /// unbounded allocation on hostile input.
-const MAX_SCAN_BYTES: usize = 64 * 1024;
+///
+/// Exposed as a public constant so callers can set framing limits or
+/// metric thresholds against the same value.
+pub const MAX_SCAN_BYTES: usize = 64 * 1024;
 
 /// One byte of slack around each float compare. The CoT parsers on the
 /// wire emit `lat="34.123"` shapes; floats written and parsed symmetrically
@@ -214,6 +217,19 @@ pub struct DeltaStats {
     /// Total bytes saved vs. sending the full payload. Computed as
     /// `full_len - delta_len` for each emitted delta.
     pub bytes_saved: u64,
+    /// Total LRU evictions observed — each tick corresponds to one UID
+    /// bumped out of the cache under cache-size pressure, which forces a
+    /// subsequent full emit the next time that UID is seen. A sustained
+    /// non-zero rate under steady workload is a signal that the
+    /// configured `cache_size` is undersized for the active UID count.
+    pub evicted: u64,
+    /// Total events whose payload exceeded [`MAX_SCAN_BYTES`] and were
+    /// therefore emitted as full without attempting delta compression.
+    /// A non-zero rate is worth an alert: it indicates either an
+    /// unusually large legitimate CoT event, or a hostile client padding
+    /// the payload (e.g. with whitespace or dummy detail) to defeat
+    /// delta-compression and inflate bandwidth.
+    pub oversized: u64,
 }
 
 impl DeltaEncoder {
@@ -252,7 +268,20 @@ impl DeltaEncoder {
     /// unchanged. This lets the caller unconditionally route every
     /// outbound message through the encoder without pre-classifying CoT
     /// vs. non-CoT frames.
+    ///
+    /// Payloads larger than [`MAX_SCAN_BYTES`] are always emitted as
+    /// [`DeltaOutput::Full`] and counted in [`DeltaStats::oversized`]
+    /// without attempting to parse — see F-62 in the technical analysis.
+    /// This protects against an adversary who pads detail with whitespace
+    /// to force full emits and inflate bandwidth: the counter makes the
+    /// pattern observable to operators.
     pub fn encode(&mut self, raw: &Bytes) -> DeltaOutput {
+        if raw.len() > MAX_SCAN_BYTES {
+            self.stats.oversized = self.stats.oversized.saturating_add(1);
+            self.stats.full = self.stats.full.saturating_add(1);
+            return DeltaOutput::Full(raw.clone());
+        }
+
         let snapshot = match parse_snapshot(raw) {
             Some(s) if !s.uid.is_empty() => s,
             _ => {
@@ -264,7 +293,7 @@ impl DeltaEncoder {
         let prior = self.cache.get(&snapshot.uid).cloned();
         match prior {
             None => {
-                let _ = self.cache.put(snapshot.uid.clone(), snapshot);
+                self.insert_snapshot(snapshot);
                 self.stats.full = self.stats.full.saturating_add(1);
                 DeltaOutput::Full(raw.clone())
             }
@@ -275,7 +304,7 @@ impl DeltaEncoder {
                     || prior.event_type != snapshot.event_type
                     || prior.how != snapshot.how
                 {
-                    let _ = self.cache.put(snapshot.uid.clone(), snapshot);
+                    self.insert_snapshot(snapshot);
                     self.stats.full = self.stats.full.saturating_add(1);
                     return DeltaOutput::Full(raw.clone());
                 }
@@ -309,9 +338,23 @@ impl DeltaEncoder {
                 let saved = raw.len().saturating_sub(xml.len()) as u64;
                 self.stats.delta = self.stats.delta.saturating_add(1);
                 self.stats.bytes_saved = self.stats.bytes_saved.saturating_add(saved);
-                let _ = self.cache.put(snapshot.uid.clone(), snapshot);
+                self.insert_snapshot(snapshot);
                 DeltaOutput::Delta(Bytes::from(xml))
             }
+        }
+    }
+
+    /// Insert a snapshot into the cache, counting any LRU eviction that
+    /// displaces a different UID. The underlying `LruCache::push` returns
+    /// `Some((key, value))` both when an entry is evicted under capacity
+    /// pressure and when the same key is overwritten, so we filter to
+    /// cross-UID displacements only.
+    fn insert_snapshot(&mut self, snapshot: CotSnapshot) {
+        let uid = snapshot.uid.clone();
+        if let Some((displaced, _)) = self.cache.push(uid.clone(), snapshot)
+            && displaced != uid
+        {
+            self.stats.evicted = self.stats.evicted.saturating_add(1);
         }
     }
 
@@ -1055,5 +1098,52 @@ mod tests {
         let _ = enc.encode(&full_event("U2", 34.0, -118.0, "t"));
         // U1 should have been evicted.
         assert_eq!(enc.len(), 1);
+    }
+
+    #[test]
+    fn oversized_payload_is_counted_and_emitted_full() {
+        // F-62: a payload larger than MAX_SCAN_BYTES bypasses parsing
+        // entirely — the encoder emits Full and bumps DeltaStats::oversized
+        // so operators can alert on a client padding traffic to defeat
+        // delta compression.
+        let mut enc = DeltaEncoder::new(cap(16), 0.0);
+        let big = {
+            let mut s = String::with_capacity(MAX_SCAN_BYTES + 64);
+            s.push_str(r#"<event version="2.0" uid="U1" type="a-f-G-U-C" how="m-g" time="t" start="t" stale="t"><point lat="34.0" lon="-118.0" hae="0" ce="1" le="1"/><detail>"#);
+            while s.len() < MAX_SCAN_BYTES {
+                s.push_str("<pad>x</pad>");
+            }
+            s.push_str("</detail></event>");
+            Bytes::from(s)
+        };
+        assert!(big.len() > MAX_SCAN_BYTES);
+
+        let out = enc.encode(&big);
+        assert!(matches!(out, DeltaOutput::Full(_)));
+        assert_eq!(enc.stats().oversized, 1);
+        assert_eq!(enc.stats().full, 1);
+        // No cache pollution from oversized payloads — the encoder must
+        // never parse them, so nothing is cached.
+        assert_eq!(enc.len(), 0);
+    }
+
+    #[test]
+    fn lru_eviction_is_counted_in_stats() {
+        // F-61: evictions bump DeltaStats::evicted so operators can alert
+        // on sustained eviction rate, which signals the cache_size is
+        // undersized for the active UID count.
+        let mut enc = DeltaEncoder::new(cap(2), 0.0);
+        let _ = enc.encode(&full_event("U1", 34.0, -118.0, "t"));
+        let _ = enc.encode(&full_event("U2", 34.0, -118.0, "t"));
+        assert_eq!(enc.stats().evicted, 0);
+
+        // Encoding a third UID forces an eviction of the LRU entry (U1).
+        let _ = enc.encode(&full_event("U3", 34.0, -118.0, "t"));
+        assert_eq!(enc.stats().evicted, 1);
+
+        // Re-encoding a still-resident UID must NOT count as an eviction
+        // — it's just a cache update, not capacity pressure.
+        let _ = enc.encode(&full_event("U3", 35.0, -119.0, "t2"));
+        assert_eq!(enc.stats().evicted, 1);
     }
 }

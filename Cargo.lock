@@ -3156,6 +3156,7 @@ name = "rustgate-core"
 version = "0.8.0"
 dependencies = [
  "arbitrary",
+ "base64",
  "bytes",
  "chacha20poly1305",
  "hex",
@@ -3191,7 +3192,6 @@ dependencies = [
 name = "rustgate-enrollment"
 version = "0.8.0"
 dependencies = [
- "base64",
  "bytes",
  "cms",
  "der",
@@ -3227,7 +3227,6 @@ dependencies = [
  "anyhow",
  "async-nats",
  "async-trait",
- "base64",
  "bytes",
  "criterion",
  "etcd-client",
@@ -3275,7 +3274,6 @@ dependencies = [
 name = "rustgate-http"
 version = "0.8.0"
 dependencies = [
- "base64",
  "bytes",
  "fastrand",
  "futures",
@@ -3393,6 +3391,7 @@ dependencies = [
  "clap",
  "figment",
  "futures",
+ "hex",
  "http-body",
  "http-body-util",
  "hyper",
@@ -3413,6 +3412,7 @@ dependencies = [
  "rustgate-test-utils",
  "rustgate-transport",
  "rustgate-websocket",
+ "rustix",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -3452,7 +3452,6 @@ name = "rustgate-transport"
 version = "0.8.0"
 dependencies = [
  "arc-swap",
- "base64",
  "bytes",
  "criterion",
  "futures",
@@ -3571,9 +3570,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.11"
+version = "0.103.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20a6af516fea4b20eccceaf166e8aa666ac996208e8a644ce3ef5aa783bc7cd4"
+checksum = "8279bb85272c9f10811ae6a6c547ff594d6a7f3c6c6b02ee9726d1d0dcfcdd06"
 dependencies = [
  "aws-lc-rs",
  "ring",
