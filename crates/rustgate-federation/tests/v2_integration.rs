@@ -15,8 +15,10 @@ use std::time::Duration;
 use rustgate_federation::v2::proto::figpb;
 use rustgate_federation::v2::proto::figpb::federated_channel_client::FederatedChannelClient;
 use rustgate_federation::v2::server::{FederationService, OnEvent};
+use rustgate_test_utils::certs::TestCa;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, ServerTlsConfig};
 
 /// Start a FederationService on an ephemeral port and return the address.
 async fn start_server(federate_id: &str, groups: Vec<String>, on_event: OnEvent) -> String {
@@ -41,6 +43,88 @@ async fn start_server(federate_id: &str, groups: Vec<String>, on_event: OnEvent)
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     format!("http://{addr}")
+}
+
+/// Fixtures needed to connect to an mTLS-protected test federation
+/// server. Returned as a bundle so tests can build both the URL and
+/// the client config from the same CA.
+struct MtlsFixtures {
+    url: String,
+    ca_pem: String,
+    client_cert_pem: String,
+    client_key_pem: String,
+}
+
+/// Start a FederationService behind a TLS listener that requires
+/// client certificates signed by the same CA. Used by the handler
+/// tests that exercise `peer_id_from_request` — without mTLS, every
+/// request would be rejected with `Unauthenticated` (F-44 / #759).
+async fn start_mtls_server(
+    federate_id: &str,
+    groups: Vec<String>,
+    on_event: OnEvent,
+    client_cn: &str,
+) -> MtlsFixtures {
+    let ca = TestCa::new("federation-test-ca");
+    let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
+    let client_cert = ca.issue_client_cert(client_cn, &[]);
+
+    let svc = FederationService::new(federate_id.to_string(), groups, on_event);
+    let service = figpb::federated_channel_server::FederatedChannelServer::new(svc);
+
+    let tls = ServerTlsConfig::new()
+        .identity(Identity::from_pem(
+            server_cert.cert_pem.as_bytes(),
+            server_cert.key_pem.as_bytes(),
+        ))
+        .client_ca_root(Certificate::from_pem(ca.cert_pem.as_bytes()));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+    drop(tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .tls_config(tls)
+            .expect("server tls config")
+            .add_service(service)
+            .serve_with_incoming(incoming)
+            .await
+            .expect("server");
+    }));
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    MtlsFixtures {
+        url: format!("https://localhost:{}", addr.port()),
+        ca_pem: ca.cert_pem.clone(),
+        client_cert_pem: client_cert.cert_pem,
+        client_key_pem: client_cert.key_pem,
+    }
+}
+
+/// Build a `tonic` channel that completes the mTLS handshake against
+/// the fixtures from [`start_mtls_server`].
+async fn mtls_client(fixtures: &MtlsFixtures) -> FederatedChannelClient<tonic::transport::Channel> {
+    let tls = ClientTlsConfig::new()
+        .domain_name("localhost")
+        .ca_certificate(Certificate::from_pem(fixtures.ca_pem.as_bytes()))
+        .identity(Identity::from_pem(
+            fixtures.client_cert_pem.as_bytes(),
+            fixtures.client_key_pem.as_bytes(),
+        ));
+
+    let channel = Endpoint::from_shared(fixtures.url.clone())
+        .expect("endpoint")
+        .tls_config(tls)
+        .expect("client tls config")
+        .connect()
+        .await
+        .expect("connect");
+
+    FederatedChannelClient::new(channel)
 }
 
 fn noop_on_event() -> OnEvent {
@@ -94,11 +178,13 @@ async fn get_identity_returns_server_info() {
 
 #[tokio::test]
 async fn health_check_returns_serving() {
-    let addr = start_server("health-server", vec![], noop_on_event()).await;
-
-    let mut client = FederatedChannelClient::connect(addr)
-        .await
-        .expect("connect");
+    // mTLS is required for any RPC that calls `peer_id_from_request`
+    // — health_check, send_one_event, server_event_stream,
+    // binary_message_stream, server_rol_stream, and
+    // client_federate_groups_stream. See F-44 / #759.
+    let fixtures =
+        start_mtls_server("health-server", vec![], noop_on_event(), "health-client").await;
+    let mut client = mtls_client(&fixtures).await;
 
     let resp = client
         .health_check(figpb::ClientHealth {
@@ -117,11 +203,15 @@ async fn health_check_returns_serving() {
 #[tokio::test]
 async fn send_one_event_triggers_callback() {
     let (on_event, count) = counting_on_event();
-    let addr = start_server("event-server", vec!["Alpha".into()], on_event).await;
+    let fixtures = start_mtls_server(
+        "event-server",
+        vec!["Alpha".into()],
+        on_event,
+        "event-client",
+    )
+    .await;
 
-    let mut client = FederatedChannelClient::connect(addr)
-        .await
-        .expect("connect");
+    let mut client = mtls_client(&fixtures).await;
 
     let event = figpb::FederatedEvent {
         event: Some(figpb::GeoEvent {
@@ -262,11 +352,15 @@ async fn client_event_stream_receives_broadcast() {
 #[tokio::test]
 async fn server_event_stream_forwards_events() {
     let (on_event, collected) = collecting_on_event();
-    let addr = start_server("inbound-server", vec!["Alpha".into()], on_event).await;
+    let fixtures = start_mtls_server(
+        "inbound-server",
+        vec!["Alpha".into()],
+        on_event,
+        "inbound-client",
+    )
+    .await;
 
-    let mut client = FederatedChannelClient::connect(addr)
-        .await
-        .expect("connect");
+    let mut client = mtls_client(&fixtures).await;
 
     // Create a stream of events to send
     let (tx, rx) = mpsc::channel(16);
@@ -306,6 +400,11 @@ async fn server_event_stream_forwards_events() {
 
 #[tokio::test]
 async fn client_federate_groups_stream_tracks_groups() {
+    // This test keeps its own `Arc<FederationService>` so it can call
+    // `broadcast_to_groups` directly later, which means it can't use
+    // `start_mtls_server` (that helper consumes the service). Inline
+    // the mTLS wiring instead — same pattern as the helper, just with
+    // a caller-owned Arc.
     let svc = FederationService::new(
         "group-tracker".into(),
         vec!["Local".into()],
@@ -317,6 +416,17 @@ async fn client_federate_groups_stream_tracks_groups() {
     let service =
         figpb::federated_channel_server::FederatedChannelServer::from_arc(Arc::clone(&svc));
 
+    let ca = TestCa::new("federation-test-ca");
+    let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
+    let client_cert = ca.issue_client_cert("group-tracker-client", &[]);
+
+    let tls = ServerTlsConfig::new()
+        .identity(Identity::from_pem(
+            server_cert.cert_pem.as_bytes(),
+            server_cert.key_pem.as_bytes(),
+        ))
+        .client_ca_root(Certificate::from_pem(ca.cert_pem.as_bytes()));
+
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -325,6 +435,8 @@ async fn client_federate_groups_stream_tracks_groups() {
 
     drop(tokio::spawn(async move {
         tonic::transport::Server::builder()
+            .tls_config(tls)
+            .expect("server tls config")
             .add_service(service)
             .serve_with_incoming(incoming)
             .await
@@ -333,9 +445,14 @@ async fn client_federate_groups_stream_tracks_groups() {
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let mut client = FederatedChannelClient::connect(format!("http://{addr}"))
-        .await
-        .expect("connect");
+    let fixtures = MtlsFixtures {
+        url: format!("https://localhost:{}", addr.port()),
+        ca_pem: ca.cert_pem.clone(),
+        client_cert_pem: client_cert.cert_pem,
+        client_key_pem: client_cert.key_pem,
+    };
+
+    let mut client = mtls_client(&fixtures).await;
 
     // Send our groups to the server
     let (tx, rx) = mpsc::channel(16);
