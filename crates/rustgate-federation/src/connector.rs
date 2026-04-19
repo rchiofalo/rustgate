@@ -12,7 +12,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use rustgate_core::constants::HANDSHAKE_TIMEOUT;
 use rustgate_core::identity::Identity;
-use rustgate_core::net::configure_tcp_keepalive;
+use rustgate_core::net::configure_tactical_socket;
 use rustgate_core::pem::{parse_ca_store, parse_certs, parse_key};
 use rustgate_transport::extract_identity;
 use rustls::RootCertStore;
@@ -143,7 +143,7 @@ impl PeerConnector {
             })?
             .map_err(|e| anyhow::anyhow!("TCP connect to {addr}: {e}"))?;
 
-        configure_tcp_keepalive(&tcp);
+        configure_tactical_socket(&tcp);
 
         let sni: ServerName<'static> = server_name
             .to_string()
@@ -299,7 +299,7 @@ impl DynamicPeerConnector {
             })?
             .map_err(|e| anyhow::anyhow!("TCP connect to {addr}: {e}"))?;
 
-        configure_tcp_keepalive(&tcp);
+        configure_tactical_socket(&tcp);
 
         let sni: ServerName<'static> = server_name
             .to_string()

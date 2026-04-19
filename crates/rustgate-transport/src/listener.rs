@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use rustgate_core::error::{Result, TransportError};
-use rustgate_core::net::configure_tcp_keepalive;
+use rustgate_core::net::configure_tactical_socket;
 use tokio::net::{TcpListener, ToSocketAddrs};
 use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
@@ -134,7 +134,7 @@ impl TlsListener {
                 }
             };
 
-            configure_tcp_keepalive(&tcp_stream);
+            configure_tactical_socket(&tcp_stream);
 
             debug!(peer_addr = %peer_addr, "TCP connection accepted");
 

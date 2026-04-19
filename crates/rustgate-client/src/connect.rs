@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use rustgate_core::net::configure_tactical_socket;
 use rustls_pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -83,6 +84,10 @@ pub(crate) async fn dial(config: &ClientConfig) -> Result<Stream> {
 
 async fn dial_inner(config: &ClientConfig) -> Result<Stream> {
     let tcp = TcpStream::connect(&config.server_addr).await?;
+    // Match listener-side tactical-socket defaults on the dial side —
+    // keepalive + `TCP_NODELAY` — so a client emitting single CoT events
+    // is not penalized by the peer's delayed-ACK timer.
+    configure_tactical_socket(&tcp);
     if config.plaintext {
         return Ok(Stream::Plain(tcp));
     }

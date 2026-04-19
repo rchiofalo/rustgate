@@ -11,7 +11,9 @@
 #                              rustgate-core/src/constants.rs.
 #   2. tcp-keepalive         — every file that uses `TcpListener` must also
 #                              call `rustgate_core::net::configure_tcp_keepalive`
-#                              on accepted streams.
+#                              (or the combined `configure_tactical_socket`
+#                              helper, which also sets `TCP_NODELAY`) on
+#                              accepted streams.
 #   3. rejection-audit       — rejection-themed `tracing::warn!`/`warn!` must
 #                              be followed within 10 lines by an `audit::*`
 #                              call so the compliance trail stays intact.
@@ -105,12 +107,14 @@ check_tcp_keepalive() {
         [[ -z "$file" ]] && continue
         [[ "$file" =~ $allow ]] && continue
         # Require an actual call site (`\(`) so a comment that merely
-        # mentions the helper can't silence the check.
-        if ! rg -q 'configure_tcp_keepalive\(' "$file"; then
+        # mentions the helper can't silence the check. `configure_tactical_socket`
+        # is a strict superset (keepalive + `TCP_NODELAY`) and satisfies the
+        # check — see `rustgate-core::net`.
+        if ! rg -q 'configure_tcp_keepalive\(|configure_tactical_socket\(' "$file"; then
             local line
             line=$(rg -n 'TcpListener' "$file" | head -1 | cut -d: -f1)
             report "$file" "${line:-1}" \
-                "TcpListener is used but \`configure_tcp_keepalive\` is never called — every accepted stream must go through \`rustgate_core::net::configure_tcp_keepalive\`."
+                "TcpListener is used but neither \`configure_tcp_keepalive\` nor \`configure_tactical_socket\` is called — every accepted stream must go through one of these \`rustgate_core::net\` helpers."
         fi
     done < <(rg -l --type rust 'TcpListener' crates/*/src/ 2>/dev/null || true)
 }

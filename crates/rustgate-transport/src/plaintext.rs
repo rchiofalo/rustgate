@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use rustgate_core::constants::{ANONYMOUS_IDENTITY, PLAINTEXT_GROUP};
 use rustgate_core::error::{Result, TransportError};
 use rustgate_core::identity::Identity;
-use rustgate_core::net::configure_tcp_keepalive;
+use rustgate_core::net::configure_tactical_socket;
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tracing::{debug, warn};
 
@@ -124,7 +124,7 @@ impl PlaintextListener {
                 }
             };
 
-            configure_tcp_keepalive(&tcp_stream);
+            configure_tactical_socket(&tcp_stream);
 
             debug!(peer_addr = %peer_addr, "plaintext TCP connection accepted");
 
@@ -170,6 +170,29 @@ mod tests {
         assert!(session.identity().cn.starts_with("anonymous-"));
         assert!(session.identity().groups.contains("__plaintext__"));
         assert!(session.identity().fingerprint.is_empty());
+
+        let _client_stream = client.await.expect("join");
+    }
+
+    #[tokio::test]
+    async fn accepted_socket_has_tcp_nodelay_set() {
+        // F-151 / #745 — `configure_tactical_socket` must leave
+        // `TCP_NODELAY = 1` on the accepted end. A regression that drops
+        // Nagle-disable would silently reintroduce a 40 ms latency
+        // penalty on small tactical messages; assert it end-to-end.
+        let cfg = PlaintextIdentityConfig::default();
+        let listener = PlaintextListener::bind("127.0.0.1:0", cfg)
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+
+        let client = tokio::spawn(async move { TcpStream::connect(addr).await.expect("connect") });
+
+        let session = listener.accept().await.expect("accept");
+        let nodelay = socket2::SockRef::from(&session.stream)
+            .tcp_nodelay()
+            .expect("tcp_nodelay readable");
+        assert!(nodelay, "accepted socket should have TCP_NODELAY set");
 
         let _client_stream = client.await.expect("join");
     }
