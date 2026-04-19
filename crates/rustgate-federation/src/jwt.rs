@@ -59,7 +59,32 @@ const EXPIRY_SWEEP_INTERVAL: u64 = 128;
 /// Maximum clock skew tolerance in seconds for `iat` validation.
 /// Tokens issued slightly in the future (within this window) are accepted
 /// to account for clock drift between federation peers.
-const MAX_CLOCK_SKEW_SECS: u64 = 60;
+///
+/// Sized to exceed [`rustgate_core::constants::FEDERATION_HEARTBEAT_TIMEOUT`]
+/// (90 s) so NTP drift that still keeps heartbeats flowing cannot
+/// simultaneously reject freshly-issued JWTs. Prior to #764 this was 60 s
+/// which produced a flapping regime under 60–90 s clock drift: heartbeats
+/// declared the peer alive, but every token refresh failed with
+/// [`JwtError::IssuedInFuture`] and triggered a
+/// `peer_connected` → `token_rejected` loop.
+///
+/// The compile-time assertion below pins the invariant so a future tweak
+/// to either constant cannot silently reintroduce the flap. 120 s gives
+/// a 30 s safety margin over the heartbeat timeout — enough to absorb
+/// typical stateless jitter without noticeably widening the replay
+/// surface. Operators who need to tolerate larger drift should also bump
+/// heartbeat timeouts, not just this value.
+const MAX_CLOCK_SKEW_SECS: u64 = 120;
+
+// Guard the heartbeat vs clock-skew invariant at compile time. If someone
+// lowers `MAX_CLOCK_SKEW_SECS` below `FEDERATION_HEARTBEAT_TIMEOUT` or
+// raises the heartbeat timeout past the clock skew, the build breaks
+// here instead of reintroducing the #764 flapping regime in production.
+const _: () = assert!(
+    MAX_CLOCK_SKEW_SECS >= rustgate_core::constants::FEDERATION_HEARTBEAT_TIMEOUT.as_secs(),
+    "MAX_CLOCK_SKEW_SECS must be >= FEDERATION_HEARTBEAT_TIMEOUT to avoid \
+     JWT iat flapping under NTP drift — see issue #764",
+);
 
 /// Warn when revocation cache reaches this fraction of capacity.
 const REVOCATION_WARN_THRESHOLD: f64 = 0.8;
@@ -872,6 +897,65 @@ mod tests {
         let token = encode(&auth.signing, &claims).expect("encode");
         let result = auth.validate(&token);
         assert!(result.is_ok(), "iat within skew should be accepted");
+    }
+
+    /// Regression test for issue #764. A federated peer whose clock is
+    /// `FEDERATION_HEARTBEAT_TIMEOUT` seconds ahead of the verifier must
+    /// still be able to present a freshly-issued token. Prior to the
+    /// fix, `MAX_CLOCK_SKEW_SECS = 60` would reject tokens from any
+    /// peer drifting past 60 s even though heartbeats were still
+    /// flowing — producing a `peer_connected` / `token_rejected` flap.
+    #[test]
+    fn iat_at_heartbeat_timeout_drift_accepted() {
+        use rustgate_core::constants::FEDERATION_HEARTBEAT_TIMEOUT;
+
+        let auth = make_authority();
+
+        // Peer's clock is ahead by the full heartbeat timeout — the
+        // worst case where heartbeats still keep the link declared
+        // alive. Clock skew tolerance must cover this (plus a small
+        // safety margin).
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time");
+        let drift = FEDERATION_HEARTBEAT_TIMEOUT.as_secs();
+        let future_iat = now.as_secs() + drift;
+
+        let claims = FederationClaims {
+            sub: "peer-1".to_string(),
+            iss: "rustgate-test".to_string(),
+            exp: future_iat + 3600,
+            iat: future_iat,
+            jti: "test-jti-764".to_string(),
+            groups: vec![],
+        };
+
+        let token = encode(&auth.signing, &claims).expect("encode");
+        let result = auth.validate(&token);
+        assert!(
+            result.is_ok(),
+            "token issued from peer drifting at heartbeat-timeout bound \
+             must be accepted — otherwise liveness and auth disagree \
+             (issue #764): got {result:?}"
+        );
+    }
+
+    /// Runtime check mirroring the compile-time assertion on
+    /// `MAX_CLOCK_SKEW_SECS >= FEDERATION_HEARTBEAT_TIMEOUT`. The
+    /// `const _: () = assert!(…)` in the module header is the primary
+    /// guard; this test documents the invariant in the failing-test
+    /// output if somebody disables the compile-time assertion.
+    #[test]
+    fn clock_skew_exceeds_heartbeat_timeout() {
+        use rustgate_core::constants::FEDERATION_HEARTBEAT_TIMEOUT;
+
+        assert!(
+            MAX_CLOCK_SKEW_SECS >= FEDERATION_HEARTBEAT_TIMEOUT.as_secs(),
+            "MAX_CLOCK_SKEW_SECS ({}) must be >= FEDERATION_HEARTBEAT_TIMEOUT ({:?}) \
+             to avoid JWT iat flapping under NTP drift (issue #764)",
+            MAX_CLOCK_SKEW_SECS,
+            FEDERATION_HEARTBEAT_TIMEOUT
+        );
     }
 
     #[test]
