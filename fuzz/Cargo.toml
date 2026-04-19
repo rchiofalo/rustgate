@@ -19,6 +19,7 @@ tokio-util = { version = "0.7", features = ["codec"] }
 rustgate-core = { path = "../crates/rustgate-core", features = ["fuzz"] }
 rustgate-transport = { path = "../crates/rustgate-transport" }
 rustgate-cot = { path = "../crates/rustgate-cot", features = ["fuzz"] }
+rustgate-mavlink = { path = "../crates/rustgate-mavlink" }
 rustgate-proto = { path = "../crates/rustgate-proto" }
 rustgate-federation = { path = "../crates/rustgate-federation", features = ["v2"] }
 rustgate-nats = { path = "../crates/rustgate-nats" }
@@ -106,4 +107,19 @@ doc = false
 [[bin]]
 name = "authz_eval"
 path = "fuzz_targets/authz_eval.rs"
+doc = false
+
+[[bin]]
+name = "mavlink_v2_frame"
+path = "fuzz_targets/mavlink_v2_frame.rs"
+doc = false
+
+[[bin]]
+name = "cot_mask_strip_coordinates"
+path = "fuzz_targets/cot_mask_strip_coordinates.rs"
+doc = false
+
+[[bin]]
+name = "obligation_apply"
+path = "fuzz_targets/obligation_apply.rs"
 doc = false

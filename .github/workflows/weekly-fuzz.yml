@@ -19,13 +19,16 @@ jobs:
       fail-fast: false
       matrix:
         target:
+          - cot_mask_strip_coordinates
           - cot_parse
           - crl_parse
           - csr_parse
           - federation_frame_parse
           - jwt_parse
           - length_prefixed_codec
+          - mavlink_v2_frame
           - nats_wire_event
+          - obligation_apply
           - proto_roundtrip
           - structured_cot_event
           - structured_routable_message

@@ -1,10 +1,38 @@
 // Copyright © 2026 Roberto Chiofalo.
 
-//! MQTT topic ↔ rustgate group mapping and validation.
+//! MQTT topic ↔ rustgate group mapping, filter validation, and
+//! wildcard matching.
 //!
-//! MQTT topics are UTF-8 strings with `/` as a level separator.
-//! rustgate group names are restricted to printable ASCII without `/`.
-//! This module handles the translation and validates both sides.
+//! MQTT topics are UTF-8 strings with `/` as a level separator. rustgate
+//! group names are reused as-is (preserving `/`) so that a multi-level
+//! topic like `fleet/A/position` maps 1:1 to the group the certificate
+//! issuer provisioned in the client's `OU` field.
+//!
+//! # Wildcards
+//!
+//! MQTT subscribe filters may contain two wildcards per [MQTT 5.0
+//! §4.7.1]:
+//!
+//! - `+` — single-level wildcard. Matches exactly one topic level at the
+//!   position it occupies. `fleet/+/position` matches `fleet/A/position`
+//!   but not `fleet/A/B/position`.
+//! - `#` — multi-level wildcard. Matches zero or more trailing levels.
+//!   Must appear as the **last** character of the filter and must be
+//!   preceded by `/` (or be the entire filter). `fleet/#` matches
+//!   `fleet`, `fleet/A`, and `fleet/A/B/position`.
+//!
+//! Wildcards are **never** accepted in PUBLISH topics. They are gated
+//! in SUBSCRIBE filters by [`WildcardPolicy`] so operators can shut off
+//! the `#` broadcast firehose for untrusted fleets.
+//!
+//! Wildcard subscriptions are expanded at SUBSCRIBE time against the
+//! client's own `Identity.groups` set — the router never synthesises
+//! new groups from a wildcard. This keeps the existing group-membership
+//! authorisation model intact: if a cert does not carry
+//! `fleet/A/position` in its OU, a client cannot receive messages
+//! addressed to that group no matter how permissive the filter.
+//!
+//! [MQTT 5.0 §4.7.1]: https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Topic_Names_and
 
 use std::borrow::Cow;
 
@@ -13,6 +41,46 @@ use crate::error::MqttError;
 /// Maximum group name length after topic mapping.
 const MAX_GROUP_LEN: usize = 255;
 
+/// MQTT single-level wildcard character.
+const WILDCARD_SINGLE: char = '+';
+
+/// MQTT multi-level wildcard character.
+const WILDCARD_MULTI: char = '#';
+
+/// Topic level separator per MQTT 5.0 §1.5.4.
+const LEVEL_SEP: char = '/';
+
+/// Policy controlling which wildcards are accepted in SUBSCRIBE filters.
+///
+/// PUBLISH topics always reject wildcards regardless of this policy —
+/// the MQTT spec forbids them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WildcardPolicy {
+    /// Reject both `+` and `#`. Exact-topic subscriptions only. Matches
+    /// the rustgate v1 behaviour before wildcards were supported.
+    Reject,
+    /// Accept `+` (single-level). Reject `#` (multi-level).
+    ///
+    /// This is the default: most fleets want `fleet/+/position`-style
+    /// fan-out without exposing the `fleet/#` broadcast firehose.
+    #[default]
+    SingleLevelOnly,
+    /// Accept both `+` and `#`. Operators should only enable this on
+    /// listeners where authorised clients legitimately need full-subtree
+    /// subscriptions — for example, a SIEM tap.
+    Full,
+}
+
+impl WildcardPolicy {
+    fn accepts_multi_level(self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    fn accepts_single_level(self) -> bool {
+        matches!(self, Self::SingleLevelOnly | Self::Full)
+    }
+}
+
 /// Map an MQTT topic to a rustgate group name.
 ///
 /// If `prefix` is `Some`, the topic must start with the prefix; the prefix
@@ -20,6 +88,10 @@ const MAX_GROUP_LEN: usize = 255;
 /// `None`, the topic is used as-is.
 ///
 /// Returns `Cow::Borrowed` when no prefix is configured (zero allocation).
+///
+/// This helper is only for **exact** (wildcard-free) topics — the PUBLISH
+/// path and the non-wildcard branch of SUBSCRIBE. Wildcard filters are
+/// handled by [`filter_matches`] against the client's identity groups.
 pub fn topic_to_group<'a>(topic: &'a str, prefix: Option<&str>) -> Result<Cow<'a, str>, MqttError> {
     let group = if let Some(pfx) = prefix {
         topic.strip_prefix(pfx).ok_or_else(|| {
@@ -59,7 +131,7 @@ pub fn validate_publish_topic(topic: &str) -> Result<(), MqttError> {
     if topic.is_empty() {
         return Err(MqttError::InvalidTopic("empty topic".into()));
     }
-    if topic.contains('+') || topic.contains('#') {
+    if topic.contains(WILDCARD_SINGLE) || topic.contains(WILDCARD_MULTI) {
         return Err(MqttError::InvalidTopic(
             "wildcards (+, #) are not allowed in publish topics".into(),
         ));
@@ -67,20 +139,107 @@ pub fn validate_publish_topic(topic: &str) -> Result<(), MqttError> {
     Ok(())
 }
 
-/// Validate that a subscribe topic filter is acceptable for v1.
+/// Validate a subscribe topic filter against an MQTT wildcard policy.
 ///
-/// In v1, wildcards (`+`, `#`) are rejected. Only exact topic matches
-/// are supported. Future versions will add wildcard support.
-pub fn validate_subscribe_filter(filter: &str) -> Result<(), MqttError> {
+/// Enforces the MQTT 5.0 §4.7.1 level-boundary rules:
+///
+/// - `+` is only valid as an entire level (not `fleet+`, not `+x`).
+/// - `#` is only valid as the last level and must be preceded by `/`
+///   (or be the entire filter).
+///
+/// A filter whose wildcard usage is syntactically correct but forbidden
+/// by `policy` is rejected with a policy-specific error.
+pub fn validate_subscribe_filter(filter: &str, policy: WildcardPolicy) -> Result<(), MqttError> {
     if filter.is_empty() {
         return Err(MqttError::InvalidTopic("empty topic filter".into()));
     }
-    if filter.contains('+') || filter.contains('#') {
-        return Err(MqttError::InvalidTopic(
-            "wildcard topic filters are not supported in v1".into(),
-        ));
+
+    let levels: Vec<&str> = filter.split(LEVEL_SEP).collect();
+    let last_idx = levels.len() - 1;
+
+    for (idx, level) in levels.iter().enumerate() {
+        let contains_single = level.contains(WILDCARD_SINGLE);
+        let contains_multi = level.contains(WILDCARD_MULTI);
+
+        if contains_single {
+            if *level != "+" {
+                return Err(MqttError::InvalidTopic(format!(
+                    "'+' must occupy an entire topic level: got '{level}'"
+                )));
+            }
+            if !policy.accepts_single_level() {
+                return Err(MqttError::InvalidTopic(
+                    "single-level wildcard '+' is disabled by listener policy".into(),
+                ));
+            }
+        }
+
+        if contains_multi {
+            if *level != "#" {
+                return Err(MqttError::InvalidTopic(format!(
+                    "'#' must occupy an entire topic level: got '{level}'"
+                )));
+            }
+            if idx != last_idx {
+                return Err(MqttError::InvalidTopic(
+                    "'#' must be the last topic level".into(),
+                ));
+            }
+            if !policy.accepts_multi_level() {
+                return Err(MqttError::InvalidTopic(
+                    "multi-level wildcard '#' is disabled by listener policy".into(),
+                ));
+            }
+        }
+
+        // Levels without wildcards must satisfy the group-name character rules.
+        // Wildcard-only levels (`+` / `#`) bypass the per-character check.
+        if !contains_single && !contains_multi {
+            validate_level_chars(level)?;
+        }
     }
     Ok(())
+}
+
+/// Return whether a filter contains any wildcard characters.
+pub fn filter_has_wildcards(filter: &str) -> bool {
+    filter.contains(WILDCARD_SINGLE) || filter.contains(WILDCARD_MULTI)
+}
+
+/// Match an MQTT topic filter against a concrete topic.
+///
+/// Implements MQTT 5.0 §4.7.1 matching semantics:
+///
+/// - Level counts must match, unless the filter's final level is `#`.
+/// - `+` matches exactly one level (any non-empty level contents).
+/// - `#` matches zero or more trailing levels (may match the empty tail).
+///
+/// Callers must have already passed `filter` through
+/// [`validate_subscribe_filter`]; this function assumes syntactic
+/// correctness and does not re-validate.
+pub fn filter_matches(filter: &str, topic: &str) -> bool {
+    let filter_levels: Vec<&str> = filter.split(LEVEL_SEP).collect();
+    let topic_levels: Vec<&str> = topic.split(LEVEL_SEP).collect();
+
+    for (idx, fl) in filter_levels.iter().enumerate() {
+        if *fl == "#" {
+            // '#' absorbs zero or more trailing topic levels (including empty).
+            return true;
+        }
+        let Some(tl) = topic_levels.get(idx) else {
+            // Filter has more literal levels than the topic provides.
+            return false;
+        };
+        if *fl == "+" {
+            // '+' matches exactly one level.
+            continue;
+        }
+        if fl != tl {
+            return false;
+        }
+    }
+    // All filter levels consumed — topic must have no trailing levels.
+    filter_levels.len() == topic_levels.len()
 }
 
 /// Validate a group name against rustgate's naming rules.
@@ -88,8 +247,12 @@ pub fn validate_subscribe_filter(filter: &str) -> Result<(), MqttError> {
 /// Group names must be:
 /// - 1–255 bytes long
 /// - ASCII printable characters only
-/// - No `/` (reserved as MQTT level separator; stripped during mapping)
 /// - No whitespace
+/// - No MQTT wildcard characters (`+`, `#`)
+///
+/// `/` is permitted as a hierarchy separator so that multi-level MQTT
+/// topics can round-trip through the router without an explicit
+/// remapping step.
 fn validate_group_name(name: &str) -> Result<(), MqttError> {
     if name.is_empty() {
         return Err(MqttError::InvalidTopic(
@@ -101,15 +264,36 @@ fn validate_group_name(name: &str) -> Result<(), MqttError> {
             "group name exceeds {MAX_GROUP_LEN} byte limit"
         )));
     }
-    if name.contains('/') {
-        return Err(MqttError::InvalidTopic(
-            "mapped group name must not contain '/'".into(),
-        ));
-    }
     for ch in name.chars() {
+        if ch == WILDCARD_SINGLE || ch == WILDCARD_MULTI {
+            return Err(MqttError::InvalidTopic(format!(
+                "wildcard character in group name: {ch:?}"
+            )));
+        }
+        // '/' is an allowed separator even though it is non-graphic in the
+        // ASCII-control sense; all other non-graphic / whitespace chars reject.
+        if ch == LEVEL_SEP {
+            continue;
+        }
         if ch.is_ascii_whitespace() || !ch.is_ascii_graphic() {
             return Err(MqttError::InvalidTopic(format!(
                 "invalid character in group name: {ch:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate the character set of a non-wildcard filter level. Mirrors the
+/// per-character rules of [`validate_group_name`] but operates on a single
+/// level so empty-level diagnostics point at the right place.
+fn validate_level_chars(level: &str) -> Result<(), MqttError> {
+    // Empty levels ("foo//bar") are permitted by MQTT spec and round-trip
+    // cleanly through `filter_matches` / `topic_to_group`; no rejection here.
+    for ch in level.chars() {
+        if ch.is_ascii_whitespace() || !ch.is_ascii_graphic() {
+            return Err(MqttError::InvalidTopic(format!(
+                "invalid character in topic level: {ch:?}"
             )));
         }
     }
@@ -154,8 +338,19 @@ mod tests {
     }
 
     #[test]
-    fn slash_in_group_rejected() {
-        assert!(topic_to_group("a/b", None).is_err());
+    fn hierarchical_group_name_accepted() {
+        // '/' is now allowed so MQTT multi-level topics map through cleanly.
+        assert_eq!(
+            topic_to_group("fleet/A/position", None).unwrap().as_ref(),
+            "fleet/A/position"
+        );
+    }
+
+    #[test]
+    fn wildcard_chars_in_group_rejected() {
+        // Wildcards still cannot appear in a *publish* topic / group mapping.
+        assert!(topic_to_group("fleet/+/position", None).is_err());
+        assert!(topic_to_group("fleet/#", None).is_err());
     }
 
     #[test]
@@ -169,16 +364,102 @@ mod tests {
         assert!(validate_publish_topic("sensors/#").is_err());
     }
 
+    // ----- validate_subscribe_filter (policy matrix) -----
+
     #[test]
-    fn wildcard_in_subscribe_rejected_v1() {
-        assert!(validate_subscribe_filter("sensors/+/temp").is_err());
-        assert!(validate_subscribe_filter("sensors/#").is_err());
+    fn reject_policy_refuses_all_wildcards() {
+        let p = WildcardPolicy::Reject;
+        assert!(validate_subscribe_filter("alpha", p).is_ok());
+        assert!(validate_subscribe_filter("fleet/+/position", p).is_err());
+        assert!(validate_subscribe_filter("fleet/#", p).is_err());
     }
 
     #[test]
-    fn valid_subscribe_filter_accepted() {
-        assert!(validate_subscribe_filter("alpha").is_ok());
+    fn single_level_policy_accepts_plus_rejects_hash() {
+        let p = WildcardPolicy::SingleLevelOnly;
+        assert!(validate_subscribe_filter("alpha", p).is_ok());
+        assert!(validate_subscribe_filter("fleet/+/position", p).is_ok());
+        assert!(validate_subscribe_filter("+", p).is_ok());
+        assert!(validate_subscribe_filter("fleet/#", p).is_err());
+        assert!(validate_subscribe_filter("#", p).is_err());
     }
+
+    #[test]
+    fn full_policy_accepts_both_wildcards() {
+        let p = WildcardPolicy::Full;
+        assert!(validate_subscribe_filter("alpha", p).is_ok());
+        assert!(validate_subscribe_filter("fleet/+/position", p).is_ok());
+        assert!(validate_subscribe_filter("fleet/#", p).is_ok());
+        assert!(validate_subscribe_filter("#", p).is_ok());
+    }
+
+    #[test]
+    fn plus_must_be_entire_level() {
+        let p = WildcardPolicy::Full;
+        assert!(validate_subscribe_filter("fleet/A+B/position", p).is_err());
+        assert!(validate_subscribe_filter("fleet/+x/position", p).is_err());
+        assert!(validate_subscribe_filter("fleet/x+/position", p).is_err());
+    }
+
+    #[test]
+    fn hash_must_be_last_level_and_entire_level() {
+        let p = WildcardPolicy::Full;
+        assert!(validate_subscribe_filter("fleet/#/position", p).is_err());
+        assert!(validate_subscribe_filter("fleet/x#", p).is_err());
+        assert!(validate_subscribe_filter("fleet/#x", p).is_err());
+    }
+
+    #[test]
+    fn empty_filter_rejected() {
+        assert!(validate_subscribe_filter("", WildcardPolicy::Full).is_err());
+    }
+
+    // ----- filter_has_wildcards / filter_matches -----
+
+    #[test]
+    fn filter_has_wildcards_detects_plus_and_hash() {
+        assert!(!filter_has_wildcards("fleet/A/position"));
+        assert!(filter_has_wildcards("fleet/+/position"));
+        assert!(filter_has_wildcards("fleet/#"));
+    }
+
+    #[test]
+    fn filter_matches_exact() {
+        assert!(filter_matches("fleet/A/position", "fleet/A/position"));
+        assert!(!filter_matches("fleet/A/position", "fleet/B/position"));
+    }
+
+    #[test]
+    fn filter_matches_plus_single_level() {
+        assert!(filter_matches("fleet/+/position", "fleet/A/position"));
+        assert!(filter_matches("fleet/+/position", "fleet/B/position"));
+        // '+' does not span levels.
+        assert!(!filter_matches("fleet/+/position", "fleet/A/B/position"));
+        // Level count must match without '#'.
+        assert!(!filter_matches("fleet/+/position", "fleet/A"));
+    }
+
+    #[test]
+    fn filter_matches_hash_multi_level() {
+        assert!(filter_matches("fleet/#", "fleet"));
+        assert!(filter_matches("fleet/#", "fleet/A"));
+        assert!(filter_matches("fleet/#", "fleet/A/B/position"));
+        assert!(!filter_matches("fleet/#", "other/A"));
+    }
+
+    #[test]
+    fn filter_matches_bare_plus_matches_single_level_only() {
+        assert!(filter_matches("+", "alpha"));
+        assert!(!filter_matches("+", "alpha/bravo"));
+    }
+
+    #[test]
+    fn filter_matches_bare_hash_matches_everything() {
+        assert!(filter_matches("#", "alpha"));
+        assert!(filter_matches("#", "alpha/bravo/charlie"));
+    }
+
+    // ----- group-name validator -----
 
     #[test]
     fn whitespace_in_group_rejected() {
@@ -203,5 +484,10 @@ mod tests {
         assert!(validate_topic_prefix("").is_ok());
         assert!(validate_topic_prefix("rustgate").is_err());
         assert!(validate_topic_prefix("r").is_err());
+    }
+
+    #[test]
+    fn default_policy_is_single_level_only() {
+        assert_eq!(WildcardPolicy::default(), WildcardPolicy::SingleLevelOnly);
     }
 }
