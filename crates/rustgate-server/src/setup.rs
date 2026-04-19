@@ -696,6 +696,13 @@ pub(crate) async fn start_enrollment(
         enrollment_server = enrollment_server.with_rate_limit_callback(std::sync::Arc::new(|| {
             crate::metrics::enrollment_rate_limited().inc();
         }));
+        // Issue #767 / F-41: expose rate-limiter mutex poison as a
+        // dedicated counter so operators can alert separately from
+        // rate-limit rejections (both surface as HTTP 503 otherwise).
+        enrollment_server =
+            enrollment_server.with_rate_limit_poison_callback(std::sync::Arc::new(|| {
+                crate::metrics::enrollment_rate_limit_poison().inc();
+            }));
     }
 
     tracing::info!(
