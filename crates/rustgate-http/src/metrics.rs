@@ -20,6 +20,7 @@ static CIRCUIT_STATE: OnceLock<IntGaugeVec> = OnceLock::new();
 static RETRIES: OnceLock<IntCounterVec> = OnceLock::new();
 static FILTERED: OnceLock<IntCounterVec> = OnceLock::new();
 static QUEUE_DEPTH: OnceLock<IntGauge> = OnceLock::new();
+static DROPPED: OnceLock<IntCounterVec> = OnceLock::new();
 
 // ── Fallback constructors ──────────────────────────────────────────
 
@@ -124,6 +125,17 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(queue_depth.clone()))?;
     let _ = QUEUE_DEPTH.set(queue_depth);
 
+    let dropped = IntCounterVec::new(
+        Opts::new(
+            "rustgate_http_dropped_total",
+            "Messages dropped before per-target dispatch (admission-queue \
+             shed). Labelled by reason (`channel_full`, `channel_closed`).",
+        ),
+        &["reason"],
+    )?;
+    registry.register(Box::new(dropped.clone()))?;
+    let _ = DROPPED.set(dropped);
+
     Ok(())
 }
 
@@ -178,6 +190,18 @@ pub fn queue_depth() -> &'static IntGauge {
     QUEUE_DEPTH.get_or_init(|| fallback_gauge("rustgate_http_queue_depth", "fallback"))
 }
 
+/// Pre-dispatch admission-queue drops counter, labelled by reason.
+///
+/// Increments when a message is shed before reaching per-target
+/// dispatch (e.g. the internal bounded channel is full or closed).
+/// Paired with a DLQ entry under the synthetic `admission` target
+/// when the DLQ is configured, so no drop is silent.
+pub fn dropped() -> &'static IntCounterVec {
+    DROPPED.get_or_init(|| {
+        fallback_counter_vec("rustgate_http_dropped_total", "fallback", &["reason"])
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::panic, clippy::unwrap_used)]
@@ -227,5 +251,14 @@ mod tests {
     fn queue_depth_can_set() {
         queue_depth().set(42);
         assert_eq!(queue_depth().get(), 42);
+    }
+
+    #[test]
+    fn dropped_can_increment_with_reason() {
+        let counter = dropped();
+        if let Ok(child) = counter.get_metric_with_label_values(&["channel_full"]) {
+            child.inc();
+            assert!(child.get() >= 1);
+        }
     }
 }

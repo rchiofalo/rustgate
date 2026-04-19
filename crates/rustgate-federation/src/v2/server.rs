@@ -293,22 +293,44 @@ impl FederationService {
 
     /// Extract peer ID from the mTLS client certificate CN.
     ///
-    /// Prefers the Common Name (CN) from the peer's TLS certificate subject,
-    /// which is authenticated via mTLS and cannot be spoofed. Falls back to
-    /// the remote IP address with a warning if the certificate is unavailable
-    /// or cannot be parsed (e.g., non-mTLS connections during testing).
-    ///
+    /// Returns the Common Name (CN) from the peer's TLS certificate
+    /// subject, which is authenticated via mTLS and cannot be spoofed.
     /// The extracted CN is sanitized (length-capped, control characters
     /// stripped) to prevent log-injection from malicious certificates.
-    fn peer_id_from_request<T>(request: &Request<T>) -> String {
+    ///
+    /// # Errors
+    ///
+    /// Returns `Status::unauthenticated` when the peer cannot be
+    /// identified by certificate CN. Historically the server fell back
+    /// to the remote IP address in this path, which silently matched
+    /// IP-keyed `peer_groups` entries regardless of whether the TLS
+    /// identity was present. An expired or malformed client cert would
+    /// then inherit the groups of any legitimate peer previously seen
+    /// at the same address. The rejection short-circuits every RPC
+    /// handler before any group or hop-count evaluation runs, and
+    /// emits `audit::federation_peer_rejected` tagged with the remote
+    /// address for forensic correlation. Operators relying on the
+    /// previous IP-fallback behaviour for non-mTLS testing must now
+    /// supply a real client certificate.
+    fn peer_id_from_request<T>(request: &Request<T>) -> Result<String, Status> {
+        // Tests cannot attach a real client certificate to a `tonic::Request`
+        // without running a full TLS handshake. They inject a synthesized
+        // CN via `Request::extensions_mut()` instead; the prod path below
+        // is unchanged. Release builds never see this extension because
+        // nothing outside the test harness inserts it.
+        #[cfg(test)]
+        if let Some(test_cn) = request.extensions().get::<TestPeerCn>() {
+            return Ok(test_cn.0.clone());
+        }
+
         // Try to extract CN from the mTLS peer certificate.
         // Uses an iterator chain to avoid nested if-let that triggers
         // clippy::collapsible_if.
-        let cn = request
+        let (cn, cert_present) = request
             .peer_certs()
             .and_then(|certs| certs.first().cloned())
-            .and_then(|cert_der| {
-                x509_parser::parse_x509_certificate(cert_der.as_ref())
+            .map(|cert_der| {
+                let cn = x509_parser::parse_x509_certificate(cert_der.as_ref())
                     .ok()
                     .and_then(|(_, parsed)| {
                         parsed
@@ -327,23 +349,36 @@ impl FederationService {
                                 sanitized
                             })
                             .filter(|s| !s.is_empty())
-                    })
-            });
+                    });
+                (cn, true)
+            })
+            .unwrap_or((None, false));
 
         if let Some(cn) = cn {
-            return cn;
+            return Ok(cn);
         }
 
-        // Fall back to remote address with a warning
-        if let Some(addr) = request.remote_addr() {
-            warn!(
-                remote_addr = %addr,
-                "federation peer identity falling back to IP address — mTLS peer certificate not available"
-            );
-            return addr.to_string();
-        }
-
-        "unknown".to_string()
+        // mTLS CN extraction failed — refuse the RPC and record the
+        // attempt. Fallback to IP (the pre-F-44 behaviour) is the
+        // security bug this path closes.
+        let remote = request
+            .remote_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let reason = if cert_present {
+            "peer_cert_unparseable_or_empty_cn"
+        } else {
+            "peer_cert_missing"
+        };
+        warn!(
+            remote_addr = %remote,
+            reason = %reason,
+            "federation peer rejected — mTLS client certificate CN unavailable"
+        );
+        rustgate_core::audit::federation_peer_rejected(&remote, reason);
+        Err(Status::unauthenticated(
+            "federation peer identity unavailable: mTLS client certificate required",
+        ))
     }
 
     /// Create a pre-configured `tonic::transport::Server` with federation
@@ -397,7 +432,7 @@ impl FederatedChannel for FederationService {
         &self,
         request: Request<figpb::FederatedEvent>,
     ) -> Result<Response<figpb::Empty>, Status> {
-        let peer_id = Self::peer_id_from_request(&request);
+        let peer_id = Self::peer_id_from_request(&request)?;
         let event = request.into_inner();
 
         if !Self::validate_hop_count(&event, &peer_id) {
@@ -427,7 +462,7 @@ impl FederatedChannel for FederationService {
         &self,
         request: Request<figpb::ClientHealth>,
     ) -> Result<Response<figpb::ServerHealth>, Status> {
-        let peer_id = Self::peer_id_from_request(&request);
+        let peer_id = Self::peer_id_from_request(&request)?;
         debug!(peer = %peer_id, "health check received");
         Ok(Response::new(figpb::ServerHealth {
             status: figpb::server_health::ServingStatus::Serving as i32,
@@ -465,7 +500,7 @@ impl FederatedChannel for FederationService {
         &self,
         request: Request<Streaming<figpb::FederatedEvent>>,
     ) -> Result<Response<figpb::Subscription>, Status> {
-        let peer_id = Self::peer_id_from_request(&request);
+        let peer_id = Self::peer_id_from_request(&request)?;
         let mut stream = request.into_inner();
 
         info!(peer = %peer_id, "server_event_stream opened (receiving events)");
@@ -530,7 +565,7 @@ impl FederatedChannel for FederationService {
         &self,
         request: Request<Streaming<figpb::BinaryBlob>>,
     ) -> Result<Response<figpb::Empty>, Status> {
-        let peer_id = Self::peer_id_from_request(&request);
+        let peer_id = Self::peer_id_from_request(&request)?;
         let mut stream = request.into_inner();
 
         // Drain the stream without processing (binary blobs not supported)
@@ -547,7 +582,7 @@ impl FederatedChannel for FederationService {
         &self,
         request: Request<Streaming<figpb::Rol>>,
     ) -> Result<Response<figpb::Subscription>, Status> {
-        let peer_id = Self::peer_id_from_request(&request);
+        let peer_id = Self::peer_id_from_request(&request)?;
         let mut stream = request.into_inner();
 
         // Drain ROL stream without processing (missions not supported)
@@ -564,7 +599,7 @@ impl FederatedChannel for FederationService {
         &self,
         request: Request<Streaming<figpb::FederateGroups>>,
     ) -> Result<Response<figpb::Subscription>, Status> {
-        let peer_id = Self::peer_id_from_request(&request);
+        let peer_id = Self::peer_id_from_request(&request)?;
         let mut stream = request.into_inner();
 
         info!(peer = %peer_id, "client_federate_groups_stream opened (receiving groups)");
@@ -722,12 +757,30 @@ impl FederatedChannel for FederationService {
     }
 }
 
+/// Test-only extension that carries a synthesized peer CN through a
+/// `tonic::Request`. Tests cannot complete a real mTLS handshake in
+/// unit scope, so `peer_id_from_request` consults this extension (and
+/// only this extension) under `#[cfg(test)]` before following the
+/// production cert-extraction path. Release builds never observe the
+/// type because its constructor lives behind the same cfg.
+#[cfg(test)]
+#[derive(Clone)]
+struct TestPeerCn(String);
+
 #[cfg(test)]
 #[allow(unused_results, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
+
+    /// Build a `tonic::Request` carrying a synthesized peer CN. Mirrors
+    /// what the prod path would extract from a real mTLS client cert.
+    fn request_with_peer_cn<T>(inner: T, cn: &str) -> Request<T> {
+        let mut req = Request::new(inner);
+        req.extensions_mut().insert(TestPeerCn(cn.to_string()));
+        req
+    }
 
     fn noop_on_event() -> OnEvent {
         Arc::new(|_event, _peer| {})
@@ -887,9 +940,12 @@ mod tests {
     async fn health_check_returns_serving() {
         let svc = FederationService::new("s".into(), vec![], noop_on_event());
         let resp = svc
-            .health_check(Request::new(figpb::ClientHealth {
-                status: figpb::client_health::ServingStatus::Serving as i32,
-            }))
+            .health_check(request_with_peer_cn(
+                figpb::ClientHealth {
+                    status: figpb::client_health::ServingStatus::Serving as i32,
+                },
+                "test-peer",
+            ))
             .await
             .expect("health_check");
         let health = resp.into_inner();
@@ -911,7 +967,7 @@ mod tests {
             ..Default::default()
         };
         let _ = svc
-            .send_one_event(Request::new(event))
+            .send_one_event(request_with_peer_cn(event, "unknown"))
             .await
             .expect("send_one_event");
         assert_eq!(count.load(Ordering::Relaxed), 1);
@@ -1055,12 +1111,16 @@ mod tests {
     }
 
     #[test]
-    fn peer_id_falls_back_to_unknown_without_tls() {
-        // Without TLS extensions or remote_addr, peer_id_from_request
-        // should return "unknown" as a last resort.
+    fn peer_id_rejects_request_without_tls_cert() {
+        // Without TLS extensions the RPC must be refused — see F-44 /
+        // issue #759. The previous IP-fallback behaviour let a peer
+        // without a parseable mTLS cert inherit IP-keyed `peer_groups`
+        // entries; this test guards that the function never returns a
+        // synthetic identity on that path again.
         let request = Request::new(figpb::Empty {});
-        let peer_id = FederationService::peer_id_from_request(&request);
-        assert_eq!(peer_id, "unknown");
+        let err = FederationService::peer_id_from_request(&request)
+            .expect_err("peer_id extraction must fail without a client cert");
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
     }
 
     #[tokio::test]
@@ -1081,7 +1141,7 @@ mod tests {
         };
 
         let _ = svc
-            .send_one_event(Request::new(event))
+            .send_one_event(request_with_peer_cn(event, "unknown"))
             .await
             .expect("send_one_event");
 
@@ -1110,7 +1170,7 @@ mod tests {
         };
 
         let _ = svc
-            .send_one_event(Request::new(event))
+            .send_one_event(request_with_peer_cn(event, "unknown"))
             .await
             .expect("send_one_event");
 
@@ -1134,7 +1194,9 @@ mod tests {
             federate_groups: vec!["Beta".into()],
             ..Default::default()
         };
-        let result = svc.send_one_event(Request::new(event)).await;
+        let result = svc
+            .send_one_event(request_with_peer_cn(event, "unknown"))
+            .await;
         assert!(result.is_err());
         let status = result.unwrap_err();
         assert_eq!(status.code(), tonic::Code::PermissionDenied);
@@ -1154,7 +1216,9 @@ mod tests {
             federate_groups: vec!["Alpha".into()],
             ..Default::default()
         };
-        let result = svc.send_one_event(Request::new(event)).await;
+        let result = svc
+            .send_one_event(request_with_peer_cn(event, "unknown"))
+            .await;
         assert!(result.is_ok());
         assert_eq!(count.load(Ordering::Relaxed), 1, "callback should fire");
     }
@@ -1169,7 +1233,9 @@ mod tests {
             federate_groups: vec!["AnyGroup".into()],
             ..Default::default()
         };
-        let result = svc.send_one_event(Request::new(event)).await;
+        let result = svc
+            .send_one_event(request_with_peer_cn(event, "unknown"))
+            .await;
         assert!(result.is_ok());
         assert_eq!(
             count.load(Ordering::Relaxed),
@@ -1193,7 +1259,7 @@ mod tests {
         };
 
         let _ = svc
-            .send_one_event(Request::new(event))
+            .send_one_event(request_with_peer_cn(event, "unknown"))
             .await
             .expect("send_one_event");
 
@@ -1222,7 +1288,7 @@ mod tests {
         };
 
         let _ = svc
-            .send_one_event(Request::new(event))
+            .send_one_event(request_with_peer_cn(event, "unknown"))
             .await
             .expect("send_one_event");
 
@@ -1251,7 +1317,7 @@ mod tests {
         };
 
         let _ = svc
-            .send_one_event(Request::new(event))
+            .send_one_event(request_with_peer_cn(event, "unknown"))
             .await
             .expect("send_one_event");
 
@@ -1280,7 +1346,7 @@ mod tests {
         };
 
         let _ = svc
-            .send_one_event(Request::new(event))
+            .send_one_event(request_with_peer_cn(event, "unknown"))
             .await
             .expect("send_one_event");
 
@@ -1340,7 +1406,9 @@ mod tests {
             federate_groups: vec!["Alpha".into()],
             ..Default::default()
         };
-        let result = svc.send_one_event(Request::new(event)).await;
+        let result = svc
+            .send_one_event(request_with_peer_cn(event, "unknown"))
+            .await;
         assert!(result.is_err());
         let status = result.unwrap_err();
         assert_eq!(status.code(), tonic::Code::PermissionDenied);
@@ -1360,7 +1428,9 @@ mod tests {
             federate_groups: vec![],
             ..Default::default()
         };
-        let result = svc.send_one_event(Request::new(event)).await;
+        let result = svc
+            .send_one_event(request_with_peer_cn(event, "unknown"))
+            .await;
         assert!(result.is_ok());
         assert_eq!(count.load(Ordering::Relaxed), 1);
     }
@@ -1405,7 +1475,9 @@ mod tests {
             federate_groups: vec!["alpha".into(), "bravo".into()],
             ..Default::default()
         };
-        let result = svc.send_one_event(Request::new(event)).await;
+        let result = svc
+            .send_one_event(request_with_peer_cn(event, "unknown"))
+            .await;
         assert!(
             result.is_err(),
             "event must be rejected when any claimed group is unauthorized"

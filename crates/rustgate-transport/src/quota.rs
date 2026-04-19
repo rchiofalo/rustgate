@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use parking_lot::RwLock;
 use serde::Deserialize;
@@ -28,6 +28,13 @@ pub struct TenantQuota {
     /// Reserved for future per-tenant message rate limiting. Not yet enforced.
     #[serde(default)]
     pub max_message_rate: u32,
+    /// Maximum bytes that may be queued at any instant across all egress
+    /// paths (router broadcast, HTTP publisher, NATS bridge, federation
+    /// outbound) for this tenant. 0 = unlimited. Used by
+    /// [`TenantQuotaTracker::try_reserve_bytes`] to prevent a single noisy
+    /// tenant from exhausting the global [`crate::backpressure::BackpressureGate`].
+    #[serde(default)]
+    pub max_queued_bytes: u64,
 }
 
 /// Quota configuration loaded from file.
@@ -44,6 +51,9 @@ pub struct QuotaConfig {
 #[derive(Debug, Default)]
 struct TenantCounters {
     active_connections: AtomicU32,
+    /// Bytes currently reserved on egress queues for this tenant. Parallel
+    /// to `active_connections` but governed by `max_queued_bytes`.
+    queued_bytes: AtomicUsize,
 }
 
 /// Tracks and enforces per-tenant resource quotas.
@@ -167,6 +177,102 @@ impl TenantQuotaTracker {
             .unwrap_or(0)
     }
 
+    /// Attempt to reserve `bytes` worth of egress queue capacity for
+    /// `tenant`. Returns a [`TenantBytePermit`] on success; the permit
+    /// releases the reservation automatically when dropped.
+    ///
+    /// Returns `None` if the tenant's `max_queued_bytes` would be exceeded,
+    /// OR if the tenant has no quota configured (no entry in `tenants` and
+    /// no `default_quota`). Callers that want to fall through to the global
+    /// gate in the no-config case should treat `None` as "no per-tenant
+    /// accounting applies", not as a rejection.
+    ///
+    /// A `max_queued_bytes` value of `0` is treated as unlimited, matching
+    /// the semantics of `max_connections`. In that case the reservation
+    /// is still tracked so operators can observe real-time byte usage.
+    pub fn try_reserve_bytes(
+        self: &Arc<Self>,
+        tenant: &str,
+        bytes: usize,
+    ) -> Option<TenantBytePermit> {
+        let quota = self.quota_for(tenant)?;
+        let max = quota.max_queued_bytes;
+
+        // Fast path: counter already exists.
+        {
+            let counters = self.counters.read();
+            if let Some(c) = counters.get(tenant)
+                && Self::try_add_bytes(&c.queued_bytes, bytes, max)
+            {
+                return Some(TenantBytePermit::new(
+                    Arc::clone(self),
+                    tenant.to_owned(),
+                    bytes,
+                ));
+            }
+            if counters.get(tenant).is_some() {
+                // Counter exists but was at/above the cap.
+                return None;
+            }
+        }
+
+        // Slow path: create counter entry then CAS.
+        let mut counters = self.counters.write();
+        let entry = counters
+            .entry(tenant.to_owned())
+            .or_insert_with(|| Arc::new(TenantCounters::default()));
+        if Self::try_add_bytes(&entry.queued_bytes, bytes, max) {
+            Some(TenantBytePermit::new(
+                Arc::clone(self),
+                tenant.to_owned(),
+                bytes,
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// CAS loop: atomically add `n` to `counter` if the result would stay
+    /// at or below `max` (treating `max == 0` as unlimited). Saturates at
+    /// `usize::MAX` on overflow to avoid wraparound.
+    fn try_add_bytes(counter: &AtomicUsize, n: usize, max: u64) -> bool {
+        loop {
+            let current = counter.load(Ordering::Relaxed);
+            let new = current.saturating_add(n);
+            if max > 0 && (new as u64) > max {
+                return false;
+            }
+            if counter
+                .compare_exchange_weak(current, new, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    /// Release `bytes` of previously reserved egress queue capacity for
+    /// `tenant`. Saturates at zero to prevent underflow on over-release.
+    fn release_bytes(&self, tenant: &str, bytes: usize) {
+        let counters = self.counters.read();
+        if let Some(c) = counters.get(tenant) {
+            let _ = c
+                .queued_bytes
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(bytes))
+                });
+        }
+    }
+
+    /// Current queued-byte reservation for a tenant.
+    pub fn queued_bytes(&self, tenant: &str) -> usize {
+        let counters = self.counters.read();
+        counters
+            .get(tenant)
+            .map(|c| c.queued_bytes.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
     /// Load a `QuotaConfig` from a JSON file path.
     ///
     /// # Errors
@@ -178,6 +284,63 @@ impl TenantQuotaTracker {
         let data = std::fs::read_to_string(path)?;
         let config: QuotaConfig = serde_json::from_str(&data)?;
         Ok(config)
+    }
+}
+
+/// RAII guard that releases a tenant byte reservation on drop.
+///
+/// Acquired via [`TenantQuotaTracker::try_reserve_bytes`]. Designed to be
+/// attached to in-flight egress envelopes (HTTP publisher queue entries,
+/// NATS publish tasks, federation outbound messages) so that droppedor
+/// completed messages release their reservation automatically —
+/// including panics inside the egress pipeline.
+///
+/// # Design
+///
+/// The permit holds a reference back to the tracker via `Arc` so that
+/// `Drop` never panics even if callers lose their tracker reference
+/// first. It is sized-on-acquire (the reservation count is captured at
+/// construction time), so mutating `bytes` after acquisition is not
+/// supported — acquire a new permit instead.
+#[must_use = "dropping the permit immediately releases the reservation"]
+pub struct TenantBytePermit {
+    tracker: Arc<TenantQuotaTracker>,
+    tenant: String,
+    bytes: usize,
+}
+
+impl TenantBytePermit {
+    fn new(tracker: Arc<TenantQuotaTracker>, tenant: String, bytes: usize) -> Self {
+        Self {
+            tracker,
+            tenant,
+            bytes,
+        }
+    }
+
+    /// Number of bytes reserved by this permit.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Tenant key this permit belongs to.
+    pub fn tenant(&self) -> &str {
+        &self.tenant
+    }
+}
+
+impl std::fmt::Debug for TenantBytePermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TenantBytePermit")
+            .field("tenant", &self.tenant)
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+
+impl Drop for TenantBytePermit {
+    fn drop(&mut self) {
+        self.tracker.release_bytes(&self.tenant, self.bytes);
     }
 }
 
@@ -193,6 +356,23 @@ mod tests {
             TenantQuota {
                 max_connections: max_conn,
                 max_message_rate: 0,
+                max_queued_bytes: 0,
+            },
+        );
+        QuotaConfig {
+            tenants,
+            default_quota: None,
+        }
+    }
+
+    fn config_with_byte_quota(tenant: &str, max_queued_bytes: u64) -> QuotaConfig {
+        let mut tenants = HashMap::new();
+        let _ = tenants.insert(
+            tenant.to_string(),
+            TenantQuota {
+                max_connections: 0,
+                max_message_rate: 0,
+                max_queued_bytes,
             },
         );
         QuotaConfig {
@@ -255,6 +435,7 @@ mod tests {
             default_quota: Some(TenantQuota {
                 max_connections: 1,
                 max_message_rate: 0,
+                max_queued_bytes: 0,
             }),
         };
         let tracker = TenantQuotaTracker::new(config);
@@ -269,6 +450,7 @@ mod tests {
             default_quota: Some(TenantQuota {
                 max_connections: 2,
                 max_message_rate: 0,
+                max_queued_bytes: 0,
             }),
         };
         let tracker = TenantQuotaTracker::new(config);
@@ -295,5 +477,136 @@ mod tests {
         assert_eq!(tracker.active_connections("acme"), 2);
         tracker.record_disconnect("acme");
         assert_eq!(tracker.active_connections("acme"), 1);
+    }
+
+    #[test]
+    fn try_reserve_bytes_admits_under_limit() {
+        let tracker = Arc::new(TenantQuotaTracker::new(config_with_byte_quota(
+            "acme", 1_000,
+        )));
+        let p1 = tracker.try_reserve_bytes("acme", 400).unwrap();
+        let p2 = tracker.try_reserve_bytes("acme", 400).unwrap();
+        assert_eq!(tracker.queued_bytes("acme"), 800);
+        assert_eq!(p1.bytes(), 400);
+        assert_eq!(p2.tenant(), "acme");
+    }
+
+    #[test]
+    fn try_reserve_bytes_rejects_over_limit() {
+        let tracker = Arc::new(TenantQuotaTracker::new(config_with_byte_quota(
+            "acme", 1_000,
+        )));
+        let _p1 = tracker.try_reserve_bytes("acme", 900).unwrap();
+        // 900 + 200 would exceed 1000.
+        assert!(tracker.try_reserve_bytes("acme", 200).is_none());
+        // Exact fit at boundary succeeds.
+        let _p2 = tracker
+            .try_reserve_bytes("acme", 100)
+            .expect("reservation at the exact cap boundary must succeed");
+        // Over boundary fails.
+        assert!(tracker.try_reserve_bytes("acme", 1).is_none());
+    }
+
+    #[test]
+    fn permit_drop_releases_reservation() {
+        let tracker = Arc::new(TenantQuotaTracker::new(config_with_byte_quota(
+            "acme", 1_000,
+        )));
+        {
+            let _permit = tracker.try_reserve_bytes("acme", 800).unwrap();
+            assert_eq!(tracker.queued_bytes("acme"), 800);
+        }
+        assert_eq!(tracker.queued_bytes("acme"), 0);
+        // After release, a full new reservation must succeed.
+        let _permit = tracker.try_reserve_bytes("acme", 1_000).unwrap();
+    }
+
+    #[test]
+    fn zero_max_queued_bytes_means_unlimited() {
+        let tracker = Arc::new(TenantQuotaTracker::new(config_with_byte_quota("acme", 0)));
+        let _p1 = tracker.try_reserve_bytes("acme", 1_000_000).unwrap();
+        let _p2 = tracker.try_reserve_bytes("acme", 1_000_000).unwrap();
+        // Even with unlimited cap, bytes are tracked for observability.
+        assert_eq!(tracker.queued_bytes("acme"), 2_000_000);
+    }
+
+    #[test]
+    fn unknown_tenant_no_default_yields_no_permit() {
+        let tracker = Arc::new(TenantQuotaTracker::new(QuotaConfig {
+            tenants: HashMap::new(),
+            default_quota: None,
+        }));
+        // No quota configured — caller should fall back to global gate
+        // only, so we return None instead of a dummy permit.
+        assert!(tracker.try_reserve_bytes("unknown", 1_000).is_none());
+    }
+
+    #[test]
+    fn default_quota_applies_byte_limit_to_unknown() {
+        let config = QuotaConfig {
+            tenants: HashMap::new(),
+            default_quota: Some(TenantQuota {
+                max_connections: 0,
+                max_message_rate: 0,
+                max_queued_bytes: 500,
+            }),
+        };
+        let tracker = Arc::new(TenantQuotaTracker::new(config));
+        let _p = tracker.try_reserve_bytes("stranger", 500).unwrap();
+        // Over cap rejected.
+        assert!(tracker.try_reserve_bytes("stranger", 1).is_none());
+    }
+
+    #[test]
+    fn release_bytes_saturates_at_zero() {
+        let tracker = Arc::new(TenantQuotaTracker::new(config_with_byte_quota(
+            "acme", 1_000,
+        )));
+        // Prime the counter map.
+        {
+            let _permit = tracker.try_reserve_bytes("acme", 100).unwrap();
+        }
+        // Explicit over-release path — would underflow if not saturating.
+        tracker.release_bytes("acme", 1_000_000);
+        assert_eq!(tracker.queued_bytes("acme"), 0);
+        // Counter still usable after over-release.
+        let _p = tracker.try_reserve_bytes("acme", 1_000).unwrap();
+    }
+
+    #[test]
+    fn byte_and_connection_counters_are_independent() {
+        // Tenant with both limits.
+        let mut tenants = HashMap::new();
+        let _ = tenants.insert(
+            "acme".to_string(),
+            TenantQuota {
+                max_connections: 2,
+                max_message_rate: 0,
+                max_queued_bytes: 1_000,
+            },
+        );
+        let tracker = Arc::new(TenantQuotaTracker::new(QuotaConfig {
+            tenants,
+            default_quota: None,
+        }));
+        // Connection limit independent of byte limit.
+        assert!(tracker.check_and_record_connection("acme"));
+        assert!(tracker.check_and_record_connection("acme"));
+        assert!(!tracker.check_and_record_connection("acme"));
+        // Bytes still have their full quota.
+        let _p = tracker.try_reserve_bytes("acme", 1_000).unwrap();
+        assert!(tracker.try_reserve_bytes("acme", 1).is_none());
+    }
+
+    #[test]
+    fn permit_debug_redacts_nothing_sensitive() {
+        let tracker = Arc::new(TenantQuotaTracker::new(config_with_byte_quota(
+            "acme", 1_000,
+        )));
+        let permit = tracker.try_reserve_bytes("acme", 256).unwrap();
+        let debug = format!("{permit:?}");
+        assert!(debug.contains("TenantBytePermit"));
+        assert!(debug.contains("acme"));
+        assert!(debug.contains("256"));
     }
 }
