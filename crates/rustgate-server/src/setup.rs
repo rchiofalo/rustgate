@@ -1470,6 +1470,7 @@ pub(crate) fn start_mqtt(
         max_packet_size: cli.mqtt_max_packet_size,
         min_keep_alive_secs: cli.mqtt_min_keep_alive_secs,
         response_channel_capacity: cli.mqtt_response_channel_capacity,
+        wildcard_policy: cli.mqtt_wildcard_policy.into(),
     };
     let task = tokio::spawn(async move {
         rustgate_mqtt::MqttServer::run(config).await;

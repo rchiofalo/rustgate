@@ -527,6 +527,19 @@ pub(crate) struct Cli {
     )]
     pub(crate) mqtt_response_channel_capacity: usize,
 
+    /// MQTT SUBSCRIBE wildcard policy. `reject` disables wildcards entirely;
+    /// `single-level-only` (default) accepts `+` but rejects `#`; `full`
+    /// accepts both `+` and `#`. Wildcard filters are expanded at SUBSCRIBE
+    /// time against the client certificate's group SAN — clients never
+    /// receive messages from groups they could not have joined explicitly.
+    #[arg(
+        long,
+        default_value_t = MqttWildcardPolicy::default(),
+        value_enum,
+        env = "RUSTGATE_MQTT_WILDCARD_POLICY"
+    )]
+    pub(crate) mqtt_wildcard_policy: MqttWildcardPolicy,
+
     // -- Plaintext input flags --
     /// Bind address for plaintext TCP input (e.g. 0.0.0.0:8087).
     /// WARNING: connections are NOT encrypted. Use only on trusted networks.
@@ -1092,6 +1105,36 @@ pub(crate) enum AuthzPolicyFormat {
     Cedar,
 }
 
+/// MQTT SUBSCRIBE wildcard policy selector for the CLI / config file.
+///
+/// Mirrors [`rustgate_mqtt::WildcardPolicy`] but is owned by the server
+/// crate so `rustgate-mqtt` does not need a clap dependency. The
+/// defaulting behaviour (`single-level-only`) matches the MQTT adapter's
+/// own default so operators who omit the flag get spec-conformant
+/// single-level (`+`) wildcards without the `#` firehose.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum MqttWildcardPolicy {
+    /// Reject both `+` and `#`. Exact-topic subscriptions only.
+    Reject,
+    /// Accept `+` (single-level). Reject `#` (multi-level). Default.
+    #[default]
+    SingleLevelOnly,
+    /// Accept both `+` and `#`.
+    Full,
+}
+
+#[cfg(feature = "mqtt")]
+impl From<MqttWildcardPolicy> for rustgate_mqtt::WildcardPolicy {
+    fn from(policy: MqttWildcardPolicy) -> Self {
+        match policy {
+            MqttWildcardPolicy::Reject => Self::Reject,
+            MqttWildcardPolicy::SingleLevelOnly => Self::SingleLevelOnly,
+            MqttWildcardPolicy::Full => Self::Full,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum PeerDiscoveryBackend {
@@ -1264,6 +1307,7 @@ define_config_file! {
     mqtt_max_packet_size: usize,
     mqtt_min_keep_alive_secs: u16,
     mqtt_response_channel_capacity: usize,
+    mqtt_wildcard_policy: MqttWildcardPolicy,
     tcp_bind: Option<String>,
     udp_bind: Option<String>,
     udp_rate_limit: u32,
