@@ -319,7 +319,7 @@ impl JwtAuthority {
 
     /// Register an HS256 verifier key for a peer identified by `kid`.
     ///
-    /// The secret must be at least [`MIN_SECRET_LENGTH`] bytes. Used to
+    /// The secret must be at least 32 bytes (`MIN_SECRET_LENGTH`). Used to
     /// validate tokens issued by a remote HS256 peer; bootstraps the
     /// verifier registry alongside or instead of the fallback
     /// `legacy_verifier`.
@@ -567,8 +567,8 @@ pub enum JwtError {
         /// Algorithm configured on the verifier selected by `kid`.
         key: Algorithm,
     },
-    /// Provided `kid` is empty, exceeds [`MAX_KID_LENGTH`], or contains
-    /// non-printable / control characters.
+    /// Provided `kid` is empty, exceeds 64 bytes (`MAX_KID_LENGTH`), or
+    /// contains non-printable / control characters.
     InvalidKid,
 }
 
