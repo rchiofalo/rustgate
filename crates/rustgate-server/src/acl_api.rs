@@ -148,8 +148,11 @@ fn install_current(state: &AclApiState) -> Result<(), &'static str> {
 /// as the error body returned to clients that submit a malformed group
 /// name. Embedded in the API response so operators can self-correct
 /// without consulting the source.
-const GROUP_ID_RULES: &str =
-    "group id must be 1–128 bytes and contain only ASCII alphanumeric or `_`, `.`, `:`, `-`";
+const GROUP_ID_RULES: &str = "group id must be 1–128 bytes, contain only ASCII alphanumeric or \
+                              `_`, `.`, `:`, `-`, and must not use the reserved `__*__` form \
+                              (e.g. `__plaintext__`, `__ANON__`) — those names are reserved for \
+                              transport-layer synthetic groups and cannot appear in an \
+                              operator-authored ACL policy";
 
 /// Validate a group identifier against a strict allow list of characters.
 ///
@@ -180,9 +183,25 @@ const GROUP_ID_RULES: &str =
 /// The 128-byte cap matches the `MAX_CN_LENGTH` convention in
 /// `rustgate_transport::extract` and bounds the worst-case memory
 /// footprint of the in-memory ACL map.
+///
+/// ## Reserved-sentinel namespace
+///
+/// Names matching the `__*__` sentinel shape are rejected via
+/// [`rustgate_core::constants::is_reserved_group_id`]. Those names are
+/// reserved for transport-layer synthetic groups (plaintext sessions,
+/// anonymous federation ingress, tenant-quota fallback); a policy
+/// keyed by one of them would either shadow the synthetic group's
+/// meaning at the PEP or — in the `__plaintext__` case — silently
+/// apply an operator ACL entry to every anonymous plaintext session
+/// the server accepted, broadcasting to a population the operator did
+/// not enumerate. Rejecting at ingress prevents the configuration
+/// mistake from reaching the router.
 fn valid_group_id(group: &str) -> bool {
     let len = group.len();
     if !(1..=128).contains(&len) {
+        return false;
+    }
+    if rustgate_core::constants::is_reserved_group_id(group) {
         return false;
     }
     group
@@ -639,6 +658,64 @@ mod tests {
             "/api/acl/groups/has space",
             TEST_AUTH,
             b"{}",
+            &state,
+        )
+        .expect("handled");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Reserved-sentinel group ids must be rejected at the REST API
+    /// boundary so a live `PUT` cannot sneak `__plaintext__` past the
+    /// same guardrail the file-based loader enforces. See issue #749
+    /// and `GroupAclFile::validate_operator_policy` for the rationale.
+    #[test]
+    fn put_group_rejects_plaintext_sentinel() {
+        let (_d, state) = make_state();
+        let resp = handle_request(
+            &Method::PUT,
+            "/api/acl/groups/__plaintext__",
+            TEST_AUTH,
+            br#"{"send":["alice"]}"#,
+            &state,
+        )
+        .expect("handled");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp);
+        assert!(
+            body.contains("reserved"),
+            "error body must mention the reservation: {body}"
+        );
+        // The in-memory file must not have been mutated — fail-closed.
+        let file = state.current.read().unwrap();
+        assert!(!file.groups.contains_key("__plaintext__"));
+    }
+
+    #[test]
+    fn put_group_rejects_arbitrary_sentinel_shape() {
+        let (_d, state) = make_state();
+        let resp = handle_request(
+            &Method::PUT,
+            "/api/acl/groups/__anything__",
+            TEST_AUTH,
+            b"{}",
+            &state,
+        )
+        .expect("handled");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A DELETE against a reserved name must also be rejected — not
+    /// because a sentinel entry could exist (the put path rejects it
+    /// first) but so the surface area stays symmetric and a probe
+    /// against the name returns the same deterministic signal.
+    #[test]
+    fn delete_group_rejects_sentinel_shape() {
+        let (_d, state) = make_state();
+        let resp = handle_request(
+            &Method::DELETE,
+            "/api/acl/groups/__plaintext__",
+            TEST_AUTH,
+            &[],
             &state,
         )
         .expect("handled");
