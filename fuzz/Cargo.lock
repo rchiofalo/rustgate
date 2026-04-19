@@ -1013,9 +1013,9 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "lru"
-version = "0.16.3"
+version = "0.16.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1dc47f592c06f33f8e3aea9591776ec7c9f9e4124778ff8a3c3b87159f7e593"
+checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
 dependencies = [
  "hashbrown 0.16.1",
 ]
@@ -1468,9 +1468,9 @@ dependencies = [
 
 [[package]]
 name = "redb"
-version = "2.6.3"
+version = "4.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8eca1e9d98d5a7e9002d0013e18d5a9b000aee942eb134883a82f06ebffb6c01"
+checksum = "67f7f231ea7b1172b7ac00ccf96b1250f0fb5a16d5585836aa4ebc997df7cbde"
 dependencies = [
  "libc",
 ]
@@ -1556,14 +1556,18 @@ name = "rustgate-core"
 version = "0.8.0"
 dependencies = [
  "arbitrary",
+ "base64",
  "bytes",
  "chacha20poly1305",
  "hex",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "sha2",
  "socket2",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
  "zeroize",
 ]
@@ -1584,7 +1588,6 @@ name = "rustgate-federation"
 version = "0.8.0"
 dependencies = [
  "anyhow",
- "base64",
  "bytes",
  "futures",
  "hmac",
@@ -1595,6 +1598,7 @@ dependencies = [
  "redb",
  "rustgate-core",
  "rustgate-proto",
+ "rustgate-resilience",
  "rustgate-transport",
  "rustls",
  "rustls-pki-types",
@@ -1627,6 +1631,7 @@ dependencies = [
  "rustgate-core",
  "rustgate-cot",
  "rustgate-federation",
+ "rustgate-mavlink",
  "rustgate-nats",
  "rustgate-proto",
  "rustgate-transport",
@@ -1634,6 +1639,17 @@ dependencies = [
  "serde_json",
  "tokio-tungstenite",
  "tokio-util",
+]
+
+[[package]]
+name = "rustgate-mavlink"
+version = "0.8.0"
+dependencies = [
+ "bytes",
+ "rustgate-core",
+ "thiserror 2.0.18",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -1670,6 +1686,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustgate-resilience"
+version = "0.8.0"
+dependencies = [
+ "fastrand",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rustgate-transport"
 version = "0.8.0"
 dependencies = [
@@ -1683,11 +1708,13 @@ dependencies = [
  "rustgate-authz",
  "rustgate-core",
  "rustgate-cot",
+ "rustgate-resilience",
  "rustls",
  "rustls-pki-types",
  "serde",
  "serde_json",
  "sha2",
+ "smol_str",
  "subtle",
  "thiserror 2.0.18",
  "tokio",
@@ -1722,9 +1749,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.37"
+version = "0.23.38"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "758025cb5fccfd3bc2fd74708fd4682be41d99e5dff73c377c0646c6012c73a4"
+checksum = "69f9466fb2c14ea04357e91413efb882e2a6d4a406e625449bc0a5d360d53a21"
 dependencies = [
  "log",
  "once_cell",
