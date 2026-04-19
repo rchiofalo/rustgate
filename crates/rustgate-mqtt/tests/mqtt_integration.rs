@@ -713,6 +713,22 @@ async fn concurrent_multi_client_publish_and_receive() {
                 payload.as_bytes(),
             );
             write_v5_packet(&mut pub_stream, &mqttbytes::v5::Packet::Publish(publish)).await;
+
+            // QoS 0 PUBLISH has no PUBACK feedback loop, so if we drop
+            // the TLS stream here the server may close the connection
+            // before it has finished parsing the PUBLISH out of its
+            // read buffer and fanned the message out to subscribers —
+            // which is exactly what was flaking the receiver's 3 s
+            // timeout on loaded CI runners. Round-tripping a PINGREQ /
+            // PINGRESP forces the server to drain every byte up to and
+            // including the PUBLISH through its per-session state
+            // machine before we tear the connection down.
+            write_v5_packet(&mut pub_stream, &mqttbytes::v5::Packet::PingReq).await;
+            let pong = read_v5_packet(&mut pub_stream, &mut pub_buf).await;
+            assert!(
+                matches!(pong, mqttbytes::v5::Packet::PingResp),
+                "expected PingResp after PUBLISH, got {pong:?}"
+            );
         });
         receivers.push(handle);
     }
@@ -723,10 +739,16 @@ async fn concurrent_multi_client_publish_and_receive() {
     }
 
     // --- Receiver should get all messages ---
+    //
+    // Budget the receiver generously (10 s per packet) — the publishers
+    // have already synchronised with the server via PINGRESP above, so
+    // any delay here is pure scheduler jitter on a loaded CI runner.
+    // The previous 3 s timeout was the flake source documented in the
+    // failing `test` job on `main` (fix/flaky-mqtt-concurrent-test).
     let mut received = Vec::new();
     for _ in 0..num_publishers {
         let packet = tokio::time::timeout(
-            Duration::from_secs(3),
+            Duration::from_secs(10),
             read_v5_packet(&mut recv_stream, &mut recv_buf),
         )
         .await
