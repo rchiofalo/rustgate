@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Number of distinct IPs that triggers an inline sweep of stale entries.
@@ -21,6 +21,13 @@ const SWEEP_THRESHOLD: usize = 1024;
 
 /// Minimum interval between full sweeps to avoid excessive iteration.
 const MIN_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Callback fired when the rate-limiter state mutex is poisoned.
+///
+/// Wired by the server binary to a Prometheus counter so operators can
+/// alert on poison events (which indicate a prior panic in the limiter
+/// and imply the process is degraded).
+pub type PoisonCallback = Arc<dyn Fn() + Send + Sync>;
 
 /// Sliding-window rate limiter keyed by IP address.
 ///
@@ -31,11 +38,22 @@ const MIN_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// This replaces the previous fixed-window design that relied on a periodic
 /// prune task — cleanup now happens lazily, removing the window where stale
 /// entries could block legitimate requests.
-#[derive(Debug)]
 pub struct RateLimiter {
     state: Mutex<RateLimitState>,
     max_requests: usize,
     window: Duration,
+    on_poison: Option<PoisonCallback>,
+}
+
+impl std::fmt::Debug for RateLimiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RateLimiter")
+            .field("state", &self.state)
+            .field("max_requests", &self.max_requests)
+            .field("window", &self.window)
+            .field("on_poison", &self.on_poison.is_some())
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -57,7 +75,19 @@ impl RateLimiter {
             }),
             max_requests,
             window,
+            on_poison: None,
         }
+    }
+
+    /// Register a callback fired whenever the state mutex is observed as
+    /// poisoned. Poison means a prior panic while holding the lock — the
+    /// limiter now fails-closed (rejects requests) instead of recovering
+    /// the inner state, so this callback is the observability hook that
+    /// tells operators the limiter is degraded.
+    #[must_use]
+    pub fn with_poison_callback(mut self, cb: PoisonCallback) -> Self {
+        self.on_poison = Some(cb);
+        self
     }
 
     /// Configured maximum requests per IP within the window.
@@ -65,19 +95,46 @@ impl RateLimiter {
         self.max_requests
     }
 
+    /// Configured sliding-window duration.
+    pub fn window(&self) -> Duration {
+        self.window
+    }
+
     /// Check if a request from `ip` is allowed.
     ///
     /// Returns `true` if under the limit, `false` if rate-limited.
     /// Automatically prunes timestamps older than the window for this IP
     /// and periodically sweeps all IPs to reclaim memory from departed clients.
+    ///
+    /// # Fail-closed on poison
+    ///
+    /// If the state mutex is poisoned (prior panic while holding the
+    /// lock), this function returns `false` and fires the optional
+    /// `on_poison` callback. The inner state is *not* recovered: trusting
+    /// whatever partially-mutated map remains could bypass the rate limit
+    /// (e.g., the poisoning thread could have dropped entries mid-sweep).
+    /// Rejecting the request on poison is the conservative posture for a
+    /// security endpoint — the caller translates `false` to HTTP 503.
     pub fn check(&self, ip: IpAddr) -> bool {
         let now = Instant::now();
         let cutoff = now - self.window;
 
         let mut state = match self.state.lock() {
             Ok(s) => s,
-            // Poisoned mutex — allow the request rather than blocking
-            Err(e) => e.into_inner(),
+            // Poisoned mutex: a previous holder panicked and may have
+            // left the map in an inconsistent state. Fire the poison
+            // observer (so operators see the metric) and reject the
+            // request — do NOT call `e.into_inner()`, that would trust
+            // corrupted state on a security-critical path.
+            Err(_) => {
+                if let Some(cb) = &self.on_poison {
+                    cb();
+                }
+                tracing::warn!(
+                    "enrollment rate-limiter mutex poisoned, rejecting request (fail-closed)"
+                );
+                return false;
+            }
         };
 
         // Inline sweep: remove stale IPs when the map is large or enough
@@ -185,6 +242,75 @@ mod tests {
         assert!(
             !state.map.contains_key(&ip),
             "stale IP should be swept inline"
+        );
+    }
+
+    #[test]
+    fn poisoned_mutex_fails_closed_and_fires_callback() {
+        // Issue #767 / F-41: on mutex poison the limiter must reject the
+        // request (return false). The previous implementation called
+        // `e.into_inner()` and treated the recovered state as authoritative,
+        // which could bypass the limit if the prior panic left the map in
+        // an inconsistent state. Security endpoints must fail-closed.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let poison_count = Arc::new(AtomicUsize::new(0));
+        let poison_count_cb = Arc::clone(&poison_count);
+        let limiter = RateLimiter::new(10, Duration::from_secs(60)).with_poison_callback(Arc::new(
+            move || {
+                let _ = poison_count_cb.fetch_add(1, Ordering::Relaxed);
+            },
+        ));
+
+        // Poison the mutex: spawn a thread that locks and panics.
+        let limiter_arc = Arc::new(limiter);
+        let poisoner = {
+            let l = Arc::clone(&limiter_arc);
+            std::thread::spawn(move || {
+                let _guard = l.state.lock().expect("initial lock");
+                panic!("intentional poison for test");
+            })
+        };
+        // The spawned thread panics; join returns Err but we only care
+        // about side-effects on the mutex.
+        assert!(poisoner.join().is_err(), "poisoner thread should panic");
+
+        let ip: IpAddr = "10.0.0.1".parse().expect("valid IP");
+        assert!(
+            !limiter_arc.check(ip),
+            "check() must return false on poisoned mutex (fail-closed)"
+        );
+        assert_eq!(
+            poison_count.load(Ordering::Relaxed),
+            1,
+            "on_poison callback must fire on every poisoned check()"
+        );
+
+        // Subsequent checks stay fail-closed and keep firing the callback —
+        // poison is sticky and there is no recovery path inside the limiter.
+        assert!(!limiter_arc.check(ip));
+        assert_eq!(poison_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn poisoned_mutex_without_callback_still_fails_closed() {
+        // The poison callback is optional. Absence of a callback must
+        // never flip the safety posture back to fail-open.
+        let limiter = RateLimiter::new(10, Duration::from_secs(60));
+        let limiter_arc = Arc::new(limiter);
+        let poisoner = {
+            let l = Arc::clone(&limiter_arc);
+            std::thread::spawn(move || {
+                let _guard = l.state.lock().expect("initial lock");
+                panic!("intentional poison for test");
+            })
+        };
+        let _ = poisoner.join();
+
+        let ip: IpAddr = "10.0.0.1".parse().expect("valid IP");
+        assert!(
+            !limiter_arc.check(ip),
+            "must fail-closed even without callback"
         );
     }
 }

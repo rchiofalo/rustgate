@@ -400,3 +400,65 @@ async fn unknown_path_returns_404() {
     let resp = env.send_request(req).await;
     assert_eq!(resp.status(), 404);
 }
+
+// -------------------------------------------------------------------------
+// F-40: refuse to start without TLS (issue #767)
+//
+// PKCS#12 enrollment responses embed unencrypted certificate bags
+// integrity-protected only by the standardized "atakatak" password.
+// TLS is therefore the only real confidentiality boundary on this
+// endpoint; running plaintext would leak client certs to anyone on the
+// path. `EnrollmentServer::run` must reject an empty cert_pem or
+// key_pem up front, with an error that names the invariant.
+// -------------------------------------------------------------------------
+
+#[tokio::test]
+async fn run_rejects_empty_cert_pem_to_prevent_plaintext() {
+    let env = TestEnv::new();
+    let signer =
+        CsrSigner::from_pem(&env.ca_cert_pem, &env.ca_key_pem, "TestOrg").expect("build signer");
+    let credentials = Credentials::new(
+        "admin".to_string(),
+        zeroize::Zeroizing::new("secret".to_string()),
+    );
+    let server = EnrollmentServer::new(signer, credentials);
+
+    let err = server
+        .run(env.addr, "   \n\t", &env.server_key_pem)
+        .await
+        .expect_err("run() must refuse to start without a TLS cert");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("TLS"),
+        "error must mention TLS requirement, got: {msg}"
+    );
+    assert!(
+        msg.to_lowercase().contains("plaintext")
+            || msg.to_lowercase().contains("refusing to start")
+            || msg.to_lowercase().contains("refuse"),
+        "error must explain the refusal, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn run_rejects_empty_key_pem_to_prevent_plaintext() {
+    let env = TestEnv::new();
+    let signer =
+        CsrSigner::from_pem(&env.ca_cert_pem, &env.ca_key_pem, "TestOrg").expect("build signer");
+    let credentials = Credentials::new(
+        "admin".to_string(),
+        zeroize::Zeroizing::new("secret".to_string()),
+    );
+    let server = EnrollmentServer::new(signer, credentials);
+
+    let err = server
+        .run(env.addr, &env.server_cert_pem, "")
+        .await
+        .expect_err("run() must refuse to start without a TLS key");
+
+    assert!(
+        err.to_string().contains("TLS"),
+        "error must mention TLS requirement, got: {err}"
+    );
+}

@@ -134,6 +134,7 @@ static AUTHZ_CACHE_MISSES: OnceLock<IntCounter> = OnceLock::new();
 
 static ARCHIVE_BYTES: OnceLock<IntGauge> = OnceLock::new();
 static ENROLLMENT_RATE_LIMITED: OnceLock<IntCounter> = OnceLock::new();
+static ENROLLMENT_RATE_LIMIT_POISON: OnceLock<IntCounter> = OnceLock::new();
 static TENANT_QUOTA_REJECTIONS: OnceLock<IntCounterVec> = OnceLock::new();
 
 #[cfg(feature = "spiffe")]
@@ -512,6 +513,18 @@ pub fn init() -> prometheus::Result<()> {
     ))?;
     registry.register(Box::new(enrollment_rate_limited.clone()))?;
     let _ = ENROLLMENT_RATE_LIMITED.set(enrollment_rate_limited);
+
+    // Increments once per request observed while the rate-limiter mutex
+    // is poisoned (see `rustgate-enrollment::ratelimit` / issue #767).
+    // A non-zero value means a panic previously occurred while holding
+    // the lock and all CSR requests are now being rejected fail-closed;
+    // alert on any non-zero sample and restart the process.
+    let enrollment_rate_limit_poison = IntCounter::with_opts(Opts::new(
+        "rustgate_enrollment_rate_limit_poison_total",
+        "CSR signing requests observed while the rate-limiter mutex is poisoned (fail-closed)",
+    ))?;
+    registry.register(Box::new(enrollment_rate_limit_poison.clone()))?;
+    let _ = ENROLLMENT_RATE_LIMIT_POISON.set(enrollment_rate_limit_poison);
 
     let tenant_quota_rejections = IntCounterVec::new(
         Opts::new(
@@ -1022,6 +1035,17 @@ pub fn client_ocsp_cache_misses() -> Option<&'static IntCounter> {
 pub fn enrollment_rate_limited() -> &'static IntCounter {
     ENROLLMENT_RATE_LIMITED
         .get_or_init(|| fallback_counter("rustgate_enrollment_rate_limited_total", "fallback"))
+}
+
+/// Counter for CSR signing requests observed while the enrollment
+/// server's rate-limiter state mutex is poisoned (issue #767 / F-41).
+/// Any non-zero sample indicates a prior panic while holding the lock
+/// and the limiter is now fail-closed — every subsequent CSR request
+/// is rejected with HTTP 503. Alert on non-zero and restart.
+#[cfg(feature = "enrollment")]
+pub fn enrollment_rate_limit_poison() -> &'static IntCounter {
+    ENROLLMENT_RATE_LIMIT_POISON
+        .get_or_init(|| fallback_counter("rustgate_enrollment_rate_limit_poison_total", "fallback"))
 }
 
 /// Per-tenant quota rejection counter, labelled by `tenant`.

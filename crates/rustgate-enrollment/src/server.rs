@@ -40,7 +40,7 @@ use crate::datapackage::DataPackageStore;
 use crate::error::EnrollmentError;
 use crate::handlers::util::build_response;
 use crate::handlers::{api, packages, revoke, sign};
-use crate::ratelimit::RateLimiter;
+use crate::ratelimit::{PoisonCallback, RateLimiter};
 use crate::revocation::RevocationStore;
 use crate::signing::CsrSigner;
 
@@ -64,6 +64,10 @@ pub struct EnrollmentServer {
     revocation: Option<Arc<RevocationStore>>,
     sign_limiter: Arc<RateLimiter>,
     on_rate_limit: Option<RateLimitCallback>,
+    /// Callback fired when the rate-limiter state mutex is poisoned.
+    /// Held here (rather than only on the limiter) so `with_rate_limit`
+    /// can rebuild the limiter without dropping the subscription.
+    on_rate_limit_poison: Option<PoisonCallback>,
     /// Whether EST (RFC 7030) endpoints are enabled at runtime.
     #[cfg(feature = "est")]
     est_enabled: bool,
@@ -94,6 +98,7 @@ impl EnrollmentServer {
                 DEFAULT_SIGN_RATE_WINDOW,
             )),
             on_rate_limit: None,
+            on_rate_limit_poison: None,
             #[cfg(feature = "est")]
             est_enabled: false,
         }
@@ -105,7 +110,11 @@ impl EnrollmentServer {
     /// from any single IP within `window`. Wired from the
     /// `--enrollment-rate-limit` CLI flag in the server binary.
     pub fn with_rate_limit(mut self, max_requests: usize, window: Duration) -> Self {
-        self.sign_limiter = Arc::new(RateLimiter::new(max_requests, window));
+        let mut limiter = RateLimiter::new(max_requests, window);
+        if let Some(cb) = self.on_rate_limit_poison.clone() {
+            limiter = limiter.with_poison_callback(cb);
+        }
+        self.sign_limiter = Arc::new(limiter);
         self
     }
 
@@ -114,6 +123,30 @@ impl EnrollmentServer {
     /// binary to increment a Prometheus counter.
     pub fn with_rate_limit_callback(mut self, cb: RateLimitCallback) -> Self {
         self.on_rate_limit = Some(cb);
+        self
+    }
+
+    /// Register a callback fired whenever the rate-limiter state mutex
+    /// is observed as poisoned (issue #767 / F-41). Poison indicates a
+    /// prior panic while holding the lock; the limiter now fails-closed
+    /// on poison rather than trusting a potentially corrupted map.
+    /// Operators wire this to a Prometheus counter so a single poison
+    /// event is surfaced and can drive an alert — a fail-closed limiter
+    /// manifests as 503s for every CSR request, so the metric is the
+    /// quickest diagnostic.
+    ///
+    /// Safe to call in any order relative to [`Self::with_rate_limit`]:
+    /// the existing limiter's configured `max_requests` and `window`
+    /// are preserved when the poison callback is attached.
+    #[must_use]
+    pub fn with_rate_limit_poison_callback(mut self, cb: PoisonCallback) -> Self {
+        self.on_rate_limit_poison = Some(Arc::clone(&cb));
+        let (max_requests, window) = {
+            let l = &self.sign_limiter;
+            (l.max_requests(), l.window())
+        };
+        self.sign_limiter =
+            Arc::new(RateLimiter::new(max_requests, window).with_poison_callback(cb));
         self
     }
 
@@ -149,12 +182,48 @@ impl EnrollmentServer {
     ///
     /// Binds to `bind_addr` with server-only TLS (no client cert verification).
     /// This is a long-running future that processes requests until dropped.
+    ///
+    /// # TLS is non-negotiable (issue #767 / F-40)
+    ///
+    /// PKCS#12 enrollment responses contain **unencrypted** certificate
+    /// bags integrity-protected only by an HMAC-SHA1 MAC under the
+    /// standardized `"atakatak"` password (see
+    /// [`crate::pkcs12`] module docs). Anyone who captures a bundle on
+    /// the wire recovers the full client certificate chain. TLS is the
+    /// only real confidentiality boundary on this endpoint.
+    ///
+    /// This function therefore refuses to start if `cert_pem` or
+    /// `key_pem` is empty/whitespace — an explicit precondition check
+    /// rather than letting the downstream TLS builder return a generic
+    /// "failed to parse server certs" error. EST (RFC 7030) over
+    /// plaintext is similarly impossible: the EST handlers share this
+    /// same listener, so if the TLS config is present the EST endpoints
+    /// also ride on TLS; if the preflight check rejects the config,
+    /// nothing starts at all.
     pub async fn run(
         self,
         bind_addr: SocketAddr,
         cert_pem: &str,
         key_pem: &str,
     ) -> Result<(), EnrollmentError> {
+        // F-40 precondition: reject a plaintext/empty TLS config outright.
+        // `build_server_tls_config` would also reject empty inputs via
+        // `parse_certs` / `parse_key`, but its error message ("failed to
+        // parse server certs") does not communicate the security rationale
+        // — the operator sees a parser error rather than "P12 enrollment
+        // REQUIRES TLS, refusing to start". See module-level docs on
+        // `crate::pkcs12` for why the confidentiality boundary is TLS and
+        // not the PFX password.
+        if cert_pem.trim().is_empty() || key_pem.trim().is_empty() {
+            return Err(EnrollmentError::Config(
+                "enrollment server requires TLS (non-empty cert_pem and key_pem): \
+                 PKCS#12 bundles contain unencrypted certificate bags protected \
+                 only by a publicly-known standardized password, so the TLS \
+                 channel is the real confidentiality boundary. Refusing to start \
+                 without TLS."
+                    .to_string(),
+            ));
+        }
         let tls_config = build_server_tls_config(cert_pem, key_pem)?;
         let acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
