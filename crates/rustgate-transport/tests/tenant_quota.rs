@@ -37,6 +37,7 @@ fn config_single(tenant: &str, max_conn: u32) -> QuotaConfig {
         TenantQuota {
             max_connections: max_conn,
             max_message_rate: 0,
+            max_queued_bytes: 0,
         },
     );
     QuotaConfig {
@@ -81,6 +82,7 @@ async fn default_quota_applies_to_unknown_tenant() {
         default_quota: Some(TenantQuota {
             max_connections: 1,
             max_message_rate: 0,
+            max_queued_bytes: 0,
         }),
     };
     let tracker = Arc::new(TenantQuotaTracker::new(config));
@@ -146,6 +148,7 @@ async fn no_tenant_uses_default_quota() {
         default_quota: Some(TenantQuota {
             max_connections: 2,
             max_message_rate: 0,
+            max_queued_bytes: 0,
         }),
     };
     let tracker = Arc::new(TenantQuotaTracker::new(config));
@@ -173,6 +176,7 @@ async fn independent_tenant_quotas() {
         TenantQuota {
             max_connections: 1,
             max_message_rate: 0,
+            max_queued_bytes: 0,
         },
     );
     let _ = tenants.insert(
@@ -180,6 +184,7 @@ async fn independent_tenant_quotas() {
         TenantQuota {
             max_connections: 1,
             max_message_rate: 0,
+            max_queued_bytes: 0,
         },
     );
     let config = QuotaConfig {
