@@ -26,7 +26,7 @@ use tracing::{debug, info, warn};
 use crate::error::MqttError;
 use crate::listener::MqttPreSession;
 use crate::packet::{MqttPacket, PacketCodec, PacketReader, PacketWriter, ProtocolLevel};
-use crate::topic;
+use crate::topic::{self, WildcardPolicy};
 
 /// Keep-alive multiplier per MQTT spec: the server MUST allow 1.5x the
 /// client's requested keep-alive before considering the connection dead.
@@ -128,6 +128,7 @@ pub(crate) async fn handle_mqtt_session(
     max_packet_size: usize,
     min_keep_alive_secs: u16,
     response_channel_capacity: usize,
+    wildcard_policy: WildcardPolicy,
     client_id_registry: Arc<ClientIdRegistry>,
     _permit: OwnedSemaphorePermit,
 ) {
@@ -249,6 +250,7 @@ pub(crate) async fn handle_mqtt_session(
         router: &router,
         session_id,
         topic_prefix: topic_prefix.as_deref(),
+        wildcard_policy,
         keep_alive: keep_alive_duration,
     };
 
@@ -418,6 +420,7 @@ struct ReadLoopParams<'a> {
     router: &'a Router,
     session_id: u64,
     topic_prefix: Option<&'a str>,
+    wildcard_policy: WildcardPolicy,
     keep_alive: std::time::Duration,
 }
 
@@ -436,6 +439,7 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<(), MqttError
     let router = params.router;
     let session_id = params.session_id;
     let topic_prefix = params.topic_prefix;
+    let wildcard_policy = params.wildcard_policy;
     let keep_alive = params.keep_alive;
     loop {
         let packet = match tokio::time::timeout(keep_alive, reader.read_packet()).await {
@@ -454,8 +458,16 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<(), MqttError
                     handle_publish_v5(resp_tx, identity, router, topic_prefix, publish).await?;
                 }
                 mqttbytes::v5::Packet::Subscribe(sub) => {
-                    handle_subscribe_v5(resp_tx, identity, router, session_id, topic_prefix, sub)
-                        .await?;
+                    handle_subscribe_v5(
+                        resp_tx,
+                        identity,
+                        router,
+                        session_id,
+                        topic_prefix,
+                        wildcard_policy,
+                        sub,
+                    )
+                    .await?;
                 }
                 mqttbytes::v5::Packet::Unsubscribe(unsub) => {
                     handle_unsubscribe_v5(
@@ -464,6 +476,7 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<(), MqttError
                         router,
                         session_id,
                         topic_prefix,
+                        wildcard_policy,
                         unsub,
                     )
                     .await?;
@@ -485,8 +498,16 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<(), MqttError
                     handle_publish_v4(resp_tx, identity, router, topic_prefix, publish).await?;
                 }
                 mqttbytes::v4::Packet::Subscribe(sub) => {
-                    handle_subscribe_v4(resp_tx, identity, router, session_id, topic_prefix, sub)
-                        .await?;
+                    handle_subscribe_v4(
+                        resp_tx,
+                        identity,
+                        router,
+                        session_id,
+                        topic_prefix,
+                        wildcard_policy,
+                        sub,
+                    )
+                    .await?;
                 }
                 mqttbytes::v4::Packet::Unsubscribe(unsub) => {
                     handle_unsubscribe_v4(
@@ -495,6 +516,7 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<(), MqttError
                         router,
                         session_id,
                         topic_prefix,
+                        wildcard_policy,
                         unsub,
                     )
                     .await?;
@@ -622,12 +644,14 @@ async fn handle_publish_v4(
 // SUBSCRIBE handlers
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_subscribe_v5(
     resp_tx: &mpsc::Sender<ResponsePacket>,
     identity: &Arc<Identity>,
     router: &Router,
     session_id: u64,
     topic_prefix: Option<&str>,
+    wildcard_policy: WildcardPolicy,
     sub: mqttbytes::v5::Subscribe,
 ) -> Result<(), MqttError> {
     let mut return_codes = Vec::with_capacity(sub.filters.len());
@@ -638,15 +662,26 @@ async fn handle_subscribe_v5(
             continue;
         }
 
-        let code =
-            match try_join_group(identity, router, session_id, &filter.path, topic_prefix).await {
-                Ok(()) => match filter.qos {
-                    mqttbytes::QoS::AtMostOnce => mqttbytes::v5::SubscribeReasonCode::QoS0,
-                    mqttbytes::QoS::AtLeastOnce => mqttbytes::v5::SubscribeReasonCode::QoS1,
-                    mqttbytes::QoS::ExactlyOnce => unreachable!(),
-                },
-                Err(_) => mqttbytes::v5::SubscribeReasonCode::NotAuthorized,
-            };
+        let code = match try_join_filter(
+            identity,
+            router,
+            session_id,
+            &filter.path,
+            topic_prefix,
+            wildcard_policy,
+        )
+        .await
+        {
+            Ok(()) => match filter.qos {
+                mqttbytes::QoS::AtMostOnce => mqttbytes::v5::SubscribeReasonCode::QoS0,
+                mqttbytes::QoS::AtLeastOnce => mqttbytes::v5::SubscribeReasonCode::QoS1,
+                mqttbytes::QoS::ExactlyOnce => unreachable!(),
+            },
+            Err(MqttError::InvalidTopic(_)) => {
+                mqttbytes::v5::SubscribeReasonCode::TopicFilterInvalid
+            }
+            Err(_) => mqttbytes::v5::SubscribeReasonCode::NotAuthorized,
+        };
         return_codes.push(code);
     }
 
@@ -660,12 +695,14 @@ async fn handle_subscribe_v5(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_subscribe_v4(
     resp_tx: &mpsc::Sender<ResponsePacket>,
     identity: &Arc<Identity>,
     router: &Router,
     session_id: u64,
     topic_prefix: Option<&str>,
+    wildcard_policy: WildcardPolicy,
     sub: mqttbytes::v4::Subscribe,
 ) -> Result<(), MqttError> {
     let mut return_codes = Vec::with_capacity(sub.filters.len());
@@ -676,11 +713,21 @@ async fn handle_subscribe_v4(
             continue;
         }
 
-        let code =
-            match try_join_group(identity, router, session_id, &filter.path, topic_prefix).await {
-                Ok(()) => mqttbytes::v4::SubscribeReasonCode::Success(filter.qos),
-                Err(_) => mqttbytes::v4::SubscribeReasonCode::Failure,
-            };
+        // MQTT 3.1.1 collapses all subscribe failures to `Failure` — there is
+        // no distinct `TopicFilterInvalid` / `NotAuthorized` code on the wire.
+        let code = match try_join_filter(
+            identity,
+            router,
+            session_id,
+            &filter.path,
+            topic_prefix,
+            wildcard_policy,
+        )
+        .await
+        {
+            Ok(()) => mqttbytes::v4::SubscribeReasonCode::Success(filter.qos),
+            Err(_) => mqttbytes::v4::SubscribeReasonCode::Failure,
+        };
         return_codes.push(code);
     }
 
@@ -694,30 +741,77 @@ async fn handle_subscribe_v4(
     Ok(())
 }
 
-/// Validate a subscription filter and dynamically join the mapped group.
-async fn try_join_group(
+/// Validate a subscription filter and dynamically join each mapped group.
+///
+/// For wildcard-free filters the filter maps 1:1 to a single rustgate
+/// group, which is joined after the membership check. For wildcard
+/// filters (`+` / `#`, subject to `wildcard_policy`) the filter is
+/// expanded against `identity.groups` — the client's certificate-derived
+/// group set — and each matching group is joined individually. The
+/// server never synthesises new groups from a wildcard; the cert is the
+/// authorisation boundary.
+///
+/// Returns `InvalidTopic` for syntactically malformed filters (including
+/// wildcards disabled by policy) and `NotAuthorized` when the filter
+/// resolves to no authorised groups.
+async fn try_join_filter(
     identity: &Identity,
     router: &Router,
     session_id: u64,
     filter: &str,
     topic_prefix: Option<&str>,
+    wildcard_policy: WildcardPolicy,
 ) -> Result<(), MqttError> {
-    topic::validate_subscribe_filter(filter)?;
-    let group = topic::topic_to_group(filter, topic_prefix)?;
+    topic::validate_subscribe_filter(filter, wildcard_policy)?;
 
-    if !identity.is_member_of(&group) {
-        return Err(MqttError::NotAuthorized(format!(
-            "not a member of group '{group}'"
-        )));
+    if !topic::filter_has_wildcards(filter) {
+        // Exact-topic path: preserves pre-wildcard behaviour byte-for-byte.
+        let group = topic::topic_to_group(filter, topic_prefix)?;
+        if !identity.is_member_of(&group) {
+            return Err(MqttError::NotAuthorized(format!(
+                "not a member of group '{group}'"
+            )));
+        }
+        if !router.join_group(&identity.cn, session_id, &group).await {
+            return Err(MqttError::NotAuthorized(format!(
+                "failed to join group '{group}' (limit exceeded)"
+            )));
+        }
+        debug!(cn = %identity.cn, group = %group, "MQTT subscribed to group");
+        return Ok(());
     }
 
-    if !router.join_group(&identity.cn, session_id, &group).await {
-        return Err(MqttError::NotAuthorized(format!(
-            "failed to join group '{group}' (limit exceeded)"
-        )));
+    // Wildcard path: expand against identity's certificate-derived groups.
+    // Strip the listener's topic prefix from the filter (if configured and
+    // present) so matching happens in the group-name coordinate space.
+    let stripped_filter = match topic_prefix {
+        Some(pfx) => filter.strip_prefix(pfx).ok_or_else(|| {
+            MqttError::InvalidTopic(format!("wildcard filter must start with prefix '{pfx}'"))
+        })?,
+        None => filter,
+    };
+
+    let mut joined = 0usize;
+    for group in &identity.groups {
+        if !topic::filter_matches(stripped_filter, group) {
+            continue;
+        }
+        if router.join_group(&identity.cn, session_id, group).await {
+            joined += 1;
+            debug!(
+                cn = %identity.cn,
+                group = %group,
+                filter = %filter,
+                "MQTT wildcard expanded subscription"
+            );
+        }
     }
 
-    debug!(cn = %identity.cn, group = %group, "MQTT subscribed to group");
+    if joined == 0 {
+        return Err(MqttError::NotAuthorized(format!(
+            "wildcard filter '{filter}' matched no authorised groups"
+        )));
+    }
     Ok(())
 }
 
@@ -725,23 +819,30 @@ async fn try_join_group(
 // UNSUBSCRIBE handlers
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_unsubscribe_v5(
     resp_tx: &mpsc::Sender<ResponsePacket>,
     identity: &Identity,
     router: &Router,
     session_id: u64,
     topic_prefix: Option<&str>,
+    wildcard_policy: WildcardPolicy,
     unsub: mqttbytes::v5::Unsubscribe,
 ) -> Result<(), MqttError> {
     let mut reasons = Vec::with_capacity(unsub.filters.len());
 
     for filter in &unsub.filters {
-        let reason = match topic::topic_to_group(filter, topic_prefix) {
-            Ok(group) => {
-                let _ = router.leave_group(&identity.cn, session_id, &group).await;
-                debug!(cn = %identity.cn, group = %group, "MQTT unsubscribed from group");
-                mqttbytes::v5::UnsubAckReason::Success
-            }
+        let reason = match leave_filter(
+            identity,
+            router,
+            session_id,
+            filter,
+            topic_prefix,
+            wildcard_policy,
+        )
+        .await
+        {
+            Ok(_) => mqttbytes::v5::UnsubAckReason::Success,
             Err(_) => mqttbytes::v5::UnsubAckReason::TopicFilterInvalid,
         };
         reasons.push(reason);
@@ -760,19 +861,27 @@ async fn handle_unsubscribe_v5(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_unsubscribe_v4(
     resp_tx: &mpsc::Sender<ResponsePacket>,
     identity: &Identity,
     router: &Router,
     session_id: u64,
     topic_prefix: Option<&str>,
+    wildcard_policy: WildcardPolicy,
     unsub: mqttbytes::v4::Unsubscribe,
 ) -> Result<(), MqttError> {
     for filter in &unsub.topics {
-        if let Ok(group) = topic::topic_to_group(filter, topic_prefix) {
-            let _ = router.leave_group(&identity.cn, session_id, &group).await;
-            debug!(cn = %identity.cn, group = %group, "MQTT unsubscribed from group");
-        }
+        // MQTT 3.1.1 UNSUBACK has no reason codes — failures are silent.
+        let _ = leave_filter(
+            identity,
+            router,
+            session_id,
+            filter,
+            topic_prefix,
+            wildcard_policy,
+        )
+        .await;
     }
 
     let unsuback = mqttbytes::v4::UnsubAck { pkid: unsub.pkid };
@@ -781,6 +890,50 @@ async fn handle_unsubscribe_v4(
         serialize_v4(&mqttbytes::v4::Packet::UnsubAck(unsuback))?,
     )
     .await?;
+    Ok(())
+}
+
+/// Mirror of [`try_join_filter`] for UNSUBSCRIBE: validates the filter
+/// under the same policy and calls `leave_group` on every group the
+/// filter matches. Returns `InvalidTopic` on syntax errors so v5 can
+/// surface `TopicFilterInvalid`; the router's `leave_group` call is
+/// idempotent and silently no-ops when the session is not in the group.
+async fn leave_filter(
+    identity: &Identity,
+    router: &Router,
+    session_id: u64,
+    filter: &str,
+    topic_prefix: Option<&str>,
+    wildcard_policy: WildcardPolicy,
+) -> Result<(), MqttError> {
+    topic::validate_subscribe_filter(filter, wildcard_policy)?;
+
+    if !topic::filter_has_wildcards(filter) {
+        let group = topic::topic_to_group(filter, topic_prefix)?;
+        let _ = router.leave_group(&identity.cn, session_id, &group).await;
+        debug!(cn = %identity.cn, group = %group, "MQTT unsubscribed from group");
+        return Ok(());
+    }
+
+    let stripped_filter = match topic_prefix {
+        Some(pfx) => filter.strip_prefix(pfx).ok_or_else(|| {
+            MqttError::InvalidTopic(format!("wildcard filter must start with prefix '{pfx}'"))
+        })?,
+        None => filter,
+    };
+
+    for group in &identity.groups {
+        if !topic::filter_matches(stripped_filter, group) {
+            continue;
+        }
+        let _ = router.leave_group(&identity.cn, session_id, group).await;
+        debug!(
+            cn = %identity.cn,
+            group = %group,
+            filter = %filter,
+            "MQTT wildcard expanded unsubscription"
+        );
+    }
     Ok(())
 }
 

@@ -8,6 +8,7 @@ use rustgate_transport::Router;
 use tokio::sync::{Notify, Semaphore};
 
 use crate::listener::MqttListener;
+use crate::topic::WildcardPolicy;
 
 /// Configuration for [`MqttServer::run`](crate::MqttServer::run).
 #[derive(Debug)]
@@ -41,6 +42,15 @@ pub struct MqttServerConfig {
     /// Channel capacity for response packets flowing from read loop to
     /// write loop (per session).
     pub response_channel_capacity: usize,
+
+    /// Wildcard policy applied to SUBSCRIBE topic filters.
+    ///
+    /// Default is [`WildcardPolicy::SingleLevelOnly`], which accepts `+`
+    /// (single-level) filters such as `fleet/+/position` but rejects `#`
+    /// (multi-level). Set to [`WildcardPolicy::Full`] on listeners where
+    /// authorised clients legitimately need full-subtree subscriptions;
+    /// set to [`WildcardPolicy::Reject`] to match pre-wildcard behaviour.
+    pub wildcard_policy: WildcardPolicy,
 }
 
 impl MqttServerConfig {
