@@ -964,6 +964,34 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 100 * 1024 * 1024, env = "RUSTGATE_CLIENT_QUEUE_MAX_BYTES")]
     pub(crate) client_queue_max_bytes: u64,
 
+    /// Path to a file containing the 32-byte HMAC-SHA256 key that
+    /// integrity-protects stored offline messages. The file must
+    /// contain exactly 64 hex characters (optionally followed by
+    /// whitespace) and must be readable only by the rustgate owner
+    /// (mode 0600). When set, the queue survives restarts without
+    /// silently discarding stored messages.
+    ///
+    /// When unset, the queue refuses to start if pre-existing stored
+    /// entries are found — either supply this flag to preserve them,
+    /// or use `--client-queue-wipe-on-start` to discard them.
+    #[arg(long, env = "RUSTGATE_CLIENT_QUEUE_KEY_FILE")]
+    pub(crate) client_queue_key_file: Option<std::path::PathBuf>,
+
+    /// Explicitly wipe the on-disk store-and-forward queue at startup
+    /// before generating a fresh ephemeral HMAC key. Emits a
+    /// `store_forward.key_rotated` audit event recording the depth of
+    /// the discarded entries. Mutually exclusive with
+    /// `--client-queue-key-file`. Use only when the operator is
+    /// acknowledging deliberate data loss (e.g. during key rotation
+    /// without a persisted predecessor).
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "RUSTGATE_CLIENT_QUEUE_WIPE_ON_START",
+        conflicts_with = "client_queue_key_file"
+    )]
+    pub(crate) client_queue_wipe_on_start: bool,
+
     /// OTLP gRPC endpoint for OpenTelemetry trace export (e.g. http://localhost:4317).
     /// Requires --features otel. When not set, OTel tracing is disabled even if
     /// compiled with the otel feature.
@@ -1291,6 +1319,8 @@ define_config_file! {
     access_log: Option<String>,
     client_queue_dir: Option<std::path::PathBuf>,
     client_queue_max_bytes: u64,
+    client_queue_key_file: Option<std::path::PathBuf>,
+    client_queue_wipe_on_start: bool,
     otel_endpoint: Option<String>,
     otel_service_name: String,
     otlp_metrics: bool,

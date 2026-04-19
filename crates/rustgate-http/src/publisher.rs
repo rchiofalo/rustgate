@@ -38,6 +38,18 @@ const CHANNEL_BUFFER: usize = 256;
 /// Non-revealing User-Agent to prevent version fingerprinting.
 const RUSTGATE_USER_AGENT: &str = "Rustgate";
 
+/// Synthetic DLQ target name for admission-queue drops.
+///
+/// Used when a message is shed before per-target dispatch (the bounded
+/// channel is full or closed). DLQ filenames will be
+/// `admission_{timestamp}.dlq.enc`. Target-name config validation allows
+/// users to choose the literal string "admission" for one of their own
+/// targets, which would interleave user traffic with admission-shed
+/// messages in the same DLQ files. The `target` field inside each JSON
+/// entry always disambiguates, and users can avoid the collision by not
+/// naming a target "admission".
+const ADMISSION_DLQ_TARGET: &str = "admission";
+
 /// Maximum response body to drain on error responses (1 MiB).
 ///
 /// Prevents memory exhaustion from malicious servers while still draining
@@ -187,6 +199,12 @@ impl HttpPublisher {
     }
 
     /// Fire-and-forget publish. Non-blocking — drops on channel full.
+    ///
+    /// When the admission queue rejects a message (channel full or closed),
+    /// and a DLQ is configured, the message is persisted under the synthetic
+    /// `admission` DLQ target with the drop reason. This prevents silent loss
+    /// of messages that never reach per-target dispatch and keeps the
+    /// forensic trail symmetric with circuit-open drops.
     pub fn publish(&self, msg: &RoutableMessage) {
         // Echo prevention at the publisher level (case-insensitive to
         // defend against inconsistent casing across transport adapters)
@@ -203,12 +221,28 @@ impl HttpPublisher {
                     "HTTP dispatch channel full, dropping message"
                 );
                 #[cfg(feature = "metrics")]
-                crate::metrics::errors()
-                    .with_label_values(&["_all", "channel_full"])
-                    .inc();
+                {
+                    crate::metrics::errors()
+                        .with_label_values(&["_all", "channel_full"])
+                        .inc();
+                    crate::metrics::dropped()
+                        .with_label_values(&["channel_full"])
+                        .inc();
+                }
+                // Fail-open DLQ persist so the drop is not silent.
+                if let Some(ref dlq) = self.dlq {
+                    dlq.dead_letter(ADMISSION_DLQ_TARGET, msg, "channel_full");
+                }
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 tracing::warn!("HTTP dispatch channel closed");
+                #[cfg(feature = "metrics")]
+                crate::metrics::dropped()
+                    .with_label_values(&["channel_closed"])
+                    .inc();
+                if let Some(ref dlq) = self.dlq {
+                    dlq.dead_letter(ADMISSION_DLQ_TARGET, msg, "channel_closed");
+                }
             }
         }
     }
@@ -1088,6 +1122,103 @@ mod tests {
         // If echo prevention failed, try_recv would return messages
         // Since we dropped _rx, the send would fail — but publish()
         // should return before even trying to send (echo prevention)
+    }
+
+    /// Build a minimal `RoutableMessage` for admission tests.
+    fn admission_test_msg(cn: &str) -> rustgate_core::message::RoutableMessage {
+        rustgate_core::message::RoutableMessage {
+            source: rustgate_core::identity::Identity {
+                cn: cn.to_string(),
+                fingerprint: Default::default(),
+                groups: Default::default(),
+                tenant: None,
+                spiffe_id: None,
+                attributes: Arc::new(Default::default()),
+            },
+            destination: rustgate_core::message::Destination::Broadcast,
+            payload: bytes::Bytes::from_static(b"admission-shed payload"),
+            metadata: rustgate_core::message::Metadata {
+                received_at: std::time::SystemTime::now(),
+                source_protocol: "tcp".to_string(),
+                message_type: rustgate_core::message::MessageType::Position,
+                ttl: None,
+            },
+        }
+    }
+
+    /// Synthetic key ring for DLQ encryption in tests.
+    fn admission_test_key_ring() -> rustgate_core::encrypted::KeyRing {
+        let key_json = r#"{
+            "active_key_id": "test-key",
+            "keys": {
+                "test-key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+        }"#;
+        rustgate_core::encrypted::KeyRing::from_bytes(key_json.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn admission_full_persists_to_dlq() {
+        // Regression for #813: admission-queue drops previously bypassed
+        // the DLQ, silently losing messages that never reached dispatch.
+        let dir = tempfile::tempdir().unwrap();
+        let dlq = Arc::new(DeadLetterQueue::new(
+            dir.path().to_path_buf(),
+            admission_test_key_ring(),
+            None,
+        ));
+
+        // Capacity-1 channel: first send fills it, second send returns Full.
+        let (tx, rx) = mpsc::channel::<Arc<RoutableMessage>>(1);
+
+        let publisher = HttpPublisher {
+            tx: tx.clone(),
+            targets: Arc::new(vec![]),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+            dlq: Some(dlq),
+            worker_handle: Arc::new(std::sync::Mutex::new(None)),
+        };
+
+        // Saturate the channel so the next `publish` hits `TrySendError::Full`.
+        tx.try_send(Arc::new(admission_test_msg("filler"))).unwrap();
+
+        let msg = admission_test_msg("alice");
+        publisher.publish(&msg);
+
+        // Keep the receiver alive to ensure we exercised the Full path, not Closed.
+        drop(rx);
+
+        // A DLQ file prefixed with the synthetic target name must exist.
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(entries.len(), 1, "expected exactly one DLQ file");
+        let name = entries[0].file_name().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with(&format!("{ADMISSION_DLQ_TARGET}_")),
+            "expected admission-shed DLQ file, got: {name}"
+        );
+        assert!(name.ends_with(".dlq.enc"), "got: {name}");
+    }
+
+    #[test]
+    fn admission_full_without_dlq_is_tolerated() {
+        // Admission-full must remain non-fatal when no DLQ is configured.
+        let (tx, rx) = mpsc::channel::<Arc<RoutableMessage>>(1);
+
+        let publisher = HttpPublisher {
+            tx: tx.clone(),
+            targets: Arc::new(vec![]),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+            dlq: None,
+            worker_handle: Arc::new(std::sync::Mutex::new(None)),
+        };
+
+        tx.try_send(Arc::new(admission_test_msg("filler"))).unwrap();
+        // Must not panic, must not block.
+        publisher.publish(&admission_test_msg("alice"));
+        drop(rx);
     }
 
     #[test]
