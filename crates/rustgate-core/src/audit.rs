@@ -140,6 +140,26 @@ pub fn federation_connect_failed(peer_id: &PeerId, error: &str) {
     );
 }
 
+/// Record a federation peer rejection at the mTLS boundary when the
+/// client certificate CN cannot be extracted.
+///
+/// Emitted when a federation RPC arrives without a parseable client
+/// certificate CN — historically the server fell back to identifying
+/// the peer by remote IP, which silently matched IP-keyed
+/// `peer_groups` entries regardless of whether the TLS identity was
+/// valid. Callers must reject the RPC after emitting this event; the
+/// forensic trail links the refused remote address to the rejection
+/// reason (missing cert, malformed DER, empty CN after sanitization).
+pub fn federation_peer_rejected(remote_addr: &str, reason: &str) {
+    audit!(
+        "federation.peer_rejected",
+        remote_addr = %remote_addr,
+        reason = %reason,
+        action = "reject",
+        result = "failure"
+    );
+}
+
 /// Record an enrollment CSR signing event.
 pub fn enrollment_signed(username: &str, client_uid: &str) {
     audit!(
