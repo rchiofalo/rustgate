@@ -148,17 +148,37 @@ mod tests {
 
     #[test]
     fn expired_entries_allow_new_requests() {
-        let limiter = RateLimiter::new(1, Duration::from_millis(1));
+        // The window must be large enough that *both* the "over limit"
+        // rejection and the "after expiry" allow are unambiguous even on a
+        // loaded CI runner where `Instant::now()` between two back-to-back
+        // `check()` calls can drift several milliseconds. The previous 1 ms
+        // window was too tight: if the second call landed >= 1 ms after the
+        // first, the cutoff comparison `t <= cutoff` pruned the first
+        // timestamp, leaving the slot free and flipping the `!check` assert
+        // to `check returned true`. See the CI failure documented on main
+        // (fix/flaky-ratelimit-expired-entries-test).
+        //
+        // With a 200 ms window, two immediate calls are reliably inside
+        // the same window (normal jitter is single-digit milliseconds),
+        // and a 400 ms sleep comfortably exceeds the window so the third
+        // call is reliably allowed.
+        let limiter = RateLimiter::new(1, Duration::from_millis(200));
         let ip: IpAddr = "10.0.0.1".parse().expect("valid IP");
 
         assert!(limiter.check(ip));
-        assert!(!limiter.check(ip));
+        assert!(
+            !limiter.check(ip),
+            "second request inside the 200 ms window must be rate-limited"
+        );
 
-        // Wait for window to expire
-        std::thread::sleep(Duration::from_millis(10));
+        // Wait well past the window so the first timestamp is pruned.
+        std::thread::sleep(Duration::from_millis(400));
 
         // Should be allowed again after window expires
-        assert!(limiter.check(ip));
+        assert!(
+            limiter.check(ip),
+            "request after the 200 ms window expired must be allowed"
+        );
     }
 
     #[test]
