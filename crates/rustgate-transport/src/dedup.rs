@@ -6,8 +6,8 @@
 //! (for example, a direct client connection and a federation peer that
 //! forwarded it), subscribers should only receive it once. This module
 //! provides a bounded LRU cache, keyed by
-//! `SHA-256(uid || 0x00 || time_le || 0x00 || payload)`, that the router
-//! consults on the dispatch hot path.
+//! `SHA-256(tenant || 0x00 || uid || 0x00 || time_le || 0x00 || payload)`,
+//! that the router consults on the dispatch hot path.
 //!
 //! For CoT XML payloads the `uid` and `time` attributes are extracted
 //! and folded into the key alongside the payload hash. For non-CoT
@@ -16,6 +16,26 @@
 //! `uid` empty and `time` set to zero. Either way, two byte-identical
 //! payloads within the window are suppressed; two different payloads
 //! sharing a `(uid, time)` pair pass through independently.
+//!
+//! # Tenant isolation
+//!
+//! By default, the cache folds each sender's tenant (derived from the
+//! X.509 Organization field on the client certificate) into the key so
+//! a message sent by tenant `A` cannot suppress a byte-identical
+//! message sent by tenant `B`. Without this, a malicious tenant could
+//! probe for the existence of messages in another tenant by submitting
+//! candidate `(uid, time, payload)` triples and observing whether
+//! delivery succeeds (= the other tenant did not send this) or is
+//! silently deduplicated (= the other tenant sent exactly this). See
+//! issue #722.
+//!
+//! Single-tenant deployments, or multi-tenant deployments where
+//! cross-tenant duplicate suppression is explicitly desired, can opt
+//! back into the pre-#722 behaviour with
+//! [`DedupCache::with_cross_tenant(true)`][DedupCache::with_cross_tenant]
+//! — equivalent to forcing the tenant slot in the key preimage to
+//! empty for every caller. The flag is a stance-setter, not a runtime
+//! toggle: it is fixed at construction time and documented loudly.
 //!
 //! Disabled by default; the server enables it via the
 //! `--dedup-window-secs` CLI flag (a value of `0` keeps it off).
@@ -57,6 +77,11 @@ pub struct DedupCache {
     hits: AtomicU64,
     on_duplicate: Option<OnDuplicate>,
     on_insert: Option<OnInsert>,
+    /// When `true`, the tenant slot in the key preimage is forced to
+    /// empty for every lookup/insert so byte-identical messages from
+    /// different tenants collide — the pre-#722 behaviour. Defaults to
+    /// `false` (tenant-isolated).
+    cross_tenant: bool,
 }
 
 impl std::fmt::Debug for DedupCache {
@@ -64,6 +89,7 @@ impl std::fmt::Debug for DedupCache {
         f.debug_struct("DedupCache")
             .field("window", &self.window)
             .field("hits", &self.hits.load(Ordering::Relaxed))
+            .field("cross_tenant", &self.cross_tenant)
             .finish()
     }
 }
@@ -72,7 +98,9 @@ impl DedupCache {
     /// Create a new dedup cache with the given dedup window and capacity.
     ///
     /// `max_entries` of zero is normalized to `1` since the underlying
-    /// LRU implementation requires a non-zero capacity.
+    /// LRU implementation requires a non-zero capacity. Tenant
+    /// isolation is on by default — use
+    /// [`with_cross_tenant`][Self::with_cross_tenant] to disable it.
     pub fn new(window: Duration, max_entries: usize) -> Self {
         let cap = NonZeroUsize::new(max_entries.max(1)).unwrap_or(NonZeroUsize::MIN);
         Self {
@@ -81,6 +109,7 @@ impl DedupCache {
             hits: AtomicU64::new(0),
             on_duplicate: None,
             on_insert: None,
+            cross_tenant: false,
         }
     }
 
@@ -91,6 +120,31 @@ impl DedupCache {
             return None;
         }
         Some(Self::new(Duration::from_secs(secs), max_entries))
+    }
+
+    /// Opt into cross-tenant deduplication.
+    ///
+    /// When `true`, the tenant slot in the cache key preimage is forced
+    /// to empty so a message sent by tenant `A` suppresses a
+    /// byte-identical message from tenant `B`. **This is unsafe in any
+    /// deployment where tenants do not fully trust each other** — it
+    /// opens a cross-tenant timing side-channel (issue #722) because a
+    /// malicious tenant can probe for the existence of specific
+    /// messages in another tenant by observing whether candidate
+    /// payloads are silently suppressed. Single-tenant deployments, or
+    /// deployments where cross-tenant duplicate suppression is
+    /// explicitly desired, can opt in with eyes open.
+    ///
+    /// Defaults to `false` (tenant-isolated).
+    pub fn with_cross_tenant(mut self, cross_tenant: bool) -> Self {
+        self.cross_tenant = cross_tenant;
+        self
+    }
+
+    /// Whether this cache folds the tenant into the key (`false`) or
+    /// forces it to empty (`true`). Exposed for diagnostics and tests.
+    pub fn is_cross_tenant(&self) -> bool {
+        self.cross_tenant
     }
 
     /// Install a callback fired once per suppressed duplicate.
@@ -124,14 +178,23 @@ impl DedupCache {
         self.window
     }
 
-    /// Check whether `SHA-256(uid || 0x00 || 0 || 0x00 || payload)` was
-    /// already seen within the configured window. Returns `true` on
+    /// Check whether
+    /// `SHA-256(tenant || 0x00 || uid || 0x00 || 0_i64_le || 0x00 || payload)`
+    /// was already seen within the configured window. Returns `true` on
     /// duplicate; otherwise inserts and returns `false`.
     ///
     /// The `time` parameter has been removed from the public API; the
     /// payload hash alone subsumes it.
-    pub fn check_and_insert(&self, uid: &str, payload: &[u8]) -> bool {
-        let key = build_key(uid, payload);
+    ///
+    /// `tenant` should be the sender's tenant key (typically the X.509
+    /// Organization field on the client certificate; an empty string is
+    /// used for clients with no tenant attribute). When this cache was
+    /// built with [`with_cross_tenant(true)`][Self::with_cross_tenant]
+    /// the supplied `tenant` is ignored and the tenant slot is forced
+    /// empty — see the type-level docs for the security implications.
+    pub fn check_and_insert(&self, tenant: &str, uid: &str, payload: &[u8]) -> bool {
+        let effective_tenant = if self.cross_tenant { "" } else { tenant };
+        let key = build_key(effective_tenant, uid, payload);
         let now = Instant::now();
         let window = self.window;
 
@@ -163,29 +226,42 @@ impl DedupCache {
         false
     }
 
-    /// Convenience wrapper for callers that have only the raw payload.
+    /// Convenience wrapper for callers that have only the raw payload
+    /// and the sender's tenant.
     ///
     /// For CoT XML payloads the `uid` attribute is extracted and folded
     /// into the key. For non-CoT payloads (protobuf, raw binary) the
     /// cache falls back to a pure content-hash key with an empty `uid`,
     /// so byte-identical payloads are still deduped.
-    pub fn check_payload(&self, payload: &[u8]) -> bool {
+    ///
+    /// `tenant` should come from `Identity.tenant.as_deref().unwrap_or("")`
+    /// on the dispatch path. See
+    /// [`check_and_insert`][Self::check_and_insert] for the full
+    /// semantics and the cross-tenant-mode caveat.
+    pub fn check_payload(&self, tenant: &str, payload: &[u8]) -> bool {
         let uid = crate::replay::extract_xml_attr(payload, b"uid=")
             .and_then(|u| std::str::from_utf8(u).ok())
             .unwrap_or("");
-        self.check_and_insert(uid, payload)
+        self.check_and_insert(tenant, uid, payload)
     }
 }
 
 /// Build the 32-byte cache key.
 ///
-/// The format is `SHA-256(uid || 0x00 || 0_i64_le || 0x00 || payload)`.
+/// The format is
+/// `SHA-256(tenant || 0x00 || uid || 0x00 || 0_i64_le || 0x00 || payload)`.
 /// The `time` slot is fixed at zero (little-endian i64) and retained in
 /// the hash preimage for stability with any external tooling that may
 /// hash the same shape; since the full payload is also hashed, the time
 /// slot is informational and cannot cause collisions.
-fn build_key(uid: &str, payload: &[u8]) -> Key {
+///
+/// Folding `tenant` into the preimage prevents a malicious tenant from
+/// probing for the existence of messages in another tenant by observing
+/// whether candidate payloads are silently suppressed (issue #722).
+fn build_key(tenant: &str, uid: &str, payload: &[u8]) -> Key {
     let mut hasher = Sha256::new();
+    hasher.update(tenant.as_bytes());
+    hasher.update([0u8]);
     hasher.update(uid.as_bytes());
     hasher.update([0u8]);
     hasher.update(0i64.to_le_bytes());
@@ -206,16 +282,16 @@ mod tests {
     #[test]
     fn duplicate_is_detected() {
         let c = cache(60, 16);
-        assert!(!c.check_and_insert("UID-1", b"hello"));
-        assert!(c.check_and_insert("UID-1", b"hello"));
+        assert!(!c.check_and_insert("", "UID-1", b"hello"));
+        assert!(c.check_and_insert("", "UID-1", b"hello"));
         assert_eq!(c.hits(), 1);
     }
 
     #[test]
     fn different_payload_same_uid_passes() {
         let c = cache(60, 16);
-        assert!(!c.check_and_insert("UID-1", b"hello"));
-        assert!(!c.check_and_insert("UID-1", b"world"));
+        assert!(!c.check_and_insert("", "UID-1", b"hello"));
+        assert!(!c.check_and_insert("", "UID-1", b"world"));
         assert_eq!(c.hits(), 0);
     }
 
@@ -224,21 +300,21 @@ mod tests {
         // Use a real 10ms window and sleep past it to exercise the TTL
         // expiry branch (not the zero-window short-circuit).
         let c = DedupCache::new(Duration::from_millis(10), 16);
-        assert!(!c.check_and_insert("UID-1", b"hello"));
+        assert!(!c.check_and_insert("", "UID-1", b"hello"));
         std::thread::sleep(Duration::from_millis(20));
-        assert!(!c.check_and_insert("UID-1", b"hello"));
+        assert!(!c.check_and_insert("", "UID-1", b"hello"));
         assert_eq!(c.hits(), 0);
     }
 
     #[test]
     fn lru_eviction_drops_oldest() {
         let c = cache(3600, 2);
-        assert!(!c.check_and_insert("U1", b"a"));
-        assert!(!c.check_and_insert("U2", b"b"));
-        assert!(!c.check_and_insert("U3", b"c")); // evicts U1
+        assert!(!c.check_and_insert("", "U1", b"a"));
+        assert!(!c.check_and_insert("", "U2", b"b"));
+        assert!(!c.check_and_insert("", "U3", b"c")); // evicts U1
         assert_eq!(c.len(), 2);
         // U1 was evicted — re-insertion is not a duplicate.
-        assert!(!c.check_and_insert("U1", b"a"));
+        assert!(!c.check_and_insert("", "U1", b"a"));
     }
 
     #[test]
@@ -255,9 +331,9 @@ mod tests {
         c.set_on_duplicate(Arc::new(move || {
             let _ = cc.fetch_add(1, Ordering::Relaxed);
         }));
-        assert!(!c.check_and_insert("U", b"x"));
-        assert!(c.check_and_insert("U", b"x"));
-        assert!(c.check_and_insert("U", b"x"));
+        assert!(!c.check_and_insert("", "U", b"x"));
+        assert!(c.check_and_insert("", "U", b"x"));
+        assert!(c.check_and_insert("", "U", b"x"));
         assert_eq!(counter.load(Ordering::Relaxed), 2);
     }
 
@@ -269,12 +345,12 @@ mod tests {
         c.set_on_insert(Arc::new(move |len| {
             ll.store(len as u64, Ordering::Relaxed);
         }));
-        assert!(!c.check_and_insert("U1", b"x"));
+        assert!(!c.check_and_insert("", "U1", b"x"));
         assert_eq!(last_len.load(Ordering::Relaxed), 1);
-        assert!(!c.check_and_insert("U2", b"y"));
+        assert!(!c.check_and_insert("", "U2", b"y"));
         assert_eq!(last_len.load(Ordering::Relaxed), 2);
         // Duplicate should NOT fire on_insert.
-        assert!(c.check_and_insert("U1", b"x"));
+        assert!(c.check_and_insert("", "U1", b"x"));
         assert_eq!(last_len.load(Ordering::Relaxed), 2);
     }
 
@@ -282,8 +358,8 @@ mod tests {
     fn check_payload_extracts_cot_attrs() {
         let c = cache(60, 16);
         let xml = br#"<event uid="ALPHA" time="2024-01-01T00:00:00Z" type="a-f-G"/>"#;
-        assert!(!c.check_payload(xml));
-        assert!(c.check_payload(xml));
+        assert!(!c.check_payload("", xml));
+        assert!(c.check_payload("", xml));
     }
 
     #[test]
@@ -294,8 +370,8 @@ mod tests {
         let payload: &[u8] = &[
             0x0a, 0x05, b'h', b'e', b'l', b'l', b'o', 0x10, 0x2a, 0x18, 0xff, 0x01,
         ];
-        assert!(!c.check_payload(payload));
-        assert!(c.check_payload(payload));
+        assert!(!c.check_payload("", payload));
+        assert!(c.check_payload("", payload));
         assert_eq!(c.hits(), 1);
     }
 
@@ -304,8 +380,64 @@ mod tests {
         let c = cache(60, 16);
         let a: &[u8] = &[0x0a, 0x01, 0x41];
         let b: &[u8] = &[0x0a, 0x01, 0x42];
-        assert!(!c.check_payload(a));
-        assert!(!c.check_payload(b));
+        assert!(!c.check_payload("", a));
+        assert!(!c.check_payload("", b));
         assert_eq!(c.hits(), 0);
+    }
+
+    // ----- Tenant isolation regression tests (#722) -------------------
+
+    #[test]
+    fn different_tenants_same_payload_pass_independently() {
+        // The attack model: tenant B sends a byte-identical message to
+        // one tenant A just sent. With isolation (default), B's send
+        // MUST be admitted — otherwise B has confirmed A sent exactly
+        // this payload.
+        let c = cache(60, 16);
+        assert!(!c.check_and_insert("tenant-a", "UID-1", b"hello"));
+        assert!(!c.check_and_insert("tenant-b", "UID-1", b"hello"));
+        assert_eq!(c.hits(), 0);
+    }
+
+    #[test]
+    fn same_tenant_same_payload_still_deduped() {
+        // Intra-tenant dedup MUST still work — that is the whole point.
+        let c = cache(60, 16);
+        assert!(!c.check_and_insert("tenant-a", "UID-1", b"hello"));
+        assert!(c.check_and_insert("tenant-a", "UID-1", b"hello"));
+        assert_eq!(c.hits(), 1);
+    }
+
+    #[test]
+    fn cross_tenant_mode_suppresses_across_tenants() {
+        // With the explicit opt-in, pre-#722 behaviour is preserved:
+        // tenant B's byte-identical resend after tenant A is suppressed.
+        let c = DedupCache::new(Duration::from_secs(60), 16).with_cross_tenant(true);
+        assert!(c.is_cross_tenant());
+        assert!(!c.check_and_insert("tenant-a", "UID-1", b"hello"));
+        assert!(c.check_and_insert("tenant-b", "UID-1", b"hello"));
+        assert_eq!(c.hits(), 1);
+    }
+
+    #[test]
+    fn missing_tenant_treated_as_empty() {
+        // Clients without an Organization field pass "" on the hot
+        // path. Two "" senders of the same payload collide, which is
+        // the pre-tenant behaviour and the correct fallback.
+        let c = cache(60, 16);
+        assert!(!c.check_and_insert("", "UID-1", b"hello"));
+        assert!(c.check_and_insert("", "UID-1", b"hello"));
+        assert_eq!(c.hits(), 1);
+    }
+
+    #[test]
+    fn tenant_affects_check_payload_too() {
+        // The convenience wrapper honours the tenant boundary for CoT.
+        let c = cache(60, 16);
+        let xml = br#"<event uid="ALPHA" time="2024-01-01T00:00:00Z" type="a-f-G"/>"#;
+        assert!(!c.check_payload("tenant-a", xml));
+        assert!(!c.check_payload("tenant-b", xml));
+        assert!(c.check_payload("tenant-a", xml));
+        assert_eq!(c.hits(), 1);
     }
 }

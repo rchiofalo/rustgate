@@ -261,11 +261,30 @@ A `GroupAclPolicy` is consulted before delivery:
 
 ### 4.3 Deduplication
 
-The router maintains a per-server `DedupCache` keyed by message UID +
-content hash. A message that hashes to the same key as a recently routed
-message (within the configured time window) is dropped before delivery.
-This collapses retransmissions, federation echoes, and multi-path
-duplicates without requiring sequence numbers from clients.
+The router maintains a per-server `DedupCache` keyed by
+`SHA-256(tenant || 0x00 || uid || 0x00 || 0_i64_le || 0x00 || payload)`.
+A message that hashes to the same key as a recently routed message
+(within the configured time window) is dropped before delivery. This
+collapses retransmissions, federation echoes, and multi-path duplicates
+without requiring sequence numbers from clients.
+
+**Tenant isolation (default).** The sender's tenant, derived from the
+X.509 Organization (O) field on the client certificate, is folded into
+the dedup key. A message sent by tenant `A` cannot suppress a
+byte-identical message sent by tenant `B`. Without this, a malicious
+tenant could probe for the existence of messages in another tenant by
+submitting candidate `(uid, time, payload)` triples and observing
+whether delivery succeeds (= the other tenant did not send this) or is
+silently deduplicated (= the other tenant sent exactly this).
+
+**Cross-tenant opt-in (unsafe).** Single-tenant deployments, or
+multi-tenant deployments where cross-tenant duplicate suppression is
+explicitly desired, can opt back into cross-tenant dedup with
+`--dedup-cross-tenant` (env `RUSTGATE_DEDUP_CROSS_TENANT=true`). This
+forces the tenant slot empty in every key and **re-opens the timing
+side-channel described above**. The server logs a `WARN` on startup
+when this mode is active. Leave it off unless you have a concrete
+reason and have accepted the risk.
 
 ### 4.4 Backpressure and priority
 
