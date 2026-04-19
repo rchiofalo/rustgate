@@ -1,5 +1,7 @@
 // Copyright © 2026 Roberto Chiofalo.
 
+#![allow(clippy::panic, clippy::unwrap_used)]
+
 //! Integration tests for the enrollment HTTPS server.
 //!
 //! Spins up a real enrollment server on localhost with ephemeral certs,
@@ -7,6 +9,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -23,6 +26,30 @@ use tokio_rustls::TlsConnector;
 fn free_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind for port discovery");
     listener.local_addr().expect("local_addr").port()
+}
+
+/// Connect to the given address, retrying briefly while the background server
+/// finishes binding its listener.
+///
+/// `spawn_server_with` launches the server in a detached tokio task and
+/// returns immediately, so the first `TcpStream::connect` can race the
+/// listener `bind` and hit `ECONNREFUSED`. Retry for up to ~2 s to cover
+/// slow-starting runners without masking a genuinely dead server.
+async fn connect_with_retry(addr: SocketAddr) -> TcpStream {
+    let mut last_err = None;
+    for _ in 0..100 {
+        match TcpStream::connect(addr).await {
+            Ok(stream) => return stream,
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+    panic!(
+        "TCP connect to {addr} never succeeded after retries: {:?}",
+        last_err
+    );
 }
 
 /// Build test infrastructure: CA, server cert, signer, credentials.
@@ -114,7 +141,7 @@ impl TestEnv {
         &self,
         req: Request<Full<Bytes>>,
     ) -> hyper::Response<hyper::body::Incoming> {
-        let tcp = TcpStream::connect(self.addr).await.expect("TCP connect");
+        let tcp = connect_with_retry(self.addr).await;
 
         let server_name = rustls_pki_types::ServerName::try_from("localhost").expect("server name");
         let tls = self
