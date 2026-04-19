@@ -16,6 +16,7 @@ pub mod error;
 #[cfg(feature = "est")]
 pub mod est;
 mod handlers;
+mod keypair;
 pub mod pkcs12;
 pub mod ratelimit;
 pub mod response;
