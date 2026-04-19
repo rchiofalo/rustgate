@@ -14,9 +14,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hmac::{Hmac, Mac};
+use rustgate_core::b64;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -302,18 +301,18 @@ impl std::error::Error for JwtError {}
 /// Encode claims into a signed JWT string.
 fn encode(secret: &[u8], claims: &FederationClaims) -> Result<String, JwtError> {
     let header = r#"{"alg":"HS256","typ":"JWT"}"#;
-    let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
+    let header_b64 = b64::encode_url_safe(header.as_bytes());
 
     let payload_json =
         serde_json::to_string(claims).map_err(|e| JwtError::SerializationError(e.to_string()))?;
-    let payload_b64 = URL_SAFE_NO_PAD.encode(payload_json.as_bytes());
+    let payload_b64 = b64::encode_url_safe(payload_json.as_bytes());
 
     let signing_input = format!("{header_b64}.{payload_b64}");
 
     let mut mac = HmacSha256::new_from_slice(secret).map_err(|_| JwtError::InvalidSignature)?;
     mac.update(signing_input.as_bytes());
     let signature = mac.finalize().into_bytes();
-    let signature_b64 = URL_SAFE_NO_PAD.encode(signature);
+    let signature_b64 = b64::encode_url_safe(signature);
 
     Ok(format!("{signing_input}.{signature_b64}"))
 }
@@ -326,9 +325,7 @@ fn decode(secret: &[u8], token: &str) -> Result<FederationClaims, JwtError> {
     }
 
     let signing_input = format!("{}.{}", parts[0], parts[1]);
-    let actual_sig = URL_SAFE_NO_PAD
-        .decode(parts[2])
-        .map_err(|_| JwtError::Malformed)?;
+    let actual_sig = b64::decode_url_safe(parts[2]).map_err(|_| JwtError::Malformed)?;
 
     let mut mac = HmacSha256::new_from_slice(secret).map_err(|_| JwtError::InvalidSignature)?;
     mac.update(signing_input.as_bytes());
@@ -336,9 +333,7 @@ fn decode(secret: &[u8], token: &str) -> Result<FederationClaims, JwtError> {
     mac.verify_slice(&actual_sig)
         .map_err(|_| JwtError::InvalidSignature)?;
 
-    let payload_bytes = URL_SAFE_NO_PAD
-        .decode(parts[1])
-        .map_err(|_| JwtError::Malformed)?;
+    let payload_bytes = b64::decode_url_safe(parts[1]).map_err(|_| JwtError::Malformed)?;
     let claims: FederationClaims = serde_json::from_slice(&payload_bytes)
         .map_err(|e| JwtError::SerializationError(e.to_string()))?;
 
@@ -555,8 +550,8 @@ mod tests {
     #[test]
     fn base64url_roundtrip() {
         let data = b"Hello, Federation JWT!";
-        let encoded = URL_SAFE_NO_PAD.encode(data);
-        let decoded = URL_SAFE_NO_PAD.decode(&encoded).expect("decode");
+        let encoded = b64::encode_url_safe(data);
+        let decoded = b64::decode_url_safe(&encoded).expect("decode");
         assert_eq!(decoded, data);
     }
 

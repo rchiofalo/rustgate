@@ -9,9 +9,9 @@
 //! [`SignedData`]: cms::signed_data::SignedData
 //! [RFC 7030]: https://www.rfc-editor.org/rfc/rfc7030
 
-use base64::Engine as _;
 use cms::content_info::ContentInfo;
 use der::{Decode, Encode};
+use rustgate_core::b64;
 use x509_cert::Certificate;
 
 use crate::error::EnrollmentError;
@@ -53,7 +53,7 @@ pub fn build_certs_only_bag(certs_der: &[&[u8]]) -> Result<Vec<u8>, EnrollmentEr
 /// RFC 4648 Section 4 (standard alphabet, no line wrapping required).
 pub fn build_certs_only_base64(certs_der: &[&[u8]]) -> Result<String, EnrollmentError> {
     let der = build_certs_only_bag(certs_der)?;
-    Ok(base64::engine::general_purpose::STANDARD.encode(der))
+    Ok(b64::encode(der))
 }
 
 #[cfg(test)]
@@ -103,9 +103,7 @@ mod tests {
         let b64 = build_certs_only_base64(&[&cert_der]).unwrap();
 
         // Verify base64 decodes back to valid DER
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(&b64)
-            .unwrap();
+        let decoded = b64::decode(&b64).unwrap();
         let ci = ContentInfo::from_der(&decoded).unwrap();
         assert_eq!(
             ci.content_type,

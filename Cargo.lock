@@ -3156,6 +3156,7 @@ name = "rustgate-core"
 version = "0.8.0"
 dependencies = [
  "arbitrary",
+ "base64",
  "bytes",
  "chacha20poly1305",
  "hex",
@@ -3191,7 +3192,6 @@ dependencies = [
 name = "rustgate-enrollment"
 version = "0.8.0"
 dependencies = [
- "base64",
  "bytes",
  "cms",
  "der",
@@ -3227,7 +3227,6 @@ dependencies = [
  "anyhow",
  "async-nats",
  "async-trait",
- "base64",
  "bytes",
  "criterion",
  "etcd-client",
@@ -3275,7 +3274,6 @@ dependencies = [
 name = "rustgate-http"
 version = "0.8.0"
 dependencies = [
- "base64",
  "bytes",
  "fastrand",
  "futures",
@@ -3452,7 +3450,6 @@ name = "rustgate-transport"
 version = "0.8.0"
 dependencies = [
  "arc-swap",
- "base64",
  "bytes",
  "criterion",
  "futures",

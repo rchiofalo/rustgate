@@ -8,11 +8,11 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use base64::Engine;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
 use hyper_util::rt::TokioIo;
+use rustgate_core::b64;
 use rustgate_enrollment::{Credentials, CsrSigner, EnrollmentServer};
 use rustgate_test_utils::certs::TestCa;
 use rustls_pki_types::pem::PemObject;
@@ -137,7 +137,7 @@ impl TestEnv {
 }
 
 fn encode_basic_auth(user: &str, pass: &str) -> String {
-    let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+    let encoded = b64::encode(format!("{user}:{pass}"));
     format!("Basic {encoded}")
 }
 
