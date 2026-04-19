@@ -54,6 +54,8 @@
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -117,6 +119,15 @@ pub enum EncryptError {
     /// This indicates the file was truncated after writing.
     #[error("encrypted file truncated: terminator chunk missing")]
     Truncated,
+    /// The target path resolves to a symbolic link. `EncryptedWriter` refuses
+    /// to follow symlinks so a malicious local user cannot redirect a write
+    /// to a sensitive file on a shared host. Unix only — on other platforms
+    /// this variant is unreachable.
+    #[error("target path is a symlink; refusing to follow")]
+    SymlinkTarget {
+        /// The offending path.
+        path: PathBuf,
+    },
 }
 
 /// On-disk JSON layout for the key file.
@@ -276,11 +287,19 @@ impl EncryptedWriter {
         let mut base_nonce = [0u8; 8];
         getrandom(&mut base_nonce)?;
 
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(path)?;
+        // Refuse to follow a symlink at the final path component.
+        //
+        // On a multi-tenant host, an attacker who can plant a symlink at
+        // `path` could otherwise trick us into truncating and overwriting
+        // whatever file the symlink points to — a sensitive file owned by
+        // a different principal, for example. `O_NOFOLLOW` is the atomic
+        // TOCTOU-free defense: the open() call itself fails with `ELOOP`
+        // (or `EMLINK` on some platforms) when the terminal component is
+        // a symlink, which we translate into `EncryptError::SymlinkTarget`
+        // so callers can surface a clear error. Intermediate symlinks in
+        // the path are still followed; the policy here is "don't follow
+        // the tip", matching how `open(O_NOFOLLOW)` is defined on Linux.
+        let file = open_no_follow(path)?;
         let mut writer = BufWriter::new(file);
 
         // Write header
@@ -319,6 +338,21 @@ impl EncryptedWriter {
         if self.finished {
             return Err(EncryptError::Aead("writer already finished".into()));
         }
+        // Reserve the post-increment BEFORE we seal and write the chunk.
+        //
+        // ChaCha20-Poly1305 is catastrophically insecure under nonce reuse.
+        // The old code called `checked_add(1)` *after* writing, so if the
+        // counter was at `u32::MAX` we would seal + persist a chunk with
+        // nonce `(base, u32::MAX)`, fail the increment, and leave the
+        // counter pinned at `u32::MAX`. A subsequent `finish()` — or any
+        // caller ignoring the `CounterOverflow` error — would then seal
+        // the terminator using the same nonce as the last data chunk.
+        // Checking overflow up-front makes refusal atomic: if we cannot
+        // advance, we do not write.
+        let next_counter = self
+            .counter
+            .checked_add(1)
+            .ok_or(EncryptError::CounterOverflow)?;
         let nonce = chunk_nonce(&self.base_nonce, self.counter);
         let aad = self.build_aad(AAD_KIND_DATA);
         let ciphertext = self
@@ -339,10 +373,7 @@ impl EncryptedWriter {
             .ok_or_else(|| EncryptError::Aead("writer already closed".into()))?;
         writer.write_all(&len.to_be_bytes())?;
         writer.write_all(&ciphertext)?;
-        self.counter = self
-            .counter
-            .checked_add(1)
-            .ok_or(EncryptError::CounterOverflow)?;
+        self.counter = next_counter;
         Ok(())
     }
 
@@ -361,6 +392,14 @@ impl EncryptedWriter {
         if self.finished {
             return Ok(());
         }
+        // Reserve the post-increment before sealing the terminator — see
+        // the equivalent guard in `write_chunk` for the nonce-reuse threat
+        // model. Refusal must be atomic or we risk writing the terminator
+        // with the same nonce as the last data chunk.
+        let next_counter = self
+            .counter
+            .checked_add(1)
+            .ok_or(EncryptError::CounterOverflow)?;
         let nonce = chunk_nonce(&self.base_nonce, self.counter);
         let aad = self.build_aad(AAD_KIND_TERMINATOR);
         let ciphertext = self
@@ -382,10 +421,7 @@ impl EncryptedWriter {
         writer.write_all(&len.to_be_bytes())?;
         writer.write_all(&ciphertext)?;
         writer.flush()?;
-        self.counter = self
-            .counter
-            .checked_add(1)
-            .ok_or(EncryptError::CounterOverflow)?;
+        self.counter = next_counter;
         self.finished = true;
         Ok(())
     }
@@ -535,6 +571,91 @@ fn chunk_nonce(base: &[u8; 8], counter: u32) -> [u8; 12] {
     nonce[..8].copy_from_slice(base);
     nonce[8..].copy_from_slice(&counter.to_be_bytes());
     nonce
+}
+
+/// Platform-specific `O_NOFOLLOW` value.
+///
+/// The constant is defined in each platform's `<fcntl.h>` and the numeric
+/// value differs across Unix flavours. We pin the values explicitly rather
+/// than pulling in the `libc` crate for one flag, since adding a new
+/// workspace dep for a single constant would be out of proportion.
+#[cfg(unix)]
+const fn o_nofollow() -> i32 {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        0x20000
+    }
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly",
+    ))]
+    {
+        0x0100
+    }
+    // Any other Unix variant falls back to the Linux value; unknown targets
+    // would need explicit vetting but the workspace only ships Linux and
+    // macOS builds today.
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly",
+    )))]
+    {
+        0x20000
+    }
+}
+
+/// Open `path` for write+truncate+create, refusing to follow a terminal
+/// symlink. See the comment in [`EncryptedWriter::create`] for the threat
+/// model.
+fn open_no_follow(path: &Path) -> Result<File, EncryptError> {
+    let mut opts = OpenOptions::new();
+    let _ = opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        let _ = opts.custom_flags(o_nofollow());
+    }
+    match opts.open(path) {
+        Ok(f) => Ok(f),
+        Err(e) => Err(translate_open_err(path, e)),
+    }
+}
+
+/// Translate an `open()` error, promoting the `O_NOFOLLOW` rejection into
+/// [`EncryptError::SymlinkTarget`] so callers can distinguish a planted
+/// symlink from a generic I/O failure.
+fn translate_open_err(path: &Path, e: std::io::Error) -> EncryptError {
+    #[cfg(unix)]
+    {
+        // Linux: ELOOP = 40. macOS / BSD: ELOOP = 62. On macOS some kernels
+        // return EMLINK for `O_NOFOLLOW` denial instead of ELOOP; accept both.
+        // We match on raw_os_error so we don't depend on std's ErrorKind
+        // taxonomy, which is not stable across Rust versions for this case.
+        const ELOOP_LINUX: i32 = 40;
+        const ELOOP_BSD: i32 = 62;
+        const EMLINK_BSD: i32 = 31;
+        if let Some(code) = e.raw_os_error()
+            && matches!(code, ELOOP_LINUX | ELOOP_BSD | EMLINK_BSD)
+        {
+            return EncryptError::SymlinkTarget {
+                path: path.to_path_buf(),
+            };
+        }
+    }
+    EncryptError::Io(e)
 }
 
 /// A thread-safe wrapper around [`EncryptedWriter`] suitable for sharing
@@ -842,5 +963,85 @@ mod tests {
             err.contains("unknown field"),
             "error should mention unknown field: {err}"
         );
+    }
+
+    // --- F-31: symlink TOCTOU ---
+
+    #[cfg(unix)]
+    #[test]
+    fn create_refuses_to_follow_symlink_at_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir();
+        // Plant a sensitive file the attacker would like us to clobber.
+        let sensitive = dir.join("sensitive.dat");
+        std::fs::write(&sensitive, b"I should not be overwritten").unwrap();
+        // Attacker places a symlink at the path we are asked to write to,
+        // pointing at the sensitive file.
+        let enc_path = dir.join("archive.enc");
+        symlink(&sensitive, &enc_path).unwrap();
+
+        let ring = make_key_ring("k1", &[("k1", [0xcc; 32])]);
+        let err = EncryptedWriter::create(&enc_path, &ring).unwrap_err();
+        match err {
+            EncryptError::SymlinkTarget { path } => assert_eq!(path, enc_path),
+            other => panic!("expected SymlinkTarget, got {other:?}"),
+        }
+
+        // The sensitive file is untouched.
+        assert_eq!(
+            std::fs::read(&sensitive).unwrap(),
+            b"I should not be overwritten"
+        );
+    }
+
+    // --- F-33: counter overflow never writes + never reuses a nonce ---
+
+    #[test]
+    fn write_chunk_at_counter_max_refuses_before_writing() {
+        let dir = tempdir();
+        let enc_path = dir.join("counter_max.enc");
+        let ring = make_key_ring("k1", &[("k1", [0xdd; 32])]);
+
+        // Write a normal chunk first so the header + one data chunk are on disk.
+        let pre_len = {
+            let mut w = EncryptedWriter::create(&enc_path, &ring).unwrap();
+            w.write_chunk(b"ok").unwrap();
+            // Force the next call to exhaust the counter.
+            w.counter = u32::MAX;
+            w.flush().unwrap();
+            let len_after_flush = std::fs::metadata(&enc_path).unwrap().len();
+
+            let err = w.write_chunk(b"would-overflow").unwrap_err();
+            assert!(matches!(err, EncryptError::CounterOverflow));
+            // Counter must not have advanced past u32::MAX (no silent wrap).
+            assert_eq!(w.counter, u32::MAX);
+            // The failed write must not have appended anything to disk.
+            w.flush().unwrap();
+            let len_after_fail = std::fs::metadata(&enc_path).unwrap().len();
+            assert_eq!(
+                len_after_flush, len_after_fail,
+                "failed write_chunk must not append bytes to the file"
+            );
+
+            // A follow-up finish() must also refuse — without this guard the
+            // terminator would reuse the nonce of the previous call.
+            let err2 = w.finish().unwrap_err();
+            assert!(matches!(err2, EncryptError::CounterOverflow));
+            // No partial terminator was written either.
+            let len_after_finish = std::fs::metadata(&enc_path).unwrap().len();
+            assert_eq!(len_after_flush, len_after_finish);
+            len_after_flush
+        };
+
+        // Drop the writer without a successful finish. The file on disk has
+        // no terminator (we refused to write one), so decrypt_file should
+        // report Truncated — which is exactly the outcome we want: a user
+        // who hit the counter cap is forced to rotate the key or the file,
+        // not to trust a partially-sealed archive.
+        let dec_path = dir.join("counter_max.txt");
+        let err = decrypt_file(&enc_path, &dec_path, &ring).unwrap_err();
+        assert!(matches!(err, EncryptError::Truncated), "got {err:?}");
+        let _ = pre_len; // silence unused-binding when the assert above passes
     }
 }
