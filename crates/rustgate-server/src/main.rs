@@ -1170,11 +1170,12 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
 
     // ── CoT archive retention / rotation ───────────────────────────
     let archive_rotation_handle = if let Some(ref dir) = cli.archive_dir
-        && (cli.archive_max_size > 0 || cli.archive_max_age > 0)
+        && (cli.archive_max_size > 0 || cli.archive_max_age > 0 || cli.archive_max_active_bytes > 0)
     {
         let cfg = archive_rotation::RotationConfig {
             dir: std::path::PathBuf::from(dir),
             max_bytes: cli.archive_max_size,
+            max_active_bytes: cli.archive_max_active_bytes,
             max_age: std::time::Duration::from_secs(cli.archive_max_age),
             // `cli.validate()` enforces `archive_rotate_interval >= 60` when
             // rotation is enabled (F-69), so the `.max(1)` defense here is
@@ -1185,6 +1186,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
         tracing::info!(
             dir = %dir,
             max_bytes = cli.archive_max_size,
+            max_active_bytes = cli.archive_max_active_bytes,
             max_age_secs = cli.archive_max_age,
             interval_secs = cli.archive_rotate_interval,
             "CoT archive rotation enabled",
