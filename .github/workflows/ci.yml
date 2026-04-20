@@ -72,6 +72,17 @@ jobs:
       - name: Enforce shared-infrastructure patterns
         run: bash scripts/check-playbook-drift.sh
 
+      - name: Install pyyaml for release-artifact name check
+        run: python3 -m pip install --user --break-system-packages pyyaml
+
+      # Guards against a future edit of `release-binary.yml` silently making
+      # two matrix entries produce the same `.tar.gz` filename (F-21). Runs
+      # on every PR — even those not touching the workflow — so a rename of
+      # the matrix discriminator in an unrelated file (e.g. a shared shell
+      # helper) still surfaces here before a release tag cuts in.
+      - name: Enforce release artifact filename uniqueness (F-21)
+        run: python3 scripts/check-release-artifact-names.py
+
   lint:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
