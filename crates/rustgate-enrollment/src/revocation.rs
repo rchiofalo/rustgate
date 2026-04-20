@@ -19,6 +19,7 @@ use time::OffsetDateTime;
 use tokio::sync::RwLock;
 
 use crate::error::EnrollmentError;
+use crate::keypair::ZeroizingKeyPair;
 
 /// Default CRL validity period in days.
 const DEFAULT_CRL_VALIDITY_DAYS: u32 = 7;
@@ -122,7 +123,10 @@ pub struct RevocationStore {
     /// In-memory copy of revoked entries, keyed by hex serial.
     entries: RwLock<HashMap<String, RevokedEntry>>,
     /// CA issuer for CRL signing.
-    issuer: Issuer<'static, KeyPair>,
+    ///
+    /// The key is wrapped in [`ZeroizingKeyPair`] so rcgen's serialized-DER
+    /// copy is wiped on drop (issue #766 / F-39).
+    issuer: Issuer<'static, ZeroizingKeyPair>,
     /// CRL validity period in days.
     crl_validity_days: u32,
     /// Cached CRL PEM (regenerated on revocation).
@@ -396,11 +400,15 @@ impl RevocationStore {
     }
 }
 
-/// Build a `Issuer` from CA PEM for CRL signing.
+/// Build a CRL-signing `Issuer` from CA PEM.
+///
+/// The key is wrapped in [`ZeroizingKeyPair`] so the serialized-DER copy
+/// rcgen retains is wiped on drop (issue #766 / F-39). See `keypair.rs`
+/// for the residual ring-level exposure this wrapper does not cover.
 fn build_crl_issuer(
     ca_cert_pem: &str,
     ca_key_pem: &str,
-) -> Result<Issuer<'static, KeyPair>, EnrollmentError> {
+) -> Result<Issuer<'static, ZeroizingKeyPair>, EnrollmentError> {
     // Shared PEM helpers from `rustgate_core::pem` for consistent
     // error mapping (`ConfigError::PemParse`).
     let mut ca_certs = rustgate_core::pem::parse_certs(ca_cert_pem.as_bytes())
@@ -414,7 +422,7 @@ fn build_crl_issuer(
     let key_pair = KeyPair::try_from(&key_der)
         .map_err(|e| EnrollmentError::Config(format!("failed to load CA key: {e}")))?;
 
-    Issuer::from_ca_cert_der(&ca_cert_der, key_pair)
+    Issuer::from_ca_cert_der(&ca_cert_der, ZeroizingKeyPair::new(key_pair))
         .map_err(|e| EnrollmentError::Config(format!("failed to build CRL issuer: {e}")))
 }
 

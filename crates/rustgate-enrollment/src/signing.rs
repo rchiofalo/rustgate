@@ -17,11 +17,16 @@ use rustls_pki_types::PrivateKeyDer;
 use zeroize::Zeroizing;
 
 use crate::error::EnrollmentError;
+use crate::keypair::ZeroizingKeyPair;
 
 /// Signs PKCS#10 certificate signing requests with the server CA.
 pub struct CsrSigner {
     /// CA issuer handle combining certificate params and signing key.
-    issuer: Issuer<'static, KeyPair>,
+    ///
+    /// The key is wrapped in [`ZeroizingKeyPair`] so rcgen's serialized-DER
+    /// copy is wiped on drop (issue #766 / F-39). See `keypair.rs` for the
+    /// residual ring-level exposure that this wrapper does not cover.
+    issuer: Issuer<'static, ZeroizingKeyPair>,
     /// Original CA certificate DER bytes for enrollment responses.
     /// Kept separate because `Issuer` is reconstructed from the DER and
     /// clients need the exact original CA cert bytes.
@@ -59,7 +64,9 @@ impl CsrSigner {
         let ca_cert_der = certs.remove(0).to_vec();
 
         // Load CA key — supports PKCS#8, PKCS#1 (RSA), and SEC1 (EC) PEM formats.
-        let ca_key = load_private_key(ca_key_pem)?;
+        // Wrapped in ZeroizingKeyPair so the serialized-DER copy rcgen retains
+        // is wiped on Drop (issue #766 / F-39).
+        let ca_key = ZeroizingKeyPair::new(load_private_key(ca_key_pem)?);
 
         // Build an Issuer directly from the CA cert DER and private key.
         // The Issuer extracts the subject DN and extensions needed for signing
