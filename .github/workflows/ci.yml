@@ -72,8 +72,19 @@ jobs:
       - name: Enforce shared-infrastructure patterns
         run: bash scripts/check-playbook-drift.sh
 
-      - name: Install pyyaml for release-artifact name check
-        run: python3 -m pip install --user --break-system-packages pyyaml
+      - name: Install Python YAML dependency
+        # PyYAML is preinstalled on ubuntu-latest hosted runners but is absent
+        # on the minimal self-hosted Linux runners. Install via apt rather
+        # than pip to avoid the PEP 668 "externally managed" error that
+        # system Python raises on Ubuntu 23.04+ when pip writes to the system
+        # site-packages without --break-system-packages. No-op when already
+        # present. (Same pattern used by the helm job below for the RBAC
+        # scanner.)
+        run: |
+          if ! python3 -c 'import yaml' 2>/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends python3-yaml
+          fi
 
       # Guards against a future edit of `release-binary.yml` silently making
       # two matrix entries produce the same `.tar.gz` filename (F-21). Runs
