@@ -70,6 +70,14 @@ pub(crate) async fn load_group_acl(
     let config: crate::acl_config::GroupAclFile =
         serde_json::from_str(&data).context("parsing group ACL file")?;
 
+    // Reject reserved-sentinel group ids (`__*__`) before the policy
+    // reaches the router. See `GroupAclFile::validate_operator_policy`
+    // for the threat model — a policy keyed by `__plaintext__` would
+    // silently apply to every anonymous plaintext session.
+    if let Err(msg) = config.validate_operator_policy() {
+        anyhow::bail!("invalid group ACL file: {msg}");
+    }
+
     let mut groups = std::collections::HashMap::new();
     for (group_id, entry) in &config.groups {
         let _ = groups.insert(

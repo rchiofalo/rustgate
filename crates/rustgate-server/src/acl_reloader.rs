@@ -79,6 +79,18 @@ impl AclReloader {
             anyhow::anyhow!("failed to parse ACL file {}: {e}", self.acl_path.display())
         })?;
 
+        // Reject reserved-sentinel group ids (`__*__`) on reload, same
+        // guardrail the startup loader applies. A bad reload must fail
+        // closed — the stored hash is NOT updated here, so the next
+        // reload tick re-parses the file and re-reports the same error
+        // instead of silently treating the bad state as "already loaded".
+        if let Err(msg) = config.validate_operator_policy() {
+            return Err(anyhow::anyhow!(
+                "refusing to reload ACL file {}: {msg}",
+                self.acl_path.display()
+            ));
+        }
+
         let mut groups = std::collections::HashMap::new();
         for (group_id, entry) in config.groups {
             let _ = groups.insert(
@@ -383,5 +395,68 @@ mod tests {
         let h1 = AclReloader::compute_hash(b"data-a");
         let h2 = AclReloader::compute_hash(b"data-b");
         assert_ne!(h1, h2);
+    }
+
+    /// A reload that would swap in a policy keyed by a reserved
+    /// sentinel (e.g. `__plaintext__`) must fail closed: the reload
+    /// returns an error, the router continues to serve the previous
+    /// policy, and the stored hash stays on the previous value so the
+    /// next poll re-reports the same error instead of silently
+    /// treating the bad file as "already loaded".
+    ///
+    /// Regression for issue #749 — the scenario where an operator
+    /// hot-edits the ACL JSON to reference the synthetic plaintext
+    /// group and the reloader would otherwise happily swap that into
+    /// the dispatch path.
+    #[test]
+    fn reload_rejects_reserved_sentinel_group() {
+        let dir = tempfile::tempdir().unwrap();
+        write_acl_file(dir.path(), INITIAL_ACL);
+
+        let initial_hash = AclReloader::compute_hash(INITIAL_ACL.as_bytes());
+        let router = Arc::new(Router::new());
+        let reloader = AclReloader::new(
+            dir.path().join("acl.json"),
+            Arc::clone(&router),
+            initial_hash,
+        );
+
+        // Overwrite with a file whose only group is the reserved
+        // plaintext sentinel.
+        write_acl_file(
+            dir.path(),
+            r#"{
+                "groups": {
+                    "__plaintext__": {"send": ["alice"]}
+                }
+            }"#,
+        );
+
+        let err = reloader
+            .reload()
+            .expect_err("sentinel-keyed policy must be rejected on reload");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("__plaintext__"),
+            "error must name the offending key: {msg}"
+        );
+        assert!(msg.contains("reserved"), "error must explain why: {msg}");
+
+        // Router policy is untouched — no ACL was ever installed by
+        // the initial call path, so snapshot stays None.
+        let snap = router.acl_snapshot();
+        assert!(snap.as_ref().is_none(), "router must keep prior state");
+
+        // Prove the stored hash was NOT advanced to the bad-file hash:
+        // overwrite with a *different* good policy (`UPDATED_ACL`
+        // — differs from `INITIAL_ACL` — so the hash comparison
+        // genuinely detects a change) and assert the reload swaps. If
+        // the reloader had mistakenly stored the sentinel file's hash,
+        // the next reload path would skip the parse entirely.
+        write_acl_file(dir.path(), UPDATED_ACL);
+        assert!(
+            reloader.reload().unwrap(),
+            "after writing a different valid file, next reload must swap"
+        );
     }
 }
