@@ -442,3 +442,315 @@ pub(crate) fn write_v5_to_buf(
     .map_err(|e| MqttError::Malformed(format!("write error: {e}")))?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used, unused_results)]
+mod tests {
+    //! Unit tests for the pure codec paths (protocol negotiation, framing,
+    //! serialization). The I/O-wrapping types (`PacketCodec`, `PacketReader`,
+    //! `PacketWriter`) hold a `TlsStream` and are covered by the integration
+    //! tests in `tests/mqtt_integration.rs`; the tests here target the
+    //! byte-level logic that doesn't need a live TLS stream to exercise.
+
+    use mqttbytes::QoS;
+
+    use super::*;
+
+    // -----------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------
+
+    /// Build on-the-wire bytes for a minimal v3.1.1 CONNECT.
+    fn v4_connect_bytes(client_id: &str) -> BytesMut {
+        let connect = mqttbytes::v4::Connect::new(client_id);
+        let mut buf = BytesMut::with_capacity(64);
+        connect.write(&mut buf).expect("write v4 connect");
+        buf
+    }
+
+    /// Build on-the-wire bytes for a minimal v5 CONNECT.
+    fn v5_connect_bytes(client_id: &str) -> BytesMut {
+        let connect = mqttbytes::v5::Connect::new(client_id);
+        let mut buf = BytesMut::with_capacity(64);
+        connect.write(&mut buf).expect("write v5 connect");
+        buf
+    }
+
+    // -----------------------------------------------------------------
+    // Protocol negotiation (try_parse_connect)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn connect_returns_none_for_buffer_shorter_than_ten_bytes() {
+        // The parser needs at least 10 bytes to peek at the protocol level;
+        // anything shorter must be an incremental "read more" signal, not
+        // an error — otherwise we'd reject clients whose CONNECT bytes
+        // arrive in multiple TCP reads (the common case on slow links).
+        let mut buf = BytesMut::from(&b"\x10\x0c\x00\x04MQ"[..]);
+        let mut protocol = None;
+        let r = try_parse_connect(&mut buf, &mut protocol, 16 * 1024).expect("ok");
+        assert!(r.is_none());
+        assert!(
+            protocol.is_none(),
+            "must not commit to a protocol level yet"
+        );
+    }
+
+    #[test]
+    fn connect_returns_none_when_level_byte_is_beyond_buffer() {
+        // Pass the initial 10-byte gate, but use a 3-byte remaining-length
+        // encoding so `level_offset = 1 + rl_len + 2 + 4 = 10` lands
+        // exactly at buffer end — the level byte has not yet arrived.
+        // The parser must return `Ok(None)` ("need more bytes") instead of
+        // committing to a protocol level or reading past the buffer end.
+        //
+        // Bytes: `\x10` (CONNECT), `\x80\x80\x01` (continuation-flagged
+        // remaining length), six filler bytes for the partial variable
+        // header = 10 bytes total.
+        let mut buf = BytesMut::from(&b"\x10\x80\x80\x01XXXXXX"[..]);
+        assert_eq!(buf.len(), 10, "test relies on exact 10-byte boundary");
+        let mut protocol = None;
+        let r = try_parse_connect(&mut buf, &mut protocol, 16 * 1024).expect("ok");
+        assert!(
+            r.is_none(),
+            "must signal need-more-bytes, not commit a level"
+        );
+        assert!(protocol.is_none());
+    }
+
+    #[test]
+    fn connect_rejects_non_connect_packet_type() {
+        // First byte 0x30 == PUBLISH (type 3 in upper nibble). Any packet
+        // other than CONNECT at handshake time is a protocol violation —
+        // the server must abort immediately rather than wait for more
+        // bytes that would never reinterpret this as a CONNECT.
+        let mut buf = BytesMut::from(&b"\x30\x0c\x00\x04MQTT\x04\x02\x00\x00"[..]);
+        let mut protocol = None;
+        let err = try_parse_connect(&mut buf, &mut protocol, 16 * 1024).unwrap_err();
+        assert!(matches!(err, MqttError::ConnectExpected));
+        assert!(protocol.is_none(), "protocol must stay unset on rejection");
+    }
+
+    #[test]
+    fn connect_rejects_unsupported_protocol_level() {
+        // Construct a syntactically valid CONNECT frame whose protocol
+        // level is 3 (legacy MQTT 3.1 / "MQIsdp"). The parser only scans
+        // for the level byte at a known offset; surfacing the raw value
+        // in the error helps operators diagnose legacy clients.
+        let mut buf = BytesMut::from(&b"\x10\x0c\x00\x04MQTT\x03\x02\x00\x00"[..]);
+        let mut protocol = None;
+        let err = try_parse_connect(&mut buf, &mut protocol, 16 * 1024).unwrap_err();
+        match err {
+            MqttError::UnsupportedProtocol(level) => assert_eq!(level, 3),
+            other => panic!("expected UnsupportedProtocol(3), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn connect_level_4_negotiates_v311() {
+        let mut buf = v4_connect_bytes("client-a");
+        let mut protocol = None;
+        let packet = try_parse_connect(&mut buf, &mut protocol, 16 * 1024)
+            .expect("ok")
+            .expect("packet decoded");
+        assert_eq!(protocol, Some(ProtocolLevel::V311));
+        assert!(matches!(
+            packet,
+            MqttPacket::V4(mqttbytes::v4::Packet::Connect(_))
+        ));
+        assert!(buf.is_empty(), "full packet was consumed");
+    }
+
+    #[test]
+    fn connect_level_5_negotiates_v50() {
+        let mut buf = v5_connect_bytes("client-b");
+        let mut protocol = None;
+        let packet = try_parse_connect(&mut buf, &mut protocol, 16 * 1024)
+            .expect("ok")
+            .expect("packet decoded");
+        assert_eq!(protocol, Some(ProtocolLevel::V50));
+        match packet {
+            MqttPacket::V5(boxed) => assert!(matches!(*boxed, mqttbytes::v5::Packet::Connect(_))),
+            MqttPacket::V4(_) => panic!("expected v5 packet"),
+        }
+        assert!(buf.is_empty(), "full packet was consumed");
+    }
+
+    // -----------------------------------------------------------------
+    // Top-level dispatcher (try_parse)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn try_parse_with_v311_protocol_decodes_without_renegotiation() {
+        // Once the handshake has chosen V311, subsequent packets must be
+        // decoded via the v4 codec — not routed back through the CONNECT
+        // negotiator. A PUBACK is a good signal because it exists in
+        // both versions but has different wire formats for reason codes,
+        // so picking the wrong codec would surface as Malformed.
+        let puback = mqttbytes::v4::PubAck::new(42);
+        let mut buf = BytesMut::with_capacity(8);
+        puback.write(&mut buf).expect("encode puback");
+        let mut protocol = Some(ProtocolLevel::V311);
+        let packet = try_parse(&mut buf, &mut protocol, 16 * 1024)
+            .expect("ok")
+            .expect("decoded");
+        assert!(matches!(
+            packet,
+            MqttPacket::V4(mqttbytes::v4::Packet::PubAck(pa)) if pa.pkid == 42,
+        ));
+    }
+
+    #[test]
+    fn try_parse_with_v50_protocol_decodes_without_renegotiation() {
+        // Symmetric coverage for the v5 dispatch arm — a regression that
+        // routed post-handshake v5 traffic through the CONNECT negotiator
+        // would fail every non-CONNECT packet type on a v5 session.
+        let puback = mqttbytes::v5::PubAck::new(99);
+        let mut buf = BytesMut::with_capacity(16);
+        puback.write(&mut buf).expect("encode v5 puback");
+        let mut protocol = Some(ProtocolLevel::V50);
+        let packet = try_parse(&mut buf, &mut protocol, 16 * 1024)
+            .expect("ok")
+            .expect("decoded");
+        match packet {
+            MqttPacket::V5(boxed) => assert!(matches!(
+                *boxed,
+                mqttbytes::v5::Packet::PubAck(pa) if pa.pkid == 99,
+            )),
+            MqttPacket::V4(_) => panic!("expected v5 decode"),
+        }
+    }
+
+    #[test]
+    fn try_parse_insufficient_bytes_returns_none() {
+        // The codec owns buffer refill; a partial frame MUST NOT error
+        // — it must signal "read more" so the outer loop can fill the
+        // buffer on the next tokio read.
+        let mut buf = BytesMut::from(&b"\x40"[..]); // PUBACK type byte alone
+        let mut protocol = Some(ProtocolLevel::V311);
+        let r = try_parse(&mut buf, &mut protocol, 16 * 1024).expect("ok");
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn try_parse_malformed_frame_returns_malformed_error() {
+        // SUBSCRIBE with rem_len=0 — mqttbytes emits PayloadRequired;
+        // we remap all non-insufficient errors to `Malformed(String)` so
+        // the session layer has a single fatal-parse path to handle.
+        let mut buf = BytesMut::from(&b"\x82\x00"[..]);
+        let mut protocol = Some(ProtocolLevel::V311);
+        let err = try_parse(&mut buf, &mut protocol, 16 * 1024).unwrap_err();
+        assert!(matches!(err, MqttError::Malformed(_)));
+    }
+
+    #[test]
+    fn try_parse_none_protocol_delegates_to_connect_negotiator() {
+        // With protocol=None, try_parse must route to try_parse_connect
+        // — the fact that this is a PUBLISH must surface as
+        // `ConnectExpected`, not as a parse error on the PUBLISH itself.
+        let mut buf = BytesMut::from(&b"\x30\x0c\x00\x04MQTT\x04\x02\x00\x00"[..]);
+        let mut protocol: Option<ProtocolLevel> = None;
+        let err = try_parse(&mut buf, &mut protocol, 16 * 1024).unwrap_err();
+        assert!(matches!(err, MqttError::ConnectExpected));
+    }
+
+    // -----------------------------------------------------------------
+    // Serialization (write_v4_to_buf / write_v5_to_buf)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn write_v4_connack_roundtrips_through_parser() {
+        let connack = mqttbytes::v4::ConnAck {
+            session_present: false,
+            code: mqttbytes::v4::ConnectReturnCode::Success,
+        };
+        let mut buf = BytesMut::with_capacity(16);
+        write_v4_to_buf(&mqttbytes::v4::Packet::ConnAck(connack), &mut buf).expect("serialize");
+        assert!(!buf.is_empty());
+
+        let decoded = mqttbytes::v4::read(&mut buf, 16 * 1024).expect("parse");
+        match decoded {
+            mqttbytes::v4::Packet::ConnAck(a) => {
+                assert_eq!(a.code, mqttbytes::v4::ConnectReturnCode::Success);
+                assert!(!a.session_present);
+            }
+            other => panic!("expected ConnAck, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_v4_publish_roundtrips() {
+        let publish = mqttbytes::v4::Publish::new("a/b", QoS::AtMostOnce, b"payload".to_vec());
+        let mut buf = BytesMut::with_capacity(64);
+        write_v4_to_buf(&mqttbytes::v4::Packet::Publish(publish), &mut buf).expect("serialize");
+
+        let decoded = mqttbytes::v4::read(&mut buf, 16 * 1024).expect("parse");
+        match decoded {
+            mqttbytes::v4::Packet::Publish(p) => {
+                assert_eq!(p.topic, "a/b");
+                assert_eq!(&p.payload[..], b"payload");
+            }
+            other => panic!("expected Publish, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_v4_server_only_packets_are_silent_noop() {
+        // The server never encodes Connect, Subscribe, or PingReq — the
+        // `_ => Ok(())` arm in write_v4_to_buf silently skips them. This
+        // is deliberate: flipping it to panic-on-unknown would make every
+        // future packet-type addition a potential DoS vector. Pinning
+        // the contract here keeps a future refactor honest.
+        let cases: [mqttbytes::v4::Packet; 3] = [
+            mqttbytes::v4::Packet::Connect(mqttbytes::v4::Connect::new("c")),
+            mqttbytes::v4::Packet::Subscribe(mqttbytes::v4::Subscribe::new("t", QoS::AtMostOnce)),
+            mqttbytes::v4::Packet::PingReq,
+        ];
+        for pkt in cases {
+            let mut buf = BytesMut::with_capacity(16);
+            write_v4_to_buf(&pkt, &mut buf).expect("noop");
+            assert!(
+                buf.is_empty(),
+                "server-only packet {pkt:?} must not emit bytes",
+            );
+        }
+    }
+
+    #[test]
+    fn write_v5_connack_roundtrips_through_parser() {
+        let connack = mqttbytes::v5::ConnAck {
+            session_present: false,
+            code: mqttbytes::v5::ConnectReturnCode::Success,
+            properties: Some(mqttbytes::v5::ConnAckProperties::new()),
+        };
+        let mut buf = BytesMut::with_capacity(16);
+        write_v5_to_buf(&mqttbytes::v5::Packet::ConnAck(connack), &mut buf).expect("serialize");
+        assert!(!buf.is_empty());
+
+        let decoded = mqttbytes::v5::read(&mut buf, 16 * 1024).expect("parse");
+        assert!(matches!(
+            decoded,
+            mqttbytes::v5::Packet::ConnAck(a) if matches!(a.code, mqttbytes::v5::ConnectReturnCode::Success),
+        ));
+    }
+
+    #[test]
+    fn write_v5_disconnect_produces_bytes() {
+        // Distinct from v4: the server actively sends v5 Disconnect with
+        // a reason code. A regression in the `Disconnect(p) => p.write()`
+        // arm would silently drop every server-initiated disconnect,
+        // indistinguishable from "client reset the TCP" to the client.
+        let disconnect = mqttbytes::v5::Disconnect::new();
+        let mut buf = BytesMut::with_capacity(16);
+        write_v5_to_buf(&mqttbytes::v5::Packet::Disconnect(disconnect), &mut buf)
+            .expect("serialize");
+        assert!(!buf.is_empty());
+        // First byte is the fixed header: upper nibble is packet type.
+        // DISCONNECT is type 14 (0xE0 >> 4 == 0x0E).
+        assert_eq!(buf[0] >> 4, 0x0E);
+    }
+}
