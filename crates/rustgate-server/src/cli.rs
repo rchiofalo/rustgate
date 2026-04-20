@@ -832,6 +832,19 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 100_000, env = "RUSTGATE_DEDUP_CACHE_SIZE")]
     pub(crate) dedup_cache_size: usize,
 
+    /// Opt into cross-tenant duplicate suppression. When `false` (the
+    /// default), the dedup key folds in the sender's tenant so a
+    /// message sent by tenant `A` CANNOT suppress a byte-identical
+    /// message sent by tenant `B`. Setting this to `true` forces the
+    /// tenant slot empty on every lookup, restoring the pre-#722
+    /// behaviour. **Unsafe in any multi-tenant deployment where
+    /// tenants do not fully trust each other** — it opens a timing
+    /// side-channel where a malicious tenant can probe for specific
+    /// messages in another tenant. Leave disabled unless you have a
+    /// concrete reason and have accepted the risk.
+    #[arg(long, default_value_t = false, env = "RUSTGATE_DEDUP_CROSS_TENANT")]
+    pub(crate) dedup_cross_tenant: bool,
+
     /// Enable per-UID delta encoding for outbound CoT events on XML sessions.
     /// When enabled, each writer task tracks the last-sent event per UID
     /// and emits a compact `<delta>` wrapper carrying only the fields
@@ -1444,6 +1457,7 @@ define_config_file! {
     otlp_metrics_interval: u64,
     dedup_window_secs: u64,
     dedup_cache_size: usize,
+    dedup_cross_tenant: bool,
     cot_delta_encoding: bool,
     cot_delta_cache_size: u64,
     cot_delta_epsilon_meters: f64,

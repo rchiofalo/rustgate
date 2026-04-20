@@ -1340,7 +1340,7 @@ impl Router {
         {
             let guard = self.dedup.load();
             if let Some(ref dedup) = **guard
-                && dedup.check_payload(&msg.payload)
+                && dedup.check_payload(msg.source.tenant.as_deref().unwrap_or(""), &msg.payload)
             {
                 debug!(
                     source = %msg.source.cn,

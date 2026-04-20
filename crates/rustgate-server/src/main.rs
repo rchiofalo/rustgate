@@ -682,6 +682,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     #[cfg_attr(not(feature = "metrics"), allow(unused_mut))]
     if let Some(mut dedup) =
         rustgate_transport::DedupCache::from_secs(cli.dedup_window_secs, cli.dedup_cache_size)
+            .map(|d| d.with_cross_tenant(cli.dedup_cross_tenant))
     {
         #[cfg(feature = "metrics")]
         {
@@ -693,11 +694,23 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
             }));
         }
         router.set_dedup(Some(dedup));
-        tracing::info!(
-            window_secs = cli.dedup_window_secs,
-            cache_size = cli.dedup_cache_size,
-            "cross-path message deduplication enabled"
-        );
+        if cli.dedup_cross_tenant {
+            tracing::warn!(
+                window_secs = cli.dedup_window_secs,
+                cache_size = cli.dedup_cache_size,
+                "cross-path message deduplication enabled WITHOUT tenant \
+                 isolation (--dedup-cross-tenant); cross-tenant timing \
+                 side-channel is open (issue #722) — only use in \
+                 single-tenant deployments or with explicit operator \
+                 acceptance",
+            );
+        } else {
+            tracing::info!(
+                window_secs = cli.dedup_window_secs,
+                cache_size = cli.dedup_cache_size,
+                "cross-path message deduplication enabled (tenant-isolated)"
+            );
+        }
     }
 
     // ── ACL hot-reload ─────────────────────────────────────────────
