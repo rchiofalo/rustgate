@@ -120,6 +120,11 @@ impl CotArchiver {
     /// Return the path of the archive segment that is currently active
     /// (i.e. the file the writer would append to right now).
     ///
+    /// Encrypted archivers include the `.enc` suffix — previously this
+    /// always returned the plaintext name, which meant the rotation
+    /// sweep never actually matched (and therefore never excluded) the
+    /// encrypted active file from deletion.
+    ///
     /// The rotation task uses this to exclude the in-progress file from
     /// both size accounting and deletion sweeps, avoiding races against
     /// the writer.
@@ -129,7 +134,80 @@ impl CotArchiver {
             .unwrap_or_default()
             .as_secs();
         let today = utc_date_string(secs);
-        self.dir.join(format!("cot-{today}.jsonl"))
+        if self.key_ring.is_some() {
+            self.dir.join(format!("cot-{today}.jsonl.enc"))
+        } else {
+            self.dir.join(format!("cot-{today}.jsonl"))
+        }
+    }
+
+    /// If the currently-active archive file exceeds `max_bytes`, seal
+    /// and rename it to a timestamp-suffixed path, then drop the writer
+    /// so the next record opens a fresh segment at the stable
+    /// `cot-<date>.jsonl[.enc]` name.
+    ///
+    /// Returns `Some(rolled_path)` when a roll occurred; `None` when
+    /// `max_bytes == 0`, the writer is not open yet, or the on-disk
+    /// size is still under the cap.
+    ///
+    /// Encrypted files are sealed by dropping the underlying
+    /// [`EncryptedWriter`](rustgate_core::encrypted::EncryptedWriter),
+    /// which writes the terminator chunk in its `Drop` impl. Without
+    /// that the rolled `.enc` file would fail decryption.
+    pub fn roll_if_over_size(&self, max_bytes: u64) -> Option<PathBuf> {
+        if max_bytes == 0 {
+            return None;
+        }
+        let active = self.active_path();
+        let mut state = match self.inner.lock() {
+            Ok(s) => s,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        // Flush any buffered writes so the on-disk size accurately
+        // reflects what we have written. BufWriter (plaintext) batches
+        // small writes; the EncryptedWriter already persists each chunk
+        // on `write_chunk` but flushing is still cheap.
+        let writer = state.writer.as_mut()?;
+        match writer {
+            ArchiveSink::Plain(p) => {
+                let _ = p.flush();
+            }
+            ArchiveSink::Encrypted(e) => {
+                let _ = e.flush();
+            }
+        }
+
+        let size = std::fs::metadata(&active).map(|m| m.len()).unwrap_or(0);
+        if size < max_bytes {
+            return None;
+        }
+
+        // Over threshold: drop the writer (this seals encrypted files
+        // via `EncryptedWriter::Drop`) then rename the now-closed file
+        // to carry a roll-timestamp suffix. Clearing `current_date`
+        // forces `write_line` to open a fresh segment on the next
+        // write — the stable `cot-<date>.jsonl[.enc]` path is free
+        // again after the rename.
+        state.writer = None;
+        let rolled = rolled_path(&active);
+        if let Err(err) = std::fs::rename(&active, &rolled) {
+            tracing::warn!(
+                from = %active.display(),
+                to = %rolled.display(),
+                error = %err,
+                "archive rotation: failed to rename rolled segment",
+            );
+            return None;
+        }
+        state.current_date = String::new();
+        tracing::info!(
+            rolled = %rolled.display(),
+            bytes = size,
+            max_bytes,
+            "CoT archive: rolled active segment due to size cap",
+        );
+        Some(rolled)
     }
 
     /// Flush any buffered data to disk.
@@ -212,6 +290,40 @@ fn write_line(
     if let Err(e) = res {
         tracing::error!(error = %e, "failed to write archive line");
     }
+}
+
+/// Build the timestamped roll-off path for an active archive segment.
+///
+/// Given `<dir>/cot-<date>.jsonl[.enc]`, inserts a `T<hh-mm-ss>` stamp
+/// before the `.jsonl` extension so plaintext and encrypted paths share
+/// the same suffix placement. The stamp is the current UTC time-of-day;
+/// collisions at sub-second precision are tolerated — the second roll
+/// would observe the target path already exists via the `rename` error
+/// and log a warning without dropping data (the next rotation tick
+/// retries with a later timestamp).
+fn rolled_path(active: &std::path::Path) -> PathBuf {
+    let secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let in_day = secs % 86_400;
+    let h = (in_day / 3600) as u32;
+    let m = ((in_day / 60) % 60) as u32;
+    let s = (in_day % 60) as u32;
+    let stamp = format!("T{h:02}-{m:02}-{s:02}");
+    let parent = active.parent().unwrap_or_else(|| std::path::Path::new(""));
+    let name = active
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    let new_name = match name.find(".jsonl") {
+        Some(idx) => {
+            let (head, tail) = name.split_at(idx);
+            format!("{head}{stamp}{tail}")
+        }
+        None => format!("{name}{stamp}"),
+    };
+    parent.join(new_name)
 }
 
 fn open_sink(
@@ -300,6 +412,8 @@ fn base64_encode(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::panic, clippy::unwrap_used)]
+
     use super::*;
 
     #[test]
@@ -463,6 +577,266 @@ mod tests {
         assert!(plaintext.ends_with('\n'));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rolled_path_inserts_stamp_before_jsonl_plaintext() {
+        let active = std::path::PathBuf::from("/var/archive/cot-2026-04-20.jsonl");
+        let rolled = rolled_path(&active);
+        let name = rolled.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.starts_with("cot-2026-04-20T"),
+            "name should start with stable prefix: {name}"
+        );
+        assert!(
+            name.ends_with(".jsonl"),
+            "name should end with .jsonl: {name}"
+        );
+        // The stamp should be exactly T<hh-mm-ss>, i.e. 9 chars wedged
+        // between the date and the extension.
+        assert_eq!(name.len(), "cot-2026-04-20".len() + 9 + ".jsonl".len());
+        assert_eq!(rolled.parent(), Some(std::path::Path::new("/var/archive")));
+    }
+
+    #[test]
+    fn rolled_path_inserts_stamp_before_jsonl_encrypted() {
+        // The `.enc` suffix must be preserved — sealing happens on the
+        // encrypted file so the rolled name must still carry `.enc`.
+        let active = std::path::PathBuf::from("/var/archive/cot-2026-04-20.jsonl.enc");
+        let rolled = rolled_path(&active);
+        let name = rolled.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("cot-2026-04-20T"));
+        assert!(
+            name.ends_with(".jsonl.enc"),
+            "must keep .enc suffix: {name}"
+        );
+    }
+
+    #[tokio::test]
+    async fn roll_if_over_size_rolls_plaintext_segment() {
+        // Record enough bytes to exceed the cap, call roll_if_over_size,
+        // and assert:
+        //   (a) the original active path is gone,
+        //   (b) a timestamp-suffixed sibling file now holds the data,
+        //   (c) a subsequent record() re-opens the stable active path.
+        let dir = std::env::temp_dir().join(format!(
+            "rustgate-archive-roll-plain-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let archiver = CotArchiver::new(&dir);
+        let msg = make_test_msg();
+
+        // Write a few records so the active file has some on-disk bytes.
+        for _ in 0..5 {
+            archiver.record(&msg).await;
+        }
+        archiver.flush();
+
+        let active_before = archiver.active_path();
+        let size_before = std::fs::metadata(&active_before)
+            .expect("active file present")
+            .len();
+        assert!(size_before > 0);
+
+        // Cap well below what we just wrote.
+        let rolled = archiver
+            .roll_if_over_size(1)
+            .expect("should roll when size > cap");
+
+        assert_ne!(rolled, active_before, "rolled name must differ from active");
+        assert!(rolled.exists(), "rolled file must exist on disk");
+        assert!(
+            !active_before.exists(),
+            "stable active path should be vacant after the rename"
+        );
+        assert_eq!(
+            std::fs::metadata(&rolled).unwrap().len(),
+            size_before,
+            "rolled file should hold all the bytes we wrote",
+        );
+
+        // After the roll, the next record re-opens the stable path.
+        archiver.record(&msg).await;
+        archiver.flush();
+        assert!(
+            active_before.exists(),
+            "record() after roll should open a fresh active segment"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn roll_if_over_size_no_op_when_writer_not_open() {
+        // With no record() call yet, the writer is None. Rolling must
+        // be a no-op — we have nothing to seal or rename.
+        let dir = std::env::temp_dir().join(format!(
+            "rustgate-archive-roll-notopen-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let archiver = CotArchiver::new(&dir);
+        assert_eq!(archiver.roll_if_over_size(1024), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn roll_if_over_size_no_op_when_under_cap() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustgate-archive-roll-undercap-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let archiver = CotArchiver::new(&dir);
+        archiver.record(&make_test_msg()).await;
+        archiver.flush();
+
+        // Cap well above what we wrote.
+        assert_eq!(archiver.roll_if_over_size(10 * 1024 * 1024), None);
+        assert!(archiver.active_path().exists(), "active file must remain");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn roll_if_over_size_zero_cap_is_disabled() {
+        // max_bytes == 0 means "feature off" — the archiver must not
+        // touch the file even if it would otherwise qualify.
+        let dir = std::env::temp_dir().join(format!(
+            "rustgate-archive-roll-disabled-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let archiver = CotArchiver::new(&dir);
+        for _ in 0..3 {
+            archiver.record(&make_test_msg()).await;
+        }
+        archiver.flush();
+        let before = archiver.active_path();
+        let bytes = std::fs::metadata(&before).unwrap().len();
+
+        assert_eq!(archiver.roll_if_over_size(0), None);
+        assert!(before.exists(), "zero cap must not roll");
+        assert_eq!(std::fs::metadata(&before).unwrap().len(), bytes);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn active_path_encrypted_carries_enc_suffix() {
+        use std::collections::BTreeMap;
+
+        let dir = std::env::temp_dir().join(format!(
+            "rustgate-archive-active-enc-{}",
+            std::process::id()
+        ));
+        // No I/O — just constructing the archiver to check active_path().
+        let mut keys = BTreeMap::new();
+        let _ = keys.insert(
+            "k1".to_string(),
+            "1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+        );
+        let kf = rustgate_core::encrypted::KeyFile {
+            active_key_id: "k1".to_string(),
+            keys,
+        };
+        let bytes = serde_json::to_vec(&kf).unwrap();
+        let ring =
+            std::sync::Arc::new(rustgate_core::encrypted::KeyRing::from_bytes(&bytes).unwrap());
+
+        let archiver = CotArchiver::with_encryption(&dir, ring);
+        let active = archiver.active_path();
+        let name = active.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.ends_with(".jsonl.enc"),
+            "encrypted active_path must carry .enc suffix: {name}"
+        );
+    }
+
+    #[tokio::test]
+    async fn roll_if_over_size_rolls_encrypted_segment_and_round_trips() {
+        // Core property: after a size-triggered roll on an encrypted
+        // archiver the rolled `.enc` file must be fully sealed so
+        // `decrypt_file` can round-trip it. This is what makes dropping
+        // the writer the correct sealing mechanism — `EncryptedWriter`
+        // writes the terminator chunk on drop.
+        use std::collections::BTreeMap;
+
+        let dir =
+            std::env::temp_dir().join(format!("rustgate-archive-roll-enc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut keys = BTreeMap::new();
+        let _ = keys.insert(
+            "k1".to_string(),
+            "2222222222222222222222222222222222222222222222222222222222222222".to_string(),
+        );
+        let kf = rustgate_core::encrypted::KeyFile {
+            active_key_id: "k1".to_string(),
+            keys,
+        };
+        let bytes = serde_json::to_vec(&kf).unwrap();
+        let ring =
+            std::sync::Arc::new(rustgate_core::encrypted::KeyRing::from_bytes(&bytes).unwrap());
+
+        let archiver = CotArchiver::with_encryption(&dir, std::sync::Arc::clone(&ring));
+        let msg = make_test_msg();
+        for _ in 0..4 {
+            archiver.record(&msg).await;
+        }
+        archiver.flush();
+
+        let active_before = archiver.active_path();
+        assert!(
+            active_before.exists(),
+            "encrypted active file must exist before roll: {}",
+            active_before.display()
+        );
+
+        let rolled = archiver
+            .roll_if_over_size(1)
+            .expect("should roll encrypted segment");
+        assert!(rolled.exists(), "rolled .enc file must exist");
+        assert!(
+            rolled.to_string_lossy().ends_with(".jsonl.enc"),
+            "rolled encrypted file must retain .enc suffix: {}",
+            rolled.display()
+        );
+
+        // Round-trip decrypt the rolled file: if sealing failed this
+        // returns `MissingTerminator`.
+        let out = dir.join("decrypted.jsonl");
+        rustgate_core::encrypted::decrypt_file(&rolled, &out, &ring)
+            .expect("rolled .enc should be fully sealed and decrypt cleanly");
+        let plaintext = std::fs::read_to_string(&out).unwrap();
+        assert!(plaintext.contains("\"cn\":\"alice\""));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn make_test_msg() -> rustgate_core::message::RoutableMessage {
+        rustgate_core::message::RoutableMessage {
+            source: rustgate_core::identity::Identity::new(
+                "alice".to_string(),
+                "fp-123".to_string(),
+                std::collections::BTreeSet::new(),
+            )
+            .expect("valid identity"),
+            destination: rustgate_core::message::Destination::Broadcast,
+            payload: bytes::Bytes::from_static(b"<event/>"),
+            metadata: rustgate_core::message::Metadata {
+                received_at: SystemTime::now(),
+                source_protocol: "cot".to_string(),
+                message_type: rustgate_core::message::MessageType::Position,
+                ttl: None,
+            },
+        }
     }
 
     #[tokio::test]

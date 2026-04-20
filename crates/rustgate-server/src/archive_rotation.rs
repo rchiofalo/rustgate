@@ -13,8 +13,14 @@
 //! * `max_bytes` — after the age sweep, if the remaining files still
 //!   exceed `max_bytes`, the oldest files (by mtime) are deleted until
 //!   the total drops below the cap.
+//! * `max_active_bytes` — before each sweep, if the currently-written
+//!   segment exceeds this cap, the archiver seals and rolls it to a
+//!   timestamp-suffixed sibling. Without this, a flood of events (e.g.
+//!   a policy spamming `Obligation::Unknown(...)` — see #887 Part 4.4)
+//!   can grow the active file to tens of gigabytes between daily
+//!   rotations, degrading startup and filling disk.
 //!
-//! Both bounds default to `0`, which disables them.
+//! All three bounds default to `0`, which disables them.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,6 +35,11 @@ pub struct RotationConfig {
     pub dir: PathBuf,
     /// Maximum total bytes across all archive files. `0` = unlimited.
     pub max_bytes: u64,
+    /// Per-active-segment byte cap. When the segment currently being
+    /// appended to exceeds this size, the rotation task asks the
+    /// archiver to seal + rename the file and open a fresh segment.
+    /// `0` = unlimited. Has no effect without `archiver`.
+    pub max_active_bytes: u64,
     /// Maximum file age. `Duration::ZERO` = unlimited.
     pub max_age: Duration,
     /// Interval between rotation passes.
@@ -36,7 +47,7 @@ pub struct RotationConfig {
     /// Optional reference to the live archiver. When set, the rotation
     /// pass will exclude the archiver's currently active segment from
     /// both size accounting and deletion sweeps so it never races the
-    /// writer.
+    /// writer. Required for `max_active_bytes` to take effect.
     pub archiver: Option<Arc<CotArchiver>>,
 }
 
@@ -180,6 +191,18 @@ pub fn spawn(cfg: RotationConfig) -> tokio::task::JoinHandle<()> {
         let _ = ticker.tick().await;
         loop {
             let _ = ticker.tick().await;
+
+            // Per-active-segment size check runs BEFORE the directory
+            // sweep so the just-rolled file is immediately eligible for
+            // eviction by `max_bytes` / `max_age` in the same pass.
+            if let Some(archiver) = cfg.archiver.as_ref()
+                && cfg.max_active_bytes > 0
+            {
+                let archiver = Arc::clone(archiver);
+                let cap = cfg.max_active_bytes;
+                let _ = tokio::task::spawn_blocking(move || archiver.roll_if_over_size(cap)).await;
+            }
+
             let dir = cfg.dir.clone();
             let max_bytes = cfg.max_bytes;
             let max_age = cfg.max_age;

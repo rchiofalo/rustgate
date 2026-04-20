@@ -1008,9 +1008,23 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 0, env = "RUSTGATE_ARCHIVE_MAX_AGE")]
     pub(crate) archive_max_age: u64,
 
+    /// Per-active-segment byte cap for the CoT archive. When the file
+    /// currently being appended to grows beyond this size, the archiver
+    /// seals it (writing the encrypted terminator when applicable),
+    /// renames it with a `T<hh-mm-ss>` suffix, and opens a fresh
+    /// segment at the stable `cot-<date>.jsonl[.enc]` path. Complements
+    /// the daily date-based rotation for workloads where a single day
+    /// can produce tens of gigabytes — e.g. a misbehaving policy that
+    /// emits an audit record per message (#887 Part 4.4).
+    ///
+    /// Has no effect unless `--archive-dir` is set. `0` = unlimited.
+    #[arg(long, default_value_t = 0, env = "RUSTGATE_ARCHIVE_MAX_ACTIVE_BYTES")]
+    pub(crate) archive_max_active_bytes: u64,
+
     /// Interval (in seconds) between archive rotation passes. Defaults
     /// to 60s. Has no effect unless `--archive-dir` is set and at least
-    /// one of `--archive-max-size` or `--archive-max-age` is non-zero.
+    /// one of `--archive-max-size`, `--archive-max-age`, or
+    /// `--archive-max-active-bytes` is non-zero.
     #[arg(long, default_value_t = 60, env = "RUSTGATE_ARCHIVE_ROTATE_INTERVAL")]
     pub(crate) archive_rotate_interval: u64,
 
@@ -1456,6 +1470,7 @@ define_config_file! {
     archive_key_file: Option<std::path::PathBuf>,
     archive_max_size: u64,
     archive_max_age: u64,
+    archive_max_active_bytes: u64,
     archive_rotate_interval: u64,
     package_max_age_hours: u64,
     audit_log: Option<String>,
@@ -1566,8 +1581,10 @@ impl Cli {
         // window and increases load for no operator benefit. Enforce a
         // hard minimum of MIN_ROTATION_INTERVAL_SECS and warn below the
         // recommended RECOMMENDED_MIN_ROTATION_INTERVAL_SECS.
-        let archive_rotation_enabled =
-            self.archive_dir.is_some() && (self.archive_max_size > 0 || self.archive_max_age > 0);
+        let archive_rotation_enabled = self.archive_dir.is_some()
+            && (self.archive_max_size > 0
+                || self.archive_max_age > 0
+                || self.archive_max_active_bytes > 0);
         if archive_rotation_enabled {
             if self.archive_rotate_interval < MIN_ROTATION_INTERVAL_SECS {
                 anyhow::bail!(
