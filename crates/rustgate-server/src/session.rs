@@ -1046,3 +1046,201 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for PrefixedReader<R>
         std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used, unused_results)]
+mod tests {
+    use rustgate_transport::{RawLengthPrefixedCodec, RawLineCodec, TakXmlCodec};
+
+    use super::*;
+
+    /// Minimal CoT v2 event used to exercise the delta encoder. Kept in
+    /// sync shape-wise with the fixture `rustgate_cot::delta::tests`
+    /// already uses — any divergence there should break this helper.
+    fn cot_event(uid: &str, lat: f64, lon: f64, time: &str) -> Bytes {
+        Bytes::from(format!(
+            r#"<event version="2.0" uid="{uid}" type="a-f-G-U-C" how="m-g" time="{time}" start="{time}" stale="{time}"><point lat="{lat}" lon="{lon}" hae="100.0" ce="9.9" le="9.9"/><detail><contact callsign="ALPHA"/></detail></event>"#,
+        ))
+    }
+
+    // -----------------------------------------------------------------
+    // codec_is_xml
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn codec_is_xml_true_for_tak_xml_codec() {
+        // TAK CoT XML is the only codec the delta encoder should run for;
+        // everything else must be treated as opaque and bypassed.
+        let codec = TakXmlCodec;
+        assert!(
+            codec_is_xml(&codec),
+            "TakXmlCodec.protocol_id() is the sole trigger for delta encoding"
+        );
+    }
+
+    #[test]
+    fn codec_is_xml_false_for_raw_line_codec() {
+        let codec = RawLineCodec;
+        assert!(
+            !codec_is_xml(&codec),
+            "RawLineCodec is not XML — delta encoder must skip"
+        );
+    }
+
+    #[test]
+    fn codec_is_xml_false_for_raw_length_prefixed_codec() {
+        let codec = RawLengthPrefixedCodec;
+        assert!(
+            !codec_is_xml(&codec),
+            "RawLengthPrefixedCodec is not XML — delta encoder must skip"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // DeltaConfig::build_encoder
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn delta_config_disabled_returns_none() {
+        // When delta is off the writer path must cheaply skip encoder
+        // construction — no allocation, no LRU, no per-session state.
+        let cfg = DeltaConfig {
+            enabled: false,
+            cache_size: 1024,
+            epsilon_meters: 1.0,
+        };
+        assert!(cfg.build_encoder().is_none());
+    }
+
+    #[test]
+    fn delta_config_enabled_returns_encoder_with_requested_capacity() {
+        let cfg = DeltaConfig {
+            enabled: true,
+            cache_size: 16,
+            epsilon_meters: 0.0,
+        };
+        let encoder = cfg.build_encoder().expect("enabled => Some(DeltaEncoder)");
+        // Freshly built encoder has no cached UIDs yet — capacity is
+        // observable only indirectly, but the empty-len invariant is
+        // enough to pin the happy path.
+        assert!(
+            encoder.is_empty(),
+            "brand-new encoder should have no cached UIDs"
+        );
+    }
+
+    #[test]
+    fn delta_config_cache_size_zero_coerces_to_nonzero_min() {
+        // `NonZeroUsize::new(0)` is `None`; the fallback path uses
+        // `NonZeroUsize::MIN`. This test pins that we never panic on
+        // a mis-configured zero cache_size and always produce a usable
+        // encoder.
+        let cfg = DeltaConfig {
+            enabled: true,
+            cache_size: 0,
+            epsilon_meters: 0.0,
+        };
+        let encoder = cfg
+            .build_encoder()
+            .expect("cache_size=0 must still produce Some(encoder)");
+        assert!(encoder.is_empty());
+    }
+
+    #[test]
+    fn delta_config_cache_size_one_accepted() {
+        // cache_size=1 is the smallest meaningful capacity: sanity-check
+        // that `max(1)` plus `NonZeroUsize::new` together do not regress
+        // to None/panic.
+        let cfg = DeltaConfig {
+            enabled: true,
+            cache_size: 1,
+            epsilon_meters: 0.0,
+        };
+        let encoder = cfg.build_encoder().expect("cache_size=1 must succeed");
+        assert!(encoder.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // apply_delta
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn apply_delta_first_event_emits_full_bytes() {
+        // First sighting of a UID must always fall through as Full,
+        // otherwise the remote peer has no baseline to reconstruct
+        // subsequent deltas against.
+        let mut enc = DeltaEncoder::new(NonZeroUsize::new(4).unwrap(), 0.0);
+        let payload = cot_event("U1", 34.0, -118.0, "2026-01-01T00:00:00Z");
+        match apply_delta(&mut enc, &payload) {
+            DeltaDispatch::Send(out) => {
+                assert_eq!(
+                    out, payload,
+                    "first-seen UID must emit identical bytes (Full path)"
+                );
+            }
+            DeltaDispatch::Skip => panic!("first event must never be suppressed"),
+        }
+        assert_eq!(enc.stats().full, 1);
+        assert_eq!(enc.stats().suppressed, 0);
+    }
+
+    #[test]
+    fn apply_delta_identical_bytes_are_suppressed() {
+        // Exact-byte retransmission of the same event → Suppressed.
+        // This relies on rustgate_cot::delta's "nothing changed" check
+        // which fires regardless of epsilon.
+        let mut enc = DeltaEncoder::new(NonZeroUsize::new(4).unwrap(), 0.0);
+        let payload = cot_event("U1", 34.0, -118.0, "2026-01-01T00:00:00Z");
+        // Prime the cache.
+        let _ = apply_delta(&mut enc, &payload);
+        // Second identical event must be skipped (no socket write).
+        match apply_delta(&mut enc, &payload) {
+            DeltaDispatch::Skip => {}
+            DeltaDispatch::Send(_) => {
+                panic!("identical retransmission must map to DeltaDispatch::Skip")
+            }
+        }
+        assert_eq!(enc.stats().suppressed, 1);
+    }
+
+    #[test]
+    fn apply_delta_changed_position_emits_delta_bytes() {
+        // Second event with a moved point produces Delta-wrapped XML
+        // that is strictly smaller than a full retransmission; both
+        // map to DeltaDispatch::Send in the session layer.
+        let mut enc = DeltaEncoder::new(NonZeroUsize::new(4).unwrap(), 0.0);
+        let first = cot_event("U1", 34.0, -118.0, "2026-01-01T00:00:00Z");
+        let second = cot_event("U1", 35.0, -117.0, "2026-01-01T00:00:05Z");
+        let _ = apply_delta(&mut enc, &first);
+        match apply_delta(&mut enc, &second) {
+            DeltaDispatch::Send(out) => {
+                let rendered =
+                    std::str::from_utf8(&out).expect("delta wrapper must be valid UTF-8 XML");
+                assert!(
+                    rendered.contains("<delta "),
+                    "expected <delta> wrapper in second emission; got {rendered}"
+                );
+            }
+            DeltaDispatch::Skip => panic!("position change must not be suppressed"),
+        }
+        assert_eq!(enc.stats().delta, 1);
+    }
+
+    #[test]
+    fn apply_delta_non_cot_payload_falls_back_to_full() {
+        // Non-CoT input (garbage XML / raw bytes) takes the "parse
+        // failure → emit Full" branch in the encoder. The session
+        // layer must still forward the original bytes unchanged.
+        let mut enc = DeltaEncoder::new(NonZeroUsize::new(4).unwrap(), 0.0);
+        let payload = Bytes::from_static(b"not a cot event at all");
+        match apply_delta(&mut enc, &payload) {
+            DeltaDispatch::Send(out) => assert_eq!(out, payload),
+            DeltaDispatch::Skip => {
+                panic!("non-CoT payload must never be suppressed — always passthrough as Full")
+            }
+        }
+        assert_eq!(enc.stats().full, 1);
+        assert_eq!(enc.stats().suppressed, 0);
+        assert_eq!(enc.stats().delta, 0);
+    }
+}
