@@ -297,4 +297,163 @@ mod tests {
         };
         assert_eq!(Destination::Direct(id).to_string(), "direct:alice");
     }
+
+    #[test]
+    fn destination_display_multicast_joins_groups_with_commas() {
+        // Pins the human-readable Multicast rendering used in audit log
+        // entries — the brackets + comma-separated list let operators grep
+        // for any referenced group with a simple literal substring.
+        let d = Destination::Multicast(vec!["alpha".into(), "bravo".into(), "charlie".into()]);
+        assert_eq!(d.to_string(), "multicast:[alpha,bravo,charlie]");
+    }
+
+    #[test]
+    fn destination_display_multicast_empty_list() {
+        // Empty Multicast still has stable shape: "multicast:[]".
+        let d = Destination::Multicast(Vec::new());
+        assert_eq!(d.to_string(), "multicast:[]");
+    }
+
+    #[test]
+    fn destination_kind_str_is_low_cardinality_label() {
+        // These strings are Prometheus label values and SIEM-grep tokens —
+        // they must stay short, ASCII, and stable across releases.
+        assert_eq!(
+            Destination::Group("g".into()).kind_str(),
+            "group",
+            "metrics label must be 'group' for Destination::Group"
+        );
+        assert_eq!(
+            Destination::Broadcast.kind_str(),
+            "broadcast",
+            "metrics label must be 'broadcast' for Destination::Broadcast"
+        );
+        assert_eq!(
+            Destination::Multicast(vec!["a".into(), "b".into()]).kind_str(),
+            "multicast",
+            "metrics label must be 'multicast' for Destination::Multicast"
+        );
+        let id = Identity {
+            cn: "carol".into(),
+            fingerprint: "fp".into(),
+            groups: std::collections::BTreeSet::new(),
+            tenant: None,
+            spiffe_id: None,
+            attributes: std::sync::Arc::new(std::collections::BTreeMap::new()),
+        };
+        assert_eq!(
+            Destination::Direct(id).kind_str(),
+            "direct",
+            "metrics label must be 'direct' for Destination::Direct"
+        );
+    }
+
+    #[test]
+    fn destination_kind_str_returns_static_str() {
+        // Pins the fact that kind_str yields a compile-time &'static str
+        // suitable for direct use as a Prometheus label without allocation.
+        let _static_check: &'static str = Destination::Broadcast.kind_str();
+    }
+
+    #[test]
+    fn source_federation_constant_is_stable() {
+        // Documented in CLAUDE.md as the tag used to mark federated
+        // messages; downstream loop-prevention filters key off this
+        // exact string. Parallel to SOURCE_MAVLINK.
+        assert_eq!(SOURCE_FEDERATION, "federation");
+    }
+
+    #[test]
+    fn metadata_is_expired_none_ttl_never_expires() {
+        // Messages with no TTL are immortal — required so federated
+        // control traffic (which never sets a TTL) doesn't silently
+        // drop from the position cache.
+        let meta = Metadata {
+            received_at: SystemTime::UNIX_EPOCH,
+            source_protocol: "tcp".into(),
+            message_type: MessageType::Chat,
+            ttl: None,
+        };
+        assert!(
+            !meta.is_expired(),
+            "Metadata::is_expired must return false when ttl is None"
+        );
+    }
+
+    #[test]
+    fn metadata_is_expired_past_ttl_is_true() {
+        // received_at long in the past, ttl only 1ms -> expired.
+        let meta = Metadata {
+            received_at: SystemTime::now()
+                .checked_sub(Duration::from_secs(60))
+                .expect("clock arithmetic"),
+            source_protocol: "tcp".into(),
+            message_type: MessageType::Position,
+            ttl: Some(Duration::from_millis(1)),
+        };
+        assert!(
+            meta.is_expired(),
+            "Metadata::is_expired must return true when now > received_at + ttl"
+        );
+    }
+
+    #[test]
+    fn metadata_is_expired_within_ttl_is_false() {
+        // received_at ~now, generous ttl -> not expired.
+        let meta = Metadata {
+            received_at: SystemTime::now(),
+            source_protocol: "tcp".into(),
+            message_type: MessageType::Position,
+            ttl: Some(Duration::from_secs(3600)),
+        };
+        assert!(
+            !meta.is_expired(),
+            "Metadata::is_expired must return false when now < received_at + ttl"
+        );
+    }
+
+    #[test]
+    fn metadata_is_expired_future_received_at_treated_as_fresh() {
+        // Clock skew defense: if received_at is in the future (another
+        // node's clock ran ahead), elapsed() returns Err; the contract
+        // is to treat that as "not expired" so we do not silently drop
+        // legitimate messages. Pin this to prevent accidental strictness.
+        let meta = Metadata {
+            received_at: SystemTime::now()
+                .checked_add(Duration::from_secs(3600))
+                .expect("clock arithmetic"),
+            source_protocol: "federation".into(),
+            message_type: MessageType::Alert,
+            ttl: Some(Duration::from_secs(1)),
+        };
+        assert!(
+            !meta.is_expired(),
+            "future received_at must not count as expired (clock-skew tolerance)"
+        );
+    }
+
+    #[test]
+    fn message_type_display_other_preserves_payload() {
+        // Edge case: the inner label for Other is forwarded verbatim.
+        assert_eq!(MessageType::Other(String::new()).to_string(), "other:");
+        assert_eq!(
+            MessageType::Other("a-b_c.d/e".into()).to_string(),
+            "other:a-b_c.d/e"
+        );
+    }
+
+    #[test]
+    fn message_type_equality_includes_inner_string() {
+        // Two Other variants are equal iff their payloads match — pins
+        // the derived PartialEq/Eq semantics used by routing decisions.
+        assert_eq!(
+            MessageType::Other("x".into()),
+            MessageType::Other("x".into())
+        );
+        assert_ne!(
+            MessageType::Other("x".into()),
+            MessageType::Other("y".into())
+        );
+        assert_ne!(MessageType::Position, MessageType::Chat);
+    }
 }
