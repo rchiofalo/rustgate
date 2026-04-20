@@ -63,3 +63,63 @@ impl MqttServerConfig {
     /// Default response channel capacity per session.
     pub const DEFAULT_RESPONSE_CHANNEL_CAPACITY: usize = 64;
 }
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used, unused_results)]
+mod tests {
+    use rustgate_core::constants::MAX_FRAME_SIZE;
+
+    use super::*;
+
+    // ------------------------------------------------------------------
+    // Default constants — pin the wire / operator-visible numbers.
+    // Changing any of these affects CONNACK negotiation, keep-alive
+    // floors, and session memory footprint, so a silent drift in the
+    // constant is exactly the sort of thing this test catches.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn default_max_packet_size_is_sixteen_mib() {
+        // 16 MiB keeps MQTT in lockstep with the websocket frame cap
+        // and with `rustgate_core::constants::MAX_FRAME_SIZE`.
+        assert_eq!(MqttServerConfig::DEFAULT_MAX_PACKET_SIZE, 16 * 1024 * 1024,);
+        assert_eq!(MqttServerConfig::DEFAULT_MAX_PACKET_SIZE, 16_777_216);
+    }
+
+    #[test]
+    fn default_max_packet_size_matches_shared_frame_cap() {
+        // Cross-check that the MQTT default does not drift away from
+        // the workspace-wide shared frame cap used by the length-
+        // prefixed and protobuf codecs.
+        assert_eq!(MqttServerConfig::DEFAULT_MAX_PACKET_SIZE, MAX_FRAME_SIZE,);
+    }
+
+    #[test]
+    fn default_min_keep_alive_is_thirty_seconds() {
+        // Clients requesting 0 (disabled) or a smaller value have this
+        // value forced upon them — changing it alters CONNACK behaviour.
+        assert_eq!(MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS, 30);
+    }
+
+    #[test]
+    fn default_response_channel_capacity_is_sixty_four() {
+        // Per-session backpressure boundary between the read loop and
+        // the write loop. Changing this affects memory accounting in
+        // tests that assert queue depth.
+        assert_eq!(MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY, 64);
+    }
+
+    // ------------------------------------------------------------------
+    // Trait bounds — pin compile-time invariants cheaply, without
+    // spinning up a Router / TLS stack just to test `Debug`.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn config_type_is_debug() {
+        // The `#[derive(Debug)]` must remain — tracing expansions such
+        // as `tracing::info!(?config, ...)` would fail to compile if a
+        // future refactor accidentally dropped the derive.
+        fn assert_debug<T: std::fmt::Debug>() {}
+        assert_debug::<MqttServerConfig>();
+    }
+}

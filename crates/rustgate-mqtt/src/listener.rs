@@ -172,3 +172,186 @@ fn extract_client_identity(tls_stream: &TlsStream) -> Result<Identity> {
 
     extract_identity(client_cert)
 }
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used, unused_results)]
+mod tests {
+    use rustgate_test_utils::certs::TestCa;
+
+    use super::*;
+
+    // ------------------------------------------------------------------
+    // These tests exercise the bind / local_addr / Debug surface of the
+    // listener without driving real TLS handshakes — the integration
+    // suite under `tests/mqtt_integration.rs` already covers the
+    // handshake + CONNECT path end-to-end, so here we pin the
+    // socket-level invariants (SO_REUSEADDR, port release on drop,
+    // EADDRINUSE propagation) and the operator-visible Debug shape.
+    // ------------------------------------------------------------------
+
+    /// Build a server-side `TlsConfig` using a throw-away test CA.
+    fn test_tls_config() -> TlsConfig {
+        let ca = TestCa::new("mqtt-listener-test");
+        let server = ca.issue_server_cert("localhost", &["localhost"]);
+        TlsConfig::from_pem(&server.cert_pem, &server.key_pem, &ca.cert_pem)
+            .expect("build TlsConfig from freshly issued test certs")
+    }
+
+    fn loopback_zero() -> SocketAddr {
+        "127.0.0.1:0"
+            .parse()
+            .expect("static loopback address must parse")
+    }
+
+    // ------------------------------------------------------------------
+    // bind(…) happy path + local_addr
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn bind_to_loopback_zero_succeeds() {
+        let listener = MqttListener::bind(loopback_zero(), &test_tls_config())
+            .expect("bind to 127.0.0.1:0 should succeed");
+        // Just holding `listener` long enough to drop here proves the
+        // full bind→listen→from_std chain does not panic on a clean host.
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn local_addr_returns_non_zero_port() {
+        let listener = MqttListener::bind(loopback_zero(), &test_tls_config()).expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        assert!(
+            addr.port() != 0,
+            "kernel should have assigned a concrete ephemeral port, got {addr}",
+        );
+    }
+
+    #[tokio::test]
+    async fn local_addr_ip_is_loopback() {
+        let listener = MqttListener::bind(loopback_zero(), &test_tls_config()).expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        assert!(
+            addr.ip().is_loopback(),
+            "bound IP should be loopback, got {}",
+            addr.ip(),
+        );
+    }
+
+    #[tokio::test]
+    async fn two_listeners_on_different_ports_coexist() {
+        // Proves the builder is not accidentally stateful — each call
+        // yields a fresh socket, independently accepting on its own
+        // port.
+        let tls = test_tls_config();
+        let a = MqttListener::bind(loopback_zero(), &tls).expect("bind a");
+        let b = MqttListener::bind(loopback_zero(), &tls).expect("bind b");
+        let addr_a = a.local_addr().expect("local_addr a");
+        let addr_b = b.local_addr().expect("local_addr b");
+        assert_ne!(
+            addr_a.port(),
+            addr_b.port(),
+            "two concurrent binds to 0 should get distinct ports",
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Error path: EADDRINUSE when the port is actively held.
+    // SO_REUSEADDR allows rebinding to a TIME_WAIT socket, but it does
+    // NOT let two live listeners share the same (addr, port) — that
+    // requires SO_REUSEPORT, which the listener intentionally does not
+    // enable.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn second_bind_to_same_port_fails_while_first_is_alive() {
+        let tls = test_tls_config();
+        let first = MqttListener::bind(loopback_zero(), &tls).expect("first bind");
+        let addr = first.local_addr().expect("local_addr");
+
+        // Second bind MUST fail while `first` is still alive.
+        let second = MqttListener::bind(addr, &tls);
+        assert!(
+            second.is_err(),
+            "second bind to {addr} while first is alive must fail (EADDRINUSE), \
+             but succeeded — SO_REUSEPORT must not be enabled",
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // SO_REUSEADDR behaviour: after the first listener drops, rebinding
+    // to the same concrete port works. Without the set_reuse_address
+    // call this can race with lingering kernel state on some platforms.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn port_is_released_on_drop_and_can_be_rebound() {
+        let tls = test_tls_config();
+        let first = MqttListener::bind(loopback_zero(), &tls).expect("first bind");
+        let addr = first.local_addr().expect("local_addr");
+        drop(first);
+
+        // Rebinding to the exact same (addr, port) must succeed — this
+        // is the user-visible outcome of set_reuse_address(true) in the
+        // bind path.
+        let second = MqttListener::bind(addr, &tls).expect("second bind after drop");
+        let addr2 = second.local_addr().expect("local_addr");
+        assert_eq!(
+            addr, addr2,
+            "rebound listener should report the same port as the dropped one",
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Debug impl — stabilised shape for operator log lines. The listener
+    // ends up printed by `tracing::info!(?listener, …)` on startup, so
+    // drift here is visible to operators.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn debug_impl_renders_type_name() {
+        let listener = MqttListener::bind(loopback_zero(), &test_tls_config()).expect("bind");
+        let rendered = format!("{listener:?}");
+        assert!(
+            rendered.contains("MqttListener"),
+            "Debug should mention the type name; got: {rendered}",
+        );
+    }
+
+    #[tokio::test]
+    async fn debug_impl_includes_local_addr_field() {
+        let listener = MqttListener::bind(loopback_zero(), &test_tls_config()).expect("bind");
+        let rendered = format!("{listener:?}");
+        assert!(
+            rendered.contains("local_addr"),
+            "Debug should include the local_addr field; got: {rendered}",
+        );
+        assert!(
+            rendered.contains("conn_rate"),
+            "Debug should include the conn_rate field; got: {rendered}",
+        );
+    }
+
+    #[tokio::test]
+    async fn debug_impl_includes_bound_port_value() {
+        let listener = MqttListener::bind(loopback_zero(), &test_tls_config()).expect("bind");
+        let port = listener.local_addr().expect("local_addr").port();
+        let rendered = format!("{listener:?}");
+        assert!(
+            rendered.contains(&port.to_string()),
+            "Debug output should embed the concrete bound port {port}; got: {rendered}",
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Type-surface checks (compile-time only).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn pre_session_is_debug() {
+        // `MqttPreSession` is printed by `tracing::debug!(?pre_session, …)`
+        // in the accept loop before it is converted into a full session
+        // object; losing the derive would silently break that diagnostic.
+        fn assert_debug<T: std::fmt::Debug>() {}
+        assert_debug::<MqttPreSession>();
+    }
+}
