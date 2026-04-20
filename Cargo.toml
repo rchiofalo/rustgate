@@ -111,7 +111,7 @@ hex = "0.4"
 ahash = "0.8"
 smol_str = { version = "0.3", features = ["serde"] }
 cedar-policy = "4"
-spiffe = { version = "0.12", default-features = false, features = ["workload-api-x509"] }
+spiffe = { version = "0.13", default-features = false, features = ["workload-api-x509"] }
 async-trait = "0.1.89"
 mdns-sd = { version = "0.19", default-features = false, features = ["async"] }
 etcd-client = { version = "0.18", default-features = false, features = ["tls"] }
