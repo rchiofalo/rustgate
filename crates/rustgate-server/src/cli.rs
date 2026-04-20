@@ -452,6 +452,19 @@ pub(crate) struct Cli {
     #[arg(long, env = "RUSTGATE_MAX_QUEUED_BYTES_LOW_WATER")]
     pub(crate) max_queued_bytes_low_water: Option<usize>,
 
+    /// Minimum milliseconds the queued-bytes counter must stay at/below the
+    /// low-water mark before the accept loop resumes after a block. Prevents
+    /// rapid oscillation when load hovers around the high-water mark (see
+    /// issue #878). Set to `0` for the pre-dwell behaviour of resuming the
+    /// instant the counter crosses back below the low-water mark.
+    /// Default: 1000 ms.
+    #[arg(
+        long,
+        default_value_t = 1000,
+        env = "RUSTGATE_BACKPRESSURE_RESUME_DWELL_MS"
+    )]
+    pub(crate) backpressure_resume_dwell_ms: u64,
+
     /// Bind address for the WebSocket (wss://) listener (e.g. 0.0.0.0:8443).
     /// Requires --features websocket.
     #[arg(long, env = "RUSTGATE_WEBSOCKET_BIND", value_parser = parse_socket_addr)]
@@ -1376,6 +1389,7 @@ define_config_file! {
     max_concurrent_handshakes: usize,
     max_queued_bytes: usize,
     max_queued_bytes_low_water: Option<usize>,
+    backpressure_resume_dwell_ms: u64,
     websocket_bind: Option<String>,
     ws_max_frames_per_sec: u32,
     ws_max_bytes_per_sec: u64,

@@ -561,11 +561,14 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     let max_connections: u32 = cli.max_connections as u32;
     let (group_acl, acl_file_hash, acl_file_parsed) = setup::load_group_acl(&cli).await?;
     // ── Global admission control / backpressure gate ─────────────
-    #[cfg_attr(not(feature = "metrics"), allow(unused_mut))]
     let mut backpressure_gate = BackpressureGate::with_limits(
         cli.max_queued_bytes,
         cli.max_queued_bytes_low_water
             .unwrap_or_else(|| cli.max_queued_bytes.saturating_mul(9) / 10),
+    );
+    BackpressureGate::with_resume_dwell(
+        &mut backpressure_gate,
+        std::time::Duration::from_millis(cli.backpressure_resume_dwell_ms),
     );
     #[cfg(feature = "metrics")]
     {
@@ -585,6 +588,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     tracing::info!(
         max_queued_bytes = backpressure_gate.high_water(),
         low_water_bytes = backpressure_gate.low_water(),
+        resume_dwell_ms = cli.backpressure_resume_dwell_ms,
         "admission control enabled"
     );
 

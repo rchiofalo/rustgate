@@ -51,7 +51,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 rustgate-test-utils = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
 futures = { workspace = true }
 bytes = { workspace = true }
 criterion = { workspace = true }
