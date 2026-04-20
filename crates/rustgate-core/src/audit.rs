@@ -546,6 +546,75 @@ pub fn authz_reload_failed(path: &str, stage: &str, error: &str) {
     );
 }
 
+/// Record a hash-chained audit-log discontinuity detected at startup.
+///
+/// Emitted when the persisted anchor tip in `<audit_path>.anchor` does not
+/// match the live tip recovered from the audit log itself. `action` values:
+///
+/// - `"refuse_start"` — the server refused to start because
+///   `--audit-allow-chain-break` was not set.
+/// - `"continue"` — the operator explicitly opted in via
+///   `--audit-allow-chain-break`; the new chain extends from `live_tip`
+///   but the break is recorded for forensics.
+///
+/// The first record written after a `"continue"` decision is the only audit
+/// entry where the anchor tip is *known* to disagree with the audit log's
+/// chain state, so SIEM rules that alert on this event should also check
+/// for the anchor-update record that follows on the next clean shutdown.
+pub fn chain_discontinuity(
+    audit_path: &str,
+    anchor_tip: &str,
+    live_tip: &str,
+    action: &str,
+    reason: &str,
+) {
+    audit!(
+        "audit.chain_discontinuity",
+        audit_path = %audit_path,
+        anchor_tip = %anchor_tip,
+        live_tip = %live_tip,
+        reason = %reason,
+        action = %action,
+        result = "detected"
+    );
+}
+
+/// Record that the audit-chain anchor was persisted at graceful shutdown.
+///
+/// Surfaces every clean shutdown through the audit trail so a missing record
+/// between restarts is itself a signal worth investigating — a crash or kill
+/// produces no anchor_persisted entry, whereas a clean shutdown produces
+/// exactly one.
+pub fn chain_anchor_persisted(audit_path: &str, tip: &str) {
+    audit!(
+        "audit.chain_anchor_persisted",
+        audit_path = %audit_path,
+        tip = %tip,
+        action = "persist_anchor",
+        result = "success"
+    );
+}
+
+/// Record that persisting the audit-chain anchor at shutdown failed.
+///
+/// The error text is emitted verbatim so operators can distinguish disk-full,
+/// permission-denied, and read-only-filesystem failures without chasing the
+/// correlated ERROR-level tracing record. On the next startup a missing
+/// anchor presents as [`ChainContinuity::NoAnchor`] which is benign, so the
+/// audit chain itself is not broken by this failure — but the operator
+/// loses the tamper-detection signal for the window it took to retry.
+///
+/// [`ChainContinuity::NoAnchor`]: crate::audit_chain::ChainContinuity::NoAnchor
+pub fn chain_anchor_persist_failed(audit_path: &str, error: &str) {
+    audit!(
+        "audit.chain_anchor_persist_failed",
+        audit_path = %audit_path,
+        error = %error,
+        action = "persist_anchor",
+        result = "failure"
+    );
+}
+
 /// Record server startup.
 pub fn server_started(bind: &str, version: &str) {
     let timestamp = SystemTime::now()

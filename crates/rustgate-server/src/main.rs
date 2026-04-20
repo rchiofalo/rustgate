@@ -61,6 +61,44 @@ impl EncryptedLineWriter {
     }
 }
 
+/// Carrier for the audit-log anchor lifecycle. Created during tracing setup
+/// (before the subscriber is installed) and threaded into [`run`] so the
+/// post-drain shutdown path can refresh `<audit_path>.anchor` with the final
+/// hash-chain tip. A pending-break variant captures a discontinuity detected
+/// at startup so the follow-up `audit.chain_discontinuity` record can be
+/// emitted *after* tracing is live — otherwise the event would land on
+/// stderr instead of in the audit log itself.
+enum AuditAnchorHandle {
+    /// A mismatch was detected between the persisted anchor and the live
+    /// tip, and `--audit-allow-chain-break` was set. The break is recorded
+    /// and forwarded to the Active variant once the chain writer is wired
+    /// in so the event can land in the hash-chained audit trail.
+    PendingBreak {
+        path: std::path::PathBuf,
+        anchor_tip: String,
+        live_tip: String,
+    },
+    /// Writer is live; the observer reflects the chain tip after every
+    /// record. `break_info` is set only on the first run after a
+    /// `--audit-allow-chain-break` override so the post-tracing-init
+    /// emission can include the expected/actual pair in the audit event.
+    Active {
+        path: std::path::PathBuf,
+        tip_observer: Arc<arc_swap::ArcSwap<String>>,
+        break_info: Option<(String, String)>,
+    },
+}
+
+impl AuditAnchorHandle {
+    fn pending_break(path: std::path::PathBuf, anchor_tip: String, live_tip: String) -> Self {
+        Self::PendingBreak {
+            path,
+            anchor_tip,
+            live_tip,
+        }
+    }
+}
+
 impl std::io::Write for EncryptedLineWriter {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
         self.buf.extend_from_slice(data);
@@ -142,6 +180,13 @@ fn main() -> anyhow::Result<()> {
             None
         };
 
+    // Handle persisted across startup → shutdown so the anchor file can be
+    // refreshed on clean exit. Populated only on the plain-file audit-log
+    // path (not "-" / stdout, not the encrypted-archive path — the latter
+    // restarts at genesis each run because the on-disk record format is
+    // opaque without the key). Issue #718.
+    let mut audit_anchor_handle: Option<AuditAnchorHandle> = None;
+
     // Dedicated audit log sink: filters only target="audit" events and writes
     // JSON lines to the configured file (or stdout when "-"). When an archive
     // key file is configured and the path is not "-", events are encrypted
@@ -172,6 +217,52 @@ fn main() -> anyhow::Result<()> {
             std::sync::Mutex::new(Box::new(chain))
         } else {
             let path = std::path::Path::new(audit_path);
+
+            // Compare the persisted anchor (from last clean shutdown) with
+            // the live tip recovered from the audit log itself. A mismatch
+            // means either the log was rotated without carrying the anchor
+            // forward, restored from backup, or tampered with — all three
+            // cases warrant operator attention. The audit.chain_discontinuity
+            // event below is emitted *after* tracing init so it lands in the
+            // audit log, not in the early stderr stream. Issue #718.
+            match rustgate_core::audit_chain::check_chain_continuity(path) {
+                Ok(rustgate_core::audit_chain::ChainContinuity::NoAnchor) => {
+                    // First run after enabling the audit log; benign. The
+                    // anchor is persisted on the next clean shutdown.
+                }
+                Ok(rustgate_core::audit_chain::ChainContinuity::Match { .. }) => {
+                    // Chain continuous across the last shutdown; all good.
+                }
+                Ok(rustgate_core::audit_chain::ChainContinuity::Mismatch {
+                    anchor_tip,
+                    live_tip,
+                }) => {
+                    if !cli.audit_allow_chain_break {
+                        anyhow::bail!(
+                            "audit chain discontinuity detected for {audit_path}: \
+                             anchor tip `{anchor_tip}` does not match live tip \
+                             `{live_tip}`. Investigate the log for tampering or \
+                             rotation without anchor carry-forward, then rerun \
+                             with --audit-allow-chain-break to continue from the \
+                             current tip (the break will be recorded in the audit \
+                             trail)."
+                        );
+                    }
+                    // Operator opt-in: fall through; the audit.chain_discontinuity
+                    // event is emitted below once tracing is live so the
+                    // operational decision is captured in the audit trail
+                    // itself.
+                    audit_anchor_handle = Some(AuditAnchorHandle::pending_break(
+                        path.to_path_buf(),
+                        anchor_tip,
+                        live_tip,
+                    ));
+                }
+                Err(e) => {
+                    anyhow::bail!("failed to evaluate audit log continuity for {audit_path}: {e}");
+                }
+            }
+
             let prev = rustgate_core::audit_chain::read_chain_tip(path).map_err(|e| {
                 anyhow::anyhow!("failed to read audit log chain tip {audit_path}: {e}")
             })?;
@@ -180,7 +271,27 @@ fn main() -> anyhow::Result<()> {
                 .append(true)
                 .open(audit_path)
                 .map_err(|e| anyhow::anyhow!("failed to open audit log {audit_path}: {e}"))?;
-            let chain = rustgate_core::audit_chain::HashChainWriter::new(file, prev);
+            let tip_observer = Arc::new(arc_swap::ArcSwap::from_pointee(prev.clone()));
+            let chain = rustgate_core::audit_chain::HashChainWriter::new(file, prev)
+                .with_tip_observer(Arc::clone(&tip_observer));
+            // Upgrade the handle (or create one) so shutdown knows which
+            // path + observer to persist.
+            audit_anchor_handle = Some(match audit_anchor_handle.take() {
+                Some(AuditAnchorHandle::PendingBreak {
+                    path: bp,
+                    anchor_tip,
+                    live_tip,
+                }) => AuditAnchorHandle::Active {
+                    path: bp,
+                    tip_observer: Arc::clone(&tip_observer),
+                    break_info: Some((anchor_tip, live_tip)),
+                },
+                _ => AuditAnchorHandle::Active {
+                    path: path.to_path_buf(),
+                    tip_observer: Arc::clone(&tip_observer),
+                    break_info: None,
+                },
+            });
             std::sync::Mutex::new(Box::new(chain))
         };
         let filter =
@@ -297,10 +408,31 @@ fn main() -> anyhow::Result<()> {
     tracing::info!(bind = %cli.bind, "rustgate starting");
     audit::server_started(&cli.bind, env!("CARGO_PKG_VERSION"));
 
-    tokio::runtime::Runtime::new()?.block_on(run(cli))
+    // If the operator opted into a chain break via --audit-allow-chain-break,
+    // record it in the audit log now that the subscriber is installed. This
+    // ensures the break is cryptographically chained from the live tip
+    // forward, with the anchor/live pair captured so a downstream SIEM can
+    // correlate the skip with the subsequent anchor_persisted event on
+    // clean shutdown.
+    if let Some(AuditAnchorHandle::Active {
+        path,
+        break_info: Some((anchor_tip, live_tip)),
+        ..
+    }) = audit_anchor_handle.as_ref()
+    {
+        rustgate_core::audit::chain_discontinuity(
+            &path.display().to_string(),
+            anchor_tip,
+            live_tip,
+            "continue",
+            "operator_opt_in_audit_allow_chain_break",
+        );
+    }
+
+    tokio::runtime::Runtime::new()?.block_on(run(cli, audit_anchor_handle))
 }
 
-async fn run(cli: Cli) -> anyhow::Result<()> {
+async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow::Result<()> {
     // ── TLS setup ───────────────────────────────────────────────────
     let tls_build = setup::build_tls_config(&cli).await?;
     let tls_config = tls_build.tls_config;
@@ -1277,6 +1409,36 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 sessions = router.session_count().await,
                 "drain timeout reached, forcing exit"
             );
+        }
+    }
+
+    // Persist the audit-chain tip to `<audit_path>.anchor` so the next
+    // startup can detect tampering (truncation, log rotation without
+    // anchor carry-forward, restore-from-backup) via a mismatch. Issue
+    // #718. Emitted *before* the OTel/OTLP flushes so the anchor-persisted
+    // audit record lands in the same chain as the tip it records — if the
+    // anchor write fails the failure record is still the final entry in
+    // the current chain.
+    if let Some(AuditAnchorHandle::Active {
+        path, tip_observer, ..
+    }) = audit_anchor_handle.as_ref()
+    {
+        let tip: String = (**tip_observer.load()).clone();
+        match rustgate_core::audit_chain::write_anchor(path, &tip) {
+            Ok(()) => {
+                rustgate_core::audit::chain_anchor_persisted(&path.display().to_string(), &tip);
+            }
+            Err(e) => {
+                tracing::error!(
+                    path = %path.display(),
+                    error = %e,
+                    "failed to persist audit chain anchor at shutdown"
+                );
+                rustgate_core::audit::chain_anchor_persist_failed(
+                    &path.display().to_string(),
+                    &e.to_string(),
+                );
+            }
         }
     }
 

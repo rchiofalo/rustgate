@@ -3156,6 +3156,7 @@ name = "rustgate-core"
 version = "0.8.0"
 dependencies = [
  "arbitrary",
+ "arc-swap",
  "base64",
  "bytes",
  "chacha20poly1305",
@@ -3390,6 +3391,7 @@ name = "rustgate-server"
 version = "0.8.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "bytes",
  "clap",
  "figment",
