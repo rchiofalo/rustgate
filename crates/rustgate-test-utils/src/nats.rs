@@ -7,7 +7,14 @@
 //! on drop and each instance gets its own JetStream store directory.
 //!
 //! Startup uses a retry loop with fast-fail on process exit to work around the
-//! inherent TOCTOU race in ephemeral port selection.
+//! inherent TOCTOU race in ephemeral port selection, and a two-stage readiness
+//! probe — NATS protocol `INFO` greeting followed by a JetStream
+//! `$JS.API.ACCOUNT.INFO` round-trip — because nats-server binds its TCP
+//! listener well before the JetStream meta-leader is elected, so the naïve
+//! "TCP is up" check returns a server that silently times out on the very
+//! first KV/stream create call. Tests that create a JetStream KV bucket in
+//! their setup (federation HA claim manager, for example) flake on fast
+//! hosts without this second probe.
 
 #![allow(clippy::panic)]
 
@@ -120,17 +127,54 @@ impl TestNatsServer {
             if let Ok(mut stream) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
                 let mut buf = [0u8; 5];
                 if stream.read_exact(&mut buf).await.is_ok() && &buf == b"INFO " {
-                    return Ok(Self {
-                        child,
-                        port,
-                        url: format!("nats://127.0.0.1:{port}"),
-                        _store_dir: store_dir,
-                    });
+                    // NATS protocol is up. Now wait for JetStream to be ready
+                    // — the subsystem initializes *after* the TCP listener, and
+                    // the gap between "TCP accepts" and "JS meta leader elected"
+                    // is long enough on busy hosts to flake any test that
+                    // creates a KV bucket or stream in its setup.
+                    let url = format!("nats://127.0.0.1:{port}");
+                    if Self::jetstream_ready(&url, deadline).await {
+                        return Ok(Self {
+                            child,
+                            port,
+                            url,
+                            _store_dir: store_dir,
+                        });
+                    }
+                    // JetStream never came up inside the readiness window —
+                    // fall through to the deadline check above, which will
+                    // kill the child and return a timeout error on the next
+                    // loop iteration. We intentionally do not return here so
+                    // the `process exited immediately` fast-fail remains a
+                    // distinguishable path from "JS probe failed".
                 }
             }
 
             tokio::time::sleep(Self::POLL_INTERVAL).await;
         }
+    }
+
+    /// Wait for the JetStream subsystem to be ready on `url`, bounded by
+    /// `deadline`. Returns `true` once `$JS.API.ACCOUNT.INFO` succeeds, or
+    /// `false` if the deadline elapses first.
+    ///
+    /// We intentionally open a fresh client for the probe and drop it once
+    /// the probe succeeds — the probe connection is not reused by callers,
+    /// who create their own via [`Self::jetstream`]. Using a throwaway
+    /// connection means a probe failure cannot leave the caller holding a
+    /// half-initialized context, and the garbage-collection-on-drop path
+    /// is the common case so it's well-exercised.
+    async fn jetstream_ready(url: &str, deadline: tokio::time::Instant) -> bool {
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(client) = async_nats::connect(url).await {
+                let js = async_nats::jetstream::new(client);
+                if js.query_account().await.is_ok() {
+                    return true;
+                }
+            }
+            tokio::time::sleep(Self::POLL_INTERVAL).await;
+        }
+        false
     }
 
     /// Find a free TCP port by binding to `:0`.
@@ -194,4 +238,42 @@ macro_rules! require_nats {
             }
         }
     };
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    /// Pins the invariant that `start()` returns only after JetStream is
+    /// truly ready — not merely after the TCP listener and NATS protocol
+    /// are ready. Previously this function returned as soon as the server
+    /// replied to the NATS `INFO` greeting, so downstream code that
+    /// immediately created a KV bucket (e.g. the federation HA claim
+    /// manager in setup) could race the JS meta-leader election and time
+    /// out. The first KV create after `start()` must succeed without
+    /// retry.
+    #[tokio::test]
+    async fn start_completes_only_after_jetstream_accepts_kv_create() {
+        let Some(server) = TestNatsServer::start().await else {
+            eprintln!("SKIP: nats-server not found in PATH");
+            return;
+        };
+
+        let js = server.jetstream().await;
+        // Must succeed on the very first call — no retry loop here.
+        let kv = js
+            .create_key_value(async_nats::jetstream::kv::Config {
+                bucket: "test-js-readiness".into(),
+                max_age: Duration::from_secs(5),
+                ..Default::default()
+            })
+            .await
+            .expect("KV bucket must create immediately after start()");
+        // Round-trip a put/get to prove the bucket is actually operational,
+        // not just metadata-accepted.
+        let _revision = kv.put("k", "v".into()).await.expect("put");
+        let value = kv.get("k").await.expect("get").expect("entry present");
+        assert_eq!(&value[..], b"v");
+    }
 }
