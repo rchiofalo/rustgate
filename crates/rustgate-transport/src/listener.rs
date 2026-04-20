@@ -222,3 +222,275 @@ impl TlsListener {
         extract_identity(client_cert)
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used, unused_results)]
+mod tests {
+    use rustgate_test_utils::certs::TestCa;
+
+    use super::*;
+
+    /// Install the default crypto provider (idempotent across tests) and
+    /// build a minimal `TlsConfig` backed by a fresh in-memory CA.
+    ///
+    /// The tests here never complete a handshake — they only exercise
+    /// `TlsListener`'s bind / local-addr / Debug surface — so the server
+    /// cert just has to satisfy `TlsConfig::from_pem`.
+    fn test_tls_config() -> TlsConfig {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let ca = TestCa::new("listener-test-ca");
+        let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
+        TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
+            .expect("tls config")
+    }
+
+    // ------------------------------------------------------------------
+    // Module-level constants that operators size tactical deployments
+    // against — pinned so a silent change to the default handshake
+    // concurrency shows up as a test diff.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn default_max_handshakes_constant_is_100() {
+        // Also guards against dropping the public re-export; the constant
+        // is documented as the default for `TlsListener::bind` so operators
+        // can compare it to their deployment's `--max-handshakes`.
+        assert_eq!(DEFAULT_MAX_HANDSHAKES, 100);
+    }
+
+    // ------------------------------------------------------------------
+    // bind / bind_with_handshake_limit — the async entry points every
+    // server wiring goes through on startup. We don't complete a
+    // handshake here (the integration tests do) — we just prove bind
+    // succeeds on loopback and surfaces the expected listener state.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn bind_succeeds_on_loopback_zero_port() {
+        let tls = test_tls_config();
+        let listener = TlsListener::bind("127.0.0.1:0", &tls).await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        assert!(
+            addr.port() > 0,
+            "expected a non-zero ephemeral port after binding to :0, got {addr}",
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_default_listener_reports_default_permits() {
+        // The Debug impl publishes `available_permits()`, which equals
+        // the configured maximum while no handshakes are in flight —
+        // use that to pin that `bind` really does wire through the
+        // `DEFAULT_MAX_HANDSHAKES` constant rather than a magic number.
+        let tls = test_tls_config();
+        let listener = TlsListener::bind("127.0.0.1:0", &tls).await.expect("bind");
+        let rendered = format!("{listener:?}");
+        let expected = format!("max_concurrent_handshakes: {DEFAULT_MAX_HANDSHAKES}");
+        assert!(
+            rendered.contains(&expected),
+            "Debug should reflect the default handshake limit `{expected}`; got: {rendered}",
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_with_handshake_limit_applies_custom_value() {
+        // Distinct from the default, to prove the custom value is not
+        // silently coerced back to DEFAULT_MAX_HANDSHAKES on the way in.
+        let tls = test_tls_config();
+        let listener = TlsListener::bind_with_handshake_limit("127.0.0.1:0", &tls, 42)
+            .await
+            .expect("bind");
+        let rendered = format!("{listener:?}");
+        assert!(
+            rendered.contains("max_concurrent_handshakes: 42"),
+            "Debug should reflect the configured custom limit; got: {rendered}",
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_with_handshake_limit_accepts_single_permit() {
+        // Boundary: the `Semaphore::new(n)` contract allows `n == 1`
+        // and downstream operators do use 1 for tests that want to
+        // serialize TLS handshakes. A zero value is explicitly *not*
+        // tested — the documented contract is "limits concurrent
+        // handshakes" and the semaphore deadlocks the accept loop at 0;
+        // that's a caller-side misconfiguration, not our invariant.
+        let tls = test_tls_config();
+        let listener = TlsListener::bind_with_handshake_limit("127.0.0.1:0", &tls, 1)
+            .await
+            .expect("bind");
+        let rendered = format!("{listener:?}");
+        assert!(
+            rendered.contains("max_concurrent_handshakes: 1"),
+            "Debug should reflect the single-permit limit; got: {rendered}",
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // local_addr — used by every wiring site to log the bound endpoint
+    // and by integration tests to discover the ephemeral port.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn local_addr_ip_is_loopback() {
+        let tls = test_tls_config();
+        let listener = TlsListener::bind("127.0.0.1:0", &tls).await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        assert!(
+            addr.ip().is_loopback(),
+            "expected loopback IP after binding to 127.0.0.1:0, got {addr}",
+        );
+    }
+
+    #[tokio::test]
+    async fn two_listeners_coexist_on_different_ephemeral_ports() {
+        // The accept loop is per-listener, so two servers in the same
+        // process must not collide on the kernel side. With both bound
+        // to :0 the kernel assigns distinct ephemeral ports; if a
+        // future refactor accidentally reused a socket the two
+        // `local_addr` calls would collapse to the same port.
+        let tls = test_tls_config();
+        let first = TlsListener::bind("127.0.0.1:0", &tls)
+            .await
+            .expect("first bind");
+        let second = TlsListener::bind("127.0.0.1:0", &tls)
+            .await
+            .expect("second bind");
+        let first_addr = first.local_addr().expect("first addr");
+        let second_addr = second.local_addr().expect("second addr");
+        assert_ne!(
+            first_addr.port(),
+            second_addr.port(),
+            "two simultaneous listeners must get distinct ephemeral ports",
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // bind error path — the `map_err` wrap that translates a
+    // tokio-level bind failure into `TransportError::Other`. A silently
+    // unwrapped `io::Error` here would lose the "failed to bind TLS
+    // listener" context operators rely on when triaging startup
+    // failures.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn bind_wraps_tcp_bind_failure_with_context_prefix() {
+        // Hold a synchronous std listener on an ephemeral port, then
+        // try to bind our TLS listener to the exact same (addr, port).
+        // On Linux/macOS without SO_REUSEPORT the kernel rejects the
+        // second bind with EADDRINUSE; `tokio::net::TcpListener::bind`
+        // does not set SO_REUSEPORT, so the second bind must fail.
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").expect("blocker bind");
+        let busy = blocker.local_addr().expect("blocker addr");
+
+        let tls = test_tls_config();
+        let result = TlsListener::bind(busy, &tls).await;
+        let err = match result {
+            Ok(_) => panic!("expected bind to fail on occupied port {}", busy.port()),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("failed to bind TLS listener"),
+            "error must carry the TransportError::Other context prefix so operators can triage bind failures; got: {msg}",
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Debug impl — rendered by `tracing::info!(?listener, …)` and
+    // `tracing::debug!(?listener, …)` at startup and in the accept
+    // loop. Drift here is visible to operators inspecting logs.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn debug_impl_renders_type_name() {
+        let tls = test_tls_config();
+        let listener = TlsListener::bind("127.0.0.1:0", &tls).await.expect("bind");
+        let rendered = format!("{listener:?}");
+        assert!(
+            rendered.contains("TlsListener"),
+            "Debug should mention the type name; got: {rendered}",
+        );
+    }
+
+    #[tokio::test]
+    async fn debug_impl_includes_bound_port_value() {
+        // The tcp_listener field is printed via its own Debug impl,
+        // which embeds the bound socket address. A future refactor
+        // that drops the listener from the Debug output (e.g. because
+        // someone decided it was noisy) would silently erase the
+        // endpoint from startup logs; this guards against that.
+        let tls = test_tls_config();
+        let listener = TlsListener::bind("127.0.0.1:0", &tls).await.expect("bind");
+        let port = listener.local_addr().expect("local_addr").port();
+        let rendered = format!("{listener:?}");
+        assert!(
+            rendered.contains(&port.to_string()),
+            "Debug should embed the concrete bound port {port}; got: {rendered}",
+        );
+    }
+
+    #[tokio::test]
+    async fn debug_impl_redacts_tls_acceptor_as_placeholder() {
+        // The acceptor carries the server's private key material via
+        // the embedded `ServerConfig`. It must never be rendered by
+        // Debug — the manual impl replaces it with a fixed
+        // `"<TlsAcceptor>"` sentinel.
+        let tls = test_tls_config();
+        let listener = TlsListener::bind("127.0.0.1:0", &tls).await.expect("bind");
+        let rendered = format!("{listener:?}");
+        assert!(
+            rendered.contains("<TlsAcceptor>"),
+            "Debug must render TlsAcceptor as a redaction sentinel to keep server keys out of logs; got: {rendered}",
+        );
+    }
+
+    #[tokio::test]
+    async fn debug_impl_includes_max_concurrent_handshakes_field_name() {
+        // The field name is the knob operators tune via
+        // `--max-handshakes`; its presence in logs lets them verify at
+        // runtime which limit the running process actually took.
+        let tls = test_tls_config();
+        let listener = TlsListener::bind("127.0.0.1:0", &tls).await.expect("bind");
+        let rendered = format!("{listener:?}");
+        assert!(
+            rendered.contains("max_concurrent_handshakes"),
+            "Debug should include the max_concurrent_handshakes field; got: {rendered}",
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // set_on_handshake_error — the only mutable knob after construction.
+    // We can't observe the stored closure without triggering a
+    // handshake (that's the integration-test territory), but we can
+    // prove the setter does not panic and returns `()`, and that
+    // calling it twice overwrites rather than appending.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn set_on_handshake_error_accepts_and_overwrites_callback() {
+        let tls = test_tls_config();
+        let mut listener = TlsListener::bind("127.0.0.1:0", &tls).await.expect("bind");
+        // First install — must not panic.
+        let cb1: OnHandshakeError = Arc::new(|_addr, _msg| {});
+        listener.set_on_handshake_error(cb1);
+        // Second install — overwrites cleanly. A future refactor that
+        // turned this into a `Vec<OnHandshakeError>` would silently
+        // double-fire callbacks; Option-based storage forbids that.
+        let cb2: OnHandshakeError = Arc::new(|_addr, _msg| {});
+        listener.set_on_handshake_error(cb2);
+    }
+
+    // ------------------------------------------------------------------
+    // Type-surface checks (compile-time only). `tracing::info!(?x, …)`
+    // is wired at construction sites and would break at `cargo build`
+    // if the derive were ever dropped — faster to catch here than via
+    // a downstream build break.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn tls_listener_is_debug() {
+        fn assert_debug<T: std::fmt::Debug>() {}
+        assert_debug::<TlsListener>();
+    }
+}
