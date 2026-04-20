@@ -240,4 +240,67 @@ mod tests {
             RustgateError::Config(ConfigError::PemParse { .. })
         ));
     }
+
+    #[test]
+    fn parse_key_rejects_empty_pem() {
+        // Empty input goes through the same PemParse mapping — we do
+        // not emit EmptyPem for keys since a missing key is a parse
+        // failure, not a "no entries of expected kind" situation.
+        let err = parse_key(b"").unwrap_err();
+        match err {
+            RustgateError::Config(ConfigError::PemParse { kind, .. }) => {
+                assert_eq!(kind, "private key");
+            }
+            other => panic!("expected PemParse for empty key input, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_ca_store_accepts_chain_of_multiple_cas() {
+        // Two distinct self-signed CAs concatenated into one PEM blob
+        // should both land in the returned RootCertStore — this pins
+        // the per-cert add loop (lines 101-107) across multiple entries.
+        let fx1 = fixture();
+        let fx2 = fixture();
+        let chain = format!("{}{}", fx1.ca_pem, fx2.ca_pem);
+        let store = parse_ca_store(chain.as_bytes()).unwrap();
+        assert_eq!(store.len(), 2);
+    }
+
+    #[test]
+    fn parse_ca_store_accepts_non_ca_leaf_silently() {
+        // Documents current behavior: `RootCertStore::add` does NOT
+        // enforce `BasicConstraints: CA:TRUE`, so a misconfigured
+        // operator who drops a leaf certificate into their CA bundle
+        // will have it silently accepted as a trust anchor. This is
+        // permissive-by-design in rustls — the operator's intent is
+        // authoritative. Tracking this here so any future tightening
+        // (defensive CA check before add) breaks this test loudly.
+        let fx = fixture();
+        let store = parse_ca_store(fx.leaf_cert_pem.as_bytes()).unwrap();
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn parse_ca_store_rejects_valid_pem_with_garbage_der() {
+        // Pins the `ConfigError::Other` path: the PEM envelope is
+        // valid (so `pem_slice_iter` succeeds), but the base64-decoded
+        // payload is not a parseable X.509 certificate. `store.add`
+        // rejects it, and the error must be mapped to
+        // `ConfigError::Other` with a message that names the failure.
+        //
+        // AAAA base64-decodes to three zero bytes — structurally not
+        // a valid DER SEQUENCE, so webpki's trust-anchor parser fails.
+        let input = b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+        let err = parse_ca_store(input).unwrap_err();
+        match err {
+            RustgateError::Config(ConfigError::Other(msg)) => {
+                assert!(
+                    msg.contains("CA certificate"),
+                    "expected error to mention 'CA certificate', got {msg:?}"
+                );
+            }
+            other => panic!("expected ConfigError::Other for garbage DER, got {other:?}"),
+        }
+    }
 }
