@@ -229,6 +229,7 @@ mod tests {
             local_region: None,
             max_groups_per_peer: crate::config::DEFAULT_MAX_GROUPS_PER_PEER,
             max_group_name_length: crate::config::DEFAULT_MAX_GROUP_NAME_LENGTH,
+            trust_peer_groups: false,
         }
     }
 
