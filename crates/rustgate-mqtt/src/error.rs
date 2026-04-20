@@ -53,3 +53,172 @@ pub enum MqttError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used, unused_results)]
+mod tests {
+    use std::io;
+
+    use super::*;
+
+    // -----------------------------------------------------------------
+    // Display messages — pin the operator-facing text for every variant
+    // so a thiserror refactor cannot silently change log / diagnostic
+    // output. Every MQTT session error is rendered into either a
+    // disconnect reason code or an audit/tracing field, so the exact
+    // string shape matters.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn display_unsupported_protocol_includes_version_byte() {
+        assert_eq!(
+            MqttError::UnsupportedProtocol(3).to_string(),
+            "unsupported protocol version: 3",
+        );
+    }
+
+    #[test]
+    fn display_persistent_session_unsupported_is_stable() {
+        assert_eq!(
+            MqttError::PersistentSessionUnsupported.to_string(),
+            "persistent sessions are not supported",
+        );
+    }
+
+    #[test]
+    fn display_will_unsupported_is_stable() {
+        assert_eq!(
+            MqttError::WillUnsupported.to_string(),
+            "will messages are not supported",
+        );
+    }
+
+    #[test]
+    fn display_qos2_unsupported_is_stable() {
+        assert_eq!(
+            MqttError::Qos2Unsupported.to_string(),
+            "QoS 2 (exactly-once) is not supported",
+        );
+    }
+
+    #[test]
+    fn display_not_authorized_quotes_topic() {
+        assert_eq!(
+            MqttError::NotAuthorized("fleet/alpha".to_string()).to_string(),
+            "not authorized for topic: fleet/alpha",
+        );
+    }
+
+    #[test]
+    fn display_invalid_topic_quotes_topic() {
+        assert_eq!(
+            MqttError::InvalidTopic("bad/#/topic".to_string()).to_string(),
+            "invalid topic: bad/#/topic",
+        );
+    }
+
+    #[test]
+    fn display_packet_too_large_includes_size_and_max() {
+        assert_eq!(
+            MqttError::PacketTooLarge {
+                size: 20_000_000,
+                max: 16_777_216,
+            }
+            .to_string(),
+            "packet too large: 20000000 bytes exceeds 16777216 byte limit",
+        );
+    }
+
+    #[test]
+    fn display_malformed_packet_includes_reason() {
+        assert_eq!(
+            MqttError::Malformed("truncated variable header".to_string()).to_string(),
+            "malformed packet: truncated variable header",
+        );
+    }
+
+    #[test]
+    fn display_connect_expected_is_stable() {
+        assert_eq!(
+            MqttError::ConnectExpected.to_string(),
+            "expected CONNECT as first packet",
+        );
+    }
+
+    #[test]
+    fn display_client_id_in_use_quotes_id() {
+        // The back-tick wrapping is important: it makes the ID visually
+        // distinct in logs when the ID contains spaces or unusual
+        // characters, which reduces operator confusion when diagnosing
+        // a takeover attempt.
+        assert_eq!(
+            MqttError::ClientIdInUse("tak-client-42".to_string()).to_string(),
+            "client ID `tak-client-42` is already in use by another identity",
+        );
+    }
+
+    #[test]
+    fn display_keep_alive_timeout_includes_seconds() {
+        assert_eq!(
+            MqttError::KeepAliveTimeout(90).to_string(),
+            "keep-alive timeout (90s)",
+        );
+    }
+
+    #[test]
+    fn display_io_includes_inner_message() {
+        let io_err = io::Error::new(io::ErrorKind::ConnectionReset, "peer went away");
+        let err = MqttError::from(io_err);
+        // The inner Display of `io::Error` is appended as `{0}`.
+        assert_eq!(err.to_string(), "I/O error: peer went away");
+    }
+
+    // -----------------------------------------------------------------
+    // Conversions & trait bounds
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn from_io_error_maps_to_io_variant() {
+        // The `#[from]` attribute on `Io(#[from] std::io::Error)` means
+        // any `io::Error` should lift into `MqttError::Io` transparently
+        // (used on the session hot path via `?`).
+        let io_err = io::Error::from(io::ErrorKind::TimedOut);
+        let err: MqttError = io_err.into();
+        match err {
+            MqttError::Io(inner) => assert_eq!(inner.kind(), io::ErrorKind::TimedOut),
+            other => panic!("expected MqttError::Io, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mqtt_error_implements_std_error() {
+        // Pin the trait bound so downstream `Box<dyn std::error::Error>`
+        // boxing (used by the session layer when funnelling errors into
+        // `anyhow` contexts) keeps compiling.
+        fn assert_std_error<E: std::error::Error>() {}
+        assert_std_error::<MqttError>();
+    }
+
+    #[test]
+    fn mqtt_error_is_send_sync() {
+        // Errors are routed across task boundaries when the session's
+        // `tokio::spawn`-ed read/write halves converge on a shutdown;
+        // losing Send/Sync would silently break that compile-time
+        // invariant.
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<MqttError>();
+    }
+
+    #[test]
+    fn debug_impl_renders_variant_name() {
+        // `Debug` ends up in `tracing::error!(?err, …)` emissions —
+        // stabilise that the variant name is present so log-grepping
+        // for `ClientIdInUse` finds the relevant records.
+        let err = MqttError::ClientIdInUse("abc".to_string());
+        let rendered = format!("{err:?}");
+        assert!(
+            rendered.contains("ClientIdInUse"),
+            "Debug should name the variant; got {rendered}",
+        );
+    }
+}
