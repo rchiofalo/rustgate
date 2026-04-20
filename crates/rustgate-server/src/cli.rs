@@ -11,6 +11,16 @@ use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand, Value
 use rustgate_core::protocol::{FramingStrategy, HeaderSize};
 use serde::{Deserialize, Serialize};
 
+/// Hard minimum for `--archive-rotate-interval` (seconds). Rotation cadences
+/// below this are rejected at config validation time: they widen the
+/// torn-write window and stress disk I/O for no operator benefit. See F-69.
+const MIN_ROTATION_INTERVAL_SECS: u64 = 60;
+
+/// Recommended minimum for `--archive-rotate-interval` (seconds). Values
+/// between [`MIN_ROTATION_INTERVAL_SECS`] and this constant emit a startup
+/// warning but are allowed.
+const RECOMMENDED_MIN_ROTATION_INTERVAL_SECS: u64 = 300;
+
 /// Validate that a CLI argument is a valid socket address (ip:port).
 fn parse_socket_addr(s: &str) -> Result<String, String> {
     let _ = s
@@ -1522,6 +1532,32 @@ impl Cli {
             anyhow::bail!("--acl-reload-interval must be >= 1 when --group-acl-file is set");
         }
 
+        // CoT archive rotation cadence must not be too aggressive. Short
+        // intervals (e.g., 1 minute) open/close archive files and rewrite
+        // the chain-tip anchor frequently, which widens the torn-write
+        // window and increases load for no operator benefit. Enforce a
+        // hard minimum of MIN_ROTATION_INTERVAL_SECS and warn below the
+        // recommended RECOMMENDED_MIN_ROTATION_INTERVAL_SECS.
+        let archive_rotation_enabled =
+            self.archive_dir.is_some() && (self.archive_max_size > 0 || self.archive_max_age > 0);
+        if archive_rotation_enabled {
+            if self.archive_rotate_interval < MIN_ROTATION_INTERVAL_SECS {
+                anyhow::bail!(
+                    "--archive-rotate-interval ({}) must be >= {} seconds",
+                    self.archive_rotate_interval,
+                    MIN_ROTATION_INTERVAL_SECS,
+                );
+            }
+            if self.archive_rotate_interval < RECOMMENDED_MIN_ROTATION_INTERVAL_SECS {
+                tracing::warn!(
+                    interval_secs = self.archive_rotate_interval,
+                    recommended_min_secs = RECOMMENDED_MIN_ROTATION_INTERVAL_SECS,
+                    "--archive-rotate-interval is below the recommended minimum; \
+                     aggressive rotation widens the torn-write window and stresses disk I/O",
+                );
+            }
+        }
+
         // Validate ws buffer size — CLI args go through the clap value_parser,
         // but TOML config values bypass it and need an explicit check here.
         let _ = validate_write_buffer_range(self.ws_max_write_buffer_bytes)
@@ -2298,5 +2334,60 @@ mod tests {
         let dir = tempfile::tempdir().expect("tmpdir");
         let cli = cli_with_temp_tls(&dir);
         cli.validate().expect("default config should be valid");
+    }
+
+    #[test]
+    fn validate_rejects_aggressive_archive_rotate_interval() {
+        // An interval below the hard minimum must be rejected at config
+        // validation so operators cannot opt in to a torn-write-inducing
+        // cadence by accident. See F-69.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut cli = cli_with_temp_tls(&dir);
+        cli.archive_dir = Some(dir.path().to_string_lossy().into_owned());
+        cli.archive_max_size = 1_000_000;
+        cli.archive_rotate_interval = 30;
+
+        let err = cli.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("--archive-rotate-interval (30) must be >= 60 seconds"),
+            "expected min-interval error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_archive_rotate_interval_at_minimum() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut cli = cli_with_temp_tls(&dir);
+        cli.archive_dir = Some(dir.path().to_string_lossy().into_owned());
+        cli.archive_max_size = 1_000_000;
+        cli.archive_rotate_interval = 60;
+        // Emits a warning but must not bail.
+        cli.validate().expect("60s minimum should be accepted");
+    }
+
+    #[test]
+    fn validate_accepts_archive_rotate_interval_above_recommended() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut cli = cli_with_temp_tls(&dir);
+        cli.archive_dir = Some(dir.path().to_string_lossy().into_owned());
+        cli.archive_max_age = 86400;
+        cli.archive_rotate_interval = 600;
+        cli.validate()
+            .expect("cadence above recommended should be accepted");
+    }
+
+    #[test]
+    fn validate_skips_rotation_check_when_rotation_disabled() {
+        // If --archive-max-size and --archive-max-age are both zero, the
+        // rotation task does not spawn — the interval is irrelevant and
+        // must not trigger validation.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut cli = cli_with_temp_tls(&dir);
+        cli.archive_dir = Some(dir.path().to_string_lossy().into_owned());
+        cli.archive_max_size = 0;
+        cli.archive_max_age = 0;
+        cli.archive_rotate_interval = 1; // aggressive, but rotation is off
+        cli.validate().expect("disabled rotation should skip check");
     }
 }

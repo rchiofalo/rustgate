@@ -39,6 +39,18 @@ use sha2::{Digest, Sha256};
 /// Genesis previous-hash value: 64 zero hex characters.
 pub const GENESIS_PREV: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
+/// Maximum number of bytes read from the end of an existing chain file when
+/// recovering the tip across a process restart. Caps startup cost and bounds
+/// the torn-write recovery walk regardless of file size.
+///
+/// If the trailing window contains no valid record (all torn or corrupt),
+/// [`read_chain_tip`] returns [`io::ErrorKind::InvalidData`] and refuses to
+/// silently re-genesis the chain — the operator must verify/repair the log
+/// out-of-band. This makes hostile or accidentally-large corruption visible
+/// rather than hidden behind a multi-minute startup read that previously
+/// walked the entire file (and, on each torn line, re-walked it).
+pub const REWIND_BUDGET: u64 = 16 * 1024 * 1024;
+
 /// Errors that can occur while writing through a [`HashChainWriter`].
 #[derive(Debug, thiserror::Error)]
 pub enum AuditChainError {
@@ -308,11 +320,17 @@ pub fn verify_audit_log(path: &Path) -> Result<VerifyReport, VerifyError> {
 /// Read the last chain tip from an existing audit log so a writer can resume
 /// the chain across process restarts.
 ///
-/// The *last* line of the file must be a valid JSON object containing a
-/// `sha256` string field; if not, this is treated as a torn write from a
-/// previous process and the partial trailing line is truncated in place
-/// before returning the tip from the previous (now-final) line. Returns
-/// [`GENESIS_PREV`] when the file does not exist or contains no records.
+/// Behaviour:
+/// - Returns [`GENESIS_PREV`] when the file does not exist or is empty.
+/// - Reads **at most [`REWIND_BUDGET`] trailing bytes**. Startup cost is
+///   `O(REWIND_BUDGET)` regardless of log size; a hostile or accidentally
+///   enormous log cannot stall startup.
+/// - If the last line is a torn/partial JSON record (common after a crash),
+///   it is truncated in place and the *previous* complete line is used.
+/// - Torn/corrupt line truncation is bounded to the rewound tail. If no
+///   valid record is found within the budget, returns
+///   [`io::ErrorKind::InvalidData`] so the operator can verify/repair the
+///   log out-of-band rather than silently re-genesising the chain.
 pub fn read_chain_tip(path: &Path) -> io::Result<String> {
     let mut file = match OpenOptions::new().read(true).write(true).open(path) {
         Ok(f) => f,
@@ -320,64 +338,108 @@ pub fn read_chain_tip(path: &Path) -> io::Result<String> {
         Err(e) => return Err(e),
     };
 
-    // Read the entire file. Audit logs are typically small relative to memory,
-    // and this avoids backwards-seek bookkeeping.
-    let mut bytes = Vec::new();
+    let file_len = file.metadata()?.len();
+    if file_len == 0 {
+        return Ok(GENESIS_PREV.to_string());
+    }
+
+    // Seek to the start of the trailing window. We only ever read the last
+    // REWIND_BUDGET bytes — never the whole file — so startup is O(budget)
+    // instead of O(file × torn_lines) as the previous recursive loop was.
+    let start = file_len.saturating_sub(REWIND_BUDGET);
+    let _ = file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::with_capacity(file_len.saturating_sub(start) as usize);
     let _ = file.read_to_end(&mut bytes)?;
-    if bytes.is_empty() {
-        return Ok(GENESIS_PREV.to_string());
-    }
 
-    // A valid file must end with a newline. If it does not, the trailing
-    // partial line is torn — truncate it.
-    let trailing_newline = bytes.last() == Some(&b'\n');
-    if !trailing_newline {
-        let last_nl = bytes.iter().rposition(|&b| b == b'\n');
-        let truncate_to = last_nl.map(|i| i + 1).unwrap_or(0);
-        file.set_len(truncate_to as u64)?;
-        let _ = file.seek(SeekFrom::End(0))?;
-        bytes.truncate(truncate_to);
-        if bytes.is_empty() {
-            return Ok(GENESIS_PREV.to_string());
-        }
-    }
-
-    // Find the last non-empty line.
-    let without_trailing = &bytes[..bytes.len() - 1];
-    let last_line_start = without_trailing
-        .iter()
-        .rposition(|&b| b == b'\n')
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    let last_line = &without_trailing[last_line_start..];
-
-    if last_line.is_empty() {
-        // Trailing blank line(s). Treat as no records.
-        return Ok(GENESIS_PREV.to_string());
-    }
-
-    // The last line must parse as a JSON object containing `sha256`. If it
-    // does not (torn or corrupt), truncate it and recurse to look at the
-    // previous line.
-    match serde_json::from_slice::<serde_json::Value>(last_line) {
-        Ok(serde_json::Value::Object(map)) => {
-            if let Some(serde_json::Value::String(h)) = map.get("sha256") {
-                Ok(h.clone())
-            } else {
-                Err(io::Error::new(
+    // If we did not start at offset 0, the leading bytes are the tail of a
+    // line that started before our window. Drop everything before the first
+    // newline so we only examine complete records that fall entirely inside
+    // the budget. `tail_file_offset` is the absolute file position where our
+    // in-memory `bytes` buffer begins — used when truncating corrupt tails
+    // back to disk.
+    let tail_file_offset = if start > 0 {
+        match bytes.iter().position(|&b| b == b'\n') {
+            Some(first_nl) => {
+                let drop = first_nl + 1;
+                let _ = bytes.drain(..drop);
+                start + drop as u64
+            }
+            None => {
+                // No newline anywhere in REWIND_BUDGET bytes — the final
+                // record is larger than the budget (or the file is a single
+                // huge unterminated blob). Refuse to guess.
+                return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "audit log last record is missing sha256 field",
-                ))
+                    "audit log tail contains no complete records within REWIND_BUDGET",
+                ));
             }
         }
-        _ => {
-            // Truncate the corrupt last line and try again from the previous
-            // record.
-            let new_len = last_line_start;
-            file.set_len(new_len as u64)?;
-            let _ = file.seek(SeekFrom::End(0))?;
-            drop(file);
-            read_chain_tip(path)
+    } else {
+        0
+    };
+
+    // A valid file ends with `\n`. If it does not, truncate the torn trailing
+    // partial line on disk before we continue.
+    if bytes.last() != Some(&b'\n') {
+        let last_nl = bytes.iter().rposition(|&b| b == b'\n');
+        let keep = last_nl.map(|i| i + 1).unwrap_or(0);
+        let new_file_len = tail_file_offset + keep as u64;
+        file.set_len(new_file_len)?;
+        let _ = file.seek(SeekFrom::End(0))?;
+        bytes.truncate(keep);
+    }
+
+    // Walk bounded-backwards through complete lines in the tail window,
+    // truncating torn/corrupt trailing records on disk as we go. The loop
+    // is bounded by the number of newlines in the tail (≤ REWIND_BUDGET).
+    loop {
+        if bytes.is_empty() {
+            // If the tail began at offset 0 and we consumed the whole file
+            // without finding a valid record, the file is either empty or
+            // entirely corrupt. Only the empty case is safe to treat as
+            // "no chain yet".
+            if tail_file_offset == 0 {
+                return Ok(GENESIS_PREV.to_string());
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "audit log tip unrecoverable within REWIND_BUDGET; manual repair required",
+            ));
+        }
+
+        // `bytes` ends in `\n` here. Find the last complete line.
+        let without_trailing = &bytes[..bytes.len() - 1];
+        let last_line_start = without_trailing
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let last_line = &without_trailing[last_line_start..];
+
+        if last_line.is_empty() {
+            // Trailing blank line(s). Strip one and retry the previous line.
+            bytes.truncate(bytes.len() - 1);
+            continue;
+        }
+
+        match serde_json::from_slice::<serde_json::Value>(last_line) {
+            Ok(serde_json::Value::Object(map)) => {
+                if let Some(serde_json::Value::String(h)) = map.get("sha256") {
+                    return Ok(h.clone());
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "audit log last record is missing sha256 field",
+                ));
+            }
+            _ => {
+                // Corrupt last line — truncate it on disk (bounded to the
+                // rewound tail) and retry against the previous record.
+                let new_file_len = tail_file_offset + last_line_start as u64;
+                file.set_len(new_file_len)?;
+                let _ = file.seek(SeekFrom::End(0))?;
+                bytes.truncate(last_line_start);
+            }
         }
     }
 }
@@ -851,5 +913,108 @@ mod tests {
         assert_eq!(report.tip, final_tip);
         assert_eq!(report.records, 3);
         let _ = std::fs::remove_file(anchor_path(f.path()));
+    }
+
+    #[test]
+    fn read_chain_tip_refuses_when_tail_has_no_records() {
+        // File is larger than REWIND_BUDGET and the trailing window contains
+        // no newline — simulating a hostile log or a single record larger
+        // than the budget. Startup must refuse rather than loop.
+        let f = NamedTempFile::new().unwrap();
+        let mut big = vec![b'X'; (REWIND_BUDGET as usize) + 4096];
+        // Ensure a valid record exists BEFORE our budget window, so we can
+        // confirm the code deliberately refuses to reach for it rather than
+        // incidentally finding nothing.
+        let valid = br#"{"event":"a","prev_sha256":"0000","sha256":"abc"}"#;
+        big[..valid.len()].copy_from_slice(valid);
+        big[valid.len()] = b'\n';
+        std::fs::write(f.path(), &big).unwrap();
+
+        let err = read_chain_tip(f.path()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string()
+                .contains("no complete records within REWIND_BUDGET"),
+            "expected budget error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn read_chain_tip_recovers_from_large_prefix() {
+        // Prefix well beyond REWIND_BUDGET of valid-looking lines, then a
+        // valid trailing record. The tip should be returned from the tail
+        // without ever reading the prefix. We measure "did not read the
+        // prefix" by timing — the old full-file walk would be ~10× slower
+        // — but we rely on logic here: read_chain_tip must succeed.
+        let f = NamedTempFile::new().unwrap();
+        {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(f.path())
+                .unwrap();
+            // Pad with enough bytes to push real records past REWIND_BUDGET.
+            // Each filler line is ~64 bytes; write ~20 MiB of filler.
+            let filler_line = vec![b'x'; 63];
+            let mut count_bytes: u64 = 0;
+            while count_bytes < REWIND_BUDGET + (2 * 1024 * 1024) {
+                file.write_all(&filler_line).unwrap();
+                file.write_all(b"\n").unwrap();
+                count_bytes += 64;
+            }
+            // Now a real chain. The HashChainWriter is used so the last line
+            // has a valid `sha256`.
+            let mut w = HashChainWriter::new(file, GENESIS_PREV.to_string());
+            w.write_all(br#"{"event":"final"}"#).unwrap();
+            w.write_all(b"\n").unwrap();
+            w.flush().unwrap();
+        }
+        let tip = read_chain_tip(f.path()).unwrap();
+        assert_ne!(tip, GENESIS_PREV);
+    }
+
+    #[test]
+    fn read_chain_tip_recovers_torn_write_after_large_prefix() {
+        // Large prefix of filler bytes (past REWIND_BUDGET) followed by a
+        // valid chain, then a torn partial trailing record. The recovery
+        // must truncate the torn tail and return the previous valid tip.
+        let f = NamedTempFile::new().unwrap();
+        {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(f.path())
+                .unwrap();
+            let filler_line = vec![b'y'; 63];
+            let mut count_bytes: u64 = 0;
+            while count_bytes < REWIND_BUDGET + (1024 * 1024) {
+                file.write_all(&filler_line).unwrap();
+                file.write_all(b"\n").unwrap();
+                count_bytes += 64;
+            }
+        }
+        // Append a real chain via HashChainWriter.
+        {
+            let file = OpenOptions::new().append(true).open(f.path()).unwrap();
+            let mut w = HashChainWriter::new(file, GENESIS_PREV.to_string());
+            w.write_all(br#"{"event":"a"}"#).unwrap();
+            w.write_all(b"\n").unwrap();
+            w.write_all(br#"{"event":"b"}"#).unwrap();
+            w.write_all(b"\n").unwrap();
+            w.flush().unwrap();
+        }
+        let good_tip = read_chain_tip(f.path()).unwrap();
+
+        // Append a torn trailing line (no newline).
+        {
+            let mut file = OpenOptions::new().append(true).open(f.path()).unwrap();
+            file.write_all(b"{\"event\":\"c\",\"prev_sha2").unwrap();
+            file.flush().unwrap();
+        }
+
+        let recovered = read_chain_tip(f.path()).unwrap();
+        assert_eq!(recovered, good_tip);
     }
 }
