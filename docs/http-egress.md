@@ -140,13 +140,13 @@ client-key = "/etc/rustgate/tls/client-key.pem"
 | `ca-cert` | PEM-encoded CA certificate for server verification |
 | `client-cert` | PEM-encoded client certificate for mutual TLS |
 | `client-key` | PEM-encoded client private key (must pair with `client-cert`) |
-| `pin-sha256` | Array of base64-encoded SHA-256 certificate pins (requires `ca-cert`) |
+| `pin-sha256` | Array of base64-encoded SHA-256 SPKI pins (RFC 7469; requires `ca-cert`) |
 
 `client-cert` and `client-key` must both be present or both absent.
 
-#### Certificate Pinning
+#### Certificate Pinning (RFC 7469 SPKI)
 
-Pin the target server's leaf certificate to defend against CA compromise or mis-issuance. When configured, the server's certificate DER is hashed with SHA-256 and compared against the configured pins after standard WebPKI chain validation.
+Pin the target server's public key to defend against CA compromise or mis-issuance. When configured, the SHA-256 of the leaf certificate's **SubjectPublicKeyInfo (SPKI)** is compared against the configured pins after standard WebPKI chain validation — the [RFC 7469] / HPKP convention. Pinning the SPKI rather than the full certificate DER means routine rotations that preserve the key (new serial, new validity window, new SAN list) do **not** force a pin update.
 
 ```toml
 [targets.tls]
@@ -157,13 +157,28 @@ pin-sha256 = [
 ]
 ```
 
-Multiple pins allow for certificate rotation — the old and new certificate pins can coexist. Generate a pin from a certificate:
+Generate an SPKI pin from a certificate or a raw public key:
 
 ```bash
-openssl x509 -in cert.pem -outform DER | openssl dgst -sha256 -binary | base64
+# From a leaf certificate PEM
+openssl x509 -in server.pem -pubkey -noout \
+  | openssl pkey -pubin -outform der \
+  | openssl dgst -sha256 -binary \
+  | base64
+
+# From a standalone public key PEM (e.g. for a key-in-waiting)
+openssl pkey -in pubkey.pem -pubin -outform der \
+  | openssl dgst -sha256 -binary \
+  | base64
 ```
 
+Multiple pins are encouraged — list at least one active pin and one backup key-in-waiting pin so operators can roll the key without a flag-day migration.
+
 `pin-sha256` requires `ca-cert` to also be set (explicit trust anchor). Using certificate pinning with the default Mozilla root store is insecure because any public CA could issue a matching certificate.
+
+> **Breaking change vs pre-#948 builds:** earlier rustgate versions hashed the full leaf certificate DER. Existing full-DER pins do **not** match the new SPKI semantic and must be regenerated with the OpenSSL recipe above. See [issue #948](https://github.com/rchiofalo/rustgate/issues/948).
+
+[RFC 7469]: https://datatracker.ietf.org/doc/html/rfc7469
 
 ### Message Filtering
 

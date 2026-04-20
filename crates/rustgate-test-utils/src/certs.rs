@@ -35,6 +35,17 @@ fn ensure_crypto_provider() {
     });
 }
 
+/// Generate a fresh server key pair for use with
+/// [`TestCa::issue_server_cert_with_key`].
+///
+/// Exposed so tests can model "same key, different certs" flows — in
+/// particular the RFC 7469 SPKI-pinning regression test (issue #948),
+/// where a reissued cert must still satisfy an existing pin.
+pub fn generate_server_keypair() -> KeyPair {
+    ensure_crypto_provider();
+    KeyPair::generate().expect("failed to generate key pair")
+}
+
 /// Extract the serial number from a PEM-encoded certificate.
 fn extract_serial_from_pem(pem: &str) -> SerialNumber {
     let cert_der = rustls_pki_types::CertificateDer::pem_slice_iter(pem.as_bytes())
@@ -81,6 +92,24 @@ impl TestCa {
 
     /// Issue a server certificate with the given common name and SANs.
     pub fn issue_server_cert(&self, cn: &str, san_dns: &[&str]) -> TestCert {
+        let key_pair = KeyPair::generate().expect("failed to generate key pair");
+        self.issue_server_cert_with_key(&key_pair, cn, san_dns)
+    }
+
+    /// Issue a server certificate reusing an existing key pair.
+    ///
+    /// Each call produces a cert with a fresh serial, validity window, and
+    /// signature — the leaf DER bytes change — but the SPKI bytes stay
+    /// identical because the public key comes from `key_pair`. This lets
+    /// tests model the common DevOps pattern of annual cert rotation with
+    /// long-lived key material, and is the cornerstone of the RFC 7469
+    /// SPKI-pinning regression test (issue #948).
+    pub fn issue_server_cert_with_key(
+        &self,
+        key_pair: &KeyPair,
+        cn: &str,
+        san_dns: &[&str],
+    ) -> TestCert {
         let mut params = CertificateParams::default();
         params.is_ca = IsCa::NoCa;
         params
@@ -96,9 +125,8 @@ impl TestCa {
             .map(|s| rcgen::SanType::DnsName((*s).try_into().expect("invalid DNS name")))
             .collect();
 
-        let key_pair = KeyPair::generate().expect("failed to generate key pair");
         let cert = params
-            .signed_by(&key_pair, &self.issuer)
+            .signed_by(key_pair, &self.issuer)
             .expect("failed to sign server cert");
 
         TestCert {
