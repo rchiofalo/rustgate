@@ -34,4 +34,10 @@ time = { workspace = true }
 # Optional deps for the `nats` feature
 tempfile = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["net", "time", "io-util", "process", "rt"], optional = true }
-async-nats = { workspace = true, optional = true }
+# `kv` feature is needed by the `start_completes_only_after_jetstream_accepts_kv_create`
+# regression test which put/get's a KV bucket to prove JetStream is operational
+# (not just metadata-accepted) once `TestNatsServer::start()` returns. Callers
+# of this crate who consume `TestNatsServer` themselves do not need KV — it's
+# purely for our internal readiness test — but features are workspace-wide so
+# we enable it here rather than bifurcating test vs. non-test dep lines.
+async-nats = { workspace = true, features = ["kv"], optional = true }
