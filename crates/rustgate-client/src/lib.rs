@@ -429,3 +429,238 @@ impl Drop for ClientInner {
         self.shutdown.notify_waiters();
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used, unused_results)]
+mod tests {
+    use rustgate_core::protocol::{FramingStrategy, HeaderSize};
+
+    use super::*;
+
+    fn minimal_tls_material() -> TlsMaterial {
+        // The build() tests only care that *some* TlsMaterial is present;
+        // we never actually parse these bytes here. Parse validation lives
+        // in `connect.rs::tests`.
+        TlsMaterial::PemBytes {
+            cert: b"placeholder".to_vec(),
+            key: Zeroizing::new(b"placeholder".to_vec()),
+            ca: b"placeholder".to_vec(),
+        }
+    }
+
+    #[test]
+    fn builder_requires_server_addr() {
+        let err = ClientConfig::builder()
+            .plaintext(true)
+            .build()
+            .expect_err("builder without server_addr must fail");
+        match err {
+            ClientError::MissingField("server_addr") => {}
+            other => panic!("expected MissingField(server_addr), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builder_requires_tls_unless_plaintext() {
+        let err = ClientConfig::builder()
+            .server_addr("example.test:9443")
+            .build()
+            .expect_err("non-plaintext builder without tls must fail");
+        match err {
+            // The field message must mention `.plaintext(true)` so users
+            // know the escape hatch.
+            ClientError::MissingField(msg) => {
+                assert!(
+                    msg.contains("tls") && msg.contains("plaintext"),
+                    "MissingField message should guide user to plaintext(true); got {msg:?}",
+                );
+            }
+            other => panic!("expected MissingField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builder_plaintext_bypasses_tls_requirement() {
+        let cfg = ClientConfig::builder()
+            .server_addr("example.test:9443")
+            .plaintext(true)
+            .build()
+            .expect("plaintext builder should succeed without TLS material");
+        assert!(cfg.plaintext);
+        assert!(cfg.tls.is_none());
+    }
+
+    #[test]
+    fn builder_derives_server_name_from_host_portion() {
+        let cfg = ClientConfig::builder()
+            .server_addr("tak.example.test:9443")
+            .mtls_pem_bytes(
+                b"placeholder".to_vec(),
+                b"placeholder".to_vec(),
+                b"placeholder".to_vec(),
+            )
+            .build()
+            .unwrap();
+        assert_eq!(cfg.server_name, "tak.example.test");
+    }
+
+    #[test]
+    fn builder_falls_back_to_localhost_when_addr_has_no_port() {
+        // `rsplit_once(':')` returns None for addresses without a colon,
+        // so the fallback path triggers. Pins the "localhost" default.
+        let cfg = ClientConfig::builder()
+            .server_addr("noport")
+            .plaintext(true)
+            .build()
+            .unwrap();
+        assert_eq!(cfg.server_name, "localhost");
+    }
+
+    #[test]
+    fn builder_explicit_server_name_overrides_derivation() {
+        let cfg = ClientConfig::builder()
+            .server_addr("10.0.0.5:9443")
+            .server_name("tak.example.test")
+            .plaintext(true)
+            .build()
+            .unwrap();
+        // Host-based routing case from the docstring: explicit SNI must
+        // win over the address-derived default.
+        assert_eq!(cfg.server_name, "tak.example.test");
+    }
+
+    #[test]
+    fn builder_defaults_codec_to_length_prefixed4() {
+        let cfg = ClientConfig::builder()
+            .server_addr("host:1")
+            .plaintext(true)
+            .build()
+            .unwrap();
+        assert_eq!(cfg.codec, Codec::LengthPrefixed4);
+    }
+
+    #[test]
+    fn builder_defaults_connect_timeout_to_thirty_seconds() {
+        let cfg = ClientConfig::builder()
+            .server_addr("host:1")
+            .plaintext(true)
+            .build()
+            .unwrap();
+        assert_eq!(cfg.connect_timeout, Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn builder_preserves_explicit_codec_and_timeout() {
+        let cfg = ClientConfig::builder()
+            .server_addr("host:1")
+            .plaintext(true)
+            .codec(Codec::XmlStream)
+            .connect_timeout(Duration::from_millis(750))
+            .build()
+            .unwrap();
+        assert_eq!(cfg.codec, Codec::XmlStream);
+        assert_eq!(cfg.connect_timeout, Some(Duration::from_millis(750)));
+    }
+
+    #[test]
+    fn builder_stores_mtls_pem_bytes_wrapped_in_zeroizing() {
+        // The key buffer must be wrapped in `Zeroizing<Vec<u8>>` so it is
+        // wiped on drop. Assert on the enum shape — zeroize behaviour
+        // itself is covered by the `zeroize` crate's own tests.
+        let cfg = ClientConfig::builder()
+            .server_addr("host:1")
+            .mtls_pem_bytes(vec![0xAA], vec![0xBB], vec![0xCC])
+            .build()
+            .unwrap();
+        match cfg.tls {
+            Some(TlsMaterial::PemBytes { cert, key, ca }) => {
+                assert_eq!(cert, vec![0xAA]);
+                assert_eq!(ca, vec![0xCC]);
+                assert_eq!(&**key, &[0xBB]);
+            }
+            other => panic!("expected PemBytes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builder_stores_mtls_pem_files_as_pathbufs() {
+        let cfg = ClientConfig::builder()
+            .server_addr("host:1")
+            .mtls_pem_files("/tmp/cert.pem", "/tmp/key.pem", "/tmp/ca.pem")
+            .build()
+            .unwrap();
+        match cfg.tls {
+            Some(TlsMaterial::PemFiles { cert, key, ca }) => {
+                assert_eq!(cert.to_string_lossy(), "/tmp/cert.pem");
+                assert_eq!(key.to_string_lossy(), "/tmp/key.pem");
+                assert_eq!(ca.to_string_lossy(), "/tmp/ca.pem");
+            }
+            other => panic!("expected PemFiles, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_config_debug_redacts_tls_material() {
+        // Custom `Debug` impl must never expose the TLS material — pins
+        // the security contract so a future refactor can't accidentally
+        // leak key bytes via `{:?}` formatting in logs or error chains.
+        let cfg = ClientConfig {
+            server_addr: "host:1".to_string(),
+            server_name: "host".to_string(),
+            tls: Some(minimal_tls_material()),
+            codec: Codec::LengthPrefixed4,
+            plaintext: false,
+            connect_timeout: Some(Duration::from_secs(30)),
+            reconnect: None,
+        };
+        let rendered = format!("{cfg:?}");
+        assert!(
+            rendered.contains("<redacted>"),
+            "ClientConfig Debug output must redact tls; got {rendered}"
+        );
+        assert!(
+            !rendered.contains("placeholder"),
+            "Debug output leaked TLS bytes: {rendered}"
+        );
+    }
+
+    #[test]
+    fn codec_to_framed_maps_every_variant() {
+        // The round-trip through `FramingStrategy` is the contract
+        // between user-facing `Codec` and internal `FramedCodec` —
+        // if a new variant is added, this test forces a conscious
+        // mapping decision.
+        let cases: &[(Codec, FramingStrategy)] = &[
+            (
+                Codec::LengthPrefixed1,
+                FramingStrategy::LengthPrefixed {
+                    header_size: HeaderSize::One,
+                },
+            ),
+            (
+                Codec::LengthPrefixed2,
+                FramingStrategy::LengthPrefixed {
+                    header_size: HeaderSize::Two,
+                },
+            ),
+            (
+                Codec::LengthPrefixed4,
+                FramingStrategy::LengthPrefixed {
+                    header_size: HeaderSize::Four,
+                },
+            ),
+            (Codec::XmlStream, FramingStrategy::XmlStream),
+            (Codec::LineDelimited, FramingStrategy::LineDelimited),
+        ];
+        for (codec, expected) in cases {
+            let framed = codec.to_framed();
+            let roundtrip = rustgate_transport::FramedCodec::try_from_strategy(expected)
+                .expect("expected FramingStrategy is always valid");
+            assert_eq!(
+                format!("{framed:?}"),
+                format!("{roundtrip:?}"),
+                "Codec::{codec:?} must map to {expected:?}",
+            );
+        }
+    }
+}
