@@ -364,7 +364,7 @@ impl BackpressureGate {
     /// Returns immediately when [`is_admitting`](Self::is_admitting) is
     /// `true`. Otherwise, awaits a wakeup from [`sub`](Self::sub) — or,
     /// when the dwell timer is in flight and no further `sub` arrives,
-    /// polls periodically ([`DWELL_POLL_INTERVAL`]) so dwell expiry
+    /// polls periodically (every `DWELL_POLL_INTERVAL`) so dwell expiry
     /// cannot stall indefinitely.
     ///
     /// When called from a TLS accept loop, stalling here does not
