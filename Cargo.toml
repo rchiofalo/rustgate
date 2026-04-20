@@ -98,7 +98,7 @@ x509-cert = "0.2"
 subtle = "2"
 unicode-normalization = "0.1"
 arc-swap = "1"
-lru = "0.16.4"
+lru = "0.17.0"
 zeroize = { version = "1", features = ["derive"] }
 ocsp-stapler = "0.4"
 fastrand = "2"
