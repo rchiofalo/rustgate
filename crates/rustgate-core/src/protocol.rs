@@ -44,3 +44,80 @@ impl HeaderSize {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_size_byte_count_matches_variant() {
+        // Protocol contract: these values are serialized on the wire.
+        // Changing them is a breaking protocol change.
+        assert_eq!(HeaderSize::One.byte_count(), 1);
+        assert_eq!(HeaderSize::Two.byte_count(), 2);
+        assert_eq!(HeaderSize::Four.byte_count(), 4);
+    }
+
+    #[test]
+    fn header_size_byte_count_is_const_per_variant() {
+        // byte_count takes self by value (Copy), so calling twice
+        // on the same variant returns the same number.
+        let h = HeaderSize::Two;
+        assert_eq!(h.byte_count(), h.byte_count());
+    }
+
+    #[test]
+    fn header_size_is_copy_and_eq() {
+        let a = HeaderSize::Four;
+        let b = a; // Copy — a still usable below.
+        assert_eq!(a, b);
+        assert_eq!(a, HeaderSize::Four);
+        assert_ne!(a, HeaderSize::One);
+    }
+
+    #[test]
+    fn header_size_debug_output_includes_variant_name() {
+        // Diagnostic contract: Debug output for a HeaderSize contains
+        // the variant name verbatim so tracing fields are human-readable.
+        assert!(format!("{:?}", HeaderSize::One).contains("One"));
+        assert!(format!("{:?}", HeaderSize::Two).contains("Two"));
+        assert!(format!("{:?}", HeaderSize::Four).contains("Four"));
+    }
+
+    #[test]
+    fn framing_strategy_is_clone_and_debug() {
+        // FramingStrategy is cloned into per-session codec state and
+        // is logged at session setup; Clone + Debug must compile and
+        // produce non-empty output for every variant.
+        for strategy in [
+            FramingStrategy::LengthPrefixed {
+                header_size: HeaderSize::Four,
+            },
+            FramingStrategy::XmlStream,
+            FramingStrategy::LineDelimited,
+            FramingStrategy::TakProtobuf,
+            FramingStrategy::Mavlink,
+        ] {
+            let cloned = strategy.clone();
+            assert!(!format!("{cloned:?}").is_empty());
+        }
+    }
+
+    #[test]
+    fn framing_strategy_length_prefixed_preserves_header_size() {
+        // The LengthPrefixed variant is the only non-unit variant.
+        // Cloning must carry the inner HeaderSize through unchanged.
+        let original = FramingStrategy::LengthPrefixed {
+            header_size: HeaderSize::Two,
+        };
+        let cloned = original.clone();
+        match cloned {
+            FramingStrategy::LengthPrefixed { header_size } => {
+                assert_eq!(header_size, HeaderSize::Two);
+                assert_eq!(header_size.byte_count(), 2);
+            }
+            other => panic!("expected LengthPrefixed, got {other:?}"),
+        }
+    }
+}
