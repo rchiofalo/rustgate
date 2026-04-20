@@ -3306,6 +3306,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "wiremock",
+ "x509-parser",
  "zeroize",
 ]
 

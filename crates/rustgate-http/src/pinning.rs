@@ -3,9 +3,36 @@
 //! Certificate pinning verifier for outbound TLS connections.
 //!
 //! Wraps the standard WebPKI verifier with an additional SHA-256 pin
-//! check on the leaf certificate DER. This provides defense-in-depth
-//! against CA compromise or mis-issuance — even if the certificate
-//! chains to a trusted CA, it must also match a pre-configured pin.
+//! check on the leaf certificate's **SubjectPublicKeyInfo (SPKI)** per
+//! [RFC 7469]. This provides defense-in-depth against CA compromise or
+//! mis-issuance — even if the certificate chains to a trusted CA, its
+//! public key must also match a pre-configured pin.
+//!
+//! ## Semantic
+//!
+//! Each pin is `SHA-256(subjectPublicKeyInfo DER)`, not a hash of the
+//! whole certificate. This matches the RFC 7469 / HPKP / Chromium /
+//! Mozilla / OpenSSL convention and the pin produced by the standard
+//! OpenSSL recipe:
+//!
+//! ```text
+//! openssl x509 -in server.pem -pubkey -noout \
+//!   | openssl pkey -pubin -outform der \
+//!   | openssl dgst -sha256 -binary \
+//!   | base64
+//! ```
+//!
+//! ## Breaking change vs pre-#948 behaviour
+//!
+//! Earlier builds hashed the full leaf certificate DER, so a same-key
+//! reissue (new serial/validity/SANs) broke the pin and forced a config
+//! change. SPKI pinning now lets rotation-with-key-reuse pass without a
+//! config change — the common DevOps practice of annual cert rotation
+//! with long-lived key material no longer invalidates every deployed
+//! pin. Operators who held full-DER pins from a previous deployment
+//! must regenerate them with the OpenSSL recipe above.
+//!
+//! [RFC 7469]: https://datatracker.ietf.org/doc/html/rfc7469
 
 use std::fmt;
 use std::sync::Arc;
@@ -22,11 +49,12 @@ use crate::error::HttpError;
 /// in addition to standard WebPKI chain validation.
 ///
 /// The inner verifier handles X.509 chain validation and revocation.
-/// This wrapper adds a post-verification check that the leaf certificate's
-/// DER-encoded SHA-256 hash matches at least one configured pin.
+/// This wrapper adds a post-verification check that the SHA-256 hash
+/// of the leaf certificate's SubjectPublicKeyInfo (SPKI) matches at
+/// least one configured pin — the RFC 7469 convention.
 pub(crate) struct PinnedCertVerifier {
     inner: Arc<dyn ServerCertVerifier>,
-    /// SHA-256 hashes of acceptable leaf certificate DER encodings.
+    /// SHA-256 hashes of acceptable leaf-certificate SPKI DER encodings.
     pins: Vec<[u8; 32]>,
 }
 
@@ -63,19 +91,25 @@ impl ServerCertVerifier for PinnedCertVerifier {
             now,
         )?;
 
-        // Second: SHA-256 pin check on the leaf certificate DER
-        let cert_hash = Sha256::digest(end_entity.as_ref());
+        // Second: SHA-256 pin check on the leaf certificate's SPKI
+        // (RFC 7469). Pinning the SPKI rather than the full DER lets a
+        // same-key reissue (new serial, new validity window, new SAN
+        // list) match an existing pin — aligning with standard HPKP
+        // tooling and avoiding a forced config change on every cert
+        // rotation that preserves the key.
+        let spki = extract_spki_der(end_entity)?;
+        let spki_hash = Sha256::digest(spki);
         let matches_pin = self
             .pins
             .iter()
-            .any(|pin| pin.as_slice() == cert_hash.as_slice());
+            .any(|pin| pin.as_slice() == spki_hash.as_slice());
 
         if matches_pin {
             Ok(ServerCertVerified::assertion())
         } else {
             Err(TlsError::General(format!(
-                "certificate pin mismatch: SHA-256 {} did not match any of {} configured pins",
-                hex::encode(cert_hash),
+                "certificate SPKI pin mismatch: SHA-256 {} did not match any of {} configured pins",
+                hex::encode(spki_hash),
                 self.pins.len()
             )))
         }
@@ -102,6 +136,28 @@ impl ServerCertVerifier for PinnedCertVerifier {
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.inner.supported_verify_schemes()
     }
+}
+
+/// Extract the raw DER bytes of a leaf certificate's `SubjectPublicKeyInfo`
+/// (SPKI) for RFC 7469 pin computation.
+///
+/// Returns a borrow of the bytes inside the certificate — no allocation
+/// or copy. A parse failure here is surfaced as a rustls
+/// [`TlsError::General`] so the rustls handshake path fails closed with
+/// a descriptive error rather than silently admitting the connection.
+fn extract_spki_der<'a>(cert: &'a CertificateDer<'_>) -> Result<&'a [u8], TlsError> {
+    let (_, parsed) = x509_parser::parse_x509_certificate(cert.as_ref())
+        .map_err(|e| TlsError::General(format!("certificate SPKI extraction failed: {e}")))?;
+    Ok(parsed.tbs_certificate.subject_pki.raw)
+}
+
+/// Compute the pin bytes for a leaf certificate. Shared between the
+/// verifier hot path (via `extract_spki_der`) and test helpers that need
+/// to produce pins from issued test certs.
+#[cfg(test)]
+pub(crate) fn spki_pin(cert: &CertificateDer<'_>) -> [u8; 32] {
+    let spki = extract_spki_der(cert).expect("test cert must be parseable");
+    Sha256::digest(spki).into()
 }
 
 /// Parse base64-encoded SHA-256 pins into raw 32-byte arrays.
@@ -340,20 +396,19 @@ mod tests {
         assert!(parse_pem_private_key(b"not a key").is_none());
     }
 
-    /// Codifies the current pin semantic: `pin_sha256` hashes the **entire
-    /// leaf certificate DER**, not the SubjectPublicKeyInfo (SPKI). Any
-    /// cert reissue — even with identical subject, SAN list, and issuer —
-    /// produces a new DER encoding (new serial, new validity window, new
-    /// signature) and therefore a new pin hash.
-    ///
-    /// Regression guard for #813: if we ever migrate to RFC 7469 SPKI
-    /// pinning, this test must be updated (not deleted) to reflect the new
-    /// semantic, because the config-file format stays named `pin_sha256`.
+    /// Two independently-issued certs whose key pairs differ must hash to
+    /// different SPKI pins. This is the pinning hot path's core property:
+    /// the pin is sensitive to the key, so a compromised-CA attacker
+    /// cannot silently swap the leaf cert for one signed under a
+    /// different key and pass the pin check.
     #[test]
-    fn pin_is_full_leaf_der_not_spki_or_subject() {
+    fn distinct_keypairs_hash_to_distinct_spki_pins() {
         use rustgate_test_utils::certs::TestCa;
 
-        let ca = TestCa::new("pin-regression-ca");
+        let ca = TestCa::new("pin-distinct-keys-ca");
+        // Each issue_server_cert call rolls a fresh keypair internally,
+        // so the two leaf certs have different SPKI even though the
+        // subject and SAN list match.
         let cert_a = ca.issue_server_cert("edge.example", &["edge.example"]);
         let cert_b = ca.issue_server_cert("edge.example", &["edge.example"]);
 
@@ -366,30 +421,74 @@ mod tests {
             .next()
             .expect("cert B DER");
 
-        // Full DER bytes must differ across reissues (serial/validity change).
+        let pin_a = spki_pin(&der_a);
+        let pin_b = spki_pin(&der_b);
         assert_ne!(
-            der_a.as_ref(),
-            der_b.as_ref(),
-            "reissued certs should have distinct DER encodings"
-        );
-
-        // SHA-256 over the full DER — the exact operation verifier performs.
-        let hash_a = Sha256::digest(der_a.as_ref());
-        let hash_b = Sha256::digest(der_b.as_ref());
-        assert_ne!(
-            hash_a.as_slice(),
-            hash_b.as_slice(),
-            "pin semantic: full-DER hashing — a reissued cert MUST NOT \
-             match the pin of its predecessor. Rotating certs requires \
-             also rotating the pin list (configure both pins during the \
-             overlap window). See `TlsConfig::pin_sha256` docs."
+            pin_a, pin_b,
+            "distinct keypairs must produce distinct SPKI pins",
         );
     }
 
+    /// Core RFC 7469 property: an SPKI pin survives a same-key cert
+    /// reissue. `rustgate_test_utils::TestCa::issue_server_cert_with_key`
+    /// rolls a fresh serial, validity window, and signature over the
+    /// supplied keypair, so the leaf DER changes but the SPKI stays
+    /// byte-identical. The pin must continue to match.
+    ///
+    /// This is the direct regression guard for #948. Prior to this
+    /// migration, `pin_sha256` hashed the full leaf DER and a routine
+    /// annual rotation with long-lived keys forced every operator to
+    /// update their pin list. With SPKI pinning the same rotation is a
+    /// no-op for pins.
     #[test]
-    fn verifier_accepts_matching_pin_from_real_cert() {
-        // Happy-path: the verifier's hashing matches our parse_pem pipeline,
-        // so a pin computed from the same DER the server will present is a hit.
+    fn spki_pin_survives_same_key_reissue() {
+        use rustgate_test_utils::certs::{TestCa, generate_server_keypair};
+
+        let ca = TestCa::new("pin-same-key-ca");
+        let keypair = generate_server_keypair();
+        let cert_a = ca.issue_server_cert_with_key(&keypair, "edge.example", &["edge.example"]);
+        let cert_b = ca.issue_server_cert_with_key(&keypair, "edge.example", &["edge.example"]);
+
+        let der_a = parse_pem_certs(cert_a.cert_pem.as_bytes())
+            .into_iter()
+            .next()
+            .expect("cert A DER");
+        let der_b = parse_pem_certs(cert_b.cert_pem.as_bytes())
+            .into_iter()
+            .next()
+            .expect("cert B DER");
+
+        // Sanity: the full-DER bytes changed (rcgen bumps serial and
+        // signs afresh on every issue), so a legacy full-DER pin would
+        // have broken.
+        assert_ne!(
+            der_a.as_ref(),
+            der_b.as_ref(),
+            "reissued leaf DERs should differ",
+        );
+
+        // But the SPKI bytes — and therefore the pin — stay identical.
+        let spki_a = extract_spki_der(&der_a).expect("SPKI A");
+        let spki_b = extract_spki_der(&der_b).expect("SPKI B");
+        assert_eq!(
+            spki_a, spki_b,
+            "same keypair must yield same SPKI bytes across reissues",
+        );
+
+        let pin_a = spki_pin(&der_a);
+        let pin_b = spki_pin(&der_b);
+        assert_eq!(
+            pin_a, pin_b,
+            "SPKI pin must match across same-key reissues (RFC 7469 semantic)",
+        );
+    }
+
+    /// Round-trip the config-file base64 ingestion: an SPKI pin computed
+    /// from a real issued cert must survive `b64::encode` → `parse_pins`
+    /// and come out byte-identical, matching what the verifier's hot
+    /// path computes.
+    #[test]
+    fn verifier_accepts_matching_spki_pin_from_real_cert() {
         use rustgate_test_utils::certs::TestCa;
 
         let ca = TestCa::new("pin-ok-ca");
@@ -400,11 +499,52 @@ mod tests {
             .expect("server cert DER");
 
         // Compute the expected pin exactly as the verifier would.
-        let expected_pin: [u8; 32] = Sha256::digest(der.as_ref()).into();
+        let expected_pin = spki_pin(&der);
 
         // Round-trip through base64 parse to mirror config-file ingestion.
         let b64_pin = b64::encode(expected_pin);
         let parsed = parse_pins(&[b64_pin]).expect("pin parses");
         assert_eq!(parsed, vec![expected_pin]);
+    }
+
+    /// A legacy full-DER pin — the pre-#948 hash — must **not** match
+    /// the new SPKI-based verifier. Operators who held full-DER pins
+    /// from an earlier deployment see a mismatch and are forced to
+    /// regenerate; silent acceptance of the old pin format would defeat
+    /// the migration's whole point.
+    #[test]
+    fn legacy_full_der_pin_no_longer_matches() {
+        use rustgate_test_utils::certs::TestCa;
+
+        let ca = TestCa::new("pin-legacy-ca");
+        let cert = ca.issue_server_cert("legacy.example", &["legacy.example"]);
+        let der = parse_pem_certs(cert.cert_pem.as_bytes())
+            .into_iter()
+            .next()
+            .expect("server cert DER");
+
+        // Pre-#948 pin shape: SHA-256 of the whole leaf DER.
+        let legacy_pin: [u8; 32] = Sha256::digest(der.as_ref()).into();
+        // Post-#948 pin shape: SHA-256 of the SPKI bytes.
+        let spki_pin_bytes = spki_pin(&der);
+        assert_ne!(
+            legacy_pin, spki_pin_bytes,
+            "full-DER hash and SPKI hash are distinct by construction — \
+             otherwise the migration test below is vacuous",
+        );
+    }
+
+    /// `extract_spki_der` surfaces an x509-parser failure as a rustls
+    /// `TlsError::General` so the verifier fails closed on a malformed
+    /// cert rather than panicking or silently admitting the connection.
+    #[test]
+    fn extract_spki_der_rejects_malformed_cert() {
+        let garbage = CertificateDer::from(vec![0x00, 0x01, 0x02, 0x03]);
+        let err = extract_spki_der(&garbage).expect_err("must reject garbage");
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("SPKI extraction failed"),
+            "error must name the SPKI extraction step; got {rendered}",
+        );
     }
 }
