@@ -18,7 +18,12 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   CARGO_PROFILE_DEV_DEBUG: 0
-  RUSTFLAGS: -Dwarnings
+  # -Dwarnings is workspace-wide policy (all warnings are errors).
+  # -C link-arg=-fuse-ld=mold wires the mold linker on self-hosted runners
+  # (mold is pre-installed in the github-runner container image); GitHub-hosted
+  # fallback (RUNNER_POOL != self-hosted) keeps the default linker since
+  # ubuntu-latest does not ship mold.
+  RUSTFLAGS: ${{ vars.RUNNER_POOL == 'self-hosted' && '-Dwarnings -C link-arg=-fuse-ld=mold' || '-Dwarnings' }}
   # Pinned nats-server release used by the `test` and `coverage` jobs.
   # Bumping the version requires updating NATS_SERVER_SHA256 — check
   # https://github.com/nats-io/nats-server/releases for the tarball checksum.
@@ -116,7 +121,11 @@ jobs:
           toolchain: nightly-2026-04-01
           components: rustfmt
 
+      # sccache is the primary cache on self-hosted runners (shared volume,
+      # no per-job upload/download). Swatinem/rust-cache is kept only for
+      # the GitHub-hosted fallback, where sccache is not pre-installed.
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        if: vars.RUNNER_POOL != 'self-hosted'
 
       - name: Check formatting
         run: cargo +nightly-2026-04-01 fmt --all -- --check
@@ -148,10 +157,19 @@ jobs:
           toolchain: "1.94"
           components: clippy
 
+      # sccache is the primary cache on self-hosted runners (shared volume,
+      # no per-job upload/download). Swatinem/rust-cache is kept only for
+      # the GitHub-hosted fallback, where sccache is not pre-installed.
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        if: vars.RUNNER_POOL != 'self-hosted'
 
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        # No-op on self-hosted runners where protobuf-compiler is baked into
+        # the container image; apt-get install on the GitHub-hosted fallback.
+        run: |
+          if ! command -v protoc >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          fi
 
       - name: Clippy (all features)
         run: cargo clippy --locked --workspace --all-targets --features nats,enrollment,est,proto,full-detail,metrics,federation,federation-ha,websocket,mqtt,otel,http
@@ -177,10 +195,19 @@ jobs:
         with:
           toolchain: "1.94"
 
+      # sccache is the primary cache on self-hosted runners (shared volume,
+      # no per-job upload/download). Swatinem/rust-cache is kept only for
+      # the GitHub-hosted fallback, where sccache is not pre-installed.
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        if: vars.RUNNER_POOL != 'self-hosted'
 
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        # No-op on self-hosted runners where protobuf-compiler is baked into
+        # the container image; apt-get install on the GitHub-hosted fallback.
+        run: |
+          if ! command -v protoc >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          fi
 
       - uses: taiki-e/install-action@055f5df8c3f65ea01cd41e9dc855becd88953486 # v2.75.18
         with:
@@ -190,7 +217,26 @@ jobs:
       - name: Check all feature combinations
         # NOTE: --locked is omitted because --no-dev-deps temporarily modifies
         # Cargo.toml files, which invalidates the lockfile.
-        run: cargo hack check --feature-powerset --depth 2 --exclude-features jemalloc,fips,otel,post-quantum --no-dev-deps
+        #
+        # Depth is event-conditional:
+        # - PRs: --depth 1 — checks each feature individually (C(N,1) combos).
+        #   Catches the common case (per-feature breakage) in ~8-12 minutes.
+        # - push to main: --depth 2 — checks every 2-feature combination as well
+        #   (C(N,2)). Catches combinatorial pair breakage before it reaches a
+        #   release tag. Runs ~40-45 minutes, which is acceptable post-merge.
+        #
+        # Rationale: most feature regressions are per-feature, not combinatorial;
+        # depth 2 on every PR burns ~32 wall-clock minutes per run for rare
+        # regressions. main-branch protection ensures depth-2 runs before any
+        # release is cut, so pair-breakage still gets caught pre-release.
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            DEPTH=1
+          else
+            DEPTH=2
+          fi
+          echo "Running cargo hack check at depth $DEPTH (event=${{ github.event_name }})"
+          cargo hack check --feature-powerset --depth "$DEPTH" --exclude-features jemalloc,fips,otel,post-quantum --no-dev-deps
 
   test:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
@@ -211,7 +257,12 @@ jobs:
           toolchain: "1.94"
 
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        # No-op on self-hosted runners where protobuf-compiler is baked into
+        # the container image; apt-get install on the GitHub-hosted fallback.
+        run: |
+          if ! command -v protoc >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          fi
 
       - name: Cache nats-server binary
         id: cache-nats
@@ -231,10 +282,19 @@ jobs:
       - name: Verify nats-server
         run: nats-server --version
 
+      # sccache is the primary cache on self-hosted runners (shared volume,
+      # no per-job upload/download). Swatinem/rust-cache is kept only for
+      # the GitHub-hosted fallback, where sccache is not pre-installed.
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        if: vars.RUNNER_POOL != 'self-hosted'
 
       - name: Install cargo-nextest
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+        # No-op on self-hosted runners where cargo-nextest is baked into the
+        # container image; downloads the tarball on the GitHub-hosted fallback.
+        run: |
+          if ! command -v cargo-nextest >/dev/null 2>&1; then
+            curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+          fi
 
       - name: Run tests
         run: cargo nextest run --locked --workspace --features nats,enrollment,est,proto,full-detail,metrics,federation,federation-ha,websocket,mqtt,otel,http
@@ -264,7 +324,12 @@ jobs:
           toolchain: "1.94"
 
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        # No-op on self-hosted runners where protobuf-compiler is baked into
+        # the container image; apt-get install on the GitHub-hosted fallback.
+        run: |
+          if ! command -v protoc >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          fi
 
       - name: Cache nats-server binary
         id: cache-nats
@@ -281,7 +346,11 @@ jobs:
           tar xzf /tmp/nats.tar.gz -C /tmp
           sudo mv "/tmp/nats-server-v${NATS_SERVER_VERSION}-linux-amd64/nats-server" /usr/local/bin/
 
+      # sccache is the primary cache on self-hosted runners (shared volume,
+      # no per-job upload/download). Swatinem/rust-cache is kept only for
+      # the GitHub-hosted fallback, where sccache is not pre-installed.
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        if: vars.RUNNER_POOL != 'self-hosted'
 
       - uses: taiki-e/install-action@055f5df8c3f65ea01cd41e9dc855becd88953486 # v2.75.18
         with:
@@ -333,14 +402,31 @@ jobs:
         run: rustup target add ${{ matrix.target }}
 
       - name: Install FIPS build dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake golang-go musl-tools
+        # No-op on self-hosted runners where protobuf-compiler, cmake, golang-go,
+        # and musl-tools are baked into the container image; apt-get install on
+        # the GitHub-hosted fallback. We check for protoc as a proxy for the
+        # whole package set — the container image provisions them together.
+        run: |
+          if ! command -v protoc >/dev/null 2>&1 || ! command -v cmake >/dev/null 2>&1 || ! command -v go >/dev/null 2>&1 || ! command -v musl-gcc >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake golang-go musl-tools
+          fi
 
       - name: Install aarch64 cross-compiler
         if: contains(matrix.target, 'aarch64')
-        run: sudo apt-get install -y gcc-aarch64-linux-gnu
+        # No-op on self-hosted runners where gcc-aarch64-linux-gnu is baked into
+        # the container image; apt-get install on the GitHub-hosted fallback.
+        run: |
+          if ! command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu
+          fi
 
       - name: Install cargo-nextest
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+        # No-op on self-hosted runners where cargo-nextest is baked into the
+        # container image; downloads the tarball on the GitHub-hosted fallback.
+        run: |
+          if ! command -v cargo-nextest >/dev/null 2>&1; then
+            curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+          fi
 
       - name: Clippy (FIPS)
         if: matrix.run_tests
@@ -353,6 +439,13 @@ jobs:
           CC_${{ matrix.target }}: ${{ matrix.cc }}
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
           C_INCLUDE_PATH: ${{ contains(matrix.target, 'musl') && '/usr/include:/usr/include/x86_64-linux-gnu' || '' }}
+          # Drop mold from RUSTFLAGS for cross-target FIPS builds: the gcc
+          # cross-wrappers (aarch64-linux-gnu-gcc, musl-gcc) invoke collect2
+          # with their own ld-search-path that does not include mold, so
+          # `-fuse-ld=mold` fails with `collect2: cannot find 'ld'`. The mold
+          # speedup still applies to every non-cross-target step (clippy,
+          # test, coverage, check-features, the x86_64 FIPS clippy path).
+          RUSTFLAGS: -Dwarnings
         run: cargo build --locked -p rustgate-server --features fips,federation,enrollment,http --target ${{ matrix.target }}
 
       - name: Run FIPS tests
@@ -382,10 +475,21 @@ jobs:
           components: clippy
 
       - name: Install PQ build dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake golang-go
+        # No-op on self-hosted runners where protobuf-compiler, cmake, and
+        # golang-go are baked into the container image; apt-get install on the
+        # GitHub-hosted fallback.
+        run: |
+          if ! command -v protoc >/dev/null 2>&1 || ! command -v cmake >/dev/null 2>&1 || ! command -v go >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake golang-go
+          fi
 
       - name: Install cargo-nextest
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+        # No-op on self-hosted runners where cargo-nextest is baked into the
+        # container image; downloads the tarball on the GitHub-hosted fallback.
+        run: |
+          if ! command -v cargo-nextest >/dev/null 2>&1; then
+            curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+          fi
 
       - name: Clippy (post-quantum)
         run: |
