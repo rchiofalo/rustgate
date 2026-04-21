@@ -1,0 +1,10 @@
+{
+  "_comment": "Baseline size for the rustgate release binary. Used by scripts/check-binary-size.py in CI to detect >10% size regressions. Update this file when a PR legitimately grows the binary (new feature, new dep). Set to 0 to skip enforcement and only report sizes; the script will exit 0 with a notice annotation instructing the next PR to commit the observed value.",
+  "_threshold_percent": 10,
+  "binaries": {
+    "rustgate-default": {
+      "features": "nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket,otel,http",
+      "baseline_bytes": 0
+    }
+  }
+}
