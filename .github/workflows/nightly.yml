@@ -117,10 +117,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
 
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        # No-op on self-hosted runners where protobuf-compiler is baked into
+        # the container image; apt-get install on the GitHub-hosted fallback.
+        run: |
+          if ! command -v protoc >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          fi
 
       - name: Install cargo-fuzz
-        run: cargo +nightly install cargo-fuzz --locked
+        # No-op on self-hosted runners where cargo-fuzz is baked into the
+        # container image; installs via cargo on the GitHub-hosted fallback.
+        run: |
+          if ! command -v cargo-fuzz >/dev/null 2>&1; then
+            cargo +nightly install cargo-fuzz --locked
+          fi
 
       - name: Run fuzzer for 10 minutes
         run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=600
