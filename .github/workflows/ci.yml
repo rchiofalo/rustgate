@@ -439,6 +439,13 @@ jobs:
           CC_${{ matrix.target }}: ${{ matrix.cc }}
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
           C_INCLUDE_PATH: ${{ contains(matrix.target, 'musl') && '/usr/include:/usr/include/x86_64-linux-gnu' || '' }}
+          # Drop mold from RUSTFLAGS for cross-target FIPS builds: the gcc
+          # cross-wrappers (aarch64-linux-gnu-gcc, musl-gcc) invoke collect2
+          # with their own ld-search-path that does not include mold, so
+          # `-fuse-ld=mold` fails with `collect2: cannot find 'ld'`. The mold
+          # speedup still applies to every non-cross-target step (clippy,
+          # test, coverage, check-features, the x86_64 FIPS clippy path).
+          RUSTFLAGS: -Dwarnings
         run: cargo build --locked -p rustgate-server --features fips,federation,enrollment,http --target ${{ matrix.target }}
 
       - name: Run FIPS tests
