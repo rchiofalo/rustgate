@@ -4007,9 +4007,9 @@ dependencies = [
 
 [[package]]
 name = "spiffe"
-version = "0.12.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ce89d478a0709d93311d0ff6981902893a912cc573b00dcb40f0d15856d4950"
+checksum = "9aff6a0d35863f8d175720ac9958b4f4417a524879957c28078feb72c30e01b8"
 dependencies = [
  "arc-swap",
  "fastrand",
