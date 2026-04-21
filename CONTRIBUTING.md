@@ -64,7 +64,7 @@ CI runs as parallel jobs. All checks must pass before merging to `main` (enforce
 | `clippy` | `cargo clippy` with all features + `cargo doc` |
 | `check-features` | `cargo hack` feature powerset (depth 2, excludes fips/jemalloc/post-quantum) |
 | `test` | `cargo nextest run` with all features (except fips/jemalloc/post-quantum) + doc tests |
-| `coverage` | `cargo tarpaulin` code coverage |
+| `coverage` | `cargo llvm-cov --nextest` code coverage |
 | `fips` | Clippy, build, and tests with `--features fips` |
 | `post-quantum` | Clippy, build, and tests with `--features post-quantum` |
 | `audit` | `cargo deny check` + `cargo audit` |
