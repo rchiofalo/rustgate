@@ -5,7 +5,7 @@
 # by dependabot (see .github/dependabot.yml, ecosystem: docker). The
 # @sha256 digest is mandatory — the CI "Validate Dockerfile FROM digest
 # pinning" step fails any FROM line without it.
-FROM rust:1.94-alpine@sha256:77237dd363a0b127bb5ef532c2d64c0deb380b738e43a9c4bdac73398d6d0a08 AS builder
+FROM rust:1.95-alpine@sha256:606fd313a0f49743ee2a7bd49a0914bab7deedb12791f3a846a34a4711db7ed2 AS builder
 
 RUN apk add --no-cache musl-dev protobuf-dev make
 
