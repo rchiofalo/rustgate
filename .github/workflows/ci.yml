@@ -371,6 +371,18 @@ jobs:
     needs: [lint, clippy]
     runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
 
+    # Override the workflow-level RUSTFLAGS to drop `-fuse-ld=mold` on the FIPS
+    # job. Two reasons: (1) the aarch64-unknown-linux-gnu cross-compile matrix
+    # entry uses `aarch64-linux-gnu-gcc` which does not see the host's native
+    # `mold` binary in its cross-toolchain `ld` search path — gcc's collect2
+    # errors with `cannot find 'ld'`; (2) aws-lc-fips-sys has its own C/C++
+    # link requirements and we keep the native x86_64-musl matrix entry on the
+    # default linker too so behaviour is uniform across the matrix. The lint,
+    # clippy, check-features, test, and coverage jobs continue to use mold
+    # (inherit from the workflow-level RUSTFLAGS).
+    env:
+      RUSTFLAGS: -Dwarnings
+
     strategy:
       fail-fast: false
       matrix:
