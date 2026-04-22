@@ -61,6 +61,21 @@ Per-connection frame-rate and byte-rate limits for WebSocket clients. Clients ex
 - Byte rate limits protect against clients sending large payloads. A value of `1048576` (1 MB/sec) is reasonable for position data.
 - Both limits can be used together. Set `ws-max-violations` higher (e.g., `20`) if transient bursts are expected.
 
+### WebSocket Active Health Check (Ping/Pong)
+
+| Flag | Env Var | Default |
+|------|---------|---------|
+| `--ws-ping-interval-secs` | `RUSTGATE_WS_PING_INTERVAL_SECS` | `0` (disabled) |
+| `--ws-pong-timeout-secs` | `RUSTGATE_WS_PONG_TIMEOUT_SECS` | `0` (disabled) |
+
+`tokio-tungstenite` auto-replies to inbound Ping frames but never probes the peer itself, so a session wedged behind a silent NAT/proxy middlebox appears healthy at the library level while no bytes move in either direction. Setting `--ws-ping-interval-secs` to a non-zero value emits a Ping frame every `N` seconds. Inbound Pong timestamps are recorded; if `--ws-pong-timeout-secs` is also non-zero, a session whose last Pong is older than `ping_interval + pong_timeout` is terminated with a heartbeat-timeout error.
+
+**Tuning guidance:**
+- For tactical/long-lived sessions behind NAT middleboxes with typical 60-second idle timers, set `--ws-ping-interval-secs=30` to keep NAT state warm.
+- Set `--ws-pong-timeout-secs=10`-`30` to drop genuinely silent peers without being aggressive about transient Pong loss.
+- Setting ping interval without a pong timeout (`--ws-pong-timeout-secs=0`) keeps Pings flowing forever without ever terminating a session — useful for warming middleboxes when transient Pong drops must be tolerated.
+- Both `0` (default) preserves legacy behaviour: `tokio-tungstenite` still auto-replies to inbound Pings but the server does not actively probe.
+
 ### Session Circuit Breaker
 
 | Flag | Env Var | Default |

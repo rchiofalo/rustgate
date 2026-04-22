@@ -9,6 +9,7 @@
 //! All connections require a valid client certificate; identity is extracted
 //! exclusively from the X.509 certificate, never from headers or query params.
 
+pub mod health;
 mod rate_limit;
 mod server;
 
