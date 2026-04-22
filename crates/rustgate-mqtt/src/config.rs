@@ -31,6 +31,88 @@ pub type OnMqttAccept = Arc<dyn Fn() + Send + Sync>;
 /// the permit gate.
 pub type OnMqttReject = Arc<dyn Fn() + Send + Sync>;
 
+/// Callback invoked once per MQTT PUBLISH that is authorised and handed
+/// to the router for delivery.
+///
+/// Wired by the server crate to feed the `rustgate_mqtt_publishes_total`
+/// Prometheus counter. Fires exactly once per successful PUBLISH — after
+/// topic validation, prefix mapping, and group-membership authorisation
+/// pass, and immediately before the router forwards the envelope.
+pub type OnMqttPublish = Arc<dyn Fn() + Send + Sync>;
+
+/// Callback invoked once per MQTT PUBLISH that is rejected by the
+/// session handler (QoS2 unsupported, invalid topic, or not authorised
+/// for the resolved group).
+///
+/// Wired by the server crate to feed the
+/// `rustgate_mqtt_publishes_rejected_total` Prometheus counter. Fires
+/// exactly once per rejected PUBLISH regardless of which validation
+/// branch triggered the refusal, so operators get a single admission-
+/// failure signal without per-reason cardinality.
+pub type OnMqttPublishReject = Arc<dyn Fn() + Send + Sync>;
+
+/// Callback invoked once per SUBSCRIBE topic filter that is successfully
+/// bound to an authorised group.
+///
+/// Wired by the server crate to feed the `rustgate_mqtt_subscribes_total`
+/// Prometheus counter. Fires *per filter*, not per SUBSCRIBE packet — a
+/// single MQTT SUBSCRIBE with three wildcard filters may produce up to
+/// three increments — so the counter tracks actual group bindings rather
+/// than packet counts.
+pub type OnMqttSubscribe = Arc<dyn Fn() + Send + Sync>;
+
+/// Callback invoked once per SUBSCRIBE topic filter that is rejected by
+/// the session handler (QoS2 unsupported, filter invalid under the
+/// active wildcard policy, or not authorised for any resolved group).
+///
+/// Wired by the server crate to feed the
+/// `rustgate_mqtt_subscribes_rejected_total` Prometheus counter. Fires
+/// *per filter*, mirroring [`OnMqttSubscribe`] — a SUBSCRIBE with three
+/// filters where two are denied produces two increments on this counter
+/// and one on [`OnMqttSubscribe`].
+pub type OnMqttSubscribeReject = Arc<dyn Fn() + Send + Sync>;
+
+/// Bundle of session-level observer callbacks (publish accept/reject,
+/// subscribe accept/reject) passed through to every spawned MQTT
+/// session.
+///
+/// Packaged as a single struct so that threading the four callbacks
+/// through the already-large `handle_mqtt_session` call does not push
+/// the argument count above the documented `#[allow(clippy::too_many_
+/// arguments)]` justification. The four fields are fired independently
+/// at the publish and subscribe hot paths; a `None` field leaves the
+/// corresponding hot path untouched.
+#[derive(Default, Clone)]
+pub struct MqttSessionHooks {
+    /// Fires after a PUBLISH is handed to the router. See
+    /// [`OnMqttPublish`].
+    pub on_publish: Option<OnMqttPublish>,
+
+    /// Fires when a PUBLISH is rejected. See [`OnMqttPublishReject`].
+    pub on_publish_reject: Option<OnMqttPublishReject>,
+
+    /// Fires per accepted SUBSCRIBE filter. See [`OnMqttSubscribe`].
+    pub on_subscribe: Option<OnMqttSubscribe>,
+
+    /// Fires per rejected SUBSCRIBE filter. See
+    /// [`OnMqttSubscribeReject`].
+    pub on_subscribe_reject: Option<OnMqttSubscribeReject>,
+}
+
+impl std::fmt::Debug for MqttSessionHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let fmt_cb = |cb: &Option<Arc<dyn Fn() + Send + Sync>>| {
+            if cb.is_some() { "Some(<cb>)" } else { "None" }
+        };
+        f.debug_struct("MqttSessionHooks")
+            .field("on_publish", &fmt_cb(&self.on_publish))
+            .field("on_publish_reject", &fmt_cb(&self.on_publish_reject))
+            .field("on_subscribe", &fmt_cb(&self.on_subscribe))
+            .field("on_subscribe_reject", &fmt_cb(&self.on_subscribe_reject))
+            .finish()
+    }
+}
+
 /// Configuration for [`MqttServer::run`](crate::MqttServer::run).
 pub struct MqttServerConfig {
     /// The bound MQTT TLS listener.
@@ -83,6 +165,13 @@ pub struct MqttServerConfig {
     /// a closure that increments `rustgate_mqtt_connections_rejected_total`.
     /// See [`OnMqttReject`].
     pub on_reject: Option<OnMqttReject>,
+
+    /// Optional per-session observer callbacks for PUBLISH / SUBSCRIBE
+    /// admission outcomes. `None` leaves every hot path untouched; the
+    /// server crate installs closures that increment the
+    /// `rustgate_mqtt_{publishes,subscribes}{_rejected,}_total` Prometheus
+    /// counters. See [`MqttSessionHooks`].
+    pub session_hooks: Option<MqttSessionHooks>,
 }
 
 impl MqttServerConfig {
@@ -124,6 +213,7 @@ impl std::fmt::Debug for MqttServerConfig {
                     "None"
                 },
             )
+            .field("session_hooks", &self.session_hooks)
             .finish()
     }
 }
@@ -244,6 +334,7 @@ mod tests {
             wildcard_policy: WildcardPolicy::default(),
             on_accept: None,
             on_reject: None,
+            session_hooks: None,
         };
         let rendered = format!("{config:?}");
         assert!(
@@ -285,6 +376,7 @@ mod tests {
             wildcard_policy: WildcardPolicy::default(),
             on_accept: Some(Arc::new(|| {})),
             on_reject: Some(Arc::new(|| {})),
+            session_hooks: Some(MqttSessionHooks::default()),
         };
         let rendered = format!("{config:?}");
         assert!(
@@ -294,6 +386,123 @@ mod tests {
         assert!(
             rendered.contains("on_reject: \"Some(<cb>)\""),
             "expected `on_reject: \"Some(<cb>)\"` sentinel, got: {rendered}",
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Session-level hooks (`MqttSessionHooks`) — publish/subscribe
+    // admission observers. Follow the same pattern as `OnMqttAccept` /
+    // `OnMqttReject`: pin the `Send + Sync` bounds on each type alias
+    // and pin the manual `Debug` impl's `Some(<cb>)` / `None` sentinels
+    // so a refactor that silently dropped a bound or broke the debug
+    // rendering cannot land without failing a test here first.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn on_publish_type_is_send_sync_arc_fn() {
+        fn assert_bounds<T: Send + Sync + 'static>(_: &T) {}
+        let cb: OnMqttPublish = Arc::new(|| {});
+        assert_bounds(&cb);
+    }
+
+    #[test]
+    fn on_publish_reject_type_is_send_sync_arc_fn() {
+        fn assert_bounds<T: Send + Sync + 'static>(_: &T) {}
+        let cb: OnMqttPublishReject = Arc::new(|| {});
+        assert_bounds(&cb);
+    }
+
+    #[test]
+    fn on_subscribe_type_is_send_sync_arc_fn() {
+        fn assert_bounds<T: Send + Sync + 'static>(_: &T) {}
+        let cb: OnMqttSubscribe = Arc::new(|| {});
+        assert_bounds(&cb);
+    }
+
+    #[test]
+    fn on_subscribe_reject_type_is_send_sync_arc_fn() {
+        fn assert_bounds<T: Send + Sync + 'static>(_: &T) {}
+        let cb: OnMqttSubscribeReject = Arc::new(|| {});
+        assert_bounds(&cb);
+    }
+
+    #[test]
+    fn session_hooks_default_has_no_callbacks_installed() {
+        // `MqttSessionHooks::default()` is the wiring seed for
+        // metrics-off builds — every field must be `None` so that the
+        // session's hot path does not pay a closure-dispatch cost for
+        // callbacks that will never fire.
+        let hooks = MqttSessionHooks::default();
+        assert!(hooks.on_publish.is_none());
+        assert!(hooks.on_publish_reject.is_none());
+        assert!(hooks.on_subscribe.is_none());
+        assert!(hooks.on_subscribe_reject.is_none());
+    }
+
+    #[test]
+    fn session_hooks_debug_none_renders_all_fields_as_none_sentinel() {
+        let rendered = format!("{:?}", MqttSessionHooks::default());
+        assert!(
+            rendered.contains("on_publish: \"None\""),
+            "expected `on_publish: \"None\"` sentinel, got: {rendered}",
+        );
+        assert!(
+            rendered.contains("on_publish_reject: \"None\""),
+            "expected `on_publish_reject: \"None\"` sentinel, got: {rendered}",
+        );
+        assert!(
+            rendered.contains("on_subscribe: \"None\""),
+            "expected `on_subscribe: \"None\"` sentinel, got: {rendered}",
+        );
+        assert!(
+            rendered.contains("on_subscribe_reject: \"None\""),
+            "expected `on_subscribe_reject: \"None\"` sentinel, got: {rendered}",
+        );
+    }
+
+    #[test]
+    fn session_hooks_debug_some_renders_cb_sentinel_for_each_installed_field() {
+        // Install each callback independently so a regression that
+        // wired up the wrong field (copy-paste bug in the server crate)
+        // is caught by a test that exercises each field's rendering
+        // in isolation rather than all-or-nothing.
+        let hooks = MqttSessionHooks {
+            on_publish: Some(Arc::new(|| {})),
+            on_publish_reject: Some(Arc::new(|| {})),
+            on_subscribe: Some(Arc::new(|| {})),
+            on_subscribe_reject: Some(Arc::new(|| {})),
+        };
+        let rendered = format!("{hooks:?}");
+        assert!(rendered.contains("on_publish: \"Some(<cb>)\""));
+        assert!(rendered.contains("on_publish_reject: \"Some(<cb>)\""));
+        assert!(rendered.contains("on_subscribe: \"Some(<cb>)\""));
+        assert!(rendered.contains("on_subscribe_reject: \"Some(<cb>)\""));
+    }
+
+    #[test]
+    fn session_hooks_clone_duplicates_arc_without_wrapping() {
+        // `MqttSessionHooks` derives `Clone` so the server crate can
+        // hand it by value into every session spawn without bumping
+        // `Arc`-of-`Arc` indirection. Verify that cloning preserves
+        // strong_count sharing rather than creating a new arc.
+        let inner: OnMqttPublish = Arc::new(|| {});
+        let hooks = MqttSessionHooks {
+            on_publish: Some(Arc::clone(&inner)),
+            ..MqttSessionHooks::default()
+        };
+        let initial_count = Arc::strong_count(&inner);
+        let cloned = hooks.clone();
+        let after_clone = Arc::strong_count(&inner);
+        assert_eq!(
+            after_clone,
+            initial_count + 1,
+            "cloning hooks must bump the inner Arc's strong count, not wrap in a new Arc",
+        );
+        drop(cloned);
+        assert_eq!(
+            Arc::strong_count(&inner),
+            initial_count,
+            "dropping the clone must restore the original strong count",
         );
     }
 }

@@ -130,8 +130,9 @@ struct ResponsePacket {
 // by `listener::accept_loop`. Every argument maps to a distinct config or
 // runtime handle that must be owned by this task (pre-handshake state,
 // router Arc, prefix, three size/time caps, wildcard policy, client-id
-// registry, admission permit). Packaging into a struct would duplicate the
-// listener's own config surface for zero call-site reduction.
+// registry, admission permit, optional metrics hooks). Packaging into a
+// struct would duplicate the listener's own config surface for zero
+// call-site reduction.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_mqtt_session(
     pre: MqttPreSession,
@@ -143,6 +144,7 @@ pub(crate) async fn handle_mqtt_session(
     wildcard_policy: WildcardPolicy,
     client_id_registry: Arc<ClientIdRegistry>,
     _permit: OwnedSemaphorePermit,
+    session_hooks: Option<crate::config::MqttSessionHooks>,
 ) {
     let identity = pre.identity;
     let peer_addr = pre.peer_addr;
@@ -270,6 +272,7 @@ pub(crate) async fn handle_mqtt_session(
         topic_prefix: topic_prefix.as_deref(),
         wildcard_policy,
         keep_alive: keep_alive_duration,
+        session_hooks: session_hooks.as_ref(),
     };
 
     let read_result = tokio::select! {
@@ -430,6 +433,48 @@ async fn send_response(
 }
 
 // ---------------------------------------------------------------------------
+// Session hook dispatch
+//
+// The four helpers below are the only places `MqttSessionHooks` is looked
+// up from inside the publish / subscribe hot paths. Centralising them here
+// lets the individual callers stay readable (`fire_publish_reject(hooks)`)
+// without every call site paying the closure-option dance — and makes the
+// fire-site wiring a one-liner that shows up in test coverage directly.
+// ---------------------------------------------------------------------------
+
+fn fire_publish_accept(hooks: Option<&crate::config::MqttSessionHooks>) {
+    if let Some(h) = hooks
+        && let Some(cb) = &h.on_publish
+    {
+        cb();
+    }
+}
+
+fn fire_publish_reject(hooks: Option<&crate::config::MqttSessionHooks>) {
+    if let Some(h) = hooks
+        && let Some(cb) = &h.on_publish_reject
+    {
+        cb();
+    }
+}
+
+fn fire_subscribe_accept(hooks: Option<&crate::config::MqttSessionHooks>) {
+    if let Some(h) = hooks
+        && let Some(cb) = &h.on_subscribe
+    {
+        cb();
+    }
+}
+
+fn fire_subscribe_reject(hooks: Option<&crate::config::MqttSessionHooks>) {
+    if let Some(h) = hooks
+        && let Some(cb) = &h.on_subscribe_reject
+    {
+        cb();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Read loop
 // ---------------------------------------------------------------------------
 
@@ -445,6 +490,7 @@ struct ReadLoopParams<'a> {
     topic_prefix: Option<&'a str>,
     wildcard_policy: WildcardPolicy,
     keep_alive: std::time::Duration,
+    session_hooks: Option<&'a crate::config::MqttSessionHooks>,
 }
 
 /// Read loop: process inbound MQTT packets from the client.
@@ -464,6 +510,7 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<(), MqttError
     let topic_prefix = params.topic_prefix;
     let wildcard_policy = params.wildcard_policy;
     let keep_alive = params.keep_alive;
+    let session_hooks = params.session_hooks;
     loop {
         let packet = match tokio::time::timeout(keep_alive, reader.read_packet()).await {
             Ok(Ok(pkt)) => pkt,
@@ -478,7 +525,15 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<(), MqttError
             // --- v5 packets ---
             MqttPacket::V5(boxed) => match *boxed {
                 mqttbytes::v5::Packet::Publish(publish) => {
-                    handle_publish_v5(resp_tx, identity, router, topic_prefix, publish).await?;
+                    handle_publish_v5(
+                        resp_tx,
+                        identity,
+                        router,
+                        topic_prefix,
+                        session_hooks,
+                        publish,
+                    )
+                    .await?;
                 }
                 mqttbytes::v5::Packet::Subscribe(sub) => {
                     handle_subscribe_v5(
@@ -488,6 +543,7 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<(), MqttError
                         session_id,
                         topic_prefix,
                         wildcard_policy,
+                        session_hooks,
                         sub,
                     )
                     .await?;
@@ -518,7 +574,15 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<(), MqttError
             // --- v4 packets ---
             MqttPacket::V4(v4_pkt) => match v4_pkt {
                 mqttbytes::v4::Packet::Publish(publish) => {
-                    handle_publish_v4(resp_tx, identity, router, topic_prefix, publish).await?;
+                    handle_publish_v4(
+                        resp_tx,
+                        identity,
+                        router,
+                        topic_prefix,
+                        session_hooks,
+                        publish,
+                    )
+                    .await?;
                 }
                 mqttbytes::v4::Packet::Subscribe(sub) => {
                     handle_subscribe_v4(
@@ -528,6 +592,7 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<(), MqttError
                         session_id,
                         topic_prefix,
                         wildcard_policy,
+                        session_hooks,
                         sub,
                     )
                     .await?;
@@ -563,22 +628,39 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<(), MqttError
 // PUBLISH handlers
 // ---------------------------------------------------------------------------
 
+// justification: adds one metrics-hooks arg to the pre-existing v5 publish
+// handler's five args. Bundling into a struct would duplicate the v4 mirror
+// handler's surface with no call-site win — both handlers are dispatched
+// exactly once per PUBLISH packet from the read loop.
+#[allow(clippy::too_many_arguments)]
 async fn handle_publish_v5(
     resp_tx: &mpsc::Sender<ResponsePacket>,
     identity: &Arc<Identity>,
     router: &Router,
     topic_prefix: Option<&str>,
+    session_hooks: Option<&crate::config::MqttSessionHooks>,
     publish: mqttbytes::v5::Publish,
 ) -> Result<(), MqttError> {
     if publish.qos == mqttbytes::QoS::ExactlyOnce {
+        fire_publish_reject(session_hooks);
         return Err(MqttError::Qos2Unsupported);
     }
 
-    topic::validate_publish_topic(&publish.topic)?;
-    let group = topic::topic_to_group(&publish.topic, topic_prefix)?;
+    if let Err(e) = topic::validate_publish_topic(&publish.topic) {
+        fire_publish_reject(session_hooks);
+        return Err(e);
+    }
+    let group = match topic::topic_to_group(&publish.topic, topic_prefix) {
+        Ok(g) => g,
+        Err(e) => {
+            fire_publish_reject(session_hooks);
+            return Err(e);
+        }
+    };
 
     // Authorization: the client must be a member of the target group.
     if !identity.is_member_of(&group) {
+        fire_publish_reject(session_hooks);
         return Err(MqttError::NotAuthorized(format!(
             "not authorized to publish to group '{group}'"
         )));
@@ -597,6 +679,7 @@ async fn handle_publish_v5(
     };
 
     router.route(msg).await;
+    fire_publish_accept(session_hooks);
 
     // QoS 1: acknowledge receipt.
     if publish.qos == mqttbytes::QoS::AtLeastOnce && publish.pkid != 0 {
@@ -615,22 +698,38 @@ async fn handle_publish_v5(
     Ok(())
 }
 
+// justification: mirrors `handle_publish_v5` for the MQTT 3.1.1 wire format.
+// The v5 sibling already carries the same six args and unifying them would
+// force an unrelated wrapper struct through every dispatch branch.
+#[allow(clippy::too_many_arguments)]
 async fn handle_publish_v4(
     resp_tx: &mpsc::Sender<ResponsePacket>,
     identity: &Arc<Identity>,
     router: &Router,
     topic_prefix: Option<&str>,
+    session_hooks: Option<&crate::config::MqttSessionHooks>,
     publish: mqttbytes::v4::Publish,
 ) -> Result<(), MqttError> {
     if publish.qos == mqttbytes::QoS::ExactlyOnce {
+        fire_publish_reject(session_hooks);
         return Err(MqttError::Qos2Unsupported);
     }
 
-    topic::validate_publish_topic(&publish.topic)?;
-    let group = topic::topic_to_group(&publish.topic, topic_prefix)?;
+    if let Err(e) = topic::validate_publish_topic(&publish.topic) {
+        fire_publish_reject(session_hooks);
+        return Err(e);
+    }
+    let group = match topic::topic_to_group(&publish.topic, topic_prefix) {
+        Ok(g) => g,
+        Err(e) => {
+            fire_publish_reject(session_hooks);
+            return Err(e);
+        }
+    };
 
     // Authorization: the client must be a member of the target group.
     if !identity.is_member_of(&group) {
+        fire_publish_reject(session_hooks);
         return Err(MqttError::NotAuthorized(format!(
             "not authorized to publish to group '{group}'"
         )));
@@ -649,6 +748,7 @@ async fn handle_publish_v4(
     };
 
     router.route(msg).await;
+    fire_publish_accept(session_hooks);
 
     // QoS 1: acknowledge receipt.
     if publish.qos == mqttbytes::QoS::AtLeastOnce && publish.pkid != 0 {
@@ -667,11 +767,12 @@ async fn handle_publish_v4(
 // SUBSCRIBE handlers
 // ---------------------------------------------------------------------------
 
-// justification: seven args is the minimum set the SUBSCRIBE handler needs —
-// response tx, session identity, router, session id, prefix, wildcard policy,
-// and the decoded packet. The handler is dispatched from the read loop once
-// per SUBSCRIBE packet; a wrapper struct would be built fresh at every call
-// with no shared lifetime benefit.
+// justification: eight args — the original seven the SUBSCRIBE handler
+// needs (response tx, session identity, router, session id, prefix,
+// wildcard policy, packet) plus the optional per-filter metrics hooks.
+// The handler is dispatched from the read loop once per SUBSCRIBE
+// packet; a wrapper struct would be built fresh at every call with no
+// shared lifetime benefit.
 #[allow(clippy::too_many_arguments)]
 async fn handle_subscribe_v5(
     resp_tx: &mpsc::Sender<ResponsePacket>,
@@ -680,6 +781,7 @@ async fn handle_subscribe_v5(
     session_id: u64,
     topic_prefix: Option<&str>,
     wildcard_policy: WildcardPolicy,
+    session_hooks: Option<&crate::config::MqttSessionHooks>,
     sub: mqttbytes::v5::Subscribe,
 ) -> Result<(), MqttError> {
     let mut return_codes = Vec::with_capacity(sub.filters.len());
@@ -687,6 +789,7 @@ async fn handle_subscribe_v5(
     for filter in &sub.filters {
         if filter.qos == mqttbytes::QoS::ExactlyOnce {
             return_codes.push(mqttbytes::v5::SubscribeReasonCode::ImplementationSpecific);
+            fire_subscribe_reject(session_hooks);
             continue;
         }
 
@@ -700,15 +803,22 @@ async fn handle_subscribe_v5(
         )
         .await
         {
-            Ok(()) => match filter.qos {
-                mqttbytes::QoS::AtMostOnce => mqttbytes::v5::SubscribeReasonCode::QoS0,
-                mqttbytes::QoS::AtLeastOnce => mqttbytes::v5::SubscribeReasonCode::QoS1,
-                mqttbytes::QoS::ExactlyOnce => unreachable!(),
-            },
+            Ok(()) => {
+                fire_subscribe_accept(session_hooks);
+                match filter.qos {
+                    mqttbytes::QoS::AtMostOnce => mqttbytes::v5::SubscribeReasonCode::QoS0,
+                    mqttbytes::QoS::AtLeastOnce => mqttbytes::v5::SubscribeReasonCode::QoS1,
+                    mqttbytes::QoS::ExactlyOnce => unreachable!(),
+                }
+            }
             Err(MqttError::InvalidTopic(_)) => {
+                fire_subscribe_reject(session_hooks);
                 mqttbytes::v5::SubscribeReasonCode::TopicFilterInvalid
             }
-            Err(_) => mqttbytes::v5::SubscribeReasonCode::NotAuthorized,
+            Err(_) => {
+                fire_subscribe_reject(session_hooks);
+                mqttbytes::v5::SubscribeReasonCode::NotAuthorized
+            }
         };
         return_codes.push(code);
     }
@@ -724,9 +834,10 @@ async fn handle_subscribe_v5(
 }
 
 // justification: mirrors `handle_subscribe_v5` for the MQTT 3.1.1 wire
-// format; the v5 path already carries the same seven args, and unifying them
-// under a struct would force every branch in the dispatch to unpack fields
-// that differ only in the generic `sub` packet type.
+// format with the same eight args including the optional metrics hooks.
+// Unifying the pair under a struct would force every branch in the read-
+// loop dispatch to unpack fields that differ only in the generic `sub`
+// packet type.
 #[allow(clippy::too_many_arguments)]
 async fn handle_subscribe_v4(
     resp_tx: &mpsc::Sender<ResponsePacket>,
@@ -735,6 +846,7 @@ async fn handle_subscribe_v4(
     session_id: u64,
     topic_prefix: Option<&str>,
     wildcard_policy: WildcardPolicy,
+    session_hooks: Option<&crate::config::MqttSessionHooks>,
     sub: mqttbytes::v4::Subscribe,
 ) -> Result<(), MqttError> {
     let mut return_codes = Vec::with_capacity(sub.filters.len());
@@ -742,6 +854,7 @@ async fn handle_subscribe_v4(
     for filter in &sub.filters {
         if filter.qos == mqttbytes::QoS::ExactlyOnce {
             return_codes.push(mqttbytes::v4::SubscribeReasonCode::Failure);
+            fire_subscribe_reject(session_hooks);
             continue;
         }
 
@@ -757,8 +870,14 @@ async fn handle_subscribe_v4(
         )
         .await
         {
-            Ok(()) => mqttbytes::v4::SubscribeReasonCode::Success(filter.qos),
-            Err(_) => mqttbytes::v4::SubscribeReasonCode::Failure,
+            Ok(()) => {
+                fire_subscribe_accept(session_hooks);
+                mqttbytes::v4::SubscribeReasonCode::Success(filter.qos)
+            }
+            Err(_) => {
+                fire_subscribe_reject(session_hooks);
+                mqttbytes::v4::SubscribeReasonCode::Failure
+            }
         };
         return_codes.push(code);
     }

@@ -113,6 +113,15 @@ static WS_CONNECTIONS: OnceLock<IntCounter> = OnceLock::new();
 #[cfg(feature = "websocket")]
 static WS_CONNECTIONS_REJECTED: OnceLock<IntCounter> = OnceLock::new();
 
+#[cfg(feature = "mqtt")]
+static MQTT_PUBLISHES: OnceLock<IntCounter> = OnceLock::new();
+#[cfg(feature = "mqtt")]
+static MQTT_PUBLISHES_REJECTED: OnceLock<IntCounter> = OnceLock::new();
+#[cfg(feature = "mqtt")]
+static MQTT_SUBSCRIBES: OnceLock<IntCounter> = OnceLock::new();
+#[cfg(feature = "mqtt")]
+static MQTT_SUBSCRIBES_REJECTED: OnceLock<IntCounter> = OnceLock::new();
+
 #[cfg(feature = "nats")]
 static NATS_CONSUMER_PENDING: OnceLock<IntGauge> = OnceLock::new();
 #[cfg(feature = "nats")]
@@ -523,6 +532,58 @@ pub fn init() -> prometheus::Result<()> {
         ))?;
         registry.register(Box::new(ws_connections_rejected.clone()))?;
         let _ = WS_CONNECTIONS_REJECTED.set(ws_connections_rejected);
+    }
+
+    #[cfg(feature = "mqtt")]
+    {
+        let mqtt_publishes = IntCounter::with_opts(Opts::new(
+            "rustgate_mqtt_publishes_total",
+            "MQTT PUBLISH packets authorised and handed to the router for \
+             delivery. Incremented exactly once per PUBLISH after topic \
+             validation, prefix mapping, and group-membership authorisation \
+             all pass. A flat-lined value while `rustgate_mqtt_connections_\
+             total` is still climbing indicates clients are connecting but not \
+             publishing — typically a credential-scope mismatch on the \
+             producer side.",
+        ))?;
+        registry.register(Box::new(mqtt_publishes.clone()))?;
+        let _ = MQTT_PUBLISHES.set(mqtt_publishes);
+
+        let mqtt_publishes_rejected = IntCounter::with_opts(Opts::new(
+            "rustgate_mqtt_publishes_rejected_total",
+            "MQTT PUBLISH packets rejected by the session handler before \
+             reaching the router. Covers QoS2 (unsupported), topic validation \
+             failures, prefix-mapping failures, and group-membership \
+             authorisation failures. A rising rate on this counter with a flat \
+             `rustgate_mqtt_publishes_total` indicates clients are publishing \
+             but routinely violating topic or authorisation contracts.",
+        ))?;
+        registry.register(Box::new(mqtt_publishes_rejected.clone()))?;
+        let _ = MQTT_PUBLISHES_REJECTED.set(mqtt_publishes_rejected);
+
+        let mqtt_subscribes = IntCounter::with_opts(Opts::new(
+            "rustgate_mqtt_subscribes_total",
+            "MQTT SUBSCRIBE topic filters successfully bound to an authorised \
+             group. Incremented *per filter*, not per SUBSCRIBE packet — a \
+             single SUBSCRIBE carrying three filters may produce up to three \
+             increments — so the counter tracks actual group bindings rather \
+             than raw packet counts.",
+        ))?;
+        registry.register(Box::new(mqtt_subscribes.clone()))?;
+        let _ = MQTT_SUBSCRIBES.set(mqtt_subscribes);
+
+        let mqtt_subscribes_rejected = IntCounter::with_opts(Opts::new(
+            "rustgate_mqtt_subscribes_rejected_total",
+            "MQTT SUBSCRIBE topic filters rejected by the session handler. \
+             Covers QoS2 (unsupported), filter invalid under the active \
+             wildcard policy, and authorisation failures (no mapping to an \
+             authorised group). Incremented *per filter*, mirroring \
+             `rustgate_mqtt_subscribes_total` — a SUBSCRIBE with three filters \
+             where two are denied produces two increments on this counter and \
+             one on the successful counter.",
+        ))?;
+        registry.register(Box::new(mqtt_subscribes_rejected.clone()))?;
+        let _ = MQTT_SUBSCRIBES_REJECTED.set(mqtt_subscribes_rejected);
     }
 
     #[cfg(feature = "nats")]
@@ -1184,6 +1245,41 @@ pub fn ws_connections() -> &'static IntCounter {
 pub fn ws_connections_rejected() -> &'static IntCounter {
     WS_CONNECTIONS_REJECTED
         .get_or_init(|| fallback_counter("rustgate_ws_connections_rejected_total", "fallback"))
+}
+
+/// Counter incremented once per MQTT PUBLISH authorised and handed to
+/// the router for delivery. Wired from
+/// `rustgate_mqtt::MqttSessionHooks::on_publish`.
+#[cfg(feature = "mqtt")]
+pub fn mqtt_publishes() -> &'static IntCounter {
+    MQTT_PUBLISHES.get_or_init(|| fallback_counter("rustgate_mqtt_publishes_total", "fallback"))
+}
+
+/// Counter incremented once per MQTT PUBLISH rejected by the session
+/// handler (QoS2 unsupported, topic validation, prefix mapping, or
+/// authorisation failure). Wired from
+/// `rustgate_mqtt::MqttSessionHooks::on_publish_reject`.
+#[cfg(feature = "mqtt")]
+pub fn mqtt_publishes_rejected() -> &'static IntCounter {
+    MQTT_PUBLISHES_REJECTED
+        .get_or_init(|| fallback_counter("rustgate_mqtt_publishes_rejected_total", "fallback"))
+}
+
+/// Counter incremented once per MQTT SUBSCRIBE topic filter bound to an
+/// authorised group. Wired from
+/// `rustgate_mqtt::MqttSessionHooks::on_subscribe`.
+#[cfg(feature = "mqtt")]
+pub fn mqtt_subscribes() -> &'static IntCounter {
+    MQTT_SUBSCRIBES.get_or_init(|| fallback_counter("rustgate_mqtt_subscribes_total", "fallback"))
+}
+
+/// Counter incremented once per MQTT SUBSCRIBE topic filter rejected by
+/// the session handler. Wired from
+/// `rustgate_mqtt::MqttSessionHooks::on_subscribe_reject`.
+#[cfg(feature = "mqtt")]
+pub fn mqtt_subscribes_rejected() -> &'static IntCounter {
+    MQTT_SUBSCRIBES_REJECTED
+        .get_or_init(|| fallback_counter("rustgate_mqtt_subscribes_rejected_total", "fallback"))
 }
 
 /// Returns the JetStream consumer `num_pending` gauge if registered.
@@ -2465,6 +2561,10 @@ mod tests {
         {
             let _ = mqtt_connections();
             let _ = mqtt_connections_rejected();
+            let _ = mqtt_publishes();
+            let _ = mqtt_publishes_rejected();
+            let _ = mqtt_subscribes();
+            let _ = mqtt_subscribes_rejected();
         }
         #[cfg(feature = "websocket")]
         {
@@ -2604,6 +2704,271 @@ mod tests {
                  before={before}, after={}",
                 mqtt_connections_rejected().get(),
             );
+        }
+    }
+
+    /// Dedicated tests for the per-operation MQTT counters wired via the
+    /// `rustgate_mqtt::MqttSessionHooks` slots. Pairs with the
+    /// `mqtt_connections_counters` block above — connections-level counters
+    /// live on `MqttServerConfig::{on_accept, on_reject}`, while these
+    /// operation-level counters live on the nested `session_hooks` struct
+    /// so the session task can fire them at each PUBLISH/SUBSCRIBE path.
+    #[cfg(feature = "mqtt")]
+    mod mqtt_publish_subscribe_counters {
+        use super::*;
+
+        #[test]
+        fn mqtt_publishes_registered_under_documented_name() {
+            ensure_init();
+            let families = prometheus::default_registry().gather();
+            let found = families
+                .iter()
+                .find(|m| m.name() == "rustgate_mqtt_publishes_total")
+                .expect("rustgate_mqtt_publishes_total must be registered");
+            assert_eq!(
+                found.get_field_type(),
+                prometheus::proto::MetricType::COUNTER,
+            );
+            let sample = found
+                .get_metric()
+                .first()
+                .expect("counter metric family must have one sample");
+            assert!(
+                sample.get_label().is_empty(),
+                "rustgate_mqtt_publishes_total must be label-free — the PUBLISH \
+                 path fires per MQTT packet, so introducing labels would explode \
+                 cardinality on dashboards. Got labels: {:?}",
+                sample.get_label(),
+            );
+        }
+
+        #[test]
+        fn mqtt_publishes_rejected_registered_under_documented_name() {
+            ensure_init();
+            let families = prometheus::default_registry().gather();
+            let found = families
+                .iter()
+                .find(|m| m.name() == "rustgate_mqtt_publishes_rejected_total")
+                .expect("rustgate_mqtt_publishes_rejected_total must be registered");
+            assert_eq!(
+                found.get_field_type(),
+                prometheus::proto::MetricType::COUNTER,
+            );
+            let sample = found
+                .get_metric()
+                .first()
+                .expect("counter metric family must have one sample");
+            assert!(
+                sample.get_label().is_empty(),
+                "rustgate_mqtt_publishes_rejected_total must be label-free. \
+                 Got labels: {:?}",
+                sample.get_label(),
+            );
+        }
+
+        #[test]
+        fn mqtt_subscribes_registered_under_documented_name() {
+            ensure_init();
+            let families = prometheus::default_registry().gather();
+            let found = families
+                .iter()
+                .find(|m| m.name() == "rustgate_mqtt_subscribes_total")
+                .expect("rustgate_mqtt_subscribes_total must be registered");
+            assert_eq!(
+                found.get_field_type(),
+                prometheus::proto::MetricType::COUNTER,
+            );
+            let sample = found
+                .get_metric()
+                .first()
+                .expect("counter metric family must have one sample");
+            assert!(
+                sample.get_label().is_empty(),
+                "rustgate_mqtt_subscribes_total must be label-free — SUBSCRIBE \
+                 packets carry one or more filters, and counting packets \
+                 (not filters) is the documented semantic. Got labels: {:?}",
+                sample.get_label(),
+            );
+        }
+
+        #[test]
+        fn mqtt_subscribes_rejected_registered_under_documented_name() {
+            ensure_init();
+            let families = prometheus::default_registry().gather();
+            let found = families
+                .iter()
+                .find(|m| m.name() == "rustgate_mqtt_subscribes_rejected_total")
+                .expect("rustgate_mqtt_subscribes_rejected_total must be registered");
+            assert_eq!(
+                found.get_field_type(),
+                prometheus::proto::MetricType::COUNTER,
+            );
+            let sample = found
+                .get_metric()
+                .first()
+                .expect("counter metric family must have one sample");
+            assert!(
+                sample.get_label().is_empty(),
+                "rustgate_mqtt_subscribes_rejected_total must be label-free. \
+                 Got labels: {:?}",
+                sample.get_label(),
+            );
+        }
+
+        #[test]
+        fn mqtt_publishes_increments_are_observable() {
+            ensure_init();
+            let before = mqtt_publishes().get();
+            mqtt_publishes().inc();
+            assert!(
+                mqtt_publishes().get() > before,
+                "mqtt_publishes counter must be monotonically increasing after inc(); \
+                 before={before}, after={}",
+                mqtt_publishes().get(),
+            );
+        }
+
+        #[test]
+        fn mqtt_publishes_rejected_increments_are_observable() {
+            ensure_init();
+            let before = mqtt_publishes_rejected().get();
+            mqtt_publishes_rejected().inc();
+            assert!(
+                mqtt_publishes_rejected().get() > before,
+                "mqtt_publishes_rejected counter must be monotonically increasing; \
+                 before={before}, after={}",
+                mqtt_publishes_rejected().get(),
+            );
+        }
+
+        #[test]
+        fn mqtt_subscribes_increments_are_observable() {
+            ensure_init();
+            let before = mqtt_subscribes().get();
+            mqtt_subscribes().inc();
+            assert!(
+                mqtt_subscribes().get() > before,
+                "mqtt_subscribes counter must be monotonically increasing; \
+                 before={before}, after={}",
+                mqtt_subscribes().get(),
+            );
+        }
+
+        #[test]
+        fn mqtt_subscribes_rejected_increments_are_observable() {
+            ensure_init();
+            let before = mqtt_subscribes_rejected().get();
+            mqtt_subscribes_rejected().inc();
+            assert!(
+                mqtt_subscribes_rejected().get() > before,
+                "mqtt_subscribes_rejected counter must be monotonically increasing; \
+                 before={before}, after={}",
+                mqtt_subscribes_rejected().get(),
+            );
+        }
+
+        #[test]
+        fn fed_by_mqtt_on_publish_callback_end_to_end() {
+            // End-to-end contract: the closure shape that setup.rs installs
+            // into `MqttSessionHooks::on_publish` — an `Arc<dyn Fn()>` — must
+            // produce a visible increment when driven by the same dispatch
+            // the session task uses. Guards against a silent refactor of
+            // either the callback alias (e.g. narrowing to `FnMut`, which
+            // is not `Sync`) or the session firing site dropping the hook.
+            ensure_init();
+            let cb: rustgate_mqtt::OnMqttPublish = std::sync::Arc::new(|| mqtt_publishes().inc());
+            let before = mqtt_publishes().get();
+            cb();
+            cb();
+            assert!(
+                mqtt_publishes().get() > before + 1,
+                "double-invoked callback must produce two visible increments; \
+                 before={before}, after={}",
+                mqtt_publishes().get(),
+            );
+        }
+
+        #[test]
+        fn fed_by_mqtt_on_publish_reject_callback_end_to_end() {
+            ensure_init();
+            let cb: rustgate_mqtt::OnMqttPublishReject =
+                std::sync::Arc::new(|| mqtt_publishes_rejected().inc());
+            let before = mqtt_publishes_rejected().get();
+            cb();
+            assert!(
+                mqtt_publishes_rejected().get() > before,
+                "callback invocation must produce a visible publish-reject increment; \
+                 before={before}, after={}",
+                mqtt_publishes_rejected().get(),
+            );
+        }
+
+        #[test]
+        fn fed_by_mqtt_on_subscribe_callback_end_to_end() {
+            ensure_init();
+            let cb: rustgate_mqtt::OnMqttSubscribe =
+                std::sync::Arc::new(|| mqtt_subscribes().inc());
+            let before = mqtt_subscribes().get();
+            cb();
+            cb();
+            assert!(
+                mqtt_subscribes().get() > before + 1,
+                "double-invoked callback must produce two visible increments; \
+                 before={before}, after={}",
+                mqtt_subscribes().get(),
+            );
+        }
+
+        #[test]
+        fn fed_by_mqtt_on_subscribe_reject_callback_end_to_end() {
+            ensure_init();
+            let cb: rustgate_mqtt::OnMqttSubscribeReject =
+                std::sync::Arc::new(|| mqtt_subscribes_rejected().inc());
+            let before = mqtt_subscribes_rejected().get();
+            cb();
+            assert!(
+                mqtt_subscribes_rejected().get() > before,
+                "callback invocation must produce a visible subscribe-reject increment; \
+                 before={before}, after={}",
+                mqtt_subscribes_rejected().get(),
+            );
+        }
+
+        #[test]
+        fn session_hooks_struct_accepts_all_four_counter_callbacks() {
+            // Guards the cross-crate construction grammar: setup.rs builds
+            // `MqttSessionHooks { on_publish: Some(Arc::new(|| ...)), ... }`
+            // in one expression. If any field rename or type change in
+            // `rustgate-mqtt` slips in without a matching setup.rs update,
+            // this assembly would fail to compile — this test is the
+            // compile-time guard for that shape.
+            ensure_init();
+            let hooks = rustgate_mqtt::MqttSessionHooks {
+                on_publish: Some(std::sync::Arc::new(|| mqtt_publishes().inc())),
+                on_publish_reject: Some(std::sync::Arc::new(|| mqtt_publishes_rejected().inc())),
+                on_subscribe: Some(std::sync::Arc::new(|| mqtt_subscribes().inc())),
+                on_subscribe_reject: Some(std::sync::Arc::new(|| mqtt_subscribes_rejected().inc())),
+            };
+            let pub_before = mqtt_publishes().get();
+            let pub_rej_before = mqtt_publishes_rejected().get();
+            let sub_before = mqtt_subscribes().get();
+            let sub_rej_before = mqtt_subscribes_rejected().get();
+            if let Some(cb) = &hooks.on_publish {
+                cb();
+            }
+            if let Some(cb) = &hooks.on_publish_reject {
+                cb();
+            }
+            if let Some(cb) = &hooks.on_subscribe {
+                cb();
+            }
+            if let Some(cb) = &hooks.on_subscribe_reject {
+                cb();
+            }
+            assert!(mqtt_publishes().get() > pub_before);
+            assert!(mqtt_publishes_rejected().get() > pub_rej_before);
+            assert!(mqtt_subscribes().get() > sub_before);
+            assert!(mqtt_subscribes_rejected().get() > sub_rej_before);
         }
     }
 

@@ -37,6 +37,7 @@ impl MqttServer {
             wildcard_policy,
             on_accept,
             on_reject,
+            session_hooks,
         } = config;
 
         let client_id_registry = ClientIdRegistry::new();
@@ -79,6 +80,7 @@ impl MqttServer {
                             let router = Arc::clone(&router);
                             let prefix = topic_prefix.clone();
                             let registry = Arc::clone(&client_id_registry);
+                            let hooks = session_hooks.clone();
                             drop(tokio::spawn(handle_mqtt_session(
                                 pre_session,
                                 router,
@@ -89,6 +91,7 @@ impl MqttServer {
                                 wildcard_policy,
                                 registry,
                                 permit,
+                                hooks,
                             )));
                         }
                         Ok(None) => {
