@@ -1592,11 +1592,14 @@ impl Router {
                 Vec::new()
             }
             Err(e) => {
+                let session = hash_cn(cn);
+                let error = e.to_string();
                 warn!(
-                    session = %hash_cn(cn),
-                    error = %e,
+                    session = %session,
+                    error = %error,
                     "client queue drain task join failed"
                 );
+                rustgate_core::audit::store_forward_drain_panic(&session, &error);
                 Vec::new()
             }
         }

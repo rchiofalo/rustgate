@@ -715,6 +715,26 @@ pub fn store_forward_key_rotated(path: &str, depth: u64, reason: &str) {
     );
 }
 
+/// Record a panic or cancellation of the `spawn_blocking` task that drains
+/// a client's offline store-forward queue on reconnect. `session_hash` is
+/// the PII-safe `hash_cn` of the client identity. The join error is
+/// logged as free-form text because `JoinError` does not carry structured
+/// fields beyond panic/cancel classification.
+///
+/// Emitted in addition to an operator-facing `warn!` so SIEMs receive a
+/// durable signal that a specific client's queued messages were silently
+/// dropped — a panicking redb backend would otherwise surface only in
+/// ephemeral logs.
+pub fn store_forward_drain_panic(session_hash: &str, error: &str) {
+    audit!(
+        "store_forward.drain_panic",
+        session = %session_hash,
+        error = %error,
+        action = "drain_queue",
+        result = "panic"
+    );
+}
+
 /// Record a message being shed by per-target rate limiting.
 pub fn http_rate_limited(target: &str, source_cn: &str) {
     audit!(
@@ -1013,6 +1033,12 @@ mod tests {
             store_forward_dropped("client-cn", "writer_channel_full");
             store_forward_dropped("client-cn", "writer_task_gone");
             store_forward_dropped("", "");
+        }
+
+        #[test]
+        fn test_store_forward_drain_panic() {
+            store_forward_drain_panic("deadbeef1234", "task panicked: internal redb error");
+            store_forward_drain_panic("", "");
         }
     }
 
