@@ -149,6 +149,7 @@ static AUTHZ_CACHE_MISSES: OnceLock<IntCounter> = OnceLock::new();
 
 static ARCHIVE_BYTES: OnceLock<IntGauge> = OnceLock::new();
 static CRL_AGE_SECONDS: OnceLock<IntGauge> = OnceLock::new();
+static CERT_EXPIRY_SECONDS: OnceLock<IntGauge> = OnceLock::new();
 static ENROLLMENT_RATE_LIMITED: OnceLock<IntCounter> = OnceLock::new();
 static ENROLLMENT_RATE_LIMIT_POISON: OnceLock<IntCounter> = OnceLock::new();
 static TENANT_QUOTA_REJECTIONS: OnceLock<IntCounterVec> = OnceLock::new();
@@ -683,6 +684,15 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(crl_age_seconds.clone()))?;
     let _ = CRL_AGE_SECONDS.set(crl_age_seconds);
 
+    let cert_expiry_seconds = IntGauge::with_opts(Opts::new(
+        "rustgate_cert_expiry_seconds",
+        "Seconds remaining until the active server leaf certificate's notAfter \
+         (negative if already expired). Refreshed on every /ready dependency poll \
+         and after every cert hot-reload. Alert on <604800 (7d) for rotation SLO.",
+    ))?;
+    registry.register(Box::new(cert_expiry_seconds.clone()))?;
+    let _ = CERT_EXPIRY_SECONDS.set(cert_expiry_seconds);
+
     let enrollment_rate_limited = IntCounter::with_opts(Opts::new(
         "rustgate_enrollment_rate_limited_total",
         "CSR signing requests rejected by the per-IP rate limiter",
@@ -990,6 +1000,13 @@ pub fn archive_bytes() -> &'static IntGauge {
 /// CRL parsing and after every SIGHUP-driven CRL re-validation.
 pub fn crl_age_seconds() -> &'static IntGauge {
     CRL_AGE_SECONDS.get_or_init(|| fallback_gauge("rustgate_crl_age_seconds", "fallback"))
+}
+
+/// Returns the server-cert expiry gauge. Updated as a side effect of
+/// [`check_tls_cert`]. The value is `notAfter - now` in seconds and can
+/// be negative once the cert has expired.
+pub fn cert_expiry_seconds() -> &'static IntGauge {
+    CERT_EXPIRY_SECONDS.get_or_init(|| fallback_gauge("rustgate_cert_expiry_seconds", "fallback"))
 }
 
 // ── Accessor functions ──────────────────────────────────────────────
@@ -1917,6 +1934,11 @@ fn check_tls_cert(reloader: &rustgate_transport::CertReloader) -> DependencyChec
     let validity = cert.validity();
     let now = x509_parser::time::ASN1Time::now();
 
+    let not_after_ts = validity.not_after.timestamp();
+    let now_ts = now.timestamp();
+    let remaining_secs = not_after_ts - now_ts;
+    cert_expiry_seconds().set(remaining_secs);
+
     if now < validity.not_before {
         return DependencyCheck::unhealthy("certificate not yet valid");
     }
@@ -1925,9 +1947,6 @@ fn check_tls_cert(reloader: &rustgate_transport::CertReloader) -> DependencyChec
     }
 
     // Warn if the certificate expires within 7 days.
-    let not_after_ts = validity.not_after.timestamp();
-    let now_ts = now.timestamp();
-    let remaining_secs = not_after_ts - now_ts;
     let seven_days_secs: i64 = 7 * 24 * 60 * 60;
     if remaining_secs < seven_days_secs {
         let days = remaining_secs / (24 * 60 * 60);
@@ -3691,5 +3710,64 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(label_names, expected);
         assert_eq!(metric.get_gauge().get_value() as i64, 1);
+    }
+
+    #[test]
+    fn cert_expiry_gauge_set_to_positive_remaining_seconds_for_valid_cert() {
+        use rustgate_test_utils::certs::TestCa;
+        ensure_init();
+
+        let ca = TestCa::new("test-ca");
+        let server = ca.issue_server_cert("valid-server", &["localhost"]);
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, &server.cert_pem).expect("write cert");
+        std::fs::write(&key_path, &server.key_pem).expect("write key");
+
+        let reloader =
+            rustgate_transport::CertReloader::new(&cert_path, &key_path).expect("reloader");
+        // check_tls_cert updates the gauge as a side effect; invoke it and
+        // read the gauge back.
+        let _ = check_tls_cert(&reloader);
+        assert!(
+            cert_expiry_seconds().get() > 0,
+            "fresh test cert must have positive remaining seconds"
+        );
+    }
+
+    #[test]
+    fn cert_expiry_gauge_negative_after_expired_cert_check() {
+        use rustgate_test_utils::certs::TestCa;
+        ensure_init();
+
+        let ca = TestCa::new("test-ca");
+        let expired = ca.issue_expired_client_cert("expired-server", &[]);
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, &expired.cert_pem).expect("write cert");
+        std::fs::write(&key_path, &expired.key_pem).expect("write key");
+
+        let reloader =
+            rustgate_transport::CertReloader::new(&cert_path, &key_path).expect("reloader");
+        let _ = check_tls_cert(&reloader);
+        assert!(
+            cert_expiry_seconds().get() < 0,
+            "expired cert must drive the gauge negative for alert rules"
+        );
+    }
+
+    #[test]
+    fn cert_expiry_gauge_registered_under_documented_name() {
+        ensure_init();
+        let families = prometheus::default_registry().gather();
+        let family = families
+            .iter()
+            .find(|mf| mf.name() == "rustgate_cert_expiry_seconds")
+            .expect("rustgate_cert_expiry_seconds must be registered");
+        assert_eq!(family.get_metric().len(), 1);
     }
 }
