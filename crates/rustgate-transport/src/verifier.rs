@@ -15,6 +15,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, UnixTime};
 use rustls::server::WebPkiClientVerifier;
@@ -40,29 +41,34 @@ struct CachedVerifier {
 ///
 /// On each `verify_client_cert` call, the verifier checks whether the
 /// trust store generation has changed. If so, it rebuilds the inner
-/// [`WebPkiClientVerifier`] with the fresh root store. Signature
-/// verification methods delegate to the crypto provider and do not
-/// depend on the root store.
+/// [`WebPkiClientVerifier`] with the fresh root store **and** refreshes
+/// the `root_hint_subjects` list so the TLS `CertificateRequest`
+/// advertises every currently-trusted CA. Signature verification
+/// methods delegate to the crypto provider and do not depend on the
+/// root store.
 ///
-/// # Root hint staleness
+/// # Root hint freshness (F-50)
 ///
-/// `root_hint_subjects` returns the subjects computed at construction
-/// time. After adding a new CA, that CA won't appear in the TLS
-/// `CertificateRequest` `certificate_authorities` list until the
-/// server process restarts. Some mTLS clients may not send their
-/// certificate if their issuing CA is absent from the hints.
-///
-/// Actual certificate *validation* always uses the latest root store,
-/// so a client that does send its certificate will be verified
-/// correctly regardless of hint freshness. If hint accuracy is
-/// critical, restart the server after trust store changes.
+/// `root_hint_subjects` is served from an atomic [`ArcSwap`] of a
+/// `&'static [DistinguishedName]` slice that is replaced alongside the
+/// inner [`WebPkiClientVerifier`] on generation advance. Each rebuild
+/// leaks a small heap buffer (~`sizeof(DN) × N` bytes per rotation) via
+/// [`Vec::leak`] so the returned reference has a stable lifetime for
+/// the rustls trait contract — rotations are rare and the leak is
+/// bounded by rotation rate. Clients whose issuing CA is added after
+/// startup will now see it advertised in the handshake immediately.
 pub struct DynamicCertVerifier {
     provider: RootStoreProvider,
     crls: Vec<CertificateRevocationListDer<'static>>,
     cached: Mutex<CachedVerifier>,
-    /// Subjects from the initial root store, used for `root_hint_subjects`.
-    /// These are hints only — actual verification uses the live root store.
-    initial_subjects: Vec<DistinguishedName>,
+    /// Current root-hint subjects. Replaced atomically on every trust
+    /// store generation advance so handshakes always see the live
+    /// advertised CA list. Backed by a `&'static` slice produced via
+    /// `Vec::leak`, so the returned reference from `root_hint_subjects`
+    /// can outlive any `&self` borrow (required by the rustls trait
+    /// contract). Using a static-lifetime payload avoids the
+    /// `arc_swap::Guard` lifetime-escape problem.
+    current_subjects: ArcSwap<&'static [DistinguishedName]>,
 }
 
 impl DynamicCertVerifier {
@@ -78,7 +84,7 @@ impl DynamicCertVerifier {
         crls: Vec<CertificateRevocationListDer<'static>>,
     ) -> Result<Arc<Self>, Error> {
         let (generation, root_store) = provider();
-        let initial_subjects = root_store.subjects();
+        let initial_subjects: &'static [DistinguishedName] = Vec::leak(root_store.subjects());
         let verifier = Self::build_verifier(Arc::new(root_store), &crls)?;
 
         Ok(Arc::new(Self {
@@ -88,7 +94,7 @@ impl DynamicCertVerifier {
                 generation,
                 verifier,
             }),
-            initial_subjects,
+            current_subjects: ArcSwap::from_pointee(initial_subjects),
         }))
     }
 
@@ -118,16 +124,27 @@ impl DynamicCertVerifier {
         }
 
         // Generation changed — rebuild using the store we already fetched.
+        // Share the store via `Arc::clone` so we can still read its
+        // subjects after handing one reference to `build_verifier`; we
+        // leak the fresh subject slice only on success so rebuild
+        // failures don't leave orphan heap buffers behind.
         debug!(
             old_generation = cached.generation,
             new_generation = current_gen,
             "trust store changed, rebuilding client cert verifier"
         );
+        let root_store = Arc::new(root_store);
 
-        match Self::build_verifier(Arc::new(root_store), &self.crls) {
+        match Self::build_verifier(Arc::clone(&root_store), &self.crls) {
             Ok(verifier) => {
                 cached.generation = current_gen;
                 cached.verifier = Arc::clone(&verifier);
+                // Compute and swap in the fresh subject slice only
+                // after the rebuild succeeds — on error we keep the old
+                // hints aligned with the still-active cached verifier
+                // so handshakes don't advertise CAs we can't validate.
+                let fresh_subjects: &'static [DistinguishedName] = Vec::leak(root_store.subjects());
+                self.current_subjects.store(Arc::new(fresh_subjects));
                 Ok(verifier)
             }
             Err(e) => {
@@ -154,7 +171,11 @@ impl fmt::Debug for DynamicCertVerifier {
 
 impl ClientCertVerifier for DynamicCertVerifier {
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
-        &self.initial_subjects
+        // Double-deref: the Guard derefs to `Arc<&'static [DN]>`, which
+        // derefs to `&'static [DN]`. The static lifetime trivially
+        // outlives any `&self` borrow, satisfying the rustls trait
+        // contract without leaking the Arc.
+        **self.current_subjects.load()
     }
 
     fn verify_client_cert(
@@ -260,6 +281,112 @@ mod tests {
         generation.store(1, Ordering::Release);
         let v3 = verifier.current_verifier().unwrap();
         assert!(!Arc::ptr_eq(&v1, &v3));
+    }
+
+    #[test]
+    fn root_hint_subjects_refreshes_after_ca_rotation() {
+        // F-50 regression: before the fix, `root_hint_subjects` returned
+        // a static slice snapshotted at construction — adding a new CA
+        // at runtime left the TLS `CertificateRequest` advertising the
+        // stale list. After the fix, each generation advance atomically
+        // swaps in the fresh subject set.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let ca1 = rustgate_test_utils::certs::TestCa::new("Dynamic Test CA One");
+        let ca2 = rustgate_test_utils::certs::TestCa::new("Dynamic Test CA Two");
+
+        let mut store1 = RootCertStore::empty();
+        for cert in rustls_pki_types::pem::PemObject::pem_slice_iter(ca1.cert_pem.as_bytes())
+            .collect::<Result<Vec<CertificateDer<'static>>, _>>()
+            .unwrap()
+        {
+            store1.add(cert).unwrap();
+        }
+
+        let mut store2 = store1.clone();
+        for cert in rustls_pki_types::pem::PemObject::pem_slice_iter(ca2.cert_pem.as_bytes())
+            .collect::<Result<Vec<CertificateDer<'static>>, _>>()
+            .unwrap()
+        {
+            store2.add(cert).unwrap();
+        }
+
+        let generation = Arc::new(AtomicU64::new(0));
+        let gen_clone = Arc::clone(&generation);
+        let s1 = store1.clone();
+        let s2 = store2.clone();
+        let verifier = DynamicCertVerifier::new(
+            Box::new(move || {
+                let g = gen_clone.load(Ordering::Acquire);
+                let store = if g == 0 { s1.clone() } else { s2.clone() };
+                (g, store)
+            }),
+            Vec::new(),
+        )
+        .expect("build verifier");
+
+        let subjects_before = verifier.root_hint_subjects().len();
+        assert_eq!(subjects_before, 1, "initial hints must advertise one CA");
+
+        // Advance generation AND trigger a verifier refresh — the latter
+        // is how `current_verifier` observes the change in production.
+        generation.store(1, Ordering::Release);
+        let _ = verifier.current_verifier().unwrap();
+
+        let subjects_after = verifier.root_hint_subjects().len();
+        assert_eq!(
+            subjects_after, 2,
+            "after CA rotation the hint list must include the new CA"
+        );
+    }
+
+    #[test]
+    fn root_hint_subjects_keeps_old_list_on_rebuild_error() {
+        // When a rebuild fails, the cached verifier stays in place; the
+        // hint list must also stay in lockstep so we never advertise CAs
+        // whose keys we cannot actually verify against.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let ca = rustgate_test_utils::certs::TestCa::new("Dynamic Test CA");
+        let mut good = RootCertStore::empty();
+        for cert in rustls_pki_types::pem::PemObject::pem_slice_iter(ca.cert_pem.as_bytes())
+            .collect::<Result<Vec<CertificateDer<'static>>, _>>()
+            .unwrap()
+        {
+            good.add(cert).unwrap();
+        }
+
+        let generation = Arc::new(AtomicU64::new(0));
+        let gen_clone = Arc::clone(&generation);
+        let good_clone = good.clone();
+        let verifier = DynamicCertVerifier::new(
+            Box::new(move || {
+                let g = gen_clone.load(Ordering::Acquire);
+                // Generation 1 returns an empty store which fails to
+                // build a WebPkiClientVerifier (needs at least one root).
+                let store = if g == 0 {
+                    good_clone.clone()
+                } else {
+                    RootCertStore::empty()
+                };
+                (g, store)
+            }),
+            Vec::new(),
+        )
+        .expect("build verifier");
+
+        let before = verifier.root_hint_subjects().len();
+        assert_eq!(before, 1);
+
+        generation.store(1, Ordering::Release);
+        // Force a rebuild attempt (it fails internally but returns the cached verifier).
+        let _ = verifier.current_verifier().unwrap();
+
+        let after = verifier.root_hint_subjects().len();
+        assert_eq!(
+            after, 1,
+            "rebuild failure must keep hints aligned with the live cached verifier"
+        );
     }
 
     #[test]

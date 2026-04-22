@@ -49,7 +49,8 @@ async fn slow_reader_keeps_gate_pressed_until_drain() {
             Arc::new(move || {
                 let _ = d.fetch_add(1, Ordering::Relaxed);
             }),
-        );
+        )
+        .unwrap();
         let p = Arc::clone(&peak);
         BackpressureGate::set_on_bytes_changed(
             &mut gate,
@@ -62,7 +63,8 @@ async fn slow_reader_keeps_gate_pressed_until_drain() {
                     }
                 }
             }),
-        );
+        )
+        .unwrap();
     }
 
     let router = Arc::new(Router::new().with_backpressure(Arc::clone(&gate)));

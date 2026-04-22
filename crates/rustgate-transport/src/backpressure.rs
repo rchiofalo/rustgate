@@ -92,6 +92,30 @@ pub type OnDeferred = Arc<dyn Fn() + Send + Sync>;
 /// from inside the closure.
 pub type OnBytesChanged = Arc<dyn Fn(usize) + Send + Sync>;
 
+/// Returned by the three `BackpressureGate` setters (`with_resume_dwell`,
+/// `set_on_deferred`, `set_on_bytes_changed`) when they can no longer take
+/// effect because the gate has already been shared via `Arc::clone`.
+///
+/// These setters rely on `Arc::get_mut`, which only succeeds while the
+/// `Arc` has a single strong reference. Before this error existed, a
+/// late call silently no-op'd: a developer wiring metrics after cloning
+/// the gate into the router and the accept loop would see no panic and
+/// no log, and the gate would run without the metric callback
+/// installed. The returned `Err` now surfaces that misordering so
+/// `main()` (or any caller) can fail startup instead of drifting into
+/// production with missing instrumentation.
+#[derive(Debug, thiserror::Error)]
+pub enum BackpressureConfigError {
+    /// The gate was cloned before the setter could install its value.
+    #[error(
+        "backpressure gate already cloned — `{setter}` must be called before the first Arc::clone"
+    )]
+    AlreadyShared {
+        /// Name of the setter that failed, for diagnostics.
+        setter: &'static str,
+    },
+}
+
 /// Shared admission-control gate.
 ///
 /// Tracks queued bytes with an [`AtomicUsize`] and coordinates the
@@ -183,13 +207,22 @@ impl BackpressureGate {
     /// Must be called before the gate is cloned (same contract as
     /// [`BackpressureGate::set_on_deferred`] and
     /// [`BackpressureGate::set_on_bytes_changed`]).
-    pub fn with_resume_dwell(self: &mut Arc<Self>, dwell: Duration) {
-        debug_assert!(
-            Arc::get_mut(self).is_some(),
-            "with_resume_dwell must be called before the gate is cloned"
-        );
-        if let Some(this) = Arc::get_mut(self) {
-            this.resume_dwell = dwell;
+    ///
+    /// Returns [`BackpressureConfigError::AlreadyShared`] when the gate
+    /// has already been cloned — the previous `debug_assert!` would
+    /// silently no-op in release builds (F-51).
+    pub fn with_resume_dwell(
+        self: &mut Arc<Self>,
+        dwell: Duration,
+    ) -> Result<(), BackpressureConfigError> {
+        match Arc::get_mut(self) {
+            Some(this) => {
+                this.resume_dwell = dwell;
+                Ok(())
+            }
+            None => Err(BackpressureConfigError::AlreadyShared {
+                setter: "with_resume_dwell",
+            }),
         }
     }
 
@@ -197,13 +230,22 @@ impl BackpressureGate {
     /// because the gate is over the high-water mark.
     ///
     /// **Callback must be non-blocking** — see the docs on [`OnDeferred`].
-    pub fn set_on_deferred(self: &mut Arc<Self>, cb: OnDeferred) {
-        debug_assert!(
-            Arc::get_mut(self).is_some(),
-            "set_on_deferred must be called before the gate is cloned"
-        );
-        if let Some(this) = Arc::get_mut(self) {
-            this.on_deferred = Some(cb);
+    ///
+    /// Returns [`BackpressureConfigError::AlreadyShared`] when the gate
+    /// has already been cloned — previously this dropped the callback
+    /// silently in release builds (F-51).
+    pub fn set_on_deferred(
+        self: &mut Arc<Self>,
+        cb: OnDeferred,
+    ) -> Result<(), BackpressureConfigError> {
+        match Arc::get_mut(self) {
+            Some(this) => {
+                this.on_deferred = Some(cb);
+                Ok(())
+            }
+            None => Err(BackpressureConfigError::AlreadyShared {
+                setter: "set_on_deferred",
+            }),
         }
     }
 
@@ -211,13 +253,22 @@ impl BackpressureGate {
     /// used to refresh a Prometheus gauge.
     ///
     /// **Callback must be non-blocking** — see the docs on [`OnBytesChanged`].
-    pub fn set_on_bytes_changed(self: &mut Arc<Self>, cb: OnBytesChanged) {
-        debug_assert!(
-            Arc::get_mut(self).is_some(),
-            "set_on_bytes_changed must be called before the gate is cloned"
-        );
-        if let Some(this) = Arc::get_mut(self) {
-            this.on_bytes_changed = Some(cb);
+    ///
+    /// Returns [`BackpressureConfigError::AlreadyShared`] when the gate
+    /// has already been cloned — previously this dropped the callback
+    /// silently in release builds (F-51).
+    pub fn set_on_bytes_changed(
+        self: &mut Arc<Self>,
+        cb: OnBytesChanged,
+    ) -> Result<(), BackpressureConfigError> {
+        match Arc::get_mut(self) {
+            Some(this) => {
+                this.on_bytes_changed = Some(cb);
+                Ok(())
+            }
+            None => Err(BackpressureConfigError::AlreadyShared {
+                setter: "set_on_bytes_changed",
+            }),
         }
     }
 
@@ -461,13 +512,13 @@ mod tests {
     /// use the default constructor or a short explicit dwell.
     fn zero_dwell_gate(high_water: usize) -> Arc<BackpressureGate> {
         let mut gate = BackpressureGate::new(high_water);
-        BackpressureGate::with_resume_dwell(&mut gate, Duration::ZERO);
+        BackpressureGate::with_resume_dwell(&mut gate, Duration::ZERO).unwrap();
         gate
     }
 
     fn zero_dwell_with_limits(high_water: usize, low_water: usize) -> Arc<BackpressureGate> {
         let mut gate = BackpressureGate::with_limits(high_water, low_water);
-        BackpressureGate::with_resume_dwell(&mut gate, Duration::ZERO);
+        BackpressureGate::with_resume_dwell(&mut gate, Duration::ZERO).unwrap();
         gate
     }
 
@@ -639,7 +690,8 @@ mod tests {
             Arc::new(move || {
                 let _ = c.fetch_add(1, Ordering::Relaxed);
             }),
-        );
+        )
+        .unwrap();
         gate.add(100);
         // Poll wait_for_capacity once; it should trip the callback then
         // park, so we race it with a short timeout.
@@ -766,7 +818,7 @@ mod tests {
         // dwell expires. Previously this depended on an external
         // wakeup; the DWELL_POLL_INTERVAL branch now handles it.
         let mut gate = BackpressureGate::with_limits(1_000, 900);
-        BackpressureGate::with_resume_dwell(&mut gate, Duration::from_millis(300));
+        BackpressureGate::with_resume_dwell(&mut gate, Duration::from_millis(300)).unwrap();
         gate.add(1_000);
         gate.sub(200); // 800 <= 900
         assert!(!gate.is_admitting());
@@ -821,8 +873,66 @@ mod tests {
     #[test]
     fn with_resume_dwell_updates_field() {
         let mut gate = BackpressureGate::new(1_000);
-        BackpressureGate::with_resume_dwell(&mut gate, Duration::from_millis(250));
+        BackpressureGate::with_resume_dwell(&mut gate, Duration::from_millis(250)).unwrap();
         assert_eq!(gate.resume_dwell(), Duration::from_millis(250));
+    }
+
+    #[test]
+    fn setters_return_err_after_clone() {
+        // F-51: previously these setters silently no-op'd after the gate
+        // was shared. They must now surface the misordering so callers
+        // can fail startup instead of drifting without instrumentation.
+        let mut gate = BackpressureGate::new(1_000);
+        let _held = Arc::clone(&gate);
+
+        let dwell_err = BackpressureGate::with_resume_dwell(&mut gate, Duration::from_millis(250))
+            .expect_err("with_resume_dwell must fail after clone");
+        match dwell_err {
+            BackpressureConfigError::AlreadyShared { setter } => {
+                assert_eq!(setter, "with_resume_dwell");
+            }
+        }
+
+        let deferred_err = BackpressureGate::set_on_deferred(&mut gate, Arc::new(|| {}))
+            .expect_err("set_on_deferred must fail after clone");
+        match deferred_err {
+            BackpressureConfigError::AlreadyShared { setter } => {
+                assert_eq!(setter, "set_on_deferred");
+            }
+        }
+
+        let bytes_err = BackpressureGate::set_on_bytes_changed(&mut gate, Arc::new(|_| {}))
+            .expect_err("set_on_bytes_changed must fail after clone");
+        match bytes_err {
+            BackpressureConfigError::AlreadyShared { setter } => {
+                assert_eq!(setter, "set_on_bytes_changed");
+            }
+        }
+    }
+
+    #[test]
+    fn setters_succeed_before_clone() {
+        let mut gate = BackpressureGate::new(1_000);
+        BackpressureGate::with_resume_dwell(&mut gate, Duration::from_millis(250)).unwrap();
+        BackpressureGate::set_on_deferred(&mut gate, Arc::new(|| {})).unwrap();
+        BackpressureGate::set_on_bytes_changed(&mut gate, Arc::new(|_| {})).unwrap();
+        assert_eq!(gate.resume_dwell(), Duration::from_millis(250));
+    }
+
+    #[test]
+    fn config_error_display_names_setter() {
+        let err = BackpressureConfigError::AlreadyShared {
+            setter: "set_on_deferred",
+        };
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("set_on_deferred"),
+            "Display must surface setter name: {rendered}",
+        );
+        assert!(
+            rendered.contains("already cloned"),
+            "Display must explain the cause: {rendered}",
+        );
     }
 
     #[test]
