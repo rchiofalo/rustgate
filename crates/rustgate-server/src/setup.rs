@@ -1538,6 +1538,21 @@ pub(crate) fn start_mqtt(
     #[cfg(not(feature = "metrics"))]
     let on_reject: Option<rustgate_mqtt::OnMqttReject> = None;
 
+    #[cfg(feature = "metrics")]
+    let session_hooks: Option<rustgate_mqtt::MqttSessionHooks> =
+        Some(rustgate_mqtt::MqttSessionHooks {
+            on_publish: Some(std::sync::Arc::new(|| metrics::mqtt_publishes().inc())),
+            on_publish_reject: Some(std::sync::Arc::new(|| {
+                metrics::mqtt_publishes_rejected().inc()
+            })),
+            on_subscribe: Some(std::sync::Arc::new(|| metrics::mqtt_subscribes().inc())),
+            on_subscribe_reject: Some(std::sync::Arc::new(|| {
+                metrics::mqtt_subscribes_rejected().inc()
+            })),
+        });
+    #[cfg(not(feature = "metrics"))]
+    let session_hooks: Option<rustgate_mqtt::MqttSessionHooks> = None;
+
     let config = rustgate_mqtt::MqttServerConfig {
         listener: mqtt_listener,
         router: Arc::clone(router),
@@ -1550,6 +1565,7 @@ pub(crate) fn start_mqtt(
         wildcard_policy: cli.mqtt_wildcard_policy.into(),
         on_accept,
         on_reject,
+        session_hooks,
     };
     let task = tokio::spawn(async move {
         rustgate_mqtt::MqttServer::run(config).await;

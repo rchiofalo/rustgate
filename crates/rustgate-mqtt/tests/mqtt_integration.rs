@@ -63,6 +63,7 @@ impl TestServer {
             wildcard_policy,
             on_accept: None,
             on_reject: None,
+            session_hooks: None,
         };
 
         drop(tokio::spawn(MqttServer::run(config)));
@@ -430,6 +431,7 @@ async fn connection_limit_rejects_excess() {
         wildcard_policy: WildcardPolicy::default(),
         on_accept: None,
         on_reject: None,
+        session_hooks: None,
     };
 
     drop(tokio::spawn(MqttServer::run(config)));
@@ -638,6 +640,7 @@ async fn max_packet_size_rejects_oversized_publish() {
         wildcard_policy: WildcardPolicy::default(),
         on_accept: None,
         on_reject: None,
+        session_hooks: None,
     };
 
     drop(tokio::spawn(MqttServer::run(config)));
