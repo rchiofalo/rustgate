@@ -205,7 +205,12 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
     }
     deps.router.replay_positions(&handle).await;
 
-    #[allow(unused_mut)] // Mutable borrows needed for proto negotiation
+    // justification: both halves need `mut` only when the `proto` feature is
+    // on (protocol negotiation reads+writes the first handshake frames).
+    // Under the default build both move straight into `run_session_loop`
+    // immutably. Binding without `mut` and conditionally reassigning would
+    // force an unreachable branch under `#[cfg(feature = "proto")]`.
+    #[allow(unused_mut)]
     let (mut reader, mut writer) = session.split();
 
     // Run protocol negotiation for TakNegotiate mode.
@@ -770,6 +775,11 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
 
                         let session_router = Arc::clone(&router);
                         let session_codec = Arc::clone(&codec);
+                        // justification: `nats_publisher` is `()` when the
+                        // `nats` feature is off and `Option<NatsPublisher>`
+                        // when on. `.clone()` compiles in both; removing it
+                        // would break the default build. Same rationale as
+                        // the clone in `main.rs`.
                         #[allow(clippy::clone_on_copy)]
                         let session_nats = nats_publisher.clone();
                         let session_fed = fed_forward.clone();

@@ -179,6 +179,12 @@ impl WebSocketServer {
     }
 }
 
+// justification: per-WebSocket-connection task spawned once by the accept
+// loop. Each argument is a distinct runtime handle or cap that must be
+// owned by this task for its lifetime (router, codec, three optional
+// forwarders, throttle, replay filter, circuit threshold, three rate-limit
+// caps, and more below). Bundling into a `WsSessionArgs` struct would push
+// the fan-in onto the accept loop with no call-site reduction.
 #[allow(clippy::too_many_arguments)]
 async fn handle_ws_session(
     session: WsSession,
@@ -299,6 +305,10 @@ async fn handle_ws_session(
     );
 }
 
+// justification: half of the `handle_ws_session` fan-in plus the rate
+// limiter state that only the read path mutates. Called from exactly one
+// place; extracting a struct would force the session handler to hold a
+// redundant copy of references it already has in scope.
 #[allow(clippy::too_many_arguments)]
 async fn ws_read_loop(
     mut ws_read: SplitStream<WsStream>,
