@@ -50,6 +50,46 @@ pub type OnFederationForward =
 /// as of Rust 1.94. Async work is dispatched via the publisher's internal channel.
 pub type OnHttpForward = Arc<dyn Fn(RoutableMessage) + Send + Sync>;
 
+/// Fired once per successful WebSocket session registration (post-mTLS,
+/// post-upgrade, post-tenant-quota). Used by `rustgate-server` to increment
+/// the `rustgate_ws_connections_total` Prometheus counter. The crate stays
+/// metrics-agnostic — no `prometheus` dependency leaks in.
+pub type OnWsAcceptFn = Arc<dyn Fn() + Send + Sync>;
+
+/// Fired once per WebSocket connection rejected on the session-handler
+/// boundary: per-IP rate limit, TLS handshake failure, identity extraction
+/// failure, upgrade handshake failure, connection-limit exhaustion, tenant
+/// quota exhaustion. Used by `rustgate-server` to increment the
+/// `rustgate_ws_connections_rejected_total` Prometheus counter.
+pub type OnWsRejectFn = Arc<dyn Fn() + Send + Sync>;
+
+/// Bundle of WebSocket session lifecycle callbacks.
+///
+/// Held by `WsServerConfig` to keep its constructor under the clippy
+/// `too_many_arguments` threshold while preserving per-event fan-out.
+/// Adding a frame-level counter in the future slots in additional
+/// `Option<Arc<dyn Fn() + Send + Sync>>` fields without further widening.
+#[derive(Clone, Default)]
+pub struct WsSessionHooks {
+    /// See [`OnWsAcceptFn`].
+    pub on_connection_accept: Option<OnWsAcceptFn>,
+    /// See [`OnWsRejectFn`]. Cloned into `WsListenerConfig.on_connection_rejected`
+    /// so the accept-loop reject branches can observe it as well.
+    pub on_connection_rejected: Option<OnWsRejectFn>,
+}
+
+impl std::fmt::Debug for WsSessionHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WsSessionHooks")
+            .field("on_connection_accept", &self.on_connection_accept.is_some())
+            .field(
+                "on_connection_rejected",
+                &self.on_connection_rejected.is_some(),
+            )
+            .finish()
+    }
+}
+
 /// Default maximum pending write bytes per WebSocket connection: 4 MiB.
 ///
 /// When the write loop has sent more than this many bytes without the
@@ -84,6 +124,11 @@ pub struct WsServerConfig {
     /// Active WebSocket heartbeat configuration. See [`HealthCheckConfig`]
     /// for semantics. Defaults to fully disabled.
     pub health_check: HealthCheckConfig,
+    /// Observability callbacks fired on connection accept / reject. Wired by
+    /// `rustgate-server` under `#[cfg(feature = "metrics")]` to increment the
+    /// `rustgate_ws_connections_total` and `rustgate_ws_connections_rejected_total`
+    /// Prometheus counters. `None` disables dispatch with no runtime cost.
+    pub session_hooks: Option<WsSessionHooks>,
     pub shutdown: Arc<Notify>,
 }
 
@@ -123,6 +168,7 @@ impl WebSocketServer {
             ws_max_violations,
             max_write_buffer_bytes,
             health_check,
+            session_hooks,
             shutdown,
         } = config;
 
@@ -142,6 +188,11 @@ impl WebSocketServer {
                                         peer_addr,
                                         "WebSocket connection limit reached",
                                     );
+                                    if let Some(hooks) = session_hooks.as_ref()
+                                        && let Some(cb) = hooks.on_connection_rejected.as_ref()
+                                    {
+                                        cb();
+                                    }
                                     continue;
                                 }
                             };
@@ -160,9 +211,10 @@ impl WebSocketServer {
                             let vio = ws_max_violations;
                             let mwb = max_write_buffer_bytes;
                             let hc = health_check;
+                            let hooks = session_hooks.clone();
                             drop(tokio::spawn(handle_ws_session(
                                 session, router, session_codec, nats, fed, http, tc, rf,
-                                cb, fps, bps, vio, mwb, hc, permit,
+                                cb, fps, bps, vio, mwb, hc, hooks, permit,
                             )));
                         }
                         Err(e) => {
@@ -183,8 +235,9 @@ impl WebSocketServer {
 // loop. Each argument is a distinct runtime handle or cap that must be
 // owned by this task for its lifetime (router, codec, three optional
 // forwarders, throttle, replay filter, circuit threshold, three rate-limit
-// caps, and more below). Bundling into a `WsSessionArgs` struct would push
-// the fan-in onto the accept loop with no call-site reduction.
+// caps, observability hooks, and more below). Bundling into a
+// `WsSessionArgs` struct would push the fan-in onto the accept loop with
+// no call-site reduction.
 #[allow(clippy::too_many_arguments)]
 async fn handle_ws_session(
     session: WsSession,
@@ -201,6 +254,7 @@ async fn handle_ws_session(
     ws_max_violations: u32,
     max_write_buffer_bytes: usize,
     health_check: HealthCheckConfig,
+    session_hooks: Option<WsSessionHooks>,
     _permit: OwnedSemaphorePermit,
 ) {
     let identity = session.identity_arc();
@@ -253,7 +307,17 @@ async fn handle_ws_session(
         // CN for compliance, but the structured log field is PII-safe.
         warn!(cn = %hash_cn(&identity.cn), "connection rejected: tenant quota exceeded");
         rustgate_core::audit::connection_rejected(peer_addr, "tenant quota exceeded");
+        if let Some(hooks) = session_hooks.as_ref()
+            && let Some(cb) = hooks.on_connection_rejected.as_ref()
+        {
+            cb();
+        }
         return;
+    }
+    if let Some(hooks) = session_hooks.as_ref()
+        && let Some(cb) = hooks.on_connection_accept.as_ref()
+    {
+        cb();
     }
     for pending in buffered_offline {
         let (msg, audit) = pending.into_parts();
