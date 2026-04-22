@@ -529,6 +529,63 @@ jobs:
       - name: Run PQ HTTP tests
         run: cargo nextest run --locked -p rustgate-http --features post-quantum
 
+  binary-size:
+    # Release-binary size regression gate (issue #832). Builds the same
+    # feature set as .github/workflows/release-binary.yml's default target
+    # (nats,enrollment,proto,full-detail,metrics,federation,federation-ha,
+    # websocket,otel,http), strips the binary, and compares its byte count
+    # against the checked-in baseline in ci/binary-size-baseline.json.
+    #
+    # First-run behaviour: the baseline ships as 0, so the check is
+    # report-only — it emits a `::notice::` with the observed size and
+    # exits 0. A follow-up PR commits the observed value to enable the
+    # ±10% regression gate. After that, any PR whose binary grows beyond
+    # the threshold fails CI until the PR either reduces the growth or
+    # bumps baseline_bytes in the same commit (so the delta is visible
+    # in review).
+    if: github.event.pull_request.draft == false || github.event_name == 'push'
+    needs: [lint, clippy]
+    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@6c3c2f2c1c457b00c10c4848d6f5491db3b629df # v2.18.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # 1.94
+        with:
+          toolchain: "1.94"
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Build release binary
+        # Must stay in sync with RELEASE_FEATURES in release-binary.yml and
+        # the `features` field of `rustgate-default` in
+        # ci/binary-size-baseline.json. Drift between the three will cause
+        # the baseline to measure a different binary than what we ship.
+        run: cargo build --locked --release --package rustgate-server --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket,otel,http
+
+      - name: Strip release binary
+        # Release packaging in release-binary.yml ships the stripped binary
+        # (via `tar -czf` of the default cargo output which includes debug
+        # info only when debug=1). Strip here to measure the same shape.
+        # `strip` ships by default on ubuntu-latest (binutils) and on any
+        # self-hosted runner with build-essential installed.
+        run: strip target/release/rustgate
+
+      - name: Check binary size against baseline
+        # Emits a GitHub step-summary table and a `::notice::` (or
+        # `::error::` on regression) annotation. See
+        # scripts/check-binary-size.py module docstring for details.
+        run: python3 scripts/check-binary-size.py rustgate-default target/release/rustgate
+
   audit:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [check-features, test]
