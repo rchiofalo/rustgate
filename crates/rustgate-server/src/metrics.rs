@@ -134,6 +134,7 @@ static NATS_CONSUMER_INFO_SECONDS: OnceLock<Histogram> = OnceLock::new();
 static NEGOTIATIONS: OnceLock<IntCounterVec> = OnceLock::new();
 
 static HANDSHAKE_FAILURES: OnceLock<IntCounterVec> = OnceLock::new();
+static TLS_HANDSHAKE_DURATION_SECONDS: OnceLock<HistogramVec> = OnceLock::new();
 
 static CLIENT_OCSP_CACHE_HITS: OnceLock<IntCounter> = OnceLock::new();
 static CLIENT_OCSP_CACHE_MISSES: OnceLock<IntCounter> = OnceLock::new();
@@ -293,6 +294,13 @@ pub(crate) fn enabled_features() -> String {
         features.push("http");
     }
     features.join(",")
+}
+
+fn fallback_histogram_vec(name: &str, help: &str, labels: &[&str]) -> HistogramVec {
+    match HistogramVec::new(HistogramOpts::new(name, help), labels) {
+        Ok(hv) => hv,
+        Err(_) => std::process::abort(),
+    }
 }
 
 // ── Registration ────────────────────────────────────────────────────
@@ -636,6 +644,27 @@ pub fn init() -> prometheus::Result<()> {
     )?;
     registry.register(Box::new(handshake_failures.clone()))?;
     let _ = HANDSHAKE_FAILURES.set(handshake_failures);
+
+    // Bucket range picked for tactical mTLS handshakes:
+    //  - Floor 1 ms captures ring/aws-lc-rs best-case LAN handshakes
+    //    (typical ~2–5 ms); a coarser floor would collapse the P50
+    //    into the first bucket on healthy deployments.
+    //  - 100–500 ms brackets cross-WAN and PQ/hybrid kx groups
+    //    (ML-KEM-768 adds ~30–60 ms per round trip on commodity CPUs).
+    //  - Ceiling 10 s catches pathological stalls before the TLS
+    //    acceptor surrenders; anything slower is a bug, not a bucket.
+    let tls_handshake_duration_seconds = HistogramVec::new(
+        HistogramOpts::new(
+            "rustgate_tls_handshake_duration_seconds",
+            "TLS handshake duration in seconds, labelled by outcome",
+        )
+        .buckets(vec![
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+        ]),
+        &["outcome"],
+    )?;
+    registry.register(Box::new(tls_handshake_duration_seconds.clone()))?;
+    let _ = TLS_HANDSHAKE_DURATION_SECONDS.set(tls_handshake_duration_seconds);
 
     let client_ocsp_cache_hits = IntCounter::with_opts(Opts::new(
         "rustgate_client_ocsp_cache_hits_total",
@@ -1320,6 +1349,20 @@ pub fn negotiations() -> &'static IntCounterVec {
 pub fn handshake_failures() -> &'static IntCounterVec {
     HANDSHAKE_FAILURES.get_or_init(|| {
         fallback_counter_vec("rustgate_handshake_failures_total", "fallback", &["reason"])
+    })
+}
+
+/// Histogram of TLS handshake durations in seconds, labelled by
+/// `outcome="success"` or `outcome="failure"`. Populated via the
+/// `TlsListener::set_on_handshake_duration` callback installed under
+/// `#[cfg(feature = "metrics")]` at startup.
+pub fn tls_handshake_duration_seconds() -> &'static HistogramVec {
+    TLS_HANDSHAKE_DURATION_SECONDS.get_or_init(|| {
+        fallback_histogram_vec(
+            "rustgate_tls_handshake_duration_seconds",
+            "fallback",
+            &["outcome"],
+        )
     })
 }
 
@@ -2573,6 +2616,7 @@ mod tests {
         }
         let _ = negotiations();
         let _ = handshake_failures();
+        let _ = tls_handshake_duration_seconds();
     }
 
     /// Dedicated tests for the MQTT listener counters wired via the
@@ -3474,6 +3518,99 @@ mod tests {
                 .with_label_values(&["expired_cert"])
                 .get(),
             before + 1
+        );
+    }
+
+    // ── tls_handshake_duration_seconds ─────────────────────────────
+
+    #[test]
+    fn tls_handshake_duration_is_registered_under_canonical_name() {
+        // Operators scrape by name — a rename without a dashboard update
+        // silently drops the alert. Pin the canonical name here so any
+        // accidental churn fails the build before it reaches ops.
+        ensure_init();
+        let hv = super::tls_handshake_duration_seconds();
+        // Exercise both label values the callback emits to guarantee both
+        // series materialize in `/metrics`.
+        hv.with_label_values(&["success"]).observe(0.002);
+        hv.with_label_values(&["failure"]).observe(0.002);
+        let mfs = prometheus::default_registry().gather();
+        let names: Vec<&str> = mfs.iter().map(|mf| mf.name()).collect();
+        assert!(
+            names.contains(&"rustgate_tls_handshake_duration_seconds"),
+            "expected rustgate_tls_handshake_duration_seconds in registry, got: {names:?}",
+        );
+    }
+
+    #[test]
+    fn tls_handshake_duration_success_label_observes() {
+        ensure_init();
+        let hv = super::tls_handshake_duration_seconds();
+        // Use a large, unlikely value so an unrelated test's observation
+        // does not accidentally satisfy the sum delta.
+        let before = hv.with_label_values(&["success"]).get_sample_sum();
+        hv.with_label_values(&["success"]).observe(1.5);
+        let after = hv.with_label_values(&["success"]).get_sample_sum();
+        assert!(
+            (after - before - 1.5).abs() < 1e-9,
+            "expected sum to rise by 1.5 after observe(1.5); before={before}, after={after}",
+        );
+    }
+
+    #[test]
+    fn tls_handshake_duration_failure_label_observes_separately_from_success() {
+        // The two label values are distinct series; observing one must
+        // not move the counter on the other. A regression would mean the
+        // label was either ignored on registration or collapsed into a
+        // single bucket — either breaks the "% success" PromQL queries
+        // operators build on top of this histogram.
+        ensure_init();
+        let hv = super::tls_handshake_duration_seconds();
+        let success_before = hv.with_label_values(&["success"]).get_sample_count();
+        hv.with_label_values(&["failure"]).observe(0.042);
+        let success_after = hv.with_label_values(&["success"]).get_sample_count();
+        assert_eq!(
+            success_before, success_after,
+            "observing on failure label must not touch the success series",
+        );
+    }
+
+    #[test]
+    fn tls_handshake_duration_bucket_floor_separates_from_ceiling() {
+        // Confirm the configured buckets actually cover the tactical mTLS
+        // latency range. A silent buckets(&[]) default on a future edit
+        // would collapse every observation into `+Inf`, killing any
+        // P50/P99 query; observing at 1 ms and 5 s must land in
+        // different cumulative buckets.
+        ensure_init();
+        let hv = super::tls_handshake_duration_seconds();
+        // Fresh label value to avoid cross-test interference.
+        let child = hv.with_label_values(&["success"]);
+        let fast_before = child.get_sample_count();
+        child.observe(0.001);
+        child.observe(5.0);
+        let fast_after = child.get_sample_count();
+        assert_eq!(
+            fast_after - fast_before,
+            2,
+            "both observations must be counted",
+        );
+        // Use gathered metric families to inspect the buckets directly.
+        let mfs = prometheus::default_registry().gather();
+        let mf = mfs
+            .iter()
+            .find(|mf| mf.name() == "rustgate_tls_handshake_duration_seconds")
+            .expect("metric family must be registered");
+        // At least 6 bucket boundaries — the configured list has 12.
+        let metric = mf
+            .get_metric()
+            .first()
+            .expect("at least one labelled series");
+        let buckets = metric.get_histogram().get_bucket();
+        assert!(
+            buckets.len() >= 6,
+            "expected >=6 buckets on TLS handshake histogram, got {}",
+            buckets.len(),
         );
     }
 
