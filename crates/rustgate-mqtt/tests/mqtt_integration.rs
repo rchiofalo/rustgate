@@ -61,6 +61,8 @@ impl TestServer {
             min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
             response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
             wildcard_policy,
+            on_accept: None,
+            on_reject: None,
         };
 
         drop(tokio::spawn(MqttServer::run(config)));
@@ -426,6 +428,8 @@ async fn connection_limit_rejects_excess() {
         min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
         response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
         wildcard_policy: WildcardPolicy::default(),
+        on_accept: None,
+        on_reject: None,
     };
 
     drop(tokio::spawn(MqttServer::run(config)));
@@ -632,6 +636,8 @@ async fn max_packet_size_rejects_oversized_publish() {
         min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
         response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
         wildcard_policy: WildcardPolicy::default(),
+        on_accept: None,
+        on_reject: None,
     };
 
     drop(tokio::spawn(MqttServer::run(config)));

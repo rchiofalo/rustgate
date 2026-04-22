@@ -35,6 +35,8 @@ impl MqttServer {
             min_keep_alive_secs,
             response_channel_capacity,
             wildcard_policy,
+            on_accept,
+            on_reject,
         } = config;
 
         let client_id_registry = ClientIdRegistry::new();
@@ -63,9 +65,16 @@ impl MqttServer {
                                         peer_addr,
                                         "MQTT connection limit reached",
                                     );
+                                    if let Some(ref cb) = on_reject {
+                                        cb();
+                                    }
                                     continue;
                                 }
                             };
+
+                            if let Some(ref cb) = on_accept {
+                                cb();
+                            }
 
                             let router = Arc::clone(&router);
                             let prefix = topic_prefix.clone();
