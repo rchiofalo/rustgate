@@ -134,6 +134,43 @@ jobs:
           tar -czf "$ARCHIVE" -C "target/${{ matrix.target }}/release" rustgate
           echo "ARCHIVE=$ARCHIVE" >> $GITHUB_ENV
 
+      - name: Verify archive name matches build variant
+        # Defense-in-depth for #887 F-21: the release upload step uses
+        # `gh release upload --clobber`, so a FIPS binary packaged under
+        # the non-FIPS filename (or vice versa) would silently overwrite
+        # the other variant — downstream consumers trust the filename
+        # token to drive FIPS policy. Failing here keeps a future
+        # refactor that drops the `-fips-` / `-pq-` prefix from shipping.
+        run: |
+          set -euo pipefail
+          FIPS="${{ matrix.fips }}"
+          PQ="${{ matrix.pq }}"
+          case "$FIPS $PQ" in
+            "true false")  expected_prefix="rustgate-fips-" ;;
+            "false true")  expected_prefix="rustgate-pq-" ;;
+            "false false") expected_prefix="rustgate-" ;;
+            *)
+              echo "::error::matrix must set exactly one of fips|pq (got fips=$FIPS pq=$PQ)"
+              exit 1
+              ;;
+          esac
+          case "$ARCHIVE" in
+            "$expected_prefix"*) ;;
+            *)
+              echo "::error::archive '$ARCHIVE' must start with '$expected_prefix' for matrix fips=$FIPS pq=$PQ"
+              exit 1
+              ;;
+          esac
+          if [ "$expected_prefix" = "rustgate-" ]; then
+            case "$ARCHIVE" in
+              "rustgate-fips-"*|"rustgate-pq-"*)
+                echo "::error::default build but archive '$ARCHIVE' carries a fips/pq marker"
+                exit 1
+                ;;
+            esac
+          fi
+          echo "OK: archive '$ARCHIVE' matches matrix (fips=$FIPS, pq=$PQ)"
+
       - name: Generate SHA256 checksum
         run: sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
 
@@ -184,6 +221,26 @@ jobs:
         with:
           pattern: slsa-hash-*
           merge-multiple: true
+
+      - name: Assert archive names are unique across the build matrix
+        # Defense-in-depth for #887 F-21: if two matrix cells ever
+        # produce the same archive path (a future refactor accidentally
+        # dropping the `-fips-` / `-pq-` prefix, a new target + variant
+        # combination that collides with an existing one, …), the
+        # release upload step (`--clobber`) would silently overwrite
+        # one with the other. Fail here if any collision is detected.
+        run: |
+          set -euo pipefail
+          mapfile -t names < <(awk '{print $2}' ./*.sha256 | sort)
+          dupes=$(printf '%s\n' "${names[@]}" | uniq -d)
+          if [ -n "$dupes" ]; then
+            echo "::error::duplicate archive names detected across the build matrix"
+            while IFS= read -r dup; do
+              echo "::error::duplicate: $dup"
+            done <<<"$dupes"
+            exit 1
+          fi
+          echo "OK: ${#names[@]} unique archive names across the build matrix"
 
       - name: Combine hashes for SLSA provenance
         id: combine
