@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use tracing::{info, warn};
 
+use crate::TRANSPORT_LABEL;
 use crate::config::MqttServerConfig;
 use crate::session::{ClientIdRegistry, handle_mqtt_session};
 
@@ -38,7 +39,11 @@ impl MqttServer {
 
         let client_id_registry = ClientIdRegistry::new();
 
-        info!(addr = ?listener.local_addr().ok(), "MQTT server started");
+        info!(
+            transport = TRANSPORT_LABEL,
+            addr = ?listener.local_addr().ok(),
+            "MQTT server started",
+        );
 
         loop {
             tokio::select! {
@@ -49,7 +54,11 @@ impl MqttServer {
                             let permit = match Arc::clone(&connection_limit).try_acquire_owned() {
                                 Ok(p) => p,
                                 Err(_) => {
-                                    warn!(peer = %peer_addr, "connection limit reached, rejecting MQTT client");
+                                    warn!(
+                                        transport = TRANSPORT_LABEL,
+                                        peer = %peer_addr,
+                                        "connection limit reached, rejecting MQTT client",
+                                    );
                                     rustgate_core::audit::connection_rejected(
                                         peer_addr,
                                         "MQTT connection limit reached",
@@ -77,12 +86,12 @@ impl MqttServer {
                             // TLS handshake failed or cert invalid — already logged by listener.
                         }
                         Err(e) => {
-                            warn!(error = %e, "MQTT accept error");
+                            warn!(transport = TRANSPORT_LABEL, error = %e, "MQTT accept error");
                         }
                     }
                 }
                 () = shutdown.notified() => {
-                    info!("MQTT server shutting down");
+                    info!(transport = TRANSPORT_LABEL, "MQTT server shutting down");
                     break;
                 }
             }

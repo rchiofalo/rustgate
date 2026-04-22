@@ -25,7 +25,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
 use crate::health::{HealthCheckConfig, LastPong, new_last_pong};
-use crate::{WsListener, WsSession, WsStream};
+use crate::{TRANSPORT_LABEL, WsListener, WsSession, WsStream};
 
 /// Callback for NATS publishing after local routing.
 ///
@@ -126,7 +126,11 @@ impl WebSocketServer {
             shutdown,
         } = config;
 
-        info!(addr = ?listener.local_addr().ok(), "WebSocket server started");
+        info!(
+            transport = TRANSPORT_LABEL,
+            addr = ?listener.local_addr().ok(),
+            "WebSocket server started",
+        );
 
         loop {
             tokio::select! {
@@ -137,7 +141,11 @@ impl WebSocketServer {
                             let permit = match Arc::clone(&connection_limit).try_acquire_owned() {
                                 Ok(p) => p,
                                 Err(_) => {
-                                    warn!(peer = %peer_addr, "connection limit reached, rejecting WebSocket client");
+                                    warn!(
+                                        transport = TRANSPORT_LABEL,
+                                        peer = %peer_addr,
+                                        "connection limit reached, rejecting WebSocket client",
+                                    );
                                     rustgate_core::audit::connection_rejected(
                                         peer_addr,
                                         "WebSocket connection limit reached",
@@ -166,12 +174,12 @@ impl WebSocketServer {
                             )));
                         }
                         Err(e) => {
-                            warn!(error = %e, "WebSocket accept error");
+                            warn!(transport = TRANSPORT_LABEL, error = %e, "WebSocket accept error");
                         }
                     }
                 }
                 () = shutdown.notified() => {
-                    info!("WebSocket server shutting down");
+                    info!(transport = TRANSPORT_LABEL, "WebSocket server shutting down");
                     break;
                 }
             }
@@ -208,6 +216,7 @@ async fn handle_ws_session(
     let cn = identity.cn.clone();
 
     info!(
+        transport = TRANSPORT_LABEL,
         peer_addr = %peer_addr,
         cn = %hash_cn(&cn),
         groups = ?identity.groups,
@@ -242,6 +251,7 @@ async fn handle_ws_session(
     let filtered_count = before - buffered_offline.len();
     if filtered_count > 0 {
         info!(
+            transport = TRANSPORT_LABEL,
             cn = %hash_cn(&identity.cn),
             filtered = filtered_count,
             delivered = buffered_offline.len(),
@@ -251,7 +261,11 @@ async fn handle_ws_session(
     if !router.register(handle.clone()).await {
         // F-153: hash CN before logging — the audit call retains the raw
         // CN for compliance, but the structured log field is PII-safe.
-        warn!(cn = %hash_cn(&identity.cn), "connection rejected: tenant quota exceeded");
+        warn!(
+            transport = TRANSPORT_LABEL,
+            cn = %hash_cn(&identity.cn),
+            "connection rejected: tenant quota exceeded",
+        );
         rustgate_core::audit::connection_rejected(peer_addr, "tenant quota exceeded");
         return;
     }
@@ -299,6 +313,7 @@ async fn handle_ws_session(
     router.unregister(&cn, session_id).await;
 
     info!(
+        transport = TRANSPORT_LABEL,
         peer_addr = %peer_addr,
         cn = %hash_cn(&cn),
         "WebSocket session ended"
