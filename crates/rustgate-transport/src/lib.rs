@@ -34,7 +34,7 @@ pub use acl::{GroupAcl, GroupAclPolicy};
 pub use backpressure::{
     BackpressureGate, BackpressurePermit, DEFAULT_MAX_QUEUED_BYTES, OnBytesChanged, OnDeferred,
 };
-pub use cache::PositionCache;
+pub use cache::{OnCacheSize, PositionCache};
 pub use cert_reloader::CertReloader;
 #[cfg(feature = "ocsp")]
 pub use client_ocsp::OcspStaplerFetcher;

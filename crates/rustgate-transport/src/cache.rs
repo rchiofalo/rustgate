@@ -60,8 +60,10 @@
 //! [`Router::replay_positions`]: crate::Router::replay_positions
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use rustgate_core::message::RoutableMessage;
 use tokio::sync::RwLock;
 
@@ -71,12 +73,40 @@ const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(15);
 /// Default maximum number of entries in the position cache.
 const DEFAULT_MAX_ENTRIES: usize = 100_000;
 
+/// Callback invoked whenever the cache's entry count changes.
+///
+/// The argument is the post-mutation size. Fires on [`PositionCache::store`]
+/// (including capacity-driven eviction), [`PositionCache::remove`], and
+/// [`PositionCache::sweep`]. Used by the server crate to feed the
+/// `rustgate_position_cache_size` Prometheus gauge; kept transport-agnostic
+/// so this crate does not leak a `prometheus` dependency.
+pub type OnCacheSize = Arc<dyn Fn(usize) + Send + Sync>;
+
 /// Stores the most recent position report per client CN.
-#[derive(Debug)]
 pub struct PositionCache {
     entries: RwLock<HashMap<String, RoutableMessage>>,
     /// Maximum number of entries before oldest-entry eviction kicks in.
     max_entries: usize,
+    /// Lock-free hot-swappable size-change observer. `None` when unset;
+    /// wired by `rustgate_server::setup` after construction so the transport
+    /// crate stays metrics-agnostic.
+    on_size: ArcSwap<Option<OnCacheSize>>,
+}
+
+impl std::fmt::Debug for PositionCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PositionCache")
+            .field("max_entries", &self.max_entries)
+            .field(
+                "on_size",
+                &if self.on_size.load().is_some() {
+                    "Some(<cb>)"
+                } else {
+                    "None"
+                },
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 /// Check if a message has expired based on its TTL.
@@ -99,6 +129,7 @@ impl Default for PositionCache {
         Self {
             entries: RwLock::new(HashMap::new()),
             max_entries: DEFAULT_MAX_ENTRIES,
+            on_size: ArcSwap::new(Arc::new(None)),
         }
     }
 }
@@ -113,6 +144,22 @@ impl PositionCache {
         Self {
             entries: RwLock::new(HashMap::new()),
             max_entries,
+            on_size: ArcSwap::new(Arc::new(None)),
+        }
+    }
+
+    /// Install (or replace) a callback that fires whenever the entry count
+    /// changes. Called with the post-mutation size. Wired by the server
+    /// crate to update `rustgate_position_cache_size`.
+    pub fn set_on_size(&self, cb: OnCacheSize) {
+        self.on_size.store(Arc::new(Some(cb)));
+    }
+
+    fn notify_size(&self, size: usize) {
+        let guard = self.on_size.load();
+        let cb_ref: &Option<OnCacheSize> = &guard;
+        if let Some(cb) = cb_ref {
+            cb(size);
         }
     }
 
@@ -122,26 +169,30 @@ impl PositionCache {
     /// (by `received_at` time) is evicted first.
     pub async fn store(&self, msg: RoutableMessage) {
         let cn = msg.source.cn.clone();
-        let mut entries = self.entries.write().await;
+        let size = {
+            let mut entries = self.entries.write().await;
 
-        // If this CN already exists, replacing it won't grow the cache.
-        if !entries.contains_key(&cn) && entries.len() >= self.max_entries {
-            // Evict the oldest entry by received_at time.
-            if let Some(oldest_cn) = entries
-                .iter()
-                .min_by_key(|(_, m)| m.metadata.received_at)
-                .map(|(cn, _)| cn.clone())
-            {
-                tracing::warn!(
-                    evicted_cn = %oldest_cn,
-                    size = entries.len(),
-                    max = self.max_entries,
-                    "position cache at capacity, evicting oldest entry",
-                );
-                let _ = entries.remove(&oldest_cn);
+            // If this CN already exists, replacing it won't grow the cache.
+            if !entries.contains_key(&cn) && entries.len() >= self.max_entries {
+                // Evict the oldest entry by received_at time.
+                if let Some(oldest_cn) = entries
+                    .iter()
+                    .min_by_key(|(_, m)| m.metadata.received_at)
+                    .map(|(cn, _)| cn.clone())
+                {
+                    tracing::warn!(
+                        evicted_cn = %oldest_cn,
+                        size = entries.len(),
+                        max = self.max_entries,
+                        "position cache at capacity, evicting oldest entry",
+                    );
+                    let _ = entries.remove(&oldest_cn);
+                }
             }
-        }
-        let _ = entries.insert(cn, msg);
+            let _ = entries.insert(cn, msg);
+            entries.len()
+        };
+        self.notify_size(size);
     }
 
     /// Get all cached position reports for replay to a new session.
@@ -159,18 +210,29 @@ impl PositionCache {
 
     /// Remove the cached position for a CN (e.g., on disconnect).
     pub async fn remove(&self, cn: &str) {
-        let mut entries = self.entries.write().await;
-        let _ = entries.remove(cn);
+        let size = {
+            let mut entries = self.entries.write().await;
+            let _ = entries.remove(cn);
+            entries.len()
+        };
+        self.notify_size(size);
     }
 
     /// Remove all expired entries from the cache.
     ///
     /// Returns the number of entries removed.
     pub async fn sweep(&self) -> usize {
-        let mut entries = self.entries.write().await;
-        let before = entries.len();
-        entries.retain(|_, msg| !is_expired(msg));
-        before - entries.len()
+        let (removed, size) = {
+            let mut entries = self.entries.write().await;
+            let before = entries.len();
+            entries.retain(|_, msg| !is_expired(msg));
+            let after = entries.len();
+            (before - after, after)
+        };
+        if removed > 0 {
+            self.notify_size(size);
+        }
+        removed
     }
 
     /// Number of cached positions (including expired entries not yet swept).
@@ -447,5 +509,126 @@ mod tests {
         let cns: Vec<&str> = all.iter().map(|m| m.source.cn.as_str()).collect();
         assert!(cns.contains(&"alice"));
         assert!(cns.contains(&"bob"));
+    }
+
+    mod on_size {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use super::*;
+
+        #[tokio::test]
+        async fn store_fires_callback_with_post_mutation_size() {
+            let cache = PositionCache::new();
+            let seen = Arc::new(AtomicUsize::new(0));
+            let seen_cb = Arc::clone(&seen);
+            cache.set_on_size(Arc::new(move |size| {
+                seen_cb.store(size, Ordering::SeqCst);
+            }));
+
+            cache.store(make_position_with_ttl("alice", None)).await;
+            assert_eq!(seen.load(Ordering::SeqCst), 1);
+
+            cache.store(make_position_with_ttl("bob", None)).await;
+            assert_eq!(seen.load(Ordering::SeqCst), 2);
+        }
+
+        #[tokio::test]
+        async fn remove_fires_callback_with_post_mutation_size() {
+            let cache = PositionCache::new();
+            cache.store(make_position_with_ttl("alice", None)).await;
+            cache.store(make_position_with_ttl("bob", None)).await;
+
+            let seen = Arc::new(AtomicUsize::new(usize::MAX));
+            let seen_cb = Arc::clone(&seen);
+            cache.set_on_size(Arc::new(move |size| {
+                seen_cb.store(size, Ordering::SeqCst);
+            }));
+
+            cache.remove("alice").await;
+            assert_eq!(seen.load(Ordering::SeqCst), 1);
+
+            cache.remove("bob").await;
+            assert_eq!(seen.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn sweep_fires_callback_only_when_entries_removed() {
+            let cache = PositionCache::new();
+            cache.store(make_position_with_ttl("alice", None)).await; // non-expiring
+            cache.store(make_expired_position("bob")).await;
+
+            let fires = Arc::new(AtomicUsize::new(0));
+            let seen_size = Arc::new(AtomicUsize::new(usize::MAX));
+            let fires_cb = Arc::clone(&fires);
+            let seen_cb = Arc::clone(&seen_size);
+            cache.set_on_size(Arc::new(move |size| {
+                let _ = fires_cb.fetch_add(1, Ordering::SeqCst);
+                seen_cb.store(size, Ordering::SeqCst);
+            }));
+
+            let removed = cache.sweep().await;
+            assert_eq!(removed, 1);
+            assert_eq!(fires.load(Ordering::SeqCst), 1);
+            assert_eq!(seen_size.load(Ordering::SeqCst), 1);
+
+            // Second sweep removes nothing → callback must not fire again.
+            let removed2 = cache.sweep().await;
+            assert_eq!(removed2, 0);
+            assert_eq!(
+                fires.load(Ordering::SeqCst),
+                1,
+                "no callback on no-op sweep"
+            );
+        }
+
+        #[tokio::test]
+        async fn capacity_eviction_reports_post_insert_size() {
+            let cache = PositionCache::with_max_entries(2);
+            cache.store(make_position_with_ttl("alice", None)).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            cache.store(make_position_with_ttl("bob", None)).await;
+
+            let seen = Arc::new(AtomicUsize::new(usize::MAX));
+            let seen_cb = Arc::clone(&seen);
+            cache.set_on_size(Arc::new(move |size| {
+                seen_cb.store(size, Ordering::SeqCst);
+            }));
+
+            // Third insert triggers oldest-eviction; net size stays at 2.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            cache.store(make_position_with_ttl("charlie", None)).await;
+            assert_eq!(seen.load(Ordering::SeqCst), 2);
+        }
+
+        #[tokio::test]
+        async fn replacing_callback_uses_latest() {
+            let cache = PositionCache::new();
+            let first = Arc::new(AtomicUsize::new(0));
+            let second = Arc::new(AtomicUsize::new(0));
+            let first_cb = Arc::clone(&first);
+            let second_cb = Arc::clone(&second);
+
+            cache.set_on_size(Arc::new(move |_| {
+                let _ = first_cb.fetch_add(1, Ordering::SeqCst);
+            }));
+            cache.store(make_position_with_ttl("alice", None)).await;
+            assert_eq!(first.load(Ordering::SeqCst), 1);
+
+            cache.set_on_size(Arc::new(move |_| {
+                let _ = second_cb.fetch_add(1, Ordering::SeqCst);
+            }));
+            cache.store(make_position_with_ttl("bob", None)).await;
+            assert_eq!(first.load(Ordering::SeqCst), 1, "old cb must not fire");
+            assert_eq!(second.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn no_callback_installed_is_silent_noop() {
+            let cache = PositionCache::new();
+            cache.store(make_position_with_ttl("alice", None)).await;
+            cache.remove("alice").await;
+            // Nothing panics or deadlocks when no observer is wired.
+            assert_eq!(cache.len().await, 0);
+        }
     }
 }

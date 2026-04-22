@@ -81,6 +81,8 @@ static MESSAGES_ROUTED: OnceLock<IntCounterVec> = OnceLock::new();
 static DEDUP_HITS: OnceLock<IntCounter> = OnceLock::new();
 static DEDUP_CACHE_SIZE: OnceLock<IntGauge> = OnceLock::new();
 
+static POSITION_CACHE_SIZE: OnceLock<IntGauge> = OnceLock::new();
+
 static COT_DELTA_FULL: OnceLock<IntCounter> = OnceLock::new();
 static COT_DELTA_DELTA: OnceLock<IntCounter> = OnceLock::new();
 static COT_DELTA_SUPPRESSED: OnceLock<IntCounter> = OnceLock::new();
@@ -280,6 +282,18 @@ pub fn init() -> prometheus::Result<()> {
     ))?;
     registry.register(Box::new(dedup_cache_size.clone()))?;
     let _ = DEDUP_CACHE_SIZE.set(dedup_cache_size);
+
+    let position_cache_size = IntGauge::with_opts(Opts::new(
+        "rustgate_position_cache_size",
+        "Current number of entries in the latest-position cache \
+         (one per client CN). Bounded by the cache's `max_entries` \
+         capacity (default 100,000); sustained growth near the cap \
+         indicates either a large active fleet or leaked stale entries \
+         from clients that never disconnected. Alert on approach to \
+         capacity: `rustgate_position_cache_size / 100000 > 0.9`.",
+    ))?;
+    registry.register(Box::new(position_cache_size.clone()))?;
+    let _ = POSITION_CACHE_SIZE.set(position_cache_size);
 
     let cot_delta_full = IntCounter::with_opts(Opts::new(
         "rustgate_cot_delta_full_total",
@@ -907,6 +921,10 @@ pub fn dedup_hits() -> &'static IntCounter {
 
 pub fn dedup_cache_size() -> &'static IntGauge {
     DEDUP_CACHE_SIZE.get_or_init(|| fallback_gauge("rustgate_dedup_cache_size", "fallback"))
+}
+
+pub fn position_cache_size() -> &'static IntGauge {
+    POSITION_CACHE_SIZE.get_or_init(|| fallback_gauge("rustgate_position_cache_size", "fallback"))
 }
 
 pub fn cot_delta_full() -> &'static IntCounter {
@@ -3240,5 +3258,85 @@ mod tests {
         crl_age_seconds().set(age);
         assert_eq!(crl_age_seconds().get(), age);
         crl_age_seconds().set(prior);
+    }
+
+    mod position_cache_size_gauge {
+        use std::sync::Arc;
+
+        use rustgate_transport::PositionCache;
+
+        use super::*;
+
+        #[test]
+        fn registered_under_documented_name() {
+            ensure_init();
+            // Confirm the gauge is reachable on a scrape and carries no labels
+            // (alert rules consume the bare metric name). A rename or
+            // accidental labelling would silently break every deployed alert.
+            let families = prometheus::default_registry().gather();
+            let mf = families
+                .iter()
+                .find(|f| f.name() == "rustgate_position_cache_size")
+                .expect("rustgate_position_cache_size must be registered");
+            assert_eq!(mf.get_metric().len(), 1);
+            assert!(
+                mf.get_metric()[0].get_label().is_empty(),
+                "gauge must have no labels"
+            );
+        }
+
+        #[test]
+        fn set_and_read_roundtrip() {
+            ensure_init();
+            let prior = position_cache_size().get();
+            position_cache_size().set(42);
+            assert_eq!(position_cache_size().get(), 42);
+            // Restore so sibling tests that use the shared default registry
+            // observe the starting value they expect.
+            position_cache_size().set(prior);
+        }
+
+        #[tokio::test]
+        async fn fed_by_cache_callback_end_to_end() {
+            ensure_init();
+
+            let cache = Arc::new(PositionCache::new());
+            cache.set_on_size(Arc::new(|size| {
+                position_cache_size().set(size as i64);
+            }));
+
+            let prior = position_cache_size().get();
+
+            let msg = rustgate_core::message::RoutableMessage {
+                source: rustgate_core::identity::Identity::new(
+                    "alice".to_string(),
+                    "alice-fp".to_string(),
+                    std::collections::BTreeSet::new(),
+                )
+                .expect("valid identity"),
+                destination: rustgate_core::message::Destination::Broadcast,
+                payload: bytes::Bytes::from_static(b"<event/>"),
+                metadata: rustgate_core::message::Metadata {
+                    received_at: std::time::SystemTime::now(),
+                    source_protocol: "cot".to_string(),
+                    message_type: rustgate_core::message::MessageType::Position,
+                    ttl: None,
+                },
+            };
+
+            cache.store(msg).await;
+            assert_eq!(
+                position_cache_size().get(),
+                prior + 1,
+                "store must increment gauge via callback"
+            );
+
+            cache.remove("alice").await;
+            assert_eq!(
+                position_cache_size().get(),
+                prior,
+                "remove must decrement gauge via callback"
+            );
+        }
     }
 }

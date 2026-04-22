@@ -677,6 +677,14 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     #[cfg(feature = "metrics")]
     let _ = router_slot.set(Arc::clone(&router));
 
+    // Feed the `rustgate_position_cache_size` gauge whenever the cache
+    // mutates. The callback is a lock-free hot-swap via `ArcSwap`, so
+    // this installs cheaply and fires on every `store`/`remove`/`sweep`.
+    #[cfg(feature = "metrics")]
+    router.cache().set_on_size(std::sync::Arc::new(|size| {
+        metrics::position_cache_size().set(size as i64);
+    }));
+
     #[cfg(feature = "metrics")]
     if let Some(ref q) = client_queue {
         metrics::spawn_client_queue_metrics_task(Arc::clone(q), Arc::clone(&metrics_identity));
