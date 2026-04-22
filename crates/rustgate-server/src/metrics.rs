@@ -103,7 +103,9 @@ static SESSIONS_ACTIVE: OnceLock<IntGauge> = OnceLock::new();
 
 static NATS_PUBLISHES: OnceLock<IntCounter> = OnceLock::new();
 
+#[cfg(feature = "mqtt")]
 static MQTT_CONNECTIONS: OnceLock<IntCounter> = OnceLock::new();
+#[cfg(feature = "mqtt")]
 static MQTT_CONNECTIONS_REJECTED: OnceLock<IntCounter> = OnceLock::new();
 
 #[cfg(feature = "nats")]
@@ -473,29 +475,32 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(nats_publishes.clone()))?;
     let _ = NATS_PUBLISHES.set(nats_publishes);
 
-    let mqtt_connections = IntCounter::with_opts(Opts::new(
-        "rustgate_mqtt_connections_total",
-        "mTLS-authenticated MQTT sessions accepted by the MQTT listener. \
-         Incremented after the TLS handshake and client-certificate \
-         validation succeed and the shared cross-transport connection-limit \
-         permit is acquired, immediately before the per-session task is \
-         spawned. Does not count TLS handshake failures, certificate \
-         validation failures, or per-IP rate-limit rejections — those are \
-         visible via the shared listener-level counters.",
-    ))?;
-    registry.register(Box::new(mqtt_connections.clone()))?;
-    let _ = MQTT_CONNECTIONS.set(mqtt_connections);
+    #[cfg(feature = "mqtt")]
+    {
+        let mqtt_connections = IntCounter::with_opts(Opts::new(
+            "rustgate_mqtt_connections_total",
+            "mTLS-authenticated MQTT sessions accepted by the MQTT listener. \
+             Incremented after the TLS handshake and client-certificate \
+             validation succeed and the shared cross-transport connection-limit \
+             permit is acquired, immediately before the per-session task is \
+             spawned. Does not count TLS handshake failures, certificate \
+             validation failures, or per-IP rate-limit rejections — those are \
+             visible via the shared listener-level counters.",
+        ))?;
+        registry.register(Box::new(mqtt_connections.clone()))?;
+        let _ = MQTT_CONNECTIONS.set(mqtt_connections);
 
-    let mqtt_connections_rejected = IntCounter::with_opts(Opts::new(
-        "rustgate_mqtt_connections_rejected_total",
-        "MQTT connections rejected because the shared cross-transport \
-         connection-limit semaphore was saturated at the moment the session \
-         was about to be admitted. A non-zero rate indicates the operator \
-         should either raise `--max-connections` or investigate whether a \
-         misbehaving client is consuming the budget.",
-    ))?;
-    registry.register(Box::new(mqtt_connections_rejected.clone()))?;
-    let _ = MQTT_CONNECTIONS_REJECTED.set(mqtt_connections_rejected);
+        let mqtt_connections_rejected = IntCounter::with_opts(Opts::new(
+            "rustgate_mqtt_connections_rejected_total",
+            "MQTT connections rejected because the shared cross-transport \
+             connection-limit semaphore was saturated at the moment the session \
+             was about to be admitted. A non-zero rate indicates the operator \
+             should either raise `--max-connections` or investigate whether a \
+             misbehaving client is consuming the budget.",
+        ))?;
+        registry.register(Box::new(mqtt_connections_rejected.clone()))?;
+        let _ = MQTT_CONNECTIONS_REJECTED.set(mqtt_connections_rejected);
+    }
 
     #[cfg(feature = "nats")]
     {
@@ -1111,6 +1116,7 @@ pub fn nats_publishes() -> &'static IntCounter {
 
 /// Counter incremented once per mTLS-authenticated MQTT session accepted
 /// by the MQTT listener. Wired from `rustgate_mqtt::MqttServerConfig::on_accept`.
+#[cfg(feature = "mqtt")]
 pub fn mqtt_connections() -> &'static IntCounter {
     MQTT_CONNECTIONS.get_or_init(|| fallback_counter("rustgate_mqtt_connections_total", "fallback"))
 }
@@ -1118,6 +1124,7 @@ pub fn mqtt_connections() -> &'static IntCounter {
 /// Counter incremented once per MQTT connection rejected because the
 /// shared cross-transport connection-limit semaphore was saturated.
 /// Wired from `rustgate_mqtt::MqttServerConfig::on_reject`.
+#[cfg(feature = "mqtt")]
 pub fn mqtt_connections_rejected() -> &'static IntCounter {
     MQTT_CONNECTIONS_REJECTED
         .get_or_init(|| fallback_counter("rustgate_mqtt_connections_rejected_total", "fallback"))
@@ -2396,8 +2403,11 @@ mod tests {
         let _ = messages_routed();
         let _ = sessions_active();
         let _ = nats_publishes();
-        let _ = mqtt_connections();
-        let _ = mqtt_connections_rejected();
+        #[cfg(feature = "mqtt")]
+        {
+            let _ = mqtt_connections();
+            let _ = mqtt_connections_rejected();
+        }
         let _ = negotiations();
         let _ = handshake_failures();
     }
@@ -2406,6 +2416,7 @@ mod tests {
     /// `rustgate_mqtt::MqttServerConfig::{on_accept, on_reject}` callback
     /// slots. Grouped into a nested module so the assertions read together
     /// as the contract being protected.
+    #[cfg(feature = "mqtt")]
     mod mqtt_connections_counters {
         use super::*;
 
