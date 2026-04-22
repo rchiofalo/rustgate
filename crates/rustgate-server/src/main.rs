@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use anyhow::Context as _;
 use tokio::sync::Semaphore;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -569,7 +570,8 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     BackpressureGate::with_resume_dwell(
         &mut backpressure_gate,
         std::time::Duration::from_millis(cli.backpressure_resume_dwell_ms),
-    );
+    )
+    .context("configure backpressure resume dwell")?;
     #[cfg(feature = "metrics")]
     {
         BackpressureGate::set_on_deferred(
@@ -577,13 +579,15 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
             Arc::new(|| {
                 metrics::admission_deferred_total().inc();
             }),
-        );
+        )
+        .context("install backpressure deferred-callback")?;
         BackpressureGate::set_on_bytes_changed(
             &mut backpressure_gate,
             Arc::new(|n| {
                 metrics::queued_bytes().set(i64::try_from(n).unwrap_or(i64::MAX));
             }),
-        );
+        )
+        .context("install backpressure bytes-changed callback")?;
     }
     tracing::info!(
         max_queued_bytes = backpressure_gate.high_water(),
