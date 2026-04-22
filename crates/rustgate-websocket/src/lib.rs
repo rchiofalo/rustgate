@@ -34,7 +34,7 @@ use rustgate_resilience::conn_rate_limiter::ConnRateLimiter;
 use rustgate_transport::{TlsConfig, extract_identity};
 pub use server::{
     DEFAULT_MAX_WRITE_BUFFER_BYTES, OnFederationForward, OnHttpForward, OnNatsPublish,
-    WebSocketServer, WsServerConfig,
+    OnWsAcceptFn, OnWsRejectFn, WebSocketServer, WsServerConfig, WsSessionHooks,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
@@ -121,6 +121,7 @@ pub struct WsListener {
     conn_rate: ConnRateLimiter,
     max_frame_size: usize,
     max_message_size: usize,
+    on_connection_rejected: Option<OnWsRejectFn>,
 }
 
 impl std::fmt::Debug for WsListener {
@@ -131,12 +132,15 @@ impl std::fmt::Debug for WsListener {
             .field("conn_rate", &self.conn_rate)
             .field("max_frame_size", &self.max_frame_size)
             .field("max_message_size", &self.max_message_size)
+            .field(
+                "on_connection_rejected",
+                &self.on_connection_rejected.is_some(),
+            )
             .finish()
     }
 }
 
 /// Configuration for constructing a [`WsListener`].
-#[derive(Debug)]
 pub struct WsListenerConfig {
     /// Maximum connection attempts per IP within the rate limit window.
     pub conn_rate_limit: usize,
@@ -146,6 +150,28 @@ pub struct WsListenerConfig {
     pub max_frame_size: usize,
     /// Maximum WebSocket message size in bytes.
     pub max_message_size: usize,
+    /// Fired on every connection rejected inside the accept loop (per-IP
+    /// rate limit, TLS handshake failure, identity extraction failure,
+    /// upgrade handshake failure). Typically cloned from
+    /// [`WsSessionHooks::on_connection_rejected`] so both the accept-loop
+    /// rejects and the post-accept rejects in the session handler increment
+    /// the same counter.
+    pub on_connection_rejected: Option<OnWsRejectFn>,
+}
+
+impl std::fmt::Debug for WsListenerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WsListenerConfig")
+            .field("conn_rate_limit", &self.conn_rate_limit)
+            .field("conn_rate_window", &self.conn_rate_window)
+            .field("max_frame_size", &self.max_frame_size)
+            .field("max_message_size", &self.max_message_size)
+            .field(
+                "on_connection_rejected",
+                &self.on_connection_rejected.is_some(),
+            )
+            .finish()
+    }
 }
 
 impl Default for WsListenerConfig {
@@ -155,6 +181,7 @@ impl Default for WsListenerConfig {
             conn_rate_window: DEFAULT_CONN_RATE_WINDOW,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            on_connection_rejected: None,
         }
     }
 }
@@ -211,6 +238,7 @@ impl WsListener {
             conn_rate: ConnRateLimiter::new(config.conn_rate_limit, config.conn_rate_window),
             max_frame_size: config.max_frame_size,
             max_message_size: config.max_message_size,
+            on_connection_rejected: config.on_connection_rejected,
         })
     }
 
@@ -219,6 +247,13 @@ impl WsListener {
         self.tcp
             .local_addr()
             .map_err(|e| TransportError::Other(format!("failed to get local address: {e}")).into())
+    }
+
+    #[inline]
+    fn fire_rejected(&self) {
+        if let Some(cb) = self.on_connection_rejected.as_ref() {
+            cb();
+        }
     }
 
     /// Accept a new WebSocket connection with mTLS authentication.
@@ -235,6 +270,7 @@ impl WsListener {
                 Ok(conn) => conn,
                 Err(e) => {
                     warn!(error = %e, "TCP accept failed");
+                    self.fire_rejected();
                     continue;
                 }
             };
@@ -246,6 +282,7 @@ impl WsListener {
                     "connection rejected: rate limit exceeded for IP"
                 );
                 drop(tcp_stream);
+                self.fire_rejected();
                 continue;
             }
 
@@ -256,6 +293,7 @@ impl WsListener {
                 Ok(stream) => stream,
                 Err(e) => {
                     warn!(peer_addr = %peer_addr, error = %e, "TLS handshake failed");
+                    self.fire_rejected();
                     continue;
                 }
             };
@@ -271,6 +309,7 @@ impl WsListener {
                 Ok(id) => id,
                 Err(e) => {
                     warn!(peer_addr = %peer_addr, error = %e, "identity extraction failed");
+                    self.fire_rejected();
                     continue;
                 }
             };
@@ -296,10 +335,12 @@ impl WsListener {
                 Ok(Ok(stream)) => stream,
                 Ok(Err(e)) => {
                     warn!(peer_addr = %peer_addr, error = %e, "WebSocket upgrade failed");
+                    self.fire_rejected();
                     continue;
                 }
                 Err(_) => {
                     warn!(peer_addr = %peer_addr, "WebSocket upgrade timed out");
+                    self.fire_rejected();
                     continue;
                 }
             };
@@ -388,5 +429,69 @@ mod tests {
 
         // Should be allowed again after window expires.
         assert!(!limiter.is_limited(ip));
+    }
+
+    mod session_hooks {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use super::*;
+
+        fn assert_send_sync<T: Send + Sync + 'static>() {}
+
+        #[test]
+        fn on_ws_accept_fn_is_send_sync_static() {
+            assert_send_sync::<OnWsAcceptFn>();
+        }
+
+        #[test]
+        fn on_ws_reject_fn_is_send_sync_static() {
+            assert_send_sync::<OnWsRejectFn>();
+        }
+
+        #[test]
+        fn ws_session_hooks_default_is_all_none() {
+            let hooks = WsSessionHooks::default();
+            assert!(hooks.on_connection_accept.is_none());
+            assert!(hooks.on_connection_rejected.is_none());
+        }
+
+        #[test]
+        fn ws_session_hooks_debug_redacts_closure_bodies() {
+            let hooks = WsSessionHooks {
+                on_connection_accept: Some(Arc::new(|| {})),
+                on_connection_rejected: None,
+            };
+            let debug = format!("{:?}", hooks);
+            // Presence is reported as a bool, not the closure body.
+            assert!(debug.contains("on_connection_accept: true"), "{debug}");
+            assert!(debug.contains("on_connection_rejected: false"), "{debug}");
+        }
+
+        #[test]
+        fn ws_session_hooks_clone_shares_callback_state() {
+            let counter = Arc::new(AtomicUsize::new(0));
+            let c = Arc::clone(&counter);
+            let hooks = WsSessionHooks {
+                on_connection_accept: Some(Arc::new(move || {
+                    let _ = c.fetch_add(1, Ordering::SeqCst);
+                })),
+                on_connection_rejected: None,
+            };
+            let cloned = hooks.clone();
+            if let Some(cb) = hooks.on_connection_accept.as_ref() {
+                cb();
+            }
+            if let Some(cb) = cloned.on_connection_accept.as_ref() {
+                cb();
+            }
+            assert_eq!(counter.load(Ordering::SeqCst), 2);
+        }
+
+        #[test]
+        fn ws_listener_config_default_has_no_reject_hook() {
+            let cfg = WsListenerConfig::default();
+            assert!(cfg.on_connection_rejected.is_none());
+        }
     }
 }

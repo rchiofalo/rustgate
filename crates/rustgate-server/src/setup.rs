@@ -1405,11 +1405,23 @@ pub(crate) fn start_websocket<P: NatsPublish + Send + Sync + 'static>(
     let addr: std::net::SocketAddr = ws_bind
         .parse()
         .context("parsing --websocket-bind address")?;
+
+    #[cfg(feature = "metrics")]
+    let ws_session_hooks = Some(rustgate_websocket::WsSessionHooks {
+        on_connection_accept: Some(Arc::new(|| metrics::ws_connections().inc())),
+        on_connection_rejected: Some(Arc::new(|| metrics::ws_connections_rejected().inc())),
+    });
+    #[cfg(not(feature = "metrics"))]
+    let ws_session_hooks: Option<rustgate_websocket::WsSessionHooks> = None;
+
     let ws_config = rustgate_websocket::WsListenerConfig {
         conn_rate_limit: cli.ws_conn_rate_limit,
         conn_rate_window: std::time::Duration::from_secs(cli.ws_conn_rate_window_secs),
         max_frame_size: cli.ws_max_frame_size,
         max_message_size: cli.ws_max_message_size,
+        on_connection_rejected: ws_session_hooks
+            .as_ref()
+            .and_then(|h| h.on_connection_rejected.clone()),
     };
     let ws_listener =
         rustgate_websocket::WsListener::bind_with_config(addr, tls_config, ws_config)?;
@@ -1468,6 +1480,7 @@ pub(crate) fn start_websocket<P: NatsPublish + Send + Sync + 'static>(
             ping_interval: std::time::Duration::from_secs(cli.ws_ping_interval_secs),
             pong_timeout: std::time::Duration::from_secs(cli.ws_pong_timeout_secs),
         },
+        session_hooks: ws_session_hooks,
         shutdown: Arc::clone(&shutdown),
     };
     let task = tokio::spawn(async move {

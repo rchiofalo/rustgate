@@ -108,6 +108,11 @@ static MQTT_CONNECTIONS: OnceLock<IntCounter> = OnceLock::new();
 #[cfg(feature = "mqtt")]
 static MQTT_CONNECTIONS_REJECTED: OnceLock<IntCounter> = OnceLock::new();
 
+#[cfg(feature = "websocket")]
+static WS_CONNECTIONS: OnceLock<IntCounter> = OnceLock::new();
+#[cfg(feature = "websocket")]
+static WS_CONNECTIONS_REJECTED: OnceLock<IntCounter> = OnceLock::new();
+
 #[cfg(feature = "nats")]
 static NATS_CONSUMER_PENDING: OnceLock<IntGauge> = OnceLock::new();
 #[cfg(feature = "nats")]
@@ -501,6 +506,23 @@ pub fn init() -> prometheus::Result<()> {
         ))?;
         registry.register(Box::new(mqtt_connections_rejected.clone()))?;
         let _ = MQTT_CONNECTIONS_REJECTED.set(mqtt_connections_rejected);
+    }
+
+    #[cfg(feature = "websocket")]
+    {
+        let ws_connections = IntCounter::with_opts(Opts::new(
+            "rustgate_ws_connections_total",
+            "WebSocket sessions successfully registered (post-mTLS, post-upgrade, post-tenant-quota)",
+        ))?;
+        registry.register(Box::new(ws_connections.clone()))?;
+        let _ = WS_CONNECTIONS.set(ws_connections);
+
+        let ws_connections_rejected = IntCounter::with_opts(Opts::new(
+            "rustgate_ws_connections_rejected_total",
+            "WebSocket connections rejected on the session-handler boundary (per-IP rate limit, TLS, identity, upgrade, connection-limit, tenant quota)",
+        ))?;
+        registry.register(Box::new(ws_connections_rejected.clone()))?;
+        let _ = WS_CONNECTIONS_REJECTED.set(ws_connections_rejected);
     }
 
     #[cfg(feature = "nats")]
@@ -1145,6 +1167,23 @@ pub fn mqtt_connections() -> &'static IntCounter {
 pub fn mqtt_connections_rejected() -> &'static IntCounter {
     MQTT_CONNECTIONS_REJECTED
         .get_or_init(|| fallback_counter("rustgate_mqtt_connections_rejected_total", "fallback"))
+}
+
+/// Accepted WebSocket session counter. Fired once per session the router
+/// successfully registers (post-mTLS, post-upgrade, post-tenant-quota).
+#[cfg(feature = "websocket")]
+pub fn ws_connections() -> &'static IntCounter {
+    WS_CONNECTIONS.get_or_init(|| fallback_counter("rustgate_ws_connections_total", "fallback"))
+}
+
+/// Rejected WebSocket connection counter. Fired once per connection refused
+/// on the session-handler boundary. Reasons are retained in the audit trail
+/// (`rustgate_core::audit::connection_rejected`); this counter tracks the
+/// aggregate rate for dashboards and alerting.
+#[cfg(feature = "websocket")]
+pub fn ws_connections_rejected() -> &'static IntCounter {
+    WS_CONNECTIONS_REJECTED
+        .get_or_init(|| fallback_counter("rustgate_ws_connections_rejected_total", "fallback"))
 }
 
 /// Returns the JetStream consumer `num_pending` gauge if registered.
@@ -2426,6 +2465,11 @@ mod tests {
         {
             let _ = mqtt_connections();
             let _ = mqtt_connections_rejected();
+        }
+        #[cfg(feature = "websocket")]
+        {
+            let _ = ws_connections();
+            let _ = ws_connections_rejected();
         }
         let _ = negotiations();
         let _ = handshake_failures();
@@ -3769,5 +3813,102 @@ mod tests {
             .find(|mf| mf.name() == "rustgate_cert_expiry_seconds")
             .expect("rustgate_cert_expiry_seconds must be registered");
         assert_eq!(family.get_metric().len(), 1);
+    }
+
+    #[cfg(feature = "websocket")]
+    mod ws_connection_counters {
+        use std::sync::Arc;
+
+        use super::super::{ws_connections, ws_connections_rejected};
+        use super::ensure_init;
+
+        fn find_metric_family(name: &str) -> Option<prometheus::proto::MetricFamily> {
+            prometheus::default_registry()
+                .gather()
+                .into_iter()
+                .find(|mf| mf.name() == name)
+        }
+
+        #[test]
+        fn ws_connections_registered_under_documented_name() {
+            ensure_init();
+            let mf = find_metric_family("rustgate_ws_connections_total")
+                .expect("rustgate_ws_connections_total should be registered by init()");
+            assert_eq!(mf.get_metric().len(), 1, "counter is unlabeled");
+            assert_eq!(
+                mf.get_metric()[0].get_label().len(),
+                0,
+                "counter has zero label arity"
+            );
+        }
+
+        #[test]
+        fn ws_connections_rejected_registered_under_documented_name() {
+            ensure_init();
+            let mf = find_metric_family("rustgate_ws_connections_rejected_total")
+                .expect("rustgate_ws_connections_rejected_total should be registered by init()");
+            assert_eq!(mf.get_metric().len(), 1, "counter is unlabeled");
+            assert_eq!(
+                mf.get_metric()[0].get_label().len(),
+                0,
+                "counter has zero label arity"
+            );
+        }
+
+        #[test]
+        fn ws_connections_increment_observable() {
+            ensure_init();
+            let before = ws_connections().get();
+            ws_connections().inc();
+            assert!(ws_connections().get() > before);
+        }
+
+        #[test]
+        fn ws_connections_rejected_increment_observable() {
+            ensure_init();
+            let before = ws_connections_rejected().get();
+            ws_connections_rejected().inc();
+            assert!(ws_connections_rejected().get() > before);
+        }
+
+        #[test]
+        fn fed_by_ws_on_connection_accept_callback_end_to_end() {
+            ensure_init();
+            // Mirrors the closure `rustgate-server::setup::setup_websocket`
+            // builds under `#[cfg(feature = "metrics")]`.
+            let cb: Arc<dyn Fn() + Send + Sync> = Arc::new(|| ws_connections().inc());
+            let before = ws_connections().get();
+            cb();
+            cb();
+            assert!(ws_connections().get() >= before + 2);
+        }
+
+        #[test]
+        fn fed_by_ws_on_connection_rejected_callback_end_to_end() {
+            ensure_init();
+            let cb: Arc<dyn Fn() + Send + Sync> = Arc::new(|| ws_connections_rejected().inc());
+            let before = ws_connections_rejected().get();
+            cb();
+            assert!(ws_connections_rejected().get() > before);
+        }
+
+        #[test]
+        fn session_hooks_struct_accepts_both_counter_callbacks() {
+            ensure_init();
+            let hooks = rustgate_websocket::WsSessionHooks {
+                on_connection_accept: Some(Arc::new(|| ws_connections().inc())),
+                on_connection_rejected: Some(Arc::new(|| ws_connections_rejected().inc())),
+            };
+            let before_accept = ws_connections().get();
+            let before_reject = ws_connections_rejected().get();
+            if let Some(cb) = hooks.on_connection_accept.as_ref() {
+                cb();
+            }
+            if let Some(cb) = hooks.on_connection_rejected.as_ref() {
+                cb();
+            }
+            assert!(ws_connections().get() > before_accept);
+            assert!(ws_connections_rejected().get() > before_reject);
+        }
     }
 }

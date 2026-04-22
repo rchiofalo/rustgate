@@ -125,6 +125,7 @@ impl TestWsServer {
             ws_max_violations: 0,
             max_write_buffer_bytes: 0,
             health_check: rustgate_websocket::health::HealthCheckConfig::DISABLED,
+            session_hooks: None,
             shutdown: Arc::clone(&shutdown),
         };
 
@@ -452,6 +453,7 @@ async fn ws_nats_and_federation_callbacks_fire() {
         ws_max_violations: 0,
         max_write_buffer_bytes: 0,
         health_check: rustgate_websocket::health::HealthCheckConfig::DISABLED,
+        session_hooks: None,
         shutdown: Arc::clone(&shutdown),
     };
 
