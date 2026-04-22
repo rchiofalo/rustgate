@@ -63,6 +63,25 @@ pub type OnWsAcceptFn = Arc<dyn Fn() + Send + Sync>;
 /// `rustgate_ws_connections_rejected_total` Prometheus counter.
 pub type OnWsRejectFn = Arc<dyn Fn() + Send + Sync>;
 
+/// Fired once per inbound application frame (Binary or Text) after the
+/// payload is extracted but before rate-limiting / throttling / replay /
+/// routing. Control frames (Close, Pong, Ping) are not counted as
+/// application frames and do not fire this hook.
+///
+/// Used by `rustgate-server` to increment the
+/// `rustgate_ws_frames_received_total` Prometheus counter. The crate stays
+/// metrics-agnostic — no `prometheus` dependency leaks in.
+pub type OnWsFrameReceivedFn = Arc<dyn Fn() + Send + Sync>;
+
+/// Fired once per inbound application frame dropped on the post-receipt
+/// rejection paths: per-connection frame/byte rate limit exceeded,
+/// per-client throttle drop, replay-filter duplicate suppression, or
+/// router drop (dedup, TTL, Send-PEP deny, oversize multicast).
+///
+/// Used by `rustgate-server` to increment the
+/// `rustgate_ws_frames_rejected_total` Prometheus counter.
+pub type OnWsFrameRejectedFn = Arc<dyn Fn() + Send + Sync>;
+
 /// Bundle of WebSocket session lifecycle callbacks.
 ///
 /// Held by `WsServerConfig` to keep its constructor under the clippy
@@ -76,6 +95,10 @@ pub struct WsSessionHooks {
     /// See [`OnWsRejectFn`]. Cloned into `WsListenerConfig.on_connection_rejected`
     /// so the accept-loop reject branches can observe it as well.
     pub on_connection_rejected: Option<OnWsRejectFn>,
+    /// See [`OnWsFrameReceivedFn`].
+    pub on_frame_received: Option<OnWsFrameReceivedFn>,
+    /// See [`OnWsFrameRejectedFn`].
+    pub on_frame_rejected: Option<OnWsFrameRejectedFn>,
 }
 
 impl std::fmt::Debug for WsSessionHooks {
@@ -86,6 +109,8 @@ impl std::fmt::Debug for WsSessionHooks {
                 "on_connection_rejected",
                 &self.on_connection_rejected.is_some(),
             )
+            .field("on_frame_received", &self.on_frame_received.is_some())
+            .field("on_frame_rejected", &self.on_frame_rejected.is_some())
             .finish()
     }
 }
@@ -347,11 +372,18 @@ async fn handle_ws_session(
 
     let last_pong = new_last_pong();
 
+    let on_frame_received = session_hooks
+        .as_ref()
+        .and_then(|h| h.on_frame_received.clone());
+    let on_frame_rejected = session_hooks
+        .as_ref()
+        .and_then(|h| h.on_frame_rejected.clone());
+
     let read_result = {
         let router = Arc::clone(&router);
         let read_last_pong = Arc::clone(&last_pong);
         tokio::select! {
-            r = ws_read_loop(ws_read, &identity, &router, nats_publish.as_ref(), fed_forward.as_ref(), http_forward.as_ref(), &throttle, &replay_filter, &mut ws_rate_limiter, read_last_pong) => r,
+            r = ws_read_loop(ws_read, &identity, &router, nats_publish.as_ref(), fed_forward.as_ref(), http_forward.as_ref(), &throttle, &replay_filter, &mut ws_rate_limiter, read_last_pong, on_frame_received.as_ref(), on_frame_rejected.as_ref()) => r,
             r = ws_write_loop(ws_write, &mut priority_rx, &mut normal_rx, &*codec, max_write_buffer_bytes, health_check, Arc::clone(&last_pong)) => r,
         }
     };
@@ -370,9 +402,10 @@ async fn handle_ws_session(
 }
 
 // justification: half of the `handle_ws_session` fan-in plus the rate
-// limiter state that only the read path mutates. Called from exactly one
-// place; extracting a struct would force the session handler to hold a
-// redundant copy of references it already has in scope.
+// limiter state that only the read path mutates, plus the frame-level
+// observability hooks. Called from exactly one place; extracting a struct
+// would force the session handler to hold a redundant copy of references
+// it already has in scope.
 #[allow(clippy::too_many_arguments)]
 async fn ws_read_loop(
     mut ws_read: SplitStream<WsStream>,
@@ -385,6 +418,8 @@ async fn ws_read_loop(
     replay_filter: &Option<Arc<ReplayFilter>>,
     ws_rate_limiter: &mut Option<crate::rate_limit::WsRateLimiter>,
     last_pong: LastPong,
+    on_frame_received: Option<&OnWsFrameReceivedFn>,
+    on_frame_rejected: Option<&OnWsFrameRejectedFn>,
 ) -> Result<(), String> {
     let mut msg_builder = MessageBuilder::new();
 
@@ -409,6 +444,13 @@ async fn ws_read_loop(
             _ => continue, // Ping auto-replied by tungstenite; frames ignored
         };
 
+        // Application frame received. Fires before any rejection path so
+        // `_received_total - _rejected_total` yields the successfully-routed
+        // frame count.
+        if let Some(cb) = on_frame_received {
+            cb();
+        }
+
         // Per-connection frame/byte rate limiting
         if let Some(limiter) = ws_rate_limiter
             && let Err(exceeded) = limiter.check(payload.len())
@@ -432,6 +474,9 @@ async fn ws_read_loop(
                     "WebSocket frame dropped: byte rate exceeded",
                 );
             }
+            if let Some(cb) = on_frame_rejected {
+                cb();
+            }
             if limiter.should_disconnect() {
                 return Err("disconnected: sustained rate limit violations".into());
             }
@@ -448,6 +493,9 @@ async fn ws_read_loop(
                 "websocket/inbound",
                 t.rate() as usize,
             );
+            if let Some(cb) = on_frame_rejected {
+                cb();
+            }
             continue;
         }
 
@@ -456,6 +504,9 @@ async fn ws_read_loop(
             && filter.is_replay(&payload)
         {
             debug!(cn = %hash_cn(&identity.cn), "message dropped: replay detected");
+            if let Some(cb) = on_frame_rejected {
+                cb();
+            }
             continue;
         }
 
@@ -468,6 +519,9 @@ async fn ws_read_loop(
         // and all egress MUST be skipped to keep external sinks
         // consistent with local delivery.
         let Some(routed) = router.route_for_egress(msg).await else {
+            if let Some(cb) = on_frame_rejected {
+                cb();
+            }
             continue;
         };
 

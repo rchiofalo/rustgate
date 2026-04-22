@@ -103,6 +103,10 @@ static NATS_PUBLISHES: OnceLock<IntCounter> = OnceLock::new();
 static WS_CONNECTIONS: OnceLock<IntCounter> = OnceLock::new();
 #[cfg(feature = "websocket")]
 static WS_CONNECTIONS_REJECTED: OnceLock<IntCounter> = OnceLock::new();
+#[cfg(feature = "websocket")]
+static WS_FRAMES_RECEIVED: OnceLock<IntCounter> = OnceLock::new();
+#[cfg(feature = "websocket")]
+static WS_FRAMES_REJECTED: OnceLock<IntCounter> = OnceLock::new();
 
 #[cfg(feature = "nats")]
 static NATS_CONSUMER_PENDING: OnceLock<IntGauge> = OnceLock::new();
@@ -366,6 +370,20 @@ pub fn init() -> prometheus::Result<()> {
         ))?;
         registry.register(Box::new(ws_connections_rejected.clone()))?;
         let _ = WS_CONNECTIONS_REJECTED.set(ws_connections_rejected);
+
+        let ws_frames_received = IntCounter::with_opts(Opts::new(
+            "rustgate_ws_frames_received_total",
+            "WebSocket application frames (Binary/Text) received after payload extraction, before rate-limit/throttle/replay/routing",
+        ))?;
+        registry.register(Box::new(ws_frames_received.clone()))?;
+        let _ = WS_FRAMES_RECEIVED.set(ws_frames_received);
+
+        let ws_frames_rejected = IntCounter::with_opts(Opts::new(
+            "rustgate_ws_frames_rejected_total",
+            "WebSocket application frames dropped after receipt (per-connection rate limit, per-client throttle, replay filter, router drop)",
+        ))?;
+        registry.register(Box::new(ws_frames_rejected.clone()))?;
+        let _ = WS_FRAMES_REJECTED.set(ws_frames_rejected);
     }
 
     #[cfg(feature = "nats")]
@@ -970,6 +988,26 @@ pub fn ws_connections() -> &'static IntCounter {
 pub fn ws_connections_rejected() -> &'static IntCounter {
     WS_CONNECTIONS_REJECTED
         .get_or_init(|| fallback_counter("rustgate_ws_connections_rejected_total", "fallback"))
+}
+
+/// Received WebSocket application-frame counter. Fired once per Binary/Text
+/// frame after payload extraction, before the rate-limit / throttle / replay /
+/// routing chain — so `received - rejected` approximates successfully-routed
+/// frames.
+#[cfg(feature = "websocket")]
+pub fn ws_frames_received() -> &'static IntCounter {
+    WS_FRAMES_RECEIVED
+        .get_or_init(|| fallback_counter("rustgate_ws_frames_received_total", "fallback"))
+}
+
+/// Rejected WebSocket application-frame counter. Fired once per inbound
+/// Binary/Text frame dropped by the per-connection rate limiter, the
+/// per-client throttle, the replay filter, or the router (dedup, TTL,
+/// Send-PEP deny, oversize multicast).
+#[cfg(feature = "websocket")]
+pub fn ws_frames_rejected() -> &'static IntCounter {
+    WS_FRAMES_REJECTED
+        .get_or_init(|| fallback_counter("rustgate_ws_frames_rejected_total", "fallback"))
 }
 
 /// Returns the JetStream consumer `num_pending` gauge if registered.
@@ -2249,6 +2287,8 @@ mod tests {
         {
             let _ = ws_connections();
             let _ = ws_connections_rejected();
+            let _ = ws_frames_received();
+            let _ = ws_frames_rejected();
         }
         let _ = negotiations();
         let _ = handshake_failures();
@@ -3288,6 +3328,7 @@ mod tests {
             let hooks = rustgate_websocket::WsSessionHooks {
                 on_connection_accept: Some(Arc::new(|| ws_connections().inc())),
                 on_connection_rejected: Some(Arc::new(|| ws_connections_rejected().inc())),
+                ..Default::default()
             };
             let before_accept = ws_connections().get();
             let before_reject = ws_connections_rejected().get();
@@ -3299,6 +3340,106 @@ mod tests {
             }
             assert!(ws_connections().get() > before_accept);
             assert!(ws_connections_rejected().get() > before_reject);
+        }
+    }
+
+    #[cfg(feature = "websocket")]
+    mod ws_frame_counters {
+        use std::sync::Arc;
+
+        use super::super::{ws_frames_received, ws_frames_rejected};
+        use super::ensure_init;
+
+        fn find_metric_family(name: &str) -> Option<prometheus::proto::MetricFamily> {
+            prometheus::default_registry()
+                .gather()
+                .into_iter()
+                .find(|mf| mf.name() == name)
+        }
+
+        #[test]
+        fn ws_frames_received_registered_under_documented_name() {
+            ensure_init();
+            let mf = find_metric_family("rustgate_ws_frames_received_total")
+                .expect("rustgate_ws_frames_received_total should be registered by init()");
+            assert_eq!(mf.get_metric().len(), 1, "counter is unlabeled");
+            assert_eq!(
+                mf.get_metric()[0].get_label().len(),
+                0,
+                "counter has zero label arity"
+            );
+        }
+
+        #[test]
+        fn ws_frames_rejected_registered_under_documented_name() {
+            ensure_init();
+            let mf = find_metric_family("rustgate_ws_frames_rejected_total")
+                .expect("rustgate_ws_frames_rejected_total should be registered by init()");
+            assert_eq!(mf.get_metric().len(), 1, "counter is unlabeled");
+            assert_eq!(
+                mf.get_metric()[0].get_label().len(),
+                0,
+                "counter has zero label arity"
+            );
+        }
+
+        #[test]
+        fn ws_frames_received_increment_observable() {
+            ensure_init();
+            let before = ws_frames_received().get();
+            ws_frames_received().inc();
+            assert!(ws_frames_received().get() > before);
+        }
+
+        #[test]
+        fn ws_frames_rejected_increment_observable() {
+            ensure_init();
+            let before = ws_frames_rejected().get();
+            ws_frames_rejected().inc();
+            assert!(ws_frames_rejected().get() > before);
+        }
+
+        #[test]
+        fn fed_by_ws_on_frame_received_callback_end_to_end() {
+            ensure_init();
+            // Mirrors the closure `rustgate-server::setup::setup_websocket`
+            // builds under `#[cfg(feature = "metrics")]` for frame-level
+            // observability.
+            let cb: Arc<dyn Fn() + Send + Sync> = Arc::new(|| ws_frames_received().inc());
+            let before = ws_frames_received().get();
+            cb();
+            cb();
+            cb();
+            assert!(ws_frames_received().get() >= before + 3);
+        }
+
+        #[test]
+        fn fed_by_ws_on_frame_rejected_callback_end_to_end() {
+            ensure_init();
+            let cb: Arc<dyn Fn() + Send + Sync> = Arc::new(|| ws_frames_rejected().inc());
+            let before = ws_frames_rejected().get();
+            cb();
+            assert!(ws_frames_rejected().get() > before);
+        }
+
+        #[test]
+        fn session_hooks_struct_accepts_frame_counter_callbacks() {
+            ensure_init();
+            let hooks = rustgate_websocket::WsSessionHooks {
+                on_frame_received: Some(Arc::new(|| ws_frames_received().inc())),
+                on_frame_rejected: Some(Arc::new(|| ws_frames_rejected().inc())),
+                ..Default::default()
+            };
+            let before_received = ws_frames_received().get();
+            let before_rejected = ws_frames_rejected().get();
+            if let Some(cb) = hooks.on_frame_received.as_ref() {
+                cb();
+            }
+            if let Some(cb) = hooks.on_frame_rejected.as_ref() {
+                cb();
+            }
+            assert!(ws_frames_received().get() > before_received);
+            assert!(ws_frames_rejected().get() > before_rejected);
         }
     }
 }

@@ -25,7 +25,8 @@ use rustgate_resilience::conn_rate_limiter::ConnRateLimiter;
 use rustgate_transport::{TlsConfig, extract_identity};
 pub use server::{
     DEFAULT_MAX_WRITE_BUFFER_BYTES, OnFederationForward, OnHttpForward, OnNatsPublish,
-    OnWsAcceptFn, OnWsRejectFn, WebSocketServer, WsServerConfig, WsSessionHooks,
+    OnWsAcceptFn, OnWsFrameReceivedFn, OnWsFrameRejectedFn, OnWsRejectFn, WebSocketServer,
+    WsServerConfig, WsSessionHooks,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
@@ -445,6 +446,8 @@ mod tests {
             let hooks = WsSessionHooks::default();
             assert!(hooks.on_connection_accept.is_none());
             assert!(hooks.on_connection_rejected.is_none());
+            assert!(hooks.on_frame_received.is_none());
+            assert!(hooks.on_frame_rejected.is_none());
         }
 
         #[test]
@@ -452,11 +455,15 @@ mod tests {
             let hooks = WsSessionHooks {
                 on_connection_accept: Some(Arc::new(|| {})),
                 on_connection_rejected: None,
+                on_frame_received: Some(Arc::new(|| {})),
+                on_frame_rejected: None,
             };
             let debug = format!("{:?}", hooks);
             // Presence is reported as a bool, not the closure body.
             assert!(debug.contains("on_connection_accept: true"), "{debug}");
             assert!(debug.contains("on_connection_rejected: false"), "{debug}");
+            assert!(debug.contains("on_frame_received: true"), "{debug}");
+            assert!(debug.contains("on_frame_rejected: false"), "{debug}");
         }
 
         #[test]
@@ -468,6 +475,8 @@ mod tests {
                     let _ = c.fetch_add(1, Ordering::SeqCst);
                 })),
                 on_connection_rejected: None,
+                on_frame_received: None,
+                on_frame_rejected: None,
             };
             let cloned = hooks.clone();
             if let Some(cb) = hooks.on_connection_accept.as_ref() {
@@ -480,9 +489,47 @@ mod tests {
         }
 
         #[test]
+        fn ws_session_hooks_frame_callbacks_fire_independently() {
+            let recv_count = Arc::new(AtomicUsize::new(0));
+            let rej_count = Arc::new(AtomicUsize::new(0));
+            let r = Arc::clone(&recv_count);
+            let j = Arc::clone(&rej_count);
+            let hooks = WsSessionHooks {
+                on_frame_received: Some(Arc::new(move || {
+                    let _ = r.fetch_add(1, Ordering::SeqCst);
+                })),
+                on_frame_rejected: Some(Arc::new(move || {
+                    let _ = j.fetch_add(1, Ordering::SeqCst);
+                })),
+                ..Default::default()
+            };
+            if let Some(cb) = hooks.on_frame_received.as_ref() {
+                cb();
+                cb();
+            }
+            if let Some(cb) = hooks.on_frame_rejected.as_ref() {
+                cb();
+            }
+            assert_eq!(recv_count.load(Ordering::SeqCst), 2);
+            assert_eq!(rej_count.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
         fn ws_listener_config_default_has_no_reject_hook() {
             let cfg = WsListenerConfig::default();
             assert!(cfg.on_connection_rejected.is_none());
+        }
+
+        #[test]
+        fn on_ws_frame_received_fn_is_send_sync_static() {
+            fn assert_send_sync<T: Send + Sync + 'static>() {}
+            assert_send_sync::<OnWsFrameReceivedFn>();
+        }
+
+        #[test]
+        fn on_ws_frame_rejected_fn_is_send_sync_static() {
+            fn assert_send_sync<T: Send + Sync + 'static>() {}
+            assert_send_sync::<OnWsFrameRejectedFn>();
         }
     }
 }

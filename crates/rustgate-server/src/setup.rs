@@ -1402,6 +1402,8 @@ pub(crate) fn start_websocket<P: NatsPublish + Send + Sync + 'static>(
     let ws_session_hooks = Some(rustgate_websocket::WsSessionHooks {
         on_connection_accept: Some(Arc::new(|| metrics::ws_connections().inc())),
         on_connection_rejected: Some(Arc::new(|| metrics::ws_connections_rejected().inc())),
+        on_frame_received: Some(Arc::new(|| metrics::ws_frames_received().inc())),
+        on_frame_rejected: Some(Arc::new(|| metrics::ws_frames_rejected().inc())),
     });
     #[cfg(not(feature = "metrics"))]
     let ws_session_hooks: Option<rustgate_websocket::WsSessionHooks> = None;
