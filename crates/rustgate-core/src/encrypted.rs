@@ -112,6 +112,18 @@ pub enum EncryptError {
         /// The missing active key id.
         id: String,
     },
+    /// The active key's `not_after` is in the past, so it must not be used
+    /// for new writes. Historical data encrypted under this key is still
+    /// readable — only new-write admission is blocked. Operators must
+    /// rotate the `active_key_id` to a key whose `not_after` is in the
+    /// future (or unset).
+    #[error("active key id {id:?} expired at unix_seconds={not_after}")]
+    ActiveKeyExpired {
+        /// The expired active key id.
+        id: String,
+        /// The unix timestamp (seconds since epoch) at which the key expired.
+        not_after: i64,
+    },
     /// The shared writer's mutex was poisoned by a previous panic.
     #[error("encrypted writer mutex poisoned")]
     WriterPoisoned,
@@ -145,6 +157,16 @@ pub struct KeyFile {
     pub active_key_id: String,
     /// All known keys, indexed by id.
     pub keys: BTreeMap<String, String>,
+    /// Optional per-key expiration expressed as unix seconds since epoch.
+    ///
+    /// Any id listed here must also appear in `keys`. When the `active_key_id`
+    /// has an entry whose value is `<=` the current system time, new-write
+    /// admission is rejected with [`EncryptError::ActiveKeyExpired`]. Keys
+    /// that do not appear in this map have no expiration and may be used
+    /// indefinitely (historical behaviour — unchanged for existing key
+    /// files that pre-date this field).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub key_expirations: BTreeMap<String, i64>,
 }
 
 /// Loaded key material — keys decoded into raw bytes wrapped in
@@ -153,6 +175,7 @@ pub struct KeyFile {
 pub struct KeyRing {
     active_key_id: String,
     keys: BTreeMap<String, Arc<Zeroizing<[u8; 32]>>>,
+    not_after: BTreeMap<String, i64>,
 }
 
 impl std::fmt::Debug for KeyRing {
@@ -160,6 +183,7 @@ impl std::fmt::Debug for KeyRing {
         f.debug_struct("KeyRing")
             .field("active_key_id", &self.active_key_id)
             .field("key_count", &self.keys.len())
+            .field("expiring_key_count", &self.not_after.len())
             .finish()
     }
 }
@@ -198,9 +222,17 @@ impl KeyRing {
             buf.copy_from_slice(&raw);
             let _ = keys.insert(id.clone(), Arc::new(buf));
         }
+        for id in parsed.key_expirations.keys() {
+            if !parsed.keys.contains_key(id) {
+                return Err(EncryptError::KeyFile(format!(
+                    "key_expirations references unknown key id {id:?}"
+                )));
+            }
+        }
         Ok(Self {
             active_key_id: parsed.active_key_id,
             keys,
+            not_after: parsed.key_expirations,
         })
     }
 
@@ -222,6 +254,11 @@ impl KeyRing {
     /// [`KeyRing::from_bytes`], which enforces the invariant). Returning an
     /// error rather than falling back to a sentinel key prevents accidentally
     /// encrypting data with an all-zero key.
+    ///
+    /// This accessor does **not** check expiration — callers that must
+    /// refuse expired keys for new writes should first consult
+    /// [`KeyRing::active_key_expired_at`] (the `EncryptedWriter::create`
+    /// entrypoint does this automatically).
     pub fn active_key(&self) -> Result<Arc<Zeroizing<[u8; 32]>>, EncryptError> {
         self.keys
             .get(&self.active_key_id)
@@ -229,6 +266,26 @@ impl KeyRing {
             .ok_or_else(|| EncryptError::UnknownActiveKey {
                 id: self.active_key_id.clone(),
             })
+    }
+
+    /// Unix-seconds `not_after` for key `id`, if one was configured.
+    ///
+    /// Returns `None` both for keys that have no expiration configured and
+    /// for unknown ids — callers that need to distinguish the two cases
+    /// should combine this with [`KeyRing::key`].
+    pub fn not_after(&self, id: &str) -> Option<i64> {
+        self.not_after.get(id).copied()
+    }
+
+    /// Returns `true` if the active key has an expiration configured and
+    /// `not_after <= now_unix_seconds`. Keys without an expiration never
+    /// report expired. This method does not read the system clock itself
+    /// so callers can deterministically test both sides of the boundary.
+    pub fn active_key_expired_at(&self, now_unix_seconds: i64) -> bool {
+        match self.not_after.get(&self.active_key_id) {
+            Some(&not_after) => not_after <= now_unix_seconds,
+            None => false,
+        }
     }
 }
 
@@ -275,6 +332,17 @@ impl EncryptedWriter {
     /// use a fresh path per rotation window (e.g. a new file per UTC date).
     pub fn create(path: &Path, key_ring: &KeyRing) -> Result<Self, EncryptError> {
         let key_id = key_ring.active_key_id().to_string();
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        if key_ring.active_key_expired_at(now_unix) {
+            let not_after = key_ring.not_after(&key_id).unwrap_or(0);
+            return Err(EncryptError::ActiveKeyExpired {
+                id: key_id,
+                not_after,
+            });
+        }
         let key_bytes = key_ring.active_key()?;
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes[..]));
 
@@ -716,6 +784,7 @@ mod tests {
         let kf = KeyFile {
             active_key_id: active.to_string(),
             keys: map,
+            key_expirations: BTreeMap::new(),
         };
         let json = serde_json::to_vec(&kf).unwrap();
         KeyRing::from_bytes(&json).unwrap()
@@ -846,6 +915,7 @@ mod tests {
         let ring = KeyRing {
             active_key_id: "ghost".to_string(),
             keys: BTreeMap::new(),
+            not_after: BTreeMap::new(),
         };
         let err = ring.active_key().unwrap_err();
         match err {
@@ -1043,5 +1113,200 @@ mod tests {
         let err = decrypt_file(&enc_path, &dec_path, &ring).unwrap_err();
         assert!(matches!(err, EncryptError::Truncated), "got {err:?}");
         let _ = pre_len; // silence unused-binding when the assert above passes
+    }
+
+    mod key_expiration {
+        use super::*;
+
+        fn now_unix_seconds() -> i64 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+        }
+
+        #[test]
+        fn legacy_key_file_without_expirations_field_deserializes_cleanly() {
+            // Pre-expiration key-file shape: no `key_expirations` field at
+            // all. `#[serde(default)]` must supply an empty map so existing
+            // key files keep loading without a migration.
+            let json = br#"{
+                "active_key_id": "k1",
+                "keys": { "k1": "1111111111111111111111111111111111111111111111111111111111111111" }
+            }"#;
+            let ring = KeyRing::from_bytes(json).expect("legacy key file must load");
+            assert_eq!(ring.active_key_id(), "k1");
+            assert_eq!(ring.not_after("k1"), None);
+            assert!(!ring.active_key_expired_at(i64::MAX));
+        }
+
+        #[test]
+        fn key_expirations_field_is_parsed_and_exposed_via_accessor() {
+            let json = br#"{
+                "active_key_id": "k1",
+                "keys": {
+                    "k1": "1111111111111111111111111111111111111111111111111111111111111111",
+                    "k2": "2222222222222222222222222222222222222222222222222222222222222222"
+                },
+                "key_expirations": { "k1": 2000000000, "k2": 3000000000 }
+            }"#;
+            let ring = KeyRing::from_bytes(json).expect("ring");
+            assert_eq!(ring.not_after("k1"), Some(2000000000));
+            assert_eq!(ring.not_after("k2"), Some(3000000000));
+            assert_eq!(ring.not_after("unknown"), None);
+        }
+
+        #[test]
+        fn key_expirations_referencing_unknown_id_is_rejected() {
+            // A key_expirations entry that references an id not present in
+            // `keys` is a config-file typo — refusing to load is safer than
+            // silently ignoring it, because a typo in the active key's
+            // expiration would otherwise leave the key never-expiring.
+            let json = br#"{
+                "active_key_id": "k1",
+                "keys": { "k1": "1111111111111111111111111111111111111111111111111111111111111111" },
+                "key_expirations": { "k2-typo": 2000000000 }
+            }"#;
+            let err = KeyRing::from_bytes(json).expect_err("must reject");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("k2-typo") && msg.contains("key_expirations"),
+                "got {msg}"
+            );
+        }
+
+        #[test]
+        fn active_key_expired_at_boundary_is_exclusive_at_future_and_inclusive_at_past() {
+            // not_after semantics: "key is unusable at and after this time."
+            // Boundary cases matter because operators schedule rotations
+            // precisely on the minute.
+            let json = br#"{
+                "active_key_id": "k1",
+                "keys": { "k1": "1111111111111111111111111111111111111111111111111111111111111111" },
+                "key_expirations": { "k1": 100 }
+            }"#;
+            let ring = KeyRing::from_bytes(json).expect("ring");
+            assert!(!ring.active_key_expired_at(99), "before boundary");
+            assert!(ring.active_key_expired_at(100), "at boundary (inclusive)");
+            assert!(ring.active_key_expired_at(101), "past boundary");
+        }
+
+        #[test]
+        fn active_key_without_expiration_never_reports_expired() {
+            let ring = make_key_ring("k1", &[("k1", [0x11; 32])]);
+            assert!(!ring.active_key_expired_at(i64::MAX));
+        }
+
+        #[test]
+        fn encrypted_writer_create_refuses_when_active_key_is_expired() {
+            // Core admission contract: a key that expired before "now" must
+            // not be used for new writes. Historical data encrypted under
+            // this key is still readable (active_key() itself does not
+            // check expiration) — only the create() path is gated.
+            let json = br#"{
+                "active_key_id": "k1",
+                "keys": { "k1": "1111111111111111111111111111111111111111111111111111111111111111" },
+                "key_expirations": { "k1": 1 }
+            }"#;
+            let ring = KeyRing::from_bytes(json).expect("ring");
+            let dir = tempdir();
+            let enc_path = dir.join("expired.enc");
+            let err = EncryptedWriter::create(&enc_path, &ring).expect_err("must refuse");
+            match err {
+                EncryptError::ActiveKeyExpired { id, not_after } => {
+                    assert_eq!(id, "k1");
+                    assert_eq!(not_after, 1);
+                }
+                other => panic!("expected ActiveKeyExpired, got {other:?}"),
+            }
+            // The refused create() must not have left any file on disk.
+            assert!(
+                !enc_path.exists(),
+                "expired-key create() must not create file"
+            );
+        }
+
+        #[test]
+        fn encrypted_writer_create_succeeds_with_future_expiration() {
+            let future = now_unix_seconds().saturating_add(3600);
+            let json = format!(
+                r#"{{
+                    "active_key_id": "k1",
+                    "keys": {{ "k1": "1111111111111111111111111111111111111111111111111111111111111111" }},
+                    "key_expirations": {{ "k1": {future} }}
+                }}"#
+            );
+            let ring = KeyRing::from_bytes(json.as_bytes()).expect("ring");
+            let dir = tempdir();
+            let enc_path = dir.join("future.enc");
+            let mut w = EncryptedWriter::create(&enc_path, &ring).expect("must succeed");
+            w.write_chunk(b"payload").expect("write");
+            w.finish().expect("finish");
+            assert!(enc_path.exists());
+        }
+
+        #[test]
+        fn non_active_key_expiration_does_not_block_active_key_writes() {
+            // Expiration on a non-active key is tracked (useful for audit /
+            // operator visibility) but does not gate writes — only the
+            // active key's expiration matters for admission.
+            let json = br#"{
+                "active_key_id": "k1",
+                "keys": {
+                    "k1": "1111111111111111111111111111111111111111111111111111111111111111",
+                    "k2": "2222222222222222222222222222222222222222222222222222222222222222"
+                },
+                "key_expirations": { "k2": 1 }
+            }"#;
+            let ring = KeyRing::from_bytes(json).expect("ring");
+            assert_eq!(ring.not_after("k2"), Some(1));
+            let dir = tempdir();
+            let enc_path = dir.join("non_active.enc");
+            let _ = EncryptedWriter::create(&enc_path, &ring).expect("active key not expired");
+        }
+
+        #[test]
+        fn key_expirations_round_trip_through_serde_with_non_empty_map() {
+            let mut keys = BTreeMap::new();
+            let _ = keys.insert(
+                "k1".to_string(),
+                "1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+            );
+            let mut expirations = BTreeMap::new();
+            let _ = expirations.insert("k1".to_string(), 5_000_000_000i64);
+            let kf = KeyFile {
+                active_key_id: "k1".to_string(),
+                keys,
+                key_expirations: expirations,
+            };
+            let json = serde_json::to_vec(&kf).expect("serialize");
+            let round: KeyFile = serde_json::from_slice(&json).expect("deserialize");
+            assert_eq!(round.key_expirations.get("k1"), Some(&5_000_000_000));
+        }
+
+        #[test]
+        fn key_expirations_is_omitted_from_serialization_when_empty() {
+            // skip_serializing_if keeps the on-disk shape of legacy key
+            // files stable — writing a KeyFile with no expirations produces
+            // the same JSON shape pre-expiration builds would have written.
+            let kf = KeyFile {
+                active_key_id: "k1".to_string(),
+                keys: {
+                    let mut m = BTreeMap::new();
+                    let _ = m.insert(
+                        "k1".to_string(),
+                        "1111111111111111111111111111111111111111111111111111111111111111"
+                            .to_string(),
+                    );
+                    m
+                },
+                key_expirations: BTreeMap::new(),
+            };
+            let json = serde_json::to_string(&kf).expect("serialize");
+            assert!(
+                !json.contains("key_expirations"),
+                "empty map must be omitted: {json}"
+            );
+        }
     }
 }
