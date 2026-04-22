@@ -142,15 +142,7 @@ impl NatsSubscriber {
         stream: &jetstream::stream::Stream,
     ) -> Result<jetstream::consumer::Consumer<jetstream::consumer::pull::Config>, async_nats::Error>
     {
-        let consumer_name = format!("rustgate-sub-{}", self.config.instance_id);
-        let config = jetstream::consumer::pull::Config {
-            durable_name: Some(consumer_name.clone()),
-            ack_policy: AckPolicy::Explicit,
-            max_ack_pending: self.config.max_ack_pending,
-            deliver_policy: jetstream::consumer::DeliverPolicy::New,
-            filter_subject: format!("{}.>", self.config.subject_prefix),
-            ..Default::default()
-        };
+        let (consumer_name, config) = build_consumer_config(&self.config);
 
         let consumer = stream
             .get_or_create_consumer(&consumer_name, config)
@@ -158,6 +150,7 @@ impl NatsSubscriber {
         tracing::info!(
             consumer = %consumer_name,
             max_ack_pending = self.config.max_ack_pending,
+            max_deliver = self.config.max_deliver,
             "JetStream pull consumer ready"
         );
         Ok(consumer)
@@ -375,6 +368,26 @@ fn handle_lag_poll_result<E: std::fmt::Display>(
     }
 }
 
+/// Build the JetStream pull-consumer config from a `NatsConfig`.
+///
+/// Extracted from `ensure_consumer` so the wiring from `NatsConfig` fields
+/// onto the `pull::Config` struct can be pinned by unit tests without
+/// requiring a live NATS server. `ensure_consumer` only adds the server
+/// RPC on top of this pure projection.
+fn build_consumer_config(config: &NatsConfig) -> (String, jetstream::consumer::pull::Config) {
+    let consumer_name = format!("rustgate-sub-{}", config.instance_id);
+    let pull_config = jetstream::consumer::pull::Config {
+        durable_name: Some(consumer_name.clone()),
+        ack_policy: AckPolicy::Explicit,
+        max_ack_pending: config.max_ack_pending,
+        max_deliver: config.max_deliver,
+        deliver_policy: jetstream::consumer::DeliverPolicy::New,
+        filter_subject: format!("{}.>", config.subject_prefix),
+        ..Default::default()
+    };
+    (consumer_name, pull_config)
+}
+
 /// Extract the group segment from a NATS subject.
 ///
 /// Expected format: `"{prefix}.{group}.{action}"` (e.g., `"points.ALPHA.update"`).
@@ -520,5 +533,56 @@ mod tests {
             extract_group_from_subject("points.update", "points", "CUSTOM"),
             "CUSTOM"
         );
+    }
+
+    #[test]
+    fn build_consumer_config_carries_max_deliver_from_nats_config() {
+        // Pin that a positive `max_deliver` in NatsConfig round-trips into
+        // the JetStream pull::Config. A regression here silently reopens
+        // the poison-message gap called out in #883.
+        let nats_config = NatsConfig {
+            instance_id: "test-instance".to_string(),
+            max_deliver: 5,
+            ..Default::default()
+        };
+        let (name, pull_config) = build_consumer_config(&nats_config);
+        assert_eq!(name, "rustgate-sub-test-instance");
+        assert_eq!(pull_config.max_deliver, 5);
+        // Other fields still plumbed as before.
+        assert_eq!(pull_config.max_ack_pending, nats_config.max_ack_pending);
+        assert_eq!(pull_config.durable_name, Some(name));
+        assert_eq!(
+            pull_config.filter_subject,
+            format!("{}.>", nats_config.subject_prefix)
+        );
+    }
+
+    #[test]
+    fn build_consumer_config_default_max_deliver_is_server_default_sentinel() {
+        // Default `max_deliver = 0` is the wire sentinel that tells the
+        // JetStream server to use its own default (unlimited). This is the
+        // only back-compat posture — any positive default would change
+        // redelivery behaviour for existing deployments on upgrade.
+        let nats_config = NatsConfig {
+            instance_id: "test-instance".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(nats_config.max_deliver, 0);
+        let (_, pull_config) = build_consumer_config(&nats_config);
+        assert_eq!(pull_config.max_deliver, 0);
+    }
+
+    #[test]
+    fn build_consumer_config_high_max_deliver_round_trips() {
+        // Pin that the wiring does not clamp, sign-flip, or otherwise
+        // mangle large positive values — the `i64` field is trusted as
+        // given, so a silent `min(x, 100)` or similar would be visible here.
+        let nats_config = NatsConfig {
+            instance_id: "test-instance".to_string(),
+            max_deliver: 1_000,
+            ..Default::default()
+        };
+        let (_, pull_config) = build_consumer_config(&nats_config);
+        assert_eq!(pull_config.max_deliver, 1_000);
     }
 }
