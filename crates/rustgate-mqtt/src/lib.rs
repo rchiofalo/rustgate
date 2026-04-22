@@ -41,7 +41,7 @@ mod topic;
 /// dashboard regression.
 pub const TRANSPORT_LABEL: &str = "mqtt";
 
-pub use config::MqttServerConfig;
+pub use config::{MqttServerConfig, OnMqttAccept, OnMqttReject};
 pub use error::MqttError;
 pub use listener::MqttListener;
 pub use server::MqttServer;

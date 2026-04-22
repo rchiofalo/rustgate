@@ -103,6 +103,9 @@ static SESSIONS_ACTIVE: OnceLock<IntGauge> = OnceLock::new();
 
 static NATS_PUBLISHES: OnceLock<IntCounter> = OnceLock::new();
 
+static MQTT_CONNECTIONS: OnceLock<IntCounter> = OnceLock::new();
+static MQTT_CONNECTIONS_REJECTED: OnceLock<IntCounter> = OnceLock::new();
+
 #[cfg(feature = "nats")]
 static NATS_CONSUMER_PENDING: OnceLock<IntGauge> = OnceLock::new();
 #[cfg(feature = "nats")]
@@ -469,6 +472,30 @@ pub fn init() -> prometheus::Result<()> {
     ))?;
     registry.register(Box::new(nats_publishes.clone()))?;
     let _ = NATS_PUBLISHES.set(nats_publishes);
+
+    let mqtt_connections = IntCounter::with_opts(Opts::new(
+        "rustgate_mqtt_connections_total",
+        "mTLS-authenticated MQTT sessions accepted by the MQTT listener. \
+         Incremented after the TLS handshake and client-certificate \
+         validation succeed and the shared cross-transport connection-limit \
+         permit is acquired, immediately before the per-session task is \
+         spawned. Does not count TLS handshake failures, certificate \
+         validation failures, or per-IP rate-limit rejections — those are \
+         visible via the shared listener-level counters.",
+    ))?;
+    registry.register(Box::new(mqtt_connections.clone()))?;
+    let _ = MQTT_CONNECTIONS.set(mqtt_connections);
+
+    let mqtt_connections_rejected = IntCounter::with_opts(Opts::new(
+        "rustgate_mqtt_connections_rejected_total",
+        "MQTT connections rejected because the shared cross-transport \
+         connection-limit semaphore was saturated at the moment the session \
+         was about to be admitted. A non-zero rate indicates the operator \
+         should either raise `--max-connections` or investigate whether a \
+         misbehaving client is consuming the budget.",
+    ))?;
+    registry.register(Box::new(mqtt_connections_rejected.clone()))?;
+    let _ = MQTT_CONNECTIONS_REJECTED.set(mqtt_connections_rejected);
 
     #[cfg(feature = "nats")]
     {
@@ -1080,6 +1107,20 @@ pub fn sessions_active() -> &'static IntGauge {
 
 pub fn nats_publishes() -> &'static IntCounter {
     NATS_PUBLISHES.get_or_init(|| fallback_counter("rustgate_nats_publishes_total", "fallback"))
+}
+
+/// Counter incremented once per mTLS-authenticated MQTT session accepted
+/// by the MQTT listener. Wired from `rustgate_mqtt::MqttServerConfig::on_accept`.
+pub fn mqtt_connections() -> &'static IntCounter {
+    MQTT_CONNECTIONS.get_or_init(|| fallback_counter("rustgate_mqtt_connections_total", "fallback"))
+}
+
+/// Counter incremented once per MQTT connection rejected because the
+/// shared cross-transport connection-limit semaphore was saturated.
+/// Wired from `rustgate_mqtt::MqttServerConfig::on_reject`.
+pub fn mqtt_connections_rejected() -> &'static IntCounter {
+    MQTT_CONNECTIONS_REJECTED
+        .get_or_init(|| fallback_counter("rustgate_mqtt_connections_rejected_total", "fallback"))
 }
 
 /// Returns the JetStream consumer `num_pending` gauge if registered.
@@ -2355,8 +2396,141 @@ mod tests {
         let _ = messages_routed();
         let _ = sessions_active();
         let _ = nats_publishes();
+        let _ = mqtt_connections();
+        let _ = mqtt_connections_rejected();
         let _ = negotiations();
         let _ = handshake_failures();
+    }
+
+    /// Dedicated tests for the MQTT listener counters wired via the
+    /// `rustgate_mqtt::MqttServerConfig::{on_accept, on_reject}` callback
+    /// slots. Grouped into a nested module so the assertions read together
+    /// as the contract being protected.
+    mod mqtt_connections_counters {
+        use super::*;
+
+        #[test]
+        fn mqtt_connections_registered_under_documented_name() {
+            // A drift between the registered Prometheus name and the help
+            // text documented in dashboards would silently break ops alerts.
+            // Gather the default registry and confirm an entry with the
+            // expected name and zero label arity (a bare `IntCounter`,
+            // not a `CounterVec` — a future refactor that adds labels must
+            // land here first so the alerting grammar evolves in lockstep).
+            ensure_init();
+            let families = prometheus::default_registry().gather();
+            let found = families
+                .iter()
+                .find(|m| m.name() == "rustgate_mqtt_connections_total")
+                .expect("rustgate_mqtt_connections_total must be registered");
+            assert_eq!(
+                found.get_field_type(),
+                prometheus::proto::MetricType::COUNTER,
+            );
+            let sample = found
+                .get_metric()
+                .first()
+                .expect("counter metric family must have one sample");
+            assert!(
+                sample.get_label().is_empty(),
+                "rustgate_mqtt_connections_total must be label-free — a future refactor \
+                 that introduces labels would silently break existing PromQL queries. \
+                 Got labels: {:?}",
+                sample.get_label(),
+            );
+        }
+
+        #[test]
+        fn mqtt_connections_rejected_registered_under_documented_name() {
+            ensure_init();
+            let families = prometheus::default_registry().gather();
+            let found = families
+                .iter()
+                .find(|m| m.name() == "rustgate_mqtt_connections_rejected_total")
+                .expect("rustgate_mqtt_connections_rejected_total must be registered");
+            assert_eq!(
+                found.get_field_type(),
+                prometheus::proto::MetricType::COUNTER,
+            );
+            let sample = found
+                .get_metric()
+                .first()
+                .expect("counter metric family must have one sample");
+            assert!(
+                sample.get_label().is_empty(),
+                "rustgate_mqtt_connections_rejected_total must be label-free. \
+                 Got labels: {:?}",
+                sample.get_label(),
+            );
+        }
+
+        #[test]
+        fn mqtt_connections_increments_are_observable() {
+            // Pins the hot-path contract: `counter.inc()` — i.e. what the
+            // callback installed from setup.rs actually runs — is visible
+            // in the next `.get()` read. Use a relative delta so parallel
+            // tests that also touch the counter do not race us.
+            ensure_init();
+            let before = mqtt_connections().get();
+            mqtt_connections().inc();
+            assert!(
+                mqtt_connections().get() > before,
+                "mqtt_connections counter must be monotonically increasing after inc(); \
+                 before={before}, after={}",
+                mqtt_connections().get(),
+            );
+        }
+
+        #[test]
+        fn mqtt_connections_rejected_increments_are_observable() {
+            ensure_init();
+            let before = mqtt_connections_rejected().get();
+            mqtt_connections_rejected().inc();
+            assert!(
+                mqtt_connections_rejected().get() > before,
+                "mqtt_connections_rejected counter must be monotonically increasing; \
+                 before={before}, after={}",
+                mqtt_connections_rejected().get(),
+            );
+        }
+
+        #[test]
+        fn fed_by_mqtt_on_accept_callback_end_to_end() {
+            // End-to-end contract: the exact closure shape that setup.rs
+            // installs — `Arc::new(|| metrics::mqtt_connections().inc())` —
+            // must produce a visible increment when driven by the same
+            // `Fn()` dispatch that `rustgate_mqtt::MqttServer` uses. This
+            // is the single regression guard for the cross-crate wiring;
+            // without it, a silent refactor of the callback signature on
+            // either side (e.g. narrowing `Fn()` to `FnMut()` which is not
+            // `Sync`) would land green and ship dark.
+            ensure_init();
+            let cb: rustgate_mqtt::OnMqttAccept = std::sync::Arc::new(|| mqtt_connections().inc());
+            let before = mqtt_connections().get();
+            cb();
+            cb();
+            assert!(
+                mqtt_connections().get() > before + 1,
+                "double-invoked callback must produce two visible increments; \
+                 before={before}, after={}",
+                mqtt_connections().get(),
+            );
+        }
+
+        #[test]
+        fn fed_by_mqtt_on_reject_callback_end_to_end() {
+            ensure_init();
+            let cb: rustgate_mqtt::OnMqttReject =
+                std::sync::Arc::new(|| mqtt_connections_rejected().inc());
+            let before = mqtt_connections_rejected().get();
+            cb();
+            assert!(
+                mqtt_connections_rejected().get() > before,
+                "callback invocation must produce a visible reject-counter increment; \
+                 before={before}, after={}",
+                mqtt_connections_rejected().get(),
+            );
+        }
     }
 
     #[test]

@@ -1512,6 +1512,19 @@ pub(crate) fn start_mqtt(
 
     let shutdown = Arc::new(tokio::sync::Notify::new());
 
+    #[cfg(feature = "metrics")]
+    let on_accept: Option<rustgate_mqtt::OnMqttAccept> =
+        Some(std::sync::Arc::new(|| metrics::mqtt_connections().inc()));
+    #[cfg(not(feature = "metrics"))]
+    let on_accept: Option<rustgate_mqtt::OnMqttAccept> = None;
+
+    #[cfg(feature = "metrics")]
+    let on_reject: Option<rustgate_mqtt::OnMqttReject> = Some(std::sync::Arc::new(|| {
+        metrics::mqtt_connections_rejected().inc()
+    }));
+    #[cfg(not(feature = "metrics"))]
+    let on_reject: Option<rustgate_mqtt::OnMqttReject> = None;
+
     let config = rustgate_mqtt::MqttServerConfig {
         listener: mqtt_listener,
         router: Arc::clone(router),
@@ -1522,6 +1535,8 @@ pub(crate) fn start_mqtt(
         min_keep_alive_secs: cli.mqtt_min_keep_alive_secs,
         response_channel_capacity: cli.mqtt_response_channel_capacity,
         wildcard_policy: cli.mqtt_wildcard_policy.into(),
+        on_accept,
+        on_reject,
     };
     let task = tokio::spawn(async move {
         rustgate_mqtt::MqttServer::run(config).await;
