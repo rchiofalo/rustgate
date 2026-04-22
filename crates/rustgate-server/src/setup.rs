@@ -416,6 +416,13 @@ pub(crate) async fn bind_tls_listener(
         }
     }));
 
+    #[cfg(feature = "metrics")]
+    listener.set_on_handshake_duration(Arc::new(|elapsed, outcome| {
+        metrics::tls_handshake_duration_seconds()
+            .with_label_values(&[outcome])
+            .observe(elapsed.as_secs_f64());
+    }));
+
     Ok(TlsListenerHandle {
         listener,
         cert_reloader,

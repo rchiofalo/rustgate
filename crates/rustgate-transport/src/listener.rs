@@ -4,6 +4,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rustgate_core::error::{Result, TransportError};
 use rustgate_core::net::configure_tactical_socket;
@@ -22,6 +23,19 @@ use crate::session::AuthenticatedSession;
 /// caller to classify and record the failure (e.g. for metrics).
 pub type OnHandshakeError = Arc<dyn Fn(SocketAddr, &str) + Send + Sync>;
 
+/// Callback invoked once each TLS handshake completes, regardless of outcome.
+///
+/// Receives the elapsed handshake duration and an `outcome` label —
+/// `"success"` when the handshake produced a usable TLS stream, `"failure"`
+/// when the acceptor returned an error. Fired after identity extraction
+/// is *not* attempted; the boundary is the TLS layer, so a cert that fails
+/// downstream `extract_identity()` still counts as a `"success"` here.
+///
+/// Intended for histogram observation (e.g. Prometheus
+/// `rustgate_tls_handshake_duration_seconds`). The callback must not block
+/// the accept loop — keep the observation cheap.
+pub type OnHandshakeDuration = Arc<dyn Fn(Duration, &str) + Send + Sync>;
+
 /// Default maximum number of concurrent TLS handshakes when no limit is specified.
 pub const DEFAULT_MAX_HANDSHAKES: usize = 100;
 
@@ -34,6 +48,9 @@ pub struct TlsListener {
     handshake_semaphore: Arc<Semaphore>,
     /// Optional callback invoked on TLS handshake failures.
     on_handshake_error: Option<OnHandshakeError>,
+    /// Optional callback invoked after every handshake attempt with the
+    /// measured duration and an outcome label.
+    on_handshake_duration: Option<OnHandshakeDuration>,
 }
 
 impl std::fmt::Debug for TlsListener {
@@ -98,6 +115,7 @@ impl TlsListener {
             tls_acceptor,
             handshake_semaphore: Arc::new(Semaphore::new(max_concurrent_handshakes)),
             on_handshake_error: None,
+            on_handshake_duration: None,
         })
     }
 
@@ -108,6 +126,18 @@ impl TlsListener {
     /// (e.g. for Prometheus metrics).
     pub fn set_on_handshake_error(&mut self, cb: OnHandshakeError) {
         self.on_handshake_error = Some(cb);
+    }
+
+    /// Register a callback invoked after every handshake attempt with the
+    /// measured duration and an outcome label (`"success"` / `"failure"`).
+    ///
+    /// Intended for histogram observation. Timing begins when the
+    /// accept-loop starts the `TlsAcceptor::accept` future and ends when
+    /// that future resolves, so the measurement captures the full TLS
+    /// handshake round-trip but not the upstream TCP accept or the
+    /// downstream identity-extraction work.
+    pub fn set_on_handshake_duration(&mut self, cb: OnHandshakeDuration) {
+        self.on_handshake_duration = Some(cb);
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
@@ -159,19 +189,28 @@ impl TlsListener {
                 );
             }
 
+            let handshake_start = Instant::now();
             let tls_stream = match self
                 .tls_acceptor
                 .accept(tcp_stream)
                 .instrument(tracing::info_span!("tls_handshake", peer_addr = %peer_addr))
                 .await
             {
-                Ok(stream) => stream,
+                Ok(stream) => {
+                    if let Some(ref cb) = self.on_handshake_duration {
+                        cb(handshake_start.elapsed(), "success");
+                    }
+                    stream
+                }
                 Err(e) => {
                     // Permit is released here when `_permit` is dropped.
                     let err_msg = e.to_string();
                     rustgate_core::audit::tls_accept_error(peer_addr, &err_msg);
                     if let Some(ref cb) = self.on_handshake_error {
                         cb(peer_addr, &err_msg);
+                    }
+                    if let Some(ref cb) = self.on_handshake_duration {
+                        cb(handshake_start.elapsed(), "failure");
                     }
                     warn!(peer_addr = %peer_addr, error = %e, "TLS handshake failed");
                     continue;
@@ -479,6 +518,37 @@ mod tests {
         // double-fire callbacks; Option-based storage forbids that.
         let cb2: OnHandshakeError = Arc::new(|_addr, _msg| {});
         listener.set_on_handshake_error(cb2);
+    }
+
+    // ------------------------------------------------------------------
+    // set_on_handshake_duration — parallel to set_on_handshake_error.
+    // We cannot observe the stored closure without completing a handshake
+    // (covered in the rustgate-server integration wiring), but we prove
+    // the setter accepts any correctly-typed Arc and that repeat installs
+    // overwrite rather than accumulate — the same Option-based invariant
+    // the error callback relies on.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn set_on_handshake_duration_accepts_and_overwrites_callback() {
+        let tls = test_tls_config();
+        let mut listener = TlsListener::bind("127.0.0.1:0", &tls).await.expect("bind");
+        let cb1: OnHandshakeDuration = Arc::new(|_elapsed, _outcome| {});
+        listener.set_on_handshake_duration(cb1);
+        let cb2: OnHandshakeDuration = Arc::new(|_elapsed, _outcome| {});
+        listener.set_on_handshake_duration(cb2);
+    }
+
+    #[test]
+    fn on_handshake_duration_fn_is_send_sync_static() {
+        // The callback is stored behind `Option<Arc<dyn Fn>>` and invoked
+        // from the accept-loop task, so the alias must satisfy the trait
+        // bounds the Arc holds (`Send + Sync + 'static`). If the type were
+        // ever relaxed to not require one of those, wiring it from
+        // `rustgate-server::setup.rs` would stop compiling; pin here to
+        // catch it before it reaches downstream crates.
+        fn assert_bounds<T: Send + Sync + 'static>() {}
+        assert_bounds::<OnHandshakeDuration>();
     }
 
     // ------------------------------------------------------------------
