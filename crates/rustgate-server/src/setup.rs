@@ -1703,3 +1703,159 @@ pub(crate) async fn start_udp<P: NatsPublish + Send + Sync + 'static>(
 
     Ok(Some(SubsystemHandle::new(shutdown, task)))
 }
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used)]
+mod tests {
+    //! Unit tests for the pure synchronous helpers in `setup.rs`.
+    //!
+    //! The async `start_*` / `connect_*` orchestrators wire live
+    //! listeners, TLS material, and background tasks — those paths are
+    //! exercised end-to-end by integration tests. These tests pin the
+    //! small, allocation-free validation and mapping helpers that turn
+    //! CLI arguments into subsystem config, since those are the paths
+    //! that silently mis-route the whole server if they drift.
+
+    use clap::Parser;
+
+    use super::*;
+
+    /// Build a minimal CLI with the required TLS material flags.
+    ///
+    /// Additional flags are appended by each test; the `--cert / --key / --ca`
+    /// triplet is `required_unless_present_any = ["config", "spiffe"]`, so
+    /// clap rejects a bare invocation.
+    fn parse_cli(extra: &[&str]) -> Cli {
+        let mut argv: Vec<&str> = vec![
+            "rustgate", "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
+        ];
+        argv.extend_from_slice(extra);
+        Cli::try_parse_from(argv).expect("cli parses")
+    }
+
+    // -----------------------------------------------------------------
+    // validate_framing
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn validate_framing_accepts_defaults() {
+        // Default framing (xml) + default encoding (raw) is the stock
+        // configuration every build must support regardless of features.
+        let cli = parse_cli(&[]);
+        validate_framing(&cli).expect("defaults must validate");
+    }
+
+    #[test]
+    fn validate_framing_accepts_length_prefixed_with_cot() {
+        let cli = parse_cli(&["--framing", "length-prefixed", "--encoding", "cot"]);
+        validate_framing(&cli).expect("length-prefixed + cot must validate");
+    }
+
+    #[test]
+    fn validate_framing_accepts_line_with_raw() {
+        let cli = parse_cli(&["--framing", "line", "--encoding", "raw"]);
+        validate_framing(&cli).expect("line + raw must validate");
+    }
+
+    #[cfg(feature = "proto")]
+    #[test]
+    fn validate_framing_accepts_tak_protobuf_pair() {
+        // With `proto` compiled in, tak-protobuf framing paired with
+        // tak-protobuf encoding is the real TAK binary configuration.
+        let cli = parse_cli(&["--framing", "tak-protobuf", "--encoding", "tak-protobuf"]);
+        validate_framing(&cli).expect("tak-protobuf pair must validate with proto feature");
+    }
+
+    #[cfg(feature = "proto")]
+    #[test]
+    fn validate_framing_accepts_tak_negotiate_with_tak_protobuf_encoding() {
+        // tak-negotiate starts XML and upgrades to protobuf mid-session;
+        // it satisfies the "framing is a protobuf-capable mode"
+        // precondition for tak-protobuf encoding.
+        let cli = parse_cli(&["--framing", "tak-negotiate", "--encoding", "tak-protobuf"]);
+        validate_framing(&cli).expect("tak-negotiate + tak-protobuf must validate");
+    }
+
+    #[cfg(feature = "proto")]
+    #[test]
+    fn validate_framing_rejects_tak_protobuf_encoding_with_xml_framing() {
+        // With proto enabled, the feature-gate check passes — but the
+        // framing/encoding conflict check still fires: xml framing
+        // cannot carry tak-protobuf bytes on the wire.
+        let cli = parse_cli(&["--framing", "xml", "--encoding", "tak-protobuf"]);
+        let err = validate_framing(&cli).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--encoding tak-protobuf requires --framing"),
+            "unexpected error: {msg}",
+        );
+    }
+
+    #[cfg(feature = "proto")]
+    #[test]
+    fn validate_framing_rejects_tak_protobuf_encoding_with_length_prefixed_framing() {
+        let cli = parse_cli(&["--framing", "length-prefixed", "--encoding", "tak-protobuf"]);
+        assert!(validate_framing(&cli).is_err());
+    }
+
+    #[cfg(not(feature = "proto"))]
+    #[test]
+    fn validate_framing_rejects_tak_protobuf_framing_without_proto_feature() {
+        // Without the `proto` feature compiled in, any tak-protobuf
+        // framing/encoding selection must surface a startup error
+        // instead of silently falling through to a codec that cannot
+        // actually decode tak-protobuf bytes.
+        let cli = parse_cli(&["--framing", "tak-protobuf"]);
+        let err = validate_framing(&cli).unwrap_err();
+        assert!(err.to_string().contains("--features proto"));
+    }
+
+    #[cfg(not(feature = "proto"))]
+    #[test]
+    fn validate_framing_rejects_tak_negotiate_framing_without_proto_feature() {
+        let cli = parse_cli(&["--framing", "tak-negotiate"]);
+        assert!(validate_framing(&cli).is_err());
+    }
+
+    #[cfg(not(feature = "proto"))]
+    #[test]
+    fn validate_framing_rejects_tak_protobuf_encoding_without_proto_feature() {
+        let cli = parse_cli(&["--encoding", "tak-protobuf"]);
+        assert!(validate_framing(&cli).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // build_throttle_config
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn build_throttle_config_returns_none_when_rate_is_zero() {
+        // Default rate of 0 disables per-client throttling; the helper
+        // must return `None` so the session loop skips the allow() check
+        // entirely — any `Some` here would make throttling always-on.
+        let cli = parse_cli(&[]);
+        assert_eq!(cli.client_message_rate, 0, "test precondition");
+        assert!(build_throttle_config(&cli).is_none());
+    }
+
+    #[test]
+    fn build_throttle_config_uses_cli_rate_and_burst() {
+        let cli = parse_cli(&["--client-message-rate", "250", "--client-burst", "500"]);
+        let cfg = build_throttle_config(&cli).expect("throttle enabled");
+        assert_eq!(cfg.rate, 250);
+        assert_eq!(cfg.burst, 500);
+    }
+
+    #[test]
+    fn build_throttle_config_uses_default_burst_when_only_rate_is_set() {
+        // CLI default for --client-burst is 200; callers who only set
+        // --client-message-rate must still get a usable throttle config
+        // with the documented default burst so a misconfiguration does
+        // not silently produce a zero-burst throttle (which would drop
+        // every message).
+        let cli = parse_cli(&["--client-message-rate", "100"]);
+        let cfg = build_throttle_config(&cli).expect("throttle enabled");
+        assert_eq!(cfg.rate, 100);
+        assert_eq!(cfg.burst, 200, "default burst must flow through");
+    }
+}
