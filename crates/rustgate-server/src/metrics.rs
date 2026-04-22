@@ -65,6 +65,8 @@ pub(crate) const DEFAULT_MAX_HTTP_CONNECTIONS: usize = 128;
 
 // ── Metric statics ──────────────────────────────────────────────────
 
+static BUILD_INFO: OnceLock<prometheus::IntGaugeVec> = OnceLock::new();
+
 static CONNECTIONS_ACCEPTED: OnceLock<IntCounter> = OnceLock::new();
 static CONNECTIONS_ACTIVE: OnceLock<IntGauge> = OnceLock::new();
 static CONNECTIONS_REJECTED: OnceLock<IntCounter> = OnceLock::new();
@@ -189,12 +191,119 @@ fn fallback_counter_vec(name: &str, help: &str, labels: &[&str]) -> IntCounterVe
     }
 }
 
+/// Labels emitted on the `rustgate_build_info` gauge.
+///
+/// Fixed at compile time — the metric carries one time series over the
+/// lifetime of a process, so the values never change after startup and
+/// any Grafana `topk` / `group by` over these labels is safe to run on
+/// cardinality grounds. Version tracking across a fleet works by diffing
+/// the label set visible at scrape time, which is the conventional
+/// Prometheus `*_build_info` pattern.
+pub(crate) const BUILD_INFO_LABELS: &[&str] = &["version", "rust_version", "features"];
+
+/// Return the comma-separated list of optional features enabled at
+/// compile time, ordered to match [`BUILD_INFO_LABELS`].
+///
+/// Each `cfg!` macro is resolved at compile time by rustc so the string
+/// is computed once per build. `metrics` is always present because this
+/// function only compiles under `#[cfg(feature = "metrics")]` in the
+/// first place; it is listed explicitly so operators grepping the
+/// scraped output see the full active feature set.
+pub(crate) fn enabled_features() -> String {
+    let mut features: Vec<&'static str> = Vec::new();
+    features.push("metrics");
+    if cfg!(feature = "nats") {
+        features.push("nats");
+    }
+    if cfg!(feature = "enrollment") {
+        features.push("enrollment");
+    }
+    if cfg!(feature = "est") {
+        features.push("est");
+    }
+    if cfg!(feature = "proto") {
+        features.push("proto");
+    }
+    if cfg!(feature = "full-detail") {
+        features.push("full-detail");
+    }
+    if cfg!(feature = "federation") {
+        features.push("federation");
+    }
+    if cfg!(feature = "federation-ha") {
+        features.push("federation-ha");
+    }
+    if cfg!(feature = "peer-discovery-dns-sd") {
+        features.push("peer-discovery-dns-sd");
+    }
+    if cfg!(feature = "peer-discovery-consul") {
+        features.push("peer-discovery-consul");
+    }
+    if cfg!(feature = "peer-discovery-etcd") {
+        features.push("peer-discovery-etcd");
+    }
+    if cfg!(feature = "websocket") {
+        features.push("websocket");
+    }
+    if cfg!(feature = "mqtt") {
+        features.push("mqtt");
+    }
+    if cfg!(feature = "otel") {
+        features.push("otel");
+    }
+    if cfg!(feature = "fips") {
+        features.push("fips");
+    }
+    if cfg!(feature = "post-quantum") {
+        features.push("post-quantum");
+    }
+    if cfg!(feature = "jemalloc") {
+        features.push("jemalloc");
+    }
+    if cfg!(feature = "ocsp") {
+        features.push("ocsp");
+    }
+    if cfg!(feature = "spiffe") {
+        features.push("spiffe");
+    }
+    if cfg!(feature = "cedar") {
+        features.push("cedar");
+    }
+    if cfg!(feature = "http") {
+        features.push("http");
+    }
+    features.join(",")
+}
+
 // ── Registration ────────────────────────────────────────────────────
 
 /// Register all metrics with the default Prometheus registry.
 /// Must be called once at startup before any metrics are recorded.
 pub fn init() -> prometheus::Result<()> {
     let registry = prometheus::default_registry();
+
+    // Standard Prometheus `*_build_info` gauge — a single time series
+    // pinned at value 1 for the active (version, rust_version, features)
+    // tuple. Grafana queries use `count by (version) (rustgate_build_info)`
+    // to observe rollout progress across a fleet, and `rustgate_build_info{version!~"0\\.8\\..*"}`
+    // alerts when instances lag behind the approved release window.
+    let build_info = prometheus::IntGaugeVec::new(
+        Opts::new(
+            "rustgate_build_info",
+            "Build metadata for this rustgate process (version, rust_version, features). Always 1.",
+        ),
+        BUILD_INFO_LABELS,
+    )?;
+    registry.register(Box::new(build_info.clone()))?;
+    let features = enabled_features();
+    build_info
+        .with_label_values(&[
+            env!("CARGO_PKG_VERSION"),
+            env!("CARGO_PKG_RUST_VERSION"),
+            features.as_str(),
+        ])
+        .set(1);
+    let _ = BUILD_INFO.set(build_info);
 
     let connections_accepted = IntCounter::with_opts(Opts::new(
         "rustgate_connections_accepted_total",
@@ -3338,5 +3447,64 @@ mod tests {
                 "remove must decrement gauge via callback"
             );
         }
+    }
+
+    #[test]
+    fn build_info_labels_shape() {
+        // The documented label order is (version, rust_version, features);
+        // scrapers and dashboards depend on this. Lock it in a test.
+        assert_eq!(BUILD_INFO_LABELS, &["version", "rust_version", "features"]);
+    }
+
+    #[test]
+    fn enabled_features_always_includes_metrics() {
+        // `enabled_features` is only reachable from the metrics HTTP server,
+        // which is itself feature-gated. "metrics" must therefore always be
+        // present in the returned string.
+        let s = enabled_features();
+        assert!(s.split(',').any(|f| f == "metrics"), "features: {s:?}");
+    }
+
+    #[test]
+    fn build_info_registered_after_init() {
+        ensure_init();
+        assert!(
+            BUILD_INFO.get().is_some(),
+            "init() must populate BUILD_INFO OnceLock"
+        );
+    }
+
+    #[test]
+    fn build_info_exposes_pinned_label_tuple_at_one() {
+        ensure_init();
+        let gv = BUILD_INFO.get().expect("init must have run");
+        let gauge = gv.with_label_values(&[
+            env!("CARGO_PKG_VERSION"),
+            env!("CARGO_PKG_RUST_VERSION"),
+            enabled_features().as_str(),
+        ]);
+        assert_eq!(gauge.get(), 1, "rustgate_build_info must be pinned at 1");
+    }
+
+    #[test]
+    fn build_info_gathered_from_default_registry() {
+        ensure_init();
+        let families = prometheus::default_registry().gather();
+        let family = families
+            .iter()
+            .find(|mf| mf.name() == "rustgate_build_info")
+            .expect("rustgate_build_info not registered");
+        assert_eq!(
+            family.get_metric().len(),
+            1,
+            "expected a single time series"
+        );
+        let metric = &family.get_metric()[0];
+        let mut label_names: Vec<&str> = metric.get_label().iter().map(|l| l.name()).collect();
+        label_names.sort_unstable();
+        let mut expected: Vec<&str> = BUILD_INFO_LABELS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(label_names, expected);
+        assert_eq!(metric.get_gauge().get_value() as i64, 1);
     }
 }
