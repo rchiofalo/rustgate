@@ -226,8 +226,7 @@ def main(argv: list[str]) -> int:
             print(
                 f"::error file={rel},line={lineno}::"
                 f"missing `// justification:` comment above #[allow({lints})] — "
-                f"see rules/shared-infrastructure.md 'Allow annotations' section "
-                f"(F-156).",
+                f"see CONTRIBUTING.md 'Allow annotations' section (F-156).",
                 file=sys.stderr,
             )
 

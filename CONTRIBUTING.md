@@ -96,6 +96,56 @@ helm lint helm/
 
 The `rustgate-test-utils` crate relaxes `panic = "allow"` since test setup failures should panic.
 
+### Allow annotations (F-156)
+
+Every `#[allow(...)]` in production code MUST be preceded by a
+`// justification:` comment explaining why the lint cannot be fixed in
+place. The rule is enforced in CI by `scripts/check-allow-justified.py`
+(the `playbook-lint` job). A missing justification fails the build with a
+`::error` annotation pointing at the offending line.
+
+Exemptions — tests only. The rule does not apply to:
+
+- The `rustgate-test-utils` crate (whole crate is test-support).
+- Files under `crates/*/tests/` (integration tests).
+- Files under `crates/*/benches/` and `crates/*/examples/`.
+- `build.rs` build scripts (generated-code paths).
+- Items under `#[cfg(test)]` or inside a `mod tests { … }` block.
+
+What counts as a good justification:
+
+- *Why clippy is wrong here* — a generated module (prost/tonic) we cannot
+  patch upstream; a feature-conditional type (e.g. `.clone()` on a value
+  that is `()` without `--features nats` and `Option<T>` with it) where
+  the allowed spelling is the only one that compiles in every config; a
+  `dead_code` field read by an accessor the lint cannot see.
+- *Why refactoring is worse* — `too_many_arguments` on a dispatch
+  entrypoint called from exactly one site, where bundling into a struct
+  would move the fan-in upstream with no call-site reduction.
+- *Forward reference* — a metric registered for a stable Prometheus
+  schema that a later issue wires up; include the issue number.
+
+What does NOT count:
+
+- "Clippy false positive" with no further detail.
+- "Fix later" without an issue link.
+- "Obvious" — if it were obvious the lint would not fire.
+
+Format:
+
+```rust
+// justification: <one or two sentences explaining the trade-off>.
+#[allow(clippy::too_many_arguments)]
+fn handle(req: Request, providers: &Providers, …) { … }
+```
+
+Multi-line justifications are fine — the script just requires that the
+first comment line above the `#[allow]` starts with `// justification:`.
+See `crates/rustgate-cot/src/delta.rs`,
+`crates/rustgate-server/src/metrics.rs`, and
+`crates/rustgate-mqtt/src/session.rs` for representative examples of each
+category.
+
 ## Project Structure
 
 The workspace is organized as independent crates under `crates/`:

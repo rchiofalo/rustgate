@@ -53,7 +53,12 @@ pub(crate) fn serialize(
 ///
 /// When the `proto` feature is disabled, returns a config error — the
 /// format should have been rejected at validation time.
-#[allow(unused_variables)] // `msg` unused when proto feature is off
+// justification: `msg` is only consumed inside `#[cfg(feature = "proto")]`.
+// When the feature is off we still return a `Config` error (the format
+// should have been rejected at validation time — this is a belt-and-braces
+// guard); duplicating the signature under `#[cfg]` would double the surface
+// area for no benefit.
+#[allow(unused_variables)]
 fn serialize_protobuf(msg: &RoutableMessage) -> Result<(Vec<u8>, &'static str), HttpError> {
     #[cfg(feature = "proto")]
     {

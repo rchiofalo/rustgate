@@ -74,6 +74,12 @@ pub trait OcspFetcher: Send + Sync + 'static {
 }
 
 /// Production OCSP fetcher backed by `ocsp_stapler::Client`.
+// justification: `ocsp_stapler::Client` does not implement `Debug` upstream
+// and derives would fail. Custom `Debug` impl would have nothing meaningful
+// to print (the client is an opaque HTTP pool with secrets in memory).
+// The type is visible only through the `ClientOcspFetcher` trait and never
+// printed in our logs, so the workspace-wide `missing_debug_implementations`
+// warning is a false positive here.
 #[cfg(feature = "ocsp")]
 #[allow(missing_debug_implementations)]
 pub struct OcspStaplerFetcher {

@@ -542,6 +542,10 @@ pub fn parse_snapshot(raw: &Bytes) -> Option<CotSnapshot> {
 /// Dispatch a quick-xml Start or Empty event to the right branch of the
 /// parser. Returns `true` when the caller should stop iterating (top-level
 /// closing tag encountered).
+// justification: these are the parser state references threaded through the
+// top-level quick-xml loop. Wrapping them in a struct would force the loop
+// body to destructure and re-borrow on every iteration (hot XML parse path)
+// without improving call-site ergonomics — there is exactly one caller.
 #[allow(clippy::too_many_arguments)]
 fn handle_open(
     e: &quick_xml::events::BytesStart<'_>,

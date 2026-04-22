@@ -353,6 +353,11 @@ impl EnrollmentServer {
 }
 
 /// Route an incoming HTTP request to the appropriate handler.
+// justification: request plus every pluggable provider (signer, credentials,
+// contacts, packages, revocation, rate limiter, rate-limit callback, EST
+// gate) is needed here — none of them is optional on the dispatch path, and
+// bundling them into a struct would just shift the positional-args problem
+// to that struct's construction with no type-safety gain.
 #[allow(clippy::too_many_arguments)]
 async fn handle_request(
     req: Request<hyper::body::Incoming>,

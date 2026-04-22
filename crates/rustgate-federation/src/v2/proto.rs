@@ -14,6 +14,11 @@
 /// - `Identity`, `Subscription`, `ServerHealth`, `ClientHealth`
 /// - `FederateGroups`, `Rol`, `BinaryBlob`
 /// - `federated_channel_client` / `federated_channel_server` — gRPC stubs
+// justification: generated prost/tonic code routinely trips rust and clippy
+// lints (missing docs, nonstandard casing, redundant closures, `unused_async`)
+// that we have no way to fix without forking the tool. The blanket is scoped
+// to the one generated submodule so the rest of the crate keeps full lint
+// coverage. Same applies to `binarypayload` below.
 #[allow(warnings)]
 pub mod figpb {
     tonic::include_proto!("com.atakmap");
@@ -23,6 +28,8 @@ pub mod figpb {
 ///
 /// Used by `GeoEvent.bloads` for carrying binary attachments alongside
 /// federation events.
+// justification: see `figpb` above — generated prost code must opt out of
+// the workspace lint set we cannot patch.
 #[allow(warnings)]
 pub mod binarypayload {
     include!(concat!(env!("OUT_DIR"), "/gov.tak.cop.proto.v1.rs"));

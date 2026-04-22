@@ -99,6 +99,13 @@ jobs:
       - name: Enforce release artifact filename uniqueness (F-21)
         run: python3 scripts/check-release-artifact-names.py
 
+      # Requires `// justification:` comments on every production `#[allow(...)]`
+      # annotation (F-156). Test modules, `#[cfg(test)]`-gated items, and the
+      # `rustgate-test-utils` crate are exempt — rationale lives in
+      # `CONTRIBUTING.md` under "Allow annotations (F-156)".
+      - name: Enforce #[allow] justifications (F-156)
+        run: python3 scripts/check-allow-justified.py
+
   lint:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}

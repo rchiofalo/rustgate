@@ -379,7 +379,11 @@ pub(crate) async fn bind_tls_listener(
         );
     }
 
-    // `mut` is only needed when `metrics` is enabled (for `set_on_handshake_error`).
+    // justification: the `mut` binding is only consumed under
+    // `#[cfg(feature = "metrics")]` (`set_on_handshake_error` registers a
+    // mutable callback slot). Binding without `mut` and then introducing a
+    // second cfg-gated let-rebinding would be strictly uglier than tagging
+    // the unused_mut here.
     #[allow(unused_mut)]
     let mut listener = TlsListener::bind_with_server_config(
         &cli.bind,
@@ -1526,6 +1530,13 @@ pub(crate) fn warn_mqtt_disabled(cli: &Cli) {
 // ---------------------------------------------------------------------------
 
 /// Start the plaintext TCP listener and return its subsystem handle.
+// justification: setup entrypoint wiring together the router, admission
+// semaphore, codec, optional NATS publisher, optional federation forward
+// callback, optional HTTP forward callback, throttle config, archiver,
+// replay filter, and metrics identity. Every input is needed for exactly
+// one long-lived task; bundling them into a `StartPlaintextTcpArgs` struct
+// would duplicate the CLI's own shape without reducing the number of live
+// references the caller owns.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
     cli: &Cli,
@@ -1561,6 +1572,10 @@ pub(crate) async fn start_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let shutdown_clone = Arc::clone(&shutdown);
 
+    // justification: same feature-conditional clone pattern as the other
+    // NATS publisher clones above — `()` on the default build,
+    // `Option<NatsPublisher>` under `--features nats`. `.clone()` is the
+    // only spelling that compiles in both.
     #[allow(clippy::clone_on_copy)]
     let pt_nats = nats_publisher.clone();
     let config = PlaintextTcpConfig {

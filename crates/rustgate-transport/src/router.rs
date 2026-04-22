@@ -932,6 +932,11 @@ impl Router {
     /// broadcast, multicast, offline-drain, position replay) emits the
     /// same fields in the same shape, and so future audit-shaped
     /// obligations slot in without touching each site individually.
+    // justification: seven args mirror the fields the `authz_denied`
+    // audit emitter consumes (obligations, engine, subject cn, recipient
+    // cn, resource kind+id, optional rule id). Every Receive PEP site in
+    // this file calls it on the hot path; bundling into a struct would
+    // force per-call construction with no type-safety gain.
     #[allow(clippy::too_many_arguments)]
     fn audit_classified_receive(
         &self,

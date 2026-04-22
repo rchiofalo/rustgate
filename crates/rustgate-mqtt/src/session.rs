@@ -124,6 +124,12 @@ struct ResponsePacket {
 ///
 /// Performs the CONNECT handshake, registers with the router, runs the
 /// read/write loops concurrently, and unregisters on exit.
+// justification: entry-point for a per-connection task spawned exactly once
+// by `listener::accept_loop`. Every argument maps to a distinct config or
+// runtime handle that must be owned by this task (pre-handshake state,
+// router Arc, prefix, three size/time caps, wildcard policy, client-id
+// registry, admission permit). Packaging into a struct would duplicate the
+// listener's own config surface for zero call-site reduction.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_mqtt_session(
     pre: MqttPreSession,
@@ -648,6 +654,11 @@ async fn handle_publish_v4(
 // SUBSCRIBE handlers
 // ---------------------------------------------------------------------------
 
+// justification: seven args is the minimum set the SUBSCRIBE handler needs —
+// response tx, session identity, router, session id, prefix, wildcard policy,
+// and the decoded packet. The handler is dispatched from the read loop once
+// per SUBSCRIBE packet; a wrapper struct would be built fresh at every call
+// with no shared lifetime benefit.
 #[allow(clippy::too_many_arguments)]
 async fn handle_subscribe_v5(
     resp_tx: &mpsc::Sender<ResponsePacket>,
@@ -699,6 +710,10 @@ async fn handle_subscribe_v5(
     Ok(())
 }
 
+// justification: mirrors `handle_subscribe_v5` for the MQTT 3.1.1 wire
+// format; the v5 path already carries the same seven args, and unifying them
+// under a struct would force every branch in the dispatch to unpack fields
+// that differ only in the generic `sub` packet type.
 #[allow(clippy::too_many_arguments)]
 async fn handle_subscribe_v4(
     resp_tx: &mpsc::Sender<ResponsePacket>,
@@ -823,6 +838,10 @@ async fn try_join_filter(
 // UNSUBSCRIBE handlers
 // ---------------------------------------------------------------------------
 
+// justification: symmetric with the SUBSCRIBE handlers above — same seven
+// inputs, same call-once-per-packet dispatch pattern. Keeping the signature
+// shape consistent across all four handlers lets maintainers grep the whole
+// MQTT dispatch surface with one pattern.
 #[allow(clippy::too_many_arguments)]
 async fn handle_unsubscribe_v5(
     resp_tx: &mpsc::Sender<ResponsePacket>,
@@ -865,6 +884,9 @@ async fn handle_unsubscribe_v5(
     Ok(())
 }
 
+// justification: v4 counterpart to `handle_unsubscribe_v5`. Same seven-arg
+// shape; kept symmetric with the v5 and SUBSCRIBE handlers above so the
+// dispatch table has one uniform signature per MQTT packet kind.
 #[allow(clippy::too_many_arguments)]
 async fn handle_unsubscribe_v4(
     resp_tx: &mpsc::Sender<ResponsePacket>,

@@ -129,6 +129,10 @@ pub struct ReplayStore {
     db: Arc<Database>,
     inner: Arc<Mutex<Inner>>,
     max_bytes: u64,
+    // justification: kept for `Debug` derivation and forthcoming restart
+    // diagnostics (issue #656 — replay-store maintenance CLI). The handle is
+    // cloned into every federation peer task, so adding the field now avoids
+    // a format-shift later when the diagnostic hook lands.
     #[allow(dead_code)]
     path: PathBuf,
 }

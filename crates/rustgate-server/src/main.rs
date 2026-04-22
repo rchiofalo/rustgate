@@ -1299,7 +1299,12 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
                             }
                         };
                         let router = Arc::clone(&router);
-                        #[allow(clippy::clone_on_copy)] // Type varies by feature flag
+                        // justification: `nats_publisher` is `()` when the
+                        // `nats` feature is off and `Option<NatsPublisher>`
+                        // when it is on. `.clone()` is the one spelling that
+                        // compiles in both configurations; dereferencing
+                        // would break the featureless build.
+                        #[allow(clippy::clone_on_copy)]
                         let publisher = nats_publisher.clone();
                         let fed = fed_forward.clone();
                         #[cfg(feature = "http")]

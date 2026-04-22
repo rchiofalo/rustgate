@@ -730,15 +730,21 @@ pub fn record_authz_cache_stats(hits_delta: u64, misses_delta: u64) {
 }
 
 /// Returns the federation per-peer queue-bytes gauge vector.
+// justification: accessor exposed for the federation admin API (issue #778)
+// and for integration tests that assert on peer-lag gauges without poking
+// Prometheus default registry. Kept `pub` so the rustgate-federation crate
+// can read it once wired, without re-registering a parallel gauge.
 #[cfg(feature = "federation")]
-#[allow(dead_code)] // exposed for future API consumers / tests
+#[allow(dead_code)]
 pub fn federation_peer_queue_bytes() -> Option<&'static prometheus::IntGaugeVec> {
     FEDERATION_PEER_QUEUE_BYTES.get()
 }
 
 /// Returns the federation per-peer oldest-message-age gauge vector.
+// justification: sibling of `federation_peer_queue_bytes` — same
+// admin-API/tests rationale; the two are consumed as a pair.
 #[cfg(feature = "federation")]
-#[allow(dead_code)] // exposed for future API consumers / tests
+#[allow(dead_code)]
 pub fn federation_peer_oldest_seconds() -> Option<&'static prometheus::IntGaugeVec> {
     FEDERATION_PEER_OLDEST_SECONDS.get()
 }
@@ -859,7 +865,11 @@ pub fn messages_dropped() -> &'static IntCounterVec {
     })
 }
 
-#[allow(dead_code)] // wired when router TTL drops are observed from the session layer
+// justification: registered counter with no increment site yet — the router
+// does not currently observe TTL drops at the session layer (planned as part
+// of issue #887 session-side observability). Registering the metric now keeps
+// the Prometheus schema stable for operators who already scrape it.
+#[allow(dead_code)]
 pub fn messages_expired() -> &'static IntCounter {
     MESSAGES_EXPIRED.get_or_init(|| fallback_counter("rustgate_messages_expired_total", "fallback"))
 }
@@ -947,7 +957,11 @@ pub fn nats_consumer_info_seconds() -> Option<&'static Histogram> {
     NATS_CONSUMER_INFO_SECONDS.get()
 }
 
-#[allow(dead_code)] // only used when `proto` feature enables TAK negotiation
+// justification: only the `proto` feature increments this counter (TAK
+// protocol-version negotiation). Left unconditionally `pub` so the metric
+// exposition is identical across feature sets — operators do not need a
+// branched dashboard for the proto build vs the default build.
+#[allow(dead_code)]
 pub fn negotiations() -> &'static IntCounterVec {
     NEGOTIATIONS.get_or_init(|| {
         fallback_counter_vec("rustgate_negotiations_total", "fallback", &["result"])
@@ -1023,13 +1037,20 @@ pub fn refresh_jemalloc_stats() {
 }
 
 /// Returns the client-cert OCSP cache hit counter.
-#[allow(dead_code)] // only referenced when the `ocsp` feature is enabled
+// justification: incremented only on the `ocsp` feature path inside the
+// transport crate; the accessor is kept `pub` + unconditional so the server
+// metrics module has one place to list the full OCSP metric surface.
+// Gating this with `#[cfg(feature = "ocsp")]` would fragment the exposition
+// in a way that operators on a non-ocsp build would see as "missing metrics".
+#[allow(dead_code)]
 pub fn client_ocsp_cache_hits() -> Option<&'static IntCounter> {
     CLIENT_OCSP_CACHE_HITS.get()
 }
 
 /// Returns the client-cert OCSP cache miss counter.
-#[allow(dead_code)] // only referenced when the `ocsp` feature is enabled
+// justification: sibling of `client_ocsp_cache_hits` — same ocsp-feature
+// rationale, same rationale for staying unconditional.
+#[allow(dead_code)]
 pub fn client_ocsp_cache_misses() -> Option<&'static IntCounter> {
     CLIENT_OCSP_CACHE_MISSES.get()
 }
@@ -1244,7 +1265,12 @@ pub fn classify_handshake_error(error: &str) -> &'static str {
 /// bucketed under `"other"`.
 pub struct MetricsIdentity {
     allowlist: Option<HashSet<String>>,
-    #[allow(dead_code)] // read by `per_identity_enabled` and used by callers when wiring Tier 2
+    // justification: read by `per_identity_enabled()` and consumed by
+    // callers wiring the Tier 2 per-identity histograms. Clippy flags the
+    // field because the constructor stores it without any internal method
+    // consuming it, but the accessor below (also `#[allow(dead_code)]` for
+    // the same reason) is the entire point of the field.
+    #[allow(dead_code)]
     per_identity: bool,
 }
 
@@ -1263,7 +1289,11 @@ impl MetricsIdentity {
     }
 
     /// Construct a disabled identity (no allowlist, Tier 2 off).
-    #[allow(dead_code)] // helper for tests and external embedders
+    // justification: ergonomic constructor for tests and external embedders
+    // (the rustgate-client integration test binary uses this to silence
+    // cardinality without threading `Option<HashSet>` through every call).
+    // Used outside this crate, so clippy's dead-code heuristic misses it.
+    #[allow(dead_code)]
     pub fn disabled() -> Self {
         Self {
             allowlist: None,
@@ -1281,7 +1311,10 @@ impl MetricsIdentity {
     }
 
     /// Whether Tier 2 per-identity metrics are enabled.
-    #[allow(dead_code)] // observable on the type for callers
+    // justification: external observers (tests, admin API) query this to
+    // decide whether to scrape the Tier-2 histogram set. There is no
+    // internal caller; the method exists for callers outside this crate.
+    #[allow(dead_code)]
     pub fn per_identity_enabled(&self) -> bool {
         self.per_identity
     }
@@ -2003,6 +2036,11 @@ pub type RouterSlot = Arc<OnceLock<Arc<rustgate_transport::Router>>>;
 /// - Connection count bounded by `max_http_connections`
 /// - Per-connection timeout of [`HTTP_CONNECTION_TIMEOUT`]
 /// - Header read timeout of 5 seconds
+// justification: the metrics/admin server needs every pluggable surface
+// wired into one long-running task (bind, health, readiness, optional
+// federation API, ACL API, bearer token, hot-reloadable router slot, conn
+// cap). This is called once from the setup path; a builder would just move
+// the fan-in upstream without reducing the number of live inputs.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve(
     bind: SocketAddr,
