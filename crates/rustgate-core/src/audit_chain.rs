@@ -3,8 +3,16 @@
 //! Hash-chained, tamper-evident audit log writer and verifier.
 //!
 //! Each audit record (a single JSON object on its own line) is augmented with
-//! two fields before being written:
+//! three fields before being written:
 //!
+//! - `seq` — monotonically increasing 64-bit record number, starting at `0`
+//!   for the genesis record and resuming after restart via
+//!   [`read_chain_state`]. Part of the canonical JSON, so the chain hash
+//!   protects it from tampering. Lets an external consumer (SIEM tailing
+//!   the log) detect gaps — the hash chain alone proves ordering and
+//!   integrity but not completeness, because a tail truncation plus anchor
+//!   rewrite still verifies. Sequence numbers make that attack visible to
+//!   any consumer that has ever seen a later seq.
 //! - `prev_sha256` — the `sha256` of the previous record, or 64 zero hex
 //!   characters for the genesis record (or when continuing an existing chain
 //!   from a fresh process start that does not yet know the previous hash).
@@ -87,6 +95,7 @@ pub struct HashChainWriter<W: Write> {
     inner: W,
     buf: Vec<u8>,
     prev: String,
+    next_seq: u64,
     line_number: usize,
     /// Optional external observer of the current chain tip. Updated atomically
     /// on every chain advance so a shutdown path can snapshot the latest tip
@@ -100,14 +109,32 @@ impl<W: Write> HashChainWriter<W> {
     /// Create a new chain writer starting from `prev` (use [`GENESIS_PREV`]
     /// for a brand-new chain, or the last known hash to continue an existing
     /// chain across process restarts).
+    ///
+    /// The record sequence counter starts at `0`. When resuming across a
+    /// restart, pair this with [`HashChainWriter::with_next_seq`] using the
+    /// `next_seq` returned by [`read_chain_state`] so the chain does not
+    /// replay an earlier sequence number after a crash or restart.
     pub fn new(inner: W, prev: String) -> Self {
         Self {
             inner,
             buf: Vec::with_capacity(1024),
             prev,
+            next_seq: 0,
             line_number: 0,
             tip_observer: None,
         }
+    }
+
+    /// Override the starting sequence number. The writer assigns `seq` to the
+    /// next record, then increments monotonically. Use the value returned by
+    /// [`read_chain_state`] when resuming a chain across a restart so the
+    /// audit stream carries a single strictly-increasing `seq` series across
+    /// process boundaries. Legacy chains that were written before `seq` was
+    /// introduced report `0` here and keep writing forward; the first new
+    /// record then carries `seq=0`.
+    pub fn with_next_seq(mut self, next_seq: u64) -> Self {
+        self.next_seq = next_seq;
+        self
     }
 
     /// Attach an [`ArcSwap`] that the writer will update on every chain
@@ -126,6 +153,13 @@ impl<W: Write> HashChainWriter<W> {
     /// `prev` if nothing has been written yet).
     pub fn tip(&self) -> &str {
         &self.prev
+    }
+
+    /// Return the sequence number that will be stamped onto the *next*
+    /// record. Exposed primarily for tests and for tooling that wants to
+    /// snapshot the writer's cursor without flushing a record.
+    pub fn next_seq(&self) -> u64 {
+        self.next_seq
     }
 
     /// Process a single complete line (without trailing newline). The line is
@@ -152,6 +186,15 @@ impl<W: Write> HashChainWriter<W> {
         let mut map: BTreeMap<String, serde_json::Value> = orig.into_iter().collect();
         let _ = map.remove("prev_sha256");
         let _ = map.remove("sha256");
+        // Any `seq` field supplied by the caller is overwritten: the chain
+        // owns the sequence counter so downstream consumers can rely on it
+        // being strictly monotonic across the whole log. Chain-injected
+        // `seq` is part of the canonical JSON hashed below, so tampering
+        // with it invalidates `sha256` and every following record.
+        let _ = map.insert(
+            "seq".to_string(),
+            serde_json::Value::Number(self.next_seq.into()),
+        );
         let canonical =
             serde_json::to_vec(&map).map_err(|source| AuditChainError::InvalidJson {
                 line_number,
@@ -176,6 +219,12 @@ impl<W: Write> HashChainWriter<W> {
         self.inner.write_all(&out)?;
         self.inner.write_all(b"\n")?;
         self.prev = digest;
+        // Saturating so a pathological operator who somehow reaches 2^64
+        // records does not wrap silently back to 0 and restart the series.
+        // At 1M records/sec that ceiling is ~580,000 years out, but explicit
+        // saturation is cheaper than reasoning about wrap-around attacks
+        // against any downstream gap detector.
+        self.next_seq = self.next_seq.saturating_add(1);
         if let Some(ref observer) = self.tip_observer {
             observer.store(Arc::new(self.prev.clone()));
         }
@@ -442,6 +491,77 @@ pub fn read_chain_tip(path: &Path) -> io::Result<String> {
             }
         }
     }
+}
+
+/// Recover both the chain tip and the next sequence number a writer should
+/// use after resuming an existing log. This is the preferred startup path
+/// for a chained audit writer — using [`read_chain_tip`] alone resets the
+/// sequence counter to `0` on every restart, which breaks downstream gap
+/// detection.
+///
+/// Behaviour mirrors [`read_chain_tip`]: the file is opened, the tail is
+/// truncated if torn, and the final `sha256` is returned. In addition, the
+/// last record's `seq` field (if present) is parsed and returned incremented
+/// by one so the caller can pass it to
+/// [`HashChainWriter::with_next_seq`]. Records written by a pre-`seq` build
+/// have no `seq` field; for back-compat we report `next_seq = 0` there so
+/// the next record restarts the series. The hash chain still carries
+/// forward correctly either way — `seq` is a downstream-visible counter,
+/// not a chain linkage primitive.
+pub fn read_chain_state(path: &Path) -> io::Result<(String, u64)> {
+    let tip = read_chain_tip(path)?;
+    if tip == GENESIS_PREV {
+        return Ok((tip, 0));
+    }
+    // read_chain_tip has already truncated any torn trailing record, so the
+    // last non-empty line on disk is guaranteed to be a valid JSON object
+    // whose sha256 matches `tip`. We only need to parse its `seq` field.
+    let file = OpenOptions::new().read(true).open(path)?;
+    let file_len = file.metadata()?.len();
+    if file_len == 0 {
+        return Ok((tip, 0));
+    }
+    // Bounded tail read — same budget as read_chain_tip so a hostile log
+    // cannot turn startup into a full-file scan on the seq path either.
+    let mut file = file;
+    let start = file_len.saturating_sub(REWIND_BUDGET);
+    let _ = file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::with_capacity(file_len.saturating_sub(start) as usize);
+    let _ = file.read_to_end(&mut bytes)?;
+    if start > 0
+        && let Some(first_nl) = bytes.iter().position(|&b| b == b'\n')
+    {
+        let _ = bytes.drain(..=first_nl);
+    }
+    // Trim the terminating newline (if any) so rposition gives us the start
+    // of the *last* record rather than an empty suffix.
+    while bytes.last() == Some(&b'\n') {
+        bytes.truncate(bytes.len() - 1);
+    }
+    let last_line_start = bytes
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let last_line = &bytes[last_line_start..];
+    let seq = match serde_json::from_slice::<serde_json::Value>(last_line) {
+        Ok(serde_json::Value::Object(map)) => map
+            .get("seq")
+            .and_then(|v| v.as_u64())
+            .map(|n| n.saturating_add(1))
+            .unwrap_or(0),
+        // read_chain_tip already validated the last line parses and has
+        // `sha256`; the only way we get here is if the tip file changed
+        // under us between calls, which is an operational race we surface
+        // rather than paper over.
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "audit log last record changed between read_chain_tip and read_chain_state",
+            ));
+        }
+    };
+    Ok((tip, seq))
 }
 
 /// Compute the anchor-file path for a given audit-log path. Kept as a
@@ -1016,5 +1136,169 @@ mod tests {
 
         let recovered = read_chain_tip(f.path()).unwrap();
         assert_eq!(recovered, good_tip);
+    }
+
+    /// Extract the `seq` field from every record in an audit log. Used by
+    /// the sequence-number tests below.
+    fn seqs_of(path: &Path) -> Vec<Option<u64>> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).unwrap();
+                v.get("seq").and_then(|s| s.as_u64())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn writer_injects_monotonic_seq_from_genesis() {
+        let f = NamedTempFile::new().unwrap();
+        write_records(
+            f.path(),
+            &[r#"{"event":"a"}"#, r#"{"event":"b"}"#, r#"{"event":"c"}"#],
+        );
+        assert_eq!(seqs_of(f.path()), vec![Some(0), Some(1), Some(2)]);
+        // Chain still verifies end-to-end — seq is inside the canonical
+        // JSON so the hash chain protects it.
+        let report = verify_audit_log(f.path()).unwrap();
+        assert_eq!(report.records, 3);
+    }
+
+    #[test]
+    fn writer_overwrites_caller_supplied_seq() {
+        // If a caller sneaks a `seq` field into the pre-chain record, the
+        // writer must replace it: the chain owns the counter so downstream
+        // consumers can trust it.
+        let f = NamedTempFile::new().unwrap();
+        write_records(
+            f.path(),
+            &[r#"{"event":"a","seq":9999}"#, r#"{"event":"b","seq":123}"#],
+        );
+        assert_eq!(seqs_of(f.path()), vec![Some(0), Some(1)]);
+        // And verification must still succeed against the overwritten seq.
+        let report = verify_audit_log(f.path()).unwrap();
+        assert_eq!(report.records, 2);
+    }
+
+    #[test]
+    fn read_chain_state_resumes_seq_across_restart() {
+        // Simulates a process restart: write three records, close the
+        // writer, read the state back, continue with a second writer and
+        // confirm the sequence kept advancing (0,1,2,3,4) rather than
+        // restarting from 0.
+        let f = NamedTempFile::new().unwrap();
+        write_records(
+            f.path(),
+            &[r#"{"event":"a"}"#, r#"{"event":"b"}"#, r#"{"event":"c"}"#],
+        );
+        let (tip, next_seq) = read_chain_state(f.path()).unwrap();
+        assert_ne!(tip, GENESIS_PREV);
+        assert_eq!(next_seq, 3);
+
+        let file = OpenOptions::new().append(true).open(f.path()).unwrap();
+        let mut w = HashChainWriter::new(file, tip.clone()).with_next_seq(next_seq);
+        w.write_all(br#"{"event":"d"}"#).unwrap();
+        w.write_all(b"\n").unwrap();
+        w.write_all(br#"{"event":"e"}"#).unwrap();
+        w.write_all(b"\n").unwrap();
+        w.flush().unwrap();
+
+        assert_eq!(
+            seqs_of(f.path()),
+            vec![Some(0), Some(1), Some(2), Some(3), Some(4)]
+        );
+        // And the chain as a whole still verifies.
+        let report = verify_audit_log(f.path()).unwrap();
+        assert_eq!(report.records, 5);
+    }
+
+    #[test]
+    fn read_chain_state_returns_genesis_on_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("never-created.log");
+        let (tip, next_seq) = read_chain_state(&missing).unwrap();
+        assert_eq!(tip, GENESIS_PREV);
+        assert_eq!(next_seq, 0);
+    }
+
+    #[test]
+    fn read_chain_state_reports_next_seq_zero_for_legacy_records() {
+        // Simulates an audit log written by a pre-seq build: hand-craft
+        // records that chain correctly but carry no `seq` field. A new
+        // writer resuming from here must start at seq=0 so forward
+        // records are still monotonic, even if a gap detector will see
+        // the older records as unnumbered.
+        let f = NamedTempFile::new().unwrap();
+        let path = f.path();
+
+        // Replay the old pre-seq algorithm: hash(prev || canonical_without_chain_fields),
+        // no seq injection.
+        let rec1_map: BTreeMap<&str, serde_json::Value> =
+            [("event", serde_json::Value::String("legacy-a".into()))]
+                .into_iter()
+                .collect();
+        let rec1_canonical = serde_json::to_vec(&rec1_map).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(GENESIS_PREV.as_bytes());
+        hasher.update(&rec1_canonical);
+        let rec1_hash = hex_encode(&hasher.finalize());
+        let rec1 = format!(
+            r#"{{"event":"legacy-a","prev_sha256":"{}","sha256":"{}"}}"#,
+            GENESIS_PREV, rec1_hash
+        );
+
+        let rec2_map: BTreeMap<&str, serde_json::Value> =
+            [("event", serde_json::Value::String("legacy-b".into()))]
+                .into_iter()
+                .collect();
+        let rec2_canonical = serde_json::to_vec(&rec2_map).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(rec1_hash.as_bytes());
+        hasher.update(&rec2_canonical);
+        let rec2_hash = hex_encode(&hasher.finalize());
+        let rec2 = format!(
+            r#"{{"event":"legacy-b","prev_sha256":"{}","sha256":"{}"}}"#,
+            rec1_hash, rec2_hash
+        );
+
+        std::fs::write(path, format!("{rec1}\n{rec2}\n")).unwrap();
+        // Sanity-check: the hand-written legacy log is itself valid.
+        let report = verify_audit_log(path).unwrap();
+        assert_eq!(report.records, 2);
+        assert_eq!(report.tip, rec2_hash);
+
+        let (tip, next_seq) = read_chain_state(path).unwrap();
+        assert_eq!(tip, rec2_hash);
+        // Pre-seq records had no `seq` field → the counter restarts at 0
+        // so forward records are monotonic among themselves. The hash
+        // chain carries across the boundary unchanged.
+        assert_eq!(next_seq, 0);
+    }
+
+    #[test]
+    fn tampering_with_injected_seq_is_detected_by_hash_chain() {
+        // Sanity: because the writer-injected `seq` is part of the
+        // canonical JSON hashed into `sha256`, editing it post-hoc must
+        // invalidate verify_audit_log.
+        let f = NamedTempFile::new().unwrap();
+        write_records(
+            f.path(),
+            &[r#"{"event":"a"}"#, r#"{"event":"b"}"#, r#"{"event":"c"}"#],
+        );
+
+        // Replace the middle record's seq=1 with seq=42 without rebuilding
+        // its sha256. The hash check must fire.
+        let contents = std::fs::read_to_string(f.path()).unwrap();
+        let mutated = contents.replacen("\"seq\":1", "\"seq\":42", 1);
+        assert_ne!(contents, mutated, "test fixture must mutate the file");
+        std::fs::write(f.path(), mutated).unwrap();
+
+        let err = verify_audit_log(f.path()).unwrap_err();
+        assert!(
+            matches!(err, VerifyError::HashMismatch { line: 2, .. }),
+            "expected HashMismatch on line 2, got {err:?}"
+        );
     }
 }

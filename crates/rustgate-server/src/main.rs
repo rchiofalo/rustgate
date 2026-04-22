@@ -264,9 +264,10 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
-            let prev = rustgate_core::audit_chain::read_chain_tip(path).map_err(|e| {
-                anyhow::anyhow!("failed to read audit log chain tip {audit_path}: {e}")
-            })?;
+            let (prev, next_seq) =
+                rustgate_core::audit_chain::read_chain_state(path).map_err(|e| {
+                    anyhow::anyhow!("failed to read audit log chain state {audit_path}: {e}")
+                })?;
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -274,6 +275,7 @@ fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("failed to open audit log {audit_path}: {e}"))?;
             let tip_observer = Arc::new(arc_swap::ArcSwap::from_pointee(prev.clone()));
             let chain = rustgate_core::audit_chain::HashChainWriter::new(file, prev)
+                .with_next_seq(next_seq)
                 .with_tip_observer(Arc::clone(&tip_observer));
             // Upgrade the handle (or create one) so shutdown knows which
             // path + observer to persist.
