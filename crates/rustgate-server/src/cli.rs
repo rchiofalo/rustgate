@@ -301,6 +301,13 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 1000, env = "RUSTGATE_NATS_MAX_ACK_PENDING")]
     pub(crate) nats_max_ack_pending: i64,
 
+    /// Maximum JetStream delivery attempts per message before the consumer
+    /// gives up (poison-message defence). `0` keeps the JetStream server
+    /// default (unlimited) for backwards compatibility; recommended
+    /// production value is `5`.
+    #[arg(long, default_value_t = 0, env = "RUSTGATE_NATS_MAX_DELIVER")]
+    pub(crate) nats_max_deliver: i64,
+
     /// Path to JetStream replay checkpoint file. When set, the server
     /// persists the last replayed sequence number and resumes from it
     /// on restart instead of replaying the entire history stream.
@@ -1397,6 +1404,7 @@ define_config_file! {
     nats_subscription_capacity: usize,
     nats_live_stream: String,
     nats_max_ack_pending: i64,
+    nats_max_deliver: i64,
     nats_checkpoint_path: Option<String>,
     http_config_file: Option<String>,
     enrollment_bind: Option<String>,
@@ -1792,6 +1800,7 @@ mod tests {
             "RUSTGATE_NATS_SUBSCRIPTION_CAPACITY",
             "RUSTGATE_NATS_LIVE_STREAM",
             "RUSTGATE_NATS_MAX_ACK_PENDING",
+            "RUSTGATE_NATS_MAX_DELIVER",
             "RUSTGATE_NATS_CHECKPOINT_PATH",
             "RUSTGATE_ENROLLMENT_BIND",
             "RUSTGATE_CA_KEY",

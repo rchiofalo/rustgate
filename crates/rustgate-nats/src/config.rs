@@ -120,6 +120,24 @@ pub struct NatsConfig {
     /// many messages until earlier ones are acknowledged.
     pub max_ack_pending: i64,
 
+    /// Maximum number of JetStream delivery attempts for any single
+    /// message before the consumer gives up and advances past it
+    /// (default: 0 = unlimited, matching the JetStream server default).
+    ///
+    /// Defense-in-depth against poison messages: if processing panics
+    /// mid-handler or the task is cancelled between receive and ACK, the
+    /// message would otherwise redeliver indefinitely. A positive value
+    /// caps that redelivery loop so a single bad message cannot wedge
+    /// the consumer. Operators can watch for the
+    /// `$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.*.*` advisory subject
+    /// (emitted by the NATS server on each give-up) if they want an
+    /// alerting signal — this crate does not subscribe to it here.
+    ///
+    /// Recommended starting value: `5`. Large enough to survive a
+    /// transient pod restart, small enough that a persistently-failing
+    /// message drops within a few seconds of re-delivery intervals.
+    pub max_deliver: i64,
+
     /// Optional path for JetStream replay checkpoint file.
     /// When set, stores the last processed sequence number so
     /// subsequent restarts resume from the checkpoint.
@@ -216,6 +234,7 @@ impl Default for NatsConfig {
             subscription_capacity: 1024,
             live_stream: "RUSTGATE_LIVE".to_string(),
             max_ack_pending: 1000,
+            max_deliver: 0,
             checkpoint_path: None,
         }
     }
@@ -477,5 +496,44 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(config.subscription_capacity, 256);
+    }
+
+    #[test]
+    fn default_max_deliver_is_unlimited_sentinel() {
+        // Default `0` is the JetStream wire sentinel that tells the server
+        // to use its own unlimited default. This is the only back-compat
+        // posture — any positive default would change redelivery behaviour
+        // for existing deployments on upgrade, which is not a silent change
+        // we are willing to ship.
+        let config = NatsConfig::default();
+        assert_eq!(config.max_deliver, 0);
+    }
+
+    #[test]
+    fn custom_max_deliver_round_trips() {
+        let config = NatsConfig {
+            max_deliver: 5,
+            ..Default::default()
+        };
+        assert_eq!(config.max_deliver, 5);
+    }
+
+    #[test]
+    fn max_deliver_does_not_affect_validation() {
+        // `max_deliver` has no syntactic constraints (positive caps redeliveries,
+        // 0 means unlimited, negative values would be rejected by the NATS
+        // server at consumer-create time). The config validator should not
+        // guess at semantics — just round-trip.
+        let positive = NatsConfig {
+            max_deliver: 100,
+            ..Default::default()
+        };
+        positive.validate().unwrap();
+
+        let zero = NatsConfig {
+            max_deliver: 0,
+            ..Default::default()
+        };
+        zero.validate().unwrap();
     }
 }
