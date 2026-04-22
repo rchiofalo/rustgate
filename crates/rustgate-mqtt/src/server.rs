@@ -110,3 +110,219 @@ impl MqttServer {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used, unused_results)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    use rustgate_test_utils::certs::TestCa;
+    use rustgate_transport::{Router, TlsConfig};
+    use tokio::sync::{Notify, Semaphore};
+
+    use super::*;
+    use crate::config::{MqttServerConfig, MqttSessionHooks};
+    use crate::listener::MqttListener;
+    use crate::topic::WildcardPolicy;
+
+    // ------------------------------------------------------------------
+    // These tests exercise the accept-loop orchestration of
+    // `MqttServer::run` without driving real TLS handshakes — the
+    // integration suite under `tests/mqtt_integration.rs` already covers
+    // the full handshake + CONNECT + PUBLISH + SUBSCRIBE path end-to-end.
+    // Here we pin the lifecycle invariants (Debug trait bound, shutdown
+    // responsiveness, on-accept / on-reject plumbing presence) that the
+    // accept loop itself owns and that a refactor could silently break
+    // without tripping a wire-level test.
+    // ------------------------------------------------------------------
+
+    /// Build a server-side `TlsConfig` using a throw-away test CA.
+    fn test_tls_config(label: &str) -> TlsConfig {
+        let ca = TestCa::new(label);
+        let server = ca.issue_server_cert("localhost", &["localhost"]);
+        TlsConfig::from_pem(&server.cert_pem, &server.key_pem, &ca.cert_pem)
+            .expect("build TlsConfig from freshly issued test certs")
+    }
+
+    fn loopback_zero() -> SocketAddr {
+        "127.0.0.1:0"
+            .parse()
+            .expect("static loopback address must parse")
+    }
+
+    /// Assemble an `MqttServerConfig` bound to a fresh loopback port.
+    ///
+    /// The listener has no clients, so the only path the accept loop can
+    /// take is the shutdown branch. This keeps each test focused on
+    /// lifecycle semantics rather than handshake mechanics.
+    fn build_config(shutdown: Arc<Notify>, label: &str) -> MqttServerConfig {
+        let tls = test_tls_config(label);
+        let listener = MqttListener::bind(loopback_zero(), &tls).expect("bind MQTT listener");
+        MqttServerConfig {
+            listener,
+            router: Arc::new(Router::default()),
+            connection_limit: Arc::new(Semaphore::new(1)),
+            shutdown,
+            topic_prefix: None,
+            max_packet_size: MqttServerConfig::DEFAULT_MAX_PACKET_SIZE,
+            min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
+            response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
+            wildcard_policy: WildcardPolicy::default(),
+            on_accept: None,
+            on_reject: None,
+            session_hooks: None,
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Trait bounds — pin the `Debug` derive cheaply so a future refactor
+    // that accidentally drops it (e.g. because an added field is not
+    // `Debug`) lands as a compile error here, not inside a tracing macro
+    // expansion at an unrelated call site.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn server_type_is_debug() {
+        fn assert_debug<T: std::fmt::Debug>() {}
+        assert_debug::<MqttServer>();
+    }
+
+    #[test]
+    fn server_debug_renders_struct_name() {
+        let rendered = format!("{:?}", MqttServer);
+        assert_eq!(rendered, "MqttServer");
+    }
+
+    // ------------------------------------------------------------------
+    // Shutdown responsiveness — the accept loop `tokio::select!`s on
+    // `listener.accept()` and `shutdown.notified()`. These tests verify
+    // that the `shutdown` branch wins deterministically when no client is
+    // connecting, so an operator-initiated SIGTERM translates into a
+    // clean drain rather than a hang waiting for an accept that will
+    // never arrive.
+    // ------------------------------------------------------------------
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_returns_immediately_when_shutdown_pre_notified() {
+        // Notify *before* spawning `run` — tokio's Notify stores one
+        // permit, so the first `notified()` poll inside the select
+        // completes without ever parking.
+        let shutdown = Arc::new(Notify::new());
+        shutdown.notify_one();
+        let config = build_config(Arc::clone(&shutdown), "mqtt-server-pre-notified");
+
+        // Bound the test with a generous virtual-time timeout so a
+        // regression that stops honouring the shutdown notify manifests
+        // as a test failure rather than hanging CI.
+        tokio::time::timeout(Duration::from_secs(5), MqttServer::run(config))
+            .await
+            .expect("MqttServer::run must return when shutdown was notified before spawn");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_returns_when_shutdown_fires_after_spawn() {
+        // The more realistic path: operator sends SIGTERM while the
+        // server is idling in `listener.accept()`. Spawn `run`, yield
+        // once so it reaches the select, then notify.
+        let shutdown = Arc::new(Notify::new());
+        let config = build_config(Arc::clone(&shutdown), "mqtt-server-post-notified");
+
+        let handle = tokio::spawn(MqttServer::run(config));
+        // One yield is enough under current_thread flavour to let the
+        // spawned task advance past the setup and park on the select.
+        tokio::task::yield_now().await;
+        shutdown.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("MqttServer::run must exit within timeout after shutdown is notified")
+            .expect("MqttServer::run task must not panic during shutdown");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_ignores_extra_shutdown_notifications() {
+        // `Notify::notify_one` coalesces — a second notify after the
+        // loop has already exited must be a silent no-op rather than
+        // re-arming the notify and stranding the next run invocation.
+        let shutdown = Arc::new(Notify::new());
+        let config = build_config(Arc::clone(&shutdown), "mqtt-server-double-notify");
+
+        let handle = tokio::spawn(MqttServer::run(config));
+        tokio::task::yield_now().await;
+        shutdown.notify_one();
+        // Second notify after the loop has already broken out.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("run must still terminate cleanly when extra notifies arrive")
+            .expect("run task must not panic on duplicate shutdown notify");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_notify_is_observed_by_concurrent_readers() {
+        // Pin the contract that the `Arc<Notify>` handed in to
+        // `MqttServerConfig` is the *same* handle the run loop awaits.
+        // If a refactor ever clones or swaps the notify during config
+        // destructure, external holders (e.g. the server crate's
+        // `stop_subsystem` helper) would be unable to trigger shutdown
+        // — this test would catch that before it reached integration.
+        let shutdown = Arc::new(Notify::new());
+        let external = Arc::clone(&shutdown);
+        let config = build_config(shutdown, "mqtt-server-shared-notify");
+
+        let handle = tokio::spawn(MqttServer::run(config));
+        tokio::task::yield_now().await;
+        external.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("external Arc<Notify> must still be able to shut down the loop")
+            .expect("run task must not panic when notified via cloned Arc");
+    }
+
+    // ------------------------------------------------------------------
+    // Observer wiring — the accept loop fires `on_accept` only on the
+    // success path and `on_reject` only on the connection-limit-exceeded
+    // path. Neither fires on a clean shutdown with no inbound clients,
+    // so the invariant we can cheaply verify here is that installing the
+    // callbacks does not itself perturb the shutdown path (e.g. through
+    // a panicking destructor during config destructure).
+    // ------------------------------------------------------------------
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_exits_cleanly_with_observers_installed() {
+        let shutdown = Arc::new(Notify::new());
+        let tls = test_tls_config("mqtt-server-observers");
+        let listener = MqttListener::bind(loopback_zero(), &tls).expect("bind");
+        let config = MqttServerConfig {
+            listener,
+            router: Arc::new(Router::default()),
+            connection_limit: Arc::new(Semaphore::new(1)),
+            shutdown: Arc::clone(&shutdown),
+            topic_prefix: None,
+            max_packet_size: MqttServerConfig::DEFAULT_MAX_PACKET_SIZE,
+            min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
+            response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
+            wildcard_policy: WildcardPolicy::default(),
+            on_accept: Some(Arc::new(|| {
+                panic!("on_accept must not fire on clean shutdown with no clients")
+            })),
+            on_reject: Some(Arc::new(|| {
+                panic!("on_reject must not fire on clean shutdown with no clients")
+            })),
+            session_hooks: Some(MqttSessionHooks::default()),
+        };
+
+        let handle = tokio::spawn(MqttServer::run(config));
+        tokio::task::yield_now().await;
+        shutdown.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("run must terminate with observers installed")
+            .expect("run task must not panic on shutdown with no accept / reject events");
+    }
+}
