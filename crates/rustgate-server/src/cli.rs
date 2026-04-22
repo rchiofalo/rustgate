@@ -517,6 +517,24 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 10, env = "RUSTGATE_WS_CONN_RATE_WINDOW_SECS")]
     pub(crate) ws_conn_rate_window_secs: u64,
 
+    /// Interval in seconds between active WebSocket Ping health-check frames.
+    /// Set to 0 (default) to disable the active heartbeat — `tokio-tungstenite`
+    /// already auto-responds to inbound Pings but never probes the peer, so
+    /// silent NAT/proxy middleboxes can leave a session wedged indefinitely.
+    /// When enabled, the server emits a Ping every `N` seconds and records
+    /// inbound Pong timestamps to detect stalled peers.
+    #[arg(long, default_value_t = 0, env = "RUSTGATE_WS_PING_INTERVAL_SECS")]
+    pub(crate) ws_ping_interval_secs: u64,
+
+    /// Additional grace seconds beyond `--ws-ping-interval-secs` before a
+    /// session with no Pong is dropped. The deadline is
+    /// `ping_interval + pong_timeout`; 0 (default) keeps Pings flowing without
+    /// ever terminating a silent session — useful for keeping middleboxes
+    /// warm when transient Pong loss should be tolerated. Only meaningful
+    /// when `--ws-ping-interval-secs` is non-zero.
+    #[arg(long, default_value_t = 0, env = "RUSTGATE_WS_PONG_TIMEOUT_SECS")]
+    pub(crate) ws_pong_timeout_secs: u64,
+
     // -- MQTT flags --
     /// Bind address for the MQTT (mqtts://) listener (e.g. 0.0.0.0:8883).
     /// Requires --features mqtt.
@@ -1413,6 +1431,8 @@ define_config_file! {
     ws_max_message_size: usize,
     ws_conn_rate_limit: usize,
     ws_conn_rate_window_secs: u64,
+    ws_ping_interval_secs: u64,
+    ws_pong_timeout_secs: u64,
     mqtt_bind: Option<String>,
     mqtt_topic_prefix: Option<String>,
     mqtt_max_packet_size: usize,

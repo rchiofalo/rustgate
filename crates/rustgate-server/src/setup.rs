@@ -1452,6 +1452,10 @@ pub(crate) fn start_websocket<P: NatsPublish + Send + Sync + 'static>(
         ws_max_bytes_per_sec: cli.ws_max_bytes_per_sec,
         ws_max_violations: cli.ws_max_violations,
         max_write_buffer_bytes: cli.ws_max_write_buffer_bytes,
+        health_check: rustgate_websocket::health::HealthCheckConfig {
+            ping_interval: std::time::Duration::from_secs(cli.ws_ping_interval_secs),
+            pong_timeout: std::time::Duration::from_secs(cli.ws_pong_timeout_secs),
+        },
         shutdown: Arc::clone(&shutdown),
     };
     let task = tokio::spawn(async move {

@@ -7,6 +7,7 @@
 //! same session registration, group enforcement, position cache replay.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::Bytes;
 use futures::stream::{SplitSink, SplitStream};
@@ -19,9 +20,11 @@ use rustgate_core::message::RoutableMessage;
 use rustgate_cot::MessageBuilder;
 use rustgate_transport::{ClientThrottle, ReplayFilter, Router, SessionHandle, ThrottleConfig};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::time::{Interval, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
+use crate::health::{HealthCheckConfig, LastPong, new_last_pong};
 use crate::{WsListener, WsSession, WsStream};
 
 /// Callback for NATS publishing after local routing.
@@ -78,6 +81,9 @@ pub struct WsServerConfig {
     /// Maximum pending write bytes per connection before disconnecting
     /// a slow consumer. 0 = unlimited (not recommended).
     pub max_write_buffer_bytes: usize,
+    /// Active WebSocket heartbeat configuration. See [`HealthCheckConfig`]
+    /// for semantics. Defaults to fully disabled.
+    pub health_check: HealthCheckConfig,
     pub shutdown: Arc<Notify>,
 }
 
@@ -116,6 +122,7 @@ impl WebSocketServer {
             ws_max_bytes_per_sec,
             ws_max_violations,
             max_write_buffer_bytes,
+            health_check,
             shutdown,
         } = config;
 
@@ -152,9 +159,10 @@ impl WebSocketServer {
                             let bps = ws_max_bytes_per_sec;
                             let vio = ws_max_violations;
                             let mwb = max_write_buffer_bytes;
+                            let hc = health_check;
                             drop(tokio::spawn(handle_ws_session(
                                 session, router, session_codec, nats, fed, http, tc, rf,
-                                cb, fps, bps, vio, mwb, permit,
+                                cb, fps, bps, vio, mwb, hc, permit,
                             )));
                         }
                         Err(e) => {
@@ -186,6 +194,7 @@ async fn handle_ws_session(
     ws_max_bytes_per_sec: u64,
     ws_max_violations: u32,
     max_write_buffer_bytes: usize,
+    health_check: HealthCheckConfig,
     _permit: OwnedSemaphorePermit,
 ) {
     let identity = session.identity_arc();
@@ -266,11 +275,14 @@ async fn handle_ws_session(
         None
     };
 
+    let last_pong = new_last_pong();
+
     let read_result = {
         let router = Arc::clone(&router);
+        let read_last_pong = Arc::clone(&last_pong);
         tokio::select! {
-            r = ws_read_loop(ws_read, &identity, &router, nats_publish.as_ref(), fed_forward.as_ref(), http_forward.as_ref(), &throttle, &replay_filter, &mut ws_rate_limiter) => r,
-            r = ws_write_loop(ws_write, &mut priority_rx, &mut normal_rx, &*codec, max_write_buffer_bytes) => r,
+            r = ws_read_loop(ws_read, &identity, &router, nats_publish.as_ref(), fed_forward.as_ref(), http_forward.as_ref(), &throttle, &replay_filter, &mut ws_rate_limiter, read_last_pong) => r,
+            r = ws_write_loop(ws_write, &mut priority_rx, &mut normal_rx, &*codec, max_write_buffer_bytes, health_check, Arc::clone(&last_pong)) => r,
         }
     };
 
@@ -298,6 +310,7 @@ async fn ws_read_loop(
     throttle: &Option<ClientThrottle>,
     replay_filter: &Option<Arc<ReplayFilter>>,
     ws_rate_limiter: &mut Option<crate::rate_limit::WsRateLimiter>,
+    last_pong: LastPong,
 ) -> Result<(), String> {
     let mut msg_builder = MessageBuilder::new();
 
@@ -313,7 +326,13 @@ async fn ws_read_loop(
             Message::Binary(data) => data,
             Message::Text(text) => Bytes::copy_from_slice(text.as_bytes()),
             Message::Close(_) => return Ok(()),
-            _ => continue, // Ping/Pong handled by tungstenite
+            Message::Pong(_) => {
+                // Record liveness for the write loop's deadline check.
+                // Lock is only held for the Instant write; never across await.
+                *last_pong.lock() = Instant::now();
+                continue;
+            }
+            _ => continue, // Ping auto-replied by tungstenite; frames ignored
         };
 
         // Per-connection frame/byte rate limiting
@@ -391,6 +410,24 @@ async fn ws_read_loop(
     }
 }
 
+/// Action chosen on each iteration of the write loop.
+enum WriteAction {
+    /// A routed message is ready to be encoded and sent.
+    Send(rustgate_transport::RoutedMessage),
+    /// The ping interval elapsed; emit a Ping frame after a staleness check.
+    Ping,
+}
+
+/// Await the next tick of an optional interval, or never if the interval
+/// is `None`. `std::future::pending()` keeps the select! arm disarmed
+/// without ever completing, which is what we want when the feature is off.
+async fn tick_or_never(ticker: Option<&mut Interval>) -> Instant {
+    match ticker {
+        Some(t) => t.tick().await.into_std(),
+        None => std::future::pending::<Instant>().await,
+    }
+}
+
 /// Write loop for WebSocket sessions with biased priority drain.
 ///
 /// Always checks the priority channel (Position and Alert messages)
@@ -401,36 +438,79 @@ async fn ws_read_loop(
 /// If `max_write_buffer_bytes` is non-zero and the pending byte count
 /// exceeds the limit, the connection is terminated to prevent memory
 /// exhaustion from slow-reading clients.
+///
+/// When `health_check.ping_enabled()` is true, emits a `Message::Ping`
+/// every `ping_interval`. Before sending, the last recorded Pong is
+/// consulted via `health_check.is_stale`; if the peer has been silent
+/// past the configured tolerance the session is terminated.
+#[allow(clippy::too_many_arguments)]
 async fn ws_write_loop(
     mut ws_write: SplitSink<WsStream, Message>,
     priority_rx: &mut mpsc::Receiver<rustgate_transport::RoutedMessage>,
     normal_rx: &mut mpsc::Receiver<rustgate_transport::RoutedMessage>,
     codec: &dyn Codec,
     max_write_buffer_bytes: usize,
+    health_check: HealthCheckConfig,
+    last_pong: LastPong,
 ) -> Result<(), String> {
     let mut priority_open = true;
     let mut normal_open = true;
     let mut pending_bytes: usize = 0;
+
+    let mut ping_ticker: Option<Interval> = if health_check.ping_enabled() {
+        let mut t = tokio::time::interval(health_check.ping_interval);
+        // Skip missed ticks instead of bursting catch-up Pings if the
+        // loop stalls (e.g. blocked on a slow send). Delay avoids a
+        // flurry of frames after any backpressure event.
+        t.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        Some(t)
+    } else {
+        None
+    };
+
     loop {
         if !priority_open && !normal_open {
             break;
         }
-        let msg = tokio::select! {
+        let action = tokio::select! {
             biased;
             msg = priority_rx.recv(), if priority_open => match msg {
-                Some(m) => m,
+                Some(m) => WriteAction::Send(m),
                 None => {
                     priority_open = false;
                     continue;
                 }
             },
             msg = normal_rx.recv(), if normal_open => match msg {
-                Some(m) => m,
+                Some(m) => WriteAction::Send(m),
                 None => {
                     normal_open = false;
                     continue;
                 }
             },
+            _ = tick_or_never(ping_ticker.as_mut()) => WriteAction::Ping,
+        };
+
+        let msg = match action {
+            WriteAction::Send(m) => m,
+            WriteAction::Ping => {
+                // Snapshot the last pong before emitting the next ping so a
+                // silent peer is detected before more Pings pile up.
+                let recorded = *last_pong.lock();
+                if health_check.is_stale(recorded, Instant::now()) {
+                    return Err("WebSocket heartbeat timeout: no Pong received".into());
+                }
+                match tokio::time::timeout(
+                    WRITE_TIMEOUT,
+                    ws_write.send(Message::Ping(Bytes::new())),
+                )
+                .await
+                {
+                    Ok(Ok(())) => continue,
+                    Ok(Err(e)) => return Err(format!("WebSocket ping write error: {e}")),
+                    Err(_) => return Err("write timeout on Ping (slow consumer)".into()),
+                }
+            }
         };
 
         let encoded = match codec.encode_payload(&msg) {
