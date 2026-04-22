@@ -23,9 +23,9 @@ const DEFAULT_SWEEP_THRESHOLD: usize = 512;
 ///
 /// Bounds memory under IPv6 prefix-scan floods: an attacker cycling
 /// through a /48 (2^80 source addresses) cannot bloat the map past this
-/// limit. Combined with [`canonical_key`] — which collapses IPv6 to the
-/// /64 prefix — 65_536 entries exactly covers the worst-case /48 scan
-/// after prefix collapsing (2^16 = 65_536 distinct /64 prefixes per /48).
+/// limit. Combined with the internal `/64` prefix collapsing for IPv6,
+/// 65_536 entries exactly covers the worst-case /48 scan (2^16 = 65_536
+/// distinct `/64` prefixes per /48).
 pub const DEFAULT_MAX_TRACKED_IPS: usize = 65_536;
 
 /// Per-IP sliding-window connection rate limiter.
