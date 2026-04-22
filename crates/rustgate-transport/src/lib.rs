@@ -46,7 +46,8 @@ pub use codecs::{RawLengthPrefixedCodec, RawLineCodec, TakXmlCodec};
 #[cfg(feature = "fips")]
 pub use config::install_fips_provider;
 pub use config::{
-    TlsConfig, TlsMinVersion, check_crl_freshness, is_fips_provider_active, is_pq_provider_active,
+    CrlFileSummary, TlsConfig, TlsMinVersion, check_crl_freshness, crl_max_age_seconds,
+    is_fips_provider_active, is_pq_provider_active,
 };
 #[cfg(feature = "post-quantum")]
 pub use config::{install_pq_provider, install_provider_with_kx_groups};

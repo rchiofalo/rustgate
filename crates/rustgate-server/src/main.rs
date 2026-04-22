@@ -1626,13 +1626,18 @@ async fn reload_all_configs(
         let path_owned = path.to_string();
         let join = tokio::task::spawn_blocking(move || reload_crl_file(&path_owned)).await;
         match join {
-            Ok(Ok(count)) => {
+            Ok(Ok(summary)) => {
+                #[cfg(feature = "metrics")]
+                if let Some(age) = summary.max_age_seconds {
+                    metrics::crl_age_seconds().set(age);
+                }
                 tracing::info!(
                     target: "audit",
                     event_type = "config.reload",
                     component = "crl",
                     result = "success",
-                    crl_count = count as u64,
+                    crl_count = summary.count as u64,
+                    crl_max_age_seconds = summary.max_age_seconds.unwrap_or_default(),
                     path = %path,
                     "CRL re-parsed (restart server to apply changes to active listener)"
                 );
@@ -1695,11 +1700,13 @@ async fn reload_all_configs(
     }
 }
 
-/// Read and parse a CRL PEM file. Returns the number of CRL entries on success.
+/// Read and parse a CRL PEM file. Returns a summary with the entry count
+/// and the age in seconds of the stalest CRL on success.
 ///
 /// Used by [`reload_all_configs`] to validate CRL files on SIGHUP without
-/// touching the live TLS listener.
-fn reload_crl_file(path: &str) -> anyhow::Result<usize> {
+/// touching the live TLS listener. The returned age is fed into the
+/// `rustgate_crl_age_seconds` gauge so operators alert on stale CRLs.
+fn reload_crl_file(path: &str) -> anyhow::Result<rustgate_transport::CrlFileSummary> {
     rustgate_transport::TlsConfig::validate_crl_file(path).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
