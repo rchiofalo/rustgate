@@ -453,6 +453,11 @@ async fn tick_or_never(ticker: Option<&mut Interval>) -> Instant {
 /// every `ping_interval`. Before sending, the last recorded Pong is
 /// consulted via `health_check.is_stale`; if the peer has been silent
 /// past the configured tolerance the session is terminated.
+// justification: seven inputs (write sink, two priority channels, codec,
+// byte cap, health-check config, last-pong timestamp) each represent a
+// distinct loop-local piece of state. Bundling into a struct would build
+// a single-use wrapper at the one call site in `handle_ws_session` and
+// move the fan-in upstream without reducing live references.
 #[allow(clippy::too_many_arguments)]
 async fn ws_write_loop(
     mut ws_write: SplitSink<WsStream, Message>,
