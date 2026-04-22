@@ -147,6 +147,10 @@ pub(crate) async fn build_tls_config(cli: &Cli) -> anyhow::Result<TlsConfigBuild
                 .await
                 .context("reading CRL file")?;
             tls_config = tls_config.with_crls(&crl_pem).context("loading CRL data")?;
+            #[cfg(feature = "metrics")]
+            if let Some(age) = tls_config.crl_max_age_seconds() {
+                crate::metrics::crl_age_seconds().set(age);
+            }
         }
 
         return Ok(TlsConfigBuild {
@@ -191,6 +195,10 @@ pub(crate) async fn build_tls_config(cli: &Cli) -> anyhow::Result<TlsConfigBuild
             .await
             .context("reading CRL file")?;
         tls_config = tls_config.with_crls(&crl_pem).context("loading CRL data")?;
+        #[cfg(feature = "metrics")]
+        if let Some(age) = tls_config.crl_max_age_seconds() {
+            crate::metrics::crl_age_seconds().set(age);
+        }
     }
 
     Ok(TlsConfigBuild {

@@ -234,14 +234,15 @@ impl TlsConfig {
     /// Re-read and validate a CRL PEM file from disk.
     ///
     /// Parses the PEM blocks, runs freshness checks, and emits the same
-    /// audit events that [`Self::with_crls`] does. Returns the number of
-    /// CRL entries found on success.
+    /// audit events that [`Self::with_crls`] does. Returns a
+    /// [`CrlFileSummary`] with the CRL count and the age (in seconds)
+    /// of the stalest CRL on success.
     ///
     /// Used by SIGHUP-driven config reload to detect operator errors in
     /// CRL files without restarting the server. The active TLS listener
     /// does not currently swap CRLs at runtime — applying CRL changes to
     /// in-flight handshakes still requires a server restart.
-    pub fn validate_crl_file(path: &str) -> Result<usize> {
+    pub fn validate_crl_file(path: &str) -> Result<CrlFileSummary> {
         let crl_pem = std::fs::read_to_string(path).map_err(|e| {
             RustgateError::from(ConfigError::Other(format!(
                 "failed to read CRL file {path}: {e}"
@@ -287,7 +288,10 @@ impl TlsConfig {
                 "CRL file contains stale entries (nextUpdate in the past)"
             );
         }
-        Ok(count)
+        Ok(CrlFileSummary {
+            count,
+            max_age_seconds: crl_max_age_seconds(&crls),
+        })
     }
 
     /// Get a clone of the loaded CRLs.
@@ -297,6 +301,64 @@ impl TlsConfig {
     pub fn crls(&self) -> &[CertificateRevocationListDer<'static>] {
         &self.crls
     }
+
+    /// Return the age in seconds of the oldest loaded CRL.
+    ///
+    /// Convenience wrapper around [`crl_max_age_seconds`] for callers
+    /// that already own a built `TlsConfig`. Returns `None` when no
+    /// CRLs are configured or when every loaded CRL fails to re-parse.
+    pub fn crl_max_age_seconds(&self) -> Option<i64> {
+        crl_max_age_seconds(&self.crls)
+    }
+}
+
+/// Result of [`TlsConfig::validate_crl_file`].
+///
+/// Carries the entry count plus the age in seconds of the stalest
+/// parsed CRL (the largest `now - thisUpdate` across all loaded
+/// entries). Callers wire the age into
+/// `rustgate_crl_age_seconds` so operators can alert when a CRL
+/// publisher has stopped refreshing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrlFileSummary {
+    /// Number of CRL PEM blocks parsed from the file.
+    pub count: usize,
+    /// Age in seconds of the stalest CRL's `thisUpdate`, or `None`
+    /// when none of the loaded entries could be re-parsed for the
+    /// `thisUpdate` timestamp (the freshness warning path has already
+    /// surfaced the parse failure).
+    pub max_age_seconds: Option<i64>,
+}
+
+/// Return the age in seconds of the "stalest" loaded CRL — the largest
+/// elapsed time since any CRL's `thisUpdate` field.
+///
+/// This is the worst-case freshness signal: if two CRLs are loaded and
+/// one was issued 1h ago and the other 3d ago, this returns 3d
+/// (≈259 200s). Operators wire this into a gauge like
+/// `rustgate_crl_age_seconds` and alert when it exceeds the CRL
+/// refresh SLO (typically 24h) to detect a CRL publisher that has
+/// stopped updating.
+///
+/// Returns `None` when the slice is empty or every entry fails to
+/// parse (so no meaningful age can be computed). Individual parse
+/// failures are silently skipped so a single malformed CRL does not
+/// erase the signal from sibling CRLs.
+pub fn crl_max_age_seconds(crls: &[CertificateRevocationListDer<'static>]) -> Option<i64> {
+    if crls.is_empty() {
+        return None;
+    }
+    let now_ts = ASN1Time::now().timestamp();
+    let mut max_age: Option<i64> = None;
+    for crl_der in crls {
+        if let Ok((_, crl)) = parse_x509_crl(crl_der.as_ref()) {
+            // x509-parser names the accessor `last_update()`; the
+            // ASN.1 field it returns is `thisUpdate` from RFC 5280 §5.1.
+            let age = now_ts.saturating_sub(crl.last_update().timestamp());
+            max_age = Some(max_age.map_or(age, |m| m.max(age)));
+        }
+    }
+    max_age
 }
 
 /// Check freshness of loaded CRLs by examining the `nextUpdate` field.
@@ -581,6 +643,59 @@ mod tests {
                 parse_kx_groups("X25519MLKEM768,SECP256R1MLKEM768,MLKEM768,MLKEM1024").unwrap();
             assert_eq!(groups.len(), 4);
             assert_eq!(groups[0].name(), rustls::NamedGroup::X25519MLKEM768);
+        }
+    }
+
+    mod crl_age {
+        use rustgate_test_utils::certs::TestCa;
+        use rustls_pki_types::pem::PemObject;
+
+        #[test]
+        fn empty_slice_returns_none() {
+            assert_eq!(super::super::crl_max_age_seconds(&[]), None);
+        }
+
+        #[test]
+        fn fresh_crl_reports_small_age() {
+            let ca = TestCa::new("crl-age-ca");
+            let client = ca.issue_client_cert("victim", &["alpha"]);
+            let crl_pem = ca.generate_crl(&[&client.cert_pem]);
+            let crls: Vec<_> =
+                rustls::pki_types::CertificateRevocationListDer::pem_slice_iter(crl_pem.as_bytes())
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .unwrap();
+            let age = super::super::crl_max_age_seconds(&crls).unwrap();
+            assert!((0..=60).contains(&age), "fresh CRL age {age}s out of band");
+        }
+
+        #[test]
+        fn malformed_crl_bytes_suppress_entry_but_keep_siblings() {
+            // Mix a real CRL with a bogus DER blob and confirm the real
+            // one still anchors the age. Ensures `crl_max_age_seconds`
+            // silently skips parse failures rather than collapsing the
+            // signal to `None` when even one sibling is valid.
+            let ca = TestCa::new("crl-age-sibling-ca");
+            let client = ca.issue_client_cert("victim", &["alpha"]);
+            let crl_pem = ca.generate_crl(&[&client.cert_pem]);
+            let real =
+                rustls::pki_types::CertificateRevocationListDer::pem_slice_iter(crl_pem.as_bytes())
+                    .next()
+                    .unwrap()
+                    .unwrap();
+
+            let bogus = rustls::pki_types::CertificateRevocationListDer::from(vec![
+                0x30, 0x00, // minimal SEQUENCE, not a valid CRL
+            ]);
+
+            let crls = vec![real, bogus];
+            let age = super::super::crl_max_age_seconds(&crls).unwrap();
+            assert!(age >= 0);
+        }
+
+        #[test]
+        fn all_unparseable_returns_none() {
+            let bogus = rustls::pki_types::CertificateRevocationListDer::from(vec![0x30, 0x00]);
+            assert_eq!(super::super::crl_max_age_seconds(&[bogus]), None);
         }
     }
 }

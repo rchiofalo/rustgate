@@ -139,6 +139,7 @@ static AUTHZ_CACHE_HITS: OnceLock<IntCounter> = OnceLock::new();
 static AUTHZ_CACHE_MISSES: OnceLock<IntCounter> = OnceLock::new();
 
 static ARCHIVE_BYTES: OnceLock<IntGauge> = OnceLock::new();
+static CRL_AGE_SECONDS: OnceLock<IntGauge> = OnceLock::new();
 static ENROLLMENT_RATE_LIMITED: OnceLock<IntCounter> = OnceLock::new();
 static ENROLLMENT_RATE_LIMIT_POISON: OnceLock<IntCounter> = OnceLock::new();
 static TENANT_QUOTA_REJECTIONS: OnceLock<IntCounterVec> = OnceLock::new();
@@ -513,6 +514,20 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(archive_bytes.clone()))?;
     let _ = ARCHIVE_BYTES.set(archive_bytes);
 
+    // Age of the stalest loaded CRL, in seconds. Set at startup after CRL
+    // parsing and refreshed on SIGHUP reload. A growing value means the
+    // CRL publisher has stopped refreshing; alert on >86400 (24h) to
+    // catch stalled revocation pipelines before cert lifecycles lapse.
+    let crl_age_seconds = IntGauge::with_opts(Opts::new(
+        "rustgate_crl_age_seconds",
+        "Seconds since the stalest loaded CRL's `thisUpdate` timestamp \
+         (maximum across all configured CRLs). Stays at 0 when no CRL is \
+         configured. Refreshed at startup and on SIGHUP. Alert on >86400 \
+         (24h) to detect CRL publishers that have stopped refreshing.",
+    ))?;
+    registry.register(Box::new(crl_age_seconds.clone()))?;
+    let _ = CRL_AGE_SECONDS.set(crl_age_seconds);
+
     let enrollment_rate_limited = IntCounter::with_opts(Opts::new(
         "rustgate_enrollment_rate_limited_total",
         "CSR signing requests rejected by the per-IP rate limiter",
@@ -813,6 +828,13 @@ pub fn spawn_federation_lag_updater(
 /// archive directory, refreshed by the rotation task).
 pub fn archive_bytes() -> &'static IntGauge {
     ARCHIVE_BYTES.get_or_init(|| fallback_gauge("rustgate_archive_bytes", "fallback"))
+}
+
+/// Returns the CRL-age gauge. The value is the age in seconds of the
+/// stalest loaded CRL's `thisUpdate` field. Refreshed at startup after
+/// CRL parsing and after every SIGHUP-driven CRL re-validation.
+pub fn crl_age_seconds() -> &'static IntGauge {
+    CRL_AGE_SECONDS.get_or_init(|| fallback_gauge("rustgate_crl_age_seconds", "fallback"))
 }
 
 // ── Accessor functions ──────────────────────────────────────────────
@@ -3159,5 +3181,64 @@ mod tests {
         let readiness = ReadinessState::new();
         let resp = readiness_response(&health, &readiness);
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn crl_age_gauge_registered_under_documented_name() {
+        ensure_init();
+        let families = prometheus::default_registry().gather();
+        let family = families
+            .iter()
+            .find(|mf| mf.name() == "rustgate_crl_age_seconds")
+            .expect("rustgate_crl_age_seconds not registered");
+        // Single time-series — no labels, matches the documented shape.
+        assert_eq!(family.get_metric().len(), 1);
+        assert!(family.get_metric()[0].get_label().is_empty());
+    }
+
+    #[test]
+    fn crl_age_gauge_set_and_read_roundtrip() {
+        ensure_init();
+        // Deliberately idempotent: restore prior value at end so parallel
+        // readiness tests observing the gauge see the baseline.
+        let prior = crl_age_seconds().get();
+        crl_age_seconds().set(12_345);
+        assert_eq!(crl_age_seconds().get(), 12_345);
+        crl_age_seconds().set(prior);
+    }
+
+    #[test]
+    fn crl_age_gauge_fed_by_tlsconfig_helper_for_real_crl() {
+        use rustgate_test_utils::certs::TestCa;
+
+        ensure_init();
+        let ca = TestCa::new("crl-age-server-ca");
+        let server = ca.issue_server_cert("server", &["localhost"]);
+        let client = ca.issue_client_cert("victim", &["alpha"]);
+        let crl_pem = ca.generate_crl(&[&client.cert_pem]);
+
+        // Go through the full production path: load into `TlsConfig`,
+        // read the age from the convenience method, then push it into
+        // the gauge. This is exactly the sequence setup.rs runs at
+        // startup.
+        let tls_config = rustgate_transport::TlsConfig::from_pem(
+            &server.cert_pem,
+            &server.key_pem,
+            &ca.cert_pem,
+        )
+        .expect("TlsConfig::from_pem");
+        let tls_config = tls_config.with_crls(&crl_pem).expect("with_crls");
+        let age = tls_config
+            .crl_max_age_seconds()
+            .expect("CRL just issued, expected Some(age)");
+        assert!(
+            (0..=60).contains(&age),
+            "fresh CRL age {age}s out of [0,60]"
+        );
+
+        let prior = crl_age_seconds().get();
+        crl_age_seconds().set(age);
+        assert_eq!(crl_age_seconds().get(), age);
+        crl_age_seconds().set(prior);
     }
 }
