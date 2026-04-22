@@ -294,4 +294,145 @@ mod tests {
             "Debug impl should emit the type name; got {rendered}"
         );
     }
+
+    #[test]
+    fn build_tls_config_missing_key_file_returns_io_error() {
+        // Complements `build_tls_config_missing_cert_file_returns_io_error`:
+        // if the key path does not resolve, std::fs::read propagates
+        // `NotFound` through `?` into `ClientError::Io` — the same branch
+        // as the cert path but via the `key` field of `TlsMaterial::PemFiles`.
+        let (ca, client) = fixture();
+        let mut cert_f = NamedTempFile::new().unwrap();
+        let mut ca_f = NamedTempFile::new().unwrap();
+        cert_f.write_all(client.cert_pem.as_bytes()).unwrap();
+        ca_f.write_all(ca.cert_pem.as_bytes()).unwrap();
+
+        let material = TlsMaterial::PemFiles {
+            cert: cert_f.path().to_path_buf(),
+            key: std::path::PathBuf::from("/definitely/does/not/exist/rustgate-client-key.pem"),
+            ca: ca_f.path().to_path_buf(),
+        };
+        match build_tls_config(&material) {
+            Err(ClientError::Io(io_err)) => {
+                assert_eq!(
+                    io_err.kind(),
+                    std::io::ErrorKind::NotFound,
+                    "missing key file must surface NotFound, got {io_err:?}",
+                );
+            }
+            other => panic!("expected Io(NotFound), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_tls_config_missing_ca_file_returns_io_error() {
+        // Mirror of the missing-cert / missing-key variants for the third
+        // `std::fs::read` call on the CA path — closes the last unguarded
+        // IO branch on the `TlsMaterial::PemFiles` leg.
+        let (_, client) = fixture();
+        let mut cert_f = NamedTempFile::new().unwrap();
+        let mut key_f = NamedTempFile::new().unwrap();
+        cert_f.write_all(client.cert_pem.as_bytes()).unwrap();
+        key_f.write_all(client.key_pem.as_bytes()).unwrap();
+
+        let material = TlsMaterial::PemFiles {
+            cert: cert_f.path().to_path_buf(),
+            key: key_f.path().to_path_buf(),
+            ca: std::path::PathBuf::from("/definitely/does/not/exist/rustgate-client-ca.pem"),
+        };
+        match build_tls_config(&material) {
+            Err(ClientError::Io(io_err)) => {
+                assert_eq!(
+                    io_err.kind(),
+                    std::io::ErrorKind::NotFound,
+                    "missing CA file must surface NotFound, got {io_err:?}",
+                );
+            }
+            other => panic!("expected Io(NotFound), got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Dial + Stream path — the builder prevents `plaintext=false`
+    // without TLS material at build time, but `dial_inner` also guards
+    // the same invariant at run time as defense in depth. A direct
+    // construction bypasses the builder so we can exercise the `dial_
+    // inner` guard directly rather than hoping the builder check never
+    // drifts away from it.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn dial_without_tls_on_non_plaintext_config_returns_missing_field() {
+        // Spawn a throwaway local TCP listener so `TcpStream::connect`
+        // itself succeeds — the `MissingField("tls")` branch fires only
+        // *after* the TCP connect returns.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let accept_task = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let cfg = crate::ClientConfig {
+            server_addr: addr,
+            server_name: "localhost".into(),
+            tls: None,
+            codec: crate::Codec::LengthPrefixed4,
+            plaintext: false,
+            connect_timeout: None,
+            reconnect: None,
+        };
+        match dial(&cfg).await {
+            Err(ClientError::MissingField(field)) => {
+                assert_eq!(field, "tls", "expected `tls` missing-field token");
+            }
+            Err(other) => panic!("expected MissingField(\"tls\"), got Err({other:?})"),
+            Ok(_) => panic!("expected MissingField(\"tls\"), got Ok(_)"),
+        }
+        let _ = accept_task.await;
+    }
+
+    #[tokio::test]
+    async fn dial_plaintext_connects_and_stream_round_trips_bytes() {
+        // End-to-end happy path for the plaintext branch: spawn a local
+        // TCP listener that echoes one frame back, dial with
+        // `plaintext=true`, then exercise the `Stream::Plain` AsyncRead
+        // + AsyncWrite + flush impls by round-tripping bytes through
+        // them. A refactor that broke any of the delegating
+        // `std::pin::Pin::new(s).poll_*` branches for the Plain variant
+        // would fail here before integration tests pick it up.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let echo_task = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4];
+            sock.read_exact(&mut buf).await.unwrap();
+            sock.write_all(&buf).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+
+        let cfg = crate::ClientConfig {
+            server_addr: addr,
+            server_name: "localhost".into(),
+            tls: None,
+            codec: crate::Codec::LengthPrefixed4,
+            plaintext: true,
+            connect_timeout: Some(std::time::Duration::from_secs(5)),
+            reconnect: None,
+        };
+        let mut stream = dial(&cfg).await.expect("plaintext dial must succeed");
+        stream.write_all(b"ping").await.unwrap();
+        stream.flush().await.unwrap();
+        let mut out = [0u8; 4];
+        stream.read_exact(&mut out).await.unwrap();
+        assert_eq!(&out, b"ping");
+
+        // Clean shutdown exercises the Plain variant's poll_shutdown
+        // branch — a regression that stubbed that arm would surface as
+        // a hang or an error here.
+        stream.shutdown().await.unwrap();
+
+        echo_task.await.unwrap();
+    }
 }
