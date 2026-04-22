@@ -647,3 +647,404 @@ async fn ws_write_loop(
 
     Ok(())
 }
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used, unused_results)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    use rustgate_core::codec::Codec;
+    use rustgate_test_utils::certs::TestCa;
+    use rustgate_transport::{Router, TlsConfig};
+    use tokio::sync::{Notify, Semaphore};
+
+    use super::*;
+    use crate::WsListener;
+    use crate::health::HealthCheckConfig;
+
+    // ------------------------------------------------------------------
+    // These tests exercise the lifecycle surface of `WebSocketServer::run`
+    // and the type-alias / Debug / Default contracts of the surrounding
+    // configuration types. The integration suite under `tests/ws_server.rs`
+    // (12 tests) already covers the full handshake + upgrade + framing
+    // path end-to-end, so here we pin the bits that integration coverage
+    // cannot see without spinning up a full TLS + upgrade + mTLS stack:
+    // Debug derives, callback trait bounds, shutdown responsiveness of
+    // the accept loop, and the pure async helper `tick_or_never`.
+    // ------------------------------------------------------------------
+
+    /// Build a server-side `TlsConfig` using a throw-away test CA.
+    fn test_tls_config(label: &str) -> TlsConfig {
+        let ca = TestCa::new(label);
+        let server = ca.issue_server_cert("localhost", &["localhost"]);
+        TlsConfig::from_pem(&server.cert_pem, &server.key_pem, &ca.cert_pem)
+            .expect("build TlsConfig from freshly issued test certs")
+    }
+
+    fn loopback_zero() -> SocketAddr {
+        "127.0.0.1:0"
+            .parse()
+            .expect("static loopback address must parse")
+    }
+
+    /// Minimal stub codec that is only ever asked for its `protocol_id`
+    /// during Debug rendering and never exercised on the wire. A full
+    /// `LengthPrefixedCodec` would drag `rustgate-transport`'s codec
+    /// stack into these tests without paying for its weight.
+    #[derive(Debug)]
+    struct NoopCodec;
+
+    impl Codec for NoopCodec {
+        fn protocol_id(&self) -> &'static str {
+            "noop-test"
+        }
+        fn framing(&self) -> rustgate_core::protocol::FramingStrategy {
+            rustgate_core::protocol::FramingStrategy::LineDelimited
+        }
+        fn decode_payload(&self, frame: bytes::BytesMut) -> std::io::Result<bytes::Bytes> {
+            Ok(frame.freeze())
+        }
+        fn encode_payload(&self, msg: &RoutableMessage) -> std::io::Result<bytes::Bytes> {
+            Ok(msg.payload.clone())
+        }
+        fn detect(&self, _prefix: &[u8]) -> f32 {
+            0.0
+        }
+    }
+
+    /// Assemble a `WsServerConfig` bound to a fresh loopback port.
+    ///
+    /// No clients connect during these tests, so the accept loop parks on
+    /// the select. This keeps each test focused on lifecycle semantics
+    /// (Debug surface, shutdown responsiveness) rather than handshake
+    /// mechanics.
+    fn build_config(shutdown: Arc<Notify>, label: &str) -> WsServerConfig {
+        let tls = test_tls_config(label);
+        let listener = WsListener::bind(loopback_zero(), &tls).expect("bind WsListener");
+        WsServerConfig {
+            listener,
+            router: Arc::new(Router::default()),
+            connection_limit: Arc::new(Semaphore::new(1)),
+            codec: Arc::new(NoopCodec),
+            nats_publish: None,
+            fed_forward: None,
+            http_forward: None,
+            throttle_config: None,
+            replay_filter: None,
+            circuit_breaker_threshold: 0,
+            ws_max_frames_per_sec: 0,
+            ws_max_bytes_per_sec: 0,
+            ws_max_violations: 0,
+            max_write_buffer_bytes: DEFAULT_MAX_WRITE_BUFFER_BYTES,
+            health_check: HealthCheckConfig::DISABLED,
+            session_hooks: None,
+            shutdown,
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Trait bounds — pin the `Debug` derive on `WebSocketServer` and the
+    // operator-observable default buffer cap. A refactor that dropped
+    // either would land as a compile error or a silent drift in operator
+    // expectations, neither of which integration tests would flag.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn server_type_is_debug() {
+        fn assert_debug<T: std::fmt::Debug>() {}
+        assert_debug::<WebSocketServer>();
+    }
+
+    #[test]
+    fn server_debug_renders_struct_name() {
+        assert_eq!(format!("{:?}", WebSocketServer), "WebSocketServer");
+    }
+
+    #[test]
+    fn default_max_write_buffer_bytes_is_four_mib() {
+        // 4 MiB is the documented slow-consumer cap. Changing it affects
+        // every WebSocket session's memory accounting; a silent drift
+        // would surface only under production load where memory pressure
+        // would already be hurting.
+        assert_eq!(DEFAULT_MAX_WRITE_BUFFER_BYTES, 4 * 1024 * 1024);
+        assert_eq!(DEFAULT_MAX_WRITE_BUFFER_BYTES, 4_194_304);
+    }
+
+    // ------------------------------------------------------------------
+    // Callback type aliases — every cross-thread callback must satisfy
+    // `Send + Sync + 'static` so it can be cloned into spawned tasks
+    // without re-boxing. Compile-time assertions here mean a refactor
+    // that narrowed any bound lands as a failure at this file, not at a
+    // transitive call site in `rustgate-server::setup`.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn on_nats_publish_type_is_send_sync_arc_fn() {
+        fn assert_bounds<T: Send + Sync + 'static>(_: &T) {}
+        let cb: OnNatsPublish = Arc::new(|_msg: RoutableMessage| {});
+        assert_bounds(&cb);
+    }
+
+    #[test]
+    fn on_federation_forward_type_is_send_sync_arc_fn() {
+        fn assert_bounds<T: Send + Sync + 'static>(_: &T) {}
+        let cb: OnFederationForward =
+            Arc::new(|_b: Bytes, _g: Vec<String>, _m: rustgate_core::message::Metadata| {});
+        assert_bounds(&cb);
+    }
+
+    #[test]
+    fn on_http_forward_type_is_send_sync_arc_fn() {
+        fn assert_bounds<T: Send + Sync + 'static>(_: &T) {}
+        let cb: OnHttpForward = Arc::new(|_msg: RoutableMessage| {});
+        assert_bounds(&cb);
+    }
+
+    #[test]
+    fn on_ws_accept_type_is_send_sync_arc_fn() {
+        fn assert_bounds<T: Send + Sync + 'static>(_: &T) {}
+        let cb: OnWsAcceptFn = Arc::new(|| {});
+        assert_bounds(&cb);
+    }
+
+    #[test]
+    fn on_ws_reject_type_is_send_sync_arc_fn() {
+        fn assert_bounds<T: Send + Sync + 'static>(_: &T) {}
+        let cb: OnWsRejectFn = Arc::new(|| {});
+        assert_bounds(&cb);
+    }
+
+    // ------------------------------------------------------------------
+    // `WsSessionHooks` — pin Default (both callbacks None), manual Debug
+    // rendering (so a `tracing::debug!(?config, …)` call site never leaks
+    // a raw closure pointer), and Clone sharing (no Arc-in-Arc wrapping).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn session_hooks_default_has_no_callbacks_installed() {
+        let hooks = WsSessionHooks::default();
+        assert!(hooks.on_connection_accept.is_none());
+        assert!(hooks.on_connection_rejected.is_none());
+    }
+
+    #[test]
+    fn session_hooks_debug_renders_bool_sentinels_for_none() {
+        let rendered = format!("{:?}", WsSessionHooks::default());
+        // The manual Debug impl collapses each callback field to
+        // `.is_some()` so the rendered output carries `false` when
+        // neither is installed. Pin both tokens so a regression that
+        // accidentally printed the raw Option (which would try to render
+        // the non-Debug `Arc<dyn Fn>` and fail to compile) is caught.
+        assert!(
+            rendered.contains("on_connection_accept: false"),
+            "expected `on_connection_accept: false` sentinel, got: {rendered}",
+        );
+        assert!(
+            rendered.contains("on_connection_rejected: false"),
+            "expected `on_connection_rejected: false` sentinel, got: {rendered}",
+        );
+    }
+
+    #[test]
+    fn session_hooks_debug_renders_true_when_callbacks_installed() {
+        let hooks = WsSessionHooks {
+            on_connection_accept: Some(Arc::new(|| {})),
+            on_connection_rejected: Some(Arc::new(|| {})),
+        };
+        let rendered = format!("{hooks:?}");
+        assert!(rendered.contains("on_connection_accept: true"));
+        assert!(rendered.contains("on_connection_rejected: true"));
+    }
+
+    #[test]
+    fn session_hooks_clone_shares_inner_arc() {
+        // `WsSessionHooks` derives `Clone` so the server crate can hand
+        // it by value into every session spawn without bumping
+        // `Arc`-of-`Arc` indirection. Verify that cloning preserves
+        // strong_count sharing rather than creating a new arc.
+        let inner: OnWsAcceptFn = Arc::new(|| {});
+        let hooks = WsSessionHooks {
+            on_connection_accept: Some(Arc::clone(&inner)),
+            on_connection_rejected: None,
+        };
+        let initial = Arc::strong_count(&inner);
+        let cloned = hooks.clone();
+        assert_eq!(
+            Arc::strong_count(&inner),
+            initial + 1,
+            "cloning hooks must bump the inner Arc's strong count",
+        );
+        drop(cloned);
+        assert_eq!(
+            Arc::strong_count(&inner),
+            initial,
+            "dropping the clone must restore the original strong count",
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // `WsServerConfig::Debug` — operators depend on this rendering in
+    // startup log lines. Pin that Debug does not leak the router's inner
+    // state (rendered as `<Router>`) or the codec's live trait object
+    // (rendered as its `protocol_id`). Either regression would surface
+    // as a sudden deluge of noise in operator logs.
+    // ------------------------------------------------------------------
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn config_debug_redacts_router_and_renders_codec_id() {
+        let shutdown = Arc::new(Notify::new());
+        let config = build_config(shutdown, "ws-config-debug");
+        let rendered = format!("{config:?}");
+        assert!(
+            rendered.contains("<Router>"),
+            "Debug must redact Router inner state, got: {rendered}",
+        );
+        assert!(
+            rendered.contains("noop-test"),
+            "Debug must render codec protocol_id, got: {rendered}",
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // `tick_or_never` — pure async helper that parks forever on `None`
+    // and ticks on `Some`. The write loop relies on `None` keeping the
+    // select-arm disarmed without ever completing. A regression that
+    // resolved immediately on `None` would flood the write loop with
+    // spurious Ping dispatches.
+    // ------------------------------------------------------------------
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tick_or_never_with_none_never_resolves() {
+        // Bound the non-resolution check with a short timeout — if
+        // the future resolved spuriously, the `expect_err` would fail
+        // and the test would flag the regression.
+        let result = tokio::time::timeout(Duration::from_millis(50), tick_or_never(None)).await;
+        assert!(
+            result.is_err(),
+            "tick_or_never(None) must never resolve — got: {result:?}",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tick_or_never_with_some_returns_after_interval_elapses() {
+        // Use a 1ms interval so the first tick fires immediately (the
+        // initial tick from `tokio::time::interval` completes
+        // instantly), then the helper resolves. Bound by a 500ms
+        // timeout so a regression that never ticked would flag.
+        let mut interval = tokio::time::interval(Duration::from_millis(1));
+        let _initial = tokio::time::timeout(
+            Duration::from_millis(500),
+            tick_or_never(Some(&mut interval)),
+        )
+        .await
+        .expect("tick_or_never(Some) must resolve within the timeout");
+    }
+
+    // ------------------------------------------------------------------
+    // Shutdown responsiveness — the accept loop `tokio::select!`s on
+    // `listener.accept()` and `shutdown.notified()`. These tests pin
+    // that the shutdown branch wins deterministically when no client is
+    // connecting, so operator-initiated SIGTERM translates into a clean
+    // drain rather than a hang waiting for an accept that will never
+    // arrive.
+    // ------------------------------------------------------------------
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_returns_immediately_when_shutdown_pre_notified() {
+        // `tokio::sync::Notify` stores one permit — a `notify_one`
+        // before spawn means the first `notified()` poll inside the
+        // select completes without ever parking.
+        let shutdown = Arc::new(Notify::new());
+        shutdown.notify_one();
+        let config = build_config(Arc::clone(&shutdown), "ws-server-pre-notified");
+
+        tokio::time::timeout(Duration::from_secs(5), WebSocketServer::run(config))
+            .await
+            .expect("WebSocketServer::run must exit when shutdown was notified before spawn");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_returns_when_shutdown_fires_after_spawn() {
+        let shutdown = Arc::new(Notify::new());
+        let config = build_config(Arc::clone(&shutdown), "ws-server-post-notified");
+
+        let handle = tokio::spawn(WebSocketServer::run(config));
+        // One yield is enough under current_thread flavour to let the
+        // spawned task advance past the setup and park on the select.
+        tokio::task::yield_now().await;
+        shutdown.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("run must exit within timeout after shutdown is notified")
+            .expect("run task must not panic during shutdown");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_notify_is_observed_by_cloned_external_handle() {
+        // Pin the contract that the `Arc<Notify>` handed to
+        // `WsServerConfig` is the *same* handle the run loop awaits —
+        // cloning before the move must not detach the outside holder.
+        // A regression here would break `rustgate-server`'s
+        // `stop_subsystem` driver silently.
+        let shutdown = Arc::new(Notify::new());
+        let external = Arc::clone(&shutdown);
+        let config = build_config(shutdown, "ws-server-cloned-notify");
+
+        let handle = tokio::spawn(WebSocketServer::run(config));
+        tokio::task::yield_now().await;
+        external.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("external Arc<Notify> must still trigger shutdown")
+            .expect("run task must not panic when notified via the cloned Arc");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_exits_cleanly_with_observers_installed() {
+        // Install panicking observers that *must not* fire on a clean
+        // shutdown with no inbound clients. A future refactor that
+        // accidentally fired the callbacks on the shutdown branch
+        // would panic the spawned task.
+        let shutdown = Arc::new(Notify::new());
+        let tls = test_tls_config("ws-server-observers");
+        let listener = WsListener::bind(loopback_zero(), &tls).expect("bind");
+        let config = WsServerConfig {
+            listener,
+            router: Arc::new(Router::default()),
+            connection_limit: Arc::new(Semaphore::new(1)),
+            codec: Arc::new(NoopCodec),
+            nats_publish: None,
+            fed_forward: None,
+            http_forward: None,
+            throttle_config: None,
+            replay_filter: None,
+            circuit_breaker_threshold: 0,
+            ws_max_frames_per_sec: 0,
+            ws_max_bytes_per_sec: 0,
+            ws_max_violations: 0,
+            max_write_buffer_bytes: DEFAULT_MAX_WRITE_BUFFER_BYTES,
+            health_check: HealthCheckConfig::DISABLED,
+            session_hooks: Some(WsSessionHooks {
+                on_connection_accept: Some(Arc::new(|| {
+                    panic!("on_connection_accept must not fire on clean shutdown with no clients")
+                })),
+                on_connection_rejected: Some(Arc::new(|| {
+                    panic!("on_connection_rejected must not fire on clean shutdown with no clients")
+                })),
+            }),
+            shutdown: Arc::clone(&shutdown),
+        };
+
+        let handle = tokio::spawn(WebSocketServer::run(config));
+        tokio::task::yield_now().await;
+        shutdown.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("run must terminate with observers installed")
+            .expect("run task must not panic on shutdown with no accept / reject events");
+    }
+}
