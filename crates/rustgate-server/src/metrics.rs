@@ -54,6 +54,12 @@ pub type AclApiHandler = Arc<
 ///
 /// Used as the default value for `--metrics-max-connections` in the CLI
 /// and by test helpers.
+// justification: `pub(crate)` so the CLI layer and integration tests can
+// reference it, but without `--features metrics` the `serve` entrypoint
+// below is cfg-gated out and nothing reads this constant. Rather than
+// cfg-gating the const itself (and forcing every test to mirror the cfg
+// arms on `default = DEFAULT_MAX_HTTP_CONNECTIONS`), we allow it unread
+// in the unfeatured build.
 #[allow(dead_code)]
 pub(crate) const DEFAULT_MAX_HTTP_CONNECTIONS: usize = 128;
 

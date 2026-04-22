@@ -223,7 +223,11 @@ pub fn enrollment_auth_failed(peer: &str) {
 }
 
 /// Record a federation API configuration change.
-#[allow(dead_code)] // Wired when federation config API is added
+// justification: staged for the federation config API (issue #778 follow-up)
+// which lands in a separate PR; exporting it now lets callers wire the audit
+// emission without a second round-trip through this crate when the feature
+// flips on.
+#[allow(dead_code)]
 pub fn federation_config_changed(actor: &str, action: &str, peer_id: &PeerId) {
     audit!(
         "federation.config_changed",
@@ -353,6 +357,11 @@ pub fn spiffe_svid_refresh_failure(error: &str) {
 /// Emitted by the router's policy enforcement point whenever an installed
 /// [`PolicyEngine`](https://docs.rs/rustgate-authz) returns a Deny verdict,
 /// including when the default effect denies an unmatched request.
+// justification: seven args mirror the deny-record schema required by the
+// compliance tooling downstream (subject CN + fingerprint, action, resource
+// kind + id, optional rule id, policy id). A struct literal here would add
+// construction noise to every call site in the router's hot PEP path without
+// changing what ends up on the wire.
 #[allow(clippy::too_many_arguments)]
 pub fn authz_denied(
     subject_cn: &str,
