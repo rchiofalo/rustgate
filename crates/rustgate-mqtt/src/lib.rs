@@ -32,6 +32,15 @@ mod server;
 mod session;
 mod topic;
 
+/// Canonical value of the `transport` structured-log field emitted by every
+/// session-lifecycle event in this crate.
+///
+/// Exposed as a named constant (not a magic string) so downstream consumers
+/// grep for the exact token their log aggregator is configured against, and
+/// so a future rename surfaces as a single-point diff rather than a silent
+/// dashboard regression.
+pub const TRANSPORT_LABEL: &str = "mqtt";
+
 pub use config::MqttServerConfig;
 pub use error::MqttError;
 pub use listener::MqttListener;

@@ -24,6 +24,7 @@ use rustgate_transport::{
 use tokio::sync::{OwnedSemaphorePermit, mpsc};
 use tracing::{debug, info, warn};
 
+use crate::TRANSPORT_LABEL;
 use crate::error::MqttError;
 use crate::listener::MqttPreSession;
 use crate::packet::{MqttPacket, PacketCodec, PacketReader, PacketWriter, ProtocolLevel};
@@ -79,6 +80,7 @@ impl ClientIdRegistry {
             // chars) but we still hash them for PII-safe production logs.
             // `client_id` is untrusted — keep the CR/LF-safe sanitizer.
             warn!(
+                transport = TRANSPORT_LABEL,
                 client_id = %sanitize_for_log(client_id),
                 existing_cn = %hash_cn(existing_cn),
                 new_cn = %hash_cn(cn),
@@ -202,6 +204,7 @@ pub(crate) async fn handle_mqtt_session(
     };
 
     info!(
+        transport = TRANSPORT_LABEL,
         peer = %peer_addr,
         cn = %hash_cn(&cn),
         groups = ?identity.groups,
@@ -223,6 +226,7 @@ pub(crate) async fn handle_mqtt_session(
     let filtered_count = before - buffered.len();
     if filtered_count > 0 {
         info!(
+            transport = TRANSPORT_LABEL,
             cn = %hash_cn(&cn),
             filtered = filtered_count,
             delivered = buffered.len(),
@@ -230,7 +234,11 @@ pub(crate) async fn handle_mqtt_session(
         );
     }
     if !router.register(handle.clone()).await {
-        warn!(cn = %hash_cn(&cn), "connection rejected: tenant quota exceeded");
+        warn!(
+            transport = TRANSPORT_LABEL,
+            cn = %hash_cn(&cn),
+            "connection rejected: tenant quota exceeded",
+        );
         rustgate_core::audit::connection_rejected(peer_addr, "tenant quota exceeded");
         return;
     }
@@ -294,7 +302,12 @@ pub(crate) async fn handle_mqtt_session(
     }
 
     router.unregister(&cn, session_id).await;
-    info!(cn = %hash_cn(&cn), peer = %peer_addr, "MQTT session ended");
+    info!(
+        transport = TRANSPORT_LABEL,
+        cn = %hash_cn(&cn),
+        peer = %peer_addr,
+        "MQTT session ended",
+    );
 }
 
 /// Perform the MQTT CONNECT handshake.
