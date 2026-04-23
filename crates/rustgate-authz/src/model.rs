@@ -483,7 +483,7 @@ mod model_tests {
     //! has load-bearing invariants that the existing
     //! `subject_hash_tests` suite does not cover.
 
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
 
     use super::*;
 
@@ -763,9 +763,4 @@ mod model_tests {
         fn assert_bounds<T: Copy + Eq + std::hash::Hash>() {}
         assert_bounds::<SubjectHash>();
     }
-
-    // ── BTreeMap param for the `identity` helper in this module ────
-    // (silences unused-import warnings if rustc ever flags it).
-    #[allow(dead_code)]
-    fn _suppress_unused_btreemap(_: BTreeMap<String, rustgate_core::AttrValue>) {}
 }
