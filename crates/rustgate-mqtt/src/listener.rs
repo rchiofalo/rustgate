@@ -354,4 +354,180 @@ mod tests {
         fn assert_debug<T: std::fmt::Debug>() {}
         assert_debug::<MqttPreSession>();
     }
+
+    // ------------------------------------------------------------------
+    // Rate-limit constants — tight numeric pins. The threat-model D8
+    // guidance and the module-level doc comment both quote the "10
+    // attempts per 10 s window" figure; any silent drift here is a
+    // policy regression that must go through review.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn conn_rate_limit_constant_matches_documented_value() {
+        assert_eq!(
+            super::CONN_RATE_LIMIT,
+            10,
+            "CONN_RATE_LIMIT drift — threat-model D8 and the ops runbooks \
+             quote 10 connection attempts per window; loosening this pin \
+             is a deliberate policy change and must not happen silently",
+        );
+    }
+
+    #[test]
+    fn conn_rate_window_constant_matches_documented_value() {
+        assert_eq!(
+            super::CONN_RATE_WINDOW,
+            Duration::from_secs(10),
+            "CONN_RATE_WINDOW drift — the sliding-window duration must stay \
+             at 10 s so CONN_RATE_LIMIT has the documented meaning",
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // IPv6 bind path — rustgate-mqtt is deployed behind proxies and on
+    // dual-stack hosts, so the v6 branch of `Domain::for_address(addr)`
+    // must work for a loopback address as well as v4. Binding alone
+    // does not require a valid TLS handshake, so the shared test CA
+    // (v4 SANs only) is sufficient here.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn bind_supports_ipv6_loopback_address_family() {
+        let ipv6: SocketAddr = "[::1]:0"
+            .parse()
+            .expect("static v6 loopback address must parse");
+        let listener = MqttListener::bind(ipv6, &test_tls_config())
+            .expect("bind to [::1]:0 must succeed on a host with IPv6 enabled");
+        let addr = listener.local_addr().expect("local_addr");
+        assert!(
+            addr.is_ipv6(),
+            "listener bound to [::1]:0 should report an IPv6 local_addr, got {addr}",
+        );
+        assert!(
+            addr.ip().is_loopback(),
+            "listener bound to [::1]:0 should report a loopback local_addr, got {}",
+            addr.ip(),
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Debug redaction — the listener ends up printed by `tracing::info!`
+    // at startup and by various diagnostic paths; raw TLS material
+    // (acceptor internals, `ServerConfig`, PEM bytes) must never make
+    // it to a log sink that could be aggregated to a less-privileged
+    // collector. Asserting absence of specific tokens is a defensive
+    // pin — the current Debug impl only prints `local_addr` and
+    // `conn_rate`, but a well-meaning derive(Debug) or an added field
+    // could regress that invariant silently.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn debug_impl_does_not_leak_tls_material() {
+        let listener = MqttListener::bind(loopback_zero(), &test_tls_config()).expect("bind");
+        let rendered = format!("{listener:?}");
+        for leak in ["TlsAcceptor", "ServerConfig", "-----BEGIN"] {
+            assert!(
+                !rendered.contains(leak),
+                "MqttListener Debug output must not leak TLS material — \
+                 found {leak:?} in: {rendered}",
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Compile-time trait bounds — the listener is held by server code
+    // and moved into `tokio::spawn` futures, so it must stay
+    // `Send + Sync`. `MqttPreSession` crosses the accept/drain boundary
+    // into a per-session task and must stay `Send`. These are
+    // zero-runtime-cost pins that fail at compile time if a field
+    // regresses onto a non-`Send` type (`Rc`, `RefCell`, raw pointers).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn listener_type_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<MqttListener>();
+    }
+
+    #[test]
+    fn pre_session_type_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<MqttPreSession>();
+    }
+
+    // ------------------------------------------------------------------
+    // Field visibility — the MQTT session layer destructures
+    // `MqttPreSession` (`let MqttPreSession { identity, stream,
+    // peer_addr } = pre;`) to take ownership of each field. Regressing
+    // any field to private or renaming one would break the consumer
+    // without a clear error surface here. The closure is coerced to an
+    // `fn` pointer so the compiler type-checks it even though we have
+    // no real TLS stream to call it with.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn pre_session_fields_are_destructurable_from_within_crate() {
+        let _probe: fn(MqttPreSession) -> (Arc<Identity>, TlsStream, SocketAddr) =
+            |pre| (pre.identity, pre.stream, pre.peer_addr);
+    }
+
+    #[test]
+    fn pre_session_identity_is_arc_wrapped_for_shared_ownership() {
+        // Pin the identity field to `Arc<Identity>` — the session task
+        // and the router both hold references to the identity, so
+        // anything less than `Arc` would force a deep clone on the hot
+        // path and silently regress connect latency.
+        let _probe: fn(MqttPreSession) -> Arc<Identity> = |pre| pre.identity;
+    }
+
+    // ------------------------------------------------------------------
+    // Accept → Ok(None) on client-side TCP drop before the TLS record
+    // layer starts. This is the quiet-failure path that lets callers
+    // loop without `panic!` or `?` noise when misbehaving clients
+    // churn the socket. We drive a real kernel-level TCP handshake
+    // followed by an immediate drop, so the server-side TLS read
+    // observes EOF and the accept loop converts that into `Ok(None)`
+    // at line 130 (`Ok(Err(e))` arm). Without this test a future
+    // refactor could accidentally upgrade the branch to a hard error
+    // and take down the listener on the first rude client.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn accept_returns_ok_none_after_client_drops_before_tls_handshake() {
+        let listener = MqttListener::bind(loopback_zero(), &test_tls_config()).expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+
+        // Spawn the accept future first so the TCP SYN lands on a
+        // socket that is already in the accept queue.
+        let accept_fut = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(5), listener.accept()).await
+        });
+
+        // Client side: complete the TCP handshake, then immediately
+        // drop the stream without writing any TLS ClientHello bytes.
+        // The server-side `acceptor.accept(...)` will observe EOF and
+        // return an `io::Error`, which the accept loop converts to
+        // `Ok(None)`.
+        let stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("client TCP connect must succeed against a live listener");
+        drop(stream);
+
+        let result = accept_fut
+            .await
+            .expect("accept task should join without panicking")
+            .expect("accept should finish well before the 5 s test bound");
+
+        match result {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!(
+                "expected Ok(None) after the client dropped the TCP stream \
+                 before sending ClientHello; got Ok(Some(_))",
+            ),
+            Err(e) => panic!(
+                "expected Ok(None) on a failed TLS handshake, got Err({e}) — \
+                 the accept loop must keep the listener alive on rude clients",
+            ),
+        }
+    }
 }
