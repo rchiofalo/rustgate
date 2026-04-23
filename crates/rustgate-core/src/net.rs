@@ -101,4 +101,154 @@ mod tests {
         // error is the extent of what we can assert cross-platform.
         assert!(SockRef::from(&server).tcp_nodelay().unwrap());
     }
+
+    #[test]
+    fn keepalive_idle_and_interval_constants_pin_rustgate_defaults() {
+        // Pin the keepalive timing contract so an accidental edit of the
+        // durations at the top of the file fails here rather than silently
+        // shifting every production TCP listener onto a different dead-
+        // connection detection curve. 30s idle + 10s interval means a
+        // genuinely dead peer is detected in ≈40s-plus, which is the shape
+        // rustgate's tactical deployments (NAT middleboxes with short UDP
+        // timeouts, flaky satcom) depend on; doubling the idle time would
+        // halve the liveness signal and push dead-peer cleanup past the
+        // federation-heartbeat budget (see FEDERATION_HEARTBEAT_TIMEOUT).
+        assert_eq!(super::TCP_KEEPALIVE_IDLE, Duration::from_secs(30));
+        assert_eq!(super::TCP_KEEPALIVE_INTERVAL, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn tcp_nodelay_starts_disabled_so_configure_is_not_a_no_op() {
+        use socket2::SockRef;
+
+        // Defensive: if a future OS ever ships sockets with Nagle already
+        // disabled by default, every nodelay assertion in this file would
+        // become vacuously true (passes whether or not the helper runs).
+        // This test fails loudly in that case so we know to redesign the
+        // positive-path tests rather than trust them silently.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+
+        assert!(
+            !SockRef::from(&server).tcp_nodelay().unwrap(),
+            "fresh accepted TCP sockets should have Nagle enabled (TCP_NODELAY=false)"
+        );
+        assert!(
+            !SockRef::from(&client).tcp_nodelay().unwrap(),
+            "fresh connected TCP sockets should have Nagle enabled (TCP_NODELAY=false)"
+        );
+    }
+
+    #[test]
+    fn configure_tcp_keepalive_enables_so_keepalive_flag() {
+        use socket2::SockRef;
+
+        // The keepalive helper is the load-bearing half of the dead-peer
+        // signal — `configure_tactical_socket` explicitly composes it
+        // with nodelay, and every accepted TCP stream in the workspace
+        // routes through one of those two entry points. Pin that the
+        // SO_KEEPALIVE flag is actually set (cross-platform accessor),
+        // not just that the call did not error.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+
+        // Sanity: fresh sockets do not have SO_KEEPALIVE enabled, so a
+        // helper that silently no-ops would be caught here.
+        assert!(
+            !SockRef::from(&server).keepalive().unwrap(),
+            "fresh accepted TCP sockets should have SO_KEEPALIVE disabled by default"
+        );
+
+        configure_tcp_keepalive(&server);
+        configure_tcp_keepalive(&client);
+
+        assert!(
+            SockRef::from(&server).keepalive().unwrap(),
+            "configure_tcp_keepalive must enable SO_KEEPALIVE on the server socket"
+        );
+        assert!(
+            SockRef::from(&client).keepalive().unwrap(),
+            "configure_tcp_keepalive must enable SO_KEEPALIVE on the client socket"
+        );
+    }
+
+    #[test]
+    fn tactical_socket_enables_both_so_keepalive_and_tcp_nodelay_observably() {
+        use socket2::SockRef;
+
+        // End-to-end pin on the combined helper: the F-151 / #745
+        // regression was that listeners set keepalive but forgot
+        // `TCP_NODELAY`, paying a ~40ms Nagle+DELACK penalty per
+        // tactical message. `configure_tactical_socket` exists precisely
+        // to make the "keepalive + nodelay" pair atomic at every call
+        // site, so we must assert both observables after a single call.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = std::net::TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+
+        configure_tactical_socket(&server);
+
+        let sock = SockRef::from(&server);
+        assert!(
+            sock.keepalive().unwrap(),
+            "configure_tactical_socket must enable SO_KEEPALIVE"
+        );
+        assert!(
+            sock.tcp_nodelay().unwrap(),
+            "configure_tactical_socket must enable TCP_NODELAY"
+        );
+    }
+
+    #[test]
+    fn tactical_socket_is_idempotent_on_repeated_calls() {
+        use socket2::SockRef;
+
+        // The helpers are called by shared code paths (session spawns,
+        // cert reloads, reconnection loops) that can plausibly run more
+        // than once against the same live socket; there is no "has it
+        // been configured" gate, so the contract is that calling the
+        // helper twice is a safe no-op rather than toggling any flag.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = std::net::TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+
+        configure_tactical_socket(&server);
+        configure_tactical_socket(&server);
+        configure_tactical_socket(&server);
+
+        let sock = SockRef::from(&server);
+        assert!(
+            sock.keepalive().unwrap(),
+            "SO_KEEPALIVE should remain enabled after repeated configure calls"
+        );
+        assert!(
+            sock.tcp_nodelay().unwrap(),
+            "TCP_NODELAY should remain enabled after repeated configure calls"
+        );
+    }
+
+    #[test]
+    fn tactical_socket_accepts_both_tcp_listener_and_tcp_stream_via_as_fd_bound() {
+        // Compile-time + runtime assertion that the `impl AsFd` bound
+        // accepts every type the workspace passes in. If a future
+        // refactor narrowed the bound to `&TcpStream`, the callers that
+        // pass a `TcpListener` (e.g. server/metrics.rs, enrollment/server.rs)
+        // would fail to compile, but not via this module's own suite —
+        // this test is the load-bearing self-check that the generic
+        // bound stays wide enough for every call site in the workspace.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        configure_tactical_socket(&listener);
+
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        configure_tactical_socket(&client);
+        configure_tactical_socket(&server);
+    }
 }
