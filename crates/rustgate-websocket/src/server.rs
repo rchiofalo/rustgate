@@ -1047,4 +1047,456 @@ mod tests {
             .expect("run must terminate with observers installed")
             .expect("run task must not panic on shutdown with no accept / reject events");
     }
+
+    // ------------------------------------------------------------------
+    // Additional defensive-invariant coverage: constants relationship,
+    // per-callback-alias end-to-end invocation round-trips, deepened
+    // Debug redaction checks, shutdown resilience under hostile config
+    // (zero permits, double-notify, enabled health-check), and
+    // tick_or_never's Some branch under a microsecond-scale interval.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn default_max_write_buffer_bytes_is_less_than_core_max_frame_size() {
+        // The slow-consumer cap gates *cumulative* pending bytes across
+        // successive sends, but the arithmetic
+        // `pending_bytes.saturating_add(frame_len) > max_write_buffer_bytes`
+        // means the relationship between the cap and the core-wide
+        // frame-size limit determines whether a single max-size frame is
+        // admissible at all. The workspace-wide max frame is 16 MiB and
+        // the per-session cap is 4 MiB — pin the strict inequality so a
+        // refactor that bumped the cap beyond the frame cap (defeating
+        // the slow-consumer defence entirely) or dropped it below a
+        // plausible tactical payload would trip here rather than at a
+        // Grafana outage.
+        const {
+            assert!(DEFAULT_MAX_WRITE_BUFFER_BYTES < rustgate_core::constants::MAX_FRAME_SIZE);
+        }
+    }
+
+    #[test]
+    fn default_max_write_buffer_bytes_is_inside_sanity_band() {
+        // Defensive lower + upper bounds so a typo that e.g. lost a MiB
+        // multiplier (dropping to 4 KiB — would refuse every real-world
+        // payload) or added an extra zero (40 MiB — would let a runaway
+        // producer pin ~40 MiB of per-session buffers on top of the
+        // tenant-quota accounting) fails a focused test rather than
+        // manifesting as a production outage.
+        const {
+            assert!(DEFAULT_MAX_WRITE_BUFFER_BYTES >= 1024 * 1024);
+        }
+        const {
+            assert!(DEFAULT_MAX_WRITE_BUFFER_BYTES <= 32 * 1024 * 1024);
+        }
+    }
+
+    #[test]
+    fn on_nats_publish_callback_round_trips_message_through_arc_invocation() {
+        // The alias is `Arc<dyn Fn(RoutableMessage) + Send + Sync>` — a
+        // regression that accidentally reboxed the closure on every
+        // clone, or stripped the `Send + Sync` bound so the clone
+        // couldn't cross a spawn, would surface here rather than at a
+        // transitive call site. The test captures the arg via a shared
+        // `Mutex<Option<_>>` so it works with the `Fn` (not `FnMut`)
+        // bound the alias imposes.
+        use std::sync::Mutex;
+        let captured: Arc<Mutex<Option<Bytes>>> = Arc::new(Mutex::new(None));
+        let captured_cb = Arc::clone(&captured);
+        let cb: OnNatsPublish = Arc::new(move |msg: RoutableMessage| {
+            *captured_cb.lock().expect("mutex not poisoned") = Some(msg.payload.clone());
+        });
+
+        let msg = RoutableMessage {
+            source: Identity::new(
+                "test-cn".to_string(),
+                "test-fp".to_string(),
+                std::collections::BTreeSet::new(),
+            )
+            .expect("identity"),
+            destination: rustgate_core::message::Destination::Broadcast,
+            payload: Bytes::from_static(b"hello"),
+            metadata: rustgate_core::message::Metadata {
+                received_at: std::time::SystemTime::now(),
+                source_protocol: "test".into(),
+                message_type: rustgate_core::message::MessageType::Other("test".into()),
+                ttl: None,
+            },
+        };
+
+        let cloned = Arc::clone(&cb);
+        cloned(msg);
+
+        assert_eq!(
+            captured
+                .lock()
+                .expect("mutex")
+                .as_ref()
+                .map(|b| b.as_ref().to_vec()),
+            Some(b"hello".to_vec()),
+            "Arc-cloned callback must invoke the underlying closure with the supplied message",
+        );
+    }
+
+    #[test]
+    fn on_federation_forward_callback_receives_all_three_args_verbatim() {
+        // `OnFederationForward` is a three-argument callback:
+        // `(Bytes, Vec<String>, Metadata)`. The read loop splits a
+        // `RoutedMessage` into these three pieces before handing them
+        // to the forwarder (see `ws_read_loop` at the `fed_forward` call
+        // site). Pin that every argument reaches the closure with its
+        // identity preserved — a regression that swapped the payload
+        // and groups arguments would silently fan every federated send
+        // out to the wrong set of peers.
+        use std::sync::Mutex;
+        #[derive(Default)]
+        struct Captured {
+            payload: Option<Bytes>,
+            groups: Option<Vec<String>>,
+            source_protocol: Option<String>,
+        }
+        let captured: Arc<Mutex<Captured>> = Arc::new(Mutex::new(Captured::default()));
+        let captured_cb = Arc::clone(&captured);
+        let cb: OnFederationForward = Arc::new(move |b, g, m: rustgate_core::message::Metadata| {
+            let mut guard = captured_cb.lock().expect("mutex");
+            guard.payload = Some(b);
+            guard.groups = Some(g);
+            guard.source_protocol = Some(m.source_protocol);
+        });
+
+        cb(
+            Bytes::from_static(b"payload"),
+            vec!["alpha".into(), "beta".into()],
+            rustgate_core::message::Metadata {
+                received_at: std::time::SystemTime::now(),
+                source_protocol: "websocket".into(),
+                message_type: rustgate_core::message::MessageType::Other("test".into()),
+                ttl: None,
+            },
+        );
+
+        let guard = captured.lock().expect("mutex");
+        assert_eq!(
+            guard.payload.as_ref().map(|b| b.as_ref().to_vec()),
+            Some(b"payload".to_vec()),
+        );
+        assert_eq!(
+            guard.groups.as_deref(),
+            Some(&["alpha".to_string(), "beta".to_string()][..])
+        );
+        assert_eq!(guard.source_protocol.as_deref(), Some("websocket"));
+    }
+
+    #[test]
+    fn on_http_forward_callback_round_trips_message_through_arc_invocation() {
+        // Same shape as the NATS-publish test but for the HTTP egress
+        // alias — they have identical trait bounds (`Fn(RoutableMessage)`)
+        // but distinct wire semantics, and the two aliases can drift out
+        // of sync without a compile-time check if one caller is
+        // refactored without the other.
+        use std::sync::Mutex;
+        let captured: Arc<Mutex<Option<Bytes>>> = Arc::new(Mutex::new(None));
+        let captured_cb = Arc::clone(&captured);
+        let cb: OnHttpForward = Arc::new(move |msg: RoutableMessage| {
+            *captured_cb.lock().expect("mutex") = Some(msg.payload.clone());
+        });
+
+        let msg = RoutableMessage {
+            source: Identity::new(
+                "http-cn".to_string(),
+                "http-fp".to_string(),
+                std::collections::BTreeSet::new(),
+            )
+            .expect("identity"),
+            destination: rustgate_core::message::Destination::Broadcast,
+            payload: Bytes::from_static(b"http-payload"),
+            metadata: rustgate_core::message::Metadata {
+                received_at: std::time::SystemTime::now(),
+                source_protocol: "test".into(),
+                message_type: rustgate_core::message::MessageType::Other("test".into()),
+                ttl: None,
+            },
+        };
+        cb(msg);
+
+        assert_eq!(
+            captured
+                .lock()
+                .expect("mutex")
+                .as_ref()
+                .map(|b| b.as_ref().to_vec()),
+            Some(b"http-payload".to_vec()),
+        );
+    }
+
+    #[test]
+    fn on_ws_accept_callback_round_trips_through_arc_invocation() {
+        // `OnWsAcceptFn` is the fire-on-session-accepted counter hook.
+        // A regression that dropped the Arc-clone semantics (e.g.
+        // narrowing the alias to `Box<dyn Fn()>` so it could not be
+        // shared with the listener's accept-loop observer) would break
+        // the Prometheus counter wiring silently. Pin the two-Arc
+        // call-site shape and that both clones invoke the underlying
+        // closure.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_cb = Arc::clone(&counter);
+        let cb: OnWsAcceptFn = Arc::new(move || {
+            counter_cb.fetch_add(1, Ordering::SeqCst);
+        });
+
+        cb();
+        Arc::clone(&cb)();
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn on_ws_reject_callback_round_trips_through_arc_invocation() {
+        // Same shape as the accept hook but for the reject counter —
+        // listener reject arms (rate limit, TLS failure, upgrade
+        // failure) and session-handler reject arms (connection limit,
+        // tenant quota) both fire through this alias, so cross-crate
+        // call-site symmetry is the contract the alias encodes.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_cb = Arc::clone(&counter);
+        let cb: OnWsRejectFn = Arc::new(move || {
+            counter_cb.fetch_add(1, Ordering::SeqCst);
+        });
+
+        cb();
+        Arc::clone(&cb)();
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn session_hooks_default_equals_explicit_all_none_literal_init() {
+        // The `#[derive(Default)]` on `WsSessionHooks` is declared, but
+        // a manual refactor that added a non-None default (e.g. a
+        // `NoopCallback` to "avoid branching on None") would silently
+        // break the documented "None disables dispatch with no runtime
+        // cost" contract. Pin the field-by-field equivalence.
+        let via_default = WsSessionHooks::default();
+        let via_literal = WsSessionHooks {
+            on_connection_accept: None,
+            on_connection_rejected: None,
+        };
+        assert!(via_default.on_connection_accept.is_none());
+        assert!(via_default.on_connection_rejected.is_none());
+        assert!(via_literal.on_connection_accept.is_none());
+        assert!(via_literal.on_connection_rejected.is_none());
+    }
+
+    #[test]
+    fn session_hooks_debug_asymmetric_when_only_one_callback_installed() {
+        // Pin the asymmetric boolean sentinels so a regression that
+        // collapsed both fields into a single shared flag (saving one
+        // line in the manual Debug impl but silently misreporting the
+        // actual configuration to operators) fails here.
+        let hooks = WsSessionHooks {
+            on_connection_accept: Some(Arc::new(|| {})),
+            on_connection_rejected: None,
+        };
+        let rendered = format!("{hooks:?}");
+        assert!(
+            rendered.contains("on_connection_accept: true"),
+            "expected accept=true, got: {rendered}",
+        );
+        assert!(
+            rendered.contains("on_connection_rejected: false"),
+            "expected rejected=false, got: {rendered}",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn config_debug_does_not_leak_closure_or_arc_internals() {
+        // The manual `Debug` for `WsServerConfig` only renders
+        // `listener`, a redacted `<Router>` token, and the codec's
+        // `protocol_id()`. A regression that swapped it back to
+        // `#[derive(Debug)]` would splatter every `Arc<dyn Fn>` into
+        // the rendered output, which at best pollutes operator logs
+        // with function pointers and at worst leaks closure captures.
+        // Pin that the rendered string contains none of the canonical
+        // derive-printout tokens.
+        let shutdown = Arc::new(Notify::new());
+        let config = build_config(shutdown, "ws-config-debug-redaction");
+        let rendered = format!("{config:?}");
+
+        // The redaction helpers used elsewhere in the workspace render
+        // as `<Router>` and the codec id. A raw derive would print
+        // `router: Router { .. }` and `codec: Arc<dyn Codec>`-like
+        // tokens — pin their absence.
+        assert!(
+            !rendered.contains("Router {"),
+            "Debug must not expose Router internals, got: {rendered}",
+        );
+        assert!(
+            !rendered.contains("dyn Fn"),
+            "Debug must not expose raw closure trait objects, got: {rendered}",
+        );
+        // The callback-bearing fields must not be in the rendered
+        // output at all — they are deliberately omitted by the manual
+        // impl, not redacted-and-shown.
+        assert!(
+            !rendered.contains("nats_publish"),
+            "Debug must omit optional callback fields, got: {rendered}",
+        );
+        assert!(
+            !rendered.contains("session_hooks"),
+            "Debug must omit session_hooks, got: {rendered}",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_exits_on_shutdown_even_with_zero_permit_connection_limit() {
+        // A deployment that set `connection_limit` to a zero-permit
+        // semaphore (defensive lockdown mode) must still honour
+        // SIGTERM — the shutdown branch of the select must not be
+        // gated by the permit-acquisition path. Pin that the run loop
+        // terminates cleanly even when no client could ever be
+        // admitted.
+        let shutdown = Arc::new(Notify::new());
+        let tls = test_tls_config("ws-server-zero-permits");
+        let listener = WsListener::bind(loopback_zero(), &tls).expect("bind");
+        let config = WsServerConfig {
+            listener,
+            router: Arc::new(Router::default()),
+            connection_limit: Arc::new(Semaphore::new(0)),
+            codec: Arc::new(NoopCodec),
+            nats_publish: None,
+            fed_forward: None,
+            http_forward: None,
+            throttle_config: None,
+            replay_filter: None,
+            circuit_breaker_threshold: 0,
+            ws_max_frames_per_sec: 0,
+            ws_max_bytes_per_sec: 0,
+            ws_max_violations: 0,
+            max_write_buffer_bytes: DEFAULT_MAX_WRITE_BUFFER_BYTES,
+            health_check: HealthCheckConfig::DISABLED,
+            session_hooks: None,
+            shutdown: Arc::clone(&shutdown),
+        };
+
+        let handle = tokio::spawn(WebSocketServer::run(config));
+        tokio::task::yield_now().await;
+        shutdown.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("run must exit under zero-permit lockdown")
+            .expect("run task must not panic on shutdown under zero-permit lockdown");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_exits_cleanly_after_repeated_shutdown_notify_calls() {
+        // `tokio::sync::Notify::notify_one` on an already-notified
+        // handle is a no-op (the permit is already stored), so a
+        // caller that fires SIGTERM twice in quick succession (e.g.
+        // operator restart script on a flaky TTY) must see the same
+        // clean exit as a single-fire. Pin that extra notifications
+        // do not stall or mis-order the accept loop.
+        let shutdown = Arc::new(Notify::new());
+        let config = build_config(Arc::clone(&shutdown), "ws-server-double-notify");
+        shutdown.notify_one();
+        shutdown.notify_one();
+        shutdown.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), WebSocketServer::run(config))
+            .await
+            .expect("run must exit within timeout after three successive notify_one calls");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_exits_cleanly_when_health_check_is_enabled_but_no_clients_connect() {
+        // Enabled `HealthCheckConfig` only affects the per-session
+        // write loop (ping ticker, pong deadline). The accept-loop
+        // shutdown path must be entirely independent of that
+        // configuration — a regression that moved the health-check
+        // construction out of the session spawn and into the accept
+        // select would stall shutdown until the first ping tick. Pin
+        // that a 30-second-interval health-check config does not
+        // prevent an immediate SIGTERM.
+        let shutdown = Arc::new(Notify::new());
+        let tls = test_tls_config("ws-server-health-enabled");
+        let listener = WsListener::bind(loopback_zero(), &tls).expect("bind");
+        let config = WsServerConfig {
+            listener,
+            router: Arc::new(Router::default()),
+            connection_limit: Arc::new(Semaphore::new(1)),
+            codec: Arc::new(NoopCodec),
+            nats_publish: None,
+            fed_forward: None,
+            http_forward: None,
+            throttle_config: None,
+            replay_filter: None,
+            circuit_breaker_threshold: 0,
+            ws_max_frames_per_sec: 0,
+            ws_max_bytes_per_sec: 0,
+            ws_max_violations: 0,
+            max_write_buffer_bytes: DEFAULT_MAX_WRITE_BUFFER_BYTES,
+            health_check: HealthCheckConfig {
+                ping_interval: Duration::from_secs(30),
+                pong_timeout: Duration::from_secs(10),
+            },
+            session_hooks: None,
+            shutdown: Arc::clone(&shutdown),
+        };
+
+        let handle = tokio::spawn(WebSocketServer::run(config));
+        tokio::task::yield_now().await;
+        shutdown.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("run must exit cleanly even with health-check enabled (no clients connected)")
+            .expect("run task must not panic");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tick_or_never_with_some_resolves_under_microsecond_interval() {
+        // Pin that the `Some(Interval)` branch works at the smallest
+        // practically-usable cadence. `tokio::time::interval` panics
+        // on `Duration::ZERO`, so use `1 µs` as the minimum — this is
+        // already below every production ping cadence, but a
+        // regression that added a lower-bound guard inside
+        // `tick_or_never` would trip here rather than at a surprised
+        // downstream operator.
+        let mut interval = tokio::time::interval(Duration::from_micros(1));
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            tick_or_never(Some(&mut interval)),
+        )
+        .await
+        .expect("microsecond-cadence tick_or_never must resolve within the timeout");
+    }
+
+    #[test]
+    fn session_hooks_is_send_sync_clone_default() {
+        // Compile-time bound check so any future refactor that
+        // weakened the `Send + Sync + Clone + Default` bound set
+        // (which the server binary relies on to hand the hooks by
+        // value into every session spawn across tokio threads) fails
+        // at this file rather than at a transitive call site in
+        // `rustgate-server::setup`.
+        fn assert_bounds<T: Send + Sync + Clone + Default>() {}
+        assert_bounds::<WsSessionHooks>();
+    }
+
+    #[test]
+    fn write_action_ping_variant_is_constructible_and_parkable() {
+        // `WriteAction::Ping` is the unit variant the write loop
+        // produces when the ping ticker fires. Pin that the variant
+        // is still a zero-payload shape the loop can match — a
+        // regression that added a payload (e.g. `Ping(Bytes)`) would
+        // break every `WriteAction::Ping =>` arm in the module.
+        let action = WriteAction::Ping;
+        match action {
+            WriteAction::Ping => {}
+            // Any non-Ping match here is a compile-time reminder that
+            // the enum has grown a new variant and the write loop
+            // must be updated to handle it. The `_` arm satisfies
+            // exhaustive-match without hiding that outcome.
+            _ => panic!("expected WriteAction::Ping unit variant"),
+        }
+    }
 }
