@@ -585,4 +585,452 @@ mod tests {
         let (_, pull_config) = build_consumer_config(&nats_config);
         assert_eq!(pull_config.max_deliver, 1_000);
     }
+
+    // ------------------------------------------------------------------
+    // `DEFAULT_LAG_POLL_INTERVAL` const — module docs name 5s as the
+    // lag-polling cadence, and the binary crate's Prometheus
+    // dashboards assume the gauge is refreshed at that rate. A silent
+    // bump would skew every dashboard's smoothing window.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn default_lag_poll_interval_is_five_seconds() {
+        assert_eq!(
+            DEFAULT_LAG_POLL_INTERVAL,
+            Duration::from_secs(5),
+            "DEFAULT_LAG_POLL_INTERVAL must stay 5s — Prometheus dashboards depend on this cadence",
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // `LagSnapshot` type-surface pins — `Copy + Clone + Debug +
+    // PartialEq + Eq` is the bound set the binary crate relies on for
+    // caching the latest snapshot in atomic slots and comparing
+    // before/after values in tests. A refactor that added a non-`Copy`
+    // field (e.g. a stream-name `String`) would trip the assertion
+    // below rather than at the first cache-store call site.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn lag_snapshot_has_copy_clone_debug_eq_bounds() {
+        fn assert_bounds<T: Copy + Clone + std::fmt::Debug + PartialEq + Eq>() {}
+        assert_bounds::<LagSnapshot>();
+    }
+
+    #[test]
+    fn lag_snapshot_equality_distinguishes_every_field() {
+        let base = LagSnapshot {
+            num_pending: 1,
+            num_redelivered: 2,
+            ack_floor_stream_seq: 3,
+        };
+        let diff_pending = LagSnapshot {
+            num_pending: 99,
+            num_redelivered: 2,
+            ack_floor_stream_seq: 3,
+        };
+        let diff_redelivered = LagSnapshot {
+            num_pending: 1,
+            num_redelivered: 99,
+            ack_floor_stream_seq: 3,
+        };
+        let diff_ack = LagSnapshot {
+            num_pending: 1,
+            num_redelivered: 2,
+            ack_floor_stream_seq: 99,
+        };
+        assert_eq!(base, base, "identical snapshots must be equal");
+        assert_ne!(base, diff_pending, "num_pending delta must flip equality");
+        assert_ne!(
+            base, diff_redelivered,
+            "num_redelivered delta must flip equality",
+        );
+        assert_ne!(
+            base, diff_ack,
+            "ack_floor_stream_seq delta must flip equality",
+        );
+    }
+
+    #[test]
+    fn lag_snapshot_debug_exposes_all_three_field_values() {
+        let snap = LagSnapshot {
+            num_pending: 11,
+            num_redelivered: 22,
+            ack_floor_stream_seq: 33,
+        };
+        let rendered = format!("{snap:?}");
+        // Operators grep for these field names in log output when
+        // triaging backpressure — a custom Debug impl that dropped a
+        // field would fail here rather than in a live incident.
+        assert!(rendered.contains("num_pending"));
+        assert!(rendered.contains("num_redelivered"));
+        assert!(rendered.contains("ack_floor_stream_seq"));
+        assert!(rendered.contains("11"));
+        assert!(rendered.contains("22"));
+        assert!(rendered.contains("33"));
+    }
+
+    // ------------------------------------------------------------------
+    // `LagCallback` / `LatencyCallback` alias bounds — both are
+    // cloned into the lag-poll task (which is spawned via
+    // `tokio::spawn`), so they must stay `Send + Sync + Clone`. A
+    // regression that narrowed either alias from the documented
+    // `Arc<dyn Fn(...) + Send + Sync>` pattern would trip here at
+    // test-compile rather than at the first spawn site.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn callback_aliases_are_send_sync_clone() {
+        fn assert_bounds<T: Send + Sync + Clone>() {}
+        assert_bounds::<LagCallback>();
+        assert_bounds::<LatencyCallback>();
+    }
+
+    // ------------------------------------------------------------------
+    // `handle_lag_poll_result` callback ordering — on success, the
+    // latency histogram MUST fire before the lag gauge so the
+    // histogram counts include the current poll. A silent reorder
+    // would lag the histogram one tick behind the gauge and hide
+    // spike patterns in Grafana.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn handle_lag_poll_result_invokes_latency_before_lag_on_success() {
+        use std::sync::Mutex;
+        let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let order_for_lag = Arc::clone(&order);
+        let order_for_lat = Arc::clone(&order);
+        let lag_cb: LagCallback = Arc::new(move |_snap| {
+            order_for_lag.lock().unwrap().push("lag");
+        });
+        let lat_cb: LatencyCallback = Arc::new(move |_d| {
+            order_for_lat.lock().unwrap().push("latency");
+        });
+        let ok: Result<LagSnapshot, &'static str> = Ok(LagSnapshot {
+            num_pending: 0,
+            num_redelivered: 0,
+            ack_floor_stream_seq: 0,
+        });
+        handle_lag_poll_result(ok, Duration::from_millis(1), &lag_cb, Some(&lat_cb));
+        let calls = order.lock().unwrap();
+        assert_eq!(
+            *calls,
+            vec!["latency", "lag"],
+            "latency histogram must fire before lag gauge on success",
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // `handle_lag_poll_result` error path — latency still fires so
+    // the histogram includes failed polls (they count against the
+    // backend's SLO), but the lag gauge must NOT fire so the gauge
+    // retains its last-known-good value instead of decaying to zero
+    // on every transient failure.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn handle_lag_poll_result_error_fires_latency_but_not_lag() {
+        use std::sync::Mutex;
+        let lag_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let lag_count_cb = Arc::clone(&lag_count);
+        let lag_cb: LagCallback = Arc::new(move |_snap| {
+            *lag_count_cb.lock().unwrap() += 1;
+        });
+        let latency_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let latency_count_cb = Arc::clone(&latency_count);
+        let lat_cb: LatencyCallback = Arc::new(move |_d| {
+            *latency_count_cb.lock().unwrap() += 1;
+        });
+        let err: Result<LagSnapshot, &'static str> = Err("boom");
+        handle_lag_poll_result(err, Duration::from_millis(1), &lag_cb, Some(&lat_cb));
+        assert_eq!(
+            *lag_count.lock().unwrap(),
+            0,
+            "lag callback must not fire on error",
+        );
+        assert_eq!(
+            *latency_count.lock().unwrap(),
+            1,
+            "latency callback must fire on every poll, including errors",
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // `handle_lag_poll_result` with `latency_callback = None` — the
+    // binary crate may wire only the lag gauge. Helper must still
+    // invoke the lag callback on `Ok` without panicking on the
+    // absent-histogram branch.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn handle_lag_poll_result_without_latency_callback_still_invokes_lag() {
+        use std::sync::Mutex;
+        let captured: Arc<Mutex<Option<LagSnapshot>>> = Arc::new(Mutex::new(None));
+        let captured_cb = Arc::clone(&captured);
+        let lag_cb: LagCallback = Arc::new(move |snap| {
+            *captured_cb.lock().unwrap() = Some(snap);
+        });
+        let ok: Result<LagSnapshot, &'static str> = Ok(LagSnapshot {
+            num_pending: 77,
+            num_redelivered: 3,
+            ack_floor_stream_seq: 1_000,
+        });
+        handle_lag_poll_result(ok, Duration::from_millis(1), &lag_cb, None);
+        let snap = captured
+            .lock()
+            .unwrap()
+            .expect("lag callback must have fired");
+        assert_eq!(snap.num_pending, 77);
+        assert_eq!(snap.num_redelivered, 3);
+        assert_eq!(snap.ack_floor_stream_seq, 1_000);
+    }
+
+    // ------------------------------------------------------------------
+    // `handle_lag_poll_result` duration pass-through — the helper
+    // receives `elapsed` already-measured by the caller so the
+    // histogram value matches the actual poll duration. A refactor
+    // that recomputed elapsed internally (e.g. from `Instant::now()`
+    // at entry) would drift from the caller's measurement.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn handle_lag_poll_result_passes_elapsed_duration_verbatim() {
+        use std::sync::Mutex;
+        let seen: Arc<Mutex<Option<Duration>>> = Arc::new(Mutex::new(None));
+        let seen_cb = Arc::clone(&seen);
+        let lag_cb: LagCallback = Arc::new(|_snap| {});
+        let lat_cb: LatencyCallback = Arc::new(move |d| {
+            *seen_cb.lock().unwrap() = Some(d);
+        });
+        let ok: Result<LagSnapshot, &'static str> = Ok(LagSnapshot {
+            num_pending: 0,
+            num_redelivered: 0,
+            ack_floor_stream_seq: 0,
+        });
+        handle_lag_poll_result(ok, Duration::from_millis(137), &lag_cb, Some(&lat_cb));
+        assert_eq!(
+            seen.lock()
+                .unwrap()
+                .expect("latency callback must have fired"),
+            Duration::from_millis(137),
+            "latency callback must receive the caller-supplied elapsed duration verbatim",
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // `LagPollerGuard` drop-aborts the wrapped task so the lag poller
+    // cannot outlive the subscriber. A regression that made Drop a
+    // no-op would leak a tokio task per reconnect (and eventually
+    // flood tokio's task registry on long-running deployments). The
+    // test proves the abort happened by observing the future's Drop
+    // side-effect via a shared AtomicBool.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn lag_poller_guard_aborts_wrapped_task_on_drop() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct DropProbe(Arc<AtomicBool>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let future_dropped = Arc::new(AtomicBool::new(false));
+        let dropped_for_task = Arc::clone(&future_dropped);
+        let handle = tokio::spawn(async move {
+            let _probe = DropProbe(dropped_for_task);
+            std::future::pending::<()>().await;
+        });
+
+        // Ensure the task is actually polled and parked on `pending`
+        // before we drop the guard.
+        tokio::task::yield_now().await;
+        assert!(
+            !future_dropped.load(Ordering::SeqCst),
+            "task future must still be live before guard drop",
+        );
+
+        let guard = LagPollerGuard(handle);
+        drop(guard);
+
+        // Give the runtime a handful of yields to process the abort
+        // and drop the future. Aborted tasks drop their futures.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            if future_dropped.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+        assert!(
+            future_dropped.load(Ordering::SeqCst),
+            "LagPollerGuard::drop must abort the wrapped task (future must be dropped)",
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // `extract_group_from_subject` edge cases — the helper funnels
+    // every inbound NATS message into the group-ACL pipeline. Any
+    // miscategorisation here silently routes messages under the
+    // wrong group (or the fallback group). The existing suite covers
+    // the standard cases; these pin the deeper parsing invariants.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn extract_group_deep_subject_returns_first_segment_only() {
+        // Subjects with four or more segments must still yield only
+        // the group token, never the full action tail.
+        assert_eq!(
+            extract_group_from_subject("points.CYAN.position.update.v2", "points", "__ANON__"),
+            "CYAN",
+        );
+    }
+
+    #[test]
+    fn extract_group_subject_equal_to_prefix_returns_default() {
+        // Bare prefix with no trailing dot has no group — must fall
+        // back to default rather than e.g. returning the prefix.
+        assert_eq!(
+            extract_group_from_subject("points", "points", "__ANON__"),
+            "__ANON__",
+        );
+    }
+
+    #[test]
+    fn extract_group_subject_is_prefix_plus_trailing_dot_returns_default() {
+        // `"points."` strips to `""`, which has no interior dot →
+        // must fall back to default, not yield an empty group.
+        assert_eq!(
+            extract_group_from_subject("points.", "points", "__ANON__"),
+            "__ANON__",
+        );
+    }
+
+    #[test]
+    fn extract_group_handles_multi_segment_prefix() {
+        // The prefix may itself contain dots (e.g. `"cot.live"`). The
+        // helper must strip the whole prefix, not just the first
+        // segment — otherwise a `"cot.live.BRAVO.update"` subject
+        // would mis-route to group `"live"`.
+        assert_eq!(
+            extract_group_from_subject("cot.live.BRAVO.update", "cot.live", "__ANON__"),
+            "BRAVO",
+        );
+    }
+
+    #[test]
+    fn extract_group_rejects_byte_prefix_that_is_not_a_segment() {
+        // `"pointsx.GROUP.action"` has `"points"` as a byte prefix
+        // but `"pointsx"` is a different segment. The helper's
+        // `.strip_prefix('.')` guard must reject this and fall back
+        // to default — otherwise any namespace with a common byte
+        // prefix (e.g. `tracks` vs `tracks_hist`) would silently
+        // leak messages across.
+        assert_eq!(
+            extract_group_from_subject("pointsx.GROUP.action", "points", "__ANON__"),
+            "__ANON__",
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // `build_consumer_config` — the pull-consumer wiring pins we
+    // care about beyond the `max_deliver` covered above: ACK
+    // policy, deliver policy, durable/consumer-name agreement,
+    // multi-segment prefix in `filter_subject`, and idempotence
+    // across repeated calls. Any silent drift here reshapes the
+    // delivery semantics on the NATS side.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn build_consumer_config_sets_ack_policy_explicit() {
+        // AckPolicy::Explicit is the whole point — switching to
+        // `None` (fire-and-forget) or `All` (ack-all-prior) would
+        // silently break at-least-once delivery.
+        let nats_config = NatsConfig {
+            instance_id: "test-instance".to_string(),
+            ..Default::default()
+        };
+        let (_, pull_config) = build_consumer_config(&nats_config);
+        assert!(
+            matches!(pull_config.ack_policy, AckPolicy::Explicit),
+            "ack_policy must be Explicit so each message is individually acknowledged",
+        );
+    }
+
+    #[test]
+    fn build_consumer_config_sets_deliver_policy_new() {
+        // DeliverPolicy::New — a regression to ::All would replay
+        // every message ever stored on restart, causing a
+        // backpressure storm. ::Last would only deliver the
+        // latest. Neither is a valid substitute.
+        let nats_config = NatsConfig {
+            instance_id: "test-instance".to_string(),
+            ..Default::default()
+        };
+        let (_, pull_config) = build_consumer_config(&nats_config);
+        assert!(
+            matches!(
+                pull_config.deliver_policy,
+                jetstream::consumer::DeliverPolicy::New
+            ),
+            "deliver_policy must be New so the consumer starts from the current stream head",
+        );
+    }
+
+    #[test]
+    fn build_consumer_config_durable_name_matches_returned_consumer_name() {
+        // The helper returns the consumer name it intends to use;
+        // pull_config.durable_name must match so the caller's
+        // `get_or_create_consumer(&name, pull_config)` call sees a
+        // self-consistent pair.
+        let nats_config = NatsConfig {
+            instance_id: "alpha".to_string(),
+            ..Default::default()
+        };
+        let (name, pull_config) = build_consumer_config(&nats_config);
+        assert_eq!(name, "rustgate-sub-alpha");
+        assert_eq!(
+            pull_config.durable_name,
+            Some(name),
+            "durable_name in pull_config must equal the returned consumer name",
+        );
+    }
+
+    #[test]
+    fn build_consumer_config_filter_subject_handles_multi_segment_prefix() {
+        // Embedded-dot prefix `"cot.live"` must produce
+        // `"cot.live.>"` verbatim. A refactor that normalised the
+        // prefix or quoted the dots would silently change the
+        // subscription pattern.
+        let nats_config = NatsConfig {
+            instance_id: "x".to_string(),
+            subject_prefix: "cot.live".to_string(),
+            ..Default::default()
+        };
+        let (_, pull_config) = build_consumer_config(&nats_config);
+        assert_eq!(pull_config.filter_subject, "cot.live.>");
+    }
+
+    #[test]
+    fn build_consumer_config_is_idempotent_across_repeated_calls() {
+        // Two successive calls with identical inputs must produce
+        // identical outputs. A regression that seeded a non-
+        // deterministic field (e.g. a timestamp suffix on the
+        // durable name) would break JetStream's
+        // `get_or_create_consumer` idempotence and leak a consumer
+        // per call.
+        let nats_config = NatsConfig {
+            instance_id: "alpha".to_string(),
+            max_deliver: 7,
+            ..Default::default()
+        };
+        let (n1, c1) = build_consumer_config(&nats_config);
+        let (n2, c2) = build_consumer_config(&nats_config);
+        assert_eq!(n1, n2);
+        assert_eq!(c1.durable_name, c2.durable_name);
+        assert_eq!(c1.max_ack_pending, c2.max_ack_pending);
+        assert_eq!(c1.max_deliver, c2.max_deliver);
+        assert_eq!(c1.filter_subject, c2.filter_subject);
+    }
 }
