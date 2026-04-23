@@ -493,4 +493,210 @@ mod tests {
         let result = called.lock().expect("lock").take();
         assert_eq!(result, Some(("peer-1".to_string(), 42)));
     }
+
+    // ── OnPeerAvailable contract pins ──────────────────────────────────
+    //
+    // The existing suite only exercises `OnClaimLost`; the sibling alias
+    // `OnPeerAvailable` (fired when a foreign pod's claim expires and the
+    // peer becomes adoptable) had no functional test. A regression that
+    // narrowed the signature to `Fn(&str)` — cheap to type, catastrophic
+    // to wire — would not compile at call sites but would pass every
+    // existing test in this module silently.
+
+    #[test]
+    fn on_peer_available_callback_fires_with_owned_peer_id_string() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let seen_clone = seen.clone();
+
+        let callback: OnPeerAvailable = Arc::new(move |peer_id: String| {
+            *seen_clone.lock().expect("lock") = Some(peer_id);
+        });
+
+        callback("orphaned-peer".to_string());
+
+        let result = seen.lock().expect("lock").take();
+        assert_eq!(result, Some("orphaned-peer".to_string()));
+    }
+
+    // ── Callback-bound compile-time pins ───────────────────────────────
+    //
+    // Both callback aliases flow across task boundaries: `OnPeerAvailable`
+    // is moved into a `tokio::spawn` block after a jittered sleep inside
+    // `watch_expired_claims`, and `OnClaimLost` is called from inside the
+    // refresh loop's `tokio::select!`. A regression that dropped `Send`
+    // or `Sync` or narrowed the lifetime away from `'static` would only
+    // surface at those call sites — pinning the bounds at the module's
+    // own test harness fails the offending edit at the first-level build
+    // rather than after a `spawn` somewhere else in the crate refuses to
+    // compile.
+
+    #[test]
+    fn on_peer_available_type_satisfies_send_sync_static_bound() {
+        fn assert_bounds<T: Send + Sync + 'static>() {}
+        assert_bounds::<OnPeerAvailable>();
+    }
+
+    #[test]
+    fn on_claim_lost_type_satisfies_send_sync_static_bound() {
+        fn assert_bounds<T: Send + Sync + 'static>() {}
+        assert_bounds::<OnClaimLost>();
+    }
+
+    // ── Callback Arc-cloneability ──────────────────────────────────────
+    //
+    // `OnPeerAvailable = Arc<dyn Fn(String) + Send + Sync>` and its sibling
+    // are cloned into per-claim spawn blocks inside `watch_expired_claims`
+    // (the closure is moved into a `tokio::spawn` after being cloned once
+    // per expiry event). A regression that changed the alias to a bare
+    // `Box<dyn Fn ...>` would still satisfy the functional signature tests
+    // above but would fail at that clone site. Pin the Arc-shared-closure
+    // contract by holding two handles, firing each, and asserting both
+    // routes observe the same inner state.
+
+    #[test]
+    fn callback_arcs_can_be_cloned_independently_and_fire_shared_closure() {
+        let counter = Arc::new(std::sync::Mutex::new(0u32));
+        let counter_for_closure = counter.clone();
+
+        let original: OnPeerAvailable = Arc::new(move |_peer_id: String| {
+            let mut guard = counter_for_closure.lock().expect("lock");
+            *guard += 1;
+        });
+        let cloned = original.clone();
+
+        // Both handles point at the same underlying closure.
+        assert_eq!(
+            Arc::strong_count(&original),
+            2,
+            "clone must bump the strong count, not wrap in an outer Arc"
+        );
+
+        original("peer-A".to_string());
+        cloned("peer-B".to_string());
+
+        let final_count = *counter.lock().expect("lock");
+        assert_eq!(
+            final_count, 2,
+            "both Arc handles must route through the same captured mutex"
+        );
+    }
+
+    // ── adoption_jitter distribution pins ──────────────────────────────
+    //
+    // The existing suite calls `adoption_jitter()` exactly once and asserts
+    // the sample is below `MAX_ADOPT_JITTER_MS`. That catches only the
+    // pathological "always returns a huge duration" regression. Two
+    // defensive-invariant gaps remain: (a) the helper could regress to a
+    // fixed constant (e.g. an editor accidentally deleting the modulo and
+    // leaving `Duration::from_millis(0)`), silently defeating the
+    // thundering-herd mitigation the documentation advertises; and (b) a
+    // refactor that changed the modulus to a type-narrow `u32` or flipped
+    // the operand order could push a single call beyond the bound on a
+    // subsec_nanos value close to `u32::MAX`. Many-sample tests close both
+    // gaps — a single degenerate run cannot satisfy both "distinct values
+    // observed" and "no sample exceeds the bound" simultaneously unless
+    // the formula is healthy.
+
+    #[test]
+    fn adoption_jitter_stays_strictly_below_max_across_many_samples() {
+        // 2048 samples at ~1µs each exercises a ~2ms span of subsec_nanos
+        // values — enough for the modulo to cycle through the full output
+        // range several times. Every single one must still honour the
+        // bound.
+        let max = Duration::from_millis(MAX_ADOPT_JITTER_MS);
+        for _ in 0..2048 {
+            let jitter = ClaimManager::adoption_jitter();
+            assert!(
+                jitter < max,
+                "adoption_jitter returned {jitter:?}, must be < {max:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn adoption_jitter_samples_span_more_than_one_distinct_value() {
+        // If the helper ever regressed to a constant (deleted modulo, hard
+        // coded zero, or the `subsec_nanos` source was accidentally
+        // replaced with a field that returns the same value every call),
+        // the distinct-value count across a modest sample would collapse
+        // to one and fail here. The assertion is probabilistic in the
+        // formal sense — subsec_nanos can in principle repeat — but the
+        // ~512µs span covered by 512 sequential calls at microsecond
+        // resolution makes a degenerate collapse astronomically unlikely
+        // on any platform whose `SystemTime::now()` resolves at even
+        // millisecond granularity.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..512 {
+            let _ = seen.insert(ClaimManager::adoption_jitter());
+        }
+        assert!(
+            seen.len() > 1,
+            "adoption_jitter produced only {} distinct value(s) across 512 samples \
+             — the thundering-herd mitigation has regressed to a constant",
+            seen.len()
+        );
+    }
+
+    // ── Constant cross-coherence pins ──────────────────────────────────
+    //
+    // The existing `constants_are_reasonable` pins `TTL > refresh` and
+    // `jitter < adopt * 1000`. Two stronger invariants the module docs
+    // imply but no test enforces: (a) the claim lifecycle doc advertises
+    // "re-puts every 10s to keep the 30s TTL alive" — operationally this
+    // requires the TTL to survive at least *one* missed refresh (e.g. a
+    // brief NATS hiccup), so `CLAIM_TTL_SECS >= 2 * REFRESH_INTERVAL_SECS`
+    // is the design-motivated invariant; (b) every duration constant in
+    // this module is meant as a positive interval — a zero-sentinel
+    // regression on any of them silently breaks the module (zero refresh
+    // spins hot, zero TTL expires instantly, zero jitter defeats the
+    // herd-mitigation contract, zero adopt delay skips the documented
+    // remote-cleanup window).
+
+    #[test]
+    fn claim_ttl_permits_at_least_two_full_refresh_windows_before_expiry() {
+        // Stronger than `TTL > refresh` (the existing invariant). The
+        // lifecycle contract requires surviving at least one missed
+        // refresh without losing the claim — so TTL must be at least
+        // *two* refresh intervals. At 30s TTL / 10s refresh the margin
+        // is three refreshes; the assertion is the lower bound.
+        //
+        // Wrapped in `const { … }` so the assertion fires at
+        // compile time (every operand is a `const u64`) rather than
+        // at test-binary startup.
+        const {
+            assert!(
+                CLAIM_TTL_SECS >= 2 * REFRESH_INTERVAL_SECS,
+                "CLAIM_TTL_SECS must be >= 2 * REFRESH_INTERVAL_SECS so one missed refresh does not expire the claim"
+            );
+        }
+    }
+
+    #[test]
+    fn ha_duration_constants_are_all_strictly_positive() {
+        // Every operand is a `const u64`, so the assertions are const-
+        // evaluated and fire at compile time in the `const { … }`
+        // block. The failure messages still surface to the operator
+        // via the rustc diagnostic when a regression lands.
+        const {
+            assert!(CLAIM_TTL_SECS > 0, "CLAIM_TTL_SECS must be > 0");
+        }
+        const {
+            assert!(
+                REFRESH_INTERVAL_SECS > 0,
+                "REFRESH_INTERVAL_SECS must be > 0 (zero would busy-loop the refresh task)"
+            );
+        }
+        const {
+            assert!(
+                MAX_ADOPT_JITTER_MS > 0,
+                "MAX_ADOPT_JITTER_MS must be > 0 (zero defeats the thundering-herd mitigation)"
+            );
+        }
+        const {
+            assert!(
+                ADOPT_DELAY_SECS > 0,
+                "ADOPT_DELAY_SECS must be > 0 (zero skips the documented remote-cleanup window)"
+            );
+        }
+    }
 }
