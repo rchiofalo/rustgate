@@ -522,6 +522,7 @@ mod tests {
         let kf = rustgate_core::encrypted::KeyFile {
             active_key_id: "k1".to_string(),
             keys,
+            key_expirations: std::collections::BTreeMap::new(),
         };
         let bytes = serde_json::to_vec(&kf).expect("serialize");
         let ring = std::sync::Arc::new(
@@ -745,6 +746,7 @@ mod tests {
         let kf = rustgate_core::encrypted::KeyFile {
             active_key_id: "k1".to_string(),
             keys,
+            key_expirations: std::collections::BTreeMap::new(),
         };
         let bytes = serde_json::to_vec(&kf).unwrap();
         let ring =
@@ -780,6 +782,7 @@ mod tests {
         let kf = rustgate_core::encrypted::KeyFile {
             active_key_id: "k1".to_string(),
             keys,
+            key_expirations: std::collections::BTreeMap::new(),
         };
         let bytes = serde_json::to_vec(&kf).unwrap();
         let ring =
