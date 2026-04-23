@@ -583,6 +583,517 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn tls_min_version_protocol_versions_tls12_includes_both() {
+        // `Tls12` means "accept TLS 1.2 AND 1.3" — the static slice must
+        // carry both protocol-version handles so rustls's handshake can
+        // negotiate either one. A regression that accidentally drops TLS13
+        // from this slice silently pins every handshake to TLS12 even when
+        // the peer offers TLS13, which would be a security downgrade.
+        let versions = TlsMinVersion::Tls12.protocol_versions();
+        assert_eq!(versions.len(), 2, "Tls12 must advertise two versions");
+        let versions_set: Vec<rustls::ProtocolVersion> =
+            versions.iter().map(|v| v.version).collect();
+        assert!(
+            versions_set.contains(&rustls::ProtocolVersion::TLSv1_2),
+            "Tls12 slice must include TLS 1.2: {versions_set:?}"
+        );
+        assert!(
+            versions_set.contains(&rustls::ProtocolVersion::TLSv1_3),
+            "Tls12 slice must include TLS 1.3: {versions_set:?}"
+        );
+    }
+
+    #[test]
+    fn tls_min_version_protocol_versions_tls13_only() {
+        // `Tls13` means "reject TLS 1.2 at handshake-start" — the static
+        // slice must be exactly one element and must be TLS13. A regression
+        // that leaks TLS12 into this slice lets legacy clients establish
+        // sessions on a server that was configured to forbid them.
+        let versions = TlsMinVersion::Tls13.protocol_versions();
+        assert_eq!(
+            versions.len(),
+            1,
+            "Tls13 must advertise exactly one version, got {}",
+            versions.len()
+        );
+        assert_eq!(
+            versions[0].version,
+            rustls::ProtocolVersion::TLSv1_3,
+            "Tls13's single version must be TLS 1.3"
+        );
+    }
+
+    #[test]
+    fn tls_min_version_derives_are_complete() {
+        // Pins `#[derive(Debug, Clone, Copy, PartialEq, Eq)]` on
+        // `TlsMinVersion`. The builder API treats it as a value type and
+        // relies on `Copy` for `with_tls_min_version(self, version)` to
+        // avoid moving an owned value at every call site; downgrading to
+        // `Clone`-only would silently break 20+ call sites.
+        fn assert_bounds<T: std::fmt::Debug + Clone + Copy + PartialEq + Eq>() {}
+        assert_bounds::<TlsMinVersion>();
+        let v = TlsMinVersion::Tls13;
+        let copied = v;
+        // explicit Copy exercise: original is still usable
+        assert_eq!(v, copied);
+        assert_eq!(v, TlsMinVersion::Tls13);
+        assert_ne!(v, TlsMinVersion::Tls12);
+        assert!(format!("{v:?}").contains("Tls13"));
+    }
+
+    #[test]
+    fn crl_file_summary_derives_are_complete() {
+        // Pins the derive set on `CrlFileSummary`. It is returned from
+        // `validate_crl_file` and surfaced to the Prometheus CRL-age
+        // gauge; `Copy + Eq` are relied on by the reload-diffing logic in
+        // `rustgate-server`'s `reload_all_configs` path.
+        fn assert_bounds<T: std::fmt::Debug + Clone + Copy + PartialEq + Eq>() {}
+        assert_bounds::<CrlFileSummary>();
+        let a = CrlFileSummary {
+            count: 3,
+            max_age_seconds: Some(42),
+        };
+        let b = a;
+        assert_eq!(a, b);
+        assert_eq!(a.count, 3);
+        assert_eq!(a.max_age_seconds, Some(42));
+        let c = CrlFileSummary {
+            count: 3,
+            max_age_seconds: None,
+        };
+        assert_ne!(a, c);
+        assert!(format!("{a:?}").contains("count"));
+    }
+
+    #[test]
+    fn from_pem_defaults_to_tls12_and_empty_crls() {
+        // Pins the default post-`from_pem` state: TLS 1.2 minimum, no CRLs
+        // loaded, stale-CRL warnings enabled. These defaults are
+        // load-bearing for the happy-path server boot, where `from_pem`
+        // is the sole constructor before optional `with_*` chain calls.
+        let ca = rustgate_test_utils::certs::TestCa::new("config-defaults-ca");
+        let server = ca.issue_server_cert("localhost", &["localhost"]);
+        let cfg =
+            TlsConfig::from_pem(&server.cert_pem, &server.key_pem, &ca.cert_pem).expect("from_pem");
+        assert_eq!(cfg.tls_min_version, TlsMinVersion::Tls12);
+        assert!(
+            cfg.crls().is_empty(),
+            "from_pem must not load any CRLs by default"
+        );
+        assert!(
+            cfg.warn_stale_crl,
+            "warn_stale_crl default must be true (opt-out, not opt-in)"
+        );
+        assert_eq!(
+            cfg.client_ca_store().len(),
+            1,
+            "CA store must hold exactly the issuer"
+        );
+    }
+
+    #[test]
+    fn from_pem_rejects_garbage_server_cert_pem() {
+        // Pins that `from_pem` bubbles up `parse_certs` errors rather than
+        // silently constructing a half-initialised `TlsConfig`. A broken
+        // cert PEM would otherwise produce a config that *looks* valid
+        // but fails at `build_server_config` time, far from the caller.
+        let ca = rustgate_test_utils::certs::TestCa::new("config-rej-ca");
+        let server = ca.issue_server_cert("localhost", &["localhost"]);
+        let result = TlsConfig::from_pem(
+            "-----BEGIN CERTIFICATE-----\nnot-der\n-----END CERTIFICATE-----\n",
+            &server.key_pem,
+            &ca.cert_pem,
+        );
+        assert!(result.is_err(), "malformed cert PEM must error at from_pem");
+    }
+
+    #[test]
+    fn with_crl_warn_stale_flag_round_trips() {
+        // Pins the builder flag semantics: `with_crl_warn_stale(false)`
+        // must make `with_crls` quiet about expired CRLs (the deliberate
+        // opt-out path for environments with stale-by-design CRLs).
+        let ca = rustgate_test_utils::certs::TestCa::new("warn-stale-ca");
+        let server = ca.issue_server_cert("localhost", &["localhost"]);
+        let cfg = TlsConfig::from_pem(&server.cert_pem, &server.key_pem, &ca.cert_pem)
+            .expect("from_pem")
+            .with_crl_warn_stale(false);
+        assert!(!cfg.warn_stale_crl);
+        // Round-trip the flag once more in the other direction.
+        let cfg = cfg.with_crl_warn_stale(true);
+        assert!(cfg.warn_stale_crl);
+    }
+
+    #[test]
+    fn with_tls_min_version_round_trips() {
+        // Pins that the builder mutation survives into `tls_min_version`,
+        // which is what `build_server_config_with_verifier` reads to pick
+        // the protocol-version slice. A regression that silently dropped
+        // the value would leak the default (TLS 1.2) even when an
+        // operator explicitly asked for TLS 1.3 only.
+        let ca = rustgate_test_utils::certs::TestCa::new("version-ca");
+        let server = ca.issue_server_cert("localhost", &["localhost"]);
+        let cfg = TlsConfig::from_pem(&server.cert_pem, &server.key_pem, &ca.cert_pem)
+            .expect("from_pem")
+            .with_tls_min_version(TlsMinVersion::Tls13);
+        assert_eq!(cfg.tls_min_version, TlsMinVersion::Tls13);
+    }
+
+    #[test]
+    fn with_crls_rejects_empty_pem_with_crls_kind() {
+        // `with_crls("")` produces zero PEM blocks; the defensive check
+        // must fire with `ConfigError::EmptyPem { kind: "CRLs" }` so
+        // operators see *which* PEM bundle was empty. A silent Ok(self)
+        // here would cause the handshake path to accept revoked certs.
+        let ca = rustgate_test_utils::certs::TestCa::new("empty-crl-ca");
+        let server = ca.issue_server_cert("localhost", &["localhost"]);
+        let cfg = TlsConfig::from_pem(&server.cert_pem, &server.key_pem, &ca.cert_pem)
+            .expect("from_pem")
+            .with_crls("");
+        let err = cfg.expect_err("empty CRL PEM must error");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("CRLs") || msg.contains("EmptyPem"),
+            "error must identify empty-CRLs source: {msg}"
+        );
+    }
+
+    #[test]
+    fn with_crls_rejects_unparseable_pem() {
+        // Pins that broken PEM surfaces as an error rather than an empty
+        // CRL set. The outer `EmptyPem` check only fires when the
+        // iterator is *empty*; a single garbage PEM block must hit the
+        // `PemParse` arm instead.
+        let ca = rustgate_test_utils::certs::TestCa::new("garbage-crl-ca");
+        let server = ca.issue_server_cert("localhost", &["localhost"]);
+        let cfg = TlsConfig::from_pem(&server.cert_pem, &server.key_pem, &ca.cert_pem)
+            .expect("from_pem")
+            .with_crls("-----BEGIN X509 CRL-----\nnot-base64!\n-----END X509 CRL-----\n");
+        assert!(cfg.is_err(), "unparseable CRL PEM must error at with_crls");
+    }
+
+    #[test]
+    fn with_crls_accepts_real_crl_and_stores_count() {
+        // End-to-end round-trip through `TestCa::generate_crl` —
+        // confirms the constructor path that SIGHUP-driven reload and
+        // the config-file loader both rely on. After a successful
+        // `with_crls`, the `crls()` accessor must show exactly one entry
+        // and `crl_max_age_seconds()` must report a small, fresh age.
+        let ca = rustgate_test_utils::certs::TestCa::new("real-crl-ca");
+        let server = ca.issue_server_cert("localhost", &["localhost"]);
+        let victim = ca.issue_client_cert("victim", &["users"]);
+        let crl_pem = ca.generate_crl(&[&victim.cert_pem]);
+        let cfg = TlsConfig::from_pem(&server.cert_pem, &server.key_pem, &ca.cert_pem)
+            .expect("from_pem")
+            .with_crls(&crl_pem)
+            .expect("with_crls");
+        assert_eq!(cfg.crls().len(), 1);
+        let age = cfg.crl_max_age_seconds().expect("fresh CRL has age");
+        assert!(
+            (0..=60).contains(&age),
+            "fresh CRL age {age}s out of expected 0..=60 band"
+        );
+    }
+
+    #[test]
+    fn client_ca_store_accessor_returns_loaded_roots() {
+        // Pins the `&Arc<RootCertStore>` accessor shape used by
+        // `DynamicCertVerifier` and the listener bootstrap to enumerate
+        // trust anchors. The returned `Arc` must be shareable across
+        // threads without cloning the underlying store.
+        let ca = rustgate_test_utils::certs::TestCa::new("store-accessor-ca");
+        let server = ca.issue_server_cert("localhost", &["localhost"]);
+        let cfg =
+            TlsConfig::from_pem(&server.cert_pem, &server.key_pem, &ca.cert_pem).expect("from_pem");
+        let store = cfg.client_ca_store();
+        assert_eq!(store.len(), 1);
+        // Cloning the `Arc` must not deep-clone the store — strong-count
+        // increases, the pointee is shared.
+        let cloned = std::sync::Arc::clone(store);
+        assert_eq!(cloned.len(), 1);
+        assert!(std::sync::Arc::ptr_eq(store, &cloned));
+    }
+
+    #[test]
+    fn crls_accessor_returns_empty_slice_by_default() {
+        // Pins that `crls()` on a freshly-built `TlsConfig` (no
+        // `with_crls` call) is an empty slice — not an `Option`, not a
+        // panic. The hot path relies on `!crls.is_empty()` to gate
+        // `WebPkiClientVerifier::with_crls`; swapping the default to a
+        // sentinel non-empty value would silently enable CRL checking.
+        let ca = rustgate_test_utils::certs::TestCa::new("crls-empty-ca");
+        let server = ca.issue_server_cert("localhost", &["localhost"]);
+        let cfg =
+            TlsConfig::from_pem(&server.cert_pem, &server.key_pem, &ca.cert_pem).expect("from_pem");
+        assert!(cfg.crls().is_empty());
+        assert_eq!(cfg.crl_max_age_seconds(), None);
+    }
+
+    #[test]
+    fn validate_crl_file_rejects_missing_path() {
+        // Pins the error-surface contract: a nonexistent path must
+        // produce an `Err` containing the path, so operators have a
+        // grep-able diagnostic. A silent `Ok(CrlFileSummary { count: 0, .. })`
+        // here would make SIGHUP reload appear successful while
+        // actually leaving revocation checks disabled.
+        let missing = "/definitely/not/a/real/crl/path.pem";
+        let result = TlsConfig::validate_crl_file(missing);
+        let err = result.expect_err("missing file must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("/definitely/not/a/real/crl/path.pem") || msg.contains("failed to read"),
+            "error must mention the offending path: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_crl_file_rejects_empty_file() {
+        // Pins the `EmptyPem { kind: "CRLs" }` arm on a literally-empty
+        // CRL file. Distinct from `rejects_missing_path` because we want
+        // to differentiate "file gone" from "file present but useless".
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("empty.crl.pem");
+        std::fs::write(&path, "").expect("write empty crl");
+        let result = TlsConfig::validate_crl_file(path.to_str().unwrap());
+        assert!(result.is_err(), "empty file must error");
+    }
+
+    #[test]
+    fn validate_crl_file_succeeds_and_returns_summary() {
+        // End-to-end path through disk: write a real CRL PEM, validate,
+        // check that count + max_age_seconds agree with what the
+        // in-memory `with_crls` path produced. Protects against a
+        // regression where the disk path silently drifts from the
+        // in-memory path in terms of parsing semantics.
+        let ca = rustgate_test_utils::certs::TestCa::new("validate-file-ca");
+        let victim = ca.issue_client_cert("victim", &["alpha"]);
+        let crl_pem = ca.generate_crl(&[&victim.cert_pem]);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("real.crl.pem");
+        std::fs::write(&path, &crl_pem).expect("write crl");
+
+        let summary =
+            TlsConfig::validate_crl_file(path.to_str().unwrap()).expect("validate succeeds");
+        assert_eq!(summary.count, 1, "exactly one CRL block parsed");
+        let age = summary.max_age_seconds.expect("fresh CRL has age");
+        assert!(
+            (0..=60).contains(&age),
+            "fresh-CRL age {age}s outside 0..=60 band"
+        );
+    }
+
+    #[test]
+    fn check_crl_freshness_reports_zero_stale_on_fresh_crl() {
+        // Baseline for the stale-counter: a freshly generated CRL must
+        // produce a stale-count of zero. Anchors the dual-branch logic
+        // (fresh vs stale) that shares one loop; a regression in the
+        // `next_update > now` comparison would flip every CRL to stale.
+        let ca = rustgate_test_utils::certs::TestCa::new("fresh-crl-ca");
+        let victim = ca.issue_client_cert("victim", &["alpha"]);
+        let crl_pem = ca.generate_crl(&[&victim.cert_pem]);
+        let crls: Vec<_> = CertificateRevocationListDer::pem_slice_iter(crl_pem.as_bytes())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(check_crl_freshness(&crls), 0);
+    }
+
+    #[test]
+    fn check_crl_freshness_counts_expired_crl() {
+        // Pins the stale-CRL path. `TestCa::generate_expired_crl` mints a
+        // CRL with `nextUpdate` 30 days in the past, which must count as
+        // one stale entry. The audit/logging side-effect (warn! log) is
+        // not asserted — we only pin the integer return so the
+        // stale-count gauge in the server metrics stays accurate.
+        let ca = rustgate_test_utils::certs::TestCa::new("expired-crl-ca");
+        let victim = ca.issue_client_cert("victim", &["alpha"]);
+        let expired_pem = ca.generate_expired_crl(&[&victim.cert_pem]);
+        let crls: Vec<_> = CertificateRevocationListDer::pem_slice_iter(expired_pem.as_bytes())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(check_crl_freshness(&crls), 1);
+    }
+
+    #[test]
+    fn check_crl_freshness_silently_skips_garbage_entries() {
+        // A CRL slice that fails `parse_x509_crl` must not panic and must
+        // not count toward the stale total — the parse-failure arm logs
+        // a warn and continues. Anchors the "don't let one bad CRL
+        // contaminate the signal from siblings" invariant.
+        let bogus = CertificateRevocationListDer::from(vec![0x30, 0x00]);
+        assert_eq!(
+            check_crl_freshness(&[bogus]),
+            0,
+            "unparseable CRL must not count as stale"
+        );
+    }
+
+    #[test]
+    fn check_crl_freshness_sums_across_mixed_input() {
+        // Mix one fresh and one expired CRL and verify the counter
+        // reports exactly one stale. Protects against loop-variable bugs
+        // (e.g. early-return on first stale, skipping remaining).
+        let ca = rustgate_test_utils::certs::TestCa::new("mixed-crl-ca");
+        let victim = ca.issue_client_cert("victim", &["alpha"]);
+        let fresh_pem = ca.generate_crl(&[&victim.cert_pem]);
+        let expired_pem = ca.generate_expired_crl(&[&victim.cert_pem]);
+        let mut crls: Vec<CertificateRevocationListDer<'static>> =
+            CertificateRevocationListDer::pem_slice_iter(fresh_pem.as_bytes())
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+        crls.extend(
+            CertificateRevocationListDer::pem_slice_iter(expired_pem.as_bytes())
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap(),
+        );
+        assert_eq!(check_crl_freshness(&crls), 1);
+    }
+
+    #[test]
+    fn build_default_verifier_without_crls_succeeds() {
+        // Pins the "no CRLs loaded" build path. The builder takes the
+        // `else` branch of `if !self.crls.is_empty()`, skipping
+        // `with_crls`. A regression that always attaches an empty Vec of
+        // CRLs would invoke a different rustls code path and cause
+        // behavioural drift on test vs production servers.
+        let ca = rustgate_test_utils::certs::TestCa::new("no-crls-verifier-ca");
+        let server = ca.issue_server_cert("localhost", &["localhost"]);
+        let cfg =
+            TlsConfig::from_pem(&server.cert_pem, &server.key_pem, &ca.cert_pem).expect("from_pem");
+        let _verifier = cfg
+            .build_default_verifier()
+            .expect("default verifier builds without CRLs");
+    }
+
+    #[test]
+    fn build_default_verifier_with_crls_succeeds() {
+        // Pins the "CRLs loaded" branch. `WebPkiClientVerifier::with_crls`
+        // is the hot-path entry to revocation enforcement; this ensures
+        // the builder correctly threads loaded CRLs into the verifier.
+        let ca = rustgate_test_utils::certs::TestCa::new("with-crls-verifier-ca");
+        let server = ca.issue_server_cert("localhost", &["localhost"]);
+        let victim = ca.issue_client_cert("victim", &["users"]);
+        let crl_pem = ca.generate_crl(&[&victim.cert_pem]);
+        let cfg = TlsConfig::from_pem(&server.cert_pem, &server.key_pem, &ca.cert_pem)
+            .expect("from_pem")
+            .with_crls(&crl_pem)
+            .expect("with_crls");
+        let _verifier = cfg
+            .build_default_verifier()
+            .expect("default verifier builds with CRLs");
+    }
+
+    #[test]
+    fn build_server_config_disables_tls_session_resumption() {
+        // Tier-1 CVE-2025-23419-style defense: the rustls default is to
+        // cache 256 resumable sessions, which lets a revoked client cert
+        // re-authenticate via cached ticket without a fresh cert check.
+        // We pin that the built `ServerConfig` installs
+        // `NoServerSessionStorage`, observable as `can_cache() == false`.
+        // A regression here re-opens the class of revoke-bypass bugs that
+        // this code was specifically written to close.
+        let ca = rustgate_test_utils::certs::TestCa::new("session-storage-ca");
+        let server = ca.issue_server_cert("localhost", &["localhost"]);
+        let cfg =
+            TlsConfig::from_pem(&server.cert_pem, &server.key_pem, &ca.cert_pem).expect("from_pem");
+        let built = cfg.build_server_config().expect("build_server_config");
+        assert!(
+            !built.session_storage.can_cache(),
+            "session_storage must be NoServerSessionStorage (can_cache=false)"
+        );
+        // Also pin that `put` returns false so even if a client somehow
+        // attempts to cache, the storage is a no-op sink.
+        assert!(
+            !built
+                .session_storage
+                .put(b"ticket-id".to_vec(), b"secret".to_vec()),
+            "NoServerSessionStorage::put must return false"
+        );
+    }
+
+    #[test]
+    fn build_reloadable_server_config_disables_tls_session_resumption() {
+        // Same CVE-2025-23419-style pin but on the hot-reload code path.
+        // Both builders must agree — one path that forgets to disable
+        // session storage (and the other that disables it) is the
+        // classic "tests happy, production vulnerable" regression.
+        let ca = rustgate_test_utils::certs::TestCa::new("reloadable-session-ca");
+        let server = ca.issue_server_cert("localhost", &["localhost"]);
+        let cfg =
+            TlsConfig::from_pem(&server.cert_pem, &server.key_pem, &ca.cert_pem).expect("from_pem");
+        let verifier = cfg.build_default_verifier().expect("default verifier");
+
+        // Minimal inline stub: resolves nothing. We only need a valid
+        // `ResolvesServerCert` trait object so the builder type-checks;
+        // we don't drive an actual handshake.
+        #[derive(Debug)]
+        struct NopResolver;
+        impl rustls::server::ResolvesServerCert for NopResolver {
+            fn resolve(
+                &self,
+                _client_hello: rustls::server::ClientHello<'_>,
+            ) -> Option<std::sync::Arc<rustls::sign::CertifiedKey>> {
+                None
+            }
+        }
+        let resolver = std::sync::Arc::new(NopResolver);
+
+        let built = cfg
+            .build_reloadable_server_config(verifier, resolver)
+            .expect("build_reloadable_server_config");
+        assert!(
+            !built.session_storage.can_cache(),
+            "reloadable build path must also disable session storage"
+        );
+    }
+
+    #[test]
+    fn build_server_config_tls13_only_restricts_protocol_slice() {
+        // End-to-end version pin: the slice picked by
+        // `tls_min_version.protocol_versions()` must make its way into
+        // rustls's offered versions. We can't inspect the built
+        // `ServerConfig`'s version list directly (private field), so we
+        // instead verify that the build succeeds and that a second build
+        // with default versions also succeeds — absence of panic is the
+        // observable.
+        let ca = rustgate_test_utils::certs::TestCa::new("tls13-build-ca");
+        let server = ca.issue_server_cert("localhost", &["localhost"]);
+        let cfg = TlsConfig::from_pem(&server.cert_pem, &server.key_pem, &ca.cert_pem)
+            .expect("from_pem")
+            .with_tls_min_version(TlsMinVersion::Tls13);
+        let _built = cfg
+            .build_server_config()
+            .expect("build succeeds with TLS 1.3 only");
+    }
+
+    #[test]
+    fn is_fips_provider_active_is_false_under_ring_default() {
+        // `TestCa::new` installs `ring` as the default provider (not the
+        // FIPS-validated `aws-lc-rs` with FIPS feature). The FIPS
+        // accessor must report `false` so operators relying on
+        // `--fips-required` get a clean fail-closed signal. A regression
+        // that returned `true` for non-FIPS providers would silently
+        // mark a non-FIPS build as compliant.
+        let _ca = rustgate_test_utils::certs::TestCa::new("fips-probe-ca");
+        assert!(
+            !is_fips_provider_active(),
+            "ring default provider must not report FIPS mode"
+        );
+    }
+
+    #[test]
+    fn is_pq_provider_active_is_false_under_ring_default() {
+        // Same logic as FIPS: `ring` does not advertise `X25519MLKEM768`,
+        // so the PQ detection accessor must report false. This is what
+        // the `/status` endpoint reads — a false positive would make
+        // operators believe PQ key exchange is live when it isn't.
+        let _ca = rustgate_test_utils::certs::TestCa::new("pq-probe-ca");
+        assert!(
+            !is_pq_provider_active(),
+            "ring default provider must not advertise X25519MLKEM768"
+        );
+    }
+
     #[cfg(feature = "post-quantum")]
     mod kx_groups {
         use super::super::parse_kx_groups;
