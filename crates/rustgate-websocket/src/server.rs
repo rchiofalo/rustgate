@@ -1069,7 +1069,9 @@ mod tests {
         // the slow-consumer defence entirely) or dropped it below a
         // plausible tactical payload would trip here rather than at a
         // Grafana outage.
-        assert!(DEFAULT_MAX_WRITE_BUFFER_BYTES < rustgate_core::constants::MAX_FRAME_SIZE);
+        const {
+            assert!(DEFAULT_MAX_WRITE_BUFFER_BYTES < rustgate_core::constants::MAX_FRAME_SIZE);
+        }
     }
 
     #[test]
@@ -1080,8 +1082,12 @@ mod tests {
         // producer pin ~40 MiB of per-session buffers on top of the
         // tenant-quota accounting) fails a focused test rather than
         // manifesting as a production outage.
-        assert!(DEFAULT_MAX_WRITE_BUFFER_BYTES >= 1 * 1024 * 1024);
-        assert!(DEFAULT_MAX_WRITE_BUFFER_BYTES <= 32 * 1024 * 1024);
+        const {
+            assert!(DEFAULT_MAX_WRITE_BUFFER_BYTES >= 1024 * 1024);
+        }
+        const {
+            assert!(DEFAULT_MAX_WRITE_BUFFER_BYTES <= 32 * 1024 * 1024);
+        }
     }
 
     #[test]
