@@ -87,3 +87,165 @@ pub trait Codec: Send + Sync + std::fmt::Debug {
     /// confidence score. Returns 0.0 if the prefix does not match.
     fn detect(&self, prefix: &[u8]) -> f32;
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::panic, clippy::unwrap_used)]
+
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+    use std::time::SystemTime;
+
+    use bytes::{Bytes, BytesMut};
+
+    use super::*;
+    use crate::identity::Identity;
+    use crate::message::{Destination, MessageType, Metadata, RoutableMessage};
+    use crate::protocol::HeaderSize;
+
+    /// A minimal `Codec` implementation that exercises the trait contract
+    /// end-to-end without pulling in a real protocol crate. Lives only in
+    /// this test module.
+    #[derive(Debug)]
+    struct StubCodec {
+        id: &'static str,
+        framing: FramingStrategy,
+    }
+
+    impl Codec for StubCodec {
+        fn protocol_id(&self) -> &str {
+            self.id
+        }
+
+        fn framing(&self) -> FramingStrategy {
+            self.framing.clone()
+        }
+
+        fn decode_payload(&self, frame: BytesMut) -> std::io::Result<Bytes> {
+            Ok(frame.freeze())
+        }
+
+        fn encode_payload(&self, msg: &RoutableMessage) -> std::io::Result<Bytes> {
+            Ok(msg.payload.clone())
+        }
+
+        fn detect(&self, prefix: &[u8]) -> f32 {
+            if prefix.first().copied() == Some(b'<') {
+                1.0
+            } else {
+                0.0
+            }
+        }
+    }
+
+    fn make_message(payload: &'static [u8]) -> RoutableMessage {
+        let identity = Identity::new(
+            "tester".to_string(),
+            "fingerprint".to_string(),
+            BTreeSet::new(),
+        )
+        .unwrap();
+        RoutableMessage {
+            source: identity,
+            destination: Destination::Broadcast,
+            payload: Bytes::from_static(payload),
+            metadata: Metadata {
+                received_at: SystemTime::now(),
+                source_protocol: "test".to_string(),
+                message_type: MessageType::Other("test".to_string()),
+                ttl: None,
+            },
+        }
+    }
+
+    #[test]
+    fn codec_trait_is_object_safe_and_send_sync_debug() {
+        fn assert_bounds<T: Send + Sync + std::fmt::Debug + ?Sized>() {}
+        assert_bounds::<dyn Codec>();
+
+        let boxed: Box<dyn Codec> = Box::new(StubCodec {
+            id: "stub-xml",
+            framing: FramingStrategy::XmlStream,
+        });
+        assert_eq!(boxed.protocol_id(), "stub-xml");
+
+        let arced: Arc<dyn Codec> = Arc::from(boxed);
+        assert!(matches!(arced.framing(), FramingStrategy::XmlStream));
+    }
+
+    #[test]
+    fn codec_passthrough_decode_payload_is_zero_copy() {
+        let codec = StubCodec {
+            id: "stub",
+            framing: FramingStrategy::LengthPrefixed {
+                header_size: HeaderSize::Four,
+            },
+        };
+        let mut buf = BytesMut::with_capacity(16);
+        buf.extend_from_slice(b"hello world");
+        let decoded = codec.decode_payload(buf).unwrap();
+        assert_eq!(&decoded[..], b"hello world");
+    }
+
+    #[test]
+    fn codec_encode_payload_reads_message_payload() {
+        let codec = StubCodec {
+            id: "stub",
+            framing: FramingStrategy::LineDelimited,
+        };
+        let msg = make_message(b"<event/>");
+        let encoded = codec.encode_payload(&msg).unwrap();
+        assert_eq!(&encoded[..], b"<event/>");
+    }
+
+    #[test]
+    fn codec_detect_returns_bounded_confidence_score() {
+        let codec = StubCodec {
+            id: "stub-xml",
+            framing: FramingStrategy::XmlStream,
+        };
+        assert_eq!(codec.detect(b""), 0.0);
+        assert_eq!(codec.detect(b"\x00\x01\x02"), 0.0);
+        let confidence = codec.detect(b"<event");
+        assert!(
+            (0.0..=1.0).contains(&confidence),
+            "confidence {confidence} outside documented [0.0, 1.0] range"
+        );
+        assert!(confidence > 0.0);
+    }
+
+    #[test]
+    fn codec_framing_strategy_round_trips_through_trait() {
+        let framings = [
+            FramingStrategy::LengthPrefixed {
+                header_size: HeaderSize::Two,
+            },
+            FramingStrategy::XmlStream,
+            FramingStrategy::LineDelimited,
+            FramingStrategy::TakProtobuf,
+            FramingStrategy::Mavlink,
+        ];
+        for framing in framings {
+            let codec: Box<dyn Codec> = Box::new(StubCodec {
+                id: "stub",
+                framing: framing.clone(),
+            });
+            let expected_name = format!("{framing:?}");
+            let returned_name = format!("{:?}", codec.framing());
+            assert_eq!(returned_name, expected_name);
+        }
+    }
+
+    #[test]
+    fn codec_debug_output_contains_stub_marker() {
+        let codec = StubCodec {
+            id: "stub-xml",
+            framing: FramingStrategy::XmlStream,
+        };
+        let dbg = format!("{codec:?}");
+        assert!(
+            dbg.contains("StubCodec"),
+            "Debug output missing type name: {dbg}"
+        );
+    }
+}
