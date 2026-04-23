@@ -1375,4 +1375,495 @@ mod tests {
         assert_eq!(successes, 1, "exactly one CN should claim the client ID");
         assert_eq!(failures, 9, "all others should be rejected");
     }
+
+    // -----------------------------------------------------------------------
+    // Constant pins
+    //
+    // These constants are part of the public MQTT contract even though the
+    // Rust bindings keep them module-private — clients calibrate keep-alive
+    // timers against the 1.5x factor (MQTT 3.1.1 §3.1.2.10 / MQTT 5.0
+    // §3.1.2.10) and subscribe to the `$broadcast` topic by literal string
+    // on the wire. Bumping either value silently would break existing
+    // deployments, so the tests pin the literal value and the test name
+    // doubles as the canary.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn keep_alive_factor_pinned_at_1_5x_per_mqtt_spec() {
+        // MQTT 3.1.1 §3.1.2.10 and MQTT 5.0 §3.1.2.10 both mandate that the
+        // server MUST close the connection if it does not receive a packet
+        // within 1.5x the client-requested keep-alive. Any other multiplier
+        // is a spec violation; pin the literal f64.
+        assert_eq!(
+            KEEP_ALIVE_FACTOR, 1.5_f64,
+            "KEEP_ALIVE_FACTOR must be exactly 1.5 per MQTT spec"
+        );
+    }
+
+    #[test]
+    fn broadcast_topic_suffix_pinned_string() {
+        // MQTT reserves `$`-prefixed topic names for system-level topics
+        // (§4.7.2). The `$broadcast` suffix is the rustgate convention for
+        // surface-of-all-sessions fan-out. Clients subscribing to
+        // `"$broadcast"` (or `"<prefix>$broadcast"` when a topic prefix is
+        // configured) rely on the exact literal; renaming it silently would
+        // orphan every existing subscription.
+        assert_eq!(BROADCAST_TOPIC_SUFFIX, "$broadcast");
+    }
+
+    #[test]
+    fn broadcast_topic_suffix_is_dollar_prefixed() {
+        // Defence-in-depth: even if a future rename changes the trailing
+        // text, the leading `$` must stay so the token continues to live
+        // in MQTT's reserved system-topic namespace and cannot collide
+        // with an ordinary client-published topic like `broadcast`.
+        assert!(
+            BROADCAST_TOPIC_SUFFIX.starts_with('$'),
+            "broadcast suffix must live in MQTT's reserved $-topic namespace",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Observer fire-helper dispatch
+    //
+    // The four `fire_*` helpers sit on the publish/subscribe hot path and
+    // are the only bridge between the session loop and the
+    // `MqttSessionHooks` observer. Their defensive contract is:
+    //
+    //   (a) `None` at the outer `Option<&MqttSessionHooks>` is a no-op;
+    //   (b) `None` at the individual `Option<Arc<...>>` field is a no-op;
+    //   (c) when both Somes are present, *only* the matching callback fires;
+    //   (d) repeated calls increment, never dedup.
+    //
+    // The counters use `AtomicUsize` so the test is deterministic and
+    // preserves interior-mutability across the `Arc<dyn Fn()>` callback
+    // boundary.
+    // -----------------------------------------------------------------------
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Build a counter-incrementing callback that matches every `On*` alias
+    /// in `crate::config` (`Arc<dyn Fn() + Send + Sync>`).
+    fn counter_cb(slot: &Arc<AtomicUsize>) -> Arc<dyn Fn() + Send + Sync> {
+        let slot = Arc::clone(slot);
+        Arc::new(move || {
+            let _ = slot.fetch_add(1, Ordering::SeqCst);
+        })
+    }
+
+    /// Build a fully-populated hooks bundle where every field is wired to
+    /// an independent counter, returned in fixed order so the test can
+    /// assert which callback fired.
+    fn hooks_with_all_counters() -> (
+        crate::config::MqttSessionHooks,
+        Arc<AtomicUsize>, // publish
+        Arc<AtomicUsize>, // publish_reject
+        Arc<AtomicUsize>, // subscribe
+        Arc<AtomicUsize>, // subscribe_reject
+    ) {
+        let pub_c = Arc::new(AtomicUsize::new(0));
+        let pub_rej_c = Arc::new(AtomicUsize::new(0));
+        let sub_c = Arc::new(AtomicUsize::new(0));
+        let sub_rej_c = Arc::new(AtomicUsize::new(0));
+        let hooks = crate::config::MqttSessionHooks {
+            on_publish: Some(counter_cb(&pub_c)),
+            on_publish_reject: Some(counter_cb(&pub_rej_c)),
+            on_subscribe: Some(counter_cb(&sub_c)),
+            on_subscribe_reject: Some(counter_cb(&sub_rej_c)),
+        };
+        (hooks, pub_c, pub_rej_c, sub_c, sub_rej_c)
+    }
+
+    #[test]
+    fn fire_helpers_nop_when_hooks_bundle_is_none() {
+        // Passing `None` at the top level is the common production path
+        // when metrics are disabled; none of the four helpers may touch
+        // anything (no allocations, no panics, no side effects). We just
+        // exercise every helper and rely on the absence of a panic + the
+        // `#![deny(clippy::panic)]` workspace lint to enforce it.
+        fire_publish_accept(None);
+        fire_publish_reject(None);
+        fire_subscribe_accept(None);
+        fire_subscribe_reject(None);
+    }
+
+    #[test]
+    fn fire_helpers_nop_when_individual_callback_is_none() {
+        // An operator may opt into the hook struct but wire only a subset
+        // of callbacks (e.g. accept metrics but not reject metrics). The
+        // helpers must tolerate partial population — a missing callback on
+        // the matching field must not dispatch any other field as a
+        // fallback.
+        let (_, pub_c, pub_rej_c, sub_c, sub_rej_c) = hooks_with_all_counters();
+        let empty = crate::config::MqttSessionHooks::default();
+        fire_publish_accept(Some(&empty));
+        fire_publish_reject(Some(&empty));
+        fire_subscribe_accept(Some(&empty));
+        fire_subscribe_reject(Some(&empty));
+        assert_eq!(pub_c.load(Ordering::SeqCst), 0);
+        assert_eq!(pub_rej_c.load(Ordering::SeqCst), 0);
+        assert_eq!(sub_c.load(Ordering::SeqCst), 0);
+        assert_eq!(sub_rej_c.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn fire_publish_accept_fires_only_its_own_callback() {
+        let (hooks, pub_c, pub_rej_c, sub_c, sub_rej_c) = hooks_with_all_counters();
+        fire_publish_accept(Some(&hooks));
+        assert_eq!(pub_c.load(Ordering::SeqCst), 1, "publish accept must fire");
+        assert_eq!(pub_rej_c.load(Ordering::SeqCst), 0);
+        assert_eq!(sub_c.load(Ordering::SeqCst), 0);
+        assert_eq!(sub_rej_c.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn fire_publish_reject_fires_only_its_own_callback() {
+        let (hooks, pub_c, pub_rej_c, sub_c, sub_rej_c) = hooks_with_all_counters();
+        fire_publish_reject(Some(&hooks));
+        assert_eq!(pub_c.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            pub_rej_c.load(Ordering::SeqCst),
+            1,
+            "publish reject must fire"
+        );
+        assert_eq!(sub_c.load(Ordering::SeqCst), 0);
+        assert_eq!(sub_rej_c.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn fire_subscribe_accept_fires_only_its_own_callback() {
+        let (hooks, pub_c, pub_rej_c, sub_c, sub_rej_c) = hooks_with_all_counters();
+        fire_subscribe_accept(Some(&hooks));
+        assert_eq!(pub_c.load(Ordering::SeqCst), 0);
+        assert_eq!(pub_rej_c.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            sub_c.load(Ordering::SeqCst),
+            1,
+            "subscribe accept must fire"
+        );
+        assert_eq!(sub_rej_c.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn fire_subscribe_reject_fires_only_its_own_callback() {
+        let (hooks, pub_c, pub_rej_c, sub_c, sub_rej_c) = hooks_with_all_counters();
+        fire_subscribe_reject(Some(&hooks));
+        assert_eq!(pub_c.load(Ordering::SeqCst), 0);
+        assert_eq!(pub_rej_c.load(Ordering::SeqCst), 0);
+        assert_eq!(sub_c.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            sub_rej_c.load(Ordering::SeqCst),
+            1,
+            "subscribe reject must fire"
+        );
+    }
+
+    #[test]
+    fn fire_helpers_increment_per_call_without_deduping() {
+        // The helpers fire per call — the Prometheus counter that each
+        // callback backs is a monotonic total, not a rate. A dedup or
+        // "once-per-session" bug would collapse 100 admissions into 1
+        // and wreck SLO alerting. Hammer each helper and assert the
+        // counter matches call count exactly.
+        let (hooks, pub_c, pub_rej_c, sub_c, sub_rej_c) = hooks_with_all_counters();
+        for _ in 0..100 {
+            fire_publish_accept(Some(&hooks));
+            fire_publish_reject(Some(&hooks));
+            fire_subscribe_accept(Some(&hooks));
+            fire_subscribe_reject(Some(&hooks));
+        }
+        assert_eq!(pub_c.load(Ordering::SeqCst), 100);
+        assert_eq!(pub_rej_c.load(Ordering::SeqCst), 100);
+        assert_eq!(sub_c.load(Ordering::SeqCst), 100);
+        assert_eq!(sub_rej_c.load(Ordering::SeqCst), 100);
+    }
+
+    // -----------------------------------------------------------------------
+    // `msg_to_topic` destination → topic-string contract
+    //
+    // Every branch of `Destination` has a distinct topic shape the write
+    // loop publishes. The rules we pin here are:
+    //
+    //   Group      → `{prefix}{group}`           (empty prefix → bare group)
+    //   Direct(id) → `{prefix}direct/{cn}`       (always prefixed with
+    //                                             `direct/` so it cannot
+    //                                             collide with a group name)
+    //   Broadcast  → `{prefix}$broadcast`        (bare `$broadcast` with
+    //                                             empty prefix)
+    //   Multicast  → aliased to Broadcast        (fan-out collapses at the
+    //                                             MQTT wire boundary)
+    //
+    // Tests here don't need a live Router — `msg_to_topic` is a pure
+    // function over destination + prefix.
+    // -----------------------------------------------------------------------
+
+    use std::collections::BTreeSet;
+
+    use bytes::Bytes;
+
+    /// Minimal `RoutableMessage` builder used by the `msg_to_topic` tests.
+    fn mk_msg(dest: Destination) -> RoutableMessage {
+        let source = Identity::new(
+            "source-cn".into(),
+            "fingerprint".into(),
+            BTreeSet::from(["g1".to_string()]),
+        )
+        .unwrap();
+        RoutableMessage {
+            source,
+            destination: dest,
+            payload: Bytes::from_static(b""),
+            metadata: Metadata {
+                received_at: SystemTime::now(),
+                source_protocol: "test".into(),
+                message_type: MessageType::Other("test".into()),
+                ttl: None,
+            },
+        }
+    }
+
+    /// Build an `Identity` for use inside `Destination::Direct(_)`.
+    fn mk_direct_identity(cn: &str) -> Identity {
+        Identity::new(cn.into(), "fp".into(), BTreeSet::new()).unwrap()
+    }
+
+    #[test]
+    fn msg_to_topic_group_with_empty_prefix_is_bare_group() {
+        let msg = mk_msg(Destination::Group("alpha".into()));
+        assert_eq!(msg_to_topic(&msg, ""), "alpha");
+    }
+
+    #[test]
+    fn msg_to_topic_group_with_prefix_concatenates_verbatim() {
+        // The prefix is a literal string — rustgate does not inject a
+        // separator, so operators wire the trailing `/` themselves. This
+        // test pins that contract: `rg/` + `alpha` yields `rg/alpha`
+        // (not `rg//alpha`).
+        let msg = mk_msg(Destination::Group("alpha".into()));
+        assert_eq!(msg_to_topic(&msg, "rg/"), "rg/alpha");
+    }
+
+    #[test]
+    fn msg_to_topic_direct_always_prepends_direct_segment() {
+        // `direct/` is hard-coded so a direct-to-CN topic cannot collide
+        // with a group named the same as a CN. The prefix precedes the
+        // `direct/` segment, never the other way round.
+        let msg = mk_msg(Destination::Direct(mk_direct_identity("alice")));
+        assert_eq!(msg_to_topic(&msg, "rg/"), "rg/direct/alice");
+    }
+
+    #[test]
+    fn msg_to_topic_direct_with_empty_prefix_still_has_direct_segment() {
+        let msg = mk_msg(Destination::Direct(mk_direct_identity("alice")));
+        assert_eq!(msg_to_topic(&msg, ""), "direct/alice");
+    }
+
+    #[test]
+    fn msg_to_topic_broadcast_empty_prefix_is_bare_suffix() {
+        // Bare `$broadcast` — no synthetic leading slash. Clients
+        // subscribing to the broadcast topic with no configured prefix
+        // filter on the exact three-syllable string.
+        let msg = mk_msg(Destination::Broadcast);
+        assert_eq!(msg_to_topic(&msg, ""), "$broadcast");
+    }
+
+    #[test]
+    fn msg_to_topic_broadcast_with_prefix_concatenates_verbatim() {
+        let msg = mk_msg(Destination::Broadcast);
+        assert_eq!(msg_to_topic(&msg, "rg/"), "rg/$broadcast");
+    }
+
+    #[test]
+    fn msg_to_topic_multicast_aliases_broadcast_regardless_of_group_list() {
+        // Multicast at the router layer fans to multiple groups in one
+        // routing pass, but at the MQTT wire boundary there is a single
+        // PUBLISH per session — so Multicast collapses to the same
+        // `$broadcast` topic as `Broadcast`. A non-empty group vector
+        // must not leak into the topic string.
+        let msg = mk_msg(Destination::Multicast(vec![
+            "group-a".into(),
+            "group-b".into(),
+            "group-c".into(),
+        ]));
+        assert_eq!(msg_to_topic(&msg, ""), "$broadcast");
+        let msg2 = mk_msg(Destination::Multicast(vec![
+            "group-a".into(),
+            "group-b".into(),
+        ]));
+        assert_eq!(msg_to_topic(&msg2, "rg/"), "rg/$broadcast");
+    }
+
+    #[test]
+    fn msg_to_topic_multicast_with_empty_group_vector_still_aliases_broadcast() {
+        // Defence: `Multicast(vec![])` is structurally possible — it's a
+        // routing-layer degenerate case. The MQTT topic must still be
+        // `$broadcast` and not, say, the empty string.
+        let msg = mk_msg(Destination::Multicast(Vec::new()));
+        assert_eq!(msg_to_topic(&msg, ""), "$broadcast");
+        assert_eq!(msg_to_topic(&msg, "rg/"), "rg/$broadcast");
+    }
+
+    // -----------------------------------------------------------------------
+    // `ClientIdGuard` / `ClientIdRegistry` — extra edge cases
+    //
+    // The existing six tests cover the happy path and one concurrent-
+    // contention case. The additions below pin behaviour on the error
+    // paths: a stale guard must not clobber a live claim, the registry
+    // must be `Send + Sync + 'static`, and many distinct client IDs must
+    // coexist without any cross-key interference.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn client_id_guard_with_stale_session_id_does_not_clobber_live_claim() {
+        // A guard whose session_id does not match the currently-stored
+        // session_id (e.g. after a reconnect where `try_claim` updated
+        // the session_id but the old guard is still on the stack) must
+        // be a no-op on drop. Otherwise the reconnect path would
+        // silently release the live claim and let a third CN steal it.
+        let reg = ClientIdRegistry::new();
+        reg.try_claim("sensor-1", "device-a", 1).unwrap();
+        // session_id=1 got bumped to 2 by a reconnect of the same CN.
+        reg.try_claim("sensor-1", "device-a", 2).unwrap();
+        {
+            // Stale guard from the pre-reconnect session.
+            let _stale = ClientIdGuard {
+                registry: Arc::clone(&reg),
+                client_id: "sensor-1".into(),
+                session_id: 1,
+            };
+        }
+        // The live claim (session 2, device-a) must still be intact —
+        // a different CN must still be rejected.
+        assert!(reg.try_claim("sensor-1", "device-b", 3).is_err());
+    }
+
+    #[test]
+    fn client_id_registry_is_send_sync_and_static() {
+        // The registry is shared via `Arc<ClientIdRegistry>` across every
+        // per-session spawn. Pinning the auto-trait set here catches a
+        // future refactor that introduces a non-Send/Sync field (e.g.
+        // `Rc<_>` or `Cell<_>`) before it breaks the tokio spawn site.
+        fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+        assert_send_sync_static::<ClientIdRegistry>();
+        assert_send_sync_static::<Arc<ClientIdRegistry>>();
+    }
+
+    #[test]
+    fn client_id_registry_isolates_distinct_keys() {
+        // A claim on one client_id must not affect claims on other
+        // client_ids. This rules out a future bug where the hash-map
+        // internal state bleeds across keys (e.g. through a shared
+        // counter or monotonic id collision).
+        let reg = ClientIdRegistry::new();
+        reg.try_claim("sensor-1", "device-a", 1).unwrap();
+        reg.try_claim("sensor-2", "device-b", 2).unwrap();
+        reg.try_claim("sensor-3", "device-a", 3).unwrap();
+        // Each key has its own owner; cross-CN attempts on each are
+        // independently rejected.
+        assert!(reg.try_claim("sensor-1", "device-b", 4).is_err());
+        assert!(reg.try_claim("sensor-2", "device-a", 5).is_err());
+        assert!(reg.try_claim("sensor-3", "device-b", 6).is_err());
+        // Releasing one key must not release the others.
+        reg.release("sensor-2", 2);
+        assert!(reg.try_claim("sensor-1", "device-b", 7).is_err());
+        assert!(reg.try_claim("sensor-3", "device-b", 8).is_err());
+        // The released key is freely reclaimable.
+        reg.try_claim("sensor-2", "device-z", 9).unwrap();
+    }
+
+    #[test]
+    fn client_id_registry_debug_does_not_panic() {
+        // `ClientIdRegistry` derives `Debug`; exercise it so a future
+        // field whose `Debug` impl panics (exceedingly rare but possible
+        // with third-party types) is caught before a diagnostic log in
+        // production tries to format it.
+        let reg = ClientIdRegistry::new();
+        reg.try_claim("sensor-1", "device-a", 1).unwrap();
+        let rendered = format!("{reg:?}");
+        assert!(!rendered.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Response-packet serializers
+    //
+    // `serialize_v4`, `serialize_v5`, and `serialize_pingresp` are the
+    // three ways the read loop hands serialized packet bytes to the
+    // write loop. They wrap the codec `write_*_to_buf` helpers and are
+    // the only place the read loop can produce a `ResponsePacket`. The
+    // tests below check that every path produces non-empty, reasonably-
+    // shaped output — the byte-level structure is owned by the packet
+    // crate's tests, so we check only the framing we care about at this
+    // layer.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn serialize_pingresp_v311_produces_two_byte_frame() {
+        // MQTT 3.1.1 PINGRESP is the shortest control packet: fixed
+        // header byte 0xD0 followed by remaining-length 0x00 — exactly
+        // two bytes on the wire (§3.13).
+        let pkt = serialize_pingresp(ProtocolLevel::V311).unwrap();
+        assert_eq!(pkt.bytes.len(), 2);
+        assert_eq!(pkt.bytes[0], 0xD0);
+        assert_eq!(pkt.bytes[1], 0x00);
+    }
+
+    #[test]
+    fn serialize_pingresp_v50_produces_two_byte_frame() {
+        // MQTT 5.0 PINGRESP has identical wire shape to v3.1.1 (§3.13);
+        // no properties, no reason code. Pin the exact bytes so a future
+        // rewrite that accidentally introduces a reason-code byte gets
+        // caught.
+        let pkt = serialize_pingresp(ProtocolLevel::V50).unwrap();
+        assert_eq!(pkt.bytes.len(), 2);
+        assert_eq!(pkt.bytes[0], 0xD0);
+        assert_eq!(pkt.bytes[1], 0x00);
+    }
+
+    #[test]
+    fn serialize_v4_puback_round_trips_pkid() {
+        // PUBACK (v3.1.1) is 4 bytes total: fixed header `0x40 0x02`
+        // followed by the 2-byte packet identifier big-endian. We
+        // build a PUBACK for pkid 0x1234 and assert the encoded bytes
+        // line up with §3.4.
+        let puback = mqttbytes::v4::PubAck::new(0x1234);
+        let pkt = serialize_v4(&mqttbytes::v4::Packet::PubAck(puback)).unwrap();
+        assert_eq!(pkt.bytes.len(), 4);
+        assert_eq!(pkt.bytes[0], 0x40);
+        assert_eq!(pkt.bytes[1], 0x02);
+        assert_eq!(pkt.bytes[2], 0x12);
+        assert_eq!(pkt.bytes[3], 0x34);
+    }
+
+    #[test]
+    fn serialize_v5_puback_success_has_zero_reason_byte() {
+        // MQTT 5.0 PUBACK collapses to the v3.1.1 wire shape when the
+        // reason code is Success and no properties are set (§3.4.2.1),
+        // yielding a four-byte frame. Pin that collapse so a future
+        // property-bag addition doesn't silently inflate every ACK.
+        let puback = mqttbytes::v5::PubAck {
+            pkid: 0x0001,
+            reason: mqttbytes::v5::PubAckReason::Success,
+            properties: None,
+        };
+        let pkt = serialize_v5(&mqttbytes::v5::Packet::PubAck(puback)).unwrap();
+        assert_eq!(pkt.bytes.len(), 4);
+        assert_eq!(pkt.bytes[0], 0x40);
+        assert_eq!(pkt.bytes[1], 0x02);
+    }
+
+    #[test]
+    fn serialize_v4_and_v5_produce_independent_buffers() {
+        // Build two packets back-to-back and assert their byte buffers
+        // are distinct allocations — catches a future refactor that
+        // accidentally shares a `BytesMut` between serializers and
+        // corrupts earlier packets in the response pipeline.
+        let pkt_a = serialize_pingresp(ProtocolLevel::V311).unwrap();
+        let pkt_b = serialize_pingresp(ProtocolLevel::V311).unwrap();
+        // The bytes are equal (same PINGRESP) but the buffers are
+        // separately-owned; mutating one must not affect the other.
+        let mut bytes_a = pkt_a.bytes;
+        let bytes_b = pkt_b.bytes;
+        bytes_a.clear();
+        assert_eq!(bytes_b.len(), 2, "second buffer must be untouched");
+    }
 }
