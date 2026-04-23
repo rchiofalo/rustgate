@@ -983,6 +983,675 @@ mod tests {
     }
 
     #[test]
+    fn native_engine_is_clone_debug_send_sync() {
+        // `NativeEngine` is shipped to the dataplane wrapped in
+        // `Arc<dyn PolicyEngine>`; the router also stores a typed
+        // handle so it can call `cache_stats_direct` without the
+        // Option round-trip. Both paths require
+        // `Send + Sync + Clone + Debug`. A future refactor that
+        // dropped any of the derives (for instance, replacing
+        // `#[derive(Debug)]` with a manual impl that forgot to cover
+        // both fields, or adding a `!Send` field like `Rc<_>`) must
+        // fail at this compile-time bound helper rather than at the
+        // first router call site where the error message is much
+        // harder to triage.
+        fn assert_bounds<T: Clone + std::fmt::Debug + Send + Sync + 'static>() {}
+        assert_bounds::<NativeEngine>();
+    }
+
+    #[test]
+    fn cloned_engine_preserves_policy_id_and_has_fresh_cache() {
+        // `NativeEngine` derives `Clone`, and `DecisionCache::Clone`
+        // is documented to return a fresh empty cache with the same
+        // sizing (see `cache.rs::Clone`). Pin both halves of that
+        // contract on an engine that has been primed with evaluations:
+        // the clone must share the same `policy_id` (so logs correlate
+        // across hot-reload), but its `cache_stats_direct()` must
+        // report zero hits/misses (so metrics don't carry the source
+        // engine's steady-state counters into a freshly-spawned router
+        // replica).
+        let rules = ruleset(
+            Effect::Deny,
+            vec![rule(
+                "allow-alice",
+                Effect::Allow,
+                Action::Send,
+                ResourceMatcher::Broadcast,
+                subject_cn("alice"),
+            )],
+        );
+        let engine = NativeEngine::new(rules).expect("valid ruleset compiles");
+        let id = identity("alice", &[]);
+        let subject = Subject::from_identity(&id);
+        engine.evaluate(&subject, &Resource::Broadcast, Action::Send);
+        engine.evaluate(&subject, &Resource::Broadcast, Action::Send);
+        let before = engine.cache_stats_direct();
+        assert_eq!(before.hits, 1);
+        assert_eq!(before.misses, 1);
+
+        let cloned = engine.clone();
+        assert_eq!(
+            cloned.policy_id(),
+            engine.policy_id(),
+            "clone must share policy_id"
+        );
+        let fresh = cloned.cache_stats_direct();
+        assert_eq!(fresh.hits, 0, "clone must have zero hits");
+        assert_eq!(fresh.misses, 0, "clone must have zero misses");
+    }
+
+    #[test]
+    fn policy_engine_trait_default_cache_stats_returns_none() {
+        // The `PolicyEngine::cache_stats` trait method has a
+        // `fn ... -> Option<CacheStats> { None }` default so backends
+        // without a cache (Cedar, future OPA) can opt out of the
+        // Prometheus hit/miss gauges. Pin the default by writing a
+        // minimal impl that only overrides `evaluate` and `policy_id`:
+        // the default `cache_stats()` must return `None`. A refactor
+        // that silently replaced the default with `Some(CacheStats::default())`
+        // would cause cache-less backends to emit zero-gauge telemetry
+        // that looks healthy but is meaningless.
+        struct NoopEngine;
+        impl PolicyEngine for NoopEngine {
+            fn evaluate(
+                &self,
+                _subject: &Subject<'_>,
+                _resource: &Resource<'_>,
+                _action: Action,
+            ) -> DecisionOutcome {
+                DecisionOutcome::deny()
+            }
+            fn policy_id(&self) -> &str {
+                "noop"
+            }
+        }
+        let engine: Box<dyn PolicyEngine> = Box::new(NoopEngine);
+        assert!(
+            engine.cache_stats().is_none(),
+            "default cache_stats must be None"
+        );
+    }
+
+    #[test]
+    fn policy_engine_trait_default_compile_warnings_is_empty_slice() {
+        // Mirror of the cache_stats default test — the
+        // `compile_warnings` default returns `&[]`. Pin it so a
+        // cache-less backend that chose not to surface warnings
+        // doesn't accidentally produce a leaky default (e.g. a static
+        // "not supported" string that operators would treat as a real
+        // compile warning).
+        struct NoopEngine;
+        impl PolicyEngine for NoopEngine {
+            fn evaluate(
+                &self,
+                _subject: &Subject<'_>,
+                _resource: &Resource<'_>,
+                _action: Action,
+            ) -> DecisionOutcome {
+                DecisionOutcome::allow()
+            }
+            fn policy_id(&self) -> &str {
+                "noop"
+            }
+        }
+        let engine: Box<dyn PolicyEngine> = Box::new(NoopEngine);
+        assert!(
+            engine.compile_warnings().is_empty(),
+            "default compile_warnings must be empty"
+        );
+    }
+
+    #[test]
+    fn cache_distinguishes_direct_from_group_with_same_field_value() {
+        // The `resource_hash` helper folds `kind_tag().hash(..)` in
+        // *before* the variant's inner field. A regression that
+        // dropped the kind_tag feed would fold
+        // `Direct { target_cn: "ops" }` and `Group { group: "ops" }`
+        // into the same cache bucket — an authz escape hatch where a
+        // direct-send decision could satisfy a group-send check. Pin
+        // the cache-miss count to 2 so a silent hash collapse trips
+        // here rather than at a correctness outage.
+        let rules = ruleset(
+            Effect::Deny,
+            vec![rule(
+                "allow-any",
+                Effect::Allow,
+                Action::Send,
+                ResourceMatcher::Any,
+                subject_cn("alice"),
+            )],
+        );
+        let engine = NativeEngine::new(rules).expect("valid ruleset compiles");
+        let id = identity("alice", &[]);
+        let subject = Subject::from_identity(&id);
+
+        engine.evaluate(
+            &subject,
+            &Resource::Direct { target_cn: "ops" },
+            Action::Send,
+        );
+        engine.evaluate(&subject, &Resource::Group { group: "ops" }, Action::Send);
+        let stats = engine.cache_stats_direct();
+        assert_eq!(
+            stats.misses, 2,
+            "Direct and Group sharing a field value must still be distinct cache keys"
+        );
+        assert_eq!(stats.hits, 0);
+    }
+
+    #[test]
+    fn cache_distinguishes_nats_subjects_with_distinct_bodies() {
+        // `resource_hash` feeds the NatsSubject body into the
+        // hasher; two distinct subjects must produce two cache
+        // misses. A regression that hashed only `kind_tag` (or
+        // collapsed all NatsSubject resources into one key) would
+        // let an allow decision on `"cot.position"` satisfy a
+        // later check for `"cot.chat"`.
+        let rules = ruleset(
+            Effect::Deny,
+            vec![rule(
+                "allow-any",
+                Effect::Allow,
+                Action::Send,
+                ResourceMatcher::Any,
+                subject_cn("alice"),
+            )],
+        );
+        let engine = NativeEngine::new(rules).expect("valid ruleset compiles");
+        let id = identity("alice", &[]);
+        let subject = Subject::from_identity(&id);
+
+        engine.evaluate(
+            &subject,
+            &Resource::NatsSubject {
+                subject: "cot.position",
+            },
+            Action::Send,
+        );
+        engine.evaluate(
+            &subject,
+            &Resource::NatsSubject {
+                subject: "cot.chat",
+            },
+            Action::Send,
+        );
+        let stats = engine.cache_stats_direct();
+        assert_eq!(
+            stats.misses, 2,
+            "distinct NatsSubject bodies must be distinct cache keys"
+        );
+    }
+
+    #[test]
+    fn cache_distinguishes_federation_peers() {
+        // Mirror of the NatsSubject test for Federation — two peer
+        // ids must be distinct cache keys.
+        let rules = ruleset(
+            Effect::Deny,
+            vec![rule(
+                "allow-any",
+                Effect::Allow,
+                Action::Federate,
+                ResourceMatcher::Any,
+                subject_cn("alice"),
+            )],
+        );
+        let engine = NativeEngine::new(rules).expect("valid ruleset compiles");
+        let id = identity("alice", &[]);
+        let subject = Subject::from_identity(&id);
+
+        engine.evaluate(
+            &subject,
+            &Resource::Federation { peer_id: "peer-a" },
+            Action::Federate,
+        );
+        engine.evaluate(
+            &subject,
+            &Resource::Federation { peer_id: "peer-b" },
+            Action::Federate,
+        );
+        let stats = engine.cache_stats_direct();
+        assert_eq!(
+            stats.misses, 2,
+            "distinct Federation peer ids must be distinct cache keys"
+        );
+    }
+
+    #[test]
+    fn cache_hit_preserves_obligation_vector_and_rule_id_exactly() {
+        // `CachedOutcome` in `cache.rs` round-trips the `rule_id` and
+        // `obligations` fields; a regression that stripped obligations
+        // on the cached path (or returned the first miss's rule_id on
+        // every subsequent hit) would silently skip masking on every
+        // cached allow. Prime the cache with one evaluation, then pin
+        // that the second (cached) evaluation returns a bitwise-identical
+        // outcome: same decision, same rule_id, same obligations in the
+        // same order.
+        let mut r = rule(
+            "allow-with-mixed-obligations",
+            Effect::Allow,
+            Action::Send,
+            ResourceMatcher::Broadcast,
+            subject_cn("alice"),
+        );
+        r.obligations = vec![Obligation::MaskPoint, Obligation::AuditExtended];
+        let rules = ruleset(Effect::Deny, vec![r]);
+        let engine = NativeEngine::new(rules).expect("valid ruleset compiles");
+        let id = identity("alice", &[]);
+        let subject = Subject::from_identity(&id);
+
+        let miss = engine.evaluate(&subject, &Resource::Broadcast, Action::Send);
+        let hit = engine.evaluate(&subject, &Resource::Broadcast, Action::Send);
+        let stats = engine.cache_stats_direct();
+        assert_eq!(stats.hits, 1, "second call must be a cache hit");
+
+        assert_eq!(miss.decision, hit.decision);
+        assert_eq!(miss.rule_id, hit.rule_id);
+        assert_eq!(
+            miss.obligations, hit.obligations,
+            "cached outcome must preserve obligation vector verbatim"
+        );
+        assert_eq!(
+            hit.obligations,
+            vec![Obligation::MaskPoint, Obligation::AuditExtended],
+            "cached obligations must preserve ordering"
+        );
+    }
+
+    #[test]
+    fn federate_action_rule_does_not_fire_for_send() {
+        // Rules are bucketed by `(action, resource_kind)` in
+        // `compile.rs`. A rule authored for `Action::Federate` must
+        // not fire on a `Send` evaluation — otherwise a policy that
+        // allowed federation of a subject's payload would silently
+        // also allow broadcast from that subject. Pin that mixing
+        // actions across a single tuple falls through to
+        // `default_effect` instead.
+        let rules = ruleset(
+            Effect::Deny,
+            vec![rule(
+                "allow-alice-federate",
+                Effect::Allow,
+                Action::Federate,
+                ResourceMatcher::Broadcast,
+                subject_cn("alice"),
+            )],
+        );
+        let engine = NativeEngine::new(rules).expect("valid ruleset compiles");
+        let id = identity("alice", &[]);
+        let subject = Subject::from_identity(&id);
+
+        let send_outcome = engine.evaluate(&subject, &Resource::Broadcast, Action::Send);
+        assert_eq!(
+            send_outcome.decision,
+            Decision::Deny,
+            "Federate-scoped allow must not satisfy a Send check"
+        );
+        assert!(send_outcome.rule_id.is_none());
+
+        let federate_outcome = engine.evaluate(&subject, &Resource::Broadcast, Action::Federate);
+        assert_eq!(federate_outcome.decision, Decision::Allow);
+        assert_eq!(
+            federate_outcome.rule_id.as_deref(),
+            Some("allow-alice-federate")
+        );
+    }
+
+    #[test]
+    fn receive_action_rule_does_not_fire_for_send() {
+        // Mirror of the Federate test for the Receive action — a
+        // rule scoped to `Receive` must not leak to `Send`. This is
+        // the canonical split between "who can read this" and "who
+        // can write this"; a regression that collapsed them would
+        // let every receive-allowed subject also send.
+        let rules = ruleset(
+            Effect::Deny,
+            vec![rule(
+                "allow-alice-receive",
+                Effect::Allow,
+                Action::Receive,
+                ResourceMatcher::Broadcast,
+                subject_cn("alice"),
+            )],
+        );
+        let engine = NativeEngine::new(rules).expect("valid ruleset compiles");
+        let id = identity("alice", &[]);
+        let subject = Subject::from_identity(&id);
+
+        let send_outcome = engine.evaluate(&subject, &Resource::Broadcast, Action::Send);
+        assert_eq!(
+            send_outcome.decision,
+            Decision::Deny,
+            "Receive-scoped allow must not satisfy a Send check"
+        );
+
+        let receive_outcome = engine.evaluate(&subject, &Resource::Broadcast, Action::Receive);
+        assert_eq!(receive_outcome.decision, Decision::Allow);
+    }
+
+    #[test]
+    fn allow_rule_on_direct_target_cn_rejects_other_cn() {
+        // `ResourceMatcher::Direct { target_cn: Some("alice") }`
+        // must match only `Resource::Direct { target_cn: "alice" }`.
+        // A refactor of the resource-predicate lowering that compared
+        // against the wrong field (or ignored the field entirely)
+        // would silently grant `Direct { target_cn: "bob" }` the
+        // same permission.
+        let rules = ruleset(
+            Effect::Deny,
+            vec![rule(
+                "allow-direct-to-alice",
+                Effect::Allow,
+                Action::Send,
+                ResourceMatcher::Direct {
+                    target_cn: Some("alice".to_string()),
+                },
+                subject_cn("sender"),
+            )],
+        );
+        let engine = NativeEngine::new(rules).expect("valid ruleset compiles");
+        let id = identity("sender", &[]);
+        let subject = Subject::from_identity(&id);
+
+        let to_alice = engine.evaluate(
+            &subject,
+            &Resource::Direct { target_cn: "alice" },
+            Action::Send,
+        );
+        assert_eq!(to_alice.decision, Decision::Allow);
+        assert_eq!(to_alice.rule_id.as_deref(), Some("allow-direct-to-alice"));
+
+        let to_bob = engine.evaluate(
+            &subject,
+            &Resource::Direct { target_cn: "bob" },
+            Action::Send,
+        );
+        assert_eq!(
+            to_bob.decision,
+            Decision::Deny,
+            "Direct-to-alice rule must not fire for Direct-to-bob"
+        );
+        assert!(to_bob.rule_id.is_none());
+    }
+
+    #[test]
+    fn kind_specific_deny_wins_over_any_resource_allow() {
+        // Scan order: kind-specific bucket first, then any_resource.
+        // A deny in the kind-specific bucket must short-circuit the
+        // whole evaluation — the any_resource bucket is never
+        // consulted. This is the "per-kind deny overrides global
+        // allow" pattern: a global allow-any for administrative
+        // subjects, with a per-kind deny for a sensitive group.
+        // A refactor that consulted any_resource first would invert
+        // the contract.
+        let rules = ruleset(
+            Effect::Deny,
+            vec![
+                rule(
+                    "deny-broadcast-alice",
+                    Effect::Deny,
+                    Action::Send,
+                    ResourceMatcher::Broadcast,
+                    subject_cn("alice"),
+                ),
+                rule(
+                    "allow-any-alice",
+                    Effect::Allow,
+                    Action::Send,
+                    ResourceMatcher::Any,
+                    subject_cn("alice"),
+                ),
+            ],
+        );
+        let engine = NativeEngine::new(rules).expect("valid ruleset compiles");
+        let id = identity("alice", &[]);
+        let subject = Subject::from_identity(&id);
+        let outcome = engine.evaluate(&subject, &Resource::Broadcast, Action::Send);
+        assert_eq!(outcome.decision, Decision::Deny);
+        assert_eq!(outcome.rule_id.as_deref(), Some("deny-broadcast-alice"));
+    }
+
+    #[test]
+    fn any_resource_allow_fires_when_kind_bucket_has_no_matching_rule() {
+        // Complement of the kind-specific-deny-wins test. When the
+        // kind-specific bucket has no matching rule, evaluation falls
+        // through to the any_resource bucket; a matching allow there
+        // must attribute its rule_id rather than silently falling
+        // through to default_effect. This is the typical
+        // "administrative allow-any" shape — operators add a broad
+        // allow for themselves and expect it to apply to every
+        // resource kind.
+        let rules = ruleset(
+            Effect::Deny,
+            vec![rule(
+                "allow-admin-any",
+                Effect::Allow,
+                Action::Send,
+                ResourceMatcher::Any,
+                subject_cn("admin"),
+            )],
+        );
+        let engine = NativeEngine::new(rules).expect("valid ruleset compiles");
+        let id = identity("admin", &[]);
+        let subject = Subject::from_identity(&id);
+        let outcome = engine.evaluate(&subject, &Resource::Broadcast, Action::Send);
+        assert_eq!(outcome.decision, Decision::Allow);
+        assert_eq!(outcome.rule_id.as_deref(), Some("allow-admin-any"));
+    }
+
+    #[test]
+    fn with_cache_capacity_replaces_cache_and_resets_counters() {
+        // `with_cache_capacity` is a builder that swaps
+        // `self.cache = DecisionCache::new(...)`. The new cache is
+        // freshly constructed, so counters must be zero even when the
+        // source engine had been primed. A refactor that preserved
+        // the old cache (for instance, by resizing in place) would
+        // leak pre-build counters into the post-build observer
+        // surface and produce misleading Prometheus metrics on the
+        // first scrape after a cache-capacity reconfiguration.
+        let rules = ruleset(
+            Effect::Deny,
+            vec![rule(
+                "allow-alice",
+                Effect::Allow,
+                Action::Send,
+                ResourceMatcher::Broadcast,
+                subject_cn("alice"),
+            )],
+        );
+        let primed = NativeEngine::new(rules).expect("valid ruleset compiles");
+        let id = identity("alice", &[]);
+        let subject = Subject::from_identity(&id);
+        primed.evaluate(&subject, &Resource::Broadcast, Action::Send);
+        primed.evaluate(&subject, &Resource::Broadcast, Action::Send);
+        assert_eq!(primed.cache_stats_direct().misses, 1);
+        assert_eq!(primed.cache_stats_direct().hits, 1);
+
+        let rebuilt = primed.with_cache_capacity(4, 16);
+        let stats = rebuilt.cache_stats_direct();
+        assert_eq!(stats.hits, 0, "with_cache_capacity must reset hits");
+        assert_eq!(stats.misses, 0, "with_cache_capacity must reset misses");
+
+        // Evaluation still works on the rebuilt engine.
+        let outcome = rebuilt.evaluate(&subject, &Resource::Broadcast, Action::Send);
+        assert_eq!(outcome.decision, Decision::Allow);
+    }
+
+    #[test]
+    fn empty_engine_denies_every_action_variant() {
+        // The `empty()` safe-fallback must deny every
+        // `Action` variant — not just `Send`. A regression that
+        // hard-coded the fallback outcome for a single action (for
+        // instance, a refactor that short-circuited
+        // `evaluate_uncached` on `Action::Send` only) would silently
+        // let Federate or Receive through during the pre-policy-load
+        // window. Iterate over every variant to pin the invariant at
+        // the action-axis boundary.
+        let engine = NativeEngine::empty();
+        let id = identity("alice", &["ops"]);
+        let subject = Subject::from_identity(&id);
+        for action in [
+            Action::Send,
+            Action::Receive,
+            Action::Federate,
+            Action::Publish,
+            Action::Subscribe,
+        ] {
+            let outcome = engine.evaluate(&subject, &Resource::Broadcast, action);
+            assert_eq!(
+                outcome.decision,
+                Decision::Deny,
+                "empty engine must deny {action:?}"
+            );
+            assert!(outcome.rule_id.is_none());
+        }
+    }
+
+    #[test]
+    fn cache_distinguishes_subjects_with_same_cn_but_different_groups() {
+        // `SubjectHash` folds in cn, groups, and attributes. Two
+        // identities with the same CN but distinct group sets must
+        // hash to distinct cache keys — otherwise a policy decision
+        // cached for "alice in ops" would silently apply to "alice
+        // in not-ops", which is the whole point of group-scoped
+        // rules. Pin the miss count at 2 to guard against a regression
+        // that collapsed the group feed out of the subject hash.
+        let rules = ruleset(
+            Effect::Deny,
+            vec![rule(
+                "allow-ops",
+                Effect::Allow,
+                Action::Send,
+                ResourceMatcher::Broadcast,
+                SubjectMatcher {
+                    groups_any_of: vec!["ops".to_string()],
+                    ..Default::default()
+                },
+            )],
+        );
+        let engine = NativeEngine::new(rules).expect("valid ruleset compiles");
+        let alice_ops = identity("alice", &["ops"]);
+        let alice_dev = identity("alice", &["dev"]);
+        let s_ops = Subject::from_identity(&alice_ops);
+        let s_dev = Subject::from_identity(&alice_dev);
+
+        engine.evaluate(&s_ops, &Resource::Broadcast, Action::Send);
+        engine.evaluate(&s_dev, &Resource::Broadcast, Action::Send);
+        let stats = engine.cache_stats_direct();
+        assert_eq!(
+            stats.misses, 2,
+            "same CN, distinct groups must produce distinct cache keys"
+        );
+    }
+
+    #[test]
+    fn scan_returns_first_matching_deny_rather_than_scanning_to_end() {
+        // The `scan` helper in `engine.rs` short-circuits on the
+        // first deny and stops scanning the bucket. This matters for
+        // performance on large policies (a global deny at the top of
+        // the bucket keeps the scanner's worst case linear in
+        // position, not in bucket size) and for correctness (the
+        // attributed rule_id must be the first-seen deny). Build a
+        // bucket with two deny rules both matching the same tuple
+        // and pin that the *first* one wins — a refactor that
+        // returned the *last* matching deny would still produce a
+        // correct "deny" decision but would break audit attribution.
+        let rules = ruleset(
+            Effect::Allow,
+            vec![
+                rule(
+                    "deny-first",
+                    Effect::Deny,
+                    Action::Send,
+                    ResourceMatcher::Broadcast,
+                    subject_cn("alice"),
+                ),
+                rule(
+                    "deny-second",
+                    Effect::Deny,
+                    Action::Send,
+                    ResourceMatcher::Broadcast,
+                    subject_cn("alice"),
+                ),
+            ],
+        );
+        let engine = NativeEngine::new(rules).expect("valid ruleset compiles");
+        let id = identity("alice", &[]);
+        let subject = Subject::from_identity(&id);
+        let outcome = engine.evaluate(&subject, &Resource::Broadcast, Action::Send);
+        assert_eq!(outcome.decision, Decision::Deny);
+        assert_eq!(outcome.rule_id.as_deref(), Some("deny-first"));
+    }
+
+    #[test]
+    fn compile_warnings_are_stable_across_repeated_reads() {
+        // Operators read `compile_warnings()` once at load time and
+        // then again when the authz-reloader's tracing output fires.
+        // Pin that the slice is stable across successive reads — a
+        // refactor that implemented `compile_warnings` via a
+        // lazily-computed `OnceCell` and accidentally recomputed on
+        // every call would still return the right warnings but would
+        // allocate on every trace, making the hot path observably
+        // slower during load-event storms.
+        let rules = ruleset(
+            Effect::Deny,
+            vec![rule(
+                "allow-any-admin",
+                Effect::Allow,
+                Action::Send,
+                ResourceMatcher::Any,
+                subject_cn("admin"),
+            )],
+        );
+        let engine = NativeEngine::new(rules).expect("valid ruleset compiles");
+        let first = engine.compile_warnings().to_vec();
+        let second = engine.compile_warnings().to_vec();
+        let third = PolicyEngine::compile_warnings(&engine).to_vec();
+        assert_eq!(first, second, "two inherent reads must agree");
+        assert_eq!(
+            first, third,
+            "inherent and trait-method reads must agree across calls"
+        );
+        assert!(!first.is_empty(), "test-fixture policy expected to warn");
+    }
+
+    #[test]
+    fn cached_outcome_on_default_effect_deny_has_no_rule_id() {
+        // The cache round-trips the full `DecisionOutcome` including
+        // the `rule_id: None` on default-deny fall-throughs. A
+        // regression that synthesised a sentinel rule_id on the cache
+        // path (e.g. `"__cached__"`) would silently poison audit
+        // records and SIEM filters that key on null rule_ids for
+        // "no-rule-matched" events.
+        let rules = ruleset(
+            Effect::Deny,
+            vec![rule(
+                "allow-bob",
+                Effect::Allow,
+                Action::Send,
+                ResourceMatcher::Broadcast,
+                subject_cn("bob"),
+            )],
+        );
+        let engine = NativeEngine::new(rules).expect("valid ruleset compiles");
+        let id = identity("alice", &[]);
+        let subject = Subject::from_identity(&id);
+
+        let first = engine.evaluate(&subject, &Resource::Broadcast, Action::Send);
+        let second = engine.evaluate(&subject, &Resource::Broadcast, Action::Send);
+        let stats = engine.cache_stats_direct();
+        assert_eq!(stats.hits, 1);
+        assert_eq!(first.decision, Decision::Deny);
+        assert!(first.rule_id.is_none());
+        assert_eq!(second.decision, Decision::Deny);
+        assert!(
+            second.rule_id.is_none(),
+            "cached default-deny must preserve rule_id=None"
+        );
+        assert!(second.obligations.is_empty());
+    }
+
+    #[test]
     fn evaluate_uses_attribute_predicates_via_subject_matcher() {
         // The attribute_eq path on SubjectMatcher lives in the
         // compiled form and the runtime matcher in `compile.rs`; the
