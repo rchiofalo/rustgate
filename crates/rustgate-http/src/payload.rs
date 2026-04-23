@@ -280,4 +280,240 @@ mod tests {
         let decoded = b64::decode(parsed["payload"].as_str().unwrap()).unwrap();
         assert_eq!(decoded, binary_data);
     }
+
+    #[test]
+    fn json_content_type_is_application_json_exact_string() {
+        // The content-type strings are part of the on-the-wire
+        // contract every downstream consumer (load balancers,
+        // reverse proxies, SIEM ingest pipelines) inspects to
+        // decide how to route, parse, and rate-limit. Pin the
+        // exact `&'static str` value so a "normalise" refactor
+        // that swapped to `application/json; charset=utf-8` or
+        // `text/json` (both technically valid) would fail here
+        // rather than at the first downstream consumer whose
+        // content-type allowlist did not include the new form.
+        let msg = make_msg(b"test");
+        let (_, content_type) = serialize(&msg, PayloadFormat::Json, "inst").unwrap();
+        assert_eq!(
+            content_type, "application/json",
+            "content-type must be the exact literal `application/json`"
+        );
+    }
+
+    #[test]
+    fn raw_xml_content_type_is_application_xml_exact_string() {
+        // Symmetric to the JSON content-type pin — `application/xml`
+        // is the advertised type for RawXml passthrough. A refactor
+        // to `text/xml` (the legacy form) would silently change
+        // every deployed consumer's content-negotiation outcome.
+        let msg = make_msg(b"<event/>");
+        let (_, content_type) = serialize(&msg, PayloadFormat::RawXml, "inst").unwrap();
+        assert_eq!(
+            content_type, "application/xml",
+            "content-type must be the exact literal `application/xml`"
+        );
+    }
+
+    #[test]
+    fn json_wire_message_field_names_are_snake_case_contract() {
+        // `HttpWireMessage` has no `#[serde(rename_all = …)]`
+        // attribute, so the JSON output uses the Rust field names
+        // verbatim (`source_cn`, `source_groups`, `destination`,
+        // `message_type`, `source_protocol`, `received_at`,
+        // `payload`, `payload_size`, `instance_id`). Every deployed
+        // downstream consumer decodes against these exact keys. A
+        // regression that added `rename_all = "camelCase"` would
+        // silently produce `sourceCn`, `messageType`, etc., and
+        // break every consumer without any compile error. Pin all
+        // nine field names so the serde rename contract trips here
+        // rather than at the consumer's JSON decoder.
+        let msg = make_msg(b"test");
+        let (body, _) = serialize(&msg, PayloadFormat::Json, "inst").unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let obj = parsed.as_object().expect("top-level must be a JSON object");
+        for expected in [
+            "source_cn",
+            "source_groups",
+            "destination",
+            "message_type",
+            "source_protocol",
+            "received_at",
+            "payload",
+            "payload_size",
+            "instance_id",
+        ] {
+            assert!(
+                obj.contains_key(expected),
+                "wire JSON must carry the `{expected}` field name verbatim (snake_case); got keys: {:?}",
+                obj.keys().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn payload_size_is_raw_byte_length_not_base64_expanded_length() {
+        // `payload_size: msg.payload.len()` — a raw-bytes count,
+        // NOT the base64-encoded string length. The documented
+        // contract is "bytes of the original payload". A refactor
+        // that used `payload_b64.len()` would silently inflate the
+        // field by ~33% (base64 expansion ratio) and break every
+        // downstream consumer that used the field for billing,
+        // quota, or protocol-frame-size decisions. Choose a payload
+        // length (10 bytes) where raw length and base64 length
+        // differ visibly (10 bytes → base64 "dGVzdC0wMTIzNDU=" =
+        // 16 chars) so the distinction is unambiguous.
+        let payload = b"test-01234"; // exactly 10 bytes
+        let msg = make_msg(payload);
+        let (body, _) = serialize(&msg, PayloadFormat::Json, "inst").unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let size = parsed["payload_size"]
+            .as_u64()
+            .expect("numeric payload_size");
+        assert_eq!(
+            size, 10,
+            "payload_size must be raw byte count (10), not base64 length (~16)"
+        );
+        let b64_len = parsed["payload"].as_str().expect("string payload").len();
+        assert!(
+            b64_len > 10,
+            "sanity check — the base64 encoding of 10 bytes is longer than 10 chars \
+             (got {b64_len}) so `size == b64_len` cannot be a coincidence"
+        );
+    }
+
+    #[test]
+    fn empty_payload_roundtrips_with_zero_size_and_empty_base64_field() {
+        // Zero-length payload is a documented edge case — an empty
+        // CoT `<detail/>` section or a control-plane keepalive
+        // forwarded as HTTP. The wire JSON must carry
+        // `payload_size: 0` and `payload: ""` (empty base64 string)
+        // without any panic or None-field collapse. A regression
+        // that short-circuited empty payloads to `payload: null`
+        // would silently break every downstream consumer whose
+        // JSON schema specified `payload: string`.
+        let msg = make_msg(b"");
+        let (body, _) = serialize(&msg, PayloadFormat::Json, "inst").unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["payload_size"], 0);
+        assert_eq!(
+            parsed["payload"], "",
+            "empty payload must serialise as the empty string"
+        );
+        // And round-trip: decoding the empty base64 string gives zero bytes.
+        let decoded = b64::decode("").unwrap();
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn instance_id_passthrough_preserves_hyphen_and_alphanumeric_characters() {
+        // `instance_id` is injected by the caller as a static
+        // `&str` and emitted verbatim. Operators pick this id in
+        // various shapes (hex uuids, k8s pod names with hyphens,
+        // numeric ordinals). Pin that a representative shape
+        // (`pod-07-a1b2c3`) survives byte-for-byte — a regression
+        // that ran `instance_id` through a sanitiser or
+        // url-encoder would silently change the field and break
+        // operator dashboards keyed on exact pod identifiers.
+        let msg = make_msg(b"x");
+        let (body, _) = serialize(&msg, PayloadFormat::Json, "pod-07-a1b2c3").unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            parsed["instance_id"], "pod-07-a1b2c3",
+            "instance_id must survive verbatim (no sanitisation, no url-encoding)"
+        );
+    }
+
+    #[test]
+    fn format_destination_multicast_three_groups_uses_comma_separator() {
+        // `format_destination` joins the multicast groups with a
+        // literal comma. Pin the separator exactly — a regression
+        // to `";"`, `" "`, or URL-encoded `"%2C"` would silently
+        // break every downstream parser that split on `","` to
+        // recover the group list.
+        let dest = Destination::Multicast(vec![
+            "alpha".to_string(),
+            "bravo".to_string(),
+            "charlie".to_string(),
+        ]);
+        let rendered = format_destination(&dest);
+        assert_eq!(
+            rendered, "multicast:alpha,bravo,charlie",
+            "multicast join must use a bare `,` separator with no whitespace"
+        );
+    }
+
+    #[test]
+    fn format_destination_multicast_empty_group_vector_yields_bare_prefix() {
+        // Edge case — `Destination::Multicast(vec![])` is possible
+        // at the type level even if rare at the router layer. The
+        // function must still render the `"multicast:"` prefix
+        // with an empty suffix (not panic, not drop the prefix).
+        // A naive `groups[0]`-style implementation would panic on
+        // an empty vector; the current iter-based implementation
+        // does not, and this test pins the contract.
+        let dest = Destination::Multicast(vec![]);
+        let rendered = format_destination(&dest);
+        assert_eq!(
+            rendered, "multicast:",
+            "empty multicast vector must render the bare prefix with no suffix"
+        );
+    }
+
+    #[test]
+    fn format_destination_group_with_empty_name_yields_bare_prefix() {
+        // Symmetric edge case — `Destination::Group("".to_string())`
+        // is a valid value at the type level. The format must emit
+        // `"group:"` without panicking or synthesising any default
+        // group name. The test pins that an empty group name
+        // survives as an empty suffix rather than being silently
+        // replaced (a regression that filled in a default would
+        // silently route orphaned messages into a real group).
+        let dest = Destination::Group(String::new());
+        let rendered = format_destination(&dest);
+        assert_eq!(
+            rendered, "group:",
+            "empty group name must render as the bare prefix, not be replaced by a default"
+        );
+    }
+
+    #[test]
+    fn raw_xml_passthrough_preserves_binary_bytes_byte_for_byte() {
+        // The RawXml branch returns `msg.payload.to_vec()`
+        // verbatim — no re-encoding, no UTF-8 validation. This
+        // matters because the docstring explicitly notes that CoT
+        // XML may contain binary content or non-UTF-8 sequences in
+        // some edge cases (embedded attachment bytes, raw
+        // protobuf interop blobs). A regression to a UTF-8-validating
+        // pass-through (e.g., via `str::from_utf8(...)?`) would
+        // silently fail on those payloads. Pin byte-for-byte
+        // equality against a deliberately-non-UTF-8 input.
+        let binary: Vec<u8> = vec![0xFF, 0xFE, 0x00, 0x80, 0x81, 0xC0];
+        let msg = make_msg(&binary);
+        let (body, _) = serialize(&msg, PayloadFormat::RawXml, "inst").unwrap();
+        assert_eq!(
+            body, binary,
+            "raw XML passthrough must return the payload bytes verbatim including non-UTF-8"
+        );
+    }
+
+    #[test]
+    fn json_preserves_source_protocol_verbatim_for_federation_hop() {
+        // `source_protocol` is the grep-key the router + audit
+        // trail use to distinguish "originated locally" from
+        // "forwarded from a federated peer" (`"federation"`). Pin
+        // that the literal string survives into the JSON wire —
+        // a silent case-normalisation (`"Federation"`, `"FEDERATION"`)
+        // or case-folding refactor would break downstream
+        // echo-prevention + provenance tracking without tripping
+        // the default-happy-path "tcp" test.
+        let mut msg = make_msg(b"x");
+        msg.metadata.source_protocol = "federation".to_string();
+        let (body, _) = serialize(&msg, PayloadFormat::Json, "inst").unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            parsed["source_protocol"], "federation",
+            "source_protocol must survive verbatim (no case-normalisation) so \
+             the `federation` audit/echo-prevention grep token remains intact"
+        );
+    }
 }
