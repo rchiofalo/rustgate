@@ -227,4 +227,174 @@ mod tests {
             "allow_private=true must bypass the filter entirely, even on DNS failure: {msg}"
         );
     }
+
+    /// `reqwest::ClientBuilder::dns_resolver()` takes `Arc<dyn Resolve>`,
+    /// which implicitly requires `Resolve: Send + Sync + 'static`. Pin
+    /// that contract at compile time via a generic helper parameterised
+    /// on `Resolve + ?Sized` so a future refactor that accidentally
+    /// introduced a non-Send field (e.g. an `Rc`, a `RefCell`, or a
+    /// `*const T`) fails here rather than at the transitive `reqwest`
+    /// call site deep inside a hot path. The `Arc<dyn Resolve>` shape
+    /// specifically matches how this type is consumed in production —
+    /// a `Box<dyn Resolve>` compile assertion would be weaker because
+    /// reqwest's API does not accept that shape.
+    #[test]
+    fn resolver_is_shareable_as_arc_dyn_resolve() {
+        use std::sync::Arc;
+
+        fn assert_resolve_trait_object<T: Resolve + ?Sized>(_: &Arc<T>) {}
+        let shared: Arc<dyn Resolve> = Arc::new(SsrfSafeResolver::new(false));
+        assert_resolve_trait_object(&shared);
+    }
+
+    /// The `Resolving` type alias from reqwest is
+    /// `Pin<Box<dyn Future<Output = Result<Addrs, _>> + Send>>`, and
+    /// reqwest drives it from a multi-threaded executor. Pin that the
+    /// future returned by our impl is `Send` via a compile-time helper —
+    /// a regression that held a non-Send local (e.g. an `Rc<RefCell<_>>`)
+    /// across the `.await` inside the `Box::pin(async move { … })` body
+    /// would fail here rather than silently break integration tests that
+    /// happen to run on a single-threaded runtime.
+    #[tokio::test]
+    async fn resolving_future_is_send_across_await_points() {
+        fn assert_send<T: Send>(_: &T) {}
+        let resolver = SsrfSafeResolver::new(true);
+        let fut = resolver.resolve(name("localhost"));
+        assert_send(&fut);
+        // Drive the future to completion so the future-is-Send assertion
+        // is paired with a runtime observation that the future works end
+        // to end on a multi-threaded runtime — `#[tokio::test]` defaults
+        // to the current-thread flavor, so spawn explicitly.
+        let addrs: Vec<_> = tokio::spawn(fut)
+            .await
+            .expect("task must not panic")
+            .expect("localhost must resolve when allow_private=true")
+            .collect();
+        assert!(
+            !addrs.is_empty(),
+            "localhost must yield at least one loopback address"
+        );
+    }
+
+    /// Concurrent `resolve()` calls on a shared `Arc<SsrfSafeResolver>`
+    /// must not interfere. The struct currently holds only a `bool`, so
+    /// there is no lock to contend on, but a future refactor that added
+    /// a mutable cache or an atomic counter field could silently regress
+    /// this — and reqwest hits the resolver concurrently for every
+    /// in-flight target under load. Pin the reentrant contract via two
+    /// tokio tasks resolving `localhost` through the same shared handle
+    /// and asserting both complete without panic and both yield a
+    /// loopback address.
+    #[tokio::test]
+    async fn concurrent_resolves_on_shared_arc_do_not_interfere() {
+        use std::sync::Arc;
+
+        let resolver: Arc<SsrfSafeResolver> = Arc::new(SsrfSafeResolver::new(true));
+        let a = {
+            let r = resolver.clone();
+            tokio::spawn(async move {
+                let addrs: Vec<_> = r
+                    .resolve(name("localhost"))
+                    .await
+                    .expect("task a: localhost must resolve")
+                    .collect();
+                assert!(
+                    !addrs.is_empty(),
+                    "task a: localhost must yield >=1 address"
+                );
+            })
+        };
+        let b = {
+            let r = resolver.clone();
+            tokio::spawn(async move {
+                let addrs: Vec<_> = r
+                    .resolve(name("localhost"))
+                    .await
+                    .expect("task b: localhost must resolve")
+                    .collect();
+                assert!(
+                    !addrs.is_empty(),
+                    "task b: localhost must yield >=1 address"
+                );
+            })
+        };
+        a.await.expect("task a must not panic");
+        b.await.expect("task b must not panic");
+    }
+
+    /// Rejection error messages must be byte-identical across repeated
+    /// calls with the same name. Operators' log-grep and SIEM ingest
+    /// rules key off the exact token format, and a regression that
+    /// introduced non-deterministic ordering (HashMap iteration leaking
+    /// into the error string) or an incident-unique identifier (a UUID
+    /// or a timestamp) would silently break those rules without tripping
+    /// any existing test.
+    #[tokio::test]
+    async fn resolve_rejection_error_message_is_deterministic_across_calls() {
+        let resolver = SsrfSafeResolver::new(false);
+        let msg_a = resolver
+            .resolve(name("localhost"))
+            .await
+            .err()
+            .expect("first rejection")
+            .to_string();
+        let msg_b = resolver
+            .resolve(name("localhost"))
+            .await
+            .err()
+            .expect("second rejection")
+            .to_string();
+        assert_eq!(
+            msg_a, msg_b,
+            "rejection message must be byte-identical across calls so grep/SIEM rules stay stable"
+        );
+    }
+
+    /// When the escape hatch is on, a DNS failure must *not* be labelled
+    /// as `PermissionDenied` — that kind is reserved for SSRF rejections
+    /// and a silent relabelling would corrupt the retry and circuit-
+    /// breaker classification upstream. The sibling test
+    /// `resolve_escape_hatch_does_not_filter_public_hostnames` pins the
+    /// message content; this one pins the ErrorKind boundary that
+    /// `resolve_rejection_surfaces_as_permission_denied` established for
+    /// the filter path — together they cover both sides of the
+    /// classifier contract.
+    #[tokio::test]
+    async fn resolve_escape_hatch_does_not_emit_permission_denied_on_dns_failure() {
+        let resolver = SsrfSafeResolver::new(true);
+        let err = resolver
+            .resolve(name("allow-path-dns-fail.invalid"))
+            .await
+            .err()
+            .expect("RFC 6761 .invalid TLD must fail DNS");
+
+        if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+            assert_ne!(
+                io_err.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "escape hatch must surface DNS errors verbatim, not SSRF-labelled ones: {io_err:?}"
+            );
+        }
+    }
+
+    /// The rejection error message is grep'd into operator dashboards
+    /// and may pass through structured logging. Embedded CR/LF would
+    /// split log lines and open a log-forging surface; the format
+    /// explicitly keeps a single-line shape with the offending name
+    /// between backticks. Pin that no control character (U+0000–U+001F
+    /// or U+007F) leaks into the output.
+    #[tokio::test]
+    async fn resolve_rejection_error_message_contains_no_control_characters() {
+        let resolver = SsrfSafeResolver::new(false);
+        let msg = resolver
+            .resolve(name("localhost"))
+            .await
+            .err()
+            .expect("localhost must be rejected")
+            .to_string();
+        assert!(
+            !msg.chars().any(|c| c.is_control()),
+            "rejection message must not contain control chars (log-forging defence): {msg:?}"
+        );
+    }
 }
