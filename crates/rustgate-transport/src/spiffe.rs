@@ -397,4 +397,213 @@ mod tests {
         let key = PrivateKeyDer::from_pem_slice(pem.as_bytes()).expect("parse key");
         key.secret_der().to_vec()
     }
+
+    #[test]
+    fn default_config_refresh_interval_is_exactly_five_minutes() {
+        // The module doc-comment commits to a 300-second polling interval
+        // as the default fallback when the streaming Workload API is not
+        // available. Pin this explicitly so a future `Duration::from_secs(N)`
+        // edit in `impl Default` cannot silently reshape every SPIFFE
+        // deployment's SVID-refresh cadence — a too-short interval floods
+        // the SPIRE agent; a too-long interval lets SVIDs expire before the
+        // next refresh lands.
+        let cfg = SpiffeConfig::default();
+        assert_eq!(cfg.refresh_interval, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn spiffe_config_supports_clone_and_debug_derives() {
+        // `SpiffeConfig` is passed through startup code and captured into
+        // the refresh task's async closure, so `Clone` is load-bearing —
+        // narrowing to `&'static SpiffeConfig` would force a ripple through
+        // `spawn_refresh_task` and the server bin. `Debug` is the operator
+        // UX contract for `tracing::debug!(config = ?cfg, …)` one-liners
+        // on startup; both derives are pinned here so a silent removal of
+        // either one breaks this test instead of callers.
+        let cfg = SpiffeConfig {
+            workload_api_socket: "unix:///run/spire/api.sock".into(),
+            expected_trust_domain: Some("example.org".into()),
+            refresh_interval: Duration::from_secs(60),
+        };
+        let cloned = cfg.clone();
+        assert_eq!(cloned.workload_api_socket, cfg.workload_api_socket);
+        assert_eq!(cloned.expected_trust_domain, cfg.expected_trust_domain);
+        assert_eq!(cloned.refresh_interval, cfg.refresh_interval);
+        let rendered = format!("{cfg:?}");
+        assert!(
+            rendered.contains("SpiffeConfig"),
+            "Debug output missing struct name: {rendered}",
+        );
+        assert!(
+            rendered.contains("example.org"),
+            "Debug output missing trust_domain field: {rendered}",
+        );
+    }
+
+    #[test]
+    fn spiffe_hooks_debug_elides_both_callback_fields() {
+        // `SpiffeHooks` has a MANUAL `Debug` impl that uses
+        // `debug_struct("SpiffeHooks").finish()` — no fields are emitted,
+        // on purpose, because the `Arc<dyn Fn(...)>` callbacks render as
+        // raw pointers that leak binary layout to any logger. A future
+        // `#[derive(Debug)]` would silently put the callback pointers into
+        // every `tracing::debug!(hooks = ?h, …)` line; this test pins the
+        // contract by asserting the rendered shape and the absence of
+        // field labels `on_success` / `on_failure`.
+        let hooks = SpiffeHooks {
+            on_success: Arc::new(|_| {}),
+            on_failure: Arc::new(|| {}),
+        };
+        let rendered = format!("{hooks:?}");
+        assert!(
+            rendered.contains("SpiffeHooks"),
+            "Debug output missing struct name: {rendered}",
+        );
+        assert!(
+            !rendered.contains("on_success"),
+            "Debug output leaked on_success field: {rendered}",
+        );
+        assert!(
+            !rendered.contains("on_failure"),
+            "Debug output leaked on_failure field: {rendered}",
+        );
+    }
+
+    #[test]
+    fn spiffe_hooks_is_clone_preserving_arc_callback_references() {
+        // `SpiffeHooks` derives `Clone` so the server binary can pass one
+        // hook set into `spawn_refresh_task` while also keeping a handle
+        // locally for further refresh-task wiring. Each `Arc<dyn Fn(...)>`
+        // clone bumps the strong count, not the body — we verify the
+        // cloned handle invokes the SAME closure by counting calls through
+        // a shared `AtomicUsize`. Without this test, a refactor that
+        // accidentally cloned deeply (e.g. `Arc::new(**orig)`) or shallowly
+        // swapped one callback for a no-op could ship silently.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let failure_count = Arc::new(AtomicUsize::new(0));
+        let sc = Arc::clone(&success_count);
+        let fc = Arc::clone(&failure_count);
+        let hooks = SpiffeHooks {
+            on_success: Arc::new(move |_expiry| {
+                let _ = sc.fetch_add(1, Ordering::Relaxed);
+            }),
+            on_failure: Arc::new(move || {
+                let _ = fc.fetch_add(1, Ordering::Relaxed);
+            }),
+        };
+        let cloned = hooks.clone();
+
+        (hooks.on_success)(42);
+        (cloned.on_success)(43);
+        (cloned.on_failure)();
+
+        assert_eq!(success_count.load(Ordering::Relaxed), 2);
+        assert_eq!(failure_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn append_der_as_pem_emits_canonical_begin_end_markers_with_label() {
+        // RFC 7468 requires `-----BEGIN <label>-----` and
+        // `-----END <label>-----` as the envelope markers. A future refactor
+        // that dropped the dashes, the label, or the trailing newline
+        // would break every strict downstream parser (OpenSSL, rustls
+        // pki-types). The label parameter is load-bearing — the same helper
+        // is used for both CERTIFICATE and PRIVATE KEY labels.
+        let mut out = String::new();
+        append_der_as_pem(&mut out, "CERTIFICATE", &[0x30, 0x82, 0x01, 0x23]);
+        assert!(
+            out.starts_with("-----BEGIN CERTIFICATE-----\n"),
+            "missing BEGIN marker: {out:?}",
+        );
+        assert!(
+            out.ends_with("-----END CERTIFICATE-----\n"),
+            "missing END marker: {out:?}",
+        );
+
+        let mut out2 = String::new();
+        append_der_as_pem(&mut out2, "PRIVATE KEY", &[0x30, 0x82, 0x01, 0x23]);
+        assert!(out2.starts_with("-----BEGIN PRIVATE KEY-----\n"));
+        assert!(out2.ends_with("-----END PRIVATE KEY-----\n"));
+    }
+
+    #[test]
+    fn append_der_as_pem_wraps_base64_body_at_64_columns_per_line() {
+        // RFC 7468 mandates that PEM base64 bodies wrap at 64 characters
+        // per line — strict parsers reject payloads that exceed that width.
+        // The encoder uses direct string slicing (`idx..idx+64`) on the
+        // base64 output, which is ASCII so char and byte boundaries align.
+        // A regression that dropped the 64-col wrap (writing the entire
+        // base64 on one long line) would still round-trip through rustls
+        // pki-types (lenient) but fail every OpenSSL-backed deployment.
+        // We feed 200 random-ish bytes so the base64 output is > 256 chars
+        // and must span multiple lines — then we assert every interior
+        // base64 line is exactly 64 columns wide (the last line may be
+        // shorter because the total base64 length need not be a multiple
+        // of 64).
+        let input: Vec<u8> = (0u8..200).collect();
+        let mut out = String::new();
+        append_der_as_pem(&mut out, "CERTIFICATE", &input);
+
+        let lines: Vec<&str> = out.lines().collect();
+        // Strip BEGIN + END markers; body lines are everything in between.
+        let body: Vec<&str> = lines
+            .iter()
+            .filter(|l| !l.starts_with("-----"))
+            .copied()
+            .collect();
+        assert!(
+            body.len() >= 4,
+            "expected multiple body lines for 200-byte input, got {body:?}",
+        );
+        // Every body line EXCEPT the final one must be exactly 64 cols.
+        for line in &body[..body.len() - 1] {
+            assert_eq!(
+                line.len(),
+                64,
+                "interior body line is not 64 cols: {line:?}",
+            );
+        }
+        // The final line is <= 64 cols (may be shorter on the last chunk).
+        assert!(
+            body[body.len() - 1].len() <= 64,
+            "trailing body line > 64 cols: {:?}",
+            body[body.len() - 1],
+        );
+    }
+
+    #[test]
+    fn svid_expiry_unix_extracts_real_notafter_from_testca_cert_as_positive_seconds() {
+        // The two existing tests only exercise the error/zero branches
+        // (empty chain, garbage DER). The happy path — parse a well-formed
+        // X.509 cert and extract the `notAfter` unix timestamp — was
+        // otherwise unexercised inside the module's own suite. This test
+        // issues a real cert via `TestCa`, parses it through
+        // `svid_expiry_unix`, and asserts the returned timestamp is
+        // strictly greater than the current unix time — a regression that
+        // silently returned 0 on the happy path (e.g. because
+        // `x509_parser::prelude` moved and the import no longer resolves)
+        // would fail here rather than only manifesting as an `expiry=0`
+        // audit-log field in production. We do NOT upper-bound the
+        // returned timestamp because `TestCa` uses `rcgen`'s default
+        // `CertificateParams` which places `notAfter` far in the future
+        // (intentionally, so test certs do not expire during CI) — any
+        // value strictly greater than `now` is sufficient to validate the
+        // positive path.
+        use rustgate_test_utils::certs::TestCa;
+        let ca = TestCa::new("SPIFFE Expiry Test CA");
+        let cert = ca.issue_server_cert("svid.spiffe.test", &["svid.spiffe.test"]);
+        let chain_der = pem_to_der_chain(&cert.cert_pem);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let expiry = svid_expiry_unix(&chain_der);
+
+        assert!(
+            expiry > now,
+            "expected future notAfter, got expiry={expiry} (now={now})",
+        );
+    }
 }
