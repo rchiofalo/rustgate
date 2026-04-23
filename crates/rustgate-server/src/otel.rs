@@ -114,4 +114,135 @@ mod tests {
         // this test may hit the populated path — that's fine either way.
         shutdown();
     }
+
+    /// An empty endpoint string is *accepted* by
+    /// `opentelemetry_otlp::SpanExporter::builder().with_tonic()` —
+    /// tonic treats it as "use the crate default endpoint" and defers
+    /// resolution until a connection is attempted. The contract we pin
+    /// here is therefore **no panic at layer construction**: a
+    /// deployment that ships an unset `RUSTGATE_OTEL_ENDPOINT` starts
+    /// cleanly and the connect failure surfaces later as a runtime
+    /// export error, not a startup panic. A regression that added
+    /// `assert!(!endpoint.is_empty())` upstream would break this
+    /// contract.
+    #[tokio::test]
+    async fn init_layer_tolerates_empty_endpoint_without_panic() {
+        let result = init_layer::<tracing_subscriber::Registry>("", "test-service");
+        assert!(
+            result.is_ok(),
+            "empty endpoint must fall through to tonic's default URI rather than panicking",
+        );
+        shutdown();
+    }
+
+    /// A malformed endpoint (e.g. no scheme, stray whitespace, or a
+    /// scheme tonic does not support) must return a `Result::Err`, not
+    /// `panic!`. This pins the `map_err(|e| anyhow::anyhow!("OTLP span
+    /// exporter: {e}"))` branch so a bad config file surfaces as a
+    /// readable error in the startup log rather than a stack trace.
+    #[tokio::test]
+    async fn init_layer_rejects_malformed_endpoint_without_panic() {
+        let result =
+            init_layer::<tracing_subscriber::Registry>("not a valid uri at all", "test-service");
+        assert!(
+            result.is_err(),
+            "init_layer must reject a clearly-malformed endpoint rather than panicking",
+        );
+    }
+
+    /// The error message for a failed `init_layer` call must carry the
+    /// `"OTLP span exporter"` prefix so operators can grep the startup
+    /// log to distinguish this failure mode from other
+    /// `tracing_subscriber` layer errors further down the init
+    /// sequence. A silent drift of the prefix would break runbook
+    /// regex patterns. We trigger the failure via a clearly-malformed
+    /// URI (empty-string is tolerated by tonic — see sibling test) so
+    /// this test focuses purely on the `map_err` formatting contract.
+    #[tokio::test]
+    async fn init_layer_error_message_names_otlp_span_exporter() {
+        // Cannot use `.expect_err` because `Box<dyn Layer<_>>` has no
+        // `Debug` impl; match on the result by hand instead.
+        let result =
+            init_layer::<tracing_subscriber::Registry>("not a valid uri at all", "test-service");
+        let err = match result {
+            Ok(_) => panic!("malformed endpoint must surface as Err"),
+            Err(e) => e,
+        };
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("OTLP span exporter"),
+            "error must carry the `OTLP span exporter` prefix for log-grep; got {rendered:?}",
+        );
+    }
+
+    /// Calling `shutdown` multiple times after a failed-to-init path
+    /// must stay panic-free. The failure path does not populate
+    /// `PROVIDER`, so each `shutdown` hits the `OnceLock::get() ==
+    /// None` branch — but the function still has to be a no-op rather
+    /// than unwrap-on-nothing. A regression that changed
+    /// `if let Some(provider)` to `.unwrap()` would fail here.
+    #[test]
+    fn shutdown_is_idempotent_across_repeated_calls() {
+        for _ in 0..5 {
+            shutdown();
+        }
+    }
+
+    /// The `Layer<S>` returned by `init_layer` must satisfy `Send +
+    /// Sync + 'static` so it can be composed into a
+    /// `tracing_subscriber::Registry` that is then moved onto a
+    /// background task. A refactor that introduced a non-`Send`
+    /// temporary inside the layer chain would fail here at
+    /// test-compile time rather than at the call site in
+    /// `rustgate_server::setup`.
+    #[tokio::test]
+    async fn init_layer_returns_send_sync_static_layer() {
+        fn assert_send_sync_static<T: Send + Sync + 'static + ?Sized>(_: &T) {}
+
+        let layer = init_layer::<tracing_subscriber::Registry>(
+            "http://localhost:4317",
+            "bounds-check-service",
+        )
+        .expect("valid endpoint must succeed");
+        assert_send_sync_static(layer.as_ref());
+        shutdown();
+    }
+
+    /// `init_layer` must accept an empty service name without
+    /// panicking — the OTel SDK treats the service name as an
+    /// opaque string and will serialize whatever we hand it. A
+    /// regression that added an `assert!(!service_name.is_empty())`
+    /// would break deployments that key service.name off an env var
+    /// that silently evaluated to empty.
+    ///
+    /// We cannot easily inspect the `Resource`'s `service.name`
+    /// attribute after the fact from outside the OTel SDK, so the
+    /// test's job is solely to pin "no panic, no error on empty
+    /// name".
+    #[tokio::test]
+    async fn init_layer_accepts_empty_service_name_without_panic() {
+        let result = init_layer::<tracing_subscriber::Registry>("http://localhost:4317", "");
+        assert!(
+            result.is_ok(),
+            "empty service name must not block layer construction",
+        );
+        shutdown();
+    }
+
+    /// `init_layer` must accept a long service name — some
+    /// deployments synthesize `service.name` from
+    /// `cluster.namespace.pod` triplets that can easily exceed 128
+    /// chars. The SDK does not document a cap, so the contract we
+    /// pin is "any string that fits in a `String` flows through".
+    #[tokio::test]
+    async fn init_layer_accepts_long_service_name_without_truncation_error() {
+        let long_name = "a".repeat(512);
+        let result =
+            init_layer::<tracing_subscriber::Registry>("http://localhost:4317", &long_name);
+        assert!(
+            result.is_ok(),
+            "long service name must not trip an internal size check",
+        );
+        shutdown();
+    }
 }
