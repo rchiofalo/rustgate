@@ -197,6 +197,7 @@ fn is_cancel_event(payload: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::panic, clippy::unwrap_used)]
     use std::collections::BTreeSet;
 
     use bytes::Bytes;
@@ -334,5 +335,190 @@ mod tests {
     fn is_cancel_normal_event() {
         let xml = br#"<event uid="a1"><detail><emergency type="911" /></detail></event>"#;
         assert!(!is_cancel_event(xml));
+    }
+
+    /// Pins the `Debug + Send + Sync + 'static` bound surface on
+    /// `EmergencyRepeater`. It lives inside `Arc<EmergencyRepeater>`
+    /// shared between the router's `process()` call site and the
+    /// `start_repeat_task`'s background tokio task; any regression to
+    /// the three bounds would break `Arc::new(...)` + `tokio::spawn` at
+    /// the consumer elsewhere, so pinning at the declaration gives a
+    /// crisp failure message at the source of the break.
+    #[test]
+    fn repeater_implements_debug_send_sync_static() {
+        fn assert_bounds<T>()
+        where
+            T: std::fmt::Debug + Send + Sync + 'static,
+        {
+        }
+        assert_bounds::<EmergencyRepeater>();
+    }
+
+    /// Pins the two module-level defaults — both are documented cadence
+    /// values (`3` seconds between repeats, `5` minutes before stale).
+    /// A regression that silently tightened either would starve
+    /// reconnecting clients of replay (too short) or bloat the active
+    /// set with long-expired alerts (too long).
+    #[test]
+    fn default_repeat_interval_and_stale_delay_have_documented_literal_values() {
+        assert_eq!(DEFAULT_REPEAT_INTERVAL, Duration::from_secs(3));
+        assert_eq!(DEFAULT_STALE_DELAY, Duration::from_secs(300));
+    }
+
+    /// Pins that `new()` and `default()` produce repeaters that are
+    /// observably identical at the configuration surface (repeat
+    /// interval + initial emptiness). A future refactor that forked
+    /// one constructor's behaviour from the other would trip here.
+    #[tokio::test]
+    async fn new_and_default_produce_observably_identical_repeaters() {
+        let via_new = EmergencyRepeater::new();
+        let via_default = EmergencyRepeater::default();
+
+        assert_eq!(via_new.repeat_interval(), via_default.repeat_interval());
+        assert_eq!(via_new.repeat_interval(), DEFAULT_REPEAT_INTERVAL);
+        assert!(via_new.is_empty().await);
+        assert!(via_default.is_empty().await);
+        assert_eq!(via_new.len().await, 0);
+        assert_eq!(via_default.len().await, 0);
+    }
+
+    /// Pins the `repeat_interval()` accessor round-trip at both the
+    /// smallest sensible (1 ms) and largest representable
+    /// (`u64::MAX` seconds) boundaries. A regression that clamped or
+    /// narrowed the stored value would trip here. The accessor is
+    /// load-bearing because `start_repeat_task` reads it once at spawn
+    /// time to construct the ticker interval; a silent clamp would
+    /// quietly change the re-broadcast cadence in production.
+    #[test]
+    fn repeat_interval_accessor_round_trips_across_boundary_values() {
+        let short =
+            EmergencyRepeater::with_intervals(Duration::from_millis(1), Duration::from_secs(300));
+        assert_eq!(short.repeat_interval(), Duration::from_millis(1));
+
+        let long = EmergencyRepeater::with_intervals(
+            Duration::from_secs(u64::MAX),
+            Duration::from_secs(u64::MAX),
+        );
+        assert_eq!(long.repeat_interval(), Duration::from_secs(u64::MAX));
+    }
+
+    /// Pins that `extract_uid` accepts ONLY double-quoted attributes —
+    /// single-quoted `uid='...'` is deliberately rejected. Documents
+    /// the module's strict-wire-format contract so any future relaxation
+    /// (e.g. accepting single quotes) is a visible change that updates
+    /// this test and the downstream dedup cache's UID normalization.
+    #[test]
+    fn extract_uid_rejects_single_quoted_attribute_value() {
+        let xml = b"<event type='b-a-o' uid='single-quoted' />";
+        assert_eq!(extract_uid(xml), None);
+    }
+
+    /// Pins the "space after `<event`" contract in the attribute
+    /// parser: `<event>` with no attributes whatsoever returns `None`
+    /// because the parser searches for `<event ` (with trailing space)
+    /// and a zero-attribute `<event>` has no space. This is the
+    /// expected behaviour — a zero-attribute event has nothing to
+    /// cache and should not be mistakenly coerced to an empty UID.
+    #[test]
+    fn extract_uid_returns_none_for_event_tag_without_attributes() {
+        let xml = b"<event><detail /></event>";
+        assert_eq!(extract_uid(xml), None);
+    }
+
+    /// Pins that `is_cancel_event` returns `false` (not a panic) for
+    /// non-UTF-8 payloads. CoT payloads should always be UTF-8, but
+    /// corrupted, truncated, or maliciously-crafted bytes must not
+    /// crash the router — the graceful `std::str::from_utf8` → `false`
+    /// path is the documented fail-safe.
+    #[test]
+    fn is_cancel_returns_false_gracefully_for_non_utf8_payload() {
+        let not_utf8: &[u8] = &[0xff, 0xfe, 0xfd, 0x00, 0x80];
+        assert!(!is_cancel_event(not_utf8));
+    }
+
+    /// Pins the strict-literal match on `cancel="true"` — any other
+    /// value (`"false"`, `"TRUE"`, `"1"`, arbitrary text) must NOT
+    /// trigger cancel semantics. A regression that loosened this to
+    /// case-insensitive or "any non-empty value" matching would allow
+    /// an operator typo to silently cancel every active alert.
+    #[test]
+    fn is_cancel_requires_exact_true_literal_value() {
+        let xml_false = br#"<event uid="a1"><detail><emergency cancel="false" /></detail></event>"#;
+        let xml_upper = br#"<event uid="a1"><detail><emergency cancel="TRUE" /></detail></event>"#;
+        let xml_numeric = br#"<event uid="a1"><detail><emergency cancel="1" /></detail></event>"#;
+        assert!(!is_cancel_event(xml_false));
+        assert!(!is_cancel_event(xml_upper));
+        assert!(!is_cancel_event(xml_numeric));
+    }
+
+    /// Pins that `process()` replaces the cached emergency for a given
+    /// UID when a second emergency with the same UID arrives. This is
+    /// the "emergency update" code path — a moved 911 alert must
+    /// replace the previous cached position, not duplicate it or
+    /// leave the stale copy behind. `HashMap::insert` semantics
+    /// already give us this, but pinning it guards against any future
+    /// switch to `entry().or_insert_with(...)` that would silently
+    /// keep the stale copy.
+    #[tokio::test]
+    async fn process_replaces_existing_cached_emergency_for_same_uid() {
+        let repeater = EmergencyRepeater::new();
+
+        let initial = make_alert(
+            "alert-1",
+            r#"<event type="b-a-o-tbl" uid="alert-1"><detail><point lat="0" /></detail></event>"#,
+        );
+        let updated = make_alert(
+            "alert-1",
+            r#"<event type="b-a-o-tbl" uid="alert-1"><detail><point lat="42" /></detail></event>"#,
+        );
+
+        assert!(repeater.process(&initial).await);
+        assert!(repeater.process(&updated).await);
+        assert_eq!(
+            repeater.len().await,
+            1,
+            "same-UID re-process must replace, not duplicate"
+        );
+
+        let active = repeater.active_events().await;
+        assert_eq!(active.len(), 1);
+        let payload = std::str::from_utf8(&active[0].payload).unwrap();
+        assert!(
+            payload.contains(r#"lat="42""#),
+            "active event must reflect the UPDATED payload, not the initial one: {payload}"
+        );
+    }
+
+    /// Pins that `process()` on an alert with no UID attribute returns
+    /// `false` and does not cache anything. A malformed alert should
+    /// be silently dropped (CoT XML that lacks a UID cannot be
+    /// deduped, cancelled, or routed by ID), never coerced to a
+    /// synthetic UID that would collide across sources.
+    #[tokio::test]
+    async fn process_returns_false_for_alert_with_missing_uid_attribute() {
+        let repeater = EmergencyRepeater::new();
+        let msg = make_alert(
+            "ignored",
+            r#"<event type="b-a-o-tbl"><detail><emergency type="911" /></detail></event>"#,
+        );
+        assert!(!repeater.process(&msg).await);
+        assert!(repeater.is_empty().await);
+    }
+
+    /// Pins that cancelling an unknown UID is a no-op — `process()`
+    /// returns `false`, the cache stays empty, and no panic or log-
+    /// corruption occurs. This is the common race: the cancel arrives
+    /// at this pod before the original alert (e.g., the alert went to
+    /// a different pod first and the cancel arrived via federation).
+    #[tokio::test]
+    async fn cancel_of_unknown_uid_is_a_silent_no_op() {
+        let repeater = EmergencyRepeater::new();
+        let cancel = make_alert(
+            "ghost-uid",
+            r#"<event type="b-a-o-tbl" uid="ghost-uid"><detail><emergency cancel="true" /></detail></event>"#,
+        );
+        assert!(!repeater.process(&cancel).await);
+        assert!(repeater.is_empty().await);
+        assert_eq!(repeater.len().await, 0);
     }
 }
