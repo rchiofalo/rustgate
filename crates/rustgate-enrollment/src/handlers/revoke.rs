@@ -156,3 +156,173 @@ struct RevokeRequest {
 fn default_reason() -> String {
     "unspecified".to_string()
 }
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used)]
+mod tests {
+    use http_body_util::BodyExt;
+    use hyper::StatusCode;
+
+    use super::*;
+    use crate::revocation::RevocationStore;
+
+    async fn collect_body(resp: Response<Full<Bytes>>) -> (StatusCode, Option<String>, Bytes) {
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let bytes = resp
+            .into_body()
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes();
+        (status, content_type, bytes)
+    }
+
+    async fn fresh_store() -> (tempfile::TempDir, RevocationStore) {
+        let ca = rustgate_test_utils::certs::TestCa::new("Revoke Handler Test CA");
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("revocations.json");
+        let store = RevocationStore::new(db_path, &ca.cert_pem, &ca.key_pem)
+            .await
+            .unwrap();
+        (dir, store)
+    }
+
+    #[tokio::test]
+    async fn handle_crl_returns_pem_with_correct_content_type() {
+        let (_dir, store) = fresh_store().await;
+
+        let resp = handle_crl(&store).await;
+        let (status, content_type, body) = collect_body(resp).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type.as_deref(), Some("application/x-pem-file"));
+        let body_str = std::str::from_utf8(&body).expect("utf8 CRL PEM");
+        assert!(
+            body_str.contains("-----BEGIN X509 CRL-----"),
+            "CRL PEM missing begin marker: {body_str}"
+        );
+        assert!(
+            body_str.contains("-----END X509 CRL-----"),
+            "CRL PEM missing end marker: {body_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_crl_reflects_newly_revoked_serial() {
+        let (_dir, store) = fresh_store().await;
+        let newly = store
+            .revoke("deadbeef", "key_compromise", "admin")
+            .await
+            .unwrap();
+        assert!(newly);
+
+        let resp = handle_crl(&store).await;
+        let (status, _, body) = collect_body(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        let pem = std::str::from_utf8(&body).expect("utf8");
+
+        // Decode the PEM body to DER and confirm the revoked serial is
+        // present. Matching on the raw PEM would be unsafe — base64 output
+        // is not stable across re-encodings.
+        let der_lines: String = pem
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect();
+        let der = rustgate_core::b64::decode(der_lines.trim()).expect("base64 CRL body");
+        let (_, crl) =
+            x509_parser::parse_x509_crl(&der).expect("parseable CRL DER from handler output");
+        let serials: Vec<String> = crl
+            .iter_revoked_certificates()
+            .map(|entry| format!("{:x}", entry.user_certificate))
+            .collect();
+        assert!(
+            serials.iter().any(|s| s == "deadbeef"),
+            "expected deadbeef in revoked serials, got {serials:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_list_revoked_returns_empty_array_when_no_revocations() {
+        let (_dir, store) = fresh_store().await;
+
+        let resp = handle_list_revoked(&store).await;
+        let (status, content_type, body) = collect_body(resp).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type.as_deref(), Some("application/json"));
+        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+        assert_eq!(
+            parsed.as_array().expect("JSON array").len(),
+            0,
+            "expected empty array, got {parsed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_list_revoked_returns_entries_with_expected_fields() {
+        let (_dir, store) = fresh_store().await;
+        let _ = store
+            .revoke("aabbcc", "superseded", "operator")
+            .await
+            .unwrap();
+        let _ = store
+            .revoke("112233", "key_compromise", "admin")
+            .await
+            .unwrap();
+
+        let resp = handle_list_revoked(&store).await;
+        let (status, _, body) = collect_body(resp).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_slice(&body).expect("JSON array of entries");
+        assert_eq!(parsed.len(), 2);
+
+        // Map by serial so we don't rely on HashMap iteration order.
+        let mut by_serial: std::collections::HashMap<String, &serde_json::Value> =
+            std::collections::HashMap::new();
+        for entry in &parsed {
+            let serial = entry["serial"].as_str().expect("serial str").to_string();
+            let _ = by_serial.insert(serial, entry);
+        }
+
+        let aabbcc = by_serial.get("aabbcc").expect("aabbcc present");
+        assert_eq!(aabbcc["reason"], "superseded");
+        assert_eq!(aabbcc["revoked_by"], "operator");
+        assert!(
+            aabbcc["revoked_at"].as_u64().is_some(),
+            "revoked_at should be a unix timestamp integer"
+        );
+
+        let t112233 = by_serial.get("112233").expect("112233 present");
+        assert_eq!(t112233["reason"], "key_compromise");
+        assert_eq!(t112233["revoked_by"], "admin");
+    }
+
+    #[test]
+    fn revoke_request_uses_default_reason_when_absent() {
+        let parsed: RevokeRequest =
+            serde_json::from_str(r#"{"serial":"aa"}"#).expect("parses with default reason");
+        assert_eq!(parsed.serial, "aa");
+        assert_eq!(parsed.reason, "unspecified");
+    }
+
+    #[test]
+    fn revoke_request_honours_explicit_reason() {
+        let parsed: RevokeRequest =
+            serde_json::from_str(r#"{"serial":"bb","reason":"cessation_of_operation"}"#)
+                .expect("parses with explicit reason");
+        assert_eq!(parsed.serial, "bb");
+        assert_eq!(parsed.reason, "cessation_of_operation");
+    }
+
+    #[test]
+    fn default_reason_is_unspecified() {
+        assert_eq!(default_reason(), "unspecified");
+    }
+}
