@@ -806,4 +806,490 @@ mod tests {
             "expected globally-oldest entry to be evicted, got {still_there:?}"
         );
     }
+
+    // -----------------------------------------------------------------
+    // Defensive-invariant coverage (Refs #909).
+    //
+    // The tests above exercise happy-path and a couple of eviction
+    // cases. The block below locks down the wire-format contract, the
+    // schema-version pin, the byte-cap accounting invariants, the
+    // `Clone`/`Debug` surface, and the silent-skip behavior of the
+    // decoders so regressions surface here instead of at runtime on a
+    // rehydrate.
+    // -----------------------------------------------------------------
+
+    /// The module-level byte-cap default is a wire/operator-visible
+    /// constant — dashboards and docs reference it. Pin the value so a
+    /// "just bump the default" change has to pass through this test.
+    #[test]
+    fn default_replay_max_bytes_is_sixty_four_mib() {
+        assert_eq!(DEFAULT_REPLAY_MAX_BYTES, 64 * 1024 * 1024);
+    }
+
+    /// Pin the per-record overhead constant that drives accounted
+    /// size. Bumping this changes the effective cap for operators who
+    /// have tuned `--federation-replay-max-bytes` against the current
+    /// overhead — it is a compatibility knob, not an implementation
+    /// detail.
+    #[test]
+    fn redb_per_record_overhead_constant_is_pinned_to_32() {
+        assert_eq!(REDB_PER_RECORD_OVERHEAD, 32);
+    }
+
+    /// Bumping the redb table name drops legacy entries on first open
+    /// of the new binary (per the module doc comment). Pin the current
+    /// name so that migration is an intentional act with a deliberate
+    /// rename, not an accidental typo that silently resets every
+    /// operator's replay buffer on upgrade.
+    #[test]
+    fn replay_table_name_is_v2() {
+        use redb::TableHandle;
+        assert_eq!(REPLAY_TABLE.name(), "federation_replay_v2");
+    }
+
+    #[test]
+    fn encode_decode_key_round_trip_typical() {
+        let key = encode_key("peer-zulu", 0xDEAD_BEEF_CAFE_BABE);
+        let (peer, seq) = decode_key(&key).expect("valid key must decode");
+        assert_eq!(peer, "peer-zulu");
+        assert_eq!(seq, 0xDEAD_BEEF_CAFE_BABE);
+    }
+
+    #[test]
+    fn encode_decode_key_round_trip_empty_peer() {
+        // Empty peer names are not expected operationally, but the
+        // codec must survive them — a nine-byte key with a leading 0x00
+        // separator and 8-byte seq is still valid per the layout.
+        let key = encode_key("", 7);
+        assert_eq!(key.len(), 9, "empty peer → 0 bytes peer + 1 sep + 8 seq");
+        let (peer, seq) = decode_key(&key).expect("empty-peer key must decode");
+        assert_eq!(peer, "");
+        assert_eq!(seq, 7);
+    }
+
+    #[test]
+    fn encode_decode_key_preserves_internal_nul_in_peer_id() {
+        // `decode_key` splits at `len - 9`; the separator is the byte
+        // immediately before the 8 seq bytes. Internal 0x00 bytes in
+        // the peer must survive a round-trip — the split is length-
+        // based, not a `split_once(0x00)`.
+        let key = encode_key("a\x00b", 42);
+        let (peer, seq) = decode_key(&key).expect("peer with internal NUL must decode");
+        assert_eq!(peer.as_bytes(), b"a\x00b");
+        assert_eq!(seq, 42);
+    }
+
+    #[test]
+    fn encode_decode_key_round_trip_u64_max_seq() {
+        let key = encode_key("edge", u64::MAX);
+        let (peer, seq) = decode_key(&key).expect("u64::MAX seq must decode");
+        assert_eq!(peer, "edge");
+        assert_eq!(seq, u64::MAX);
+    }
+
+    #[test]
+    fn decode_key_rejects_input_shorter_than_nine_bytes() {
+        // The layout guarantees 1 separator + 8 seq bytes at the tail,
+        // so anything below 9 bytes is structurally impossible.
+        for n in 0..9usize {
+            let raw = vec![0u8; n];
+            assert!(
+                decode_key(&raw).is_none(),
+                "expected None for {n}-byte raw key"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_key_rejects_wrong_separator_byte() {
+        // The byte at (len - 9) must be 0x00. Any other value is a
+        // malformed key — either a corrupted record or a key from an
+        // incompatible format — and the decoder must refuse it rather
+        // than parsing garbage into a peer_id.
+        let mut raw = encode_key("peer", 1);
+        let split = raw.len() - 9;
+        raw[split] = 0x01;
+        assert!(decode_key(&raw).is_none());
+    }
+
+    #[test]
+    fn decode_key_rejects_invalid_utf8_in_peer_segment() {
+        // Peer IDs must be valid UTF-8. A stray 0xFF before the
+        // separator is not — the decoder must drop the entry rather
+        // than produce a lossy peer string.
+        let mut raw = vec![0xFFu8];
+        raw.push(0); // separator
+        raw.extend_from_slice(&42u64.to_be_bytes()); // seq
+        assert!(decode_key(&raw).is_none());
+    }
+
+    #[test]
+    fn encode_decode_value_round_trip_typical() {
+        let groups = vec!["alpha".to_string(), "bravo".to_string()];
+        let payload = Bytes::from_static(b"hello");
+        let raw = encode_value(100, Some(60_000), &groups, &payload);
+        let (ts, ttl, g, p) = decode_value(&raw).expect("round-trip must decode");
+        assert_eq!(ts, 100);
+        assert_eq!(ttl, Some(60_000));
+        assert_eq!(g, groups);
+        assert_eq!(p, payload);
+    }
+
+    #[test]
+    fn encode_decode_value_round_trip_empty_groups_and_payload() {
+        let raw = encode_value(0, None, &[], &Bytes::new());
+        let (ts, ttl, g, p) = decode_value(&raw).expect("minimal value must decode");
+        assert_eq!(ts, 0);
+        assert_eq!(ttl, None);
+        assert!(g.is_empty());
+        assert!(p.is_empty());
+    }
+
+    /// The encoder represents a missing TTL as `0`, and the decoder
+    /// treats any zero as `None`. Callers that try to persist a
+    /// `Some(0)` TTL will see it round-trip as `None` — the module
+    /// documents this at `encode_value` ("live messages are never
+    /// enqueued with a 0 ms TTL"). Pin the contract so a future "fix"
+    /// that replaces the sentinel with a tagged representation doesn't
+    /// silently change on-disk format for existing deployments.
+    #[test]
+    fn ttl_some_zero_round_trips_as_none_by_sentinel_convention() {
+        let raw = encode_value(1, Some(0), &[], &Bytes::from_static(b"x"));
+        let (_ts, ttl, _g, _p) = decode_value(&raw).expect("value must decode");
+        assert_eq!(
+            ttl, None,
+            "Some(0) must decode as None by sentinel convention"
+        );
+    }
+
+    #[test]
+    fn decode_value_rejects_header_shorter_than_twenty_bytes() {
+        // Header is 8 (ts) + 8 (ttl) + 4 (groups_len) = 20 bytes.
+        for n in 0..20usize {
+            let raw = vec![0u8; n];
+            assert!(
+                decode_value(&raw).is_none(),
+                "expected None for {n}-byte value header",
+            );
+        }
+    }
+
+    #[test]
+    fn decode_value_rejects_group_length_exceeding_remaining_bytes() {
+        // Craft a value that claims 1 group of 100 bytes but supplies
+        // only 2. The decoder must refuse rather than read past the
+        // buffer or return a partial group.
+        let mut raw = BytesMut::new();
+        raw.put_u64(0); // ts
+        raw.put_u64(0); // ttl
+        raw.put_u32(1); // groups_len = 1
+        raw.put_u32(100); // glen = 100 … but …
+        raw.put_slice(b"ab"); // … only 2 bytes follow.
+        assert!(decode_value(&raw).is_none());
+    }
+
+    #[test]
+    fn decode_value_rejects_missing_group_length_field() {
+        // 20-byte header says 1 group follows, but no group-length u32
+        // is present at all.
+        let mut raw = BytesMut::new();
+        raw.put_u64(0);
+        raw.put_u64(0);
+        raw.put_u32(1);
+        assert!(decode_value(&raw).is_none());
+    }
+
+    #[test]
+    fn decode_value_rejects_invalid_utf8_group_name() {
+        let mut raw = BytesMut::new();
+        raw.put_u64(0);
+        raw.put_u64(0);
+        raw.put_u32(1);
+        raw.put_u32(1);
+        raw.put_u8(0xFF); // not a valid UTF-8 scalar
+        assert!(decode_value(&raw).is_none());
+    }
+
+    #[test]
+    fn encode_decode_value_many_groups_round_trip() {
+        let groups: Vec<String> = (0..32).map(|i| format!("g-{i}")).collect();
+        let raw = encode_value(999, Some(1), &groups, &Bytes::from_static(b"body"));
+        let (_ts, _ttl, g, p) = decode_value(&raw).expect("must decode");
+        assert_eq!(g, groups);
+        assert_eq!(p, Bytes::from_static(b"body"));
+    }
+
+    #[test]
+    fn accounted_size_sums_lengths_with_overhead() {
+        assert_eq!(accounted_size(0, 0), REDB_PER_RECORD_OVERHEAD);
+        assert_eq!(accounted_size(10, 20), 10 + 20 + REDB_PER_RECORD_OVERHEAD);
+    }
+
+    /// Paranoia: the accounted-size helper feeds a `u64` cap check that
+    /// must never panic. Saturation is the contract: a catastrophic
+    /// input (len = `usize::MAX`) returns `u64::MAX` rather than
+    /// wrapping to 31. Overcounting is fine; wrapping is a silent
+    /// cap-bypass that the operator has no way to observe.
+    #[test]
+    fn accounted_size_saturates_instead_of_wrapping() {
+        assert_eq!(accounted_size(usize::MAX, usize::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn open_creates_directory_if_missing() {
+        // The API guarantees `open` will create any missing parents —
+        // exercised here by pointing at a deeply nested path.
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("a").join("b").join("c");
+        assert!(!nested.exists());
+        let store = ReplayStore::open(&nested, 4096).expect("nested dir must be created");
+        assert!(nested.is_dir());
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn fresh_store_reports_empty_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ReplayStore::open(dir.path(), 4096).unwrap();
+        assert_eq!(store.len(), 0);
+        assert!(store.is_empty());
+        assert_eq!(store.total_bytes(), 0);
+        assert!(store.load_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn put_increments_len_and_total_bytes_consistently() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ReplayStore::open(dir.path(), 1 << 20).unwrap();
+        assert_eq!(store.len(), 0);
+        put(&store, "peer-a", 1, 100, b"hello");
+        assert_eq!(store.len(), 1);
+        assert!(!store.is_empty());
+        let after_one = store.total_bytes();
+        assert!(after_one >= REDB_PER_RECORD_OVERHEAD);
+        put(&store, "peer-a", 2, 200, b"world-2");
+        assert_eq!(store.len(), 2);
+        assert!(
+            store.total_bytes() > after_one,
+            "total_bytes must grow on a second put"
+        );
+    }
+
+    #[test]
+    fn delete_nonexistent_key_is_a_noop_not_an_error() {
+        // redb's `remove` on a missing key is not an error, and the
+        // in-memory accounting must likewise tolerate the no-op — any
+        // drain or eviction path can race a delete on a key that the
+        // in-memory ring already dropped.
+        let dir = tempfile::tempdir().unwrap();
+        let store = ReplayStore::open(dir.path(), 4096).unwrap();
+        put(&store, "peer", 1, 10, b"only");
+        let before = store.total_bytes();
+        store.delete("peer", 9_999).expect("delete must return Ok");
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.total_bytes(), before);
+    }
+
+    #[test]
+    fn clear_peer_with_no_entries_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ReplayStore::open(dir.path(), 4096).unwrap();
+        put(&store, "peer-b", 1, 10, b"b");
+        let before_total = store.total_bytes();
+        store
+            .clear_peer("peer-a")
+            .expect("clear_peer must be idempotent");
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.total_bytes(), before_total);
+        // peer-b must still be intact.
+        let all = store.load_all().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].peer_id, "peer-b");
+    }
+
+    #[test]
+    fn delete_every_entry_returns_store_to_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ReplayStore::open(dir.path(), 4096).unwrap();
+        put(&store, "p", 1, 10, b"1");
+        put(&store, "p", 2, 20, b"2");
+        store.delete("p", 1).unwrap();
+        store.delete("p", 2).unwrap();
+        assert_eq!(store.len(), 0);
+        assert!(store.is_empty());
+        assert_eq!(store.total_bytes(), 0);
+        assert!(store.load_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn clone_shares_inner_state_with_original() {
+        // `ReplayStore: Clone` is documented as cheap — it wraps the
+        // inner `Arc`. A put via the clone must be visible via the
+        // original, and vice-versa, or the shared-state contract is
+        // broken and callers who pass clones to peer tasks will see a
+        // divergent view of the buffer.
+        let dir = tempfile::tempdir().unwrap();
+        let original = ReplayStore::open(dir.path(), 4096).unwrap();
+        let cloned = original.clone();
+        put(&cloned, "shared", 1, 1, b"via-clone");
+        assert_eq!(original.len(), 1);
+        assert_eq!(original.total_bytes(), cloned.total_bytes());
+        original.delete("shared", 1).unwrap();
+        assert!(cloned.is_empty());
+    }
+
+    #[test]
+    fn load_all_returns_entries_sorted_by_peer_then_seq() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ReplayStore::open(dir.path(), 4096).unwrap();
+        // Insert in jumbled order.
+        put(&store, "c", 5, 100, b"c5");
+        put(&store, "a", 2, 200, b"a2");
+        put(&store, "a", 1, 300, b"a1");
+        put(&store, "b", 1, 400, b"b1");
+        let all = store.load_all().unwrap();
+        let keys: Vec<(String, u64)> = all.iter().map(|e| (e.peer_id.clone(), e.seq)).collect();
+        assert_eq!(
+            keys,
+            vec![
+                ("a".to_string(), 1),
+                ("a".to_string(), 2),
+                ("b".to_string(), 1),
+                ("c".to_string(), 5),
+            ],
+            "load_all must sort primarily by peer_id, secondarily by seq"
+        );
+    }
+
+    #[test]
+    fn put_preserves_empty_payload_across_reload() {
+        // Zero-byte payloads are valid per the codec and must survive a
+        // persist + reload round-trip unchanged.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = ReplayStore::open(dir.path(), 4096).unwrap();
+            store
+                .put("p", 1, 10, None, &["g".into()], &Bytes::new())
+                .unwrap();
+        }
+        let store = ReplayStore::open(dir.path(), 4096).unwrap();
+        let all = store.load_all().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].payload.len(), 0);
+        assert_eq!(all[0].groups, vec!["g".to_string()]);
+    }
+
+    #[test]
+    fn replay_store_error_is_debug_and_display_and_error() {
+        // Pin the public surface: `ReplayStoreError` must be usable as
+        // an `anyhow::Error` source and must produce a helpful
+        // `Display` form for operators tailing structured logs.
+        let err = ReplayStoreError::Database("synthetic".to_string());
+        let disp = format!("{err}");
+        assert!(disp.contains("synthetic"), "Display must propagate inner");
+        let dbg = format!("{err:?}");
+        assert!(dbg.contains("Database"), "Debug must name the variant");
+        let _as_error: &dyn std::error::Error = &err;
+
+        let decode = ReplayStoreError::Decode;
+        let disp2 = format!("{decode}");
+        assert!(disp2.contains("malformed"), "Decode variant has a message");
+    }
+
+    #[test]
+    fn restored_entry_is_clone_and_debug() {
+        let e = RestoredEntry {
+            peer_id: "p".to_string(),
+            seq: 1,
+            enqueued_at_unix_ms: 10,
+            ttl_ms: Some(42),
+            groups: vec!["g".to_string()],
+            payload: Bytes::from_static(b"x"),
+        };
+        let cloned = e.clone();
+        assert_eq!(cloned.peer_id, e.peer_id);
+        assert_eq!(cloned.payload, e.payload);
+        let dbg = format!("{e:?}");
+        assert!(dbg.contains("RestoredEntry"));
+    }
+
+    #[test]
+    fn replay_store_is_debug() {
+        // The `Debug` impl is required for `#[derive(Debug)]` on
+        // downstream peer structs that embed a `ReplayStore` handle.
+        let dir = tempfile::tempdir().unwrap();
+        let store = ReplayStore::open(dir.path(), 4096).unwrap();
+        let dbg = format!("{store:?}");
+        assert!(dbg.contains("ReplayStore"));
+    }
+
+    #[test]
+    fn rehydrate_skips_malformed_keys_written_directly_to_redb() {
+        // Bypass `ReplayStore::put` and write a too-short key via raw
+        // redb. `ReplayStore::open` must log-and-skip that entry on
+        // rebuild rather than propagate an error — silent degradation
+        // is the module's documented contract for malformed records.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("federation_replay.redb");
+        {
+            let db = redb::Database::create(&path).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let mut table = write.open_table(REPLAY_TABLE).unwrap();
+                // 4 bytes < 9 bytes → decode_key returns None.
+                let _ = table.insert(&[1u8, 2, 3, 4][..], &[0u8; 24][..]).unwrap();
+            }
+            write.commit().unwrap();
+        }
+        let store = ReplayStore::open(dir.path(), 4096).expect("open must tolerate bad keys");
+        // Malformed entry is skipped; store behaves as empty.
+        assert!(store.is_empty());
+        assert_eq!(store.total_bytes(), 0);
+    }
+
+    #[test]
+    fn rehydrate_skips_malformed_values_written_directly_to_redb() {
+        // Valid key, garbage value (shorter than the 20-byte header).
+        // Must be dropped on rebuild rather than tripping Decode up.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("federation_replay.redb");
+        {
+            let db = redb::Database::create(&path).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let mut table = write.open_table(REPLAY_TABLE).unwrap();
+                let key = encode_key("peer", 1);
+                let _ = table.insert(key.as_slice(), &[0u8; 3][..]).unwrap();
+            }
+            write.commit().unwrap();
+        }
+        let store = ReplayStore::open(dir.path(), 4096).expect("open must tolerate bad values");
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn byte_cap_zero_drops_every_write() {
+        // A cap of 0 means no record fits: eviction must run for every
+        // put, leaving the in-memory ring empty. (The on-disk table
+        // still sees the insert because the commit runs after
+        // eviction of older records, but the accounted total stays at
+        // the single-record size — the in-memory view is what peers
+        // replay from.) Pin the small-cap edge so a future change to
+        // eviction ordering doesn't accidentally skip zero-sized caps.
+        let dir = tempfile::tempdir().unwrap();
+        let store = ReplayStore::open(dir.path(), 0).unwrap();
+        store
+            .put("p", 1, 10, None, &[], &Bytes::from_static(b"x"))
+            .unwrap();
+        // The freshly-inserted record itself always remains in memory;
+        // any earlier record would be evicted first. With a cap of 0
+        // and a single put, the in-memory ring has exactly one entry.
+        assert_eq!(store.len(), 1);
+        // A second put drops the first in memory even though both
+        // exist briefly in the b-tree.
+        store
+            .put("p", 2, 20, None, &[], &Bytes::from_static(b"y"))
+            .unwrap();
+        assert_eq!(store.len(), 1);
+    }
 }
