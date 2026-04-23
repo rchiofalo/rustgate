@@ -264,4 +264,200 @@ mod tests {
         let checkpoint = Checkpoint::new(PathBuf::from("/nonexistent/path/checkpoint"));
         assert!(checkpoint.load().await.is_none());
     }
+
+    #[tokio::test]
+    async fn checkpoint_load_trims_whitespace_and_newlines_from_seq_string() {
+        // `load` does `data.trim().parse()`, so a file containing
+        // `"  42  \n"` (e.g. written by `echo 42 > checkpoint`) must parse
+        // cleanly. Operators who edit the checkpoint file by hand during an
+        // incident response would otherwise hit a silent resume-from-zero
+        // because `"42\n".parse::<u64>()` returns `Err(ParseIntError)`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint");
+        tokio::fs::write(&path, "  42  \n").await.unwrap();
+
+        let checkpoint = Checkpoint::new(path);
+        assert_eq!(checkpoint.load().await, Some(42));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_load_empty_file_returns_none() {
+        // An existing but empty checkpoint file (e.g. from a torn write or
+        // a zero-byte sentinel) must route to `None` via the parse-failure
+        // path rather than returning `Some(0)` — replaying from seq=0
+        // would silently re-process the entire stream.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint");
+        tokio::fs::write(&path, "").await.unwrap();
+
+        let checkpoint = Checkpoint::new(path);
+        assert!(
+            checkpoint.load().await.is_none(),
+            "empty file must parse as None, not Some(0)",
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_load_overflow_seq_returns_none() {
+        // `u64::from_str` rejects values > u64::MAX. The `.ok()` on the
+        // parse result routes such a file to `None` — a silent wrap-around
+        // to 0 would cause a full-stream replay on the next restart.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint");
+        tokio::fs::write(&path, "99999999999999999999999999999")
+            .await
+            .unwrap();
+
+        let checkpoint = Checkpoint::new(path);
+        assert!(
+            checkpoint.load().await.is_none(),
+            "overflow must reject cleanly, not wrap to 0",
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_load_negative_value_returns_none() {
+        // `u64::from_str` rejects leading `-`. Pin this so a config
+        // migration that writes a signed `i64` representation by mistake
+        // fails loudly at load rather than silently resuming from 0.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint");
+        tokio::fs::write(&path, "-1").await.unwrap();
+
+        let checkpoint = Checkpoint::new(path);
+        assert!(
+            checkpoint.load().await.is_none(),
+            "negative seq must reject cleanly",
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_save_creates_parent_dirs_recursively() {
+        // `save` calls `tokio::fs::create_dir_all(parent)` before writing
+        // so operators who point `--nats-checkpoint-path` at a
+        // not-yet-created nested directory get the path materialised
+        // automatically — otherwise every fresh deployment would need a
+        // `mkdir -p` prestart step.
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("a").join("b").join("c").join("checkpoint");
+        assert!(!nested.parent().unwrap().exists());
+
+        let checkpoint = Checkpoint::new(nested.clone());
+        checkpoint.save(7).await.unwrap();
+
+        assert!(nested.exists(), "file must exist: {nested:?}");
+        assert_eq!(checkpoint.load().await, Some(7));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_save_at_bare_filename_does_not_panic_on_none_parent() {
+        // A path like `PathBuf::from("checkpoint")` has `parent() ==
+        // Some("")` rather than `None`, but the guard is against the
+        // `None` case — pin that both the guard branch and the
+        // empty-parent branch execute cleanly. A regression that removed
+        // the `if let Some(parent)` wrap and unwrapped directly would
+        // panic on a root-level Path like `PathBuf::from("/")`.
+        let dir = tempfile::tempdir().unwrap();
+        let bare = dir.path().join("checkpoint");
+        let checkpoint = Checkpoint::new(bare.clone());
+        checkpoint.save(3).await.unwrap();
+        assert_eq!(checkpoint.load().await, Some(3));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_save_is_atomic_overwrite_not_append() {
+        // `tokio::fs::write` replaces the file contents; the semantics
+        // matter because a regression that switched to an append-mode
+        // writer would produce "4242" after two saves of `42`, which
+        // `parse::<u64>()` would decode as a wildly wrong sequence.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint");
+        let checkpoint = Checkpoint::new(path.clone());
+
+        checkpoint.save(42).await.unwrap();
+        checkpoint.save(7).await.unwrap();
+
+        let contents = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(contents, "7", "overwrite, not append");
+        assert_eq!(checkpoint.load().await, Some(7));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_save_and_load_round_trips_u64_max() {
+        // The wire format is `seq.to_string()`, so u64::MAX (20 chars)
+        // must still round-trip cleanly — pin that no one silently
+        // narrows the on-disk encoding to `i32` or `u32` in a refactor.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint");
+        let checkpoint = Checkpoint::new(path);
+
+        checkpoint.save(u64::MAX).await.unwrap();
+        assert_eq!(checkpoint.load().await, Some(u64::MAX));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_debug_impl_renders_path_field() {
+        // Pin the `#[derive(Debug)]` surface so a future refactor that
+        // narrowed the struct (e.g. adding a non-Debug field without a
+        // manual impl) would fail at test-compile time rather than
+        // blowing up at the first `tracing::debug!(?cp, …)` call site.
+        let cp = Checkpoint::new(PathBuf::from("/tmp/rustgate-replay.cp"));
+        let rendered = format!("{cp:?}");
+        assert!(rendered.contains("Checkpoint"), "{rendered}");
+        assert!(
+            rendered.contains("rustgate-replay.cp"),
+            "path must be visible: {rendered}",
+        );
+    }
+
+    #[test]
+    fn jetstream_replay_and_checkpoint_compile_time_debug_bounds() {
+        // Compile-time bound assertion: both types carry `Debug` so
+        // `tracing::debug!(?replay, …)` stays compilable across the
+        // workspace. A future refactor that narrowed either type's
+        // composed members to a non-`Debug` shape fails here at test
+        // compile rather than at a transitive caller.
+        fn assert_debug<T: std::fmt::Debug + ?Sized>() {}
+        assert_debug::<Checkpoint>();
+        assert_debug::<JetStreamReplay>();
+    }
+
+    #[tokio::test]
+    async fn jetstream_replay_new_preserves_none_checkpoint_path() {
+        // `require_nats!` — skips gracefully when `nats-server` isn't on
+        // PATH so this test passes on dev machines without the binary.
+        // Pins that `JetStreamReplay::new(client, config, None)`
+        // preserves the None in the `checkpoint_path` field — the
+        // `replay()` code path keys off `self.checkpoint_path.as_ref()`
+        // and a silent conversion to `Some(PathBuf::new())` during a
+        // builder-pattern refactor would flip the replay behaviour from
+        // `DeliverLastPerSubject` to a `ByStartSequence { start_sequence: 0 }`.
+        let nats = rustgate_test_utils::require_nats!();
+        let client = async_nats::connect(nats.url()).await.unwrap();
+        let replay = JetStreamReplay::new(client, NatsConfig::default(), None);
+        let rendered = format!("{replay:?}");
+        assert!(
+            rendered.contains("checkpoint_path: None"),
+            "None must survive construction: {rendered}",
+        );
+    }
+
+    #[tokio::test]
+    async fn jetstream_replay_new_preserves_some_checkpoint_path() {
+        // Counterpart to the None test above — pins that a caller who
+        // provides `Some(PathBuf)` sees the exact path in the Debug
+        // output. A regression that accidentally canonicalised or
+        // rewrote the path during construction (e.g. to an absolute
+        // form) would be caught here before it reached the
+        // `Checkpoint::new` call site in `replay()`.
+        let nats = rustgate_test_utils::require_nats!();
+        let client = async_nats::connect(nats.url()).await.unwrap();
+        let path = PathBuf::from("/var/lib/rustgate/replay.cp");
+        let replay = JetStreamReplay::new(client, NatsConfig::default(), Some(path));
+        let rendered = format!("{replay:?}");
+        assert!(
+            rendered.contains("/var/lib/rustgate/replay.cp"),
+            "Some path must survive construction verbatim: {rendered}",
+        );
+    }
 }
