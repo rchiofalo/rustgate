@@ -414,4 +414,237 @@ mod tests {
         let refresh = CONN_REFRESH_SECS;
         assert!(ttl > refresh, "TTL must exceed refresh interval");
     }
+
+    /// Pins the full trait-bound surface on `Direction`. `Copy` is
+    /// load-bearing because every hot-path comparison in `list_pods`
+    /// (`if conn.direction == Direction::Outbound`) relies on by-value
+    /// copying instead of references. `Send + Sync + 'static` are
+    /// load-bearing because `ConnectionInfo` (which owns a `Direction`)
+    /// is shipped across the `refresh_registrations` background task.
+    #[test]
+    fn direction_implements_copy_clone_partial_eq_debug_send_sync_static() {
+        fn assert_bounds<T>()
+        where
+            T: Copy + Clone + PartialEq + Eq + std::fmt::Debug + Send + Sync + 'static,
+        {
+        }
+        assert_bounds::<Direction>();
+    }
+
+    /// Pins the wire contract for unknown variant rejection. `Direction`
+    /// is serialized `rename_all = "lowercase"` so the canonical wire
+    /// tokens are `"outbound"` and `"inbound"`; any other casing or
+    /// unknown value MUST fail deserialization (if a future peer running
+    /// an older version emitted `"Outbound"`, we want a crisp parse
+    /// error, not a silent coerce to a default variant).
+    #[test]
+    fn direction_serde_rejects_capital_case_and_unknown_variants() {
+        for hostile in [
+            "\"Outbound\"",
+            "\"OUTBOUND\"",
+            "\"Inbound\"",
+            "\"INBOUND\"",
+            "\"outbound \"", // trailing space
+            "\" outbound\"", // leading space
+            "\"wizard\"",
+            "\"\"",
+            "\"both\"",
+            "\"none\"",
+        ] {
+            let result: Result<Direction, _> = serde_json::from_str(hostile);
+            assert!(
+                result.is_err(),
+                "expected serde rejection of hostile Direction wire value {hostile}, got Ok"
+            );
+        }
+    }
+
+    /// Pins the `Clone + Debug + Send + Sync + 'static` bound surface on
+    /// `ConnectionInfo`. It lives inside `Arc<Mutex<HashMap<…,
+    /// ConnectionInfo>>>` in the refresh task, so a regression that
+    /// removed `Send` or `Sync` would break the `tokio::spawn` at
+    /// compile time elsewhere — pinning here gives a crisp error.
+    #[test]
+    fn connection_info_implements_clone_debug_send_sync_static() {
+        fn assert_bounds<T>()
+        where
+            T: Clone + std::fmt::Debug + Send + Sync + 'static,
+        {
+        }
+        assert_bounds::<ConnectionInfo>();
+    }
+
+    /// Pins forward-compatibility: `ConnectionInfo` deserialization must
+    /// tolerate unknown fields from newer pods (serde's default when
+    /// `deny_unknown_fields` is absent). A regression that added
+    /// `#[serde(deny_unknown_fields)]` would silently break every
+    /// cross-version upgrade in a rolling deployment.
+    #[test]
+    fn connection_info_deserialize_tolerates_unknown_fields_from_newer_pods() {
+        let forward_compat_json = r#"{
+            "peer_id": "peer-future",
+            "pod_id": "pod-future",
+            "direction": "outbound",
+            "connected_at": 1700000000,
+            "fencing_token": 42,
+            "future_field_added_in_v3": "ignored",
+            "another_unknown": 99
+        }"#;
+        let parsed: ConnectionInfo =
+            serde_json::from_str(forward_compat_json).expect("unknown fields must be tolerated");
+        assert_eq!(parsed.peer_id.as_str(), "peer-future");
+        assert_eq!(parsed.pod_id, "pod-future");
+        assert_eq!(parsed.fencing_token, Some(42));
+    }
+
+    /// Pins that `fencing_token: Some(0)` is NOT omitted from the wire
+    /// shape — the `skip_serializing_if = "Option::is_none"` attribute
+    /// must only trigger on `None`, not on `Some(0)`. A regression that
+    /// swapped the predicate for `Option::is_none_or(|x| *x == 0)` would
+    /// silently drop the first revision of a fencing claim (revision 0
+    /// is the zero-indexed first NATS KV put) and cause every initial
+    /// claim to look unfenced to the split-brain detector.
+    #[test]
+    fn connection_info_fencing_token_zero_is_serialized_not_omitted() {
+        let info = ConnectionInfo {
+            peer_id: rustgate_core::PeerId::new("peer-1"),
+            pod_id: "pod-abc".into(),
+            direction: Direction::Outbound,
+            connected_at: 1700000000,
+            fencing_token: Some(0),
+        };
+        let json = serde_json::to_string(&info).expect("serialize");
+        assert!(
+            json.contains("\"fencing_token\":0"),
+            "Some(0) fencing_token must be serialized, got: {json}"
+        );
+    }
+
+    /// Pins round-trip at the `u64::MAX` boundary. Fencing tokens come
+    /// from NATS KV revision numbers which grow monotonically over the
+    /// life of a KV bucket; pinning the boundary guards against any
+    /// future narrowing refactor (e.g. swapping `u64` for `u32` to save
+    /// 4 bytes) that would silently truncate large revisions.
+    #[test]
+    fn connection_info_fencing_token_roundtrips_at_u64_max_boundary() {
+        let info = ConnectionInfo {
+            peer_id: rustgate_core::PeerId::new("peer-1"),
+            pod_id: "pod-abc".into(),
+            direction: Direction::Outbound,
+            connected_at: u64::MAX,
+            fencing_token: Some(u64::MAX),
+        };
+        let json = serde_json::to_string(&info).expect("serialize");
+        let parsed: ConnectionInfo = serde_json::from_str(&json).expect("deserialize at u64::MAX");
+        assert_eq!(parsed.fencing_token, Some(u64::MAX));
+        assert_eq!(parsed.connected_at, u64::MAX);
+    }
+
+    /// Pins the `PodInfo` JSON wire shape: all four documented fields
+    /// (`id`, `claimed_peers`, `connections`, `last_heartbeat`) must
+    /// appear in the serialized output. An operator REST dashboard
+    /// keyed off these exact field names would break silently if a
+    /// refactor renamed any of them.
+    #[test]
+    fn pod_info_json_shape_contains_all_documented_fields() {
+        let pod = PodInfo {
+            id: "pod-1".into(),
+            claimed_peers: 3,
+            connections: 5,
+            last_heartbeat: 1700000000,
+        };
+        let json = serde_json::to_string(&pod).expect("serialize");
+        for expected in [
+            "\"id\":\"pod-1\"",
+            "\"claimed_peers\":3",
+            "\"connections\":5",
+            "\"last_heartbeat\":1700000000",
+        ] {
+            assert!(
+                json.contains(expected),
+                "PodInfo JSON missing documented field token `{expected}`: {json}"
+            );
+        }
+    }
+
+    /// Pins the `Clone + Debug + Send + Sync + 'static` bound set on
+    /// `PodInfo` — the pod registry's `list_pods()` returns `Vec<PodInfo>`
+    /// across the tokio runtime boundary and the REST API layer clones
+    /// pod snapshots for Prometheus export.
+    #[test]
+    fn pod_info_implements_clone_debug_send_sync_static() {
+        fn assert_bounds<T>()
+        where
+            T: Clone + std::fmt::Debug + Send + Sync + 'static,
+        {
+        }
+        assert_bounds::<PodInfo>();
+    }
+
+    /// Pins `Send + Sync` on `ConnectionRegistry` itself. The registry
+    /// is held as `Arc<ConnectionRegistry>` inside the federation
+    /// manager and shared across the gRPC server's async runtime, the
+    /// inbound-connection-register task, and the refresh loop — all
+    /// three require both bounds. Removing an internal field that's
+    /// `Send + Sync` (e.g., swapping `tokio::sync::Mutex` for a
+    /// non-Send primitive) would break the `Arc<Self>` share at
+    /// compile time; pinning here catches the regression at the type
+    /// level.
+    #[test]
+    fn connection_registry_type_implements_send_and_sync() {
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+        assert_send::<ConnectionRegistry>();
+        assert_sync::<ConnectionRegistry>();
+    }
+
+    /// Pins the three NATS-KV constants. `CONN_BUCKET` must stay
+    /// stable because it is the shared distributed-registry key
+    /// across a heterogeneous pod fleet — a rename would silently
+    /// split a rolling-upgrade fleet into two isolated registries.
+    /// `CONN_TTL_SECS = 30` and `CONN_REFRESH_SECS = 10` are the
+    /// documented cadence; pinning both literals here lets the
+    /// changelog catch a silent cadence change.
+    #[test]
+    fn conn_constants_have_documented_literal_values() {
+        assert_eq!(CONN_BUCKET, "federation-connections");
+        assert_eq!(CONN_TTL_SECS, 30);
+        assert_eq!(CONN_REFRESH_SECS, 10);
+    }
+
+    /// Strengthens the existing `conn_ttl_exceeds_refresh` test: the
+    /// refresh cadence must fire at least THREE times within a single
+    /// TTL window so two consecutive refresh failures (e.g. a transient
+    /// NATS disconnect) still leaves a successful refresh cycle before
+    /// the TTL drops the entry. With `CONN_TTL_SECS=30` and
+    /// `CONN_REFRESH_SECS=10`, this means `30 >= 3 * 10 = 30` — any
+    /// regression that tightened TTL below the 3× safety margin would
+    /// make a single missed refresh cause entries to go missing across
+    /// the pod fleet.
+    #[test]
+    fn conn_refresh_fires_at_least_three_times_within_ttl_window() {
+        // Bind to locals to keep clippy::assertions_on_constants quiet —
+        // the runtime check stays effective while the lint sees a non-const
+        // operand. The existing `conn_ttl_exceeds_refresh` uses this pattern.
+        let ttl = CONN_TTL_SECS;
+        let refresh = CONN_REFRESH_SECS;
+        assert!(
+            ttl >= 3 * refresh,
+            "TTL ({ttl}s) must allow at least 3 refreshes ({refresh}s each) \
+             so two transient failures still leave a safety margin"
+        );
+    }
+
+    /// Pins the `CONN_REFRESH_SECS > 0` floor. A zero refresh interval
+    /// would cause `tokio::time::interval(Duration::from_secs(0))` to
+    /// panic (the tokio contract rejects zero-duration intervals), and
+    /// a regression that set it to zero would crash the background
+    /// refresh task at `start()`.
+    #[test]
+    fn conn_refresh_secs_is_strictly_positive() {
+        let refresh = CONN_REFRESH_SECS;
+        let ttl = CONN_TTL_SECS;
+        assert!(refresh > 0);
+        assert!(ttl > 0);
+    }
 }
