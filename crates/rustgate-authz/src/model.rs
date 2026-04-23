@@ -472,3 +472,295 @@ mod subject_hash_tests {
         assert_ne!(SubjectHash::compute(&a), SubjectHash::compute(&b));
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used)]
+mod model_tests {
+    //! Defensive pins on the small surrounding model types
+    //! (`DecisionOutcome` helpers, `Resource::kind_tag`, `Action` and
+    //! `Obligation` serde contract, `CacheStats` derives, and the
+    //! `Subject` borrow adapters). These types are small but each one
+    //! has load-bearing invariants that the existing
+    //! `subject_hash_tests` suite does not cover.
+
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    // ── DecisionOutcome helpers ────────────────────────────────────
+
+    #[test]
+    fn decision_outcome_allow_is_allow_with_no_rule_no_obligations() {
+        // The `allow()` shorthand is the canonical "policy allows with
+        // no side-effects" return from group-ACL / Cedar backends that
+        // don't emit obligations. Pin that it yields precisely
+        // `Decision::Allow` with both optional fields in their empty
+        // state — if a refactor flipped the defaults (e.g. seeded a
+        // bogus `rule_id`), downstream cache code would key decisions
+        // on synthetic rule identifiers that never existed.
+        let o = DecisionOutcome::allow();
+        assert_eq!(o.decision, Decision::Allow);
+        assert!(o.rule_id.is_none());
+        assert!(o.obligations.is_empty());
+        assert!(o.is_allow());
+    }
+
+    #[test]
+    fn decision_outcome_deny_is_deny_with_no_rule_no_obligations() {
+        // Mirror of the allow test — pin the deny shape. `is_allow()`
+        // must return false on a deny outcome; a bug there would let
+        // denied traffic pass at every call site that short-circuits on
+        // `if outcome.is_allow()`.
+        let o = DecisionOutcome::deny();
+        assert_eq!(o.decision, Decision::Deny);
+        assert!(o.rule_id.is_none());
+        assert!(o.obligations.is_empty());
+        assert!(!o.is_allow());
+    }
+
+    #[test]
+    fn decision_outcome_is_allow_ignores_rule_id_and_obligations() {
+        // `is_allow()` must inspect only the verdict, not the
+        // obligations or `rule_id`. If the helper ever incorporated
+        // obligation emptiness into the check (e.g. `|| obligations.is_empty()`),
+        // an explicit allow with `MaskPoint` would stop counting as an
+        // allow — masking would silently fall back to "deny" semantics
+        // in every call site.
+        let allow_with_rule = DecisionOutcome {
+            decision: Decision::Allow,
+            rule_id: Some("rule-7".into()),
+            obligations: vec![Obligation::MaskPoint, Obligation::AuditExtended],
+        };
+        assert!(allow_with_rule.is_allow());
+        let deny_with_rule = DecisionOutcome {
+            decision: Decision::Deny,
+            rule_id: Some("rule-8".into()),
+            obligations: vec![Obligation::TagClassified],
+        };
+        assert!(!deny_with_rule.is_allow());
+    }
+
+    // ── Resource::kind_tag ─────────────────────────────────────────
+
+    #[test]
+    fn resource_kind_tag_matches_documented_wire_values() {
+        // `kind_tag` is the discriminant that compiled policies use to
+        // bucket rules by resource kind. The mapping Direct=0, Group=1,
+        // Broadcast=2, Federation=3, NatsSubject=4 is load-bearing — a
+        // silent reshuffle would place rules into wrong buckets and
+        // cause wholesale allow/deny flips in production without any
+        // compile failure. Pin each mapping concretely.
+        assert_eq!(Resource::Direct { target_cn: "alice" }.kind_tag(), 0);
+        assert_eq!(Resource::Group { group: "ops" }.kind_tag(), 1);
+        assert_eq!(Resource::Broadcast.kind_tag(), 2);
+        assert_eq!(Resource::Federation { peer_id: "peer1" }.kind_tag(), 3);
+        assert_eq!(Resource::NatsSubject { subject: "a.b.c" }.kind_tag(), 4);
+    }
+
+    #[test]
+    fn resource_kind_tags_are_all_distinct() {
+        // Stronger invariant: the five kind tags must be pairwise
+        // distinct. If two Resource variants were accidentally assigned
+        // the same tag (e.g. via a refactor that reordered and lost an
+        // increment), rules for one kind would fire on the other's
+        // traffic. Computed distinctness-via-set.
+        let tags: BTreeSet<u8> = [
+            Resource::Direct { target_cn: "x" }.kind_tag(),
+            Resource::Group { group: "x" }.kind_tag(),
+            Resource::Broadcast.kind_tag(),
+            Resource::Federation { peer_id: "x" }.kind_tag(),
+            Resource::NatsSubject { subject: "x" }.kind_tag(),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            tags.len(),
+            5,
+            "all five kind tags must be distinct: {tags:?}"
+        );
+    }
+
+    #[test]
+    fn resource_kind_tag_is_independent_of_inner_fields() {
+        // `kind_tag` keys only on the enum discriminant. Different
+        // `target_cn` or `group` values must not shift the tag — if
+        // they ever did, compiled rule bucketing would leak bucket
+        // identity into subject/group lookups.
+        assert_eq!(
+            Resource::Direct { target_cn: "alice" }.kind_tag(),
+            Resource::Direct { target_cn: "bob" }.kind_tag()
+        );
+        assert_eq!(
+            Resource::Group { group: "ops" }.kind_tag(),
+            Resource::Group { group: "admins" }.kind_tag()
+        );
+    }
+
+    // ── Action + Obligation serde contract ──────────────────────────
+
+    #[test]
+    fn action_serde_round_trips_via_snake_case_wire_names() {
+        // `rename_all = "snake_case"` is a wire contract with stored
+        // policy JSON files: `send`, `receive`, `federate`, `publish`,
+        // `subscribe`. A regression to `PascalCase` or `kebab-case`
+        // would make every stored policy fail to parse. Pin both the
+        // serialize and deserialize direction for all five variants.
+        for (action, wire) in [
+            (Action::Send, "\"send\""),
+            (Action::Receive, "\"receive\""),
+            (Action::Federate, "\"federate\""),
+            (Action::Publish, "\"publish\""),
+            (Action::Subscribe, "\"subscribe\""),
+        ] {
+            let ser = serde_json::to_string(&action).expect("serialize action");
+            assert_eq!(ser, wire, "{action:?}");
+            let de: Action = serde_json::from_str(wire).expect("deserialize action");
+            assert_eq!(de, action);
+        }
+    }
+
+    #[test]
+    fn obligation_serde_round_trips_via_snake_case_wire_names() {
+        // Same invariant as actions: obligation serialization is part
+        // of the policy wire format. `MaskPoint` maps to `mask_point`,
+        // etc. Pin the full mapping so a rename of the Rust variant
+        // doesn't silently desynchronise from the policy files.
+        for (obl, wire) in [
+            (Obligation::MaskPoint, "\"mask_point\""),
+            (Obligation::MaskPayload, "\"mask_payload\""),
+            (Obligation::TagClassified, "\"tag_classified\""),
+            (Obligation::AuditExtended, "\"audit_extended\""),
+        ] {
+            let ser = serde_json::to_string(&obl).expect("serialize obligation");
+            assert_eq!(ser, wire, "{obl:?}");
+            let de: Obligation = serde_json::from_str(wire).expect("deserialize obligation");
+            assert_eq!(de, obl);
+        }
+    }
+
+    #[test]
+    fn action_rejects_unknown_wire_tag() {
+        // A malformed policy file with an unknown action name must
+        // fail deserialization — not silently coerce to a default.
+        // Pin that `serde_json::from_str` returns `Err` for unknown
+        // tags so `#[non_exhaustive]` growth remains a visible change.
+        let res: Result<Action, _> = serde_json::from_str("\"admin\"");
+        assert!(res.is_err(), "unknown action tag must be rejected");
+    }
+
+    #[test]
+    fn obligation_rejects_unknown_wire_tag() {
+        // Same as actions — unknown obligation tags must error rather
+        // than fall back silently.
+        let res: Result<Obligation, _> = serde_json::from_str("\"encrypt_body\"");
+        assert!(res.is_err(), "unknown obligation tag must be rejected");
+    }
+
+    #[test]
+    fn action_and_obligation_are_copy_and_hash() {
+        // Compile-time pin: both types are `Copy + Hash + Eq` so they
+        // can key HashMaps/HashSets and be moved freely on the
+        // evaluation hot path without clone cost. A regression that
+        // removed either bound (e.g. added a non-Copy field) would
+        // fail this generic-function assertion.
+        fn assert_copy_hash_eq<T: Copy + std::hash::Hash + Eq>() {}
+        assert_copy_hash_eq::<Action>();
+        assert_copy_hash_eq::<Obligation>();
+        assert_copy_hash_eq::<Decision>();
+    }
+
+    // ── CacheStats ─────────────────────────────────────────────────
+
+    #[test]
+    fn cache_stats_default_is_zeros_and_copy_and_eq() {
+        // `CacheStats` is returned from `PolicyEngine::cache_stats`
+        // across crate boundaries. Its `Default`, `Copy`, and `Eq`
+        // derives are the lightweight plumbing that lets callers
+        // compare snapshots without borrowing. Pin the zero-initialised
+        // shape and the derive set.
+        let a = CacheStats::default();
+        assert_eq!(a.hits, 0);
+        assert_eq!(a.misses, 0);
+        // Copy semantics: move and compare.
+        let b = a;
+        let c = a;
+        assert_eq!(b, c);
+        // Inequality when fields differ.
+        let d = CacheStats { hits: 1, misses: 0 };
+        assert_ne!(a, d);
+    }
+
+    // ── Subject borrow adapters ─────────────────────────────────────
+
+    fn plaintext_identity_for_subject() -> Identity {
+        let mut groups = BTreeSet::new();
+        let _ = groups.insert("ops".to_string());
+        Identity::plaintext("cn-alice".to_string(), groups).expect("valid plaintext")
+    }
+
+    #[test]
+    fn subject_from_identity_borrows_every_field_verbatim() {
+        // `Subject::from_identity` is the cold-path adapter used in
+        // tests and one-shot evaluators. Pin that each field on the
+        // resulting `Subject` points at the source `Identity`'s bytes
+        // (CN, groups, attributes, fingerprint, SPIFFE). A regression
+        // that swapped in a dropped `to_string()` would allocate on
+        // every call — or worse, lose the tie-back for borrow-checked
+        // slices on the hot path.
+        let id = plaintext_identity_for_subject();
+        let subj = Subject::from_identity(&id);
+        assert!(std::ptr::eq(subj.cn, id.cn.as_str()));
+        assert!(std::ptr::eq(subj.groups, &id.groups));
+        assert!(std::ptr::eq(subj.attributes, id.attributes.as_ref()));
+        assert!(std::ptr::eq(subj.fingerprint, id.fingerprint.as_str()));
+        assert!(subj.spiffe_id.is_none());
+    }
+
+    #[test]
+    fn subject_with_hash_uses_provided_hash_verbatim() {
+        // The hot path precomputes `SubjectHash` once per session and
+        // reuses it. Pin that `with_hash` installs the caller-supplied
+        // value without recomputing — a silent recompute would
+        // reintroduce per-evaluation hashing cost.
+        let id = plaintext_identity_for_subject();
+        let sentinel = SubjectHash {
+            primary: 0xDEAD_BEEF,
+            secondary: 0xCAFE_F00D,
+        };
+        let subj = Subject::with_hash(&id, sentinel);
+        assert_eq!(subj.subject_hash.primary, 0xDEAD_BEEF);
+        assert_eq!(subj.subject_hash.secondary, 0xCAFE_F00D);
+    }
+
+    #[test]
+    fn subject_compute_hash_matches_subject_hash_compute() {
+        // `Subject::compute_hash` is the compatibility wrapper for
+        // older bench code. It must delegate to `SubjectHash::compute`
+        // rather than reimplement the hashing — otherwise the two
+        // paths could drift and benches would measure different code
+        // than production.
+        let id = plaintext_identity_for_subject();
+        assert_eq!(Subject::compute_hash(&id), SubjectHash::compute(&id));
+    }
+
+    #[test]
+    fn subject_fingerprint_is_empty_for_plaintext_identity() {
+        // Plaintext sessions carry an empty fingerprint. The Subject
+        // adapter must pass that through verbatim — router code uses
+        // `subject.fingerprint.is_empty()` to distinguish TLS from
+        // non-TLS when emitting audit events. This is the symmetry
+        // point with `plaintext.rs::session_identity_fingerprint_*`.
+        let id = plaintext_identity_for_subject();
+        let subj = Subject::from_identity(&id);
+        assert!(subj.fingerprint.is_empty());
+    }
+
+    #[test]
+    fn subject_hash_is_copy_and_eq_for_cache_keying() {
+        // `SubjectHash` is copied into every `DecisionKey` in the
+        // authz cache. Pin `Copy + Eq + Hash` so the cache can key
+        // on the hash without clone cost.
+        fn assert_bounds<T: Copy + Eq + std::hash::Hash>() {}
+        assert_bounds::<SubjectHash>();
+    }
+}
