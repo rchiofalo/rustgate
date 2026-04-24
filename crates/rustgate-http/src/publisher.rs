@@ -17,7 +17,7 @@ use rustgate_core::b64;
 use rustgate_core::message::RoutableMessage;
 use rustgate_core::sanitize::sanitize_for_log;
 use rustgate_resilience::backpressure::{BackpressureGate, BackpressurePermit};
-use rustgate_resilience::circuit::CircuitBreaker;
+use rustgate_resilience::circuit::{CircuitBreaker, OnStateChange, STATE_HALF_OPEN, STATE_OPEN};
 use rustgate_resilience::retry;
 use rustgate_resilience::token_bucket::TokenBucket;
 use sha2::{Digest, Sha256};
@@ -400,7 +400,8 @@ fn build_target(
         retry
             .and_then(|r| r.half_open_success_threshold)
             .unwrap_or(2),
-    );
+    )
+    .with_on_state_change(build_circuit_observer(&tc.name));
 
     let custom_headers = tc
         .headers
@@ -436,6 +437,46 @@ fn build_target(
         custom_headers,
         max_payload_bytes: tc.effective_max_payload_bytes(),
         rate_limiter,
+    })
+}
+
+/// Build the per-target `OnStateChange` observer attached to the circuit.
+///
+/// The observer fires on every transition; today we only act on
+/// `Open → HalfOpen`, which is the moment the breaker decides to admit
+/// a probe after cooldown. This is the trigger point for DLQ
+/// auto-drain: messages that were dead-lettered during the outage
+/// become eligible for replay the moment a probe succeeds (the
+/// subsequent `HalfOpen → Closed` transition already emits
+/// `http_circuit_recovered` via `record_success`).
+///
+/// The `Closed → Open` and `HalfOpen → Closed` transitions are NOT
+/// emitted from this observer — their audit events are emitted at the
+/// `record_failure` / `record_success` call sites in
+/// `publish_with_retry`, and firing again here would double-log.
+/// `HalfOpen → Open` (probe failure) is treated the same way
+/// (`record_failure` already emits `http_circuit_tripped`).
+///
+/// The callback body is deliberately short: it emits the audit event,
+/// nudges the Prometheus gauge, and returns. Any heavy work (e.g. a
+/// future DLQ file-replay task) will be dispatched from inside via
+/// `tokio::spawn` / `spawn_background` rather than blocking the
+/// transition path.
+fn build_circuit_observer(target_name: &str) -> OnStateChange {
+    let name = target_name.to_string();
+    Arc::new(move |old, new| {
+        if old == STATE_OPEN && new == STATE_HALF_OPEN {
+            rustgate_core::audit::http_circuit_probing(&name);
+            #[cfg(feature = "metrics")]
+            crate::metrics::circuit_state()
+                .with_label_values(&[name.as_str()])
+                // 2 == half-open; matches rustgate_resilience::circuit::STATE_HALF_OPEN
+                .set(2);
+            tracing::info!(
+                target = %sanitize_for_log(&name),
+                "HTTP target entering half-open probe window; queued DLQ messages eligible for drain on recovery"
+            );
+        }
     })
 }
 
@@ -1434,5 +1475,103 @@ mod tests {
         };
         let err = HttpPublisher::new(config).unwrap_err();
         assert!(err.to_string().contains("no enabled"), "got: {err}");
+    }
+
+    // ── Circuit breaker observer wiring (issue #881) ───────────────
+
+    // Only the metrics-gated tests below reference these state constants;
+    // gating the import keeps the `post-quantum` build (no `metrics`) clean.
+    #[cfg(feature = "metrics")]
+    use rustgate_resilience::circuit::{
+        STATE_CLOSED as CB_CLOSED, STATE_HALF_OPEN as CB_HALF_OPEN, STATE_OPEN as CB_OPEN,
+    };
+
+    /// Directly invoking the observer with the load-bearing transition
+    /// `(Open, HalfOpen)` must not panic and must set the Prometheus
+    /// circuit_state gauge to 2 for the target. This is the contract
+    /// downstream DLQ auto-drain wiring relies on — the observer is
+    /// responsible for visibility; actual replay is a follow-up.
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn circuit_observer_sets_gauge_to_halfopen_on_open_to_halfopen() {
+        let target = "test-observer-halfopen-transition";
+        let obs = build_circuit_observer(target);
+
+        obs(CB_OPEN, CB_HALF_OPEN);
+
+        let gauge = crate::metrics::circuit_state()
+            .get_metric_with_label_values(&[target])
+            .expect("label ok");
+        assert_eq!(gauge.get(), 2);
+    }
+
+    /// Transitions other than `(Open, HalfOpen)` must not touch the
+    /// metric. `Closed → Open` and `HalfOpen → Closed` have their own
+    /// emitters in `publish_with_retry`; firing from the observer too
+    /// would double-log the audit event and double-set the gauge.
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn circuit_observer_ignores_unrelated_transitions() {
+        // Use a unique target so prior tests can't contaminate the
+        // assertion (Prometheus label values are a shared process-wide
+        // namespace across tests in the same binary).
+        let target = "test-observer-no-op-transitions";
+        let obs = build_circuit_observer(target);
+
+        // None of these are the load-bearing Open → HalfOpen transition.
+        obs(CB_CLOSED, CB_OPEN);
+        obs(CB_HALF_OPEN, CB_OPEN);
+        obs(CB_HALF_OPEN, CB_CLOSED);
+        // Self-transitions are nonsensical but must not panic either.
+        obs(CB_CLOSED, CB_CLOSED);
+
+        let gauge = crate::metrics::circuit_state()
+            .get_metric_with_label_values(&[target])
+            .expect("label ok");
+        // If the observer fired on any of the above, the gauge would
+        // have been set to 2. Default value is 0 for an unobserved
+        // label tuple.
+        assert_eq!(gauge.get(), 0);
+    }
+
+    /// End-to-end: a real `CircuitBreaker` with the HTTP observer
+    /// attached transitions through Closed → Open → HalfOpen under the
+    /// normal API (trip via `record_failure`, recover via cooldown +
+    /// `allow_request`), and the gauge reaches 2 at the HalfOpen
+    /// probe window. Pins the full wiring — if a future refactor
+    /// drops `.with_on_state_change()` from `build_target`, this test
+    /// fails instead of the regression slipping silently into main.
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn circuit_observer_fires_via_real_breaker_transition() {
+        let target = "test-observer-end-to-end";
+        let breaker =
+            rustgate_resilience::circuit::CircuitBreaker::new(1, Duration::from_millis(10), 3, 1)
+                .with_on_state_change(build_circuit_observer(target));
+
+        // Closed → Open (record_failure returns bool; discarded deliberately).
+        let _ = breaker.record_failure();
+        // Cooldown elapses → next allow_request transitions to HalfOpen.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(breaker.allow_request());
+
+        let gauge = crate::metrics::circuit_state()
+            .get_metric_with_label_values(&[target])
+            .expect("label ok");
+        assert_eq!(gauge.get(), 2, "observer did not set gauge to halfopen");
+    }
+
+    /// The observer is fire-and-forget: cloning the closure (which
+    /// happens every time `with_on_state_change` is called) and firing
+    /// it concurrently from multiple threads must be safe. Pins the
+    /// `Arc<dyn Fn + Send + Sync>` contract in the callback type
+    /// alias so a future refactor that accidentally drops `Sync`
+    /// breaks here rather than at some distant call site.
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn circuit_observer_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>(_: &T) {}
+        let obs = build_circuit_observer("send-sync-check");
+        assert_send_sync(&obs);
     }
 }

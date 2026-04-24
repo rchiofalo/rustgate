@@ -19,15 +19,31 @@
 //! probes are allowed. Additional requests are rejected while probes are
 //! in flight, preventing thundering-herd against a recovering endpoint.
 
+use std::fmt;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tokio::time::Instant;
 
 /// Circuit breaker states represented as atomic values.
-const STATE_CLOSED: u8 = 0;
-const STATE_OPEN: u8 = 1;
-const STATE_HALF_OPEN: u8 = 2;
+pub const STATE_CLOSED: u8 = 0;
+pub const STATE_OPEN: u8 = 1;
+pub const STATE_HALF_OPEN: u8 = 2;
+
+/// Callback fired on every state transition.
+///
+/// Receives `(old_state, new_state)` using the `STATE_*` numeric
+/// constants (0=Closed, 1=Open, 2=HalfOpen). Invoked synchronously from
+/// inside the transition code path, so implementations MUST NOT block
+/// on locks held by the caller of `record_success` / `record_failure`
+/// / `allow_request`. Dispatch heavy work via `tokio::spawn` or the
+/// workspace's `spawn_background` helper inside the callback body.
+///
+/// The primary use case is letting downstream crates react to
+/// `Open → HalfOpen` (target recovered, kick off a DLQ drain) without
+/// polling. Other transitions may be observed for metrics or audit.
+pub type OnStateChange = Arc<dyn Fn(u8, u8) + Send + Sync>;
 
 /// Per-target circuit breaker.
 ///
@@ -35,7 +51,6 @@ const STATE_HALF_OPEN: u8 = 2;
 /// (`allow_request`) requires no locking. The `opened_at` timestamp
 /// is protected by the state machine invariant: only one thread
 /// transitions Open → HalfOpen via compare-exchange.
-#[derive(Debug)]
 pub struct CircuitBreaker {
     state: AtomicU8,
     consecutive_failures: AtomicU32,
@@ -54,6 +69,44 @@ pub struct CircuitBreaker {
     half_open_successes: AtomicU32,
     /// Successful probes needed to transition HalfOpen → Closed.
     success_threshold: u32,
+    /// Optional callback fired on every state transition.
+    ///
+    /// Set once at construction time via
+    /// [`CircuitBreaker::with_on_state_change`]. Lock-free read
+    /// (`OnceLock::get`) on every transition; None when no callback is
+    /// configured (no per-transition cost beyond the pointer check).
+    on_state_change: OnceLock<OnStateChange>,
+}
+
+// Manual `Debug` because the `on_state_change` field holds a
+// `dyn Fn` trait object, which does not implement `Debug`. The
+// callback is intentionally omitted from the output — a boolean
+// "configured" flag is shown instead. Atomic counters are loaded
+// with `Relaxed` since `Debug` is only used for diagnostics and
+// never participates in synchronization.
+impl fmt::Debug for CircuitBreaker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CircuitBreaker")
+            .field("state", &self.state.load(Ordering::Relaxed))
+            .field(
+                "consecutive_failures",
+                &self.consecutive_failures.load(Ordering::Relaxed),
+            )
+            .field("threshold", &self.threshold)
+            .field("cooldown", &self.cooldown)
+            .field(
+                "half_open_probes",
+                &self.half_open_probes.load(Ordering::Relaxed),
+            )
+            .field("max_half_open_probes", &self.max_half_open_probes)
+            .field(
+                "half_open_successes",
+                &self.half_open_successes.load(Ordering::Relaxed),
+            )
+            .field("success_threshold", &self.success_threshold)
+            .field("on_state_change", &self.on_state_change.get().is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl CircuitBreaker {
@@ -79,6 +132,35 @@ impl CircuitBreaker {
             max_half_open_probes,
             half_open_successes: AtomicU32::new(0),
             success_threshold,
+            on_state_change: OnceLock::new(),
+        }
+    }
+
+    /// Attach an on-state-change callback (builder).
+    ///
+    /// Set-once — subsequent calls are ignored silently, matching
+    /// `OnceLock` semantics. The callback is invoked on every
+    /// transition with `(old_state, new_state)` using the `STATE_*`
+    /// numeric constants.
+    ///
+    /// This exists so downstream crates (the HTTP DLQ auto-drain in
+    /// rustgate-http, federation reconnect logic, metrics gauges) can
+    /// react to recovery transitions without polling. The callback
+    /// runs on the thread that performed the transition, so keep the
+    /// body short — dispatch heavy work via `tokio::spawn` from
+    /// inside the callback body.
+    #[must_use]
+    pub fn with_on_state_change(self, cb: OnStateChange) -> Self {
+        let _ = self.on_state_change.set(cb);
+        self
+    }
+
+    /// Fire the on-state-change callback if one is configured.
+    /// No-op when the callback is `None`, so the non-observability path
+    /// is a single `OnceLock::get` pointer check.
+    fn notify_state_change(&self, old: u8, new: u8) {
+        if let Some(cb) = self.on_state_change.get() {
+            cb(old, new);
         }
     }
 
@@ -180,6 +262,7 @@ impl CircuitBreaker {
         let prev = self.state.swap(STATE_CLOSED, Ordering::AcqRel);
         if prev != STATE_CLOSED {
             tracing::info!("circuit breaker recovered to closed");
+            self.notify_state_change(prev, STATE_CLOSED);
         }
     }
 
@@ -193,6 +276,7 @@ impl CircuitBreaker {
         }
         if prev != STATE_OPEN {
             tracing::warn!("circuit breaker tripped to open");
+            self.notify_state_change(prev, STATE_OPEN);
         }
     }
 
@@ -226,6 +310,10 @@ impl CircuitBreaker {
                 // Start at 1 — this request is the first probe.
                 self.half_open_probes.store(1, Ordering::Release);
                 self.half_open_successes.store(0, Ordering::Release);
+                // Fire observer — this is the load-bearing transition
+                // the DLQ auto-drain hook watches for. The callback
+                // must be short; heavy work is spawned from inside.
+                self.notify_state_change(STATE_OPEN, STATE_HALF_OPEN);
             }
 
             transitioned
@@ -558,5 +646,161 @@ mod tests {
         assert!(cb.allow_request());
         cb.record_success();
         assert!(cb.is_closed());
+    }
+
+    // -----------------------------------------------------------------------
+    // on_state_change callback
+    // -----------------------------------------------------------------------
+
+    use std::sync::Mutex;
+
+    /// Shared type alias for the callback-under-test's transition log.
+    /// Declared here (rather than inline on `capture_transitions`) to
+    /// keep `clippy::type_complexity` happy without an `#[allow]`.
+    type TransitionLog = Arc<Mutex<Vec<(u8, u8)>>>;
+
+    /// Helper — collect (old, new) transition pairs into a Vec for
+    /// assertion. Uses a parking_lot-style std Mutex because the
+    /// callback fires from both sync and tokio contexts in the tests.
+    fn capture_transitions() -> (OnStateChange, TransitionLog) {
+        let log: TransitionLog = Arc::new(Mutex::new(Vec::new()));
+        let log_clone = Arc::clone(&log);
+        let cb: OnStateChange = Arc::new(move |old, new| {
+            log_clone.lock().unwrap().push((old, new));
+        });
+        (cb, log)
+    }
+
+    #[test]
+    fn on_state_change_fires_on_closed_to_open() {
+        let (cb_fn, log) = capture_transitions();
+        let cb = breaker(1, 60_000).with_on_state_change(cb_fn);
+        cb.record_failure();
+        assert_eq!(cb.state_value(), STATE_OPEN);
+        let got = log.lock().unwrap().clone();
+        assert_eq!(got, vec![(STATE_CLOSED, STATE_OPEN)]);
+    }
+
+    #[tokio::test]
+    async fn on_state_change_fires_on_open_to_half_open() {
+        let (cb_fn, log) = capture_transitions();
+        let cb = breaker(1, 10).with_on_state_change(cb_fn);
+        cb.record_failure();
+        // Drain the Closed → Open event so the test assertion
+        // targets only the recovery transition.
+        log.lock().unwrap().clear();
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(cb.allow_request());
+        assert_eq!(cb.state_value(), STATE_HALF_OPEN);
+
+        let got = log.lock().unwrap().clone();
+        assert_eq!(got, vec![(STATE_OPEN, STATE_HALF_OPEN)]);
+    }
+
+    #[tokio::test]
+    async fn on_state_change_fires_on_half_open_to_closed() {
+        let (cb_fn, log) = capture_transitions();
+        let cb = breaker(1, 10).with_on_state_change(cb_fn);
+        cb.record_failure();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(cb.allow_request()); // → HalfOpen
+        log.lock().unwrap().clear();
+
+        cb.record_success(); // success_threshold=1 → Closed
+        assert!(cb.is_closed());
+        let got = log.lock().unwrap().clone();
+        assert_eq!(got, vec![(STATE_HALF_OPEN, STATE_CLOSED)]);
+    }
+
+    #[tokio::test]
+    async fn on_state_change_fires_on_half_open_to_open() {
+        let (cb_fn, log) = capture_transitions();
+        let cb = breaker(1, 10).with_on_state_change(cb_fn);
+        cb.record_failure();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(cb.allow_request()); // → HalfOpen
+        log.lock().unwrap().clear();
+
+        cb.record_failure(); // HalfOpen probe fails → Open
+        assert_eq!(cb.state_value(), STATE_OPEN);
+        let got = log.lock().unwrap().clone();
+        assert_eq!(got, vec![(STATE_HALF_OPEN, STATE_OPEN)]);
+    }
+
+    #[tokio::test]
+    async fn on_state_change_captures_full_recovery_cycle() {
+        // Pins the event order a DLQ-drain observer sees across a
+        // realistic outage + recovery: Closed → Open → HalfOpen →
+        // Closed. The Open → HalfOpen event is the one that triggers
+        // the drain, and the surrounding events are what operators
+        // correlate in audit logs.
+        let (cb_fn, log) = capture_transitions();
+        let cb = breaker_full(1, 10, 3, 1).with_on_state_change(cb_fn);
+        cb.record_failure();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(cb.allow_request());
+        cb.record_success();
+
+        let got = log.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec![
+                (STATE_CLOSED, STATE_OPEN),
+                (STATE_OPEN, STATE_HALF_OPEN),
+                (STATE_HALF_OPEN, STATE_CLOSED),
+            ]
+        );
+    }
+
+    #[test]
+    fn on_state_change_is_none_by_default_and_costs_nothing() {
+        // Without `with_on_state_change`, the callback is None and
+        // state transitions still work. This is the zero-cost path.
+        let cb = breaker(1, 1000);
+        cb.record_failure();
+        assert_eq!(cb.state_value(), STATE_OPEN);
+        // If notify_state_change panicked on a None callback, this
+        // would have unwound before we got here.
+    }
+
+    #[test]
+    fn with_on_state_change_is_set_once_silently() {
+        // OnceLock semantics: second call is a no-op, not a panic.
+        // Mirrors how the HTTP publisher wires the drain hook during
+        // construction and may double-call if a builder path is
+        // refactored without realising.
+        let (first_cb, first_log) = capture_transitions();
+        let (second_cb, second_log) = capture_transitions();
+        let cb = breaker(1, 60_000)
+            .with_on_state_change(first_cb)
+            .with_on_state_change(second_cb);
+
+        cb.record_failure();
+        assert_eq!(cb.state_value(), STATE_OPEN);
+
+        // Only the first callback received the event; the second
+        // was silently dropped.
+        assert_eq!(first_log.lock().unwrap().len(), 1);
+        assert_eq!(second_log.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn on_state_change_does_not_fire_on_identical_state_writes() {
+        // `close()` is called internally whenever HalfOpen accumulates
+        // enough successes, but it's also invoked defensively on some
+        // paths. The prev != STATE_CLOSED guard in close() means
+        // redundant closes do not fire the callback. Same for trip().
+        // Pin this so a future refactor that hoists the callback out
+        // of the guard does not spam observers with false transitions.
+        let (cb_fn, log) = capture_transitions();
+        let cb = breaker(3, 1000).with_on_state_change(cb_fn);
+
+        // Two successes in the Closed state — no transition, callback
+        // must not fire.
+        cb.record_success();
+        cb.record_success();
+        assert!(cb.is_closed());
+        assert_eq!(log.lock().unwrap().len(), 0);
     }
 }
