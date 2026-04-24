@@ -494,6 +494,8 @@ pub(crate) fn render_human(report: &ConnReport) -> String {
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
+    // playbook-drift-ok: test-only fixtures for probe() — these TcpListeners never
+    // accept production traffic, so keepalive/TCP_NODELAY hardening does not apply.
     use tokio::net::TcpListener;
 
     use super::*;

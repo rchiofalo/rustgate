@@ -250,7 +250,9 @@ fn main() -> anyhow::Result<()> {
                     match tcp {
                         Some(t) => diagnostics::test_connection::Target::Tcp(t.clone()),
                         None => {
-                            return Err(anyhow::anyhow!("test-connection requires --tcp HOST:PORT"));
+                            return Err(anyhow::anyhow!(
+                                "test-connection requires --tcp HOST:PORT"
+                            ));
                         }
                     }
                 }
