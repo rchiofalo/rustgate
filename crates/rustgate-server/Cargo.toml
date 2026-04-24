@@ -16,11 +16,11 @@ workspace = true
 
 [features]
 nats = ["dep:rustgate-nats"]
-enrollment = ["dep:rustgate-enrollment", "dep:rustls-pki-types"]
+enrollment = ["dep:rustgate-enrollment"]
 est = ["enrollment", "rustgate-enrollment/est"]
 proto = ["dep:rustgate-proto", "rustgate-transport/proto", "rustgate-http?/proto"]
 full-detail = ["nats", "rustgate-nats/full-detail"]
-metrics = ["dep:prometheus", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:x509-parser", "rustgate-http?/metrics"]
+metrics = ["dep:prometheus", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "rustgate-http?/metrics"]
 federation = ["dep:rustgate-federation", "rustgate-federation/v2", "rustgate-federation/api"]
 federation-ha = ["federation", "rustgate-federation/ha"]
 # Sub-features selecting which dynamic peer-discovery backends the server
@@ -71,7 +71,7 @@ opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 tikv-jemallocator = { workspace = true, optional = true }
 tikv-jemalloc-ctl = { workspace = true, optional = true }
-rustls-pki-types = { workspace = true, optional = true }
+rustls-pki-types = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "signal", "fs", "macros", "time", "net"] }
 tokio-util = { workspace = true }
 bytes = { workspace = true }
@@ -86,10 +86,11 @@ figment = { workspace = true }
 toml = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
-x509-parser = { workspace = true, optional = true }
+x509-parser = { workspace = true }
 zeroize = { workspace = true }
 hex = { workspace = true }
 rustix = { workspace = true }
+time = { workspace = true }
 
 [dev-dependencies]
 rustgate-test-utils = { workspace = true }
