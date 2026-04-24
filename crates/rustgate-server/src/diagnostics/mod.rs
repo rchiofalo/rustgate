@@ -26,3 +26,4 @@
 pub(crate) mod cert_info;
 pub(crate) mod check_cert_expiry;
 pub(crate) mod crl_info;
+pub(crate) mod generate_config;

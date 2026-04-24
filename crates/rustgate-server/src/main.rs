@@ -181,6 +181,10 @@ fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
+        Some(Command::GenerateConfig) => {
+            diagnostics::generate_config::run()?;
+            return Ok(());
+        }
         None => {}
     }
 
