@@ -1022,43 +1022,6 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     #[cfg(not(feature = "metrics"))]
     let _ = acl_file_parsed;
 
-    // ── Management REST API (read-only status endpoints) ───────────
-    //
-    // Registered only when `--mgmt-api-token-file` is supplied. Exposes
-    // `/api/cert/status`, `/api/crl/status`, and `/api/dedup/stats` for
-    // operator diagnostics. All routes require `Authorization: Bearer`
-    // and are constant-time compared. The handler is read-only: no
-    // endpoint mutates router/TLS state, so a narrow scrape token is
-    // safe to hand to low-trust polling jobs.
-    #[cfg(feature = "metrics")]
-    {
-        if let Some(ref token_file) = cli.mgmt_api_token_file {
-            let token = tokio::fs::read_to_string(token_file).await.map_err(|e| {
-                anyhow::anyhow!("failed to read management API token file {token_file}: {e}")
-            })?;
-            let token = token.trim().as_bytes().to_vec();
-            if token.is_empty() {
-                anyhow::bail!("management API token file {token_file} is empty");
-            }
-            acl_api::validate_bearer_token_length(&token, "management API")
-                .map_err(|e| anyhow::anyhow!("{e} (from {token_file})"))?;
-            let api_state = Arc::new(mgmt_api::MgmtApiState {
-                router: Arc::clone(&router),
-                cert_reloader: cert_reloader.as_ref().map(Arc::clone),
-                crl_path: cli.crl.as_ref().map(std::path::PathBuf::from),
-                auth_token: zeroize::Zeroizing::new(token),
-            });
-            let handler: metrics::MgmtApiHandler = Arc::new(move |method, path, auth, body| {
-                mgmt_api::handle_request(method, path, auth, body, &api_state)
-            });
-            let _ = mgmt_api_slot.set(handler);
-            tracing::info!(
-                "management REST API enabled at /api/cert/, /api/crl/, /api/dedup/ \
-                 (read-only status endpoints)"
-            );
-        }
-    }
-
     let connection_limit = Arc::new(Semaphore::new(max_connections as usize));
 
     // ── NATS ────────────────────────────────────────────────────────
@@ -1309,6 +1272,111 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     let udp_shutdown =
         setup::start_udp(&cli, &router, &nats_publisher, &fed_forward, &replay_filter).await?;
 
+    // ── Management REST API ────────────────────────────────────────
+    //
+    // Registered only when `--mgmt-api-token-file` is supplied. Exposes
+    // read-only status endpoints (`/api/cert/status`, `/api/crl/status`,
+    // `/api/dedup/stats`) and write endpoints (`/api/clients/{cn}/
+    // disconnect`, `/api/reload`). All routes require
+    // `Authorization: Bearer` and are constant-time compared.
+    //
+    // Deferred until after `fed_peer_reloader` is constructed so the
+    // `/api/reload` callback can capture every component the SIGHUP
+    // path reloads — cert, ACL, CRL, OCSP stapler, federation peers.
+    // The metrics server dispatcher reads `mgmt_api_slot.get()` on each
+    // request, so setting it this late is race-free.
+    #[cfg(feature = "metrics")]
+    {
+        if let Some(ref token_file) = cli.mgmt_api_token_file {
+            let token = tokio::fs::read_to_string(token_file).await.map_err(|e| {
+                anyhow::anyhow!("failed to read management API token file {token_file}: {e}")
+            })?;
+            let token = token.trim().as_bytes().to_vec();
+            if token.is_empty() {
+                anyhow::bail!("management API token file {token_file} is empty");
+            }
+            acl_api::validate_bearer_token_length(&token, "management API")
+                .map_err(|e| anyhow::anyhow!("{e} (from {token_file})"))?;
+
+            // Capture the same handles the SIGHUP reloader uses so the
+            // HTTP-triggered reload path takes exactly the same code
+            // path and emits the same audit events — operators should
+            // not be able to tell the two surfaces apart by their
+            // side-effects.
+            let cert_for_reload = cert_reloader.clone();
+            let acl_for_reload = acl_reloader_handle.clone();
+            let crl_path_for_reload = cli.crl.clone();
+            #[cfg(feature = "ocsp")]
+            let ocsp_for_reload = ocsp_stapler.clone();
+            #[cfg(feature = "federation")]
+            let fed_peers_for_reload = fed_peer_reloader.clone();
+
+            // Only build the reload callback if at least one reloadable
+            // component is wired up — otherwise `POST /api/reload` has
+            // nothing to do and should 503 rather than pretend success.
+            let has_reloadable = cert_for_reload.is_some()
+                || acl_for_reload.is_some()
+                || crl_path_for_reload.is_some();
+            #[cfg(feature = "federation")]
+            let has_reloadable = has_reloadable || fed_peers_for_reload.is_some();
+
+            let reload_fn: Option<mgmt_api::ReloadFn> = if has_reloadable {
+                Some(Arc::new(move || {
+                    let cert = cert_for_reload.clone();
+                    let acl = acl_for_reload.clone();
+                    let crl = crl_path_for_reload.clone();
+                    #[cfg(feature = "ocsp")]
+                    let ocsp = ocsp_for_reload.clone();
+                    #[cfg(feature = "federation")]
+                    let fed = fed_peers_for_reload.clone();
+                    Box::pin(async move {
+                        let report = reload_all_configs(
+                            cert.as_ref(),
+                            acl.as_ref(),
+                            crl.as_deref(),
+                            #[cfg(feature = "ocsp")]
+                            ocsp.as_ref(),
+                            #[cfg(feature = "federation")]
+                            fed.as_ref(),
+                        )
+                        .await;
+                        serde_json::to_value(&report).unwrap_or_else(|e| {
+                            serde_json::json!({
+                                "error": format!("serialize reload report: {e}")
+                            })
+                        })
+                    })
+                }))
+            } else {
+                None
+            };
+
+            let api_state = Arc::new(mgmt_api::MgmtApiState {
+                router: Arc::clone(&router),
+                cert_reloader: cert_reloader.as_ref().map(Arc::clone),
+                crl_path: cli.crl.as_ref().map(std::path::PathBuf::from),
+                reload: reload_fn,
+                auth_token: zeroize::Zeroizing::new(token),
+            });
+            let handler: metrics::MgmtApiHandler = Arc::new(move |method, path, auth, body| {
+                let api_state = Arc::clone(&api_state);
+                let method = method.clone();
+                let path = path.to_string();
+                let auth = auth.map(|s| s.to_string());
+                let body = body.to_vec();
+                Box::pin(async move {
+                    mgmt_api::handle_request(&method, &path, auth.as_deref(), &body, &api_state)
+                        .await
+                })
+            });
+            let _ = mgmt_api_slot.set(handler);
+            tracing::info!(
+                "management REST API enabled at /api/cert/, /api/crl/, /api/dedup/, \
+                 /api/clients/, and /api/reload"
+            );
+        }
+    }
+
     // ── SIGHUP config reload (Unix only) ───────────────────────────
     //
     // On SIGHUP we reload the server certificate, the group ACL policy,
@@ -1329,7 +1397,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
                 spawn_background("sighup-reloader", async move {
                     while sighup.recv().await.is_some() {
                         tracing::info!("SIGHUP received, reloading config");
-                        reload_all_configs(
+                        let _ = reload_all_configs(
                             cert_for_hup.as_ref(),
                             acl_for_hup.as_ref(),
                             crl_path_for_hup.as_deref(),
@@ -1600,11 +1668,76 @@ async fn shutdown_signal() {
     }
 }
 
+/// On-wire per-component result entry in [`ReloadReport`].
+///
+/// `changed` carries the component-specific "work was done" bit — for
+/// `cert` it is the rotated flag, for `acl` and `federation_peers` it is
+/// the swapped flag, and for `crl` it is always `None` (CRL is re-parsed
+/// not hot-swapped). Keeping the field optional rather than e.g. a
+/// defaulted `false` prevents operators from misreading "no cert
+/// reloader configured" as "cert did not rotate."
+#[derive(Debug, Default, serde::Serialize)]
+pub(crate) struct ComponentReloadOutcome {
+    /// `"success"`, `"failure"`, or `"skipped"` when the component is
+    /// not configured on this server.
+    pub(crate) result: &'static str,
+    /// Human-readable error when `result == "failure"`. `None` otherwise.
+    pub(crate) error: Option<String>,
+    /// Component-specific "something changed" bit.
+    pub(crate) changed: Option<bool>,
+    /// CRL-only: number of entries parsed at reload time.
+    pub(crate) crl_count: Option<u64>,
+    /// CRL-only: age in seconds of the stalest CRL's `thisUpdate`.
+    pub(crate) crl_max_age_seconds: Option<i64>,
+}
+
+impl ComponentReloadOutcome {
+    fn skipped() -> Self {
+        Self {
+            result: "skipped",
+            ..Self::default()
+        }
+    }
+    fn success(changed: Option<bool>) -> Self {
+        Self {
+            result: "success",
+            changed,
+            ..Self::default()
+        }
+    }
+    fn failure(error: impl std::fmt::Display) -> Self {
+        Self {
+            result: "failure",
+            error: Some(error.to_string()),
+            ..Self::default()
+        }
+    }
+}
+
+/// Aggregate structured result of a single [`reload_all_configs`] pass.
+///
+/// SIGHUP fires this and discards the result (the audit log carries the
+/// per-component outcomes). The HTTP `POST /api/reload` endpoint fires
+/// the same path and serializes this struct to the caller, so operators
+/// can tell from the response whether cert + ACL + CRL all reloaded
+/// cleanly without scraping the audit stream.
+#[derive(Debug, Default, serde::Serialize)]
+pub(crate) struct ReloadReport {
+    pub(crate) cert: ComponentReloadOutcome,
+    pub(crate) acl: ComponentReloadOutcome,
+    pub(crate) crl: ComponentReloadOutcome,
+    #[cfg(feature = "federation")]
+    pub(crate) federation_peers: ComponentReloadOutcome,
+}
+
 /// Reload server config components in sequence on a SIGHUP-style signal.
 ///
 /// Each component is reloaded independently — a failure in one does not
 /// prevent the others from running. Structured audit events are emitted
-/// per component so operators can correlate reload outcomes.
+/// per component so operators can correlate reload outcomes, and the
+/// returned [`ReloadReport`] carries the same per-component status for
+/// HTTP callers that want a structured response rather than a tail of
+/// the audit log.
 ///
 /// `crl_path` is best-effort: it re-reads and parses the CRL file from
 /// disk and reports parse / freshness issues, but the live TLS listener
@@ -1619,12 +1752,14 @@ async fn reload_all_configs(
     #[cfg(feature = "federation")] fed_peer_reloader: Option<
         &Arc<federation_reloader::FederationPeerReloader>,
     >,
-) {
+) -> ReloadReport {
+    let mut report = ReloadReport::default();
+
     // 1. Server certificate
     if let Some(reloader) = cert_reloader {
         let r = Arc::clone(reloader);
         let join = tokio::task::spawn_blocking(move || r.reload()).await;
-        match join {
+        report.cert = match join {
             Ok(Ok(rotated)) => {
                 #[cfg(feature = "ocsp")]
                 if rotated
@@ -1646,6 +1781,7 @@ async fn reload_all_configs(
                     rotated = rotated,
                     "certificate reload completed"
                 );
+                ComponentReloadOutcome::success(Some(rotated))
             }
             Ok(Err(e)) => {
                 tracing::warn!(
@@ -1656,6 +1792,7 @@ async fn reload_all_configs(
                     error = %e,
                     "certificate reload failed"
                 );
+                ComponentReloadOutcome::failure(e)
             }
             Err(e) => {
                 tracing::warn!(
@@ -1666,17 +1803,19 @@ async fn reload_all_configs(
                     error = %e,
                     "certificate reload task panicked"
                 );
+                ComponentReloadOutcome::failure(e)
             }
-        }
+        };
     } else {
         tracing::debug!("SIGHUP: no cert reloader configured (cert_reload_interval=0)");
+        report.cert = ComponentReloadOutcome::skipped();
     }
 
     // 2. Group ACL policy
     if let Some(reloader) = acl_reloader {
         let r = Arc::clone(reloader);
         let join = tokio::task::spawn_blocking(move || r.reload()).await;
-        match join {
+        report.acl = match join {
             Ok(Ok(swapped)) => {
                 tracing::info!(
                     target: "audit",
@@ -1686,6 +1825,7 @@ async fn reload_all_configs(
                     swapped = swapped,
                     "ACL reload completed"
                 );
+                ComponentReloadOutcome::success(Some(swapped))
             }
             Ok(Err(e)) => {
                 tracing::warn!(
@@ -1696,6 +1836,7 @@ async fn reload_all_configs(
                     error = %e,
                     "ACL reload failed"
                 );
+                ComponentReloadOutcome::failure(e)
             }
             Err(e) => {
                 tracing::warn!(
@@ -1706,17 +1847,19 @@ async fn reload_all_configs(
                     error = %e,
                     "ACL reload task panicked"
                 );
+                ComponentReloadOutcome::failure(e)
             }
-        }
+        };
     } else {
         tracing::debug!("SIGHUP: no ACL reloader configured");
+        report.acl = ComponentReloadOutcome::skipped();
     }
 
     // 3. CRL file (re-parse only — see function docs)
     if let Some(path) = crl_path {
         let path_owned = path.to_string();
         let join = tokio::task::spawn_blocking(move || reload_crl_file(&path_owned)).await;
-        match join {
+        report.crl = match join {
             Ok(Ok(summary)) => {
                 #[cfg(feature = "metrics")]
                 if let Some(age) = summary.max_age_seconds {
@@ -1732,6 +1875,12 @@ async fn reload_all_configs(
                     path = %path,
                     "CRL re-parsed (restart server to apply changes to active listener)"
                 );
+                ComponentReloadOutcome {
+                    result: "success",
+                    crl_count: Some(summary.count as u64),
+                    crl_max_age_seconds: summary.max_age_seconds,
+                    ..Default::default()
+                }
             }
             Ok(Err(e)) => {
                 tracing::warn!(
@@ -1743,6 +1892,7 @@ async fn reload_all_configs(
                     error = %e,
                     "CRL reload failed"
                 );
+                ComponentReloadOutcome::failure(e)
             }
             Err(e) => {
                 tracing::warn!(
@@ -1754,16 +1904,18 @@ async fn reload_all_configs(
                     error = %e,
                     "CRL reload task panicked"
                 );
+                ComponentReloadOutcome::failure(e)
             }
-        }
+        };
     } else {
         tracing::debug!("SIGHUP: no CRL configured");
+        report.crl = ComponentReloadOutcome::skipped();
     }
 
     // 4. Federation peers
     #[cfg(feature = "federation")]
     if let Some(reloader) = fed_peer_reloader {
-        match reloader.reload().await {
+        report.federation_peers = match reloader.reload().await {
             Ok(swapped) => {
                 tracing::info!(
                     target: "audit",
@@ -1773,6 +1925,7 @@ async fn reload_all_configs(
                     swapped = swapped,
                     "federation peer reload completed"
                 );
+                ComponentReloadOutcome::success(Some(swapped))
             }
             Err(e) => {
                 tracing::warn!(
@@ -1783,12 +1936,18 @@ async fn reload_all_configs(
                     error = %e,
                     "federation peer reload failed"
                 );
+                ComponentReloadOutcome::failure(e)
             }
-        }
+        };
     } else {
         #[cfg(feature = "federation")]
-        tracing::debug!("SIGHUP: no federation peer reloader configured");
+        {
+            tracing::debug!("SIGHUP: no federation peer reloader configured");
+            report.federation_peers = ComponentReloadOutcome::skipped();
+        }
     }
+
+    report
 }
 
 /// Read and parse a CRL PEM file. Returns a summary with the entry count
@@ -1881,8 +2040,9 @@ mod tests {
 
     #[tokio::test]
     async fn reload_all_configs_tolerates_all_none() {
-        // Should not panic when nothing is configured.
-        reload_all_configs(
+        // Should not panic when nothing is configured and every component
+        // reports "skipped" rather than a masked failure.
+        let report = reload_all_configs(
             None,
             None,
             None,
@@ -1892,12 +2052,17 @@ mod tests {
             None,
         )
         .await;
+        assert_eq!(report.cert.result, "skipped");
+        assert_eq!(report.acl.result, "skipped");
+        assert_eq!(report.crl.result, "skipped");
+        #[cfg(feature = "federation")]
+        assert_eq!(report.federation_peers.result, "skipped");
     }
 
     #[tokio::test]
     async fn reload_all_configs_reports_crl_failure_without_aborting() {
         // Missing CRL path should produce a structured failure but return.
-        reload_all_configs(
+        let report = reload_all_configs(
             None,
             None,
             Some("/definitely/not/a/real/path.pem"),
@@ -1907,6 +2072,19 @@ mod tests {
             None,
         )
         .await;
+        assert_eq!(
+            report.crl.result, "failure",
+            "expected failure for missing CRL path, got {:?}",
+            report.crl
+        );
+        assert!(
+            report.crl.error.is_some(),
+            "failure must carry an error message"
+        );
+        // Other components stay skipped — a single failure must not
+        // poison the aggregate report.
+        assert_eq!(report.cert.result, "skipped");
+        assert_eq!(report.acl.result, "skipped");
     }
 
     #[tokio::test]
@@ -1938,7 +2116,7 @@ mod tests {
         std::fs::write(&acl_path, updated).unwrap();
 
         // Pass an invalid CRL path to verify partial failure tolerance.
-        reload_all_configs(
+        let report = reload_all_configs(
             None,
             Some(&reloader),
             Some("/no/such/crl.pem"),
@@ -1948,6 +2126,9 @@ mod tests {
             None,
         )
         .await;
+        assert_eq!(report.acl.result, "success");
+        assert_eq!(report.acl.changed, Some(true));
+        assert_eq!(report.crl.result, "failure");
 
         // Verify the router actually swapped to the new policy.
         let snap = router.acl_snapshot();
