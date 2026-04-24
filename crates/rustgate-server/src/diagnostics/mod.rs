@@ -3,17 +3,19 @@
 //! Operator-facing diagnostic subcommands.
 //!
 //! These are pure utilities run via CLI subcommands (`cert-info`,
-//! `crl-info`, …) that inspect on-disk TLS artifacts without touching
-//! the running server. Each entry point reads a file, parses it, and
-//! writes a stable, machine-readable report to stdout — either a
-//! human-friendly key/value layout or strict JSON for scripted
-//! pipelines.
+//! `crl-info`, `test-connection`, …) that inspect on-disk TLS
+//! artifacts or probe network endpoints without touching the running
+//! server. Each entry point builds a stable, machine-readable report
+//! and writes it to stdout — either a human-friendly key/value layout
+//! or strict JSON for scripted pipelines.
 //!
 //! The modules here deliberately avoid shared state: every subcommand
-//! can be invoked before the tokio runtime, before tracing, and before
-//! any configuration has been loaded. That keeps them usable in
-//! bootstrap and break-glass scenarios (an operator diagnosing a
-//! handshake failure on a host that cannot start the server at all).
+//! can be invoked before tracing and before any configuration has
+//! been loaded. `test-connection` builds its own single-threaded
+//! tokio runtime on the fly; the file-inspection commands run
+//! entirely synchronously. That keeps them usable in bootstrap and
+//! break-glass scenarios (an operator diagnosing a handshake failure
+//! on a host that cannot start the server at all).
 //!
 //! # Stability
 //!
@@ -27,3 +29,4 @@ pub(crate) mod cert_info;
 pub(crate) mod check_cert_expiry;
 pub(crate) mod crl_info;
 pub(crate) mod generate_config;
+pub(crate) mod test_connection;

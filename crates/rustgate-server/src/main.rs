@@ -187,6 +187,82 @@ fn main() -> anyhow::Result<()> {
             diagnostics::generate_config::run()?;
             return Ok(());
         }
+        Some(Command::TestConnection {
+            ref tcp,
+            #[cfg(feature = "nats")]
+            ref nats,
+            #[cfg(feature = "http")]
+            ref http,
+            timeout_secs,
+            json,
+        }) => {
+            // Translate the flag-style CLI into the probe's internal
+            // `Target` enum. Exactly one target must be set — clap
+            // enforces mutual exclusion, but we still need to catch
+            // the all-none case (no flag supplied at all) with a
+            // friendly error rather than a panic.
+            let target = {
+                #[cfg(all(feature = "nats", feature = "http"))]
+                {
+                    match (tcp, nats, http) {
+                        (Some(t), None, None) => {
+                            diagnostics::test_connection::Target::Tcp(t.clone())
+                        }
+                        (None, Some(u), None) => {
+                            diagnostics::test_connection::Target::Nats(u.clone())
+                        }
+                        (None, None, Some(u)) => {
+                            diagnostics::test_connection::Target::Http(u.clone())
+                        }
+                        _ => {
+                            return Err(anyhow::anyhow!(
+                                "test-connection requires exactly one of --tcp, --nats, --http"
+                            ));
+                        }
+                    }
+                }
+                #[cfg(all(feature = "nats", not(feature = "http")))]
+                {
+                    match (tcp, nats) {
+                        (Some(t), None) => diagnostics::test_connection::Target::Tcp(t.clone()),
+                        (None, Some(u)) => diagnostics::test_connection::Target::Nats(u.clone()),
+                        _ => {
+                            return Err(anyhow::anyhow!(
+                                "test-connection requires exactly one of --tcp, --nats"
+                            ));
+                        }
+                    }
+                }
+                #[cfg(all(not(feature = "nats"), feature = "http"))]
+                {
+                    match (tcp, http) {
+                        (Some(t), None) => diagnostics::test_connection::Target::Tcp(t.clone()),
+                        (None, Some(u)) => diagnostics::test_connection::Target::Http(u.clone()),
+                        _ => {
+                            return Err(anyhow::anyhow!(
+                                "test-connection requires exactly one of --tcp, --http"
+                            ));
+                        }
+                    }
+                }
+                #[cfg(all(not(feature = "nats"), not(feature = "http")))]
+                {
+                    match tcp {
+                        Some(t) => diagnostics::test_connection::Target::Tcp(t.clone()),
+                        None => {
+                            return Err(anyhow::anyhow!(
+                                "test-connection requires --tcp HOST:PORT"
+                            ));
+                        }
+                    }
+                }
+            };
+            let code = diagnostics::test_connection::run(target, timeout_secs, json)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            return Ok(());
+        }
         None => {}
     }
 
