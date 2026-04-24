@@ -683,6 +683,9 @@ mod tests {
         // And the reverse direction.
         let via_std: std::result::Result<u32, RustgateError> = Ok(9);
         let via_alias: Result<u32> = via_std;
-        assert_eq!(via_alias.unwrap(), 9);
+        match via_alias {
+            Ok(n) => assert_eq!(n, 9),
+            Err(_) => panic!("expected Ok(9)"),
+        }
     }
 }
