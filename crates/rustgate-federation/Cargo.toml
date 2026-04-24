@@ -41,7 +41,7 @@ futures = { workspace = true }
 bytes = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true, optional = true }
-tonic = { workspace = true, features = ["codegen", "transport", "tls-ring", "tls-webpki-roots"], optional = true }
+tonic = { workspace = true, features = ["codegen", "transport", "tls-ring", "tls-webpki-roots", "gzip", "zstd"], optional = true }
 tonic-prost = { workspace = true, optional = true }
 tokio-stream = { workspace = true, optional = true }
 tracing = { workspace = true }

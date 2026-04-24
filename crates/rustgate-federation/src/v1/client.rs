@@ -642,6 +642,7 @@ mod tests {
             region: None,
             zone: None,
             priority: 100,
+            compression: None,
         };
         let peer = Arc::new(PeerHandle::new(peer_config));
         let on_msg: OnMessage = Arc::new(|_id, _data| {});
@@ -725,6 +726,7 @@ mod tests {
             region: None,
             zone: None,
             priority: 100,
+            compression: None,
         };
         let peer = Arc::new(PeerHandle::new(peer_config));
         let on_msg: OnMessage = Arc::new(|_id, _data| {});
@@ -790,6 +792,7 @@ mod tests {
             region: None,
             zone: None,
             priority: 100,
+            compression: None,
         };
         let peer = Arc::new(PeerHandle::new(peer_config));
         let on_msg: OnMessage = Arc::new(|_id, _data| {});
@@ -853,6 +856,7 @@ mod tests {
             region: None,
             zone: None,
             priority: 100,
+            compression: None,
         };
         let peer = Arc::new(PeerHandle::new(peer_config));
         let on_msg: OnMessage = Arc::new(|_id, _data| {});
@@ -924,6 +928,7 @@ mod tests {
             region: None,
             zone: None,
             priority: 100,
+            compression: None,
         };
 
         let peer = Arc::new(PeerHandle::new(peer_config));
@@ -984,6 +989,7 @@ mod tests {
             region: None,
             zone: None,
             priority: 100,
+            compression: None,
         };
 
         let peer = Arc::new(PeerHandle::new(peer_config));
@@ -1045,6 +1051,7 @@ mod tests {
             region: None,
             zone: None,
             priority: 100,
+            compression: None,
         };
 
         let peer = Arc::new(PeerHandle::new(peer_config));
@@ -1126,6 +1133,7 @@ mod tests {
             region: None,
             zone: None,
             priority: 100,
+            compression: None,
         };
 
         let peer = Arc::new(PeerHandle::new(peer_config));
@@ -1188,6 +1196,7 @@ mod tests {
             region: None,
             zone: None,
             priority: 100,
+            compression: None,
         };
 
         let peer = Arc::new(PeerHandle::new(peer_config));

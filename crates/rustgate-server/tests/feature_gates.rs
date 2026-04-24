@@ -139,6 +139,7 @@ mod federation_gate {
             region: None,
             zone: None,
             priority: 100,
+            compression: None,
         };
         assert_eq!(peer.id.as_str(), "peer-1");
         assert!(peer.enabled);

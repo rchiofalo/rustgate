@@ -579,6 +579,7 @@ mod tests {
             region: None,
             zone: None,
             priority: 100,
+            compression: None,
         }
     }
 

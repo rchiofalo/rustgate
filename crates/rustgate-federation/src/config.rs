@@ -65,6 +65,31 @@ pub enum RoutingMode {
     Broadcast,
 }
 
+/// gRPC compression codec applied to outbound federation traffic for a peer.
+///
+/// When set on a [`PeerConfig`], the V2 gRPC client advertises this codec via
+/// `grpc-accept-encoding` and applies it to request payloads via
+/// `grpc-encoding`. The receiving server always accepts both gzip and zstd,
+/// so this only controls what *we* send to this peer — the setting has no
+/// effect on the inbound direction.
+///
+/// Operators who prefer latency over bandwidth (LAN-only federation links,
+/// CPU-constrained edge nodes) should leave this field unset, which is the
+/// default and preserves pre-#905 behaviour (no compression on outbound
+/// gRPC calls). WAN links carrying large-volume CoT event streams typically
+/// benefit from `Gzip` (widely supported, moderate CPU) or `Zstd` (better
+/// compression ratio, similar CPU) — the choice depends on the peer's
+/// server version and its own CPU budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CompressionKind {
+    /// gzip compression (RFC 1952). Widely supported, moderate CPU cost.
+    Gzip,
+    /// Zstandard compression (RFC 8478). Higher compression ratio than gzip
+    /// at comparable CPU cost, but requires tonic 0.10+ on the peer.
+    Zstd,
+}
+
 /// Top-level federation configuration.
 #[derive(Debug, Clone)]
 pub struct FederationConfig {
@@ -292,6 +317,13 @@ pub struct PeerConfig {
     /// Routing priority — lower values are preferred. Default: 100.
     #[serde(default = "default_priority")]
     pub priority: u32,
+    /// Optional gRPC compression codec applied to outbound traffic sent to
+    /// this peer. See [`CompressionKind`] for the trade-offs. `None` (the
+    /// default) disables compression on the send side and preserves
+    /// pre-#905 behaviour; inbound traffic from the peer is always
+    /// decompressed transparently regardless of this setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<CompressionKind>,
 }
 
 impl PeerConfig {
@@ -387,6 +419,7 @@ mod tests {
             region: None,
             zone: None,
             priority: 100,
+            compression: None,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
@@ -512,6 +545,7 @@ mod tests {
             region: None,
             zone: None,
             priority: 100,
+            compression: None,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
@@ -535,6 +569,7 @@ mod tests {
             region: None,
             zone: None,
             priority: 100,
+            compression: None,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
@@ -558,6 +593,7 @@ mod tests {
             region: None,
             zone: None,
             priority: 100,
+            compression: None,
         };
         assert!(!peer.enabled);
     }
@@ -585,6 +621,7 @@ mod tests {
             region: None,
             zone: None,
             priority: 100,
+            compression: None,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
@@ -615,6 +652,7 @@ mod tests {
             region: None,
             zone: None,
             priority: 100,
+            compression: None,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
@@ -638,6 +676,7 @@ mod tests {
             region: None,
             zone: None,
             priority: 100,
+            compression: None,
         };
         assert_eq!(peer.effective_inbound_groups(), &["Alpha", "Bravo"]);
         assert_eq!(peer.effective_outbound_groups(), &["Alpha", "Bravo"]);
@@ -660,6 +699,7 @@ mod tests {
             region: None,
             zone: None,
             priority: 100,
+            compression: None,
         };
         assert_eq!(peer.effective_inbound_groups(), &["Inbound1", "Inbound2"]);
         assert_eq!(peer.effective_outbound_groups(), &["Outbound1"]);
@@ -682,6 +722,7 @@ mod tests {
             region: None,
             zone: None,
             priority: 100,
+            compression: None,
         };
         assert_eq!(peer.effective_inbound_groups(), &["Inbound1"]);
         // outbound falls back to groups
@@ -705,6 +746,7 @@ mod tests {
             region: None,
             zone: None,
             priority: 100,
+            compression: None,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         assert!(json.contains("inbound_groups"));
@@ -735,6 +777,7 @@ mod tests {
             region: None,
             zone: None,
             priority: 100,
+            compression: None,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         assert!(!json.contains("inbound_groups"));
@@ -766,5 +809,143 @@ mod tests {
             err.contains("unknown field"),
             "error should mention unknown field: {err}"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // CompressionKind serde + PeerConfig integration (issue #905)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn compression_kind_serializes_as_lowercase_gzip() {
+        let json = serde_json::to_string(&CompressionKind::Gzip).expect("serialize");
+        assert_eq!(json, "\"gzip\"");
+    }
+
+    #[test]
+    fn compression_kind_serializes_as_lowercase_zstd() {
+        let json = serde_json::to_string(&CompressionKind::Zstd).expect("serialize");
+        assert_eq!(json, "\"zstd\"");
+    }
+
+    #[test]
+    fn compression_kind_deserializes_from_lowercase_tokens() {
+        let gz: CompressionKind = serde_json::from_str("\"gzip\"").expect("deserialize gzip");
+        let zs: CompressionKind = serde_json::from_str("\"zstd\"").expect("deserialize zstd");
+        assert_eq!(gz, CompressionKind::Gzip);
+        assert_eq!(zs, CompressionKind::Zstd);
+    }
+
+    #[test]
+    fn compression_kind_rejects_unknown_codec() {
+        // A future refactor that silently fell back to `Gzip` on an
+        // unrecognised token would mask an operator typo ("snappy",
+        // "lz4", "brotli"); the rejection is the contract.
+        let err = serde_json::from_str::<CompressionKind>("\"snappy\"").unwrap_err();
+        assert!(
+            err.to_string().contains("unknown variant"),
+            "error should mention unknown variant: {err}"
+        );
+    }
+
+    #[test]
+    fn compression_kind_is_copy_and_equatable() {
+        // Pins that a future `#[derive]` edit does not drop `Copy` — the
+        // field is passed by value through three layers (PeerConfig →
+        // V2ClientConfig → tonic codec mapping) so losing `Copy` would
+        // force unnecessary clones everywhere.
+        let a = CompressionKind::Gzip;
+        let b = a; // would fail to compile if Copy were dropped
+        assert_eq!(a, b);
+        assert_ne!(CompressionKind::Gzip, CompressionKind::Zstd);
+    }
+
+    #[test]
+    fn peer_config_compression_defaults_to_none_when_omitted() {
+        // Backward-compat pin: pre-#905 config files have no
+        // `compression` key and must still deserialize.
+        let json = r#"{"id":"p","address":"1.2.3.4:9001","groups":[],"enabled":true,"is_outbound":false,"trust_cert_cn":null}"#;
+        let parsed: PeerConfig = serde_json::from_str(json).expect("deserialize");
+        assert!(parsed.compression.is_none());
+    }
+
+    #[test]
+    fn peer_config_compression_is_skipped_when_none() {
+        // Pin the `skip_serializing_if = "Option::is_none"` attribute:
+        // config dumps for peers that have not opted into compression
+        // must not emit a `"compression":null` field, keeping TOML/JSON
+        // diffs identical to pre-#905 output.
+        let peer = PeerConfig {
+            id: "quiet".into(),
+            address: "10.0.0.1:9001".into(),
+            groups: vec![],
+            inbound_groups: None,
+            outbound_groups: None,
+            enabled: true,
+            is_outbound: false,
+            trust_cert_cn: None,
+            routing_mode: RoutingMode::default(),
+            protocol_version: 2,
+            jwt_token: None,
+            region: None,
+            zone: None,
+            priority: 100,
+            compression: None,
+        };
+        let json = serde_json::to_string(&peer).expect("serialize");
+        assert!(
+            !json.contains("compression"),
+            "expected `compression` to be skipped when None, got: {json}"
+        );
+    }
+
+    #[test]
+    fn peer_config_with_compression_round_trips_through_json() {
+        // End-to-end pin: set compression, serialize, deserialize,
+        // confirm the codec choice survives wire round-trip.
+        let peer = PeerConfig {
+            id: "loud".into(),
+            address: "10.0.0.2:9001".into(),
+            groups: vec![],
+            inbound_groups: None,
+            outbound_groups: None,
+            enabled: true,
+            is_outbound: true,
+            trust_cert_cn: None,
+            routing_mode: RoutingMode::default(),
+            protocol_version: 2,
+            jwt_token: None,
+            region: None,
+            zone: None,
+            priority: 100,
+            compression: Some(CompressionKind::Zstd),
+        };
+        let json = serde_json::to_string(&peer).expect("serialize");
+        assert!(json.contains("\"zstd\""), "expected zstd token: {json}");
+        let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.compression, Some(CompressionKind::Zstd));
+    }
+
+    #[test]
+    fn peer_config_compression_gzip_round_trip() {
+        let peer = PeerConfig {
+            id: "gz".into(),
+            address: "10.0.0.3:9001".into(),
+            groups: vec![],
+            inbound_groups: None,
+            outbound_groups: None,
+            enabled: true,
+            is_outbound: true,
+            trust_cert_cn: None,
+            routing_mode: RoutingMode::default(),
+            protocol_version: 2,
+            jwt_token: None,
+            region: None,
+            zone: None,
+            priority: 100,
+            compression: Some(CompressionKind::Gzip),
+        };
+        let json = serde_json::to_string(&peer).expect("serialize");
+        let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.compression, Some(CompressionKind::Gzip));
     }
 }

@@ -80,6 +80,7 @@ fn peer(id: &str, addr: &str) -> PeerConfig {
         region: None,
         zone: None,
         priority: 100,
+        compression: None,
     }
 }
 
