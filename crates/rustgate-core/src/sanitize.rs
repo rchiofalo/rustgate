@@ -163,4 +163,190 @@ mod tests {
             "alice\u{FFFD}FAKE ENTRY\u{FFFD}"
         );
     }
+
+    // -- defensive-invariant coverage -----------------------------------
+
+    #[test]
+    fn all_c0_control_chars_replaced_including_del() {
+        // Sweep every C0 control (0x00..=0x1F) AND 0x7F (DEL). ESC (0x1B)
+        // is the CSI introducer — when not followed by `[`, the docstring
+        // says ESC alone is replaced — so ESC is still in the expected
+        // output. A regression that carved an exception for e.g. `\t`
+        // (tab, 0x09) or `\x7F` (DEL) would start passing raw control
+        // bytes through into log fields and enable a class of forging
+        // attacks the function exists to prevent.
+        for byte in 0x00u8..=0x1F {
+            let c = char::from(byte);
+            let input = format!("x{c}y");
+            let output = sanitize_for_log(&input);
+            assert_eq!(
+                output, "x\u{FFFD}y",
+                "C0 control byte {byte:#04x} must be replaced with U+FFFD"
+            );
+        }
+        // DEL (0x7F) is also Cc category; must be treated the same way.
+        let input = "a\u{007F}b";
+        assert_eq!(
+            sanitize_for_log(input),
+            "a\u{FFFD}b",
+            "DEL must be replaced"
+        );
+    }
+
+    #[test]
+    fn all_c1_control_chars_except_0x9b_csi_introducer_are_replaced() {
+        // Sweep C1 control range 0x80..=0x9F. 0x9B is the CSI introducer
+        // and handled separately (introducer replaced + body consumed);
+        // every other byte in the range must be replaced.
+        for code in 0x80u32..=0x9F {
+            if code == 0x9B {
+                continue;
+            }
+            let c = char::from_u32(code).expect("C1 code points are valid chars");
+            let input = format!("x{c}y");
+            let output = sanitize_for_log(&input);
+            assert_eq!(
+                output, "x\u{FFFD}y",
+                "C1 control codepoint U+{code:04X} must be replaced with U+FFFD"
+            );
+        }
+    }
+
+    #[test]
+    fn csi_consumed_when_only_intermediate_bytes_present_and_no_final_at_eof() {
+        // Truncated CSI sequence with parameter + intermediate bytes but
+        // no final byte at EOF. Per ECMA-48 §5.4, parameter bytes are
+        // 0x30-0x3F and intermediate bytes 0x20-0x2F; both ranges are in
+        // our consumed 0x20..=0x3F window. A regression that required a
+        // final byte before consuming would let `12;34` leak into the log
+        // stream as printable characters.
+        assert_eq!(sanitize_for_log("\x1b[12;34"), "\u{FFFD}");
+        // Same pattern with C1 introducer.
+        assert_eq!(sanitize_for_log("\u{9B}12;34"), "\u{FFFD}");
+        // Intermediate-only body (no parameter bytes, just 0x20-0x2F).
+        assert_eq!(sanitize_for_log("\x1b[!\"#$"), "\u{FFFD}");
+    }
+
+    #[test]
+    fn csi_with_final_byte_immediately_after_bracket_with_no_parameters() {
+        // `\x1B[Xhello` — `X` is 0x58, in 0x40..=0x7E (final byte range),
+        // so consumed immediately; the trailing "hello" survives. Pins the
+        // zero-parameter path of `consume_csi_body` — a regression that
+        // required at least one parameter byte before accepting a final
+        // would loop forever or fail to consume the final here.
+        assert_eq!(sanitize_for_log("\x1b[Xhello"), "\u{FFFD}hello");
+        assert_eq!(sanitize_for_log("\u{9B}Xworld"), "\u{FFFD}world");
+        // Final byte at end of input — no trailing text.
+        assert_eq!(sanitize_for_log("\x1b[m"), "\u{FFFD}");
+    }
+
+    #[test]
+    fn consecutive_esc_introducers_each_produce_independent_replacements() {
+        // `\x1B\x1B\x1B` — three consecutive ESC characters. Each is its
+        // own introducer; none is followed by `[`, so each contributes
+        // exactly one U+FFFD and nothing is consumed beyond the introducer
+        // itself. A regression that treated the first ESC as opening a
+        // CSI body would silently swallow the next two ESCs.
+        assert_eq!(sanitize_for_log("\x1b\x1b\x1b"), "\u{FFFD}\u{FFFD}\u{FFFD}");
+        // Mixed: ESC then proper CSI then ESC alone.
+        assert_eq!(
+            sanitize_for_log("\x1b\x1b[31mred\x1b"),
+            "\u{FFFD}\u{FFFD}red\u{FFFD}"
+        );
+    }
+
+    #[test]
+    fn lone_c1_csi_introducer_at_eof_produces_exactly_one_replacement() {
+        // `\u{9B}` alone with nothing after — the C1 CSI path enters
+        // `consume_csi_body` which finds EOF and breaks cleanly. A
+        // regression that assumed the body always had at least one byte
+        // (e.g. via unchecked `chars.next().unwrap()`) would panic here.
+        assert_eq!(sanitize_for_log("\u{9B}"), "\u{FFFD}");
+        assert_eq!(sanitize_for_log("prefix\u{9B}"), "prefix\u{FFFD}");
+    }
+
+    #[test]
+    fn unicode_format_and_bidi_override_characters_pass_through_by_design() {
+        // `char::is_control()` covers only General_Category = Cc (C0 +
+        // C1). Format characters (Cf) like U+202E RIGHT-TO-LEFT OVERRIDE
+        // and U+FEFF BYTE ORDER MARK are intentionally NOT replaced —
+        // they are legal in UTF-8 identifiers and may legitimately appear
+        // in CNs for non-Latin scripts. Pin this as the documented
+        // scope-limit so a future "stronger sanitizer" refactor is a
+        // conscious decision, not an accident.
+        assert_eq!(sanitize_for_log("a\u{202E}b"), "a\u{202E}b");
+        assert_eq!(sanitize_for_log("\u{FEFF}start"), "\u{FEFF}start");
+        assert_eq!(sanitize_for_log("\u{200E}\u{200F}"), "\u{200E}\u{200F}");
+    }
+
+    #[test]
+    fn sanitize_is_idempotent_on_arbitrary_input() {
+        // U+FFFD is not a control character and not a CSI introducer, so
+        // feeding `sanitize_for_log`'s output back through it must be a
+        // no-op. Operational importance: log pipelines that re-sanitize
+        // at a downstream stage must not mutate an already-clean string
+        // (e.g. by doubling the replacement marker).
+        let corpus = [
+            "plain text",
+            "line1\nline2",
+            "\x1b[31mRED\x1b[0m",
+            "\u{9B}31mX",
+            "\x00\x1b\x7F",
+            "",
+            "caf\u{00e9} \u{1F600}",
+        ];
+        for s in corpus {
+            let once = sanitize_for_log(s);
+            let twice = sanitize_for_log(&once);
+            assert_eq!(once, twice, "sanitize must be idempotent for input {s:?}");
+        }
+    }
+
+    #[test]
+    fn log_forging_with_newline_and_csi_is_fully_neutralized() {
+        // Worst-case attacker-controlled CN: attempt to forge a complete
+        // log entry by injecting a newline followed by a styled-and-
+        // fabricated "authorized=true" line. A regression that left
+        // either the newline or the CSI introducer in place would
+        // re-enable the injection.
+        let malicious = "user\n\x1b[32m2024-01-01T00:00:00Z authorized=true\x1b[0m";
+        let out = sanitize_for_log(malicious);
+        assert_eq!(
+            out,
+            "user\u{FFFD}\u{FFFD}2024-01-01T00:00:00Z authorized=true\u{FFFD}"
+        );
+        // Defence-in-depth: the raw control bytes and CSI introducers must
+        // be absent from the output.
+        assert!(!out.contains('\n'), "newline leaked: {out:?}");
+        assert!(!out.contains('\x1b'), "ESC leaked: {out:?}");
+    }
+
+    #[test]
+    fn sanitized_output_contains_no_raw_control_introducers() {
+        // Cross-cutting invariant: whatever the input, the output must
+        // never contain `\x1B` (C0 CSI introducer), `\u{9B}` (C1 CSI
+        // introducer), `\n`, `\r`, `\0`, or `\t`. This is a stronger
+        // black-box contract than per-variant checks — a regression that
+        // added a new bypass path (e.g. dropping the `is_control()` arm)
+        // would fail here across the whole corpus at once.
+        let corpus = [
+            "\x1b[31mred\x1b[0m",
+            "\u{9B}1;2;3m",
+            "line1\r\nline2",
+            "bell\x07here",
+            "vt\x0bff\x0c",
+            "control\x00null",
+            "tab\there",
+            "\x1b\x1b\x1b\x7F",
+        ];
+        for input in corpus {
+            let out = sanitize_for_log(input);
+            for forbidden in &['\x1B', '\u{9B}', '\n', '\r', '\0', '\t', '\x07'] {
+                assert!(
+                    !out.contains(*forbidden),
+                    "forbidden char {forbidden:?} leaked through input {input:?} → {out:?}"
+                );
+            }
+        }
+    }
 }
