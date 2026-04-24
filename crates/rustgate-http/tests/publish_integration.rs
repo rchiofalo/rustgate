@@ -58,6 +58,10 @@ fn target_config(name: &str, url: &str) -> TargetConfig {
         rate_limit_per_sec: None,
         capture_response_body: None,
         max_response_body_bytes: None,
+        batch_enabled: None,
+        batch_max_messages: None,
+        batch_max_bytes: None,
+        batch_format: None,
     }
 }
 
@@ -961,5 +965,287 @@ async fn publisher_rejects_oversized_cap_at_construction() {
     assert!(
         err.to_string().contains("exceeds the 1 MiB cap"),
         "expected 1 MiB cap error, got: {err}"
+    );
+}
+
+// ── Batch egress tests (issue #906) ────────────────────────────────
+
+/// A batch-enabled target with `batch_max_messages = 3` accumulates two
+/// messages silently and emits a single HTTP POST when the third arrives.
+/// The request body is a JSON array carrying all three per-message
+/// payloads in insertion order.
+#[tokio::test]
+async fn batch_json_array_flushes_on_count_threshold() {
+    use rustgate_http::config::BatchFormat;
+
+    let server = MockServer::start().await;
+
+    // Exactly one outbound request should reach the server — the count
+    // threshold must coalesce all three messages into a single POST.
+    Mock::given(method("POST"))
+        .and(path("/ingest"))
+        .and(header("content-type", "application/json"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut tc = target_config("batch-count", &format!("{}/ingest", server.uri()));
+    tc.batch_enabled = Some(true);
+    tc.batch_max_messages = Some(3);
+    tc.batch_max_bytes = Some(1024 * 1024); // large enough that count wins
+    tc.batch_format = Some(BatchFormat::JsonArray);
+    let config = http_config(vec![tc]);
+    let publisher = HttpPublisher::new(config).unwrap();
+
+    for cn in ["alice", "bob", "carol"] {
+        publisher.publish(&make_msg(cn, "tcp", MessageType::Position));
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    publisher.shutdown().await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let received = server.received_requests().await.unwrap();
+    assert_eq!(
+        received.len(),
+        1,
+        "batch-count target must emit exactly one POST for three messages"
+    );
+    let body = std::str::from_utf8(&received[0].body).expect("utf-8 body");
+    // The body is a JSON array with three serialized entries whose
+    // source_cn fields must match insertion order.
+    let value: serde_json::Value = serde_json::from_str(body).expect("valid json array");
+    let arr = value.as_array().expect("body is a JSON array");
+    assert_eq!(arr.len(), 3, "batch array carries all three messages");
+    let cns: Vec<_> = arr
+        .iter()
+        .map(|v| v["source_cn"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(cns, vec!["alice", "bob", "carol"]);
+}
+
+/// When `batch_format = ndjson`, the flushed body uses newline-delimited
+/// JSON and the `application/x-ndjson` content type. One line per
+/// per-message payload, terminating newline included — the format most
+/// SIEM ingestion endpoints (Elastic `_bulk`, Splunk HEC, Loki Push)
+/// actually expect.
+#[tokio::test]
+async fn batch_ndjson_flushes_with_correct_content_type() {
+    use rustgate_http::config::BatchFormat;
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/ingest"))
+        .and(header("content-type", "application/x-ndjson"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut tc = target_config("batch-ndjson", &format!("{}/ingest", server.uri()));
+    tc.batch_enabled = Some(true);
+    tc.batch_max_messages = Some(2);
+    tc.batch_max_bytes = Some(1024 * 1024);
+    tc.batch_format = Some(BatchFormat::Ndjson);
+    let config = http_config(vec![tc]);
+    let publisher = HttpPublisher::new(config).unwrap();
+
+    publisher.publish(&make_msg("alice", "tcp", MessageType::Position));
+    publisher.publish(&make_msg("bob", "tcp", MessageType::Position));
+
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    publisher.shutdown().await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let received = server.received_requests().await.unwrap();
+    assert_eq!(received.len(), 1, "ndjson target must emit one POST");
+    let body = std::str::from_utf8(&received[0].body).expect("utf-8 body");
+    assert!(
+        body.ends_with('\n'),
+        "ndjson body must end with a terminating newline"
+    );
+    let lines: Vec<&str> = body.trim_end_matches('\n').split('\n').collect();
+    assert_eq!(lines.len(), 2, "two messages produce two ndjson lines");
+    for line in &lines {
+        let _: serde_json::Value = serde_json::from_str(line).expect("each line is valid json");
+    }
+}
+
+/// A trickle of messages that never hits count or byte thresholds must
+/// not be lost — the worker's shutdown path drains every non-empty
+/// batcher before returning. Pins the no-leak promise baked into
+/// `drain_batchers`.
+#[tokio::test]
+async fn batch_drains_trailing_messages_on_shutdown() {
+    use rustgate_http::config::BatchFormat;
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/ingest"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1) // exactly one drain-flushed request
+        .mount(&server)
+        .await;
+
+    // Thresholds configured well above the two messages we send so the
+    // only way a request reaches the server is via the shutdown drain.
+    let mut tc = target_config("batch-drain", &format!("{}/ingest", server.uri()));
+    tc.batch_enabled = Some(true);
+    tc.batch_max_messages = Some(100);
+    tc.batch_max_bytes = Some(1024 * 1024);
+    tc.batch_format = Some(BatchFormat::JsonArray);
+    let config = http_config(vec![tc]);
+    let publisher = HttpPublisher::new(config).unwrap();
+
+    publisher.publish(&make_msg("alice", "tcp", MessageType::Position));
+    publisher.publish(&make_msg("bob", "tcp", MessageType::Position));
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    publisher.shutdown().await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let received = server.received_requests().await.unwrap();
+    assert_eq!(
+        received.len(),
+        1,
+        "shutdown drain must flush the trailing batch exactly once"
+    );
+    let body = std::str::from_utf8(&received[0].body).expect("utf-8 body");
+    let value: serde_json::Value = serde_json::from_str(body).expect("valid json");
+    let arr = value.as_array().expect("body is a JSON array");
+    assert_eq!(arr.len(), 2, "drain flushes both buffered messages");
+}
+
+/// When `batch_enabled` is absent or false, the publisher must retain
+/// the pre-#906 per-message dispatch behaviour — one POST per message.
+/// Pins that the batching branch is strictly additive and does not leak
+/// into un-opted-in targets.
+#[tokio::test]
+async fn batch_disabled_retains_per_message_dispatch() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/solo"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(3) // one per message, batching off
+        .mount(&server)
+        .await;
+
+    // batch_enabled left as None — should behave identically to a pre-
+    // #906 target.
+    let tc = target_config("solo", &format!("{}/solo", server.uri()));
+    let config = http_config(vec![tc]);
+    let publisher = HttpPublisher::new(config).unwrap();
+
+    for cn in ["a", "b", "c"] {
+        publisher.publish(&make_msg(cn, "tcp", MessageType::Position));
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    publisher.shutdown().await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let received = server.received_requests().await.unwrap();
+    assert_eq!(
+        received.len(),
+        3,
+        "batching-off target must dispatch one POST per message"
+    );
+}
+
+/// Batch-size is stable across the same batched request's retries.
+/// Pins that a single logical batch is not fragmented when the receiver
+/// returns 503 — the same combined body hits the wire on every attempt,
+/// and the `x-rustgate-delivery-id` header is identical, so downstream
+/// deduplication still works.
+#[tokio::test]
+async fn batch_delivery_id_is_stable_across_retries() {
+    use rustgate_http::config::BatchFormat;
+
+    let server = MockServer::start().await;
+
+    // First request fails 503, second succeeds. Both carry the same
+    // rendered batch body and the same delivery-id header.
+    Mock::given(method("POST"))
+        .and(path("/ingest"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/ingest"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let mut tc = target_config("batch-retry", &format!("{}/ingest", server.uri()));
+    tc.batch_enabled = Some(true);
+    tc.batch_max_messages = Some(2);
+    tc.batch_max_bytes = Some(1024 * 1024);
+    tc.batch_format = Some(BatchFormat::JsonArray);
+    tc.retry = Some(rustgate_http::config::RetryConfig {
+        max_attempts: Some(3),
+        backoff_base_secs: Some(0),
+        circuit_breaker_threshold: Some(10),
+        circuit_breaker_cooldown_secs: Some(60),
+        half_open_max_probes: None,
+        half_open_success_threshold: None,
+    });
+    let config = http_config(vec![tc]);
+    let publisher = HttpPublisher::new(config).unwrap();
+
+    publisher.publish(&make_msg("alice", "tcp", MessageType::Position));
+    publisher.publish(&make_msg("bob", "tcp", MessageType::Position));
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    publisher.shutdown().await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let received = server.received_requests().await.unwrap();
+    assert_eq!(received.len(), 2, "one 503 + one success for the batch");
+    let id1 = received[0]
+        .headers
+        .get("x-rustgate-delivery-id")
+        .expect("delivery id on request 1")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let id2 = received[1]
+        .headers
+        .get("x-rustgate-delivery-id")
+        .expect("delivery id on request 2")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        id1, id2,
+        "delivery id stable across batched-request retries"
+    );
+    assert_eq!(received[0].body, received[1].body, "same batched body");
+}
+
+/// Config validation: a target with batching enabled but a non-JSON
+/// serialization format must be rejected at construction time. Only
+/// JSON-valued entries can be framed into a JSON array or NDJSON stream;
+/// mixing RawXml or Protobuf bodies into a JSON envelope would produce
+/// an invalid payload for the receiver.
+#[tokio::test]
+async fn batch_rejects_non_json_payload_format() {
+    use rustgate_http::config::PayloadFormat;
+
+    let mut tc = target_config("batch-xml", "https://example.com/hook");
+    tc.batch_enabled = Some(true);
+    tc.format = Some(PayloadFormat::RawXml);
+    let config = http_config(vec![tc]);
+
+    let err = HttpPublisher::new(config).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.to_lowercase().contains("json") || msg.to_lowercase().contains("batch"),
+        "expected batch+format conflict message, got: {msg}"
     );
 }

@@ -6,11 +6,12 @@
 //! metadata, and base64-encoded payload; and raw XML passthrough for
 //! consumers that expect CoT XML directly.
 
+use bytes::Bytes;
 use rustgate_core::b64;
 use rustgate_core::message::{Destination, RoutableMessage};
 use serde::Serialize;
 
-use crate::config::PayloadFormat;
+use crate::config::{BatchFormat, PayloadFormat};
 use crate::error::HttpError;
 
 /// JSON wire format for an HTTP-forwarded message.
@@ -111,6 +112,73 @@ pub(crate) fn format_destination(dest: &Destination) -> String {
             format!("multicast:{}", joined.join(","))
         }
     }
+}
+
+/// Concatenate already-serialized single-message bodies into a combined
+/// batch request body.
+///
+/// Returns `(combined_body, content_type)`. The caller is responsible
+/// for deciding *when* to flush — this helper is pure and does no I/O,
+/// no locking, and no size checking.
+///
+/// # Framing
+///
+/// - [`BatchFormat::JsonArray`] — wraps bodies in `[…, …, …]` with a
+///   single `,` separator between entries. Each `body` element MUST
+///   already be a valid JSON document (typically from
+///   [`serialize`] with [`PayloadFormat::Json`]); the helper does not
+///   re-parse or re-validate, so feeding it non-JSON bytes produces
+///   structurally-invalid output by design. Content-Type:
+///   `application/json`.
+/// - [`BatchFormat::Ndjson`] — joins bodies with `\n` separators and
+///   appends a trailing `\n` (standard NDJSON convention: every line
+///   including the last ends with LF). Content-Type:
+///   `application/x-ndjson`.
+///
+/// # Empty input
+///
+/// An empty body slice produces `[]` for `JsonArray` and `""` for
+/// `Ndjson`. Callers should avoid flushing an empty batch in practice
+/// — the [`Batcher`](crate::batch::Batcher) only yields flush payloads
+/// when at least one message is buffered — but the helper itself is
+/// total.
+pub(crate) fn render_batch(bodies: &[Bytes], format: BatchFormat) -> (Bytes, &'static str) {
+    match format {
+        BatchFormat::JsonArray => render_json_array(bodies),
+        BatchFormat::Ndjson => render_ndjson(bodies),
+    }
+}
+
+fn render_json_array(bodies: &[Bytes]) -> (Bytes, &'static str) {
+    if bodies.is_empty() {
+        return (Bytes::from_static(b"[]"), "application/json");
+    }
+    // Exact-size preallocation: 2 brackets + sum-of-lengths + (n-1) commas.
+    let total: usize = bodies.iter().map(|b| b.len()).sum();
+    let cap = total + 2 + bodies.len().saturating_sub(1);
+    let mut buf = Vec::with_capacity(cap);
+    buf.push(b'[');
+    for (i, body) in bodies.iter().enumerate() {
+        if i > 0 {
+            buf.push(b',');
+        }
+        buf.extend_from_slice(body);
+    }
+    buf.push(b']');
+    (Bytes::from(buf), "application/json")
+}
+
+fn render_ndjson(bodies: &[Bytes]) -> (Bytes, &'static str) {
+    if bodies.is_empty() {
+        return (Bytes::new(), "application/x-ndjson");
+    }
+    let total: usize = bodies.iter().map(|b| b.len()).sum();
+    let mut buf = Vec::with_capacity(total + bodies.len());
+    for body in bodies {
+        buf.extend_from_slice(body);
+        buf.push(b'\n');
+    }
+    (Bytes::from(buf), "application/x-ndjson")
 }
 
 /// Format a SystemTime as RFC 3339 / ISO 8601 UTC timestamp.
@@ -515,5 +583,87 @@ mod tests {
             "source_protocol must survive verbatim (no case-normalisation) so \
              the `federation` audit/echo-prevention grep token remains intact"
         );
+    }
+
+    // ── render_batch (issue #906 batch framing) ────────────────────────
+
+    #[test]
+    fn render_batch_json_array_single_message_wraps_in_brackets() {
+        let bodies = vec![Bytes::from_static(br#"{"a":1}"#)];
+        let (body, ct) = render_batch(&bodies, BatchFormat::JsonArray);
+        assert_eq!(ct, "application/json");
+        assert_eq!(&body[..], br#"[{"a":1}]"#);
+    }
+
+    #[test]
+    fn render_batch_json_array_multi_message_comma_separated() {
+        let bodies = vec![
+            Bytes::from_static(br#"{"a":1}"#),
+            Bytes::from_static(br#"{"b":2}"#),
+            Bytes::from_static(br#"{"c":3}"#),
+        ];
+        let (body, ct) = render_batch(&bodies, BatchFormat::JsonArray);
+        assert_eq!(ct, "application/json");
+        assert_eq!(&body[..], br#"[{"a":1},{"b":2},{"c":3}]"#);
+        // Roundtrip: the result parses as a JSON array of three objects.
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v.as_array().map(Vec::len), Some(3));
+    }
+
+    #[test]
+    fn render_batch_json_array_empty_input_emits_bare_brackets() {
+        let (body, ct) = render_batch(&[], BatchFormat::JsonArray);
+        assert_eq!(ct, "application/json");
+        assert_eq!(&body[..], b"[]");
+    }
+
+    #[test]
+    fn render_batch_ndjson_single_message_appends_newline() {
+        let bodies = vec![Bytes::from_static(br#"{"a":1}"#)];
+        let (body, ct) = render_batch(&bodies, BatchFormat::Ndjson);
+        assert_eq!(ct, "application/x-ndjson");
+        assert_eq!(&body[..], b"{\"a\":1}\n");
+    }
+
+    #[test]
+    fn render_batch_ndjson_multi_message_every_line_including_last_ends_with_lf() {
+        let bodies = vec![
+            Bytes::from_static(br#"{"a":1}"#),
+            Bytes::from_static(br#"{"b":2}"#),
+            Bytes::from_static(br#"{"c":3}"#),
+        ];
+        let (body, ct) = render_batch(&bodies, BatchFormat::Ndjson);
+        assert_eq!(ct, "application/x-ndjson");
+        assert_eq!(&body[..], b"{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n");
+        // Every NDJSON line is independently parseable.
+        let lines: Vec<&[u8]> = body
+            .split(|&b| b == b'\n')
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(lines.len(), 3);
+        for line in lines {
+            let _: serde_json::Value = serde_json::from_slice(line).unwrap();
+        }
+    }
+
+    #[test]
+    fn render_batch_ndjson_empty_input_emits_empty_body() {
+        let (body, ct) = render_batch(&[], BatchFormat::Ndjson);
+        assert_eq!(ct, "application/x-ndjson");
+        assert!(body.is_empty());
+    }
+
+    #[test]
+    fn render_batch_preserves_raw_bytes_verbatim() {
+        // The helper is format-agnostic about the *content* of each body;
+        // it only frames them. Non-JSON bytes round-trip byte-for-byte
+        // (behaviour is "structurally invalid output by design", but the
+        // render step itself must not mutate input bytes).
+        let a = Bytes::from_static(b"hello");
+        let b = Bytes::from_static(b"world");
+        let (ndjson, _) = render_batch(&[a.clone(), b.clone()], BatchFormat::Ndjson);
+        assert_eq!(&ndjson[..], b"hello\nworld\n");
+        let (arr, _) = render_batch(&[a, b], BatchFormat::JsonArray);
+        assert_eq!(&arr[..], b"[hello,world]");
     }
 }

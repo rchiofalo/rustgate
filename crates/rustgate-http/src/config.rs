@@ -147,6 +147,60 @@ pub struct TargetConfig {
     /// unbounded log volume through this path. Capped at 1 MiB by
     /// config validation.
     pub max_response_body_bytes: Option<usize>,
+
+    /// Enable per-target batching — coalesce multiple routable messages
+    /// into a single HTTP request (default: `false`).
+    ///
+    /// When enabled, the publisher buffers serialized message bodies in
+    /// a per-target in-memory batcher and flushes a combined request
+    /// when either [`batch_max_messages`](Self::batch_max_messages) or
+    /// [`batch_max_bytes`](Self::batch_max_bytes) is reached, whichever
+    /// fires first. The shape of the combined body is determined by
+    /// [`batch_format`](Self::batch_format) (JSON array by default).
+    ///
+    /// **Scope:** batching is only supported for the `json` payload
+    /// format. `raw-xml` and `protobuf` targets are rejected at
+    /// validation time when `batch-enabled = true` because there is no
+    /// portable wire-level framing to concatenate raw XML documents or
+    /// independent protobuf messages without downstream cooperation.
+    /// Operators who need batched XML or protobuf delivery should ship
+    /// multiple single-message requests instead.
+    ///
+    /// Closes the batch half of #906.
+    pub batch_enabled: Option<bool>,
+
+    /// Flush the batch once it contains this many messages
+    /// (default: 100, minimum: 2).
+    ///
+    /// A single-message "batch" is degenerate — it adds envelope
+    /// overhead without amortizing any request cost — so the minimum
+    /// is 2. There is no hard upper bound; operators pick a value that
+    /// matches the downstream receiver's tolerance for large request
+    /// bodies (Splunk HEC: up to 1 MB, Datadog Logs: 5 MB, Elastic
+    /// bulk: unbounded but rejected via 413 on overrun).
+    pub batch_max_messages: Option<usize>,
+
+    /// Flush the batch once the accumulated serialized bytes reach
+    /// this size (default: 1 MiB, minimum: 1 KiB).
+    ///
+    /// Measured on the serialized single-message bodies *before*
+    /// batch rendering overhead (JSON-array commas + brackets, or
+    /// NDJSON newlines), so the final request body is slightly
+    /// larger than this cap. Operators should set this comfortably
+    /// below the downstream receiver's hard request-body limit.
+    pub batch_max_bytes: Option<usize>,
+
+    /// How to concatenate batched message bodies on the wire
+    /// (default: [`BatchFormat::JsonArray`]).
+    ///
+    /// - `json-array` — emit `[msg1, msg2, …]` with `Content-Type:
+    ///   application/json`. Suitable for endpoints expecting a typed
+    ///   array (Datadog Logs, generic webhooks, custom collectors).
+    /// - `ndjson` — emit one message per line separated by `\n` with
+    ///   `Content-Type: application/x-ndjson`. Suitable for bulk log
+    ///   ingestion endpoints (Splunk HEC raw endpoint, Loki push API,
+    ///   Elastic `_bulk`).
+    pub batch_format: Option<BatchFormat>,
 }
 
 /// Custom HTTP header entry.
@@ -184,6 +238,24 @@ pub enum PayloadFormat {
     /// Protobuf-encoded CoT event via `rustgate-proto` (requires `proto` feature).
     /// Content-Type: `application/x-protobuf`.
     Protobuf,
+}
+
+/// Batch framing format for multi-message HTTP requests.
+///
+/// Selects how the per-message serialized bodies are concatenated into a
+/// single request body when
+/// [`TargetConfig::batch_enabled`](TargetConfig::batch_enabled) is `true`.
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum BatchFormat {
+    /// JSON array: `[msg1, msg2, …]`. Content-Type: `application/json`.
+    /// Suitable for endpoints expecting a typed JSON array.
+    #[default]
+    JsonArray,
+    /// Newline-delimited JSON: `msg1\nmsg2\n…`. Content-Type:
+    /// `application/x-ndjson`. Suitable for bulk log ingestion endpoints
+    /// (Splunk HEC raw, Loki push, Elastic `_bulk`).
+    Ndjson,
 }
 
 /// Authentication for outbound requests.
@@ -358,7 +430,55 @@ impl TargetConfig {
     pub fn effective_max_response_body_bytes(&self) -> usize {
         self.max_response_body_bytes.unwrap_or(4 * 1024)
     }
+
+    /// Whether this target batches messages into combined HTTP requests
+    /// (default: `false`).
+    pub fn effective_batch_enabled(&self) -> bool {
+        self.batch_enabled.unwrap_or(false)
+    }
+
+    /// Effective batch flush threshold in messages (default:
+    /// [`DEFAULT_BATCH_MAX_MESSAGES`]).
+    pub fn effective_batch_max_messages(&self) -> usize {
+        self.batch_max_messages
+            .unwrap_or(DEFAULT_BATCH_MAX_MESSAGES)
+    }
+
+    /// Effective batch flush threshold in serialized bytes (default:
+    /// [`DEFAULT_BATCH_MAX_BYTES`]).
+    pub fn effective_batch_max_bytes(&self) -> usize {
+        self.batch_max_bytes.unwrap_or(DEFAULT_BATCH_MAX_BYTES)
+    }
+
+    /// Effective batch framing format (default: [`BatchFormat::JsonArray`]).
+    pub fn effective_batch_format(&self) -> BatchFormat {
+        self.batch_format.unwrap_or_default()
+    }
 }
+
+/// Default per-target batch flush threshold in messages.
+///
+/// Chosen to amortise TLS/TCP per-request cost meaningfully while
+/// staying well below every major receiver's batch size cap (Splunk HEC
+/// batch endpoint: effectively unbounded but rate-limited per event;
+/// Datadog Logs: 1000; Elastic `_bulk`: unbounded on size, not count).
+pub const DEFAULT_BATCH_MAX_MESSAGES: usize = 100;
+
+/// Default per-target batch flush threshold in serialized bytes (1 MiB).
+///
+/// Matches Splunk HEC's default 1 MB request body cap, which is the
+/// tightest of the major receivers' defaults.
+pub const DEFAULT_BATCH_MAX_BYTES: usize = 1024 * 1024;
+
+/// Absolute floor for `batch-max-messages`. A batch of 1 is degenerate
+/// (adds envelope overhead without amortizing any request cost), so
+/// operators must configure at least 2.
+pub(crate) const MIN_BATCH_MAX_MESSAGES: usize = 2;
+
+/// Absolute floor for `batch-max-bytes`. Below 1 KiB the flush
+/// threshold fires on every realistic JSON envelope, which is
+/// indistinguishable from batching being off and wastes batcher state.
+pub(crate) const MIN_BATCH_MAX_BYTES: usize = 1024;
 
 impl RetryConfig {
     /// Effective max retry attempts (default: 3).
@@ -700,6 +820,45 @@ impl HttpConfig {
                 target.name
             ));
         }
+
+        // Batch configuration: only validate the shape when opt-in.
+        // Pre-#906 configs leave every batch-* field `None` and must
+        // not trigger any new error path.
+        if target.batch_enabled == Some(true) {
+            // Batching only frames JSON bodies. Raw XML and protobuf
+            // do not have a portable "array of messages" encoding that
+            // every downstream would accept; rejecting at validation
+            // time keeps operators from discovering the mismatch as
+            // silent 4xx responses at runtime.
+            let fmt = target.effective_format();
+            if fmt != PayloadFormat::Json {
+                errors.push(format!(
+                    "target `{}`: batch-enabled = true requires format = json (got {fmt:?}); \
+                     raw-xml and protobuf do not have a portable batch wire format",
+                    target.name
+                ));
+            }
+
+            if let Some(n) = target.batch_max_messages
+                && n < MIN_BATCH_MAX_MESSAGES
+            {
+                errors.push(format!(
+                    "target `{}`: batch-max-messages ({n}) must be >= {MIN_BATCH_MAX_MESSAGES} \
+                     (a batch of 1 is degenerate — adds envelope overhead without amortizing cost)",
+                    target.name
+                ));
+            }
+
+            if let Some(n) = target.batch_max_bytes
+                && n < MIN_BATCH_MAX_BYTES
+            {
+                errors.push(format!(
+                    "target `{}`: batch-max-bytes ({n}) must be >= {MIN_BATCH_MAX_BYTES} \
+                     (below 1 KiB every realistic message body triggers an immediate flush)",
+                    target.name
+                ));
+            }
+        }
     }
 }
 
@@ -766,6 +925,10 @@ mod tests {
             rate_limit_per_sec: None,
             capture_response_body: None,
             max_response_body_bytes: None,
+            batch_enabled: None,
+            batch_max_messages: None,
+            batch_max_bytes: None,
+            batch_format: None,
         }
     }
 
