@@ -16,7 +16,7 @@ workspace = true
 metrics = []
 
 [dependencies]
-tokio = { workspace = true, features = ["sync", "rt", "time"] }
+tokio = { workspace = true, features = ["macros", "sync", "rt", "time"] }
 fastrand = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
