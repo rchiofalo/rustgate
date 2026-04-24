@@ -675,6 +675,22 @@ pub fn http_circuit_recovered(target: &str) {
     );
 }
 
+/// Record a circuit breaker entering the Half-Open probe window.
+///
+/// Fires at the moment the breaker transitions from Open to Half-Open
+/// — cooldown has elapsed and the next request will be released as a
+/// probe. This is the trigger point for DLQ auto-drain: any messages
+/// dead-lettered while the circuit was open are now eligible for
+/// replay once the probe succeeds.
+pub fn http_circuit_probing(target: &str) {
+    audit!(
+        "http.circuit_probing",
+        target = %target,
+        action = "circuit_breaker",
+        result = "probing"
+    );
+}
+
 /// Record a failed TLS verifier rebuild after trust store change.
 pub fn verifier_rebuild_failed(error: &str) {
     audit!(
