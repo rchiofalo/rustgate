@@ -38,6 +38,7 @@ impl MqttServer {
             on_accept,
             on_reject,
             session_hooks,
+            forwarding_hooks,
         } = config;
 
         let client_id_registry = ClientIdRegistry::new();
@@ -81,6 +82,7 @@ impl MqttServer {
                             let prefix = topic_prefix.clone();
                             let registry = Arc::clone(&client_id_registry);
                             let hooks = session_hooks.clone();
+                            let forwarding = forwarding_hooks.clone();
                             drop(tokio::spawn(handle_mqtt_session(
                                 pre_session,
                                 router,
@@ -92,6 +94,7 @@ impl MqttServer {
                                 registry,
                                 permit,
                                 hooks,
+                                forwarding,
                             )));
                         }
                         Ok(None) => {
@@ -172,6 +175,7 @@ mod tests {
             on_accept: None,
             on_reject: None,
             session_hooks: None,
+            forwarding_hooks: None,
         }
     }
 
@@ -314,6 +318,7 @@ mod tests {
                 panic!("on_reject must not fire on clean shutdown with no clients")
             })),
             session_hooks: Some(MqttSessionHooks::default()),
+            forwarding_hooks: None,
         };
 
         let handle = tokio::spawn(MqttServer::run(config));

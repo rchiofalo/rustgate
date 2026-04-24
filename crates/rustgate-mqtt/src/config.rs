@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use rustgate_core::egress::{OnFederationForward, OnHttpForward, OnNatsPublish};
 use rustgate_transport::Router;
 use tokio::sync::{Notify, Semaphore};
 
@@ -113,6 +114,54 @@ impl std::fmt::Debug for MqttSessionHooks {
     }
 }
 
+/// Bundle of post-route egress forwarding callbacks fired by the MQTT
+/// session on the PUBLISH hot path.
+///
+/// Mirrors the three sinks already wired on the WebSocket transport
+/// (NATS bridge, federation forwarder, HTTP egress) so that MQTT
+/// PUBLISHes participate in horizontal scale-out, server-to-server
+/// mesh delivery, and webhook fan-out with the same post-Send-PEP
+/// payload the router produces. Each field is an independent optional
+/// sink — `None` skips the corresponding fan-out at no runtime cost.
+///
+/// Packaged as a single struct so threading the three callbacks
+/// through the already-large `handle_mqtt_session` call (which carries
+/// a narrow `#[allow(clippy::too_many_arguments)]` justification) does
+/// not push the argument count further. The alias types live in
+/// `rustgate_core::egress` so the same shapes are shared workspace-
+/// wide.
+#[derive(Default, Clone)]
+pub struct MqttForwardingHooks {
+    /// Fires after a successful local route to hand the message off to
+    /// the NATS publisher. See
+    /// [`OnNatsPublish`](rustgate_core::egress::OnNatsPublish).
+    pub nats_publish: Option<OnNatsPublish>,
+
+    /// Fires after a successful local route to hand the payload off to
+    /// the federation forwarder. See
+    /// [`OnFederationForward`](rustgate_core::egress::OnFederationForward).
+    pub federation_forward: Option<OnFederationForward>,
+
+    /// Fires after a successful local route to hand the message off to
+    /// the HTTP egress publisher. See
+    /// [`OnHttpForward`](rustgate_core::egress::OnHttpForward).
+    pub http_forward: Option<OnHttpForward>,
+}
+
+impl std::fmt::Debug for MqttForwardingHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let fmt_cb = |present: bool| if present { "Some(<cb>)" } else { "None" };
+        f.debug_struct("MqttForwardingHooks")
+            .field("nats_publish", &fmt_cb(self.nats_publish.is_some()))
+            .field(
+                "federation_forward",
+                &fmt_cb(self.federation_forward.is_some()),
+            )
+            .field("http_forward", &fmt_cb(self.http_forward.is_some()))
+            .finish()
+    }
+}
+
 /// Configuration for [`MqttServer::run`](crate::MqttServer::run).
 pub struct MqttServerConfig {
     /// The bound MQTT TLS listener.
@@ -172,6 +221,15 @@ pub struct MqttServerConfig {
     /// `rustgate_mqtt_{publishes,subscribes}{_rejected,}_total` Prometheus
     /// counters. See [`MqttSessionHooks`].
     pub session_hooks: Option<MqttSessionHooks>,
+
+    /// Optional post-route egress forwarding callbacks (NATS bridge,
+    /// federation forwarder, HTTP egress). `None` disables every fan-
+    /// out at no runtime cost. The server crate wires these under
+    /// `#[cfg(feature = "nats|federation|http")]` blocks so MQTT
+    /// PUBLISHes participate in the same scale-out / mesh / webhook
+    /// paths already used by the WebSocket transport. See
+    /// [`MqttForwardingHooks`].
+    pub forwarding_hooks: Option<MqttForwardingHooks>,
 }
 
 impl MqttServerConfig {
@@ -214,6 +272,7 @@ impl std::fmt::Debug for MqttServerConfig {
                 },
             )
             .field("session_hooks", &self.session_hooks)
+            .field("forwarding_hooks", &self.forwarding_hooks)
             .finish()
     }
 }
@@ -335,6 +394,7 @@ mod tests {
             on_accept: None,
             on_reject: None,
             session_hooks: None,
+            forwarding_hooks: None,
         };
         let rendered = format!("{config:?}");
         assert!(
@@ -344,6 +404,10 @@ mod tests {
         assert!(
             rendered.contains("on_reject: \"None\""),
             "Debug output must contain `on_reject: \"None\"` sentinel, got: {rendered}",
+        );
+        assert!(
+            rendered.contains("forwarding_hooks: None"),
+            "Debug output must contain `forwarding_hooks: None` sentinel, got: {rendered}",
         );
     }
 
@@ -377,6 +441,7 @@ mod tests {
             on_accept: Some(Arc::new(|| {})),
             on_reject: Some(Arc::new(|| {})),
             session_hooks: Some(MqttSessionHooks::default()),
+            forwarding_hooks: Some(MqttForwardingHooks::default()),
         };
         let rendered = format!("{config:?}");
         assert!(
@@ -497,6 +562,107 @@ mod tests {
             after_clone,
             initial_count + 1,
             "cloning hooks must bump the inner Arc's strong count, not wrap in a new Arc",
+        );
+        drop(cloned);
+        assert_eq!(
+            Arc::strong_count(&inner),
+            initial_count,
+            "dropping the clone must restore the original strong count",
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Forwarding hooks (`MqttForwardingHooks`) — post-route egress fan
+    // out bundle. Follows the same contract as `MqttSessionHooks` so
+    // the server crate can install each field independently under its
+    // own feature gate (`nats`, `federation`, `http`). The callback
+    // aliases themselves live in `rustgate_core::egress` and are
+    // verified workspace-wide there; these tests pin the MQTT-side
+    // wiring: that the struct derives `Default + Clone`, that the
+    // manual `Debug` renders the `Some(<cb>)` / `None` sentinels, and
+    // that cloning preserves `Arc` strong-count sharing so the server
+    // crate does not accidentally stack `Arc`-of-`Arc` on every
+    // session spawn.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn forwarding_hooks_default_has_no_callbacks_installed() {
+        // `MqttForwardingHooks::default()` is the wiring seed for
+        // builds that opt out of every egress sink — every field must
+        // be `None` so the session's hot path does not pay a closure-
+        // dispatch cost for fan-outs that will never fire.
+        let hooks = MqttForwardingHooks::default();
+        assert!(hooks.nats_publish.is_none());
+        assert!(hooks.federation_forward.is_none());
+        assert!(hooks.http_forward.is_none());
+    }
+
+    #[test]
+    fn forwarding_hooks_debug_none_renders_all_fields_as_none_sentinel() {
+        // The manual `Debug` impl mirrors the `MqttSessionHooks`
+        // sentinel shape so operator log greps see the wiring state
+        // uniformly across both hook bundles.
+        let rendered = format!("{:?}", MqttForwardingHooks::default());
+        assert!(
+            rendered.contains("nats_publish: \"None\""),
+            "expected `nats_publish: \"None\"` sentinel, got: {rendered}",
+        );
+        assert!(
+            rendered.contains("federation_forward: \"None\""),
+            "expected `federation_forward: \"None\"` sentinel, got: {rendered}",
+        );
+        assert!(
+            rendered.contains("http_forward: \"None\""),
+            "expected `http_forward: \"None\"` sentinel, got: {rendered}",
+        );
+    }
+
+    #[test]
+    fn forwarding_hooks_debug_some_renders_cb_sentinel_for_each_installed_field() {
+        // Install each callback independently so a regression that
+        // wired the wrong field (copy-paste bug in the server crate's
+        // `start_mqtt` fan-out) is caught by a test that exercises
+        // each field's rendering in isolation rather than all-or-
+        // nothing.
+        let hooks = MqttForwardingHooks {
+            nats_publish: Some(Arc::new(|_msg| {})),
+            federation_forward: Some(Arc::new(|_payload, _groups, _meta| {})),
+            http_forward: Some(Arc::new(|_msg| {})),
+        };
+        let rendered = format!("{hooks:?}");
+        assert!(
+            rendered.contains("nats_publish: \"Some(<cb>)\""),
+            "expected `nats_publish: \"Some(<cb>)\"` sentinel, got: {rendered}",
+        );
+        assert!(
+            rendered.contains("federation_forward: \"Some(<cb>)\""),
+            "expected `federation_forward: \"Some(<cb>)\"` sentinel, got: {rendered}",
+        );
+        assert!(
+            rendered.contains("http_forward: \"Some(<cb>)\""),
+            "expected `http_forward: \"Some(<cb>)\"` sentinel, got: {rendered}",
+        );
+    }
+
+    #[test]
+    fn forwarding_hooks_clone_duplicates_arc_without_wrapping() {
+        // Same `Arc` strong-count-sharing contract as
+        // `session_hooks_clone_duplicates_arc_without_wrapping`, but
+        // exercised through the `nats_publish` slot because the egress
+        // bundle is cloned into the per-session spawn exactly the way
+        // `MqttSessionHooks` is.
+        let inner: OnNatsPublish = Arc::new(|_msg| {});
+        let hooks = MqttForwardingHooks {
+            nats_publish: Some(Arc::clone(&inner)),
+            ..MqttForwardingHooks::default()
+        };
+        let initial_count = Arc::strong_count(&inner);
+        let cloned = hooks.clone();
+        let after_clone = Arc::strong_count(&inner);
+        assert_eq!(
+            after_clone,
+            initial_count + 1,
+            "cloning forwarding hooks must bump the inner Arc's strong count, not wrap in a new Arc",
         );
         drop(cloned);
         assert_eq!(

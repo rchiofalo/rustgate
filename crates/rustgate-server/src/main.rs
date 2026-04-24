@@ -1156,7 +1156,16 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
 
     // ── MQTT listener ──────────────────────────────────────────────
     #[cfg(feature = "mqtt")]
-    let mqtt_shutdown = setup::start_mqtt(&cli, &tls_config, &router, &connection_limit)?;
+    let mqtt_shutdown = setup::start_mqtt(setup::MqttSetup {
+        cli: &cli,
+        tls_config: &tls_config,
+        router: &router,
+        connection_limit: &connection_limit,
+        nats_publisher: &nats_publisher,
+        fed_forward: &fed_forward,
+        #[cfg(feature = "http")]
+        http_forward: &http_forward,
+    })?;
 
     #[cfg(not(feature = "mqtt"))]
     setup::warn_mqtt_disabled(&cli);
