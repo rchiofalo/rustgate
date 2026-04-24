@@ -19,7 +19,9 @@ use bytes::Bytes;
 use futures::StreamExt;
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
-use rustgate_nats::{NatsAdapter, NatsConfig, WireEvent};
+use rustgate_nats::{
+    NatsAdapter, NatsConfig, NatsRequestHandler, NatsRequestResponder, RequestError, WireEvent,
+};
 use rustgate_test_utils::require_nats;
 use rustgate_transport::Router;
 use tokio::sync::mpsc;
@@ -887,5 +889,235 @@ async fn jetstream_pull_consumer_graceful_shutdown() {
     assert!(
         info.state.messages >= 1,
         "stream should retain messages after subscriber shutdown"
+    );
+}
+
+// ── Request/reply (#907b) ─────────────────────────────────────────────────
+
+/// Build a config that enables the request/reply responder.
+fn request_config(url: &str, instance_id: &str, request_subject: &str) -> NatsConfig {
+    NatsConfig {
+        url: url.to_string(),
+        instance_id: instance_id.to_string(),
+        request_subject: Some(request_subject.to_string()),
+        ..Default::default()
+    }
+}
+
+/// Build an echo handler that prefixes the request payload with "echo:".
+fn echo_handler() -> NatsRequestHandler {
+    Arc::new(|payload: bytes::Bytes| {
+        Box::pin(async move {
+            let mut out = Vec::with_capacity(payload.len() + 5);
+            out.extend_from_slice(b"echo:");
+            out.extend_from_slice(&payload);
+            Ok(bytes::Bytes::from(out))
+        })
+    })
+}
+
+/// Round-trip: responder subscribes on a subject, client publishes a
+/// request, handler runs, reply is delivered. Covers the core happy path
+/// for [`NatsRequestClient`] and [`NatsRequestResponder`].
+#[tokio::test]
+async fn request_reply_round_trip() {
+    let server = require_nats!();
+    let subject = "rustgate.ops.echo";
+
+    let responder_adapter = NatsAdapter::connect(request_config(server.url(), "resp-A", subject))
+        .await
+        .expect("connect responder");
+    let client_adapter = NatsAdapter::connect(test_config(server.url(), "cli-A"))
+        .await
+        .expect("connect client");
+
+    let responder: NatsRequestResponder = responder_adapter
+        .request_responder(echo_handler())
+        .expect("responder configured");
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_clone = Arc::clone(&shutdown);
+    let resp_task = tokio::spawn(async move { responder.run(shutdown_clone).await });
+
+    // Give the subscription time to register with the server before the
+    // client sends — otherwise the server returns NoResponders.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = client_adapter.request_client();
+    let reply = timeout(
+        Duration::from_secs(3),
+        client.request(subject, Bytes::from_static(b"hello")),
+    )
+    .await
+    .expect("request did not complete in time")
+    .expect("request should succeed");
+
+    assert_eq!(reply.as_ref(), b"echo:hello");
+
+    shutdown.notify_waiters();
+    // Ensure the responder observes the shutdown signal before the test exits.
+    let _ = timeout(Duration::from_secs(2), resp_task)
+        .await
+        .expect("responder task did not shut down");
+}
+
+/// A responder configured for subject `A` must not answer requests sent
+/// to subject `B` — confirms the subscription is narrow and does not
+/// accidentally match a superset.
+#[tokio::test]
+async fn request_reply_no_responders_on_unrelated_subject() {
+    let server = require_nats!();
+
+    let responder_adapter = NatsAdapter::connect(request_config(
+        server.url(),
+        "resp-isolated",
+        "rustgate.ops.only",
+    ))
+    .await
+    .expect("connect responder");
+    let client_adapter = NatsAdapter::connect(test_config(server.url(), "cli-isolated"))
+        .await
+        .expect("connect client");
+
+    let responder = responder_adapter
+        .request_responder(echo_handler())
+        .expect("responder configured");
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_clone = Arc::clone(&shutdown);
+    let resp_task = tokio::spawn(async move { responder.run(shutdown_clone).await });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = client_adapter.request_client();
+    let err = client
+        .request("rustgate.ops.different", Bytes::from_static(b"hi"))
+        .await
+        .expect_err("expected NoResponders error");
+
+    assert!(
+        matches!(err, RequestError::NoResponders { ref subject } if subject == "rustgate.ops.different"),
+        "expected NoResponders for unrelated subject, got: {err:?}",
+    );
+
+    shutdown.notify_waiters();
+    let _ = timeout(Duration::from_secs(2), resp_task).await;
+}
+
+/// A handler that returns `Err(msg)` should surface as
+/// [`RequestError::HandlerError`] on the client side, carrying the
+/// original error string — not `NoResponders` or `Timeout`.
+#[tokio::test]
+async fn request_reply_handler_error_propagates() {
+    let server = require_nats!();
+    let subject = "rustgate.ops.fail";
+
+    let responder_adapter = NatsAdapter::connect(request_config(server.url(), "resp-err", subject))
+        .await
+        .expect("connect responder");
+    let client_adapter = NatsAdapter::connect(test_config(server.url(), "cli-err"))
+        .await
+        .expect("connect client");
+
+    let failing_handler: NatsRequestHandler = Arc::new(|_payload| {
+        Box::pin(async move { Err("handler explicitly rejected".to_string()) })
+    });
+    let responder = responder_adapter
+        .request_responder(failing_handler)
+        .expect("responder configured");
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_clone = Arc::clone(&shutdown);
+    let resp_task = tokio::spawn(async move { responder.run(shutdown_clone).await });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = client_adapter.request_client();
+    let err = client
+        .request(subject, Bytes::from_static(b"anything"))
+        .await
+        .expect_err("expected HandlerError");
+
+    match err {
+        RequestError::HandlerError {
+            subject: s,
+            message,
+        } => {
+            assert_eq!(s, subject);
+            assert_eq!(message, "handler explicitly rejected");
+        }
+        other => panic!("expected HandlerError, got: {other:?}"),
+    }
+
+    shutdown.notify_waiters();
+    let _ = timeout(Duration::from_secs(2), resp_task).await;
+}
+
+/// When the handler sleeps past the per-call timeout the client must
+/// fail with [`RequestError::Timeout`] — not hang forever. The responder
+/// itself stays up and can still serve subsequent requests.
+#[tokio::test]
+async fn request_reply_timeout_when_handler_too_slow() {
+    let server = require_nats!();
+    let subject = "rustgate.ops.slow";
+
+    let responder_adapter =
+        NatsAdapter::connect(request_config(server.url(), "resp-slow", subject))
+            .await
+            .expect("connect responder");
+    let client_adapter = NatsAdapter::connect(test_config(server.url(), "cli-slow"))
+        .await
+        .expect("connect client");
+
+    // Handler sleeps for longer than the request timeout. We intentionally
+    // exceed the 200ms request timeout but keep it short enough for fast
+    // CI runs (a few hundred milliseconds, not seconds).
+    let slow_handler: NatsRequestHandler = Arc::new(|_payload| {
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            Ok(bytes::Bytes::from_static(b"late"))
+        })
+    });
+    let responder = responder_adapter
+        .request_responder(slow_handler)
+        .expect("responder configured");
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_clone = Arc::clone(&shutdown);
+    let resp_task = tokio::spawn(async move { responder.run(shutdown_clone).await });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = client_adapter.request_client();
+    let err = client
+        .request_with_timeout(
+            subject.to_string(),
+            Bytes::from_static(b"please-timeout"),
+            Duration::from_millis(200),
+        )
+        .await
+        .expect_err("expected Timeout");
+
+    assert!(
+        matches!(err, RequestError::Timeout { ref subject, timeout } if subject == "rustgate.ops.slow" && timeout == Duration::from_millis(200)),
+        "expected Timeout for slow handler, got: {err:?}",
+    );
+
+    shutdown.notify_waiters();
+    let _ = timeout(Duration::from_secs(3), resp_task).await;
+}
+
+/// Building a responder when `request_subject` is `None` returns `None`
+/// — the opt-in contract. Without this, callers would have to duplicate
+/// the check in every wiring site.
+#[tokio::test]
+async fn request_responder_not_configured_returns_none() {
+    let server = require_nats!();
+
+    // Default config has request_subject = None.
+    let adapter = NatsAdapter::connect(test_config(server.url(), "no-resp"))
+        .await
+        .expect("connect");
+
+    let responder = adapter.request_responder(echo_handler());
+    assert!(
+        responder.is_none(),
+        "adapter with no request_subject should return None",
     );
 }

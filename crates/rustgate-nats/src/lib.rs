@@ -10,12 +10,16 @@
 pub mod config;
 pub mod jetstream;
 pub mod publisher;
+pub mod request;
 pub mod serde_compat;
 pub mod subscriber;
 
 pub use config::{NatsConfig, NatsConfigError, NatsTlsConfig, NatsTlsConfigError};
 pub use jetstream::JetStreamReplay;
 pub use publisher::NatsPublisher;
+pub use request::{
+    ERROR_HEADER, NatsRequestClient, NatsRequestHandler, NatsRequestResponder, RequestError,
+};
 pub use serde_compat::WireEvent;
 pub use subscriber::{LagCallback, LagSnapshot, LatencyCallback, NatsSubscriber};
 
@@ -91,6 +95,35 @@ impl NatsAdapter {
             self.config.clone(),
             self.config.checkpoint_path.clone(),
         )
+    }
+
+    /// Create a request/reply client over the existing NATS connection.
+    ///
+    /// Always available — the client is a thin wrapper over
+    /// [`async_nats::Client::send_request`] and does not require any
+    /// configuration. See [`NatsRequestClient`] for the full API.
+    pub fn request_client(&self) -> NatsRequestClient {
+        NatsRequestClient::new(self.client.clone())
+    }
+
+    /// Create a request/reply responder bound to the configured
+    /// `request_subject`.
+    ///
+    /// Returns `None` when the configuration does not set
+    /// [`NatsConfig::request_subject`] — this is the signal that the
+    /// operator did not opt in to running a responder, so the caller
+    /// should skip wiring the handler.
+    ///
+    /// The returned responder has not yet subscribed — call
+    /// [`NatsRequestResponder::run`] on a background task to start
+    /// processing requests.
+    pub fn request_responder(&self, handler: NatsRequestHandler) -> Option<NatsRequestResponder> {
+        let subject = self.config.request_subject.clone()?;
+        Some(NatsRequestResponder::new(
+            self.client.clone(),
+            subject,
+            handler,
+        ))
     }
 }
 
