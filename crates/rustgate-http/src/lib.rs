@@ -42,6 +42,7 @@
 pub(crate) mod auth;
 pub mod config;
 pub(crate) mod dlq;
+pub mod dlq_reader;
 pub mod error;
 pub(crate) mod filter;
 #[cfg(feature = "metrics")]
