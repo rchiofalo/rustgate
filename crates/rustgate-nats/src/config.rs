@@ -143,6 +143,23 @@ pub struct NatsConfig {
     /// subsequent restarts resume from the checkpoint.
     pub checkpoint_path: Option<PathBuf>,
 
+    /// Optional subject on which to run a NATS request/reply responder.
+    ///
+    /// When set to `Some(subject)`, callers that build a
+    /// [`crate::request::NatsRequestResponder`] via
+    /// [`crate::NatsAdapter::request_responder`] will subscribe here and
+    /// dispatch incoming requests to the supplied handler. When `None`,
+    /// no responder is wired and `request_responder` returns `None`.
+    ///
+    /// The subject is validated like [`subject_prefix`] — multi-level
+    /// subjects (`rustgate.ops.status`) are allowed, but wildcards
+    /// (`*`, `>`) are rejected because a responder subscribes to one
+    /// concrete subject. Operators who want multiple endpoints should
+    /// configure several responders, each with its own subject.
+    ///
+    /// [`subject_prefix`]: Self::subject_prefix
+    pub request_subject: Option<String>,
+
     /// Optional narrow-subscribe filters for the JetStream pull consumer.
     ///
     /// When empty (default), the consumer subscribes to the full
@@ -184,6 +201,14 @@ impl NatsConfig {
         validate_nats_subject_prefix(&self.subject_prefix, "subject_prefix")?;
         validate_nats_subject_prefix(&self.jetstream_subject_prefix, "jetstream_subject_prefix")?;
         validate_nats_subject_token(&self.default_group, "default_group")?;
+        // Optional: request/reply responder subject (issue #907b). When
+        // unset, no responder is wired. When set, the same rules apply
+        // as for `subject_prefix`: dots allowed for multi-level
+        // subjects, wildcards rejected because the responder subscribes
+        // to one concrete subject.
+        if let Some(ref subject) = self.request_subject {
+            validate_nats_subject_prefix(subject, "request_subject")?;
+        }
         validate_subject_filters(&self.subject_filters, &self.subject_prefix)?;
         self.tls.validate().map_err(NatsConfigError::Tls)?;
         Ok(())
@@ -315,6 +340,7 @@ impl Default for NatsConfig {
             max_ack_pending: 1000,
             max_deliver: 0,
             checkpoint_path: None,
+            request_subject: None,
             subject_filters: Vec::new(),
         }
     }
@@ -543,6 +569,103 @@ mod tests {
     fn tab_in_default_group_rejected() {
         let config = NatsConfig {
             default_group: "group\tname".to_string(),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn default_request_subject_is_none() {
+        // Responder is strictly opt-in. A default of `None` means
+        // clients that do not configure request/reply never subscribe
+        // to anything extra — critical for deployments that only want
+        // the streaming bridge (the vast majority today).
+        let config = NatsConfig::default();
+        assert!(config.request_subject.is_none());
+    }
+
+    #[test]
+    fn request_subject_valid_multi_level_accepted() {
+        let config = NatsConfig {
+            request_subject: Some("rustgate.ops.status".to_string()),
+            ..Default::default()
+        };
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn request_subject_single_token_accepted() {
+        let config = NatsConfig {
+            request_subject: Some("ping".to_string()),
+            ..Default::default()
+        };
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn wildcard_in_request_subject_rejected() {
+        // Responders subscribe to one concrete subject; `>`/`*` would
+        // require the handler to switch on subject at runtime, which is
+        // out of scope for the initial cut.
+        let config = NatsConfig {
+            request_subject: Some("rustgate.ops.>".to_string()),
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, NatsConfigError::InvalidSubject { ref field, .. } if field == "request_subject"),
+            "expected InvalidSubject for request_subject, got: {err}"
+        );
+    }
+
+    #[test]
+    fn asterisk_in_request_subject_rejected() {
+        let config = NatsConfig {
+            request_subject: Some("rustgate.*.status".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn empty_request_subject_rejected() {
+        // `Some("")` is semantically invalid — callers who want to
+        // disable request/reply must pass `None`. The empty-string case
+        // is a common misconfiguration (e.g. unset env var rendered as
+        // empty string by a shell) and we should fail it loudly at
+        // validate() rather than subscribe to "".
+        let config = NatsConfig {
+            request_subject: Some(String::new()),
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, NatsConfigError::InvalidSubject { ref field, .. } if field == "request_subject"),
+        );
+    }
+
+    #[test]
+    fn control_char_in_request_subject_rejected() {
+        let config = NatsConfig {
+            request_subject: Some("rustgate\x01ops".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn space_in_request_subject_rejected() {
+        let config = NatsConfig {
+            request_subject: Some("rustgate ops".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn non_ascii_in_request_subject_rejected() {
+        let config = NatsConfig {
+            request_subject: Some("caf\u{00e9}".to_string()),
             ..Default::default()
         };
         assert!(config.validate().is_err());
