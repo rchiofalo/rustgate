@@ -160,6 +160,38 @@ pub struct NatsConfig {
     /// [`subject_prefix`]: Self::subject_prefix
     pub request_subject: Option<String>,
 
+    /// Optional subject to republish poison messages before they are ACKed.
+    ///
+    /// When a subscriber receives a message it cannot process locally — the
+    /// payload is oversized, the JSON is unparseable, the position is the
+    /// CoT "unknown" sentinel, or the identity fails validation — it must
+    /// still ACK so the pull consumer can advance past the stuck sequence.
+    /// Silently swallowing those bytes is the current behaviour, which means
+    /// operators have no way to inspect what the upstream producer sent.
+    ///
+    /// When this field is `Some(subject)`, the subscriber publishes the
+    /// original payload to that subject (with diagnostic headers: reason,
+    /// original subject, millis-since-epoch timestamp) before ACKing the
+    /// poison message. The payload is forwarded unchanged — whatever
+    /// garbage arrived is exactly what operators will see on the DLQ.
+    ///
+    /// **Best-effort.** A failed DLQ publish is logged at `warn` but does
+    /// NOT block the ACK of the original message — blocking would defeat
+    /// the whole point of giving up on the stuck sequence and could wedge
+    /// the consumer on transient NATS publish errors.
+    ///
+    /// **Loop prevention.** The DLQ subject MUST NOT start with
+    /// `{subject_prefix}.`. The live stream captures that entire namespace
+    /// with a `{subject_prefix}.>` wildcard; a DLQ subject inside that
+    /// namespace would be recaptured, redelivered, re-classified as poison,
+    /// republished to DLQ, and so on indefinitely. Operators who want the
+    /// DLQ archived into a JetStream stream should configure a second
+    /// stream on a disjoint subject (e.g. `rustgate.dlq`).
+    ///
+    /// Wildcards (`*`, `>`) are rejected for the same reason as
+    /// `subject_prefix` — the publisher writes to one concrete subject.
+    pub dead_letter_subject: Option<String>,
+
     /// Optional narrow-subscribe filters for the JetStream pull consumer.
     ///
     /// When empty (default), the consumer subscribes to the full
@@ -208,6 +240,27 @@ impl NatsConfig {
         // to one concrete subject.
         if let Some(ref subject) = self.request_subject {
             validate_nats_subject_prefix(subject, "request_subject")?;
+        }
+        if let Some(ref dlq) = self.dead_letter_subject {
+            validate_nats_subject_prefix(dlq, "dead_letter_subject")?;
+            // Loop-prevention safety rail: the live stream captures
+            // `{subject_prefix}.>`. If the DLQ subject lives inside that
+            // namespace, every DLQ publish is immediately recaptured,
+            // redelivered, re-classified as poison, and republished —
+            // producing an unbounded feedback loop that wedges the
+            // consumer on one poisoned payload. Reject at validate() time
+            // rather than discover this in production.
+            let stream_prefix = format!("{}.", self.subject_prefix);
+            if dlq.starts_with(&stream_prefix) {
+                return Err(NatsConfigError::InvalidSubject {
+                    field: "dead_letter_subject".to_string(),
+                    reason: format!(
+                        "`{dlq}` is inside the live-stream subject space `{stream_prefix}>` — \
+                         DLQ traffic would be recaptured and redelivered, producing an infinite \
+                         loop. Choose a subject outside the `{stream_prefix}` namespace."
+                    ),
+                });
+            }
         }
         validate_subject_filters(&self.subject_filters, &self.subject_prefix)?;
         self.tls.validate().map_err(NatsConfigError::Tls)?;
@@ -341,6 +394,7 @@ impl Default for NatsConfig {
             max_deliver: 0,
             checkpoint_path: None,
             request_subject: None,
+            dead_letter_subject: None,
             subject_filters: Vec::new(),
         }
     }
@@ -860,6 +914,156 @@ mod tests {
             matches!(err, NatsConfigError::InvalidSubject { ref field, .. } if field == "subject_prefix"),
             "expected prefix error first, got: {err}"
         );
+    }
+
+    // --- dead_letter_subject ---
+
+    #[test]
+    fn default_dead_letter_subject_is_none() {
+        // DLQ is strictly opt-in: existing deployments that never set
+        // `dead_letter_subject` keep the current silent-drop behaviour.
+        // Any non-None default would silently start republishing poison
+        // messages to an unexpected subject on upgrade.
+        let config = NatsConfig::default();
+        assert!(config.dead_letter_subject.is_none());
+    }
+
+    #[test]
+    fn dead_letter_subject_multi_level_accepted() {
+        let config = NatsConfig {
+            dead_letter_subject: Some("rustgate.dlq".to_string()),
+            ..Default::default()
+        };
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn dead_letter_subject_single_token_accepted() {
+        let config = NatsConfig {
+            dead_letter_subject: Some("deadletter".to_string()),
+            ..Default::default()
+        };
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn wildcard_in_dead_letter_subject_rejected() {
+        // The subscriber publishes to one concrete subject; `>` and `*`
+        // have no meaning on the publish path and almost certainly
+        // indicate operator confusion between DLQ and subject_filters.
+        let config = NatsConfig {
+            dead_letter_subject: Some("rustgate.dlq.>".to_string()),
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, NatsConfigError::InvalidSubject { ref field, .. } if field == "dead_letter_subject"),
+            "expected InvalidSubject on dead_letter_subject, got: {err}"
+        );
+    }
+
+    #[test]
+    fn asterisk_in_dead_letter_subject_rejected() {
+        let config = NatsConfig {
+            dead_letter_subject: Some("rustgate.*.dlq".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn empty_dead_letter_subject_rejected() {
+        // `Some("")` is a classic env-var-rendered-as-empty-string
+        // misconfiguration. Operators who want to disable DLQ must
+        // pass `None`.
+        let config = NatsConfig {
+            dead_letter_subject: Some(String::new()),
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, NatsConfigError::InvalidSubject { ref field, .. } if field == "dead_letter_subject"),
+        );
+    }
+
+    #[test]
+    fn control_char_in_dead_letter_subject_rejected() {
+        let config = NatsConfig {
+            dead_letter_subject: Some("rustgate\x01dlq".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn non_ascii_in_dead_letter_subject_rejected() {
+        let config = NatsConfig {
+            dead_letter_subject: Some("caf\u{00e9}.dlq".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn dead_letter_subject_inside_live_stream_prefix_rejected() {
+        // The whole point of the loop-prevention rule: if the DLQ is
+        // captured by the live stream wildcard, DLQ traffic becomes new
+        // poison traffic, forever.
+        let config = NatsConfig {
+            subject_prefix: "points".to_string(),
+            dead_letter_subject: Some("points.dlq".to_string()),
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        let message = err.to_string();
+        assert!(
+            matches!(err, NatsConfigError::InvalidSubject { ref field, .. } if field == "dead_letter_subject"),
+            "expected InvalidSubject on dead_letter_subject, got: {err}"
+        );
+        // Error message should explicitly mention the loop hazard so a
+        // confused operator can understand why the config was rejected
+        // without consulting the docs.
+        assert!(
+            message.contains("loop"),
+            "error message should explain the loop hazard, got: {message}"
+        );
+    }
+
+    #[test]
+    fn dead_letter_subject_equal_to_prefix_accepted() {
+        // Edge case: the rule rejects `{prefix}.xxx`, not `{prefix}`
+        // itself — the live stream doesn't capture the bare prefix
+        // (it captures `{prefix}.>`), so `{prefix}` alone is safe.
+        // This is a deliberate choice: the pattern-match is prefix +
+        // trailing dot, and the bare prefix is not inside that namespace.
+        let config = NatsConfig {
+            subject_prefix: "points".to_string(),
+            dead_letter_subject: Some("points".to_string()),
+            ..Default::default()
+        };
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn dead_letter_subject_unrelated_prefix_accepted() {
+        // The canonical deployment pattern: DLQ in a sibling namespace
+        // captured by a separate JetStream stream (e.g. `rustgate.dlq`
+        // while the live stream is `points.>`).
+        let config = NatsConfig {
+            subject_prefix: "points".to_string(),
+            dead_letter_subject: Some("rustgate.dlq".to_string()),
+            ..Default::default()
+        };
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn dead_letter_subject_round_trips() {
+        let config = NatsConfig {
+            dead_letter_subject: Some("rustgate.dlq".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(config.dead_letter_subject.as_deref(), Some("rustgate.dlq"));
     }
 
     #[test]

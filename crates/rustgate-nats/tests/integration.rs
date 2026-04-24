@@ -1121,3 +1121,149 @@ async fn request_responder_not_configured_returns_none() {
         "adapter with no request_subject should return None",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Dead-letter subject (poison message preservation).
+//
+// The subscriber silently ACKs four classes of local-drop traffic so the
+// pull consumer can advance past stuck sequences: oversized payloads,
+// unparseable JSON, unknown-position CoT, and identity-validation
+// failures. When `dead_letter_subject` is set, the original bytes are
+// republished there (with diagnostic headers) before the ACK so operators
+// can inspect what the upstream producer sent. These tests exercise the
+// happy path (unparseable JSON → DLQ) and the opt-in semantics (DLQ not
+// configured → silent drop, no DLQ traffic anywhere).
+// ---------------------------------------------------------------------------
+
+/// Unparseable JSON published to the live subject surfaces on the DLQ with
+/// the expected diagnostic headers, and the original payload is preserved
+/// unchanged. This is the end-to-end proof that the poison-preservation
+/// path in `NatsSubscriber::publish_dead_letter` actually reaches the wire.
+#[tokio::test]
+async fn dead_letter_publishes_unparseable_payload() {
+    let server = require_nats!();
+
+    let mut sub_config = test_config(server.url(), "dlq-sub-unparseable");
+    // Canonical deployment pattern: DLQ in a sibling subject namespace,
+    // disjoint from the live stream's `points.>` wildcard, so DLQ traffic
+    // is not recaptured and redelivered.
+    sub_config.dead_letter_subject = Some("rustgate.dlq".to_string());
+    let sub_adapter = NatsAdapter::connect(sub_config).await.expect("connect sub");
+
+    let raw_client = async_nats::connect(server.url())
+        .await
+        .expect("raw connect");
+    let mut dlq_sub = raw_client
+        .subscribe("rustgate.dlq")
+        .await
+        .expect("subscribe DLQ");
+
+    let pub_client = async_nats::connect(server.url())
+        .await
+        .expect("pub connect");
+
+    let router = Arc::new(Router::new());
+    let subscriber = sub_adapter.subscriber();
+    let sub_router = Arc::clone(&router);
+    let sub_task = tokio::spawn(async move {
+        let _ = subscriber.run(sub_router).await;
+    });
+
+    // Let the subscriber materialize the live stream and bind a consumer
+    // before we inject the poison. Without this, the publish races the
+    // stream creation and the message is silently dropped by NATS.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Bogus bytes that cannot be decoded as `WireEvent` — this fires the
+    // `unparseable` branch in the subscriber receive loop.
+    let poison = bytes::Bytes::from_static(b"not-json-at-all-just-garbage");
+    pub_client
+        .publish("points.ALPHA", poison.clone())
+        .await
+        .expect("publish poison");
+
+    let dlq_msg = timeout(Duration::from_secs(5), dlq_sub.next())
+        .await
+        .expect("DLQ timeout")
+        .expect("DLQ subscription ended");
+
+    // Original payload preserved byte-for-byte — the whole point of DLQ
+    // is that forensic tooling sees what the producer actually sent.
+    assert_eq!(dlq_msg.payload.as_ref(), poison.as_ref());
+
+    let headers = dlq_msg.headers.as_ref().expect("DLQ message has headers");
+    assert_eq!(
+        headers.get("X-Rustgate-DLQ-Reason").map(|v| v.as_str()),
+        Some("unparseable"),
+        "reason slug identifies which drop path fired",
+    );
+    assert_eq!(
+        headers
+            .get("X-Rustgate-DLQ-Original-Subject")
+            .map(|v| v.as_str()),
+        Some("points.ALPHA"),
+        "original subject preserved for per-tenant triage",
+    );
+    assert!(
+        headers
+            .get("X-Rustgate-DLQ-Timestamp")
+            .and_then(|v| v.as_str().parse::<u128>().ok())
+            .is_some(),
+        "timestamp header is a parseable unix-millis integer",
+    );
+
+    sub_task.abort();
+}
+
+/// When `dead_letter_subject` is `None` (the default), poison messages are
+/// silently dropped as before — nothing arrives on any would-be DLQ
+/// subject. Guards against a regression where the DLQ helper fires
+/// unconditionally and surprises operators who never opted in.
+#[tokio::test]
+async fn no_dead_letter_when_subject_not_configured() {
+    let server = require_nats!();
+
+    // Default config has `dead_letter_subject = None`.
+    let sub_config = test_config(server.url(), "no-dlq-sub");
+    assert!(
+        sub_config.dead_letter_subject.is_none(),
+        "default config must not enable DLQ",
+    );
+    let sub_adapter = NatsAdapter::connect(sub_config).await.expect("connect sub");
+
+    let raw_client = async_nats::connect(server.url())
+        .await
+        .expect("raw connect");
+    // Subscribe to a plausible DLQ subject anyway — if the helper ever
+    // started publishing unconditionally, this subscription would catch it.
+    let mut dlq_sub = raw_client
+        .subscribe("rustgate.dlq")
+        .await
+        .expect("subscribe DLQ");
+
+    let pub_client = async_nats::connect(server.url())
+        .await
+        .expect("pub connect");
+
+    let router = Arc::new(Router::new());
+    let subscriber = sub_adapter.subscriber();
+    let sub_router = Arc::clone(&router);
+    let sub_task = tokio::spawn(async move {
+        let _ = subscriber.run(sub_router).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    pub_client
+        .publish("points.ALPHA", bytes::Bytes::from_static(b"not-json"))
+        .await
+        .expect("publish poison");
+
+    let result = timeout(Duration::from_secs(2), dlq_sub.next()).await;
+    assert!(
+        result.is_err(),
+        "no DLQ traffic expected when dead_letter_subject is unset",
+    );
+
+    sub_task.abort();
+}
