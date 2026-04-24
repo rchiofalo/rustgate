@@ -14,9 +14,13 @@ use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use rustgate_core::codec::Codec;
 use rustgate_core::constants::{READ_TIMEOUT, WRITE_TIMEOUT};
+// Egress callback aliases live in `rustgate_core::egress` so that any
+// session crate (WebSocket, MQTT, future adapters) can reuse the same
+// shapes without depending on a sibling transport crate. Re-exporting
+// here keeps the public WS API stable for existing callers.
+pub use rustgate_core::egress::{OnFederationForward, OnHttpForward, OnNatsPublish};
 use rustgate_core::identity::Identity;
 use rustgate_core::masking::hash_cn;
-use rustgate_core::message::RoutableMessage;
 use rustgate_cot::MessageBuilder;
 use rustgate_transport::{ClientThrottle, ReplayFilter, Router, SessionHandle, ThrottleConfig};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
@@ -26,29 +30,6 @@ use tracing::{debug, info, warn};
 
 use crate::health::{HealthCheckConfig, LastPong, new_last_pong};
 use crate::{TRANSPORT_LABEL, WsListener, WsSession, WsStream};
-
-/// Callback for NATS publishing after local routing.
-///
-/// The closure spawns async work internally (fire-and-forget).
-///
-/// Uses `Fn` (not `AsyncFn`) because `dyn AsyncFn` is not object-safe
-/// as of Rust 1.93. Async work is dispatched via `spawn_background()`.
-pub type OnNatsPublish = Arc<dyn Fn(RoutableMessage) + Send + Sync>;
-
-/// Callback for federation forwarding.
-///
-/// Receives `(payload_bytes, source_groups)`.
-///
-/// Uses `Fn` (not `AsyncFn`) because `dyn AsyncFn` is not object-safe
-/// as of Rust 1.93. Async work is dispatched via `spawn_background()`.
-pub type OnFederationForward =
-    Arc<dyn Fn(Bytes, Vec<String>, rustgate_core::message::Metadata) + Send + Sync>;
-
-/// Callback for HTTP egress forwarding (fire-and-forget).
-///
-/// Uses `Fn` (not `AsyncFn`) because `dyn AsyncFn` is not object-safe
-/// as of Rust 1.94. Async work is dispatched via the publisher's internal channel.
-pub type OnHttpForward = Arc<dyn Fn(RoutableMessage) + Send + Sync>;
 
 /// Fired once per successful WebSocket session registration (post-mTLS,
 /// post-upgrade, post-tenant-quota). Used by `rustgate-server` to increment
@@ -655,6 +636,7 @@ mod tests {
     use std::time::Duration;
 
     use rustgate_core::codec::Codec;
+    use rustgate_core::message::RoutableMessage;
     use rustgate_test_utils::certs::TestCa;
     use rustgate_transport::{Router, TlsConfig};
     use tokio::sync::{Notify, Semaphore};

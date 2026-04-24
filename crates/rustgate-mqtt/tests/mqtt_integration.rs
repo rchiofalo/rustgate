@@ -12,7 +12,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::BytesMut;
-use rustgate_mqtt::{MqttListener, MqttServer, MqttServerConfig, WildcardPolicy};
+use rustgate_mqtt::{
+    MqttForwardingHooks, MqttListener, MqttServer, MqttServerConfig, WildcardPolicy,
+};
 use rustgate_test_utils::certs::TestCa;
 use rustgate_test_utils::tls::build_client_tls_config;
 use rustgate_transport::{Router, TlsConfig};
@@ -64,6 +66,49 @@ impl TestServer {
             on_accept: None,
             on_reject: None,
             session_hooks: None,
+            forwarding_hooks: None,
+        };
+
+        drop(tokio::spawn(MqttServer::run(config)));
+
+        Self {
+            addr,
+            shutdown,
+            router,
+        }
+    }
+
+    /// Build a test server with a populated `MqttForwardingHooks` bundle
+    /// — the only knob that matters for the #903 egress fan-out tests.
+    fn new_with_forwarding(
+        ca: &TestCa,
+        router: Arc<Router>,
+        forwarding_hooks: MqttForwardingHooks,
+    ) -> Self {
+        let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
+        let tls_config =
+            TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
+                .expect("tls config");
+
+        let listener =
+            MqttListener::bind("127.0.0.1:0".parse().unwrap(), &tls_config).expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let shutdown = Arc::new(Notify::new());
+
+        let config = MqttServerConfig {
+            listener,
+            router: Arc::clone(&router),
+            connection_limit: Arc::new(Semaphore::new(100)),
+            shutdown: Arc::clone(&shutdown),
+            topic_prefix: None,
+            max_packet_size: 1024 * 1024,
+            min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
+            response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
+            wildcard_policy: WildcardPolicy::default(),
+            on_accept: None,
+            on_reject: None,
+            session_hooks: None,
+            forwarding_hooks: Some(forwarding_hooks),
         };
 
         drop(tokio::spawn(MqttServer::run(config)));
@@ -432,6 +477,7 @@ async fn connection_limit_rejects_excess() {
         on_accept: None,
         on_reject: None,
         session_hooks: None,
+        forwarding_hooks: None,
     };
 
     drop(tokio::spawn(MqttServer::run(config)));
@@ -641,6 +687,7 @@ async fn max_packet_size_rejects_oversized_publish() {
         on_accept: None,
         on_reject: None,
         session_hooks: None,
+        forwarding_hooks: None,
     };
 
     drop(tokio::spawn(MqttServer::run(config)));
@@ -1096,6 +1143,165 @@ async fn unsubscribe_wildcard_stops_delivery() {
         write_v5_packet(&mut bob, &mqttbytes::v5::Packet::Publish(publish)).await;
     }
     assert_no_packet(&mut alice, &mut alice_buf, Duration::from_millis(300)).await;
+
+    server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Forwarding fan-out (#903) — post-route egress callbacks must fire once
+// per successful local route and must not fire when no hooks are installed.
+// These tests close the loop on the session.rs `fire_forwarding` helper: a
+// compile check confirms the three `MqttForwardingHooks` slots are wired
+// into the session, but only an end-to-end send proves the hot path
+// actually invokes each callback with the post-Send-PEP payload.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn publish_fires_all_three_forwarding_callbacks_once() {
+    let ca = TestCa::new("MQTT Test CA");
+    let bob_cert = ca.issue_client_cert("bob", &["alpha"]);
+    let router = Arc::new(Router::new());
+
+    // Event collectors for each sink. `Arc<Mutex<Vec<_>>>` is the
+    // workspace-standard pattern for test callbacks (see
+    // `.claude/rules/testing.md`). A local type alias tames the
+    // federation tuple so clippy's `type_complexity` lint is happy.
+    type FedEvent = (bytes::Bytes, Vec<String>, rustgate_core::message::Metadata);
+    let nats_events: Arc<std::sync::Mutex<Vec<rustgate_core::message::RoutableMessage>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let fed_events: Arc<std::sync::Mutex<Vec<FedEvent>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let http_events: Arc<std::sync::Mutex<Vec<rustgate_core::message::RoutableMessage>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let nats_clone = Arc::clone(&nats_events);
+    let fed_clone = Arc::clone(&fed_events);
+    let http_clone = Arc::clone(&http_events);
+
+    let forwarding_hooks = MqttForwardingHooks {
+        nats_publish: Some(Arc::new(move |msg| {
+            nats_clone.lock().unwrap().push(msg);
+        })),
+        federation_forward: Some(Arc::new(move |payload, groups, metadata| {
+            fed_clone.lock().unwrap().push((payload, groups, metadata));
+        })),
+        http_forward: Some(Arc::new(move |msg| {
+            http_clone.lock().unwrap().push(msg);
+        })),
+    };
+
+    let server = TestServer::new_with_forwarding(&ca, Arc::clone(&router), forwarding_hooks);
+
+    let bob_tls = build_client_tls_config(&bob_cert.cert_pem, &bob_cert.key_pem, &ca.cert_pem);
+    let mut bob = mqtt_connect(server.addr, &bob_tls).await;
+    let mut bob_buf = BytesMut::new();
+
+    let connect = mqttbytes::v5::Connect::new("bob");
+    write_v5_packet(&mut bob, &mqttbytes::v5::Packet::Connect(connect)).await;
+    let _ = read_v5_packet(&mut bob, &mut bob_buf).await; // CONNACK
+
+    // Single PUBLISH — route_for_egress should return Some and each
+    // sink should observe the message exactly once.
+    let publish =
+        mqttbytes::v5::Publish::new("alpha", mqttbytes::QoS::AtMostOnce, b"fan-out-test-payload");
+    write_v5_packet(&mut bob, &mqttbytes::v5::Packet::Publish(publish)).await;
+
+    // Give the async task a moment to dispatch the callbacks. The
+    // router + session hot path both complete synchronously-ish, but
+    // the tokio runtime needs a yield before we snapshot.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // All three sinks must have seen exactly one event.
+    let nats_events = nats_events.lock().unwrap();
+    let fed_events = fed_events.lock().unwrap();
+    let http_events = http_events.lock().unwrap();
+    assert_eq!(
+        nats_events.len(),
+        1,
+        "nats_publish must fire once per successful route, saw {} events",
+        nats_events.len(),
+    );
+    assert_eq!(
+        fed_events.len(),
+        1,
+        "federation_forward must fire once per successful route, saw {} events",
+        fed_events.len(),
+    );
+    assert_eq!(
+        http_events.len(),
+        1,
+        "http_forward must fire once per successful route, saw {} events",
+        http_events.len(),
+    );
+
+    // Payload must carry the bytes bob wrote — no re-encoding.
+    assert_eq!(nats_events[0].payload.as_ref(), b"fan-out-test-payload");
+    assert_eq!(http_events[0].payload.as_ref(), b"fan-out-test-payload");
+    assert_eq!(fed_events[0].0.as_ref(), b"fan-out-test-payload");
+
+    // Federation groups must reflect the publisher's cert-derived
+    // group membership (bob ∈ ["alpha"]) so the federation bridge can
+    // scope the fan-out correctly downstream.
+    assert!(
+        fed_events[0].1.iter().any(|g| g == "alpha"),
+        "federation_forward groups must include 'alpha' (bob's cert group), got {:?}",
+        fed_events[0].1,
+    );
+
+    drop(nats_events);
+    drop(fed_events);
+    drop(http_events);
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn publish_with_no_forwarding_hooks_does_not_panic() {
+    // Smoke test for the happy-path of the `None`-bundle case.
+    // Every other existing test in this file passes `None` and does
+    // not exercise PUBLISH, so this test exists specifically to pin
+    // that a PUBLISH with no forwarding hooks installed completes
+    // cleanly — no panic, no hang, no error on the session loop.
+    let ca = TestCa::new("MQTT Test CA");
+    let client_cert = ca.issue_client_cert("alice", &["alpha"]);
+    let router = Arc::new(Router::new());
+
+    let server = TestServer::new(&ca, Arc::clone(&router), None);
+    let client_tls =
+        build_client_tls_config(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem);
+    let mut stream = mqtt_connect(server.addr, &client_tls).await;
+    let mut buf = BytesMut::new();
+
+    write_v5_packet(
+        &mut stream,
+        &mqttbytes::v5::Packet::Connect(mqttbytes::v5::Connect::new("alice")),
+    )
+    .await;
+    let _ = read_v5_packet(&mut stream, &mut buf).await; // CONNACK
+
+    let publish = mqttbytes::v5::Publish::new(
+        "alpha",
+        mqttbytes::QoS::AtLeastOnce, // QoS 1 so we observe PUBACK as the "done" signal
+        b"no-hooks-smoke",
+    );
+    let mut publish = publish;
+    publish.pkid = 7;
+    write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Publish(publish)).await;
+
+    // PUBACK must still arrive — forwarding-hook absence cannot stall
+    // the ack path.
+    let packet = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_v5_packet(&mut stream, &mut buf),
+    )
+    .await
+    .expect("puback must arrive even when no forwarding hooks installed");
+    match packet {
+        mqttbytes::v5::Packet::PubAck(puback) => {
+            assert_eq!(puback.pkid, 7);
+            assert_eq!(puback.reason, mqttbytes::v5::PubAckReason::Success);
+        }
+        other => panic!("expected PubAck with no-hooks, got {other:?}"),
+    }
 
     server.shutdown();
 }

@@ -13,6 +13,7 @@ pub mod audit_chain;
 pub mod b64;
 pub mod codec;
 pub mod constants;
+pub mod egress;
 pub mod encrypted;
 pub mod error;
 pub mod identity;

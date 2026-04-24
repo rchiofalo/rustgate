@@ -1509,14 +1509,39 @@ pub(crate) fn warn_websocket_disabled(cli: &Cli) {
 // MQTT
 // ---------------------------------------------------------------------------
 
+/// Inputs for [`start_mqtt`], bundled to keep the fanout of egress
+/// callbacks (NATS publisher, federation forwarder, HTTP egress) out of
+/// a parameter list that is already at the `#[allow(too_many_
+/// arguments)]` boundary. Mirrors [`WebSocketSetup`] so both session
+/// transports thread the exact same wiring through a single entry
+/// point.
+#[cfg(feature = "mqtt")]
+pub(crate) struct MqttSetup<'a, P: NatsPublish> {
+    pub(crate) cli: &'a Cli,
+    pub(crate) tls_config: &'a TlsConfig,
+    pub(crate) router: &'a Arc<Router>,
+    pub(crate) connection_limit: &'a Arc<Semaphore>,
+    pub(crate) nats_publisher: &'a Option<P>,
+    pub(crate) fed_forward: &'a Option<FedForwardFn>,
+    #[cfg(feature = "http")]
+    pub(crate) http_forward: &'a Option<HttpForwardFn>,
+}
+
 /// Start the MQTT listener and return its subsystem handle.
 #[cfg(feature = "mqtt")]
-pub(crate) fn start_mqtt(
-    cli: &Cli,
-    tls_config: &TlsConfig,
-    router: &Arc<Router>,
-    connection_limit: &Arc<Semaphore>,
+pub(crate) fn start_mqtt<P: NatsPublish + Send + Sync + 'static>(
+    setup: MqttSetup<'_, P>,
 ) -> anyhow::Result<Option<SubsystemHandle>> {
+    let MqttSetup {
+        cli,
+        tls_config,
+        router,
+        connection_limit,
+        nats_publisher,
+        fed_forward,
+        #[cfg(feature = "http")]
+        http_forward,
+    } = setup;
     let mqtt_bind = match cli.mqtt_bind.as_ref() {
         Some(b) => b,
         None => return Ok(None),
@@ -1561,6 +1586,48 @@ pub(crate) fn start_mqtt(
     #[cfg(not(feature = "metrics"))]
     let session_hooks: Option<rustgate_mqtt::MqttSessionHooks> = None;
 
+    // Wire the egress fan-out callbacks for NATS / federation / HTTP.
+    // Each leg is independent and each feature flag gates just its own
+    // leg — all three may be present, any subset may be absent, and the
+    // session crate treats `None` as a no-op.
+    let nats_cb: Option<rustgate_core::egress::OnNatsPublish> = {
+        #[cfg(feature = "nats")]
+        {
+            nats_publisher
+                .clone()
+                .map(|p| -> rustgate_core::egress::OnNatsPublish {
+                    Arc::new(move |msg| {
+                        let p = p.clone();
+                        spawn_background("mqtt-nats-publish", async move {
+                            p.publish(&msg).await;
+                        });
+                    })
+                })
+        }
+        #[cfg(not(feature = "nats"))]
+        {
+            let _ = nats_publisher;
+            None
+        }
+    };
+
+    let forwarding_hooks = Some(rustgate_mqtt::MqttForwardingHooks {
+        nats_publish: nats_cb,
+        federation_forward: fed_forward.clone(),
+        http_forward: {
+            #[cfg(feature = "http")]
+            {
+                http_forward
+                    .clone()
+                    .map(|fwd| -> rustgate_core::egress::OnHttpForward { fwd })
+            }
+            #[cfg(not(feature = "http"))]
+            {
+                None
+            }
+        },
+    });
+
     let config = rustgate_mqtt::MqttServerConfig {
         listener: mqtt_listener,
         router: Arc::clone(router),
@@ -1574,6 +1641,7 @@ pub(crate) fn start_mqtt(
         on_accept,
         on_reject,
         session_hooks,
+        forwarding_hooks,
     };
     let task = tokio::spawn(async move {
         rustgate_mqtt::MqttServer::run(config).await;

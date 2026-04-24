@@ -145,6 +145,7 @@ pub(crate) async fn handle_mqtt_session(
     client_id_registry: Arc<ClientIdRegistry>,
     _permit: OwnedSemaphorePermit,
     session_hooks: Option<crate::config::MqttSessionHooks>,
+    forwarding_hooks: Option<crate::config::MqttForwardingHooks>,
 ) {
     let identity = pre.identity;
     let peer_addr = pre.peer_addr;
@@ -273,6 +274,7 @@ pub(crate) async fn handle_mqtt_session(
         wildcard_policy,
         keep_alive: keep_alive_duration,
         session_hooks: session_hooks.as_ref(),
+        forwarding_hooks: forwarding_hooks.as_ref(),
     };
 
     let read_result = tokio::select! {
@@ -474,6 +476,31 @@ fn fire_subscribe_reject(hooks: Option<&crate::config::MqttSessionHooks>) {
     }
 }
 
+/// Fan out the post-Send-PEP routed message to NATS / federation / HTTP
+/// egress sinks.
+///
+/// Mirrors the WebSocket write-loop's fan-out block verbatim so that an
+/// MQTT PUBLISH that survives the router's obligations (dedup, TTL,
+/// Send-PEP deny, oversize multicast) is visible to every external
+/// sink in exactly the same way a WebSocket inbound message would be.
+/// Each sink is independent — a `None` field is a no-op and never
+/// allocates.
+fn fire_forwarding(hooks: Option<&crate::config::MqttForwardingHooks>, routed: &RoutableMessage) {
+    let Some(h) = hooks else {
+        return;
+    };
+    if let Some(cb) = &h.nats_publish {
+        cb(routed.clone());
+    }
+    if let Some(fwd) = &h.federation_forward {
+        let groups: Vec<String> = routed.source.groups.iter().cloned().collect();
+        fwd(routed.payload.clone(), groups, routed.metadata.clone());
+    }
+    if let Some(fwd) = &h.http_forward {
+        fwd(routed.clone());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Read loop
 // ---------------------------------------------------------------------------
@@ -491,6 +518,7 @@ struct ReadLoopParams<'a> {
     wildcard_policy: WildcardPolicy,
     keep_alive: std::time::Duration,
     session_hooks: Option<&'a crate::config::MqttSessionHooks>,
+    forwarding_hooks: Option<&'a crate::config::MqttForwardingHooks>,
 }
 
 /// Read loop: process inbound MQTT packets from the client.
@@ -511,6 +539,7 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<(), MqttError
     let wildcard_policy = params.wildcard_policy;
     let keep_alive = params.keep_alive;
     let session_hooks = params.session_hooks;
+    let forwarding_hooks = params.forwarding_hooks;
     loop {
         let packet = match tokio::time::timeout(keep_alive, reader.read_packet()).await {
             Ok(Ok(pkt)) => pkt,
@@ -531,6 +560,7 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<(), MqttError
                         router,
                         topic_prefix,
                         session_hooks,
+                        forwarding_hooks,
                         publish,
                     )
                     .await?;
@@ -580,6 +610,7 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<(), MqttError
                         router,
                         topic_prefix,
                         session_hooks,
+                        forwarding_hooks,
                         publish,
                     )
                     .await?;
@@ -628,10 +659,14 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<(), MqttError
 // PUBLISH handlers
 // ---------------------------------------------------------------------------
 
-// justification: adds one metrics-hooks arg to the pre-existing v5 publish
-// handler's five args. Bundling into a struct would duplicate the v4 mirror
-// handler's surface with no call-site win — both handlers are dispatched
-// exactly once per PUBLISH packet from the read loop.
+// justification: adds a second hooks-bundle arg (`forwarding_hooks`) to the
+// v5 publish handler, bringing the count to seven. Both hook bundles are
+// distinct concerns — `session_hooks` drives admission-outcome counters
+// while `forwarding_hooks` drives post-route egress fan-out — and both
+// are threaded all the way down from `MqttServerConfig`. Merging them
+// would force unrelated concerns into the same bundle and complicate the
+// `MqttSessionHooks` / `MqttForwardingHooks` public types that callers
+// construct independently.
 #[allow(clippy::too_many_arguments)]
 async fn handle_publish_v5(
     resp_tx: &mpsc::Sender<ResponsePacket>,
@@ -639,6 +674,7 @@ async fn handle_publish_v5(
     router: &Router,
     topic_prefix: Option<&str>,
     session_hooks: Option<&crate::config::MqttSessionHooks>,
+    forwarding_hooks: Option<&crate::config::MqttForwardingHooks>,
     publish: mqttbytes::v5::Publish,
 ) -> Result<(), MqttError> {
     if publish.qos == mqttbytes::QoS::ExactlyOnce {
@@ -678,10 +714,30 @@ async fn handle_publish_v5(
         },
     };
 
-    router.route(msg).await;
+    // Capture the post-Send-PEP form so NATS / federation / HTTP egress
+    // forwarders receive the mutated payload (obligations such as
+    // `MaskPoint` applied). `None` means the router dropped the message
+    // — dedup, TTL, Send-PEP deny, oversize multicast — and all egress
+    // MUST be skipped to keep external sinks consistent with local
+    // delivery.
+    let Some(routed) = router.route_for_egress(msg).await else {
+        fire_publish_accept(session_hooks);
+        return ack_publish_v5(resp_tx, &publish).await;
+    };
+
+    fire_forwarding(forwarding_hooks, &routed);
     fire_publish_accept(session_hooks);
 
-    // QoS 1: acknowledge receipt.
+    ack_publish_v5(resp_tx, &publish).await
+}
+
+/// Emit the QoS 1 PUBACK (if required) for a v5 PUBLISH. Factored out so
+/// both the routed and the router-dropped paths share the same ack code
+/// verbatim.
+async fn ack_publish_v5(
+    resp_tx: &mpsc::Sender<ResponsePacket>,
+    publish: &mqttbytes::v5::Publish,
+) -> Result<(), MqttError> {
     if publish.qos == mqttbytes::QoS::AtLeastOnce && publish.pkid != 0 {
         let puback = mqttbytes::v5::PubAck {
             pkid: publish.pkid,
@@ -694,13 +750,12 @@ async fn handle_publish_v5(
         )
         .await?;
     }
-
     Ok(())
 }
 
 // justification: mirrors `handle_publish_v5` for the MQTT 3.1.1 wire format.
-// The v5 sibling already carries the same six args and unifying them would
-// force an unrelated wrapper struct through every dispatch branch.
+// The v5 sibling already carries the same seven args and unifying them
+// would force an unrelated wrapper struct through every dispatch branch.
 #[allow(clippy::too_many_arguments)]
 async fn handle_publish_v4(
     resp_tx: &mpsc::Sender<ResponsePacket>,
@@ -708,6 +763,7 @@ async fn handle_publish_v4(
     router: &Router,
     topic_prefix: Option<&str>,
     session_hooks: Option<&crate::config::MqttSessionHooks>,
+    forwarding_hooks: Option<&crate::config::MqttForwardingHooks>,
     publish: mqttbytes::v4::Publish,
 ) -> Result<(), MqttError> {
     if publish.qos == mqttbytes::QoS::ExactlyOnce {
@@ -747,10 +803,26 @@ async fn handle_publish_v4(
         },
     };
 
-    router.route(msg).await;
+    // See `handle_publish_v5` for the identical rationale — the egress
+    // fan-out only fires when the router accepts the message.
+    let Some(routed) = router.route_for_egress(msg).await else {
+        fire_publish_accept(session_hooks);
+        return ack_publish_v4(resp_tx, &publish).await;
+    };
+
+    fire_forwarding(forwarding_hooks, &routed);
     fire_publish_accept(session_hooks);
 
-    // QoS 1: acknowledge receipt.
+    ack_publish_v4(resp_tx, &publish).await
+}
+
+/// Emit the QoS 1 PUBACK (if required) for a v4 PUBLISH. Factored out so
+/// both the routed and the router-dropped paths share the same ack code
+/// verbatim.
+async fn ack_publish_v4(
+    resp_tx: &mpsc::Sender<ResponsePacket>,
+    publish: &mqttbytes::v4::Publish,
+) -> Result<(), MqttError> {
     if publish.qos == mqttbytes::QoS::AtLeastOnce && publish.pkid != 0 {
         let puback = mqttbytes::v4::PubAck::new(publish.pkid);
         send_response(
@@ -759,7 +831,6 @@ async fn handle_publish_v4(
         )
         .await?;
     }
-
     Ok(())
 }
 
