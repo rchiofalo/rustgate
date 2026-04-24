@@ -2,9 +2,9 @@
 
 //! JWT token authentication for federation connections.
 //!
-//! Supports HMAC-SHA256 (HS256) and ECDSA P-256 SHA-256 (ES256, RFC 7518)
-//! signed tokens. Tokens carry peer identity, group claims, and
-//! expiration.
+//! Supports HMAC-SHA256 (HS256), ECDSA P-256 SHA-256 (ES256, RFC 7518),
+//! and Ed25519 (EdDSA, RFC 8037) signed tokens. Tokens carry peer
+//! identity, group claims, and expiration.
 //!
 //! This is an opt-in layer — mTLS remains the default transport
 //! security. JWT adds per-connection authorization claims that can
@@ -23,6 +23,13 @@
 //!   header that routes verification to the right public key, so
 //!   operators can stage key rotation by pre-distributing the next
 //!   `kid`'s public key before flipping the issuer.
+//! - [`JwtAuthority::new_ed25519`] creates an EdDSA (Ed25519) authority.
+//!   Same asymmetric security model as ES256 — private signing key,
+//!   per-peer public verifier keys registered via
+//!   [`JwtAuthority::with_ed25519_verifier`] — but with smaller on-wire
+//!   keys (32-byte raw public keys vs 65-byte SEC1), constant-time
+//!   arithmetic by construction, and no signature malleability. Prefer
+//!   this over ES256 for new deployments.
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -108,7 +115,7 @@ pub struct FederationClaims {
     pub groups: Vec<String>,
 }
 
-/// JWT signing/verification algorithm per RFC 7518.
+/// JWT signing/verification algorithm per RFC 7518 / RFC 8037.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Algorithm {
     /// HMAC-SHA256 — symmetric, a single secret signs and verifies.
@@ -116,6 +123,10 @@ pub enum Algorithm {
     /// ECDSA P-256 with SHA-256 — asymmetric, fixed 64-byte signature
     /// `(r || s)` per RFC 7518 §3.4.
     Es256,
+    /// Ed25519 (EdDSA) — asymmetric, fixed 64-byte signature per
+    /// RFC 8037 §3.1. Serialised in the JWT header as `"EdDSA"` (not
+    /// `"Ed25519"`), matching RFC 8037's `"alg"` value table.
+    EdDsa,
 }
 
 impl Algorithm {
@@ -123,6 +134,7 @@ impl Algorithm {
         match self {
             Algorithm::Hs256 => "HS256",
             Algorithm::Es256 => "ES256",
+            Algorithm::EdDsa => "EdDSA",
         }
     }
 
@@ -130,6 +142,7 @@ impl Algorithm {
         match s {
             "HS256" => Some(Algorithm::Hs256),
             "ES256" => Some(Algorithm::Es256),
+            "EdDSA" => Some(Algorithm::EdDsa),
             _ => None,
         }
     }
@@ -143,10 +156,11 @@ impl std::fmt::Display for Algorithm {
 
 /// Active signing key used to issue tokens.
 ///
-/// The `Es256` variant boxes the [`ring_sig::EcdsaKeyPair`] because it
-/// is ~264 bytes (vs ~48 bytes for the HS256 variant), and we don't
-/// want every `SigningKey` value to pay that cost when the authority
-/// is HS256. The clippy `large_enum_variant` lint flags the disparity.
+/// The `Es256` and `EdDsa` variants box their ring key pairs because
+/// they're larger than the HS256 variant (~264 B for `EcdsaKeyPair`,
+/// ~128 B for `Ed25519KeyPair` vs ~48 B for HS256), and we don't want
+/// every `SigningKey` value to pay that cost when the authority is
+/// HS256. The clippy `large_enum_variant` lint flags the disparity.
 enum SigningKey {
     Hs256 {
         secret: Zeroizing<Vec<u8>>,
@@ -156,6 +170,10 @@ enum SigningKey {
         key_pair: Box<ring_sig::EcdsaKeyPair>,
         kid: String,
     },
+    EdDsa {
+        key_pair: Box<ring_sig::Ed25519KeyPair>,
+        kid: String,
+    },
 }
 
 impl SigningKey {
@@ -163,6 +181,7 @@ impl SigningKey {
         match self {
             SigningKey::Hs256 { .. } => Algorithm::Hs256,
             SigningKey::Es256 { .. } => Algorithm::Es256,
+            SigningKey::EdDsa { .. } => Algorithm::EdDsa,
         }
     }
 
@@ -170,6 +189,7 @@ impl SigningKey {
         match self {
             SigningKey::Hs256 { kid, .. } => kid.as_deref(),
             SigningKey::Es256 { kid, .. } => Some(kid.as_str()),
+            SigningKey::EdDsa { kid, .. } => Some(kid.as_str()),
         }
     }
 
@@ -190,6 +210,13 @@ impl SigningKey {
                     .map_err(|_| JwtError::InvalidSignature)?;
                 Ok(sig.as_ref().to_vec())
             }
+            SigningKey::EdDsa { key_pair, .. } => {
+                // Ed25519 is deterministic (RFC 8032 §5.1.6) so no RNG
+                // is required; ring's `sign` never fails for this algo
+                // because the key material was validated at construction.
+                let sig = key_pair.sign(signing_input);
+                Ok(sig.as_ref().to_vec())
+            }
         }
     }
 }
@@ -204,6 +231,10 @@ enum VerificationKey {
     /// ECDSA P-256 public key in SEC1 uncompressed form
     /// (`0x04 || x(32) || y(32)` = 65 bytes).
     Es256(Vec<u8>),
+    /// Ed25519 public key in raw form per RFC 8032 §5.1.5 — exactly
+    /// 32 bytes, no framing, no SPKI wrapping. Callers that have an
+    /// SPKI-wrapped key must strip the wrapper before registering.
+    EdDsa(Vec<u8>),
 }
 
 impl VerificationKey {
@@ -211,6 +242,7 @@ impl VerificationKey {
         match self {
             VerificationKey::Hs256(_) => Algorithm::Hs256,
             VerificationKey::Es256(_) => Algorithm::Es256,
+            VerificationKey::EdDsa(_) => Algorithm::EdDsa,
         }
     }
 
@@ -226,6 +258,11 @@ impl VerificationKey {
             }
             VerificationKey::Es256(pub_key) => {
                 ring_sig::UnparsedPublicKey::new(&ring_sig::ECDSA_P256_SHA256_FIXED, pub_key)
+                    .verify(signing_input, sig)
+                    .map_err(|_| JwtError::InvalidSignature)
+            }
+            VerificationKey::EdDsa(pub_key) => {
+                ring_sig::UnparsedPublicKey::new(&ring_sig::ED25519, pub_key)
                     .verify(signing_input, sig)
                     .map_err(|_| JwtError::InvalidSignature)
             }
@@ -360,6 +397,51 @@ impl JwtAuthority {
         })
     }
 
+    /// Create a new EdDSA (Ed25519) JWT authority.
+    ///
+    /// `pkcs8_der` must be a PKCS#8 v2 DER-encoded Ed25519 private key
+    /// (RFC 5958 / RFC 8410). `kid` uniquely identifies this signing
+    /// key; every issued token carries it in the header so remote
+    /// verifiers can route to the correct public key.
+    ///
+    /// The local public key is registered as a verifier under the same
+    /// `kid`, so this authority can validate tokens it issued itself.
+    ///
+    /// Compared to [`Self::new_es256`], Ed25519 offers smaller public
+    /// keys (32 bytes raw vs 65 bytes SEC1), constant-time arithmetic
+    /// by construction, and no signature malleability — prefer it for
+    /// new federation deployments.
+    pub fn new_ed25519(
+        pkcs8_der: impl AsRef<[u8]>,
+        kid: impl Into<String>,
+        issuer: impl Into<String>,
+    ) -> Result<Self, JwtError> {
+        let kid = validate_kid(kid.into())?;
+        let key_pair = ring_sig::Ed25519KeyPair::from_pkcs8(pkcs8_der.as_ref())
+            .map_err(|_| JwtError::InvalidKey)?;
+        let local_public_key = key_pair.public_key().as_ref().to_vec();
+
+        let mut verifiers = HashMap::new();
+        let _ = verifiers.insert(kid.clone(), VerificationKey::EdDsa(local_public_key));
+
+        let capacity = NonZeroUsize::new(DEFAULT_REVOCATION_CAPACITY).unwrap_or(NonZeroUsize::MIN);
+        Ok(Self {
+            signing: SigningKey::EdDsa {
+                key_pair: Box::new(key_pair),
+                kid,
+            },
+            verifiers,
+            legacy_verifier: None,
+            issuer: issuer.into(),
+            default_expiry: Duration::from_secs(3600),
+            revoked: Mutex::new(RevocationState {
+                entries: LruCache::new(capacity),
+                sweep_counter: 0,
+            }),
+            revocation_capacity: capacity,
+        })
+    }
+
     /// The algorithm this authority uses to sign issued tokens.
     pub fn signing_algorithm(&self) -> Algorithm {
         self.signing.algorithm()
@@ -416,6 +498,31 @@ impl JwtAuthority {
         let _ = self
             .verifiers
             .insert(kid, VerificationKey::Es256(public_key));
+        Ok(self)
+    }
+
+    /// Register an EdDSA (Ed25519) verifier key for a peer identified
+    /// by `kid`.
+    ///
+    /// `public_key_raw` must be exactly 32 bytes — the raw Ed25519
+    /// public key encoding per RFC 8032 §5.1.5. No PEM, no SPKI, no
+    /// JWK — unwrap at the call site. Extract directly from a
+    /// [`ring::signature::Ed25519KeyPair::public_key`] or from the
+    /// base64url `x` field of a `kty=OKP, crv=Ed25519` JWK.
+    pub fn with_ed25519_verifier(
+        mut self,
+        kid: impl Into<String>,
+        public_key_raw: impl Into<Vec<u8>>,
+    ) -> Result<Self, JwtError> {
+        let kid = validate_kid(kid.into())?;
+        let public_key = public_key_raw.into();
+        // Raw Ed25519 public keys are exactly 32 bytes per RFC 8032 §5.1.5.
+        if public_key.len() != 32 {
+            return Err(JwtError::InvalidKey);
+        }
+        let _ = self
+            .verifiers
+            .insert(kid, VerificationKey::EdDsa(public_key));
         Ok(self)
     }
 
@@ -1490,6 +1597,318 @@ mod tests {
             .expect_err("non-ascii kid");
         assert_eq!(err, JwtError::InvalidKid);
     }
+
+    // ── EdDSA (Ed25519) tests (#952 part 1) ─────────────────────────
+
+    /// Generate a fresh Ed25519 key pair. Returns (pkcs8 DER, raw 32-byte public key).
+    fn ed25519_test_keypair() -> (Vec<u8>, Vec<u8>) {
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring_sig::Ed25519KeyPair::generate_pkcs8(&rng).expect("keygen");
+        let key_pair = ring_sig::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("parse pkcs8");
+        let public_key = key_pair.public_key().as_ref().to_vec();
+        (pkcs8.as_ref().to_vec(), public_key)
+    }
+
+    #[test]
+    fn ed25519_issue_and_validate_round_trip() {
+        let (pkcs8, _pub) = ed25519_test_keypair();
+        let auth =
+            JwtAuthority::new_ed25519(pkcs8, "peer-alpha", "rustgate-test").expect("ed25519");
+
+        assert_eq!(auth.signing_algorithm(), Algorithm::EdDsa);
+        assert_eq!(auth.signing_kid(), Some("peer-alpha"));
+
+        let token = auth
+            .issue("peer-alpha", vec!["Alpha".into()])
+            .expect("issue");
+        let claims = auth.validate(&token).expect("validate");
+        assert_eq!(claims.sub, "peer-alpha");
+        assert_eq!(claims.groups, vec!["Alpha"]);
+    }
+
+    #[test]
+    fn ed25519_cross_authority_validate_via_registered_verifier() {
+        // Authority A issues with a private key it holds.
+        let (pkcs8_a, pub_a) = ed25519_test_keypair();
+        let authority_a =
+            JwtAuthority::new_ed25519(pkcs8_a, "peer-a", "rustgate-test").expect("ed25519 a");
+
+        // Authority B holds a DIFFERENT signing key but carries A's
+        // public key as a verifier — same asymmetric rationale as the
+        // ES256 path. B never sees A's signing key yet can still
+        // verify tokens A issued.
+        let (pkcs8_b, _pub_b) = ed25519_test_keypair();
+        let authority_b = JwtAuthority::new_ed25519(pkcs8_b, "peer-b", "rustgate-test")
+            .expect("ed25519 b")
+            .with_ed25519_verifier("peer-a", pub_a)
+            .expect("register a's public key");
+
+        let token = authority_a.issue("peer-a", vec![]).expect("issue");
+        let claims = authority_b.validate(&token).expect("validate");
+        assert_eq!(claims.sub, "peer-a");
+    }
+
+    #[test]
+    fn ed25519_emits_alg_and_kid_in_header() {
+        let (pkcs8, _) = ed25519_test_keypair();
+        let auth =
+            JwtAuthority::new_ed25519(pkcs8, "peer-kid-ed25519", "rustgate-test").expect("ed25519");
+        let token = auth.issue("peer-kid-ed25519", vec![]).expect("issue");
+
+        let header_b64 = token.split('.').next().expect("has header");
+        let header_bytes = b64::decode_url_safe(header_b64).expect("decode header");
+        let header: serde_json::Value = serde_json::from_slice(&header_bytes).expect("json");
+        // Per RFC 8037 the alg value is exactly "EdDSA" (not "Ed25519").
+        assert_eq!(header.get("alg").and_then(|v| v.as_str()), Some("EdDSA"));
+        assert_eq!(
+            header.get("kid").and_then(|v| v.as_str()),
+            Some("peer-kid-ed25519")
+        );
+        assert_eq!(header.get("typ").and_then(|v| v.as_str()), Some("JWT"));
+    }
+
+    #[test]
+    fn ed25519_unknown_kid_rejected() {
+        let (pkcs8_a, _) = ed25519_test_keypair();
+        let authority_a =
+            JwtAuthority::new_ed25519(pkcs8_a, "peer-a", "rustgate-test").expect("ed25519 a");
+
+        // Authority B has no record of peer-a's public key.
+        let (pkcs8_b, _) = ed25519_test_keypair();
+        let authority_b =
+            JwtAuthority::new_ed25519(pkcs8_b, "peer-b", "rustgate-test").expect("ed25519 b");
+
+        let token = authority_a.issue("peer-a", vec![]).expect("issue");
+        let err = authority_b
+            .validate(&token)
+            .expect_err("should reject unknown kid");
+        assert!(matches!(err, JwtError::UnknownKid(ref k) if k == "peer-a"));
+    }
+
+    #[test]
+    fn ed25519_authority_rejects_token_without_kid() {
+        // An EdDSA authority has `legacy_verifier: None`, so a token
+        // whose header has no `kid` cannot fall back — it's rejected.
+        let (pkcs8, _) = ed25519_test_keypair();
+        let auth = JwtAuthority::new_ed25519(pkcs8, "peer-a", "rustgate-test").expect("ed25519");
+
+        // Craft a no-kid token by signing with a separate HS256 authority.
+        let hs_auth = make_authority();
+        let token = hs_auth.issue("peer-1", vec![]).expect("issue hs");
+
+        let err = auth.validate(&token).expect_err("must reject");
+        assert!(matches!(err, JwtError::UnknownKid(ref k) if k.is_empty()));
+    }
+
+    #[test]
+    fn ed25519_algorithm_mismatch_header_vs_key_rejected() {
+        // Security defence mirroring the ES256 alg-confusion guard:
+        // an attacker crafts a token header claiming `alg: HS256` but
+        // presents a `kid` that points to an Ed25519 verifier. The
+        // verifier must refuse before any signature check rather than
+        // feed the 32-byte Ed25519 public key into HMAC as if it were
+        // a shared secret.
+
+        let (pkcs8, pub_a) = ed25519_test_keypair();
+        let _authority_a =
+            JwtAuthority::new_ed25519(pkcs8, "peer-a", "rustgate-test").expect("ed25519 a");
+
+        let hs_secret = b"test-secret-key-for-jwt-testing!!".to_vec();
+        let authority_b = JwtAuthority::new(hs_secret.clone(), "rustgate-test")
+            .expect("hs256")
+            .with_ed25519_verifier("peer-a", pub_a)
+            .expect("register ed25519 verifier");
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_secs();
+        let claims = FederationClaims {
+            sub: "peer-a".to_string(),
+            iss: "rustgate-test".to_string(),
+            exp: now + 3600,
+            iat: now,
+            jti: "attack".to_string(),
+            groups: vec![],
+        };
+        // Sign with HS256 but stamp peer-a's kid so the verifier routes
+        // to the Ed25519 entry.
+        let forged_signing = SigningKey::Hs256 {
+            secret: Zeroizing::new(hs_secret),
+            kid: Some("peer-a".to_string()),
+        };
+        let forged_token = encode(&forged_signing, &claims).expect("encode");
+
+        let err = authority_b
+            .validate(&forged_token)
+            .expect_err("must reject");
+        assert!(
+            matches!(
+                err,
+                JwtError::AlgorithmMismatch {
+                    header: Algorithm::Hs256,
+                    key: Algorithm::EdDsa,
+                }
+            ),
+            "expected AlgorithmMismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn ed25519_tampered_signature_rejected() {
+        let (pkcs8, _) = ed25519_test_keypair();
+        let auth = JwtAuthority::new_ed25519(pkcs8, "peer-a", "rustgate-test").expect("ed25519");
+        let token = auth.issue("peer-a", vec![]).expect("issue");
+
+        let parts: Vec<&str> = token.split('.').collect();
+        // Ed25519 signatures are exactly 64 bytes (RFC 8032 §5.1.6);
+        // 64 zero bytes keeps the length valid but the signature cannot
+        // verify against any real public key.
+        let bad_sig = b64::encode_url_safe([0u8; 64]);
+        let tampered = format!("{}.{}.{}", parts[0], parts[1], bad_sig);
+        assert_eq!(auth.validate(&tampered), Err(JwtError::InvalidSignature));
+    }
+
+    #[test]
+    fn ed25519_tampered_payload_rejected() {
+        // Distinct from the ES256 tampered-sig test: flip a bit in the
+        // payload segment so the signature-over-input no longer matches.
+        let (pkcs8, _) = ed25519_test_keypair();
+        let auth = JwtAuthority::new_ed25519(pkcs8, "peer-a", "rustgate-test").expect("ed25519");
+        let token = auth.issue("peer-a", vec![]).expect("issue");
+
+        let parts: Vec<&str> = token.split('.').collect();
+        let tampered = format!("{}.dGFtcGVyZWQ.{}", parts[0], parts[2]);
+        assert_eq!(auth.validate(&tampered), Err(JwtError::InvalidSignature));
+    }
+
+    #[test]
+    fn new_ed25519_rejects_malformed_pkcs8() {
+        // 64 bytes of 0xFF is not a valid PKCS#8 v2 DER blob.
+        let garbage = vec![0xFFu8; 64];
+        let err =
+            JwtAuthority::new_ed25519(garbage, "peer-a", "rustgate-test").expect_err("must reject");
+        assert_eq!(err, JwtError::InvalidKey);
+    }
+
+    #[test]
+    fn new_ed25519_rejects_ecdsa_pkcs8() {
+        // An ECDSA P-256 PKCS#8 blob is well-formed DER but the wrong
+        // algorithm — ring must refuse it rather than silently accept.
+        let (ecdsa_pkcs8, _) = es256_test_keypair();
+        let err = JwtAuthority::new_ed25519(ecdsa_pkcs8, "peer-a", "rustgate-test")
+            .expect_err("must reject cross-algorithm PKCS#8");
+        assert_eq!(err, JwtError::InvalidKey);
+    }
+
+    #[test]
+    fn with_ed25519_verifier_rejects_wrong_length_public_key() {
+        let (pkcs8, _) = ed25519_test_keypair();
+        let auth = JwtAuthority::new_ed25519(pkcs8, "peer-a", "rustgate-test").expect("ed25519");
+
+        // Too short.
+        let short = vec![0u8; 31];
+        let err = auth
+            .with_ed25519_verifier("peer-b", short)
+            .expect_err("must reject 31-byte key");
+        assert_eq!(err, JwtError::InvalidKey);
+
+        // Too long (33 bytes — e.g. an SEC1 point prefix mistakenly
+        // included).
+        let (pkcs8, _) = ed25519_test_keypair();
+        let auth = JwtAuthority::new_ed25519(pkcs8, "peer-a", "rustgate-test").expect("ed25519");
+        let long = vec![0u8; 33];
+        let err = auth
+            .with_ed25519_verifier("peer-b", long)
+            .expect_err("must reject 33-byte key");
+        assert_eq!(err, JwtError::InvalidKey);
+    }
+
+    #[test]
+    fn ed25519_invalid_kid_rejected_on_builders() {
+        let (pkcs8, _) = ed25519_test_keypair();
+        // Empty kid.
+        let err =
+            JwtAuthority::new_ed25519(&pkcs8[..], "", "rustgate-test").expect_err("empty kid");
+        assert_eq!(err, JwtError::InvalidKid);
+
+        // Oversized kid.
+        let long_kid = "a".repeat(MAX_KID_LENGTH + 1);
+        let err = JwtAuthority::new_ed25519(&pkcs8[..], long_kid, "rustgate-test")
+            .expect_err("oversized kid");
+        assert_eq!(err, JwtError::InvalidKid);
+
+        // Control character.
+        let err = JwtAuthority::new_ed25519(&pkcs8[..], "peer\x07a", "rustgate-test")
+            .expect_err("control char kid");
+        assert_eq!(err, JwtError::InvalidKid);
+
+        // Non-ASCII.
+        let err = JwtAuthority::new_ed25519(&pkcs8[..], "peer-α", "rustgate-test")
+            .expect_err("non-ascii kid");
+        assert_eq!(err, JwtError::InvalidKid);
+    }
+
+    #[test]
+    fn ed25519_signature_is_deterministic() {
+        // RFC 8032 §5.1.6: Ed25519 signatures are deterministic — the
+        // same (key, message) pair must always produce the same
+        // signature. This is a deliberate property (no nonce-reuse
+        // footgun) and differs from ES256 where randomness is required.
+        let (pkcs8, _) = ed25519_test_keypair();
+        let auth = JwtAuthority::new_ed25519(pkcs8, "peer-det", "rustgate-test").expect("ed25519");
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_secs();
+        let claims = FederationClaims {
+            sub: "peer-det".to_string(),
+            iss: "rustgate-test".to_string(),
+            exp: now + 3600,
+            iat: now,
+            jti: "fixed-jti".to_string(),
+            groups: vec![],
+        };
+        let token1 = encode(&auth.signing, &claims).expect("encode 1");
+        let token2 = encode(&auth.signing, &claims).expect("encode 2");
+        assert_eq!(
+            token1, token2,
+            "Ed25519 must produce identical output for identical input"
+        );
+    }
+
+    #[test]
+    fn ed25519_verifier_cross_algorithm_rejects_ecdsa_pubkey() {
+        // Registering a 32-byte key that happens to be drawn from ECDSA
+        // material must still be rejected on length only if it's not
+        // 32 bytes — but a 32-byte blob is always accepted as raw
+        // Ed25519 bytes (there is no way to tell ed25519 from random
+        // bytes at this layer). The meaningful cross-algorithm check is
+        // that verification itself fails: a token signed with Ed25519
+        // cannot verify against a mismatched "Ed25519" verifier built
+        // from unrelated bytes.
+        let (pkcs8_a, _pub_a) = ed25519_test_keypair();
+        let authority_a =
+            JwtAuthority::new_ed25519(pkcs8_a, "peer-a", "rustgate-test").expect("ed25519 a");
+
+        // Authority B registers the wrong 32-byte public key under
+        // peer-a's kid.
+        let (pkcs8_b, _pub_b) = ed25519_test_keypair();
+        let wrong_key = vec![0xABu8; 32];
+        let authority_b = JwtAuthority::new_ed25519(pkcs8_b, "peer-b", "rustgate-test")
+            .expect("ed25519 b")
+            .with_ed25519_verifier("peer-a", wrong_key)
+            .expect("register wrong key");
+
+        let token = authority_a.issue("peer-a", vec![]).expect("issue");
+        let err = authority_b
+            .validate(&token)
+            .expect_err("wrong Ed25519 public key must fail verification");
+        assert_eq!(err, JwtError::InvalidSignature);
+    }
+
+    // ── Back to the HS256 verifier tests ────────────────────────────
 
     #[test]
     fn with_hs256_verifier_validates_remote_peer_token() {
