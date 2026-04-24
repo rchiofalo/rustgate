@@ -11,6 +11,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rustgate_resilience::backpressure::{BackpressureGate, BackpressurePermit};
 use rustgate_resilience::reconnect::{backoff_delay, should_stop_reconnecting};
 use tokio::sync::{mpsc, watch};
 use tonic::Request;
@@ -61,6 +62,20 @@ impl fmt::Debug for V2ClientConfig {
     }
 }
 
+/// Envelope queued for delivery to a remote V2 peer.
+///
+/// The optional [`BackpressurePermit`] keeps the global byte reservation
+/// alive while the event sits in the bounded mpsc channel and is flushed
+/// over the gRPC `ServerEventStream` — dropping the envelope at the
+/// dequeue site releases the reservation automatically.
+pub(crate) struct V2Queued {
+    pub event: figpb::FederatedEvent,
+    // justification: RAII field — held solely so its `Drop` releases the
+    // gate reservation when the stream loop dequeues the envelope.
+    #[allow(dead_code)]
+    pub permit: Option<Arc<BackpressurePermit>>,
+}
+
 /// V2 gRPC outbound federation client.
 ///
 /// Maintains a persistent gRPC connection to a remote federation peer,
@@ -72,9 +87,11 @@ pub struct V2Client {
     /// Shutdown signal sender.
     shutdown_tx: Option<watch::Sender<bool>>,
     /// Channel for sending outbound events to the remote peer.
-    outbound_tx: mpsc::Sender<figpb::FederatedEvent>,
+    outbound_tx: mpsc::Sender<V2Queued>,
     /// Peer state tracking.
     peer: Arc<PeerHandle>,
+    /// Optional global backpressure gate shared with ingress admission.
+    gate: Option<Arc<BackpressureGate>>,
 }
 
 impl V2Client {
@@ -86,7 +103,7 @@ impl V2Client {
     /// 3. Reconnects automatically on failure with exponential backoff
     pub fn start(peer: Arc<PeerHandle>, config: V2ClientConfig) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (outbound_tx, outbound_rx) = mpsc::channel::<figpb::FederatedEvent>(256);
+        let (outbound_tx, outbound_rx) = mpsc::channel::<V2Queued>(256);
 
         let peer_clone = Arc::clone(&peer);
         let task_handle = tokio::spawn(connection_loop(
@@ -101,7 +118,21 @@ impl V2Client {
             shutdown_tx: Some(shutdown_tx),
             outbound_tx,
             peer,
+            gate: None,
         }
+    }
+
+    /// Attach a shared [`BackpressureGate`] so federated outbound traffic
+    /// participates in global admission control.
+    ///
+    /// Every event entering [`V2Client::send`] reserves a byte permit on
+    /// the gate while it sits in the bounded outbound channel and is
+    /// forwarded over the gRPC send stream. A stalled peer whose channel
+    /// is saturating now also pressures the shared gate — the router will
+    /// see `is_admitting()` flip to false once the aggregate in-flight
+    /// byte count crosses the high-water mark.
+    pub fn with_backpressure(&mut self, gate: Arc<BackpressureGate>) {
+        self.gate = Some(gate);
     }
 
     /// Send a FederatedEvent to the remote peer.
@@ -109,7 +140,9 @@ impl V2Client {
         use prost::Message;
         let bytes_len = event.encoded_len();
         self.peer.record_enqueue(bytes_len);
-        if self.outbound_tx.send(event).await.is_err() {
+        let permit = self.gate.as_ref().map(|g| Arc::new(g.acquire(bytes_len)));
+        let queued = V2Queued { event, permit };
+        if self.outbound_tx.send(queued).await.is_err() {
             self.peer.record_dequeue();
             return Err(anyhow::anyhow!("outbound channel closed"));
         }
@@ -171,7 +204,7 @@ pub(crate) fn post_disconnect_cooldown(reconnect_delay: Duration) -> Duration {
 async fn connection_loop(
     peer: Arc<PeerHandle>,
     config: V2ClientConfig,
-    mut outbound_rx: mpsc::Receiver<figpb::FederatedEvent>,
+    mut outbound_rx: mpsc::Receiver<V2Queued>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let mut reconnect_count: u32 = 0;
@@ -353,7 +386,7 @@ async fn run_streams(
     peer: &Arc<PeerHandle>,
     mut client: FederatedChannelClient<Channel>,
     config: &V2ClientConfig,
-    outbound_rx: &mut mpsc::Receiver<figpb::FederatedEvent>,
+    outbound_rx: &mut mpsc::Receiver<V2Queued>,
     shutdown_rx: &mut watch::Receiver<bool>,
     replay_messages: Vec<BufferedMessage>,
 ) -> anyhow::Result<()> {
@@ -521,13 +554,18 @@ async fn run_streams(
             }
 
             // Forward outbound events to remote
-            Some(event) = outbound_rx.recv() => {
+            Some(queued) = outbound_rx.recv() => {
                 peer.record_dequeue();
+                // Move the event out so we can forward it; the permit
+                // survives inside `queued` and drops at end of this arm,
+                // releasing its byte reservation back to the global gate.
+                let V2Queued { event, permit: _permit } = queued;
                 if send_tx.send(event).await.is_err() {
                     warn!(peer = %peer.id, "send stream closed");
                     break;
                 }
                 peer.record_sent();
+                // `_permit` drops here — reservation released.
             }
 
             // Periodic health checks (also measures RTT for latency-aware routing)

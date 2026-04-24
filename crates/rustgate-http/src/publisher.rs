@@ -16,6 +16,7 @@ use reqwest::header::HeaderName;
 use rustgate_core::b64;
 use rustgate_core::message::RoutableMessage;
 use rustgate_core::sanitize::sanitize_for_log;
+use rustgate_resilience::backpressure::{BackpressureGate, BackpressurePermit};
 use rustgate_resilience::circuit::CircuitBreaker;
 use rustgate_resilience::retry;
 use rustgate_resilience::token_bucket::TokenBucket;
@@ -56,6 +57,22 @@ const ADMISSION_DLQ_TARGET: &str = "admission";
 /// enough to keep HTTP connection pools healthy.
 const MAX_ERROR_RESPONSE_BYTES: usize = 1024 * 1024;
 
+/// A message queued for dispatch, optionally carrying a byte-reservation
+/// permit on the shared [`BackpressureGate`].
+///
+/// The permit's `Drop` impl releases the reservation automatically when the
+/// worker finishes dispatching the message, so the gate's in-flight
+/// accounting stays accurate without explicit bookkeeping on the worker
+/// side. Wrapped in `Arc` because permits are not `Clone` and we may want
+/// to share one across retries in the future.
+struct QueuedMessage {
+    msg: Arc<RoutableMessage>,
+    // justification: field is pure RAII — held only so its `Drop`
+    // releases the gate's byte reservation when the worker finishes.
+    #[allow(dead_code)]
+    permit: Option<Arc<BackpressurePermit>>,
+}
+
 /// Publishes routable messages to configured HTTP targets.
 ///
 /// Designed to be called from the routing path like `NatsPublisher`.
@@ -63,13 +80,18 @@ const MAX_ERROR_RESPONSE_BYTES: usize = 1024 * 1024;
 /// bounded channel to a background worker task.
 #[derive(Clone)]
 pub struct HttpPublisher {
-    tx: mpsc::Sender<Arc<RoutableMessage>>,
+    tx: mpsc::Sender<QueuedMessage>,
     targets: Arc<Vec<TargetState>>,
     shutdown: Arc<tokio::sync::Notify>,
     /// Encrypted dead-letter queue for circuit-breaker-shed messages.
     dlq: Option<Arc<DeadLetterQueue>>,
     /// Worker task handle for panic detection during shutdown.
     worker_handle: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Optional global backpressure gate. When configured, each in-flight
+    /// message holds a byte-sized permit so a slow HTTP target pressures
+    /// the global admission counter rather than silently hoarding memory
+    /// inside this publisher's bounded channel.
+    gate: Option<Arc<BackpressureGate>>,
 }
 
 impl fmt::Debug for HttpPublisher {
@@ -195,16 +217,40 @@ impl HttpPublisher {
             shutdown,
             dlq,
             worker_handle: Arc::new(std::sync::Mutex::new(Some(handle))),
+            gate: None,
         })
+    }
+
+    /// Attach a shared [`BackpressureGate`] so HTTP egress participates in
+    /// global admission control.
+    ///
+    /// When configured, each message that survives echo-prevention acquires
+    /// a byte permit sized to its payload *before* entering the dispatch
+    /// channel. The permit drops when the worker finishes dispatching the
+    /// message, so the gate's in-flight byte counter reflects what this
+    /// publisher has actually buffered. A slow HTTP endpoint that causes
+    /// the channel to back up now also pressures the global gate — the
+    /// router will see `is_admitting()` flip to `false` and stop admitting
+    /// new ingress instead of silently hoarding memory here.
+    ///
+    /// If the gate is already blocking (over the high-water mark) when
+    /// `publish` is called, the message is rejected fast via the DLQ path
+    /// rather than waiting: HTTP egress is fire-and-forget and must not
+    /// block the router's dispatch task.
+    #[must_use]
+    pub fn with_backpressure(mut self, gate: Arc<BackpressureGate>) -> Self {
+        self.gate = Some(gate);
+        self
     }
 
     /// Fire-and-forget publish. Non-blocking — drops on channel full.
     ///
-    /// When the admission queue rejects a message (channel full or closed),
-    /// and a DLQ is configured, the message is persisted under the synthetic
-    /// `admission` DLQ target with the drop reason. This prevents silent loss
-    /// of messages that never reach per-target dispatch and keeps the
-    /// forensic trail symmetric with circuit-open drops.
+    /// When the admission queue rejects a message (channel full or closed,
+    /// or the global backpressure gate is not admitting), and a DLQ is
+    /// configured, the message is persisted under the synthetic
+    /// `admission` DLQ target with the drop reason. This prevents silent
+    /// loss of messages that never reach per-target dispatch and keeps
+    /// the forensic trail symmetric with circuit-open drops.
     pub fn publish(&self, msg: &RoutableMessage) {
         // Echo prevention at the publisher level (case-insensitive to
         // defend against inconsistent casing across transport adapters)
@@ -212,7 +258,37 @@ impl HttpPublisher {
             return;
         }
 
-        match self.tx.try_send(Arc::new(msg.clone())) {
+        // Global admission check: if the shared gate is parked over the
+        // high-water mark, shed immediately rather than queueing another
+        // permit on top of the existing backlog. DLQ path below keeps the
+        // forensic trail intact.
+        let permit = match self.gate.as_ref() {
+            Some(gate) => {
+                if !gate.is_admitting() {
+                    tracing::warn!(
+                        source_cn = %sanitize_for_log(&msg.source.cn),
+                        "HTTP backpressure gate over high-water, dropping message"
+                    );
+                    #[cfg(feature = "metrics")]
+                    crate::metrics::dropped()
+                        .with_label_values(&["backpressure"])
+                        .inc();
+                    if let Some(ref dlq) = self.dlq {
+                        dlq.dead_letter(ADMISSION_DLQ_TARGET, msg, "backpressure");
+                    }
+                    return;
+                }
+                Some(Arc::new(gate.acquire(msg.payload.len())))
+            }
+            None => None,
+        };
+
+        let queued = QueuedMessage {
+            msg: Arc::new(msg.clone()),
+            permit,
+        };
+
+        match self.tx.try_send(queued) {
             Ok(()) => {
                 // The worker decrements this gauge on recv — see
                 // `dispatch_worker`.
@@ -575,8 +651,13 @@ fn build_pinned_client(
 }
 
 /// Background worker that drains the channel and fans out to targets.
+///
+/// Each [`QueuedMessage`] carries an optional [`BackpressurePermit`] that
+/// remains alive for the duration of `fan_out`; dropping the envelope at
+/// the end of each iteration releases the gate's byte reservation
+/// automatically.
 async fn dispatch_worker(
-    mut rx: mpsc::Receiver<Arc<RoutableMessage>>,
+    mut rx: mpsc::Receiver<QueuedMessage>,
     targets: Arc<Vec<TargetState>>,
     shutdown: Arc<tokio::sync::Notify>,
     dlq: Option<Arc<DeadLetterQueue>>,
@@ -587,21 +668,25 @@ async fn dispatch_worker(
             () = shutdown.notified() => {
                 tracing::info!("HTTP dispatch worker shutting down, draining queue");
                 rx.close();
-                while let Some(msg) = rx.recv().await {
+                while let Some(queued) = rx.recv().await {
                     #[cfg(feature = "metrics")]
                     crate::metrics::queue_depth().dec();
-                    fan_out(&msg, &targets, dlq.as_deref()).await;
+                    fan_out(&queued.msg, &targets, dlq.as_deref()).await;
+                    // `queued` drops here, releasing the permit.
+                    drop(queued);
                 }
                 tracing::info!("HTTP dispatch worker stopped");
                 return;
             }
             msg = rx.recv() => {
                 match msg {
-                    Some(msg) => {
+                    Some(queued) => {
                         // Paired with the inc() in `HttpPublisher::publish`.
                         #[cfg(feature = "metrics")]
                         crate::metrics::queue_depth().dec();
-                        fan_out(&msg, &targets, dlq.as_deref()).await;
+                        fan_out(&queued.msg, &targets, dlq.as_deref()).await;
+                        // `queued` drops here, releasing the permit.
+                        drop(queued);
                     }
                     None => {
                         tracing::info!("HTTP dispatch channel closed");
@@ -1044,6 +1129,7 @@ mod tests {
             shutdown: Arc::new(tokio::sync::Notify::new()),
             dlq: None,
             worker_handle: Arc::new(std::sync::Mutex::new(None)),
+            gate: None,
         };
         let debug = format!("{publisher:?}");
         assert!(debug.contains("target_count"));
@@ -1108,6 +1194,7 @@ mod tests {
             shutdown: Arc::new(tokio::sync::Notify::new()),
             dlq: None,
             worker_handle: Arc::new(std::sync::Mutex::new(None)),
+            gate: None,
         };
         // These should all be silently dropped (echo prevention)
         for protocol in &["http", "HTTP", "Http", "hTTp"] {
@@ -1181,7 +1268,7 @@ mod tests {
         ));
 
         // Capacity-1 channel: first send fills it, second send returns Full.
-        let (tx, rx) = mpsc::channel::<Arc<RoutableMessage>>(1);
+        let (tx, rx) = mpsc::channel::<QueuedMessage>(1);
 
         let publisher = HttpPublisher {
             tx: tx.clone(),
@@ -1189,10 +1276,15 @@ mod tests {
             shutdown: Arc::new(tokio::sync::Notify::new()),
             dlq: Some(dlq),
             worker_handle: Arc::new(std::sync::Mutex::new(None)),
+            gate: None,
         };
 
         // Saturate the channel so the next `publish` hits `TrySendError::Full`.
-        tx.try_send(Arc::new(admission_test_msg("filler"))).unwrap();
+        tx.try_send(QueuedMessage {
+            msg: Arc::new(admission_test_msg("filler")),
+            permit: None,
+        })
+        .unwrap();
 
         let msg = admission_test_msg("alice");
         publisher.publish(&msg);
@@ -1217,7 +1309,7 @@ mod tests {
     #[test]
     fn admission_full_without_dlq_is_tolerated() {
         // Admission-full must remain non-fatal when no DLQ is configured.
-        let (tx, rx) = mpsc::channel::<Arc<RoutableMessage>>(1);
+        let (tx, rx) = mpsc::channel::<QueuedMessage>(1);
 
         let publisher = HttpPublisher {
             tx: tx.clone(),
@@ -1225,12 +1317,91 @@ mod tests {
             shutdown: Arc::new(tokio::sync::Notify::new()),
             dlq: None,
             worker_handle: Arc::new(std::sync::Mutex::new(None)),
+            gate: None,
         };
 
-        tx.try_send(Arc::new(admission_test_msg("filler"))).unwrap();
+        tx.try_send(QueuedMessage {
+            msg: Arc::new(admission_test_msg("filler")),
+            permit: None,
+        })
+        .unwrap();
         // Must not panic, must not block.
         publisher.publish(&admission_test_msg("alice"));
         drop(rx);
+    }
+
+    #[tokio::test]
+    async fn backpressure_over_high_water_drops_to_dlq() {
+        // When the shared gate is over the high-water mark, `publish`
+        // must shed new messages instead of hoarding them in the channel.
+        let dir = tempfile::tempdir().unwrap();
+        let dlq = Arc::new(DeadLetterQueue::new(
+            dir.path().to_path_buf(),
+            admission_test_key_ring(),
+            None,
+        ));
+
+        // Gate with a tiny 64-byte cap and zero resume dwell so the
+        // first `acquire` puts us over the high-water mark and keeps us
+        // there while the permit is alive.
+        let mut gate = BackpressureGate::with_limits(64, 32);
+        gate.with_resume_dwell(std::time::Duration::ZERO).unwrap();
+        // Saturate the gate so `is_admitting()` is false.
+        let _saturate = gate.acquire(128);
+
+        let (tx, rx) = mpsc::channel::<QueuedMessage>(16);
+        let publisher = HttpPublisher {
+            tx,
+            targets: Arc::new(vec![]),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+            dlq: Some(dlq),
+            worker_handle: Arc::new(std::sync::Mutex::new(None)),
+            gate: Some(Arc::clone(&gate)),
+        };
+
+        publisher.publish(&admission_test_msg("alice"));
+
+        // Nothing queued — the message was shed before try_send.
+        drop(rx);
+
+        // DLQ has a backpressure-labelled entry.
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(entries.len(), 1, "expected exactly one DLQ file");
+    }
+
+    #[tokio::test]
+    async fn backpressure_permit_releases_on_worker_drain() {
+        // End-to-end sanity: a message entering the publisher with a
+        // configured gate acquires a permit, and dropping the envelope
+        // after dispatch releases the reservation.
+        let gate = BackpressureGate::new(1024);
+        assert_eq!(gate.current(), 0);
+
+        let (tx, mut rx) = mpsc::channel::<QueuedMessage>(4);
+        let publisher = HttpPublisher {
+            tx,
+            targets: Arc::new(vec![]),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+            dlq: None,
+            worker_handle: Arc::new(std::sync::Mutex::new(None)),
+            gate: Some(Arc::clone(&gate)),
+        };
+
+        let msg = admission_test_msg("alice");
+        let payload_len = msg.payload.len();
+        publisher.publish(&msg);
+
+        // While the envelope sits in the channel, the permit holds the
+        // reservation.
+        assert_eq!(gate.current(), payload_len);
+
+        // Simulate the dispatch worker consuming and dropping the envelope.
+        let queued = rx.recv().await.expect("envelope");
+        drop(queued);
+        assert_eq!(gate.current(), 0);
     }
 
     #[test]

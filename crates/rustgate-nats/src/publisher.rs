@@ -3,12 +3,14 @@
 //! Publishes inbound CoT messages to NATS subjects.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use async_nats::Client;
 use bytes::Bytes;
 #[cfg(not(feature = "full-detail"))]
 use rustgate_core::message::MessageType;
 use rustgate_core::message::RoutableMessage;
+use rustgate_resilience::backpressure::{BackpressureGate, BackpressurePermit};
 use tracing::Instrument;
 use unicode_normalization::UnicodeNormalization;
 
@@ -23,11 +25,40 @@ use crate::serde_compat::WireEvent;
 pub struct NatsPublisher {
     client: Client,
     config: NatsConfig,
+    /// Optional global backpressure gate. When configured, each `publish`
+    /// call reserves a byte permit sized to the payload for the duration
+    /// of the two in-flight awaits (live subject + JetStream history).
+    /// A NATS outage or slow broker then pressures the shared gate rather
+    /// than silently piling up inside the async-nats client's buffers.
+    gate: Option<Arc<BackpressureGate>>,
 }
 
 impl NatsPublisher {
     pub fn new(client: Client, config: NatsConfig) -> Self {
-        Self { client, config }
+        Self {
+            client,
+            config,
+            gate: None,
+        }
+    }
+
+    /// Attach a shared [`BackpressureGate`] so NATS egress participates in
+    /// global admission control.
+    ///
+    /// When configured, every message that passes echo-prevention and
+    /// position-unknown filtering acquires a byte permit sized to its
+    /// payload before the first publish await. The permit lives until the
+    /// JetStream history publish completes (or errors out) so the gate
+    /// sees accurate outstanding byte accounting across both publishes.
+    ///
+    /// If the gate is already parked over the high-water mark when
+    /// `publish` is called, the message is shed immediately rather than
+    /// waiting — NATS publish is fire-and-forget and must not block the
+    /// router's dispatch task.
+    #[must_use]
+    pub fn with_backpressure(mut self, gate: Arc<BackpressureGate>) -> Self {
+        self.gate = Some(gate);
+        self
     }
 
     /// Return a clone of the underlying NATS client handle.
@@ -68,12 +99,30 @@ impl NatsPublisher {
             return;
         }
 
+        // Global admission check: if the shared gate is parked over the
+        // high-water mark, shed the publish so backpressure flows upstream
+        // instead of silently buffering inside the async-nats client.
+        let _permit: Option<BackpressurePermit> = match self.gate.as_ref() {
+            Some(gate) => {
+                if !gate.is_admitting() {
+                    tracing::warn!(
+                        source_cn = %msg.source.cn,
+                        "NATS backpressure gate over high-water, dropping message"
+                    );
+                    return;
+                }
+                Some(gate.acquire(msg.payload.len()))
+            }
+            None => None,
+        };
+
         let span = tracing::debug_span!(
             "nats_publish",
             source_cn = %msg.source.cn,
         );
 
         self.publish_inner(msg).instrument(span).await;
+        // `_permit` drops here, releasing the gate's reservation.
     }
 
     /// Inner publish logic, separated so the caller can `.instrument()` a span

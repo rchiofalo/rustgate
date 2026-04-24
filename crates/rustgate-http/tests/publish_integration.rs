@@ -678,3 +678,107 @@ async fn rate_limiting_sheds_excess_traffic() {
         "at least 1 request should have been allowed"
     );
 }
+
+#[tokio::test]
+async fn slow_egress_target_pressures_global_backpressure_gate() {
+    // ── Cross-crate proof that a stalled HTTP egress target produces
+    // ── observable backpressure on the workspace-wide gate.
+    //
+    // The acceptance criterion for #956 asks for "integration test
+    // demonstrating global gate pressure from a slow egress target".
+    // We simulate that by wiring a wiremock responder that holds every
+    // request open for multiple seconds, attaching an `HttpPublisher`
+    // to a shared `BackpressureGate` with a small high-water mark, and
+    // firing enough payload to exceed it.  The gate MUST flip to
+    // non-admitting before a flusher can drain it, proving that a slow
+    // downstream target is observable at the global admission layer.
+    use std::time::Duration;
+
+    use rustgate_resilience::backpressure::BackpressureGate;
+
+    let server = MockServer::start().await;
+
+    // Responder stalls for long enough that the worker's in-flight
+    // buffer accumulates permits instead of recycling them quickly.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(2)))
+        .mount(&server)
+        .await;
+
+    // Small high-water so we can push past it with a handful of msgs.
+    // `acquire` never blocks — the gate tracks in-flight bytes and we
+    // assert the flag flips once the cumulative reservation exceeds
+    // the high-water mark.
+    //
+    // Dwell is set to `Duration::ZERO` so the "admitting" flag flips
+    // back to `true` the moment in-flight bytes drop below the
+    // low-water mark. Production keeps the default 1s dwell to avoid
+    // accept-loop oscillation; tests explicitly opt into the
+    // pre-#878 immediate-resume behaviour.
+    let mut gate = BackpressureGate::with_limits(1_024, 512);
+    gate.with_resume_dwell(Duration::ZERO)
+        .expect("dwell must set before gate is cloned");
+
+    let config = http_config(vec![target_config(
+        "slow-egress",
+        &format!("{}/webhook", server.uri()),
+    )]);
+    let publisher = HttpPublisher::new(config)
+        .expect("publisher must build")
+        .with_backpressure(Arc::clone(&gate));
+
+    // Baseline: no traffic yet, gate admitting.
+    assert!(
+        gate.is_admitting(),
+        "gate MUST start in the admitting state before any traffic"
+    );
+
+    // Build a payload just under 1 KiB so 2 messages push past the
+    // 1024-byte high-water mark. One-shot bursts arriving back-to-back
+    // simulate a router under steady load behind a stalled target.
+    let big_payload = Bytes::from(vec![b'A'; 900]);
+    for _ in 0..3u8 {
+        let mut msg = make_msg("alice", "tcp", MessageType::Position);
+        msg.payload = big_payload.clone();
+        publisher.publish(&msg);
+    }
+
+    // Poll briefly — the permits are acquired synchronously in
+    // `publish`, so the flip should happen almost immediately.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    let mut flipped = false;
+    while tokio::time::Instant::now() < deadline {
+        if !gate.is_admitting() {
+            flipped = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        flipped,
+        "gate must stop admitting once slow egress in-flight bytes exceed the high-water mark"
+    );
+
+    // Drain: shut down the publisher. Workers abort mid-flight; the
+    // `QueuedMessage` drops release the permits so the gate recovers.
+    publisher.shutdown().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // After drain, the gate should admit again — permits released.
+    // We tolerate the default `resume_dwell` by polling a bounded
+    // window; if the gate still reports blocked after the dwell,
+    // the permit accounting regressed.
+    let resume_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut resumed = false;
+    while tokio::time::Instant::now() < resume_deadline {
+        if gate.is_admitting() {
+            resumed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        resumed,
+        "gate must return to admitting after in-flight permits drain"
+    );
+}
