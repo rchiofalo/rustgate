@@ -376,13 +376,27 @@ fn handle_lag_poll_result<E: std::fmt::Display>(
 /// RPC on top of this pure projection.
 fn build_consumer_config(config: &NatsConfig) -> (String, jetstream::consumer::pull::Config) {
     let consumer_name = format!("rustgate-sub-{}", config.instance_id);
+    // JetStream accepts either `filter_subject` (singular, one pattern) or
+    // `filter_subjects` (plural, many) but not both at once. Picking the
+    // right wire is driven by `NatsConfig::subject_filters`:
+    //
+    // - empty  → back-compat `{prefix}.>` wildcard (single pattern)
+    // - one    → that exact pattern in `filter_subject`
+    // - many   → `filter_subjects` (requires server 2.10+, enabled via the
+    //            `server_2_10` feature on the workspace `async-nats` dep)
+    let (filter_subject, filter_subjects) = match config.subject_filters.as_slice() {
+        [] => (format!("{}.>", config.subject_prefix), Vec::new()),
+        [one] => (one.clone(), Vec::new()),
+        many => (String::new(), many.to_vec()),
+    };
     let pull_config = jetstream::consumer::pull::Config {
         durable_name: Some(consumer_name.clone()),
         ack_policy: AckPolicy::Explicit,
         max_ack_pending: config.max_ack_pending,
         max_deliver: config.max_deliver,
         deliver_policy: jetstream::consumer::DeliverPolicy::New,
-        filter_subject: format!("{}.>", config.subject_prefix),
+        filter_subject,
+        filter_subjects,
         ..Default::default()
     };
     (consumer_name, pull_config)
@@ -1032,5 +1046,127 @@ mod tests {
         assert_eq!(c1.max_ack_pending, c2.max_ack_pending);
         assert_eq!(c1.max_deliver, c2.max_deliver);
         assert_eq!(c1.filter_subject, c2.filter_subject);
+    }
+
+    // ── Subject-filter wiring (issue #907) ─────────────────────────────
+    //
+    // JetStream forbids setting `filter_subject` and `filter_subjects`
+    // on the same consumer — it's an XOR. `build_consumer_config` owns
+    // the dispatch between the two wires and must stay deterministic:
+    //
+    //  empty subject_filters → `filter_subject = "{prefix}.>"`, plural empty
+    //  [one]                 → `filter_subject = one`, plural empty
+    //  [a, b, ...]           → `filter_subject = ""`, plural carries the vec
+    //
+    // Each test below pins one arm of that dispatch so a refactor that
+    // accidentally double-populates (which NATS rejects at consumer-
+    // create time with a non-obvious error) fails here instead.
+
+    #[test]
+    fn build_consumer_config_empty_filters_falls_back_to_wildcard() {
+        // Back-compat contract: a config that doesn't opt in to
+        // `subject_filters` must produce the exact `{prefix}.>` filter
+        // that every existing deployment relies on. Plural must stay
+        // empty so NATS doesn't reject the consumer for setting both.
+        let nats_config = NatsConfig {
+            instance_id: "default-filter".to_string(),
+            subject_prefix: "points".to_string(),
+            subject_filters: Vec::new(),
+            ..Default::default()
+        };
+        let (_, pull_config) = build_consumer_config(&nats_config);
+        assert_eq!(pull_config.filter_subject, "points.>");
+        assert!(
+            pull_config.filter_subjects.is_empty(),
+            "filter_subjects must be empty when the singular field is populated",
+        );
+    }
+
+    #[test]
+    fn build_consumer_config_single_filter_uses_singular_field() {
+        // A single-entry filter must land in `filter_subject` (not
+        // `filter_subjects`) so we stay compatible with NATS servers
+        // that don't understand the plural field.
+        let nats_config = NatsConfig {
+            instance_id: "single".to_string(),
+            subject_prefix: "points".to_string(),
+            subject_filters: vec!["points.ALPHA.>".to_string()],
+            ..Default::default()
+        };
+        let (_, pull_config) = build_consumer_config(&nats_config);
+        assert_eq!(pull_config.filter_subject, "points.ALPHA.>");
+        assert!(pull_config.filter_subjects.is_empty());
+    }
+
+    #[test]
+    fn build_consumer_config_multi_filter_uses_plural_field() {
+        // Two or more patterns require `filter_subjects` — and the
+        // singular `filter_subject` must be the empty string, not the
+        // previous default wildcard. NATS treats a non-empty `filter_
+        // subject` alongside a non-empty `filter_subjects` as a config
+        // error at consumer-create time.
+        let nats_config = NatsConfig {
+            instance_id: "multi".to_string(),
+            subject_prefix: "points".to_string(),
+            subject_filters: vec![
+                "points.ALPHA.>".to_string(),
+                "points.BRAVO.position".to_string(),
+                "points.*.update.v2".to_string(),
+            ],
+            ..Default::default()
+        };
+        let (_, pull_config) = build_consumer_config(&nats_config);
+        assert_eq!(
+            pull_config.filter_subject, "",
+            "filter_subject must be empty when filter_subjects is populated",
+        );
+        assert_eq!(pull_config.filter_subjects.len(), 3);
+        assert_eq!(pull_config.filter_subjects[0], "points.ALPHA.>");
+        assert_eq!(pull_config.filter_subjects[1], "points.BRAVO.position");
+        assert_eq!(pull_config.filter_subjects[2], "points.*.update.v2");
+    }
+
+    #[test]
+    fn build_consumer_config_filter_subjects_preserves_order() {
+        // Downstream observability (consumer info / JetStream admin tooling)
+        // displays filter_subjects in insertion order. Shuffling them on the
+        // wire would make operator dashboards inconsistent with the config.
+        let nats_config = NatsConfig {
+            instance_id: "order".to_string(),
+            subject_prefix: "points".to_string(),
+            subject_filters: vec![
+                "points.zulu.>".to_string(),
+                "points.alpha.>".to_string(),
+                "points.mike.>".to_string(),
+            ],
+            ..Default::default()
+        };
+        let (_, pull_config) = build_consumer_config(&nats_config);
+        let got: Vec<&str> = pull_config
+            .filter_subjects
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            got,
+            vec!["points.zulu.>", "points.alpha.>", "points.mike.>"]
+        );
+    }
+
+    #[test]
+    fn build_consumer_config_single_filter_exact_prefix_wildcard_round_trips() {
+        // `subject_filters = ["{prefix}.>"]` is a valid explicit spelling
+        // of the default. Must not be rewritten, normalised, or de-duped
+        // — operators who opt in this way deserve the exact wire they
+        // asked for.
+        let nats_config = NatsConfig {
+            instance_id: "exact-wildcard".to_string(),
+            subject_prefix: "points".to_string(),
+            subject_filters: vec!["points.>".to_string()],
+            ..Default::default()
+        };
+        let (_, pull_config) = build_consumer_config(&nats_config);
+        assert_eq!(pull_config.filter_subject, "points.>");
+        assert!(pull_config.filter_subjects.is_empty());
     }
 }

@@ -142,6 +142,36 @@ pub struct NatsConfig {
     /// When set, stores the last processed sequence number so
     /// subsequent restarts resume from the checkpoint.
     pub checkpoint_path: Option<PathBuf>,
+
+    /// Optional narrow-subscribe filters for the JetStream pull consumer.
+    ///
+    /// When empty (default), the consumer subscribes to the full
+    /// `{subject_prefix}.>` wildcard — every message the stream captures
+    /// is delivered to this instance, even if it will be shed downstream
+    /// by group-based ACL filtering. That's fine for low-volume or
+    /// single-tenant deployments, but in high-volume fleets where a
+    /// given subscriber only cares about a subset of groups or message
+    /// kinds, the server-side work of matching every subject against
+    /// the consumer is wasted.
+    ///
+    /// When non-empty, each entry is passed directly to JetStream as a
+    /// `filter_subject` / `filter_subjects` (one vs many). NATS wildcards
+    /// (`*` single-token, `>` tail) are supported — e.g. `points.ALPHA.>`
+    /// or `points.*.position` — which is why these patterns bypass the
+    /// "no wildcards" rule that applies to `subject_prefix` itself.
+    ///
+    /// **Safety rail:** every entry must start with `{subject_prefix}.`
+    /// so a filter cannot silently escape the stream's subject space
+    /// and produce an always-empty consumer. Validation also rejects
+    /// empty strings, control characters, whitespace, and non-ASCII
+    /// bytes — the same hardening that protects `subject_prefix`.
+    ///
+    /// Requires NATS server 2.10 or newer for the multi-pattern form
+    /// (`filter_subjects`). The single-pattern form (`filter_subject`)
+    /// works on older servers too, but the `async-nats` crate is built
+    /// with `server_2_10` enabled workspace-wide so both wires are
+    /// available unconditionally here.
+    pub subject_filters: Vec<String>,
 }
 
 impl NatsConfig {
@@ -154,9 +184,58 @@ impl NatsConfig {
         validate_nats_subject_prefix(&self.subject_prefix, "subject_prefix")?;
         validate_nats_subject_prefix(&self.jetstream_subject_prefix, "jetstream_subject_prefix")?;
         validate_nats_subject_token(&self.default_group, "default_group")?;
+        validate_subject_filters(&self.subject_filters, &self.subject_prefix)?;
         self.tls.validate().map_err(NatsConfigError::Tls)?;
         Ok(())
     }
+}
+
+/// Validate `NatsConfig::subject_filters`.
+///
+/// Unlike [`validate_nats_subject_prefix`], wildcards (`*`, `>`) are
+/// permitted — they are the whole point of a filter. Each pattern must
+/// still be ASCII-printable, non-empty, and scoped to `{subject_prefix}.`
+/// so the consumer cannot silently bind to subjects the stream does
+/// not capture.
+fn validate_subject_filters(filters: &[String], prefix: &str) -> Result<(), NatsConfigError> {
+    if filters.is_empty() {
+        return Ok(());
+    }
+    // Match the exact byte sequence that `ensure_stream` asks JetStream
+    // to capture — any filter that escapes this prefix would bind to an
+    // always-empty subject set and silently drop all traffic.
+    let required_prefix = format!("{prefix}.");
+    for (idx, pattern) in filters.iter().enumerate() {
+        if pattern.is_empty() {
+            return Err(NatsConfigError::InvalidSubject {
+                field: format!("subject_filters[{idx}]"),
+                reason: "must not be empty".to_string(),
+            });
+        }
+        for b in pattern.bytes() {
+            // Reject control chars, whitespace, DEL (0x7F), and non-ASCII.
+            // `*` and `>` are allowed so NATS wildcards can be expressed.
+            if b <= 0x20 || b >= 0x7F {
+                return Err(NatsConfigError::InvalidSubject {
+                    field: format!("subject_filters[{idx}]"),
+                    reason: format!(
+                        "contains invalid byte 0x{b:02X}; control characters, \
+                         whitespace, and non-ASCII are not allowed"
+                    ),
+                });
+            }
+        }
+        if !pattern.starts_with(&required_prefix) {
+            return Err(NatsConfigError::InvalidSubject {
+                field: format!("subject_filters[{idx}]"),
+                reason: format!(
+                    "`{pattern}` must start with `{required_prefix}` so the \
+                     filter stays within the stream's subject space"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Validate a NATS subject prefix (may contain `.` level separators).
@@ -236,6 +315,7 @@ impl Default for NatsConfig {
             max_ack_pending: 1000,
             max_deliver: 0,
             checkpoint_path: None,
+            subject_filters: Vec::new(),
         }
     }
 }
@@ -516,6 +596,147 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(config.max_deliver, 5);
+    }
+
+    #[test]
+    fn default_subject_filters_is_empty() {
+        // Back-compat posture: an upgraded config that doesn't set
+        // `subject_filters` must produce the same `{prefix}.>` wildcard
+        // subscription as before. The emptiness is the signal to the
+        // subscriber that it should keep the wildcard.
+        let config = NatsConfig::default();
+        assert!(config.subject_filters.is_empty());
+    }
+
+    #[test]
+    fn subject_filters_single_pattern_validates() {
+        let config = NatsConfig {
+            subject_filters: vec!["points.ALPHA.>".to_string()],
+            ..Default::default()
+        };
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn subject_filters_multiple_patterns_validate() {
+        let config = NatsConfig {
+            subject_filters: vec![
+                "points.ALPHA.>".to_string(),
+                "points.BRAVO.position".to_string(),
+                "points.*.update.v2".to_string(),
+            ],
+            ..Default::default()
+        };
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn subject_filters_wildcards_allowed() {
+        // The point of a filter is wildcard matching — `*` (one token) and
+        // `>` (tail) must pass validation even though they're forbidden in
+        // `subject_prefix`.
+        for pat in ["points.*.update", "points.ALPHA.>", "points.>"] {
+            let config = NatsConfig {
+                subject_filters: vec![pat.to_string()],
+                ..Default::default()
+            };
+            config.validate().unwrap_or_else(|e| panic!("{pat}: {e}"));
+        }
+    }
+
+    #[test]
+    fn subject_filter_outside_prefix_rejected() {
+        // A filter that doesn't start with `{subject_prefix}.` would bind
+        // the consumer to a subject set the stream never captures — silent
+        // zero-traffic failure mode. Validation catches it.
+        let config = NatsConfig {
+            subject_prefix: "points".to_string(),
+            subject_filters: vec!["other.ALPHA.>".to_string()],
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, NatsConfigError::InvalidSubject { ref field, .. } if field == "subject_filters[0]"),
+            "expected InvalidSubject on subject_filters[0], got: {err}"
+        );
+    }
+
+    #[test]
+    fn subject_filter_matching_prefix_exactly_rejected() {
+        // The required prefix is `"{prefix}."` — an entry equal to just
+        // the prefix (no trailing dot) would match the prefix itself as a
+        // token but not the `.something` sub-subjects the stream captures.
+        let config = NatsConfig {
+            subject_prefix: "points".to_string(),
+            subject_filters: vec!["points".to_string()],
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn empty_filter_entry_rejected() {
+        let config = NatsConfig {
+            subject_filters: vec!["points.ALPHA.>".to_string(), String::new()],
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, NatsConfigError::InvalidSubject { ref field, .. } if field == "subject_filters[1]"),
+        );
+    }
+
+    #[test]
+    fn control_char_in_filter_rejected() {
+        let config = NatsConfig {
+            subject_filters: vec!["points.ALPHA\x01.>".to_string()],
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn space_in_filter_rejected() {
+        let config = NatsConfig {
+            subject_filters: vec!["points.ALPHA BRAVO.>".to_string()],
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn non_ascii_in_filter_rejected() {
+        let config = NatsConfig {
+            subject_filters: vec!["points.caf\u{00e9}.>".to_string()],
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn del_byte_in_filter_rejected() {
+        let config = NatsConfig {
+            subject_filters: vec!["points.ALPHA\x7F.>".to_string()],
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn subject_filter_validation_independent_of_prefix_validation() {
+        // If subject_prefix is bad, that error surfaces first. Establishes
+        // field-ordering: callers should treat the first returned error as
+        // authoritative and not assume filter validation ran.
+        let config = NatsConfig {
+            subject_prefix: "points bad".to_string(),
+            subject_filters: vec!["points bad.x".to_string()],
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, NatsConfigError::InvalidSubject { ref field, .. } if field == "subject_prefix"),
+            "expected prefix error first, got: {err}"
+        );
     }
 
     #[test]
