@@ -17,7 +17,9 @@ use rustgate_core::b64;
 use rustgate_core::message::RoutableMessage;
 use rustgate_core::sanitize::sanitize_for_log;
 use rustgate_resilience::backpressure::{BackpressureGate, BackpressurePermit};
-use rustgate_resilience::circuit::{CircuitBreaker, OnStateChange, STATE_HALF_OPEN, STATE_OPEN};
+use rustgate_resilience::circuit::{
+    CircuitBreaker, OnStateChange, STATE_CLOSED, STATE_HALF_OPEN, STATE_OPEN,
+};
 use rustgate_resilience::retry;
 use rustgate_resilience::token_bucket::TokenBucket;
 use sha2::{Digest, Sha256};
@@ -36,6 +38,18 @@ use crate::resolver::SsrfSafeResolver;
 
 /// Channel buffer size for the dispatch queue.
 const CHANNEL_BUFFER: usize = 256;
+
+/// Channel buffer size for the DLQ auto-drain trigger queue.
+///
+/// A successful `HalfOpen → Closed` circuit transition pushes the
+/// recovering target's name through this channel; the drain worker
+/// receives the name and replays that target's sealed DLQ segments.
+/// Sized small because the triggers are rare (one per confirmed
+/// recovery) and the worker coalesces repeats naturally — each
+/// drain pass re-scans the directory, so a dropped trigger is
+/// picked up on the next circuit cycle (or the admin replay
+/// endpoint, see `#881` PR C).
+const DRAIN_CHANNEL_BUFFER: usize = 32;
 
 /// Non-revealing User-Agent to prevent version fingerprinting.
 const RUSTGATE_USER_AGENT: &str = "Rustgate";
@@ -78,6 +92,13 @@ pub struct HttpPublisher {
     tx: mpsc::Sender<QueuedMessage>,
     targets: Arc<Vec<TargetState>>,
     shutdown: Arc<tokio::sync::Notify>,
+    /// Dedicated shutdown signal for the DLQ drain worker, populated only
+    /// when a DLQ is configured. Kept separate from `shutdown` so we can
+    /// wake both workers deterministically with `notify_one` on each.
+    /// `notify_waiters` would wake both, but has no stored-permit semantics
+    /// and silently drops the signal if a worker is mid-processing at the
+    /// call moment.
+    drain_shutdown: Option<Arc<tokio::sync::Notify>>,
     /// Encrypted dead-letter queue for circuit-breaker-shed messages.
     dlq: Option<Arc<DeadLetterQueue>>,
     /// Worker task handle for panic detection during shutdown.
@@ -145,13 +166,25 @@ impl HttpPublisher {
     /// Build publisher from config, constructing per-target reqwest clients.
     ///
     /// Validates configuration, loads auth secrets, and builds a dedicated
-    /// HTTP client for each enabled target. Spawns a background dispatch
-    /// worker automatically.
+    /// HTTP client for each enabled target. Spawns two background tasks
+    /// automatically: a dispatch worker that fans out inbound messages to
+    /// matching targets, and (when a DLQ is configured) a drain worker
+    /// that replays sealed DLQ segments whenever a target's circuit
+    /// breaker recovers (`HalfOpen → Closed`). `#881`.
     pub fn new(config: HttpConfig) -> Result<Self, HttpError> {
         config.validate()?;
 
         let resolver = Arc::new(SsrfSafeResolver::new(config.allow_private_urls));
         let instance_id = config.instance_id.unwrap_or_else(generate_instance_id);
+
+        // Drain channel: the circuit observer on every target `try_send`s
+        // the target's own name through this channel when it transitions
+        // from `HalfOpen → Closed`. Bounded so a pathologically flapping
+        // circuit cannot inflate memory with queued drain triggers; the
+        // worker processes triggers sequentially and coalesces repeats
+        // naturally (the directory scan on every pass picks up anything
+        // that was dropped on channel-full).
+        let (drain_tx, drain_rx) = mpsc::channel::<String>(DRAIN_CHANNEL_BUFFER);
 
         let mut targets = Vec::with_capacity(config.targets.len());
 
@@ -161,7 +194,15 @@ impl HttpPublisher {
                 continue;
             }
 
-            let target = build_target(tc, &instance_id, Arc::clone(&resolver))?;
+            // The drain_tx is cloned per-target so each circuit observer
+            // owns its own `Sender`; dropping a single target does not
+            // close the channel.
+            let target = build_target(
+                tc,
+                &instance_id,
+                Arc::clone(&resolver),
+                Some(drain_tx.clone()),
+            )?;
             targets.push(target);
         }
 
@@ -223,10 +264,54 @@ impl HttpPublisher {
             worker_dlq,
         ));
 
+        // Spawn the DLQ drain worker only when a DLQ is configured.
+        // Without a DLQ there are no sealed segments to replay, so the
+        // worker would spin on `recv()` forever consuming nothing.
+        // Dropping the receiver now (`drain_rx`) also closes the
+        // channel from the reader side, so the per-target `try_send`
+        // in the circuit observer observes `Err(Closed)` and
+        // gracefully degrades to audit/log only.
+        //
+        // The drain worker gets its own `Notify`, distinct from the
+        // dispatch worker's `shutdown`, so `HttpPublisher::shutdown`
+        // can wake both with `notify_one` each. A shared `Notify` +
+        // `notify_waiters` would race a worker that was mid-segment
+        // at the call moment and silently drop the signal.
+        let drain_shutdown = if let Some(ref dlq_arc) = dlq {
+            let drain_notify = Arc::new(tokio::sync::Notify::new());
+            let drain_targets = Arc::clone(&targets);
+            let drain_dlq = Arc::clone(dlq_arc);
+            let drain_notify_worker = Arc::clone(&drain_notify);
+            // Detach the drain worker: it is a best-effort background
+            // task, and its panic or exit does not require a
+            // graceful-shutdown wait. The dedicated `drain_notify`
+            // signals termination and the channel close drains any
+            // pending triggers on publisher drop. `tokio::spawn`
+            // returns a handle that we drop explicitly via
+            // `std::mem::drop` so the `let_underscore_future` lint
+            // stays clean.
+            std::mem::drop(tokio::spawn(drain_worker(
+                drain_rx,
+                drain_targets,
+                drain_dlq,
+                drain_notify_worker,
+            )));
+            Some(drain_notify)
+        } else {
+            // No DLQ → no drain worker spawned → no drain shutdown
+            // signal to hold. Dropping `drain_rx` closes the channel
+            // from the reader side so any per-target `try_send` in the
+            // circuit observer observes `Err(Closed)` and gracefully
+            // degrades to audit/log only.
+            std::mem::drop(drain_rx);
+            None
+        };
+
         Ok(Self {
             tx,
             targets,
             shutdown,
+            drain_shutdown,
             dlq,
             worker_handle: Arc::new(std::sync::Mutex::new(Some(handle))),
             gate: None,
@@ -351,6 +436,17 @@ impl HttpPublisher {
     /// encrypted terminators are written (readers reject unterminated files).
     pub async fn shutdown(&self) {
         self.shutdown.notify_one();
+        // The drain worker (when a DLQ is configured) waits on its own
+        // dedicated `Notify` handle — see the `drain_shutdown` field —
+        // so we signal it separately rather than sharing a single
+        // `Notify` with the dispatch worker. Sharing would require
+        // `notify_waiters`, which has no stored-permit semantics and
+        // silently drops the signal if a worker was mid-processing
+        // at the call moment; two single-waiter `Notify`s with
+        // `notify_one` each are both simpler and strictly correct.
+        if let Some(ref drain_shutdown) = self.drain_shutdown {
+            drain_shutdown.notify_one();
+        }
 
         // Take the handle out of the lock, then await it — avoids holding
         // a std::sync::Mutex guard across an .await point.
@@ -378,10 +474,18 @@ impl HttpPublisher {
 }
 
 /// Build a single target's runtime state from config.
+///
+/// `drain_tx` is the sender half of the DLQ drain channel held by
+/// [`HttpPublisher::new`]; when `Some(tx)`, the per-target circuit
+/// observer will fire a `try_send(target_name)` on every confirmed
+/// recovery (`HalfOpen → Closed`). Pass `None` from test/diagnostic
+/// paths that do not spawn a drain worker; the observer then degrades
+/// to audit/log only without attempting to signal a non-existent worker.
 fn build_target(
     tc: &TargetConfig,
     instance_id: &str,
     resolver: Arc<SsrfSafeResolver>,
+    drain_tx: Option<mpsc::Sender<String>>,
 ) -> Result<TargetState, HttpError> {
     let client = build_client(tc, resolver)?;
 
@@ -412,7 +516,7 @@ fn build_target(
             .and_then(|r| r.half_open_success_threshold)
             .unwrap_or(2),
     )
-    .with_on_state_change(build_circuit_observer(&tc.name));
+    .with_on_state_change(build_circuit_observer(&tc.name, drain_tx));
 
     let custom_headers = tc
         .headers
@@ -469,27 +573,42 @@ fn build_target(
 
 /// Build the per-target `OnStateChange` observer attached to the circuit.
 ///
-/// The observer fires on every transition; today we only act on
-/// `Open → HalfOpen`, which is the moment the breaker decides to admit
-/// a probe after cooldown. This is the trigger point for DLQ
-/// auto-drain: messages that were dead-lettered during the outage
-/// become eligible for replay the moment a probe succeeds (the
-/// subsequent `HalfOpen → Closed` transition already emits
-/// `http_circuit_recovered` via `record_success`).
+/// The observer fires on every transition and acts on two of them:
 ///
-/// The `Closed → Open` and `HalfOpen → Closed` transitions are NOT
-/// emitted from this observer — their audit events are emitted at the
-/// `record_failure` / `record_success` call sites in
+/// 1. `Open → HalfOpen` — the moment the breaker decides to admit a
+///    probe after cooldown. Emits `http_circuit_probing`, nudges the
+///    Prometheus gauge to `half-open (2)`, and logs the probe intent
+///    so operators can correlate probe admission with any concurrent
+///    4xx/5xx burst. No DLQ side-effect yet: one successful probe does
+///    not guarantee the upstream is healthy, and a failed probe would
+///    re-open the circuit immediately — replaying at this point would
+///    risk inflating an outage by burning DLQ entries against an
+///    endpoint that is about to trip again.
+///
+/// 2. `HalfOpen → Closed` — confirmed recovery. The breaker only makes
+///    this transition after `half_open_success_threshold` consecutive
+///    successes, so we treat it as durable-enough to start the auto-
+///    drain pass. The observer sends the target name through a bounded
+///    drain channel (`try_send`, non-blocking) whose receive end is
+///    held by the drain worker spawned in [`HttpPublisher::new`].
+///    If the channel is full, the drain request is dropped rather than
+///    blocking the circuit hot path — the admin endpoint (see PR C)
+///    and the next trip cycle both act as safety nets.
+///
+/// The `Closed → Open` transition is NOT emitted from this observer —
+/// its audit event is emitted at the `record_failure` call site in
 /// `publish_with_retry`, and firing again here would double-log.
 /// `HalfOpen → Open` (probe failure) is treated the same way
 /// (`record_failure` already emits `http_circuit_tripped`).
 ///
-/// The callback body is deliberately short: it emits the audit event,
-/// nudges the Prometheus gauge, and returns. Any heavy work (e.g. a
-/// future DLQ file-replay task) will be dispatched from inside via
-/// `tokio::spawn` / `spawn_background` rather than blocking the
-/// transition path.
-fn build_circuit_observer(target_name: &str) -> OnStateChange {
+/// The callback body is deliberately short: it emits at most one audit
+/// event, nudges the Prometheus gauge, optionally `try_send`s a drain
+/// request, and returns. Heavy work runs in the drain worker, not in
+/// the transition path.
+fn build_circuit_observer(
+    target_name: &str,
+    drain_tx: Option<mpsc::Sender<String>>,
+) -> OnStateChange {
     let name = target_name.to_string();
     Arc::new(move |old, new| {
         if old == STATE_OPEN && new == STATE_HALF_OPEN {
@@ -503,6 +622,41 @@ fn build_circuit_observer(target_name: &str) -> OnStateChange {
                 target = %sanitize_for_log(&name),
                 "HTTP target entering half-open probe window; queued DLQ messages eligible for drain on recovery"
             );
+        } else if old == STATE_HALF_OPEN && new == STATE_CLOSED {
+            // Confirmed recovery — trigger the auto-drain pass. The
+            // `http_circuit_recovered` audit event is already emitted by
+            // `record_success` on this transition, so we do NOT re-emit
+            // it here; the drain worker emits its own separate
+            // `http_dlq_drain_started` / `http_dlq_drain_completed`
+            // pair so operators can tell circuit recovery apart from
+            // DLQ replay progress.
+            if let Some(tx) = drain_tx.as_ref() {
+                match tx.try_send(name.clone()) {
+                    Ok(()) => {
+                        tracing::info!(
+                            target = %sanitize_for_log(&name),
+                            "HTTP target recovered; auto-drain triggered"
+                        );
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        // Another drain is queued or running; dropping
+                        // this trigger is safe because the drain worker
+                        // re-scans the directory on every pass and the
+                        // next recovery cycle (or admin replay) will
+                        // catch anything we miss.
+                        tracing::debug!(
+                            target = %sanitize_for_log(&name),
+                            "DLQ drain channel full, trigger coalesced"
+                        );
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        tracing::warn!(
+                            target = %sanitize_for_log(&name),
+                            "DLQ drain channel closed, auto-drain unavailable"
+                        );
+                    }
+                }
+            }
         }
     })
 }
@@ -1085,6 +1239,395 @@ async fn publish_with_retry(
     }
 }
 
+/// Background task that replays sealed DLQ segments when a target's
+/// circuit breaker recovers (`HalfOpen → Closed`). `#881`.
+///
+/// The worker listens on the drain channel fed by every per-target
+/// circuit observer (see [`build_circuit_observer`]). On each recovery
+/// trigger it:
+///
+/// 1. Seals the target's currently-active DLQ segment (so every
+///    dead-lettered entry — even those in the in-flight writer — is
+///    visible to the replay pass).
+/// 2. Enumerates every sealed `.dlq.enc` segment for the target, in
+///    oldest-first order.
+/// 3. For each entry in each segment, reconstructs a
+///    [`RoutableMessage`] and calls [`send_request`] with the entry's
+///    preserved `delivery_id` as `X-Rustgate-Delivery-Id` — so receiver
+///    dedup keyed on the id survives a partial replay.
+/// 4. On success the entry is counted and moves on; on failure the
+///    entry is re-persisted via [`DeadLetterQueue::dead_letter_with_id`]
+///    with reason `"replay_failed"`, preserving the original id.
+/// 5. After every entry in a segment is processed, the segment is
+///    removed from disk. Even a segment whose entries all failed is
+///    removed because the failures are safely re-captured in a fresh
+///    segment — leaving the old one would cause an infinite replay
+///    loop on every subsequent trigger.
+///
+/// The worker shuts down when either the channel closes (publisher
+/// dropped) or the `shutdown` notify fires, whichever comes first. It
+/// does NOT pace drain with back-pressure on the outbound HTTP —
+/// `send_request` already carries timeout, retry, and circuit logic,
+/// so a target that drops back into the open state mid-drain simply
+/// starts re-DLQ'ing entries and the pass ends cleanly on the next
+/// `allow_request()` check.
+async fn drain_worker(
+    mut rx: mpsc::Receiver<String>,
+    targets: Arc<Vec<TargetState>>,
+    dlq: Arc<DeadLetterQueue>,
+    shutdown: Arc<tokio::sync::Notify>,
+) {
+    tracing::info!("HTTP DLQ drain worker started");
+    loop {
+        tokio::select! {
+            biased;
+            () = shutdown.notified() => {
+                tracing::info!("HTTP DLQ drain worker shutting down");
+                return;
+            }
+            next = rx.recv() => {
+                let Some(target_name) = next else {
+                    tracing::info!("HTTP DLQ drain channel closed, worker exiting");
+                    return;
+                };
+                drain_target(&target_name, &targets, &dlq).await;
+            }
+        }
+    }
+}
+
+/// Replay every sealed DLQ segment for `target_name`. Invoked by
+/// [`drain_worker`] on each recovery trigger.
+///
+/// Seals the active writer first so the sweep sees every queued entry
+/// (even those that never hit a rotation), then walks the sealed list
+/// oldest-first. Each entry is either successfully re-delivered or
+/// re-DLQ'd under reason `"replay_failed"`; the segment is removed
+/// from disk after processing regardless of the per-entry outcome
+/// (failed entries are preserved in the newly-written segment, so the
+/// original file is redundant).
+///
+/// The per-entry loop short-circuits if the target's circuit re-opens
+/// mid-drain — remaining entries of the current segment are re-DLQ'd
+/// and the next sealed segment is skipped until the next recovery
+/// trigger. This prevents a flapping endpoint from burning the entire
+/// backlog in a single pass against an unhealthy target.
+async fn drain_target(target_name: &str, targets: &[TargetState], dlq: &DeadLetterQueue) {
+    let Some(target) = targets.iter().find(|t| t.name == target_name) else {
+        tracing::warn!(
+            target = %sanitize_for_log(target_name),
+            "DLQ drain: unknown target, ignoring trigger"
+        );
+        return;
+    };
+
+    // Seal the active writer so its entries become visible to the
+    // replay pass. Missing active writer is normal (target never
+    // dead-lettered anything since the last drain).
+    let _ = dlq.rotate_active_segment(target_name);
+
+    let segments = dlq.list_sealed_segments(target_name);
+    let segment_count = segments.len();
+
+    rustgate_core::audit::http_dlq_drain_started(target_name, segment_count);
+    tracing::info!(
+        target = %sanitize_for_log(target_name),
+        segments = segment_count,
+        "HTTP DLQ drain pass started"
+    );
+
+    if segments.is_empty() {
+        rustgate_core::audit::http_dlq_drain_completed(target_name, 0, 0);
+        return;
+    }
+
+    let mut replayed: u64 = 0;
+    let mut failed: u64 = 0;
+
+    for segment in segments {
+        let entries = match dlq.read_segment(&segment) {
+            Ok(e) => e,
+            Err(err) => {
+                tracing::warn!(
+                    target = %sanitize_for_log(target_name),
+                    path = %segment.display(),
+                    error = %err,
+                    "DLQ drain: failed to decrypt segment, skipping"
+                );
+                // Leave the unreadable segment in place — the key ring
+                // may have a compatible key added later, and silently
+                // deleting forensic evidence is the worst option.
+                continue;
+            }
+        };
+
+        for entry in entries {
+            match replay_entry(target, &entry).await {
+                ReplayOutcome::Delivered => {
+                    replayed += 1;
+                    #[cfg(feature = "metrics")]
+                    crate::metrics::dlq_replayed()
+                        .with_label_values(&[target.name.as_str(), "success"])
+                        .inc();
+                }
+                ReplayOutcome::Failed => {
+                    failed += 1;
+                    #[cfg(feature = "metrics")]
+                    crate::metrics::dlq_replayed()
+                        .with_label_values(&[target.name.as_str(), "failed"])
+                        .inc();
+                    requeue_failed_entry(dlq, target_name, &entry);
+                }
+                ReplayOutcome::Dropped => {
+                    failed += 1;
+                    #[cfg(feature = "metrics")]
+                    crate::metrics::dlq_replayed()
+                        .with_label_values(&[target.name.as_str(), "dropped"])
+                        .inc();
+                }
+            }
+        }
+
+        // Remove the sealed segment regardless of per-entry outcome —
+        // failed entries were re-persisted under a fresh segment, so
+        // leaving the drained file on disk would cause an infinite
+        // replay loop on every subsequent recovery trigger.
+        let _ = dlq.remove_segment(&segment);
+    }
+
+    rustgate_core::audit::http_dlq_drain_completed(target_name, replayed, failed);
+    tracing::info!(
+        target = %sanitize_for_log(target_name),
+        replayed,
+        failed,
+        "HTTP DLQ drain pass completed"
+    );
+}
+
+/// Outcome of replaying a single DLQ entry.
+enum ReplayOutcome {
+    /// Entry was successfully re-delivered (2xx on first attempt).
+    Delivered,
+    /// Entry failed the replay (transport error or non-2xx) — caller
+    /// must re-persist it under a fresh DLQ segment.
+    Failed,
+    /// Entry was malformed beyond recovery (payload base64 decode
+    /// error, unsupported schema) and dropped without re-persistence.
+    Dropped,
+}
+
+/// Decode and re-deliver a single DLQ entry to `target`.
+///
+/// Reconstructs a [`RoutableMessage`] with a synthetic [`Identity`]
+/// (CN preserved, everything else defaulted — the original cert
+/// material is not captured in the DLQ). Calls [`send_request`]
+/// directly so the entry's preserved `delivery_id` is forwarded on the
+/// wire exactly as-was (via `X-Rustgate-Delivery-Id`), enabling the
+/// receiver to dedup a replayed delivery against the original.
+///
+/// This uses a SINGLE HTTP attempt per entry rather than the full
+/// [`publish_with_retry`] loop: replay already runs inside the
+/// circuit-recovery window, and burning the retry budget here would
+/// re-trip the circuit on a mass replay against a flapping target.
+/// A single-attempt failure re-DLQs the entry instead, delegating the
+/// backoff to the next recovery cycle.
+async fn replay_entry(
+    target: &TargetState,
+    entry: &crate::dlq_reader::OwnedDlqEntry,
+) -> ReplayOutcome {
+    // Decode the original payload bytes. A decode failure here is a
+    // hard drop — the DLQ file is intact but the entry itself is
+    // unusable, and no retry can fix it.
+    let payload_bytes = match entry.decode_payload() {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(
+                target = %target.name,
+                source_cn = %sanitize_for_log(&entry.source_cn),
+                error = %err,
+                "DLQ replay: payload decode failed, dropping entry"
+            );
+            return ReplayOutcome::Dropped;
+        }
+    };
+    let payload = bytes::Bytes::from(payload_bytes);
+
+    // Reconstruct a synthetic RoutableMessage. Fields that are not
+    // serialized in the DLQ entry (fingerprint, groups, tenant,
+    // spiffe_id, attributes) default to empty — this mirrors what
+    // offline replay tools do and is safe because the HTTP bridge
+    // only reads `msg.source.cn`, `msg.destination`, `msg.payload`,
+    // and `msg.metadata` during serialization.
+    let msg = rustgate_core::message::RoutableMessage {
+        source: rustgate_core::identity::Identity {
+            cn: entry.source_cn.clone(),
+            fingerprint: String::new(),
+            groups: entry.source_groups.iter().cloned().collect(),
+            tenant: None,
+            spiffe_id: None,
+            attributes: std::sync::Arc::new(Default::default()),
+        },
+        destination: rustgate_core::message::Destination::Broadcast,
+        payload,
+        metadata: rustgate_core::message::Metadata {
+            received_at: std::time::SystemTime::now(),
+            source_protocol: entry.source_protocol.clone(),
+            message_type: parse_message_type(&entry.message_type),
+            ttl: None,
+        },
+    };
+
+    // Rate-limit and oversize checks mirror the dispatch path so a
+    // replay surge cannot burst past a target's steady-state cap.
+    if let Some(ref limiter) = target.rate_limiter
+        && !limiter.try_acquire()
+    {
+        tracing::debug!(
+            target = %target.name,
+            "DLQ replay: rate-limited, requeueing"
+        );
+        return ReplayOutcome::Failed;
+    }
+
+    if msg.payload.len() > target.max_payload_bytes {
+        tracing::warn!(
+            target = %target.name,
+            payload_size = msg.payload.len(),
+            "DLQ replay: payload exceeds size limit, dropping entry"
+        );
+        return ReplayOutcome::Dropped;
+    }
+
+    let (body_vec, content_type) =
+        match payload::serialize(&msg, target.format, &target.instance_id) {
+            Ok(result) => result,
+            Err(err) => {
+                tracing::warn!(
+                    target = %target.name,
+                    error = %err,
+                    "DLQ replay: payload serialization failed, dropping entry"
+                );
+                return ReplayOutcome::Dropped;
+            }
+        };
+    let body = bytes::Bytes::from(body_vec);
+
+    // Use the preserved delivery_id when available; fall back to a
+    // fresh id for pre-migration entries that carry the
+    // `#[serde(default)]` empty string.
+    let delivery_id = if entry.delivery_id.is_empty() {
+        generate_delivery_id()
+    } else {
+        entry.delivery_id.clone()
+    };
+    let content_digest = compute_content_digest(&body);
+
+    match send_request(target, body, content_type, &delivery_id, &content_digest).await {
+        Ok(_) => {
+            tracing::debug!(
+                target = %target.name,
+                delivery_id = %delivery_id,
+                "DLQ replay: entry re-delivered"
+            );
+            ReplayOutcome::Delivered
+        }
+        Err((status, err, _)) => {
+            tracing::warn!(
+                target = %target.name,
+                delivery_id = %delivery_id,
+                status = ?status,
+                error = %err,
+                "DLQ replay: entry delivery failed, will re-DLQ"
+            );
+            // Feed the circuit breaker so a mass replay against an
+            // unhealthy target re-trips it quickly, preventing the
+            // worker from burning through the backlog against an
+            // endpoint that is still down. 4xx client errors do NOT
+            // affect the circuit (consistent with the live dispatch
+            // path's classification).
+            let affects_circuit = status.is_none_or(|s| s == 429 || (500..600).contains(&s));
+            if affects_circuit && target.circuit.record_failure() {
+                rustgate_core::audit::http_circuit_tripped(&target.name);
+                #[cfg(feature = "metrics")]
+                crate::metrics::circuit_state()
+                    .with_label_values(&[target.name.as_str()])
+                    .set(1);
+            }
+            ReplayOutcome::Failed
+        }
+    }
+}
+
+/// Re-persist a replay-failed entry into a fresh DLQ segment,
+/// preserving the original `delivery_id` so a future retry against a
+/// receiver that actually accepted the first replay can dedup on id.
+fn requeue_failed_entry(
+    dlq: &DeadLetterQueue,
+    target_name: &str,
+    entry: &crate::dlq_reader::OwnedDlqEntry,
+) {
+    let payload_bytes = match entry.decode_payload() {
+        Ok(b) => b,
+        Err(_) => {
+            // Already logged in replay_entry; don't double-log.
+            return;
+        }
+    };
+    let msg = rustgate_core::message::RoutableMessage {
+        source: rustgate_core::identity::Identity {
+            cn: entry.source_cn.clone(),
+            fingerprint: String::new(),
+            groups: entry.source_groups.iter().cloned().collect(),
+            tenant: None,
+            spiffe_id: None,
+            attributes: std::sync::Arc::new(Default::default()),
+        },
+        destination: rustgate_core::message::Destination::Broadcast,
+        payload: bytes::Bytes::from(payload_bytes),
+        metadata: rustgate_core::message::Metadata {
+            received_at: std::time::SystemTime::now(),
+            source_protocol: entry.source_protocol.clone(),
+            message_type: parse_message_type(&entry.message_type),
+            ttl: None,
+        },
+    };
+    if entry.delivery_id.is_empty() {
+        // Pre-migration entry without an id: re-persist with a fresh
+        // id generated by the normal path so the receiver at least has
+        // some idempotency token to work with on the next replay.
+        dlq.dead_letter(target_name, &msg, "replay_failed");
+    } else {
+        dlq.dead_letter_with_id(target_name, &msg, "replay_failed", &entry.delivery_id);
+    }
+}
+
+/// Round-trip parse `MessageType` from the stringified form stored in
+/// the DLQ entry. Mirrors the cases in the `Display` impl exactly so a
+/// value written by the producer round-trips through the replay path
+/// without loss. Unknown strings fall back to `Other(raw)`.
+fn parse_message_type(s: &str) -> rustgate_core::message::MessageType {
+    use rustgate_core::message::MessageType;
+    match s {
+        "position" => MessageType::Position,
+        "chat" => MessageType::Chat,
+        "alert" => MessageType::Alert,
+        "status" => MessageType::Status,
+        "file" => MessageType::File,
+        "mavlink" => MessageType::Mavlink,
+        other => {
+            // `Display` writes `Other(x)` as `other:x`; peel the
+            // prefix back off if present so a round-trip produces the
+            // same variant shape. Otherwise treat the whole string as
+            // an opaque custom type.
+            if let Some(tail) = other.strip_prefix("other:") {
+                MessageType::Other(tail.to_string())
+            } else {
+                MessageType::Other(other.to_string())
+            }
+        }
+    }
+}
+
 /// Drain every target's in-memory batcher on shutdown, issuing one last
 /// HTTP request per non-empty batcher so buffered messages don't vanish
 /// when the worker stops. Runs after the main dispatch channel has
@@ -1386,6 +1929,7 @@ mod tests {
             tx,
             targets: Arc::new(vec![]),
             shutdown: Arc::new(tokio::sync::Notify::new()),
+            drain_shutdown: None,
             dlq: None,
             worker_handle: Arc::new(std::sync::Mutex::new(None)),
             gate: None,
@@ -1451,6 +1995,7 @@ mod tests {
             tx,
             targets: Arc::new(vec![]),
             shutdown: Arc::new(tokio::sync::Notify::new()),
+            drain_shutdown: None,
             dlq: None,
             worker_handle: Arc::new(std::sync::Mutex::new(None)),
             gate: None,
@@ -1534,6 +2079,7 @@ mod tests {
             tx: tx.clone(),
             targets: Arc::new(vec![]),
             shutdown: Arc::new(tokio::sync::Notify::new()),
+            drain_shutdown: None,
             dlq: Some(dlq),
             worker_handle: Arc::new(std::sync::Mutex::new(None)),
             gate: None,
@@ -1575,6 +2121,7 @@ mod tests {
             tx: tx.clone(),
             targets: Arc::new(vec![]),
             shutdown: Arc::new(tokio::sync::Notify::new()),
+            drain_shutdown: None,
             dlq: None,
             worker_handle: Arc::new(std::sync::Mutex::new(None)),
             gate: None,
@@ -1615,6 +2162,7 @@ mod tests {
             tx,
             targets: Arc::new(vec![]),
             shutdown: Arc::new(tokio::sync::Notify::new()),
+            drain_shutdown: None,
             dlq: Some(dlq),
             worker_handle: Arc::new(std::sync::Mutex::new(None)),
             gate: Some(Arc::clone(&gate)),
@@ -1646,6 +2194,7 @@ mod tests {
             tx,
             targets: Arc::new(vec![]),
             shutdown: Arc::new(tokio::sync::Notify::new()),
+            drain_shutdown: None,
             dlq: None,
             worker_handle: Arc::new(std::sync::Mutex::new(None)),
             gate: Some(Arc::clone(&gate)),
@@ -1718,7 +2267,9 @@ mod tests {
     #[test]
     fn circuit_observer_sets_gauge_to_halfopen_on_open_to_halfopen() {
         let target = "test-observer-halfopen-transition";
-        let obs = build_circuit_observer(target);
+        // `None` — this test exercises only the gauge-update side
+        // effect; drain triggers are validated by a separate test.
+        let obs = build_circuit_observer(target, None);
 
         obs(CB_OPEN, CB_HALF_OPEN);
 
@@ -1739,7 +2290,9 @@ mod tests {
         // assertion (Prometheus label values are a shared process-wide
         // namespace across tests in the same binary).
         let target = "test-observer-no-op-transitions";
-        let obs = build_circuit_observer(target);
+        // `None` — this test asserts the observer is a no-op for
+        // non-`(Open, HalfOpen)` transitions; it has nothing to drain.
+        let obs = build_circuit_observer(target, None);
 
         // None of these are the load-bearing Open → HalfOpen transition.
         obs(CB_CLOSED, CB_OPEN);
@@ -1768,9 +2321,11 @@ mod tests {
     #[tokio::test]
     async fn circuit_observer_fires_via_real_breaker_transition() {
         let target = "test-observer-end-to-end";
+        // `None` — this test validates the metrics side of the observer
+        // via a real breaker; the drain side has its own dedicated test.
         let breaker =
             rustgate_resilience::circuit::CircuitBreaker::new(1, Duration::from_millis(10), 3, 1)
-                .with_on_state_change(build_circuit_observer(target));
+                .with_on_state_change(build_circuit_observer(target, None));
 
         // Closed → Open (record_failure returns bool; discarded deliberately).
         let _ = breaker.record_failure();
@@ -1794,8 +2349,75 @@ mod tests {
     #[test]
     fn circuit_observer_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>(_: &T) {}
-        let obs = build_circuit_observer("send-sync-check");
+        // `None` — only the auto-trait bounds are under test here.
+        let obs = build_circuit_observer("send-sync-check", None);
         assert_send_sync(&obs);
+    }
+
+    // ── DLQ auto-drain helpers (issue #881) ───────────────────────────
+
+    /// `parse_message_type` is the inverse of `MessageType::Display`.
+    /// DLQ entries store the message type as a string (written by the
+    /// `Display` impl in `rustgate-core`) and the drain path must
+    /// reconstruct the original variant exactly so the replayed message
+    /// carries the same classification as the original. A silent round-trip
+    /// mismatch (e.g. `Position` → `Other("position")`) would corrupt
+    /// downstream routing on every replay.
+    #[test]
+    fn parse_message_type_round_trips_every_named_variant() {
+        use rustgate_core::message::MessageType;
+        let cases = [
+            MessageType::Position,
+            MessageType::Chat,
+            MessageType::Alert,
+            MessageType::Status,
+            MessageType::File,
+            MessageType::Mavlink,
+        ];
+        for mt in cases {
+            let s = mt.to_string();
+            let parsed = parse_message_type(&s);
+            assert_eq!(parsed, mt, "round-trip failed for {s}");
+        }
+    }
+
+    /// `Other(x)` writes as `other:x` via `Display`, so the parser must
+    /// strip the `other:` prefix and reconstruct `Other(x)` — not leak
+    /// the prefix into the payload. Covers both non-empty tails and the
+    /// empty-tail edge case (`other:` → `Other("")`).
+    #[test]
+    fn parse_message_type_preserves_other_variant_tail() {
+        use rustgate_core::message::MessageType;
+        assert_eq!(
+            parse_message_type("other:custom"),
+            MessageType::Other("custom".to_string())
+        );
+        assert_eq!(
+            parse_message_type("other:"),
+            MessageType::Other(String::new())
+        );
+        // A tail with its own colons must not be stripped a second time
+        // — the prefix peel is single-pass.
+        assert_eq!(
+            parse_message_type("other:ns:subtype"),
+            MessageType::Other("ns:subtype".to_string())
+        );
+    }
+
+    /// Strings that do not match any named variant and do not carry the
+    /// `other:` prefix fall through to `Other(raw)` verbatim. This is
+    /// the graceful-degradation path for a future variant that a newer
+    /// producer might write before an older consumer's parser is
+    /// updated — replay preserves the raw tag rather than crashing or
+    /// silently dropping the entry.
+    #[test]
+    fn parse_message_type_falls_back_to_other_for_unknown_strings() {
+        use rustgate_core::message::MessageType;
+        assert_eq!(
+            parse_message_type("unknown"),
+            MessageType::Other("unknown".to_string())
+        );
+        assert_eq!(parse_message_type(""), MessageType::Other(String::new()));
     }
 
     // ── Response body helpers (issue #906) ────────────────────────────

@@ -22,6 +22,7 @@ static FILTERED: OnceLock<IntCounterVec> = OnceLock::new();
 static QUEUE_DEPTH: OnceLock<IntGauge> = OnceLock::new();
 static DROPPED: OnceLock<IntCounterVec> = OnceLock::new();
 static DLQ_EVICTED: OnceLock<IntCounterVec> = OnceLock::new();
+static DLQ_REPLAYED: OnceLock<IntCounterVec> = OnceLock::new();
 static RESPONSE_BODIES_CAPTURED: OnceLock<IntCounterVec> = OnceLock::new();
 static BATCHES_FLUSHED: OnceLock<IntCounterVec> = OnceLock::new();
 
@@ -152,6 +153,25 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(dlq_evicted.clone()))?;
     let _ = DLQ_EVICTED.set(dlq_evicted);
 
+    let dlq_replayed = IntCounterVec::new(
+        Opts::new(
+            "rustgate_http_dlq_replayed_total",
+            "Dead-letter queue entries replayed by the auto-drain worker \
+             after a target's circuit recovered (HalfOpen -> Closed). \
+             Counted per-entry, not per-segment. Labelled by target and \
+             outcome: `success` (entry re-delivered to the target), \
+             `failed` (replay hit a transport error or 4xx/5xx and was \
+             re-persisted to a fresh DLQ segment), or `dropped` (entry \
+             malformed beyond recovery, e.g. payload base64 decode \
+             error). A climbing `failed` rate after recovery indicates \
+             the target is unhealthy in a way the circuit breaker \
+             missed.",
+        ),
+        &["target", "result"],
+    )?;
+    registry.register(Box::new(dlq_replayed.clone()))?;
+    let _ = DLQ_REPLAYED.set(dlq_replayed);
+
     let response_bodies_captured = IntCounterVec::new(
         Opts::new(
             "rustgate_http_response_bodies_captured_total",
@@ -263,6 +283,26 @@ pub fn dropped() -> &'static IntCounterVec {
 pub fn dlq_evicted() -> &'static IntCounterVec {
     DLQ_EVICTED.get_or_init(|| {
         fallback_counter_vec("rustgate_http_dlq_evicted_total", "fallback", &["target"])
+    })
+}
+
+/// DLQ entry-replay counter, labelled by target and outcome.
+///
+/// Increments once per entry processed by the auto-drain worker after
+/// a target's circuit recovered. The `result` label distinguishes
+/// `success` (re-delivered to the target), `failed` (replay hit a
+/// transport error or non-2xx status and was re-persisted to a fresh
+/// DLQ segment), and `dropped` (entry was malformed beyond recovery,
+/// e.g. payload base64 decode error). A climbing `failed` rate is the
+/// operator signal that the target is unhealthy in a way the circuit
+/// breaker missed.
+pub fn dlq_replayed() -> &'static IntCounterVec {
+    DLQ_REPLAYED.get_or_init(|| {
+        fallback_counter_vec(
+            "rustgate_http_dlq_replayed_total",
+            "fallback",
+            &["target", "result"],
+        )
     })
 }
 
@@ -401,6 +441,10 @@ mod tests {
             batches_flushed().desc()[0].fq_name,
             "rustgate_http_batches_flushed_total"
         );
+        assert_eq!(
+            dlq_replayed().desc()[0].fq_name,
+            "rustgate_http_dlq_replayed_total"
+        );
     }
 
     #[test]
@@ -435,6 +479,10 @@ mod tests {
         assert_eq!(
             labels_of(batches_flushed().desc()[0]),
             vec!["target".to_string(), "reason".to_string()]
+        );
+        assert_eq!(
+            labels_of(dlq_replayed().desc()[0]),
+            vec!["target".to_string(), "result".to_string()]
         );
         // Non-vector metrics carry no variable labels.
         assert!(labels_of(queue_depth().desc()[0]).is_empty());
@@ -559,6 +607,7 @@ mod tests {
             response_bodies_captured()
         ));
         assert!(std::ptr::eq(batches_flushed(), batches_flushed()));
+        assert!(std::ptr::eq(dlq_replayed(), dlq_replayed()));
     }
 
     #[test]
@@ -594,6 +643,7 @@ mod tests {
             request_duration().desc()[0],
             response_bodies_captured().desc()[0],
             batches_flushed().desc()[0],
+            dlq_replayed().desc()[0],
         ] {
             assert!(
                 !d.help.is_empty(),
