@@ -108,9 +108,16 @@ pub(crate) struct Cli {
     #[serde(skip_serializing)]
     pub(crate) config: Option<String>,
 
+    /// TCP socket address to bind the primary TLS listener on, as
+    /// `<host>:<port>`. Use `0.0.0.0:<port>` to accept IPv4 on all
+    /// interfaces and `[::]:<port>` to dual-bind IPv4 + IPv6.
     #[arg(short, long, default_value = "0.0.0.0:4433", env = "RUSTGATE_BIND", value_parser = parse_socket_addr)]
     pub(crate) bind: String,
 
+    /// Path to the PEM-encoded TLS server certificate presented to
+    /// every mTLS client. Required unless `--spiffe` is set (the
+    /// SPIFFE Workload API supplies the SVID instead) or the value is
+    /// provided via a config file referenced by `--config`.
     #[arg(
         long,
         default_value = "",
@@ -120,6 +127,10 @@ pub(crate) struct Cli {
     )]
     pub(crate) cert: String,
 
+    /// Path to the PEM-encoded private key matching `--cert`. The file
+    /// is read into a zeroizing buffer and wiped from memory as soon
+    /// as rustls has consumed the bytes. Required unless `--spiffe`
+    /// or `--config` supplies an equivalent value.
     #[arg(
         long,
         default_value = "",
@@ -129,6 +140,11 @@ pub(crate) struct Cli {
     )]
     pub(crate) key: String,
 
+    /// Path to the PEM-encoded trust anchor bundle used to verify
+    /// client certificates. Every client must present a certificate
+    /// chaining to this bundle. Required unless `--spiffe` is set
+    /// (trust anchors come from the Workload API) or a config file
+    /// supplies the value.
     #[arg(
         long,
         default_value = "",
@@ -1257,6 +1273,17 @@ pub(crate) enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Print an annotated TOML configuration template covering every
+    /// option rustgate reads from a config file. Each key is emitted
+    /// commented-out with its clap help text and the default the
+    /// server would apply when the option is absent, so an operator
+    /// can uncomment only the keys they want to override.
+    ///
+    /// Unlike [`Command::PrintConfig`], this runs before any parsing
+    /// and before the server loads any TLS material: it inspects the
+    /// CLI schema itself, so the output is a complete template
+    /// suitable as a starting point for a new deployment.
+    GenerateConfig,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Serialize, Deserialize)]
@@ -1436,6 +1463,14 @@ macro_rules! define_config_file {
                 )*
             }
         }
+
+        /// Snake-case identifiers of every [`ConfigFile`] field in source
+        /// order. This is the authoritative list of keys that
+        /// `generate-config` templates and that TOML deserialization
+        /// accepts (after the macro's `rename_all = "kebab-case"`).
+        pub(crate) const CONFIG_FILE_FIELDS: &[&str] = &[
+            $( stringify!($field), )*
+        ];
     };
 }
 
