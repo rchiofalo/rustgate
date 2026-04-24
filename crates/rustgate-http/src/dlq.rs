@@ -74,6 +74,17 @@ pub(crate) struct DeadLetterQueue {
 struct WriterState {
     writer: SharedEncryptedWriter,
     bytes_written: u64,
+    /// Absolute path of the active (unsealed) segment file on disk.
+    ///
+    /// Recorded at writer creation so [`DeadLetterQueue::rotate_active_segment`]
+    /// can return it to the drain worker after sealing, and so
+    /// [`DeadLetterQueue::list_sealed_segments`] can exclude the
+    /// currently-active path from its sealed-segment scan — the sweep
+    /// must never return a live file whose terminator chunk has not
+    /// yet been written, because decrypting it would surface a
+    /// truncation error and because replaying against a file that is
+    /// still being written to would race the writer's next append.
+    path: PathBuf,
 }
 
 impl fmt::Debug for DeadLetterQueue {
@@ -158,13 +169,32 @@ impl DeadLetterQueue {
         // domain effectively infinite across every DLQ segment ever
         // produced by this process.
         let delivery_id = generate_delivery_id();
+        self.dead_letter_with_id(target_name, msg, reason, &delivery_id);
+    }
 
+    /// Persist a dead-lettered message while preserving an externally-
+    /// supplied `delivery_id`. Used by the auto-drain worker when a
+    /// replay attempt fails and the entry must be re-DLQ'd — preserving
+    /// the original id keeps receiver-side dedup intact across the
+    /// retry cycle (see `#881`), so a target that accepted the first
+    /// replay but failed our 2xx read (e.g. TCP RST after response send)
+    /// will dedup the second replay on the same id.
+    ///
+    /// Callers that do NOT need id preservation should prefer
+    /// [`dead_letter`](Self::dead_letter), which generates a fresh id.
+    pub(crate) fn dead_letter_with_id(
+        &self,
+        target_name: &str,
+        msg: &RoutableMessage,
+        reason: &str,
+        delivery_id: &str,
+    ) {
         // Serialize the entry to JSON
         let entry = DlqEntry {
             timestamp: format_timestamp_now(),
             target: target_name,
             reason,
-            delivery_id: &delivery_id,
+            delivery_id,
             source_cn: &msg.source.cn,
             source_groups: msg.source.groups.iter().map(String::as_str).collect(),
             destination: crate::payload::format_destination(&msg.destination),
@@ -187,6 +217,24 @@ impl DeadLetterQueue {
         };
 
         self.write_entry(target_name, &json);
+    }
+
+    /// Decrypt and deserialize a sealed DLQ segment. Thin wrapper around
+    /// [`crate::dlq_reader::read_dlq_file`] that keeps the [`KeyRing`]
+    /// encapsulated inside the DLQ — the drain worker in `publisher.rs`
+    /// only holds `Arc<DeadLetterQueue>` and never needs direct access
+    /// to the key material.
+    ///
+    /// Returns the list of entries in file order. AEAD failures
+    /// (truncation, tampered chunk, wrong key) surface as
+    /// [`DlqReadError::Decrypt`](crate::dlq_reader::DlqReadError::Decrypt);
+    /// JSON parse failures as
+    /// [`DlqReadError::Json`](crate::dlq_reader::DlqReadError::Json).
+    pub(crate) fn read_segment(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<Vec<crate::dlq_reader::OwnedDlqEntry>, crate::dlq_reader::DlqReadError> {
+        crate::dlq_reader::read_dlq_file(path, &self.key_ring)
     }
 
     /// Write a serialized entry to the target's DLQ file.
@@ -272,6 +320,7 @@ impl DeadLetterQueue {
                         WriterState {
                             writer: w,
                             bytes_written: 0,
+                            path: file_path.clone(),
                         },
                     );
                 }
@@ -456,6 +505,180 @@ impl DeadLetterQueue {
                 }
             }
             idx += 1;
+        }
+    }
+
+    /// Seal the currently-active segment for `target_name`, if any, and
+    /// return the freshly-sealed path.
+    ///
+    /// Invariant for the replay path: every entry the drain worker wants
+    /// to read must sit inside a sealed segment. An unsealed file has no
+    /// terminator chunk, so `decrypt_file` surfaces a truncation error
+    /// rather than yielding the entries accumulated so far. Callers
+    /// invoke this once at the start of a drain pass so messages queued
+    /// during the outage — even those that never triggered a size-based
+    /// rotation — become replayable.
+    ///
+    /// Returns `None` when no active writer exists (the target either
+    /// never dead-lettered anything or its last active segment was
+    /// already rotated by the size-cap path). `Some(path)` when a live
+    /// writer was sealed: the caller may then include that path in the
+    /// list of segments to replay. After this call the target has no
+    /// active writer; the next `dead_letter` call re-initializes a fresh
+    /// segment via the standard lazy-creation path.
+    ///
+    /// Best-effort: seal failures are logged at `warn` level but the
+    /// writer is still removed from the map, because leaving a partially-
+    /// sealed writer in place would permanently wedge the target (every
+    /// subsequent `dead_letter` would keep writing to a corrupt file).
+    pub(crate) fn rotate_active_segment(&self, target_name: &str) -> Option<PathBuf> {
+        let mut guard = match self.writers.lock() {
+            Ok(w) => w,
+            Err(_) => {
+                tracing::warn!(
+                    target = %sanitize_for_log(target_name),
+                    "DLQ writer lock poisoned, cannot rotate active segment"
+                );
+                return None;
+            }
+        };
+        let state = guard.remove(target_name)?;
+        let path = state.path.clone();
+        if let Err(e) = state.writer.finish() {
+            tracing::warn!(
+                target = %sanitize_for_log(target_name),
+                path = %path.display(),
+                error = %e,
+                "failed to seal active DLQ segment during rotate"
+            );
+            return None;
+        }
+        tracing::info!(
+            target = %sanitize_for_log(target_name),
+            path = %path.display(),
+            bytes_written = state.bytes_written,
+            "sealed active DLQ segment for drain"
+        );
+        Some(path)
+    }
+
+    /// List every sealed DLQ segment on disk that belongs to `target_name`.
+    ///
+    /// A "sealed" segment is one whose filename matches the pattern
+    /// `{target}_*.{suffix}` *and* which is not the currently-active
+    /// writer path for that target. The active path is excluded because
+    /// it has no encrypted terminator chunk yet — reading it would fail
+    /// AEAD verification and replaying against it would race the writer.
+    ///
+    /// The returned list is sorted oldest-first by mtime (ties broken
+    /// lexicographically by path) so the drain worker replays segments
+    /// in the order they were produced, preserving the original
+    /// dead-letter ordering across rotations. A target with no segments
+    /// on disk yields an empty vector.
+    ///
+    /// Best-effort: individual `metadata` or directory-entry failures
+    /// are logged and skipped, matching the eviction sweep. Non-UTF-8
+    /// filenames cannot be DLQ segments (the writer never produces them)
+    /// and are silently skipped.
+    pub(crate) fn list_sealed_segments(&self, target_name: &str) -> Vec<PathBuf> {
+        if !target_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            tracing::warn!(
+                target = %sanitize_for_log(target_name),
+                "DLQ target name contains unsafe characters, skipping segment list"
+            );
+            return Vec::new();
+        }
+
+        let active_path = match self.writers.lock() {
+            Ok(guard) => guard.get(target_name).map(|s| s.path.clone()),
+            Err(_) => {
+                tracing::warn!(
+                    target = %sanitize_for_log(target_name),
+                    "DLQ writer lock poisoned, listing sealed segments without active-path exclusion"
+                );
+                None
+            }
+        };
+
+        let read = match std::fs::read_dir(&self.dir) {
+            Ok(it) => it,
+            Err(err) => {
+                tracing::warn!(
+                    target = %sanitize_for_log(target_name),
+                    dir = %self.dir.display(),
+                    error = %err,
+                    "DLQ drain: read_dir failed, no segments to replay"
+                );
+                return Vec::new();
+            }
+        };
+
+        let prefix = format!("{target_name}_");
+        struct SealedFile {
+            path: PathBuf,
+            mtime: std::time::SystemTime,
+        }
+        let mut files: Vec<SealedFile> = Vec::new();
+        for entry in read {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let name = match entry.file_name().into_string() {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if !name.starts_with(&prefix) || !name.ends_with(DLQ_FILE_SUFFIX) {
+                continue;
+            }
+            let path = entry.path();
+            if active_path.as_ref().is_some_and(|active| &path == active) {
+                continue;
+            }
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            files.push(SealedFile { path, mtime });
+        }
+
+        files.sort_by(|a, b| a.mtime.cmp(&b.mtime).then_with(|| a.path.cmp(&b.path)));
+        files.into_iter().map(|f| f.path).collect()
+    }
+
+    /// Remove a sealed DLQ segment after a successful replay pass.
+    ///
+    /// The drain worker calls this for each segment whose every entry
+    /// was successfully replayed (or re-persisted as a fresh DLQ entry
+    /// under a new `delivery_id`, which amounts to the same thing —
+    /// the bytes are preserved). Failure to remove is logged at `warn`
+    /// but not surfaced because a leftover sealed segment will either
+    /// be retried on the next drain trigger or evicted by the
+    /// `max_target_bytes` sweep.
+    pub(crate) fn remove_segment(&self, path: &std::path::Path) -> std::io::Result<()> {
+        match std::fs::remove_file(path) {
+            Ok(()) => {
+                tracing::info!(
+                    path = %path.display(),
+                    "removed drained DLQ segment"
+                );
+                Ok(())
+            }
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "failed to remove drained DLQ segment"
+                );
+                Err(err)
+            }
         }
     }
 

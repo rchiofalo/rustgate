@@ -773,6 +773,43 @@ pub fn http_dlq_failed(target: &str, error: &str) {
     );
 }
 
+/// Record the start of an auto-drain pass after a target's circuit
+/// recovered. `segment_count` is the number of sealed DLQ segments the
+/// worker is about to replay — zero is a legal value (no backlog).
+/// Paired with [`http_dlq_drain_completed`] once the worker finishes
+/// walking every segment; the two events bracket the drain window so
+/// operators can see elapsed time and per-segment success rate in the
+/// SIEM trail. `#881`.
+pub fn http_dlq_drain_started(target: &str, segment_count: usize) {
+    audit!(
+        "http.dlq_drain_started",
+        target = %target,
+        segments = segment_count,
+        action = "dlq_drain",
+        result = "started"
+    );
+}
+
+/// Record completion of an auto-drain pass. `replayed` is the number
+/// of entries that reached the target with a 2xx status; `failed` is
+/// the number that either re-entered the DLQ (re-persisted under a
+/// fresh segment) or were silently dropped as malformed. `#881`.
+///
+/// `replayed + failed` is the total entry count read from the drained
+/// segments, so operators can reconcile this against the per-entry
+/// `rustgate_http_dlq_replayed_total{result}` counter rate without
+/// depending on a subtraction.
+pub fn http_dlq_drain_completed(target: &str, replayed: u64, failed: u64) {
+    audit!(
+        "http.dlq_drain_completed",
+        target = %target,
+        replayed = replayed,
+        failed = failed,
+        action = "dlq_drain",
+        result = "completed"
+    );
+}
+
 // ── MAVLink framing audit events ────────────────────────────────────
 
 /// Record a MAVLink v2 frame rejected because its `INCOMPAT & SIGNED`
@@ -1087,6 +1124,20 @@ mod tests {
         fn test_http_circuit_recovered() {
             http_circuit_recovered("siem-collector");
             http_circuit_recovered("analytics-api");
+        }
+
+        #[test]
+        fn test_http_dlq_drain_started() {
+            http_dlq_drain_started("siem-collector", 0);
+            http_dlq_drain_started("siem-collector", 7);
+            http_dlq_drain_started("", 1);
+        }
+
+        #[test]
+        fn test_http_dlq_drain_completed() {
+            http_dlq_drain_completed("siem-collector", 0, 0);
+            http_dlq_drain_completed("siem-collector", 42, 3);
+            http_dlq_drain_completed("", 0, u64::MAX);
         }
     }
 
