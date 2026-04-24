@@ -302,7 +302,30 @@ Each target gets a separate file per process lifetime, named `{target}_{timestam
 }
 ```
 
-Dead-lettered messages can be recovered offline using `rustgate_core::encrypted::decrypt_file` with the same key ring. Each decrypted chunk is one JSON line containing message metadata and base64-encoded payload. DLQ writers are sealed during graceful shutdown to ensure encrypted terminators are written (readers reject unterminated files).
+Dead-lettered messages can be recovered offline using `rustgate_core::encrypted::decrypt_file` with the same key ring. Each decrypted chunk is one JSON record containing message metadata and base64-encoded payload. DLQ writers are sealed during graceful shutdown to ensure encrypted terminators are written (readers reject unterminated files).
+
+### Offline reader (`rustgate_http::dlq_reader`)
+
+For programmatic recovery, the `rustgate_http::dlq_reader` module exposes a stable API that decrypts a `.dlq.enc` file and yields strongly-typed `OwnedDlqEntry` records:
+
+```rust
+use rustgate_core::encrypted::KeyRing;
+use rustgate_http::dlq_reader::{OwnedDlqEntry, for_each_dlq_entry, read_dlq_file};
+
+let key_ring = KeyRing::from_bytes(std::fs::read("/etc/rustgate/keys/dlq.json")?.as_slice())?;
+
+// Convenient: load all entries into memory.
+let entries: Vec<OwnedDlqEntry> = read_dlq_file("/var/lib/rustgate/dlq/siem_1714000000.dlq.enc".as_ref(), &key_ring)?;
+
+// Streaming: one record at a time (stop early by returning Err).
+for_each_dlq_entry(path.as_ref(), &key_ring, |entry| {
+    let payload = entry.decode_payload()?; // raw bytes
+    process(entry, payload)?;
+    Ok(())
+})?;
+```
+
+The reader surfaces AEAD integrity failures (wrong key, tampered file, torn write, missing terminator) as `DlqReadError::Decrypt`, JSON shape regressions as `DlqReadError::Json`, and malformed base64 payloads as `DlqReadError::PayloadDecode`. The reader streams through a scratch tempfile that is unlinked on return, so plaintext never lands in a persistent location on disk.
 
 ## Metrics
 
