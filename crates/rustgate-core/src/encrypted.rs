@@ -1529,7 +1529,7 @@ mod tests {
             );
             let ring = KeyRing::from_bytes(json.as_bytes()).expect("ring loads");
             let key = ring.active_key().expect("active key present");
-            assert_eq!(hex::encode(&**key), expected_hex);
+            assert_eq!(hex::encode(**key), expected_hex);
         }
 
         #[test]
@@ -1704,19 +1704,17 @@ mod tests {
             // the id — not a generic JSON or key-material error —
             // because the user needs to know which derivation entry to
             // fix.
-            let json = format!(
-                r#"{{
+            let json = r#"{
                     "active_key_id": "k1",
-                    "key_derivations": {{
-                        "k1": {{
+                    "key_derivations": {
+                        "k1": {
                             "kdf": "hkdf-sha256",
                             "ikm": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
                             "salt": "",
                             "info": ""
-                        }}
-                    }}
-                }}"#
-            );
+                        }
+                    }
+                }"#;
             let _ = TEST_IKM_16; // silence dead-code when this test runs alone
             let err = KeyRing::from_bytes(json.as_bytes()).expect_err("must reject");
             match err {
