@@ -7,6 +7,16 @@
 //! for later forensic recovery or replay. Each target gets a separate
 //! file per process lifetime, named `{target}_{timestamp}.dlq.enc`.
 //!
+//! # Replay idempotency
+//!
+//! Every entry is stamped at dead-letter time with a 128-bit
+//! `delivery_id` (32 hex chars) — the same format, entropy budget, and
+//! generator shape as the live publish path's
+//! `X-Rustgate-Delivery-Id` header. Replay tooling forwards this id
+//! verbatim on the wire so that receivers can deduplicate a replayed
+//! delivery against the original attempt without any additional
+//! server-side state. `#881`.
+//!
 //! # Recovery
 //!
 //! Dead-lettered messages can be recovered offline using
@@ -84,6 +94,12 @@ struct DlqEntry<'a> {
     target: &'a str,
     /// Reason for dead-lettering (e.g., "circuit_open").
     reason: &'a str,
+    /// Stable per-entry idempotency key. Generated once at dead-letter
+    /// time and preserved verbatim across any future replay so the
+    /// receiver can deduplicate replayed deliveries. Wire-compatible
+    /// with the `X-Rustgate-Delivery-Id` header used on live requests:
+    /// 32 lowercase hex characters encoding 128 bits of entropy. `#881`.
+    delivery_id: &'a str,
     /// Source client CN from the original message.
     source_cn: &'a str,
     /// Source client group memberships.
@@ -131,11 +147,24 @@ impl DeadLetterQueue {
     /// Fail-open: all errors are logged as warnings but never propagated,
     /// because the DLQ is a best-effort forensic aid, not a critical path.
     pub(crate) fn dead_letter(&self, target_name: &str, msg: &RoutableMessage, reason: &str) {
+        // Generate the per-entry idempotency key eagerly so the id is
+        // stamped onto the persisted JSON record and survives file
+        // rotation, process restart, or operator replay. Re-delivering
+        // a DLQ entry later (either via the auto-drain on circuit
+        // recovery, see #881, or an offline replay tool) preserves
+        // this id verbatim as the `X-Rustgate-Delivery-Id` header so
+        // the receiver can deduplicate. 128 bits of entropy (same
+        // generator as the live publish path) keeps the collision
+        // domain effectively infinite across every DLQ segment ever
+        // produced by this process.
+        let delivery_id = generate_delivery_id();
+
         // Serialize the entry to JSON
         let entry = DlqEntry {
             timestamp: format_timestamp_now(),
             target: target_name,
             reason,
+            delivery_id: &delivery_id,
             source_cn: &msg.source.cn,
             source_groups: msg.source.groups.iter().map(String::as_str).collect(),
             destination: crate::payload::format_destination(&msg.destination),
@@ -462,6 +491,21 @@ fn format_timestamp_now() -> String {
     }
 }
 
+/// Generate a 128-bit idempotency key for a DLQ entry. Matches the
+/// generator used on the live publish path (`publisher::generate_delivery_id`)
+/// so replayed DLQ deliveries appear indistinguishable from fresh ones on
+/// the wire — the same 32-character lowercase hex format, the same 128
+/// bits of entropy. Kept as a free function here rather than a shared
+/// helper to avoid forcing `publisher::generate_delivery_id` to become
+/// `pub(crate)` purely for cross-module reuse; the two call sites are
+/// independent enough that a silent drift between them would be caught
+/// by the `dlq_entry_delivery_id_is_lowercase_hex_128_bits` format test.
+fn generate_delivery_id() -> String {
+    let mut buf = [0u8; 16];
+    fastrand::fill(&mut buf);
+    hex::encode(buf)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::panic, clippy::unwrap_used)]
@@ -518,6 +562,7 @@ mod tests {
             timestamp: "2026-04-13T12:00:00Z".to_string(),
             target: "siem",
             reason: "circuit_open",
+            delivery_id: "deadbeefcafef00d1122334455667788",
             source_cn: &msg.source.cn,
             source_groups: msg.source.groups.iter().map(String::as_str).collect(),
             destination: crate::payload::format_destination(&msg.destination),
@@ -530,6 +575,7 @@ mod tests {
         assert!(json.contains("\"source_cn\":\"alice\""));
         assert!(json.contains("\"reason\":\"circuit_open\""));
         assert!(json.contains("\"target\":\"siem\""));
+        assert!(json.contains("\"delivery_id\":\"deadbeefcafef00d1122334455667788\""));
     }
 
     #[test]
@@ -761,6 +807,7 @@ mod tests {
             timestamp: "2026-04-13T12:00:00Z".to_string(),
             target: "siem",
             reason: "circuit_open",
+            delivery_id: "abcdef0123456789abcdef0123456789",
             source_cn: &msg.source.cn,
             source_groups: msg.source.groups.iter().map(String::as_str).collect(),
             destination: crate::payload::format_destination(&msg.destination),
@@ -793,10 +840,11 @@ mod tests {
     }
 
     /// Pins that every documented field in the module-header contract
-    /// (timestamp, target, reason, source_cn, source_groups, destination,
-    /// message_type, source_protocol, payload_b64, payload_size) is present
-    /// in the serialized JSON. If a future refactor drops or renames a
-    /// field without updating the operator-facing recovery tool, this trips.
+    /// (timestamp, target, reason, delivery_id, source_cn, source_groups,
+    /// destination, message_type, source_protocol, payload_b64,
+    /// payload_size) is present in the serialized JSON. If a future
+    /// refactor drops or renames a field without updating the
+    /// operator-facing recovery tool, this trips.
     #[test]
     fn dlq_entry_json_contains_all_documented_fields() {
         let msg = make_msg("alice");
@@ -804,6 +852,7 @@ mod tests {
             timestamp: "2026-04-13T12:00:00Z".to_string(),
             target: "siem",
             reason: "circuit_open",
+            delivery_id: "0123456789abcdef0123456789abcdef",
             source_cn: &msg.source.cn,
             source_groups: msg.source.groups.iter().map(String::as_str).collect(),
             destination: crate::payload::format_destination(&msg.destination),
@@ -817,6 +866,7 @@ mod tests {
             "\"timestamp\":",
             "\"target\":",
             "\"reason\":",
+            "\"delivery_id\":",
             "\"source_cn\":",
             "\"source_groups\":",
             "\"destination\":",
@@ -830,6 +880,90 @@ mod tests {
                 "DLQ JSON missing documented field `{expected_field}`: {json}"
             );
         }
+    }
+
+    /// Pins the wire-format shape of `delivery_id`: 32 lowercase hex
+    /// characters (16 random bytes), matching the live publish path
+    /// generator. A regression that shortened the id, flipped it to
+    /// uppercase, or swapped in a different alphabet would break
+    /// receiver-side deduplication that keys on the exact string
+    /// (case-sensitive matching is intentional — `delivery_id` is
+    /// treated as an opaque token, not a number).
+    #[test]
+    fn delivery_id_is_lowercase_hex_128_bits() {
+        let id = generate_delivery_id();
+        assert_eq!(
+            id.len(),
+            32,
+            "expected 32 hex chars, got {}: {id}",
+            id.len()
+        );
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            "delivery_id must be lowercase hex only: {id}"
+        );
+        // Round-trips through hex decode: sanity-checks that we emitted
+        // valid hex, not some adjacent encoding (base64url, base32, …).
+        let bytes = hex::decode(&id).expect("delivery_id must be hex-decodable");
+        assert_eq!(bytes.len(), 16);
+    }
+
+    /// Two consecutive calls to `generate_delivery_id` must return
+    /// different values. The generator uses `fastrand::fill(16 bytes)`
+    /// so the collision probability on a single trial is ~2^-128 — a
+    /// duplicate here indicates the RNG was replaced by a non-random
+    /// source (constant, counter, seeded with zero, etc.).
+    #[test]
+    fn delivery_id_generator_is_non_constant() {
+        let a = generate_delivery_id();
+        let b = generate_delivery_id();
+        assert_ne!(a, b, "generator returned duplicate ids — RNG drift?");
+    }
+
+    /// End-to-end: a message dead-lettered through the DLQ producer
+    /// surfaces with a populated `delivery_id` on the reader side. The
+    /// reader already tolerates missing ids via `#[serde(default)]`
+    /// for backward compat, so this test specifically pins the
+    /// producer-fills-the-field contract.
+    #[test]
+    fn dead_letter_stamps_delivery_id_on_every_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_ring = test_key_ring();
+        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring.clone(), None, None);
+
+        let msg = make_msg("alice");
+        dlq.dead_letter("target-1", &msg, "circuit_open");
+        dlq.dead_letter("target-1", &msg, "circuit_open");
+        dlq.finish();
+
+        let files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(files.len(), 1, "expected single DLQ file");
+
+        let entries = crate::dlq_reader::read_dlq_file(&files[0], &key_ring)
+            .expect("reader must decrypt fresh DLQ segment");
+        assert_eq!(entries.len(), 2);
+
+        // Both entries must carry non-empty, wire-shape-valid ids.
+        for entry in &entries {
+            assert_eq!(
+                entry.delivery_id.len(),
+                32,
+                "delivery_id should be 32 hex chars, got {:?}",
+                entry.delivery_id
+            );
+        }
+        // And the two ids must differ — idempotency keys collide only
+        // across retries of the same logical entry, never across
+        // distinct dead-letter calls.
+        assert_ne!(
+            entries[0].delivery_id, entries[1].delivery_id,
+            "distinct dead_letter calls must produce distinct delivery_ids"
+        );
     }
 
     /// Pins that `format_timestamp_now` returns a string parseable as

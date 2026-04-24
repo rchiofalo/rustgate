@@ -84,6 +84,18 @@ pub struct OwnedDlqEntry {
     pub target: String,
     /// Reason for dead-lettering (e.g., `"circuit_open"`).
     pub reason: String,
+    /// Stable 128-bit idempotency key stamped by the writer at the moment
+    /// of dead-lettering. Replay tooling forwards this as the
+    /// `X-Rustgate-Delivery-Id` header so the receiver can deduplicate
+    /// replayed deliveries against the original attempt. `#881`.
+    ///
+    /// `#[serde(default)]` keeps the reader backward-compatible with DLQ
+    /// files produced before idempotency keys existed — pre-migration
+    /// entries deserialize as an empty string, and replay consumers are
+    /// expected to treat an empty id as "generate a fresh one" rather
+    /// than forwarding the sentinel verbatim.
+    #[serde(default)]
+    pub delivery_id: String,
     /// Source client CN from the original message.
     pub source_cn: String,
     /// Source client group memberships.
@@ -445,6 +457,7 @@ mod tests {
             timestamp: "2026-04-13T12:00:00Z".to_string(),
             target: "siem".to_string(),
             reason: "circuit_open".to_string(),
+            delivery_id: "0000000000000000ffffffffffffffff".to_string(),
             source_cn: "alice".to_string(),
             source_groups: vec!["alpha".to_string()],
             destination: "broadcast".to_string(),
@@ -468,6 +481,7 @@ mod tests {
             timestamp: "2026-04-13T12:00:00Z".to_string(),
             target: "siem".to_string(),
             reason: "circuit_open".to_string(),
+            delivery_id: String::new(),
             source_cn: "alice".to_string(),
             source_groups: vec![],
             destination: "broadcast".to_string(),
@@ -499,6 +513,7 @@ mod tests {
             timestamp: "2026-04-13T12:00:00Z".to_string(),
             target: "t1".to_string(),
             reason: "r1".to_string(),
+            delivery_id: "a1a1a1a1a1a1a1a1b2b2b2b2b2b2b2b2".to_string(),
             source_cn: "a".to_string(),
             source_groups: vec![],
             destination: "broadcast".to_string(),
@@ -545,5 +560,96 @@ mod tests {
         }"#;
         // Missing `source_protocol` — serde must refuse.
         assert!(serde_json::from_str::<OwnedDlqEntry>(bad).is_err());
+    }
+
+    /// Backward-compat: DLQ files written before `#881` do not carry a
+    /// `delivery_id` field. The reader must deserialize them without
+    /// error, with `delivery_id` defaulting to the empty string, so
+    /// operators can recover old archives without a migration step.
+    /// Downstream replay tooling treats an empty id as "generate a
+    /// fresh one" rather than forwarding the sentinel verbatim.
+    #[test]
+    fn deserialization_tolerates_missing_delivery_id_for_backward_compat() {
+        // A pre-#881 record — every other field present, no delivery_id.
+        let legacy = r#"{
+            "timestamp":"2026-04-13T12:00:00Z",
+            "target":"siem",
+            "reason":"circuit_open",
+            "source_cn":"alice",
+            "source_groups":[],
+            "destination":"broadcast",
+            "message_type":"position",
+            "source_protocol":"tcp",
+            "payload_b64":"",
+            "payload_size":0
+        }"#;
+        let entry: OwnedDlqEntry = serde_json::from_str(legacy)
+            .expect("legacy DLQ records without delivery_id must still deserialize");
+        assert_eq!(entry.delivery_id, "");
+        assert_eq!(entry.source_cn, "alice");
+    }
+
+    /// Forward-compat: records written by the #881-or-later writer
+    /// carry a populated `delivery_id`, and the reader must surface it
+    /// byte-for-byte. Keys are treated as opaque tokens on the wire —
+    /// no normalization, no case folding, no whitespace trimming.
+    #[test]
+    fn deserialization_preserves_delivery_id_verbatim() {
+        let fresh = r#"{
+            "timestamp":"2026-04-13T12:00:00Z",
+            "target":"siem",
+            "reason":"circuit_open",
+            "delivery_id":"deadbeefcafef00d0011223344556677",
+            "source_cn":"alice",
+            "source_groups":[],
+            "destination":"broadcast",
+            "message_type":"position",
+            "source_protocol":"tcp",
+            "payload_b64":"",
+            "payload_size":0
+        }"#;
+        let entry: OwnedDlqEntry = serde_json::from_str(fresh).expect("fresh record parses");
+        assert_eq!(entry.delivery_id, "deadbeefcafef00d0011223344556677");
+    }
+
+    /// End-to-end producer → consumer round-trip for `delivery_id`. The
+    /// DLQ writer stamps a fresh id per call; after encrypting, sealing,
+    /// and decrypting via the offline reader, the id survives intact
+    /// and each entry in the same segment has a distinct id.
+    #[test]
+    fn delivery_id_round_trips_through_encrypted_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_ring = test_key_ring();
+        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring.clone(), None, None);
+
+        for i in 0..3 {
+            let msg = make_msg(&format!("u{i}"), b"payload");
+            dlq.dead_letter("siem", &msg, "circuit_open");
+        }
+        dlq.finish();
+
+        let file = single_file_in(dir.path());
+        let entries = read_dlq_file(&file, &key_ring).expect("read ok");
+        assert_eq!(entries.len(), 3);
+
+        // Every entry carries a wire-shape-valid id (32 lowercase hex).
+        for entry in &entries {
+            assert_eq!(entry.delivery_id.len(), 32, "id must be 32 hex chars");
+            assert!(
+                entry
+                    .delivery_id
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+                "id must be lowercase hex only: {}",
+                entry.delivery_id
+            );
+        }
+
+        // Distinct calls → distinct ids, so replay tooling can
+        // deduplicate per-entry rather than per-batch.
+        let mut ids: Vec<_> = entries.iter().map(|e| e.delivery_id.clone()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 3, "expected 3 distinct ids, got {ids:?}");
     }
 }
