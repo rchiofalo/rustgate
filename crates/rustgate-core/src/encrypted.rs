@@ -140,12 +140,26 @@ pub enum EncryptError {
         /// The offending path.
         path: PathBuf,
     },
+    /// An entry in `key_derivations` failed to produce a valid 32-byte key.
+    ///
+    /// Carries the offending key id and a short reason. The reason string
+    /// deliberately does not include IKM or salt bytes — leaking key
+    /// material into a log line would defeat the purpose of the KDF.
+    #[error("key derivation failed for id {id:?}: {reason}")]
+    KeyDerivation {
+        /// The key id whose derivation failed.
+        id: String,
+        /// Human-readable reason (no secret material).
+        reason: String,
+    },
 }
 
 /// On-disk JSON layout for the key file.
 ///
 /// Keys are stored as 64-character lowercase hex strings (32 raw bytes,
-/// the ChaCha20-Poly1305 key length).
+/// the ChaCha20-Poly1305 key length), OR — when an operator has a single
+/// root secret they want to derive multiple subkeys from — via
+/// [`Derivation`] entries in `key_derivations`.
 ///
 /// Uses `deny_unknown_fields` to reject key files containing unexpected
 /// properties — a typo like `"actve_key_id"` produces a clear
@@ -153,20 +167,80 @@ pub enum EncryptError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeyFile {
-    /// Identifier of the key used for new writes. Must be present in `keys`.
+    /// Identifier of the key used for new writes. Must be present in
+    /// either `keys` or `key_derivations`.
     pub active_key_id: String,
-    /// All known keys, indexed by id.
+    /// All known raw keys, indexed by id. Each value is a 64-character
+    /// lowercase hex string.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub keys: BTreeMap<String, String>,
     /// Optional per-key expiration expressed as unix seconds since epoch.
     ///
-    /// Any id listed here must also appear in `keys`. When the `active_key_id`
-    /// has an entry whose value is `<=` the current system time, new-write
-    /// admission is rejected with [`EncryptError::ActiveKeyExpired`]. Keys
-    /// that do not appear in this map have no expiration and may be used
+    /// Any id listed here must also appear in either `keys` or
+    /// `key_derivations`. When the `active_key_id` has an entry whose
+    /// value is `<=` the current system time, new-write admission is
+    /// rejected with [`EncryptError::ActiveKeyExpired`]. Keys that do
+    /// not appear in this map have no expiration and may be used
     /// indefinitely (historical behaviour — unchanged for existing key
     /// files that pre-date this field).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub key_expirations: BTreeMap<String, i64>,
+    /// Optional KDF-derived keys, indexed by id.
+    ///
+    /// Each [`Derivation`] evaluates at [`KeyRing::from_bytes`] time to
+    /// produce exactly 32 bytes of key material. Derived entries are
+    /// indistinguishable from raw entries at use time — they can be the
+    /// active key, a historical key for decrypt, and can carry an
+    /// expiration in `key_expirations`. An id must appear in at most one
+    /// of `keys` or `key_derivations`; listing the same id in both is a
+    /// config-file error rejected at load.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub key_derivations: BTreeMap<String, Derivation>,
+}
+
+/// Key-derivation recipe for a single entry in [`KeyFile::key_derivations`].
+///
+/// Currently supports HKDF-SHA256 (RFC 5869). HKDF is the right primitive
+/// when an operator has a high-entropy root secret (KMS blob, HSM output,
+/// another rustgate deployment's master key) and wants to derive multiple
+/// subkeys deterministically without re-provisioning. HKDF does **not**
+/// add a work factor, so it is not suitable for low-entropy passphrases —
+/// a future `Argon2id` variant will cover that use case.
+///
+/// The `tag` field in the serialized form names the KDF (`"hkdf-sha256"`
+/// today). This leaves room for additional variants without breaking
+/// existing key files.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kdf", rename_all = "kebab-case")]
+#[serde(deny_unknown_fields)]
+pub enum Derivation {
+    /// HKDF-SHA256 — RFC 5869 Extract-and-Expand.
+    ///
+    /// The extract stage hashes IKM and salt to produce a pseudorandom
+    /// key; expand then stretches that to 32 bytes of output keyed by
+    /// `info`. Two derivations that share the same `ikm` but differ in
+    /// either `salt` or `info` produce cryptographically independent
+    /// outputs.
+    HkdfSha256 {
+        /// Input keying material, lowercase hex-encoded. MUST be at
+        /// least 16 bytes (128 bits) of entropy — shorter IKM defeats
+        /// the purpose of HKDF's extract stage. Loading refuses entries
+        /// below this threshold with [`EncryptError::KeyDerivation`].
+        ikm: String,
+        /// Salt, lowercase hex-encoded. Empty string is permitted
+        /// (RFC 5869 § 3.1 — the implementation substitutes a zero
+        /// block), but a deployment-unique random salt is strongly
+        /// recommended.
+        #[serde(default)]
+        salt: String,
+        /// Context string (free-form bytes, UTF-8 is conventional).
+        /// Bound into the expand stage so two derivations from the same
+        /// `(ikm, salt)` with different `info` values are unrelated. A
+        /// convention like `"rustgate-archive/v1/" + key_id` ties each
+        /// derivation to the deployment and id.
+        #[serde(default)]
+        info: String,
+    },
 }
 
 /// Loaded key material — keys decoded into raw bytes wrapped in
@@ -202,12 +276,29 @@ impl KeyRing {
         if parsed.active_key_id.is_empty() {
             return Err(EncryptError::KeyFile("active_key_id is empty".into()));
         }
-        if !parsed.keys.contains_key(&parsed.active_key_id) {
+
+        // Reject id overlap between raw and derived entries before doing
+        // any hex decoding or KDF work — two entries sharing an id is a
+        // config-file error (almost certainly a typo), and silently
+        // preferring one over the other would hide the mistake.
+        for id in parsed.key_derivations.keys() {
+            if parsed.keys.contains_key(id) {
+                return Err(EncryptError::KeyFile(format!(
+                    "key id {id:?} appears in both `keys` and `key_derivations`"
+                )));
+            }
+        }
+
+        let id_is_known = |id: &str| -> bool {
+            parsed.keys.contains_key(id) || parsed.key_derivations.contains_key(id)
+        };
+        if !id_is_known(&parsed.active_key_id) {
             return Err(EncryptError::KeyFile(format!(
-                "active_key_id {:?} not found in keys",
+                "active_key_id {:?} not found in keys or key_derivations",
                 parsed.active_key_id
             )));
         }
+
         let mut keys = BTreeMap::new();
         for (id, hex_value) in parsed.keys.iter() {
             let raw = hex::decode(hex_value)
@@ -222,8 +313,20 @@ impl KeyRing {
             buf.copy_from_slice(&raw);
             let _ = keys.insert(id.clone(), Arc::new(buf));
         }
+
+        // Evaluate KDF entries AFTER raw entries so overlap (caught
+        // above) would have already tripped. The derivation routine
+        // returns a `Zeroizing<[u8; 32]>` so the IKM-derived bytes are
+        // wiped when the closure returns, even though the `KeyFile`
+        // itself still holds the IKM hex string until the caller drops
+        // it.
+        for (id, derivation) in parsed.key_derivations.iter() {
+            let derived = derive_key(id, derivation)?;
+            let _ = keys.insert(id.clone(), Arc::new(derived));
+        }
+
         for id in parsed.key_expirations.keys() {
-            if !parsed.keys.contains_key(id) {
+            if !id_is_known(id) {
                 return Err(EncryptError::KeyFile(format!(
                     "key_expirations references unknown key id {id:?}"
                 )));
@@ -285,6 +388,66 @@ impl KeyRing {
         match self.not_after.get(&self.active_key_id) {
             Some(&not_after) => not_after <= now_unix_seconds,
             None => false,
+        }
+    }
+}
+
+/// Evaluate a [`Derivation`] into 32 bytes of key material.
+///
+/// Hex-decodes `ikm` and `salt` first, then runs the configured KDF.
+/// The returned bytes are wrapped in [`Zeroizing`] so the caller's
+/// subsequent `Arc::new` keeps the secret wiped on drop.
+///
+/// This function does not zeroize the `KeyFile` itself — the IKM hex
+/// string on the parsed `KeyFile` remains until the caller drops it.
+/// Intermediate decoded IKM is wrapped in [`Zeroizing`] so it is wiped
+/// as soon as HKDF is done with it.
+fn derive_key(id: &str, derivation: &Derivation) -> Result<Zeroizing<[u8; 32]>, EncryptError> {
+    match derivation {
+        Derivation::HkdfSha256 { ikm, salt, info } => {
+            // Decode IKM and salt. IKM bytes live in `Zeroizing` so the
+            // buffer is wiped as soon as this scope ends.
+            let mut ikm_bytes: Zeroizing<Vec<u8>> =
+                Zeroizing::new(hex::decode(ikm).map_err(|e| EncryptError::KeyDerivation {
+                    id: id.to_string(),
+                    reason: format!("ikm hex decode: {e}"),
+                })?);
+            // Guard against obvious IKM weakness. 16 bytes (128 bits) is
+            // a conservative floor — HKDF does not add entropy, so a
+            // toy-sized IKM produces a toy-sized-security subkey.
+            if ikm_bytes.len() < 16 {
+                let got = ikm_bytes.len();
+                zeroize::Zeroize::zeroize(&mut *ikm_bytes);
+                return Err(EncryptError::KeyDerivation {
+                    id: id.to_string(),
+                    reason: format!("ikm must be at least 16 bytes, got {got}"),
+                });
+            }
+
+            let salt_bytes = hex::decode(salt).map_err(|e| EncryptError::KeyDerivation {
+                id: id.to_string(),
+                reason: format!("salt hex decode: {e}"),
+            })?;
+
+            // RFC 5869 § 3.1: a zero-length salt is permitted and HKDF
+            // substitutes a hashlen-sized zero block. `Hkdf::new` with
+            // `None` expresses that path; an explicitly-empty salt in
+            // the key file maps to `None` so the implementation and the
+            // specification agree.
+            let salt_opt = if salt_bytes.is_empty() {
+                None
+            } else {
+                Some(salt_bytes.as_slice())
+            };
+            let hk = hkdf::Hkdf::<sha2::Sha256>::new(salt_opt, &ikm_bytes);
+
+            let mut out = Zeroizing::new([0u8; 32]);
+            hk.expand(info.as_bytes(), &mut *out)
+                .map_err(|e| EncryptError::KeyDerivation {
+                    id: id.to_string(),
+                    reason: format!("hkdf expand: {e}"),
+                })?;
+            Ok(out)
         }
     }
 }
@@ -785,6 +948,7 @@ mod tests {
             active_key_id: active.to_string(),
             keys: map,
             key_expirations: BTreeMap::new(),
+            key_derivations: BTreeMap::new(),
         };
         let json = serde_json::to_vec(&kf).unwrap();
         KeyRing::from_bytes(&json).unwrap()
@@ -1278,6 +1442,7 @@ mod tests {
                 active_key_id: "k1".to_string(),
                 keys,
                 key_expirations: expirations,
+                key_derivations: BTreeMap::new(),
             };
             let json = serde_json::to_vec(&kf).expect("serialize");
             let round: KeyFile = serde_json::from_slice(&json).expect("deserialize");
@@ -1301,10 +1466,432 @@ mod tests {
                     m
                 },
                 key_expirations: BTreeMap::new(),
+                key_derivations: BTreeMap::new(),
             };
             let json = serde_json::to_string(&kf).expect("serialize");
             assert!(
                 !json.contains("key_expirations"),
+                "empty map must be omitted: {json}"
+            );
+        }
+    }
+
+    mod key_derivation {
+        //! Tests for HKDF-derived key entries in `key_derivations`.
+        //!
+        //! The round-trip and overlap checks are the safety-critical
+        //! cases — derived keys must be distinguishable from raw keys
+        //! only at load time (they are identical at use time), and
+        //! overlapping ids must be rejected before either entry takes
+        //! effect.
+        use super::*;
+
+        /// 16-byte IKM (the configured minimum). Chosen to be
+        /// recognizably not-random so a reader can tell at a glance
+        /// this is test material.
+        const TEST_IKM_16: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        /// 32-byte IKM for stronger-than-minimum tests.
+        const TEST_IKM_32: &str =
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        #[test]
+        fn hkdf_sha256_matches_rfc_5869_test_case_3() {
+            // RFC 5869 Appendix A Test Case 3 uses empty salt and
+            // empty info with a 22-octet IKM of 0x0b repeated. We pin
+            // the first 32 bytes of the 42-octet OKM, which is what a
+            // 32-byte ChaCha20-Poly1305 key would consume. A
+            // regression that silently swapped SHA-256 for another
+            // hash, reversed the salt/IKM arguments to `Hkdf::new`,
+            // or mis-handled the zero-length salt path would fail
+            // here rather than encrypt everyone's data with a key the
+            // archive cannot reproduce.
+            //
+            // Test Case 1 (non-empty info) is not used because our
+            // API accepts `info` as free-form UTF-8, not hex-encoded
+            // bytes — the RFC's canonical info octets are not a
+            // valid UTF-8 string.
+            let ikm = "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"; // 22 bytes
+            // First 32 bytes of the 42-byte OKM from RFC 5869 §A.3.
+            let expected_hex = "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d";
+
+            let json = format!(
+                r#"{{
+                    "active_key_id": "k-derived",
+                    "key_derivations": {{
+                        "k-derived": {{
+                            "kdf": "hkdf-sha256",
+                            "ikm": "{ikm}",
+                            "salt": "",
+                            "info": ""
+                        }}
+                    }}
+                }}"#
+            );
+            let ring = KeyRing::from_bytes(json.as_bytes()).expect("ring loads");
+            let key = ring.active_key().expect("active key present");
+            assert_eq!(hex::encode(&**key), expected_hex);
+        }
+
+        #[test]
+        fn hkdf_info_is_asciistring_bound_not_hex() {
+            // `info` in RFC 5869 is a context octet string. We accept
+            // it as a UTF-8 string (the serde shape) and pass its bytes
+            // directly to HKDF — so changing the `info` text must
+            // change the output. Two derivations identical except for
+            // `info` should produce different keys.
+            let json_a = format!(
+                r#"{{
+                    "active_key_id": "k1",
+                    "key_derivations": {{
+                        "k1": {{
+                            "kdf": "hkdf-sha256",
+                            "ikm": "{TEST_IKM_32}",
+                            "salt": "",
+                            "info": "ctx-a"
+                        }}
+                    }}
+                }}"#
+            );
+            let json_b = format!(
+                r#"{{
+                    "active_key_id": "k1",
+                    "key_derivations": {{
+                        "k1": {{
+                            "kdf": "hkdf-sha256",
+                            "ikm": "{TEST_IKM_32}",
+                            "salt": "",
+                            "info": "ctx-b"
+                        }}
+                    }}
+                }}"#
+            );
+            let a = KeyRing::from_bytes(json_a.as_bytes()).unwrap();
+            let b = KeyRing::from_bytes(json_b.as_bytes()).unwrap();
+            let key_a = a.active_key().unwrap();
+            let key_b = b.active_key().unwrap();
+            assert_ne!(&**key_a, &**key_b, "info separation must alter output");
+        }
+
+        #[test]
+        fn derived_key_round_trips_through_encrypt_and_decrypt() {
+            // The whole point of the KDF wiring: a derived key must be
+            // indistinguishable from a raw key at use time. Encrypt a
+            // payload with a derived active key, decrypt with the same
+            // derivation parameters, and compare.
+            let json = format!(
+                r#"{{
+                    "active_key_id": "k-derived",
+                    "key_derivations": {{
+                        "k-derived": {{
+                            "kdf": "hkdf-sha256",
+                            "ikm": "{TEST_IKM_32}",
+                            "salt": "cafef00d",
+                            "info": "rustgate-archive/v1/k-derived"
+                        }}
+                    }}
+                }}"#
+            );
+            let ring = KeyRing::from_bytes(json.as_bytes()).expect("ring");
+            let dir = tempdir();
+            let enc_path = dir.join("derived.enc");
+            let mut w = EncryptedWriter::create(&enc_path, &ring).expect("writer");
+            w.write_chunk(b"hello kdf world").expect("write");
+            w.finish().expect("finish");
+
+            let dec_path = dir.join("derived.txt");
+            decrypt_file(&enc_path, &dec_path, &ring).expect("decrypt");
+            let plain = std::fs::read(&dec_path).expect("read decrypted");
+            assert_eq!(plain, b"hello kdf world");
+        }
+
+        #[test]
+        fn mixed_raw_and_derived_entries_load_together() {
+            // Common operational shape: one raw rotation key carried
+            // forward for decryption, one newly-derived active key.
+            // Both must be usable from the same KeyRing.
+            let json = format!(
+                r#"{{
+                    "active_key_id": "k-derived",
+                    "keys": {{
+                        "k-raw": "1111111111111111111111111111111111111111111111111111111111111111"
+                    }},
+                    "key_derivations": {{
+                        "k-derived": {{
+                            "kdf": "hkdf-sha256",
+                            "ikm": "{TEST_IKM_32}",
+                            "salt": "",
+                            "info": "k-derived"
+                        }}
+                    }}
+                }}"#
+            );
+            let ring = KeyRing::from_bytes(json.as_bytes()).expect("ring");
+            assert!(ring.key("k-raw").is_some());
+            assert!(ring.key("k-derived").is_some());
+            assert_eq!(ring.active_key_id(), "k-derived");
+        }
+
+        #[test]
+        fn overlapping_id_in_keys_and_key_derivations_is_rejected() {
+            // A key id present in both maps is almost certainly a typo
+            // — which entry should win is ambiguous and silently
+            // preferring one would hide the mistake. The load must
+            // refuse before any key material is decoded or derived.
+            let json = format!(
+                r#"{{
+                    "active_key_id": "kdup",
+                    "keys": {{
+                        "kdup": "1111111111111111111111111111111111111111111111111111111111111111"
+                    }},
+                    "key_derivations": {{
+                        "kdup": {{
+                            "kdf": "hkdf-sha256",
+                            "ikm": "{TEST_IKM_32}",
+                            "salt": "",
+                            "info": ""
+                        }}
+                    }}
+                }}"#
+            );
+            let err = KeyRing::from_bytes(json.as_bytes()).expect_err("overlap must fail");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("kdup"),
+                "error must name the offending id: {msg}"
+            );
+            assert!(
+                msg.contains("both") && msg.contains("key_derivations"),
+                "error must explain the overlap: {msg}"
+            );
+        }
+
+        #[test]
+        fn ikm_shorter_than_sixteen_bytes_is_rejected() {
+            // HKDF adds no entropy — a trivially short IKM would
+            // compromise every derived key. The 16-byte floor catches
+            // the obvious operator error of pasting in a truncated
+            // secret.
+            let short_ikm = "aabbccdd"; // 4 bytes
+            let json = format!(
+                r#"{{
+                    "active_key_id": "k1",
+                    "key_derivations": {{
+                        "k1": {{
+                            "kdf": "hkdf-sha256",
+                            "ikm": "{short_ikm}",
+                            "salt": "",
+                            "info": ""
+                        }}
+                    }}
+                }}"#
+            );
+            let err = KeyRing::from_bytes(json.as_bytes()).expect_err("must reject");
+            match err {
+                EncryptError::KeyDerivation { id, reason } => {
+                    assert_eq!(id, "k1");
+                    assert!(
+                        reason.contains("16 bytes"),
+                        "reason must cite the floor: {reason}"
+                    );
+                }
+                other => panic!("expected KeyDerivation, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn invalid_hex_ikm_surfaces_as_key_derivation_error() {
+            // A malformed hex IKM should produce a clear error naming
+            // the id — not a generic JSON or key-material error —
+            // because the user needs to know which derivation entry to
+            // fix.
+            let json = format!(
+                r#"{{
+                    "active_key_id": "k1",
+                    "key_derivations": {{
+                        "k1": {{
+                            "kdf": "hkdf-sha256",
+                            "ikm": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+                            "salt": "",
+                            "info": ""
+                        }}
+                    }}
+                }}"#
+            );
+            let _ = TEST_IKM_16; // silence dead-code when this test runs alone
+            let err = KeyRing::from_bytes(json.as_bytes()).expect_err("must reject");
+            match err {
+                EncryptError::KeyDerivation { id, reason } => {
+                    assert_eq!(id, "k1");
+                    assert!(reason.contains("ikm"), "reason must cite ikm: {reason}");
+                }
+                other => panic!("expected KeyDerivation, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn empty_salt_is_accepted_and_matches_no_salt_behavior() {
+            // RFC 5869 § 3.1: zero-length salt is valid and HKDF
+            // substitutes a hash-sized zero block. The load path must
+            // not treat empty salt as an error.
+            let json = format!(
+                r#"{{
+                    "active_key_id": "k1",
+                    "key_derivations": {{
+                        "k1": {{
+                            "kdf": "hkdf-sha256",
+                            "ikm": "{TEST_IKM_32}",
+                            "salt": "",
+                            "info": "empty-salt-ok"
+                        }}
+                    }}
+                }}"#
+            );
+            let ring = KeyRing::from_bytes(json.as_bytes()).expect("empty salt must load");
+            assert!(ring.active_key().is_ok());
+        }
+
+        #[test]
+        fn active_key_id_pointing_only_at_derived_entry_is_valid() {
+            // An install that uses ONLY derived keys (no raw entries at
+            // all) must be a valid configuration — the active key may
+            // live in `key_derivations`.
+            let json = format!(
+                r#"{{
+                    "active_key_id": "k-derived",
+                    "key_derivations": {{
+                        "k-derived": {{
+                            "kdf": "hkdf-sha256",
+                            "ikm": "{TEST_IKM_32}",
+                            "salt": "",
+                            "info": "sole-derived"
+                        }}
+                    }}
+                }}"#
+            );
+            let ring = KeyRing::from_bytes(json.as_bytes()).expect("ring");
+            assert_eq!(ring.active_key_id(), "k-derived");
+            assert!(ring.active_key().is_ok());
+        }
+
+        #[test]
+        fn active_key_id_not_in_either_map_is_rejected_with_updated_message() {
+            // The error message now mentions both maps so operators
+            // who moved an id from `keys` to `key_derivations` (or
+            // vice versa) get a useful hint.
+            let json = br#"{
+                "active_key_id": "missing",
+                "keys": { "k1": "1111111111111111111111111111111111111111111111111111111111111111" }
+            }"#;
+            let err = KeyRing::from_bytes(json).expect_err("must reject");
+            let msg = err.to_string();
+            assert!(msg.contains("missing"), "names the id: {msg}");
+            assert!(
+                msg.contains("keys") && msg.contains("key_derivations"),
+                "mentions both maps: {msg}"
+            );
+        }
+
+        #[test]
+        fn key_expirations_may_reference_derived_key_id() {
+            // A derived key with a configured expiration must be
+            // treated the same as a raw key for the admission check.
+            let json = format!(
+                r#"{{
+                    "active_key_id": "k-derived",
+                    "key_derivations": {{
+                        "k-derived": {{
+                            "kdf": "hkdf-sha256",
+                            "ikm": "{TEST_IKM_32}",
+                            "salt": "",
+                            "info": "expiring"
+                        }}
+                    }},
+                    "key_expirations": {{ "k-derived": 1 }}
+                }}"#
+            );
+            let ring = KeyRing::from_bytes(json.as_bytes()).expect("ring");
+            assert_eq!(ring.not_after("k-derived"), Some(1));
+            assert!(
+                ring.active_key_expired_at(2),
+                "derived key honors expiration"
+            );
+        }
+
+        #[test]
+        fn unknown_kdf_variant_is_rejected_at_parse_time() {
+            // `serde(tag = "kdf")` should reject an unknown KDF name
+            // with a JSON-parse-level error — not silently fall back
+            // to a default. This keeps future additions (e.g.
+            // argon2id) from being silently ignored by older binaries
+            // that don't support them.
+            let json = br#"{
+                "active_key_id": "k1",
+                "key_derivations": {
+                    "k1": {
+                        "kdf": "argon2id",
+                        "ikm": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    }
+                }
+            }"#;
+            let err = KeyRing::from_bytes(json).expect_err("must reject unknown kdf");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("argon2id") || msg.contains("variant"),
+                "error should mention the unknown tag: {msg}"
+            );
+        }
+
+        #[test]
+        fn key_derivations_roundtrip_through_serde_with_non_empty_map() {
+            let mut derivations = BTreeMap::new();
+            let _ = derivations.insert(
+                "k1".to_string(),
+                Derivation::HkdfSha256 {
+                    ikm: TEST_IKM_32.to_string(),
+                    salt: "deadbeef".to_string(),
+                    info: "rt".to_string(),
+                },
+            );
+            let kf = KeyFile {
+                active_key_id: "k1".to_string(),
+                keys: BTreeMap::new(),
+                key_expirations: BTreeMap::new(),
+                key_derivations: derivations,
+            };
+            let json = serde_json::to_vec(&kf).expect("serialize");
+            let round: KeyFile = serde_json::from_slice(&json).expect("deserialize");
+            match round.key_derivations.get("k1") {
+                Some(Derivation::HkdfSha256 { ikm, salt, info }) => {
+                    assert_eq!(ikm, TEST_IKM_32);
+                    assert_eq!(salt, "deadbeef");
+                    assert_eq!(info, "rt");
+                }
+                None => panic!("k1 round-trip lost"),
+            }
+        }
+
+        #[test]
+        fn key_derivations_is_omitted_from_serialization_when_empty() {
+            // skip_serializing_if mirrors the `key_expirations`
+            // treatment so pre-KDF key files remain byte-identical on
+            // a round-trip through `serde`.
+            let kf = KeyFile {
+                active_key_id: "k1".to_string(),
+                keys: {
+                    let mut m = BTreeMap::new();
+                    let _ = m.insert(
+                        "k1".to_string(),
+                        "1111111111111111111111111111111111111111111111111111111111111111"
+                            .to_string(),
+                    );
+                    m
+                },
+                key_expirations: BTreeMap::new(),
+                key_derivations: BTreeMap::new(),
+            };
+            let json = serde_json::to_string(&kf).expect("serialize");
+            assert!(
+                !json.contains("key_derivations"),
                 "empty map must be omitted: {json}"
             );
         }
