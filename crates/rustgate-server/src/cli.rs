@@ -93,7 +93,18 @@ fn validate_write_buffer_range(n: usize) -> Result<usize, String> {
 }
 
 #[derive(Parser, Serialize)]
-#[command(name = "rustgate", about = "Secure tactical message router", version)]
+#[command(
+    name = "rustgate",
+    about = "Secure tactical message router",
+    version,
+    // Without this, clap enforces the top-level `--cert/--key/--ca`
+    // requirement even when the user is invoking a diagnostic
+    // subcommand that has no use for them (e.g. `rustgate cert-info
+    // foo.pem`). `subcommand_negates_reqs` tells clap to skip the
+    // parent's required-arg checks whenever any subcommand is
+    // supplied, which is exactly what every diagnostic wants.
+    subcommand_negates_reqs = true,
+)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) struct Cli {
     /// Subcommand. When omitted, the server runs normally with the supplied flags.
@@ -1302,6 +1313,58 @@ pub(crate) enum Command {
     /// CLI schema itself, so the output is a complete template
     /// suitable as a starting point for a new deployment.
     GenerateConfig,
+    /// Probe a single remote endpoint for reachability, without
+    /// starting the server. Intended as a pre-flight for cron /
+    /// Ansible / systemd `ExecStartPre=` so firewall, DNS, or
+    /// service-outage problems are caught before `rustgate` itself
+    /// tries to start.
+    ///
+    /// Exit codes: `0` = connected, `1` = refused, `2` = timeout,
+    /// `3` = other error (DNS, bad URL, unexpected I/O). Exactly one
+    /// of the `--tcp`, `--nats`, or `--http` flags must be supplied.
+    TestConnection {
+        /// Plain TCP probe — three-way handshake only, no bytes sent.
+        /// Works against every listener type (TLS, WebSocket, MQTT,
+        /// plaintext, enrollment, metrics) without risking a malformed
+        /// application-layer probe.
+        #[arg(
+            long,
+            value_name = "HOST:PORT",
+            conflicts_with_all = ["nats", "http"],
+        )]
+        tcp: Option<String>,
+        /// NATS probe — TCP connect plus a read of the server's
+        /// `INFO` greeting. Catches listeners that accept TCP but
+        /// reject NATS (misconfigured auth, wrong service on the
+        /// port).
+        #[cfg(feature = "nats")]
+        #[arg(
+            long,
+            value_name = "URL",
+            conflicts_with_all = ["tcp", "http"],
+        )]
+        nats: Option<String>,
+        /// HTTP probe — send `GET /` and classify by status line.
+        /// 2xx/3xx/4xx report `connected`, 5xx reports `refused`.
+        #[cfg(feature = "http")]
+        #[arg(
+            long,
+            value_name = "URL",
+            conflicts_with_all = ["tcp", "nats"],
+        )]
+        http: Option<String>,
+        /// Overall timeout for the probe (seconds). Applies to the
+        /// whole operation: DNS resolution, TCP handshake, and any
+        /// protocol-level exchange.
+        #[arg(
+            long,
+            default_value_t = crate::diagnostics::test_connection::DEFAULT_TIMEOUT_SECS,
+        )]
+        timeout_secs: u64,
+        /// Emit a stable JSON document instead of the human layout.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Serialize, Deserialize)]
