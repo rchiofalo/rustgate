@@ -50,16 +50,26 @@ pub type AclApiHandler = Arc<
 
 /// Type-erased management API handler.
 ///
-/// When set, the metrics server delegates requests under
-/// `/api/cert/`, `/api/crl/`, and `/api/dedup/` to this handler. Returns
-/// `None` when the path does not match any management-API route so the
-/// caller can fall through to the next handler or the default 404.
+/// When set, the metrics server delegates requests under `/api/cert/`,
+/// `/api/crl/`, `/api/dedup/`, `/api/clients/`, and `/api/reload` to
+/// this handler. Returns `None` when the path does not match any
+/// management-API route so the caller can fall through to the next
+/// handler or the default 404.
 ///
-/// Signature mirrors [`AclApiHandler`] so the two share dispatch plumbing
-/// in [`serve`].
+/// Unlike [`AclApiHandler`], the management API exposes mutating
+/// endpoints (`POST /api/clients/{cn}/disconnect`, `POST /api/reload`)
+/// that need to `.await` on the router or the reload path. The handler
+/// returns a boxed `Future` so the dispatcher in [`serve`] can await
+/// without forcing the inner handler to `block_on` a runtime.
 pub type MgmtApiHandler = Arc<
-    dyn Fn(&hyper::Method, &str, Option<&str>, &[u8]) -> Option<Response<Full<Bytes>>>
-        + Send
+    dyn Fn(
+            &hyper::Method,
+            &str,
+            Option<&str>,
+            &[u8],
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Option<Response<Full<Bytes>>>> + Send>,
+        > + Send
         + Sync,
 >;
 
@@ -2556,17 +2566,22 @@ pub async fn serve(
                                     .body(Full::new(Bytes::from("not found")))
                                     .unwrap_or_else(|_| internal_error_response()));
                             }
-                            // Delegate /api/cert/, /api/crl/, /api/dedup/
-                            // paths to the read-only management handler.
-                            // Runs before the generic handler so unknown
-                            // suffixes under these prefixes produce the
-                            // handler's structured 401/404/405 envelope
-                            // rather than the bare 404 below.
+                            // Delegate /api/cert/, /api/crl/, /api/dedup/,
+                            // /api/clients/, and /api/reload paths to the
+                            // management handler. Runs before the generic
+                            // handler so unknown suffixes under these
+                            // prefixes produce the handler's structured
+                            // 401/404/405 envelope rather than the bare
+                            // 404 below. The handler is async because
+                            // disconnect/reload need to `.await` on the
+                            // router and reload futures.
                             {
                                 let path_str = req.uri().path();
                                 if (path_str.starts_with("/api/cert/")
                                     || path_str.starts_with("/api/crl/")
-                                    || path_str.starts_with("/api/dedup/"))
+                                    || path_str.starts_with("/api/dedup/")
+                                    || path_str.starts_with("/api/clients/")
+                                    || path_str == "/api/reload")
                                     && let Some(handler) = mgmt_api.get()
                                 {
                                     let method = req.method().clone();
@@ -2581,7 +2596,7 @@ pub async fn serve(
                                         .map(|b| b.to_bytes())
                                         .unwrap_or_default();
                                     if let Some(resp) =
-                                        handler(&method, &path, auth.as_deref(), &body)
+                                        handler(&method, &path, auth.as_deref(), &body).await
                                     {
                                         return Ok(resp);
                                     }

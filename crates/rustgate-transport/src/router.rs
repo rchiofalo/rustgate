@@ -1989,6 +1989,39 @@ impl Router {
         self.state.read().await.sessions.len()
     }
 
+    /// Force-disconnect a single client by CN.
+    ///
+    /// Models the close path of [`Self::close_all_session_senders`] but
+    /// targets one session. Returns `true` when a session matching `cn`
+    /// was found and its writer channels were signalled to drain; `false`
+    /// when no session is currently registered under that CN.
+    ///
+    /// CN matching is exact: the map key is the `identity.cn` recorded at
+    /// [`Self::register`] time, which preserves the original casing from
+    /// the client certificate subject. Callers that want case-insensitive
+    /// lookup should normalize via `Router::connected_clients` first.
+    ///
+    /// Sessions are NOT removed from the routing map — the session task
+    /// still runs `unregister` on its own exit path so `session_count`
+    /// stays accurate while the writer drains. This also avoids racing
+    /// with an in-flight `route_inner` that might have already looked up
+    /// the `SessionHandle` before the disconnect call arrived.
+    pub async fn disconnect_client(&self, cn: &str) -> bool {
+        let state = self.state.read().await;
+        let Some(handle) = state.sessions.get(cn) else {
+            return false;
+        };
+        {
+            let mut guard = handle.priority_sender.lock();
+            let _ = guard.take();
+        }
+        {
+            let mut guard = handle.normal_sender.lock();
+            let _ = guard.take();
+        }
+        true
+    }
+
     /// Close all outbound session channels so writer tasks observe `None`
     /// after draining whatever is already queued. Used during graceful
     /// shutdown: by dropping the senders held in each `SessionHandle`,
@@ -2858,6 +2891,47 @@ mod tests {
             prx.try_recv().is_ok(),
             "bob should see alice's position via shared group"
         );
+    }
+
+    #[tokio::test]
+    async fn disconnect_client_closes_senders_and_returns_true() {
+        let router = Router::new();
+        let alice = make_identity("alice", &["alpha"]);
+        let (ptx, ntx, _prx, _nrx) = make_channels(16, 16);
+        let handle = SessionHandle::new(alice.clone(), ptx, ntx);
+
+        let _ = router.register(handle).await;
+
+        // Disconnect returns true and clears both sender slots. Subsequent
+        // route attempts find `None` in the sender Option and give up,
+        // matching the behavior of `close_all_session_senders`.
+        assert!(router.disconnect_client("alice").await);
+
+        let state = router.state.read().await;
+        let handle = state.sessions.get("alice").expect("still registered");
+        assert!(handle.priority_sender.lock().is_none());
+        assert!(handle.normal_sender.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn disconnect_client_returns_false_for_unknown_cn() {
+        let router = Router::new();
+        // No sessions registered — disconnect is a no-op.
+        assert!(!router.disconnect_client("ghost").await);
+    }
+
+    #[tokio::test]
+    async fn disconnect_client_is_case_sensitive() {
+        // The session map keys on the exact CN recorded at register time,
+        // which preserves the cert's original casing. A case-mismatched
+        // lookup must miss rather than silently disconnect a neighbor.
+        let router = Router::new();
+        let alice = make_identity("Alice", &["alpha"]);
+        let (ptx, ntx, _prx, _nrx) = make_channels(16, 16);
+        let _ = router.register(SessionHandle::new(alice, ptx, ntx)).await;
+
+        assert!(!router.disconnect_client("alice").await);
+        assert!(router.disconnect_client("Alice").await);
     }
 
     #[tokio::test]
