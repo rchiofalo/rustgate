@@ -21,6 +21,7 @@ static RETRIES: OnceLock<IntCounterVec> = OnceLock::new();
 static FILTERED: OnceLock<IntCounterVec> = OnceLock::new();
 static QUEUE_DEPTH: OnceLock<IntGauge> = OnceLock::new();
 static DROPPED: OnceLock<IntCounterVec> = OnceLock::new();
+static DLQ_EVICTED: OnceLock<IntCounterVec> = OnceLock::new();
 
 // ── Fallback constructors ──────────────────────────────────────────
 
@@ -136,6 +137,19 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(dropped.clone()))?;
     let _ = DROPPED.set(dropped);
 
+    let dlq_evicted = IntCounterVec::new(
+        Opts::new(
+            "rustgate_http_dlq_evicted_total",
+            "Dead-letter queue files evicted by the per-target total-bytes \
+             sweep. Each increment represents one sealed `.dlq.enc` segment \
+             deleted because the target's on-disk DLQ footprint exceeded \
+             `dlq-max-target-bytes`. Labelled by target name.",
+        ),
+        &["target"],
+    )?;
+    registry.register(Box::new(dlq_evicted.clone()))?;
+    let _ = DLQ_EVICTED.set(dlq_evicted);
+
     Ok(())
 }
 
@@ -199,6 +213,19 @@ pub fn queue_depth() -> &'static IntGauge {
 pub fn dropped() -> &'static IntCounterVec {
     DROPPED.get_or_init(|| {
         fallback_counter_vec("rustgate_http_dropped_total", "fallback", &["reason"])
+    })
+}
+
+/// DLQ file-eviction counter, labelled by target.
+///
+/// Increments once per sealed `.dlq.enc` segment deleted by the
+/// per-target total-bytes sweep (`dlq-max-target-bytes`). A rising
+/// rate here indicates a target has been persistently unreachable
+/// long enough for its DLQ footprint to exceed the operator's disk
+/// budget — use it in alerting to complement the circuit-state gauge.
+pub fn dlq_evicted() -> &'static IntCounterVec {
+    DLQ_EVICTED.get_or_init(|| {
+        fallback_counter_vec("rustgate_http_dlq_evicted_total", "fallback", &["target"])
     })
 }
 

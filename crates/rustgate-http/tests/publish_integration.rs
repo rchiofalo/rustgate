@@ -66,6 +66,7 @@ fn http_config(targets: Vec<TargetConfig>) -> HttpConfig {
         dlq_dir: None,
         dlq_key_file: None,
         dlq_max_bytes: None,
+        dlq_max_target_bytes: None,
         allow_private_urls: true, // wiremock binds to 127.0.0.1
     }
 }

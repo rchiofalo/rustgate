@@ -40,6 +40,23 @@ pub struct HttpConfig {
     /// unbounded disk growth when a target stays down. Default: 256 MiB.
     pub dlq_max_bytes: Option<u64>,
 
+    /// Maximum total DLQ bytes on disk per target across every rotated
+    /// file. Once a target's on-disk DLQ footprint exceeds this cap the
+    /// oldest sealed file for that target is deleted (drop-oldest FIFO);
+    /// the currently-written active segment is always preserved. `None`
+    /// or `0` = unlimited (matches historical behaviour).
+    ///
+    /// Distinguishes from `dlq-max-bytes`, which caps a *single file*
+    /// before rotation. `dlq-max-target-bytes` caps the *total* disk
+    /// footprint for a single target after many rotations have
+    /// accumulated across a long outage. Must be `>= dlq-max-bytes`
+    /// when both are set — otherwise the size-triggered rotation
+    /// guarantee cannot be honored without also evicting the file the
+    /// writer just sealed.
+    ///
+    /// Closes #881 — unbounded DLQ growth during extended outages.
+    pub dlq_max_target_bytes: Option<u64>,
+
     /// Allow localhost/private IPs as target URLs. **Testing only** —
     /// production configs should leave this unset (defaults to `false`).
     /// Deserialization ignores this field; it can only be set programmatically.
@@ -363,6 +380,23 @@ impl HttpConfig {
             _ => {}
         }
 
+        // `dlq-max-target-bytes` must be at least `dlq-max-bytes`
+        // otherwise the per-target eviction sweep may run before the
+        // writer has finished sealing the rotated file, producing a
+        // window where the active segment is the only on-disk record
+        // for the target. Configurations that want a tight per-target
+        // cap should lower `dlq-max-bytes` rather than invert the two.
+        if let (Some(target_cap), Some(file_cap)) = (self.dlq_max_target_bytes, self.dlq_max_bytes)
+            && target_cap > 0
+            && target_cap < file_cap
+        {
+            errors.push(format!(
+                "dlq-max-target-bytes ({target_cap}) must be >= dlq-max-bytes ({file_cap}); \
+                 the per-target cap bounds the total on-disk footprint across rotations and \
+                 cannot be smaller than a single rotated file"
+            ));
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -674,6 +708,7 @@ mod tests {
             dlq_dir: None,
             dlq_key_file: None,
             dlq_max_bytes: None,
+            dlq_max_target_bytes: None,
             allow_private_urls: false,
         }
     }
@@ -1361,6 +1396,7 @@ method = "put"
             dlq_dir: Some("/tmp/dlq".to_string()),
             dlq_key_file: None,
             dlq_max_bytes: None,
+            dlq_max_target_bytes: None,
             allow_private_urls: false,
         };
         let err = cfg.validate().unwrap_err();
@@ -1378,6 +1414,7 @@ method = "put"
             dlq_dir: None,
             dlq_key_file: Some("/path/keys.json".to_string()),
             dlq_max_bytes: None,
+            dlq_max_target_bytes: None,
             allow_private_urls: false,
         };
         let err = cfg.validate().unwrap_err();
@@ -1458,5 +1495,87 @@ url = "https://example.com"
             config.dlq_key_file.as_deref(),
             Some("/etc/rustgate/keys/dlq.json")
         );
+    }
+
+    /// Pins the #881a validation rule: `dlq-max-target-bytes` must be
+    /// at least `dlq-max-bytes`. A target cap smaller than a single
+    /// rotated file would invite the eviction sweep to delete the
+    /// just-sealed segment before the writer has a chance to open a
+    /// replacement, leaving a brief window with zero sealed files for
+    /// the target — exactly the forensic gap the DLQ exists to avoid.
+    #[test]
+    fn rejects_dlq_max_target_bytes_smaller_than_dlq_max_bytes() {
+        let cfg = HttpConfig {
+            instance_id: None,
+            targets: vec![minimal_target("t1", "https://example.com")],
+            dlq_dir: None,
+            dlq_key_file: None,
+            dlq_max_bytes: Some(1024),
+            dlq_max_target_bytes: Some(512),
+            allow_private_urls: false,
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("dlq-max-target-bytes"),
+            "got: {err}"
+        );
+    }
+
+    /// Pins that `dlq-max-target-bytes = 0` is accepted and treated as
+    /// "unlimited" (the documented historical behaviour), not rejected
+    /// as smaller than `dlq-max-bytes`. Without the `target_cap > 0`
+    /// guard in the validator the comparison `0 < file_cap` would
+    /// incorrectly reject every operator who sets the cap to zero.
+    #[test]
+    fn accepts_dlq_max_target_bytes_zero_as_unlimited() {
+        let cfg = HttpConfig {
+            instance_id: None,
+            targets: vec![minimal_target("t1", "https://example.com")],
+            dlq_dir: None,
+            dlq_key_file: None,
+            dlq_max_bytes: Some(1024),
+            dlq_max_target_bytes: Some(0),
+            allow_private_urls: false,
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    /// Pins that `dlq-max-target-bytes` equal to `dlq-max-bytes` is the
+    /// boundary — must NOT be rejected. The inequality is `<`, not
+    /// `<=`.
+    #[test]
+    fn accepts_dlq_max_target_bytes_equal_to_dlq_max_bytes() {
+        let cfg = HttpConfig {
+            instance_id: None,
+            targets: vec![minimal_target("t1", "https://example.com")],
+            dlq_dir: None,
+            dlq_key_file: None,
+            dlq_max_bytes: Some(1024),
+            dlq_max_target_bytes: Some(1024),
+            allow_private_urls: false,
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    /// Pins the TOML roundtrip: `dlq-max-target-bytes` parses from the
+    /// kebab-case config key into the snake_case struct field. Operator
+    /// docs advertise the kebab-case name, so a regression that drops
+    /// `rename_all = "kebab-case"` or renames the field would break
+    /// every operator's config file.
+    #[test]
+    fn toml_dlq_max_target_bytes_roundtrips_kebab_case() {
+        let toml_str = r#"
+dlq-dir = "/var/lib/rustgate/dlq"
+dlq-key-file = "/etc/rustgate/keys/dlq.json"
+dlq-max-bytes = 268435456
+dlq-max-target-bytes = 1073741824
+
+[[targets]]
+name = "t1"
+url = "https://example.com"
+"#;
+        let config: HttpConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.dlq_max_bytes, Some(268_435_456));
+        assert_eq!(config.dlq_max_target_bytes, Some(1_073_741_824));
     }
 }
