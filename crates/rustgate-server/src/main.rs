@@ -170,6 +170,17 @@ fn main() -> anyhow::Result<()> {
             diagnostics::crl_info::run(file, json)?;
             return Ok(());
         }
+        Some(Command::CheckCertExpiry {
+            ref files,
+            warn_days,
+            json,
+        }) => {
+            let code = diagnostics::check_cert_expiry::run(files, warn_days, json)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            return Ok(());
+        }
         None => {}
     }
 

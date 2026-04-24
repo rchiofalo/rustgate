@@ -1237,6 +1237,26 @@ pub(crate) enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Check whether one or more PEM-encoded X.509 certificates are
+    /// within the warning window of their `notAfter` time, already
+    /// expired, or not yet valid. Intended to be wired into cron /
+    /// systemd pre-flight: exit code `0` = all clear, `1` = at least
+    /// one cert expiring within `--warn-days`, `2` = expired /
+    /// not-yet-valid / unreadable.
+    CheckCertExpiry {
+        /// One or more PEM files. Each file may contain a single cert,
+        /// a chain/bundle, or cert blocks mixed with key material; only
+        /// `CERTIFICATE` blocks are inspected.
+        #[arg(value_name = "FILE", required = true, num_args = 1..)]
+        files: Vec<std::path::PathBuf>,
+        /// Emit a warning (exit 1) when a cert expires within this many
+        /// days from now.
+        #[arg(long, default_value_t = crate::diagnostics::check_cert_expiry::DEFAULT_WARN_DAYS)]
+        warn_days: u32,
+        /// Emit a stable JSON document instead of the human layout.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Serialize, Deserialize)]
