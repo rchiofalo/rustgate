@@ -1483,6 +1483,7 @@ define_config_file! {
     ws_max_message_size: usize,
     ws_conn_rate_limit: usize,
     ws_conn_rate_window_secs: u64,
+    ws_subprotocols: Vec<String>,
     ws_ping_interval_secs: u64,
     ws_pong_timeout_secs: u64,
     mqtt_bind: Option<String>,
