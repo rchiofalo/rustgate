@@ -18,6 +18,7 @@ metrics = []
 [dependencies]
 tokio = { workspace = true, features = ["sync", "rt", "time"] }
 fastrand = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

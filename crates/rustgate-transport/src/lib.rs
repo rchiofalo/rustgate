@@ -3,7 +3,11 @@
 //! TLS transport, session management, and message routing for rustgate.
 
 mod acl;
-pub mod backpressure;
+/// Re-export of the relocated backpressure module for source-level
+/// compatibility with callers that used `rustgate_transport::backpressure::*`.
+/// The gate now lives in `rustgate_resilience::backpressure` so HTTP, NATS,
+/// and federation publishers can share it without a transport dependency.
+pub use rustgate_resilience::backpressure;
 mod cache;
 pub mod cert_reloader;
 mod codec;
@@ -31,9 +35,6 @@ pub mod ocsp;
 pub mod spiffe;
 
 pub use acl::{GroupAcl, GroupAclPolicy};
-pub use backpressure::{
-    BackpressureGate, BackpressurePermit, DEFAULT_MAX_QUEUED_BYTES, OnBytesChanged, OnDeferred,
-};
 pub use cache::{OnCacheSize, PositionCache};
 pub use cert_reloader::CertReloader;
 #[cfg(feature = "ocsp")]
@@ -67,6 +68,9 @@ pub use router::{
 pub use rustgate_authz;
 #[cfg(feature = "proto")]
 pub use rustgate_proto::TakFrameCodec;
+pub use rustgate_resilience::backpressure::{
+    BackpressureGate, BackpressurePermit, DEFAULT_MAX_QUEUED_BYTES, OnBytesChanged, OnDeferred,
+};
 pub use rustls::server::ResolvesServerCert;
 pub use rustls::server::danger::ClientCertVerifier;
 pub use session::{AuthenticatedSession, SessionReader, SessionWriter};

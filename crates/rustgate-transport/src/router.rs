@@ -71,11 +71,11 @@ pub struct AuthzEvent<'a> {
 use rustgate_core::identity::{GroupId, Identity};
 use rustgate_core::masking::hash_cn;
 use rustgate_core::message::{Destination, MessageType, RoutableMessage};
+use rustgate_resilience::backpressure::{BackpressureGate, BackpressurePermit};
 use tokio::sync::{RwLock, mpsc};
 use tracing::{Instrument, debug, warn};
 
 use crate::acl::GroupAclPolicy;
-use crate::backpressure::{BackpressureGate, BackpressurePermit};
 use crate::cache::PositionCache;
 use crate::dedup::DedupCache;
 use crate::store_forward::ClientQueue;

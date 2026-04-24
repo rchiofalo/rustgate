@@ -17,6 +17,7 @@ full-detail = ["dep:rustgate-proto"]
 rustgate-core = { workspace = true }
 rustgate-cot = { workspace = true }
 rustgate-proto = { workspace = true, optional = true }
+rustgate-resilience = { workspace = true }
 rustgate-transport = { workspace = true }
 async-nats = { workspace = true }
 bytes = { workspace = true }
