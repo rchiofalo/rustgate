@@ -336,6 +336,18 @@ mod tests {
         }
     }
 
+    /// Fetcher that always errors. Used to pin the "errored fetch =
+    /// nothing cached" branch of the background task so the next
+    /// handshake falls through the miss arm again (no silent
+    /// "treat errors as Good" regression).
+    struct ErrFetcher;
+
+    impl OcspFetcher for ErrFetcher {
+        fn fetch<'a>(&'a self, _leaf: &'a [u8], _issuer: &'a [u8]) -> FetchFuture<'a> {
+            Box::pin(async move { Err("injected fetch error".to_string()) })
+        }
+    }
+
     fn build_inner_and_certs() -> (Arc<dyn ClientCertVerifier>, CertificateDer<'static>) {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let ca = rustgate_test_utils::certs::TestCa::new("ClientOCSP Test CA");
@@ -444,5 +456,607 @@ mod tests {
             key_a, key_b,
             "different certs must produce different cache keys"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Defensive invariants — constants, hash primitives, type-surface bounds.
+    // -----------------------------------------------------------------------
+
+    /// The fetch queue capacity is a load-bearing knob: too small and a
+    /// moderate flood of unique handshakes drops all OCSP refreshes;
+    /// too large and a malicious flood of bogus CNs fans out unbounded
+    /// background HTTP traffic. Pin the constant so a silent edit is
+    /// caught in code review.
+    #[test]
+    fn fetch_queue_capacity_is_256() {
+        assert_eq!(FETCH_QUEUE_CAPACITY, 256);
+    }
+
+    /// `cache_key` must be SHA-256 of the input, not an alternative hash.
+    /// A silent refactor to BLAKE3 or SHA-1 (the latter is still common in
+    /// certificate fingerprint tooling) would produce keys the rest of
+    /// the OCSP plumbing would not recognise across restarts and would
+    /// break any forensics correlating fingerprints produced by external
+    /// certificate-inspection tools against the cache keys logged here.
+    #[test]
+    fn cache_key_is_sha256_of_full_der() {
+        use sha2::{Digest, Sha256};
+        let sample: &[u8] = b"arbitrary-der-payload-for-hash-identity-check";
+        let expected = Sha256::digest(sample).to_vec();
+        assert_eq!(cache_key(sample), expected);
+        assert_eq!(cache_key(sample).len(), 32);
+    }
+
+    /// Empty input must hash without panic. SHA-256 of the empty byte
+    /// string is a well-known published vector; this pins the zero-input
+    /// edge case (which can be exercised by a malformed handshake that
+    /// somehow presents an empty leaf) so a regression that called
+    /// `update` on a zero-length slice under a cfg that required a
+    /// non-zero update would be caught.
+    #[test]
+    fn cache_key_of_empty_input_matches_sha256_empty_vector() {
+        let key = cache_key(&[]);
+        // SHA-256("") per FIPS 180-4 test vectors.
+        let expected_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, expected_hex);
+    }
+
+    /// A single-bit flip must produce a completely different key
+    /// (avalanche). This is a core property of SHA-256 and the defence
+    /// behind keying on the full DER rather than the SKI: attackers who
+    /// forge certs that differ from a revoked cert by one bit must not
+    /// collide in the cache.
+    #[test]
+    fn cache_key_differs_on_single_bit_flip() {
+        let a: Vec<u8> = (0..64).collect();
+        let mut b = a.clone();
+        b[0] ^= 0x01;
+        let key_a = cache_key(&a);
+        let key_b = cache_key(&b);
+        assert_ne!(key_a, key_b);
+        // At least half the bytes should differ on a strong hash; an
+        // accidental regression to an identity or XOR-based "hash"
+        // would leave most bytes equal.
+        let diffs = key_a
+            .iter()
+            .zip(key_b.iter())
+            .filter(|(x, y)| x != y)
+            .count();
+        assert!(
+            diffs >= 16,
+            "expected strong avalanche, only {diffs}/32 bytes differ",
+        );
+    }
+
+    /// `cache_key` is a pure function — calling it twice with the same
+    /// input on different inputs must not interleave state. Pins there
+    /// is no global hasher, no thread-local accumulator.
+    #[test]
+    fn cache_key_is_purely_functional_on_interleaved_calls() {
+        let a: Vec<u8> = b"alpha".to_vec();
+        let b: Vec<u8> = b"beta".to_vec();
+        let k_a1 = cache_key(&a);
+        let k_b1 = cache_key(&b);
+        let k_a2 = cache_key(&a);
+        let k_b2 = cache_key(&b);
+        assert_eq!(k_a1, k_a2);
+        assert_eq!(k_b1, k_b2);
+        assert_ne!(k_a1, k_b1);
+    }
+
+    /// The `CachedStatus` enum must be `Copy + Clone + Debug` so the
+    /// lock-held closure in `cached_status` can return the value by
+    /// value without cloning a `String`, and so traces can log the
+    /// variant.
+    #[test]
+    fn cached_status_is_copy_clone_debug() {
+        fn assert_bounds<T: Copy + Clone + std::fmt::Debug>() {}
+        assert_bounds::<CachedStatus>();
+        // `Copy` is exercised implicitly via the bounds assertion above; use
+        // the explicit `Clone::clone` form so clippy does not flag this as
+        // `clone_on_copy` (we genuinely want to exercise the `Clone` derive).
+        let g = CachedStatus::Good;
+        let cloned = Clone::clone(&g);
+        assert!(matches!(cloned, CachedStatus::Good));
+        assert!(format!("{g:?}").contains("Good"));
+        assert!(format!("{:?}", CachedStatus::Revoked).contains("Revoked"));
+    }
+
+    /// `OcspFetcher` trait objects must be shareable across tokio tasks
+    /// (the fetcher is held by the background task spawned from `new()`
+    /// which moves into `tokio::spawn`). Pin the trait-level bounds
+    /// against a silent narrowing to `Send` or `Sync` alone.
+    #[test]
+    fn ocsp_fetcher_trait_is_send_sync_static() {
+        fn assert_bounds<T: Send + Sync + 'static + ?Sized>() {}
+        assert_bounds::<dyn OcspFetcher>();
+    }
+
+    /// The callback aliases must be `Send + Sync + Clone` because the
+    /// router clones them into per-session state and the verifier task
+    /// invokes them from the tokio runtime.
+    #[test]
+    fn on_cache_hit_and_miss_aliases_are_send_sync_clone() {
+        fn assert_bounds<T: Send + Sync + Clone>() {}
+        assert_bounds::<OnCacheHit>();
+        assert_bounds::<OnCacheMiss>();
+    }
+
+    /// The `FetchFuture` alias must remain `Send + 'a` so fetcher impls
+    /// can be awaited across task boundaries without downgrading the
+    /// trait-object bounds. A concrete assignment compiles only when
+    /// the inner future satisfies the alias bounds — a regression that
+    /// dropped `Send` or widened to `!Send` would trip on this line.
+    #[test]
+    fn fetch_future_alias_is_pin_box_dyn_send() {
+        // Use a plain `async {}` block (not an `async fn` declaration) to
+        // avoid clippy's `unused_async` warning on a body that legitimately
+        // contains no `.await` — the test's point is purely the type shape.
+        let _f: FetchFuture<'_> = Box::pin(async { Ok::<bool, String>(true) });
+        // Compile-time: the alias must also be `Send` so it can be
+        // moved into spawned tokio tasks.
+        fn is_send<T: Send>(_: &T) {}
+        let g: FetchFuture<'_> = Box::pin(async { Ok::<bool, String>(true) });
+        is_send(&g);
+    }
+
+    /// The custom `Debug` impl on `ClientOcspVerifier` prints only the
+    /// cache-entry count. It must NOT leak the inner verifier (which
+    /// might log subjects of root hints on its own `Debug`) nor the
+    /// fetcher (which may hold HTTP client state). This is the
+    /// redacted-debug defence pattern used across the workspace.
+    #[tokio::test]
+    async fn debug_redacts_inner_and_fetcher_prints_cache_entry_count() {
+        let (inner, _leaf) = build_inner_and_certs();
+        let fetcher = Arc::new(FakeFetcher {
+            good: true,
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let verifier = ClientOcspVerifier::new(inner, fetcher, None, None);
+        let s = format!("{verifier:?}");
+        assert!(s.contains("ClientOcspVerifier"));
+        assert!(s.contains("cache_entries"));
+        // Negative: should not expose the inner verifier or fetcher.
+        assert!(!s.contains("FakeFetcher"));
+        assert!(!s.contains("WebPkiClientVerifier"));
+    }
+
+    /// `ClientOcspVerifier::new` accepts `None` for both callbacks and
+    /// still produces a usable verifier. Catches a regression that
+    /// reverted the `Option` wrapper to required callbacks.
+    #[tokio::test]
+    async fn new_with_none_callbacks_is_usable() {
+        let (inner, _) = build_inner_and_certs();
+        let fetcher = Arc::new(FakeFetcher {
+            good: true,
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let verifier = ClientOcspVerifier::new(inner, fetcher, None, None);
+        // cache_len is zero on a fresh verifier.
+        assert_eq!(verifier.cache_len(), 0);
+        // cached_status on an unknown fingerprint is None.
+        assert!(verifier.cached_status(b"unknown-fingerprint").is_none());
+    }
+
+    /// The `cache_len` accessor observes the same count the Debug impl
+    /// prints and increments as the background fetcher inserts. Pins
+    /// the accessor's contract against a regression that returned a
+    /// stale or hard-coded count.
+    #[tokio::test]
+    async fn cache_len_reflects_inserts_from_background_fetcher() {
+        let (inner, leaf_der) = build_inner_and_certs();
+        let fetcher = Arc::new(FakeFetcher {
+            good: true,
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let verifier = ClientOcspVerifier::new(inner, fetcher, None, None);
+        assert_eq!(verifier.cache_len(), 0);
+        let fp = cache_key(leaf_der.as_ref());
+        verifier.schedule_fetch(fp.clone(), leaf_der.as_ref().to_vec(), Vec::new());
+        for _ in 0..50 {
+            if verifier.cache_len() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(verifier.cache_len(), 1);
+    }
+
+    /// `schedule_fetch` must drop silently when the bounded channel is
+    /// full. A regression that `.await`-ed the send or panicked on
+    /// queue saturation would turn a benign traffic burst into a
+    /// runtime crash or a latency spike on the handshake hot path.
+    #[tokio::test]
+    async fn schedule_fetch_drops_silently_when_queue_is_saturated() {
+        // Fetcher that never completes — keeps the queue full.
+        struct StuckFetcher;
+        impl OcspFetcher for StuckFetcher {
+            fn fetch<'a>(&'a self, _l: &'a [u8], _i: &'a [u8]) -> FetchFuture<'a> {
+                Box::pin(async move {
+                    // Hold forever so the queue-drain loop is blocked
+                    // on our first message; subsequent sends must
+                    // saturate the bounded channel and be dropped
+                    // without panic.
+                    futures::future::pending::<()>().await;
+                    Ok(true)
+                })
+            }
+        }
+        let (inner, _) = build_inner_and_certs();
+        let verifier = ClientOcspVerifier::new(inner, Arc::new(StuckFetcher), None, None);
+        // Prime the receiver-side loop with one message it will hold
+        // forever, then saturate the channel plus one additional send
+        // that must be dropped.
+        verifier.schedule_fetch(vec![0u8; 32], vec![0u8; 32], Vec::new());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // FETCH_QUEUE_CAPACITY + 2: one in-flight, capacity in channel,
+        // and one more to exceed the bound.
+        for i in 0..(FETCH_QUEUE_CAPACITY + 2) {
+            verifier.schedule_fetch(vec![i as u8; 32], vec![i as u8; 32], Vec::new());
+        }
+        // The test passes if we reach here without panicking. Cache
+        // remains empty because the stuck fetcher never completes.
+        assert_eq!(verifier.cache_len(), 0);
+    }
+
+    /// When the cache has a `Revoked` entry, `verify_client_cert`
+    /// rejects the handshake with an `Error::General` carrying a
+    /// message that mentions OCSP revocation. Pins the rejection path
+    /// against a silent change that swapped the variant or the text
+    /// (operators grep for "revoked" in logs during incidents).
+    #[tokio::test]
+    async fn verify_client_cert_rejects_when_cached_revoked() {
+        let (inner, leaf_der) = build_inner_and_certs();
+        let fetcher = Arc::new(FakeFetcher {
+            good: false,
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let verifier = ClientOcspVerifier::new(inner, fetcher, None, None);
+        // Seed the cache as Revoked manually via the scheduler + the
+        // fetcher (which returns false → Revoked).
+        let fp = cache_key(leaf_der.as_ref());
+        verifier.schedule_fetch(fp.clone(), leaf_der.as_ref().to_vec(), Vec::new());
+        for _ in 0..50 {
+            if matches!(verifier.cached_status(&fp), Some(CachedStatus::Revoked)) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // Sanity: the cache is seeded Revoked.
+        assert!(matches!(
+            verifier.cached_status(&fp),
+            Some(CachedStatus::Revoked)
+        ));
+        let now = UnixTime::now();
+        let result = verifier.verify_client_cert(&leaf_der, &[], now);
+        let err = result.expect_err("revoked cert must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.to_lowercase().contains("revoked"),
+            "expected 'revoked' in error, got: {msg}",
+        );
+    }
+
+    /// `verify_client_cert` returns the inner verifier's result when
+    /// the cache says the cert is Good. Pins the happy-path branch.
+    #[tokio::test]
+    async fn verify_client_cert_accepts_when_cached_good() {
+        let (inner, leaf_der) = build_inner_and_certs();
+        let fetcher = Arc::new(FakeFetcher {
+            good: true,
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let verifier = ClientOcspVerifier::new(inner, fetcher, None, None);
+        let fp = cache_key(leaf_der.as_ref());
+        verifier.schedule_fetch(fp.clone(), leaf_der.as_ref().to_vec(), Vec::new());
+        for _ in 0..50 {
+            if matches!(verifier.cached_status(&fp), Some(CachedStatus::Good)) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let now = UnixTime::now();
+        // verify_client_cert runs the inner verifier (which needs a
+        // valid chain to the test CA) and then consults the cache.
+        // A successful Ok here confirms both paths agree.
+        let result = verifier.verify_client_cert(&leaf_der, &[], now);
+        assert!(result.is_ok(), "Good cached cert must pass: {result:?}");
+    }
+
+    /// On a cache hit (Good), the `on_hit` callback is invoked exactly
+    /// once per `verify_client_cert` call. Pins the metric-counter
+    /// semantics operators depend on to understand OCSP cache
+    /// effectiveness.
+    #[tokio::test]
+    async fn on_hit_callback_fires_once_on_good_cache_hit() {
+        let (inner, leaf_der) = build_inner_and_certs();
+        let fetcher = Arc::new(FakeFetcher {
+            good: true,
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        let verifier = ClientOcspVerifier::new(
+            inner,
+            fetcher,
+            Some(Arc::new(move || {
+                let _ = h.fetch_add(1, Ordering::SeqCst);
+            })),
+            None,
+        );
+        let fp = cache_key(leaf_der.as_ref());
+        verifier.schedule_fetch(fp.clone(), leaf_der.as_ref().to_vec(), Vec::new());
+        for _ in 0..50 {
+            if matches!(verifier.cached_status(&fp), Some(CachedStatus::Good)) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        let _ = verifier.verify_client_cert(&leaf_der, &[], UnixTime::now());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// On a cache miss, the `on_miss` callback fires exactly once and a
+    /// background fetch is scheduled. The inner verifier's Ok still
+    /// stands because Tier 1 is fail-open.
+    #[tokio::test]
+    async fn on_miss_callback_fires_once_and_schedules_fetch_on_cold_cache() {
+        let (inner, leaf_der) = build_inner_and_certs();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fetcher = Arc::new(FakeFetcher {
+            good: true,
+            calls: calls.clone(),
+        });
+        let misses = Arc::new(AtomicUsize::new(0));
+        let m = misses.clone();
+        let verifier = ClientOcspVerifier::new(
+            inner,
+            fetcher,
+            None,
+            Some(Arc::new(move || {
+                let _ = m.fetch_add(1, Ordering::SeqCst);
+            })),
+        );
+        // Cold cache → miss + schedule_fetch + inner-verifier Ok.
+        let result = verifier.verify_client_cert(&leaf_der, &[], UnixTime::now());
+        assert!(
+            result.is_ok(),
+            "fail-open Tier 1 accepts cold-cache verification"
+        );
+        assert_eq!(misses.load(Ordering::SeqCst), 1);
+        // Background fetch drains eventually.
+        for _ in 0..50 {
+            if calls.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// `root_hint_subjects` delegates to the inner verifier and returns
+    /// exactly the inner's slice. A regression that returned an empty
+    /// slice would silently cause rustls to send no CA hints in the
+    /// TLS handshake, breaking clients that depend on them to pick the
+    /// right cert chain.
+    #[tokio::test]
+    async fn root_hint_subjects_delegates_to_inner() {
+        let (inner, _) = build_inner_and_certs();
+        // `DistinguishedName` is a newtype around a byte vector without
+        // `PartialEq`, so compare length and byte contents directly.
+        let inner_subjects_bytes: Vec<Vec<u8>> = inner
+            .root_hint_subjects()
+            .iter()
+            .map(|s| s.as_ref().to_vec())
+            .collect();
+        let fetcher = Arc::new(FakeFetcher {
+            good: true,
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let verifier = ClientOcspVerifier::new(inner, fetcher, None, None);
+        let wrapped_bytes: Vec<Vec<u8>> = verifier
+            .root_hint_subjects()
+            .iter()
+            .map(|s| s.as_ref().to_vec())
+            .collect();
+        assert_eq!(wrapped_bytes, inner_subjects_bytes);
+    }
+
+    /// `supported_verify_schemes` delegates to the inner verifier and
+    /// returns the inner's list verbatim. A regression that returned a
+    /// narrower set would silently reject handshakes that used a
+    /// supported-by-inner-but-filtered-by-wrapper scheme (e.g. RSA-PSS).
+    #[tokio::test]
+    async fn supported_verify_schemes_delegates_to_inner() {
+        let (inner, _) = build_inner_and_certs();
+        let inner_schemes = inner.supported_verify_schemes();
+        let fetcher = Arc::new(FakeFetcher {
+            good: true,
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let verifier = ClientOcspVerifier::new(inner, fetcher, None, None);
+        assert_eq!(verifier.supported_verify_schemes(), inner_schemes);
+        assert!(!verifier.supported_verify_schemes().is_empty());
+    }
+
+    /// When the inner verifier rejects the certificate, the wrapper
+    /// must propagate that rejection *without* consulting the cache.
+    /// Pins the "OCSP is supplemental, not substitute for path
+    /// validation" contract against a regression that flipped the
+    /// ordering and let a valid OCSP Good override a path-validation
+    /// failure.
+    #[tokio::test]
+    async fn inner_verifier_rejection_propagates_without_cache_consult() {
+        // A custom inner verifier that always rejects. We build one by
+        // hand rather than using `WebPkiClientVerifier` with an empty
+        // root store because that builder refuses to build (returns
+        // `NoRootAnchors`); we need a deterministic "inner always
+        // rejects" behaviour for this branch test.
+        #[derive(Debug)]
+        struct AlwaysReject;
+        impl ClientCertVerifier for AlwaysReject {
+            fn root_hint_subjects(&self) -> &[DistinguishedName] {
+                &[]
+            }
+            fn verify_client_cert(
+                &self,
+                _ee: &CertificateDer<'_>,
+                _inter: &[CertificateDer<'_>],
+                _now: UnixTime,
+            ) -> Result<ClientCertVerified, Error> {
+                Err(Error::General("inner-rejected".to_string()))
+            }
+            fn verify_tls12_signature(
+                &self,
+                _m: &[u8],
+                _c: &CertificateDer<'_>,
+                _d: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, Error> {
+                Err(Error::General("unused".to_string()))
+            }
+            fn verify_tls13_signature(
+                &self,
+                _m: &[u8],
+                _c: &CertificateDer<'_>,
+                _d: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, Error> {
+                Err(Error::General("unused".to_string()))
+            }
+            fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+                vec![SignatureScheme::RSA_PKCS1_SHA256]
+            }
+        }
+
+        let (_, leaf_der) = build_inner_and_certs();
+        let strict_inner: Arc<dyn ClientCertVerifier> = Arc::new(AlwaysReject);
+        let fetcher = Arc::new(FakeFetcher {
+            good: true,
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let verifier = ClientOcspVerifier::new(strict_inner, fetcher, None, None);
+        // Seed the cache as Good — the rejection path should ignore
+        // this and still fail on the inner verifier's decision.
+        let fp = cache_key(leaf_der.as_ref());
+        verifier.schedule_fetch(fp.clone(), leaf_der.as_ref().to_vec(), Vec::new());
+        for _ in 0..50 {
+            if matches!(verifier.cached_status(&fp), Some(CachedStatus::Good)) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let result = verifier.verify_client_cert(&leaf_der, &[], UnixTime::now());
+        let err = result.expect_err("inner rejection must propagate even on Good cache");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("inner-rejected"),
+            "wrapper must carry inner error verbatim, got: {msg}",
+        );
+    }
+
+    /// Weak references held by the background fetch task must release
+    /// when the last strong `Arc<ClientOcspVerifier>` is dropped, so
+    /// the spawned task exits cleanly and does not leak. Pins the
+    /// `Arc::downgrade`-based lifecycle against a regression that
+    /// upgraded to a strong reference (which would create a cycle and
+    /// leak the task).
+    #[tokio::test]
+    async fn spawned_task_exits_when_verifier_arc_is_dropped() {
+        let (inner, _) = build_inner_and_certs();
+        let fetcher = Arc::new(FakeFetcher {
+            good: true,
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let verifier = ClientOcspVerifier::new(inner, fetcher, None, None);
+        let weak = Arc::downgrade(&verifier);
+        assert!(weak.upgrade().is_some());
+        drop(verifier);
+        // Yield a few times for the spawned task to see the weak
+        // pointer fail to upgrade and terminate.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            weak.upgrade().is_none(),
+            "verifier Arc must fully drop once the caller releases it",
+        );
+    }
+
+    /// Pin that a failed fetch leaves the cache empty — the next
+    /// handshake must re-enter the miss arm and re-schedule a fetch,
+    /// not silently fail open forever via a stale `Ok(_)` insert.
+    #[tokio::test]
+    async fn errored_fetch_leaves_cache_entry_unset() {
+        let (inner, leaf_der) = build_inner_and_certs();
+        let verifier = ClientOcspVerifier::new(inner, Arc::new(ErrFetcher), None, None);
+
+        let fp = cache_key(leaf_der.as_ref());
+        verifier.schedule_fetch(fp.clone(), leaf_der.as_ref().to_vec(), Vec::new());
+
+        // Let the background task drain the queue and hit the error
+        // arm. A small fixed budget is plenty — the task is sync-on-error.
+        for _ in 0..50 {
+            if verifier.cache_len() > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(
+            verifier.cached_status(&fp).is_none(),
+            "errored fetch must not populate the cache",
+        );
+        assert_eq!(verifier.cache_len(), 0);
+    }
+
+    /// `verify_client_cert` passes an empty issuer slice when the leaf
+    /// is signed directly by a trust anchor (no intermediate). The
+    /// background fetcher must accept that input shape and not panic —
+    /// the production `OcspStaplerFetcher` fails gracefully via AIA
+    /// lookup returning nothing; injected test fetchers see the same
+    /// empty buffer.
+    #[tokio::test]
+    async fn schedule_fetch_with_empty_issuer_is_not_a_panic() {
+        let (inner, leaf_der) = build_inner_and_certs();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fetcher = Arc::new(FakeFetcher {
+            good: true,
+            calls: calls.clone(),
+        });
+        let verifier = ClientOcspVerifier::new(inner, fetcher, None, None);
+
+        let fp = cache_key(leaf_der.as_ref());
+        // Empty issuer (zero-length Vec) — the no-intermediate edge case.
+        verifier.schedule_fetch(fp.clone(), leaf_der.as_ref().to_vec(), Vec::new());
+        for _ in 0..50 {
+            if verifier.cached_status(&fp).is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "empty issuer must still reach the fetcher (production will AIA-fail gracefully)",
+        );
+    }
+
+    /// `cached_status` must never surface a stale/mismatched entry for
+    /// arbitrary input shapes. Pin a variety of byte patterns (empty
+    /// slice, all-zero 32-byte, all-`0xFF` 64-byte, short ASCII prefix)
+    /// and assert all miss.
+    #[tokio::test]
+    async fn cached_status_returns_none_for_unknown_key_shapes() {
+        let (inner, _leaf_der) = build_inner_and_certs();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fetcher = Arc::new(FakeFetcher { good: true, calls });
+        let verifier = ClientOcspVerifier::new(inner, fetcher, None, None);
+
+        assert!(verifier.cached_status(&[]).is_none());
+        assert!(verifier.cached_status(&[0u8; 32]).is_none());
+        assert!(verifier.cached_status(&[0xFFu8; 64]).is_none());
+        assert!(verifier.cached_status(b"short").is_none());
     }
 }

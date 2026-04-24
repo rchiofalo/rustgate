@@ -431,4 +431,322 @@ mod tests {
             .expect("verifier must not be poisoned");
         assert!(!inner.root_hint_subjects().is_empty());
     }
+
+    #[test]
+    fn root_store_provider_and_verifier_are_send_sync() {
+        // Structural bounds check: `DynamicCertVerifier` is stored inside
+        // `Arc<dyn ClientCertVerifier>` in every TLS listener across the
+        // workspace, which demands `Send + Sync`. The `RootStoreProvider`
+        // type alias embeds `Box<dyn Fn(...) + Send + Sync>` so that a
+        // closure capturing an `Arc<RwLock<TrustStore>>` remains sharable
+        // across the handshake worker pool. A regression that dropped
+        // either bound would only manifest at a transitive call site in
+        // `rustgate-server::setup`; pin it here so the compile failure
+        // surfaces in the module that owns the types.
+        fn assert_send_sync<T: Send + Sync + ?Sized>() {}
+        assert_send_sync::<DynamicCertVerifier>();
+        assert_send_sync::<RootStoreProvider>();
+    }
+
+    #[test]
+    fn debug_format_reports_crl_count_not_crl_contents() {
+        // The Debug impl intentionally projects `self.crls.len()` into a
+        // `crls` field rather than formatting the CRL DER bytes (which
+        // would spam logs with hex-DER blobs and potentially leak
+        // operational signal about the revocation-list shape to anyone
+        // with log access). Pin both the numeric count AND the absence
+        // of the underlying `CertificateRevocationListDer` type name in
+        // the rendered output.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let store = test_root_store();
+        let verifier = DynamicCertVerifier::new(Box::new(move || (7, store.clone())), Vec::new())
+            .expect("build verifier");
+        let dbg = format!("{verifier:?}");
+        assert!(dbg.contains("DynamicCertVerifier"));
+        assert!(
+            dbg.contains("generation: 7"),
+            "generation must be visible, got: {dbg}"
+        );
+        assert!(
+            dbg.contains("crls: 0"),
+            "crl count must be visible as len (0 here), got: {dbg}"
+        );
+        assert!(
+            !dbg.contains("CertificateRevocationListDer"),
+            "CRL DER type must not leak into Debug output"
+        );
+        assert!(
+            !dbg.contains("provider"),
+            "the RootStoreProvider closure must not leak into Debug output: {dbg}"
+        );
+    }
+
+    #[test]
+    fn debug_reflects_current_generation_after_rebuild() {
+        // The Debug impl reads `cached.generation` under the parking_lot
+        // lock — after a rebuild advances the counter, Debug must
+        // surface the new value so `tracing::debug!(?verifier, …)` on
+        // the post-rotation path carries the advertised generation,
+        // not the construction-time snapshot.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let generation = Arc::new(AtomicU64::new(0));
+        let gen_clone = Arc::clone(&generation);
+        let store = test_root_store();
+        let verifier = DynamicCertVerifier::new(
+            Box::new(move || (gen_clone.load(Ordering::Acquire), store.clone())),
+            Vec::new(),
+        )
+        .expect("build verifier");
+
+        assert!(format!("{verifier:?}").contains("generation: 0"));
+
+        generation.store(99, Ordering::Release);
+        let _ = verifier.current_verifier().expect("rebuild");
+
+        let dbg = format!("{verifier:?}");
+        assert!(
+            dbg.contains("generation: 99"),
+            "Debug must reflect post-rebuild generation, got: {dbg}"
+        );
+    }
+
+    #[test]
+    fn same_generation_does_not_rebuild_verifier() {
+        // The cached verifier identity is preserved across repeated
+        // current_verifier() calls when the provider reports the same
+        // generation — pin via Arc::ptr_eq on five consecutive calls so
+        // a regression that accidentally rebuilt on every call (losing
+        // the `cached.generation == current_gen` fast path) would cost
+        // a fresh WebPkiClientVerifier allocation per handshake and
+        // re-leak subject hints, fails here.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let store = test_root_store();
+        let verifier = DynamicCertVerifier::new(Box::new(move || (42, store.clone())), Vec::new())
+            .expect("build verifier");
+
+        let v0 = verifier.current_verifier().expect("v0");
+        for _ in 0..5 {
+            let v = verifier.current_verifier().expect("current");
+            assert!(
+                Arc::ptr_eq(&v0, &v),
+                "same-generation calls must return the cached Arc"
+            );
+        }
+    }
+
+    #[test]
+    fn generation_decrease_triggers_rebuild_not_just_increase() {
+        // The cache check is `cached.generation == current_gen` — any
+        // inequality rebuilds, including a *decrease*. Pin this so a
+        // refactor to `current_gen > cached.generation` (which would
+        // seem like a "monotonic counter" optimization) fails here: in
+        // production a rotation rollback is rare but not unreachable,
+        // and the verifier MUST reflect whatever the trust-store source
+        // reports, not its idea of linear time.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let generation = Arc::new(AtomicU64::new(5));
+        let gen_clone = Arc::clone(&generation);
+        let store = test_root_store();
+        let verifier = DynamicCertVerifier::new(
+            Box::new(move || (gen_clone.load(Ordering::Acquire), store.clone())),
+            Vec::new(),
+        )
+        .expect("build verifier");
+
+        let v_at_5 = verifier.current_verifier().expect("gen=5");
+
+        // Decrease generation.
+        generation.store(2, Ordering::Release);
+        let v_at_2 = verifier.current_verifier().expect("gen=2");
+
+        assert!(
+            !Arc::ptr_eq(&v_at_5, &v_at_2),
+            "generation decrease (5→2) must rebuild, not be silently ignored"
+        );
+    }
+
+    #[test]
+    fn provider_is_called_once_per_current_verifier_invocation() {
+        // Observability invariant: every call to `current_verifier`
+        // must ask the provider for the current state exactly once.
+        // If a future refactor cached the provider output itself (e.g.
+        // under a time-based TTL) the verifier would stop reacting to
+        // out-of-band trust-store updates between TTL ticks — pin the
+        // current contract by counting provider invocations across
+        // three reads with a static generation.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let call_count = Arc::new(AtomicU64::new(0));
+        let call_count_cb = Arc::clone(&call_count);
+        let store = test_root_store();
+        let verifier = DynamicCertVerifier::new(
+            Box::new(move || {
+                let _ = call_count_cb.fetch_add(1, Ordering::Relaxed);
+                (0, store.clone())
+            }),
+            Vec::new(),
+        )
+        .expect("build verifier");
+
+        // One call during construction.
+        assert_eq!(call_count.load(Ordering::Relaxed), 1);
+
+        // Three more calls should increment the counter by three.
+        let _ = verifier.current_verifier().expect("v1");
+        let _ = verifier.current_verifier().expect("v2");
+        let _ = verifier.current_verifier().expect("v3");
+        assert_eq!(
+            call_count.load(Ordering::Relaxed),
+            4,
+            "each current_verifier call must consult the provider exactly once"
+        );
+    }
+
+    #[test]
+    fn initial_hint_subject_count_matches_root_store_cert_count() {
+        // Pin that the DN-list leaked by `Vec::leak(root_store.subjects())`
+        // has the same cardinality as the number of certs installed
+        // during construction — a regression that dropped duplicates or
+        // silently truncated would change what the handshake
+        // CertificateRequest advertises and surface as "mystery client
+        // cert rejections" rather than a loud failure.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let ca1 = rustgate_test_utils::certs::TestCa::new("DT CA One");
+        let ca2 = rustgate_test_utils::certs::TestCa::new("DT CA Two");
+        let ca3 = rustgate_test_utils::certs::TestCa::new("DT CA Three");
+
+        let mut store = RootCertStore::empty();
+        for ca in [&ca1, &ca2, &ca3] {
+            for cert in rustls_pki_types::pem::PemObject::pem_slice_iter(ca.cert_pem.as_bytes())
+                .collect::<Result<Vec<CertificateDer<'static>>, _>>()
+                .expect("parse cert")
+            {
+                store.add(cert).expect("add cert");
+            }
+        }
+        assert_eq!(store.len(), 3, "sanity: three CAs installed");
+
+        let verifier = DynamicCertVerifier::new(Box::new(move || (0, store.clone())), Vec::new())
+            .expect("build verifier");
+        assert_eq!(
+            verifier.root_hint_subjects().len(),
+            3,
+            "hint list must include one DN per installed CA"
+        );
+    }
+
+    #[test]
+    fn new_with_non_empty_crls_constructs_successfully() {
+        // The `if !crls.is_empty() { builder.with_crls(...) }` branch in
+        // build_verifier is otherwise unexercised by the existing suite;
+        // pin it by constructing a verifier with a real CRL and
+        // asserting both construction success AND that a subsequent
+        // rebuild-through-generation-change preserves the CRL list
+        // (`self.crls.to_vec()` is passed through `build_verifier`
+        // every rebuild, so a regression that dropped it on the second
+        // path would silently disable revocation checking after the
+        // first CA rotation).
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let ca = rustgate_test_utils::certs::TestCa::new("CRL Test CA");
+        let mut store = RootCertStore::empty();
+        for cert in rustls_pki_types::pem::PemObject::pem_slice_iter(ca.cert_pem.as_bytes())
+            .collect::<Result<Vec<CertificateDer<'static>>, _>>()
+            .expect("parse")
+        {
+            store.add(cert).expect("add");
+        }
+
+        // Issue a real CRL revoking no serials (empty list is a legal
+        // published CRL — "I am current and nothing is revoked") so
+        // webpki's parser accepts it. `generate_crl` returns PEM which
+        // we decode into DER for the rustls verifier API.
+        let crl_pem = ca.generate_crl(&[]);
+        let crl_ders: Vec<CertificateRevocationListDer<'static>> =
+            rustls_pki_types::pem::PemObject::pem_slice_iter(crl_pem.as_bytes())
+                .collect::<Result<Vec<_>, _>>()
+                .expect("decode CRL PEM");
+        assert_eq!(crl_ders.len(), 1, "one CRL expected");
+        let crls = crl_ders;
+
+        let generation = Arc::new(AtomicU64::new(0));
+        let gen_clone = Arc::clone(&generation);
+        let store_c = store.clone();
+        let verifier = DynamicCertVerifier::new(
+            Box::new(move || (gen_clone.load(Ordering::Acquire), store_c.clone())),
+            crls,
+        )
+        .expect("build verifier with non-empty CRL");
+
+        // Debug reports the CRL count (1) — pins the full Vec survived construction.
+        assert!(
+            format!("{verifier:?}").contains("crls: 1"),
+            "constructor must retain the CRL vector"
+        );
+
+        // Trigger rebuild; the CRL list is cloned and re-applied on
+        // every rebuild. Absence of panic/error here is the pin.
+        generation.store(1, Ordering::Release);
+        let _ = verifier.current_verifier().expect("rebuild preserves CRLs");
+
+        // CRL count must survive the rebuild.
+        assert!(
+            format!("{verifier:?}").contains("crls: 1"),
+            "rebuild must not drop the CRL vector"
+        );
+    }
+
+    #[test]
+    fn root_hint_subjects_does_not_acquire_cached_mutex() {
+        // `root_hint_subjects` is on the TLS handshake hot path and is
+        // called every time the server assembles a `CertificateRequest`.
+        // The `ArcSwap` backing it exists specifically so reads do not
+        // block on the rebuild mutex — pin this by holding the mutex
+        // in the current thread and concurrently calling
+        // `root_hint_subjects` in a second thread within a bounded
+        // timeout. A regression that added a `self.cached.lock()` call
+        // to the hint accessor would cause the spawned thread to
+        // deadlock past the timeout and the test would fail.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let store = test_root_store();
+        let verifier = DynamicCertVerifier::new(Box::new(move || (0, store.clone())), Vec::new())
+            .expect("build verifier");
+
+        let v_for_thread = Arc::clone(&verifier);
+        let _guard = verifier.cached.lock();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _thread = std::thread::spawn(move || {
+            let count = v_for_thread.root_hint_subjects().len();
+            let _ = tx.send(count);
+        });
+
+        let count = rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("root_hint_subjects must not block on cached mutex");
+        assert!(
+            count > 0,
+            "non-empty hint list expected from lock-free read"
+        );
+        drop(_guard);
+    }
+
+    #[test]
+    fn verifier_usable_as_dyn_client_cert_verifier_via_arc() {
+        // rustls consumes the verifier as `Arc<dyn ClientCertVerifier>`.
+        // Pin that `Arc<DynamicCertVerifier>` up-casts to that trait
+        // object cleanly (both the unsize coercion and the
+        // `Send + Sync` auto-traits on the `dyn` projection). A future
+        // refactor that narrowed any of the inner fields to a
+        // non-Send/Sync type would fail here rather than at the call
+        // site in `rustgate-server::setup`.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let store = test_root_store();
+        let verifier = DynamicCertVerifier::new(Box::new(move || (0, store.clone())), Vec::new())
+            .expect("build verifier");
+
+        let as_trait: Arc<dyn ClientCertVerifier> = verifier;
+        assert!(!as_trait.root_hint_subjects().is_empty());
+        assert!(!as_trait.supported_verify_schemes().is_empty());
+    }
 }

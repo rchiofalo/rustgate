@@ -248,4 +248,239 @@ mod tests {
         let h = hash_cn("");
         assert_eq!(h.len(), 12);
     }
+
+    // ── defensive-invariant coverage ────────────────────────────────
+
+    #[test]
+    fn mask_cert_serial_output_is_always_eleven_chars_for_input_longer_than_ten_bytes() {
+        // The masked shape is `{4 prefix}...{4 suffix}` — exactly 4 + 3 + 4
+        // = 11 characters, regardless of input length. Pin this so a
+        // regression that e.g. widened the prefix/suffix to 6 each (making
+        // correlation easier at the cost of disclosing more of the serial)
+        // trips here rather than silently leaking more bytes into logs.
+        for input in [
+            "12345678901",                      // 11 chars (just over boundary)
+            "A1B2C3D4E5F6",                     // 12
+            "0123456789ABCDEF0123456789ABCDEF", // 32
+            &"x".repeat(1024),                  // pathological long
+        ] {
+            let out = mask_cert_serial(input);
+            assert_eq!(
+                out.len(),
+                11,
+                "mask_cert_serial output must be exactly 11 chars for input of len {}, got {out:?}",
+                input.len()
+            );
+            assert!(
+                out.contains("..."),
+                "masked output must contain separator: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mask_cert_serial_non_ascii_short_input_returns_verbatim_without_panic() {
+        // Short non-ASCII input (under 10 BYTES, not chars) takes the
+        // verbatim early-return path and must not panic on byte-slice
+        // operations. Pins that the `<= 10` guard uses `len()` (bytes) and
+        // that no byte-slice indexing occurs on short inputs. A regression
+        // that re-ordered the guard after byte slicing would panic on any
+        // non-ASCII input at byte boundaries inside a UTF-8 continuation.
+        assert_eq!(mask_cert_serial("café"), "café"); // 5 bytes, short path
+        assert_eq!(mask_cert_serial("日本"), "日本"); // 6 bytes, short path
+        assert_eq!(mask_cert_serial("🔒"), "🔒"); // 4 bytes, short path
+    }
+
+    #[test]
+    fn mask_ip_bracketed_ipv6_without_port_preserves_brackets_and_masks_last_group() {
+        // Pin the `after_bracket = ""` branch — bracketed IPv6 with no
+        // trailing port. Before this test, `bracketed_ipv6_with_port`
+        // covered the `[::1]:443` case but not the no-port variant, so a
+        // regression that mis-indexed `&ip[bracket_end + 1..]` past len on
+        // empty-suffix input would only surface at a live rejection.
+        assert_eq!(mask_ip("[::1]"), "[::***]");
+        assert_eq!(mask_ip("[2001:db8::1]"), "[2001:db8::***]");
+    }
+
+    #[test]
+    fn mask_ip_invalid_non_ip_input_returns_verbatim() {
+        // A hostname or non-IP string with no colon and no dot falls
+        // through every masking branch and is returned unchanged. Pins
+        // that `mask_ip` is a best-effort helper (won't panic on bad
+        // input, won't silently truncate a short hostname fragment).
+        assert_eq!(mask_ip("hostname"), "hostname");
+        assert_eq!(mask_ip("localhost"), "localhost");
+        assert_eq!(mask_ip("x"), "x");
+    }
+
+    #[test]
+    fn mask_ip_single_colon_non_ip_returns_verbatim() {
+        // `"x:y"` — one colon, no dot, not bracketed. The IPv6 branch
+        // requires `matches(':').count() > 1`, and the IPv4-with-port
+        // branch requires `before.contains('.')` — neither fires, so the
+        // string is returned verbatim. Pins the "ambiguous single-colon
+        // input" path is handled safely rather than mis-classified as a
+        // mangled IPv4:port.
+        assert_eq!(mask_ip("x:y"), "x:y");
+        assert_eq!(mask_ip("no-port:just-text"), "no-port:just-text");
+    }
+
+    #[test]
+    fn mask_credential_output_for_long_input_is_exactly_ten_chars() {
+        // `{2 prefix}********` — exactly 2 + 8 = 10 characters, regardless
+        // of input length. Pins the output-length invariant so a regression
+        // that varied the asterisk count (e.g. scaled with input length,
+        // re-enabling length disclosure) trips here. Operationally
+        // important for log column alignment that downstream tools (grep
+        // /awk dashboards) assume.
+        for input in [
+            "abc",                      // exactly 3
+            "password123",              // medium
+            &"x".repeat(1024),          // long
+            "VeryLongSecret!@#$%^&*()", // special chars
+        ] {
+            let out = mask_credential(input);
+            assert_eq!(
+                out.len(),
+                10,
+                "mask_credential output for input of len {} must be 10 chars, got {out:?}",
+                input.len()
+            );
+            assert!(
+                out.ends_with("********"),
+                "masked output must end with 8 asterisks: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mask_credential_output_for_short_input_is_exactly_eight_chars() {
+        // Short inputs (len < 3) are fully replaced with `"********"` —
+        // exactly 8 characters. Pins the short-path invariant so a
+        // regression that padded differently (e.g. to 10 chars for column
+        // alignment) trips here rather than silently disclosing a length
+        // signal through the output shape.
+        for input in ["", "a", "ab"] {
+            let out = mask_credential(input);
+            assert_eq!(
+                out, "********",
+                "short-input mask must be exactly 8 asterisks for input {input:?}, got {out:?}"
+            );
+            assert_eq!(out.len(), 8);
+        }
+    }
+
+    #[test]
+    fn hash_cn_output_is_always_lowercase_ascii_hex() {
+        // The `{b:02x}` format specifier emits lowercase hex; pin this as
+        // the contract. A regression to `{b:02X}` (uppercase) would break
+        // any downstream log pipeline doing case-sensitive correlation
+        // (e.g. grep -F "abcd12" vs grep -F "ABCD12"). The existing
+        // `is_ascii_hexdigit` check allows EITHER case — this test closes
+        // that gap.
+        for cn in [
+            "alice",
+            "bob",
+            "\u{4e16}\u{754c}",
+            "",
+            "🔒",
+            &"x".repeat(256),
+        ] {
+            let h = hash_cn(cn);
+            assert_eq!(h.len(), 12);
+            assert!(
+                h.chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+                "hash_cn output must be lowercase hex only: {h:?} for input {cn:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hash_cn_matches_sha256_first_six_byte_truncation_spec() {
+        // Cross-check the implementation against the documented
+        // algorithmic contract — "SHA-256(cn), first 6 bytes, lowercase
+        // hex". An independent recomputation via the raw sha2 primitives
+        // must agree byte-for-byte with the module's output. A regression
+        // that swapped to a different hash (e.g. SHA-1, MD5) or changed
+        // the truncation length (first 4 bytes = 8 chars) would fail here.
+        use sha2::{Digest, Sha256};
+        for cn in [
+            "",
+            "alice",
+            "bob",
+            "\u{4e16}\u{754c}",
+            "very-long-cn-with-dashes",
+        ] {
+            let digest = Sha256::digest(cn.as_bytes());
+            let expected = format!(
+                "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                digest[0], digest[1], digest[2], digest[3], digest[4], digest[5]
+            );
+            assert_eq!(
+                hash_cn(cn),
+                expected,
+                "hash_cn({cn:?}) must equal SHA-256(cn)[..6] as lowercase hex"
+            );
+        }
+    }
+
+    #[test]
+    fn hash_cn_distinguishes_case_and_whitespace_variants() {
+        // Near-identical inputs must produce distinct hashes — operators
+        // rely on the correlation token to separate "alice" from "Alice"
+        // from "alice " (trailing space, common CN-normalisation footgun)
+        // from "ALICE". A regression that lowercased / trimmed the input
+        // before hashing would merge these into one and let a typoed CN
+        // silently co-mingle with the legitimate identity's audit trail.
+        let hashes = [
+            hash_cn("alice"),
+            hash_cn("Alice"),
+            hash_cn("ALICE"),
+            hash_cn("alice "),
+            hash_cn(" alice"),
+            hash_cn("alic"),
+            hash_cn("alicee"),
+        ];
+        let unique: std::collections::HashSet<_> = hashes.iter().collect();
+        assert_eq!(
+            unique.len(),
+            hashes.len(),
+            "near-identical CNs must produce distinct hashes, got collision in {hashes:?}"
+        );
+    }
+
+    #[test]
+    fn hash_cn_handles_large_inputs_above_sha256_block_boundary_without_panic() {
+        // SHA-256 processes 64-byte blocks internally. Test inputs well
+        // above that boundary (and into the multi-block range) to pin
+        // that the function doesn't panic on large inputs and still
+        // produces a valid 12-char hex token. A regression that added a
+        // stack-allocated bounded buffer would fail on the large inputs.
+        for size in [64, 1024, 65_536, 1_048_576] {
+            let cn = "x".repeat(size);
+            let h = hash_cn(&cn);
+            assert_eq!(
+                h.len(),
+                12,
+                "hash_cn output len must be 12 for input size {size}, got {h:?}"
+            );
+            assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+    }
+
+    #[test]
+    fn masking_functions_all_return_owned_string_type() {
+        // Compile-time pin that every public masking function returns an
+        // owned `String`, not `&str` or `Cow<'_, str>`. A regression to a
+        // borrowed return type would tie the output's lifetime to the
+        // input and break every structured-log call site that stores the
+        // masked value into a longer-lived span field. `let _: String = …`
+        // enforces this at monomorphisation time — if the return type
+        // narrowed, the test would fail to compile here.
+        let _: String = mask_cert_serial("A1B2C3D4E5F6Y3Z4");
+        let _: String = mask_ip("10.0.0.1");
+        let _: String = mask_credential("password");
+        let _: String = hash_cn("alice");
+    }
 }

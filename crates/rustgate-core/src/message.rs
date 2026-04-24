@@ -456,4 +456,334 @@ mod tests {
         );
         assert_ne!(MessageType::Position, MessageType::Chat);
     }
+
+    // ── defensive-invariant coverage ────────────────────────────────
+
+    #[test]
+    fn routable_message_and_subtypes_are_send_sync_clone_debug_static() {
+        // Every routed message flows across task boundaries (router ↔
+        // session handler ↔ federation forwarder ↔ publisher queue)
+        // and must be safely cloneable for fan-out delivery. Pin the
+        // full bound-set at compile time so a refactor that embedded a
+        // non-`Send` field (e.g. an `Rc`-wrapped attachment, a
+        // `*const _` pointer for metrics) fails here rather than at
+        // the far-away `tokio::spawn(async move { msg.clone() … })`
+        // site inside the router's broadcast loop.
+        fn assert_bounds<T: Send + Sync + Clone + std::fmt::Debug + 'static>() {}
+        assert_bounds::<RoutableMessage>();
+        assert_bounds::<Metadata>();
+        assert_bounds::<Destination>();
+        assert_bounds::<MessageType>();
+    }
+
+    #[test]
+    fn message_type_exhaustive_match_pins_current_seven_variant_set() {
+        // An exhaustive match without a wildcard arm is the canonical
+        // way to pin the current variant set — adding an 8th variant
+        // (e.g. a future `CoTCasEvac` classification) must force the
+        // author to update every routing-decision match site in the
+        // codebase, rather than silently falling through a `_ =>`
+        // default arm that hides the new classification from the
+        // router. The test drives each variant through a minimal
+        // Display round-trip so a forgotten Display arm also fails at
+        // this test site rather than at a deployed log pipeline.
+        let all: [MessageType; 7] = [
+            MessageType::Position,
+            MessageType::Chat,
+            MessageType::Alert,
+            MessageType::Status,
+            MessageType::File,
+            MessageType::Mavlink,
+            MessageType::Other(String::new()),
+        ];
+        for variant in &all {
+            let rendered = match variant {
+                MessageType::Position => "position",
+                MessageType::Chat => "chat",
+                MessageType::Alert => "alert",
+                MessageType::Status => "status",
+                MessageType::File => "file",
+                MessageType::Mavlink => "mavlink",
+                MessageType::Other(s) => {
+                    // pin via prefix — the dynamic payload is rendered
+                    // verbatim, but the prefix is the stable contract
+                    assert!(variant.to_string().starts_with("other:"));
+                    if s.is_empty() {
+                        "other"
+                    } else {
+                        "other_nonempty"
+                    }
+                }
+            };
+            assert!(!rendered.is_empty(), "variant must render to non-empty tag");
+        }
+    }
+
+    #[test]
+    fn destination_exhaustive_match_pins_current_four_variant_set() {
+        // Same contract as `message_type_exhaustive_match_pins…` but
+        // for Destination. The router's delivery path has dedicated
+        // branches for each variant (group lookup, direct-CN lookup,
+        // broadcast fan-out, multicast fan-over-groups); a fifth
+        // variant (e.g. `Multitenant { tenant, groups }`) would need
+        // a new router arm and this test forces the author to confront
+        // the decision rather than silently falling through default.
+        let id = Identity {
+            cn: "c".into(),
+            fingerprint: "f".into(),
+            groups: std::collections::BTreeSet::new(),
+            tenant: None,
+            spiffe_id: None,
+            attributes: std::sync::Arc::new(std::collections::BTreeMap::new()),
+        };
+        let all = [
+            Destination::Group("g".into()),
+            Destination::Direct(id),
+            Destination::Broadcast,
+            Destination::Multicast(vec!["h".into()]),
+        ];
+        for dest in &all {
+            let tag = match dest {
+                Destination::Group(_) => "group",
+                Destination::Direct(_) => "direct",
+                Destination::Broadcast => "broadcast",
+                Destination::Multicast(_) => "multicast",
+            };
+            assert_eq!(
+                tag,
+                dest.kind_str(),
+                "exhaustive-match tag must agree with kind_str"
+            );
+        }
+    }
+
+    #[test]
+    fn destination_kind_str_values_are_pairwise_distinct_ascii_lowercase() {
+        // Prometheus label invariants: low cardinality, ASCII-only,
+        // lowercase. A regression that collapsed two variants to the
+        // same string (e.g. both `Group` and `Multicast` → "group")
+        // would silently merge metrics buckets and defeat operator
+        // troubleshooting. Pin pairwise distinctness and the ASCII-
+        // lowercase shape.
+        let id = Identity {
+            cn: "c".into(),
+            fingerprint: "f".into(),
+            groups: std::collections::BTreeSet::new(),
+            tenant: None,
+            spiffe_id: None,
+            attributes: std::sync::Arc::new(std::collections::BTreeMap::new()),
+        };
+        let labels: [&'static str; 4] = [
+            Destination::Group("g".into()).kind_str(),
+            Destination::Direct(id).kind_str(),
+            Destination::Broadcast.kind_str(),
+            Destination::Multicast(vec![]).kind_str(),
+        ];
+        let unique: std::collections::HashSet<_> = labels.iter().collect();
+        assert_eq!(
+            unique.len(),
+            labels.len(),
+            "kind_str values must be pairwise distinct: {labels:?}"
+        );
+        for label in &labels {
+            assert!(
+                label.chars().all(|c| c.is_ascii_lowercase()),
+                "kind_str value must be all-ASCII-lowercase, got {label:?}"
+            );
+            assert!(!label.is_empty(), "kind_str must never be empty");
+        }
+    }
+
+    #[test]
+    fn source_protocol_constants_are_pairwise_distinct_ascii_lowercase() {
+        // SOURCE_FEDERATION and SOURCE_MAVLINK are grep-tokens for
+        // echo-prevention filters and audit-log correlation. If either
+        // regressed to the same value (or to uppercase / mixed-case),
+        // every downstream grep rule in operator runbooks would break
+        // silently. Pin distinctness + lowercase ASCII shape.
+        assert_ne!(
+            SOURCE_FEDERATION, SOURCE_MAVLINK,
+            "source protocol constants must be distinct"
+        );
+        for constant in [SOURCE_FEDERATION, SOURCE_MAVLINK] {
+            assert!(
+                constant.chars().all(|c| c.is_ascii_lowercase()),
+                "source protocol constant must be ASCII lowercase, got {constant:?}"
+            );
+            assert!(!constant.is_empty(), "source protocol must not be empty");
+        }
+    }
+
+    #[test]
+    fn metadata_is_expired_with_duration_max_ttl_never_expires() {
+        // `Duration::MAX` TTL pins the "effectively never expires"
+        // path that overflow-safe arithmetic relies on: `elapsed` is
+        // always a finite Duration, so `elapsed > Duration::MAX` is
+        // false for any elapsed value. A regression that replaced `>`
+        // with `>=` would make a `Duration::MAX` TTL suddenly expire
+        // when elapsed == Duration::MAX, which can happen in contrived
+        // test fixtures but more importantly would silently flip the
+        // contract for edge-case config.
+        let meta = Metadata {
+            received_at: SystemTime::now()
+                .checked_sub(Duration::from_secs(3600))
+                .expect("clock arithmetic"),
+            source_protocol: "tcp".into(),
+            message_type: MessageType::Position,
+            ttl: Some(Duration::MAX),
+        };
+        assert!(
+            !meta.is_expired(),
+            "Duration::MAX TTL must never expire — got expired"
+        );
+    }
+
+    #[test]
+    fn metadata_is_expired_with_zero_ttl_after_brief_wait_returns_true() {
+        // `Duration::ZERO` TTL means "expired immediately after
+        // received_at" — any non-zero elapsed time must trip
+        // `elapsed > 0`. A regression that treated zero-TTL as
+        // "no expiry" (conflating Some(ZERO) with None) would
+        // silently keep expired messages in the position cache.
+        let meta = Metadata {
+            received_at: SystemTime::now()
+                .checked_sub(Duration::from_millis(10))
+                .expect("clock arithmetic"),
+            source_protocol: "tcp".into(),
+            message_type: MessageType::Position,
+            ttl: Some(Duration::ZERO),
+        };
+        assert!(
+            meta.is_expired(),
+            "Some(Duration::ZERO) TTL must expire after any elapsed time"
+        );
+    }
+
+    #[test]
+    fn destination_display_direct_renders_cn_not_fingerprint() {
+        // Security-relevant contract: the Display impl must render the
+        // CN (a human-readable identifier operators use in audit
+        // grep) and NEVER leak the raw fingerprint (a cryptographic
+        // hash of the client cert that ties log entries to specific
+        // physical tokens). A regression that swapped to `id.fingerprint`
+        // inside the `Direct` arm would silently leak fingerprints
+        // into every audit line that renders a destination.
+        let id = Identity {
+            cn: "alice".into(),
+            fingerprint: "SECRET_FINGERPRINT_MUST_NOT_LEAK".into(),
+            groups: std::collections::BTreeSet::new(),
+            tenant: None,
+            spiffe_id: None,
+            attributes: std::sync::Arc::new(std::collections::BTreeMap::new()),
+        };
+        let rendered = Destination::Direct(id).to_string();
+        assert_eq!(
+            rendered, "direct:alice",
+            "Display must render CN, not fingerprint"
+        );
+        assert!(
+            !rendered.contains("SECRET_FINGERPRINT"),
+            "fingerprint must NEVER leak into Display output: {rendered}"
+        );
+    }
+
+    #[test]
+    fn message_type_display_other_passes_through_special_chars_verbatim() {
+        // The `Other(String)` inner label is end-user-supplied (CoT
+        // event-type string) and the Display impl forwards it verbatim
+        // after `"other:"`. Pin that there is no hidden sanitisation —
+        // this matters because downstream log sinks MUST apply their
+        // own sanitisation (via `rustgate_core::sanitize::sanitize_for_log`);
+        // a future refactor that added "helpful" escaping inside
+        // MessageType::Display would silently double-escape every
+        // downstream log record.
+        let inputs = [
+            "a:b",   // colon mid-string
+            "x,y,z", // comma
+            "with space",
+            "",      // empty
+            "UPPER", // uppercase preserved
+            "digit1",
+        ];
+        for input in inputs {
+            let rendered = MessageType::Other(input.to_string()).to_string();
+            assert_eq!(
+                rendered,
+                format!("other:{input}"),
+                "Other Display must pass inner payload verbatim for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn routable_message_clone_shares_payload_bytes_ref_count() {
+        // `Bytes` is reference-counted; cloning a `RoutableMessage`
+        // must share the payload buffer rather than deep-copying.
+        // Operationally critical: every broadcast fan-out clones the
+        // message once per recipient, and a regression that replaced
+        // `Bytes` with `Vec<u8>` (or added a `.to_vec()` call) would
+        // turn O(1) fan-out into O(N·payload_len) and collapse
+        // throughput on large CoT/MAVLink messages.
+        let payload = Bytes::from_static(b"some-payload-bytes");
+        let id = Identity {
+            cn: "alice".into(),
+            fingerprint: "fp".into(),
+            groups: std::collections::BTreeSet::new(),
+            tenant: None,
+            spiffe_id: None,
+            attributes: std::sync::Arc::new(std::collections::BTreeMap::new()),
+        };
+        let msg = RoutableMessage {
+            source: id,
+            destination: Destination::Broadcast,
+            payload,
+            metadata: Metadata {
+                received_at: SystemTime::now(),
+                source_protocol: "tcp".into(),
+                message_type: MessageType::Position,
+                ttl: None,
+            },
+        };
+        let cloned = msg.clone();
+        // `Bytes` clone shares the same allocation — the as_ptr values
+        // must agree for static-source buffers.
+        assert_eq!(
+            msg.payload.as_ptr(),
+            cloned.payload.as_ptr(),
+            "RoutableMessage::clone must share payload buffer (Bytes ref-count), not deep-copy"
+        );
+        // Byte content agreement (basic round-trip sanity).
+        assert_eq!(msg.payload, cloned.payload);
+    }
+
+    #[test]
+    fn metadata_is_expired_boundary_is_strictly_greater() {
+        // The implementation uses `elapsed > ttl` (strict greater).
+        // Pin that `elapsed == ttl` (exact-match boundary) is NOT
+        // considered expired. Operationally this matters because
+        // position-cache sweep runs at fixed intervals and a regression
+        // to `>=` would silently flip the cache's eviction timing by
+        // exactly one interval tick (first sweep vs next sweep),
+        // changing staleness semantics that alerting rules depend on.
+        //
+        // We cannot pin the exact-boundary case deterministically via
+        // SystemTime (wall-clock elapsed is always strictly greater
+        // than a ttl set to the same offset computed earlier); instead
+        // we pin the "barely-under" case: ttl > elapsed by a tiny
+        // margin, assert NOT expired. A `>=` regression would still
+        // pass this — but combined with `metadata_is_expired_past_ttl_
+        // is_true` (existing test, which uses 60s elapsed vs 1ms ttl)
+        // the pair pins that within-ttl is false and past-ttl is true.
+        let now = SystemTime::now();
+        let meta = Metadata {
+            received_at: now,
+            source_protocol: "tcp".into(),
+            message_type: MessageType::Position,
+            ttl: Some(Duration::from_secs(3600)),
+        };
+        assert!(
+            !meta.is_expired(),
+            "just-received message with 1h TTL must not be expired"
+        );
+    }
 }

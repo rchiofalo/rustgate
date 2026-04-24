@@ -298,4 +298,184 @@ mod tests {
         write_peers(dir.path(), "{not json");
         assert!(r.reload().await.is_err());
     }
+
+    /// `compute_hash` must yield exactly 32 bytes of output — the
+    /// `[u8; 32]` return type pins it at the type system, but a future
+    /// refactor that changed the signature to `Vec<u8>` (e.g. to feed a
+    /// length-prefixed hasher) would pass type-check while silently
+    /// changing the digest size operators see in `tracing::debug!` lines.
+    /// Length-pin the digest as a defensive smoke assertion.
+    #[test]
+    fn compute_hash_output_length_is_sha256_32_bytes() {
+        let h = FederationPeerReloader::compute_hash(b"peers");
+        assert_eq!(
+            h.len(),
+            32,
+            "SHA-256 digest must be exactly 32 bytes; a different size implies the algorithm was silently swapped"
+        );
+    }
+
+    /// Pin the SHA-256 of the empty byte slice against the RFC 6234 /
+    /// NIST FIPS 180-4 reference vector. This is the cheapest possible
+    /// cross-build determinism check — a regression where the hasher was
+    /// accidentally re-keyed (e.g. via `Sha256::new_with_prefix(b"...")`
+    /// added for "domain separation"), truncated, or swapped for a
+    /// different algorithm with a similar API surface (SHA-256/224,
+    /// SHA-512/256) would trip here rather than silently breaking every
+    /// operator's `last_hash` after a rolling deploy.
+    #[test]
+    fn compute_hash_empty_input_matches_rfc_sha256_empty_vector() {
+        const SHA256_EMPTY: [u8; 32] = [
+            0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f,
+            0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b,
+            0x78, 0x52, 0xb8, 0x55,
+        ];
+        assert_eq!(
+            FederationPeerReloader::compute_hash(b""),
+            SHA256_EMPTY,
+            "compute_hash(b\"\") must match the RFC 6234 SHA-256 empty vector; any drift means the hash function is not what the module docs advertise"
+        );
+    }
+
+    /// The `spawn_watcher` task loops forever and calls `reload()` on every
+    /// tick; if the peers file is temporarily missing (e.g. a ConfigMap
+    /// remount window under Kubernetes), the reload must surface an error
+    /// — silent success with an empty peer set would disconnect every live
+    /// federation peer mid-operation. Pin that (a) the error propagates,
+    /// and (b) the error message names both the fact that it's the
+    /// federation peers file (so operators grepping audit logs for the
+    /// reload failure can find it) and the actual path (so they can see
+    /// which deployment this is).
+    #[tokio::test]
+    async fn reload_with_missing_peers_file_returns_error_including_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-peers.json");
+        let mgr = manager(vec![]);
+        let r = FederationPeerReloader::new(&missing, mgr, [0u8; 32]);
+
+        let err = r
+            .reload()
+            .await
+            .expect_err("missing file must surface as Err");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("federation peers file"),
+            "error must name the file category for operator grep: {msg}"
+        );
+        assert!(
+            msg.contains(missing.display().to_string().as_str()),
+            "error must echo the actual path so multi-deploy operators can disambiguate: {msg}"
+        );
+    }
+
+    /// State-integrity invariant: a reload that fails at the JSON parse
+    /// stage must **not** advance `last_hash`. The design intent — load
+    /// bytes → hash → compare → parse → swap → update hash — is that only
+    /// a fully-successful swap commits the new hash, so that a subsequent
+    /// recovery (operator rolls the bad config back to a prior good one)
+    /// is detected as "back to previous known-good" rather than "drift".
+    /// A regression that hoisted the `last_hash = new_hash` assignment
+    /// above the parse step would silently pass the existing
+    /// `reload_rejects_invalid_json` test (which only checks `is_err()`)
+    /// but break this one: after a bad reload, writing the original good
+    /// content should look like a no-op (`Ok(false)`), not a change.
+    #[tokio::test]
+    async fn reload_err_on_invalid_json_preserves_last_hash_so_recovery_is_deterministic() {
+        let dir = tempfile::tempdir().unwrap();
+        let initial = format!("[{PEER_ALPHA}]");
+        write_peers(dir.path(), &initial);
+        let mgr = manager(serde_json::from_str(&initial).unwrap());
+        let r = FederationPeerReloader::new(
+            dir.path().join("peers.json"),
+            mgr,
+            FederationPeerReloader::compute_hash(initial.as_bytes()),
+        );
+
+        // Corrupt the file; reload must fail.
+        write_peers(dir.path(), "{not json");
+        assert!(
+            r.reload().await.is_err(),
+            "invalid JSON must fail the reload"
+        );
+
+        // Restore the original good content; reload must report unchanged
+        // (because last_hash was preserved across the bad reload).
+        write_peers(dir.path(), &initial);
+        assert!(
+            !r.reload().await.unwrap(),
+            "after rolling bad config back to the known-good original, reload must see last_hash unchanged (== hash of original) and return false; if it returns true, last_hash was corrupted by the bad reload"
+        );
+    }
+
+    /// Symmetric positive-path invariant to the state-integrity test
+    /// above: a **successful** reload must advance `last_hash` so that an
+    /// immediate second reload on the same file returns `Ok(false)`. The
+    /// existing `reload_adds_new_peer_to_config` test only asserts the
+    /// first reload returns `true` and the manager saw the swap — it does
+    /// not pin that the hash is committed, so a refactor that dropped
+    /// the post-swap `*guard = new_hash` would silently make every
+    /// reload a full swap (hammering `FederationManager::swap_peers` on
+    /// every poller tick) without tripping the existing suite.
+    #[tokio::test]
+    async fn reload_after_successful_swap_advances_last_hash_so_second_reload_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let initial = format!("[{PEER_ALPHA}]");
+        write_peers(dir.path(), &initial);
+        let mgr = manager(serde_json::from_str(&initial).unwrap());
+        let r = FederationPeerReloader::new(
+            dir.path().join("peers.json"),
+            Arc::clone(&mgr),
+            FederationPeerReloader::compute_hash(initial.as_bytes()),
+        );
+
+        // Change the file and drive one successful reload.
+        let updated = format!("[{PEER_ALPHA},{PEER_BETA}]");
+        write_peers(dir.path(), &updated);
+        assert!(
+            r.reload().await.unwrap(),
+            "first reload on a changed file must perform a swap"
+        );
+
+        // Immediately drive a second reload against the *same* updated
+        // file. last_hash should now match the updated hash, so the
+        // reload must short-circuit before the parse step.
+        assert!(
+            !r.reload().await.unwrap(),
+            "second reload on unchanged file must return false; a true return means last_hash was not advanced on the preceding successful swap"
+        );
+    }
+
+    /// Parse-error messages must carry the file path so an operator
+    /// looking at the `config.reload component=federation_peers
+    /// result=failure` audit line can correlate it to the actual file on
+    /// disk (important under Kubernetes/multi-tenant deployments where
+    /// several servers share a log aggregator but write to different
+    /// ConfigMaps). The existing `reload_rejects_invalid_json` test only
+    /// checks `is_err()` so a refactor that dropped `self.peers_path` from
+    /// the error context (e.g. to "simplify" with `?` on a raw serde
+    /// error) would silently lose this diagnostic.
+    #[tokio::test]
+    async fn reload_parse_error_message_includes_path_for_operator_grep() {
+        let dir = tempfile::tempdir().unwrap();
+        write_peers(dir.path(), "[]");
+        let mgr = manager(vec![]);
+        let path = dir.path().join("peers.json");
+        let r =
+            FederationPeerReloader::new(&path, mgr, FederationPeerReloader::compute_hash(b"[]"));
+        write_peers(dir.path(), "{not json");
+
+        let err = r
+            .reload()
+            .await
+            .expect_err("invalid JSON must surface as Err");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("parse federation peers file"),
+            "parse error must name that it is a parse failure of the peers file: {msg}"
+        );
+        assert!(
+            msg.contains(path.display().to_string().as_str()),
+            "parse error must echo the file path so operators can disambiguate deployments: {msg}"
+        );
+    }
 }

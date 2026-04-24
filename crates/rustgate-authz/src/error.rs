@@ -199,4 +199,198 @@ mod tests {
             _ => unreachable!(),
         }
     }
+
+    #[test]
+    fn authz_error_implements_std_error_trait() {
+        // The `?`-propagation chain from `parse_json` → router → server
+        // relies on `AuthzError: std::error::Error` so the type can be
+        // coerced into `Box<dyn Error + Send + Sync + 'static>` at the
+        // `anyhow::Error::from` boundary. The `#[derive(Error)]` on the
+        // enum emits this impl today; a regression that switched to a
+        // manual Display-only impl (dropping the trait) would still
+        // compile inside this crate but silently break the
+        // `anyhow`-integration downstream. The compile-time bound
+        // helper pins it here.
+        fn assert_error_trait<T: std::error::Error>() {}
+        assert_error_trait::<AuthzError>();
+    }
+
+    #[test]
+    fn authz_error_is_static_lifetime_bound() {
+        // The reloader and the startup path both stash `AuthzError`
+        // values inside `Arc`s that cross spawned-task boundaries
+        // (`tokio::spawn(async move { … })`), which requires
+        // `'static`. The `Validation` variant is trivially `'static`
+        // because `stage: &'static str` + `message: String`; the
+        // `Json` variant is `'static` because `serde_json::Error`
+        // itself is owned. A future `&'a str` field on either variant
+        // would narrow the lifetime and fail here rather than at a
+        // spawned-task call site.
+        fn assert_static<T: 'static>() {}
+        assert_static::<AuthzError>();
+    }
+
+    #[test]
+    fn json_variant_source_chains_to_underlying_serde_error() {
+        // `std::error::Error::source()` is the canonical way for
+        // error-reporting layers (anyhow, eyre, tracing) to unwind
+        // a cause chain. The `#[error("invalid policy JSON: {0}")]`
+        // template plus the `#[from]` attribute on the inner field
+        // are what make the source link present — a refactor that
+        // changed the template to a literal message or replaced
+        // `#[from]` with a manual conversion that dropped the
+        // enclosed value would silently break the cause-chain
+        // walk and operators would stop seeing the serde detail in
+        // structured error reports. The test uses
+        // `std::error::Error::source` so the intent is unambiguous.
+        use std::error::Error;
+        let serde_err: serde_json::Error =
+            serde_json::from_str::<serde_json::Value>("{not json").expect_err("must fail");
+        let err: AuthzError = serde_err.into();
+        let source = err.source();
+        assert!(
+            source.is_some(),
+            "Json variant must chain to the wrapped serde error via Error::source"
+        );
+    }
+
+    #[test]
+    fn validation_variant_has_no_source() {
+        // The `Validation` variant is self-contained — `message` is
+        // the operator-facing detail and there is no wrapped cause.
+        // Pinning `source() == None` here documents the asymmetry
+        // with `Json` and catches a future refactor that added a
+        // `#[source]` attribute to one of the fields (which would
+        // change downstream error-chain walking behaviour without
+        // any visible Display change).
+        use std::error::Error;
+        let err = AuthzError::validation("version", "bad");
+        assert!(
+            err.source().is_none(),
+            "Validation variant carries no wrapped cause; source() must be None"
+        );
+    }
+
+    #[test]
+    fn authz_error_from_impl_is_present_for_serde_json_error() {
+        // The `#[from] serde_json::Error` attribute in the `Json`
+        // variant generates `impl From<serde_json::Error> for
+        // AuthzError`. The `?`-propagation in `parse_json` desugars
+        // to that conversion. A compile-time bound helper pins the
+        // conversion trait's existence so a refactor that dropped
+        // `#[from]` and required manual construction would fail at
+        // this named test rather than at the first `?`-line in
+        // `parse_json`.
+        fn assert_from<T, U: From<T>>() {}
+        assert_from::<serde_json::Error, AuthzError>();
+    }
+
+    #[test]
+    fn validation_debug_exposes_both_field_values() {
+        // Operators occasionally log `?error` (Debug) rather than
+        // `%error` (Display) in development contexts. The derived
+        // `Debug` impl for `Validation { stage, message }` formats
+        // both fields; a future manual Debug impl that dropped one
+        // (in a misguided attempt to trim noise) would silently
+        // hide half the information from incident logs. Pin both
+        // field values appear in the rendered output.
+        let err = AuthzError::validation("rules", "duplicate rule `dup`");
+        let debug = format!("{err:?}");
+        assert!(
+            debug.contains("Validation"),
+            "Debug output must name the variant: {debug}"
+        );
+        assert!(
+            debug.contains("rules"),
+            "Debug output must include the stage field value: {debug}"
+        );
+        assert!(
+            debug.contains("dup"),
+            "Debug output must include the message field value: {debug}"
+        );
+    }
+
+    #[test]
+    fn json_variant_debug_names_variant() {
+        // Symmetric to `validation_debug_exposes_both_field_values`
+        // — pin that the `Json` variant's Debug render includes the
+        // variant tag `Json`. A manual Debug impl that collapsed
+        // both variants into a single render would silently make
+        // incident logs ambiguous between "bad JSON" and "bad rule";
+        // this test catches the collapse.
+        let serde_err: serde_json::Error =
+            serde_json::from_str::<serde_json::Value>("not json").expect_err("must fail");
+        let err: AuthzError = serde_err.into();
+        let debug = format!("{err:?}");
+        assert!(
+            debug.contains("Json"),
+            "Debug output must name the Json variant: {debug}"
+        );
+    }
+
+    #[test]
+    fn json_variant_display_delegates_to_wrapped_serde_error() {
+        // The `#[error("invalid policy JSON: {0}")]` template uses
+        // `{0}` (positional) which delegates to the wrapped type's
+        // own Display. A refactor to `{0:?}` (Debug formatting)
+        // would silently produce quoted/escaped output that breaks
+        // operator grep patterns keyed on specific serde messages.
+        // Trigger a known-shape serde error (leading `{` but no
+        // closing brace) and assert the rendered AuthzError
+        // contains text that only appears in serde's Display —
+        // specifically, the "line N column M" fragment serde_json
+        // emits for position reporting.
+        let serde_err: serde_json::Error =
+            serde_json::from_str::<serde_json::Value>("{").expect_err("must fail");
+        let serde_rendered = serde_err.to_string();
+        let err: AuthzError = serde_err.into();
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(&serde_rendered),
+            "AuthzError Display must embed the serde error's own Display output verbatim \
+             (the `{{0}}` positional delegates to Display). AuthzError: {rendered}; \
+             serde: {serde_rendered}"
+        );
+    }
+
+    #[test]
+    fn validation_display_tolerates_empty_message() {
+        // Edge case — `validation(stage, "")`. Callers in
+        // `parser::validate` sometimes build the message via
+        // `format!` where the inner component can be empty (e.g.
+        // empty rule id list). The Display template must still
+        // render the stage prefix without panicking or dropping
+        // any segment; pin that the canonical prefix and the stage
+        // name both appear in the output.
+        let err = AuthzError::validation("rules", "");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("policy validation failed"),
+            "prefix must survive empty message: {rendered}"
+        );
+        assert!(
+            rendered.contains("rules"),
+            "stage must survive empty message: {rendered}"
+        );
+    }
+
+    #[test]
+    fn validation_constructor_accepts_str_slice_input() {
+        // Symmetric to `validation_constructor_accepts_owned_string`
+        // — pin that `impl Into<String>` accepts a bare `&str`
+        // literal at the call site. Several callsites in parser.rs
+        // do exactly this: `AuthzError::validation("version", "msg")`
+        // with string-literal arguments. A refactor that narrowed
+        // the bound to `AsRef<str>` or an owned `String`-only
+        // signature would force clone-site changes in the parser;
+        // the test pins the current loose bound.
+        let err = AuthzError::validation("version", "literal message");
+        match err {
+            AuthzError::Validation { stage, message } => {
+                assert_eq!(stage, "version");
+                assert_eq!(message, "literal message");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
 }

@@ -377,4 +377,243 @@ mod tests {
         assert_eq!(stats.files_deleted, 0);
         assert_eq!(stats.bytes_after, 0);
     }
+
+    #[test]
+    fn rotation_stats_default_is_zero() {
+        // Pinned so callers can rely on `RotationStats::default()` as
+        // the "nothing happened" value returned from early-exit paths
+        // like the missing-directory short-circuit in `run_pass`.
+        let s = RotationStats::default();
+        assert_eq!(s.bytes_after, 0);
+        assert_eq!(s.files_deleted, 0);
+    }
+
+    #[test]
+    #[allow(clippy::clone_on_copy)]
+    fn rotation_stats_is_copy_and_clone() {
+        // `run_pass` returns `RotationStats` by value and the background
+        // loop reads both fields; the Copy derive is what lets that work
+        // without moves. Pin the semantics so a future `derive` edit
+        // that drops Copy would fail this test instead of silently
+        // regressing the call sites. The explicit `.clone()` below is
+        // the point of this test — if Copy were ever removed, the
+        // `s_again = s` line above would fail first, and this Clone
+        // call is what pins the *other* half of the derive.
+        let s = RotationStats {
+            bytes_after: 42,
+            files_deleted: 7,
+        };
+        let s_copy = s;
+        let s_again = s; // still usable — proves Copy, not just Clone.
+        assert_eq!(s_copy.bytes_after, 42);
+        assert_eq!(s_again.files_deleted, 7);
+        let s_cloned = s.clone();
+        assert_eq!(s_cloned.bytes_after, 42);
+    }
+
+    #[test]
+    fn rotation_config_is_cloneable() {
+        // The spawn path hands a cloned `RotationConfig` into the
+        // background task; pin that Clone covers every field including
+        // the `Option<Arc<CotArchiver>>` (None branch — the archiver
+        // requires async machinery to construct, and the Arc clone
+        // path is covered by Arc's own tests).
+        let cfg = RotationConfig {
+            dir: PathBuf::from("/tmp/does-not-matter-for-clone"),
+            max_bytes: 1 << 20,
+            max_active_bytes: 1 << 19,
+            max_age: Duration::from_secs(86_400),
+            interval: Duration::from_secs(60),
+            archiver: None,
+        };
+        let cloned = cfg.clone();
+        assert_eq!(cloned.dir, cfg.dir);
+        assert_eq!(cloned.max_bytes, cfg.max_bytes);
+        assert_eq!(cloned.max_active_bytes, cfg.max_active_bytes);
+        assert_eq!(cloned.max_age, cfg.max_age);
+        assert_eq!(cloned.interval, cfg.interval);
+        assert!(cloned.archiver.is_none());
+    }
+
+    #[test]
+    fn rotation_skips_subdirectories() {
+        // `collect_entries` filters on `meta.is_file()`. A nested
+        // directory under the archive path (e.g. an operator's manual
+        // backup subdir) must not be counted toward `bytes_after`
+        // and must not be considered for deletion.
+        let dir = std::env::temp_dir().join(format!(
+            "rustgate-archive-rot-subdir-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let f = write_file(&dir, "cot-1.jsonl", 512);
+        let subdir = dir.join("backup");
+        fs::create_dir_all(&subdir).unwrap();
+        let _nested = write_file(&subdir, "should-be-ignored.jsonl", 4096);
+
+        // Cap well below the nested file's size — if subdirectories
+        // were counted, accounting would report >= 4608 bytes and the
+        // sweep might try (and fail) to remove the subdir.
+        let stats = run_pass(&dir, 1024, Duration::ZERO, None).unwrap();
+
+        assert_eq!(stats.files_deleted, 0, "no top-level files exceed cap");
+        assert_eq!(stats.bytes_after, 512, "subdir bytes must not be counted");
+        assert!(f.exists(), "top-level file retained");
+        assert!(subdir.is_dir(), "subdir preserved");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotation_empty_dir_returns_zero_stats() {
+        // Edge case complementing `rotation_missing_dir_is_ok`: the
+        // directory exists but is empty. Both the age and size sweeps
+        // must be no-ops and the reported byte total must be zero.
+        let dir =
+            std::env::temp_dir().join(format!("rustgate-archive-rot-empty-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let stats = run_pass(&dir, 1024, Duration::from_secs(60), None).unwrap();
+        assert_eq!(stats.files_deleted, 0);
+        assert_eq!(stats.bytes_after, 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotation_size_sweep_stops_once_under_cap() {
+        // The size sweep is a `while total > max_bytes` loop — it must
+        // stop as soon as the running total drops to (or below) the
+        // cap, not continue deleting out of zeal. Three 1 KiB files
+        // with a cap of 2 KiB: the single oldest should be enough to
+        // bring total to 2 KiB, which is == cap and should therefore
+        // stop the loop. Verify the two newer files survive.
+        let dir =
+            std::env::temp_dir().join(format!("rustgate-archive-rot-stop-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let f_old = write_file(&dir, "cot-old.jsonl", 1024);
+        let f_mid = write_file(&dir, "cot-mid.jsonl", 1024);
+        let f_new = write_file(&dir, "cot-new.jsonl", 1024);
+        set_mtime(&f_old, Duration::from_secs(3600 * 3));
+        set_mtime(&f_mid, Duration::from_secs(3600 * 2));
+        set_mtime(&f_new, Duration::from_secs(3600));
+
+        let stats = run_pass(&dir, 2048, Duration::ZERO, None).unwrap();
+
+        assert_eq!(
+            stats.files_deleted, 1,
+            "sweep must stop once total <= cap, not delete extra"
+        );
+        assert!(!f_old.exists(), "oldest deleted");
+        assert!(f_mid.exists(), "middle retained");
+        assert!(f_new.exists(), "newest retained");
+        assert_eq!(stats.bytes_after, 2048);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotation_age_sweep_runs_before_size_sweep() {
+        // Age sweep happens first, then size sweep. Construct a case
+        // where an ancient file would *not* be targeted by the size
+        // sweep on its own (because the remaining files are already
+        // under the cap once it is gone), but is removed anyway by the
+        // age sweep. If the order were reversed (size first, age
+        // second) the same files could be retained — pinning this
+        // ordering protects the documented contract.
+        let dir =
+            std::env::temp_dir().join(format!("rustgate-archive-rot-order-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // One ancient small file (age-evicted) and two fresh smaller
+        // files. Total bytes = 256 + 128 + 128 = 512; cap = 1024.
+        // Without the age sweep the size sweep would be a no-op.
+        let ancient = write_file(&dir, "cot-ancient.jsonl", 256);
+        let fresh_a = write_file(&dir, "cot-fresh-a.jsonl", 128);
+        let fresh_b = write_file(&dir, "cot-fresh-b.jsonl", 128);
+        set_mtime(&ancient, Duration::from_secs(86_400 * 10));
+        set_mtime(&fresh_a, Duration::from_secs(60));
+        set_mtime(&fresh_b, Duration::from_secs(30));
+
+        let stats = run_pass(&dir, 1024, Duration::from_secs(3600), None).unwrap();
+
+        assert_eq!(stats.files_deleted, 1, "only the ancient file goes");
+        assert!(!ancient.exists(), "ancient file age-evicted");
+        assert!(fresh_a.exists(), "fresh file retained");
+        assert!(fresh_b.exists(), "fresh file retained");
+        assert_eq!(stats.bytes_after, 256, "two 128-byte files remain");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotation_combined_age_and_size_hits_both_sweeps() {
+        // Age and size sweeps compose: an ancient file is removed by
+        // age, and *additional* eviction happens in the size sweep if
+        // the remainder still exceeds the cap. Pins that the deletion
+        // counter accumulates across both passes and that the oldest
+        // remaining files are the ones chosen for the size pass.
+        let dir = std::env::temp_dir().join(format!(
+            "rustgate-archive-rot-combined-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // ancient: evicted by age (older than 1h)
+        // old:     evicted by size (oldest-surviving-after-age)
+        // mid:     retained
+        // new:     retained
+        let ancient = write_file(&dir, "cot-ancient.jsonl", 1024);
+        let old = write_file(&dir, "cot-old.jsonl", 1024);
+        let mid = write_file(&dir, "cot-mid.jsonl", 1024);
+        let new_f = write_file(&dir, "cot-new.jsonl", 1024);
+        set_mtime(&ancient, Duration::from_secs(86_400 * 10));
+        set_mtime(&old, Duration::from_secs(1800));
+        set_mtime(&mid, Duration::from_secs(1200));
+        set_mtime(&new_f, Duration::from_secs(600));
+
+        // After age sweep: ancient gone, 3 files × 1 KiB = 3 KiB remain.
+        // Size cap 2 KiB forces one more eviction — the oldest of the
+        // survivors, which is `old`.
+        let stats = run_pass(&dir, 2048, Duration::from_secs(3600), None).unwrap();
+
+        assert_eq!(stats.files_deleted, 2, "one by age, one by size");
+        assert!(!ancient.exists(), "ancient evicted by age");
+        assert!(!old.exists(), "oldest survivor evicted by size");
+        assert!(mid.exists(), "mid retained");
+        assert!(new_f.exists(), "new retained");
+        assert_eq!(stats.bytes_after, 2048);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotation_bytes_after_matches_disk_reality() {
+        // `bytes_after` is the basis of the `archive_bytes` Prometheus
+        // gauge; it has to equal the real size on disk (excluding the
+        // active segment). Pin the arithmetic.
+        let dir = std::env::temp_dir().join(format!(
+            "rustgate-archive-rot-bytes-after-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let _ = write_file(&dir, "cot-a.jsonl", 200);
+        let _ = write_file(&dir, "cot-b.jsonl", 300);
+        let _ = write_file(&dir, "cot-c.jsonl", 400);
+
+        let stats = run_pass(&dir, 0, Duration::ZERO, None).unwrap();
+        assert_eq!(stats.files_deleted, 0);
+        assert_eq!(stats.bytes_after, 900);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

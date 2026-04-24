@@ -160,4 +160,271 @@ mod tests {
         assert!(is_reserved_group_id("__MixedCase__"));
         assert!(is_reserved_group_id("__42__"));
     }
+
+    // ── Constant-value pins ────────────────────────────────────────
+    //
+    // These constants are advertised as the workspace's single source of
+    // truth in `CLAUDE.md` ("Shared Constants" table in
+    // shared-infrastructure.md) and referenced by name across all 16
+    // crates. Pinning the exact values defends against silent drift
+    // during refactors: an accidental edit to one of these values would
+    // propagate to every call site without any test failure in the
+    // touched crate.
+
+    #[test]
+    fn read_timeout_pins_to_five_minutes() {
+        // Advertised value: 5 min. Used as the per-connection read
+        // deadline across TLS, plaintext, WebSocket, MQTT, enrollment,
+        // and federation listeners.
+        assert_eq!(READ_TIMEOUT, Duration::from_secs(5 * 60));
+        assert_eq!(READ_TIMEOUT.as_secs(), 300);
+    }
+
+    #[test]
+    fn write_timeout_pins_to_thirty_seconds() {
+        // Advertised value: 30s. Write side is much shorter than read
+        // because a slow consumer should be evicted rather than allowed
+        // to block the writer indefinitely.
+        assert_eq!(WRITE_TIMEOUT, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn handshake_timeout_pins_to_ten_seconds() {
+        // Advertised value: 10s. Bounds both the TLS handshake and the
+        // WebSocket HTTP/1.1 upgrade — a client that can't complete
+        // either in 10 s is either misconfigured or adversarial.
+        assert_eq!(HANDSHAKE_TIMEOUT, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn http_connection_timeout_pins_to_fifteen_seconds() {
+        // Advertised value: 15s. Covers the metrics scraper and the
+        // enrollment HTTP endpoints — slightly looser than the TLS
+        // handshake timeout because it includes both the handshake
+        // and the HTTP request/response round-trip.
+        assert_eq!(HTTP_CONNECTION_TIMEOUT, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn max_frame_size_pins_to_sixteen_mib() {
+        // Advertised value: 16 MiB. Caps inbound frame size for
+        // length-prefixed and protobuf codecs — prevents an adversarial
+        // peer from exhausting memory with an oversized length header.
+        assert_eq!(MAX_FRAME_SIZE, 16 * 1024 * 1024);
+        assert_eq!(MAX_FRAME_SIZE, 16_777_216);
+    }
+
+    #[test]
+    fn federation_heartbeat_interval_pins_to_thirty_seconds() {
+        assert_eq!(FEDERATION_HEARTBEAT_INTERVAL, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn federation_heartbeat_timeout_pins_to_ninety_seconds() {
+        // 90s = 3× the interval, so two consecutive heartbeat drops are
+        // tolerated before a peer is marked dead. See the cross-constant
+        // invariant below (`federation_heartbeat_timeout_tolerates_three_intervals`).
+        assert_eq!(FEDERATION_HEARTBEAT_TIMEOUT, Duration::from_secs(90));
+    }
+
+    #[test]
+    fn federation_health_check_interval_pins_to_five_seconds() {
+        assert_eq!(FEDERATION_HEALTH_CHECK_INTERVAL, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn federation_max_reconnect_delay_pins_to_five_minutes() {
+        // Advertised value: 5 min. Caps the exponential-backoff schedule
+        // for federation reconnect — higher than the client ceiling
+        // because server-to-server links are less latency-sensitive.
+        assert_eq!(FEDERATION_MAX_RECONNECT_DELAY, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn client_max_reconnect_delay_pins_to_thirty_seconds() {
+        // Advertised value: 30s. Keeps interactive client reconnect
+        // snappy after a brief server restart.
+        assert_eq!(CLIENT_MAX_RECONNECT_DELAY, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn plaintext_group_sentinel_pins_to_double_underscore_literal() {
+        // This exact byte string is the key used by `plaintext.rs` and
+        // matched by `is_reserved_group_id`. Any edit that breaks the
+        // double-underscore wrap would silently break ACL admission for
+        // plaintext sessions.
+        assert_eq!(PLAINTEXT_GROUP, "__plaintext__");
+    }
+
+    #[test]
+    fn anonymous_identity_pins_to_lowercase_literal() {
+        // Advertised value: `"anonymous"`. Used as the CN for
+        // unauthenticated plaintext sessions. Lowercase is deliberate —
+        // CN normalization in the transport lowercases the cert CN, so
+        // the synthetic value must match that convention.
+        assert_eq!(ANONYMOUS_IDENTITY, "anonymous");
+    }
+
+    // ── Cross-constant invariants ──────────────────────────────────
+    //
+    // Pinning individual values is not enough: these constants have
+    // to make sense together. An edit that flips any of these
+    // orderings (for example, HEARTBEAT_TIMEOUT < HEARTBEAT_INTERVAL)
+    // would build and pass the per-constant pins above, but break
+    // the runtime semantics they describe.
+
+    #[test]
+    fn read_timeout_exceeds_write_timeout() {
+        // Reads are long-lived (waiting for next message on an idle
+        // connection). Writes are bounded (never block the writer on
+        // a slow consumer). Flipping this ordering would cause either
+        // premature idle disconnects or stuck writers.
+        assert!(
+            READ_TIMEOUT > WRITE_TIMEOUT,
+            "READ_TIMEOUT must exceed WRITE_TIMEOUT: read={READ_TIMEOUT:?}, write={WRITE_TIMEOUT:?}",
+        );
+    }
+
+    #[test]
+    fn handshake_timeout_bounded_below_read_timeout() {
+        // Handshake must fail fast so a stalled TLS negotiation cannot
+        // consume a read slot for 5 min.
+        assert!(
+            HANDSHAKE_TIMEOUT < READ_TIMEOUT,
+            "HANDSHAKE_TIMEOUT must be < READ_TIMEOUT",
+        );
+    }
+
+    #[test]
+    fn handshake_timeout_bounded_below_http_connection_timeout() {
+        // HTTP connection timeout covers the TLS handshake plus the
+        // request/response exchange — so handshake must be strictly
+        // shorter.
+        assert!(
+            HANDSHAKE_TIMEOUT < HTTP_CONNECTION_TIMEOUT,
+            "HANDSHAKE_TIMEOUT ({HANDSHAKE_TIMEOUT:?}) must be < HTTP_CONNECTION_TIMEOUT ({HTTP_CONNECTION_TIMEOUT:?})",
+        );
+    }
+
+    #[test]
+    fn federation_heartbeat_timeout_tolerates_three_intervals() {
+        // The heartbeat scheme needs to tolerate at least two consecutive
+        // lost heartbeats before declaring a peer dead. With
+        // interval=30 s and timeout=90 s, a peer has to miss three
+        // consecutive sends (or have its clock skew by >60 s) to be
+        // declared dead. Dropping this ratio below 3× would cause
+        // federation flap on ordinary packet loss.
+        assert!(
+            FEDERATION_HEARTBEAT_TIMEOUT >= FEDERATION_HEARTBEAT_INTERVAL * 3,
+            "heartbeat timeout ({FEDERATION_HEARTBEAT_TIMEOUT:?}) must tolerate ≥3 intervals ({FEDERATION_HEARTBEAT_INTERVAL:?})",
+        );
+    }
+
+    #[test]
+    fn federation_health_check_fires_multiple_times_per_heartbeat() {
+        // Health check must run faster than the heartbeat interval so
+        // the supervisor sees fresh state between heartbeats. The
+        // advertised 5s/30s ratio gives 6 samples per heartbeat window.
+        assert!(
+            FEDERATION_HEALTH_CHECK_INTERVAL < FEDERATION_HEARTBEAT_INTERVAL,
+            "health check ({FEDERATION_HEALTH_CHECK_INTERVAL:?}) must be < heartbeat interval ({FEDERATION_HEARTBEAT_INTERVAL:?})",
+        );
+    }
+
+    #[test]
+    fn federation_health_check_bounded_below_heartbeat_timeout() {
+        // The supervisor must sample the peer's state before the dead-
+        // peer detector fires — otherwise a missed heartbeat cannot be
+        // acted on.
+        assert!(
+            FEDERATION_HEALTH_CHECK_INTERVAL < FEDERATION_HEARTBEAT_TIMEOUT,
+            "health check must fire faster than peer-dead detection",
+        );
+    }
+
+    #[test]
+    fn federation_reconnect_delay_exceeds_client_reconnect_delay() {
+        // Per the module docstring on CLIENT_MAX_RECONNECT_DELAY:
+        // interactive clients are more latency-sensitive than
+        // server-to-server federation links, so the federation ceiling
+        // is deliberately higher.
+        assert!(
+            FEDERATION_MAX_RECONNECT_DELAY > CLIENT_MAX_RECONNECT_DELAY,
+            "federation reconnect ceiling ({FEDERATION_MAX_RECONNECT_DELAY:?}) must exceed client ceiling ({CLIENT_MAX_RECONNECT_DELAY:?})",
+        );
+    }
+
+    #[test]
+    fn every_duration_constant_is_non_zero() {
+        // Defends against an accidental `Duration::ZERO` or `from_secs(0)`
+        // edit that would disable a timeout rather than set it.
+        for (name, d) in [
+            ("READ_TIMEOUT", READ_TIMEOUT),
+            ("WRITE_TIMEOUT", WRITE_TIMEOUT),
+            ("HANDSHAKE_TIMEOUT", HANDSHAKE_TIMEOUT),
+            ("HTTP_CONNECTION_TIMEOUT", HTTP_CONNECTION_TIMEOUT),
+            (
+                "FEDERATION_HEARTBEAT_INTERVAL",
+                FEDERATION_HEARTBEAT_INTERVAL,
+            ),
+            ("FEDERATION_HEARTBEAT_TIMEOUT", FEDERATION_HEARTBEAT_TIMEOUT),
+            (
+                "FEDERATION_HEALTH_CHECK_INTERVAL",
+                FEDERATION_HEALTH_CHECK_INTERVAL,
+            ),
+            (
+                "FEDERATION_MAX_RECONNECT_DELAY",
+                FEDERATION_MAX_RECONNECT_DELAY,
+            ),
+            ("CLIENT_MAX_RECONNECT_DELAY", CLIENT_MAX_RECONNECT_DELAY),
+        ] {
+            assert!(!d.is_zero(), "{name} must be non-zero; got {d:?}");
+        }
+    }
+
+    #[test]
+    fn max_frame_size_exceeds_one_mib_floor() {
+        // Sanity floor: a 16-bit length prefix (~65 KiB) would be too
+        // small for any realistic federation message. If this drops
+        // below 1 MiB, something has gone badly wrong in the edit.
+        //
+        // A const-block assertion runs at compile time, so a regression
+        // that drops MAX_FRAME_SIZE below 1 MiB fails the build rather
+        // than waiting for test execution.
+        const { assert!(MAX_FRAME_SIZE >= 1024 * 1024) };
+    }
+
+    // ── Sentinel interaction with `is_reserved_group_id` ───────────
+
+    #[test]
+    fn plaintext_group_constant_matches_reserved_shape() {
+        // Belt-and-braces check: the sentinel constant that the ACL
+        // rejecter is supposed to catch actually matches the rejecter.
+        // A future rename of either value would break this pairing.
+        assert!(
+            is_reserved_group_id(PLAINTEXT_GROUP),
+            "PLAINTEXT_GROUP ({PLAINTEXT_GROUP:?}) must match is_reserved_group_id",
+        );
+    }
+
+    #[test]
+    fn anonymous_identity_is_not_reserved_group_shape() {
+        // `ANONYMOUS_IDENTITY` is a CN (subject identifier), not a
+        // group ID. Its byte shape must NOT collide with the reserved
+        // group namespace — otherwise an operator who typed `anonymous`
+        // as a group would be rejected unexpectedly.
+        assert!(
+            !is_reserved_group_id(ANONYMOUS_IDENTITY),
+            "ANONYMOUS_IDENTITY ({ANONYMOUS_IDENTITY:?}) must NOT match is_reserved_group_id",
+        );
+    }
+
+    #[test]
+    fn plaintext_and_anonymous_sentinels_are_disjoint() {
+        // The two advertised synthetic values live in different
+        // namespaces (group vs CN) and must not be equal — a merge
+        // would make the group-vs-identity distinction ambiguous in
+        // log lines and audit records.
+        assert_ne!(PLAINTEXT_GROUP, ANONYMOUS_IDENTITY);
+    }
 }

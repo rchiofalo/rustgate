@@ -543,4 +543,219 @@ mod tests {
             "expected Xml, got {err:?}"
         );
     }
+
+    // -- defensive-invariant coverage -----------------------------------
+
+    #[test]
+    fn kind_returns_stable_discriminant_strings_across_variants() {
+        // Operators grep on `MaskError::kind()` discriminants in
+        // structured-log audit trails. A refactor that renamed any of the
+        // three tokens (e.g. "xml_parse_error" → "xml") would silently
+        // break SIEM rules filtering on them. Pin the exact text on every
+        // variant.
+        let xml_err = strip_coordinates(b"<event><point").unwrap_err();
+        assert_eq!(xml_err.kind(), "xml_parse_error");
+        let io_err = MaskError::from(io::Error::other("writer failed"));
+        assert_eq!(io_err.kind(), "io_error");
+        let budget_err = MaskError::AttrBudgetExceeded {
+            limit: MAX_POINT_ATTRIBUTES,
+        };
+        assert_eq!(budget_err.kind(), "attr_budget_exceeded");
+    }
+
+    #[test]
+    fn kind_returns_static_str_independent_of_payload_bytes() {
+        // `kind()` is the payload-safe alternative to `Display`: a DEBUG
+        // log that prints the full error chain via `Display` can echo
+        // quick_xml's `EndEventMismatch { expected, found }` with
+        // payload-derived tag names and leak fragments of a classified
+        // event. `kind()` returns a `&'static str` owned by the binary's
+        // data segment — regardless of which malformed payload triggered
+        // the error, the same static token comes out. Pin that invariant
+        // by feeding three distinct malformed payloads and asserting the
+        // same static string on all three.
+        let err1 = strip_coordinates(b"<event><point").unwrap_err();
+        let err2 = strip_coordinates(b"<foo>text</bar>").unwrap_err();
+        let err3 = strip_coordinates(b"<a><b").unwrap_err();
+        let k1: &'static str = err1.kind();
+        let k2: &'static str = err2.kind();
+        let k3: &'static str = err3.kind();
+        assert_eq!(k1, "xml_parse_error");
+        assert_eq!(k2, "xml_parse_error");
+        assert_eq!(k3, "xml_parse_error");
+        // Same pointer for &'static str from the same const-returning match
+        // arm — a regression that made `kind()` allocate would fail this.
+        assert_eq!(k1.as_ptr(), k2.as_ptr());
+        assert_eq!(k2.as_ptr(), k3.as_ptr());
+    }
+
+    #[test]
+    fn source_chain_behaves_as_documented_for_every_variant() {
+        use std::error::Error as _;
+        // Xml → chains to inner quick_xml::Error so
+        // `anyhow::Context::context()` at call sites renders the parser
+        // detail.
+        let xml_err = strip_coordinates(b"<event><point").unwrap_err();
+        assert!(
+            xml_err.source().is_some(),
+            "Xml variant must chain to inner quick_xml::Error"
+        );
+        // Io → chains to inner io::Error.
+        let io_err = MaskError::from(io::Error::other("writer failed"));
+        assert!(
+            io_err.source().is_some(),
+            "Io variant must chain to inner io::Error"
+        );
+        // AttrBudgetExceeded carries only the limit value — no inner source.
+        // A regression that added a `#[source]`-annotated field would
+        // silently extend the operator-facing error chain.
+        let budget_err = MaskError::AttrBudgetExceeded {
+            limit: MAX_POINT_ATTRIBUTES,
+        };
+        assert!(
+            budget_err.source().is_none(),
+            "AttrBudgetExceeded must have no inner source"
+        );
+    }
+
+    #[test]
+    fn attr_budget_exceeded_display_embeds_limit_value_exactly() {
+        // Pin the exact Display text — operator dashboards and SIEM rules
+        // filter on the numeric limit to correlate amplification attempts.
+        // A refactor to `{limit:03}`, `{limit:#x}`, or "<point> had too
+        // many attributes" would break those filters without failing any
+        // existing test.
+        let err = MaskError::AttrBudgetExceeded { limit: 64 };
+        assert_eq!(
+            err.to_string(),
+            "<point> attribute count exceeded masking budget of 64"
+        );
+        // Non-default cap must also render with the embedded value.
+        let err = MaskError::AttrBudgetExceeded { limit: 128 };
+        assert_eq!(
+            err.to_string(),
+            "<point> attribute count exceeded masking budget of 128"
+        );
+    }
+
+    #[test]
+    fn mask_error_is_send_sync_static() {
+        // MaskError crosses async boundaries in the router. Downstream
+        // audit sinks wrap it in `Box<dyn Error + Send + Sync + 'static>`
+        // for chained-error reporting. A regression that added a borrowed
+        // field (e.g. `&str` name) would fail this bound here, instead of
+        // at the far-away boxing site.
+        fn assert_bounds<T: Send + Sync + 'static>() {}
+        assert_bounds::<MaskError>();
+    }
+
+    #[test]
+    fn point_tag_match_rejects_suffix_and_prefix_element_variants() {
+        // `is_point_tag` uses `eq_ignore_ascii_case` on the local name —
+        // anything that isn't an exact match to "point" (after namespace
+        // stripping) must pass through unmodified. Guards against a
+        // refactor to a substring / starts-with / ends-with match that
+        // would over-mask legitimate elements sharing the substring.
+        let cases: &[&str] = &[
+            r#"<pointer lat="1.0" lon="2.0" hae="3.0"/>"#,
+            r#"<pointful lat="1.0" lon="2.0" hae="3.0"/>"#,
+            r#"<mypoint lat="1.0" lon="2.0" hae="3.0"/>"#,
+            r#"<xpoint lat="1.0" lon="2.0" hae="3.0"/>"#,
+            r#"<points lat="1.0" lon="2.0" hae="3.0"/>"#,
+        ];
+        for element in cases {
+            let xml = format!(
+                r#"<event uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z">{element}</event>"#
+            );
+            let out = strip_coordinates(xml.as_bytes()).unwrap();
+            let s = std::str::from_utf8(&out).unwrap();
+            assert!(
+                s.contains("1.0") && s.contains("2.0") && s.contains("3.0"),
+                "element {element} wrongly masked: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn coordinate_attribute_matching_is_byte_exact_and_case_sensitive() {
+        // Asymmetric with the ELEMENT-name match (case-insensitive):
+        // coordinate ATTRIBUTE matching is byte-exact against b"lat" /
+        // b"lon" / b"hae". A crafted payload using uppercase attribute
+        // names keeps the coordinates intact — this is the documented
+        // contract (CoT spec mandates lowercase; changing the matcher to
+        // case-insensitive would over-mask legitimate events re-using
+        // "LAT" as a custom attribute). Pin the asymmetry explicitly so a
+        // refactor to case-insensitive attribute matching stays conscious.
+        let xml = r#"<event uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><point LAT="38.8977" LON="-77.0365" HAE="125.4"/></event>"#;
+        let out = strip_coordinates(xml.as_bytes()).unwrap();
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(s.contains(r#"LAT="38.8977""#), "LAT wrongly masked: {s}");
+        assert!(s.contains(r#"LON="-77.0365""#), "LON wrongly masked: {s}");
+        assert!(s.contains(r#"HAE="125.4""#), "HAE wrongly masked: {s}");
+    }
+
+    #[test]
+    fn deeply_nested_point_inside_detail_subtree_is_masked() {
+        // `strip_coordinates` walks a flat event stream — depth is
+        // irrelevant to the matcher. Pin that explicitly so a refactor to
+        // stateful tracking (e.g. "only mask top-level <point>") cannot
+        // create a leak by wrapping coords in deeper elements.
+        let xml = r#"<event uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><detail><__group name="Cyan"/><wrap><inner><point lat="38.8977" lon="-77.0365" hae="125.4"/></inner></wrap></detail></event>"#;
+        let out = strip_coordinates(xml.as_bytes()).unwrap();
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(
+            s.contains(r#"lat="0.0""#),
+            "deeply nested point not masked: {s}"
+        );
+        assert!(!s.contains("38.8977"), "raw lat leaked via depth: {s}");
+        assert!(!s.contains("-77.0365"), "raw lon leaked via depth: {s}");
+        assert!(!s.contains("125.4"), "raw hae leaked via depth: {s}");
+    }
+
+    #[test]
+    fn attribute_budget_is_per_element_not_document_cumulative() {
+        // The MAX_POINT_ATTRIBUTES cap fires per-<point>, NOT as a running
+        // total across the document. Two <point> elements each with 50
+        // attributes (total 100 — well over the 64-cap if summed) must
+        // both pass, proving the counter resets between elements. A
+        // regression that hoisted the counter to document scope would
+        // reject legitimate multi-point CoT payloads.
+        let attrs_each = 50;
+        assert!(
+            attrs_each <= MAX_POINT_ATTRIBUTES,
+            "test precondition: each point must stay at or below the cap"
+        );
+        assert!(
+            attrs_each * 2 > MAX_POINT_ATTRIBUTES,
+            "test precondition: two points must sum above the cap to matter"
+        );
+        let mut first = String::from(r#"<point lat="1.0" lon="2.0" hae="3.0""#);
+        for i in 0..attrs_each - 3 {
+            first.push_str(&format!(r#" a{i}="v""#));
+        }
+        first.push_str("/>");
+        let mut second = String::from(r#"<point lat="4.0" lon="5.0" hae="6.0""#);
+        for i in 0..attrs_each - 3 {
+            second.push_str(&format!(r#" b{i}="v""#));
+        }
+        second.push_str("/>");
+        let xml = format!(
+            r#"<event uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z">{first}{second}</event>"#
+        );
+        assert!(
+            strip_coordinates(xml.as_bytes()).is_ok(),
+            "per-element budget must not accumulate across <point> elements"
+        );
+    }
+
+    #[test]
+    fn max_point_attributes_public_constant_value_is_pinned_at_64() {
+        // Compile-time pin. `MAX_POINT_ATTRIBUTES` is public and governs
+        // the per-recipient masking cost ceiling; a regression that
+        // loosened it (e.g. to 1024) would let a hostile sender amplify
+        // CPU cost on a broadcast. Changing the value is a deliberate
+        // decision that must break this test.
+        const _: () = assert!(MAX_POINT_ATTRIBUTES == 64);
+        assert_eq!(MAX_POINT_ATTRIBUTES, 64);
+    }
 }

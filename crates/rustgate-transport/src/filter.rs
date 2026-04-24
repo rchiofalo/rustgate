@@ -319,4 +319,241 @@ mod tests {
         let xml = br#"<event type="b-t-f"><detail /></event>"#;
         assert!(extract_point(xml).is_none());
     }
+
+    /// Compile-time pins that `MessageFilter` and `GeoBounds` satisfy
+    /// the `Debug + Clone + Send + Sync + 'static` bound set via a
+    /// single generic helper. `MessageFilter` is cloned into `Router`
+    /// configuration and shared across async tasks; a regression that
+    /// added a non-`Send` field (an `Rc`, a `RefCell`, a raw pointer)
+    /// would silently compile at the definition site but fail at the
+    /// first transitive send boundary in the router, so the test pins
+    /// the contract at the module surface. The generic helper trips at
+    /// test-compile time on any narrowing.
+    #[test]
+    fn message_filter_and_geo_bounds_implement_debug_clone_send_sync_static() {
+        fn bounds<T: std::fmt::Debug + Clone + Send + Sync + 'static>() {}
+        bounds::<MessageFilter>();
+        bounds::<GeoBounds>();
+    }
+
+    /// `MessageFilter::new()` is advertised by the module doc as a
+    /// shorthand for `MessageFilter::default()`. Pin the two-way
+    /// equivalence by building both, feeding both through `matches`
+    /// against the same message, and asserting agreement — a regression
+    /// where `new()` silently diverged from `default()` (e.g. by starting
+    /// with a non-empty `type_prefixes` allow-list) would cause every
+    /// `new()`-built router to reject traffic the tests expect to pass,
+    /// but only in production where operators rely on the no-op shape.
+    #[test]
+    fn new_and_default_produce_observably_identical_filters() {
+        let a = MessageFilter::new();
+        let b = MessageFilter::default();
+        let msg = make_msg(r#"<event type="a-f-G" uid="test"><point lat="0" lon="0" /></event>"#);
+        assert_eq!(
+            a.matches(&msg),
+            b.matches(&msg),
+            "new() and default() must agree on matches() output"
+        );
+        assert!(a.matches(&msg), "empty filter must allow anything");
+        // Pin the Debug renderings diverge only in struct name (they
+        // don't — both render as `MessageFilter { … }`), so equality of
+        // the two renderings is the tightest pin on "observably
+        // identical" at the Debug surface.
+        assert_eq!(format!("{a:?}"), format!("{b:?}"));
+    }
+
+    /// `matches_type` has a currently-uncovered fallback branch: when
+    /// the payload is *not* CoT XML (so `extract_cot_type` returns
+    /// `None`) but the metadata carries a mapped `MessageType`, the
+    /// filter routes through `matches_message_type` to decide pass/fail.
+    /// This pins that branch by sending a non-XML payload (raw binary)
+    /// with `MessageType::Position` and a type-prefix filter for `a-`
+    /// (which `Position` maps to), asserting the filter passes. A
+    /// regression that dropped the fallback and unconditionally rejected
+    /// non-XML payloads would silently drop every protobuf/binary
+    /// position message at the filter stage.
+    #[test]
+    fn matches_type_fallback_routes_through_message_type_for_non_xml_payload() {
+        let filter = MessageFilter::new().with_type_prefixes(vec!["a-".to_string()]);
+        let msg = RoutableMessage {
+            source: Identity::new("test".to_string(), "fp".to_string(), BTreeSet::new())
+                .expect("valid identity"),
+            destination: Destination::Broadcast,
+            payload: Bytes::from_static(&[0x00, 0x01, 0x02, 0x03]),
+            metadata: Metadata {
+                received_at: SystemTime::now(),
+                source_protocol: "protobuf".to_string(),
+                message_type: MessageType::Position,
+                ttl: None,
+            },
+        };
+        assert!(
+            filter.matches(&msg),
+            "Position + prefix a- must pass via the metadata fallback path"
+        );
+    }
+
+    /// The `matches_message_type` dispatch table has a `_ => false`
+    /// catch-all that rejects every `MessageType` variant without a
+    /// documented prefix mapping — `MessageType::File` and
+    /// `MessageType::Other(...)` both fall through to it. Pin the
+    /// behaviour by driving both through a filter with a broad
+    /// type-prefix (`a-`) and asserting rejection. A regression that
+    /// turned the catch-all into `_ => true` would silently admit every
+    /// file-transfer or unknown-kind message past every configured
+    /// type filter.
+    #[test]
+    fn matches_message_type_rejects_file_and_other_variants_via_catchall() {
+        let filter = MessageFilter::new().with_type_prefixes(vec!["a-".to_string()]);
+        for mtype in [MessageType::File, MessageType::Other("mystery".to_string())] {
+            let msg = RoutableMessage {
+                source: Identity::new("test".to_string(), "fp".to_string(), BTreeSet::new())
+                    .expect("valid identity"),
+                destination: Destination::Broadcast,
+                payload: Bytes::from_static(&[0x00]),
+                metadata: Metadata {
+                    received_at: SystemTime::now(),
+                    source_protocol: "binary".to_string(),
+                    message_type: mtype.clone(),
+                    ttl: None,
+                },
+            };
+            assert!(
+                !filter.matches(&msg),
+                "unmapped message type {mtype:?} must fail the catchall and be rejected"
+            );
+        }
+    }
+
+    /// `GeoBounds::contains` uses `>=` / `<=` on all four axes, so the
+    /// bounding box is inclusive at the corners. Pin the inclusivity by
+    /// checking the exact-corner points (SW, SE, NW, NE) plus the
+    /// centre. A regression that flipped any edge to strict `>` / `<`
+    /// would silently narrow every configured bounding box by the
+    /// floating-point ULP at its boundary, dropping traffic exactly at
+    /// operator-configured latitude/longitude limits.
+    #[test]
+    fn geo_bounds_contains_is_inclusive_at_all_four_corners() {
+        let bounds = GeoBounds {
+            south: 30.0,
+            west: -100.0,
+            north: 40.0,
+            east: -80.0,
+        };
+        assert!(bounds.contains(30.0, -100.0), "SW corner must be inside");
+        assert!(bounds.contains(30.0, -80.0), "SE corner must be inside");
+        assert!(bounds.contains(40.0, -100.0), "NW corner must be inside");
+        assert!(bounds.contains(40.0, -80.0), "NE corner must be inside");
+        assert!(bounds.contains(35.0, -90.0), "centre must be inside");
+    }
+
+    /// Pin that a NaN coordinate is rejected by `contains`. IEEE 754
+    /// NaN comparisons always return `false`, so a NaN lat or lon will
+    /// naturally fall outside every finite bounding box — but pinning
+    /// this at the filter surface defends against a future refactor
+    /// that switched to `total_cmp`-based ordering (which *does* place
+    /// NaN in the sort order and could silently admit NaN points).
+    #[test]
+    fn geo_bounds_contains_rejects_nan_coordinates() {
+        let bounds = GeoBounds {
+            south: 30.0,
+            west: -100.0,
+            north: 40.0,
+            east: -80.0,
+        };
+        assert!(
+            !bounds.contains(f64::NAN, -90.0),
+            "NaN lat must be rejected"
+        );
+        assert!(!bounds.contains(35.0, f64::NAN), "NaN lon must be rejected");
+        assert!(
+            !bounds.contains(f64::NAN, f64::NAN),
+            "NaN/NaN must be rejected"
+        );
+    }
+
+    /// `extract_cot_type` calls `std::str::from_utf8(payload).ok()?` as
+    /// the first step; a non-UTF-8 payload must fall through to `None`
+    /// rather than panicking. Pin the defensive contract by feeding a
+    /// hostile byte sequence (`[0xff, 0xfe, 0xfd]`) and asserting
+    /// `None`. A regression that unwrapped the `Result<&str, _>` would
+    /// panic every tokio worker handling a malformed wire payload,
+    /// taking down the transport for every connected client.
+    #[test]
+    fn extract_cot_type_returns_none_for_non_utf8_payload() {
+        let payload: &[u8] = &[0xff, 0xfe, 0xfd, 0x00, 0x80];
+        assert_eq!(extract_cot_type(payload), None);
+    }
+
+    /// `extract_point` chains `extract_attr` for `lat` then `lon`, and
+    /// the `parse::<f64>().ok()?` inside `extract_attr` must route
+    /// non-numeric values through to `None`. Pin the contract by
+    /// feeding `lat="not-a-number"` and asserting the whole extraction
+    /// returns `None` — a regression that silently coerced to `0.0`
+    /// would bypass every configured bounding box filter on malformed
+    /// payloads.
+    #[test]
+    fn extract_point_returns_none_when_lat_is_non_numeric() {
+        let xml =
+            br#"<event type="a-f-G"><point lat="not-a-number" lon="-90.0" hae="0" /></event>"#;
+        assert!(
+            extract_point(xml).is_none(),
+            "non-numeric lat must cause the whole point extraction to fail"
+        );
+    }
+
+    /// A partial point (lat present, lon missing) must return `None`.
+    /// Pin this explicitly — `extract_point` calls `extract_attr` for
+    /// `lat` first, then `lon`, and a regression that silently defaulted
+    /// the missing coordinate to `0.0` would let partial points through
+    /// the geo filter on `(lat, 0.0)`.
+    #[test]
+    fn extract_point_returns_none_when_lon_is_missing() {
+        let xml = br#"<event type="a-f-G"><point lat="35.5" hae="0" /></event>"#;
+        assert!(
+            extract_point(xml).is_none(),
+            "missing lon must cause the whole point extraction to fail"
+        );
+    }
+
+    /// `extract_attr` steps past false-match positions by advancing
+    /// `search_from` past the matched name. Pin the disambiguation
+    /// contract by feeding `<point latitude="50" />` and searching for
+    /// `lat`: the scanner must *not* match the `lat` prefix of
+    /// `latitude` (since the `="` suffix check fails), and must return
+    /// `None`. A regression that dropped the `="` suffix check would
+    /// silently extract `50` for `lat` from `latitude="50"`, which
+    /// would feed the geo filter the wrong value every time a CoT
+    /// payload used the unofficial `latitude`/`longitude` attribute
+    /// spelling.
+    #[test]
+    fn extract_attr_does_not_confuse_prefix_attributes() {
+        assert_eq!(
+            extract_attr(r#"<point latitude="50" />"#, "lat"),
+            None,
+            "lat must not match the `lat` prefix of `latitude`"
+        );
+        assert_eq!(
+            extract_attr(r#"<point lat="35.5" />"#, "lat"),
+            Some(35.5),
+            "exact lat= must still match after the disambiguation check"
+        );
+    }
+
+    /// `with_type_prefixes(vec![])` must produce a permissive filter —
+    /// the empty-list case falls through the `if self.type_prefixes
+    /// .is_empty() { return true; }` guard in `matches_type`. Pin this
+    /// at the public API so a regression that silently flipped "empty
+    /// list means reject all" would break every operator who configured
+    /// an empty prefix list as a sentinel for "type filtering
+    /// disabled".
+    #[test]
+    fn empty_type_prefixes_vec_is_equivalent_to_no_filter() {
+        let filter = MessageFilter::new().with_type_prefixes(vec![]);
+        let msg = make_msg(r#"<event type="a-f-G" uid="test" />"#);
+        assert!(
+            filter.matches(&msg),
+            "empty prefix list must be equivalent to no type filter"
+        );
+    }
 }

@@ -106,4 +106,87 @@ mod tests {
         let _: Arc<dyn ResolvesServerCert> = stapler.clone();
         stapler.stop().await;
     }
+
+    /// Helper — build a [`CertReloader`]-backed [`Arc<dyn ResolvesServerCert>`]
+    /// anchored in a tempdir so the dir's lifetime can be threaded through the
+    /// caller. Returns the dir too so the caller keeps it alive.
+    fn build_reloader_with_tempdir(cn: &str) -> (Arc<dyn ResolvesServerCert>, tempfile::TempDir) {
+        let ca = TestCa::new(cn);
+        let leaf = ca.issue_server_cert(cn, &[cn]);
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("server.crt");
+        let key_path = dir.path().join("server.key");
+        std::fs::write(&cert_path, leaf.cert_pem.as_bytes()).unwrap();
+        std::fs::write(&key_path, leaf.key_pem.as_bytes()).unwrap();
+        let reloader = CertReloader::new(&cert_path, &key_path).unwrap();
+        (reloader, dir)
+    }
+
+    /// Batched contract pin for `wrap_resolver` / `preload` — executed as a
+    /// single `#[tokio::test]` to amortize tokio-runtime teardown cost. Each
+    /// `Stapler` spawns an `ocsp-stapler` background fetch task that keeps
+    /// the runtime shutdown loop alive for ~55s while it unwinds; splitting
+    /// this into four separate `#[tokio::test]` cases would therefore add
+    /// ~4 × 55s of CI time without isolating any failure mode that could not
+    /// be localized from the assertion label on the failing line. The four
+    /// contract clauses asserted here:
+    ///
+    /// 1. **Concrete `Arc<Stapler>` return type.** Downstream code reaches for
+    ///    `stapler.preload(...)` and `stapler.stop()` without a trait-object
+    ///    hop; a refactor that narrowed the signature to
+    ///    `-> Arc<dyn ResolvesServerCert>` would silently break those call
+    ///    sites in `TlsConfig::build_reloadable_server_config`.
+    /// 2. **`Send + Sync + 'static` bounds survive both the concrete and
+    ///    trait-object forms.** Compile-time self-check via
+    ///    `fn assert_bounds<T: Send + Sync + 'static>(_: &T)`: a regression
+    ///    that introduced an `Rc`, a non-`Send` `dyn Fn`, or a non-`'static`
+    ///    borrow inside `Stapler` fails test-compile rather than at the
+    ///    first transitive `rustls::ServerConfig` call site.
+    /// 3. **Distinct inner resolvers produce independent staplers** (not a
+    ///    shared global singleton). A regression would be invisible to
+    ///    single-reloader tests and surface only in multi-SNI-leaf deploys.
+    /// 4. **`preload()` is idempotent under the same certified key.** The
+    ///    upstream stapler deduplicates by leaf-cert fingerprint, so two
+    ///    preload calls with the same key must not panic or double-enqueue.
+    #[tokio::test]
+    async fn wrap_resolver_and_preload_contract_batch() {
+        // Clause 1: concrete Arc<Stapler> return type.
+        let (inner_concrete, _dir_concrete) = build_reloader_with_tempdir("ocsp-concrete-type");
+        let stapler_concrete: Arc<Stapler> = wrap_resolver(inner_concrete);
+        let _: Arc<dyn ResolvesServerCert> =
+            Arc::clone(&stapler_concrete) as Arc<dyn ResolvesServerCert>;
+
+        // Clause 2: Send + Sync + 'static on both concrete and erased forms.
+        fn assert_bounds<T: Send + Sync + 'static>(_: &T) {}
+        assert_bounds(&stapler_concrete);
+        let erased: Arc<dyn ResolvesServerCert> =
+            Arc::clone(&stapler_concrete) as Arc<dyn ResolvesServerCert>;
+        assert_bounds(&erased);
+
+        // Clause 3: distinct inners produce distinct staplers.
+        let (inner_b, _dir_b) = build_reloader_with_tempdir("ocsp-multi-b");
+        let stapler_b = wrap_resolver(inner_b);
+        assert!(
+            !Arc::ptr_eq(&stapler_concrete, &stapler_b),
+            "wrap_resolver must return a fresh Arc<Stapler> per call, not a shared singleton"
+        );
+
+        // Clause 4: preload() is idempotent under the same certified key.
+        let ca = TestCa::new("ocsp-preload");
+        let leaf = ca.issue_server_cert("localhost", &["localhost"]);
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("server.crt");
+        let key_path = dir.path().join("server.key");
+        std::fs::write(&cert_path, leaf.cert_pem.as_bytes()).unwrap();
+        std::fs::write(&key_path, leaf.key_pem.as_bytes()).unwrap();
+        let reloader = CertReloader::new(&cert_path, &key_path).unwrap();
+        let ckey = reloader
+            .certified_key()
+            .expect("reloader must expose its certified key immediately after construction");
+        let ckey_second = Arc::clone(&ckey);
+        let inner_preload: Arc<dyn ResolvesServerCert> = reloader;
+        let stapler_preload = wrap_resolver(inner_preload);
+        preload(&stapler_preload, ckey);
+        preload(&stapler_preload, ckey_second);
+    }
 }
