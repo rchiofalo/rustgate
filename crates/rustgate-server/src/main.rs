@@ -29,6 +29,7 @@ mod archive_rotation;
 mod audit;
 mod authz_reloader;
 mod cli;
+mod diagnostics;
 #[cfg(feature = "federation")]
 mod federation_reloader;
 #[cfg(feature = "metrics")]
@@ -160,6 +161,14 @@ fn main() -> anyhow::Result<()> {
                     std::process::exit(1);
                 }
             }
+        }
+        Some(Command::CertInfo { ref file, json }) => {
+            diagnostics::cert_info::run(file, json)?;
+            return Ok(());
+        }
+        Some(Command::CrlInfo { ref file, json }) => {
+            diagnostics::crl_info::run(file, json)?;
+            return Ok(());
         }
         None => {}
     }
