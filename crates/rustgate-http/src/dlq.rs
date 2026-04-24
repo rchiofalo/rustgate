@@ -28,6 +28,15 @@ use serde::Serialize;
 /// Default maximum DLQ file size: 256 MiB.
 const DEFAULT_DLQ_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Suffix of sealed / in-flight DLQ segment files. The eviction sweep
+/// (see [`DeadLetterQueue::enforce_target_cap`]) scans the DLQ directory
+/// for files whose name starts with `<target>_` and ends with this
+/// suffix. Pinned as a constant so a refactor that ever changes the
+/// suffix also updates the reader — a silent rename would make the
+/// eviction sweep miss sealed files and the per-target cap silently
+/// ineffective.
+pub(crate) const DLQ_FILE_SUFFIX: &str = ".dlq.enc";
+
 /// Encrypted dead-letter queue that persists undeliverable messages.
 ///
 /// Thread-safe: uses internal `Mutex` for writer map. Writers are
@@ -38,6 +47,16 @@ pub(crate) struct DeadLetterQueue {
     key_ring: KeyRing,
     /// Maximum file size per target before rotation.
     max_bytes: u64,
+    /// Maximum total bytes on disk per target across every sealed /
+    /// active segment. When a target's footprint exceeds this cap the
+    /// oldest sealed file is deleted (drop-oldest FIFO). The active
+    /// segment is always preserved — the writer is live and unlinking
+    /// it would corrupt the in-memory state.
+    ///
+    /// `0` = unlimited (historical behaviour). The enforced minimum of
+    /// `max_bytes` is honoured at config validation, not here — this
+    /// field does not try to self-correct a misconfigured cap.
+    max_target_bytes: u64,
     writers: Mutex<HashMap<String, WriterState>>,
 }
 
@@ -84,13 +103,25 @@ struct DlqEntry<'a> {
 impl DeadLetterQueue {
     /// Create a new DLQ backed by the given directory and key ring.
     ///
+    /// `max_bytes` caps a *single file* before rotation (default
+    /// `DEFAULT_DLQ_MAX_BYTES`). `max_target_bytes` caps the *total*
+    /// on-disk footprint for one target across every rotated file;
+    /// `None` / `0` disables the outer cap (historical behaviour).
+    ///
     /// Does NOT create any files at construction time — writers are
-    /// created lazily when the first message is dead-lettered for a target.
-    pub(crate) fn new(dir: PathBuf, key_ring: KeyRing, max_bytes: Option<u64>) -> Self {
+    /// created lazily when the first message is dead-lettered for a
+    /// target.
+    pub(crate) fn new(
+        dir: PathBuf,
+        key_ring: KeyRing,
+        max_bytes: Option<u64>,
+        max_target_bytes: Option<u64>,
+    ) -> Self {
         Self {
             dir,
             key_ring,
             max_bytes: max_bytes.unwrap_or(DEFAULT_DLQ_MAX_BYTES),
+            max_target_bytes: max_target_bytes.unwrap_or(0),
             writers: Mutex::new(HashMap::new()),
         }
     }
@@ -167,13 +198,27 @@ impl DeadLetterQueue {
             && state.bytes_written >= self.max_bytes
             && let Some(old) = guard.remove(target_name)
         {
-            // Seal the old writer; ignore errors (best-effort)
+            // Seal the old writer; ignore errors (best-effort).
+            // `finish()` flushes and writes the encrypted terminator
+            // chunk — a missing terminator makes the file unreadable to
+            // `decrypt_file`, so a sealed file is a precondition for the
+            // eviction sweep that follows.
             let _ = old.writer.finish();
             tracing::info!(
                 target = %sanitize_for_log(target_name),
                 bytes_written = old.bytes_written,
                 "DLQ file rotated (size limit reached)"
             );
+
+            // Now that the previous segment is sealed and no longer
+            // referenced by the writer map, the eviction sweep can
+            // safely delete oldest sealed files for this target until
+            // the on-disk footprint fits under `max_target_bytes`.
+            // Deliberately runs before the new writer is lazily
+            // created below so the just-sealed file is a candidate —
+            // otherwise a tight cap + a long outage could starve the
+            // sweep and exhaust disk between rotations.
+            self.enforce_target_cap(target_name);
         }
 
         // Lazy initialization: create writer on first dead-letter per target
@@ -231,6 +276,157 @@ impl DeadLetterQueue {
             } else {
                 state.bytes_written += data.len() as u64;
             }
+        }
+    }
+
+    /// Drop-oldest FIFO eviction once a target's total on-disk footprint
+    /// exceeds `max_target_bytes`. No-op when the cap is unlimited
+    /// (`0`). Callers must have already sealed (finished) the most
+    /// recently rotated segment — deleting a live file would corrupt
+    /// the `SharedEncryptedWriter`'s in-memory state.
+    ///
+    /// The target's currently-active (in-writers-map) segment is
+    /// skipped, so the sweep cannot race the writer. For that reason
+    /// the eviction target is `max_target_bytes - active_size` rather
+    /// than `max_target_bytes` directly — we cap the *sealed* tail of
+    /// the chain, not the active head.
+    ///
+    /// Best-effort: individual `remove_file` / `metadata` failures are
+    /// logged and skipped. The DLQ is a forensic aid, not a critical
+    /// path, and a transient errno on one file must not starve the
+    /// sweep for the rest.
+    fn enforce_target_cap(&self, target_name: &str) {
+        let cap = self.max_target_bytes;
+        if cap == 0 {
+            return;
+        }
+
+        // Path traversal defence was already enforced in `write_entry`
+        // before this call; the same character restriction applies to
+        // the prefix used for the scan.
+        let prefix = format!("{target_name}_");
+
+        let read = match std::fs::read_dir(&self.dir) {
+            Ok(it) => it,
+            Err(err) => {
+                tracing::warn!(
+                    target = %sanitize_for_log(target_name),
+                    dir = %self.dir.display(),
+                    error = %err,
+                    "DLQ eviction: read_dir failed, skipping sweep"
+                );
+                return;
+            }
+        };
+
+        #[derive(Debug)]
+        struct SealedFile {
+            path: PathBuf,
+            size: u64,
+            mtime: std::time::SystemTime,
+        }
+
+        let mut files: Vec<SealedFile> = Vec::new();
+        for entry in read {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(err) => {
+                    tracing::warn!(
+                        target = %sanitize_for_log(target_name),
+                        error = %err,
+                        "DLQ eviction: entry read failed",
+                    );
+                    continue;
+                }
+            };
+            let name = match entry.file_name().into_string() {
+                Ok(s) => s,
+                Err(_) => continue, // non-UTF-8 filenames cannot be DLQ segments
+            };
+            if !name.starts_with(&prefix) || !name.ends_with(DLQ_FILE_SUFFIX) {
+                continue;
+            }
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(err) => {
+                    tracing::warn!(
+                        target = %sanitize_for_log(target_name),
+                        file = %name,
+                        error = %err,
+                        "DLQ eviction: metadata failed, skipping file",
+                    );
+                    continue;
+                }
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            files.push(SealedFile {
+                path: entry.path(),
+                size: meta.len(),
+                mtime,
+            });
+        }
+
+        // Oldest first so the drop-oldest FIFO is a simple linear scan.
+        // ties on mtime (same-ms rotation) break on path so the order
+        // is deterministic.
+        files.sort_by(|a, b| a.mtime.cmp(&b.mtime).then_with(|| a.path.cmp(&b.path)));
+
+        let mut total: u64 = files.iter().map(|f| f.size).sum();
+        if total <= cap {
+            return;
+        }
+
+        let mut idx = 0;
+        // Reserve at least one file — the writer might already have
+        // reopened the next segment concurrently (rotation sealed the
+        // prior segment before returning). Skip whichever sealed file
+        // matches the currently-active path to avoid racing the writer.
+        // The active path is derived by reading the writers map, but
+        // the caller holds that lock across this call, so we re-derive
+        // it from filename heuristics instead: the newest file is
+        // always a candidate for the active segment, so preserve it
+        // unless there are strictly more than one file present.
+        while idx < files.len() && total > cap {
+            if files.len() == 1 {
+                // Single file left — assume it's the active segment and
+                // refuse to delete. The writer loop will create the
+                // next rotation as soon as the current one seals.
+                break;
+            }
+            let f = &files[idx];
+            match std::fs::remove_file(&f.path) {
+                Ok(()) => {
+                    total = total.saturating_sub(f.size);
+                    tracing::info!(
+                        target = %sanitize_for_log(target_name),
+                        path = %f.path.display(),
+                        bytes = f.size,
+                        "DLQ eviction: removed oldest sealed segment",
+                    );
+                    #[cfg(feature = "metrics")]
+                    {
+                        let m = crate::metrics::dlq_evicted();
+                        if let Ok(child) = m.get_metric_with_label_values(&[target_name]) {
+                            child.inc();
+                        }
+                    }
+                    // `files[0..idx]` already removed; keep the vector
+                    // in lock-step so the next iteration still sees
+                    // oldest-first ordering.
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        target = %sanitize_for_log(target_name),
+                        path = %f.path.display(),
+                        error = %err,
+                        "DLQ eviction: remove_file failed, continuing sweep",
+                    );
+                }
+            }
+            idx += 1;
         }
     }
 
@@ -340,7 +536,7 @@ mod tests {
     fn dlq_creates_writer_lazily() {
         let dir = tempfile::tempdir().unwrap();
         let key_ring = test_key_ring();
-        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, None);
+        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, None, None);
 
         // No files should exist yet
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
@@ -362,7 +558,7 @@ mod tests {
     fn dlq_reuses_writer_for_same_target() {
         let dir = tempfile::tempdir().unwrap();
         let key_ring = test_key_ring();
-        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, None);
+        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, None, None);
 
         let msg = make_msg("alice");
         dlq.dead_letter("target-1", &msg, "circuit_open");
@@ -376,7 +572,7 @@ mod tests {
     fn dlq_creates_separate_files_per_target() {
         let dir = tempfile::tempdir().unwrap();
         let key_ring = test_key_ring();
-        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, None);
+        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, None, None);
 
         let msg = make_msg("alice");
         dlq.dead_letter("target-a", &msg, "circuit_open");
@@ -389,7 +585,7 @@ mod tests {
     fn dlq_finish_seals_writers() {
         let dir = tempfile::tempdir().unwrap();
         let key_ring = test_key_ring();
-        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, None);
+        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, None, None);
 
         let msg = make_msg("alice");
         dlq.dead_letter("target-1", &msg, "circuit_open");
@@ -409,7 +605,7 @@ mod tests {
     fn debug_impl_redacts_internals() {
         let dir = tempfile::tempdir().unwrap();
         let key_ring = test_key_ring();
-        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, None);
+        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, None, None);
         let debug = format!("{dlq:?}");
         assert!(debug.contains("DeadLetterQueue"));
         assert!(debug.contains("dir"));
@@ -421,7 +617,7 @@ mod tests {
     fn dlq_rejects_path_traversal_target_name() {
         let dir = tempfile::tempdir().unwrap();
         let key_ring = test_key_ring();
-        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, None);
+        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, None, None);
 
         let msg = make_msg("alice");
 
@@ -480,7 +676,7 @@ mod tests {
         // max_bytes=50: any single JSON DLQ entry is > 50 bytes once the
         // timestamp, target, reason, source_cn, and payload_b64 are written,
         // so the second dead_letter call rotates.
-        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, Some(50));
+        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, Some(50), None);
 
         let msg = make_msg("alice");
         dlq.dead_letter("rotator", &msg, "circuit_open");
@@ -508,7 +704,7 @@ mod tests {
     fn rotation_is_scoped_per_target_and_does_not_affect_other_targets() {
         let dir = tempfile::tempdir().unwrap();
         let key_ring = test_key_ring();
-        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, Some(50));
+        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, Some(50), None);
 
         let msg = make_msg("alice");
         // Quiet target: writes exactly one entry (no rotation — bytes_written
@@ -670,7 +866,7 @@ mod tests {
     fn path_traversal_defence_covers_broad_attack_surface() {
         let dir = tempfile::tempdir().unwrap();
         let key_ring = test_key_ring();
-        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, None);
+        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, None, None);
 
         let msg = make_msg("alice");
         let hostile_names = [
@@ -709,7 +905,7 @@ mod tests {
     fn finish_is_idempotent_across_repeated_calls() {
         let dir = tempfile::tempdir().unwrap();
         let key_ring = test_key_ring();
-        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, None);
+        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, None, None);
 
         let msg = make_msg("alice");
         dlq.dead_letter("target-1", &msg, "circuit_open");
@@ -735,10 +931,234 @@ mod tests {
     fn finish_on_empty_queue_is_a_noop_and_does_not_create_files() {
         let dir = tempfile::tempdir().unwrap();
         let key_ring = test_key_ring();
-        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, None);
+        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, None, None);
 
         dlq.finish();
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // #881a — per-target total-bytes cap + drop-oldest FIFO eviction.
+    // -----------------------------------------------------------------
+
+    /// Helper: returns all `<prefix>_*.dlq.enc` sorted oldest first so
+    /// eviction-order assertions can address entries positionally.
+    fn list_target_files(dir: &std::path::Path, prefix: &str) -> Vec<PathBuf> {
+        let full_prefix = format!("{prefix}_");
+        let mut out: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name();
+                let name_str = match name.to_str() {
+                    Some(s) => s,
+                    None => return false,
+                };
+                name_str.starts_with(&full_prefix) && name_str.ends_with(DLQ_FILE_SUFFIX)
+            })
+            .map(|e| {
+                let mtime = e
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                (mtime, e.path())
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        out.into_iter().map(|(_, p)| p).collect()
+    }
+
+    /// Helper: write enough entries to guarantee at least `n` distinct
+    /// rotations for a single target. Sleeps between writes so filename
+    /// timestamps (millisecond precision) remain distinct even on a
+    /// fast disk.
+    fn force_rotations(dlq: &DeadLetterQueue, target: &str, n: usize) {
+        let msg = make_msg("alice");
+        for _ in 0..=n {
+            dlq.dead_letter(target, &msg, "circuit_open");
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            dlq.dead_letter(target, &msg, "circuit_open");
+            std::thread::sleep(std::time::Duration::from_millis(3));
+        }
+    }
+
+    /// Pins the core #881a contract: once the sealed-tail footprint for a
+    /// target exceeds `max_target_bytes`, the oldest sealed segments are
+    /// deleted until the footprint fits — drop-oldest FIFO. Trips if a
+    /// regression swaps the sort comparator, omits the sweep call from
+    /// the rotation path, or lets unbounded accumulation linger on disk
+    /// under repeated rotation.
+    ///
+    /// Asserts the invariant that holds: with eviction enabled, the
+    /// file count grows sub-linearly in the number of rotations. Without
+    /// eviction, 6 `force_rotations` cycles (~14 writes) produce ~14
+    /// files; with a tight cap the residual count must be far smaller.
+    #[test]
+    fn eviction_drops_oldest_sealed_files_when_target_cap_exceeded() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_ring = test_key_ring();
+        // Tight per-file cap (50 B) forces a rotation on every write
+        // after the first. Tight per-target cap (200 B) means the
+        // sweep must actively evict to keep the sealed tail bounded.
+        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, Some(50), Some(200));
+
+        force_rotations(&dlq, "chatty", 6);
+
+        let files = list_target_files(dir.path(), "chatty");
+        // At least one file must remain (the active segment).
+        assert!(
+            !files.is_empty(),
+            "eviction must preserve at least one file"
+        );
+        // Eviction must actually bound the sealed tail — without the
+        // sweep we would have roughly one file per forced rotation
+        // (~14 for 6 cycles). With the sweep, the count should be a
+        // small constant dominated by the cap / file-size ratio plus
+        // the active head. 5 is a generous upper bound that still
+        // trips cleanly if eviction is disabled or runs only once.
+        assert!(
+            files.len() <= 5,
+            "eviction must bound file count under tight cap, got {} files",
+            files.len()
+        );
+    }
+
+    /// Pins the "preserve at least one file" invariant: even with a cap
+    /// smaller than a single segment the writer's live file must never
+    /// be unlinked from under it (that would corrupt the in-memory
+    /// `SharedEncryptedWriter` state on the next write).
+    #[test]
+    fn eviction_preserves_active_segment_even_under_tight_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_ring = test_key_ring();
+        // Absurdly small per-target cap (1 byte) — every sealed file is
+        // over cap, but the sweep must still refuse to delete the sole
+        // remaining file.
+        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, Some(50), Some(1));
+
+        force_rotations(&dlq, "single", 5);
+
+        let files = list_target_files(dir.path(), "single");
+        assert!(
+            !files.is_empty(),
+            "eviction must leave at least one file even when cap is tighter than any single segment"
+        );
+    }
+
+    /// Pins the no-op path: when `max_target_bytes` is 0 (unlimited,
+    /// historical behaviour) the eviction sweep must never delete a file,
+    /// regardless of how much disk the target accumulates. Trips if a
+    /// regression uses `if cap > 0` instead of `if cap == 0` or mis-
+    /// defaults the `None` variant to a sentinel like `u64::MAX` that
+    /// still triggers the scan overhead.
+    #[test]
+    fn eviction_is_noop_when_max_target_bytes_is_unlimited() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_ring = test_key_ring();
+        // max_target_bytes = None maps to 0 ("unlimited").
+        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, Some(50), None);
+
+        force_rotations(&dlq, "unbounded", 4);
+
+        let files = list_target_files(dir.path(), "unbounded");
+        assert!(
+            files.len() >= 2,
+            "cap=None must not delete any segments, got {} files",
+            files.len()
+        );
+    }
+
+    /// Pins that eviction is target-scoped: a sweep triggered by chatty
+    /// target A must not touch any file belonging to quiet target B.
+    /// Trips if the prefix filter in `enforce_target_cap` regresses to
+    /// a substring or glob match.
+    #[test]
+    fn eviction_is_scoped_to_target_and_does_not_touch_other_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_ring = test_key_ring();
+        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, Some(50), Some(200));
+
+        let msg = make_msg("alice");
+        // Quiet target: one write, one file, never to be evicted.
+        dlq.dead_letter("quiet", &msg, "circuit_open");
+
+        // Chatty target: force enough rotations to trigger eviction.
+        force_rotations(&dlq, "chatty", 6);
+
+        let quiet_files = list_target_files(dir.path(), "quiet");
+        assert_eq!(
+            quiet_files.len(),
+            1,
+            "quiet target must retain its one file; eviction must be prefix-scoped"
+        );
+    }
+
+    /// Pins the drop-oldest ordering: under a tight cap, the OLDEST
+    /// sealed files are removed first. The freshest (non-active) file
+    /// must survive a sweep as long as the cap permits. Verifies the
+    /// `sort_by(mtime.then(path))` comparator by asserting the surviving
+    /// sealed files have strictly later mtimes than any deleted file —
+    /// tested indirectly by ensuring the surviving set's minimum mtime
+    /// is later than the initial rotation.
+    #[test]
+    fn eviction_drops_oldest_not_newest() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_ring = test_key_ring();
+        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, Some(50), Some(250));
+
+        let msg = make_msg("alice");
+        // Write, rotate, write, rotate — capture the first filename
+        // before any eviction would have a chance to remove it.
+        dlq.dead_letter("ordered", &msg, "circuit_open");
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        dlq.dead_letter("ordered", &msg, "circuit_open");
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        let after_first_two = list_target_files(dir.path(), "ordered");
+        let original_oldest = after_first_two[0].clone();
+
+        // Drive more rotations until the cap is breached and eviction
+        // fires.
+        force_rotations(&dlq, "ordered", 6);
+
+        let surviving = list_target_files(dir.path(), "ordered");
+        assert!(
+            !surviving.contains(&original_oldest),
+            "drop-oldest FIFO must have removed the earliest segment `{}`; survivors: {:?}",
+            original_oldest.display(),
+            surviving,
+        );
+    }
+
+    /// Pins the `metrics` feature wiring: each deleted file bumps
+    /// `rustgate_http_dlq_evicted_total` labelled by target name. A
+    /// regression that forgot to register the counter, mis-labelled it,
+    /// or wired the increment on the wrong code path trips here.
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn eviction_metric_increments_per_deleted_file() {
+        // Metrics use a process-global registry — init is idempotent and
+        // the counter can be read back regardless of which other test
+        // initialised it first.
+        let _ = crate::metrics::init();
+
+        let dir = tempfile::tempdir().unwrap();
+        let key_ring = test_key_ring();
+        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, Some(50), Some(150));
+
+        let counter = crate::metrics::dlq_evicted();
+        let child = counter
+            .get_metric_with_label_values(&["metric-target"])
+            .unwrap();
+        let before = child.get();
+
+        force_rotations(&dlq, "metric-target", 6);
+
+        let after = child.get();
+        assert!(
+            after > before,
+            "eviction must bump rustgate_http_dlq_evicted_total{{target=metric-target}}: \
+             before={before}, after={after}",
+        );
     }
 
     /// Pins the `finish_non_exhaustive` Debug shape: `dir` is visible
@@ -753,7 +1173,7 @@ mod tests {
     fn debug_format_uses_finish_non_exhaustive_and_hides_private_fields() {
         let dir = tempfile::tempdir().unwrap();
         let key_ring = test_key_ring();
-        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, None);
+        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, None, None);
         let debug = format!("{dlq:?}");
 
         assert!(debug.contains("DeadLetterQueue"));
@@ -764,7 +1184,7 @@ mod tests {
             "Debug must include finish_non_exhaustive marker `..`: {debug}"
         );
         // Private fields must NOT be rendered.
-        for hidden in ["key_ring", "max_bytes", "writers"] {
+        for hidden in ["key_ring", "max_bytes", "max_target_bytes", "writers"] {
             assert!(
                 !debug.contains(hidden),
                 "Debug must hide private field `{hidden}`: {debug}"

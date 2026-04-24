@@ -3348,6 +3348,7 @@ dependencies = [
  "rustgate-core",
  "rustgate-cot",
  "rustgate-proto",
+ "rustgate-resilience",
  "rustgate-test-utils",
  "rustgate-transport",
  "serde",
@@ -3379,6 +3380,7 @@ name = "rustgate-resilience"
 version = "0.8.0"
 dependencies = [
  "fastrand",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]

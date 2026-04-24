@@ -10,6 +10,10 @@
 //!
 //! ## Modules
 //!
+//! - [`backpressure`] — global byte-count admission gate with dwell-based
+//!   resume semantics (moved from `rustgate-transport` so every egress
+//!   publisher can share the same primitive without taking a transport
+//!   dependency).
 //! - [`circuit`] — three-state circuit breaker (Closed → Open → HalfOpen)
 //!   with probe limiting and configurable recovery threshold.
 //! - [`retry`] — exponential backoff with random jitter for request-level
@@ -29,6 +33,7 @@
 //!   breaker's current state as a `u8`) required by Prometheus gauges in
 //!   consuming crates.
 
+pub mod backpressure;
 pub mod circuit;
 pub mod conn_rate_limiter;
 pub mod reconnect;
