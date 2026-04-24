@@ -22,6 +22,7 @@ static FILTERED: OnceLock<IntCounterVec> = OnceLock::new();
 static QUEUE_DEPTH: OnceLock<IntGauge> = OnceLock::new();
 static DROPPED: OnceLock<IntCounterVec> = OnceLock::new();
 static DLQ_EVICTED: OnceLock<IntCounterVec> = OnceLock::new();
+static RESPONSE_BODIES_CAPTURED: OnceLock<IntCounterVec> = OnceLock::new();
 
 // ── Fallback constructors ──────────────────────────────────────────
 
@@ -150,6 +151,24 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(dlq_evicted.clone()))?;
     let _ = DLQ_EVICTED.set(dlq_evicted);
 
+    let response_bodies_captured = IntCounterVec::new(
+        Opts::new(
+            "rustgate_http_response_bodies_captured_total",
+            "2xx HTTP responses whose body was captured and surfaced in a \
+             structured debug log alongside the per-request `delivery_id`. \
+             Only counted for targets with `capture-response-body = true` \
+             and when the server returned a non-empty body. Operators use \
+             this to confirm that downstream acknowledgement IDs (Splunk \
+             HEC `ackId`, Elastic `_id`, Loki `traceID`) are being \
+             recorded; a flat-lining rate against a climbing \
+             `publishes_total` suggests the target is returning empty \
+             acknowledgement bodies. Labelled by target name.",
+        ),
+        &["target"],
+    )?;
+    registry.register(Box::new(response_bodies_captured.clone()))?;
+    let _ = RESPONSE_BODIES_CAPTURED.set(response_bodies_captured);
+
     Ok(())
 }
 
@@ -229,6 +248,23 @@ pub fn dlq_evicted() -> &'static IntCounterVec {
     })
 }
 
+/// 2xx responses whose body was captured for acknowledgement tracking,
+/// labelled by target name.
+///
+/// Only counted for targets with `capture-response-body = true` and
+/// when the server returned a non-empty body. A flat-lining rate
+/// against a climbing `publishes_total` is the operator signal that
+/// the target is returning empty acknowledgement bodies.
+pub fn response_bodies_captured() -> &'static IntCounterVec {
+    RESPONSE_BODIES_CAPTURED.get_or_init(|| {
+        fallback_counter_vec(
+            "rustgate_http_response_bodies_captured_total",
+            "fallback",
+            &["target"],
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::panic, clippy::unwrap_used)]
@@ -245,6 +281,7 @@ mod tests {
         let _ = retries();
         let _ = filtered();
         let _ = queue_depth();
+        let _ = response_bodies_captured();
     }
 
     #[test]
@@ -293,8 +330,8 @@ mod tests {
 
     #[test]
     fn metric_names_match_documented_schema() {
-        // Regression sentinel: the eight fully-qualified metric names
-        // are contracts with Grafana dashboards, alerting rules, and
+        // Regression sentinel: the fully-qualified metric names are
+        // contracts with Grafana dashboards, alerting rules, and
         // external scrape-aware tooling. A silent rename here would
         // break dashboards without any in-tree compile failure. Pin
         // each `fq_name` exactly.
@@ -317,6 +354,10 @@ mod tests {
         assert_eq!(filtered().desc()[0].fq_name, "rustgate_http_filtered_total");
         assert_eq!(queue_depth().desc()[0].fq_name, "rustgate_http_queue_depth");
         assert_eq!(dropped().desc()[0].fq_name, "rustgate_http_dropped_total");
+        assert_eq!(
+            response_bodies_captured().desc()[0].fq_name,
+            "rustgate_http_response_bodies_captured_total"
+        );
     }
 
     #[test]
@@ -344,6 +385,10 @@ mod tests {
         assert_eq!(labels_of(retries().desc()[0]), vec!["target".to_string()]);
         assert_eq!(labels_of(filtered().desc()[0]), vec!["target".to_string()]);
         assert_eq!(labels_of(dropped().desc()[0]), vec!["reason".to_string()]);
+        assert_eq!(
+            labels_of(response_bodies_captured().desc()[0]),
+            vec!["target".to_string()]
+        );
         // Non-vector metrics carry no variable labels.
         assert!(labels_of(queue_depth().desc()[0]).is_empty());
         assert!(labels_of(request_duration().desc()[0]).is_empty());
@@ -462,6 +507,10 @@ mod tests {
         assert!(std::ptr::eq(dropped(), dropped()));
         assert!(std::ptr::eq(queue_depth(), queue_depth()));
         assert!(std::ptr::eq(request_duration(), request_duration()));
+        assert!(std::ptr::eq(
+            response_bodies_captured(),
+            response_bodies_captured()
+        ));
     }
 
     #[test]
@@ -495,6 +544,7 @@ mod tests {
             dropped().desc()[0],
             queue_depth().desc()[0],
             request_duration().desc()[0],
+            response_bodies_captured().desc()[0],
         ] {
             assert!(
                 !d.help.is_empty(),

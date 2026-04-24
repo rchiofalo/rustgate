@@ -51,12 +51,6 @@ const RUSTGATE_USER_AGENT: &str = "Rustgate";
 /// naming a target "admission".
 const ADMISSION_DLQ_TARGET: &str = "admission";
 
-/// Maximum response body to drain on error responses (1 MiB).
-///
-/// Prevents memory exhaustion from malicious servers while still draining
-/// enough to keep HTTP connection pools healthy.
-const MAX_ERROR_RESPONSE_BYTES: usize = 1024 * 1024;
-
 /// A message queued for dispatch, optionally carrying a byte-reservation
 /// permit on the shared [`BackpressureGate`].
 ///
@@ -119,6 +113,16 @@ struct TargetState {
     max_payload_bytes: usize,
     /// Per-target rate limiter. `None` means unlimited.
     rate_limiter: Option<TokenBucket>,
+    /// Capture the response body on 2xx responses and emit it alongside
+    /// the per-request `delivery_id` in a structured debug log. Lets
+    /// operators recover downstream acknowledgement IDs (Splunk HEC
+    /// `ackId`, Elastic `_id`, Loki `traceID`) without a receiver-side
+    /// proxy. Failure-path bodies are always captured independently.
+    capture_response_body: bool,
+    /// Maximum bytes of response body to capture on either path.
+    /// Enforced symmetrically to prevent a misconfigured endpoint from
+    /// flooding structured logs with megabytes of error detail.
+    max_response_body_bytes: usize,
 }
 
 impl fmt::Debug for TargetState {
@@ -437,6 +441,8 @@ fn build_target(
         custom_headers,
         max_payload_bytes: tc.effective_max_payload_bytes(),
         rate_limiter,
+        capture_response_body: tc.effective_capture_response_body(),
+        max_response_body_bytes: tc.effective_max_response_body_bytes(),
     })
 }
 
@@ -891,7 +897,7 @@ async fn dispatch_to_target(
         )
         .await
         {
-            Ok(()) => {
+            Ok(captured) => {
                 #[cfg(feature = "metrics")]
                 crate::metrics::request_duration().observe(request_start.elapsed().as_secs_f64());
 
@@ -906,12 +912,35 @@ async fn dispatch_to_target(
                 crate::metrics::publishes()
                     .with_label_values(&[target.name.as_str()])
                     .inc();
-                tracing::debug!(
-                    target = %target.name,
-                    attempt = attempt + 1,
-                    delivery_id = %delivery_id,
-                    "HTTP publish succeeded"
-                );
+
+                // Capture-enabled targets surface the response body on
+                // a dedicated debug line alongside the delivery_id, so
+                // operators can grep the access log for downstream
+                // acknowledgement IDs (Splunk HEC `ackId`, Elastic
+                // `_id`, Loki `traceID`). Skipped when the target has
+                // the capture flag off or the response carried no
+                // body.
+                if let Some(ref ack_body) = captured {
+                    #[cfg(feature = "metrics")]
+                    crate::metrics::response_bodies_captured()
+                        .with_label_values(&[target.name.as_str()])
+                        .inc();
+                    tracing::debug!(
+                        target = %target.name,
+                        attempt = attempt + 1,
+                        delivery_id = %delivery_id,
+                        body_bytes = ack_body.len(),
+                        body = %format_body_snippet(ack_body),
+                        "HTTP publish succeeded with response body"
+                    );
+                } else {
+                    tracing::debug!(
+                        target = %target.name,
+                        attempt = attempt + 1,
+                        delivery_id = %delivery_id,
+                        "HTTP publish succeeded"
+                    );
+                }
                 return;
             }
             Err((status, err, retry_after)) => {
@@ -987,22 +1016,46 @@ async fn dispatch_to_target(
     }
 }
 
+/// Successful send outcome, carrying an optional captured response body.
+///
+/// The body is only populated when the target has `capture-response-body`
+/// enabled AND the response actually returned bytes. Empty responses
+/// (204 No Content, 200 with zero Content-Length) produce `None` so the
+/// caller can distinguish "capture disabled" from "no body" if needed.
+type SendOk = Option<bytes::Bytes>;
+
+/// Failure outcome tuple.
+///
+/// - `status`: the numeric HTTP status when the response reached us
+///   (None indicates a transport-level failure).
+/// - `error`: human-readable error string. Always includes the captured
+///   error-response body prefix when available — SIEM collectors return
+///   structured error details there and operators need them to diagnose
+///   misconfigured webhook targets.
+/// - `retry_after`: parsed `Retry-After` header on 429 responses, so the
+///   retry loop can respect server-specified backoff.
+type SendErr = (Option<u16>, String, Option<Duration>);
+
 /// Send a single HTTP request to the target.
 ///
 /// The `delivery_id` is stable across retry attempts for the same message,
 /// enabling receiver-side deduplication. The `content_digest` is the
 /// RFC 9530 `Content-Digest` header value (SHA-256).
 ///
-/// Returns `Ok(())` on 2xx, or `Err((optional_status, error_string, retry_after))`.
-/// The `retry_after` field is populated from the `Retry-After` header on 429
-/// responses, allowing the retry loop to respect server-specified backoff.
+/// On 2xx, returns `Ok(Some(body_bytes))` when the target is configured
+/// to capture the success body (and the response is non-empty), or
+/// `Ok(None)` otherwise.
+///
+/// On non-2xx, always captures the response body up to the per-target
+/// limit and embeds a truncated snippet in the error string so the
+/// failure-path log carries the server's structured error details.
 async fn send_request(
     target: &TargetState,
     body: bytes::Bytes,
     content_type: &str,
     delivery_id: &str,
     content_digest: &str,
-) -> Result<(), (Option<u16>, String, Option<Duration>)> {
+) -> Result<SendOk, SendErr> {
     let mut builder = target
         .client
         .request(target.method.clone(), &target.url)
@@ -1042,10 +1095,15 @@ async fn send_request(
 
     let status = response.status().as_u16();
     if (200..300).contains(&status) {
-        // Drain the success response body so the connection returns to the
-        // pool in a clean state (prevents connection leaks with keep-alive).
-        drain_response_body(response).await;
-        Ok(())
+        // Drain (or capture) the success response body so the connection
+        // returns to the pool in a clean state (prevents keep-alive leaks).
+        let captured = capture_response_body(
+            response,
+            target.max_response_body_bytes,
+            target.capture_response_body,
+        )
+        .await;
+        Ok(captured)
     } else {
         // Parse Retry-After header on 429 (rate-limited) responses so the
         // retry loop can respect the server's requested backoff interval.
@@ -1059,35 +1117,89 @@ async fn send_request(
         } else {
             None
         };
-        // Drain the error response body so the connection returns to the
-        // pool in a clean state — prevents connection pool poisoning when
-        // the server sends a body with 4xx/5xx responses.
-        drain_response_body(response).await;
-        Err((Some(status), format!("HTTP {status}"), retry_after))
+        // Error-path capture is unconditional — structured error bodies
+        // from SIEM collectors are the highest-leverage signal for
+        // diagnosing misconfigured targets, and the same bytes were
+        // going to be drained either way to keep the pool clean.
+        let captured = capture_response_body(response, target.max_response_body_bytes, true).await;
+        let err = match captured.as_ref() {
+            Some(body) if !body.is_empty() => {
+                format!("HTTP {status}: {}", format_body_snippet(body))
+            }
+            _ => format!("HTTP {status}"),
+        };
+        Err((Some(status), err, retry_after))
     }
 }
 
-/// Drain a response body up to [`MAX_ERROR_RESPONSE_BYTES`] to keep the
-/// connection pool healthy.
+/// Maximum bytes of response body to ever hold in memory before returning
+/// the connection to the pool. This is a hard ceiling on top of the
+/// per-target limit — a target configured with
+/// `max-response-body-bytes = 4096` caps its own captures at 4 KiB,
+/// while a target with no limit still never exceeds this global cap.
+const MAX_ERROR_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// Drain (or capture + drain) a response body, returning the captured
+/// prefix when the caller requested it.
 ///
 /// HTTP/1.1 persistent connections require the full response body to be
 /// consumed before the connection can be reused. If we skip this, the
 /// connection is dropped and must be re-established (TCP + TLS handshake),
 /// which adds latency on subsequent requests.
 ///
-/// The size cap prevents memory exhaustion from a malicious server
-/// returning an unbounded response body.
-async fn drain_response_body(response: reqwest::Response) {
-    // Check Content-Length first — if the server advertises a body larger
-    // than our cap, just drop the connection instead of reading into memory.
+/// When `capture` is `true`, returns up to `max_bytes` of the body so the
+/// caller can surface structured error details or acknowledgement IDs.
+/// When `capture` is `false`, still drains but returns `None`.
+///
+/// The per-target `max_bytes` is clamped against [`MAX_ERROR_RESPONSE_BYTES`]
+/// and the server-advertised Content-Length to prevent memory exhaustion
+/// from a malicious server returning an unbounded response body.
+async fn capture_response_body(
+    response: reqwest::Response,
+    max_bytes: usize,
+    capture: bool,
+) -> Option<bytes::Bytes> {
+    // Clamp against the crate-wide ceiling — a misconfigured per-target
+    // cap cannot exceed this no matter what.
+    let effective_cap = max_bytes.min(MAX_ERROR_RESPONSE_BYTES);
+
+    // Content-Length guard: if the server advertises a body larger than
+    // the global ceiling, don't read it. Drop the connection instead.
     if let Some(len) = response.content_length()
         && len > MAX_ERROR_RESPONSE_BYTES as u64
     {
-        return;
+        return None;
     }
-    // Drain up to the limit. Errors (timeout, connection reset) are
-    // ignored — the connection will be dropped and a new one established.
-    let _ = response.bytes().await;
+
+    // Drain the body. Errors (timeout, connection reset) are ignored —
+    // the connection will be dropped and a new one established.
+    let body_bytes = match response.bytes().await {
+        Ok(b) => b,
+        Err(_) => return None,
+    };
+
+    if !capture || body_bytes.is_empty() {
+        return None;
+    }
+
+    // Truncate at the per-target cap. `Bytes::slice` is a ref-count
+    // bump + offset update; no memcpy.
+    let take = effective_cap.min(body_bytes.len());
+    Some(body_bytes.slice(0..take))
+}
+
+/// Format a captured response body for inclusion in a structured log
+/// field or error string.
+///
+/// The body is decoded as UTF-8 with replacement characters — SIEM
+/// collectors and webhook targets overwhelmingly return JSON or
+/// plain-text error details, and a replacement-character'ed prefix is
+/// still readable in an operator dashboard. Control characters are
+/// filtered via `sanitize_for_log` to prevent log-forging attacks where
+/// a malicious server injects CR/LF into the error string.
+fn format_body_snippet(body: &[u8]) -> String {
+    let decoded = String::from_utf8_lossy(body);
+    sanitize_for_log(&decoded)
 }
 
 /// Compute the RFC 9530 Content-Digest header value for body integrity.
@@ -1466,6 +1578,8 @@ mod tests {
                 headers: None,
                 max_payload_bytes: None,
                 rate_limit_per_sec: None,
+                capture_response_body: None,
+                max_response_body_bytes: None,
             }],
             dlq_dir: None,
             dlq_key_file: None,
@@ -1573,5 +1687,157 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>(_: &T) {}
         let obs = build_circuit_observer("send-sync-check");
         assert_send_sync(&obs);
+    }
+
+    // ── Response body helpers (issue #906) ────────────────────────────
+
+    /// Valid UTF-8 is returned unchanged.
+    #[test]
+    fn format_body_snippet_preserves_utf8_json() {
+        let body = br#"{"ackId":"abc-123"}"#;
+        assert_eq!(format_body_snippet(body), r#"{"ackId":"abc-123"}"#);
+    }
+
+    /// Invalid UTF-8 gets replacement characters, never panics. The
+    /// snippet is always safe to log — critical defence against
+    /// malicious servers returning garbled bytes.
+    #[test]
+    fn format_body_snippet_replaces_invalid_utf8() {
+        // 0xff is invalid as a UTF-8 lead byte, 0xfe is a continuation
+        // without a lead — both should become U+FFFD.
+        let body = b"ok\xff\xfegarble";
+        let out = format_body_snippet(body);
+        assert!(out.starts_with("ok"));
+        assert!(out.ends_with("garble"));
+        assert!(out.contains('\u{FFFD}'), "got: {out}");
+    }
+
+    /// Log-forging defence: CR/LF in a response body cannot inject a
+    /// fake log line via the `body = ...` field. `sanitize_for_log`
+    /// replaces control characters with U+FFFD so the injected prefix
+    /// never reaches operators' grep results intact.
+    #[test]
+    fn format_body_snippet_sanitises_log_forging_attempt() {
+        let body = b"real\r\n[audit] fake_event=success";
+        let out = format_body_snippet(body);
+        assert!(!out.contains('\r'), "CR leaked: {out:?}");
+        assert!(!out.contains('\n'), "LF leaked: {out:?}");
+    }
+
+    /// Empty body renders as an empty string — callers check
+    /// `body.is_empty()` before emitting so the debug line stays
+    /// concise.
+    #[test]
+    fn format_body_snippet_empty() {
+        assert_eq!(format_body_snippet(b""), "");
+    }
+
+    /// Simulates a successful publish where the server returned a JSON
+    /// ack body and the target has `capture-response-body = true`.
+    /// Asserts the full body comes back (under the cap) and is
+    /// zero-copy — the returned `Bytes` shares the reqwest allocation.
+    #[tokio::test]
+    async fn capture_response_body_success_returns_full_body() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let ack = r#"{"ackId":"splunk-abc-123"}"#;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(ack))
+            .mount(&server)
+            .await;
+
+        let response = reqwest::get(server.uri()).await.unwrap();
+        let captured = capture_response_body(response, 4 * 1024, true).await;
+        assert_eq!(captured.as_deref(), Some(ack.as_bytes()));
+    }
+
+    /// When capture is disabled, the helper still drains the body
+    /// (connection-pool hygiene) but returns `None`. This is the
+    /// contract the success path relies on: `None` → emit the
+    /// no-body debug line; `Some` → emit the with-body debug line.
+    #[tokio::test]
+    async fn capture_response_body_disabled_returns_none_but_drains() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ignored"))
+            .mount(&server)
+            .await;
+
+        let response = reqwest::get(server.uri()).await.unwrap();
+        let captured = capture_response_body(response, 4 * 1024, false).await;
+        assert!(captured.is_none());
+    }
+
+    /// Empty bodies produce `None` even when capture is enabled, so the
+    /// caller doesn't emit an empty `body = ""` field.
+    #[tokio::test]
+    async fn capture_response_body_empty_returns_none() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let response = reqwest::get(server.uri()).await.unwrap();
+        let captured = capture_response_body(response, 4 * 1024, true).await;
+        assert!(captured.is_none());
+    }
+
+    /// Oversized bodies clamp at the per-target cap. Protects operators
+    /// from a target returning a malicious multi-MB error blob that
+    /// would otherwise flood their structured logs.
+    #[tokio::test]
+    async fn capture_response_body_clamps_at_per_target_cap() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = "A".repeat(2048);
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let response = reqwest::get(server.uri()).await.unwrap();
+        // 512-byte cap — well below the server's 2 KiB payload.
+        let captured = capture_response_body(response, 512, true).await;
+        assert_eq!(captured.as_ref().map(|b| b.len()), Some(512));
+    }
+
+    /// Global ceiling guard: when the server advertises a
+    /// Content-Length larger than MAX_ERROR_RESPONSE_BYTES (1 MiB),
+    /// the helper returns `None` without reading the body. Pins the
+    /// defence against a runaway error-body pull eating megabytes of
+    /// heap before the response is ever logged.
+    #[tokio::test]
+    async fn capture_response_body_content_length_exceeds_ceiling_short_circuits() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Just over 1 MiB. ResponseTemplate::set_body_bytes sets
+        // Content-Length for us.
+        let oversized = vec![b'B'; MAX_ERROR_RESPONSE_BYTES + 1];
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(oversized))
+            .mount(&server)
+            .await;
+
+        let response = reqwest::get(server.uri()).await.unwrap();
+        // Per-target cap is 1 MiB — without the Content-Length guard
+        // the helper would happily allocate 1 MiB+1 into a Bytes.
+        let captured = capture_response_body(response, MAX_ERROR_RESPONSE_BYTES, true).await;
+        assert!(
+            captured.is_none(),
+            "oversized Content-Length must short-circuit before body read"
+        );
     }
 }
