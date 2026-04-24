@@ -524,6 +524,28 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 10, env = "RUSTGATE_WS_CONN_RATE_WINDOW_SECS")]
     pub(crate) ws_conn_rate_window_secs: u64,
 
+    /// Comma-separated list of WebSocket subprotocol tokens the server
+    /// advertises during the upgrade handshake, in server-preference order.
+    /// Empty (the default) disables negotiation and preserves historical
+    /// behaviour — no `Sec-WebSocket-Protocol` header is sent in the
+    /// response.
+    ///
+    /// When non-empty, the server picks the first client-offered token that
+    /// also appears in this list (client-preference scan, server-final
+    /// choice, per RFC 6455 §4.2.2). If the client offered nothing or the
+    /// intersection is empty, the handshake still succeeds and no response
+    /// header is emitted. Tokens are case-sensitive ABNF tokens; leading and
+    /// trailing whitespace in each comma-separated element is trimmed.
+    ///
+    /// Example: `--websocket-subprotocols=cot.v2,tak.proto.v1`.
+    #[arg(
+        long,
+        env = "RUSTGATE_WS_SUBPROTOCOLS",
+        value_delimiter = ',',
+        num_args = 0..
+    )]
+    pub(crate) ws_subprotocols: Vec<String>,
+
     /// Interval in seconds between active WebSocket Ping health-check frames.
     /// Set to 0 (default) to disable the active heartbeat — `tokio-tungstenite`
     /// already auto-responds to inbound Pings but never probes the peer, so

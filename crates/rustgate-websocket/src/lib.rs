@@ -39,6 +39,8 @@ pub use server::{
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+use tokio_tungstenite::tungstenite::http::{HeaderValue, header};
 use tracing::{debug, warn};
 
 /// Server-side TLS stream over TCP.
@@ -55,6 +57,17 @@ pub struct WsSession {
     identity: Arc<Identity>,
     stream: WsStream,
     peer_addr: SocketAddr,
+    /// The subprotocol negotiated during the WebSocket handshake, if any.
+    ///
+    /// Set when both (a) the server was configured with a non-empty
+    /// [`WsListenerConfig::supported_subprotocols`] list, and (b) the client's
+    /// `Sec-WebSocket-Protocol` offer intersected that list. The chosen
+    /// protocol is the first server-preferred entry that also appears in the
+    /// client's offer — consistent with RFC 6455 §4.2.2, which gives the
+    /// server final say. `None` means no subprotocol was negotiated; the
+    /// session is still valid and MUST be treated as the default (unnamed)
+    /// application protocol.
+    negotiated_subprotocol: Option<String>,
 }
 
 impl WsSession {
@@ -68,6 +81,15 @@ impl WsSession {
 
     pub fn peer_addr(&self) -> SocketAddr {
         self.peer_addr
+    }
+
+    /// The subprotocol token selected by the server during the WebSocket
+    /// handshake, or `None` if no subprotocol was negotiated.
+    ///
+    /// See [`WsSession::negotiated_subprotocol`](Self) field docs for the
+    /// exact selection semantics.
+    pub fn negotiated_subprotocol(&self) -> Option<&str> {
+        self.negotiated_subprotocol.as_deref()
     }
 
     pub fn into_stream(self) -> WsStream {
@@ -85,6 +107,7 @@ impl std::fmt::Debug for WsSession {
             .field("identity", &self.identity)
             .field("peer_addr", &self.peer_addr)
             .field("stream", &"<WebSocketStream>")
+            .field("negotiated_subprotocol", &self.negotiated_subprotocol)
             .finish()
     }
 }
@@ -121,6 +144,14 @@ pub struct WsListener {
     conn_rate: ConnRateLimiter,
     max_frame_size: usize,
     max_message_size: usize,
+    /// Ordered list of WebSocket subprotocol tokens the server advertises.
+    /// When empty (the default), subprotocol negotiation is disabled and the
+    /// handshake proceeds without a `Sec-WebSocket-Protocol` response header,
+    /// matching historical behaviour. When non-empty, the first entry that
+    /// also appears in the client's `Sec-WebSocket-Protocol` offer is
+    /// selected, per RFC 6455 §4.2.2. Stored as `Arc<[String]>` so each
+    /// handshake callback closure only clones an `Arc`, not the vec contents.
+    supported_subprotocols: Arc<[String]>,
     on_connection_rejected: Option<OnWsRejectFn>,
 }
 
@@ -132,6 +163,7 @@ impl std::fmt::Debug for WsListener {
             .field("conn_rate", &self.conn_rate)
             .field("max_frame_size", &self.max_frame_size)
             .field("max_message_size", &self.max_message_size)
+            .field("supported_subprotocols", &self.supported_subprotocols)
             .field(
                 "on_connection_rejected",
                 &self.on_connection_rejected.is_some(),
@@ -150,6 +182,21 @@ pub struct WsListenerConfig {
     pub max_frame_size: usize,
     /// Maximum WebSocket message size in bytes.
     pub max_message_size: usize,
+    /// Ordered list of WebSocket subprotocol tokens the server advertises, in
+    /// server-preference order. Empty (the default) disables negotiation and
+    /// preserves historical behaviour — the handshake succeeds but no
+    /// `Sec-WebSocket-Protocol` header is emitted in the response.
+    ///
+    /// When non-empty, the handshake callback walks the client's offered
+    /// tokens in client order and picks the first one that matches any
+    /// server entry (case-sensitive, whitespace-trimmed per RFC 6455 §4.1
+    /// /ABNF rules). If no client token matches any server entry, the
+    /// handshake still completes, but no `Sec-WebSocket-Protocol` header is
+    /// sent — RFC 6455 §4.2.2 permits this and leaves the decision to close
+    /// or continue to the client. Compare to a hard-reject policy: we
+    /// deliberately stay permissive because TAK/tactical clients routinely
+    /// speak their native framing even when no subprotocol is advertised.
+    pub supported_subprotocols: Vec<String>,
     /// Fired on every connection rejected inside the accept loop (per-IP
     /// rate limit, TLS handshake failure, identity extraction failure,
     /// upgrade handshake failure). Typically cloned from
@@ -166,6 +213,7 @@ impl std::fmt::Debug for WsListenerConfig {
             .field("conn_rate_window", &self.conn_rate_window)
             .field("max_frame_size", &self.max_frame_size)
             .field("max_message_size", &self.max_message_size)
+            .field("supported_subprotocols", &self.supported_subprotocols)
             .field(
                 "on_connection_rejected",
                 &self.on_connection_rejected.is_some(),
@@ -181,6 +229,7 @@ impl Default for WsListenerConfig {
             conn_rate_window: DEFAULT_CONN_RATE_WINDOW,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            supported_subprotocols: Vec::new(),
             on_connection_rejected: None,
         }
     }
@@ -238,6 +287,7 @@ impl WsListener {
             conn_rate: ConnRateLimiter::new(config.conn_rate_limit, config.conn_rate_window),
             max_frame_size: config.max_frame_size,
             max_message_size: config.max_message_size,
+            supported_subprotocols: config.supported_subprotocols.into(),
             on_connection_rejected: config.on_connection_rejected,
         })
     }
@@ -264,6 +314,13 @@ impl WsListener {
     ///
     /// Connections are subject to per-IP rate limiting before the TLS
     /// handshake to mitigate slow-handshake denial-of-service attacks.
+    // justification: the handshake callback returns
+    // `Result<Response, Response<Option<String>>>` — a shape dictated by
+    // tungstenite's `Callback` trait, whose `Err` variant is a full HTTP
+    // response (~136 bytes). We cannot box or shrink it without breaking
+    // the trait-required signature, and the callback fires once per
+    // handshake, so the occasional stack-copy cost is irrelevant.
+    #[allow(clippy::result_large_err)]
     pub async fn accept(&self) -> Result<WsSession> {
         loop {
             let (tcp_stream, peer_addr) = match self.tcp.accept().await {
@@ -326,9 +383,58 @@ impl WsListener {
             ws_config.max_frame_size = Some(self.max_frame_size);
             ws_config.max_message_size = Some(self.max_message_size);
 
+            // Capture the subprotocol chosen inside the handshake callback.
+            // The tungstenite `Callback` trait is `FnOnce(Request, Response)
+            // -> Result<Response, ErrorResponse>`, so the callback's return
+            // value stays header-shaped; we thread the selected token back
+            // out-of-band through a shared
+            // `Arc<parking_lot::Mutex<Option<String>>>`. Both the closure
+            // and the post-handshake reader live on the same task — the
+            // mutex is never contended, just syntactically required.
+            let selected = Arc::new(parking_lot::Mutex::new(None::<String>));
+            let selected_cb = Arc::clone(&selected);
+            let server_protocols = Arc::clone(&self.supported_subprotocols);
+
             let ws_stream = match tokio::time::timeout(
                 HANDSHAKE_TIMEOUT,
-                tokio_tungstenite::accept_async_with_config(tls_stream, Some(ws_config)),
+                tokio_tungstenite::accept_hdr_async_with_config(
+                    tls_stream,
+                    move |req: &Request, mut resp: Response| {
+                        match negotiate_subprotocol(&server_protocols, req.headers()) {
+                            NegotiationOutcome::Selected(picked) => {
+                                if let Ok(hv) = HeaderValue::from_str(&picked) {
+                                    let _ = resp.headers_mut()
+                                        .insert(header::SEC_WEBSOCKET_PROTOCOL, hv);
+                                }
+                                *selected_cb.lock() = Some(picked);
+                                Ok(resp)
+                            }
+                            NegotiationOutcome::NoProtocolRequired => Ok(resp),
+                            NegotiationOutcome::Unsupported => {
+                                // Client asked for at least one protocol,
+                                // server advertises its own list, zero
+                                // overlap. Reject with 400 — real clients
+                                // (browsers, Python `websockets`, Go
+                                // `nhooyr/websocket`, `tungstenite` itself)
+                                // treat "I asked, you didn't pick" as a
+                                // fatal error anyway, so returning a plain
+                                // 400 with a machine-parseable body matches
+                                // what deployments see in practice and
+                                // surfaces the mismatch cleanly in logs.
+                                let body = "no advertised subprotocol matches server support";
+                                let err_resp = tokio_tungstenite::tungstenite::http::Response::builder()
+                                    .status(tokio_tungstenite::tungstenite::http::StatusCode::BAD_REQUEST)
+                                    .body(Some(body.to_string()))
+                                    .map_err(|e| tokio_tungstenite::tungstenite::http::Response::builder()
+                                        .status(tokio_tungstenite::tungstenite::http::StatusCode::INTERNAL_SERVER_ERROR)
+                                        .body(Some(format!("error building 400 response: {e}")))
+                                        .expect("500 fallback always builds"))?;
+                                Err(err_resp)
+                            }
+                        }
+                    },
+                    Some(ws_config),
+                ),
             )
             .await
             {
@@ -345,15 +451,95 @@ impl WsListener {
                 }
             };
 
-            debug!(peer_addr = %peer_addr, cn = %identity.cn, "WebSocket session established");
+            let negotiated_subprotocol = selected.lock().take();
+
+            debug!(
+                peer_addr = %peer_addr,
+                cn = %identity.cn,
+                subprotocol = ?negotiated_subprotocol,
+                "WebSocket session established"
+            );
 
             return Ok(WsSession {
                 identity: Arc::new(identity),
                 stream: ws_stream,
                 peer_addr,
+                negotiated_subprotocol,
             });
         }
     }
+}
+
+/// Outcome of the `Sec-WebSocket-Protocol` negotiation step. Three cases,
+/// not two, because the accept loop needs to distinguish "skip the header"
+/// from "reject the handshake":
+#[derive(Debug, PartialEq, Eq)]
+enum NegotiationOutcome {
+    /// Server and client agreed on `String`. The server echoes it in the
+    /// response header and the session records it for downstream code.
+    Selected(String),
+    /// No negotiation is required. Either the server is not configured with
+    /// any subprotocols (the historical default — pre-#884 behaviour) or
+    /// the client did not offer any. The handshake completes with no
+    /// `Sec-WebSocket-Protocol` response header and the session's
+    /// `negotiated_subprotocol()` returns `None`.
+    NoProtocolRequired,
+    /// The server advertises a non-empty list, the client offered at least
+    /// one entry, and the intersection is empty. The handshake is rejected
+    /// with a 400 response — real clients (browsers, Python `websockets`,
+    /// Go `nhooyr/websocket`, tungstenite's own client) treat "I asked, you
+    /// didn't pick" as a fatal error anyway, so rejecting explicitly surfaces
+    /// the mismatch cleanly in server logs instead of leaving it as an
+    /// opaque client-side protocol error.
+    Unsupported,
+}
+
+/// Decide which `Sec-WebSocket-Protocol` outcome applies to this request.
+///
+/// Walks the client's offered tokens in *client* order and returns the first
+/// token that also appears (case-sensitive) in the server's configured list.
+/// The "client-preference" scan is the prevailing pattern across `ws` /
+/// Node / Python `websockets` / Jetty — TAK and observability tooling expect
+/// it — and keeps the server's advertised order as a *filter* rather than a
+/// strict ranking.
+///
+/// Case sensitivity: RFC 6455 defines these tokens as ABNF `token` values,
+/// which per RFC 7230 are case-sensitive. We do not lowercase-fold — a
+/// client asking for `TAK` and a server advertising `tak` do not match,
+/// intentionally.
+fn negotiate_subprotocol(
+    server_protocols: &[String],
+    headers: &tokio_tungstenite::tungstenite::http::HeaderMap,
+) -> NegotiationOutcome {
+    if server_protocols.is_empty() {
+        // Server opted out of negotiation. Historical default. Even if the
+        // client asked, we do not and cannot know what to pick — stay silent.
+        return NegotiationOutcome::NoProtocolRequired;
+    }
+    // `Sec-WebSocket-Protocol` may appear as multiple headers *or* as one
+    // comma-separated value (RFC 7230 §3.2.2). Flatten both.
+    let mut client_tokens: Vec<&str> = Vec::new();
+    for hv in headers.get_all(header::SEC_WEBSOCKET_PROTOCOL).iter() {
+        let Ok(s) = hv.to_str() else { continue };
+        for tok in s.split(',') {
+            let trimmed = tok.trim();
+            if !trimmed.is_empty() {
+                client_tokens.push(trimmed);
+            }
+        }
+    }
+    if client_tokens.is_empty() {
+        // Server advertises a list but the client is indifferent. RFC allows
+        // this — continue with no negotiated protocol, same as the empty-
+        // server case.
+        return NegotiationOutcome::NoProtocolRequired;
+    }
+    for tok in &client_tokens {
+        if server_protocols.iter().any(|p| p == tok) {
+            return NegotiationOutcome::Selected((*tok).to_string());
+        }
+    }
+    NegotiationOutcome::Unsupported
 }
 
 /// Extract client identity from TLS peer certificates.
@@ -492,6 +678,206 @@ mod tests {
         fn ws_listener_config_default_has_no_reject_hook() {
             let cfg = WsListenerConfig::default();
             assert!(cfg.on_connection_rejected.is_none());
+        }
+    }
+
+    /// Unit tests for [`negotiate_subprotocol`] — the RFC 6455 §4.2.2
+    /// selection logic, tested purely against a `HeaderMap` so we avoid
+    /// standing up a full WebSocket handshake. Integration-level round-trip
+    /// tests live in `tests/ws_subprotocol.rs`.
+    mod subprotocol_selection {
+        use tokio_tungstenite::tungstenite::http::{HeaderMap, HeaderValue, header};
+
+        use super::*;
+
+        fn headers_with(tokens: &[&str]) -> HeaderMap {
+            let mut h = HeaderMap::new();
+            for t in tokens {
+                // HeaderMap::append returns bool ("was the key already
+                // present?"); we don't use it.
+                let _ = h.append(
+                    header::SEC_WEBSOCKET_PROTOCOL,
+                    HeaderValue::from_str(t).unwrap(),
+                );
+            }
+            h
+        }
+
+        #[test]
+        fn default_config_has_empty_subprotocols() {
+            let cfg = WsListenerConfig::default();
+            assert!(cfg.supported_subprotocols.is_empty());
+        }
+
+        #[test]
+        fn empty_server_list_is_no_protocol_required_even_if_client_offers() {
+            // Historical / pre-#884 default: the listener advertises nothing,
+            // so negotiation is disabled even if the client asked. The
+            // handshake proceeds with no `Sec-WebSocket-Protocol` response
+            // header. Real clients that sent a protocol request will treat
+            // this as a fatal error at their end — operators opting out of
+            // subprotocols must be sure their clients do the same.
+            let server: Vec<String> = Vec::new();
+            let headers = headers_with(&["cot.v2"]);
+            assert_eq!(
+                negotiate_subprotocol(&server, &headers),
+                NegotiationOutcome::NoProtocolRequired
+            );
+        }
+
+        #[test]
+        fn empty_client_is_no_protocol_required_even_if_server_advertises() {
+            // Server advertises, client is silent. RFC 6455 §4.2.2 allows
+            // this — the server leaves the header off the response and the
+            // handshake completes with an unnegotiated session.
+            let server = vec!["cot.v2".to_string()];
+            let headers = HeaderMap::new();
+            assert_eq!(
+                negotiate_subprotocol(&server, &headers),
+                NegotiationOutcome::NoProtocolRequired
+            );
+        }
+
+        #[test]
+        fn single_match_returns_selected() {
+            let server = vec!["cot.v2".to_string()];
+            let headers = headers_with(&["cot.v2"]);
+            assert_eq!(
+                negotiate_subprotocol(&server, &headers),
+                NegotiationOutcome::Selected("cot.v2".to_string())
+            );
+        }
+
+        #[test]
+        fn no_overlap_when_both_sides_speak_is_unsupported() {
+            // Both sides spoke but have zero overlap → reject. Most real
+            // clients (browsers, Python websockets, Go nhooyr/websocket,
+            // tungstenite's own client) treat "I asked, you didn't pick" as
+            // fatal anyway, so a 400 surfaces the mismatch cleanly in
+            // server-side logs rather than leaving it as an opaque client
+            // protocol error.
+            let server = vec!["cot.v2".to_string()];
+            let headers = headers_with(&["unrelated.protocol"]);
+            assert_eq!(
+                negotiate_subprotocol(&server, &headers),
+                NegotiationOutcome::Unsupported
+            );
+        }
+
+        #[test]
+        fn client_preference_wins_on_overlapping_offers() {
+            // Server advertises A, B. Client offers B, A. RFC 6455 §4.2.2
+            // leaves the final choice to the server, but the prevailing
+            // pattern across ws / Node / Python `websockets` / Jetty is to
+            // scan the *client's* list in client order and take the first
+            // server match. That keeps the server's advertised order as a
+            // filter rather than a strict preference — matches what TAK and
+            // observability tooling expect.
+            let server = vec!["a.v1".to_string(), "b.v1".to_string()];
+            let headers = headers_with(&["b.v1", "a.v1"]);
+            assert_eq!(
+                negotiate_subprotocol(&server, &headers),
+                NegotiationOutcome::Selected("b.v1".to_string())
+            );
+        }
+
+        #[test]
+        fn server_still_filters_unsupported_client_tokens() {
+            // Client offers: unknown, b.v1, a.v1. Server: a, b. First
+            // client-order token the server recognizes is b.v1, so that
+            // wins — even though the server listed a.v1 first.
+            let server = vec!["a.v1".to_string(), "b.v1".to_string()];
+            let headers = headers_with(&["unknown", "b.v1", "a.v1"]);
+            assert_eq!(
+                negotiate_subprotocol(&server, &headers),
+                NegotiationOutcome::Selected("b.v1".to_string())
+            );
+        }
+
+        #[test]
+        fn case_sensitive_mismatch_is_unsupported() {
+            // RFC 6455 `Sec-WebSocket-Protocol` tokens inherit RFC 7230
+            // `token` ABNF, which is case-sensitive. Do not lowercase-fold.
+            let server = vec!["TAK".to_string()];
+            let headers = headers_with(&["tak"]);
+            assert_eq!(
+                negotiate_subprotocol(&server, &headers),
+                NegotiationOutcome::Unsupported
+            );
+        }
+
+        #[test]
+        fn comma_separated_single_header_is_split() {
+            // RFC 7230 §3.2.2: a list-valued header may collapse multiple
+            // values into one comma-separated header. Handle both forms.
+            let server = vec!["b.v1".to_string()];
+            let headers = headers_with(&["a.v1, b.v1, c.v1"]);
+            assert_eq!(
+                negotiate_subprotocol(&server, &headers),
+                NegotiationOutcome::Selected("b.v1".to_string())
+            );
+        }
+
+        #[test]
+        fn multiple_headers_are_flattened() {
+            // Same RFC 7230 rule but for the other form — two separate
+            // `Sec-WebSocket-Protocol` headers instead of one comma list.
+            let server = vec!["b.v1".to_string()];
+            let headers = headers_with(&["a.v1", "b.v1"]);
+            assert_eq!(
+                negotiate_subprotocol(&server, &headers),
+                NegotiationOutcome::Selected("b.v1".to_string())
+            );
+        }
+
+        #[test]
+        fn trims_whitespace_around_comma_separated_tokens() {
+            // Curl / wscat / some Python stacks emit `"a.v1 , b.v1"` with
+            // whitespace around the comma. Per ABNF (RFC 7230 OWS), trim.
+            let server = vec!["b.v1".to_string()];
+            let headers = headers_with(&["  a.v1  ,  b.v1  "]);
+            assert_eq!(
+                negotiate_subprotocol(&server, &headers),
+                NegotiationOutcome::Selected("b.v1".to_string())
+            );
+        }
+
+        #[test]
+        fn empty_tokens_in_comma_list_are_ignored() {
+            // `",, b.v1 ,,"` should still match `b.v1`; empty tokens are
+            // skipped, not surfaced as spurious "" matches.
+            let server = vec!["b.v1".to_string()];
+            let headers = headers_with(&[",, b.v1 ,,"]);
+            assert_eq!(
+                negotiate_subprotocol(&server, &headers),
+                NegotiationOutcome::Selected("b.v1".to_string())
+            );
+        }
+
+        #[test]
+        fn client_offers_only_empty_tokens_is_no_protocol_required() {
+            // Pathological client sending `"  , , "` — after trimming and
+            // filtering empty entries, there is nothing for the server to
+            // match. Treat the same as "client offered nothing".
+            let server = vec!["cot.v2".to_string()];
+            let headers = headers_with(&["  ,  ,  "]);
+            assert_eq!(
+                negotiate_subprotocol(&server, &headers),
+                NegotiationOutcome::NoProtocolRequired
+            );
+        }
+
+        #[test]
+        fn ws_listener_config_debug_renders_subprotocols() {
+            // Operators inspect this struct in tracing output; pin the
+            // field rendering to catch an accidental `skip`.
+            let cfg = WsListenerConfig {
+                supported_subprotocols: vec!["cot.v2".to_string(), "tak.v1".to_string()],
+                ..WsListenerConfig::default()
+            };
+            let s = format!("{cfg:?}");
+            assert!(s.contains("cot.v2"), "{s}");
+            assert!(s.contains("tak.v1"), "{s}");
         }
     }
 }

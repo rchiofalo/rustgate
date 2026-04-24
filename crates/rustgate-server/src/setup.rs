@@ -1427,6 +1427,7 @@ pub(crate) fn start_websocket<P: NatsPublish + Send + Sync + 'static>(
         conn_rate_window: std::time::Duration::from_secs(cli.ws_conn_rate_window_secs),
         max_frame_size: cli.ws_max_frame_size,
         max_message_size: cli.ws_max_message_size,
+        supported_subprotocols: cli.ws_subprotocols.clone(),
         on_connection_rejected: ws_session_hooks
             .as_ref()
             .and_then(|h| h.on_connection_rejected.clone()),
