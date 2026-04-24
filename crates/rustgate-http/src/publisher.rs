@@ -1479,6 +1479,9 @@ mod tests {
 
     // ── Circuit breaker observer wiring (issue #881) ───────────────
 
+    // Only the metrics-gated tests below reference these state constants;
+    // gating the import keeps the `post-quantum` build (no `metrics`) clean.
+    #[cfg(feature = "metrics")]
     use rustgate_resilience::circuit::{
         STATE_CLOSED as CB_CLOSED, STATE_HALF_OPEN as CB_HALF_OPEN, STATE_OPEN as CB_OPEN,
     };
