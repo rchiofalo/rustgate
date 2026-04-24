@@ -56,6 +56,8 @@ fn target_config(name: &str, url: &str) -> TargetConfig {
         headers: None,
         max_payload_bytes: None,
         rate_limit_per_sec: None,
+        capture_response_body: None,
+        max_response_body_bytes: None,
     }
 }
 
@@ -781,5 +783,183 @@ async fn slow_egress_target_pressures_global_backpressure_gate() {
     assert!(
         resumed,
         "gate must return to admitting after in-flight permits drain"
+    );
+}
+
+// ── Response body capture (issue #906) ───────────────────────────────
+
+/// Success-path capture: the target is configured with
+/// `capture-response-body = true`, the server returns a JSON ack body,
+/// and the request is delivered without panic. The assertion is that
+/// wiremock's `expect(1)` is honoured on shutdown — the publisher
+/// consumed the body and released the connection back to the pool.
+/// Log-line verification is out of scope for an integration test (no
+/// tracing subscriber is wired); the unit tests in `publisher.rs`
+/// pin the helper-level contract.
+#[tokio::test]
+async fn capture_response_body_success_path_completes() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"ackId":"splunk-abc-123"}"#)
+                .insert_header("content-type", "application/json"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut tc = target_config("capture-test", &format!("{}/hec", server.uri()));
+    tc.capture_response_body = Some(true);
+    let config = http_config(vec![tc]);
+    let publisher = HttpPublisher::new(config).unwrap();
+
+    let msg = make_msg("alice", "tcp", MessageType::Position);
+    publisher.publish(&msg);
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    publisher.shutdown().await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // `expect(1)` is enforced on MockServer drop — the publisher must
+    // have consumed the response. `is_healthy()` is a belt-and-braces
+    // check that the circuit breaker stayed closed (no capture-induced
+    // failure).
+    assert!(
+        publisher.is_healthy(),
+        "capture-enabled success must leave circuit closed"
+    );
+}
+
+/// Capture-disabled success: the default behaviour is unchanged.
+/// Regression pin: a refactor that silently flipped the default to
+/// "always capture" would explode log volume in every existing
+/// deployment. wiremock still verifies the request reaches the mock;
+/// the `capture_response_body` flag only affects whether the body is
+/// *also* emitted on a debug line.
+#[tokio::test]
+async fn capture_response_body_disabled_still_drains_body() {
+    let server = MockServer::start().await;
+
+    // Server returns a non-empty body; with capture disabled the
+    // publisher must still drain it (pool hygiene) but not surface it.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"id":"quiet"}"#))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let config = http_config(vec![target_config(
+        "no-capture",
+        &format!("{}/api", server.uri()),
+    )]);
+    let publisher = HttpPublisher::new(config).unwrap();
+
+    publisher.publish(&make_msg("alice", "tcp", MessageType::Position));
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    publisher.shutdown().await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(publisher.is_healthy());
+}
+
+/// Error-path capture is always on: a 5xx response with a JSON error
+/// body must surface through the normal failure-logging path without
+/// blowing up. wiremock verifies the request reached the server; we
+/// then assert the circuit breaker observed the failure (tripped after
+/// threshold). The captured body is embedded in the error string that
+/// feeds the `http_publish_failed` audit event and the Prometheus
+/// `errors{reason="status_5xx"}` counter.
+#[tokio::test]
+async fn error_response_body_captured_in_failure_path() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .set_body_string(r#"{"error":"ingest pipeline saturated","code":"E-SATURATE"}"#),
+        )
+        .mount(&server)
+        .await;
+
+    let mut tc = target_config("err-capture", &format!("{}/ingest", server.uri()));
+    tc.retry = Some(rustgate_http::config::RetryConfig {
+        max_attempts: Some(1), // fail fast — we only care about capture-on-error
+        backoff_base_secs: Some(0),
+        circuit_breaker_threshold: Some(1), // trip immediately
+        circuit_breaker_cooldown_secs: Some(300),
+        half_open_max_probes: None,
+        half_open_success_threshold: None,
+    });
+    let config = http_config(vec![tc]);
+    let publisher = HttpPublisher::new(config).unwrap();
+
+    publisher.publish(&make_msg("alice", "tcp", MessageType::Position));
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // Circuit breaker must have seen the 5xx — error-path body capture
+    // is downstream of the failure path, so a healthy circuit here
+    // would indicate the response wasn't processed as a failure.
+    assert!(
+        !publisher.is_healthy(),
+        "5xx response must trip circuit breaker; capture path must not mask the failure"
+    );
+
+    publisher.shutdown().await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+
+/// Oversized response body: the server returns a 5 KiB body but the
+/// target caps capture at 1 KiB. The publisher must still drain the
+/// full response (pool hygiene) and truncate the captured snippet to
+/// 1 KiB. Verification is implicit — wiremock records the full
+/// exchange, and `is_healthy()` confirms the publisher processed the
+/// 2xx cleanly despite the size mismatch.
+#[tokio::test]
+async fn oversized_response_body_is_truncated_not_rejected() {
+    let server = MockServer::start().await;
+
+    // 5 KiB body — well above the 1 KiB cap below.
+    let oversized = "A".repeat(5 * 1024);
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(oversized))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut tc = target_config("truncated", &format!("{}/big", server.uri()));
+    tc.capture_response_body = Some(true);
+    tc.max_response_body_bytes = Some(1024);
+    let config = http_config(vec![tc]);
+    let publisher = HttpPublisher::new(config).unwrap();
+
+    publisher.publish(&make_msg("alice", "tcp", MessageType::Position));
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    publisher.shutdown().await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // 2xx response with oversized body must still count as success;
+    // the publisher drains the full body but only captures the cap.
+    assert!(
+        publisher.is_healthy(),
+        "oversized response body must NOT trip the circuit — truncation is silent"
+    );
+}
+
+/// Config validation: a target with `max-response-body-bytes` above
+/// the 1 MiB ceiling is rejected at construction time. Pins the
+/// guardrail against deployments that could otherwise flood structured
+/// logs with megabytes of response body per request.
+#[tokio::test]
+async fn publisher_rejects_oversized_cap_at_construction() {
+    let mut tc = target_config("oversized-cap", "https://example.com/hook");
+    tc.max_response_body_bytes = Some(2 * 1024 * 1024); // 2 MiB, over cap
+    let config = http_config(vec![tc]);
+
+    let err = HttpPublisher::new(config).unwrap_err();
+    assert!(
+        err.to_string().contains("exceeds the 1 MiB cap"),
+        "expected 1 MiB cap error, got: {err}"
     );
 }

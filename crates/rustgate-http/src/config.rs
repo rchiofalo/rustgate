@@ -113,6 +113,40 @@ pub struct TargetConfig {
     /// When unset, requests are unlimited (subject only to circuit breaking).
     /// Prevents overwhelming downstream endpoints with burst traffic.
     pub rate_limit_per_sec: Option<f64>,
+
+    /// Capture and surface the response body on 2xx responses (default: false).
+    ///
+    /// When enabled, up to [`max_response_body_bytes`](Self::max_response_body_bytes)
+    /// bytes of the response body are captured and emitted in a
+    /// structured `tracing::debug!` line on success alongside the
+    /// per-request `delivery_id`. Operators can grep the access log to
+    /// recover downstream acknowledgement IDs (Splunk HEC `ackId`,
+    /// Elastic `_id`, Loki `traceID`) that the receiver returns in the
+    /// body. Disabled by default so existing deployments are not
+    /// spammed with receive payload logs.
+    ///
+    /// On non-2xx responses the captured snippet is *always* included
+    /// in the failure log and error string (independent of this flag)
+    /// because structured 4xx/5xx error details from SIEM collectors
+    /// are the highest-leverage signal for diagnosing misconfigured
+    /// webhook targets. This flag therefore only controls the
+    /// success-path log, not the failure-path log.
+    pub capture_response_body: Option<bool>,
+
+    /// Maximum bytes of response body to capture on any response
+    /// (default: 4 KiB).
+    ///
+    /// Applies to both success-path capture (gated on
+    /// [`capture_response_body`](Self::capture_response_body)) and
+    /// failure-path capture (always on). Responses larger than this
+    /// limit are truncated at the byte level — no attempt is made to
+    /// honour UTF-8 boundaries because the captured bytes are emitted
+    /// through structured logging that sanitises invalid UTF-8.
+    ///
+    /// Bounded explicitly to prevent a malicious server from pushing
+    /// unbounded log volume through this path. Capped at 1 MiB by
+    /// config validation.
+    pub max_response_body_bytes: Option<usize>,
 }
 
 /// Custom HTTP header entry.
@@ -303,6 +337,26 @@ impl TargetConfig {
     /// Whether this target is enabled (default: true).
     pub fn is_enabled(&self) -> bool {
         self.enabled.unwrap_or(true)
+    }
+
+    /// Effective response-body capture flag (default: false).
+    ///
+    /// When `true`, the publisher captures up to
+    /// [`effective_max_response_body_bytes`](Self::effective_max_response_body_bytes)
+    /// bytes of each 2xx response and emits them in a structured
+    /// `tracing::debug!` line alongside the per-request `delivery_id`.
+    pub fn effective_capture_response_body(&self) -> bool {
+        self.capture_response_body.unwrap_or(false)
+    }
+
+    /// Effective maximum captured response-body size (default: 4 KiB,
+    /// capped at 1 MiB by config validation).
+    ///
+    /// Applies symmetrically to the success-path capture and the
+    /// failure-path capture (which is always on when the body is small
+    /// enough to pull cheaply).
+    pub fn effective_max_response_body_bytes(&self) -> usize {
+        self.max_response_body_bytes.unwrap_or(4 * 1024)
     }
 }
 
@@ -634,6 +688,18 @@ impl HttpConfig {
                 target.name
             ));
         }
+
+        // Response body capture cap — bounded to 1 MiB to prevent a
+        // misconfigured deployment from turning every failed request
+        // into a megabyte of structured log spam.
+        if let Some(cap) = target.max_response_body_bytes
+            && cap > 1024 * 1024
+        {
+            errors.push(format!(
+                "target `{}`: max-response-body-bytes ({cap}) exceeds the 1 MiB cap",
+                target.name
+            ));
+        }
     }
 }
 
@@ -698,6 +764,8 @@ mod tests {
             headers: None,
             max_payload_bytes: None,
             rate_limit_per_sec: None,
+            capture_response_body: None,
+            max_response_body_bytes: None,
         }
     }
 
@@ -1577,5 +1645,78 @@ url = "https://example.com"
         let config: HttpConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.dlq_max_bytes, Some(268_435_456));
         assert_eq!(config.dlq_max_target_bytes, Some(1_073_741_824));
+    }
+
+    // ── Response body capture (issue #906) ────────────────────────────
+
+    /// Defaults: capture off, cap at 4 KiB. Keeps existing deployments
+    /// from suddenly logging response bodies after the upgrade.
+    #[test]
+    fn response_body_defaults_are_conservative() {
+        let t = minimal_target("t1", "https://example.com");
+        assert!(
+            !t.effective_capture_response_body(),
+            "capture must default to off"
+        );
+        assert_eq!(
+            t.effective_max_response_body_bytes(),
+            4 * 1024,
+            "cap must default to 4 KiB"
+        );
+    }
+
+    /// Custom values round-trip through the effective accessors.
+    #[test]
+    fn response_body_explicit_values_round_trip() {
+        let mut t = minimal_target("t1", "https://example.com");
+        t.capture_response_body = Some(true);
+        t.max_response_body_bytes = Some(16 * 1024);
+        assert!(t.effective_capture_response_body());
+        assert_eq!(t.effective_max_response_body_bytes(), 16 * 1024);
+    }
+
+    /// The 1 MiB cap is enforced at validation time — no deployment can
+    /// configure a per-target cap higher than this.
+    #[test]
+    fn rejects_max_response_body_bytes_above_1mib() {
+        let mut t = minimal_target("t1", "https://example.com");
+        t.max_response_body_bytes = Some(1024 * 1024 + 1);
+        let cfg = config_with_targets(vec![t]);
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds the 1 MiB cap"),
+            "got: {err}"
+        );
+    }
+
+    /// The 1 MiB boundary is the *inclusive* upper limit. A target
+    /// configured with exactly 1 MiB must pass validation.
+    #[test]
+    fn accepts_max_response_body_bytes_at_1mib_boundary() {
+        let mut t = minimal_target("t1", "https://example.com");
+        t.max_response_body_bytes = Some(1024 * 1024);
+        let cfg = config_with_targets(vec![t]);
+        assert!(cfg.validate().is_ok());
+    }
+
+    /// TOML round-trip: kebab-case config keys deserialise into the
+    /// struct fields. Operator docs advertise kebab-case, so a
+    /// regression that drops `rename_all = "kebab-case"` or renames
+    /// either field would silently break deployed configs.
+    #[test]
+    fn toml_response_body_fields_roundtrip_kebab_case() {
+        let toml_str = r#"
+[[targets]]
+name = "splunk-hec"
+url = "https://example.com/services/collector/event"
+capture-response-body = true
+max-response-body-bytes = 8192
+"#;
+        let config: HttpConfig = toml::from_str(toml_str).unwrap();
+        let t = &config.targets[0];
+        assert_eq!(t.capture_response_body, Some(true));
+        assert_eq!(t.max_response_body_bytes, Some(8192));
+        assert!(t.effective_capture_response_body());
+        assert_eq!(t.effective_max_response_body_bytes(), 8192);
     }
 }
