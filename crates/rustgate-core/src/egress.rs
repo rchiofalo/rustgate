@@ -3,9 +3,9 @@
 //! Transport-agnostic egress forwarding callback aliases.
 //!
 //! When a session crate (WebSocket, MQTT, future adapters) accepts an
-//! inbound message and pushes it through the local [`Router`] for
-//! egress, the server binary wants to fan that same post-Send-PEP
-//! message out to optional sinks that live outside the router:
+//! inbound message and pushes it through the local router for egress,
+//! the server binary wants to fan that same post-Send-PEP message out
+//! to optional sinks that live outside the router:
 //!
 //! - the NATS bridge (horizontal scale-out to peer instances),
 //! - the federation layer (server-to-server mesh),
@@ -19,8 +19,10 @@
 //! Rust 1.94. Closures dispatch their async work internally via
 //! [`spawn_background`](crate::tasks::spawn_background).
 //!
-//! [`Router`]: https://docs.rs/rustgate-transport — the router type
-//! lives in `rustgate-transport`, which depends on this crate.
+//! The router type itself lives in the `rustgate-transport` crate,
+//! which depends on this crate — these aliases sit at the lowest
+//! common dependency layer so every transport crate and the server
+//! binary can reuse the same callback shapes.
 
 use std::sync::Arc;
 
