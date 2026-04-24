@@ -1193,6 +1193,28 @@ pub(crate) enum Command {
         #[arg(long)]
         file: String,
     },
+    /// Inspect a PEM-encoded X.509 certificate (subject, issuer, SANs,
+    /// validity, groups, SPIFFE ID, fingerprint). Useful for
+    /// debugging mTLS handshake failures without starting the server.
+    CertInfo {
+        /// Path to the certificate PEM file.
+        #[arg(value_name = "FILE")]
+        file: std::path::PathBuf,
+        /// Emit a stable JSON document instead of the human layout.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect a PEM-encoded X.509 CRL (issuer, thisUpdate /
+    /// nextUpdate freshness, and each revoked entry's serial,
+    /// revocation date, and reason).
+    CrlInfo {
+        /// Path to the CRL PEM file.
+        #[arg(value_name = "FILE")]
+        file: std::path::PathBuf,
+        /// Emit a stable JSON document instead of the human layout.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Serialize, Deserialize)]
