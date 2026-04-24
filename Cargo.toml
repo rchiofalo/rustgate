@@ -68,7 +68,7 @@ base64 = "0.22"
 tokio-tungstenite = "0.29"
 socket2 = "0.6"
 rustix = { version = "1", default-features = false, features = ["process"] }
-async-nats = { version = "0.47", default-features = false, features = ["jetstream", "nkeys"] }
+async-nats = { version = "0.47", default-features = false, features = ["jetstream", "nkeys", "server_2_10"] }
 prost = "0.14"
 prost-build = "0.14"
 prost-types = "0.14"
