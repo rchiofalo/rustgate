@@ -1341,6 +1341,7 @@ mod tests {
             dir.path().to_path_buf(),
             admission_test_key_ring(),
             None,
+            None,
         ));
 
         // Gate with a tiny 64-byte cap and zero resume dwell so the
