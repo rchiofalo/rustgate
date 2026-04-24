@@ -23,6 +23,7 @@ static QUEUE_DEPTH: OnceLock<IntGauge> = OnceLock::new();
 static DROPPED: OnceLock<IntCounterVec> = OnceLock::new();
 static DLQ_EVICTED: OnceLock<IntCounterVec> = OnceLock::new();
 static RESPONSE_BODIES_CAPTURED: OnceLock<IntCounterVec> = OnceLock::new();
+static BATCHES_FLUSHED: OnceLock<IntCounterVec> = OnceLock::new();
 
 // ── Fallback constructors ──────────────────────────────────────────
 
@@ -169,6 +170,23 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(response_bodies_captured.clone()))?;
     let _ = RESPONSE_BODIES_CAPTURED.set(response_bodies_captured);
 
+    let batches_flushed = IntCounterVec::new(
+        Opts::new(
+            "rustgate_http_batches_flushed_total",
+            "Batched HTTP egress flush events, incremented once per \
+             outbound batched request. Labelled by target name and flush \
+             reason: `count` (batch-max-messages hit), `bytes` \
+             (batch-max-bytes hit), or `drain` (graceful shutdown flush). \
+             The ratio of `drain` to `count`+`bytes` is an operator signal \
+             that batch thresholds are too high — a steady drain rate \
+             suggests traffic is arriving faster than it is being flushed \
+             by threshold pressure alone.",
+        ),
+        &["target", "reason"],
+    )?;
+    registry.register(Box::new(batches_flushed.clone()))?;
+    let _ = BATCHES_FLUSHED.set(batches_flushed);
+
     Ok(())
 }
 
@@ -265,6 +283,26 @@ pub fn response_bodies_captured() -> &'static IntCounterVec {
     })
 }
 
+/// Batched HTTP flush events counter, labelled by target and reason.
+///
+/// Increments once per outbound batched HTTP request. Reason labels:
+/// - `count` — batch-max-messages threshold hit
+/// - `bytes` — batch-max-bytes threshold hit
+/// - `drain` — graceful shutdown flush
+///
+/// A steady `drain` rate relative to `count`+`bytes` suggests batch
+/// thresholds are too high relative to arrival rate — operators can
+/// use it to tune `batch-max-messages` / `batch-max-bytes`.
+pub fn batches_flushed() -> &'static IntCounterVec {
+    BATCHES_FLUSHED.get_or_init(|| {
+        fallback_counter_vec(
+            "rustgate_http_batches_flushed_total",
+            "fallback",
+            &["target", "reason"],
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::panic, clippy::unwrap_used)]
@@ -282,6 +320,7 @@ mod tests {
         let _ = filtered();
         let _ = queue_depth();
         let _ = response_bodies_captured();
+        let _ = batches_flushed();
     }
 
     #[test]
@@ -358,6 +397,10 @@ mod tests {
             response_bodies_captured().desc()[0].fq_name,
             "rustgate_http_response_bodies_captured_total"
         );
+        assert_eq!(
+            batches_flushed().desc()[0].fq_name,
+            "rustgate_http_batches_flushed_total"
+        );
     }
 
     #[test]
@@ -388,6 +431,10 @@ mod tests {
         assert_eq!(
             labels_of(response_bodies_captured().desc()[0]),
             vec!["target".to_string()]
+        );
+        assert_eq!(
+            labels_of(batches_flushed().desc()[0]),
+            vec!["target".to_string(), "reason".to_string()]
         );
         // Non-vector metrics carry no variable labels.
         assert!(labels_of(queue_depth().desc()[0]).is_empty());
@@ -511,6 +558,7 @@ mod tests {
             response_bodies_captured(),
             response_bodies_captured()
         ));
+        assert!(std::ptr::eq(batches_flushed(), batches_flushed()));
     }
 
     #[test]
@@ -545,6 +593,7 @@ mod tests {
             queue_depth().desc()[0],
             request_duration().desc()[0],
             response_bodies_captured().desc()[0],
+            batches_flushed().desc()[0],
         ] {
             assert!(
                 !d.help.is_empty(),

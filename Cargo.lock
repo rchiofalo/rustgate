@@ -3331,6 +3331,7 @@ dependencies = [
  "hex",
  "hmac",
  "opentelemetry",
+ "parking_lot",
  "prometheus",
  "prost",
  "reqwest",

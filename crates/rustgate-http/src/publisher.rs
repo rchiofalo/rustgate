@@ -26,7 +26,8 @@ use tracing::Instrument;
 use zeroize::Zeroizing;
 
 use crate::auth::AuthState;
-use crate::config::{HttpConfig, PayloadFormat, TargetConfig};
+use crate::batch::Batcher;
+use crate::config::{BatchFormat, HttpConfig, PayloadFormat, TargetConfig};
 use crate::dlq::DeadLetterQueue;
 use crate::error::HttpError;
 use crate::filter::CompiledFilter;
@@ -123,6 +124,12 @@ struct TargetState {
     /// Enforced symmetrically to prevent a misconfigured endpoint from
     /// flooding structured logs with megabytes of error detail.
     max_response_body_bytes: usize,
+    /// Batch framing used when [`batcher`](Self::batcher) is `Some`.
+    batch_format: BatchFormat,
+    /// Per-target in-memory batcher, present iff batching is enabled
+    /// in config. `parking_lot::Mutex` is the workspace hot-path
+    /// primitive — doesn't poison, no `.unwrap()` on lock.
+    batcher: Option<Arc<parking_lot::Mutex<Batcher>>>,
 }
 
 impl fmt::Debug for TargetState {
@@ -426,6 +433,18 @@ fn build_target(
         .rate_limit_per_sec
         .map(|rate| TokenBucket::new(rate, None));
 
+    // Only instantiate a batcher when the operator opted in — `None`
+    // keeps the single-message hot path free of any lock/branch cost
+    // for the overwhelming majority of pre-#906 deployments.
+    let batcher = if tc.effective_batch_enabled() {
+        Some(Arc::new(parking_lot::Mutex::new(Batcher::new(
+            tc.effective_batch_max_messages(),
+            tc.effective_batch_max_bytes(),
+        ))))
+    } else {
+        None
+    };
+
     Ok(TargetState {
         name: tc.name.clone(),
         client,
@@ -443,6 +462,8 @@ fn build_target(
         rate_limiter,
         capture_response_body: tc.effective_capture_response_body(),
         max_response_body_bytes: tc.effective_max_response_body_bytes(),
+        batch_format: tc.effective_batch_format(),
+        batcher,
     })
 }
 
@@ -723,6 +744,11 @@ async fn dispatch_worker(
                     // `queued` drops here, releasing the permit.
                     drop(queued);
                 }
+                // Drain every per-target batcher so buffered messages that
+                // never hit a count/bytes threshold still get one final
+                // HTTP send before the worker returns. No-op on targets
+                // with batching disabled.
+                drain_batchers(&targets).await;
                 tracing::info!("HTTP dispatch worker stopped");
                 return;
             }
@@ -738,6 +764,7 @@ async fn dispatch_worker(
                     }
                     None => {
                         tracing::info!("HTTP dispatch channel closed");
+                        drain_batchers(&targets).await;
                         return;
                     }
                 }
@@ -860,17 +887,55 @@ async fn dispatch_to_target(
         }
     };
 
-    // Stable delivery ID: generated once per message-target pair so retries
-    // carry the same ID, enabling receiver-side deduplication.
+    // Convert to Bytes once — Bytes::clone() is a ref-count bump, not a memcpy,
+    // so retries and auth signing can share the same allocation.
+    let body = bytes::Bytes::from(body_vec);
+
+    // Batching branch: when the operator opted into `batch-enabled`, push
+    // the serialized single-message body into the per-target batcher and
+    // return early unless a count/bytes threshold fires. When a flush
+    // fires, render the combined batch body and run a *single* retry
+    // loop on it. The rate-limit / circuit / oversize checks above still
+    // run per-message (they govern admission into the batcher, not the
+    // outbound request cadence).
+    if let Some(ref batcher_lock) = target.batcher {
+        let flush = {
+            let mut batcher = batcher_lock.lock();
+            batcher.push(body.clone())
+        };
+        let Some(flush) = flush else {
+            return;
+        };
+        #[cfg(feature = "metrics")]
+        crate::metrics::batches_flushed()
+            .with_label_values(&[target.name.as_str(), flush.reason.as_str()])
+            .inc();
+        let bodies = flush.bodies();
+        let (batch_body, batch_ct) = payload::render_batch(&bodies, target.batch_format);
+        publish_with_retry(target, batch_body, batch_ct, Some(flush.len())).await;
+        return;
+    }
+
+    publish_with_retry(target, body, content_type, None).await;
+}
+
+/// Retry loop for a single outbound request — shared by the solo-message
+/// path and the batched path. `batch_size = Some(n)` adds `batch_size`
+/// fields to every structured log line so operators can tell a batched
+/// request apart from a solo send in the access log.
+async fn publish_with_retry(
+    target: &TargetState,
+    body: bytes::Bytes,
+    content_type: &'static str,
+    batch_size: Option<usize>,
+) {
+    // Stable delivery ID: generated once per request (solo or batch) so
+    // retries carry the same ID, enabling receiver-side deduplication.
     let delivery_id = generate_delivery_id();
 
     // Content-Digest (RFC 9530): SHA-256 hash of the serialized body for
     // end-to-end integrity verification by the receiver.
-    let content_digest = compute_content_digest(&body_vec);
-
-    // Convert to Bytes once — Bytes::clone() is a ref-count bump, not a memcpy,
-    // so retries and auth signing can share the same allocation.
-    let body = bytes::Bytes::from(body_vec);
+    let content_digest = compute_content_digest(&body);
 
     // Retry loop with optional Retry-After from 429 responses
     let mut retry_after_hint: Option<Duration> = None;
@@ -929,6 +994,7 @@ async fn dispatch_to_target(
                         target = %target.name,
                         attempt = attempt + 1,
                         delivery_id = %delivery_id,
+                        batch_size = batch_size.unwrap_or(1),
                         body_bytes = ack_body.len(),
                         body = %format_body_snippet(ack_body),
                         "HTTP publish succeeded with response body"
@@ -938,6 +1004,7 @@ async fn dispatch_to_target(
                         target = %target.name,
                         attempt = attempt + 1,
                         delivery_id = %delivery_id,
+                        batch_size = batch_size.unwrap_or(1),
                         "HTTP publish succeeded"
                     );
                 }
@@ -988,6 +1055,7 @@ async fn dispatch_to_target(
                         target = %target.name,
                         attempt = attempt + 1,
                         delivery_id = %delivery_id,
+                        batch_size = batch_size.unwrap_or(1),
                         error = %err,
                         status = ?status,
                         retryable,
@@ -1007,12 +1075,49 @@ async fn dispatch_to_target(
                     target = %target.name,
                     attempt = attempt + 1,
                     delivery_id = %delivery_id,
+                    batch_size = batch_size.unwrap_or(1),
                     error = %err,
                     status = ?status,
                     "HTTP publish failed, will retry"
                 );
             }
         }
+    }
+}
+
+/// Drain every target's in-memory batcher on shutdown, issuing one last
+/// HTTP request per non-empty batcher so buffered messages don't vanish
+/// when the worker stops. Runs after the main dispatch channel has
+/// drained and before the worker returns.
+///
+/// If a target's circuit is open at drain time the retry loop will
+/// still fire its attempts — that is consistent with the single-message
+/// shutdown path, which also runs its normal circuit / retry logic on
+/// the trailing messages.
+async fn drain_batchers(targets: &[TargetState]) {
+    for target in targets {
+        let Some(ref batcher_lock) = target.batcher else {
+            continue;
+        };
+        let flush = {
+            let mut batcher = batcher_lock.lock();
+            batcher.drain()
+        };
+        let Some(flush) = flush else {
+            continue;
+        };
+        #[cfg(feature = "metrics")]
+        crate::metrics::batches_flushed()
+            .with_label_values(&[target.name.as_str(), flush.reason.as_str()])
+            .inc();
+        let bodies = flush.bodies();
+        let (batch_body, batch_ct) = payload::render_batch(&bodies, target.batch_format);
+        tracing::info!(
+            target = %target.name,
+            batch_size = flush.len(),
+            "flushing trailing batch on shutdown"
+        );
+        publish_with_retry(target, batch_body, batch_ct, Some(flush.len())).await;
     }
 }
 
@@ -1580,6 +1685,10 @@ mod tests {
                 rate_limit_per_sec: None,
                 capture_response_body: None,
                 max_response_body_bytes: None,
+                batch_enabled: None,
+                batch_max_messages: None,
+                batch_max_bytes: None,
+                batch_format: None,
             }],
             dlq_dir: None,
             dlq_key_file: None,

@@ -40,6 +40,7 @@
 //!   for outbound TLS connections.
 
 pub(crate) mod auth;
+pub(crate) mod batch;
 pub mod config;
 pub(crate) mod dlq;
 pub mod dlq_reader;
