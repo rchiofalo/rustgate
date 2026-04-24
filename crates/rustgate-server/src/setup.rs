@@ -834,6 +834,7 @@ pub(crate) async fn start_metrics(
     readiness: &Arc<metrics::ReadinessState>,
     #[cfg(feature = "federation")] fed_api_slot: &Arc<std::sync::OnceLock<metrics::FedApiHandler>>,
     acl_api_slot: &Arc<std::sync::OnceLock<metrics::AclApiHandler>>,
+    mgmt_api_slot: &Arc<std::sync::OnceLock<metrics::MgmtApiHandler>>,
     router_slot: &metrics::RouterSlot,
 ) -> anyhow::Result<Arc<metrics::MetricsIdentity>> {
     metrics::init().context("registering metrics")?;
@@ -900,6 +901,7 @@ pub(crate) async fn start_metrics(
         #[cfg(feature = "federation")]
         let fed_api_for_metrics = Arc::clone(fed_api_slot);
         let acl_api_for_metrics = Arc::clone(acl_api_slot);
+        let mgmt_api_for_metrics = Arc::clone(mgmt_api_slot);
         let metrics_token_for_server = metrics_token.clone();
         let router_for_metrics = Arc::clone(router_slot);
         let max_http_connections = cli.metrics_max_connections;
@@ -911,6 +913,7 @@ pub(crate) async fn start_metrics(
                 #[cfg(feature = "federation")]
                 fed_api_for_metrics,
                 acl_api_for_metrics,
+                mgmt_api_for_metrics,
                 metrics_token_for_server,
                 router_for_metrics,
                 max_http_connections,

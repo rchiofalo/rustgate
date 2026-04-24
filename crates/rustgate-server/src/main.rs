@@ -34,6 +34,8 @@ mod diagnostics;
 mod federation_reloader;
 #[cfg(feature = "metrics")]
 mod metrics;
+#[cfg(feature = "metrics")]
+mod mgmt_api;
 #[cfg(feature = "otel")]
 mod otel;
 #[cfg(all(feature = "otel", feature = "metrics"))]
@@ -519,6 +521,10 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
         Arc::new(std::sync::OnceLock::new());
 
     #[cfg(feature = "metrics")]
+    let mgmt_api_slot: Arc<std::sync::OnceLock<metrics::MgmtApiHandler>> =
+        Arc::new(std::sync::OnceLock::new());
+
+    #[cfg(feature = "metrics")]
     let router_slot: metrics::RouterSlot = Arc::new(std::sync::OnceLock::new());
 
     #[cfg(feature = "metrics")]
@@ -529,6 +535,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
         #[cfg(feature = "federation")]
         &fed_api_slot,
         &acl_api_slot,
+        &mgmt_api_slot,
         &router_slot,
     )
     .await?;
@@ -1014,6 +1021,43 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     }
     #[cfg(not(feature = "metrics"))]
     let _ = acl_file_parsed;
+
+    // ── Management REST API (read-only status endpoints) ───────────
+    //
+    // Registered only when `--mgmt-api-token-file` is supplied. Exposes
+    // `/api/cert/status`, `/api/crl/status`, and `/api/dedup/stats` for
+    // operator diagnostics. All routes require `Authorization: Bearer`
+    // and are constant-time compared. The handler is read-only: no
+    // endpoint mutates router/TLS state, so a narrow scrape token is
+    // safe to hand to low-trust polling jobs.
+    #[cfg(feature = "metrics")]
+    {
+        if let Some(ref token_file) = cli.mgmt_api_token_file {
+            let token = tokio::fs::read_to_string(token_file).await.map_err(|e| {
+                anyhow::anyhow!("failed to read management API token file {token_file}: {e}")
+            })?;
+            let token = token.trim().as_bytes().to_vec();
+            if token.is_empty() {
+                anyhow::bail!("management API token file {token_file} is empty");
+            }
+            acl_api::validate_bearer_token_length(&token, "management API")
+                .map_err(|e| anyhow::anyhow!("{e} (from {token_file})"))?;
+            let api_state = Arc::new(mgmt_api::MgmtApiState {
+                router: Arc::clone(&router),
+                cert_reloader: cert_reloader.as_ref().map(Arc::clone),
+                crl_path: cli.crl.as_ref().map(std::path::PathBuf::from),
+                auth_token: zeroize::Zeroizing::new(token),
+            });
+            let handler: metrics::MgmtApiHandler = Arc::new(move |method, path, auth, body| {
+                mgmt_api::handle_request(method, path, auth, body, &api_state)
+            });
+            let _ = mgmt_api_slot.set(handler);
+            tracing::info!(
+                "management REST API enabled at /api/cert/, /api/crl/, /api/dedup/ \
+                 (read-only status endpoints)"
+            );
+        }
+    }
 
     let connection_limit = Arc::new(Semaphore::new(max_connections as usize));
 

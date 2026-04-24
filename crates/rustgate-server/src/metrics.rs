@@ -48,6 +48,21 @@ pub type AclApiHandler = Arc<
         + Sync,
 >;
 
+/// Type-erased management API handler.
+///
+/// When set, the metrics server delegates requests under
+/// `/api/cert/`, `/api/crl/`, and `/api/dedup/` to this handler. Returns
+/// `None` when the path does not match any management-API route so the
+/// caller can fall through to the next handler or the default 404.
+///
+/// Signature mirrors [`AclApiHandler`] so the two share dispatch plumbing
+/// in [`serve`].
+pub type MgmtApiHandler = Arc<
+    dyn Fn(&hyper::Method, &str, Option<&str>, &[u8]) -> Option<Response<Full<Bytes>>>
+        + Send
+        + Sync,
+>;
+
 /// Default maximum concurrent connections to the metrics HTTP server.
 /// Bounds memory usage from connection floods against the unauthenticated
 /// HTTP endpoint (the TLS listener has its own separate limit).
@@ -2442,6 +2457,7 @@ pub async fn serve(
     readiness: Arc<ReadinessState>,
     #[cfg(feature = "federation")] fed_api: Arc<OnceLock<FedApiHandler>>,
     acl_api: Arc<OnceLock<AclApiHandler>>,
+    mgmt_api: Arc<OnceLock<MgmtApiHandler>>,
     metrics_token: Option<Arc<Zeroizing<Vec<u8>>>>,
     router_slot: RouterSlot,
     max_http_connections: usize,
@@ -2477,6 +2493,7 @@ pub async fn serve(
         #[cfg(feature = "federation")]
         let fed_api = Arc::clone(&fed_api);
         let acl_api = Arc::clone(&acl_api);
+        let mgmt_api = Arc::clone(&mgmt_api);
         let metrics_token = metrics_token.clone();
         let router_slot = Arc::clone(&router_slot);
         drop(tokio::spawn(async move {
@@ -2492,6 +2509,7 @@ pub async fn serve(
                         #[cfg(feature = "federation")]
                         let fed_api = Arc::clone(&fed_api);
                         let acl_api = Arc::clone(&acl_api);
+                        let mgmt_api = Arc::clone(&mgmt_api);
                         let metrics_token = metrics_token.clone();
                         let router_slot = Arc::clone(&router_slot);
                         async move {
@@ -2537,6 +2555,41 @@ pub async fn serve(
                                     .status(StatusCode::NOT_FOUND)
                                     .body(Full::new(Bytes::from("not found")))
                                     .unwrap_or_else(|_| internal_error_response()));
+                            }
+                            // Delegate /api/cert/, /api/crl/, /api/dedup/
+                            // paths to the read-only management handler.
+                            // Runs before the generic handler so unknown
+                            // suffixes under these prefixes produce the
+                            // handler's structured 401/404/405 envelope
+                            // rather than the bare 404 below.
+                            {
+                                let path_str = req.uri().path();
+                                if (path_str.starts_with("/api/cert/")
+                                    || path_str.starts_with("/api/crl/")
+                                    || path_str.starts_with("/api/dedup/"))
+                                    && let Some(handler) = mgmt_api.get()
+                                {
+                                    let method = req.method().clone();
+                                    let path = path_str.to_string();
+                                    let auth = req
+                                        .headers()
+                                        .get(hyper::header::AUTHORIZATION)
+                                        .and_then(|v| v.to_str().ok())
+                                        .map(|s| s.to_string());
+                                    let body = http_body_util::BodyExt::collect(req.into_body())
+                                        .await
+                                        .map(|b| b.to_bytes())
+                                        .unwrap_or_default();
+                                    if let Some(resp) =
+                                        handler(&method, &path, auth.as_deref(), &body)
+                                    {
+                                        return Ok(resp);
+                                    }
+                                    return Ok(Response::builder()
+                                        .status(StatusCode::NOT_FOUND)
+                                        .body(Full::new(Bytes::from("not found")))
+                                        .unwrap_or_else(|_| internal_error_response()));
+                                }
                             }
                             // If no ACL handler is registered, fall
                             // through to the generic request handler,
@@ -3154,6 +3207,7 @@ mod tests {
                 #[cfg(feature = "federation")]
                 Arc::new(OnceLock::new()),
                 Arc::new(OnceLock::new()),
+                Arc::new(OnceLock::new()),
                 None, // no metrics token — backward compatible unauthenticated
                 server_router_slot,
                 DEFAULT_MAX_HTTP_CONNECTIONS,
@@ -3317,6 +3371,7 @@ mod tests {
                 #[cfg(feature = "federation")]
                 Arc::new(OnceLock::new()),
                 Arc::new(OnceLock::new()),
+                Arc::new(OnceLock::new()),
                 None,
                 server_router_slot,
                 DEFAULT_MAX_HTTP_CONNECTIONS,
@@ -3382,6 +3437,7 @@ mod tests {
                 server_health,
                 server_readiness,
                 #[cfg(feature = "federation")]
+                Arc::new(OnceLock::new()),
                 Arc::new(OnceLock::new()),
                 Arc::new(OnceLock::new()),
                 None,
@@ -3739,6 +3795,7 @@ mod tests {
                 health,
                 readiness,
                 #[cfg(feature = "federation")]
+                Arc::new(OnceLock::new()),
                 Arc::new(OnceLock::new()),
                 Arc::new(OnceLock::new()),
                 metrics_token,
