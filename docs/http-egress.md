@@ -41,6 +41,7 @@ The HTTP egress config is a standalone TOML file passed via `--http-config-file`
 | `dlq-dir` | string | none | Directory for encrypted dead-letter queue files (requires `dlq-key-file`) |
 | `dlq-key-file` | string | none | Path to JSON key file for DLQ encryption (same `KeyRing` format as `rustgate-core`) |
 | `dlq-max-bytes` | integer | `268435456` | Maximum DLQ file size per target before rotation (256 MiB default) |
+| `dlq-max-target-bytes` | integer | `0` (unlimited) | Maximum total DLQ bytes on disk per target across all rotated files. When the sealed-tail footprint for a target exceeds this cap the oldest sealed file is deleted (drop-oldest FIFO); the active segment is always preserved. Must be `>= dlq-max-bytes` when both are set. |
 
 ### Target Fields
 
@@ -288,10 +289,11 @@ When `dlq-dir` and `dlq-key-file` are configured, messages that cannot be delive
 ```toml
 dlq-dir = "/var/lib/rustgate/dlq"
 dlq-key-file = "/etc/rustgate/keys/dlq.json"
-dlq-max-bytes = 268435456    # 256 MiB per-target file before rotation (default)
+dlq-max-bytes = 268435456               # 256 MiB per-target file before rotation (default)
+dlq-max-target-bytes = 1073741824       # 1 GiB total footprint cap per target (optional)
 ```
 
-Each target gets a separate file per process lifetime, named `{target}_{timestamp}.dlq.enc`. Files are rotated when they exceed `dlq-max-bytes`. The key file uses the same `KeyRing` JSON format as `rustgate-core::encrypted`:
+Each target gets a separate file per process lifetime, named `{target}_{timestamp}.dlq.enc`. Files are rotated when they exceed `dlq-max-bytes`. When `dlq-max-target-bytes` is set, once the per-target on-disk footprint exceeds that cap after a rotation, the oldest sealed segments for that target are deleted until the footprint fits (drop-oldest FIFO eviction). The active segment is always preserved so the live encrypted writer is never unlinked from under the publisher. The key file uses the same `KeyRing` JSON format as `rustgate-core::encrypted`:
 
 ```json
 {
@@ -317,6 +319,7 @@ When built with `--features http,metrics`, the following Prometheus metrics are 
 | `rustgate_http_retries_total` | Counter | `target` | Retry attempts |
 | `rustgate_http_filtered_total` | Counter | `target` | Messages filtered out |
 | `rustgate_http_queue_depth` | Gauge | — | Current internal channel occupancy |
+| `rustgate_http_dlq_evicted_total` | Counter | `target` | DLQ files evicted by the per-target total-bytes sweep |
 
 Error reasons: `network`, `status_4xx`, `status_5xx`, `status_other`, `circuit_open`, `serialize`, `channel_full`, `rate_limited`, `payload_too_large`.
 

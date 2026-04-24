@@ -162,6 +162,7 @@ impl HttpPublisher {
                     std::path::PathBuf::from(dir),
                     key_ring,
                     config.dlq_max_bytes,
+                    config.dlq_max_target_bytes,
                 )))
             }
             _ => None,
@@ -1178,6 +1179,7 @@ mod tests {
             dir.path().to_path_buf(),
             admission_test_key_ring(),
             None,
+            None,
         ));
 
         // Capacity-1 channel: first send fills it, second send returns Full.
@@ -1255,6 +1257,7 @@ mod tests {
             dlq_dir: None,
             dlq_key_file: None,
             dlq_max_bytes: None,
+            dlq_max_target_bytes: None,
             allow_private_urls: false,
         };
         let err = HttpPublisher::new(config).unwrap_err();
