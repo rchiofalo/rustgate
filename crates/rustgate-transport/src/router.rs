@@ -985,6 +985,21 @@ impl Router {
         guard.as_ref().as_ref().map(|d| (d.hits(), d.len()))
     }
 
+    /// Configured deduplication window, in whole seconds, when a dedup
+    /// cache is installed.
+    ///
+    /// Returns `None` when deduplication is disabled. The value is the
+    /// `Duration` the cache was built with, truncated to seconds; the
+    /// sub-second component is dropped because the management REST API
+    /// surfaces this for human operators (who do not care about
+    /// sub-second granularity) and keeping the JSON shape a plain `u64`
+    /// avoids pulling `serde_with`/`humantime` into the server crate
+    /// solely for one field.
+    pub fn dedup_window_seconds(&self) -> Option<u64> {
+        let guard = self.dedup.load();
+        guard.as_ref().as_ref().map(|d| d.window().as_secs())
+    }
+
     /// Attach a multicast configuration for SA event routing.
     ///
     /// When configured, the router can send messages to multiple groups

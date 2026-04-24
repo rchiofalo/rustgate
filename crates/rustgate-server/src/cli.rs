@@ -1042,6 +1042,24 @@ pub(crate) struct Cli {
     #[arg(long, env = "RUSTGATE_ACL_API_TOKEN_FILE")]
     pub(crate) acl_api_token_file: Option<String>,
 
+    /// Path to a file containing the bearer token required to access the
+    /// read-only `/api/cert/`, `/api/crl/`, and `/api/dedup/` management
+    /// REST endpoints.
+    ///
+    /// When unset, the management API is not registered at all — requests
+    /// under those prefixes fall through to the metrics server's generic
+    /// 404 handler. When set, every request must present
+    /// `Authorization: Bearer <token>` and the supplied token is compared
+    /// to the file contents in constant time (subject to the same
+    /// `[32, 256]` byte length bounds as the ACL API).
+    ///
+    /// Unlike `--acl-api-token-file`, these endpoints are read-only —
+    /// they surface diagnostics (cert expiry, CRL staleness, dedup cache
+    /// stats) without allowing mutation. The token can therefore be
+    /// issued to narrower scrape/polling jobs than the ACL write token.
+    #[arg(long, env = "RUSTGATE_MGMT_API_TOKEN_FILE")]
+    pub(crate) mgmt_api_token_file: Option<String>,
+
     // -- Data retention / archival --
     /// Directory for CoT event archival (JSONL). Enables structured logging of
     /// all received CoT events to date-stamped files.
@@ -1594,6 +1612,7 @@ define_config_file! {
     authz_allow_unknown_obligations: bool,
     tenant_quota_file: Option<std::path::PathBuf>,
     acl_api_token_file: Option<String>,
+    mgmt_api_token_file: Option<String>,
     archive_dir: Option<String>,
     archive_key_file: Option<std::path::PathBuf>,
     archive_max_size: u64,
