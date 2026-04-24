@@ -76,7 +76,7 @@ pub type ReloadFn = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = JsonValue> + Sen
 /// surface.
 pub struct MgmtApiState {
     /// Router handle used by [`dedup_stats`] to read cache metrics and
-    /// by [`disconnect_client`] to signal a session writer task.
+    /// by [`disconnect_client_handler`] to signal a session writer task.
     pub router: Arc<Router>,
     /// Certificate reloader handle. Present when the server is running
     /// with a file-backed cert (the only case where
