@@ -156,6 +156,64 @@ impl NatsSubscriber {
         Ok(consumer)
     }
 
+    /// Publish a poison message to the configured dead-letter subject,
+    /// if any. Returns without side effects when `dead_letter_subject`
+    /// is `None` — the DLQ is strictly opt-in.
+    ///
+    /// The original payload is forwarded unchanged so operators can
+    /// inspect whatever garbage arrived at the subscriber. Diagnostic
+    /// context travels in headers:
+    ///
+    /// - `X-Rustgate-DLQ-Reason` — short slug identifying which drop
+    ///   path fired (`oversized`, `unparseable`, `unknown-position`,
+    ///   `invalid-identity`).
+    /// - `X-Rustgate-DLQ-Original-Subject` — the live-stream subject
+    ///   the poison message arrived on, so a forensic viewer can tell
+    ///   one group or tenant's garbage from another's.
+    /// - `X-Rustgate-DLQ-Timestamp` — Unix millis at DLQ publish time,
+    ///   useful for correlating with other logs when the original
+    ///   message has no timestamp of its own.
+    ///
+    /// **Best-effort semantics.** A failed DLQ publish is logged at
+    /// `warn` but does NOT propagate an error to the caller — the whole
+    /// point of DLQ is to unblock the consumer past stuck sequences, so
+    /// we never let a transient NATS publish error keep the original
+    /// message in the pending set.
+    async fn publish_dead_letter(
+        &self,
+        reason: &str,
+        original_subject: &str,
+        original_payload: bytes::Bytes,
+    ) {
+        let Some(ref dlq_subject) = self.config.dead_letter_subject else {
+            return;
+        };
+
+        let mut headers = async_nats::HeaderMap::new();
+        headers.insert("X-Rustgate-DLQ-Reason", reason);
+        headers.insert("X-Rustgate-DLQ-Original-Subject", original_subject);
+        let ts_millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let ts_str = ts_millis.to_string();
+        headers.insert("X-Rustgate-DLQ-Timestamp", ts_str.as_str());
+
+        if let Err(e) = self
+            .client
+            .publish_with_headers(dlq_subject.to_string(), headers, original_payload)
+            .await
+        {
+            tracing::warn!(
+                dlq_subject = %dlq_subject,
+                reason,
+                original_subject,
+                error = %e,
+                "failed to publish to dead-letter subject; original message will still be ACKed"
+            );
+        }
+    }
+
     /// Run the subscriber loop. This is a long-running future that processes
     /// messages until shutdown or an unrecoverable error.
     ///
@@ -224,6 +282,11 @@ impl NatsSubscriber {
                     "dropping oversized NATS message"
                 );
                 dropped += 1;
+                // Preserve the original payload on the DLQ (if configured)
+                // so operators can inspect the oversized garbage — we're
+                // about to ACK and lose it from the stream forever.
+                self.publish_dead_letter("oversized", msg.subject.as_str(), msg.payload.clone())
+                    .await;
                 // ACK to prevent redelivery of garbage
                 if let Err(e) = msg.ack().await {
                     tracing::debug!(error = %e, "failed to ACK oversized message");
@@ -250,6 +313,15 @@ impl NatsSubscriber {
                     Err(e) => {
                         tracing::debug!(error = %e, subject = %msg.subject, "failed to parse NATS message");
                         dropped += 1;
+                        // Preserve original bytes on DLQ before ACK — the
+                        // point of DLQ is that operators can see exactly
+                        // what malformed payload arrived.
+                        self.publish_dead_letter(
+                            "unparseable",
+                            msg.subject.as_str(),
+                            msg.payload.clone(),
+                        )
+                        .await;
                         // ACK to prevent redelivery of unparseable data
                         if let Err(ack_err) = msg.ack().await {
                             tracing::debug!(error = %ack_err, "failed to ACK unparseable message");
@@ -260,6 +332,12 @@ impl NatsSubscriber {
 
                 if wire_event.is_position_unknown() {
                     dropped += 1;
+                    self.publish_dead_letter(
+                        "unknown-position",
+                        msg.subject.as_str(),
+                        msg.payload.clone(),
+                    )
+                    .await;
                     if let Err(e) = msg.ack().await {
                         tracing::debug!(error = %e, "failed to ACK zero-position message");
                     }
@@ -271,6 +349,12 @@ impl NatsSubscriber {
                     Err(e) => {
                         tracing::warn!(error = %e, "invalid NATS message identity");
                         dropped += 1;
+                        self.publish_dead_letter(
+                            "invalid-identity",
+                            msg.subject.as_str(),
+                            msg.payload.clone(),
+                        )
+                        .await;
                         if let Err(ack_err) = msg.ack().await {
                             tracing::debug!(error = %ack_err, "failed to ACK invalid message");
                         }
