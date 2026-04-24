@@ -265,7 +265,7 @@ mod tests {
     fn round_trip_reads_all_entries_written_by_dlq() {
         let dir = tempfile::tempdir().unwrap();
         let key_ring = test_key_ring();
-        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring.clone(), None);
+        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring.clone(), None, None);
 
         let msg_a = make_msg("alice", b"<event uid='a'/>");
         let msg_b = make_msg("bob", b"\xde\xad\xbe\xef\x00binary");
@@ -330,7 +330,7 @@ mod tests {
     fn reader_rejects_file_encrypted_with_different_key() {
         let dir = tempfile::tempdir().unwrap();
         let writer_key = test_key_ring();
-        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), writer_key, None);
+        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), writer_key, None, None);
         dlq.dead_letter("siem", &make_msg("alice", b"x"), "circuit_open");
         dlq.finish();
         let file = single_file_in(dir.path());
@@ -410,7 +410,7 @@ mod tests {
     fn for_each_stops_on_callback_error() {
         let dir = tempfile::tempdir().unwrap();
         let key_ring = test_key_ring();
-        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring.clone(), None);
+        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring.clone(), None, None);
 
         for i in 0..5 {
             let msg = make_msg(&format!("u{i}"), b"payload");
