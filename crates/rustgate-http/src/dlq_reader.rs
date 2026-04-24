@@ -2,16 +2,16 @@
 
 //! Offline reader for encrypted dead-letter queue files.
 //!
-//! Companion to the writer in [`crate::dlq`]. Operators and replay
-//! tooling use this module to decrypt and iterate dead-lettered messages
-//! produced by [`DeadLetterQueue`](crate::dlq) during circuit-breaker
+//! Companion to the crate-private writer in `dlq.rs`. Operators and
+//! replay tooling use this module to decrypt and iterate dead-lettered
+//! messages produced by the `DeadLetterQueue` during circuit-breaker
 //! shedding.
 //!
 //! # Wire-format contract
 //!
-//! The writer serializes each [`DlqEntry`](crate::dlq) as a single
-//! JSON object (no trailing newline) and encrypts it as one
-//! ChaCha20-Poly1305 chunk via
+//! The writer serializes each entry as a single JSON object (no
+//! trailing newline) and encrypts it as one ChaCha20-Poly1305 chunk
+//! via
 //! [`SharedEncryptedWriter::write_line`](rustgate_core::encrypted::SharedEncryptedWriter::write_line).
 //! After decryption with [`rustgate_core::encrypted::decrypt_file`],
 //! all chunks concatenate into a stream of JSON values. A streaming
@@ -68,14 +68,14 @@ pub enum DlqReadError {
 
 /// Owned mirror of the writer-side DLQ entry.
 ///
-/// Mirrors the private `DlqEntry<'a>` serializer in [`crate::dlq`] but
-/// holds every string field by value so the reader can return records
+/// Mirrors the private `DlqEntry<'a>` serializer in `dlq.rs` but holds
+/// every string field by value so the reader can return records
 /// decoupled from the temporary file's lifetime. The field order and
 /// names are part of the wire-format contract and MUST stay in sync
 /// with the writer — the `dlq_entry_json_contains_all_documented_fields`
-/// test in [`crate::dlq`] locks the producer side, and
-/// [`round_trip_reads_all_entries_written_by_dlq`] here locks the
-/// consumer side.
+/// test in `dlq.rs` locks the producer side, and
+/// `round_trip_reads_all_entries_written_by_dlq` in this module locks
+/// the consumer side.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct OwnedDlqEntry {
     /// RFC 3339 / ISO-8601 timestamp when the message was dead-lettered.
