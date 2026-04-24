@@ -333,4 +333,278 @@ mod tests {
             "must fail-closed even without callback"
         );
     }
+
+    #[test]
+    fn constants_match_documented_values() {
+        // Pin the documented sweep constants — these are part of the
+        // operational contract: `SWEEP_THRESHOLD` sets how many distinct
+        // IPs trigger an inline prune, `MIN_SWEEP_INTERVAL` is the floor
+        // between full sweeps. Operators tune memory/CPU expectations
+        // around these values; any change must be an intentional tuning
+        // decision, not a silent refactor.
+        assert_eq!(SWEEP_THRESHOLD, 1024);
+        assert_eq!(MIN_SWEEP_INTERVAL, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn getters_return_configured_values_verbatim() {
+        // `max_requests()` and `window()` are the only observable
+        // projections of the constructor's inputs — pin that they
+        // return the configured values unchanged, no clamping, no
+        // defaulting, no rounding.
+        let limiter = RateLimiter::new(42, Duration::from_millis(123));
+        assert_eq!(limiter.max_requests(), 42);
+        assert_eq!(limiter.window(), Duration::from_millis(123));
+
+        // Zero values are legal — getters must round-trip them too.
+        let zero = RateLimiter::new(0, Duration::ZERO);
+        assert_eq!(zero.max_requests(), 0);
+        assert_eq!(zero.window(), Duration::ZERO);
+    }
+
+    #[test]
+    fn debug_format_renders_on_poison_as_bool_not_closure() {
+        // `PoisonCallback` is `Arc<dyn Fn() + Send + Sync>` — the
+        // underlying closure does not implement `Debug`, and even if
+        // it did, formatting its address leaks nothing useful for
+        // forensics while creating the illusion of identity. The
+        // custom `Debug` impl projects `on_poison` to a bool so
+        // operators can see whether a callback is registered without
+        // exposing internals.
+        let no_cb = RateLimiter::new(3, Duration::from_secs(1));
+        let dbg_no_cb = format!("{no_cb:?}");
+        assert!(
+            dbg_no_cb.contains("on_poison: false"),
+            "expected `on_poison: false`, got: {dbg_no_cb}"
+        );
+        assert!(
+            dbg_no_cb.contains("max_requests: 3"),
+            "debug must surface configured max_requests"
+        );
+        assert!(
+            dbg_no_cb.contains("window:"),
+            "debug must surface configured window"
+        );
+
+        let with_cb =
+            RateLimiter::new(3, Duration::from_secs(1)).with_poison_callback(Arc::new(|| {}));
+        let dbg_with_cb = format!("{with_cb:?}");
+        assert!(
+            dbg_with_cb.contains("on_poison: true"),
+            "expected `on_poison: true`, got: {dbg_with_cb}"
+        );
+    }
+
+    #[test]
+    fn with_poison_callback_replaces_prior_callback() {
+        // Builder semantics: `with_poison_callback` stores the callback
+        // at `self.on_poison = Some(cb)` — a second invocation replaces
+        // the first, it does not compose. Pin this so a later refactor
+        // that switches to a `Vec<PoisonCallback>` (stack-all-callbacks)
+        // has to be an explicit API change, not a silent behavior shift.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let first_count = Arc::new(AtomicUsize::new(0));
+        let second_count = Arc::new(AtomicUsize::new(0));
+        let first_cb: PoisonCallback = {
+            let c = Arc::clone(&first_count);
+            Arc::new(move || {
+                let _ = c.fetch_add(1, Ordering::Relaxed);
+            })
+        };
+        let second_cb: PoisonCallback = {
+            let c = Arc::clone(&second_count);
+            Arc::new(move || {
+                let _ = c.fetch_add(1, Ordering::Relaxed);
+            })
+        };
+
+        let limiter = RateLimiter::new(10, Duration::from_secs(60))
+            .with_poison_callback(first_cb)
+            .with_poison_callback(second_cb);
+
+        let limiter_arc = Arc::new(limiter);
+        let poisoner = {
+            let l = Arc::clone(&limiter_arc);
+            std::thread::spawn(move || {
+                let _guard = l.state.lock().expect("initial lock");
+                panic!("intentional poison for test");
+            })
+        };
+        let _ = poisoner.join();
+
+        let ip: IpAddr = "10.0.0.1".parse().expect("valid IP");
+        assert!(!limiter_arc.check(ip));
+
+        assert_eq!(
+            first_count.load(Ordering::Relaxed),
+            0,
+            "first callback must NOT fire — the second overwrote it"
+        );
+        assert_eq!(
+            second_count.load(Ordering::Relaxed),
+            1,
+            "only the most-recently-installed callback fires"
+        );
+    }
+
+    #[test]
+    fn rate_limiter_and_poison_callback_are_send_sync() {
+        // `RateLimiter` is placed behind an `Arc` and shared across
+        // tokio tasks by every enrollment HTTP handler — Send+Sync is
+        // a structural requirement, not a nice-to-have. The type
+        // alias `PoisonCallback` must likewise be Send+Sync so the
+        // callback can fire from whichever thread happens to observe
+        // poison.
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<RateLimiter>();
+        assert_send_sync::<PoisonCallback>();
+    }
+
+    #[test]
+    fn rejected_requests_do_not_append_timestamps() {
+        // CRITICAL invariant. If a rejected request appended its
+        // timestamp to the deque, every denied attempt would extend the
+        // effective rejection window: once an IP hit the limit, a
+        // hostile client spamming requests could pin that IP into
+        // permanent rejection because every attempt pushes the oldest
+        // timestamp further into the future. The implementation must
+        // only `push_back(now)` on the allow path.
+        let limiter = RateLimiter::new(2, Duration::from_secs(60));
+        let ip: IpAddr = "10.0.0.1".parse().expect("valid IP");
+
+        assert!(limiter.check(ip));
+        assert!(limiter.check(ip));
+        // Five rejected requests.
+        for _ in 0..5 {
+            assert!(!limiter.check(ip));
+        }
+
+        let state = limiter.state.lock().expect("lock");
+        let ts = state.map.get(&ip).expect("entry");
+        assert_eq!(
+            ts.len(),
+            2,
+            "rejected requests must NOT append timestamps (deque grew to {})",
+            ts.len()
+        );
+    }
+
+    #[test]
+    fn boundary_allows_exactly_max_requests_then_rejects() {
+        // Pin the comparison operator: `timestamps.len() >= max_requests`
+        // rejects AT the limit, not above. With `max = 5`, calls 1–5
+        // must succeed and call 6 must fail. A regression from `>=` to
+        // `>` would let 6 through before rejecting at 7, silently
+        // doubling the burst ceiling on short windows.
+        let limiter = RateLimiter::new(5, Duration::from_secs(60));
+        let ip: IpAddr = "10.0.0.1".parse().expect("valid IP");
+
+        for i in 0..5 {
+            assert!(limiter.check(ip), "request {i} must be allowed");
+        }
+        assert!(!limiter.check(ip), "6th request must be rejected");
+    }
+
+    #[test]
+    fn ipv4_and_ipv6_maintain_separate_quotas() {
+        // `HashMap<IpAddr, …>` keys by enum discriminant AND value, so
+        // `10.0.0.1` and `::ffff:10.0.0.1` (IPv4-mapped IPv6) do NOT
+        // share a quota. This is the documented consequence of using
+        // the raw peer address — pinning it so the "NAT caveat" note
+        // in the module doc stays accurate and anyone who later
+        // normalizes IPv4-mapped addresses has to update the docs at
+        // the same time.
+        let limiter = RateLimiter::new(1, Duration::from_secs(60));
+        let v4: IpAddr = "10.0.0.1".parse().expect("ipv4");
+        let v6_mapped: IpAddr = "::ffff:10.0.0.1".parse().expect("ipv6 mapped");
+        let v6_native: IpAddr = "2001:db8::1".parse().expect("ipv6");
+
+        assert!(limiter.check(v4));
+        assert!(!limiter.check(v4), "v4 over limit");
+        assert!(
+            limiter.check(v6_mapped),
+            "IPv4-mapped IPv6 is a distinct IpAddr variant and carries its own quota"
+        );
+        assert!(
+            limiter.check(v6_native),
+            "native IPv6 is independent of IPv4 quota"
+        );
+    }
+
+    #[test]
+    fn zero_max_requests_rejects_every_request() {
+        // `max_requests = 0` is a legal, if degenerate, configuration —
+        // useful when an operator wants to temporarily seal the
+        // endpoint via config reload rather than redeploy. Pin that
+        // even the first request is rejected (i.e. the comparison is
+        // correct at the lower boundary, not off-by-one allowing one
+        // through before rejecting).
+        let limiter = RateLimiter::new(0, Duration::from_secs(60));
+        let ip: IpAddr = "10.0.0.1".parse().expect("valid IP");
+        assert!(
+            !limiter.check(ip),
+            "first request with max=0 must be rejected"
+        );
+        assert!(
+            !limiter.check(ip),
+            "subsequent requests with max=0 remain rejected"
+        );
+    }
+
+    #[test]
+    fn fresh_limiter_has_empty_state_map() {
+        // Constructor must not pre-seed the IP map — a fresh limiter
+        // has no memory of any client. The `last_sweep` field is
+        // initialized to `Instant::now()` but is not directly
+        // assertable without brittleness; we assert only the
+        // observable property (empty map) here.
+        let limiter = RateLimiter::new(10, Duration::from_secs(60));
+        let state = limiter.state.lock().expect("lock");
+        assert!(state.map.is_empty(), "fresh limiter must have empty map");
+    }
+
+    #[test]
+    fn single_successful_check_records_exactly_one_timestamp() {
+        // Regression guard against accidental double-push (e.g. if a
+        // future refactor adds a "also record on prune" branch). One
+        // allowed call ⇒ exactly one timestamp in the deque.
+        let limiter = RateLimiter::new(10, Duration::from_secs(60));
+        let ip: IpAddr = "10.0.0.1".parse().expect("valid IP");
+
+        assert!(limiter.check(ip));
+
+        let state = limiter.state.lock().expect("lock");
+        let ts = state
+            .map
+            .get(&ip)
+            .expect("entry must exist after allowed check");
+        assert_eq!(
+            ts.len(),
+            1,
+            "exactly one timestamp per successful check() call"
+        );
+    }
+
+    #[test]
+    fn distinct_ips_create_distinct_map_entries() {
+        // Pairs with `separate_ips_have_separate_limits`: that one
+        // checks allow/reject behaviour across IPs, this one checks
+        // the internal shape — three distinct IPs create three
+        // distinct map entries (no accidental coalescing).
+        let limiter = RateLimiter::new(10, Duration::from_secs(60));
+        let ip1: IpAddr = "10.0.0.1".parse().expect("valid IP");
+        let ip2: IpAddr = "10.0.0.2".parse().expect("valid IP");
+        let ip3: IpAddr = "192.168.1.1".parse().expect("valid IP");
+
+        assert!(limiter.check(ip1));
+        assert!(limiter.check(ip2));
+        assert!(limiter.check(ip3));
+
+        let state = limiter.state.lock().expect("lock");
+        assert_eq!(state.map.len(), 3);
+        assert!(state.map.contains_key(&ip1));
+        assert!(state.map.contains_key(&ip2));
+        assert!(state.map.contains_key(&ip3));
+    }
 }

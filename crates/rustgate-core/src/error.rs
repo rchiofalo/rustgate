@@ -449,4 +449,243 @@ mod tests {
             other => panic!("expected Transport(NoCertificate), got {other:?}"),
         }
     }
+
+    #[test]
+    fn all_error_enums_satisfy_error_send_sync_static_bound() {
+        // Compile-time bound pin: every enum must satisfy the workspace-wide
+        // `Box<dyn Error + Send + Sync + 'static>` contract that all spawned
+        // tasks' Result returns and every `anyhow::Error::from(err)` call
+        // site depend on. A refactor that embedded a non-`Send` field (e.g.
+        // a raw `Rc`, `RefCell`, or a `&'a str` in a new variant) or a
+        // non-`'static` borrow would break every downstream spawn site and
+        // `thiserror`'s own blanket impls would silently stop compiling at
+        // far-away call sites — the test traps the regression locally at
+        // the bound-helper call rather than at the first `tokio::spawn`.
+        fn assert_bounds<T: std::error::Error + Send + Sync + 'static>() {}
+        assert_bounds::<TransportError>();
+        assert_bounds::<ConfigError>();
+        assert_bounds::<RustgateError>();
+    }
+
+    #[test]
+    fn errors_coerce_to_dyn_error_trait_object() {
+        // The trait-object coercion path is what every `tracing::error!(err
+        // = %err, …)` macro invocation uses under the hood, and what
+        // `anyhow::Error` relies on for its source-chain rendering. Pin the
+        // coercion explicitly so a regression that narrowed one of the
+        // error enums to not impl `std::error::Error` (e.g. by mistakenly
+        // removing the `thiserror::Error` derive during a refactor) trips
+        // here at a compile-failure on the coercion rather than at every
+        // log call site in the binary.
+        let t: TransportError = TransportError::NoCertificate;
+        let c: ConfigError = ConfigError::Other("x".into());
+        let r: RustgateError = TransportError::EmptyCertChain.into();
+        let _as_dyn_t: &dyn std::error::Error = &t;
+        let _as_dyn_c: &dyn std::error::Error = &c;
+        let _as_dyn_r: &dyn std::error::Error = &r;
+    }
+
+    #[test]
+    fn io_error_converts_to_rustgate_io_variant_not_transport_bind() {
+        // `impl From<io::Error> for RustgateError` wires `?` at the top
+        // level directly to `RustgateError::Io`, NOT to
+        // `TransportError::Bind`. This is load-bearing: `TransportError::Bind`
+        // carries the extra `addr: String` context that a bare `io::Error`
+        // cannot supply, so auto-converting a top-level I/O error into
+        // `Bind` would silently emit an empty-addr audit log at every
+        // startup-time config-read failure. A refactor that "helpfully"
+        // added `#[from] io::Error` to `TransportError::Bind` would break
+        // this discrimination and bury the mistake until a deploy
+        // reproduced the error path — pin it here.
+        let io_err = io::Error::new(io::ErrorKind::NotFound, "missing file");
+        let converted: RustgateError = io_err.into();
+        match converted {
+            RustgateError::Io(_) => {}
+            other => panic!("expected RustgateError::Io, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rustgate_error_source_chain_terminates_at_io_error_depth_two() {
+        // `RustgateError::Transport(Bind { source: io })` has a two-hop
+        // chain: the transparent top-level forwards to Bind's source
+        // (the `io::Error`), which itself has no further source. A
+        // regression that accidentally box-wrapped the io::Error inside
+        // an extra layer would extend the chain to 3 and silently change
+        // `anyhow::Error`'s default rendering (and break any downstream
+        // matcher that walks the chain by count). Pin depth exactly.
+        let io_err = io::Error::new(io::ErrorKind::ConnectionReset, "reset");
+        let inner = TransportError::Bind {
+            addr: "0.0.0.0:0".into(),
+            source: io_err,
+        };
+        let top: RustgateError = inner.into();
+        let depth1 = top
+            .source()
+            .expect("Transport(Bind) must expose the io::Error source");
+        let depth2 = depth1.source();
+        assert!(
+            depth2.is_none(),
+            "chain must terminate after io::Error, got another layer: {depth2:?}"
+        );
+    }
+
+    #[test]
+    fn rustgate_io_preserves_io_error_kind_through_downcast() {
+        // The `#[error("io: {0}")]` on `RustgateError::Io(#[from] io::Error)`
+        // pins the Display prefix, but downstream consumers (store-forward
+        // retry loop, CRL reloader backoff decision) match on the
+        // underlying `io::ErrorKind` via `err.source().and_then(|e|
+        // e.downcast_ref::<io::Error>()).map(|e| e.kind())`. Pin that the
+        // kind round-trips: a regression that wrapped the io::Error in a
+        // new error type (even one that preserved Display) would lose the
+        // downcast and silently degrade every kind-specific retry
+        // decision to the generic fallback.
+        let io_err = io::Error::new(io::ErrorKind::WouldBlock, "try again");
+        let wrapped: RustgateError = io_err.into();
+        let src = wrapped.source().expect("Io must expose source");
+        let downcast = src
+            .downcast_ref::<io::Error>()
+            .expect("source must downcast to io::Error");
+        assert_eq!(downcast.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn transport_error_exhaustive_variant_match_pins_current_seven_variant_set() {
+        // No-wildcard match through every current TransportError variant.
+        // Adding a variant without updating downstream handlers would be
+        // a silent drift (e.g. a new `TransportError::CertRevoked`
+        // variant would slip through every existing `match transport_err`
+        // site via a buried `_ =>` arm); this test forces the adder to
+        // touch a spot where the reviewer is primed to audit the
+        // corresponding audit-log-emitter / retry-classifier / operator-
+        // facing-message-table updates.
+        let variants = [
+            TransportError::Bind {
+                addr: "x".into(),
+                source: io::Error::other("_"),
+            },
+            TransportError::TlsHandshake("_".into()),
+            TransportError::NoCertificate,
+            TransportError::EmptyCertChain,
+            TransportError::MissingCommonName,
+            TransportError::MissingKeyUsage {
+                expected: "_".into(),
+            },
+            TransportError::Other("_".into()),
+        ];
+        for v in variants {
+            let kind = match v {
+                TransportError::Bind { .. } => "bind",
+                TransportError::TlsHandshake(_) => "tls",
+                TransportError::NoCertificate => "no-cert",
+                TransportError::EmptyCertChain => "empty-chain",
+                TransportError::MissingCommonName => "missing-cn",
+                TransportError::MissingKeyUsage { .. } => "missing-eku",
+                TransportError::Other(_) => "other",
+            };
+            assert!(!kind.is_empty(), "every variant must be handled");
+        }
+    }
+
+    #[test]
+    fn config_error_exhaustive_variant_match_pins_current_four_variant_set() {
+        // Same shape as the TransportError exhaustive-match pin — pins
+        // the closed-enum contract for the four ConfigError variants so
+        // a new variant forces a compile failure here rather than slip
+        // through a `_ =>` wildcard in the config-loader error handler.
+        let variants = [
+            ConfigError::PemParse {
+                kind: "_".into(),
+                reason: "_".into(),
+            },
+            ConfigError::EmptyPem { kind: "_".into() },
+            ConfigError::TlsVersion {
+                version: "_".into(),
+            },
+            ConfigError::Other("_".into()),
+        ];
+        for v in variants {
+            let kind = match v {
+                ConfigError::PemParse { .. } => "pem",
+                ConfigError::EmptyPem { .. } => "empty",
+                ConfigError::TlsVersion { .. } => "tls",
+                ConfigError::Other(_) => "other",
+            };
+            assert!(!kind.is_empty(), "every variant must be handled");
+        }
+    }
+
+    #[test]
+    fn rustgate_error_exhaustive_variant_match_pins_current_three_variant_set() {
+        // Same shape — pins the three-variant RustgateError closed-enum
+        // contract. A new top-level variant (e.g. `Authz`) would slip
+        // through every existing matcher via a buried `_ =>` arm; force
+        // the adder to touch this spot where the reviewer is primed to
+        // audit the top-level Display / From-conversion / audit-log-kind
+        // updates.
+        let variants = [
+            RustgateError::Transport(TransportError::NoCertificate),
+            RustgateError::Config(ConfigError::Other("_".into())),
+            RustgateError::Io(io::Error::other("_")),
+        ];
+        for v in variants {
+            let kind = match v {
+                RustgateError::Transport(_) => "transport",
+                RustgateError::Config(_) => "config",
+                RustgateError::Io(_) => "io",
+            };
+            assert!(!kind.is_empty(), "every top-level variant must be handled");
+        }
+    }
+
+    #[test]
+    fn rustgate_from_transport_bind_preserves_addr_context() {
+        // Pins that the transparent wrap through `From<TransportError>`
+        // preserves the inner variant's field contents bit-for-bit
+        // (specifically the `addr: String`). A refactor that
+        // "normalized" the inner variant during the transparent wrap
+        // (e.g. stripped a port for log-noise reduction) would break
+        // the audit-log invariant that the bind-failure event carries
+        // the exact addr the operator configured. The assertion
+        // matches on the wrapped variant AND compares the addr string
+        // verbatim.
+        let inner = TransportError::Bind {
+            addr: "192.0.2.1:4443".into(),
+            source: io::Error::other("probe"),
+        };
+        let top: RustgateError = inner.into();
+        match top {
+            RustgateError::Transport(TransportError::Bind { addr, .. }) => {
+                assert_eq!(
+                    addr, "192.0.2.1:4443",
+                    "addr must be preserved verbatim through From<TransportError>"
+                );
+            }
+            other => panic!("expected Transport(Bind), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn result_alias_is_identical_to_std_result_with_rustgate_error() {
+        // `pub type Result<T> = std::result::Result<T, RustgateError>` is
+        // a type alias, not a newtype — the two spellings must be
+        // interchangeable at every call site. Pin by assigning a value
+        // of one spelling to a binding of the other WITHOUT any
+        // conversion. A regression that changed the alias to a
+        // wrapper struct would fail this compile-free assignment.
+        let via_alias: Result<u32> = Ok(7);
+        let via_std: std::result::Result<u32, RustgateError> = via_alias;
+        match via_std {
+            Ok(n) => assert_eq!(n, 7),
+            Err(_) => panic!("expected Ok(7)"),
+        }
+        // And the reverse direction.
+        let via_std: std::result::Result<u32, RustgateError> = Ok(9);
+        let via_alias: Result<u32> = via_std;
+        match via_alias {
+            Ok(n) => assert_eq!(n, 9),
+            Err(_) => panic!("expected Ok(9)"),
+        }
+    }
 }

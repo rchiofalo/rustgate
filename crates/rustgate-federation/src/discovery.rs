@@ -359,4 +359,200 @@ mod tests {
             .expect("reconciler did not shut down")
             .expect("reconciler panicked");
     }
+
+    /// Minimal [`PeerDiscovery`] implementation that intentionally does NOT
+    /// override `backend_name()`, used to pin the trait's default return value.
+    struct DefaultBackendDiscovery;
+
+    #[async_trait]
+    impl PeerDiscovery for DefaultBackendDiscovery {
+        async fn discover(&self) -> anyhow::Result<Vec<PeerConfig>> {
+            Ok(vec![])
+        }
+        // backend_name() intentionally omitted — relies on trait default.
+    }
+
+    #[test]
+    fn peer_discovery_trait_default_backend_name_is_peer_discovery() {
+        // The `PeerDiscovery` trait provides a default
+        // `fn backend_name() -> &'static str` that returns "peer-discovery".
+        // Every in-tree backend (dns-sd, consul, etcd) overrides this, so the
+        // default body is otherwise untested — but external implementors can
+        // fall back on it, and audit-log field `backend=<name>` depends on
+        // the exact string. Renaming or changing this default would silently
+        // shift how cross-backend reconcile events are filtered downstream.
+        let d = DefaultBackendDiscovery;
+        assert_eq!(d.backend_name(), "peer-discovery");
+    }
+
+    #[test]
+    fn peer_discovery_is_object_safe_and_boxable_behind_arc_dyn_send_sync() {
+        // `reconciler()` takes `Arc<dyn PeerDiscovery>`, so the trait MUST
+        // stay object-safe. A future refactor adding a generic-return async
+        // method (e.g. `-> impl Future`) or a `Self`-returning method would
+        // break `dyn PeerDiscovery` at every call site across the federation
+        // crate. This compile-time assertion fails that refactor HERE rather
+        // than in `manager.rs` or `setup.rs`, pointing at the trait as the
+        // real cause. The `?Sized` bound is required because `dyn Trait` is
+        // unsized; the trait declaration itself pins `Send + Sync + 'static`.
+        fn _assert_object_send_sync<T: ?Sized + Send + Sync>() {}
+        _assert_object_send_sync::<dyn PeerDiscovery>();
+        let _boxed: Arc<dyn PeerDiscovery> =
+            Arc::new(MockDiscovery::new(vec![peer("alpha", "127.0.0.1:9100")]));
+    }
+
+    #[tokio::test]
+    async fn reconcile_is_idempotent_when_backend_returns_identical_peer_set_twice() {
+        // Two back-to-back cycles with the same peer set must leave the
+        // manager's peer list untouched — swap_peers classifies the second
+        // cycle as entirely `unchanged`, NOT as a full remove-then-add churn
+        // that would tear down and re-establish every federation connection.
+        // A regression here (e.g. returning `added = all_peers` on every
+        // cycle) would silently flap the mesh and dump reconnection storms
+        // into production logs, so pin it at the unit level.
+        let mgr = Arc::new(RwLock::new(FederationManager::new(test_config())));
+        let mock = Arc::new(MockDiscovery::new(vec![peer("alpha", "127.0.0.1:9100")]));
+
+        run_once(&mgr, mock.as_ref(), "mock").await;
+        let snapshot_first = mgr.read().await.config().peers.clone();
+        run_once(&mgr, mock.as_ref(), "mock").await;
+        let snapshot_second = mgr.read().await.config().peers.clone();
+
+        assert_eq!(mock.call_count(), 2, "discover invoked once per cycle");
+        assert_eq!(snapshot_first.len(), 1);
+        assert_eq!(snapshot_second.len(), 1);
+        assert_eq!(snapshot_first[0].id, snapshot_second[0].id);
+        assert_eq!(snapshot_second[0].id.as_str(), "alpha");
+    }
+
+    #[tokio::test]
+    async fn reconcile_handles_full_replacement_with_both_add_and_remove_in_one_cycle() {
+        // Cycle 1: `{alpha}`. Cycle 2: `{beta}` only — completely different.
+        // The reconciler MUST process both the remove (alpha) and the add
+        // (beta) in a single tick; the final peer list must be `{beta}`, not
+        // the union `{alpha, beta}` (which would indicate a missed remove)
+        // nor the stale `{alpha}` (which would indicate a missed replace).
+        // This is the symmetric complement to `reconcile_removes_vanished_*`
+        // — that test only exercises the remove path with the set shrinking;
+        // this one exercises simultaneous add AND remove in the same tick.
+        let mgr = Arc::new(RwLock::new(FederationManager::new(test_config())));
+        let mock = Arc::new(MockDiscovery::new(vec![peer("alpha", "127.0.0.1:9100")]));
+
+        run_once(&mgr, mock.as_ref(), "mock").await;
+        assert_eq!(mgr.read().await.config().peers.len(), 1);
+
+        mock.set_peers(vec![peer("beta", "127.0.0.1:9200")]);
+        run_once(&mgr, mock.as_ref(), "mock").await;
+
+        let guard = mgr.read().await;
+        assert_eq!(guard.config().peers.len(), 1);
+        assert_eq!(guard.config().peers[0].id.as_str(), "beta");
+    }
+
+    #[tokio::test]
+    async fn reconcile_recovers_after_transient_discovery_failure() {
+        // A `discover()` that returns `Err` must not poison the reconciler
+        // — the NEXT cycle's success should populate peers normally. This
+        // is the load-bearing defensive property that keeps a flaky Consul
+        // round-trip, an etcd leader election hiccup, or a momentary DNS-SD
+        // unavailability from permanently disabling the federation mesh.
+        // Without this, an operator would see peers vanish on the first
+        // error and never come back until the service restarted — exactly
+        // the failure mode the "errors are logged and swallowed" contract
+        // is designed to prevent.
+        let mgr = Arc::new(RwLock::new(FederationManager::new(test_config())));
+        let mock = Arc::new(MockDiscovery::new(vec![peer("alpha", "127.0.0.1:9100")]));
+
+        *mock.fail.lock().unwrap() = true;
+        run_once(&mgr, mock.as_ref(), "mock").await;
+        assert_eq!(
+            mgr.read().await.config().peers.len(),
+            0,
+            "first cycle errored, peers remain empty",
+        );
+
+        *mock.fail.lock().unwrap() = false;
+        run_once(&mgr, mock.as_ref(), "mock").await;
+
+        let guard = mgr.read().await;
+        assert_eq!(
+            guard.config().peers.len(),
+            1,
+            "second cycle succeeded, peers populated",
+        );
+        assert_eq!(guard.config().peers[0].id.as_str(), "alpha");
+        assert_eq!(mock.call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn reconciler_loop_skips_first_immediate_tick_before_first_discover_call() {
+        // `tokio::time::interval(d)` resolves its first `.tick()` immediately
+        // on creation; `reconciler_loop` deliberately consumes that initial
+        // tick and waits one full interval before calling `discover()` so
+        // `FederationManager::start()` has time to finish its own init
+        // before swap_peers churn begins. Pin that skip: with a 500 ms
+        // interval and a 180 ms wait after spawn, `discover()` must not
+        // have been called yet (call_count == 0). A regression removing the
+        // `let _ = ticker.tick().await;` line above the loop would fail here.
+        let mgr = Arc::new(RwLock::new(FederationManager::new(test_config())));
+        let mock = Arc::new(MockDiscovery::new(vec![peer("alpha", "127.0.0.1:9100")]));
+        let (tx, rx) = tokio::sync::watch::channel(false);
+
+        let handle = reconciler(
+            Arc::clone(&mgr),
+            mock.clone() as Arc<dyn PeerDiscovery>,
+            Duration::from_millis(500),
+            rx,
+        );
+
+        tokio::time::sleep(Duration::from_millis(180)).await;
+        assert_eq!(
+            mock.call_count(),
+            0,
+            "reconciler must not call discover() before the first full interval",
+        );
+
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("reconciler did not shut down")
+            .expect("reconciler panicked");
+    }
+
+    #[tokio::test]
+    async fn reconciler_loop_does_not_exit_when_shutdown_channel_re_sends_false() {
+        // The shutdown arm is `_ = shutdown.changed() => if *shutdown.borrow()
+        // { return }`. A spurious or deliberate `send(false)` WILL wake the
+        // arm (because `changed()` resolves on any value-received), but the
+        // inner `if` guard must keep the loop alive because the value is
+        // still false. This protects against shared shutdown-channel designs
+        // where an orchestrator may cycle a shared watch through multiple
+        // `false` values before the eventual `true` — the reconciler must
+        // only exit on the genuine signal.
+        let mgr = Arc::new(RwLock::new(FederationManager::new(test_config())));
+        let mock = Arc::new(MockDiscovery::new(vec![]));
+        let (tx, rx) = tokio::sync::watch::channel(false);
+
+        let handle = reconciler(
+            Arc::clone(&mgr),
+            mock.clone() as Arc<dyn PeerDiscovery>,
+            Duration::from_millis(500),
+            rx,
+        );
+
+        // Spurious `false` — wakes shutdown.changed() but inner guard holds.
+        tx.send(false).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !handle.is_finished(),
+            "reconciler exited on a false shutdown signal",
+        );
+
+        // Genuine `true` — loop exits cleanly.
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("reconciler did not shut down after genuine true signal")
+            .expect("reconciler panicked");
+    }
 }

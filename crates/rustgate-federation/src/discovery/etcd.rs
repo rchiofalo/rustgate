@@ -245,4 +245,231 @@ mod tests {
         assert_eq!(out[0].id.as_str(), "ok1");
         assert_eq!(out[1].id.as_str(), "ok2");
     }
+
+    #[test]
+    fn decode_entry_with_key_not_matching_prefix_uses_full_key_as_id() {
+        // `key.strip_prefix(prefix).unwrap_or(key)` is the fallback
+        // branch when etcd returns a key that does not start with the
+        // configured prefix. This can happen when the operator changes
+        // the prefix mid-flight or when a future etcd quirk returns a
+        // key that escaped the `with_prefix()` filter. The full key
+        // must become the peer id so the entry is still usable rather
+        // than being silently dropped.
+        let cfg = EtcdDiscovery::decode_entry(
+            "rustgate/peers/",
+            "totally/unrelated/key",
+            "10.0.0.99:9000",
+        )
+        .expect("decode should fall back to full key as id");
+        assert_eq!(cfg.id.as_str(), "totally/unrelated/key");
+        assert_eq!(cfg.address, "10.0.0.99:9000");
+    }
+
+    #[test]
+    fn decode_entry_with_key_equal_to_prefix_returns_none() {
+        // If the key is exactly the prefix (e.g. operator wrote
+        // `etcdctl put rustgate/peers/ 10.0.0.1:9000` by mistake),
+        // stripping yields an empty string — that must become `None`
+        // with a warning, because an empty peer id would later cause
+        // collisions in the federation manager's peer map.
+        let cfg =
+            EtcdDiscovery::decode_entry("rustgate/peers/", "rustgate/peers/", "10.0.0.1:9000");
+        assert!(
+            cfg.is_none(),
+            "empty id after prefix strip must be rejected",
+        );
+    }
+
+    #[test]
+    fn decode_entry_treats_whitespace_only_value_as_empty() {
+        // `value.trim()` precedes both the `starts_with('{')` check
+        // and the `is_empty()` check, so a value that is pure
+        // whitespace (e.g. `"   \n"`) must route into the empty-value
+        // warning branch, not the plain-`host:port` branch where it
+        // would produce a peer with an empty address.
+        let cfg = EtcdDiscovery::decode_entry(
+            "rustgate/peers/",
+            "rustgate/peers/whitespace",
+            "   \n\t  ",
+        );
+        assert!(
+            cfg.is_none(),
+            "whitespace-only value must be treated as empty",
+        );
+    }
+
+    #[test]
+    fn decode_entry_trims_surrounding_whitespace_from_plain_host_port() {
+        // The trim applies to the plain-`host:port` branch too —
+        // operators who accidentally store `"  10.0.0.1:9000\n"` in
+        // etcd (e.g. via a shell pipeline that preserves the
+        // trailing newline) must still get a valid peer config, not a
+        // silently-broken address that fails to parse.
+        let cfg = EtcdDiscovery::decode_entry(
+            "rustgate/peers/",
+            "rustgate/peers/trim",
+            "  10.0.0.1:9000\n",
+        )
+        .expect("decode should trim surrounding whitespace");
+        assert_eq!(cfg.address, "10.0.0.1:9000");
+    }
+
+    #[test]
+    fn decode_entry_plain_mode_applies_documented_defaults() {
+        // Plain `host:port` mode hardcodes 11 peer-config fields
+        // (everything except id and address). Pin every one so a
+        // silent flip (e.g. `enabled = false` during a "disable peers
+        // by default" refactor, or a bump of `protocol_version` to 3)
+        // fails a focused test rather than surfacing as a production
+        // federation outage.
+        let cfg = EtcdDiscovery::decode_entry(
+            "rustgate/peers/",
+            "rustgate/peers/defaults",
+            "10.0.0.5:9000",
+        )
+        .expect("decode");
+
+        // Group plumbing: anon group, no overrides.
+        assert_eq!(cfg.groups, vec!["__ANON__".to_string()]);
+        assert!(cfg.inbound_groups.is_none());
+        assert!(cfg.outbound_groups.is_none());
+
+        // Admission + direction.
+        assert!(cfg.enabled, "discovered peers ship enabled");
+        assert!(cfg.is_outbound, "etcd peers are outbound by default");
+
+        // Trust + auth.
+        assert!(cfg.trust_cert_cn.is_none());
+        assert!(cfg.jwt_token.is_none());
+
+        // Routing.
+        assert_eq!(cfg.routing_mode, RoutingMode::default());
+        assert_eq!(cfg.protocol_version, 2);
+
+        // Locality + priority.
+        assert!(cfg.region.is_none());
+        assert!(cfg.zone.is_none());
+        assert_eq!(cfg.priority, 100);
+    }
+
+    #[test]
+    fn decode_entry_json_id_is_taken_from_body_not_key_suffix() {
+        // The JSON branch hands the serialized `PeerConfig` straight
+        // to `serde_json::from_str` — it does **not** derive the id
+        // from the key suffix. Operators who set `id: "fleet-a"` in
+        // the JSON but store it under `rustgate/peers/node-42` must
+        // get a peer whose id is `fleet-a`, not `node-42`. Pin this
+        // so a future refactor that "helpfully" overrode the id with
+        // the key suffix would be caught here.
+        let json = r#"{
+            "id": "fleet-a",
+            "address": "10.0.0.2:9001",
+            "groups": ["east"],
+            "enabled": true,
+            "is_outbound": true,
+            "trust_cert_cn": null,
+            "protocol_version": 1
+        }"#;
+        let cfg = EtcdDiscovery::decode_entry("rustgate/peers/", "rustgate/peers/node-42", json)
+            .expect("decode");
+        assert_eq!(
+            cfg.id.as_str(),
+            "fleet-a",
+            "JSON body's id wins over key suffix"
+        );
+    }
+
+    #[test]
+    fn parse_kvs_preserves_order_of_valid_entries() {
+        // `parse_kvs` is a `filter_map` over the input slice in
+        // iteration order, so the output order must match the input
+        // order (minus bad entries). The reconciler uses this order
+        // to drive stable peer diffs — a non-deterministic
+        // reordering would manifest as bogus remove/add churn in the
+        // federation manager every tick, even when the etcd contents
+        // were unchanged.
+        let prefix = "rustgate/peers/";
+        let kvs = vec![
+            (
+                "rustgate/peers/charlie".to_string(),
+                "10.0.0.3:9000".to_string(),
+            ),
+            (
+                "rustgate/peers/alpha".to_string(),
+                "10.0.0.1:9000".to_string(),
+            ),
+            (
+                "rustgate/peers/bravo".to_string(),
+                "10.0.0.2:9000".to_string(),
+            ),
+        ];
+        let out = EtcdDiscovery::parse_kvs(prefix, &kvs);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].id.as_str(), "charlie");
+        assert_eq!(out[1].id.as_str(), "alpha");
+        assert_eq!(out[2].id.as_str(), "bravo");
+    }
+
+    #[tokio::test]
+    async fn backend_name_is_stable_etcd_token() {
+        // The reconciler tags log lines with `backend_name()` so
+        // operators grep `"etcd"` to filter for this backend's
+        // lifecycle events. Pin the exact token and the `'static`
+        // lifetime (no allocated String).
+        let d = EtcdDiscovery::new(vec!["http://127.0.0.1:2379".into()], "rustgate/peers/");
+        let name: &'static str = (&d as &dyn PeerDiscovery).backend_name();
+        assert_eq!(name, "etcd");
+    }
+
+    #[test]
+    fn new_stores_endpoints_and_prefix_without_connecting() {
+        // Connection is deliberately deferred to the first `discover`
+        // call so a transient etcd outage at startup cannot prevent
+        // rustgate from launching. Verify the constructor is
+        // side-effect-free with an unreachable endpoint — if it
+        // eagerly connected, this test would hang on the `connect`
+        // future rather than completing instantly.
+        let d = EtcdDiscovery::new(vec!["http://10.255.255.1:2379".into()], "rustgate/peers/");
+        // Assert the Debug rendering shows the stored fields — this
+        // both pins the manual Debug impl and proves new() did not
+        // error on the unreachable endpoint.
+        let rendered = format!("{d:?}");
+        assert!(rendered.contains("http://10.255.255.1:2379"));
+        assert!(rendered.contains("rustgate/peers/"));
+    }
+
+    #[test]
+    fn debug_impl_redacts_client_slot_via_finish_non_exhaustive() {
+        // Manual Debug impl: `endpoints` + `prefix` visible,
+        // `client: Mutex<Option<Client>>` elided via
+        // `finish_non_exhaustive()` (the `..` sentinel). A regression
+        // that swapped to `#[derive(Debug)]` would leak the etcd
+        // Client's internal gRPC connection state into
+        // `tracing::debug!(?backend, …)` output.
+        let d = EtcdDiscovery::new(
+            vec!["http://etcd-a:2379".into(), "http://etcd-b:2379".into()],
+            "rustgate/peers/",
+        );
+        let rendered = format!("{d:?}");
+        assert!(
+            rendered.contains("EtcdDiscovery"),
+            "debug should name the struct: {rendered}",
+        );
+        assert!(
+            rendered.contains("etcd-a:2379") && rendered.contains("etcd-b:2379"),
+            "both endpoints must be visible: {rendered}",
+        );
+        assert!(
+            rendered.contains("rustgate/peers/"),
+            "prefix must be visible: {rendered}",
+        );
+        assert!(
+            rendered.contains(".."),
+            "finish_non_exhaustive sentinel pins client slot redaction: {rendered}",
+        );
+        assert!(
+            !rendered.contains("Mutex"),
+            "client-slot Mutex internals must not leak: {rendered}",
+        );
+    }
 }

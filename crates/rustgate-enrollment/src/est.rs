@@ -515,4 +515,281 @@ mod tests {
         assert!(cn.eq_ignore_ascii_case("Alice"));
         assert!(!cn.eq_ignore_ascii_case("bob"));
     }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Module constants — pin the RFC 7030 / RFC 4519 / operational tokens so
+    // a silent edit to the top-of-file strings surfaces here rather than as a
+    // wire-level interop break with iTAK / ATAK / third-party EST clients.
+    // ────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn content_type_constants_pin_rfc7030_wire_tokens() {
+        assert_eq!(
+            CT_PKCS7_CERTS_ONLY, "application/pkcs7-mime; smime-type=certs-only",
+            "RFC 7030 §4.1.2 + §4.2.3 response content-type",
+        );
+        assert_eq!(CT_CSR_ATTRS, "application/csrattrs", "RFC 7030 §4.5.2");
+        assert_eq!(CT_PKCS10, "application/pkcs10", "RFC 7030 §4.2.1");
+    }
+
+    #[test]
+    fn oid_common_name_is_2_5_4_3_per_rfc4519() {
+        // The CN OID is the load-bearing discriminator in extract_csr_cn's
+        // RDN walk — a silent edit that pointed OID_COMMON_NAME at, say, the
+        // OU or O OID (2.5.4.11 / 2.5.4.10) would make re-enrollment accept
+        // every CSR regardless of subject CN, defeating the identity-
+        // continuity check in handle_simplereenroll. This test fails loudly
+        // on that class of regression rather than letting it slip past the
+        // `extract_cn_from_csr` happy-path test (which would still pass
+        // because rcgen emits the CN under the correct OID — it's the
+        // *lookup* side that matters).
+        assert_eq!(
+            OID_COMMON_NAME.as_bytes(),
+            der::asn1::ObjectIdentifier::new_unwrap("2.5.4.3").as_bytes(),
+        );
+    }
+
+    #[test]
+    fn max_csr_body_is_64_kib_matching_marti_sign_client_limit() {
+        // 64 KiB — CSRs are typically < 4 KiB. A silent bump to, say, 1 MiB
+        // would open a DoS amplification window where an unauthenticated IP
+        // could force the server to allocate 1 MiB per request before
+        // surfacing the 401 (rate-limit fires before auth, body-read fires
+        // after auth, but the `Limited` cap is applied at the hyper layer
+        // regardless of success/failure).
+        assert_eq!(MAX_CSR_BODY, 65_536);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // handle_cacerts — public unauthenticated endpoint that anchors every
+    // EST client's trust decision at enrollment time. Happy path must
+    // preserve the RFC 7030 §4.1.2 shape exactly.
+    // ────────────────────────────────────────────────────────────────────────
+
+    fn test_signer() -> CsrSigner {
+        let ca = rustgate_test_utils::certs::TestCa::new("Test CA");
+        CsrSigner::from_pem(&ca.cert_pem, &ca.key_pem, "TestOrg").expect("signer")
+    }
+
+    async fn collect_body(resp: Response<Full<Bytes>>) -> Bytes {
+        http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .expect("collect body")
+            .to_bytes()
+    }
+
+    #[tokio::test]
+    async fn handle_cacerts_returns_200_pkcs7_certs_only_with_ca_bag() {
+        let signer = test_signer();
+        let resp = handle_cacerts(&signer);
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap();
+        assert_eq!(ct, CT_PKCS7_CERTS_ONLY);
+
+        // Body is base64 of a PKCS#7 SignedData certs-only bag. We don't
+        // re-parse the full structure here (cms_bag has its own round-trip
+        // coverage) but we pin that the bag decodes cleanly as ASCII base64
+        // and is non-empty — a regression that emitted raw DER or an empty
+        // body would still pass the status-only assertion but break every
+        // RFC 7030 client.
+        let body = collect_body(resp).await;
+        assert!(!body.is_empty(), "body must be non-empty");
+        assert!(
+            body.iter()
+                .all(|b| b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/' || *b == b'='),
+            "body must be base64 (no PEM headers, no whitespace)",
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // handle_csrattrs — minimal RFC 7030 §4.5.2 compliance: 204 No Content
+    // with **no** Content-Type header (build_response's `!content_type
+    // .is_empty()` guard is the load-bearing branch here).
+    // ────────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn handle_csrattrs_returns_204_with_empty_body_and_no_content_type_header() {
+        let resp = handle_csrattrs();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(
+            !resp.headers().contains_key(hyper::header::CONTENT_TYPE),
+            "RFC 7030 §4.5.2: 204 response must omit Content-Type — build_response's \
+             empty-CT guard is what pins this",
+        );
+        let body = collect_body(resp).await;
+        assert!(body.is_empty(), "204 body must be empty");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // decode_pkcs10_to_pem — the base64-to-PEM wrapper that feeds CsrSigner.
+    // RFC 8951 requires tolerance of CR/LF/tab/space in the input; empty
+    // bodies must be rejected up-front so downstream PEM parsing surfaces
+    // the root cause rather than a confusing "empty cert" error.
+    // ────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn decode_pkcs10_to_pem_wraps_clean_base64_in_pem_headers() {
+        let b64 = generate_csr_b64("alice");
+        let pem = decode_pkcs10_to_pem(b64.as_bytes()).expect("wrap ok");
+        assert!(pem.starts_with("-----BEGIN CERTIFICATE REQUEST-----\n"));
+        assert!(pem.ends_with("\n-----END CERTIFICATE REQUEST-----"));
+        assert!(pem.contains(&b64), "body must contain the original base64");
+    }
+
+    #[test]
+    fn decode_pkcs10_to_pem_rejects_empty_body_with_csr_error() {
+        let err = decode_pkcs10_to_pem(b"").expect_err("empty body must error");
+        match err {
+            EnrollmentError::Csr(msg) => assert!(
+                msg.contains("empty"),
+                "error message should mention empty body, got {msg:?}",
+            ),
+            other => panic!("expected EnrollmentError::Csr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_pkcs10_to_pem_rejects_whitespace_only_body_as_empty() {
+        // After stripping CR/LF/tab/space per RFC 8951, a whitespace-only
+        // body is indistinguishable from an actually-empty body — the
+        // cleaned string is "" and the empty guard fires.
+        let err = decode_pkcs10_to_pem(b" \t\r\n \t").expect_err("whitespace-only must error");
+        match err {
+            EnrollmentError::Csr(msg) => assert!(msg.contains("empty")),
+            other => panic!("expected EnrollmentError::Csr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_pkcs10_to_pem_rejects_malformed_base64_with_csr_error() {
+        // `!!!` is not a valid base64 alphabet character — the b64::decode
+        // validator must surface an error *before* the PEM wrapper runs,
+        // so the downstream CsrSigner never sees the garbage.
+        let err = decode_pkcs10_to_pem(b"!!!not-base64!!!").expect_err("bad b64 must error");
+        match err {
+            EnrollmentError::Csr(msg) => assert!(
+                msg.contains("invalid base64"),
+                "message should mention invalid base64, got {msg:?}",
+            ),
+            other => panic!("expected EnrollmentError::Csr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_pkcs10_to_pem_strips_whitespace_per_rfc_8951() {
+        // RFC 8951 requires EST servers to tolerate line-wrapped base64
+        // (CR, LF, tab, space). Insert a mix of all four whitespace classes
+        // and assert the resulting PEM body carries the un-wrapped base64.
+        let b64 = generate_csr_b64("alice");
+        let mid = b64.len() / 2;
+        let wrapped = format!("{}\r\n \t{}", &b64[..mid], &b64[mid..]);
+        let pem = decode_pkcs10_to_pem(wrapped.as_bytes()).expect("wrap ok");
+        // Body between PEM headers must be the un-wrapped b64 string,
+        // exactly — a regression that failed to strip one of CR/LF/tab/
+        // space would leave the character embedded and break the round-
+        // trip.
+        let inner = pem
+            .strip_prefix("-----BEGIN CERTIFICATE REQUEST-----\n")
+            .unwrap()
+            .strip_suffix("\n-----END CERTIFICATE REQUEST-----")
+            .unwrap();
+        assert_eq!(inner, b64);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // extract_csr_cn — the identity-continuity anchor for re-enrollment.
+    // Existing suite covers UTF8String CNs and invalid inputs; these tests
+    // additionally pin (a) RFC 8951 whitespace tolerance (same contract as
+    // decode_pkcs10_to_pem — both helpers independently strip), and (b) the
+    // RDN walk finding a CN at a non-first position in a multi-attribute
+    // subject (the `for rdn in &csr.info.subject.0` iteration is otherwise
+    // only exercised on the CN-at-first-RDN happy path).
+    // ────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn extract_csr_cn_tolerates_whitespace_in_body_per_rfc_8951() {
+        let b64 = generate_csr_b64("alice");
+        let mid = b64.len() / 2;
+        let wrapped = format!("{}\r\n \t{}", &b64[..mid], &b64[mid..]);
+        let cn = extract_csr_cn(wrapped.as_bytes()).expect("extract ok");
+        assert_eq!(cn, Some("alice".to_string()));
+    }
+
+    #[test]
+    fn extract_csr_cn_finds_cn_in_multi_rdn_subject() {
+        use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
+
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::default();
+        let mut dn = DistinguishedName::new();
+        // Push non-CN attributes before the CN so the RDN walk has to
+        // iterate past them — a regression that stopped after the first
+        // RDN would miss the CN and return None, breaking re-enrollment
+        // identity continuity for any client whose CSR tooling emits
+        // subjects in non-CN-first order.
+        dn.push(DnType::OrganizationName, "TestOrg");
+        dn.push(DnType::OrganizationalUnitName, "Ops");
+        dn.push(DnType::CommonName, "bob");
+        params.distinguished_name = dn;
+
+        let csr = params.serialize_request(&key).unwrap();
+        let encoded = b64::encode(csr.der());
+        let cn = extract_csr_cn(encoded.as_bytes()).unwrap();
+        assert_eq!(cn, Some("bob".to_string()));
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // build_response_with_www_auth — the 401-response builder that every
+    // unauthenticated caller hits. RFC 7235 requires a `WWW-Authenticate`
+    // header on 401; RFC 7617 scopes the Basic realm. Both are pinned so
+    // a future refactor cannot drop the header or re-scope the realm
+    // silently (curl / wget / browser clients use the realm to disambiguate
+    // between per-service credential stores).
+    // ────────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn build_response_with_www_auth_sets_basic_realm_est_header() {
+        let resp = build_response_with_www_auth(
+            StatusCode::UNAUTHORIZED,
+            "text/plain",
+            Bytes::from_static(b"authentication required"),
+        );
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let wa = resp
+            .headers()
+            .get(hyper::header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok())
+            .expect("WWW-Authenticate must be present on 401");
+        assert_eq!(wa, "Basic realm=\"est\"");
+    }
+
+    #[tokio::test]
+    async fn build_response_with_www_auth_preserves_status_content_type_and_body() {
+        // Helper is status-agnostic so a future refactor reusing it for
+        // 407 (Proxy-Authenticate) or a different error code stays working
+        // — pin the full contract, not just the 401 happy path.
+        let resp = build_response_with_www_auth(
+            StatusCode::FORBIDDEN,
+            "text/plain",
+            Bytes::from_static(b"denied"),
+        );
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            resp.headers()
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/plain"),
+        );
+        assert!(
+            resp.headers().contains_key(hyper::header::WWW_AUTHENTICATE),
+            "WWW-Authenticate is always added, regardless of status",
+        );
+        let body = collect_body(resp).await;
+        assert_eq!(&body[..], b"denied");
+    }
 }

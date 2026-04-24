@@ -441,4 +441,334 @@ mod tests {
         dlq.dead_letter("valid-target_1", &msg, "circuit_open");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
+
+    /// Pins the `Send + Sync + 'static` bound surface. `Arc<DeadLetterQueue>`
+    /// is shared across every per-target sender task and lives for the life
+    /// of the HTTP publisher; if any of the three bounds regressed the
+    /// publisher would no longer compile, so pinning them here gives a
+    /// crisp failure message at the DLQ layer instead of a noisy one at
+    /// the call site.
+    #[test]
+    fn dead_letter_queue_is_send_sync_and_static() {
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+        fn assert_static<T: 'static>() {}
+        assert_send::<DeadLetterQueue>();
+        assert_sync::<DeadLetterQueue>();
+        assert_static::<DeadLetterQueue>();
+    }
+
+    /// Pins the documented default file-size cap (256 MiB) so a future
+    /// refactor that bumps the literal without revisiting the operator
+    /// docs in `docs/http.md` trips here first.
+    #[test]
+    fn default_dlq_max_bytes_is_exactly_256_mib() {
+        assert_eq!(DEFAULT_DLQ_MAX_BYTES, 256 * 1024 * 1024);
+        assert_eq!(DEFAULT_DLQ_MAX_BYTES, 268_435_456);
+    }
+
+    /// Pins the rotation contract: once a writer's `bytes_written` meets or
+    /// exceeds `max_bytes`, the NEXT `dead_letter` call seals the old writer
+    /// (leaving the old encrypted file readable on disk) and creates a new
+    /// writer with a fresh timestamp suffix. This is the core invariant that
+    /// bounds forensic file size at rest and keeps decrypt_file readable for
+    /// offline recovery.
+    #[test]
+    fn rotation_creates_new_file_once_bytes_written_meets_max_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_ring = test_key_ring();
+        // max_bytes=50: any single JSON DLQ entry is > 50 bytes once the
+        // timestamp, target, reason, source_cn, and payload_b64 are written,
+        // so the second dead_letter call rotates.
+        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, Some(50));
+
+        let msg = make_msg("alice");
+        dlq.dead_letter("rotator", &msg, "circuit_open");
+        // Brief sleep to guarantee the rotation's new filename timestamp
+        // differs from the first (both use millisecond precision); without
+        // this the OS filesystem may collide names if we run very fast on a
+        // fast disk.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        dlq.dead_letter("rotator", &msg, "circuit_open");
+
+        let count = std::fs::read_dir(dir.path()).unwrap().count();
+        assert!(
+            count >= 2,
+            "expected rotation to leave >= 2 files on disk, got {count}"
+        );
+    }
+
+    /// Pins that rotation is scoped to a single target — rotating one target
+    /// must not touch any other target's writer. A regression that held a
+    /// process-global `bytes_written` counter would cause one chatty target
+    /// to force all targets to rotate on every write, bloating disk usage
+    /// and breaking the "one file per target per lifecycle" invariant
+    /// documented in the module header.
+    #[test]
+    fn rotation_is_scoped_per_target_and_does_not_affect_other_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_ring = test_key_ring();
+        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, Some(50));
+
+        let msg = make_msg("alice");
+        // Quiet target: writes exactly one entry (no rotation — bytes_written
+        // is still 0 on first write, rotation check fires only on entries >= 2).
+        dlq.dead_letter("quiet", &msg, "circuit_open");
+
+        // Chatty target: writes twice with a sleep between, forcing rotation.
+        dlq.dead_letter("chatty", &msg, "circuit_open");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        dlq.dead_letter("chatty", &msg, "circuit_open");
+
+        // `quiet` should have exactly one file; `chatty` should have >= 2.
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        let quiet_count = entries
+            .iter()
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|s| s.starts_with("quiet_"))
+                    .unwrap_or(false)
+            })
+            .count();
+        let chatty_count = entries
+            .iter()
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|s| s.starts_with("chatty_"))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(
+            quiet_count, 1,
+            "quiet target must not rotate when only chatty target is full"
+        );
+        assert!(
+            chatty_count >= 2,
+            "chatty target must rotate independently of quiet target (got {chatty_count})"
+        );
+    }
+
+    /// Pins the wire format for a message with no groups: `source_groups`
+    /// must serialize as `[]`, NOT be omitted, NOT serialize as `null`. The
+    /// offline recovery tool and any SIEM ingest rule keys off this exact
+    /// shape.
+    #[test]
+    fn dlq_entry_serializes_empty_source_groups_as_empty_json_array() {
+        let mut msg = make_msg("alice");
+        msg.source.groups.clear();
+        let entry = DlqEntry {
+            timestamp: "2026-04-13T12:00:00Z".to_string(),
+            target: "siem",
+            reason: "circuit_open",
+            source_cn: &msg.source.cn,
+            source_groups: msg.source.groups.iter().map(String::as_str).collect(),
+            destination: crate::payload::format_destination(&msg.destination),
+            message_type: msg.metadata.message_type.to_string(),
+            source_protocol: &msg.metadata.source_protocol,
+            payload_b64: b64::encode(&msg.payload),
+            payload_size: msg.payload.len(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(
+            json.contains("\"source_groups\":[]"),
+            "empty groups must serialize as empty array, got: {json}"
+        );
+        assert!(
+            !json.contains("\"source_groups\":null"),
+            "null is not an acceptable serialization for empty groups"
+        );
+    }
+
+    /// Pins the payload-base64 round-trip: the raw payload bytes written into
+    /// the DLQ entry must survive `b64::decode` back to the original. Forensic
+    /// replay tools depend on this being a lossless encoding (not a hex
+    /// digest, not a truncation, not a UTF-8 lossy conversion).
+    #[test]
+    fn dlq_entry_payload_b64_round_trips_to_original_bytes() {
+        let payload = b"\xde\xad\xbe\xef\x00\x01\x02\xff some non-utf8 bytes \x80\x81";
+        let b64 = b64::encode(payload);
+        let decoded = b64::decode(&b64).unwrap();
+        assert_eq!(decoded.as_slice(), &payload[..]);
+    }
+
+    /// Pins that every documented field in the module-header contract
+    /// (timestamp, target, reason, source_cn, source_groups, destination,
+    /// message_type, source_protocol, payload_b64, payload_size) is present
+    /// in the serialized JSON. If a future refactor drops or renames a
+    /// field without updating the operator-facing recovery tool, this trips.
+    #[test]
+    fn dlq_entry_json_contains_all_documented_fields() {
+        let msg = make_msg("alice");
+        let entry = DlqEntry {
+            timestamp: "2026-04-13T12:00:00Z".to_string(),
+            target: "siem",
+            reason: "circuit_open",
+            source_cn: &msg.source.cn,
+            source_groups: msg.source.groups.iter().map(String::as_str).collect(),
+            destination: crate::payload::format_destination(&msg.destination),
+            message_type: msg.metadata.message_type.to_string(),
+            source_protocol: &msg.metadata.source_protocol,
+            payload_b64: b64::encode(&msg.payload),
+            payload_size: msg.payload.len(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        for expected_field in [
+            "\"timestamp\":",
+            "\"target\":",
+            "\"reason\":",
+            "\"source_cn\":",
+            "\"source_groups\":",
+            "\"destination\":",
+            "\"message_type\":",
+            "\"source_protocol\":",
+            "\"payload_b64\":",
+            "\"payload_size\":",
+        ] {
+            assert!(
+                json.contains(expected_field),
+                "DLQ JSON missing documented field `{expected_field}`: {json}"
+            );
+        }
+    }
+
+    /// Pins that `format_timestamp_now` returns a string parseable as
+    /// ISO-8601 (RFC 3339 subset). SIEM ingest, replay tools, and the
+    /// "hash-chained audit log" cross-correlation all depend on this exact
+    /// format. The fallback string `"unknown"` is the only acceptable
+    /// non-ISO-8601 value and only on formatter failure.
+    #[test]
+    fn format_timestamp_now_returns_iso_8601_parseable_output() {
+        let ts = format_timestamp_now();
+        if ts == "unknown" {
+            // Fallback path — acceptable.
+            return;
+        }
+        let parsed = time::OffsetDateTime::parse(
+            &ts,
+            &time::format_description::well_known::Iso8601::DEFAULT,
+        );
+        assert!(
+            parsed.is_ok(),
+            "format_timestamp_now must produce ISO-8601 or \"unknown\", got: {ts:?}"
+        );
+    }
+
+    /// Pins the path-traversal defence across a broader set of attack
+    /// variants than the existing `../etc/passwd` test. Each of these must
+    /// be silently dropped with no file created in the DLQ directory:
+    /// backslash (Windows path separator), single dot, double dot alone,
+    /// space, Unicode letter (not ASCII alphanumeric), null byte, tab,
+    /// newline, colon (Windows drive separator), percent (URL-escape),
+    /// tilde (home-expansion shell metachar), at-sign, and a name with
+    /// mixed-case valid + dot.
+    #[test]
+    fn path_traversal_defence_covers_broad_attack_surface() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_ring = test_key_ring();
+        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, None);
+
+        let msg = make_msg("alice");
+        let hostile_names = [
+            "..\\windows", // backslash
+            ".",           // single dot
+            "..",          // double dot alone
+            "with space",  // space
+            "café",        // non-ASCII letter (é)
+            "null\0byte",  // embedded null
+            "tab\there",   // embedded tab
+            "new\nline",   // embedded newline
+            "C:foo",       // colon (Windows drive)
+            "pct%2e%2e",   // percent
+            "~expand",     // tilde (shell home-expansion)
+            "at@sign",     // @ symbol
+            "trailing.",   // trailing dot
+            ".leadingdot", // leading dot
+            "middle.dot",  // middle dot
+        ];
+        for name in hostile_names {
+            dlq.dead_letter(name, &msg, "circuit_open");
+        }
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "path traversal defence must reject every hostile name"
+        );
+    }
+
+    /// Pins that `finish()` is idempotent: double-call must not panic and
+    /// must not double-seal (the underlying `SharedEncryptedWriter::finish`
+    /// is itself idempotent, but the DLQ-level contract is stronger — the
+    /// shutdown path calls `finish()` as part of graceful drain and an
+    /// operator-initiated SIGTERM may re-enter it).
+    #[test]
+    fn finish_is_idempotent_across_repeated_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_ring = test_key_ring();
+        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, None);
+
+        let msg = make_msg("alice");
+        dlq.dead_letter("target-1", &msg, "circuit_open");
+
+        dlq.finish();
+        dlq.finish(); // second call must not panic
+        dlq.finish(); // nor the third
+
+        // File still exists and is non-empty
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].metadata().unwrap().len() > 0);
+    }
+
+    /// Pins that `finish()` on an empty DLQ (no targets ever dead-lettered)
+    /// is a no-op — must not crash, must not create files. This is the
+    /// common shutdown path for a long-running publisher that never tripped
+    /// any circuit breaker.
+    #[test]
+    fn finish_on_empty_queue_is_a_noop_and_does_not_create_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_ring = test_key_ring();
+        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, None);
+
+        dlq.finish();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    /// Pins the `finish_non_exhaustive` Debug shape: `dir` is visible
+    /// (operator diagnostic), `key_ring` and `max_bytes` and `writers`
+    /// MUST be hidden. The existing `debug_impl_redacts_internals` test
+    /// asserts the key bytes are not rendered; this test strengthens it
+    /// by asserting the struct name, the `..` sentinel from
+    /// `finish_non_exhaustive()`, and the absence of every private field
+    /// name. A regression that replaced `finish_non_exhaustive()` with
+    /// `finish()` would render all fields by default and trip here.
+    #[test]
+    fn debug_format_uses_finish_non_exhaustive_and_hides_private_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_ring = test_key_ring();
+        let dlq = DeadLetterQueue::new(dir.path().to_path_buf(), key_ring, None);
+        let debug = format!("{dlq:?}");
+
+        assert!(debug.contains("DeadLetterQueue"));
+        assert!(debug.contains("dir"));
+        // finish_non_exhaustive appends `.. }` before the closing brace.
+        assert!(
+            debug.contains(".."),
+            "Debug must include finish_non_exhaustive marker `..`: {debug}"
+        );
+        // Private fields must NOT be rendered.
+        for hidden in ["key_ring", "max_bytes", "writers"] {
+            assert!(
+                !debug.contains(hidden),
+                "Debug must hide private field `{hidden}`: {debug}"
+            );
+        }
+    }
 }

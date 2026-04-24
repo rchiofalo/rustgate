@@ -537,3 +537,366 @@ fn build_server_tls_config(
 
     Ok(config)
 }
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used)]
+mod tests {
+    //! Unit tests for `EnrollmentServer`'s builder, `Debug` redaction,
+    //! module-level constants, and the F-40 TLS preflight in `run()`.
+    //!
+    //! Full integration coverage lives in
+    //! `tests/server_integration.rs` and `tests/est_integration.rs`.
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use rustgate_test_utils::certs::TestCa;
+    use zeroize::Zeroizing;
+
+    use super::*;
+    use crate::auth::Credentials;
+    use crate::signing::CsrSigner;
+
+    /// Build a minimal `EnrollmentServer` for structural tests.
+    /// Uses `TestCa` to produce a real signer — `CsrSigner::from_pem`
+    /// parses the CA cert + key so we cannot stub those in from thin air.
+    fn build_server_for_tests() -> EnrollmentServer {
+        let ca = TestCa::new("test-ca");
+        let signer =
+            CsrSigner::from_pem(&ca.cert_pem, &ca.key_pem, "test-org").expect("build signer");
+        let creds = Credentials::new("admin".to_string(), Zeroizing::new("secret".to_string()));
+        EnrollmentServer::new(signer, creds)
+    }
+
+    #[test]
+    fn new_default_config_has_no_optional_providers_and_uses_documented_rate_limits() {
+        // `EnrollmentServer::new` is the base constructor every deployment
+        // path calls before layering optional features via `with_*`. Three
+        // invariants must hold on the fresh struct:
+        //   1. All optional providers are `None` — a refactor that
+        //      accidentally populated one of them with a default stub
+        //      (say, an in-memory `DataPackageStore`) would silently
+        //      expose `/Marti/sync/*` endpoints on every enrollment
+        //      server, defeating the "explicitly opt-in" builder model.
+        //   2. The sign_limiter uses `DEFAULT_SIGN_RATE_LIMIT` (10) and
+        //      `DEFAULT_SIGN_RATE_WINDOW` (60s) — the CLI's
+        //      `--enrollment-rate-limit` flag omission relies on these.
+        //   3. Neither rate-limit callback is wired — a refactor that
+        //      pre-populated `on_rate_limit` with a no-op closure would
+        //      change the behaviour of `with_rate_limit_callback` from
+        //      "override None" to "replace existing" and break every
+        //      test that relies on the None-to-Some transition.
+        let server = build_server_for_tests();
+
+        assert!(
+            server.contacts_provider.is_none(),
+            "contacts_provider must default to None"
+        );
+        assert!(server.packages.is_none(), "packages must default to None");
+        assert!(
+            server.revocation.is_none(),
+            "revocation must default to None"
+        );
+        assert!(
+            server.on_rate_limit.is_none(),
+            "on_rate_limit must default to None"
+        );
+        assert!(
+            server.on_rate_limit_poison.is_none(),
+            "on_rate_limit_poison must default to None"
+        );
+        assert_eq!(
+            server.sign_limiter.max_requests(),
+            DEFAULT_SIGN_RATE_LIMIT,
+            "default sign_limiter.max_requests must match DEFAULT_SIGN_RATE_LIMIT"
+        );
+        assert_eq!(
+            server.sign_limiter.window(),
+            DEFAULT_SIGN_RATE_WINDOW,
+            "default sign_limiter.window must match DEFAULT_SIGN_RATE_WINDOW"
+        );
+    }
+
+    #[test]
+    fn debug_impl_elides_sensitive_fields_and_reports_optional_provider_bools() {
+        // The manual `Debug` impl exists precisely because a derived
+        // `Debug` would render the `Arc<CsrSigner>` (which transitively
+        // holds a private key) and the `Arc<Credentials>` (which holds
+        // the HTTP Basic auth password inside a `Zeroizing<String>`
+        // whose `Debug` delegates to the inner `String`). The manual
+        // impl must:
+        //   - Render a field named `signer` and `credentials` (operators
+        //     rely on tracing::debug!(?server, …) to confirm presence)
+        //     but their values may contain inner types' Debug output —
+        //     that is acceptable because `CsrSigner`/`Credentials` each
+        //     redact their own secrets internally.
+        //   - Render `contacts_provider: true|false`, `packages:
+        //     true|false`, `revocation: true|false` so the on-call can
+        //     see which features are wired without leaking the actual
+        //     provider state (endpoints, connection pools, redb
+        //     handles).
+        //   - Not contain any of the password bytes.
+        //
+        // The password chosen below is an unambiguous sentinel that
+        // would definitely appear in a naive derived-Debug output.
+        let ca = TestCa::new("test-ca");
+        let signer =
+            CsrSigner::from_pem(&ca.cert_pem, &ca.key_pem, "test-org").expect("build signer");
+        let creds = Credentials::new(
+            "admin".to_string(),
+            Zeroizing::new("UNIQUE-SENTINEL-PASSWORD-42".to_string()),
+        );
+        let server = EnrollmentServer::new(signer, creds);
+
+        let rendered = format!("{server:?}");
+        assert!(
+            rendered.starts_with("EnrollmentServer {"),
+            "Debug output must start with the struct name: {rendered}"
+        );
+        assert!(
+            rendered.contains("contacts_provider: false"),
+            "contacts_provider must render as bool false when unset: {rendered}"
+        );
+        assert!(
+            rendered.contains("packages: false"),
+            "packages must render as bool false when unset: {rendered}"
+        );
+        assert!(
+            rendered.contains("revocation: false"),
+            "revocation must render as bool false when unset: {rendered}"
+        );
+        assert!(
+            !rendered.contains("UNIQUE-SENTINEL-PASSWORD-42"),
+            "Debug output leaked the password bytes — \
+             Credentials::Debug should redact: {rendered}"
+        );
+    }
+
+    #[test]
+    fn with_rate_limit_overrides_default_max_requests_and_window() {
+        // The `--enrollment-rate-limit` CLI flag wires through to
+        // `with_rate_limit(max_requests, window)`; this test pins that
+        // the override actually reaches the sign_limiter rather than
+        // being dropped on the floor. A regression that e.g. swapped
+        // the argument order or forgot to reassign `self.sign_limiter`
+        // would leave the defaults in place and silently under-enforce
+        // a strict operator-configured limit.
+        let server = build_server_for_tests().with_rate_limit(7, Duration::from_secs(30));
+
+        assert_eq!(server.sign_limiter.max_requests(), 7);
+        assert_eq!(server.sign_limiter.window(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn with_rate_limit_poison_callback_preserves_existing_rate_limit_regardless_of_call_order() {
+        // The doc-comment on `with_rate_limit_poison_callback`
+        // explicitly advertises: "Safe to call in any order relative
+        // to `with_rate_limit`: the existing limiter's configured
+        // `max_requests` and `window` are preserved when the poison
+        // callback is attached." This test pins both orderings so a
+        // future refactor cannot silently regress to "rebuild with
+        // DEFAULT_SIGN_RATE_LIMIT/WINDOW whenever the poison callback
+        // is attached", which would silently reset an operator's
+        // strict override.
+        //
+        // Order 1: poison_callback first (defaults preserved)
+        let cb: PoisonCallback = Arc::new(|| {});
+        let server = build_server_for_tests().with_rate_limit_poison_callback(Arc::clone(&cb));
+        assert_eq!(
+            server.sign_limiter.max_requests(),
+            DEFAULT_SIGN_RATE_LIMIT,
+            "defaults preserved when poison callback attached first"
+        );
+        assert_eq!(
+            server.sign_limiter.window(),
+            DEFAULT_SIGN_RATE_WINDOW,
+            "defaults preserved when poison callback attached first"
+        );
+
+        // Order 2: with_rate_limit first, then poison_callback
+        // (custom rate limit preserved, not clobbered by defaults)
+        let server = build_server_for_tests()
+            .with_rate_limit(3, Duration::from_secs(15))
+            .with_rate_limit_poison_callback(Arc::clone(&cb));
+        assert_eq!(
+            server.sign_limiter.max_requests(),
+            3,
+            "custom max_requests preserved when poison callback attached after with_rate_limit"
+        );
+        assert_eq!(
+            server.sign_limiter.window(),
+            Duration::from_secs(15),
+            "custom window preserved when poison callback attached after with_rate_limit"
+        );
+    }
+
+    #[test]
+    fn module_constants_pin_documented_defaults_and_limits() {
+        // Four module-level constants drive operator-visible behaviour
+        // and must not drift without an explicit CHANGELOG note:
+        //   - DEFAULT_SIGN_RATE_LIMIT (10) — public, exposed via CLI
+        //     default; a lower value would false-reject legitimate
+        //     deployments, a higher value would weaken DoS protection.
+        //   - DEFAULT_SIGN_RATE_WINDOW (60s) — public, paired with the
+        //     above; the units matter for "10/min" to remain the
+        //     documented semantics.
+        //   - MAX_ENROLLMENT_CONNECTIONS (64) — private, caps the
+        //     `tokio::sync::Semaphore` that the accept loop pulls from
+        //     so a SYN flood against the unauthenticated TLS endpoint
+        //     cannot exhaust memory. Doubling this is cheap; halving
+        //     it could false-reject legitimate fleet refreshes.
+        //   - ENROLLMENT_HTTP_CONNECTION_TIMEOUT (30s) — private,
+        //     intentionally 2x the workspace-wide
+        //     `HTTP_CONNECTION_TIMEOUT` because CSR signing +
+        //     PKCS#12 generation can take seconds and the CI test
+        //     harness routinely runs under slow-disk conditions; a
+        //     drift to 15s would flake integration tests and trip
+        //     real slow-CA deployments.
+        assert_eq!(DEFAULT_SIGN_RATE_LIMIT, 10);
+        assert_eq!(DEFAULT_SIGN_RATE_WINDOW, Duration::from_secs(60));
+        assert_eq!(MAX_ENROLLMENT_CONNECTIONS, 64);
+        assert_eq!(ENROLLMENT_HTTP_CONNECTION_TIMEOUT, Duration::from_secs(30));
+        // Cross-check the documented "2x HTTP_CONNECTION_TIMEOUT"
+        // relationship so a bump of the core constant without a
+        // corresponding reconsideration here trips this assert.
+        assert!(
+            ENROLLMENT_HTTP_CONNECTION_TIMEOUT > rustgate_core::constants::HTTP_CONNECTION_TIMEOUT,
+            "enrollment timeout must remain higher than core HTTP_CONNECTION_TIMEOUT \
+             (CSR signing + PKCS#12 is slow)"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_rejects_both_empty_cert_and_key_pem_with_f40_security_preflight() {
+        // F-40 (issue #767): PKCS#12 enrollment bundles protect the
+        // cert bag with a publicly-known standardized password
+        // ("atakatak"), so the TLS channel is the real confidentiality
+        // boundary. The server refuses to start without TLS so an
+        // operator cannot accidentally run plaintext enrollment (which
+        // would silently leak full client cert chains to any passive
+        // observer). This test pins the empty-string rejection path
+        // and the distinctive error message that tells the operator
+        // *why* — a regression that collapsed the message into a
+        // generic "config error" would leave the operator chasing a
+        // parser bug.
+        let server = build_server_for_tests();
+        let bind = "127.0.0.1:0".parse().unwrap();
+        let err = server
+            .run(bind, "", "")
+            .await
+            .expect_err("empty pem must fail");
+        match err {
+            EnrollmentError::Config(msg) => {
+                assert!(
+                    msg.contains("requires TLS"),
+                    "error must cite the F-40 rationale 'requires TLS': {msg}"
+                );
+                assert!(
+                    msg.contains("PKCS#12"),
+                    "error must mention PKCS#12 so operator understands why: {msg}"
+                );
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_rejects_whitespace_only_cert_pem_with_f40_security_preflight() {
+        // The preflight uses `.trim().is_empty()` so a whitespace-only
+        // file (a common "accidentally fed in an empty env var via
+        // shell heredoc" mistake) is still rejected. A regression that
+        // dropped the `trim()` call would silently accept such inputs
+        // and let them fall through to `rustgate_core::pem::parse_certs`
+        // whose error message does not communicate the F-40 security
+        // rationale.
+        let ca = TestCa::new("test-ca");
+        let signer =
+            CsrSigner::from_pem(&ca.cert_pem, &ca.key_pem, "test-org").expect("build signer");
+        let creds = Credentials::new("admin".to_string(), Zeroizing::new("secret".to_string()));
+        let server = EnrollmentServer::new(signer, creds);
+
+        let bind = "127.0.0.1:0".parse().unwrap();
+        let err = server
+            .run(bind, "  \n\t  ", &ca.key_pem)
+            .await
+            .expect_err("whitespace-only cert_pem must fail the F-40 preflight");
+        match err {
+            EnrollmentError::Config(msg) => {
+                assert!(msg.contains("requires TLS"), "expected F-40 message: {msg}");
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_rejects_whitespace_only_key_pem_with_f40_security_preflight() {
+        // Symmetric to the cert-side whitespace test: empty-after-trim
+        // on the key side must also fail the F-40 preflight. Without
+        // this, an operator who fed an empty `--enrollment-key` file
+        // would see the generic rustls "failed to parse server key"
+        // error and not understand the confidentiality rationale for
+        // the refusal.
+        let ca = TestCa::new("test-ca");
+        let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
+        let signer =
+            CsrSigner::from_pem(&ca.cert_pem, &ca.key_pem, "test-org").expect("build signer");
+        let creds = Credentials::new("admin".to_string(), Zeroizing::new("secret".to_string()));
+        let server = EnrollmentServer::new(signer, creds);
+
+        let bind = "127.0.0.1:0".parse().unwrap();
+        let err = server
+            .run(bind, &server_cert.cert_pem, "\t\n   \n")
+            .await
+            .expect_err("whitespace-only key_pem must fail the F-40 preflight");
+        match err {
+            EnrollmentError::Config(msg) => {
+                assert!(msg.contains("requires TLS"), "expected F-40 message: {msg}");
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn with_rate_limit_callback_wires_none_to_some_transition_for_prometheus_fan_out() {
+        // `with_rate_limit_callback(cb)` should move the callback from
+        // `None` to `Some(Arc<dyn Fn>)`. This is the transition the
+        // server binary relies on to wire the
+        // `rustgate_enrollment_rate_limit_total` Prometheus counter —
+        // a regression that failed to store the callback, or stored a
+        // no-op wrapper rather than the caller's Arc, would silently
+        // drop every rate-limit metric. The test does not assert the
+        // callback is *invoked* on a real rate-limit hit (that is the
+        // integration test's job) — it proves only that the `None →
+        // Some` wiring happens and that the stored handle is the same
+        // `Arc` (via strong-count bookkeeping).
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_cb = Arc::clone(&counter);
+        let cb: RateLimitCallback = Arc::new(move || {
+            let _ = counter_cb.fetch_add(1, Ordering::Relaxed);
+        });
+        let strong_before = Arc::strong_count(&cb);
+
+        let server = build_server_for_tests().with_rate_limit_callback(Arc::clone(&cb));
+
+        assert!(
+            server.on_rate_limit.is_some(),
+            "with_rate_limit_callback must transition on_rate_limit to Some"
+        );
+        // One Arc clone lives on the server, one here in `cb` — strong
+        // count must have grown by exactly 1.
+        assert_eq!(
+            Arc::strong_count(&cb),
+            strong_before + 1,
+            "with_rate_limit_callback must store the caller's Arc, not wrap it"
+        );
+
+        // Firing the stored callback must reach the caller's counter.
+        let stored = server.on_rate_limit.as_ref().expect("stored callback");
+        stored();
+        stored();
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            2,
+            "stored callback must invoke the caller's closure"
+        );
+    }
+}

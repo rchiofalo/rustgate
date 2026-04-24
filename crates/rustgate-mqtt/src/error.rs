@@ -221,4 +221,283 @@ mod tests {
             "Debug should name the variant; got {rendered}",
         );
     }
+
+    // -----------------------------------------------------------------
+    // Error::source() contract — pins `#[from]`-driven chaining so
+    // downstream `anyhow::Context::context()` chains render inner IO
+    // errors in operator-facing output. The non-Io variants must
+    // return `None` so the log chain stops there, rather than
+    // accidentally inheriting a misleading cause.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn io_variant_source_returns_inner_io_error() {
+        use std::error::Error as _;
+        // `#[error("I/O error: {0}")]` + `Io(#[from] std::io::Error)`
+        // is the only variant that should chain through `source()`.
+        // A regression that dropped the `#[source]` behaviour of
+        // `#[from]` (or swapped the template to `{source}` without
+        // the `#[source]` marker) would silently break the chain,
+        // and every `anyhow::context`-wrapped caller would lose the
+        // inner io::Error from its Display chain.
+        let io_err = io::Error::new(io::ErrorKind::ConnectionAborted, "reset by peer");
+        let wrapped: MqttError = io_err.into();
+        let src = wrapped
+            .source()
+            .expect("Io variant must chain to its inner io::Error");
+        // The source is the io::Error; its Display should match the
+        // original message.
+        assert!(
+            src.to_string().contains("reset by peer"),
+            "source() must delegate to inner io::Error's Display: {}",
+            src
+        );
+    }
+
+    #[test]
+    fn non_io_variants_return_none_from_source() {
+        use std::error::Error as _;
+        // Every variant other than `Io` is self-contained (no
+        // `#[source]` / `#[from]` field), so `Error::source()` must
+        // return `None`. A regression that added `#[source]` to a
+        // non-Io variant (for example, bolting an inner cause onto
+        // `Malformed` without updating this test) would silently
+        // extend every operator-facing error chain.
+        let cases = [
+            MqttError::UnsupportedProtocol(3),
+            MqttError::PersistentSessionUnsupported,
+            MqttError::WillUnsupported,
+            MqttError::Qos2Unsupported,
+            MqttError::NotAuthorized("t".into()),
+            MqttError::InvalidTopic("t".into()),
+            MqttError::PacketTooLarge { size: 1, max: 2 },
+            MqttError::Malformed("m".into()),
+            MqttError::ConnectExpected,
+            MqttError::ClientIdInUse("i".into()),
+            MqttError::KeepAliveTimeout(30),
+        ];
+        for err in &cases {
+            assert!(
+                err.source().is_none(),
+                "variant {err:?} must NOT chain a source (got {:?})",
+                err.source()
+            );
+        }
+    }
+
+    #[test]
+    fn mqtt_error_is_static_bound() {
+        // The enum has no lifetime parameters and carries only owned
+        // data (`u8`, `u16`, `usize`, `String`, `io::Error`), so it
+        // must satisfy the `'static` bound. Downstream callers box
+        // `MqttError` as `Box<dyn std::error::Error + Send + Sync +
+        // 'static>` (the shape `anyhow::Error::new` wants) and a
+        // regression that introduced a borrowed field (e.g. `&str`
+        // instead of `String` on `Malformed`) would fail here with a
+        // pointed error rather than at the far-away boxing site.
+        fn assert_static<T: 'static>() {}
+        assert_static::<MqttError>();
+    }
+
+    // -----------------------------------------------------------------
+    // Full-variant Debug sweep — the existing single-variant test
+    // pins `ClientIdInUse`, but every variant ends up in
+    // `tracing::error!(?err, …)` at least one call site. Operators
+    // grep on variant names to filter log streams, so a
+    // `thiserror::Debug` regression that elided a variant would
+    // silently break alerting without breaking anything else.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn debug_names_every_variant_when_present_in_log_stream() {
+        let cases: [(MqttError, &str); 12] = [
+            (MqttError::UnsupportedProtocol(3), "UnsupportedProtocol"),
+            (
+                MqttError::PersistentSessionUnsupported,
+                "PersistentSessionUnsupported",
+            ),
+            (MqttError::WillUnsupported, "WillUnsupported"),
+            (MqttError::Qos2Unsupported, "Qos2Unsupported"),
+            (MqttError::NotAuthorized("t".into()), "NotAuthorized"),
+            (MqttError::InvalidTopic("t".into()), "InvalidTopic"),
+            (
+                MqttError::PacketTooLarge { size: 1, max: 2 },
+                "PacketTooLarge",
+            ),
+            (MqttError::Malformed("m".into()), "Malformed"),
+            (MqttError::ConnectExpected, "ConnectExpected"),
+            (MqttError::ClientIdInUse("i".into()), "ClientIdInUse"),
+            (MqttError::KeepAliveTimeout(30), "KeepAliveTimeout"),
+            (MqttError::Io(io::Error::from(io::ErrorKind::Other)), "Io"),
+        ];
+        for (err, expected) in &cases {
+            let rendered = format!("{err:?}");
+            assert!(
+                rendered.contains(expected),
+                "Debug for {err:?} must contain variant name {expected:?}: {rendered}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Boundary-value rendering — pins that Display templates do not
+    // panic or truncate at the integer type boundaries. `u8::MAX` in
+    // `UnsupportedProtocol`, `u16::MAX` in `KeepAliveTimeout`, and
+    // `usize::MAX` in both fields of `PacketTooLarge` are the inputs
+    // an adversary can actually produce on a hostile connection.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn unsupported_protocol_zero_and_max_render_exactly() {
+        // `0` is what a truncated / empty CONNECT packet might produce
+        // once parsed into a u8; `255` is the signed-byte boundary.
+        // A regression that used a template like `{0:02}` (zero-pad)
+        // or `{0:x}` (hex) would silently change operator-facing text
+        // and break SIEM regex rules.
+        assert_eq!(
+            MqttError::UnsupportedProtocol(0).to_string(),
+            "unsupported protocol version: 0",
+        );
+        assert_eq!(
+            MqttError::UnsupportedProtocol(u8::MAX).to_string(),
+            "unsupported protocol version: 255",
+        );
+    }
+
+    #[test]
+    fn keep_alive_timeout_at_u16_max_renders_exactly() {
+        // A hostile or buggy client can advertise `u16::MAX` seconds
+        // (just over 18 hours) and the render must survive that
+        // without allocating a garbage truncated string.
+        assert_eq!(
+            MqttError::KeepAliveTimeout(u16::MAX).to_string(),
+            "keep-alive timeout (65535s)",
+        );
+    }
+
+    #[test]
+    fn packet_too_large_at_usize_max_renders_exactly() {
+        // On a 64-bit host `usize::MAX` is 20 digits (18_446_744_073_
+        // 709_551_615). Rendering this in the size / max fields must
+        // succeed without allocating a doubled / truncated string —
+        // a refactor that switched to `fmt::LowerHex` or used
+        // arithmetic (e.g. a human-readable "GiB" renderer) on the
+        // size field would change the log shape and break SIEM rules.
+        let err = MqttError::PacketTooLarge {
+            size: usize::MAX,
+            max: usize::MAX,
+        };
+        let rendered = err.to_string();
+        // Assert the exact digit form for both fields.
+        assert!(
+            rendered.contains(&usize::MAX.to_string()),
+            "Display must render usize::MAX literal: {rendered}"
+        );
+        assert!(rendered.starts_with("packet too large: "));
+        assert!(rendered.ends_with(" byte limit"));
+    }
+
+    // -----------------------------------------------------------------
+    // Empty-payload Display defence — `String`-carrying variants must
+    // still render without producing garbage when the payload is
+    // empty (e.g. an adversary-supplied CONNECT with a zero-length
+    // Malformed reason, or a topic filter that normalises to empty).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn string_variants_tolerate_empty_payload_without_panicking() {
+        // Each variant's template appends `{0}` after a trailing
+        // separator. With an empty payload the trailing character
+        // stays in place (no silent trimming). Pin that every
+        // string-carrying Display template survives the empty-string
+        // input and renders the static prefix verbatim.
+        assert_eq!(
+            MqttError::NotAuthorized(String::new()).to_string(),
+            "not authorized for topic: ",
+        );
+        assert_eq!(
+            MqttError::InvalidTopic(String::new()).to_string(),
+            "invalid topic: ",
+        );
+        assert_eq!(
+            MqttError::Malformed(String::new()).to_string(),
+            "malformed packet: ",
+        );
+        assert_eq!(
+            MqttError::ClientIdInUse(String::new()).to_string(),
+            "client ID `` is already in use by another identity",
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Exhaustiveness pin — the enum is deliberately NOT
+    // `#[non_exhaustive]`, so the reason-code mapper in
+    // `crate::session` can `match` on every variant without a
+    // wildcard arm and rely on the compiler to flag a missed variant
+    // when a future variant is added. An exhaustive match here
+    // compiles iff the enum carries the same 12 variants as the
+    // mapper sees, guarding against a variant added to the enum but
+    // not to the mapper (or vice-versa).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn error_enum_exhaustive_match_compiles_with_no_wildcard() {
+        // The match is purely for its compile-time exhaustiveness
+        // check — the runtime assertion is tautological. A future
+        // variant added to `MqttError` without `#[non_exhaustive]`
+        // would force the new variant to be handled here, directing
+        // the maintainer to the downstream reason-code mapper.
+        fn classify(err: &MqttError) -> &'static str {
+            match err {
+                MqttError::UnsupportedProtocol(_) => "unsupported_protocol",
+                MqttError::PersistentSessionUnsupported => "persistent_session",
+                MqttError::WillUnsupported => "will",
+                MqttError::Qos2Unsupported => "qos2",
+                MqttError::NotAuthorized(_) => "not_authorized",
+                MqttError::InvalidTopic(_) => "invalid_topic",
+                MqttError::PacketTooLarge { .. } => "packet_too_large",
+                MqttError::Malformed(_) => "malformed",
+                MqttError::ConnectExpected => "connect_expected",
+                MqttError::ClientIdInUse(_) => "client_id_in_use",
+                MqttError::KeepAliveTimeout(_) => "keepalive_timeout",
+                MqttError::Io(_) => "io",
+            }
+        }
+        assert_eq!(
+            classify(&MqttError::ConnectExpected),
+            "connect_expected",
+            "sanity check that the mapping executes at all"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Io round-trip — pins that the `ErrorKind` survives the `From`
+    // conversion intact. A regression that remapped the inner
+    // io::Error's kind (e.g. collapsing every kind to `Other`) would
+    // silently break every upstream `if err.kind() ==
+    // ConnectionReset`-style branch that funnels MQTT session drops
+    // into the appropriate audit event.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn io_variant_preserves_error_kind_through_from_conversion() {
+        let kinds = [
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::WouldBlock,
+        ];
+        for kind in kinds {
+            let err: MqttError = io::Error::from(kind).into();
+            match err {
+                MqttError::Io(inner) => assert_eq!(
+                    inner.kind(),
+                    kind,
+                    "kind must survive From<io::Error> conversion unchanged"
+                ),
+                other => panic!("expected MqttError::Io for kind {kind:?}, got {other:?}"),
+            }
+        }
+    }
 }

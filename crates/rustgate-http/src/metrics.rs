@@ -261,4 +261,219 @@ mod tests {
             assert!(child.get() >= 1);
         }
     }
+
+    // ── Defensive regression pins ──────────────────────────────────
+
+    #[test]
+    fn metric_names_match_documented_schema() {
+        // Regression sentinel: the eight fully-qualified metric names
+        // are contracts with Grafana dashboards, alerting rules, and
+        // external scrape-aware tooling. A silent rename here would
+        // break dashboards without any in-tree compile failure. Pin
+        // each `fq_name` exactly.
+        use prometheus::core::Collector;
+
+        assert_eq!(
+            publishes().desc()[0].fq_name,
+            "rustgate_http_publishes_total"
+        );
+        assert_eq!(errors().desc()[0].fq_name, "rustgate_http_errors_total");
+        assert_eq!(
+            request_duration().desc()[0].fq_name,
+            "rustgate_http_request_duration_seconds"
+        );
+        assert_eq!(
+            circuit_state().desc()[0].fq_name,
+            "rustgate_http_circuit_state"
+        );
+        assert_eq!(retries().desc()[0].fq_name, "rustgate_http_retries_total");
+        assert_eq!(filtered().desc()[0].fq_name, "rustgate_http_filtered_total");
+        assert_eq!(queue_depth().desc()[0].fq_name, "rustgate_http_queue_depth");
+        assert_eq!(dropped().desc()[0].fq_name, "rustgate_http_dropped_total");
+    }
+
+    #[test]
+    fn label_schema_is_stable_per_metric() {
+        // The Prometheus timeseries identity is `(metric_name, label_set)`.
+        // Changing the label name — even keeping the semantic meaning —
+        // creates a new timeseries and breaks the rate() continuity on
+        // every dashboard. Pin the exact variable-label ordering and
+        // membership for every label-bearing metric.
+        use prometheus::core::Collector;
+
+        let labels_of = |d: &prometheus::core::Desc| -> Vec<String> {
+            d.variable_labels.iter().map(|s| s.to_string()).collect()
+        };
+
+        assert_eq!(labels_of(publishes().desc()[0]), vec!["target".to_string()]);
+        assert_eq!(
+            labels_of(errors().desc()[0]),
+            vec!["target".to_string(), "reason".to_string()]
+        );
+        assert_eq!(
+            labels_of(circuit_state().desc()[0]),
+            vec!["target".to_string()]
+        );
+        assert_eq!(labels_of(retries().desc()[0]), vec!["target".to_string()]);
+        assert_eq!(labels_of(filtered().desc()[0]), vec!["target".to_string()]);
+        assert_eq!(labels_of(dropped().desc()[0]), vec!["reason".to_string()]);
+        // Non-vector metrics carry no variable labels.
+        assert!(labels_of(queue_depth().desc()[0]).is_empty());
+        assert!(labels_of(request_duration().desc()[0]).is_empty());
+    }
+
+    #[test]
+    fn wrong_label_arity_returns_error_not_panic() {
+        // `get_metric_with_label_values` must return `Err` on arity
+        // mismatch rather than panicking. The production code threads
+        // these through `if let Ok(child)` — if prometheus ever changed
+        // the behaviour to panic, those guards would stop being enough.
+        // Pin the `Result` contract on a two-label vector (`errors`) and
+        // a zero-label metric is skipped (the zero-label case has no
+        // `get_metric_with_label_values`).
+        assert!(
+            errors()
+                .get_metric_with_label_values(&[] as &[&str])
+                .is_err()
+        );
+        assert!(
+            errors()
+                .get_metric_with_label_values(&["only-one"])
+                .is_err()
+        );
+        assert!(
+            errors()
+                .get_metric_with_label_values(&["too", "many", "labels"])
+                .is_err()
+        );
+        assert!(errors().get_metric_with_label_values(&["t", "r"]).is_ok());
+    }
+
+    #[test]
+    fn fresh_label_pair_starts_at_zero() {
+        // A never-before-seen label combination must report `0` before
+        // the first `inc()`. This is the Prometheus baseline invariant
+        // — dashboards use `rate(counter[5m])` which silently shifts if
+        // a fresh label starts at any non-zero value.
+        let counter = publishes();
+        // Use a distinctive label so parallel tests cannot collide on it.
+        let label = "fresh-label-start-zero-0x7d4e";
+        let child = counter
+            .get_metric_with_label_values(&[label])
+            .expect("label ok");
+        assert_eq!(child.get(), 0);
+    }
+
+    #[test]
+    fn fallback_counter_vec_produces_callable_counter() {
+        // Direct exercise of the `fallback_counter_vec` helper. Its
+        // error path is `std::process::abort()`, which cannot be
+        // tested — but the sunny path must yield a counter vec that
+        // accepts `with_label_values` and increments normally.
+        let cv = fallback_counter_vec("fallback_test_counter_a", "help", &["k"]);
+        let child = cv.get_metric_with_label_values(&["v"]).expect("label ok");
+        assert_eq!(child.get(), 0);
+        child.inc();
+        assert_eq!(child.get(), 1);
+    }
+
+    #[test]
+    fn fallback_gauge_starts_at_zero_and_is_signed() {
+        // `fallback_gauge` builds an `IntGauge`. Pin the documented
+        // prometheus behaviour: fresh gauge reads zero; gauges accept
+        // negative values (this differs from counters, which must be
+        // monotonically non-decreasing). If the helper ever swapped to
+        // an `IntCounter` variant, this test would fail.
+        let g = fallback_gauge("fallback_test_gauge_a", "help");
+        assert_eq!(g.get(), 0);
+        g.set(-1);
+        assert_eq!(g.get(), -1);
+        g.set(42);
+        assert_eq!(g.get(), 42);
+    }
+
+    #[test]
+    fn fallback_gauge_vec_returns_callable_vec() {
+        // Same shape as the counter-vec fallback test: exercise the
+        // sunny path and confirm per-label children are indexable and
+        // writable. Regression guard for the helper used by the circuit
+        // state accessor.
+        let gv = fallback_gauge_vec("fallback_test_gauge_vec_a", "help", &["label"]);
+        let child = gv.get_metric_with_label_values(&["x"]).expect("label ok");
+        assert_eq!(child.get(), 0);
+        child.set(7);
+        assert_eq!(child.get(), 7);
+    }
+
+    #[test]
+    fn fallback_histogram_observes_count_and_sum() {
+        // `fallback_histogram` produces a default-bucket `Histogram`.
+        // Pin the two observable fields that dashboards use: total
+        // sample count and cumulative sum. A regression that switched
+        // to a `Counter` would fail on `observe` (not present) at
+        // compile time, but a regression that switched bucket bounds
+        // would not — still, pinning count + sum makes intent explicit.
+        let h = fallback_histogram("fallback_test_hist_a", "help");
+        h.observe(0.5);
+        h.observe(1.5);
+        assert_eq!(h.get_sample_count(), 2);
+        assert!((h.get_sample_sum() - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn accessors_are_idempotent_reference_same_static_instance() {
+        // `OnceLock::get_or_init` must return the same underlying
+        // `&'static` on every call. Prometheus uses pointer-equal
+        // comparison when iterating registered collectors; a regression
+        // that created a fresh metric on every access would duplicate
+        // timeseries in the scrape output.
+        assert!(std::ptr::eq(publishes(), publishes()));
+        assert!(std::ptr::eq(errors(), errors()));
+        assert!(std::ptr::eq(circuit_state(), circuit_state()));
+        assert!(std::ptr::eq(retries(), retries()));
+        assert!(std::ptr::eq(filtered(), filtered()));
+        assert!(std::ptr::eq(dropped(), dropped()));
+        assert!(std::ptr::eq(queue_depth(), queue_depth()));
+        assert!(std::ptr::eq(request_duration(), request_duration()));
+    }
+
+    #[test]
+    fn request_duration_observes_sample_count_and_sum() {
+        // Pin the end-to-end histogram plumbing for the request-
+        // duration metric via the accessor. This complements the
+        // helper-level test by verifying the production accessor
+        // returns something observable.
+        let h = request_duration();
+        let before_count = h.get_sample_count();
+        let before_sum = h.get_sample_sum();
+        h.observe(0.25);
+        assert_eq!(h.get_sample_count(), before_count + 1);
+        assert!((h.get_sample_sum() - before_sum - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn metric_help_text_is_non_empty_for_every_accessor() {
+        // Prometheus `HELP` lines drive the descriptions in the
+        // `/metrics` exposition and in Grafana tooltips. Empty help
+        // strings would render as blank rows. Pin non-empty for every
+        // registered metric.
+        use prometheus::core::Collector;
+
+        for d in [
+            publishes().desc()[0],
+            errors().desc()[0],
+            circuit_state().desc()[0],
+            retries().desc()[0],
+            filtered().desc()[0],
+            dropped().desc()[0],
+            queue_depth().desc()[0],
+            request_duration().desc()[0],
+        ] {
+            assert!(
+                !d.help.is_empty(),
+                "help must be non-empty for {}",
+                d.fq_name
+            );
+        }
+    }
 }

@@ -144,6 +144,7 @@ impl Default for ThrottleConfig {
 }
 
 #[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use std::time::Duration;
 
@@ -229,5 +230,239 @@ mod tests {
         // Exhaust burst, wait for refill, verify it still works.
         std::thread::sleep(Duration::from_millis(10));
         assert!(throttle.allow(), "should refill without overflow");
+    }
+
+    // ── Contract-shape coverage ─────────────────────────────────────
+    //
+    // The tests above cover the sunny path of the token-bucket
+    // algorithm (allow/reject, refill, pack, overflow clamping) but
+    // leave several contract-shape invariants unpinned — bounds the
+    // read-loop depends on to even compile, the rate() accessor the
+    // audit sinks read, boundary-input clamping on burst / rate, the
+    // Default-is-full-bucket invariant, the refill-upper-bound that
+    // stops `available()` from exceeding `capacity` regardless of how
+    // long the session idles, and the CAS correctness of `allow()`
+    // under concurrent contention.  A refactor that weakens any of
+    // these would still pass every sunny-path test but surface as a
+    // silent production regression — dropped traffic on a restart,
+    // stale rate in an audit log, or a race on a shared Arc.
+    //
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn client_throttle_is_debug_send_sync() {
+        // Every session owns a `ClientThrottle` inside an `Arc` shared
+        // between the read loop, the drop-handling path, and the audit
+        // sink.  Losing `Send` or `Sync` would fail to compile at the
+        // sharing site; losing `Debug` would break every
+        // `tracing::debug!(?throttle, …)` line operators rely on for
+        // triage.  Pin the bounds locally so the offending change
+        // lights up this module first.
+        fn assert_bounds<T: std::fmt::Debug + Send + Sync>() {}
+        assert_bounds::<ClientThrottle>();
+    }
+
+    #[test]
+    fn throttle_config_is_debug_clone_copy_default_send_sync() {
+        // `ThrottleConfig` is passed by value through the builder
+        // chain and stored in the listener config struct.  The Copy
+        // derive is load-bearing (every `.build()` call takes `&self`
+        // and the caller re-uses the config afterwards).  Default is
+        // the operator-friendly "sensible defaults" hook.
+        fn assert_bounds<T: std::fmt::Debug + Clone + Copy + Default + Send + Sync>() {}
+        assert_bounds::<ThrottleConfig>();
+    }
+
+    #[test]
+    fn rate_accessor_returns_configured_value() {
+        // The `rate()` accessor exists specifically so audit sinks can
+        // log the configured limit alongside a drop event — without
+        // it, an operator who sees "client X dropped N messages" has
+        // no way to know whether the limit was 100 or 10 000.  The
+        // getter is documented as lossless for the constructor's
+        // `u32` input (no precision loss from the internal `f64`),
+        // so pin that contract across a handful of representative
+        // values.
+        assert_eq!(ClientThrottle::new(100, 10).rate(), 100);
+        assert_eq!(ClientThrottle::new(1, 1).rate(), 1);
+        assert_eq!(ClientThrottle::new(1_000_000, 10).rate(), 1_000_000);
+        // rate = 0 is legal; the resulting throttle never refills,
+        // which is a useful "disabled" sentinel — pin that the getter
+        // round-trips 0 rather than coercing to 1.
+        assert_eq!(ClientThrottle::new(0, 5).rate(), 0);
+    }
+
+    #[test]
+    fn new_clamps_zero_burst_to_one_so_throttle_always_allows_at_least_one_message() {
+        // `burst.clamp(1, MAX_CAPACITY)` — a burst of 0 would otherwise
+        // produce an always-reject throttle, which is rarely what an
+        // operator meant (typical intent is "1 token, refilled at rate").
+        // Pin the lower clamp so a regression that changed the floor
+        // fails here rather than at a mystery-loss incident.
+        let t = ClientThrottle::new(100, 0);
+        assert_eq!(
+            t.available(),
+            1,
+            "burst=0 must clamp to capacity=1, bucket starts full"
+        );
+        assert!(
+            t.allow(),
+            "zero-burst throttle must still allow the first token"
+        );
+    }
+
+    #[test]
+    fn new_with_zero_rate_exhausts_then_never_refills() {
+        // rate = 0 is a legitimate "disable refills" setting.  The
+        // bucket starts full (capacity tokens) and, once drained, does
+        // NOT refill regardless of elapsed time.  A refactor that
+        // silently treated rate=0 as "unlimited" would flip the
+        // semantics.
+        let t = ClientThrottle::new(0, 3);
+        assert!(t.allow());
+        assert!(t.allow());
+        assert!(t.allow());
+        assert!(!t.allow(), "bucket empty after capacity allows");
+        // Even after a generous wait, no refill should occur.
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            !t.allow(),
+            "rate=0 must not refill regardless of elapsed time"
+        );
+    }
+
+    #[test]
+    fn initial_available_equals_capacity_so_bucket_starts_full() {
+        // The constructor packs `capacity * 100` tokens into the
+        // initial state — a regression that started at half-capacity
+        // (or empty) would break the "first N messages always pass"
+        // contract every session-start assumes.
+        for burst in [1u32, 5, 10, 200, 65_536] {
+            let t = ClientThrottle::new(100, burst);
+            assert_eq!(
+                t.available(),
+                burst,
+                "bucket must start at exactly capacity={burst}"
+            );
+        }
+    }
+
+    #[test]
+    fn available_never_exceeds_capacity_regardless_of_idle_duration() {
+        // `available = (… + refill).min(max_x100)` caps the bucket at
+        // `capacity` even after a long idle period.  A regression that
+        // dropped the `.min(max_x100)` would let an idle session
+        // accumulate arbitrary burst credit, defeating the entire
+        // purpose of the "burst" parameter.
+        let t = ClientThrottle::new(1000, 5); // 1000 tokens/sec, burst 5
+        // Exhaust the bucket.
+        for _ in 0..5 {
+            assert!(t.allow());
+        }
+        // Wait long enough that 50 tokens' worth of refill would
+        // accrue if uncapped (50 ms × 1000 tokens/sec = 50 tokens).
+        std::thread::sleep(Duration::from_millis(50));
+        // Cap MUST hold: available must be <= 5, not 50.
+        assert!(
+            t.available() <= 5,
+            "available must cap at capacity=5 even after long idle; got {}",
+            t.available()
+        );
+    }
+
+    #[test]
+    fn pack_unpack_round_trip_at_u32_max_boundary() {
+        // Pack/unpack is a pure helper but the boundary matters: the
+        // refill path packs `available - 100` which can legitimately
+        // reach very large values when rate is high.  Pin the u32::MAX
+        // boundary so a regression that narrowed the split (e.g. used
+        // 31-bit halves) fails here.
+        let packed = pack(u32::MAX, u32::MAX);
+        let (t, s) = unpack(packed);
+        assert_eq!(t, u32::MAX);
+        assert_eq!(s, u32::MAX);
+    }
+
+    #[test]
+    fn pack_unpack_is_injective_for_distinct_token_counts_at_same_timestamp() {
+        // If two distinct `(tokens, ts)` pairs ever packed to the same
+        // u64, the CAS loop in `allow()` could race-match a state it
+        // did not actually observe and silently skip a decrement.  Pin
+        // injectivity on the token half for a fixed timestamp.
+        let a = pack(100, 500);
+        let b = pack(200, 500);
+        assert_ne!(a, b);
+        let (ta, sa) = unpack(a);
+        let (tb, sb) = unpack(b);
+        assert_eq!(sa, sb, "timestamps match");
+        assert_ne!(ta, tb, "token halves differ");
+    }
+
+    #[test]
+    fn config_build_produces_independent_throttles_per_call() {
+        // `ThrottleConfig::build(&self)` takes `&self` and returns a
+        // fresh `ClientThrottle` per call — each session gets its own
+        // token bucket, not a shared one.  A regression that stored
+        // the `ClientThrottle` inside `ThrottleConfig` and returned a
+        // clone would share state across sessions and let one busy
+        // client drain every other client's quota.
+        let cfg = ThrottleConfig::new(10, 3);
+        let a = cfg.build();
+        let b = cfg.build();
+        // Exhaust one bucket.
+        for _ in 0..3 {
+            assert!(a.allow());
+        }
+        assert!(!a.allow(), "bucket a drained");
+        // Bucket b must be independent.
+        for _ in 0..3 {
+            assert!(
+                b.allow(),
+                "bucket b must start full regardless of a's state"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_allow_calls_never_exceed_burst_without_refill() {
+        // Stress-test the CAS loop in `allow()`.  `rate = 0` pins the
+        // refill contribution at exactly 0 tokens regardless of how
+        // much wall time the threads consume (the earlier rate=0 test
+        // proves this), so the total number of `true` returns MUST
+        // equal exactly `burst` — no more, no less.  A regression in
+        // the CAS ordering (e.g. `Ordering::Relaxed` changed to a
+        // reordering-permissive combination, or the wrong `current`
+        // read before the CAS) would produce either double-counts
+        // (> burst) or lost updates (< burst).  `std::thread::scope`
+        // gives us parallel N=16 contention without spawning Tokio.
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        const THREADS: usize = 16;
+        const ATTEMPTS_PER_THREAD: usize = 100;
+        const BURST: u32 = 50;
+
+        let t = Arc::new(ClientThrottle::new(0, BURST));
+        let allowed = Arc::new(AtomicUsize::new(0));
+
+        std::thread::scope(|s| {
+            for _ in 0..THREADS {
+                let t = Arc::clone(&t);
+                let allowed = Arc::clone(&allowed);
+                let _ = s.spawn(move || {
+                    for _ in 0..ATTEMPTS_PER_THREAD {
+                        if t.allow() {
+                            let _ = allowed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+
+        let total = allowed.load(Ordering::Relaxed);
+        assert_eq!(
+            total, BURST as usize,
+            "CAS must let exactly BURST messages through under contention; got {total}"
+        );
     }
 }

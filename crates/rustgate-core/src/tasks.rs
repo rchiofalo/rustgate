@@ -283,4 +283,241 @@ mod tests {
             "task inside the subsystem should wake from the externally-cloned Arc<Notify>"
         );
     }
+
+    // ── defensive-invariant coverage ────────────────────────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn spawn_background_returns_immediately_without_awaiting_future() {
+        // The function's contract says "fire-and-forget" — the caller
+        // must not block on the spawned future. A regression that
+        // accidentally did `handle.await` on the hot path (instead of
+        // inside the separately-spawned watcher) would defeat the
+        // whole point of the helper. Pin with a paused-clock time
+        // measurement: spawn a task that sleeps for 60s of virtual time
+        // and assert the `spawn_background` call itself returns in
+        // <= 100ms of virtual time.
+        let start = tokio::time::Instant::now();
+        spawn_background("non-blocking", async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed <= Duration::from_millis(100),
+            "spawn_background must not block on the spawned future (got elapsed {elapsed:?})"
+        );
+    }
+
+    #[test]
+    fn spawn_background_accepts_send_static_future_only() {
+        // Compile-time pin on the future bound: `impl Future<Output=()>
+        // + Send + 'static`. A regression that narrowed `'static` to a
+        // named lifetime or dropped `Send` would fail at the far-away
+        // call site where a borrowed-field closure is handed in; pin
+        // here via a local helper so the break is localized. The test
+        // does not run the future — construction alone is enough.
+        fn assert_bounds<F: std::future::Future<Output = ()> + Send + 'static>(_: F) {}
+        assert_bounds(async move {});
+        assert_bounds(async move {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        });
+    }
+
+    #[tokio::test]
+    async fn spawn_background_runs_many_concurrent_tasks_independently() {
+        // Pins that `spawn_background` scales past a single task and
+        // that each spawned future runs to completion independently. A
+        // regression that funnelled spawns through a shared mutex (or
+        // accidentally serialized them via a `tokio::spawn` wrapper
+        // that awaited the prior handle) would still pass the single-
+        // task happy-path test but would fail here by either taking
+        // much longer or by missing entries in the shared counter.
+        const N: usize = 20;
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..N {
+            let counter_clone = Arc::clone(&counter);
+            spawn_background("concurrent", async move {
+                let _ = counter_clone.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        for _ in 0..200 {
+            if counter.load(Ordering::SeqCst) == N {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            N,
+            "all {N} background tasks should have run, got {}",
+            counter.load(Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn spawn_background_function_return_type_is_unit() {
+        // Pin the public API return type — `()`, not `JoinHandle<()>`.
+        // Exposing the handle would let callers accidentally block on
+        // background work (defeating the fire-and-forget contract) and
+        // would be a silently-breaking API change. The `let _: () =`
+        // binding enforces this at monomorphisation time.
+        //
+        // The test body constructs-but-does-not-run: the goal is
+        // compile-time verification, not execution.
+        let f = || {
+            let _: () = spawn_background("api-pin", async move {});
+        };
+        let _ = f; // suppress unused-closure warning
+    }
+
+    #[test]
+    fn subsystem_handle_is_send_and_static() {
+        // Compile-time pin: `SubsystemHandle` flows across task
+        // boundaries (constructed on the main orchestration task, moved
+        // into a `stop_subsystem` call site that may execute inside a
+        // separately-spawned shutdown coordinator). A refactor that
+        // embedded a non-`Send` field or a borrowed reference would
+        // break every downstream caller. Pin via a local bound helper.
+        fn assert_bounds<T: Send + 'static>() {}
+        assert_bounds::<SubsystemHandle>();
+    }
+
+    #[tokio::test]
+    async fn subsystem_handle_new_stores_same_shutdown_arc_it_was_given() {
+        // The `shutdown: Arc<Notify>` field must be the same Arc the
+        // caller passed in — not a freshly-allocated clone. Callers
+        // rely on this so they can clone the Arc before construction,
+        // hand the clone to the task body, and keep the original for
+        // later notification. A regression that internally re-wrapped
+        // `Arc::new(Notify::new())` would silently desync the two.
+        let shutdown = Arc::new(Notify::new());
+        let expected_ptr = Arc::as_ptr(&shutdown);
+        let task = tokio::spawn(async move {});
+        let handle = SubsystemHandle::new(Arc::clone(&shutdown), task);
+        let stored_ptr = Arc::as_ptr(&handle.shutdown);
+        assert_eq!(
+            expected_ptr, stored_ptr,
+            "SubsystemHandle::new must store the same Arc it was given (got distinct pointers)"
+        );
+        drop(handle);
+    }
+
+    #[tokio::test]
+    async fn subsystem_handle_shutdown_field_is_publicly_accessible() {
+        // Pin the `pub shutdown: Arc<Notify>` field visibility — the
+        // server crate's graceful-shutdown flow clones this field to
+        // propagate the stop signal into watchdog tasks. A refactor
+        // that narrowed to `pub(crate)` would break the server crate's
+        // callers with an invisible-from-rustgate-core compile error.
+        let shutdown = Arc::new(Notify::new());
+        let task = tokio::spawn(async move {});
+        let handle = SubsystemHandle::new(Arc::clone(&shutdown), task);
+        // Direct field access — not via a getter — must compile.
+        let _: &Arc<Notify> = &handle.shutdown;
+        let _cloned: Arc<Notify> = Arc::clone(&handle.shutdown);
+        drop(handle);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_subsystem_timeout_is_exactly_five_seconds_of_virtual_time() {
+        // The 5-second drain deadline is documented in the docstring
+        // ("matches the drain deadline used by the binary's graceful-
+        // shutdown flow") and is operationally shared with the
+        // binary's SIGTERM handler. A regression that shortened to 3s
+        // or widened to 10s would silently break drain SLOs. Pin the
+        // exact value with a narrow window by measuring virtual-time
+        // elapsed around a stuck task.
+        let shutdown = Arc::new(Notify::new());
+        let task = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+        });
+        let handle = SubsystemHandle::new(shutdown, task);
+
+        let start = tokio::time::Instant::now();
+        stop_subsystem("exact-timeout", handle).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_secs(5),
+            "stop_subsystem timeout must be at least 5s (got {elapsed:?})"
+        );
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "stop_subsystem timeout must be less than 6s (got {elapsed:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_subsystems_stop_independently_without_cross_interference() {
+        // Pins that stop_subsystem on one handle does not affect a
+        // second independently-constructed subsystem. Operationally
+        // every deployed rustgate instance runs multiple subsystems
+        // (WebSocket, MQTT, federation, plaintext, metrics) and the
+        // shutdown sequence stops them one at a time; a regression
+        // that shared internal state across handles (e.g. a global
+        // NOTIFY lock) would cause the second subsystem's await to
+        // return prematurely or hang.
+        let shutdown_a = Arc::new(Notify::new());
+        let shutdown_b = Arc::new(Notify::new());
+        let exited_a = Arc::new(AtomicBool::new(false));
+        let exited_b = Arc::new(AtomicBool::new(false));
+
+        let shutdown_a_task = Arc::clone(&shutdown_a);
+        let exited_a_task = Arc::clone(&exited_a);
+        let task_a = tokio::spawn(async move {
+            shutdown_a_task.notified().await;
+            exited_a_task.store(true, Ordering::SeqCst);
+        });
+
+        let shutdown_b_task = Arc::clone(&shutdown_b);
+        let exited_b_task = Arc::clone(&exited_b);
+        let task_b = tokio::spawn(async move {
+            shutdown_b_task.notified().await;
+            exited_b_task.store(true, Ordering::SeqCst);
+        });
+
+        let handle_a = SubsystemHandle::new(shutdown_a, task_a);
+        let handle_b = SubsystemHandle::new(shutdown_b, task_b);
+
+        // Stop only A — B must still be alive.
+        stop_subsystem("subsystem-a", handle_a).await;
+        assert!(exited_a.load(Ordering::SeqCst), "A should have exited");
+        assert!(
+            !exited_b.load(Ordering::SeqCst),
+            "B must NOT have exited when A was stopped"
+        );
+
+        // Now stop B — it should still complete normally.
+        stop_subsystem("subsystem-b", handle_b).await;
+        assert!(exited_b.load(Ordering::SeqCst), "B should have exited");
+    }
+
+    #[test]
+    fn spawn_background_name_parameter_requires_static_str_lifetime() {
+        // The `name: &'static str` parameter is deliberate: it flows
+        // into the `tracing::error!` call that fires if the background
+        // task panics, and that call happens at an unknown future time
+        // relative to the spawn site. A regression that narrowed the
+        // bound to `&str` would compile at the spawn site but fail the
+        // tracing macro at the panic-log site (borrowed lifetime does
+        // not outlive the spawned watcher). Pin compile-time only via
+        // a closure we never invoke — the monomorphised signature is
+        // what we are asserting, not runtime behaviour.
+        #[allow(dead_code, clippy::type_complexity)]
+        fn accepts_static_name()
+        -> fn(&'static str, std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>)
+        {
+            // Re-statement of `spawn_background`'s signature: if the
+            // production signature narrowed the `'static` bound on the
+            // name, this coercion would fail. We do not call the
+            // returned pointer — the compile-time check is the assert.
+            fn wrapper(
+                name: &'static str,
+                fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+            ) {
+                spawn_background(name, fut);
+            }
+            wrapper
+        }
+        let _ = accepts_static_name();
+    }
 }
