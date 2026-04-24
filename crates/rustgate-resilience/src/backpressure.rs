@@ -78,7 +78,7 @@ const DWELL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// counter `inc()`, a `tracing::debug!` line. Unsafe targets: file I/O,
 /// HTTP requests, `std::sync::Mutex::lock` on a shared lock. If the
 /// callback may block, dispatch the work with
-/// [`rustgate_core::tasks::spawn_background`] inside the closure body.
+/// `rustgate_core::tasks::spawn_background` inside the closure body.
 pub type OnDeferred = Arc<dyn Fn() + Send + Sync>;
 
 /// Callback invoked whenever the current queued-bytes counter changes.
@@ -88,7 +88,7 @@ pub type OnDeferred = Arc<dyn Fn() + Send + Sync>;
 /// `sub` — i.e. potentially once per message delivered — so any blocking
 /// work compounds into observable message-path latency. Safe targets:
 /// `IntGauge::set`, atomic counter updates. If the work is not
-/// provably wait-free, dispatch it with [`rustgate_core::tasks::spawn_background`]
+/// provably wait-free, dispatch it with `rustgate_core::tasks::spawn_background`
 /// from inside the closure.
 pub type OnBytesChanged = Arc<dyn Fn(usize) + Send + Sync>;
 
