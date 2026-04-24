@@ -681,6 +681,7 @@ impl FederationManager {
                             on_event,
                             replay_drain: Some(replay_drain),
                             max_hops: self.config.max_hops,
+                            compression: peer_config.compression,
                         },
                     );
 
@@ -1522,6 +1523,7 @@ impl FederationManager {
                         on_event,
                         replay_drain: Some(replay_drain),
                         max_hops: self.config.max_hops,
+                        compression: peer_config.compression,
                     },
                 );
 
@@ -1862,6 +1864,7 @@ mod tests {
             region: None,
             zone: None,
             priority: 100,
+            compression: None,
         }
     }
 
@@ -2860,6 +2863,7 @@ mod tests {
             region: region.map(String::from),
             zone: None,
             priority,
+            compression: None,
         }
     }
 

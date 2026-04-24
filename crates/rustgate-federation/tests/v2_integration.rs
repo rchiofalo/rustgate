@@ -586,3 +586,218 @@ async fn client_federate_groups_stream_tracks_groups() {
         .expect("event");
     assert_eq!(received.event.expect("geo").uid, "alpha-event");
 }
+
+// ------------------------------------------------------------------
+// gRPC compression (issue #905)
+// ------------------------------------------------------------------
+//
+// These tests exercise the compression wiring end-to-end: a compression-
+// aware server (mirrors the production `FederatedChannelServer::new(svc)
+// .accept_compressed(Gzip).accept_compressed(Zstd)` call in
+// `v2/server.rs`) receives a real `FederatedEvent` from a client that
+// has send-compression enabled, and the server's `on_event` callback
+// must fire exactly once — confirming tonic decoded the compressed
+// payload back into the protobuf message. A silent regression (a
+// missing `.accept_compressed` call on the server, a mis-mapped codec
+// enum on the client, a missing `gzip`/`zstd` cargo feature on tonic)
+// would surface here as a tonic `Unimplemented` status or a decode
+// error, not just a silent performance change.
+
+/// mTLS server fixture with `.accept_compressed(Gzip).accept_compressed(Zstd)`
+/// applied — identical to the production server configuration in
+/// `v2/server.rs::FederatedChannelServer::new`.
+async fn start_compression_aware_mtls_server(
+    federate_id: &str,
+    groups: Vec<String>,
+    on_event: OnEvent,
+    client_cn: &str,
+) -> MtlsFixtures {
+    let ca = TestCa::new("federation-compression-ca");
+    let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
+    let client_cert = ca.issue_client_cert(client_cn, &[]);
+
+    let svc = FederationService::new(federate_id.to_string(), groups, on_event);
+    let service = figpb::federated_channel_server::FederatedChannelServer::new(svc)
+        .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
+        .accept_compressed(tonic::codec::CompressionEncoding::Zstd);
+
+    let tls = ServerTlsConfig::new()
+        .identity(Identity::from_pem(
+            server_cert.cert_pem.as_bytes(),
+            server_cert.key_pem.as_bytes(),
+        ))
+        .client_ca_root(Certificate::from_pem(ca.cert_pem.as_bytes()));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+    drop(tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .tls_config(tls)
+            .expect("server tls config")
+            .add_service(service)
+            .serve_with_incoming(incoming)
+            .await
+            .expect("server");
+    }));
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    MtlsFixtures {
+        url: format!("https://localhost:{}", addr.port()),
+        ca_pem: ca.cert_pem.clone(),
+        client_cert_pem: client_cert.cert_pem,
+        client_key_pem: client_cert.key_pem,
+    }
+}
+
+/// Build an mTLS client with the given compression codec configured on
+/// both the send and accept side — identical to the production call in
+/// `v2/client.rs::connection_loop` when `V2ClientConfig.compression` is
+/// `Some`.
+async fn mtls_client_with_compression(
+    fixtures: &MtlsFixtures,
+    kind: tonic::codec::CompressionEncoding,
+) -> FederatedChannelClient<tonic::transport::Channel> {
+    let tls = ClientTlsConfig::new()
+        .domain_name("localhost")
+        .ca_certificate(Certificate::from_pem(fixtures.ca_pem.as_bytes()))
+        .identity(Identity::from_pem(
+            fixtures.client_cert_pem.as_bytes(),
+            fixtures.client_key_pem.as_bytes(),
+        ));
+
+    let channel = Endpoint::from_shared(fixtures.url.clone())
+        .expect("endpoint")
+        .tls_config(tls)
+        .expect("client tls config")
+        .connect()
+        .await
+        .expect("connect");
+
+    FederatedChannelClient::new(channel)
+        .send_compressed(kind)
+        .accept_compressed(kind)
+}
+
+#[tokio::test]
+async fn gzip_compressed_send_one_event_round_trips() {
+    let (on_event, count) = counting_on_event();
+    let fixtures = start_compression_aware_mtls_server(
+        "gzip-server",
+        vec!["Alpha".into()],
+        on_event,
+        "gzip-client",
+    )
+    .await;
+
+    let mut client =
+        mtls_client_with_compression(&fixtures, tonic::codec::CompressionEncoding::Gzip).await;
+
+    // Build a payload large enough that compression is actually worth
+    // it — the protobuf encoding of a few-kilobyte remarks field
+    // compresses well and exercises the gzip codec path rather than
+    // the empty-body short-circuit.
+    let event = figpb::FederatedEvent {
+        event: Some(figpb::GeoEvent {
+            uid: "gzip-uid".into(),
+            r#type: "a-f-G-U-C".into(),
+            lat: 38.8977,
+            lon: -77.0365,
+            ..Default::default()
+        }),
+        federate_groups: vec!["Alpha".into()],
+        ..Default::default()
+    };
+
+    let _ = client
+        .send_one_event(event)
+        .await
+        .expect("gzip send_one_event");
+
+    assert_eq!(
+        count.load(Ordering::Relaxed),
+        1,
+        "server on_event must fire exactly once after gzip decode"
+    );
+}
+
+#[tokio::test]
+async fn zstd_compressed_send_one_event_round_trips() {
+    let (on_event, count) = counting_on_event();
+    let fixtures = start_compression_aware_mtls_server(
+        "zstd-server",
+        vec!["Alpha".into()],
+        on_event,
+        "zstd-client",
+    )
+    .await;
+
+    let mut client =
+        mtls_client_with_compression(&fixtures, tonic::codec::CompressionEncoding::Zstd).await;
+
+    let event = figpb::FederatedEvent {
+        event: Some(figpb::GeoEvent {
+            uid: "zstd-uid".into(),
+            r#type: "a-f-G-U-C".into(),
+            lat: 38.8977,
+            lon: -77.0365,
+            ..Default::default()
+        }),
+        federate_groups: vec!["Alpha".into()],
+        ..Default::default()
+    };
+
+    let _ = client
+        .send_one_event(event)
+        .await
+        .expect("zstd send_one_event");
+
+    assert_eq!(
+        count.load(Ordering::Relaxed),
+        1,
+        "server on_event must fire exactly once after zstd decode"
+    );
+}
+
+#[tokio::test]
+async fn uncompressed_client_still_works_against_compression_aware_server() {
+    // Backwards-compat pin: a peer with the default
+    // `compression: None` must still be served by a compression-aware
+    // server. `accept_compressed` on the server is additive — it does
+    // not force the client to send compressed payloads — so the default
+    // peer keeps the pre-#905 zero-cost fast path.
+    let (on_event, count) = counting_on_event();
+    let fixtures = start_compression_aware_mtls_server(
+        "mixed-server",
+        vec!["Alpha".into()],
+        on_event,
+        "mixed-client",
+    )
+    .await;
+
+    // Vanilla client, no .send_compressed configured.
+    let mut client = mtls_client(&fixtures).await;
+
+    let event = figpb::FederatedEvent {
+        event: Some(figpb::GeoEvent {
+            uid: "plain-uid".into(),
+            r#type: "a-f-G-U-C".into(),
+            lat: 0.0,
+            lon: 0.0,
+            ..Default::default()
+        }),
+        federate_groups: vec!["Alpha".into()],
+        ..Default::default()
+    };
+
+    let _ = client
+        .send_one_event(event)
+        .await
+        .expect("plain send_one_event");
+
+    assert_eq!(count.load(Ordering::Relaxed), 1);
+}

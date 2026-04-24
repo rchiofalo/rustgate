@@ -414,9 +414,17 @@ impl FederationService {
     ) -> JoinHandle<Result<(), tonic::transport::Error>> {
         use super::proto::figpb::federated_channel_server::FederatedChannelServer;
 
+        // The server accepts both codecs unconditionally so any peer that
+        // opts into send-side compression (gzip or zstd, per its own
+        // per-peer config) transparently decompresses here without any
+        // matching server-side knob. Enabling accept has zero cost when
+        // no peer sends compressed payloads — tonic inspects the
+        // `grpc-encoding` header and only decodes if it is set.
         let svc = FederatedChannelServer::new(service)
             .max_decoding_message_size(max_message_size)
-            .max_encoding_message_size(max_message_size);
+            .max_encoding_message_size(max_message_size)
+            .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
+            .accept_compressed(tonic::codec::CompressionEncoding::Zstd);
 
         tokio::spawn(async move {
             info!(addr = %bind, "V2 gRPC federation server starting");

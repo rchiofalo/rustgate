@@ -20,6 +20,7 @@ use tracing::{debug, error, info, warn};
 
 use super::proto::figpb;
 use super::proto::figpb::federated_channel_client::FederatedChannelClient;
+use crate::config::CompressionKind;
 use crate::peer::{PeerHandle, PeerState};
 use crate::provenance;
 use crate::replay_buffer::BufferedMessage;
@@ -47,6 +48,22 @@ pub struct V2ClientConfig {
     pub replay_drain: Option<V2ReplayDrain>,
     /// Maximum hops for provenance metadata (used during replay).
     pub max_hops: u32,
+    /// Optional outbound gRPC compression codec. `None` sends events
+    /// uncompressed (the pre-#905 default). Set per-peer so operators on
+    /// cross-region WAN links opt in to compression while low-latency LAN
+    /// links stay on the uncompressed fast path.
+    pub compression: Option<CompressionKind>,
+}
+
+/// Translate a [`CompressionKind`] into tonic's wire-level codec enum.
+///
+/// Kept as a free helper so the mapping is unit-testable without having
+/// to stand up a full `FederatedChannelClient` fixture.
+fn compression_encoding(kind: CompressionKind) -> tonic::codec::CompressionEncoding {
+    match kind {
+        CompressionKind::Gzip => tonic::codec::CompressionEncoding::Gzip,
+        CompressionKind::Zstd => tonic::codec::CompressionEncoding::Zstd,
+    }
 }
 
 impl fmt::Debug for V2ClientConfig {
@@ -58,6 +75,7 @@ impl fmt::Debug for V2ClientConfig {
             .field("health_interval", &self.health_interval)
             .field("reconnect_delay", &self.reconnect_delay)
             .field("max_reconnects", &self.max_reconnects)
+            .field("compression", &self.compression)
             .finish_non_exhaustive()
     }
 }
@@ -263,7 +281,13 @@ async fn connection_loop(
             }
         };
 
-        let client = FederatedChannelClient::new(channel);
+        let mut client = FederatedChannelClient::new(channel);
+        if let Some(kind) = config.compression {
+            let enc = compression_encoding(kind);
+            // Chain in a temporary binding — the tonic builders consume and
+            // return Self, so we rebind after each configuration step.
+            client = client.send_compressed(enc).accept_compressed(enc);
+        }
 
         // Drain replay buffer before entering the stream loop
         let replay_messages: Vec<BufferedMessage> = config
@@ -631,6 +655,7 @@ mod tests {
             region: None,
             zone: None,
             priority: 100,
+            compression: None,
         }))
     }
 
@@ -692,6 +717,7 @@ mod tests {
                 on_event: noop_on_event(),
                 replay_drain: None,
                 max_hops: 10,
+                compression: None,
             },
         );
 
@@ -722,6 +748,7 @@ mod tests {
                 on_event: noop_on_event(),
                 replay_drain: None,
                 max_hops: 10,
+                compression: None,
             },
         );
 
@@ -749,6 +776,7 @@ mod tests {
                 on_event: noop_on_event(),
                 replay_drain: None,
                 max_hops: 10,
+                compression: None,
             },
         );
 
@@ -778,6 +806,7 @@ mod tests {
                 on_event: noop_on_event(),
                 replay_drain: None,
                 max_hops: 10,
+                compression: None,
             },
         );
 
@@ -820,5 +849,24 @@ mod tests {
     fn post_disconnect_cooldown_zero() {
         let cooldown = post_disconnect_cooldown(Duration::ZERO);
         assert_eq!(cooldown, Duration::from_secs(60));
+    }
+
+    // --------------------------------------------------------------
+    // Compression mapping (issue #905)
+    // --------------------------------------------------------------
+
+    #[test]
+    fn compression_encoding_maps_gzip_to_tonic_gzip() {
+        // A silent swap to `Zstd` here would send every outbound message
+        // on gzip-configured peers with the wrong `grpc-encoding` header,
+        // which the server would then try to decode as zstd and reject.
+        let got = compression_encoding(CompressionKind::Gzip);
+        assert_eq!(got, tonic::codec::CompressionEncoding::Gzip);
+    }
+
+    #[test]
+    fn compression_encoding_maps_zstd_to_tonic_zstd() {
+        let got = compression_encoding(CompressionKind::Zstd);
+        assert_eq!(got, tonic::codec::CompressionEncoding::Zstd);
     }
 }
