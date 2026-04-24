@@ -13,6 +13,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use rustgate_core::protocol::HeaderSize;
+use rustgate_resilience::backpressure::{BackpressureGate, BackpressurePermit};
 use rustgate_resilience::reconnect::{backoff_delay, should_stop_reconnecting};
 use rustgate_transport::LengthPrefixedCodec;
 use tokio::sync::mpsc;
@@ -68,6 +69,20 @@ impl fmt::Debug for V1ClientConfig {
     }
 }
 
+/// Envelope queued for delivery to a remote V1 peer.
+///
+/// The optional [`BackpressurePermit`] keeps the global byte reservation
+/// alive while the message sits in the bounded mpsc channel and is flushed
+/// over the wire — dropping the envelope at the dequeue site releases the
+/// reservation automatically.
+pub(crate) struct V1Queued {
+    pub data: Bytes,
+    // justification: RAII field — held solely so its `Drop` releases the
+    // gate reservation when the session loop dequeues the envelope.
+    #[allow(dead_code)]
+    pub permit: Option<Arc<BackpressurePermit>>,
+}
+
 /// V1 federation outbound client.
 ///
 /// Maintains a persistent connection to a remote peer with automatic
@@ -79,9 +94,11 @@ pub struct V1Client {
     /// Shutdown signal sender.
     shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
     /// Channel for sending outbound messages to the peer.
-    outbound_tx: mpsc::Sender<Bytes>,
+    outbound_tx: mpsc::Sender<V1Queued>,
     /// Peer state tracking.
     peer: Arc<PeerHandle>,
+    /// Optional global backpressure gate shared with ingress admission.
+    gate: Option<Arc<BackpressureGate>>,
 }
 
 impl V1Client {
@@ -91,7 +108,7 @@ impl V1Client {
     /// and will reconnect automatically on disconnection.
     pub fn start(peer: Arc<PeerHandle>, config: V1ClientConfig) -> Self {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let (outbound_tx, outbound_rx) = mpsc::channel::<Bytes>(64);
+        let (outbound_tx, outbound_rx) = mpsc::channel::<V1Queued>(64);
 
         let peer_clone = Arc::clone(&peer);
         let task_handle = tokio::spawn(connection_loop(
@@ -106,7 +123,21 @@ impl V1Client {
             shutdown_tx: Some(shutdown_tx),
             outbound_tx,
             peer,
+            gate: None,
         }
+    }
+
+    /// Attach a shared [`BackpressureGate`] so federated outbound traffic
+    /// participates in global admission control.
+    ///
+    /// Every message entering [`V1Client::send`] reserves a byte permit on
+    /// the gate while it sits in the bounded outbound channel and is
+    /// flushed over the wire. A stalled peer whose channel is saturating
+    /// now also pressures the shared gate — the router will see
+    /// `is_admitting()` flip to false once the aggregate in-flight byte
+    /// count crosses the high-water mark.
+    pub fn with_backpressure(&mut self, gate: Arc<BackpressureGate>) {
+        self.gate = Some(gate);
     }
 
     /// Send a message to the remote peer.
@@ -115,10 +146,15 @@ impl V1Client {
     pub async fn send(&self, data: Bytes) -> anyhow::Result<()> {
         let bytes_len = data.len();
         self.peer.record_enqueue(bytes_len);
-        match self.outbound_tx.send(data).await {
+        let permit = self.gate.as_ref().map(|g| Arc::new(g.acquire(bytes_len)));
+        let queued = V1Queued { data, permit };
+        match self.outbound_tx.send(queued).await {
             Ok(()) => Ok(()),
             Err(_) => {
                 // Send failed before delivery — undo the enqueue accounting.
+                // `queued` was moved into `send`; the permit on the error
+                // value (if any) drops automatically with the returned
+                // `SendError` when the caller propagates this error.
                 self.peer.record_dequeue();
                 Err(anyhow::anyhow!("V1 client send channel closed"))
             }
@@ -150,7 +186,7 @@ impl V1Client {
 async fn connection_loop(
     peer: Arc<PeerHandle>,
     config: V1ClientConfig,
-    mut outbound_rx: mpsc::Receiver<Bytes>,
+    mut outbound_rx: mpsc::Receiver<V1Queued>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let peer_id = peer.id.clone();
@@ -320,7 +356,7 @@ async fn run_session(
     peer: &PeerHandle,
     tls_stream: tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
     config: &V1ClientConfig,
-    outbound_rx: &mut mpsc::Receiver<Bytes>,
+    outbound_rx: &mut mpsc::Receiver<V1Queued>,
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
     replay_messages: Vec<BufferedMessage>,
 ) -> anyhow::Result<()> {
@@ -380,12 +416,15 @@ async fn run_session(
             // Send queued outbound messages
             msg = outbound_rx.recv() => {
                 match msg {
-                    Some(data) => {
-                        let buf = BytesMut::from(data.as_ref());
+                    Some(queued) => {
+                        let buf = BytesMut::from(queued.data.as_ref());
                         peer.record_dequeue();
                         framed.send(buf).await
                             .map_err(|e| anyhow::anyhow!("write error: {e}"))?;
                         peer.record_sent();
+                        // `queued` drops here — releases the `BackpressurePermit`
+                        // reservation (if any) back to the global gate.
+                        drop(queued);
                     }
                     None => {
                         return Ok(()); // outbound channel closed

@@ -78,7 +78,7 @@ const DWELL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// counter `inc()`, a `tracing::debug!` line. Unsafe targets: file I/O,
 /// HTTP requests, `std::sync::Mutex::lock` on a shared lock. If the
 /// callback may block, dispatch the work with
-/// [`rustgate_core::tasks::spawn_background`] inside the closure body.
+/// `rustgate_core::tasks::spawn_background` inside the closure body.
 pub type OnDeferred = Arc<dyn Fn() + Send + Sync>;
 
 /// Callback invoked whenever the current queued-bytes counter changes.
@@ -88,7 +88,7 @@ pub type OnDeferred = Arc<dyn Fn() + Send + Sync>;
 /// `sub` — i.e. potentially once per message delivered — so any blocking
 /// work compounds into observable message-path latency. Safe targets:
 /// `IntGauge::set`, atomic counter updates. If the work is not
-/// provably wait-free, dispatch it with [`rustgate_core::tasks::spawn_background`]
+/// provably wait-free, dispatch it with `rustgate_core::tasks::spawn_background`
 /// from inside the closure.
 pub type OnBytesChanged = Arc<dyn Fn(usize) + Send + Sync>;
 
@@ -597,36 +597,19 @@ mod tests {
 
     #[test]
     fn shared_permit_releases_only_on_last_clone_drop() {
-        use std::sync::Arc;
-        use std::time::SystemTime;
-
-        use bytes::Bytes;
-        use rustgate_core::identity::Identity;
-        use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
-
-        use crate::router::RoutedMessage;
-
+        // Models the router fan-out where one acquired permit is cloned
+        // across many per-recipient envelopes. Only the last drop must
+        // release the reservation. The envelope shape is irrelevant to
+        // the invariant; a simple `Vec<Arc<BackpressurePermit>>` is
+        // equivalent to the router's `RoutedMessage` wrapper for this
+        // test. The router-level integration is covered separately in
+        // `rustgate-transport/tests/backpressure_integration.rs`.
         let gate = zero_dwell_gate(10_000);
         let permit = Arc::new(gate.acquire(1024));
         assert_eq!(gate.current(), 1024);
 
-        let sender = Identity::plaintext("sender".to_string(), Default::default()).unwrap();
-        let msg = Arc::new(RoutableMessage {
-            source: sender.clone(),
-            destination: Destination::Broadcast,
-            payload: Bytes::from(vec![0u8; 1024]),
-            metadata: Metadata {
-                received_at: SystemTime::now(),
-                source_protocol: "test".to_string(),
-                message_type: MessageType::Chat,
-                ttl: None,
-            },
-        });
-
-        // Build several recipient envelopes from the same shared permit —
-        // modeling `Router::route` fan-out into per-session mpsc channels.
-        let env = RoutedMessage::with_permit(Arc::clone(&msg), Arc::clone(&permit));
-        let copies = [env.clone(), env.clone(), env.clone()];
+        // Build several recipient envelopes from the same shared permit.
+        let envelopes: Vec<Arc<BackpressurePermit>> = (0..4).map(|_| Arc::clone(&permit)).collect();
 
         // Drop the "route()-local" Arc<Permit> handle: the per-recipient
         // envelopes still hold it, so the counter must stay pegged.
@@ -638,14 +621,14 @@ mod tests {
         );
 
         // Drop envelopes one by one; only the last drop releases.
-        let mut iter = copies.into_iter();
+        let mut iter = envelopes.into_iter();
         drop(iter.next());
         assert_eq!(gate.current(), 1024);
         drop(iter.next());
         assert_eq!(gate.current(), 1024);
         drop(iter.next());
         assert_eq!(gate.current(), 1024);
-        drop(env);
+        drop(iter.next());
         assert_eq!(
             gate.current(),
             0,
