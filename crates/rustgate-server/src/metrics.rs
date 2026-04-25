@@ -152,6 +152,7 @@ static MQTT_RETAIN_STORED: OnceLock<IntCounter> = OnceLock::new();
 static MQTT_RETAIN_CLEARED: OnceLock<IntCounter> = OnceLock::new();
 #[cfg(feature = "mqtt")]
 static MQTT_RETAIN_REPLAYED: OnceLock<IntCounter> = OnceLock::new();
+#[cfg(feature = "mqtt")]
 static MQTT_WILL_PUBLISHED: OnceLock<IntCounter> = OnceLock::new();
 
 #[cfg(feature = "nats")]
