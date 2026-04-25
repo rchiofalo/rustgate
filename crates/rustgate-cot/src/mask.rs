@@ -251,6 +251,57 @@ pub fn strip_coordinates(xml: &[u8]) -> Result<Bytes, MaskError> {
         buf.clear();
     }
 
+    // Defensive round-trip check: re-parse our own output. quick_xml's
+    // reader is lenient about attribute values containing the byte that
+    // is NOT the wrapping quote (e.g. `'value with " inside'` is
+    // accepted because the value uses `'`-quotes), but the writer always
+    // emits attribute values wrapped in `"` without escaping inner `"`
+    // characters. The result is that a single permissive read followed
+    // by a single write can produce bytes that fail to re-parse — which
+    // breaks the masker's documented self-stability contract and was
+    // caught by the `cot_mask_strip_coordinates` weekly extended fuzz
+    // (the original crash artifact lives under
+    // `fuzz/corpus/cot_mask_strip_coordinates/` and is regression-pinned
+    // by a test below).
+    //
+    // Failing closed here is the right answer per the function's
+    // documented contract: "a sender that emits `<event><point …/>`
+    // and then truncates … must NOT leak coordinates via pass-through
+    // recovery". A document whose masked form we cannot ourselves
+    // re-read is exactly such a partial-parse case — we surface it as
+    // `MaskError::Xml` so the caller drops the payload rather than
+    // forwarding output that might leak coordinates back to a receiver
+    // whose parser disagrees with ours.
+    //
+    // Cost: one extra single-pass quick_xml walk over `out`. For a
+    // typical CoT event (≤2 KiB) this is microseconds; the value is
+    // a strong "if `Ok`, the bytes round-trip" invariant that future
+    // quick_xml read/write asymmetries cannot break.
+    let mut verify = Reader::from_reader(out.as_slice());
+    verify.config_mut().trim_text(false);
+    let mut verify_buf = Vec::new();
+    loop {
+        match verify.read_event_into(&mut verify_buf)? {
+            Event::Eof => break,
+            // quick_xml's reader is lazy on attribute parsing — the
+            // top-level `read_event_into` accepts a Start/Empty whose
+            // attribute *syntax* is malformed, and only surfaces the
+            // error when the caller actually iterates `attributes()`.
+            // The masker's hot path (`mask_point_attrs`) does iterate,
+            // so an output whose Start tag we cannot iterate would
+            // crash the next pass even though our own loop walked it
+            // cleanly. Force attribute parsing on every Start/Empty
+            // here so the failure surfaces in pass 1, not pass 2.
+            Event::Start(e) | Event::Empty(e) => {
+                for attr in e.attributes() {
+                    let _ = attr?;
+                }
+            }
+            _ => {}
+        }
+        verify_buf.clear();
+    }
+
     Ok(Bytes::from(out))
 }
 
@@ -757,5 +808,108 @@ mod tests {
         // decision that must break this test.
         const _: () = assert!(MAX_POINT_ATTRIBUTES == 64);
         assert_eq!(MAX_POINT_ATTRIBUTES, 64);
+    }
+
+    /// Regression test for the weekly-fuzz crash on
+    /// `cot_mask_strip_coordinates` (artifact
+    /// `crash-27a80e9c299caaa10dd933aa124b20d6f01ff229`). The fuzz
+    /// target's invariant is that `strip_coordinates(strip_coordinates(x))`
+    /// must succeed if the first call did — equivalently, masked output
+    /// must itself be valid input. quick_xml's reader is permissive about
+    /// attribute values containing the OPPOSITE quote byte (e.g. a value
+    /// wrapped in `'`-quotes can contain `"`), but its writer always
+    /// emits values wrapped in `"` without escaping inner `"` — so a
+    /// permissive read followed by a write produces bytes whose next
+    /// read fails. The fix is a defensive output-validation pass at the
+    /// end of `strip_coordinates` that re-parses the writer's output;
+    /// this test pins the fail-closed contract by feeding the exact
+    /// crash artifact and asserting that the masker returns
+    /// `MaskError::Xml` rather than producing a regression-prone byte
+    /// sequence the caller might forward verbatim.
+    #[test]
+    fn weekly_fuzz_crash_27a80e9c_fails_closed_on_unwriteable_attribute_value() {
+        // Captured from the fuzz CI artifact — base64 in the issue body
+        // and the original crash file under
+        // `fuzz/corpus/cot_mask_strip_coordinates/`. Pinned as a literal
+        // byte vector so the test is self-contained and runs in
+        // environments without the fuzz corpus on disk.
+        let crash_input: &[u8] = &[
+            60, 60, 101, 47, 118, 60, 101, 118, 126, 116, 62, 116, 62, 60, 112, 111, 105, 110, 116,
+            13, 13, 13, 13, 13, 79, 79, 79, 79, 79, 79, 79, 79, 79, 79, 79, 79, 79, 79, 79, 79, 79,
+            79, 79, 79, 79, 79, 79, 79, 79, 79, 79, 79, 79, 79, 79, 79, 79, 79, 79, 79, 79, 79, 79,
+            79, 79, 79, 79, 79, 79, 79, 79, 79, 79, 79, 79, 79, 79, 79, 79, 79, 79, 79, 79, 79, 79,
+            79, 79, 79, 60, 33, 100, 60, 91, 173, 60, 33, 69, 78, 84, 73, 84, 89, 37, 97, 116, 61,
+            39, 255, 60, 91, 101, 33, 101, 118, 34, 108, 255, 255, 56, 34, 39, 13, 13, 13, 13, 13,
+            13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13,
+            13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13,
+            13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13,
+            13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13,
+            13, 13, 62, 104, 101, 44, 0,
+        ];
+        // The pre-fix behaviour was: pass 1 returned `Ok(bytes)` whose
+        // next parse attempt failed with `position 98: attribute key
+        // must be directly followed by `=` or space`. The post-fix
+        // behaviour is that `strip_coordinates` itself catches this
+        // and returns `Err(MaskError::Xml(_))`. Either an `Ok(_)` whose
+        // bytes DO re-parse OR an `Err(MaskError::Xml(_))` is acceptable
+        // (the test allows either outcome so a hypothetical future
+        // quick_xml fix that emits round-trippable bytes would not
+        // regress this test); what is NOT acceptable is producing bytes
+        // that we ourselves cannot read back.
+        match strip_coordinates(crash_input) {
+            Ok(masked) => {
+                let mut verify = Reader::from_reader(masked.as_ref());
+                verify.config_mut().trim_text(false);
+                let mut buf = Vec::new();
+                loop {
+                    match verify.read_event_into(&mut buf) {
+                        Ok(Event::Eof) => break,
+                        Ok(_) => buf.clear(),
+                        Err(e) => panic!(
+                            "regression: strip_coordinates returned Ok(_) but its own \
+                             output fails to re-parse: {e}"
+                        ),
+                    }
+                }
+            }
+            Err(MaskError::Xml(_)) => {
+                // Expected post-fix path: defensive validation rejected
+                // the unwriteable attribute value before the bytes ever
+                // reached the caller.
+            }
+            Err(other) => panic!("expected `Ok(_)` or `MaskError::Xml(_)`, got {other:?}"),
+        }
+    }
+
+    /// Tighter contract test: any input that `strip_coordinates`
+    /// accepts MUST produce output the same function will accept on a
+    /// second pass. Documents the self-stability invariant the fuzz
+    /// target asserts, in unit-test form, so a regression on this
+    /// invariant fails locally without the fuzzer in the loop.
+    #[test]
+    fn output_is_always_re_acceptable() {
+        let inputs: &[&[u8]] = &[
+            // Normal CoT
+            SAMPLE_COT.as_bytes(),
+            // CoT with single-quoted attribute values containing literal `"`
+            // — the same shape as the fuzz crash but minimal.
+            br#"<event uid='u "1"' type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><point lat="1.0" lon="2.0" hae="3.0"/></event>"#,
+            // CoT with attribute values containing literal `&`
+            br#"<event uid="u&amp;1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><point lat="1.0" lon="2.0" hae="3.0"/></event>"#,
+        ];
+        for (idx, input) in inputs.iter().enumerate() {
+            // Either pass 1 rejects (caller fail-closes — fine), or
+            // pass 1 succeeds AND pass 2 succeeds (self-stability).
+            // Pass 1 Ok + pass 2 Err is the regression we are guarding.
+            if let Ok(first) = strip_coordinates(input)
+                && let Err(e) = strip_coordinates(&first)
+            {
+                panic!(
+                    "input {idx} self-stability broken: pass 1 Ok, pass 2 Err({e}); \
+                     pass 1 output bytes: {:?}",
+                    first.as_ref()
+                );
+            }
+        }
     }
 }
