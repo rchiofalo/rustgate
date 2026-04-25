@@ -13,6 +13,7 @@
 //! | `GET  /api/crl/status`                     | Loaded CRL file — count + staleness, if configured      |
 //! | `GET  /api/dedup/stats`                    | Cross-path deduplication cache — hits, size, window     |
 //! | `POST /api/clients/{cn}/disconnect`        | Force a single mTLS client to drain and exit            |
+//! | `POST /api/dlq/{target}/replay`            | Manually trigger a DLQ drain for an HTTP egress target  |
 //! | `POST /api/reload`                         | Trigger the same reload path SIGHUP runs, structured    |
 //!
 //! Every response is a JSON envelope of the form `{"data": ...}` on
@@ -96,6 +97,21 @@ pub struct MgmtApiState {
     /// no federation peer reloader), which would make the endpoint a
     /// no-op anyway.
     pub reload: Option<ReloadFn>,
+    /// HTTP egress publisher handle. Present when the server is running
+    /// with HTTP egress configured; `None` causes
+    /// `POST /api/dlq/{target}/replay` to return `503` rather than
+    /// silently no-op. Held by value because [`HttpPublisher`] is
+    /// `Clone` and cloning is cheap (the type owns internal `Arc`s);
+    /// the management API does not own the lifecycle — drop is still
+    /// driven by the outer subsystem handle in `main`.
+    ///
+    /// Feature-gated on `http` because `rustgate_http` is itself an
+    /// optional workspace dependency — without the feature there is
+    /// no publisher type to refer to.
+    ///
+    /// [`HttpPublisher`]: rustgate_http::HttpPublisher
+    #[cfg(feature = "http")]
+    pub http_publisher: Option<rustgate_http::HttpPublisher>,
     /// Bearer token required on every request. Stored as raw bytes so
     /// the comparison can run in constant time, wrapped in
     /// [`Zeroizing`] so the value is wiped from memory on drop.
@@ -105,10 +121,15 @@ pub struct MgmtApiState {
 impl std::fmt::Debug for MgmtApiState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Never render the bearer token; redact by default.
+        #[cfg(feature = "http")]
+        let http_publisher_present = self.http_publisher.is_some();
+        #[cfg(not(feature = "http"))]
+        let http_publisher_present = false;
         f.debug_struct("MgmtApiState")
             .field("cert_reloader_present", &self.cert_reloader.is_some())
             .field("crl_path", &self.crl_path)
             .field("reload_configured", &self.reload.is_some())
+            .field("http_publisher_present", &http_publisher_present)
             .finish_non_exhaustive()
     }
 }
@@ -166,8 +187,13 @@ pub(crate) fn auth_ok(header: Option<&str>, expected: &[u8]) -> bool {
 ///
 /// `/api/reload` is a bare path, not a prefix — the dispatcher in
 /// `metrics.rs` handles the exact-match case alongside these prefixes.
-pub(crate) const MGMT_PATH_PREFIXES: &[&str] =
-    &["/api/cert/", "/api/crl/", "/api/dedup/", "/api/clients/"];
+pub(crate) const MGMT_PATH_PREFIXES: &[&str] = &[
+    "/api/cert/",
+    "/api/crl/",
+    "/api/dedup/",
+    "/api/clients/",
+    "/api/dlq/",
+];
 
 /// Entry point called by the metrics HTTP server. Returns `Some(resp)`
 /// when the path matches a management-API route (recognized or not),
@@ -215,6 +241,27 @@ async fn route(method: &Method, path: &str, state: &MgmtApiState) -> Response<Fu
             &Method::POST => disconnect_client_handler(cn, state).await,
             _ => json_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
         };
+    }
+    #[cfg(feature = "http")]
+    if let Some(target) = path
+        .strip_prefix("/api/dlq/")
+        .and_then(|s| s.strip_suffix("/replay"))
+    {
+        return match method {
+            &Method::POST => dlq_replay_handler(target, state),
+            _ => json_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
+        };
+    }
+    // Without `http` the prefix is still in MGMT_PATH_PREFIXES (so the
+    // dispatcher routes here instead of returning a generic 404), but
+    // we short-circuit to `503` so operators get a clear "not compiled
+    // in" signal instead of an opaque "not found".
+    #[cfg(not(feature = "http"))]
+    if path.starts_with("/api/dlq/") {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "HTTP egress not compiled in (rebuild with --features http)",
+        );
     }
 
     match (method, path) {
@@ -506,6 +553,64 @@ async fn disconnect_client_handler(cn: &str, state: &MgmtApiState) -> Response<F
     })
 }
 
+// ── /api/dlq/{target}/replay ───────────────────────────────────────
+
+/// On-wire response for `POST /api/dlq/{target}/replay`.
+///
+/// The endpoint is fire-and-forget — `triggered: true` means "the
+/// drain worker has been notified", not "the drain has completed".
+/// Operators can poll `/metrics` for `rustgate_http_dlq_replayed_total`
+/// to observe progress.
+#[cfg(feature = "http")]
+#[derive(Debug, Serialize)]
+struct DlqReplayResult {
+    /// Echo of the requested target name. Round-trips so operators
+    /// scripting the endpoint can correlate the request with the
+    /// response without re-parsing the URL.
+    target: String,
+    /// `true` when the drain trigger was successfully enqueued.
+    /// Always `true` in a `200` response — error cases use
+    /// `json_error` and do not return this struct.
+    triggered: bool,
+}
+
+#[cfg(feature = "http")]
+fn dlq_replay_handler(target: &str, state: &MgmtApiState) -> Response<Full<Bytes>> {
+    if target.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "target name must not be empty");
+    }
+    let Some(publisher) = state.http_publisher.as_ref() else {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "HTTP publisher not configured",
+        );
+    };
+    match publisher.trigger_drain(target) {
+        Ok(()) => {
+            rustgate_core::audit::http_dlq_drain_started(target, 0);
+            json_ok(&DlqReplayResult {
+                target: target.to_string(),
+                triggered: true,
+            })
+        }
+        Err(rustgate_http::TriggerDrainError::DlqNotConfigured) => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "DLQ not configured on HTTP publisher",
+        ),
+        Err(rustgate_http::TriggerDrainError::UnknownTarget) => {
+            json_error(StatusCode::NOT_FOUND, "unknown HTTP target")
+        }
+        Err(rustgate_http::TriggerDrainError::ChannelFull) => json_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "drain trigger channel is full; another drain is in flight",
+        ),
+        Err(rustgate_http::TriggerDrainError::ChannelClosed) => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "drain trigger channel is closed; publisher is shutting down",
+        ),
+    }
+}
+
 // ── /api/reload ────────────────────────────────────────────────────
 
 async fn reload_handler(state: &MgmtApiState) -> Response<Full<Bytes>> {
@@ -574,6 +679,8 @@ mod tests {
             cert_reloader: None,
             crl_path,
             reload: None,
+            #[cfg(feature = "http")]
+            http_publisher: None,
             auth_token: token(),
         }
     }
@@ -603,6 +710,11 @@ mod tests {
             MGMT_PATH_PREFIXES
                 .iter()
                 .any(|p| "/api/clients/alice/disconnect".starts_with(p))
+        );
+        assert!(
+            MGMT_PATH_PREFIXES
+                .iter()
+                .any(|p| "/api/dlq/webhook-prod/replay".starts_with(p))
         );
     }
 
@@ -872,5 +984,219 @@ mod tests {
         use http_body_util::BodyExt;
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    // ── /api/dlq/{target}/replay (issue #881 PR C) ─────────────────
+
+    /// Without a configured publisher the endpoint returns `503` so
+    /// operators get a precise "not configured" signal rather than a
+    /// misleading `404` (which would imply the path is wrong).
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn dlq_replay_without_publisher_returns_503() {
+        let state = state_with(None);
+        let t = token();
+        let hdr = format!("Bearer {}", String::from_utf8(t.to_vec()).unwrap());
+        let resp = handle_request(
+            &Method::POST,
+            "/api/dlq/whatever/replay",
+            Some(&hdr),
+            &[],
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = extract_json_body(resp).await;
+        assert!(
+            body.get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .contains("HTTP publisher"),
+            "got: {body}"
+        );
+    }
+
+    /// Wrong method on the DLQ replay path is `405` — the path matches
+    /// a known endpoint shape, just not for that verb.
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn dlq_replay_wrong_method_returns_405() {
+        let state = state_with(None);
+        let t = token();
+        let hdr = format!("Bearer {}", String::from_utf8(t.to_vec()).unwrap());
+        let resp = handle_request(
+            &Method::GET,
+            "/api/dlq/anything/replay",
+            Some(&hdr),
+            &[],
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    /// `POST /api/dlq//replay` (empty target segment) is a structured
+    /// `400` rather than falling through to the publisher with an
+    /// empty string — operators get a precise diagnostic.
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn dlq_replay_empty_target_returns_400() {
+        // Build a publisher so the handler doesn't short-circuit on
+        // "publisher not configured" before checking the empty-target
+        // guard.
+        let publisher = build_test_publisher_with_target("any");
+        let state = MgmtApiState {
+            router: Arc::new(Router::new()),
+            cert_reloader: None,
+            crl_path: None,
+            reload: None,
+            http_publisher: Some(publisher.clone()),
+            auth_token: token(),
+        };
+        let t = token();
+        let hdr = format!("Bearer {}", String::from_utf8(t.to_vec()).unwrap());
+        let resp = handle_request(&Method::POST, "/api/dlq//replay", Some(&hdr), &[], &state)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        publisher.shutdown().await;
+    }
+
+    /// Unknown target name surfaces as `404` so operator tooling can
+    /// distinguish a typo from a configuration drift.
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn dlq_replay_unknown_target_returns_404() {
+        let publisher = build_test_publisher_with_target("webhook-prod");
+        let state = MgmtApiState {
+            router: Arc::new(Router::new()),
+            cert_reloader: None,
+            crl_path: None,
+            reload: None,
+            http_publisher: Some(publisher.clone()),
+            auth_token: token(),
+        };
+        let t = token();
+        let hdr = format!("Bearer {}", String::from_utf8(t.to_vec()).unwrap());
+        let resp = handle_request(
+            &Method::POST,
+            "/api/dlq/no-such-target/replay",
+            Some(&hdr),
+            &[],
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = extract_json_body(resp).await;
+        assert_eq!(
+            body.get("error").and_then(|v| v.as_str()),
+            Some("unknown HTTP target")
+        );
+        publisher.shutdown().await;
+    }
+
+    /// Happy path: a valid target on a publisher with DLQ configured
+    /// returns `200` and the JSON envelope echoes the target name.
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn dlq_replay_known_target_returns_200() {
+        let publisher = build_test_publisher_with_target("webhook-prod");
+        let state = MgmtApiState {
+            router: Arc::new(Router::new()),
+            cert_reloader: None,
+            crl_path: None,
+            reload: None,
+            http_publisher: Some(publisher.clone()),
+            auth_token: token(),
+        };
+        let t = token();
+        let hdr = format!("Bearer {}", String::from_utf8(t.to_vec()).unwrap());
+        let resp = handle_request(
+            &Method::POST,
+            "/api/dlq/webhook-prod/replay",
+            Some(&hdr),
+            &[],
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = extract_json_body(resp).await;
+        let data = body.get("data").expect("envelope.data");
+        assert_eq!(
+            data.get("target").and_then(|v| v.as_str()),
+            Some("webhook-prod")
+        );
+        assert_eq!(data.get("triggered").and_then(|v| v.as_bool()), Some(true));
+        publisher.shutdown().await;
+    }
+
+    /// Auth still applies to the DLQ replay endpoint — pin the 401
+    /// behaviour so a future refactor that accidentally moves the
+    /// auth check out of `handle_request` fails loudly.
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn dlq_replay_without_auth_returns_401() {
+        let state = state_with(None);
+        let resp = handle_request(&Method::POST, "/api/dlq/anything/replay", None, &[], &state)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Build a minimal publisher with a single named target and a
+    /// DLQ configured under a tempdir. The `TempDir` is deliberately
+    /// leaked via `Box::leak` so the key file outlives any background
+    /// drain reader for the duration of the test process — drop
+    /// ordering on tokio runtime shutdown is otherwise racy.
+    #[cfg(feature = "http")]
+    fn build_test_publisher_with_target(target_name: &str) -> rustgate_http::HttpPublisher {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_json = r#"{
+            "active_key_id": "k",
+            "keys": { "k": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+        }"#;
+        let key_path = tmp.path().join("keys.json");
+        std::fs::write(&key_path, key_json).unwrap();
+        let dlq_dir = tmp.path().join("dlq");
+
+        let config = rustgate_http::HttpConfig {
+            instance_id: Some("mgmt-api-test".to_string()),
+            targets: vec![rustgate_http::config::TargetConfig {
+                name: target_name.to_string(),
+                url: "http://127.0.0.1:1/never".to_string(),
+                method: None,
+                auth: None,
+                tls: None,
+                timeout_secs: Some(1),
+                format: None,
+                filter: None,
+                retry: None,
+                enabled: None,
+                headers: None,
+                max_payload_bytes: None,
+                rate_limit_per_sec: None,
+                capture_response_body: None,
+                max_response_body_bytes: None,
+                batch_enabled: None,
+                batch_max_messages: None,
+                batch_max_bytes: None,
+                batch_format: None,
+            }],
+            dlq_dir: Some(dlq_dir.to_string_lossy().into_owned()),
+            dlq_key_file: Some(key_path.to_string_lossy().into_owned()),
+            dlq_max_bytes: None,
+            dlq_max_target_bytes: None,
+            allow_private_urls: true,
+        };
+        let publisher = rustgate_http::HttpPublisher::new(config).unwrap();
+        // Leak the tempdir so the key file outlives the publisher's
+        // background workers — the alternative is racy drop ordering
+        // when the tokio runtime tears down at end-of-test.
+        std::mem::forget(tmp);
+        publisher
     }
 }
