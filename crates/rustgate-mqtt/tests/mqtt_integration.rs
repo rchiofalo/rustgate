@@ -1900,3 +1900,217 @@ async fn will_with_retain_flag_persists_to_retain_store() {
 
     server.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// Packet ID wrap-around boundary audit (issue #880)
+//
+// MQTT 5.0 §1.5.4 / 3.1.1 §2.3.1: Packet Identifiers are 16-bit unsigned
+// integers in the range [1, 65535] (zero is reserved as "no packet
+// identifier"). The broker echoes the inbound pkid in PUBACK / SUBACK /
+// UNSUBACK without transforming it; these tests pin that no off-by-one
+// or u16 overflow regression sneaks into the echo path. The 65535 case
+// is the load-bearing one — the upper edge of the 16-bit space — and
+// is exactly where a naive u16 + 1 increment would wrap to 0 instead
+// of staying at 65535.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn publish_qos1_pkid_max_u16_round_trips_in_puback() {
+    let ca = TestCa::new("MQTT Test CA");
+    let client_cert = ca.issue_client_cert("alice", &["alpha"]);
+    let router = Arc::new(Router::new());
+    let server = TestServer::new(&ca, Arc::clone(&router), None);
+
+    let client_tls =
+        build_client_tls_config(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem);
+    let mut stream = mqtt_connect(server.addr, &client_tls).await;
+    let mut buf = BytesMut::new();
+    let connect = mqttbytes::v5::Connect::new("pkid-max");
+    write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Connect(connect)).await;
+    let _ = read_v5_packet(&mut stream, &mut buf).await;
+
+    let mut publish =
+        mqttbytes::v5::Publish::new("alpha", mqttbytes::QoS::AtLeastOnce, b"max-pkid");
+    publish.pkid = u16::MAX; // 65535 — the upper edge of the 16-bit space
+    write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Publish(publish)).await;
+
+    let packet = read_v5_packet(&mut stream, &mut buf).await;
+    match packet {
+        mqttbytes::v5::Packet::PubAck(puback) => {
+            assert_eq!(
+                puback.pkid,
+                u16::MAX,
+                "PUBACK pkid must echo u16::MAX verbatim (regression on +1 wrap)"
+            );
+            assert_eq!(puback.reason, mqttbytes::v5::PubAckReason::Success);
+        }
+        other => panic!("expected PubAck for pkid=u16::MAX, got {other:?}"),
+    }
+
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn publish_qos1_pkid_one_round_trips_in_puback() {
+    let ca = TestCa::new("MQTT Test CA");
+    let client_cert = ca.issue_client_cert("alice", &["alpha"]);
+    let router = Arc::new(Router::new());
+    let server = TestServer::new(&ca, Arc::clone(&router), None);
+
+    let client_tls =
+        build_client_tls_config(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem);
+    let mut stream = mqtt_connect(server.addr, &client_tls).await;
+    let mut buf = BytesMut::new();
+    let connect = mqttbytes::v5::Connect::new("pkid-one");
+    write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Connect(connect)).await;
+    let _ = read_v5_packet(&mut stream, &mut buf).await;
+
+    // pkid=1 is the smallest legal pkid (zero is reserved). Pinning the
+    // lower bound alongside the upper bound bookends the valid range.
+    let mut publish =
+        mqttbytes::v5::Publish::new("alpha", mqttbytes::QoS::AtLeastOnce, b"min-pkid");
+    publish.pkid = 1;
+    write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Publish(publish)).await;
+
+    let packet = read_v5_packet(&mut stream, &mut buf).await;
+    match packet {
+        mqttbytes::v5::Packet::PubAck(puback) => {
+            assert_eq!(puback.pkid, 1);
+            assert_eq!(puback.reason, mqttbytes::v5::PubAckReason::Success);
+        }
+        other => panic!("expected PubAck for pkid=1, got {other:?}"),
+    }
+
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn publish_qos1_round_trips_pkids_across_wraparound_boundary() {
+    // Send a sequence of pkids that step across the u16 boundary
+    // (65534, 65535, 1, 2 — simulating what a client wraparound looks
+    // like on the broker's input side). Every PUBACK must echo the
+    // exact pkid sent: a regression that incremented or stored pkids
+    // in a u8 / i16 / wrapping_add sometime would surface here.
+    let ca = TestCa::new("MQTT Test CA");
+    let client_cert = ca.issue_client_cert("alice", &["alpha"]);
+    let router = Arc::new(Router::new());
+    let server = TestServer::new(&ca, Arc::clone(&router), None);
+
+    let client_tls =
+        build_client_tls_config(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem);
+    let mut stream = mqtt_connect(server.addr, &client_tls).await;
+    let mut buf = BytesMut::new();
+    let connect = mqttbytes::v5::Connect::new("pkid-wrap");
+    write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Connect(connect)).await;
+    let _ = read_v5_packet(&mut stream, &mut buf).await;
+
+    let pkid_sequence: [u16; 4] = [65534, 65535, 1, 2];
+    for pkid in pkid_sequence {
+        let mut publish = mqttbytes::v5::Publish::new(
+            "alpha",
+            mqttbytes::QoS::AtLeastOnce,
+            format!("payload-{pkid}").into_bytes(),
+        );
+        publish.pkid = pkid;
+        write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Publish(publish)).await;
+
+        let packet = read_v5_packet(&mut stream, &mut buf).await;
+        match packet {
+            mqttbytes::v5::Packet::PubAck(puback) => {
+                assert_eq!(
+                    puback.pkid, pkid,
+                    "PUBACK pkid drift on sequence step pkid={pkid}",
+                );
+            }
+            other => panic!("expected PubAck for pkid={pkid}, got {other:?}"),
+        }
+    }
+
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn subscribe_pkid_max_u16_round_trips_in_suback() {
+    // SUBSCRIBE pkid uses the same 16-bit space as PUBLISH and is
+    // echoed in SUBACK. Pin the upper edge for the SUBSCRIBE path
+    // alongside the PUBLISH coverage so a regression in EITHER
+    // packet-type echo path fails loudly.
+    let ca = TestCa::new("MQTT Test CA");
+    let client_cert = ca.issue_client_cert("alice", &["alpha"]);
+    let router = Arc::new(Router::new());
+    let server = TestServer::new(&ca, Arc::clone(&router), None);
+
+    let client_tls =
+        build_client_tls_config(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem);
+    let mut stream = mqtt_connect(server.addr, &client_tls).await;
+    let mut buf = BytesMut::new();
+    let connect = mqttbytes::v5::Connect::new("sub-pkid-max");
+    write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Connect(connect)).await;
+    let _ = read_v5_packet(&mut stream, &mut buf).await;
+
+    let mut sub = mqttbytes::v5::Subscribe::new("alpha", mqttbytes::QoS::AtMostOnce);
+    sub.pkid = u16::MAX;
+    write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Subscribe(sub)).await;
+
+    let packet = read_v5_packet(&mut stream, &mut buf).await;
+    match packet {
+        mqttbytes::v5::Packet::SubAck(suback) => {
+            assert_eq!(
+                suback.pkid,
+                u16::MAX,
+                "SUBACK pkid must echo u16::MAX verbatim",
+            );
+            assert_eq!(
+                suback.return_codes,
+                vec![mqttbytes::v5::SubscribeReasonCode::QoS0]
+            );
+        }
+        other => panic!("expected SubAck for pkid=u16::MAX, got {other:?}"),
+    }
+
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn unsubscribe_pkid_max_u16_round_trips_in_unsuback() {
+    // Same boundary pin for UNSUBSCRIBE → UNSUBACK. Three packet types
+    // that echo pkid → three boundary tests; collectively they pin the
+    // entire 16-bit echo surface against a u8/i16/wrapping_add
+    // regression in any single dispatch arm.
+    let ca = TestCa::new("MQTT Test CA");
+    let client_cert = ca.issue_client_cert("alice", &["alpha"]);
+    let router = Arc::new(Router::new());
+    let server = TestServer::new(&ca, Arc::clone(&router), None);
+
+    let client_tls =
+        build_client_tls_config(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem);
+    let mut stream = mqtt_connect(server.addr, &client_tls).await;
+    let mut buf = BytesMut::new();
+    let connect = mqttbytes::v5::Connect::new("unsub-pkid-max");
+    write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Connect(connect)).await;
+    let _ = read_v5_packet(&mut stream, &mut buf).await;
+
+    // Subscribe first so the unsubscribe has something to remove.
+    let mut sub = mqttbytes::v5::Subscribe::new("alpha", mqttbytes::QoS::AtMostOnce);
+    sub.pkid = 1;
+    write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Subscribe(sub)).await;
+    let _ = read_v5_packet(&mut stream, &mut buf).await; // SUBACK
+
+    let mut unsub = mqttbytes::v5::Unsubscribe::new("alpha");
+    unsub.pkid = u16::MAX;
+    write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Unsubscribe(unsub)).await;
+
+    let packet = read_v5_packet(&mut stream, &mut buf).await;
+    match packet {
+        mqttbytes::v5::Packet::UnsubAck(unsuback) => {
+            assert_eq!(
+                unsuback.pkid,
+                u16::MAX,
+                "UNSUBACK pkid must echo u16::MAX verbatim",
+            );
+        }
+        other => panic!("expected UnsubAck for pkid=u16::MAX, got {other:?}"),
+    }
+
+    server.shutdown();
+}
