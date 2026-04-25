@@ -146,6 +146,12 @@ static MQTT_PUBLISHES_REJECTED: OnceLock<IntCounter> = OnceLock::new();
 static MQTT_SUBSCRIBES: OnceLock<IntCounter> = OnceLock::new();
 #[cfg(feature = "mqtt")]
 static MQTT_SUBSCRIBES_REJECTED: OnceLock<IntCounter> = OnceLock::new();
+#[cfg(feature = "mqtt")]
+static MQTT_RETAIN_STORED: OnceLock<IntCounter> = OnceLock::new();
+#[cfg(feature = "mqtt")]
+static MQTT_RETAIN_CLEARED: OnceLock<IntCounter> = OnceLock::new();
+#[cfg(feature = "mqtt")]
+static MQTT_RETAIN_REPLAYED: OnceLock<IntCounter> = OnceLock::new();
 
 #[cfg(feature = "nats")]
 static NATS_CONSUMER_PENDING: OnceLock<IntGauge> = OnceLock::new();
@@ -617,6 +623,48 @@ pub fn init() -> prometheus::Result<()> {
         ))?;
         registry.register(Box::new(mqtt_subscribes_rejected.clone()))?;
         let _ = MQTT_SUBSCRIBES_REJECTED.set(mqtt_subscribes_rejected);
+
+        let mqtt_retain_stored = IntCounter::with_opts(Opts::new(
+            "rustgate_mqtt_retain_stored_total",
+            "MQTT PUBLISH packets that inserted or overwrote a retained \
+             message in the broker's last-known-value store (retain=1, \
+             non-empty payload). Operators can divide this by \
+             `rustgate_mqtt_publishes_total` to gauge what fraction of \
+             traffic is `retain=1` — sudden swings often correlate with \
+             operator config changes (a fleet flipping its retain bit on \
+             startup) and are useful for capacity planning.",
+        ))?;
+        registry.register(Box::new(mqtt_retain_stored.clone()))?;
+        let _ = MQTT_RETAIN_STORED.set(mqtt_retain_stored);
+
+        let mqtt_retain_cleared = IntCounter::with_opts(Opts::new(
+            "rustgate_mqtt_retain_cleared_total",
+            "MQTT PUBLISH packets that triggered the MQTT 5.0 §3.3.1.3 \
+             zero-byte clear semantic against the broker's retain store \
+             (retain=1 AND zero-length payload). Always non-decreasing; a \
+             flat line on this counter while `rustgate_mqtt_retain_stored_\
+             total` climbs indicates clients are setting retained values \
+             but never clearing them — the operational signal that the \
+             retain store will keep growing for the listener's lifetime.",
+        ))?;
+        registry.register(Box::new(mqtt_retain_cleared.clone()))?;
+        let _ = MQTT_RETAIN_CLEARED.set(mqtt_retain_cleared);
+
+        let mqtt_retain_replayed = IntCounter::with_opts(Opts::new(
+            "rustgate_mqtt_retain_replayed_total",
+            "MQTT retained messages delivered as PUBLISH packets to fresh \
+             subscribers. Incremented *per delivered message*, not per \
+             SUBSCRIBE — a single SUBSCRIBE whose filter expands to N \
+             retained topics produces N increments. The authorisation \
+             re-check runs before the increment fires, so this counter \
+             only counts replays the subscriber was actually allowed to \
+             receive. A spike correlates with an operator opening a wide \
+             wildcard subscribe across the retain set; flat-lined values \
+             typically mean the broker has not yet stored anything to \
+             replay.",
+        ))?;
+        registry.register(Box::new(mqtt_retain_replayed.clone()))?;
+        let _ = MQTT_RETAIN_REPLAYED.set(mqtt_retain_replayed);
     }
 
     #[cfg(feature = "nats")]
@@ -1334,6 +1382,34 @@ pub fn mqtt_subscribes() -> &'static IntCounter {
 pub fn mqtt_subscribes_rejected() -> &'static IntCounter {
     MQTT_SUBSCRIBES_REJECTED
         .get_or_init(|| fallback_counter("rustgate_mqtt_subscribes_rejected_total", "fallback"))
+}
+
+/// Counter incremented once per MQTT PUBLISH that inserted or
+/// overwrote a retained message in the broker's last-known-value
+/// store. Wired from `rustgate_mqtt::MqttSessionHooks::on_retain_stored`.
+#[cfg(feature = "mqtt")]
+pub fn mqtt_retain_stored() -> &'static IntCounter {
+    MQTT_RETAIN_STORED
+        .get_or_init(|| fallback_counter("rustgate_mqtt_retain_stored_total", "fallback"))
+}
+
+/// Counter incremented once per MQTT PUBLISH that triggered the
+/// MQTT 5.0 §3.3.1.3 zero-byte clear semantic against the broker's
+/// retain store. Wired from
+/// `rustgate_mqtt::MqttSessionHooks::on_retain_cleared`.
+#[cfg(feature = "mqtt")]
+pub fn mqtt_retain_cleared() -> &'static IntCounter {
+    MQTT_RETAIN_CLEARED
+        .get_or_init(|| fallback_counter("rustgate_mqtt_retain_cleared_total", "fallback"))
+}
+
+/// Counter incremented once per retained MQTT message delivered to a
+/// fresh subscriber after a successful SUBSCRIBE. Wired from
+/// `rustgate_mqtt::MqttSessionHooks::on_retain_replayed`.
+#[cfg(feature = "mqtt")]
+pub fn mqtt_retain_replayed() -> &'static IntCounter {
+    MQTT_RETAIN_REPLAYED
+        .get_or_init(|| fallback_counter("rustgate_mqtt_retain_replayed_total", "fallback"))
 }
 
 /// Returns the JetStream consumer `num_pending` gauge if registered.
@@ -3060,11 +3136,17 @@ mod tests {
                 on_publish_reject: Some(std::sync::Arc::new(|| mqtt_publishes_rejected().inc())),
                 on_subscribe: Some(std::sync::Arc::new(|| mqtt_subscribes().inc())),
                 on_subscribe_reject: Some(std::sync::Arc::new(|| mqtt_subscribes_rejected().inc())),
+                on_retain_stored: Some(std::sync::Arc::new(|| mqtt_retain_stored().inc())),
+                on_retain_cleared: Some(std::sync::Arc::new(|| mqtt_retain_cleared().inc())),
+                on_retain_replayed: Some(std::sync::Arc::new(|| mqtt_retain_replayed().inc())),
             };
             let pub_before = mqtt_publishes().get();
             let pub_rej_before = mqtt_publishes_rejected().get();
             let sub_before = mqtt_subscribes().get();
             let sub_rej_before = mqtt_subscribes_rejected().get();
+            let retain_stored_before = mqtt_retain_stored().get();
+            let retain_cleared_before = mqtt_retain_cleared().get();
+            let retain_replayed_before = mqtt_retain_replayed().get();
             if let Some(cb) = &hooks.on_publish {
                 cb();
             }
@@ -3077,10 +3159,22 @@ mod tests {
             if let Some(cb) = &hooks.on_subscribe_reject {
                 cb();
             }
+            if let Some(cb) = &hooks.on_retain_stored {
+                cb();
+            }
+            if let Some(cb) = &hooks.on_retain_cleared {
+                cb();
+            }
+            if let Some(cb) = &hooks.on_retain_replayed {
+                cb();
+            }
             assert!(mqtt_publishes().get() > pub_before);
             assert!(mqtt_publishes_rejected().get() > pub_rej_before);
             assert!(mqtt_subscribes().get() > sub_before);
             assert!(mqtt_subscribes_rejected().get() > sub_rej_before);
+            assert!(mqtt_retain_stored().get() > retain_stored_before);
+            assert!(mqtt_retain_cleared().get() > retain_cleared_before);
+            assert!(mqtt_retain_replayed().get() > retain_replayed_before);
         }
     }
 

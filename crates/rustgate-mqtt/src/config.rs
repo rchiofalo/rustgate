@@ -73,6 +73,44 @@ pub type OnMqttSubscribe = Arc<dyn Fn() + Send + Sync>;
 /// and one on [`OnMqttSubscribe`].
 pub type OnMqttSubscribeReject = Arc<dyn Fn() + Send + Sync>;
 
+/// Callback invoked once per PUBLISH whose `retain=1` flag and non-empty
+/// payload caused the broker's `RetainStore` to insert or overwrite the
+/// last-known-value entry for the published topic.
+///
+/// Wired by the server crate to feed the
+/// `rustgate_mqtt_retain_stored_total` Prometheus counter. Fires AFTER
+/// authorisation succeeds and AFTER the store is updated, so the
+/// counter always reflects entries actually persisted in the cache.
+pub type OnMqttRetainStored = Arc<dyn Fn() + Send + Sync>;
+
+/// Callback invoked once per PUBLISH whose `retain=1` flag combined
+/// with a zero-byte payload caused the broker's `RetainStore` to
+/// remove the entry for the published topic, per MQTT 5.0 §3.3.1.3.
+///
+/// Wired by the server crate to feed the
+/// `rustgate_mqtt_retain_cleared_total` Prometheus counter. Fires
+/// regardless of whether an entry was actually present in the store
+/// (the spec mandates the clear semantics; the counter measures
+/// operator-issued clears, not just cache-state transitions). Pairs
+/// with [`OnMqttRetainStored`] for a complete picture of retain
+/// store mutations.
+pub type OnMqttRetainCleared = Arc<dyn Fn() + Send + Sync>;
+
+/// Callback invoked once per retained `PUBLISH` packet replayed to a
+/// fresh subscriber on a successful `SUBSCRIBE`. Fires *per delivered
+/// retained message*, not per SUBSCRIBE packet — a single SUBSCRIBE
+/// whose filter matches three retained topics produces three
+/// increments.
+///
+/// Wired by the server crate to feed the
+/// `rustgate_mqtt_retain_replayed_total` Prometheus counter. The
+/// authorisation re-check runs before the callback fires, so the
+/// counter only ever counts replays the subscriber was actually
+/// allowed to receive — a metric used to detect retain-fan-out
+/// patterns (e.g. a wildcard subscribe expanding to thousands of
+/// retained topics) ahead of throughput-related operational issues.
+pub type OnMqttRetainReplayed = Arc<dyn Fn() + Send + Sync>;
+
 /// Bundle of session-level observer callbacks (publish accept/reject,
 /// subscribe accept/reject) passed through to every spawned MQTT
 /// session.
@@ -98,6 +136,19 @@ pub struct MqttSessionHooks {
     /// Fires per rejected SUBSCRIBE filter. See
     /// [`OnMqttSubscribeReject`].
     pub on_subscribe_reject: Option<OnMqttSubscribeReject>,
+
+    /// Fires per PUBLISH that stored a retained message. See
+    /// [`OnMqttRetainStored`].
+    pub on_retain_stored: Option<OnMqttRetainStored>,
+
+    /// Fires per PUBLISH that cleared a retained entry via the
+    /// MQTT 5.0 §3.3.1.3 zero-byte clear semantic. See
+    /// [`OnMqttRetainCleared`].
+    pub on_retain_cleared: Option<OnMqttRetainCleared>,
+
+    /// Fires per retained PUBLISH delivered to a fresh subscriber. See
+    /// [`OnMqttRetainReplayed`].
+    pub on_retain_replayed: Option<OnMqttRetainReplayed>,
 }
 
 impl std::fmt::Debug for MqttSessionHooks {
@@ -110,6 +161,9 @@ impl std::fmt::Debug for MqttSessionHooks {
             .field("on_publish_reject", &fmt_cb(&self.on_publish_reject))
             .field("on_subscribe", &fmt_cb(&self.on_subscribe))
             .field("on_subscribe_reject", &fmt_cb(&self.on_subscribe_reject))
+            .field("on_retain_stored", &fmt_cb(&self.on_retain_stored))
+            .field("on_retain_cleared", &fmt_cb(&self.on_retain_cleared))
+            .field("on_retain_replayed", &fmt_cb(&self.on_retain_replayed))
             .finish()
     }
 }
@@ -536,12 +590,18 @@ mod tests {
             on_publish_reject: Some(Arc::new(|| {})),
             on_subscribe: Some(Arc::new(|| {})),
             on_subscribe_reject: Some(Arc::new(|| {})),
+            on_retain_stored: Some(Arc::new(|| {})),
+            on_retain_cleared: Some(Arc::new(|| {})),
+            on_retain_replayed: Some(Arc::new(|| {})),
         };
         let rendered = format!("{hooks:?}");
         assert!(rendered.contains("on_publish: \"Some(<cb>)\""));
         assert!(rendered.contains("on_publish_reject: \"Some(<cb>)\""));
         assert!(rendered.contains("on_subscribe: \"Some(<cb>)\""));
         assert!(rendered.contains("on_subscribe_reject: \"Some(<cb>)\""));
+        assert!(rendered.contains("on_retain_stored: \"Some(<cb>)\""));
+        assert!(rendered.contains("on_retain_cleared: \"Some(<cb>)\""));
+        assert!(rendered.contains("on_retain_replayed: \"Some(<cb>)\""));
     }
 
     #[test]
