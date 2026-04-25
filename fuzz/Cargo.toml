@@ -24,6 +24,8 @@ rustgate-proto = { path = "../crates/rustgate-proto" }
 rustgate-federation = { path = "../crates/rustgate-federation", features = ["v2"] }
 rustgate-nats = { path = "../crates/rustgate-nats" }
 rustgate-authz = { path = "../crates/rustgate-authz" }
+rustgate-stanag4586 = { path = "../crates/rustgate-stanag4586" }
+rustgate-asterix = { path = "../crates/rustgate-asterix" }
 rcgen = { version = "0.14", features = ["x509-parser"] }
 serde_json = "1"
 rustls-pki-types = { version = "1", features = ["std"] }
@@ -122,4 +124,14 @@ doc = false
 [[bin]]
 name = "obligation_apply"
 path = "fuzz_targets/obligation_apply.rs"
+doc = false
+
+[[bin]]
+name = "stanag4586_vehicle_position"
+path = "fuzz_targets/stanag4586_vehicle_position.rs"
+doc = false
+
+[[bin]]
+name = "asterix_cat062"
+path = "fuzz_targets/asterix_cat062.rs"
 doc = false
