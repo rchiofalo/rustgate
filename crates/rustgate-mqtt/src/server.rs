@@ -13,6 +13,7 @@ use tracing::{info, warn};
 
 use crate::TRANSPORT_LABEL;
 use crate::config::MqttServerConfig;
+use crate::retain::RetainStore;
 use crate::session::{ClientIdRegistry, handle_mqtt_session};
 
 /// The MQTT server that manages the accept loop and session lifecycle.
@@ -42,6 +43,12 @@ impl MqttServer {
         } = config;
 
         let client_id_registry = ClientIdRegistry::new();
+        // One retain store per server, shared across every accepted
+        // session for the lifetime of the listener. Mirrors the
+        // ClientIdRegistry pattern — process-local, no operator-facing
+        // config because retain semantics are mandated by the MQTT
+        // spec rather than something a deployment turns on/off.
+        let retain_store = RetainStore::new();
 
         info!(
             transport = TRANSPORT_LABEL,
@@ -81,6 +88,7 @@ impl MqttServer {
                             let router = Arc::clone(&router);
                             let prefix = topic_prefix.clone();
                             let registry = Arc::clone(&client_id_registry);
+                            let retain = Arc::clone(&retain_store);
                             let hooks = session_hooks.clone();
                             let forwarding = forwarding_hooks.clone();
                             drop(tokio::spawn(handle_mqtt_session(
@@ -92,6 +100,7 @@ impl MqttServer {
                                 response_channel_capacity,
                                 wildcard_policy,
                                 registry,
+                                retain,
                                 permit,
                                 hooks,
                                 forwarding,

@@ -28,6 +28,7 @@ mod config;
 mod error;
 mod listener;
 mod packet;
+mod retain;
 mod server;
 mod session;
 mod topic;
