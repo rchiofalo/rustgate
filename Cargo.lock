@@ -3156,6 +3156,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustgate-asterix"
+version = "0.8.0"
+dependencies = [
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "rustgate-authz"
 version = "0.8.0"
 dependencies = [
