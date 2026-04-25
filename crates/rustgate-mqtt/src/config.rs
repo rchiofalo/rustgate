@@ -259,6 +259,21 @@ pub struct MqttServerConfig {
     /// Maximum MQTT packet size in bytes (default: 16 MiB).
     pub max_packet_size: usize,
 
+    /// Maximum number of QoS 1 / QoS 2 PUBLISHes a client may have
+    /// in-flight to the broker without intervening acks (default: 32).
+    ///
+    /// Advertised in CONNACK as MQTT 5.0 §3.2.2.3.3 `Receive Maximum`
+    /// so a compliant client self-limits and the broker has a known
+    /// concurrency cap to plan against. The wire field is a `u16` so
+    /// the operator cannot configure a value above 65535 (the spec's
+    /// implicit default when the property is absent — i.e. "no limit
+    /// beyond the wire field's range"). The default of 32 is a
+    /// conservative starting point; a deployment with high-throughput
+    /// QoS 1 traffic can raise it but must accept the additional
+    /// session-state memory cost (each in-flight PUBLISH consumes its
+    /// payload size in the read buffer until ack-and-route completes).
+    pub receive_max: u16,
+
     /// Minimum keep-alive interval in seconds. Clients requesting 0
     /// (disabled) or a value below this floor get this value imposed.
     pub min_keep_alive_secs: u16,
@@ -309,6 +324,17 @@ impl MqttServerConfig {
     /// Default maximum packet size: 16 MiB (matches websocket frame cap).
     pub const DEFAULT_MAX_PACKET_SIZE: usize = 16 * 1024 * 1024;
 
+    /// Default `Receive Maximum` advertised in CONNACK (32).
+    ///
+    /// Sized to match the default `response_channel_capacity` (64) at
+    /// roughly half — the inflight cap should be smaller than the
+    /// session's outbound channel cap so a client maxing out its
+    /// allowed pipelining cannot also fill the response channel and
+    /// block the write loop. Operators can raise this for a
+    /// throughput-sensitive deployment but should raise the response
+    /// channel cap proportionally.
+    pub const DEFAULT_RECEIVE_MAX: u16 = 32;
+
     /// Default minimum keep-alive in seconds.
     pub const DEFAULT_MIN_KEEP_ALIVE_SECS: u16 = 30;
 
@@ -325,6 +351,7 @@ impl std::fmt::Debug for MqttServerConfig {
             .field("shutdown", &"<Notify>")
             .field("topic_prefix", &self.topic_prefix)
             .field("max_packet_size", &self.max_packet_size)
+            .field("receive_max", &self.receive_max)
             .field("min_keep_alive_secs", &self.min_keep_alive_secs)
             .field("response_channel_capacity", &self.response_channel_capacity)
             .field("wildcard_policy", &self.wildcard_policy)
@@ -461,6 +488,7 @@ mod tests {
             shutdown: Arc::new(Notify::new()),
             topic_prefix: None,
             max_packet_size: 1024,
+            receive_max: MqttServerConfig::DEFAULT_RECEIVE_MAX,
             min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
             response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
             wildcard_policy: WildcardPolicy::default(),
@@ -508,6 +536,7 @@ mod tests {
             shutdown: Arc::new(Notify::new()),
             topic_prefix: None,
             max_packet_size: 1024,
+            receive_max: MqttServerConfig::DEFAULT_RECEIVE_MAX,
             min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
             response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
             wildcard_policy: WildcardPolicy::default(),

@@ -1645,6 +1645,7 @@ pub(crate) fn start_mqtt<P: NatsPublish + Send + Sync + 'static>(
         shutdown: Arc::clone(&shutdown),
         topic_prefix: cli.mqtt_topic_prefix.clone(),
         max_packet_size: cli.mqtt_max_packet_size,
+        receive_max: cli.mqtt_receive_max,
         min_keep_alive_secs: cli.mqtt_min_keep_alive_secs,
         response_channel_capacity: cli.mqtt_response_channel_capacity,
         wildcard_policy: cli.mqtt_wildcard_policy.into(),

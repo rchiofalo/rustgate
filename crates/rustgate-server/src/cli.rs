@@ -611,6 +611,13 @@ pub(crate) struct Cli {
     )]
     pub(crate) mqtt_max_packet_size: usize,
 
+    /// MQTT 5.0 Receive Maximum advertised in CONNACK (default: 32).
+    /// Maximum number of QoS 1 / QoS 2 PUBLISHes a client may have
+    /// in-flight to the broker without intervening acks. The default
+    /// matches `MqttServerConfig::DEFAULT_RECEIVE_MAX`.
+    #[arg(long, default_value_t = 32, env = "RUSTGATE_MQTT_RECEIVE_MAX")]
+    pub(crate) mqtt_receive_max: u16,
+
     /// Minimum MQTT keep-alive interval in seconds. Clients requesting 0
     /// (disabled) or a value below this floor get this value imposed.
     #[arg(long, default_value_t = 30, env = "RUSTGATE_MQTT_MIN_KEEP_ALIVE_SECS")]
@@ -1625,6 +1632,7 @@ define_config_file! {
     mqtt_bind: Option<String>,
     mqtt_topic_prefix: Option<String>,
     mqtt_max_packet_size: usize,
+    mqtt_receive_max: u16,
     mqtt_min_keep_alive_secs: u16,
     mqtt_response_channel_capacity: usize,
     mqtt_wildcard_policy: MqttWildcardPolicy,

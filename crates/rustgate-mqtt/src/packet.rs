@@ -56,17 +56,19 @@ pub(crate) struct PacketCodec {
     write_buf: BytesMut,
     pub(crate) protocol: Option<ProtocolLevel>,
     max_packet_size: usize,
+    receive_max: u16,
 }
 
 impl PacketCodec {
     /// Create a new codec wrapping the given TLS stream.
-    pub(crate) fn new(stream: TlsStream, max_packet_size: usize) -> Self {
+    pub(crate) fn new(stream: TlsStream, max_packet_size: usize, receive_max: u16) -> Self {
         Self {
             stream,
             read_buf: BytesMut::with_capacity(4096),
             write_buf: BytesMut::with_capacity(4096),
             protocol: None,
             max_packet_size,
+            receive_max,
         }
     }
 
@@ -174,6 +176,15 @@ impl PacketCodec {
         // pathological. In practice MAX_READ_BUF is 16 MiB and well below
         // the u32 ceiling, so this never trips.
         properties.max_packet_size = Some(u32::try_from(self.max_packet_size).unwrap_or(u32::MAX));
+        // MQTT 5.0 §3.2.2.3.3: Receive Maximum. Tells a compliant client
+        // the maximum number of QoS 1 / QoS 2 PUBLISHes it may have
+        // in-flight to the broker without intervening acks. The spec
+        // default (when the property is absent) is 65535, which is a
+        // useless signal — well-behaved clients respect a value the
+        // broker actually advertises. We always advertise so the client
+        // has a concrete cap to self-limit against. Note `receive_max`
+        // is a u16 on the wire so no saturation logic is needed.
+        properties.receive_max = Some(self.receive_max);
         let connack = mqttbytes::v5::ConnAck {
             session_present: false,
             code,
@@ -938,6 +949,82 @@ mod tests {
                     "broker must advertise its 16 MiB cap so a compliant client \
                      short-circuits oversized publishes locally"
                 );
+            }
+            other => panic!("expected ConnAck, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v5_connack_advertises_configured_receive_maximum() {
+        // Refs #880: MQTT 5.0 §3.2.2.3.3 — CONNACK Receive Maximum.
+        // Tells a compliant client the maximum number of QoS 1/2
+        // PUBLISHes it may have in-flight to the broker without
+        // intervening acks. The spec default when the property is
+        // absent is 65535 — operationally useless because no
+        // well-behaved client will pipeline 65k unacked publishes.
+        // Always advertising means the client has a concrete cap to
+        // self-limit against.
+        //
+        // Pin the wire format end-to-end: build CONNACK with the
+        // property, parse it back, assert the value survives. A
+        // regression that hard-coded the value, dropped the property,
+        // or swapped to `None` would silently revert clients to the
+        // 65535 default — exactly the gap #880 calls out.
+        let connack = mqttbytes::v5::ConnAck {
+            session_present: false,
+            code: mqttbytes::v5::ConnectReturnCode::Success,
+            properties: Some({
+                let mut p = mqttbytes::v5::ConnAckProperties::new();
+                p.receive_max = Some(32);
+                p
+            }),
+        };
+        let mut buf = BytesMut::with_capacity(32);
+        write_v5_to_buf(&mqttbytes::v5::Packet::ConnAck(connack), &mut buf).expect("serialize");
+
+        let decoded = mqttbytes::v5::read(&mut buf, 16 * 1024).expect("parse");
+        match decoded {
+            mqttbytes::v5::Packet::ConnAck(a) => {
+                let props = a.properties.expect("properties present");
+                assert_eq!(
+                    props.receive_max,
+                    Some(32),
+                    "broker must advertise its Receive Maximum so a compliant \
+                     client knows how many QoS 1/2 publishes it can pipeline"
+                );
+            }
+            other => panic!("expected ConnAck, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v5_connack_advertises_both_max_packet_size_and_receive_max() {
+        // The two CONNACK properties #1158 and this PR (#880 receive
+        // max) both ride on the same `write_connack_v5` call. Pin
+        // that BOTH properties survive serialization simultaneously
+        // — a regression that overwrote one with the other (e.g. by
+        // creating a fresh `ConnAckProperties::new()` mid-function
+        // and copying only one field) would manifest only when both
+        // properties were expected and the test would catch it.
+        let connack = mqttbytes::v5::ConnAck {
+            session_present: false,
+            code: mqttbytes::v5::ConnectReturnCode::Success,
+            properties: Some({
+                let mut p = mqttbytes::v5::ConnAckProperties::new();
+                p.max_packet_size = Some(16 * 1024 * 1024);
+                p.receive_max = Some(32);
+                p
+            }),
+        };
+        let mut buf = BytesMut::with_capacity(32);
+        write_v5_to_buf(&mqttbytes::v5::Packet::ConnAck(connack), &mut buf).expect("serialize");
+
+        let decoded = mqttbytes::v5::read(&mut buf, 16 * 1024).expect("parse");
+        match decoded {
+            mqttbytes::v5::Packet::ConnAck(a) => {
+                let props = a.properties.expect("properties present");
+                assert_eq!(props.max_packet_size, Some(16 * 1024 * 1024));
+                assert_eq!(props.receive_max, Some(32));
             }
             other => panic!("expected ConnAck, got {other:?}"),
         }
