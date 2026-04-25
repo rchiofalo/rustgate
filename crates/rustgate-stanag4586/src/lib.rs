@@ -71,7 +71,9 @@
 #![doc(html_no_source)]
 
 pub mod error;
+pub mod sensor_status;
 pub mod vehicle_position;
 
 pub use error::Stanag4586Error;
+pub use sensor_status::{OperationalState, SensorStatus, SensorType};
 pub use vehicle_position::{FlightState, VehiclePosition};
