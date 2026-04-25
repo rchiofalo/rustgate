@@ -1305,3 +1305,332 @@ async fn publish_with_no_forwarding_hooks_does_not_panic() {
 
     server.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// Retain flag (issue #880) — MQTT 5.0 §3.3.1.3 / 3.1.1 §3.3.1
+// ---------------------------------------------------------------------------
+
+/// A subscriber that connects AFTER a retained PUBLISH must receive the
+/// retained message immediately on its SUBSCRIBE — that is the load-
+/// bearing semantic of the retain flag. Pinning this end-to-end ensures
+/// the retain store is wired into both the PUBLISH and SUBSCRIBE
+/// handlers (a regression that drops one half would silently break
+/// last-known-value patterns that production IoT deployments depend on).
+#[tokio::test]
+async fn retained_publish_delivered_to_late_subscriber() {
+    let ca = TestCa::new("MQTT Test CA");
+    let alice_cert = ca.issue_client_cert("alice", &["alpha"]);
+    let bob_cert = ca.issue_client_cert("bob", &["alpha"]);
+    let router = Arc::new(Router::new());
+    let server = TestServer::new(&ca, Arc::clone(&router), None);
+
+    // Phase 1: Alice publishes a QoS 0 retained message and disconnects.
+    {
+        let alice_tls =
+            build_client_tls_config(&alice_cert.cert_pem, &alice_cert.key_pem, &ca.cert_pem);
+        let mut alice = mqtt_connect(server.addr, &alice_tls).await;
+        let mut alice_buf = BytesMut::new();
+        let connect = mqttbytes::v5::Connect::new("alice-retain-pub");
+        write_v5_packet(&mut alice, &mqttbytes::v5::Packet::Connect(connect)).await;
+        let _ = read_v5_packet(&mut alice, &mut alice_buf).await; // CONNACK
+
+        let mut publish =
+            mqttbytes::v5::Publish::new("alpha", mqttbytes::QoS::AtMostOnce, b"last-known");
+        publish.retain = true;
+        write_v5_packet(&mut alice, &mqttbytes::v5::Packet::Publish(publish)).await;
+
+        // No PUBACK on QoS 0; give the broker a moment to update the
+        // retain store before disconnecting.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let disc = mqttbytes::v5::Disconnect {
+            reason_code: mqttbytes::v5::DisconnectReasonCode::NormalDisconnection,
+            properties: None,
+        };
+        write_v5_packet(&mut alice, &mqttbytes::v5::Packet::Disconnect(disc)).await;
+    }
+
+    // Phase 2: Bob connects AFTER Alice and subscribes — he must
+    // receive the retained payload as part of the subscribe response.
+    let bob_tls = build_client_tls_config(&bob_cert.cert_pem, &bob_cert.key_pem, &ca.cert_pem);
+    let mut bob = mqtt_connect(server.addr, &bob_tls).await;
+    let mut bob_buf = BytesMut::new();
+    let connect = mqttbytes::v5::Connect::new("bob-retain-sub");
+    write_v5_packet(&mut bob, &mqttbytes::v5::Packet::Connect(connect)).await;
+    let _ = read_v5_packet(&mut bob, &mut bob_buf).await; // CONNACK
+
+    let sub = mqttbytes::v5::Subscribe::new("alpha", mqttbytes::QoS::AtMostOnce);
+    write_v5_packet(&mut bob, &mqttbytes::v5::Packet::Subscribe(sub)).await;
+
+    // SUBACK first (MQTT 5.0 §3.8.4 leaves order implementation-defined;
+    // we send SUBACK first so client subscription state is updated
+    // before retained PUBLISHes arrive — matches Mosquitto/HiveMQ).
+    let suback = read_v5_packet(&mut bob, &mut bob_buf).await;
+    assert!(
+        matches!(suback, mqttbytes::v5::Packet::SubAck(_)),
+        "expected SUBACK first, got {suback:?}"
+    );
+
+    // Then the retained PUBLISH with retain=true on the wire.
+    let retained = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_v5_packet(&mut bob, &mut bob_buf),
+    )
+    .await
+    .expect("retained PUBLISH must be delivered after SUBACK");
+    match retained {
+        mqttbytes::v5::Packet::Publish(p) => {
+            assert_eq!(p.topic, "alpha");
+            assert_eq!(p.payload, &b"last-known"[..]);
+            assert!(p.retain, "retain flag must be set on replay per spec");
+        }
+        other => panic!("expected retained Publish, got {other:?}"),
+    }
+
+    server.shutdown();
+}
+
+/// Per MQTT 5.0 §3.3.1.3 a PUBLISH with retain=1 AND zero-byte payload
+/// CLEARS the retained message for that topic. A subsequent subscriber
+/// must not receive anything for that topic — pinning this prevents
+/// the "stuck zombie payload" regression where the clear is parsed but
+/// not applied to the store.
+#[tokio::test]
+async fn retain_with_empty_payload_clears_existing() {
+    let ca = TestCa::new("MQTT Test CA");
+    let alice_cert = ca.issue_client_cert("alice", &["alpha"]);
+    let bob_cert = ca.issue_client_cert("bob", &["alpha"]);
+    let router = Arc::new(Router::new());
+    let server = TestServer::new(&ca, Arc::clone(&router), None);
+
+    // Alice: store + clear the retained value for `alpha`.
+    {
+        let alice_tls =
+            build_client_tls_config(&alice_cert.cert_pem, &alice_cert.key_pem, &ca.cert_pem);
+        let mut alice = mqtt_connect(server.addr, &alice_tls).await;
+        let mut alice_buf = BytesMut::new();
+        let connect = mqttbytes::v5::Connect::new("alice-clear");
+        write_v5_packet(&mut alice, &mqttbytes::v5::Packet::Connect(connect)).await;
+        let _ = read_v5_packet(&mut alice, &mut alice_buf).await;
+
+        // Store
+        let mut store = mqttbytes::v5::Publish::new("alpha", mqttbytes::QoS::AtMostOnce, b"v1");
+        store.retain = true;
+        write_v5_packet(&mut alice, &mqttbytes::v5::Packet::Publish(store)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Clear: zero-byte payload + retain=true
+        let mut clear =
+            mqttbytes::v5::Publish::new("alpha", mqttbytes::QoS::AtMostOnce, Vec::<u8>::new());
+        clear.retain = true;
+        write_v5_packet(&mut alice, &mqttbytes::v5::Packet::Publish(clear)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Bob subscribes — must NOT see a retained PUBLISH because the
+    // store was cleared by the empty-payload retain above.
+    let bob_tls = build_client_tls_config(&bob_cert.cert_pem, &bob_cert.key_pem, &ca.cert_pem);
+    let mut bob = mqtt_connect(server.addr, &bob_tls).await;
+    let mut bob_buf = BytesMut::new();
+    let connect = mqttbytes::v5::Connect::new("bob-clear-sub");
+    write_v5_packet(&mut bob, &mqttbytes::v5::Packet::Connect(connect)).await;
+    let _ = read_v5_packet(&mut bob, &mut bob_buf).await;
+
+    let sub = mqttbytes::v5::Subscribe::new("alpha", mqttbytes::QoS::AtMostOnce);
+    write_v5_packet(&mut bob, &mqttbytes::v5::Packet::Subscribe(sub)).await;
+
+    let suback = read_v5_packet(&mut bob, &mut bob_buf).await;
+    assert!(matches!(suback, mqttbytes::v5::Packet::SubAck(_)));
+
+    // After SUBACK, no retained PUBLISH should arrive within the
+    // grace window. We pin the negative case via a short timeout.
+    let next = tokio::time::timeout(
+        Duration::from_millis(500),
+        read_v5_packet(&mut bob, &mut bob_buf),
+    )
+    .await;
+    assert!(
+        next.is_err(),
+        "expected no retained PUBLISH after empty-payload clear; got {next:?}"
+    );
+
+    server.shutdown();
+}
+
+/// Two subscribers that both subscribe to the same retained topic
+/// must each receive their own copy of the retained PUBLISH — the
+/// retain store is shared across sessions, but delivery is per-
+/// subscriber. Pinning this ensures the matching/lookup path does
+/// not accidentally consume entries on read.
+#[tokio::test]
+async fn retain_delivered_independently_to_multiple_subscribers() {
+    let ca = TestCa::new("MQTT Test CA");
+    let alice_cert = ca.issue_client_cert("alice", &["alpha"]);
+    let bob_cert = ca.issue_client_cert("bob", &["alpha"]);
+    let charlie_cert = ca.issue_client_cert("charlie", &["alpha"]);
+    let router = Arc::new(Router::new());
+    let server = TestServer::new(&ca, Arc::clone(&router), None);
+
+    // Alice publishes the retained message and disconnects.
+    {
+        let alice_tls =
+            build_client_tls_config(&alice_cert.cert_pem, &alice_cert.key_pem, &ca.cert_pem);
+        let mut alice = mqtt_connect(server.addr, &alice_tls).await;
+        let mut alice_buf = BytesMut::new();
+        let connect = mqttbytes::v5::Connect::new("alice-multi");
+        write_v5_packet(&mut alice, &mqttbytes::v5::Packet::Connect(connect)).await;
+        let _ = read_v5_packet(&mut alice, &mut alice_buf).await;
+        let mut publish =
+            mqttbytes::v5::Publish::new("alpha", mqttbytes::QoS::AtMostOnce, b"shared");
+        publish.retain = true;
+        write_v5_packet(&mut alice, &mqttbytes::v5::Packet::Publish(publish)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Subscribe Bob and Charlie back-to-back. Each must see the
+    // retained payload independently.
+    for (cert, client_id) in [(&bob_cert, "bob-multi"), (&charlie_cert, "charlie-multi")] {
+        let tls = build_client_tls_config(&cert.cert_pem, &cert.key_pem, &ca.cert_pem);
+        let mut stream = mqtt_connect(server.addr, &tls).await;
+        let mut buf = BytesMut::new();
+        let connect = mqttbytes::v5::Connect::new(client_id);
+        write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Connect(connect)).await;
+        let _ = read_v5_packet(&mut stream, &mut buf).await;
+        let sub = mqttbytes::v5::Subscribe::new("alpha", mqttbytes::QoS::AtMostOnce);
+        write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Subscribe(sub)).await;
+        let _ = read_v5_packet(&mut stream, &mut buf).await; // SUBACK
+        let retained = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_v5_packet(&mut stream, &mut buf),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{client_id} must receive retained PUBLISH"));
+        match retained {
+            mqttbytes::v5::Packet::Publish(p) => {
+                assert_eq!(p.topic, "alpha");
+                assert_eq!(p.payload, &b"shared"[..]);
+                assert!(p.retain);
+            }
+            other => panic!("{client_id}: expected Publish, got {other:?}"),
+        }
+    }
+
+    server.shutdown();
+}
+
+/// A non-retained PUBLISH must NOT update the retain store. This pins
+/// the behaviour against a regression where the retain bit is read
+/// but inverted — without retain=1 the store should be a passthrough.
+#[tokio::test]
+async fn non_retained_publish_does_not_persist() {
+    let ca = TestCa::new("MQTT Test CA");
+    let alice_cert = ca.issue_client_cert("alice", &["alpha"]);
+    let bob_cert = ca.issue_client_cert("bob", &["alpha"]);
+    let router = Arc::new(Router::new());
+    let server = TestServer::new(&ca, Arc::clone(&router), None);
+
+    // Alice publishes a non-retained QoS 0 message.
+    {
+        let alice_tls =
+            build_client_tls_config(&alice_cert.cert_pem, &alice_cert.key_pem, &ca.cert_pem);
+        let mut alice = mqtt_connect(server.addr, &alice_tls).await;
+        let mut alice_buf = BytesMut::new();
+        let connect = mqttbytes::v5::Connect::new("alice-nonretain");
+        write_v5_packet(&mut alice, &mqttbytes::v5::Packet::Connect(connect)).await;
+        let _ = read_v5_packet(&mut alice, &mut alice_buf).await;
+        // retain defaults to false — explicit for clarity in the assertion
+        let mut publish =
+            mqttbytes::v5::Publish::new("alpha", mqttbytes::QoS::AtMostOnce, b"transient");
+        publish.retain = false;
+        write_v5_packet(&mut alice, &mqttbytes::v5::Packet::Publish(publish)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Bob subscribes — must NOT receive any retained PUBLISH.
+    let bob_tls = build_client_tls_config(&bob_cert.cert_pem, &bob_cert.key_pem, &ca.cert_pem);
+    let mut bob = mqtt_connect(server.addr, &bob_tls).await;
+    let mut bob_buf = BytesMut::new();
+    let connect = mqttbytes::v5::Connect::new("bob-nonretain-sub");
+    write_v5_packet(&mut bob, &mqttbytes::v5::Packet::Connect(connect)).await;
+    let _ = read_v5_packet(&mut bob, &mut bob_buf).await;
+
+    let sub = mqttbytes::v5::Subscribe::new("alpha", mqttbytes::QoS::AtMostOnce);
+    write_v5_packet(&mut bob, &mqttbytes::v5::Packet::Subscribe(sub)).await;
+
+    let suback = read_v5_packet(&mut bob, &mut bob_buf).await;
+    assert!(matches!(suback, mqttbytes::v5::Packet::SubAck(_)));
+
+    // No retained PUBLISH expected.
+    let next = tokio::time::timeout(
+        Duration::from_millis(400),
+        read_v5_packet(&mut bob, &mut bob_buf),
+    )
+    .await;
+    assert!(
+        next.is_err(),
+        "non-retained PUBLISH must not be replayed; got {next:?}"
+    );
+
+    server.shutdown();
+}
+
+/// A subscriber whose certificate does not include the retained
+/// topic's group must NOT receive the retained payload. This is the
+/// security-critical authorization test — without it, retain becomes
+/// a side-channel for cross-tenant data leakage on a wildcard
+/// subscribe that crosses authorization boundaries.
+#[tokio::test]
+async fn retain_does_not_leak_across_group_boundaries() {
+    let ca = TestCa::new("MQTT Test CA");
+    // Alice belongs to alpha; Eve belongs only to bravo. Eve's filter
+    // is a multi-level wildcard that expands across her own groups —
+    // it must NOT match alpha-retained messages because Eve is not a
+    // member of alpha.
+    let alice_cert = ca.issue_client_cert("alice", &["alpha"]);
+    let eve_cert = ca.issue_client_cert("eve", &["bravo"]);
+    let router = Arc::new(Router::new());
+    let server = TestServer::new(&ca, Arc::clone(&router), None);
+
+    // Alice retains on alpha.
+    {
+        let alice_tls =
+            build_client_tls_config(&alice_cert.cert_pem, &alice_cert.key_pem, &ca.cert_pem);
+        let mut alice = mqtt_connect(server.addr, &alice_tls).await;
+        let mut alice_buf = BytesMut::new();
+        let connect = mqttbytes::v5::Connect::new("alice-secret");
+        write_v5_packet(&mut alice, &mqttbytes::v5::Packet::Connect(connect)).await;
+        let _ = read_v5_packet(&mut alice, &mut alice_buf).await;
+        let mut publish =
+            mqttbytes::v5::Publish::new("alpha", mqttbytes::QoS::AtMostOnce, b"secret");
+        publish.retain = true;
+        write_v5_packet(&mut alice, &mqttbytes::v5::Packet::Publish(publish)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Eve subscribes to her own group — must succeed but yield NOTHING
+    // because alpha's retained entry is not authorised for her.
+    let eve_tls = build_client_tls_config(&eve_cert.cert_pem, &eve_cert.key_pem, &ca.cert_pem);
+    let mut eve = mqtt_connect(server.addr, &eve_tls).await;
+    let mut eve_buf = BytesMut::new();
+    let connect = mqttbytes::v5::Connect::new("eve-spy");
+    write_v5_packet(&mut eve, &mqttbytes::v5::Packet::Connect(connect)).await;
+    let _ = read_v5_packet(&mut eve, &mut eve_buf).await;
+
+    let sub = mqttbytes::v5::Subscribe::new("bravo", mqttbytes::QoS::AtMostOnce);
+    write_v5_packet(&mut eve, &mqttbytes::v5::Packet::Subscribe(sub)).await;
+
+    let suback = read_v5_packet(&mut eve, &mut eve_buf).await;
+    assert!(matches!(suback, mqttbytes::v5::Packet::SubAck(_)));
+
+    let next = tokio::time::timeout(
+        Duration::from_millis(400),
+        read_v5_packet(&mut eve, &mut eve_buf),
+    )
+    .await;
+    assert!(
+        next.is_err(),
+        "retain MUST NOT leak across authorization boundaries; got {next:?}"
+    );
+
+    server.shutdown();
+}

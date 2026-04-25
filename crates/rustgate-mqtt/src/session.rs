@@ -28,6 +28,7 @@ use crate::TRANSPORT_LABEL;
 use crate::error::MqttError;
 use crate::listener::MqttPreSession;
 use crate::packet::{MqttPacket, PacketCodec, PacketReader, PacketWriter, ProtocolLevel};
+use crate::retain::{RetainOutcome, RetainStore};
 use crate::topic::{self, WildcardPolicy};
 
 /// Keep-alive multiplier per MQTT spec: the server MUST allow 1.5x the
@@ -143,6 +144,7 @@ pub(crate) async fn handle_mqtt_session(
     response_channel_capacity: usize,
     wildcard_policy: WildcardPolicy,
     client_id_registry: Arc<ClientIdRegistry>,
+    retain_store: Arc<RetainStore>,
     _permit: OwnedSemaphorePermit,
     session_hooks: Option<crate::config::MqttSessionHooks>,
     forwarding_hooks: Option<crate::config::MqttForwardingHooks>,
@@ -275,6 +277,7 @@ pub(crate) async fn handle_mqtt_session(
         keep_alive: keep_alive_duration,
         session_hooks: session_hooks.as_ref(),
         forwarding_hooks: forwarding_hooks.as_ref(),
+        retain_store: &retain_store,
     };
 
     let read_result = tokio::select! {
@@ -519,6 +522,12 @@ struct ReadLoopParams<'a> {
     keep_alive: std::time::Duration,
     session_hooks: Option<&'a crate::config::MqttSessionHooks>,
     forwarding_hooks: Option<&'a crate::config::MqttForwardingHooks>,
+    /// Shared retain store for storing PUBLISH retain=1 messages and
+    /// replaying them to new subscribers. Borrowed from
+    /// [`handle_mqtt_session`]'s `Arc<RetainStore>` so the per-session
+    /// task does not own a refcount of its own — the parent handle
+    /// outlives the read loop by construction.
+    retain_store: &'a RetainStore,
 }
 
 /// Read loop: process inbound MQTT packets from the client.
@@ -540,6 +549,7 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<(), MqttError
     let keep_alive = params.keep_alive;
     let session_hooks = params.session_hooks;
     let forwarding_hooks = params.forwarding_hooks;
+    let retain_store = params.retain_store;
     loop {
         let packet = match tokio::time::timeout(keep_alive, reader.read_packet()).await {
             Ok(Ok(pkt)) => pkt,
@@ -561,6 +571,7 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<(), MqttError
                         topic_prefix,
                         session_hooks,
                         forwarding_hooks,
+                        retain_store,
                         publish,
                     )
                     .await?;
@@ -574,6 +585,7 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<(), MqttError
                         topic_prefix,
                         wildcard_policy,
                         session_hooks,
+                        retain_store,
                         sub,
                     )
                     .await?;
@@ -611,6 +623,7 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<(), MqttError
                         topic_prefix,
                         session_hooks,
                         forwarding_hooks,
+                        retain_store,
                         publish,
                     )
                     .await?;
@@ -624,6 +637,7 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<(), MqttError
                         topic_prefix,
                         wildcard_policy,
                         session_hooks,
+                        retain_store,
                         sub,
                     )
                     .await?;
@@ -675,6 +689,7 @@ async fn handle_publish_v5(
     topic_prefix: Option<&str>,
     session_hooks: Option<&crate::config::MqttSessionHooks>,
     forwarding_hooks: Option<&crate::config::MqttForwardingHooks>,
+    retain_store: &RetainStore,
     publish: mqttbytes::v5::Publish,
 ) -> Result<(), MqttError> {
     if publish.qos == mqttbytes::QoS::ExactlyOnce {
@@ -700,6 +715,27 @@ async fn handle_publish_v5(
         return Err(MqttError::NotAuthorized(format!(
             "not authorized to publish to group '{group}'"
         )));
+    }
+
+    // Update the retained-message store BEFORE routing. The retain
+    // store is independent of the live fan-out — even if the router
+    // drops the message via dedup or TTL, the retain semantics
+    // require the broker to remember the latest payload for new
+    // subscribers. The auth check above gates retain just like it
+    // gates routing, so a non-member CN cannot poison the store.
+    let outcome = retain_store.publish(
+        &publish.topic,
+        &publish.payload,
+        publish.qos,
+        publish.retain,
+    );
+    if outcome != RetainOutcome::Passthrough {
+        debug!(
+            cn = %hash_cn(&identity.cn),
+            topic = %sanitize_for_log(&publish.topic),
+            outcome = ?outcome,
+            "MQTT retain store updated"
+        );
     }
 
     let msg = RoutableMessage {
@@ -754,7 +790,7 @@ async fn ack_publish_v5(
 }
 
 // justification: mirrors `handle_publish_v5` for the MQTT 3.1.1 wire format.
-// The v5 sibling already carries the same seven args and unifying them
+// The v5 sibling already carries the same eight args and unifying them
 // would force an unrelated wrapper struct through every dispatch branch.
 #[allow(clippy::too_many_arguments)]
 async fn handle_publish_v4(
@@ -764,6 +800,7 @@ async fn handle_publish_v4(
     topic_prefix: Option<&str>,
     session_hooks: Option<&crate::config::MqttSessionHooks>,
     forwarding_hooks: Option<&crate::config::MqttForwardingHooks>,
+    retain_store: &RetainStore,
     publish: mqttbytes::v4::Publish,
 ) -> Result<(), MqttError> {
     if publish.qos == mqttbytes::QoS::ExactlyOnce {
@@ -789,6 +826,24 @@ async fn handle_publish_v4(
         return Err(MqttError::NotAuthorized(format!(
             "not authorized to publish to group '{group}'"
         )));
+    }
+
+    // See `handle_publish_v5` for the rationale — retain semantics are
+    // identical across MQTT 3.1.1 and 5.0 and live above the routing
+    // layer so even router-dropped messages update the store.
+    let outcome = retain_store.publish(
+        &publish.topic,
+        &publish.payload,
+        publish.qos,
+        publish.retain,
+    );
+    if outcome != RetainOutcome::Passthrough {
+        debug!(
+            cn = %hash_cn(&identity.cn),
+            topic = %sanitize_for_log(&publish.topic),
+            outcome = ?outcome,
+            "MQTT retain store updated"
+        );
     }
 
     let msg = RoutableMessage {
@@ -838,12 +893,12 @@ async fn ack_publish_v4(
 // SUBSCRIBE handlers
 // ---------------------------------------------------------------------------
 
-// justification: eight args — the original seven the SUBSCRIBE handler
+// justification: nine args — the original seven the SUBSCRIBE handler
 // needs (response tx, session identity, router, session id, prefix,
-// wildcard policy, packet) plus the optional per-filter metrics hooks.
-// The handler is dispatched from the read loop once per SUBSCRIBE
-// packet; a wrapper struct would be built fresh at every call with no
-// shared lifetime benefit.
+// wildcard policy, packet) plus the optional per-filter metrics hooks
+// and the shared retain store. The handler is dispatched from the read
+// loop once per SUBSCRIBE packet; a wrapper struct would be built fresh
+// at every call with no shared lifetime benefit.
 #[allow(clippy::too_many_arguments)]
 async fn handle_subscribe_v5(
     resp_tx: &mpsc::Sender<ResponsePacket>,
@@ -853,9 +908,19 @@ async fn handle_subscribe_v5(
     topic_prefix: Option<&str>,
     wildcard_policy: WildcardPolicy,
     session_hooks: Option<&crate::config::MqttSessionHooks>,
+    retain_store: &RetainStore,
     sub: mqttbytes::v5::Subscribe,
 ) -> Result<(), MqttError> {
     let mut return_codes = Vec::with_capacity(sub.filters.len());
+    // Buffer of retained-message PUBLISHes to send AFTER the SUBACK.
+    // MQTT 5.0 §3.8.4 requires retained messages to be delivered in
+    // response to a SUBSCRIBE; the spec leaves the relative order
+    // (SUBACK first vs retained PUBLISHes first) implementation-
+    // defined. We send SUBACK first so the client's subscription
+    // state is updated before the retained payloads land — this
+    // matches Eclipse Mosquitto and HiveMQ behaviour.
+    let mut retained_to_send: Vec<(String, crate::retain::RetainedMessage, mqttbytes::QoS)> =
+        Vec::new();
 
     for filter in &sub.filters {
         if filter.qos == mqttbytes::QoS::ExactlyOnce {
@@ -876,6 +941,18 @@ async fn handle_subscribe_v5(
         {
             Ok(()) => {
                 fire_subscribe_accept(session_hooks);
+                // Collect retained messages now while the filter is
+                // confirmed-authorised; defer the actual send until
+                // after SUBACK so a slow client back-pressuring the
+                // response channel cannot block the SUBACK itself.
+                collect_retained_for_filter(
+                    retain_store,
+                    identity,
+                    &filter.path,
+                    filter.qos,
+                    topic_prefix,
+                    &mut retained_to_send,
+                );
                 match filter.qos {
                     mqttbytes::QoS::AtMostOnce => mqttbytes::v5::SubscribeReasonCode::QoS0,
                     mqttbytes::QoS::AtLeastOnce => mqttbytes::v5::SubscribeReasonCode::QoS1,
@@ -901,14 +978,41 @@ async fn handle_subscribe_v5(
     )
     .await?;
 
+    // Deliver retained messages AFTER SUBACK. Each PUBLISH carries
+    // `retain=true` on the wire per MQTT 5.0 §3.3.1.3 so the client
+    // can distinguish a fresh publication from a retained replay.
+    for (topic, retained, subscriber_qos) in retained_to_send {
+        // Downgrade publisher's QoS to min(publisher_qos,
+        // subscriber_qos) per MQTT 5.0 §3.8.4 ("the QoS of Payload
+        // messages sent in response to a Subscription MUST be the
+        // minimum of the QoS of the originally published message and
+        // the Maximum QoS granted by the Server").
+        let effective_qos = min_qos(retained.qos, subscriber_qos);
+        let mut publish =
+            mqttbytes::v5::Publish::from_bytes(topic, effective_qos, retained.payload);
+        publish.retain = true;
+        // Pkid 0 is correct for QoS 0 retained PUBLISHes; for QoS 1
+        // we currently rely on the receiver tolerating pkid 0 on a
+        // retained replay (the spec allows this when the broker has
+        // not allocated a packet id, which is our case since we do
+        // not track per-subscriber retained-PUBLISH acks). The full
+        // QoS 1 retained-replay round-trip lands with the broader
+        // session-persistence work tracked under #880.
+        send_response(
+            resp_tx,
+            serialize_v5(&mqttbytes::v5::Packet::Publish(publish))?,
+        )
+        .await?;
+    }
+
     Ok(())
 }
 
 // justification: mirrors `handle_subscribe_v5` for the MQTT 3.1.1 wire
-// format with the same eight args including the optional metrics hooks.
-// Unifying the pair under a struct would force every branch in the read-
-// loop dispatch to unpack fields that differ only in the generic `sub`
-// packet type.
+// format with the same nine args including the optional metrics hooks
+// and the shared retain store. Unifying the pair under a struct would
+// force every branch in the read-loop dispatch to unpack fields that
+// differ only in the generic `sub` packet type.
 #[allow(clippy::too_many_arguments)]
 async fn handle_subscribe_v4(
     resp_tx: &mpsc::Sender<ResponsePacket>,
@@ -918,9 +1022,12 @@ async fn handle_subscribe_v4(
     topic_prefix: Option<&str>,
     wildcard_policy: WildcardPolicy,
     session_hooks: Option<&crate::config::MqttSessionHooks>,
+    retain_store: &RetainStore,
     sub: mqttbytes::v4::Subscribe,
 ) -> Result<(), MqttError> {
     let mut return_codes = Vec::with_capacity(sub.filters.len());
+    let mut retained_to_send: Vec<(String, crate::retain::RetainedMessage, mqttbytes::QoS)> =
+        Vec::new();
 
     for filter in &sub.filters {
         if filter.qos == mqttbytes::QoS::ExactlyOnce {
@@ -943,6 +1050,14 @@ async fn handle_subscribe_v4(
         {
             Ok(()) => {
                 fire_subscribe_accept(session_hooks);
+                collect_retained_for_filter(
+                    retain_store,
+                    identity,
+                    &filter.path,
+                    filter.qos,
+                    topic_prefix,
+                    &mut retained_to_send,
+                );
                 mqttbytes::v4::SubscribeReasonCode::Success(filter.qos)
             }
             Err(_) => {
@@ -959,6 +1074,20 @@ async fn handle_subscribe_v4(
         serialize_v4(&mqttbytes::v4::Packet::SubAck(suback))?,
     )
     .await?;
+
+    // Deliver retained messages after SUBACK; see `handle_subscribe_v5`
+    // for the rationale on ordering and QoS downgrade.
+    for (topic, retained, subscriber_qos) in retained_to_send {
+        let effective_qos = min_qos(retained.qos, subscriber_qos);
+        let mut publish =
+            mqttbytes::v4::Publish::from_bytes(topic, effective_qos, retained.payload);
+        publish.retain = true;
+        send_response(
+            resp_tx,
+            serialize_v4(&mqttbytes::v4::Packet::Publish(publish))?,
+        )
+        .await?;
+    }
 
     Ok(())
 }
@@ -1035,6 +1164,61 @@ async fn try_join_filter(
         )));
     }
     Ok(())
+}
+
+/// Pick the lower of two `QoS` values per MQTT spec semantics
+/// (downgrade to `min(publisher_qos, subscriber_qos)`).
+///
+/// `mqttbytes::QoS` does not implement `Ord` because the spec
+/// distinguishes 0/1/2 by behaviour, not by ordering on the wire.
+/// We define our own `min` here to keep the QoS-downgrade logic
+/// readable at the retained-PUBLISH call sites.
+fn min_qos(a: mqttbytes::QoS, b: mqttbytes::QoS) -> mqttbytes::QoS {
+    let rank = |q| match q {
+        mqttbytes::QoS::AtMostOnce => 0u8,
+        mqttbytes::QoS::AtLeastOnce => 1u8,
+        mqttbytes::QoS::ExactlyOnce => 2u8,
+    };
+    if rank(a) <= rank(b) { a } else { b }
+}
+
+/// Look up retained messages whose topic matches `filter` AND whose
+/// derived group is authorised for `identity`, and append them to
+/// `out` paired with the subscriber's requested `subscriber_qos`.
+///
+/// Called once per accepted filter inside the SUBSCRIBE handlers.
+/// The double check (filter pattern + group membership) mirrors the
+/// auth model used by `try_join_filter`: a wildcard filter is
+/// expanded against the certificate-derived group set, never against
+/// the synthesised superset of all retained topics. So an attacker
+/// who somehow placed a retained message on a topic they no longer
+/// have rights to cannot leak it to a subscriber that lacks the
+/// matching group either.
+///
+/// Topics that appear in the retain store but no longer map to a
+/// valid group (e.g. a misconfigured prefix change) are skipped
+/// silently — the retain store is best-effort and a stale entry must
+/// not break a fresh SUBSCRIBE.
+fn collect_retained_for_filter(
+    retain_store: &RetainStore,
+    identity: &Identity,
+    filter: &str,
+    subscriber_qos: mqttbytes::QoS,
+    topic_prefix: Option<&str>,
+    out: &mut Vec<(String, crate::retain::RetainedMessage, mqttbytes::QoS)>,
+) {
+    for (topic, msg) in retain_store.matching(filter, topic_prefix) {
+        // The auth boundary is the certificate-derived group set, same
+        // as for the live PUBLISH path. Stale retained entries whose
+        // topic no longer maps to a valid group are skipped — they
+        // cannot leak to anyone.
+        match topic::topic_to_group(&topic, topic_prefix) {
+            Ok(group) if identity.is_member_of(&group) => {
+                out.push((topic, msg, subscriber_qos));
+            }
+            _ => {}
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
