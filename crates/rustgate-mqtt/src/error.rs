@@ -13,9 +13,15 @@ pub enum MqttError {
     #[error("persistent sessions are not supported")]
     PersistentSessionUnsupported,
 
-    /// The client set the will flag, which is not supported in v1.
-    #[error("will messages are not supported")]
-    WillUnsupported,
+    /// The will message specified an unauthorized topic.
+    ///
+    /// Per MQTT 5.0 §3.1.2.5 the will payload is published by the broker on
+    /// behalf of the client when the connection ends ungracefully — so the
+    /// will must pass the same authorization gate as a live `PUBLISH`. A
+    /// will targeting a group the client is not a member of is rejected at
+    /// CONNECT time before the session is admitted.
+    #[error("will message rejected: {0}")]
+    WillRejected(String),
 
     /// The client attempted QoS 2, which is not supported in v1.
     #[error("QoS 2 (exactly-once) is not supported")]
@@ -86,10 +92,10 @@ mod tests {
     }
 
     #[test]
-    fn display_will_unsupported_is_stable() {
+    fn display_will_rejected_quotes_reason() {
         assert_eq!(
-            MqttError::WillUnsupported.to_string(),
-            "will messages are not supported",
+            MqttError::WillRejected("not authorized for topic 'bravo'".to_string()).to_string(),
+            "will message rejected: not authorized for topic 'bravo'",
         );
     }
 
@@ -266,7 +272,7 @@ mod tests {
         let cases = [
             MqttError::UnsupportedProtocol(3),
             MqttError::PersistentSessionUnsupported,
-            MqttError::WillUnsupported,
+            MqttError::WillRejected("t".into()),
             MqttError::Qos2Unsupported,
             MqttError::NotAuthorized("t".into()),
             MqttError::InvalidTopic("t".into()),
@@ -316,7 +322,7 @@ mod tests {
                 MqttError::PersistentSessionUnsupported,
                 "PersistentSessionUnsupported",
             ),
-            (MqttError::WillUnsupported, "WillUnsupported"),
+            (MqttError::WillRejected("t".into()), "WillRejected"),
             (MqttError::Qos2Unsupported, "Qos2Unsupported"),
             (MqttError::NotAuthorized("t".into()), "NotAuthorized"),
             (MqttError::InvalidTopic("t".into()), "InvalidTopic"),
@@ -451,7 +457,7 @@ mod tests {
             match err {
                 MqttError::UnsupportedProtocol(_) => "unsupported_protocol",
                 MqttError::PersistentSessionUnsupported => "persistent_session",
-                MqttError::WillUnsupported => "will",
+                MqttError::WillRejected(_) => "will_rejected",
                 MqttError::Qos2Unsupported => "qos2",
                 MqttError::NotAuthorized(_) => "not_authorized",
                 MqttError::InvalidTopic(_) => "invalid_topic",
