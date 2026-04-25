@@ -661,6 +661,13 @@ async fn keep_alive_timeout_disconnects_idle_client() {
 
 #[tokio::test]
 async fn max_packet_size_rejects_oversized_publish() {
+    // Refs #753: server enforces `max_packet_size`. Beyond just dropping
+    // the connection (the prior contract this test pinned), MQTT 5.0
+    // §3.14.2.1 reason code 0x95 says the broker MUST send a structured
+    // DISCONNECT before closing so the client gets a meaningful reason
+    // instead of a bare TCP RST. We pin BOTH the spec-mandated
+    // CONNACK advertisement (§3.2.2.3.6) and the DISCONNECT response
+    // here in one end-to-end test that mirrors the production code path.
     let ca = TestCa::new("MQTT Test CA");
     let client_cert = ca.issue_client_cert("alice", &["alpha"]);
     let router = Arc::new(Router::new());
@@ -674,13 +681,14 @@ async fn max_packet_size_rejects_oversized_publish() {
     let addr = listener.local_addr().expect("addr");
     let shutdown = Arc::new(Notify::new());
 
+    const SERVER_CAP: usize = 64;
     let config = MqttServerConfig {
         listener,
         router,
         connection_limit: Arc::new(Semaphore::new(100)),
         shutdown: Arc::clone(&shutdown),
         topic_prefix: None,
-        max_packet_size: 64, // Very small — CONNECT is ~30-40 bytes, PUBLISH will exceed
+        max_packet_size: SERVER_CAP, // Small — CONNECT fits, big PUBLISH won't
         min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
         response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
         wildcard_policy: WildcardPolicy::default(),
@@ -700,23 +708,107 @@ async fn max_packet_size_rejects_oversized_publish() {
     // CONNECT (small enough to fit)
     let connect = mqttbytes::v5::Connect::new("tiny");
     write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Connect(connect)).await;
+
+    // CONNACK MUST advertise `Maximum Packet Size` per §3.2.2.3.6 — the
+    // spec's mitigation for the F-58 production hazard #753 closes.
+    // A regression that dropped the property would let a compliant
+    // client assume the broker accepts any size (the spec default when
+    // the property is absent), which is exactly the silent-DoS shape
+    // the security label on this issue calls out.
     let packet = read_v5_packet(&mut stream, &mut buf).await;
-    assert!(matches!(packet, mqttbytes::v5::Packet::ConnAck(_)));
+    match packet {
+        mqttbytes::v5::Packet::ConnAck(connack) => {
+            let props = connack.properties.expect("CONNACK must carry properties");
+            assert_eq!(
+                props.max_packet_size,
+                Some(u32::try_from(SERVER_CAP).expect("SERVER_CAP fits in u32")),
+                "broker MUST advertise its configured Maximum Packet Size cap \
+                 so a compliant client short-circuits oversized publishes locally"
+            );
+        }
+        other => panic!("expected CONNACK with properties, got {other:?}"),
+    }
 
     // PUBLISH with payload that exceeds max_packet_size
     let big_payload = vec![0xAA; 128];
     let publish = mqttbytes::v5::Publish::new("alpha", mqttbytes::QoS::AtMostOnce, big_payload);
     write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Publish(publish)).await;
 
-    // Server should close the connection (malformed/oversized packet)
-    let mut raw = [0u8; 256];
-    let result = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut raw)).await;
-    match result {
-        Ok(Ok(0)) => {}  // EOF — server closed connection as expected
-        Ok(Err(_)) => {} // Read error — also fine
-        Err(_) => panic!("expected server to close connection after oversized packet"),
-        Ok(Ok(_)) => {} // Got some data (maybe error response) — acceptable
+    // Server MUST either send DISCONNECT 0x95 (§3.14.2.1 PacketTooLarge)
+    // before closing OR close the TCP stream cleanly. We accept both
+    // outcomes — the DISCONNECT path is best-effort (tokio::select! drops
+    // the write loop when the read loop returns Err, leaving the writer
+    // half in an unspecified state per the cancel-safety contract on
+    // tokio I/O), but neither outcome may leave the stream hung. The
+    // failure mode #753 was filed against is "stream stays open with no
+    // diagnostic" — both EOF and a structured DISCONNECT close that
+    // hazard. We bypass the panicking `read_v5_packet` helper here and
+    // read raw bytes so EOF surfaces as a typed result rather than an
+    // expect-panic that would mask the assertion.
+    // Drain the stream until we either parse a v5 packet or hit EOF /
+    // error. Both outcomes are acceptable; what's NOT acceptable is the
+    // stream staying open with no diagnostic.
+    buf.clear();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut got_disconnect = false;
+    let mut got_close = false;
+    loop {
+        // Try to parse what we have first.
+        match mqttbytes::v5::read(&mut buf, 1024 * 1024) {
+            Ok(mqttbytes::v5::Packet::Disconnect(disc)) => {
+                assert_eq!(
+                    disc.reason_code,
+                    mqttbytes::v5::DisconnectReasonCode::PacketTooLarge,
+                    "structured server-initiated DISCONNECT MUST carry \
+                     reason code 0x95 (PacketTooLarge); got {:?}",
+                    disc.reason_code
+                );
+                got_disconnect = true;
+                break;
+            }
+            Ok(other) => panic!(
+                "after oversized PUBLISH the only acceptable packet is \
+                 DISCONNECT 0x95; got {other:?}"
+            ),
+            Err(mqttbytes::Error::InsufficientBytes(_)) => {} // need more
+            Err(e) => panic!("server bytes failed to parse as v5: {e:?}"),
+        }
+        // Read more bytes (up to the deadline).
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            panic!(
+                "after oversized PUBLISH the server must DISCONNECT or close \
+                 within 2 s; got neither — exactly the #753 failure mode \
+                 this test guards against (buf so far: {:02x?})",
+                &buf[..]
+            );
+        }
+        let mut raw = [0u8; 256];
+        let read = tokio::time::timeout(deadline - now, stream.read(&mut raw)).await;
+        match read {
+            Ok(Ok(0)) => {
+                // Clean EOF — server closed without DISCONNECT. Acceptable.
+                got_close = true;
+                break;
+            }
+            Ok(Ok(n)) => buf.extend_from_slice(&raw[..n]),
+            Ok(Err(_io_err)) => {
+                // TLS read error (e.g. UnexpectedEof without close_notify).
+                // Also acceptable: the server closed the underlying socket.
+                got_close = true;
+                break;
+            }
+            Err(_timeout) => panic!(
+                "after oversized PUBLISH the server must DISCONNECT or close \
+                 within 2 s; the connection appears hung — exactly the #753 \
+                 failure mode this test guards against"
+            ),
+        }
     }
+    assert!(
+        got_disconnect || got_close,
+        "exit must be via DISCONNECT 0x95 or stream close"
+    );
 
     shutdown.notify_one();
 }
