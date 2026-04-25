@@ -170,6 +170,7 @@ pub(crate) async fn handle_mqtt_session(
     router: Arc<Router>,
     topic_prefix: Option<String>,
     max_packet_size: usize,
+    receive_max: u16,
     min_keep_alive_secs: u16,
     response_channel_capacity: usize,
     wildcard_policy: WildcardPolicy,
@@ -183,7 +184,7 @@ pub(crate) async fn handle_mqtt_session(
     let peer_addr = pre.peer_addr;
     let cn = identity.cn.clone();
 
-    let mut codec = PacketCodec::new(pre.stream, max_packet_size);
+    let mut codec = PacketCodec::new(pre.stream, max_packet_size, receive_max);
 
     // --- CONNECT handshake ---
     let (keep_alive, client_id, will) = match connect_handshake(

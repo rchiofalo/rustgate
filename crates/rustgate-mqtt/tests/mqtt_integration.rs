@@ -60,6 +60,7 @@ impl TestServer {
             shutdown: Arc::clone(&shutdown),
             topic_prefix,
             max_packet_size: 1024 * 1024,
+            receive_max: MqttServerConfig::DEFAULT_RECEIVE_MAX,
             min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
             response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
             wildcard_policy,
@@ -102,6 +103,7 @@ impl TestServer {
             shutdown: Arc::clone(&shutdown),
             topic_prefix: None,
             max_packet_size: 1024 * 1024,
+            receive_max: MqttServerConfig::DEFAULT_RECEIVE_MAX,
             min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
             response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
             wildcard_policy: WildcardPolicy::default(),
@@ -214,6 +216,31 @@ async fn connect_and_connack() {
     match packet {
         mqttbytes::v5::Packet::ConnAck(connack) => {
             assert_eq!(connack.code, mqttbytes::v5::ConnectReturnCode::Success);
+            // Refs #1158 + #880: every successful CONNACK MUST advertise
+            // the broker's Maximum Packet Size AND Receive Maximum so a
+            // compliant client can plan its publish strategy without
+            // falling back to the spec-default "no limit" assumption.
+            // A regression that dropped either property from the live
+            // CONNACK emission path would only show up at the
+            // server-to-stream boundary — pinning both end-to-end here
+            // catches it without requiring a manual integration test.
+            let props = connack
+                .properties
+                .expect("v5 CONNACK MUST carry properties (mqttbytes 0.6 quirk + spec compliance)");
+            assert!(
+                props.max_packet_size.is_some(),
+                "broker MUST advertise Maximum Packet Size in CONNACK (§3.2.2.3.6)"
+            );
+            assert!(
+                props.receive_max.is_some(),
+                "broker MUST advertise Receive Maximum in CONNACK (§3.2.2.3.3) so the \
+                 client knows how many QoS 1/2 publishes it can have in-flight"
+            );
+            assert_eq!(
+                props.receive_max,
+                Some(MqttServerConfig::DEFAULT_RECEIVE_MAX),
+                "advertised Receive Maximum must match the server's configured value"
+            );
         }
         other => panic!("expected ConnAck, got {other:?}"),
     }
@@ -471,6 +498,7 @@ async fn connection_limit_rejects_excess() {
         shutdown: Arc::clone(&shutdown),
         topic_prefix: None,
         max_packet_size: 1024 * 1024,
+        receive_max: MqttServerConfig::DEFAULT_RECEIVE_MAX,
         min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
         response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
         wildcard_policy: WildcardPolicy::default(),
@@ -689,6 +717,7 @@ async fn max_packet_size_rejects_oversized_publish() {
         shutdown: Arc::clone(&shutdown),
         topic_prefix: None,
         max_packet_size: SERVER_CAP, // Small — CONNECT fits, big PUBLISH won't
+        receive_max: MqttServerConfig::DEFAULT_RECEIVE_MAX,
         min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
         response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
         wildcard_policy: WildcardPolicy::default(),
