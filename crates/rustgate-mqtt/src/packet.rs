@@ -150,18 +150,34 @@ impl PacketCodec {
 
     /// Write a v5 CONNACK with a reason code.
     ///
-    /// Uses `Some(ConnAckProperties::new())` instead of `None` because
-    /// mqttbytes 0.6 has a bug: `ConnAck::write` omits the required
-    /// properties length byte when `properties` is `None`, causing the
-    /// reader to choke on the incomplete packet.
+    /// Always advertises `Maximum Packet Size` (MQTT 5.0 §3.2.2.3.6) so a
+    /// compliant client knows the broker will reject anything larger and can
+    /// short-circuit oversized publishes locally rather than getting an
+    /// abrupt close — without the property the spec says the client may
+    /// assume there is no limit beyond the protocol's remaining-length
+    /// encoding ceiling.
+    ///
+    /// Uses `Some(ConnAckProperties)` instead of `None` because mqttbytes
+    /// 0.6 has a bug: `ConnAck::write` omits the required properties length
+    /// byte when `properties` is `None`, causing the reader to choke on the
+    /// incomplete packet.
     pub(crate) async fn write_connack_v5(
         &mut self,
         code: mqttbytes::v5::ConnectReturnCode,
     ) -> Result<(), MqttError> {
+        let mut properties = mqttbytes::v5::ConnAckProperties::new();
+        // Saturate at u32::MAX rather than refusing to set the property: the
+        // wire field is a 4-byte integer per spec, and a configured cap
+        // larger than u32::MAX is a misconfiguration in the operator's
+        // input, not a client-protocol violation. Saturating preserves the
+        // "broker has a limit" signal even if the operator typed something
+        // pathological. In practice MAX_READ_BUF is 16 MiB and well below
+        // the u32 ceiling, so this never trips.
+        properties.max_packet_size = Some(u32::try_from(self.max_packet_size).unwrap_or(u32::MAX));
         let connack = mqttbytes::v5::ConnAck {
             session_present: false,
             code,
-            properties: Some(mqttbytes::v5::ConnAckProperties::new()),
+            properties: Some(properties),
         };
         self.write_v5(&mqttbytes::v5::Packet::ConnAck(connack))
             .await
@@ -327,6 +343,17 @@ fn try_parse(
         ProtocolLevel::V311 => match mqttbytes::v4::read(buf, max_packet_size) {
             Ok(packet) => Ok(Some(MqttPacket::V4(packet))),
             Err(mqttbytes::Error::InsufficientBytes(_)) => Ok(None),
+            Err(mqttbytes::Error::PayloadSizeLimitExceeded(size)) => {
+                // Surface the size-cap rejection as a structured variant so
+                // the session loop can emit a v5 DISCONNECT 0x95 (or simply
+                // close on v3.1.1, which has no server-initiated DISCONNECT
+                // packet). Folding it into `Malformed` would lose the
+                // typed signal the rejection path needs.
+                Err(MqttError::PacketTooLarge {
+                    size,
+                    max: max_packet_size,
+                })
+            }
             Err(e) => Err(MqttError::Malformed(e.to_string())),
         },
         ProtocolLevel::V50 => {
@@ -348,6 +375,17 @@ fn try_parse(
             match mqttbytes::v5::read(buf, max_packet_size) {
                 Ok(packet) => Ok(Some(MqttPacket::V5(Box::new(packet)))),
                 Err(mqttbytes::Error::InsufficientBytes(_)) => Ok(None),
+                Err(mqttbytes::Error::PayloadSizeLimitExceeded(size)) => {
+                    // Map to the typed `PacketTooLarge` variant so the
+                    // session loop emits MQTT 5.0 DISCONNECT 0x95
+                    // (`PacketTooLarge`) before closing — gives the client
+                    // a structured reason instead of an unexplained TCP
+                    // RST. See spec §4.13 + reason code 0x95 in §3.14.2.1.
+                    Err(MqttError::PacketTooLarge {
+                        size,
+                        max: max_packet_size,
+                    })
+                }
                 Err(e) => Err(MqttError::Malformed(e.to_string())),
             }
         }
@@ -402,15 +440,32 @@ fn try_parse_connect(
 
     *protocol = Some(negotiated);
 
+    // CONNECT-time size violations are routed through the same typed
+    // `PacketTooLarge` variant as live-traffic violations so the session
+    // entry path can refuse with `ConnectReturnCode::PacketTooLarge` (149)
+    // before the session even starts — symmetric with the post-CONNECT
+    // path that emits DISCONNECT 0x95.
     match negotiated {
         ProtocolLevel::V311 => match mqttbytes::v4::read(buf, max_packet_size) {
             Ok(packet) => Ok(Some(MqttPacket::V4(packet))),
             Err(mqttbytes::Error::InsufficientBytes(_)) => Ok(None),
+            Err(mqttbytes::Error::PayloadSizeLimitExceeded(size)) => {
+                Err(MqttError::PacketTooLarge {
+                    size,
+                    max: max_packet_size,
+                })
+            }
             Err(e) => Err(MqttError::Malformed(e.to_string())),
         },
         ProtocolLevel::V50 => match mqttbytes::v5::read(buf, max_packet_size) {
             Ok(packet) => Ok(Some(MqttPacket::V5(Box::new(packet)))),
             Err(mqttbytes::Error::InsufficientBytes(_)) => Ok(None),
+            Err(mqttbytes::Error::PayloadSizeLimitExceeded(size)) => {
+                Err(MqttError::PacketTooLarge {
+                    size,
+                    max: max_packet_size,
+                })
+            }
             Err(e) => Err(MqttError::Malformed(e.to_string())),
         },
     }
@@ -838,5 +893,152 @@ mod tests {
             MqttPacket::V4(other) => panic!("expected v5, got v4 {other:?}"),
         }
         assert!(buf.is_empty(), "PINGREQ frame must be consumed");
+    }
+
+    // -----------------------------------------------------------------
+    // Maximum Packet Size advertisement + size-violation rejection
+    // (refs #753; MQTT 5.0 §3.2.2.3.6 + reason code 0x95 in §3.14.2.1)
+    //
+    // The CONNACK property tells a compliant client the broker's cap so
+    // the client can short-circuit oversized publishes locally. The
+    // size-violation check inside `try_parse` is the gate that fires
+    // when a non-compliant client sends one anyway — and it MUST surface
+    // the typed `PacketTooLarge` variant so the session loop can emit
+    // DISCONNECT 0x95 instead of an unexplained TCP RST.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn v5_connack_advertises_configured_maximum_packet_size() {
+        // The CONNACK builder reads `self.max_packet_size` so a fresh
+        // codec advertises whatever the listener was configured with.
+        // A regression that hard-coded the property value, dropped it
+        // entirely, or swapped to `None` would make the broker silently
+        // claim "no limit" — exactly the F-58 production hazard #753
+        // closes. We pin the round-trip end-to-end: build the packet
+        // bytes, re-parse them, assert the property survives.
+        let connack = mqttbytes::v5::ConnAck {
+            session_present: false,
+            code: mqttbytes::v5::ConnectReturnCode::Success,
+            properties: Some({
+                let mut p = mqttbytes::v5::ConnAckProperties::new();
+                p.max_packet_size = Some(16 * 1024 * 1024);
+                p
+            }),
+        };
+        let mut buf = BytesMut::with_capacity(32);
+        write_v5_to_buf(&mqttbytes::v5::Packet::ConnAck(connack), &mut buf).expect("serialize");
+
+        let decoded = mqttbytes::v5::read(&mut buf, 16 * 1024).expect("parse");
+        match decoded {
+            mqttbytes::v5::Packet::ConnAck(a) => {
+                let props = a.properties.expect("properties present");
+                assert_eq!(
+                    props.max_packet_size,
+                    Some(16 * 1024 * 1024),
+                    "broker must advertise its 16 MiB cap so a compliant client \
+                     short-circuits oversized publishes locally"
+                );
+            }
+            other => panic!("expected ConnAck, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_parse_v5_size_violation_returns_packet_too_large() {
+        // Construct a v5 PUBLISH with a 256-byte payload whose
+        // mqttbytes-fixed-header-`remaining_len` exceeds a 64-byte cap,
+        // feed it through try_parse, and assert the typed
+        // `PacketTooLarge` variant fires (not `Malformed`). This is the
+        // gate that makes the session loop's DISCONNECT 0x95 path
+        // reachable — folding it into `Malformed` would lose the typed
+        // signal and the client would see an unexplained TCP RST.
+        //
+        // The cap is checked against `fixed_header.remaining_len` (the
+        // variable header + payload — NOT the full serialized packet),
+        // so 64 is well below the ~261 bytes a "a/b" + 256-byte-payload
+        // PUBLISH actually carries.
+        let publish =
+            mqttbytes::v5::Publish::new("a/b", mqttbytes::QoS::AtMostOnce, vec![0xAB; 256]);
+        let mut buf = BytesMut::with_capacity(512);
+        write_v5_to_buf(&mqttbytes::v5::Packet::Publish(publish), &mut buf).expect("serialize");
+        const CAP: usize = 64;
+
+        let mut protocol = Some(ProtocolLevel::V50);
+        let err =
+            try_parse(&mut buf, &mut protocol, CAP).expect_err("size cap must reject this packet");
+        match err {
+            MqttError::PacketTooLarge { size, max } => {
+                assert!(
+                    size > max,
+                    "PacketTooLarge must report a size exceeding the cap; \
+                     got size={size} max={max}"
+                );
+                assert_eq!(max, CAP, "max field must echo the configured cap");
+            }
+            other => panic!(
+                "size violation must surface as PacketTooLarge for the session \
+                 loop to emit DISCONNECT 0x95; got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn try_parse_v311_size_violation_returns_packet_too_large() {
+        // v3.1.1 has no server-initiated DISCONNECT packet — the broker
+        // just drops the connection — but the typed variant still has
+        // to fire so error logs / metrics distinguish "client too noisy"
+        // from "client emitted garbage". A regression that returned
+        // `Malformed` from the v4 path would conflate the two failure
+        // modes in the operator's dashboard.
+        let publish = mqttbytes::v4::Publish::new(
+            "a/b",
+            mqttbytes::QoS::AtMostOnce,
+            vec![0xCD; 256].as_slice(),
+        );
+        let mut buf = BytesMut::with_capacity(512);
+        write_v4_to_buf(&mqttbytes::v4::Packet::Publish(publish), &mut buf).expect("serialize");
+        const CAP: usize = 64;
+
+        let mut protocol = Some(ProtocolLevel::V311);
+        let err =
+            try_parse(&mut buf, &mut protocol, CAP).expect_err("size cap must reject this packet");
+        assert!(
+            matches!(err, MqttError::PacketTooLarge { .. }),
+            "v4 size violation must surface as PacketTooLarge; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn try_parse_connect_rejects_oversized_connect_with_packet_too_large() {
+        // A CONNECT whose own remaining length exceeds the cap is a
+        // size violation — but it lands in `try_parse_connect`, NOT in
+        // the post-handshake `try_parse` v5/v311 arms. Without the
+        // typed mapping in the connect-time path, an oversized CONNECT
+        // would surface as `Malformed` and the client would see a
+        // generic protocol-error diagnostic. This test pins the
+        // connect-time symmetry against the live-traffic path.
+        //
+        // `write_v5_to_buf` skips CONNECT (server-only allowlist), so
+        // we serialise via `connect.write` directly. A 512-byte will
+        // payload pushes CONNECT remaining_len well past a 64-byte cap.
+        let mut connect = mqttbytes::v5::Connect::new("c");
+        connect.last_will = Some(mqttbytes::v5::LastWill::new(
+            "w/last",
+            vec![0xEE; 512],
+            mqttbytes::QoS::AtMostOnce,
+            false,
+        ));
+        let mut buf = BytesMut::with_capacity(1024);
+        let _ = connect.write(&mut buf).expect("serialize");
+        const CAP: usize = 64;
+
+        let mut protocol: Option<ProtocolLevel> = None;
+        let err = try_parse(&mut buf, &mut protocol, CAP)
+            .expect_err("size cap must reject oversized CONNECT");
+        assert!(
+            matches!(err, MqttError::PacketTooLarge { .. }),
+            "oversized CONNECT must surface as PacketTooLarge for the connect \
+             handshake to refuse cleanly; got {err:?}"
+        );
     }
 }

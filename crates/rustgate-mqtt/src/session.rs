@@ -376,6 +376,27 @@ pub(crate) async fn handle_mqtt_session(
         debug!(cn = %hash_cn(&cn), error = %e, "MQTT session ended with write error");
     }
 
+    // MQTT 5.0 §3.14.2.1 reason code 0x95 (`PacketTooLarge`): when the
+    // broker rejects an inbound packet because it exceeds the
+    // `Maximum Packet Size` advertised in the matching CONNACK
+    // (§3.2.2.3.6), surface a structured DISCONNECT *before* dropping the
+    // socket so the client gets a meaningful reason instead of an
+    // unexplained TCP RST. v3.1.1 has no server-initiated DISCONNECT
+    // packet — the connection just drops, which the spec accepts. Best
+    // effort: if the writer half is already wedged the DISCONNECT write
+    // will fail and we proceed to teardown anyway.
+    if let SessionEnd::Read(Err(MqttError::PacketTooLarge { .. })) = &session_end
+        && protocol == ProtocolLevel::V50
+    {
+        let disconnect = mqttbytes::v5::Disconnect {
+            reason_code: mqttbytes::v5::DisconnectReasonCode::PacketTooLarge,
+            properties: None,
+        };
+        let _ = writer
+            .write_v5(&mqttbytes::v5::Packet::Disconnect(disconnect))
+            .await;
+    }
+
     // Publish the configured will BEFORE unregistering so the publish
     // path sees the same router state any live PUBLISH would have. The
     // unregister call only removes this session's group memberships
