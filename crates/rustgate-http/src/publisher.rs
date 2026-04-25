@@ -99,6 +99,16 @@ pub struct HttpPublisher {
     /// and silently drops the signal if a worker is mid-processing at the
     /// call moment.
     drain_shutdown: Option<Arc<tokio::sync::Notify>>,
+    /// Sender side of the DLQ drain trigger channel, populated only when
+    /// a DLQ is configured. Held so that operator-initiated drains via
+    /// the management API (`POST /api/dlq/{target}/replay`) and the
+    /// circuit-recovery observer feed the same worker — coalescing
+    /// duplicate triggers naturally and keeping the audit trail
+    /// uniform. The per-target circuit observers also clone this
+    /// sender; closing this top-level handle is therefore not enough
+    /// to shut the channel down, which is the desired property: the
+    /// drain worker only exits on its dedicated `Notify`.
+    drain_tx: Option<mpsc::Sender<String>>,
     /// Encrypted dead-letter queue for circuit-breaker-shed messages.
     dlq: Option<Arc<DeadLetterQueue>>,
     /// Worker task handle for panic detection during shutdown.
@@ -116,6 +126,42 @@ impl fmt::Debug for HttpPublisher {
             .field("target_count", &self.targets.len())
             .finish_non_exhaustive()
     }
+}
+
+/// Reasons [`HttpPublisher::trigger_drain`] can refuse to enqueue a
+/// drain. Surfaced to the management API so the
+/// `POST /api/dlq/{target}/replay` endpoint can return precise HTTP
+/// status codes (`404` for unknown target, `503` for missing DLQ,
+/// `429` for backpressure) rather than collapsing every failure to a
+/// generic `500`. Display strings are stable — operator-facing tooling
+/// and runbooks can grep for them.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum TriggerDrainError {
+    /// The publisher was constructed without `dlq_dir`/`dlq_key_file`,
+    /// so no drain worker exists. Surface as `503 Service Unavailable`
+    /// — manual replay is unavailable for fundamental configuration
+    /// reasons, not a transient problem.
+    #[error("DLQ not configured: cannot trigger drain")]
+    DlqNotConfigured,
+    /// The target name does not match any configured (and enabled)
+    /// HTTP target. Surface as `404 Not Found` — operators get a
+    /// precise signal that the target was renamed, removed, or
+    /// disabled rather than a misleading `429`.
+    #[error("unknown HTTP target")]
+    UnknownTarget,
+    /// The drain trigger channel is at capacity. The drain worker is
+    /// either mid-pass on another target or already has a backlog of
+    /// triggers to process; either way another drain will run shortly.
+    /// Surface as `429 Too Many Requests` so operator tooling can
+    /// retry without escalating to a hard error path.
+    #[error("drain trigger channel is full; another drain is in flight")]
+    ChannelFull,
+    /// The drain trigger channel has been closed — the publisher is
+    /// shutting down or the worker exited. Surface as `503 Service
+    /// Unavailable` so callers know the publisher is no longer
+    /// honoring drains.
+    #[error("drain trigger channel is closed; publisher is shutting down")]
+    ChannelClosed,
 }
 
 /// Per-target runtime state.
@@ -307,11 +353,25 @@ impl HttpPublisher {
             None
         };
 
+        // Retain the top-level drain sender only when a DLQ is
+        // configured. Without one the drain worker is never spawned
+        // and the receiver was already dropped above, so we hold
+        // `None` rather than a sender into a dead channel — that way
+        // `trigger_drain` returns a precise `DlqNotConfigured` error
+        // instead of `ChannelClosed`.
+        let top_level_drain_tx = if dlq.is_some() {
+            Some(drain_tx)
+        } else {
+            std::mem::drop(drain_tx);
+            None
+        };
+
         Ok(Self {
             tx,
             targets,
             shutdown,
             drain_shutdown,
+            drain_tx: top_level_drain_tx,
             dlq,
             worker_handle: Arc::new(std::sync::Mutex::new(Some(handle))),
             gate: None,
@@ -428,6 +488,60 @@ impl HttpPublisher {
     /// True when all circuit breakers are closed (healthy).
     pub fn is_healthy(&self) -> bool {
         self.targets.iter().all(|t| t.circuit.is_closed())
+    }
+
+    /// Names of every configured (and enabled) HTTP target, in
+    /// configuration order. Exposed for the management API so the
+    /// `POST /api/dlq/{target}/replay` handler can short-circuit
+    /// unknown-target requests with a `404` before queueing a drain
+    /// trigger that the worker would otherwise quietly drop. Ordering
+    /// matches `HttpConfig::targets` because the per-target build is
+    /// in-order — operators reading the list back via diagnostics
+    /// see the names in the same order they configured them.
+    #[must_use]
+    pub fn target_names(&self) -> Vec<String> {
+        self.targets.iter().map(|t| t.name.clone()).collect()
+    }
+
+    /// Manually trigger a DLQ drain for `target_name`.
+    ///
+    /// Designed for the management API endpoint
+    /// `POST /api/dlq/{target}/replay` — operator-initiated drains
+    /// share the same channel and the same drain worker as the
+    /// circuit-recovery observer, so a manual trigger and a recovery
+    /// trigger are indistinguishable downstream and the audit trail
+    /// stays uniform. The trigger is fire-and-forget: success means
+    /// "the drain worker has been notified", not "the drain has
+    /// completed" — the actual replay runs asynchronously.
+    ///
+    /// # Errors
+    ///
+    /// - [`TriggerDrainError::DlqNotConfigured`] when this publisher
+    ///   was built without `dlq_dir`/`dlq_key_file`. The drain worker
+    ///   is not spawned in that case and there is nothing to drain.
+    /// - [`TriggerDrainError::UnknownTarget`] when `target_name` does
+    ///   not match any configured (and enabled) target. Pinned at this
+    ///   layer so the management API can return `404` rather than
+    ///   silently queueing a trigger the worker will skip.
+    /// - [`TriggerDrainError::ChannelFull`] when the drain trigger
+    ///   channel is full. Means another drain is already queued or
+    ///   running for some target — operators can retry or rely on the
+    ///   automatic recovery trigger.
+    /// - [`TriggerDrainError::ChannelClosed`] when the publisher is
+    ///   shutting down. The drain worker has either exited or is
+    ///   about to.
+    pub fn trigger_drain(&self, target_name: &str) -> Result<(), TriggerDrainError> {
+        let Some(ref drain_tx) = self.drain_tx else {
+            return Err(TriggerDrainError::DlqNotConfigured);
+        };
+        if !self.targets.iter().any(|t| t.name == target_name) {
+            return Err(TriggerDrainError::UnknownTarget);
+        }
+        match drain_tx.try_send(target_name.to_string()) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(TriggerDrainError::ChannelFull),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(TriggerDrainError::ChannelClosed),
+        }
     }
 
     /// Signal the background worker to shut down, await drain, and seal DLQ.
@@ -1930,6 +2044,7 @@ mod tests {
             targets: Arc::new(vec![]),
             shutdown: Arc::new(tokio::sync::Notify::new()),
             drain_shutdown: None,
+            drain_tx: None,
             dlq: None,
             worker_handle: Arc::new(std::sync::Mutex::new(None)),
             gate: None,
@@ -1996,6 +2111,7 @@ mod tests {
             targets: Arc::new(vec![]),
             shutdown: Arc::new(tokio::sync::Notify::new()),
             drain_shutdown: None,
+            drain_tx: None,
             dlq: None,
             worker_handle: Arc::new(std::sync::Mutex::new(None)),
             gate: None,
@@ -2080,6 +2196,7 @@ mod tests {
             targets: Arc::new(vec![]),
             shutdown: Arc::new(tokio::sync::Notify::new()),
             drain_shutdown: None,
+            drain_tx: None,
             dlq: Some(dlq),
             worker_handle: Arc::new(std::sync::Mutex::new(None)),
             gate: None,
@@ -2122,6 +2239,7 @@ mod tests {
             targets: Arc::new(vec![]),
             shutdown: Arc::new(tokio::sync::Notify::new()),
             drain_shutdown: None,
+            drain_tx: None,
             dlq: None,
             worker_handle: Arc::new(std::sync::Mutex::new(None)),
             gate: None,
@@ -2163,6 +2281,7 @@ mod tests {
             targets: Arc::new(vec![]),
             shutdown: Arc::new(tokio::sync::Notify::new()),
             drain_shutdown: None,
+            drain_tx: None,
             dlq: Some(dlq),
             worker_handle: Arc::new(std::sync::Mutex::new(None)),
             gate: Some(Arc::clone(&gate)),
@@ -2195,6 +2314,7 @@ mod tests {
             targets: Arc::new(vec![]),
             shutdown: Arc::new(tokio::sync::Notify::new()),
             drain_shutdown: None,
+            drain_tx: None,
             dlq: None,
             worker_handle: Arc::new(std::sync::Mutex::new(None)),
             gate: Some(Arc::clone(&gate)),
@@ -2570,5 +2690,199 @@ mod tests {
             captured.is_none(),
             "oversized Content-Length must short-circuit before body read"
         );
+    }
+
+    // ── trigger_drain (manual DLQ replay, issue #881 PR C) ─────────
+
+    /// Build a `TargetConfig` whose URL is reachable for `reqwest::Client`
+    /// construction but never actually contacted — `trigger_drain` is a
+    /// pure in-process check, the URL only matters at `publish` time.
+    fn trigger_drain_test_target(name: &str) -> crate::config::TargetConfig {
+        crate::config::TargetConfig {
+            name: name.to_string(),
+            url: "http://127.0.0.1:1/never".to_string(),
+            method: None,
+            auth: None,
+            tls: None,
+            timeout_secs: Some(1),
+            format: None,
+            filter: None,
+            retry: None,
+            enabled: None,
+            headers: None,
+            max_payload_bytes: None,
+            rate_limit_per_sec: None,
+            capture_response_body: None,
+            max_response_body_bytes: None,
+            batch_enabled: None,
+            batch_max_messages: None,
+            batch_max_bytes: None,
+            batch_format: None,
+        }
+    }
+
+    /// Write a 64-zero-hex KeyRing JSON fixture and return its path,
+    /// keyed by `tmp` so the file is unlinked when the dir drops.
+    fn trigger_drain_test_keyring(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+        let key_json = r#"{
+            "active_key_id": "k",
+            "keys": { "k": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+        }"#;
+        let p = tmp.path().join("keys.json");
+        std::fs::write(&p, key_json).unwrap();
+        p
+    }
+
+    /// Build a publisher with one named target and the given DLQ
+    /// configuration. The returned `TempDir` must outlive the publisher
+    /// — drop order: publisher first, then `tmp` so the key file
+    /// survives any background reader for `Drop` paths.
+    fn trigger_drain_test_publisher(
+        target_name: &str,
+        with_dlq: bool,
+    ) -> (HttpPublisher, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dlq_dir = tmp.path().join("dlq");
+        let key_path = trigger_drain_test_keyring(&tmp);
+
+        let config = HttpConfig {
+            instance_id: Some("trigger-drain-test".to_string()),
+            targets: vec![trigger_drain_test_target(target_name)],
+            dlq_dir: if with_dlq {
+                Some(dlq_dir.to_string_lossy().into_owned())
+            } else {
+                None
+            },
+            dlq_key_file: if with_dlq {
+                Some(key_path.to_string_lossy().into_owned())
+            } else {
+                None
+            },
+            dlq_max_bytes: None,
+            dlq_max_target_bytes: None,
+            allow_private_urls: true, // 127.0.0.1 URL above
+        };
+        (HttpPublisher::new(config).unwrap(), tmp)
+    }
+
+    #[tokio::test]
+    async fn trigger_drain_returns_dlq_not_configured_when_no_dlq() {
+        // Without a DLQ the drain worker is never spawned and the
+        // top-level `drain_tx` is `None` — no point queueing a trigger
+        // that nothing will read.
+        let (publisher, _tmp) = trigger_drain_test_publisher("anything", false);
+        assert_eq!(
+            publisher.trigger_drain("anything"),
+            Err(TriggerDrainError::DlqNotConfigured)
+        );
+        publisher.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn trigger_drain_returns_unknown_target_for_unconfigured_name() {
+        // The publisher is built with one target named `webhook-prod`;
+        // a request for `does-not-exist` must surface a precise
+        // `UnknownTarget` so the management API maps it to `404`
+        // instead of silently queueing a trigger the drain worker
+        // would skip.
+        let (publisher, _tmp) = trigger_drain_test_publisher("webhook-prod", true);
+        assert_eq!(
+            publisher.trigger_drain("does-not-exist"),
+            Err(TriggerDrainError::UnknownTarget)
+        );
+        publisher.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn trigger_drain_succeeds_for_configured_target() {
+        // Happy path: the target name matches and the channel has
+        // capacity. The trigger is fire-and-forget — `Ok(())` means
+        // "the worker has been notified", not "the drain has run".
+        let (publisher, _tmp) = trigger_drain_test_publisher("webhook-prod", true);
+        assert_eq!(publisher.trigger_drain("webhook-prod"), Ok(()));
+        publisher.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn trigger_drain_returns_unknown_target_before_check_channel_state() {
+        // The order of checks inside `trigger_drain` is load-bearing:
+        // an unknown-target request must NOT consume a slot in the
+        // bounded channel, otherwise an attacker hammering an invalid
+        // name could starve legitimate triggers. Pin the order by
+        // saturating the channel first and then asserting an
+        // unknown-target call still returns `UnknownTarget` rather
+        // than `ChannelFull`.
+        let (publisher, _tmp) = trigger_drain_test_publisher("webhook-prod", true);
+        // Saturate: the channel buffer is `DRAIN_CHANNEL_BUFFER` (32).
+        // Fire that many valid-target triggers — the drain worker may
+        // drain some, but at least one should still be in the
+        // channel by the time we check the unknown-target case.
+        for _ in 0..DRAIN_CHANNEL_BUFFER * 2 {
+            let _ = publisher.trigger_drain("webhook-prod");
+        }
+        // Even with the channel under pressure, an unknown target
+        // returns `UnknownTarget` because that check fires before the
+        // `try_send`.
+        assert_eq!(
+            publisher.trigger_drain("does-not-exist"),
+            Err(TriggerDrainError::UnknownTarget)
+        );
+        publisher.shutdown().await;
+    }
+
+    #[test]
+    fn trigger_drain_error_display_strings_are_stable() {
+        // Pin the rendered Display strings — these surface in the
+        // management-API JSON `error` field, in audit logs, and in
+        // operator runbooks. Any change is a wire-format break.
+        assert_eq!(
+            TriggerDrainError::DlqNotConfigured.to_string(),
+            "DLQ not configured: cannot trigger drain"
+        );
+        assert_eq!(
+            TriggerDrainError::UnknownTarget.to_string(),
+            "unknown HTTP target"
+        );
+        assert_eq!(
+            TriggerDrainError::ChannelFull.to_string(),
+            "drain trigger channel is full; another drain is in flight"
+        );
+        assert_eq!(
+            TriggerDrainError::ChannelClosed.to_string(),
+            "drain trigger channel is closed; publisher is shutting down"
+        );
+    }
+
+    #[tokio::test]
+    async fn target_names_returns_configured_targets_in_order() {
+        // The management API uses `target_names()` to enumerate which
+        // `target` path segments are routable; pin the ordering so
+        // operators reading back the list see config order.
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = trigger_drain_test_keyring(&tmp);
+        let dlq_dir = tmp.path().join("dlq");
+        let config = HttpConfig {
+            instance_id: None,
+            targets: vec![
+                trigger_drain_test_target("alpha"),
+                trigger_drain_test_target("bravo"),
+                trigger_drain_test_target("charlie"),
+            ],
+            dlq_dir: Some(dlq_dir.to_string_lossy().into_owned()),
+            dlq_key_file: Some(key_path.to_string_lossy().into_owned()),
+            dlq_max_bytes: None,
+            dlq_max_target_bytes: None,
+            allow_private_urls: true,
+        };
+        let publisher = HttpPublisher::new(config).unwrap();
+        assert_eq!(
+            publisher.target_names(),
+            vec![
+                "alpha".to_string(),
+                "bravo".to_string(),
+                "charlie".to_string()
+            ]
+        );
+        publisher.shutdown().await;
     }
 }

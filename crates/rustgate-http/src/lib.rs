@@ -55,4 +55,4 @@ pub(crate) mod resolver;
 
 pub use config::HttpConfig;
 pub use error::HttpError;
-pub use publisher::HttpPublisher;
+pub use publisher::{HttpPublisher, TriggerDrainError};

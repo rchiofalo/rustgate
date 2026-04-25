@@ -1432,6 +1432,8 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
                 cert_reloader: cert_reloader.as_ref().map(Arc::clone),
                 crl_path: cli.crl.as_ref().map(std::path::PathBuf::from),
                 reload: reload_fn,
+                #[cfg(feature = "http")]
+                http_publisher: _http_publisher.clone(),
                 auth_token: zeroize::Zeroizing::new(token),
             });
             let handler: metrics::MgmtApiHandler = Arc::new(move |method, path, auth, body| {
@@ -1448,7 +1450,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
             let _ = mgmt_api_slot.set(handler);
             tracing::info!(
                 "management REST API enabled at /api/cert/, /api/crl/, /api/dedup/, \
-                 /api/clients/, and /api/reload"
+                 /api/clients/, /api/dlq/, and /api/reload"
             );
         }
     }
