@@ -626,6 +626,29 @@ async fn connect_handshake(
                     return Err(MqttError::PersistentSessionUnsupported);
                 }
 
+                // MQTT 5.0 §3.1.2.11.2: log when a client requests a
+                // non-zero Session Expiry Interval. rustgate doesn't
+                // retain sessions yet — the broker advertises 0 in
+                // CONNACK to clamp the client's expectation per
+                // §3.2.2.3.2 — but a fleet emitting non-zero values
+                // is the operational signal that "session
+                // persistence" is the next concrete need. The log
+                // line is at debug level (one per CONNECT, low
+                // volume) and uses sanitize_for_log on the client
+                // id so a hostile client_id string can't poison
+                // the log feed.
+                if let Some(props) = connect.properties.as_ref()
+                    && let Some(req) = props.session_expiry_interval
+                    && req != 0
+                {
+                    debug!(
+                        cn = %hash_cn(&identity.cn),
+                        client_id = %sanitize_for_log(&connect.client_id),
+                        requested_session_expiry_secs = req,
+                        "client requested non-zero MQTT 5.0 Session Expiry Interval; broker is clamping to 0 (sessions are not retained — refs #880)"
+                    );
+                }
+
                 // MQTT 5.0 has dedicated reason codes — distinguish
                 // syntax errors (`TopicNameInvalid`) from authorization
                 // failures (`NotAuthorized`) so the client gets a
@@ -999,6 +1022,25 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<ReadLoopOutco
                         reason = ?disc.reason_code,
                         "MQTT v5 DISCONNECT received"
                     );
+                    // MQTT 5.0 §3.14.2.2.2: a v5 DISCONNECT MAY carry
+                    // a Session Expiry Interval property that overrides
+                    // the value sent in CONNECT — clients use this to
+                    // "convert" a fresh session into one that should
+                    // persist after the disconnect, or vice versa.
+                    // rustgate doesn't retain sessions, so the override
+                    // has no effect; surface a debug log so an operator
+                    // monitoring the fleet can see clients trying to
+                    // toggle persistence at disconnect time. The log
+                    // is one-per-disconnect (low volume).
+                    if let Some(props) = disc.properties.as_ref()
+                        && let Some(override_secs) = props.session_expiry_interval
+                    {
+                        debug!(
+                            cn = %hash_cn(&identity.cn),
+                            disconnect_session_expiry_secs = override_secs,
+                            "client overrode Session Expiry Interval at DISCONNECT; broker ignored (sessions not retained — refs #880)"
+                        );
+                    }
                     return Ok(outcome);
                 }
                 other => {
