@@ -900,6 +900,16 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<ReadLoopOutco
     let session_hooks = params.session_hooks;
     let forwarding_hooks = params.forwarding_hooks;
     let retain_store = params.retain_store;
+    // Per-session QoS 2 inflight maps. Refs #880. Keyed by Packet
+    // Identifier; lost on disconnect by design (rustgate currently
+    // rejects clean_session=false sessions, so inflight QoS 2 state
+    // is intentionally ephemeral). Sized to start empty — pkid space
+    // is only populated as the client actually pipelines QoS 2
+    // PUBLISHes, and the typical case is a single inflight at a time.
+    let mut qos2_inflight_v5: std::collections::HashMap<u16, Qos2InflightV5> =
+        std::collections::HashMap::new();
+    let mut qos2_inflight_v4: std::collections::HashMap<u16, Qos2InflightV4> =
+        std::collections::HashMap::new();
     loop {
         let packet = match tokio::time::timeout(keep_alive, reader.read_packet()).await {
             Ok(Ok(pkt)) => pkt,
@@ -922,7 +932,21 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<ReadLoopOutco
                         session_hooks,
                         forwarding_hooks,
                         retain_store,
+                        &mut qos2_inflight_v5,
                         publish,
+                    )
+                    .await?;
+                }
+                mqttbytes::v5::Packet::PubRel(pubrel) => {
+                    handle_pubrel_v5(
+                        resp_tx,
+                        identity,
+                        router,
+                        session_hooks,
+                        forwarding_hooks,
+                        retain_store,
+                        &mut qos2_inflight_v5,
+                        pubrel,
                     )
                     .await?;
                 }
@@ -992,7 +1016,21 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<ReadLoopOutco
                         session_hooks,
                         forwarding_hooks,
                         retain_store,
+                        &mut qos2_inflight_v4,
                         publish,
+                    )
+                    .await?;
+                }
+                mqttbytes::v4::Packet::PubRel(pubrel) => {
+                    handle_pubrel_v4(
+                        resp_tx,
+                        identity,
+                        router,
+                        session_hooks,
+                        forwarding_hooks,
+                        retain_store,
+                        &mut qos2_inflight_v4,
+                        pubrel,
                     )
                     .await?;
                 }
@@ -1045,14 +1083,13 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<ReadLoopOutco
 // PUBLISH handlers
 // ---------------------------------------------------------------------------
 
-// justification: adds a second hooks-bundle arg (`forwarding_hooks`) to the
-// v5 publish handler, bringing the count to seven. Both hook bundles are
-// distinct concerns — `session_hooks` drives admission-outcome counters
-// while `forwarding_hooks` drives post-route egress fan-out — and both
-// are threaded all the way down from `MqttServerConfig`. Merging them
-// would force unrelated concerns into the same bundle and complicate the
-// `MqttSessionHooks` / `MqttForwardingHooks` public types that callers
-// construct independently.
+// justification: handle_publish_v5 carries two distinct hook bundles
+// (`session_hooks` for admission counters, `forwarding_hooks` for post-
+// route egress fan-out) plus a per-session QoS 2 inflight HashMap (refs
+// #880) that must be visible across the PUBLISH/PUBREL split. Merging
+// any of these into a wrapper struct would force unrelated concerns
+// through every adjacent dispatch site (subscribe, unsubscribe, retain
+// replay) for zero call-site reduction.
 #[allow(clippy::too_many_arguments)]
 async fn handle_publish_v5(
     resp_tx: &mpsc::Sender<ResponsePacket>,
@@ -1062,21 +1099,40 @@ async fn handle_publish_v5(
     session_hooks: Option<&crate::config::MqttSessionHooks>,
     forwarding_hooks: Option<&crate::config::MqttForwardingHooks>,
     retain_store: &RetainStore,
+    qos2_inflight: &mut std::collections::HashMap<u16, Qos2InflightV5>,
     publish: mqttbytes::v5::Publish,
 ) -> Result<(), MqttError> {
-    if publish.qos == mqttbytes::QoS::ExactlyOnce {
-        fire_publish_reject(session_hooks);
-        return Err(MqttError::Qos2Unsupported);
-    }
-
     if let Err(e) = topic::validate_publish_topic(&publish.topic) {
         fire_publish_reject(session_hooks);
+        // For QoS 2, a syntactically invalid topic triggers a PUBREC
+        // with `TopicNameInvalid` reason rather than terminating the
+        // session — the spec treats this as a per-publish failure
+        // surfacing through the four-step ack channel. QoS 0/1 still
+        // propagate the error up for the existing reject path.
+        if publish.qos == mqttbytes::QoS::ExactlyOnce && publish.pkid != 0 {
+            send_pubrec_v5(
+                resp_tx,
+                publish.pkid,
+                mqttbytes::v5::PubRecReason::TopicNameInvalid,
+            )
+            .await?;
+            return Ok(());
+        }
         return Err(e);
     }
     let group = match topic::topic_to_group(&publish.topic, topic_prefix) {
         Ok(g) => g,
         Err(e) => {
             fire_publish_reject(session_hooks);
+            if publish.qos == mqttbytes::QoS::ExactlyOnce && publish.pkid != 0 {
+                send_pubrec_v5(
+                    resp_tx,
+                    publish.pkid,
+                    mqttbytes::v5::PubRecReason::TopicNameInvalid,
+                )
+                .await?;
+                return Ok(());
+            }
             return Err(e);
         }
     };
@@ -1084,17 +1140,64 @@ async fn handle_publish_v5(
     // Authorization: the client must be a member of the target group.
     if !identity.is_member_of(&group) {
         fire_publish_reject(session_hooks);
+        if publish.qos == mqttbytes::QoS::ExactlyOnce && publish.pkid != 0 {
+            send_pubrec_v5(
+                resp_tx,
+                publish.pkid,
+                mqttbytes::v5::PubRecReason::NotAuthorized,
+            )
+            .await?;
+            return Ok(());
+        }
         return Err(MqttError::NotAuthorized(format!(
             "not authorized to publish to group '{group}'"
         )));
     }
 
-    // Update the retained-message store BEFORE routing. The retain
-    // store is independent of the live fan-out — even if the router
-    // drops the message via dedup or TTL, the retain semantics
-    // require the broker to remember the latest payload for new
-    // subscribers. The auth check above gates retain just like it
-    // gates routing, so a non-member CN cannot poison the store.
+    // QoS 2 four-step (refs #880): defer retain-store update + routing
+    // until PUBREL receipt. MQTT 5.0 §4.4 says the broker SHOULD NOT
+    // deliver the data to subscribers until it has received the PUBREL
+    // packet from the original sender — Method B in the spec
+    // taxonomy. Method A (deliver-on-PUBREC) is also legal, but
+    // Method B preserves the strongest "exactly once" guarantee: a
+    // client that crashes between PUBLISH and PUBREL leaves nothing
+    // behind, and that aligns with rustgate's clean_start-only
+    // session model where in-flight QoS 2 state is intentionally
+    // ephemeral. fire_publish_accept fires on PUBCOMP send (i.e. when
+    // routing has actually happened) so the metric matches the QoS 1
+    // semantics where "accepted" means "routed".
+    if publish.qos == mqttbytes::QoS::ExactlyOnce {
+        if publish.pkid == 0 {
+            // Spec §2.2.1: a QoS > 0 PUBLISH with pkid=0 is a Malformed
+            // Packet. Surface the reject up for session-level handling
+            // — there is no spec-defined way to ack a packet whose
+            // pkid is zero.
+            fire_publish_reject(session_hooks);
+            return Err(MqttError::Malformed(
+                "QoS 2 PUBLISH with packet identifier 0".into(),
+            ));
+        }
+        // Spec §3.3.4: a duplicate PUBLISH with the same pkid as one
+        // already in the inflight set MUST be acknowledged with a
+        // PUBREC and continue with the protocol — i.e. idempotent,
+        // do not double-deliver. Match that here by re-sending PUBREC
+        // without disturbing the saved state.
+        // Spec §3.3.4: a duplicate PUBLISH with the same pkid as one
+        // already in the inflight set is the SAME message — leave
+        // the saved state untouched and re-emit PUBREC. `entry`
+        // expresses this directly: the closure runs only on vacant,
+        // so a duplicate-pkid PUBLISH is a no-op state-wise.
+        let _ = qos2_inflight
+            .entry(publish.pkid)
+            .or_insert_with(|| Qos2InflightV5 {
+                publish: publish.clone(),
+                group: group.into_owned(),
+            });
+        send_pubrec_v5(resp_tx, publish.pkid, mqttbytes::v5::PubRecReason::Success).await?;
+        return Ok(());
+    }
+
+    // QoS 0 / 1 — deliver and ack immediately.
     let outcome = retain_store.publish(
         &publish.topic,
         &publish.payload,
@@ -1140,6 +1243,138 @@ async fn handle_publish_v5(
     ack_publish_v5(resp_tx, &publish).await
 }
 
+/// Per-session state for an in-flight QoS 2 v5 PUBLISH awaiting PUBREL.
+///
+/// Holds the original `Publish` (so retain-store update on PUBREL sees
+/// the same payload bytes the client sent) plus the post-validation
+/// `group` so the spec-required deferred-delivery path doesn't re-run
+/// the topic→group resolution that already happened at PUBREC time.
+#[derive(Debug, Clone)]
+struct Qos2InflightV5 {
+    publish: mqttbytes::v5::Publish,
+    group: String,
+}
+
+/// Send a v5 PUBREC with the given reason code.
+async fn send_pubrec_v5(
+    resp_tx: &mpsc::Sender<ResponsePacket>,
+    pkid: u16,
+    reason: mqttbytes::v5::PubRecReason,
+) -> Result<(), MqttError> {
+    let pubrec = mqttbytes::v5::PubRec {
+        pkid,
+        reason,
+        properties: None,
+    };
+    send_response(
+        resp_tx,
+        serialize_v5(&mqttbytes::v5::Packet::PubRec(pubrec))?,
+    )
+    .await
+}
+
+/// Send a v5 PUBCOMP with the given reason code.
+async fn send_pubcomp_v5(
+    resp_tx: &mpsc::Sender<ResponsePacket>,
+    pkid: u16,
+    reason: mqttbytes::v5::PubCompReason,
+) -> Result<(), MqttError> {
+    let pubcomp = mqttbytes::v5::PubComp {
+        pkid,
+        reason,
+        properties: None,
+    };
+    send_response(
+        resp_tx,
+        serialize_v5(&mqttbytes::v5::Packet::PubComp(pubcomp))?,
+    )
+    .await
+}
+
+/// Handle a v5 PUBREL — Stage 3 of the QoS 2 four-step. Deliver the
+/// previously-saved PUBLISH (retain + route) and emit PUBCOMP.
+///
+/// Refs #880. Spec: MQTT 5.0 §3.6 + §4.3.3.
+// justification: PUBREL is the "deliver" event in the QoS 2 four-step
+// and must touch all the same routing surfaces the QoS 0/1 PUBLISH path
+// does (retain store, router, forwarding hooks, session metrics) plus
+// the inflight state. Bundling those into a wrapper struct would force
+// the same struct through every adjacent dispatch site for zero call-
+// site reduction.
+#[allow(clippy::too_many_arguments)]
+async fn handle_pubrel_v5(
+    resp_tx: &mpsc::Sender<ResponsePacket>,
+    identity: &Arc<Identity>,
+    router: &Router,
+    session_hooks: Option<&crate::config::MqttSessionHooks>,
+    forwarding_hooks: Option<&crate::config::MqttForwardingHooks>,
+    retain_store: &RetainStore,
+    qos2_inflight: &mut std::collections::HashMap<u16, Qos2InflightV5>,
+    pubrel: mqttbytes::v5::PubRel,
+) -> Result<(), MqttError> {
+    let inflight = match qos2_inflight.remove(&pubrel.pkid) {
+        Some(state) => state,
+        None => {
+            // Spec §3.6.2.1.3 / §3.7.2.1: a PUBREL whose pkid does not
+            // match any in-flight QoS 2 PUBLISH is an unknown packet
+            // identifier — emit PUBCOMP(PacketIdentifierNotFound) to
+            // close the four-step on the client side. This is NOT a
+            // session-level error; the client may have already PUBCOMPed
+            // and forgotten, or this is a duplicate after our PUBCOMP
+            // already drained the map.
+            return send_pubcomp_v5(
+                resp_tx,
+                pubrel.pkid,
+                mqttbytes::v5::PubCompReason::PacketIdentifierNotFound,
+            )
+            .await;
+        }
+    };
+
+    let publish = inflight.publish;
+    let group = inflight.group;
+
+    // Retain store update happens NOW, not at PUBREC time, because
+    // §4.4 defers delivery to PUBREL — and the retain semantics are
+    // part of that deferred delivery. A client that PUBLISHes
+    // retain=1 at QoS 2 and then never sends PUBREL must NOT poison
+    // the retain store.
+    let outcome = retain_store.publish(
+        &publish.topic,
+        &publish.payload,
+        publish.qos,
+        publish.retain,
+    );
+    if outcome != RetainOutcome::Passthrough {
+        debug!(
+            cn = %hash_cn(&identity.cn),
+            topic = %sanitize_for_log(&publish.topic),
+            outcome = ?outcome,
+            "MQTT retain store updated (QoS 2 PUBREL)"
+        );
+    }
+    fire_retain_outcome(session_hooks, outcome);
+
+    let msg = RoutableMessage {
+        source: Identity::clone(identity),
+        destination: Destination::Group(group),
+        payload: publish.payload.clone(),
+        metadata: Metadata {
+            received_at: SystemTime::now(),
+            source_protocol: "mqtt".into(),
+            message_type: MessageType::Other("mqtt".into()),
+            ttl: None,
+        },
+    };
+
+    if let Some(routed) = router.route_for_egress(msg).await {
+        fire_forwarding(forwarding_hooks, &routed);
+    }
+    fire_publish_accept(session_hooks);
+
+    send_pubcomp_v5(resp_tx, pubrel.pkid, mqttbytes::v5::PubCompReason::Success).await
+}
+
 /// Emit the QoS 1 PUBACK (if required) for a v5 PUBLISH. Factored out so
 /// both the routed and the router-dropped paths share the same ack code
 /// verbatim.
@@ -1163,7 +1398,7 @@ async fn ack_publish_v5(
 }
 
 // justification: mirrors `handle_publish_v5` for the MQTT 3.1.1 wire format.
-// The v5 sibling already carries the same eight args and unifying them
+// The v5 sibling already carries the same nine args and unifying them
 // would force an unrelated wrapper struct through every dispatch branch.
 #[allow(clippy::too_many_arguments)]
 async fn handle_publish_v4(
@@ -1174,13 +1409,14 @@ async fn handle_publish_v4(
     session_hooks: Option<&crate::config::MqttSessionHooks>,
     forwarding_hooks: Option<&crate::config::MqttForwardingHooks>,
     retain_store: &RetainStore,
+    qos2_inflight: &mut std::collections::HashMap<u16, Qos2InflightV4>,
     publish: mqttbytes::v4::Publish,
 ) -> Result<(), MqttError> {
-    if publish.qos == mqttbytes::QoS::ExactlyOnce {
-        fire_publish_reject(session_hooks);
-        return Err(MqttError::Qos2Unsupported);
-    }
-
+    // v3.1.1 has no per-publish reason codes — a topic / authz failure
+    // at QoS 2 has no spec-defined ack channel that carries a reason
+    // (PUBREC in v4 is just a packet identifier, no body). The
+    // closest spec-compliant behaviour is to reject the session with
+    // a typed `MqttError`, which is what we already do for QoS 0/1.
     if let Err(e) = topic::validate_publish_topic(&publish.topic) {
         fire_publish_reject(session_hooks);
         return Err(e);
@@ -1201,9 +1437,31 @@ async fn handle_publish_v4(
         )));
     }
 
-    // See `handle_publish_v5` for the rationale — retain semantics are
-    // identical across MQTT 3.1.1 and 5.0 and live above the routing
-    // layer so even router-dropped messages update the store.
+    // QoS 2 four-step (refs #880): see v5 sibling for the rationale.
+    // v3.1.1 PUBREC carries no reason code so the PUBREC arm is much
+    // smaller — just emit the bare ack and save state for PUBREL.
+    if publish.qos == mqttbytes::QoS::ExactlyOnce {
+        if publish.pkid == 0 {
+            fire_publish_reject(session_hooks);
+            return Err(MqttError::Malformed(
+                "QoS 2 PUBLISH with packet identifier 0".into(),
+            ));
+        }
+        // See `handle_publish_v5` for the duplicate-pkid rationale.
+        let _ = qos2_inflight
+            .entry(publish.pkid)
+            .or_insert_with(|| Qos2InflightV4 {
+                publish: publish.clone(),
+                group: group.into_owned(),
+            });
+        send_pubrec_v4(resp_tx, publish.pkid).await?;
+        return Ok(());
+    }
+
+    // QoS 0 / 1 — deliver and ack immediately. See `handle_publish_v5`
+    // for the rationale — retain semantics are identical across MQTT
+    // 3.1.1 and 5.0 and live above the routing layer so even router-
+    // dropped messages update the store.
     let outcome = retain_store.publish(
         &publish.topic,
         &publish.payload,
@@ -1243,6 +1501,108 @@ async fn handle_publish_v4(
     fire_publish_accept(session_hooks);
 
     ack_publish_v4(resp_tx, &publish).await
+}
+
+/// Per-session state for an in-flight QoS 2 v4 PUBLISH awaiting PUBREL.
+/// Sibling to [`Qos2InflightV5`].
+#[derive(Debug, Clone)]
+struct Qos2InflightV4 {
+    publish: mqttbytes::v4::Publish,
+    group: String,
+}
+
+/// Send a v4 PUBREC. v3.1.1 PUBREC has no reason code field — just a
+/// packet identifier — so the helper is correspondingly simpler.
+async fn send_pubrec_v4(
+    resp_tx: &mpsc::Sender<ResponsePacket>,
+    pkid: u16,
+) -> Result<(), MqttError> {
+    let pubrec = mqttbytes::v4::PubRec::new(pkid);
+    send_response(
+        resp_tx,
+        serialize_v4(&mqttbytes::v4::Packet::PubRec(pubrec))?,
+    )
+    .await
+}
+
+/// Send a v4 PUBCOMP. v3.1.1 PUBCOMP has no reason code field — just a
+/// packet identifier. Sibling to [`send_pubcomp_v5`].
+async fn send_pubcomp_v4(
+    resp_tx: &mpsc::Sender<ResponsePacket>,
+    pkid: u16,
+) -> Result<(), MqttError> {
+    let pubcomp = mqttbytes::v4::PubComp::new(pkid);
+    send_response(
+        resp_tx,
+        serialize_v4(&mqttbytes::v4::Packet::PubComp(pubcomp))?,
+    )
+    .await
+}
+
+/// Handle a v4 PUBREL — Stage 3 of the QoS 2 four-step. Sibling to
+/// [`handle_pubrel_v5`]; v3.1.1 PUBCOMP carries no reason code so the
+/// "unknown pkid" branch silently emits a PUBCOMP rather than an
+/// explicit "PacketIdentifierNotFound" reason. This matches the
+/// v3.1.1 spec — there is no per-pkid signal channel.
+// justification: see `handle_pubrel_v5` — the same rationale applies
+// for the v3.1.1 sibling.
+#[allow(clippy::too_many_arguments)]
+async fn handle_pubrel_v4(
+    resp_tx: &mpsc::Sender<ResponsePacket>,
+    identity: &Arc<Identity>,
+    router: &Router,
+    session_hooks: Option<&crate::config::MqttSessionHooks>,
+    forwarding_hooks: Option<&crate::config::MqttForwardingHooks>,
+    retain_store: &RetainStore,
+    qos2_inflight: &mut std::collections::HashMap<u16, Qos2InflightV4>,
+    pubrel: mqttbytes::v4::PubRel,
+) -> Result<(), MqttError> {
+    let inflight = match qos2_inflight.remove(&pubrel.pkid) {
+        Some(state) => state,
+        None => {
+            // Unknown pkid — best-effort PUBCOMP so the client closes
+            // its side of the four-step. v3.1.1 has no reason channel.
+            return send_pubcomp_v4(resp_tx, pubrel.pkid).await;
+        }
+    };
+
+    let publish = inflight.publish;
+    let group = inflight.group;
+
+    let outcome = retain_store.publish(
+        &publish.topic,
+        &publish.payload,
+        publish.qos,
+        publish.retain,
+    );
+    if outcome != RetainOutcome::Passthrough {
+        debug!(
+            cn = %hash_cn(&identity.cn),
+            topic = %sanitize_for_log(&publish.topic),
+            outcome = ?outcome,
+            "MQTT retain store updated (QoS 2 PUBREL)"
+        );
+    }
+    fire_retain_outcome(session_hooks, outcome);
+
+    let msg = RoutableMessage {
+        source: Identity::clone(identity),
+        destination: Destination::Group(group),
+        payload: publish.payload.clone(),
+        metadata: Metadata {
+            received_at: SystemTime::now(),
+            source_protocol: "mqtt".into(),
+            message_type: MessageType::Other("mqtt".into()),
+            ttl: None,
+        },
+    };
+
+    if let Some(routed) = router.route_for_egress(msg).await {
+        fire_forwarding(forwarding_hooks, &routed);
+    }
+    fire_publish_accept(session_hooks);
+
+    send_pubcomp_v4(resp_tx, pubrel.pkid).await
 }
 
 /// Emit the QoS 1 PUBACK (if required) for a v4 PUBLISH. Factored out so
