@@ -329,11 +329,28 @@ fn try_parse(
             Err(mqttbytes::Error::InsufficientBytes(_)) => Ok(None),
             Err(e) => Err(MqttError::Malformed(e.to_string())),
         },
-        ProtocolLevel::V50 => match mqttbytes::v5::read(buf, max_packet_size) {
-            Ok(packet) => Ok(Some(MqttPacket::V5(Box::new(packet)))),
-            Err(mqttbytes::Error::InsufficientBytes(_)) => Ok(None),
-            Err(e) => Err(MqttError::Malformed(e.to_string())),
-        },
+        ProtocolLevel::V50 => {
+            // mqttbytes 0.6.0 incorrectly returns `PayloadRequired` for a
+            // zero-remaining-length v5 DISCONNECT (`0xE0 0x00`), which is
+            // the standard wire form for `NormalDisconnection` with no
+            // properties (MQTT 5.0 §3.14.2.1: a missing reason code byte
+            // is interpreted as `NormalDisconnection`). Pre-detect and
+            // synthesize the packet so a perfectly conformant client
+            // does not see its DISCONNECT mis-classified as a malformed
+            // packet — and so the will-message suppression path
+            // (`ReadLoopOutcome::CleanDisconnect`) actually fires.
+            if buf.len() >= 2 && buf[0] == 0xE0 && buf[1] == 0x00 {
+                let _ = buf.split_to(2);
+                return Ok(Some(MqttPacket::V5(Box::new(
+                    mqttbytes::v5::Packet::Disconnect(mqttbytes::v5::Disconnect::new()),
+                ))));
+            }
+            match mqttbytes::v5::read(buf, max_packet_size) {
+                Ok(packet) => Ok(Some(MqttPacket::V5(Box::new(packet)))),
+                Err(mqttbytes::Error::InsufficientBytes(_)) => Ok(None),
+                Err(e) => Err(MqttError::Malformed(e.to_string())),
+            }
+        }
     }
 }
 
@@ -752,5 +769,74 @@ mod tests {
         // First byte is the fixed header: upper nibble is packet type.
         // DISCONNECT is type 14 (0xE0 >> 4 == 0x0E).
         assert_eq!(buf[0] >> 4, 0x0E);
+    }
+
+    // -----------------------------------------------------------------
+    // mqttbytes 0.6.0 v5 DISCONNECT zero-payload workaround
+    //
+    // The standard wire form for a v5 DISCONNECT with `NormalDisconnection`
+    // reason code and no properties is two bytes: `0xE0 0x00`. mqttbytes
+    // 0.6.0 v5 `read` omits `Disconnect` from its zero-remaining-length
+    // packet whitelist (v4 includes it correctly), so a perfectly
+    // conformant client gets `Error::PayloadRequired` from the parser.
+    // The `try_parse` workaround pre-detects the literal byte sequence
+    // and synthesises the matching `Disconnect::new()` packet so the
+    // session loop's `ReadLoopOutcome::CleanDisconnect` branch fires
+    // and the will-suppression contract is honoured. These tests pin
+    // the workaround so a future mqttbytes upgrade (or a refactor of
+    // the codec) cannot silently regress will-suppression behaviour.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn try_parse_v5_recognizes_two_byte_disconnect() {
+        // `0xE0 0x00` → v5 Disconnect with `NormalDisconnection`.
+        let mut buf = BytesMut::from(&b"\xE0\x00"[..]);
+        let mut protocol = Some(ProtocolLevel::V50);
+        let parsed = try_parse(&mut buf, &mut protocol, 16 * 1024)
+            .expect("ok")
+            .expect("packet present");
+        match parsed {
+            MqttPacket::V5(boxed) => match *boxed {
+                mqttbytes::v5::Packet::Disconnect(d) => {
+                    assert_eq!(
+                        d.reason_code,
+                        mqttbytes::v5::DisconnectReasonCode::NormalDisconnection,
+                        "two-byte v5 DISCONNECT must materialise as NormalDisconnection",
+                    );
+                }
+                other => panic!("expected v5 Disconnect, got {other:?}"),
+            },
+            MqttPacket::V4(other) => panic!("expected v5 packet, got v4 {other:?}"),
+        }
+        // The two parsed bytes must have been consumed from the buffer
+        // — leaving them in place would re-trigger the workaround on
+        // the next `try_parse` call and loop the session.
+        assert!(buf.is_empty(), "two bytes must be consumed");
+    }
+
+    #[test]
+    fn try_parse_v5_disconnect_workaround_does_not_match_other_packets() {
+        // The workaround pre-check is `buf[0] == 0xE0 && buf[1] ==
+        // 0x00` — a more permissive match (e.g. `buf[0] == 0xE0`
+        // alone) would silently swallow conformant DISCONNECTs with
+        // explicit reason codes and lose their reason information. A
+        // hand-crafted PINGREQ (0xC0 0x00) must NOT match the
+        // workaround at all — the parser falls through to the
+        // standard path which produces `Packet::PingReq`.
+        let mut buf = BytesMut::from(&b"\xC0\x00"[..]);
+        let mut protocol = Some(ProtocolLevel::V50);
+        let parsed = try_parse(&mut buf, &mut protocol, 16 * 1024)
+            .expect("ok")
+            .expect("packet present");
+        match parsed {
+            MqttPacket::V5(boxed) => match *boxed {
+                mqttbytes::v5::Packet::PingReq => {}
+                other => {
+                    panic!("workaround must not match non-DISCONNECT byte sequences; got {other:?}")
+                }
+            },
+            MqttPacket::V4(other) => panic!("expected v5, got v4 {other:?}"),
+        }
+        assert!(buf.is_empty(), "PINGREQ frame must be consumed");
     }
 }

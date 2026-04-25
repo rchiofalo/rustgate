@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use parking_lot::Mutex;
 use rustgate_core::constants::WRITE_TIMEOUT;
 use rustgate_core::identity::Identity;
@@ -123,6 +123,36 @@ struct ResponsePacket {
     bytes: BytesMut,
 }
 
+/// Validated MQTT last-will message captured from a CONNECT packet.
+///
+/// The will is published by the broker on behalf of the client when the
+/// connection ends ungracefully (TLS error, keep-alive timeout, abrupt
+/// drop) per MQTT 3.1.1 §3.1.2.5 and MQTT 5.0 §3.1.2.5. A clean
+/// DISCONNECT (v5 with `NormalDisconnection` reason, v4 with any
+/// DISCONNECT) suppresses the will publish per spec.
+///
+/// Topic, QoS, and retain are validated at CONNECT time using the same
+/// rules applied to a live PUBLISH from the same identity, so the will
+/// cannot be used to bypass the per-group authorization gate. The
+/// derived group is cached on the struct so the publish path at session
+/// end does not need to re-resolve it.
+#[derive(Debug, Clone)]
+struct Will {
+    /// Original wire topic the client requested. Logged in operator
+    /// diagnostics; never re-validated at publish time.
+    topic: String,
+    /// Group derived from the topic at CONNECT validation time.
+    /// This is the routed `Destination::Group(_)` value for the will
+    /// publish at session end.
+    group: String,
+    /// Will payload bytes — `Bytes` so the per-group fan-out clones
+    /// without copying.
+    payload: Bytes,
+    /// Whether the will should be added to the retain store on publish.
+    /// Mirrors the wire `retain` flag from §3.1.2.7 / §3.1.3.5.
+    retain: bool,
+}
+
 /// Handle a single MQTT session from TLS handshake through disconnect.
 ///
 /// Performs the CONNECT handshake, registers with the router, runs the
@@ -156,7 +186,13 @@ pub(crate) async fn handle_mqtt_session(
     let mut codec = PacketCodec::new(pre.stream, max_packet_size);
 
     // --- CONNECT handshake ---
-    let (keep_alive, client_id) = match connect_handshake(&mut codec, &identity).await {
+    let (keep_alive, client_id, will) = match connect_handshake(
+        &mut codec,
+        &identity,
+        topic_prefix.as_deref(),
+    )
+    .await
+    {
         Ok(result) => result,
         Err(e) => {
             debug!(cn = %hash_cn(&cn), peer = %peer_addr, error = %e, "CONNECT handshake failed");
@@ -280,8 +316,19 @@ pub(crate) async fn handle_mqtt_session(
         retain_store: &retain_store,
     };
 
-    let read_result = tokio::select! {
-        r = mqtt_read_loop(&mut read_params) => r,
+    // Each branch returns a matched type so the `select!` macro can
+    // unify the two arms. The read loop returns the disconnect
+    // disposition; the write loop returning early always indicates an
+    // ungraceful close (the channel was closed while the read side was
+    // still active), so we map a write-loop `Ok(())` to "treat the
+    // session as ungraceful and publish the will if one is set".
+    enum SessionEnd {
+        Read(Result<ReadLoopOutcome, MqttError>),
+        Write(Result<(), MqttError>),
+    }
+
+    let session_end = tokio::select! {
+        r = mqtt_read_loop(&mut read_params) => SessionEnd::Read(r),
         r = mqtt_write_loop(
             &mut writer,
             protocol,
@@ -289,11 +336,29 @@ pub(crate) async fn handle_mqtt_session(
             &mut priority_rx,
             &mut normal_rx,
             &mut resp_rx,
-        ) => r,
+        ) => SessionEnd::Write(r),
     };
 
+    // Decide whether the will should be published. Only an explicit
+    // client-initiated DISCONNECT counts as graceful — every other
+    // path (read error, write error, write-loop early exit) is
+    // ungraceful and triggers the will per MQTT 3.1.1 §3.14 / 5.0
+    // §3.14.4. A v5 client that wants to fire the will despite a
+    // graceful disconnect must use `DisconnectWithWillMessage` (§4.13).
+    let publish_will = match &session_end {
+        SessionEnd::Read(Ok(ReadLoopOutcome::CleanDisconnect)) => false,
+        SessionEnd::Read(Ok(ReadLoopOutcome::DisconnectWithWill)) => true,
+        SessionEnd::Read(Err(_)) => true,
+        SessionEnd::Write(_) => true,
+    };
+
+    let read_ok = matches!(
+        &session_end,
+        SessionEnd::Read(Ok(_)) | SessionEnd::Write(Ok(_))
+    );
+
     // Flush pending outbound messages before unregistering.
-    if read_result.is_ok() {
+    if read_ok {
         flush_pending(
             &mut writer,
             protocol,
@@ -305,8 +370,21 @@ pub(crate) async fn handle_mqtt_session(
         .await;
     }
 
-    if let Err(ref e) = read_result {
+    if let SessionEnd::Read(Err(e)) = &session_end {
         debug!(cn = %hash_cn(&cn), error = %e, "MQTT session ended with error");
+    } else if let SessionEnd::Write(Err(e)) = &session_end {
+        debug!(cn = %hash_cn(&cn), error = %e, "MQTT session ended with write error");
+    }
+
+    // Publish the configured will BEFORE unregistering so the publish
+    // path sees the same router state any live PUBLISH would have. The
+    // unregister call only removes this session's group memberships
+    // and offline-queue handle — it does not affect routing for OTHER
+    // sessions, but the will publish goes through `route_for_egress`
+    // (the same path live PUBLISHes use) so we keep the ordering
+    // identical for consistency.
+    if publish_will && let Some(w) = will.as_ref() {
+        publish_will_message(&router, &identity, &retain_store, w).await;
     }
 
     router.unregister(&cn, session_id).await;
@@ -318,15 +396,131 @@ pub(crate) async fn handle_mqtt_session(
     );
 }
 
+/// Publish the validated will message on behalf of the disconnecting
+/// client. Mirrors the live `handle_publish_*` path: update the retain
+/// store first (so a `retain=true` will is observable to clients that
+/// subscribe AFTER the disconnect), then route via
+/// `route_for_egress`. Authorization was already enforced at CONNECT
+/// time when the will was validated.
+async fn publish_will_message(
+    router: &Router,
+    identity: &Arc<Identity>,
+    retain_store: &RetainStore,
+    will: &Will,
+) {
+    // The will fires at most once per session per spec — clone the
+    // payload so the underlying `Bytes` refcount survives if the
+    // session struct itself is dropped before routing completes.
+    let outcome = retain_store.publish(
+        &will.topic,
+        &will.payload,
+        mqttbytes::QoS::AtMostOnce,
+        will.retain,
+    );
+    if outcome != RetainOutcome::Passthrough {
+        debug!(
+            cn = %hash_cn(&identity.cn),
+            topic = %sanitize_for_log(&will.topic),
+            outcome = ?outcome,
+            "MQTT will retain store updated"
+        );
+    }
+
+    let msg = RoutableMessage {
+        source: Identity::clone(identity),
+        destination: Destination::Group(will.group.clone()),
+        payload: will.payload.clone(),
+        metadata: Metadata {
+            received_at: SystemTime::now(),
+            source_protocol: "mqtt".into(),
+            message_type: MessageType::Other("mqtt".into()),
+            ttl: None,
+        },
+    };
+
+    debug!(
+        cn = %hash_cn(&identity.cn),
+        topic = %sanitize_for_log(&will.topic),
+        group = %sanitize_for_log(&will.group),
+        retain = will.retain,
+        "publishing MQTT will message"
+    );
+    let _ = router.route_for_egress(msg).await;
+}
+
+/// Outcome of `validate_will`: either an authorised will to be published on
+/// ungraceful disconnect, or a CONNACK reason code identifying why the
+/// will was rejected so the handshake can refuse the connection.
+///
+/// The `Absent` case is encoded by passing `None` to `Option::map(...)`
+/// at the call site, so the enum itself only carries the validation
+/// outcomes for a will that *was* present in the CONNECT packet.
+enum WillValidation {
+    /// Will is valid and authorised for the connecting identity.
+    Valid(Will),
+    /// Will topic is malformed (wildcards, empty, prefix mismatch).
+    /// Maps to v5 `TopicNameInvalid` / v4 `NotAuthorized` (3.1.1 has
+    /// no dedicated topic-syntax CONNACK code).
+    InvalidTopic(String),
+    /// Will targets a group the identity is not a member of.
+    /// Maps to v5 `NotAuthorized` / v4 `NotAuthorized`.
+    NotAuthorized(String),
+}
+
+/// Validate a CONNECT-supplied last-will against the same authz/topic
+/// rules that gate a live PUBLISH from the same identity.
+///
+/// QoS 2 is rejected because the broker does not implement the
+/// PUBREC/PUBREL/PUBCOMP four-step handshake (mirrors `handle_publish_*`).
+/// Wildcards (`+`/`#`) in the will topic are rejected — the will is a
+/// publish, not a subscription. Group derivation respects the listener's
+/// `topic_prefix` so the will targets the same coordinate space as a
+/// regular publish from this client.
+///
+/// `topic_prefix` is optional and matches the listener configuration; it
+/// is borrowed across the call so this helper allocates only when the
+/// will is actually present.
+fn validate_will(
+    last_will_topic: &str,
+    last_will_payload: &Bytes,
+    last_will_qos: mqttbytes::QoS,
+    last_will_retain: bool,
+    identity: &Identity,
+    topic_prefix: Option<&str>,
+) -> WillValidation {
+    if last_will_qos == mqttbytes::QoS::ExactlyOnce {
+        return WillValidation::InvalidTopic("QoS 2 not supported for will messages".to_string());
+    }
+    if let Err(e) = topic::validate_publish_topic(last_will_topic) {
+        return WillValidation::InvalidTopic(e.to_string());
+    }
+    let group = match topic::topic_to_group(last_will_topic, topic_prefix) {
+        Ok(g) => g.into_owned(),
+        Err(e) => return WillValidation::InvalidTopic(e.to_string()),
+    };
+    if !identity.is_member_of(&group) {
+        return WillValidation::NotAuthorized(format!("not a member of group '{group}'"));
+    }
+    WillValidation::Valid(Will {
+        topic: last_will_topic.to_string(),
+        group,
+        payload: last_will_payload.clone(),
+        retain: last_will_retain,
+    })
+}
+
 /// Perform the MQTT CONNECT handshake.
 ///
 /// Reads the first packet (must be CONNECT), validates constraints
-/// (clean session, no will, QoS ≤ 1), and sends CONNACK. Returns the
-/// negotiated keep-alive value in seconds.
+/// (clean session, QoS ≤ 1), validates the optional last-will against
+/// the same authz rules as a live PUBLISH, and sends CONNACK. Returns
+/// the negotiated keep-alive value, the client ID, and the validated
+/// will (if any).
 async fn connect_handshake(
     codec: &mut PacketCodec,
     identity: &Identity,
-) -> Result<(u16, String), MqttError> {
+    topic_prefix: Option<&str>,
+) -> Result<(u16, String, Option<Will>), MqttError> {
     let packet = codec.read_packet().await?;
 
     match packet {
@@ -337,12 +531,35 @@ async fn connect_handshake(
                     .await?;
                 return Err(MqttError::PersistentSessionUnsupported);
             }
-            if connect.last_will.is_some() {
-                codec
-                    .write_connack_v4(mqttbytes::v4::ConnectReturnCode::RefusedProtocolVersion)
-                    .await?;
-                return Err(MqttError::WillUnsupported);
-            }
+
+            // Validate the optional will payload BEFORE accepting the
+            // connection — a will targeting an unauthorised group must
+            // refuse the CONNECT, not silently drop the will at session
+            // end. MQTT 3.1.1 has no dedicated `TopicNameInvalid`
+            // CONNACK code; collapse both topic-syntax errors and
+            // group-membership rejections to `NotAuthorized`, the
+            // closest spec-defined code for an authorization failure
+            // at handshake.
+            let will = match connect.last_will.as_ref() {
+                None => None,
+                Some(lw) => match validate_will(
+                    &lw.topic,
+                    &lw.message,
+                    lw.qos,
+                    lw.retain,
+                    identity,
+                    topic_prefix,
+                ) {
+                    WillValidation::Valid(w) => Some(w),
+                    WillValidation::InvalidTopic(reason)
+                    | WillValidation::NotAuthorized(reason) => {
+                        codec
+                            .write_connack_v4(mqttbytes::v4::ConnectReturnCode::NotAuthorized)
+                            .await?;
+                        return Err(MqttError::WillRejected(reason));
+                    }
+                },
+            };
 
             let client_id = connect.client_id.clone();
 
@@ -350,13 +567,14 @@ async fn connect_handshake(
                 cn = %hash_cn(&identity.cn),
                 client_id = %sanitize_for_log(&client_id),
                 keep_alive = connect.keep_alive,
+                will = will.is_some(),
                 "MQTT v3.1.1 CONNECT accepted"
             );
 
             codec
                 .write_connack_v4(mqttbytes::v4::ConnectReturnCode::Success)
                 .await?;
-            Ok((connect.keep_alive, client_id))
+            Ok((connect.keep_alive, client_id, will))
         }
         MqttPacket::V5(boxed) => {
             if let mqttbytes::v5::Packet::Connect(connect) = *boxed {
@@ -368,14 +586,38 @@ async fn connect_handshake(
                         .await?;
                     return Err(MqttError::PersistentSessionUnsupported);
                 }
-                if connect.last_will.is_some() {
-                    codec
-                        .write_connack_v5(
-                            mqttbytes::v5::ConnectReturnCode::ImplementationSpecificError,
-                        )
-                        .await?;
-                    return Err(MqttError::WillUnsupported);
-                }
+
+                // MQTT 5.0 has dedicated reason codes — distinguish
+                // syntax errors (`TopicNameInvalid`) from authorization
+                // failures (`NotAuthorized`) so the client gets a
+                // precise diagnostic per §3.2.2.2.
+                let will = match connect.last_will.as_ref() {
+                    None => None,
+                    Some(lw) => match validate_will(
+                        &lw.topic,
+                        &lw.message,
+                        lw.qos,
+                        lw.retain,
+                        identity,
+                        topic_prefix,
+                    ) {
+                        WillValidation::Valid(w) => Some(w),
+                        WillValidation::InvalidTopic(reason) => {
+                            codec
+                                .write_connack_v5(
+                                    mqttbytes::v5::ConnectReturnCode::TopicNameInvalid,
+                                )
+                                .await?;
+                            return Err(MqttError::WillRejected(reason));
+                        }
+                        WillValidation::NotAuthorized(reason) => {
+                            codec
+                                .write_connack_v5(mqttbytes::v5::ConnectReturnCode::NotAuthorized)
+                                .await?;
+                            return Err(MqttError::WillRejected(reason));
+                        }
+                    },
+                };
 
                 let client_id = connect.client_id.clone();
 
@@ -383,13 +625,14 @@ async fn connect_handshake(
                     cn = %hash_cn(&identity.cn),
                     client_id = %sanitize_for_log(&client_id),
                     keep_alive = connect.keep_alive,
+                    will = will.is_some(),
                     "MQTT v5.0 CONNECT accepted"
                 );
 
                 codec
                     .write_connack_v5(mqttbytes::v5::ConnectReturnCode::Success)
                     .await?;
-                Ok((connect.keep_alive, client_id))
+                Ok((connect.keep_alive, client_id, will))
             } else {
                 Err(MqttError::ConnectExpected)
             }
@@ -530,6 +773,29 @@ struct ReadLoopParams<'a> {
     retain_store: &'a RetainStore,
 }
 
+/// Outcome of the read loop. Used by the caller to decide whether to
+/// publish the configured will message at session end.
+///
+/// MQTT 3.1.1 §3.14 / 5.0 §3.14.4: a client-initiated DISCONNECT is a
+/// **graceful** termination — the broker MUST suppress the will.
+/// Anything else (TLS error, keep-alive timeout, abrupt drop) is
+/// **ungraceful**, and the will MUST be published if one was set.
+///
+/// MQTT 5.0 §4.13 reserves a special `DisconnectWithWillMessage` reason
+/// code (0x04) that *does* trigger the will despite being a normal
+/// DISCONNECT — clients use it when they want to flag an unexpected
+/// shutdown but still notify the broker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadLoopOutcome {
+    /// Client sent a DISCONNECT signalling a normal shutdown. The will
+    /// must NOT be published.
+    CleanDisconnect,
+    /// Client sent v5 DISCONNECT with `DisconnectWithWillMessage`
+    /// reason — the will MUST still fire even though the disconnect
+    /// itself was graceful (§4.13).
+    DisconnectWithWill,
+}
+
 /// Read loop: process inbound MQTT packets from the client.
 ///
 /// Handles PUBLISH (route to group), SUBSCRIBE (validate and ACK),
@@ -537,7 +803,7 @@ struct ReadLoopParams<'a> {
 ///
 /// Response packets are serialized and sent to the write loop via `resp_tx`
 /// so both loops can operate on independent halves of the TLS stream.
-async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<(), MqttError> {
+async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<ReadLoopOutcome, MqttError> {
     let reader = &mut *params.reader;
     let resp_tx = params.resp_tx;
     let protocol = params.protocol;
@@ -605,9 +871,27 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<(), MqttError
                 mqttbytes::v5::Packet::PingReq => {
                     send_response(resp_tx, serialize_pingresp(protocol)?).await?;
                 }
-                mqttbytes::v5::Packet::Disconnect(_) => {
-                    debug!(cn = %hash_cn(&identity.cn), "MQTT v5 DISCONNECT received");
-                    return Ok(());
+                mqttbytes::v5::Packet::Disconnect(disc) => {
+                    // MQTT 5.0 §4.13: `DisconnectWithWillMessage` (0x04)
+                    // is the one DISCONNECT reason that does NOT
+                    // suppress the will publish — the client wants to
+                    // signal an unexpected shutdown to subscribers
+                    // while still notifying the broker. Every other
+                    // DISCONNECT (including the default
+                    // `NormalDisconnection`) suppresses the will.
+                    let outcome = if disc.reason_code
+                        == mqttbytes::v5::DisconnectReasonCode::DisconnectWithWillMessage
+                    {
+                        ReadLoopOutcome::DisconnectWithWill
+                    } else {
+                        ReadLoopOutcome::CleanDisconnect
+                    };
+                    debug!(
+                        cn = %hash_cn(&identity.cn),
+                        reason = ?disc.reason_code,
+                        "MQTT v5 DISCONNECT received"
+                    );
+                    return Ok(outcome);
                 }
                 other => {
                     debug!(cn = %hash_cn(&identity.cn), packet = ?other, "ignoring unexpected v5 packet");
@@ -658,8 +942,12 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<(), MqttError
                     send_response(resp_tx, serialize_pingresp(protocol)?).await?;
                 }
                 mqttbytes::v4::Packet::Disconnect => {
+                    // MQTT 3.1.1 §3.14: any DISCONNECT from the client
+                    // is a graceful close — the broker MUST discard the
+                    // will. v3.1.1 has no `DisconnectWithWillMessage`
+                    // equivalent on the wire.
                     debug!(cn = %hash_cn(&identity.cn), "MQTT v4 DISCONNECT received");
-                    return Ok(());
+                    return Ok(ReadLoopOutcome::CleanDisconnect);
                 }
                 other => {
                     debug!(cn = %hash_cn(&identity.cn), packet = ?other, "ignoring unexpected v4 packet");
@@ -2120,5 +2408,201 @@ mod tests {
         let bytes_b = pkt_b.bytes;
         bytes_a.clear();
         assert_eq!(bytes_b.len(), 2, "second buffer must be untouched");
+    }
+
+    // -----------------------------------------------------------------------
+    // `validate_will` — pure-function authorization gate for last-will
+    // messages parsed out of CONNECT. Covered exhaustively at unit level
+    // because the integration tests exercise the on-the-wire path but
+    // cannot easily enumerate the cross-product of (qos, topic shape,
+    // group membership, prefix configuration). A regression that
+    // accidentally accepts an unauthorised will would silently allow an
+    // attacker to use the will publish as a privilege-escalation
+    // primitive.
+    // -----------------------------------------------------------------------
+
+    fn mk_will_identity(cn: &str, groups: &[&str]) -> Identity {
+        Identity::new(
+            cn.into(),
+            "fingerprint".into(),
+            groups.iter().map(|s| (*s).to_string()).collect(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn validate_will_accepts_authorized_publish_topic() {
+        // Happy path: alice ∈ {alpha}, will targets `alpha`, QoS 0,
+        // no prefix configured. Result must be `Valid` with the
+        // group cached and the original topic preserved verbatim.
+        let id = mk_will_identity("alice", &["alpha"]);
+        let payload = bytes::Bytes::from_static(b"offline");
+        let result = validate_will(
+            "alpha",
+            &payload,
+            mqttbytes::QoS::AtMostOnce,
+            false,
+            &id,
+            None,
+        );
+        match result {
+            WillValidation::Valid(will) => {
+                assert_eq!(will.topic, "alpha");
+                assert_eq!(will.group, "alpha");
+                assert_eq!(will.payload.as_ref(), b"offline");
+                assert!(!will.retain);
+            }
+            other => panic!("expected Valid, got {:?}", will_validation_kind(&other)),
+        }
+    }
+
+    #[test]
+    fn validate_will_rejects_qos2_as_invalid_topic() {
+        // QoS 2 requires the four-step PUBREC/PUBREL/PUBCOMP handshake
+        // which the broker does not implement. Pin that QoS 2 rejects
+        // BEFORE the topic / group check fires — otherwise an
+        // attacker-supplied empty topic could short-circuit the QoS 2
+        // gate.
+        let id = mk_will_identity("alice", &["alpha"]);
+        let payload = bytes::Bytes::from_static(b"x");
+        let result = validate_will(
+            "alpha",
+            &payload,
+            mqttbytes::QoS::ExactlyOnce,
+            false,
+            &id,
+            None,
+        );
+        assert!(matches!(result, WillValidation::InvalidTopic(_)));
+    }
+
+    #[test]
+    fn validate_will_rejects_wildcards_in_topic() {
+        // MQTT spec forbids `+` and `#` in a PUBLISH topic — and a will
+        // is just a deferred PUBLISH, so the same rule applies.
+        let id = mk_will_identity("alice", &["alpha"]);
+        let payload = bytes::Bytes::from_static(b"x");
+        let with_plus = validate_will(
+            "alpha/+",
+            &payload,
+            mqttbytes::QoS::AtMostOnce,
+            false,
+            &id,
+            None,
+        );
+        assert!(matches!(with_plus, WillValidation::InvalidTopic(_)));
+        let with_hash = validate_will(
+            "alpha/#",
+            &payload,
+            mqttbytes::QoS::AtMostOnce,
+            false,
+            &id,
+            None,
+        );
+        assert!(matches!(with_hash, WillValidation::InvalidTopic(_)));
+    }
+
+    #[test]
+    fn validate_will_rejects_empty_topic() {
+        // An empty topic is structurally invalid per MQTT spec; the
+        // gate must refuse it BEFORE any group lookup.
+        let id = mk_will_identity("alice", &["alpha"]);
+        let payload = bytes::Bytes::from_static(b"x");
+        let result = validate_will("", &payload, mqttbytes::QoS::AtMostOnce, false, &id, None);
+        assert!(matches!(result, WillValidation::InvalidTopic(_)));
+    }
+
+    #[test]
+    fn validate_will_rejects_unauthorized_group() {
+        // alice ∈ {alpha}, will targets `bravo` — must reject as
+        // NotAuthorized, NOT as InvalidTopic. A regression that
+        // collapsed both rejections into a single variant would
+        // surface the wrong CONNACK reason to the client.
+        let id = mk_will_identity("alice", &["alpha"]);
+        let payload = bytes::Bytes::from_static(b"x");
+        let result = validate_will(
+            "bravo",
+            &payload,
+            mqttbytes::QoS::AtMostOnce,
+            false,
+            &id,
+            None,
+        );
+        assert!(matches!(result, WillValidation::NotAuthorized(_)));
+    }
+
+    #[test]
+    fn validate_will_with_topic_prefix_strips_correctly() {
+        // Listener configured with prefix `rg/` — will topic
+        // `rg/alpha` must derive group `alpha` and pass auth.
+        let id = mk_will_identity("alice", &["alpha"]);
+        let payload = bytes::Bytes::from_static(b"x");
+        let result = validate_will(
+            "rg/alpha",
+            &payload,
+            mqttbytes::QoS::AtMostOnce,
+            false,
+            &id,
+            Some("rg/"),
+        );
+        match result {
+            WillValidation::Valid(will) => {
+                assert_eq!(will.topic, "rg/alpha");
+                assert_eq!(will.group, "alpha");
+            }
+            other => panic!("expected Valid, got {:?}", will_validation_kind(&other)),
+        }
+    }
+
+    #[test]
+    fn validate_will_with_topic_prefix_mismatch_is_invalid() {
+        // Will topic outside the listener prefix must reject as
+        // InvalidTopic — the prefix is part of the listener contract,
+        // not an authorization boundary.
+        let id = mk_will_identity("alice", &["alpha"]);
+        let payload = bytes::Bytes::from_static(b"x");
+        let result = validate_will(
+            "alpha",
+            &payload,
+            mqttbytes::QoS::AtMostOnce,
+            false,
+            &id,
+            Some("rg/"),
+        );
+        assert!(matches!(result, WillValidation::InvalidTopic(_)));
+    }
+
+    #[test]
+    fn validate_will_preserves_retain_flag() {
+        // The `retain` field on the validated `Will` must be the same
+        // bit the client supplied — defends against a regression that
+        // accidentally clears retain for "safety" and breaks the
+        // last-known-value pattern.
+        let id = mk_will_identity("alice", &["alpha"]);
+        let payload = bytes::Bytes::from_static(b"x");
+        let with_retain = validate_will(
+            "alpha",
+            &payload,
+            mqttbytes::QoS::AtMostOnce,
+            true,
+            &id,
+            None,
+        );
+        match with_retain {
+            WillValidation::Valid(will) => assert!(will.retain),
+            other => panic!("expected Valid, got {:?}", will_validation_kind(&other)),
+        }
+    }
+
+    /// Tiny `Debug`-ish helper because `WillValidation` does not derive
+    /// `Debug` (it would require `Will` and `Identity` to be Debug-only
+    /// types here, which they are by upstream type, but we keep the test
+    /// dependency surface minimal). Used only in `panic!` arms.
+    fn will_validation_kind(v: &WillValidation) -> &'static str {
+        match v {
+            WillValidation::Valid(_) => "Valid",
+            WillValidation::InvalidTopic(_) => "InvalidTopic",
+            WillValidation::NotAuthorized(_) => "NotAuthorized",
+        }
     }
 }

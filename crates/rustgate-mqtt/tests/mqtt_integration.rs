@@ -1634,3 +1634,269 @@ async fn retain_does_not_leak_across_group_boundaries() {
 
     server.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// Will messages (issue #880) — MQTT 5.0 §3.1.2.5–3.1.3 / 3.1.1 §3.1.2.5
+//
+// The broker publishes the configured will when a session ends
+// ungracefully (TLS error, abrupt drop, keep-alive timeout). A clean
+// DISCONNECT (v5 NormalDisconnection / v4 Disconnect) suppresses the
+// will. The will routes through the same authorization gate as a live
+// PUBLISH, so a will targeting an unauthorised group must reject the
+// CONNECT — the will cannot be used to bypass the per-group authz
+// boundary.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn will_published_on_ungraceful_disconnect() {
+    // Alice connects with a will targeting `alpha`, then drops the TCP
+    // connection abruptly. Bob (subscribed to `alpha`) must receive
+    // the will payload — this is the load-bearing semantic of the
+    // will flag.
+    let ca = TestCa::new("MQTT Test CA");
+    let alice_cert = ca.issue_client_cert("alice", &["alpha"]);
+    let bob_cert = ca.issue_client_cert("bob", &["alpha"]);
+    let router = Arc::new(Router::new());
+    let server = TestServer::new(&ca, Arc::clone(&router), None);
+
+    // Phase 1: Bob connects and subscribes to `alpha` so he can
+    // receive the will Alice will leave behind.
+    let bob_tls = build_client_tls_config(&bob_cert.cert_pem, &bob_cert.key_pem, &ca.cert_pem);
+    let mut bob = mqtt_connect(server.addr, &bob_tls).await;
+    let mut bob_buf = BytesMut::new();
+    let connect = mqttbytes::v5::Connect::new("bob-will-watch");
+    write_v5_packet(&mut bob, &mqttbytes::v5::Packet::Connect(connect)).await;
+    let _ = read_v5_packet(&mut bob, &mut bob_buf).await; // CONNACK
+
+    let sub = mqttbytes::v5::Subscribe::new("alpha", mqttbytes::QoS::AtMostOnce);
+    write_v5_packet(&mut bob, &mqttbytes::v5::Packet::Subscribe(sub)).await;
+    let _ = read_v5_packet(&mut bob, &mut bob_buf).await; // SUBACK
+
+    // Phase 2: Alice connects with a will, then drops her TCP stream
+    // without sending DISCONNECT — the broker must publish the will.
+    {
+        let alice_tls =
+            build_client_tls_config(&alice_cert.cert_pem, &alice_cert.key_pem, &ca.cert_pem);
+        let mut alice = mqtt_connect(server.addr, &alice_tls).await;
+        let mut alice_buf = BytesMut::new();
+        let mut connect = mqttbytes::v5::Connect::new("alice-will-pub");
+        connect.last_will = Some(mqttbytes::v5::LastWill::new(
+            "alpha",
+            b"alice-offline".to_vec(),
+            mqttbytes::QoS::AtMostOnce,
+            false,
+        ));
+        write_v5_packet(&mut alice, &mqttbytes::v5::Packet::Connect(connect)).await;
+        let connack = read_v5_packet(&mut alice, &mut alice_buf).await;
+        match connack {
+            mqttbytes::v5::Packet::ConnAck(c) => {
+                assert_eq!(c.code, mqttbytes::v5::ConnectReturnCode::Success);
+            }
+            other => panic!("expected ConnAck Success, got {other:?}"),
+        }
+
+        // Drop the TLS stream — that's an ungraceful close. The
+        // broker's read loop will observe a connection error and
+        // publish the will.
+        drop(alice);
+    }
+
+    // Bob should receive the will payload as a normal PUBLISH on the
+    // `alpha` topic.
+    let packet = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_v5_packet(&mut bob, &mut bob_buf),
+    )
+    .await
+    .expect("bob should receive will payload within 2s of alice's drop");
+    match packet {
+        mqttbytes::v5::Packet::Publish(p) => {
+            assert_eq!(p.topic, "alpha");
+            assert_eq!(p.payload.as_ref(), b"alice-offline");
+        }
+        other => panic!("expected Publish from will, got {other:?}"),
+    }
+
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn will_not_published_on_clean_disconnect() {
+    // Alice connects with a will, sends DISCONNECT cleanly, then
+    // closes. Bob (subscribed to `alpha`) must NOT receive the will —
+    // the spec mandates the broker discard the will on a graceful
+    // shutdown.
+    let ca = TestCa::new("MQTT Test CA");
+    let alice_cert = ca.issue_client_cert("alice", &["alpha"]);
+    let bob_cert = ca.issue_client_cert("bob", &["alpha"]);
+    let router = Arc::new(Router::new());
+    let server = TestServer::new(&ca, Arc::clone(&router), None);
+
+    let bob_tls = build_client_tls_config(&bob_cert.cert_pem, &bob_cert.key_pem, &ca.cert_pem);
+    let mut bob = mqtt_connect(server.addr, &bob_tls).await;
+    let mut bob_buf = BytesMut::new();
+    let connect = mqttbytes::v5::Connect::new("bob-clean-watch");
+    write_v5_packet(&mut bob, &mqttbytes::v5::Packet::Connect(connect)).await;
+    let _ = read_v5_packet(&mut bob, &mut bob_buf).await;
+    let sub = mqttbytes::v5::Subscribe::new("alpha", mqttbytes::QoS::AtMostOnce);
+    write_v5_packet(&mut bob, &mqttbytes::v5::Packet::Subscribe(sub)).await;
+    let _ = read_v5_packet(&mut bob, &mut bob_buf).await; // SUBACK
+
+    // Alice with will → clean DISCONNECT → close.
+    {
+        let alice_tls =
+            build_client_tls_config(&alice_cert.cert_pem, &alice_cert.key_pem, &ca.cert_pem);
+        let mut alice = mqtt_connect(server.addr, &alice_tls).await;
+        let mut alice_buf = BytesMut::new();
+        let mut connect = mqttbytes::v5::Connect::new("alice-clean-pub");
+        connect.last_will = Some(mqttbytes::v5::LastWill::new(
+            "alpha",
+            b"alice-should-not-fire".to_vec(),
+            mqttbytes::QoS::AtMostOnce,
+            false,
+        ));
+        write_v5_packet(&mut alice, &mqttbytes::v5::Packet::Connect(connect)).await;
+        let _ = read_v5_packet(&mut alice, &mut alice_buf).await; // CONNACK
+
+        let disc = mqttbytes::v5::Disconnect {
+            reason_code: mqttbytes::v5::DisconnectReasonCode::NormalDisconnection,
+            properties: None,
+        };
+        write_v5_packet(&mut alice, &mqttbytes::v5::Packet::Disconnect(disc)).await;
+        // Brief pause so the broker reads the DISCONNECT before we
+        // tear down the TCP connection — we want the broker to
+        // observe the clean disconnect, not a TCP error mid-transit.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Bob must NOT receive any message within the grace window.
+    let next = tokio::time::timeout(
+        Duration::from_millis(400),
+        read_v5_packet(&mut bob, &mut bob_buf),
+    )
+    .await;
+    assert!(
+        next.is_err(),
+        "clean DISCONNECT must suppress will publish; bob got {next:?}"
+    );
+
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn will_validation_rejects_unauthorized_topic() {
+    // Alice (member of `alpha` only) tries to CONNECT with a will
+    // targeting `bravo` — a group she is not a member of. The CONNECT
+    // must be rejected with `NotAuthorized` so the will cannot be
+    // used to bypass the per-group authz boundary.
+    let ca = TestCa::new("MQTT Test CA");
+    let alice_cert = ca.issue_client_cert("alice", &["alpha"]);
+    let router = Arc::new(Router::new());
+    let server = TestServer::new(&ca, router, None);
+
+    let alice_tls =
+        build_client_tls_config(&alice_cert.cert_pem, &alice_cert.key_pem, &ca.cert_pem);
+    let mut alice = mqtt_connect(server.addr, &alice_tls).await;
+    let mut alice_buf = BytesMut::new();
+
+    let mut connect = mqttbytes::v5::Connect::new("alice-bad-will");
+    // bravo is NOT in alice's certificate group set.
+    connect.last_will = Some(mqttbytes::v5::LastWill::new(
+        "bravo",
+        b"should-be-rejected".to_vec(),
+        mqttbytes::QoS::AtMostOnce,
+        false,
+    ));
+    write_v5_packet(&mut alice, &mqttbytes::v5::Packet::Connect(connect)).await;
+
+    let connack = read_v5_packet(&mut alice, &mut alice_buf).await;
+    match connack {
+        mqttbytes::v5::Packet::ConnAck(c) => {
+            assert_eq!(
+                c.code,
+                mqttbytes::v5::ConnectReturnCode::NotAuthorized,
+                "will targeting an unauthorised group must surface NotAuthorized in CONNACK"
+            );
+        }
+        other => panic!("expected ConnAck NotAuthorized, got {other:?}"),
+    }
+
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn will_with_retain_flag_persists_to_retain_store() {
+    // Alice connects with `will_retain=true`, then drops the TCP
+    // stream. Bob subscribes AFTER Alice is gone — he must receive
+    // the will payload via the retain replay path. This pins the
+    // wiring of the will → retain store so a regression that drops
+    // either half is caught.
+    let ca = TestCa::new("MQTT Test CA");
+    let alice_cert = ca.issue_client_cert("alice", &["alpha"]);
+    let bob_cert = ca.issue_client_cert("bob", &["alpha"]);
+    let router = Arc::new(Router::new());
+    let server = TestServer::new(&ca, Arc::clone(&router), None);
+
+    // Phase 1: Alice connects with retained will and drops abruptly.
+    {
+        let alice_tls =
+            build_client_tls_config(&alice_cert.cert_pem, &alice_cert.key_pem, &ca.cert_pem);
+        let mut alice = mqtt_connect(server.addr, &alice_tls).await;
+        let mut alice_buf = BytesMut::new();
+        let mut connect = mqttbytes::v5::Connect::new("alice-retained-will");
+        connect.last_will = Some(mqttbytes::v5::LastWill::new(
+            "alpha",
+            b"last-known-will".to_vec(),
+            mqttbytes::QoS::AtMostOnce,
+            true, // retain=true
+        ));
+        write_v5_packet(&mut alice, &mqttbytes::v5::Packet::Connect(connect)).await;
+        let _ = read_v5_packet(&mut alice, &mut alice_buf).await; // CONNACK
+
+        // Drop without DISCONNECT to trigger the will publish path.
+        drop(alice);
+        // Allow the broker time to detect the close, fire the will,
+        // and update the retain store before bob subscribes.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Phase 2: Bob subscribes — he must receive the retained will
+    // payload as a retained PUBLISH.
+    let bob_tls = build_client_tls_config(&bob_cert.cert_pem, &bob_cert.key_pem, &ca.cert_pem);
+    let mut bob = mqtt_connect(server.addr, &bob_tls).await;
+    let mut bob_buf = BytesMut::new();
+    let connect = mqttbytes::v5::Connect::new("bob-retain-will-sub");
+    write_v5_packet(&mut bob, &mqttbytes::v5::Packet::Connect(connect)).await;
+    let _ = read_v5_packet(&mut bob, &mut bob_buf).await; // CONNACK
+
+    let sub = mqttbytes::v5::Subscribe::new("alpha", mqttbytes::QoS::AtMostOnce);
+    write_v5_packet(&mut bob, &mqttbytes::v5::Packet::Subscribe(sub)).await;
+
+    // SUBACK first (matches Mosquitto/HiveMQ ordering).
+    let suback = read_v5_packet(&mut bob, &mut bob_buf).await;
+    assert!(
+        matches!(suback, mqttbytes::v5::Packet::SubAck(_)),
+        "expected SUBACK first, got {suback:?}"
+    );
+
+    // Retained will payload follows.
+    let retained = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_v5_packet(&mut bob, &mut bob_buf),
+    )
+    .await
+    .expect("retained will must replay to a late subscriber");
+    match retained {
+        mqttbytes::v5::Packet::Publish(p) => {
+            assert_eq!(p.topic, "alpha");
+            assert_eq!(p.payload.as_ref(), b"last-known-will");
+            assert!(
+                p.retain,
+                "retain flag must be set on the wire for a retained-will replay"
+            );
+        }
+        other => panic!("expected retained Publish from will, got {other:?}"),
+    }
+
+    server.shutdown();
+}
