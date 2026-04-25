@@ -17,6 +17,7 @@ static CONNECTIONS_INBOUND: OnceLock<IntGauge> = OnceLock::new();
 static CONNECTIONS_OUTBOUND: OnceLock<IntGauge> = OnceLock::new();
 
 static MESSAGES_IN: OnceLock<IntCounter> = OnceLock::new();
+static MESSAGES_IN_BY_RPC: OnceLock<IntCounterVec> = OnceLock::new();
 static MESSAGES_OUT: OnceLock<IntCounter> = OnceLock::new();
 
 static ERRORS: OnceLock<IntCounter> = OnceLock::new();
@@ -78,6 +79,16 @@ pub fn init() -> prometheus::Result<()> {
     ))?;
     registry.register(Box::new(messages_in.clone()))?;
     let _ = MESSAGES_IN.set(messages_in);
+
+    let messages_in_by_rpc = IntCounterVec::new(
+        Opts::new(
+            "rustgate_federation_messages_in_by_rpc_total",
+            "Total messages received from federation peers, broken out by V2 RPC method",
+        ),
+        &["rpc"],
+    )?;
+    registry.register(Box::new(messages_in_by_rpc.clone()))?;
+    let _ = MESSAGES_IN_BY_RPC.set(messages_in_by_rpc);
 
     let messages_out = IntCounter::with_opts(Opts::new(
         "rustgate_federation_messages_out_total",
@@ -259,6 +270,24 @@ pub fn connections_outbound() -> &'static IntGauge {
 pub fn messages_in() -> &'static IntCounter {
     MESSAGES_IN
         .get_or_init(|| fallback_counter("rustgate_federation_messages_in_total", "fallback"))
+}
+
+/// Total messages received from federation peers, broken out by V2 RPC
+/// method (counter vec, label: `rpc`).
+///
+/// Tracks accepted ingress per RPC handler so operators can attribute
+/// inbound load to a specific federation transport — e.g.
+/// `rpc="send_one_event"` for unary single-event delivery vs. the
+/// (future) streaming variants. Increments only after the handler has
+/// passed mTLS, hop-count, and group-allowlist checks.
+pub fn messages_in_by_rpc() -> &'static IntCounterVec {
+    MESSAGES_IN_BY_RPC.get_or_init(|| {
+        fallback_counter_vec(
+            "rustgate_federation_messages_in_by_rpc_total",
+            "fallback",
+            &["rpc"],
+        )
+    })
 }
 
 /// Total messages sent to federation peers (counter).
