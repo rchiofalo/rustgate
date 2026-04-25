@@ -223,13 +223,16 @@ async fn connect_and_connack() {
         mqttbytes::v5::Packet::ConnAck(connack) => {
             assert_eq!(connack.code, mqttbytes::v5::ConnectReturnCode::Success);
             // Refs #1158 + #880: every successful CONNACK MUST advertise
-            // the broker's Maximum Packet Size AND Receive Maximum so a
-            // compliant client can plan its publish strategy without
-            // falling back to the spec-default "no limit" assumption.
-            // A regression that dropped either property from the live
-            // CONNACK emission path would only show up at the
-            // server-to-stream boundary — pinning both end-to-end here
-            // catches it without requiring a manual integration test.
+            // the broker's Maximum Packet Size (§3.2.2.3.6), Receive
+            // Maximum (§3.2.2.3.3), and Session Expiry Interval
+            // (§3.2.2.3.2) so a compliant client can plan its publish
+            // strategy and session-resumption logic without falling
+            // back to the spec-default assumptions.
+            // A regression that dropped any of these properties from
+            // the live CONNACK emission path would only show up at the
+            // server-to-stream boundary — pinning all three end-to-end
+            // here catches it without requiring a manual integration
+            // test.
             let props = connack
                 .properties
                 .expect("v5 CONNACK MUST carry properties (mqttbytes 0.6 quirk + spec compliance)");
@@ -237,15 +240,80 @@ async fn connect_and_connack() {
                 props.max_packet_size.is_some(),
                 "broker MUST advertise Maximum Packet Size in CONNACK (§3.2.2.3.6)"
             );
-            assert!(
-                props.receive_max.is_some(),
-                "broker MUST advertise Receive Maximum in CONNACK (§3.2.2.3.3) so the \
-                 client knows how many QoS 1/2 publishes it can have in-flight"
-            );
             assert_eq!(
                 props.receive_max,
                 Some(MqttServerConfig::DEFAULT_RECEIVE_MAX),
                 "advertised Receive Maximum must match the server's configured value"
+            );
+            assert_eq!(
+                props.session_expiry_interval,
+                Some(0),
+                "broker MUST advertise Session Expiry Interval = 0 in CONNACK \
+                 (§3.2.2.3.2) so the client knows the broker doesn't retain \
+                 sessions — the alternative (omit the property) would let the \
+                 client assume the broker honors its CONNECT-time request"
+            );
+        }
+        other => panic!("expected ConnAck, got {other:?}"),
+    }
+
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn connect_with_session_expiry_request_is_clamped_in_connack() {
+    // Refs #880: a client that requests a non-zero Session Expiry
+    // Interval in CONNECT MUST see `0` echoed in the matching
+    // CONNACK — the broker advertises that it will not retain the
+    // session even though the client asked. Per §3.2.2.3.2: "If
+    // the Server returns a Session Expiry Interval in the CONNACK
+    // packet, the Client MUST use this value as the duration of
+    // the Session." The clamp is the spec-defined channel for the
+    // broker to override the client's request.
+    let ca = TestCa::new("MQTT Test CA");
+    let client_cert = ca.issue_client_cert("alice", &["alpha"]);
+    let router = Arc::new(Router::new());
+
+    let server = TestServer::new(&ca, router, None);
+
+    let client_tls =
+        build_client_tls_config(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem);
+    let mut stream = mqtt_connect(server.addr, &client_tls).await;
+    let mut buf = BytesMut::new();
+
+    // Build a CONNECT requesting one-hour session retention. mqttbytes
+    // 0.6's `ConnectProperties::_new()` is private, so construct the
+    // struct directly via its (public) fields. We only care about
+    // session_expiry_interval; everything else stays at the spec
+    // default of None.
+    let mut connect = mqttbytes::v5::Connect::new("session-expiry-client");
+    connect.properties = Some(mqttbytes::v5::ConnectProperties {
+        session_expiry_interval: Some(3600),
+        receive_maximum: None,
+        max_packet_size: None,
+        topic_alias_max: None,
+        request_response_info: None,
+        request_problem_info: None,
+        user_properties: Vec::new(),
+        authentication_method: None,
+        authentication_data: None,
+    });
+    write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Connect(connect)).await;
+
+    let packet = read_v5_packet(&mut stream, &mut buf).await;
+    match packet {
+        mqttbytes::v5::Packet::ConnAck(connack) => {
+            assert_eq!(connack.code, mqttbytes::v5::ConnectReturnCode::Success);
+            let props = connack.properties.expect(
+                "v5 CONNACK MUST carry properties when broker overrides any client request",
+            );
+            assert_eq!(
+                props.session_expiry_interval,
+                Some(0),
+                "broker MUST clamp the client's 3600s request to 0 in CONNACK \
+                 — a regression that echoed the client's value (or omitted the \
+                 property) would silently mislead the client into expecting \
+                 session retention that the broker doesn't actually provide"
             );
         }
         other => panic!("expected ConnAck, got {other:?}"),

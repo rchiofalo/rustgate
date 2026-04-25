@@ -185,6 +185,24 @@ impl PacketCodec {
         // has a concrete cap to self-limit against. Note `receive_max`
         // is a u16 on the wire so no saturation logic is needed.
         properties.receive_max = Some(self.receive_max);
+        // MQTT 5.0 §3.2.2.3.2: Session Expiry Interval. The broker MAY
+        // override the client's CONNECT-time request by advertising a
+        // different value here; the client MUST then treat the
+        // returned value as authoritative for the duration of this
+        // session. rustgate currently rejects clean_start=0 sessions
+        // outright (via `PersistentSessionUnsupported` upstream of
+        // this code), so the only honest signal to send is `0` —
+        // "session ends when the network connection is closed" per
+        // §4.1. Advertising explicitly (rather than omitting the
+        // property and letting the spec default of 0 apply) gives
+        // the client a positive confirmation that this broker does
+        // not retain sessions, useful when the client has its own
+        // session-resumption logic that depends on a non-zero
+        // server expiry. A future PR that adds session persistence
+        // will compute the value from the client's CONNECT property
+        // bounded by an operator-configured max — the field is here
+        // now so that change becomes a one-line diff.
+        properties.session_expiry_interval = Some(0);
         let connack = mqttbytes::v5::ConnAck {
             session_present: false,
             code,
@@ -1009,11 +1027,54 @@ mod tests {
     }
 
     #[test]
+    fn v5_connack_advertises_session_expiry_interval_zero() {
+        // Refs #880: MQTT 5.0 §3.2.2.3.2 — the broker MAY override
+        // the client's CONNECT-time Session Expiry Interval with a
+        // value in the matching CONNACK; the client MUST treat the
+        // returned value as authoritative for session duration.
+        // rustgate doesn't retain sessions across disconnect, so
+        // the only honest signal is `0` ("session ends when the
+        // network connection is closed" per §4.1).
+        //
+        // Pin the wire format: build CONNACK with session_expiry=0,
+        // parse it back, assert the value survives. A regression
+        // that dropped the property would let the client assume the
+        // broker honors the client-requested expiry — exactly the
+        // gap this PR closes.
+        let connack = mqttbytes::v5::ConnAck {
+            session_present: false,
+            code: mqttbytes::v5::ConnectReturnCode::Success,
+            properties: Some({
+                let mut p = mqttbytes::v5::ConnAckProperties::new();
+                p.session_expiry_interval = Some(0);
+                p
+            }),
+        };
+        let mut buf = BytesMut::with_capacity(32);
+        write_v5_to_buf(&mqttbytes::v5::Packet::ConnAck(connack), &mut buf).expect("serialize");
+
+        let decoded = mqttbytes::v5::read(&mut buf, 16 * 1024).expect("parse");
+        match decoded {
+            mqttbytes::v5::Packet::ConnAck(a) => {
+                let props = a.properties.expect("properties present");
+                assert_eq!(
+                    props.session_expiry_interval,
+                    Some(0),
+                    "broker must advertise Session Expiry Interval = 0 so a \
+                     compliant client knows it cannot rely on broker-side \
+                     session retention"
+                );
+            }
+            other => panic!("expected ConnAck, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn v5_connack_advertises_both_max_packet_size_and_receive_max() {
-        // The two CONNACK properties #1158 and this PR (#880 receive
-        // max) both ride on the same `write_connack_v5` call. Pin
-        // that BOTH properties survive serialization simultaneously
-        // — a regression that overwrote one with the other (e.g. by
+        // The two CONNACK properties #1158 and #1160 (receive max)
+        // both ride on the same `write_connack_v5` call. Pin that
+        // BOTH properties survive serialization simultaneously — a
+        // regression that overwrote one with the other (e.g. by
         // creating a fresh `ConnAckProperties::new()` mid-function
         // and copying only one field) would manifest only when both
         // properties were expected and the test would catch it.
