@@ -3465,7 +3465,6 @@ dependencies = [
  "rustgate-mqtt",
  "rustgate-nats",
  "rustgate-proto",
- "rustgate-stanag4586",
  "rustgate-test-utils",
  "rustgate-transport",
  "rustgate-websocket",
@@ -3498,7 +3497,6 @@ dependencies = [
  "bytes",
  "proptest",
  "thiserror 2.0.18",
- "tracing",
 ]
 
 [[package]]

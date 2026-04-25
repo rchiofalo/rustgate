@@ -102,6 +102,9 @@ crate = "rustgate-mavlink"
 [[licenses.exceptions]]
 allow = ["LicenseRef-Proprietary"]
 crate = "rustgate-resilience"
+[[licenses.exceptions]]
+allow = ["LicenseRef-Proprietary"]
+crate = "rustgate-stanag4586"
 
 [bans]
 multiple-versions = "warn"

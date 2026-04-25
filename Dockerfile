@@ -28,6 +28,7 @@ COPY crates/rustgate-resilience/Cargo.toml  crates/rustgate-resilience/Cargo.tom
 COPY crates/rustgate-transport/Cargo.toml   crates/rustgate-transport/Cargo.toml
 COPY crates/rustgate-websocket/Cargo.toml   crates/rustgate-websocket/Cargo.toml
 COPY crates/rustgate-server/Cargo.toml      crates/rustgate-server/Cargo.toml
+COPY crates/rustgate-stanag4586/Cargo.toml  crates/rustgate-stanag4586/Cargo.toml
 COPY crates/rustgate-test-utils/Cargo.toml  crates/rustgate-test-utils/Cargo.toml
 
 # Stub lib.rs / main.rs so cargo can resolve and fetch deps.
