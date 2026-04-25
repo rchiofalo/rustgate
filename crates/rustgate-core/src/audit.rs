@@ -905,6 +905,40 @@ pub fn mavlink_v1_rejected(peer: &str) {
     );
 }
 
+/// Record an MQTT will message published on behalf of a disconnecting
+/// client whose connection ended ungracefully (TLS error, keep-alive
+/// timeout, write-loop early exit, abrupt TCP close — anything that is
+/// NOT a clean DISCONNECT). Fires AFTER the `Will { topic, group }`
+/// payload has been routed via `Router::route_for_egress`, regardless
+/// of whether the router accepted or dropped the message — the audit
+/// records the broker's decision to fire the will, not the eventual
+/// delivery outcome.
+///
+/// Wired by `publish_will_message` in `rustgate_mqtt` so a SIEM can
+/// correlate ungraceful disconnects with the will-publish that
+/// followed them. The pairing matters operationally because a will
+/// publish can carry presence-loss semantics (a tactical client
+/// dropping off the network) that downstream subscribers act on; the
+/// SIEM trail records exactly when the broker took that action and on
+/// which group, regardless of who eventually saw the message.
+///
+/// `cn` is the disconnecting client's CN (hashed via `hash_cn` at the
+/// call site for PII safety). `topic` and `group` are sanitised at the
+/// call site via `sanitize_for_log` because they originate from the
+/// client's CONNECT packet and are not vetted as control characters
+/// despite the topic-validation pass.
+pub fn mqtt_will_published(cn: &str, topic: &str, group: &str, retain: bool) {
+    audit!(
+        "mqtt.will_published",
+        cn = %cn,
+        topic = %topic,
+        group = %group,
+        retain = retain,
+        action = "will_publish",
+        result = "fired"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -1207,6 +1241,19 @@ mod tests {
             mavlink_v1_rejected("192.168.1.42:14550");
             mavlink_v1_rejected("unknown");
             mavlink_v1_rejected("");
+        }
+
+        #[test]
+        fn test_mqtt_will_published() {
+            // Smoke-test every combination operators see in production:
+            // hashed CN (the typical caller wraps via `hash_cn`), a
+            // bare lowercase topic, an unprefixed group name, and both
+            // retain bit positions. Empty strings are sanitised at the
+            // call site but the audit macro itself must not panic on
+            // them either.
+            mqtt_will_published("hashed-cn-12345", "fleet/red/status", "fleet/red", true);
+            mqtt_will_published("hashed-cn-12345", "presence", "presence", false);
+            mqtt_will_published("", "", "", false);
         }
     }
 }

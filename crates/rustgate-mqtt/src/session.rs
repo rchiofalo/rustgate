@@ -448,6 +448,21 @@ async fn publish_will_message(
         "publishing MQTT will message"
     );
     let _ = router.route_for_egress(msg).await;
+
+    // Audit + metric emission AFTER the route call so the SIEM and
+    // dashboard tally only the wills the broker actually committed
+    // to firing. Both callers of this function gate it behind
+    // `publish_will == true` (the ungraceful-disconnect branch), so
+    // an event here always corresponds to a real presence-loss
+    // signal — no risk of double-counting on clean DISCONNECT or on
+    // a session that exited before will validation completed.
+    rustgate_core::audit::mqtt_will_published(
+        &hash_cn(&identity.cn),
+        &sanitize_for_log(&will.topic),
+        &sanitize_for_log(&will.group),
+        will.retain,
+    );
+    fire_will_published(session_hooks);
 }
 
 /// Outcome of `validate_will`: either an authorised will to be published on
@@ -727,6 +742,14 @@ fn fire_subscribe_reject(hooks: Option<&crate::config::MqttSessionHooks>) {
 fn fire_retain_stored(hooks: Option<&crate::config::MqttSessionHooks>) {
     if let Some(h) = hooks
         && let Some(cb) = &h.on_retain_stored
+    {
+        cb();
+    }
+}
+
+fn fire_will_published(hooks: Option<&crate::config::MqttSessionHooks>) {
+    if let Some(h) = hooks
+        && let Some(cb) = &h.on_will_published
     {
         cb();
     }
@@ -2059,6 +2082,7 @@ mod tests {
             on_retain_stored: None,
             on_retain_cleared: None,
             on_retain_replayed: None,
+            on_will_published: None,
         };
         (hooks, pub_c, pub_rej_c, sub_c, sub_rej_c)
     }
@@ -2168,6 +2192,7 @@ mod tests {
             on_retain_stored: Some(counter_cb(&stored)),
             on_retain_cleared: Some(counter_cb(&cleared)),
             on_retain_replayed: Some(counter_cb(&replayed)),
+            on_will_published: None,
         };
         (hooks, stored, cleared, replayed)
     }
