@@ -384,7 +384,7 @@ pub(crate) async fn handle_mqtt_session(
     // (the same path live PUBLISHes use) so we keep the ordering
     // identical for consistency.
     if publish_will && let Some(w) = will.as_ref() {
-        publish_will_message(&router, &identity, &retain_store, w).await;
+        publish_will_message(&router, &identity, &retain_store, session_hooks.as_ref(), w).await;
     }
 
     router.unregister(&cn, session_id).await;
@@ -406,6 +406,7 @@ async fn publish_will_message(
     router: &Router,
     identity: &Arc<Identity>,
     retain_store: &RetainStore,
+    session_hooks: Option<&crate::config::MqttSessionHooks>,
     will: &Will,
 ) {
     // The will fires at most once per session per spec — clone the
@@ -425,6 +426,7 @@ async fn publish_will_message(
             "MQTT will retain store updated"
         );
     }
+    fire_retain_outcome(session_hooks, outcome);
 
     let msg = RoutableMessage {
         source: Identity::clone(identity),
@@ -719,6 +721,43 @@ fn fire_subscribe_reject(hooks: Option<&crate::config::MqttSessionHooks>) {
         && let Some(cb) = &h.on_subscribe_reject
     {
         cb();
+    }
+}
+
+fn fire_retain_stored(hooks: Option<&crate::config::MqttSessionHooks>) {
+    if let Some(h) = hooks
+        && let Some(cb) = &h.on_retain_stored
+    {
+        cb();
+    }
+}
+
+fn fire_retain_cleared(hooks: Option<&crate::config::MqttSessionHooks>) {
+    if let Some(h) = hooks
+        && let Some(cb) = &h.on_retain_cleared
+    {
+        cb();
+    }
+}
+
+fn fire_retain_replayed(hooks: Option<&crate::config::MqttSessionHooks>) {
+    if let Some(h) = hooks
+        && let Some(cb) = &h.on_retain_replayed
+    {
+        cb();
+    }
+}
+
+/// Dispatch the appropriate retain-side metric hook based on the
+/// outcome returned by [`RetainStore::publish`]. Centralised so the
+/// three publish call sites (v5 PUBLISH, v4 PUBLISH, will-publish)
+/// share one branch matrix; a regression that wires the wrong
+/// outcome to the wrong counter would surface in only one place.
+fn fire_retain_outcome(hooks: Option<&crate::config::MqttSessionHooks>, outcome: RetainOutcome) {
+    match outcome {
+        RetainOutcome::Stored => fire_retain_stored(hooks),
+        RetainOutcome::Cleared => fire_retain_cleared(hooks),
+        RetainOutcome::Passthrough => {} // retain bit was 0 — nothing to count
     }
 }
 
@@ -1025,6 +1064,7 @@ async fn handle_publish_v5(
             "MQTT retain store updated"
         );
     }
+    fire_retain_outcome(session_hooks, outcome);
 
     let msg = RoutableMessage {
         source: Identity::clone(identity),
@@ -1133,6 +1173,7 @@ async fn handle_publish_v4(
             "MQTT retain store updated"
         );
     }
+    fire_retain_outcome(session_hooks, outcome);
 
     let msg = RoutableMessage {
         source: Identity::clone(identity),
@@ -1291,6 +1332,7 @@ async fn handle_subscribe_v5(
             serialize_v5(&mqttbytes::v5::Packet::Publish(publish))?,
         )
         .await?;
+        fire_retain_replayed(session_hooks);
     }
 
     Ok(())
@@ -1375,6 +1417,7 @@ async fn handle_subscribe_v4(
             serialize_v4(&mqttbytes::v4::Packet::Publish(publish))?,
         )
         .await?;
+        fire_retain_replayed(session_hooks);
     }
 
     Ok(())
@@ -2013,6 +2056,9 @@ mod tests {
             on_publish_reject: Some(counter_cb(&pub_rej_c)),
             on_subscribe: Some(counter_cb(&sub_c)),
             on_subscribe_reject: Some(counter_cb(&sub_rej_c)),
+            on_retain_stored: None,
+            on_retain_cleared: None,
+            on_retain_replayed: None,
         };
         (hooks, pub_c, pub_rej_c, sub_c, sub_rej_c)
     }
@@ -2098,6 +2144,90 @@ mod tests {
             sub_rej_c.load(Ordering::SeqCst),
             1,
             "subscribe reject must fire"
+        );
+    }
+
+    /// Build a hooks bundle wired only on the three retain callbacks so
+    /// the retain-side helpers can be tested in isolation from the
+    /// publish/subscribe callbacks. Returns counters in order:
+    /// (stored, cleared, replayed).
+    fn retain_hooks_with_counters() -> (
+        crate::config::MqttSessionHooks,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    ) {
+        let stored = Arc::new(AtomicUsize::new(0));
+        let cleared = Arc::new(AtomicUsize::new(0));
+        let replayed = Arc::new(AtomicUsize::new(0));
+        let hooks = crate::config::MqttSessionHooks {
+            on_publish: None,
+            on_publish_reject: None,
+            on_subscribe: None,
+            on_subscribe_reject: None,
+            on_retain_stored: Some(counter_cb(&stored)),
+            on_retain_cleared: Some(counter_cb(&cleared)),
+            on_retain_replayed: Some(counter_cb(&replayed)),
+        };
+        (hooks, stored, cleared, replayed)
+    }
+
+    #[test]
+    fn fire_retain_outcome_dispatches_stored_only_on_stored() {
+        let (hooks, stored, cleared, replayed) = retain_hooks_with_counters();
+        fire_retain_outcome(Some(&hooks), RetainOutcome::Stored);
+        assert_eq!(stored.load(Ordering::SeqCst), 1);
+        assert_eq!(cleared.load(Ordering::SeqCst), 0);
+        assert_eq!(replayed.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn fire_retain_outcome_dispatches_cleared_only_on_cleared() {
+        let (hooks, stored, cleared, replayed) = retain_hooks_with_counters();
+        fire_retain_outcome(Some(&hooks), RetainOutcome::Cleared);
+        assert_eq!(stored.load(Ordering::SeqCst), 0);
+        assert_eq!(cleared.load(Ordering::SeqCst), 1);
+        assert_eq!(replayed.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn fire_retain_outcome_is_noop_on_passthrough() {
+        // Passthrough means retain bit was 0 — no store mutation, no
+        // counter increment. A regression that fired stored/cleared
+        // on every PUBLISH would inflate the counters by 100x in
+        // typical traffic where most messages are not retained.
+        let (hooks, stored, cleared, replayed) = retain_hooks_with_counters();
+        fire_retain_outcome(Some(&hooks), RetainOutcome::Passthrough);
+        assert_eq!(stored.load(Ordering::SeqCst), 0);
+        assert_eq!(cleared.load(Ordering::SeqCst), 0);
+        assert_eq!(replayed.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn fire_retain_replayed_fires_only_its_own_callback() {
+        let (hooks, stored, cleared, replayed) = retain_hooks_with_counters();
+        fire_retain_replayed(Some(&hooks));
+        assert_eq!(stored.load(Ordering::SeqCst), 0);
+        assert_eq!(cleared.load(Ordering::SeqCst), 0);
+        assert_eq!(replayed.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn fire_retain_helpers_nop_when_individual_callback_is_none() {
+        // Operator may opt into the hook bundle but wire only the
+        // store/clear hooks and not replay. The replay helper must
+        // tolerate the partial population without spilling onto
+        // store or clear counters.
+        let (hooks, stored, cleared, replayed) = retain_hooks_with_counters();
+        let mut partial = hooks.clone();
+        partial.on_retain_replayed = None;
+        fire_retain_replayed(Some(&partial));
+        assert_eq!(stored.load(Ordering::SeqCst), 0);
+        assert_eq!(cleared.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            replayed.load(Ordering::SeqCst),
+            0,
+            "replay helper must no-op when its own field is None"
         );
     }
 

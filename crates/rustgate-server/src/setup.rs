@@ -1586,6 +1586,11 @@ pub(crate) fn start_mqtt<P: NatsPublish + Send + Sync + 'static>(
             on_subscribe_reject: Some(std::sync::Arc::new(|| {
                 metrics::mqtt_subscribes_rejected().inc()
             })),
+            on_retain_stored: Some(std::sync::Arc::new(|| metrics::mqtt_retain_stored().inc())),
+            on_retain_cleared: Some(std::sync::Arc::new(|| metrics::mqtt_retain_cleared().inc())),
+            on_retain_replayed: Some(std::sync::Arc::new(|| {
+                metrics::mqtt_retain_replayed().inc()
+            })),
         });
     #[cfg(not(feature = "metrics"))]
     let session_hooks: Option<rustgate_mqtt::MqttSessionHooks> = None;
