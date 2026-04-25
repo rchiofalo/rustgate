@@ -30,6 +30,12 @@ use crate::provenance;
 // TODO: make configurable via FederationService builder (currently hardcoded)
 pub const MAX_FEDERATION_HOPS: i64 = 8;
 
+/// Canonical `rpc` label used for `SendOneEvent` audit and metric records.
+///
+/// Co-located with the handler so the value can be referenced from
+/// tests without re-deriving the string.
+pub(crate) const RPC_SEND_ONE_EVENT: &str = "send_one_event";
+
 /// Default maximum number of groups a single federation peer can advertise.
 ///
 /// Re-exported from [`crate::config`] for backward compatibility.
@@ -444,15 +450,56 @@ impl FederatedChannel for FederationService {
         &self,
         request: Request<figpb::FederatedEvent>,
     ) -> Result<Response<figpb::Empty>, Status> {
+        // mTLS extraction failure already emits federation_peer_rejected
+        // and returns Unauthenticated — no extra audit here.
         let peer_id = Self::peer_id_from_request(&request)?;
         let event = request.into_inner();
 
         if !Self::validate_hop_count(&event, &peer_id) {
+            // Hop-count rejection is observable at the audit layer so the
+            // forensic trail records the policy decision even though the
+            // RPC contract returns Empty (the V2 protocol cannot signal
+            // hop-limit drops to the sender — it only retries on a
+            // transport error, which we do not want here).
+            rustgate_core::audit::federation_event_rejected(
+                RPC_SEND_ONE_EVENT,
+                &peer_id,
+                "hop_limit",
+            );
             return Ok(Response::new(figpb::Empty {}));
         }
 
         debug!(peer = %peer_id, "received single event");
-        self.validate_event_groups(&peer_id, &event)?;
+        if let Err(status) = self.validate_event_groups(&peer_id, &event) {
+            // Distinguish "peer not in allowlist at all" from
+            // "peer claimed an unauthorized group" — the same audit
+            // event covers both, but the reason token differs so
+            // downstream alerting can split them.
+            let reason = if self
+                .allowed_peer_groups
+                .as_ref()
+                .is_some_and(|allowed| !allowed.contains_key(&peer_id))
+            {
+                "peer_not_in_allowlist"
+            } else {
+                "unauthorized_group"
+            };
+            rustgate_core::audit::federation_event_rejected(RPC_SEND_ONE_EVENT, &peer_id, reason);
+            return Err(status);
+        }
+
+        // Success path: increment counters and emit the audit record
+        // before invoking the callback so the forensic trail captures
+        // ingress even if downstream routing panics or drops the event.
+        #[cfg(feature = "api")]
+        {
+            crate::metrics::messages_in().inc();
+            crate::metrics::messages_in_by_rpc()
+                .with_label_values(&[RPC_SEND_ONE_EVENT])
+                .inc();
+        }
+        rustgate_core::audit::federation_event_received(RPC_SEND_ONE_EVENT, &peer_id);
+
         (self.on_event)(event, peer_id);
         Ok(Response::new(figpb::Empty {}))
     }
@@ -1608,5 +1655,215 @@ mod tests {
                 "attacker-controlled record began a new log line: {line}"
             );
         }
+    }
+
+    // ── SendOneEvent V2 RPC coverage (issue #864) ─────────────────────
+    //
+    // Four tests below cover the contract required by the SendOneEvent
+    // RPC implementation: success routing into the on_event callback
+    // (which production wires through `Router::dispatch_inbound` via
+    // `manager::create_v2_event_handler`), audit emission on a
+    // post-auth policy rejection, the metrics counter increment under
+    // the `api` feature, and the unauthenticated rejection from the
+    // mTLS peer-id extraction path.
+
+    /// Capture a tracing subscriber's audit-target output to a shared
+    /// byte buffer. Used by the audit-emission test below.
+    #[derive(Clone, Default)]
+    struct AuditBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl AuditBuf {
+        fn snapshot_string(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap().clone()).to_string()
+        }
+    }
+
+    impl std::io::Write for AuditBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for AuditBuf {
+        type Writer = AuditBuf;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// SendOneEvent must dispatch the inbound event to the registered
+    /// `on_event` callback when mTLS, hop-count, and group checks all
+    /// pass. The callback is the bridge to `Router::dispatch_inbound`
+    /// in production (`manager::create_v2_event_handler`), so this
+    /// test guarantees every accepted event reaches the routing layer.
+    #[tokio::test]
+    async fn send_one_event_routes_to_router_on_success() {
+        let (on_event, count) = counting_on_event();
+        let svc = FederationService::new("s".into(), vec!["Alpha".into()], on_event);
+
+        let event = figpb::FederatedEvent {
+            event: Some(figpb::GeoEvent {
+                uid: "router-route".into(),
+                r#type: "a-f-G-U-C".into(),
+                lat: 38.8977,
+                lon: -77.0365,
+                ..Default::default()
+            }),
+            federate_groups: vec!["Alpha".into()],
+            ..Default::default()
+        };
+
+        let resp = svc
+            .send_one_event(request_with_peer_cn(event, "peer-cn"))
+            .await
+            .expect("send_one_event must succeed for an authorized event");
+        let _ = resp.into_inner();
+
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "router callback must be invoked exactly once for an accepted event"
+        );
+    }
+
+    /// A peer claiming a group it is not authorized for must be rejected
+    /// with PermissionDenied AND must produce an audit-target
+    /// `federation.event_rejected` record. This guards the post-auth
+    /// policy gate: mTLS-extracted CN passes, but the event payload
+    /// fails the allowlist — exactly the path operators want to alert
+    /// on for misconfiguration / Byzantine-peer detection.
+    #[tokio::test]
+    async fn send_one_event_emits_audit_on_failure() {
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::filter::Targets;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let buf = AuditBuf::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(buf.clone())
+            .with_filter(Targets::new().with_target("audit", tracing::Level::INFO));
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        let mut allowed = HashMap::new();
+        allowed.insert("peer-cn".to_string(), HashSet::from(["Alpha".to_string()]));
+        let (on_event, count) = counting_on_event();
+        let svc =
+            FederationService::new("s".into(), vec![], on_event).with_allowed_peer_groups(allowed);
+
+        // Claim "Bravo" — peer is only authorized for "Alpha".
+        let event = figpb::FederatedEvent {
+            federate_groups: vec!["Bravo".into()],
+            ..Default::default()
+        };
+
+        let result = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            svc.send_one_event(request_with_peer_cn(event, "peer-cn"))
+                .await
+        };
+
+        let err = result.expect_err("unauthorized-group event must be rejected");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "router callback must not fire for a rejected event"
+        );
+
+        let captured = buf.snapshot_string();
+        assert!(
+            captured.contains("federation.event_rejected"),
+            "audit log must contain federation.event_rejected; got: {captured}"
+        );
+        assert!(
+            captured.contains("send_one_event"),
+            "audit record must include the rpc=send_one_event label; got: {captured}"
+        );
+        assert!(
+            captured.contains("unauthorized_group"),
+            "audit record must include reason=unauthorized_group; got: {captured}"
+        );
+    }
+
+    /// Successful SendOneEvent calls must increment both
+    /// `messages_in` (legacy unlabelled) and
+    /// `messages_in_by_rpc{rpc="send_one_event"}` (per-RPC). The
+    /// counter wiring is gated on the `api` feature because the
+    /// metrics module itself is only compiled when `api` is enabled.
+    #[cfg(feature = "api")]
+    #[tokio::test]
+    async fn send_one_event_increments_metrics_counter() {
+        // The metrics registry is global, so seed it once and read the
+        // delta — parallel tests may also be incrementing.
+        let _ = crate::metrics::init();
+
+        let svc = FederationService::new("s".into(), vec![], noop_on_event());
+
+        let total_before = crate::metrics::messages_in().get();
+        let by_rpc_before = crate::metrics::messages_in_by_rpc()
+            .with_label_values(&[RPC_SEND_ONE_EVENT])
+            .get();
+
+        let event = figpb::FederatedEvent {
+            event: Some(figpb::GeoEvent {
+                uid: "metric-tick".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let _ = svc
+            .send_one_event(request_with_peer_cn(event, "peer-cn"))
+            .await
+            .expect("send_one_event must succeed");
+
+        let total_after = crate::metrics::messages_in().get();
+        let by_rpc_after = crate::metrics::messages_in_by_rpc()
+            .with_label_values(&[RPC_SEND_ONE_EVENT])
+            .get();
+
+        // Parallel tests share the global registry, so we bound the
+        // delta with `>=` rather than `==` — what we actually want to
+        // guarantee is that *this* RPC contributed at least once.
+        assert!(
+            total_after > total_before,
+            "messages_in counter must advance on accepted SendOneEvent"
+        );
+        assert!(
+            by_rpc_after > by_rpc_before,
+            "messages_in_by_rpc[rpc=send_one_event] must advance: before={by_rpc_before}, after={by_rpc_after}"
+        );
+    }
+
+    /// SendOneEvent must reject any request whose `tonic::Request`
+    /// carries no mTLS client certificate (and no test-only synthetic
+    /// CN). This is the F-44 / #759 invariant — the previous
+    /// IP-fallback behaviour silently accepted RPCs without a verified
+    /// peer identity. The handler must short-circuit with
+    /// `Unauthenticated` *before* any group or hop-count evaluation.
+    #[tokio::test]
+    async fn send_one_event_rejects_unauthenticated() {
+        let (on_event, count) = counting_on_event();
+        let svc = FederationService::new("s".into(), vec![], on_event);
+
+        let event = figpb::FederatedEvent {
+            federate_groups: vec!["Alpha".into()],
+            ..Default::default()
+        };
+        // Plain Request — no test-only TestPeerCn extension, so the
+        // production peer_id_from_request path runs and finds no cert.
+        let result = svc.send_one_event(Request::new(event)).await;
+
+        let err = result.expect_err("RPC without mTLS cert must be refused");
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "router callback must not fire on unauthenticated request"
+        );
     }
 }

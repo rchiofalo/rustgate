@@ -189,6 +189,53 @@ pub fn federation_group_claim_rejected(peer_cn: &str, origin_cn: &str, claimed_g
     );
 }
 
+/// Record receipt of a federated event delivered via a unary RPC.
+///
+/// Emitted by V2 federation RPC handlers (e.g. `SendOneEvent`) after an
+/// inbound event has cleared mTLS peer-id extraction, hop-count
+/// validation, and group-allowlist enforcement, and the event has been
+/// dispatched to the local routing pipeline. The forensic trail lets
+/// operators correlate ingress per peer with egress dispatch decisions
+/// downstream.
+///
+/// `rpc` is the canonical RPC name (e.g. `"send_one_event"`); `peer_cn`
+/// is the mTLS-authenticated peer CN. Field cardinality matches the
+/// `rpc` label on the `rustgate_federation_messages_in_by_rpc_total`
+/// counter so log/metric joins line up cleanly.
+pub fn federation_event_received(rpc: &str, peer_cn: &str) {
+    audit!(
+        "federation.event_received",
+        rpc = %rpc,
+        peer_cn = %peer_cn,
+        action = "receive",
+        result = "success"
+    );
+}
+
+/// Record rejection of a federated event during unary RPC handling.
+///
+/// Emitted when a V2 federation RPC handler rejects an inbound event for
+/// reasons that originate from the event payload itself rather than the
+/// mTLS handshake — hop-count exceeded, hop-count negative, or the
+/// peer's claimed groups not appearing in the configured allowlist.
+/// Mismatches at the mTLS layer are captured by
+/// [`federation_peer_rejected`]; this event covers the post-auth
+/// pre-dispatch policy gate.
+///
+/// `rpc` is the canonical RPC name; `peer_cn` is the mTLS-authenticated
+/// peer CN; `reason` is a short stable token (`"hop_limit"`,
+/// `"unauthorized_group"`, `"peer_not_in_allowlist"`).
+pub fn federation_event_rejected(rpc: &str, peer_cn: &str, reason: &str) {
+    audit!(
+        "federation.event_rejected",
+        rpc = %rpc,
+        peer_cn = %peer_cn,
+        reason = %reason,
+        action = "receive",
+        result = "rejected"
+    );
+}
+
 /// Record an enrollment CSR signing event.
 pub fn enrollment_signed(username: &str, client_uid: &str) {
     audit!(
