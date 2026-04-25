@@ -914,7 +914,7 @@ pub fn mavlink_v1_rejected(peer: &str) {
 /// records the broker's decision to fire the will, not the eventual
 /// delivery outcome.
 ///
-/// Wired by [`publish_will_message`](rustgate_mqtt) so a SIEM can
+/// Wired by `publish_will_message` in `rustgate_mqtt` so a SIEM can
 /// correlate ungraceful disconnects with the will-publish that
 /// followed them. The pairing matters operationally because a will
 /// publish can carry presence-loss semantics (a tactical client
