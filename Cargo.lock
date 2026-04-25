@@ -3160,7 +3160,6 @@ name = "rustgate-asterix"
 version = "0.8.0"
 dependencies = [
  "thiserror 2.0.18",
- "tracing",
 ]
 
 [[package]]
@@ -3536,7 +3535,6 @@ dependencies = [
  "proptest",
  "redb",
  "ring",
- "rustgate-asterix",
  "rustgate-authz",
  "rustgate-core",
  "rustgate-cot",

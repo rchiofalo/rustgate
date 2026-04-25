@@ -49,7 +49,7 @@
 //!   not synthesise it. A receive-only codec halves the surface area and
 //!   removes the entire "what time/precision/bit-mask did the upstream
 //!   sender use?" class of interop bugs.
-//! - **Mapping to [`rustgate_core::message::RoutableMessage`] / Entity.**
+//! - **Mapping to `rustgate_core::message::RoutableMessage` / Entity.**
 //!   That belongs in the integration layer (issue #847) so this crate
 //!   stays free of routing concepts. A consumer wires `Cat062Track →
 //!   RoutableMessage` based on its own deployment (group derivation,

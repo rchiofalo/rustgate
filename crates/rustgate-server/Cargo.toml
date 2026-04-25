@@ -47,9 +47,6 @@ spiffe = ["rustgate-transport/spiffe"]
 # Enables the optional Cedar authz policy backend and `--authz-policy-format cedar`.
 cedar = ["rustgate-authz/cedar"]
 http = ["dep:rustgate-http"]
-# ASTERIX (Eurocontrol surveillance) binary codec — currently decode-only
-# CAT-062 system tracks. UDP listener wiring lives in a follow-up PR.
-asterix = ["rustgate-transport/asterix"]
 
 [dependencies]
 arc-swap = { workspace = true }
