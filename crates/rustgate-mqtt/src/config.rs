@@ -110,6 +110,21 @@ pub type OnMqttRetainCleared = Arc<dyn Fn() + Send + Sync>;
 /// patterns (e.g. a wildcard subscribe expanding to thousands of
 /// retained topics) ahead of throughput-related operational issues.
 pub type OnMqttRetainReplayed = Arc<dyn Fn() + Send + Sync>;
+/// Callback invoked exactly once per will message published on a
+/// client's behalf when the connection ended ungracefully (TLS error,
+/// keep-alive timeout, write-loop early exit, abrupt TCP close — any
+/// path that is NOT a clean DISCONNECT). Fires AFTER the will payload
+/// has been routed via `Router::route_for_egress`, regardless of
+/// whether the router accepted or dropped the message — the callback
+/// records the broker's decision to fire the will, not the eventual
+/// delivery outcome.
+///
+/// Wired by the server crate to feed the
+/// `rustgate_mqtt_will_published_total` Prometheus counter. A spike on
+/// this counter typically correlates with a partition or a fleet of
+/// clients hitting their keep-alive timeout — the operational signal
+/// is "presence-loss is happening at scale, look at the network".
+pub type OnMqttWillPublished = Arc<dyn Fn() + Send + Sync>;
 
 /// Bundle of session-level observer callbacks (publish accept/reject,
 /// subscribe accept/reject) passed through to every spawned MQTT
@@ -149,6 +164,9 @@ pub struct MqttSessionHooks {
     /// Fires per retained PUBLISH delivered to a fresh subscriber. See
     /// [`OnMqttRetainReplayed`].
     pub on_retain_replayed: Option<OnMqttRetainReplayed>,
+    /// Fires once per will message published on ungraceful disconnect.
+    /// See [`OnMqttWillPublished`].
+    pub on_will_published: Option<OnMqttWillPublished>,
 }
 
 impl std::fmt::Debug for MqttSessionHooks {
@@ -164,6 +182,7 @@ impl std::fmt::Debug for MqttSessionHooks {
             .field("on_retain_stored", &fmt_cb(&self.on_retain_stored))
             .field("on_retain_cleared", &fmt_cb(&self.on_retain_cleared))
             .field("on_retain_replayed", &fmt_cb(&self.on_retain_replayed))
+            .field("on_will_published", &fmt_cb(&self.on_will_published))
             .finish()
     }
 }
@@ -593,6 +612,7 @@ mod tests {
             on_retain_stored: Some(Arc::new(|| {})),
             on_retain_cleared: Some(Arc::new(|| {})),
             on_retain_replayed: Some(Arc::new(|| {})),
+            on_will_published: Some(Arc::new(|| {})),
         };
         let rendered = format!("{hooks:?}");
         assert!(rendered.contains("on_publish: \"Some(<cb>)\""));
@@ -602,6 +622,7 @@ mod tests {
         assert!(rendered.contains("on_retain_stored: \"Some(<cb>)\""));
         assert!(rendered.contains("on_retain_cleared: \"Some(<cb>)\""));
         assert!(rendered.contains("on_retain_replayed: \"Some(<cb>)\""));
+        assert!(rendered.contains("on_will_published: \"Some(<cb>)\""));
     }
 
     #[test]

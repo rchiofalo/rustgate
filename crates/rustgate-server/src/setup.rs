@@ -1591,6 +1591,7 @@ pub(crate) fn start_mqtt<P: NatsPublish + Send + Sync + 'static>(
             on_retain_replayed: Some(std::sync::Arc::new(|| {
                 metrics::mqtt_retain_replayed().inc()
             })),
+            on_will_published: Some(std::sync::Arc::new(|| metrics::mqtt_will_published().inc())),
         });
     #[cfg(not(feature = "metrics"))]
     let session_hooks: Option<rustgate_mqtt::MqttSessionHooks> = None;

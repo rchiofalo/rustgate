@@ -45,7 +45,7 @@ pub const TRANSPORT_LABEL: &str = "mqtt";
 pub use config::{
     MqttForwardingHooks, MqttServerConfig, MqttSessionHooks, OnMqttAccept, OnMqttPublish,
     OnMqttPublishReject, OnMqttReject, OnMqttRetainCleared, OnMqttRetainReplayed,
-    OnMqttRetainStored, OnMqttSubscribe, OnMqttSubscribeReject,
+    OnMqttRetainStored, OnMqttSubscribe, OnMqttSubscribeReject, OnMqttWillPublished,
 };
 pub use error::MqttError;
 pub use listener::MqttListener;

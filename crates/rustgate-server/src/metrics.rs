@@ -152,6 +152,7 @@ static MQTT_RETAIN_STORED: OnceLock<IntCounter> = OnceLock::new();
 static MQTT_RETAIN_CLEARED: OnceLock<IntCounter> = OnceLock::new();
 #[cfg(feature = "mqtt")]
 static MQTT_RETAIN_REPLAYED: OnceLock<IntCounter> = OnceLock::new();
+static MQTT_WILL_PUBLISHED: OnceLock<IntCounter> = OnceLock::new();
 
 #[cfg(feature = "nats")]
 static NATS_CONSUMER_PENDING: OnceLock<IntGauge> = OnceLock::new();
@@ -665,6 +666,22 @@ pub fn init() -> prometheus::Result<()> {
         ))?;
         registry.register(Box::new(mqtt_retain_replayed.clone()))?;
         let _ = MQTT_RETAIN_REPLAYED.set(mqtt_retain_replayed);
+        let mqtt_will_published = IntCounter::with_opts(Opts::new(
+            "rustgate_mqtt_will_published_total",
+            "MQTT will messages published on a client's behalf when the \
+             connection ended ungracefully (TLS error, keep-alive timeout, \
+             write-loop early exit, abrupt TCP close — anything that is NOT \
+             a clean DISCONNECT). Fires AFTER the will payload has been \
+             routed via `Router::route_for_egress` and only on the \
+             ungraceful path; clean DISCONNECT (MQTT 3.1.1 §3.14 / 5.0 \
+             §3.14.4 NormalDisconnection) suppresses the will and does not \
+             increment this counter. A spike correlates with a partition \
+             or a fleet of clients hitting their keep-alive timeout — the \
+             operational signal is 'presence-loss is happening at scale, \
+             look at the network'.",
+        ))?;
+        registry.register(Box::new(mqtt_will_published.clone()))?;
+        let _ = MQTT_WILL_PUBLISHED.set(mqtt_will_published);
     }
 
     #[cfg(feature = "nats")]
@@ -1410,6 +1427,15 @@ pub fn mqtt_retain_cleared() -> &'static IntCounter {
 pub fn mqtt_retain_replayed() -> &'static IntCounter {
     MQTT_RETAIN_REPLAYED
         .get_or_init(|| fallback_counter("rustgate_mqtt_retain_replayed_total", "fallback"))
+}
+
+/// Counter incremented once per MQTT will message published on a
+/// client's behalf when the connection ended ungracefully. Wired from
+/// `rustgate_mqtt::MqttSessionHooks::on_will_published`.
+#[cfg(feature = "mqtt")]
+pub fn mqtt_will_published() -> &'static IntCounter {
+    MQTT_WILL_PUBLISHED
+        .get_or_init(|| fallback_counter("rustgate_mqtt_will_published_total", "fallback"))
 }
 
 /// Returns the JetStream consumer `num_pending` gauge if registered.
@@ -3139,6 +3165,7 @@ mod tests {
                 on_retain_stored: Some(std::sync::Arc::new(|| mqtt_retain_stored().inc())),
                 on_retain_cleared: Some(std::sync::Arc::new(|| mqtt_retain_cleared().inc())),
                 on_retain_replayed: Some(std::sync::Arc::new(|| mqtt_retain_replayed().inc())),
+                on_will_published: Some(std::sync::Arc::new(|| mqtt_will_published().inc())),
             };
             let pub_before = mqtt_publishes().get();
             let pub_rej_before = mqtt_publishes_rejected().get();
@@ -3147,6 +3174,7 @@ mod tests {
             let retain_stored_before = mqtt_retain_stored().get();
             let retain_cleared_before = mqtt_retain_cleared().get();
             let retain_replayed_before = mqtt_retain_replayed().get();
+            let will_pub_before = mqtt_will_published().get();
             if let Some(cb) = &hooks.on_publish {
                 cb();
             }
@@ -3168,8 +3196,12 @@ mod tests {
             if let Some(cb) = &hooks.on_retain_replayed {
                 cb();
             }
+            if let Some(cb) = &hooks.on_will_published {
+                cb();
+            }
             assert!(mqtt_publishes().get() > pub_before);
             assert!(mqtt_publishes_rejected().get() > pub_rej_before);
+            assert!(mqtt_will_published().get() > will_pub_before);
             assert!(mqtt_subscribes().get() > sub_before);
             assert!(mqtt_subscribes_rejected().get() > sub_rej_before);
             assert!(mqtt_retain_stored().get() > retain_stored_before);
