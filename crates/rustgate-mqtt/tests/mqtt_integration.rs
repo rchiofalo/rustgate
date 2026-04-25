@@ -168,6 +168,12 @@ async fn write_v5_packet(
         mqttbytes::v5::Packet::Disconnect(p) => {
             p.write(&mut buf).unwrap();
         }
+        // Refs #880 QoS 2: clients send PUBREL as Stage 3 of the
+        // four-step. Without this arm the test harness silently
+        // panics, masking what the wire format actually looked like.
+        mqttbytes::v5::Packet::PubRel(p) => {
+            p.write(&mut buf).unwrap();
+        }
         _ => panic!("unsupported packet type for write"),
     }
     stream.write_all(&buf).await.expect("write packet");
@@ -436,6 +442,412 @@ async fn publish_qos1_gets_puback() {
         }
         other => panic!("expected PubAck, got {other:?}"),
     }
+
+    server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// QoS 2 four-step (refs #880)
+//
+// MQTT 5.0 §4.3.3 / 3.1.1 §4.3.3 define the QoS 2 protocol as:
+//
+//   Client → Server: PUBLISH(qos=2, pkid=N)
+//   Server → Client: PUBREC(pkid=N, success)
+//   Client → Server: PUBREL(pkid=N)
+//   Server → Client: PUBCOMP(pkid=N, success)
+//
+// rustgate uses Method B per §4.4: deliver to subscribers ON PUBREL,
+// not on PUBREC. The integration tests below pin every spec-mandated
+// step + the deferred-delivery contract (subscriber sees nothing
+// between PUBLISH and PUBREL, sees the message exactly once after
+// PUBREL).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn publish_qos2_v5_completes_four_step_handshake() {
+    let ca = TestCa::new("MQTT Test CA");
+    let client_cert = ca.issue_client_cert("alice", &["alpha"]);
+    let router = Arc::new(Router::new());
+
+    let server = TestServer::new(&ca, router, None);
+    let client_tls =
+        build_client_tls_config(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem);
+    let mut stream = mqtt_connect(server.addr, &client_tls).await;
+    let mut buf = BytesMut::new();
+
+    let connect = mqttbytes::v5::Connect::new("qos2-client");
+    write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Connect(connect)).await;
+    let _ = read_v5_packet(&mut stream, &mut buf).await; // CONNACK
+
+    // Stage 1: client sends PUBLISH (qos=2, pkid=42).
+    let mut publish =
+        mqttbytes::v5::Publish::new("alpha", mqttbytes::QoS::ExactlyOnce, b"qos2 payload");
+    publish.pkid = 42;
+    write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Publish(publish)).await;
+
+    // Stage 2: broker MUST respond with PUBREC, NOT PUBACK.
+    let packet = read_v5_packet(&mut stream, &mut buf).await;
+    match packet {
+        mqttbytes::v5::Packet::PubRec(pubrec) => {
+            assert_eq!(pubrec.pkid, 42);
+            assert_eq!(
+                pubrec.reason,
+                mqttbytes::v5::PubRecReason::Success,
+                "broker must respond with PUBREC(success) after a valid \
+                 QoS 2 PUBLISH (§4.3.3)"
+            );
+        }
+        other => panic!(
+            "expected PubRec for QoS 2 publish; got {other:?} — a regression \
+             that emitted PubAck would mean the broker collapsed QoS 2 to \
+             QoS 1 silently"
+        ),
+    }
+
+    // Stage 3: client sends PUBREL.
+    let pubrel = mqttbytes::v5::PubRel::new(42);
+    write_v5_packet(&mut stream, &mqttbytes::v5::Packet::PubRel(pubrel)).await;
+
+    // Stage 4: broker MUST respond with PUBCOMP(success).
+    let packet = read_v5_packet(&mut stream, &mut buf).await;
+    match packet {
+        mqttbytes::v5::Packet::PubComp(pubcomp) => {
+            assert_eq!(pubcomp.pkid, 42);
+            assert_eq!(
+                pubcomp.reason,
+                mqttbytes::v5::PubCompReason::Success,
+                "broker must respond with PUBCOMP(success) after PUBREL for \
+                 a known pkid"
+            );
+        }
+        other => panic!("expected PubComp at end of four-step, got {other:?}"),
+    }
+
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn publish_qos2_v5_defers_delivery_until_pubrel() {
+    // Refs #880 + spec §4.4: the broker SHOULD NOT send the data to
+    // subscribers until it has received the PUBREL packet. Pin that
+    // contract end-to-end: a subscriber sees nothing between PUBLISH
+    // and PUBREL, sees the message exactly once after PUBREL.
+    let ca = TestCa::new("MQTT Test CA");
+    let publisher_cert = ca.issue_client_cert("alice", &["alpha"]);
+    let subscriber_cert = ca.issue_client_cert("bob", &["alpha"]);
+    let router = Arc::new(Router::new());
+
+    let server = TestServer::new(&ca, router, None);
+
+    // Subscriber connects and subscribes first.
+    let sub_tls = build_client_tls_config(
+        &subscriber_cert.cert_pem,
+        &subscriber_cert.key_pem,
+        &ca.cert_pem,
+    );
+    let mut sub_stream = mqtt_connect(server.addr, &sub_tls).await;
+    let mut sub_buf = BytesMut::new();
+    let connect = mqttbytes::v5::Connect::new("qos2-subscriber");
+    write_v5_packet(&mut sub_stream, &mqttbytes::v5::Packet::Connect(connect)).await;
+    let _ = read_v5_packet(&mut sub_stream, &mut sub_buf).await; // CONNACK
+    let sub = mqttbytes::v5::Subscribe::new("alpha", mqttbytes::QoS::AtLeastOnce);
+    write_v5_packet(&mut sub_stream, &mqttbytes::v5::Packet::Subscribe(sub)).await;
+    let _ = read_v5_packet(&mut sub_stream, &mut sub_buf).await; // SUBACK
+
+    // Publisher connects.
+    let pub_tls = build_client_tls_config(
+        &publisher_cert.cert_pem,
+        &publisher_cert.key_pem,
+        &ca.cert_pem,
+    );
+    let mut pub_stream = mqtt_connect(server.addr, &pub_tls).await;
+    let mut pub_buf = BytesMut::new();
+    let connect = mqttbytes::v5::Connect::new("qos2-publisher");
+    write_v5_packet(&mut pub_stream, &mqttbytes::v5::Packet::Connect(connect)).await;
+    let _ = read_v5_packet(&mut pub_stream, &mut pub_buf).await; // CONNACK
+
+    // Stage 1: publish QoS 2.
+    let mut publish = mqttbytes::v5::Publish::new(
+        "alpha",
+        mqttbytes::QoS::ExactlyOnce,
+        b"deferred qos2 payload",
+    );
+    publish.pkid = 7;
+    write_v5_packet(&mut pub_stream, &mqttbytes::v5::Packet::Publish(publish)).await;
+
+    // Stage 2: PUBREC arrives.
+    let packet = read_v5_packet(&mut pub_stream, &mut pub_buf).await;
+    assert!(matches!(packet, mqttbytes::v5::Packet::PubRec(_)));
+
+    // Subscriber must NOT see the message yet — Method B per §4.4.
+    // Use a short timeout to bound the negative-assertion window;
+    // a regression that emitted on PUBLISH-receipt would deliver
+    // here and the test would fail.
+    let no_delivery = tokio::time::timeout(
+        Duration::from_millis(200),
+        read_v5_packet(&mut sub_stream, &mut sub_buf),
+    )
+    .await;
+    assert!(
+        no_delivery.is_err(),
+        "subscriber must NOT receive the QoS 2 message before PUBREL \
+         (spec §4.4 Method B); regression would have delivered here"
+    );
+
+    // Stage 3: client sends PUBREL.
+    write_v5_packet(
+        &mut pub_stream,
+        &mqttbytes::v5::Packet::PubRel(mqttbytes::v5::PubRel::new(7)),
+    )
+    .await;
+
+    // Stage 4: PUBCOMP arrives.
+    let packet = read_v5_packet(&mut pub_stream, &mut pub_buf).await;
+    assert!(matches!(packet, mqttbytes::v5::Packet::PubComp(_)));
+
+    // NOW the subscriber sees the message — exactly once.
+    let packet = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_v5_packet(&mut sub_stream, &mut sub_buf),
+    )
+    .await
+    .expect("subscriber MUST receive the QoS 2 message after PUBREL");
+    match packet {
+        mqttbytes::v5::Packet::Publish(p) => {
+            assert_eq!(p.topic, "alpha");
+            assert_eq!(&p.payload[..], b"deferred qos2 payload");
+        }
+        other => panic!("expected delivered Publish, got {other:?}"),
+    }
+
+    // No second delivery — exactly-once means exactly-once.
+    let no_dup = tokio::time::timeout(
+        Duration::from_millis(200),
+        read_v5_packet(&mut sub_stream, &mut sub_buf),
+    )
+    .await;
+    assert!(
+        no_dup.is_err(),
+        "QoS 2 must deliver exactly once; regression would have delivered \
+         a duplicate here"
+    );
+
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn pubrel_unknown_pkid_returns_packet_identifier_not_found() {
+    // Refs #880, spec §3.7.2.1: a PUBREL whose pkid does not match
+    // any in-flight QoS 2 PUBLISH is a protocol-level "unknown
+    // identifier" — the broker MUST close the four-step on the
+    // client side with PUBCOMP(PacketIdentifierNotFound = 0x92)
+    // rather than ignoring it (which would leave the client
+    // hanging) or terminating the session (which would punish a
+    // client legitimately recovering from a torn ack).
+    let ca = TestCa::new("MQTT Test CA");
+    let client_cert = ca.issue_client_cert("alice", &["alpha"]);
+    let router = Arc::new(Router::new());
+
+    let server = TestServer::new(&ca, router, None);
+    let client_tls =
+        build_client_tls_config(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem);
+    let mut stream = mqtt_connect(server.addr, &client_tls).await;
+    let mut buf = BytesMut::new();
+
+    let connect = mqttbytes::v5::Connect::new("orphan-pubrel");
+    write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Connect(connect)).await;
+    let _ = read_v5_packet(&mut stream, &mut buf).await; // CONNACK
+
+    // Send a PUBREL for a pkid that the broker has never seen.
+    write_v5_packet(
+        &mut stream,
+        &mqttbytes::v5::Packet::PubRel(mqttbytes::v5::PubRel::new(9999)),
+    )
+    .await;
+
+    let packet = read_v5_packet(&mut stream, &mut buf).await;
+    match packet {
+        mqttbytes::v5::Packet::PubComp(pubcomp) => {
+            assert_eq!(pubcomp.pkid, 9999);
+            assert_eq!(
+                pubcomp.reason,
+                mqttbytes::v5::PubCompReason::PacketIdentifierNotFound,
+                "broker must reply PUBCOMP(PacketIdentifierNotFound = 0x92) for \
+                 a PUBREL referencing an unknown pkid (§3.7.2.1)"
+            );
+        }
+        other => panic!("expected PubComp(PacketIdentifierNotFound), got {other:?}"),
+    }
+
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn publish_qos2_v5_unauthorized_topic_returns_pubrec_not_authorized() {
+    // Refs #880: spec §3.5 / §3.6 — a per-publish authz failure on
+    // QoS 2 surfaces as PUBREC with a typed reason code, NOT as a
+    // session-terminating MqttError. The four-step ack channel
+    // exists precisely so the broker can reject individual messages
+    // without dropping the whole connection.
+    let ca = TestCa::new("MQTT Test CA");
+    let client_cert = ca.issue_client_cert("alice", &["alpha"]); // alpha only
+    let router = Arc::new(Router::new());
+
+    let server = TestServer::new(&ca, router, None);
+    let client_tls =
+        build_client_tls_config(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem);
+    let mut stream = mqtt_connect(server.addr, &client_tls).await;
+    let mut buf = BytesMut::new();
+
+    let connect = mqttbytes::v5::Connect::new("qos2-unauth");
+    write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Connect(connect)).await;
+    let _ = read_v5_packet(&mut stream, &mut buf).await;
+
+    // Publish to "bravo" — alice is NOT a member.
+    let mut publish =
+        mqttbytes::v5::Publish::new("bravo", mqttbytes::QoS::ExactlyOnce, b"unauthorized");
+    publish.pkid = 99;
+    write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Publish(publish)).await;
+
+    // Broker must reply PUBREC with NotAuthorized — NOT terminate.
+    let packet = read_v5_packet(&mut stream, &mut buf).await;
+    match packet {
+        mqttbytes::v5::Packet::PubRec(pubrec) => {
+            assert_eq!(pubrec.pkid, 99);
+            assert_eq!(
+                pubrec.reason,
+                mqttbytes::v5::PubRecReason::NotAuthorized,
+                "QoS 2 unauthorized publish must surface as PUBREC(NotAuthorized) \
+                 — a regression that returned MqttError::NotAuthorized would \
+                 terminate the session, dropping every other in-flight publish"
+            );
+        }
+        other => panic!("expected PubRec(NotAuthorized), got {other:?}"),
+    }
+
+    // The session must still be alive — send a PINGREQ to verify.
+    write_v5_packet(&mut stream, &mqttbytes::v5::Packet::PingReq).await;
+    let packet = read_v5_packet(&mut stream, &mut buf).await;
+    assert!(
+        matches!(packet, mqttbytes::v5::Packet::PingResp),
+        "session must survive a per-publish QoS 2 reject; got {packet:?}"
+    );
+
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn publish_qos2_v5_duplicate_pkid_resends_pubrec_idempotent() {
+    // Refs #880, spec §3.3.4 / §4.3.3: a duplicate PUBLISH with the
+    // same pkid as one already in the inflight set MUST be
+    // acknowledged with a PUBREC and continue with the protocol —
+    // i.e. idempotent, the broker MUST NOT double-deliver. Pin
+    // that the broker re-emits PUBREC and that subsequent PUBREL
+    // delivers exactly once.
+    let ca = TestCa::new("MQTT Test CA");
+    let publisher_cert = ca.issue_client_cert("alice", &["alpha"]);
+    let subscriber_cert = ca.issue_client_cert("bob", &["alpha"]);
+    let router = Arc::new(Router::new());
+
+    let server = TestServer::new(&ca, router, None);
+
+    // Subscriber connects and subscribes first so it sees deliveries.
+    let sub_tls = build_client_tls_config(
+        &subscriber_cert.cert_pem,
+        &subscriber_cert.key_pem,
+        &ca.cert_pem,
+    );
+    let mut sub_stream = mqtt_connect(server.addr, &sub_tls).await;
+    let mut sub_buf = BytesMut::new();
+    write_v5_packet(
+        &mut sub_stream,
+        &mqttbytes::v5::Packet::Connect(mqttbytes::v5::Connect::new("dup-subscriber")),
+    )
+    .await;
+    let _ = read_v5_packet(&mut sub_stream, &mut sub_buf).await;
+    write_v5_packet(
+        &mut sub_stream,
+        &mqttbytes::v5::Packet::Subscribe(mqttbytes::v5::Subscribe::new(
+            "alpha",
+            mqttbytes::QoS::AtLeastOnce,
+        )),
+    )
+    .await;
+    let _ = read_v5_packet(&mut sub_stream, &mut sub_buf).await; // SUBACK
+
+    let pub_tls = build_client_tls_config(
+        &publisher_cert.cert_pem,
+        &publisher_cert.key_pem,
+        &ca.cert_pem,
+    );
+    let mut pub_stream = mqtt_connect(server.addr, &pub_tls).await;
+    let mut pub_buf = BytesMut::new();
+    write_v5_packet(
+        &mut pub_stream,
+        &mqttbytes::v5::Packet::Connect(mqttbytes::v5::Connect::new("dup-publisher")),
+    )
+    .await;
+    let _ = read_v5_packet(&mut pub_stream, &mut pub_buf).await;
+
+    // First PUBLISH (qos=2, pkid=11).
+    let mut publish =
+        mqttbytes::v5::Publish::new("alpha", mqttbytes::QoS::ExactlyOnce, b"dedup payload");
+    publish.pkid = 11;
+    write_v5_packet(
+        &mut pub_stream,
+        &mqttbytes::v5::Packet::Publish(publish.clone()),
+    )
+    .await;
+
+    // First PUBREC.
+    let packet = read_v5_packet(&mut pub_stream, &mut pub_buf).await;
+    assert!(matches!(
+        packet,
+        mqttbytes::v5::Packet::PubRec(p) if p.pkid == 11
+    ));
+
+    // Duplicate PUBLISH with same pkid (mqttbytes does not surface a
+    // dup flag; the broker keys deduplication on pkid alone, which
+    // is the spec's only cross-restart-stable handle).
+    write_v5_packet(&mut pub_stream, &mqttbytes::v5::Packet::Publish(publish)).await;
+
+    // Broker must re-emit PUBREC for the duplicate.
+    let packet = read_v5_packet(&mut pub_stream, &mut pub_buf).await;
+    match packet {
+        mqttbytes::v5::Packet::PubRec(p) => assert_eq!(p.pkid, 11),
+        other => panic!("expected PubRec for duplicate pkid, got {other:?}"),
+    }
+
+    // Single PUBREL → single PUBCOMP → single delivery.
+    write_v5_packet(
+        &mut pub_stream,
+        &mqttbytes::v5::Packet::PubRel(mqttbytes::v5::PubRel::new(11)),
+    )
+    .await;
+    let _ = read_v5_packet(&mut pub_stream, &mut pub_buf).await; // PUBCOMP
+
+    let packet = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_v5_packet(&mut sub_stream, &mut sub_buf),
+    )
+    .await
+    .expect("subscriber must receive the deduplicated message");
+    match packet {
+        mqttbytes::v5::Packet::Publish(p) => assert_eq!(&p.payload[..], b"dedup payload"),
+        other => panic!("expected delivered Publish, got {other:?}"),
+    }
+
+    // No second delivery — duplicate must NOT have been routed twice.
+    let no_dup = tokio::time::timeout(
+        Duration::from_millis(300),
+        read_v5_packet(&mut sub_stream, &mut sub_buf),
+    )
+    .await;
+    assert!(
+        no_dup.is_err(),
+        "duplicate QoS 2 PUBLISH must NOT cause double delivery — \
+         a regression that re-saved state on dup would deliver twice"
+    );
 
     server.shutdown();
 }

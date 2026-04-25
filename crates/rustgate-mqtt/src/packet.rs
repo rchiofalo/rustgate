@@ -496,6 +496,13 @@ pub(crate) fn write_v4_to_buf(
         Packet::ConnAck(p) => p.write(buf),
         Packet::Publish(p) => p.write(buf),
         Packet::PubAck(p) => p.write(buf),
+        // QoS 2 four-step (refs #880): PUBREC and PUBCOMP are server →
+        // client packets in the four-way handshake. PUBREL is the
+        // *inbound* counterpart (client → server) so it does NOT
+        // appear here — only the writer side of the broker's
+        // half of the handshake.
+        Packet::PubRec(p) => p.write(buf),
+        Packet::PubComp(p) => p.write(buf),
         Packet::SubAck(p) => p.write(buf),
         Packet::UnsubAck(p) => p.write(buf),
         Packet::PingResp => mqttbytes::v4::PingResp.write(buf),
@@ -516,6 +523,10 @@ pub(crate) fn write_v5_to_buf(
         Packet::ConnAck(p) => p.write(buf),
         Packet::Publish(p) => p.write(buf),
         Packet::PubAck(p) => p.write(buf),
+        // QoS 2 four-step (refs #880): see v4 sibling above for why
+        // PUBREL is excluded from the writer arm.
+        Packet::PubRec(p) => p.write(buf),
+        Packet::PubComp(p) => p.write(buf),
         Packet::SubAck(p) => p.write(buf),
         Packet::UnsubAck(p) => p.write(buf),
         Packet::PingResp => mqttbytes::v5::PingResp.write(buf),
