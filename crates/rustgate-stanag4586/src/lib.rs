@@ -16,13 +16,14 @@
 //!
 //! This crate implements **LOI 2-3 telemetry** — the inbound vehicle
 //! state stream that any LOI 2 deployment needs to display, log, and
-//! relay — plus the **first six LOI 4 commands** (waypoint upload
+//! relay — plus the **first seven LOI 4 commands** (waypoint upload
 //! via [`waypoint_command`], sensor pointing via
 //! [`sensor_pointing_command`], mission abort via
 //! [`mission_abort_command`], GCS handover via
 //! [`gcs_handover_command`], route upload via
-//! [`route_upload_command`], and payload control via
-//! [`payload_control_command`]). The remainder of the LOI 4 command
+//! [`route_upload_command`], payload control via
+//! [`payload_control_command`], and emergency status request via
+//! [`emergency_status_request`]). The remainder of the LOI 4 command
 //! set (mode change) is deliberately out of scope and lands in
 //! follow-up PRs.
 //!
@@ -44,13 +45,14 @@
 //! # What is deliberately absent
 //!
 //! - **Remaining LOI 4+ command messages** (mode change) — separate
-//!   follow-up PRs. The first six LOI 4 commands (waypoint upload
+//!   follow-up PRs. The first seven LOI 4 commands (waypoint upload
 //!   via [`waypoint_command`], sensor pointing via
 //!   [`sensor_pointing_command`], mission abort via
 //!   [`mission_abort_command`], GCS handover via
 //!   [`gcs_handover_command`], route upload via
-//!   [`route_upload_command`], and payload control via
-//!   [`payload_control_command`]) ship in this crate.
+//!   [`route_upload_command`], payload control via
+//!   [`payload_control_command`], and emergency status request via
+//!   [`emergency_status_request`]) ship in this crate.
 //! - **Other LOI 2-3 telemetry message types** beyond vehicle
 //!   position — sensor status, payload status, system state, BIT
 //!   reports. Those use the same big-endian/typed-field approach but
@@ -82,6 +84,7 @@
 #![doc(html_no_source)]
 
 pub mod bit_report;
+pub mod emergency_status_request;
 pub mod error;
 pub mod gcs_handover_command;
 pub mod mission_abort_command;
@@ -95,6 +98,7 @@ pub mod vehicle_position;
 pub mod waypoint_command;
 
 pub use bit_report::{BitReport, FaultSeverity, SubsystemId};
+pub use emergency_status_request::{EmergencyStatusRequest, RequestKind, UrgencyLevel};
 pub use error::Stanag4586Error;
 pub use gcs_handover_command::{GcsHandoverCommand, HandoverKind};
 pub use mission_abort_command::{AbortBehaviour, MissionAbortCommand, Priority};
