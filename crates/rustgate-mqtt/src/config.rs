@@ -329,6 +329,31 @@ pub struct MqttServerConfig {
     /// (disabled) or a value below this floor get this value imposed.
     pub min_keep_alive_secs: u16,
 
+    /// MQTT 5.0 `Server Keep Alive` override advertised in CONNACK
+    /// (default: `0` = no override; broker honors the client's
+    /// CONNECT-time keep-alive request).
+    ///
+    /// Per MQTT 5.0 §3.2.2.3.14: "If the Server returns a Server Keep
+    /// Alive on the CONNACK packet, the Client MUST use this value
+    /// instead of the Keep Alive value the Client sent on CONNECT."
+    /// When configured to a non-zero value, the broker:
+    /// 1. Sets `properties.server_keep_alive = Some(server_keep_alive_secs)`
+    ///    on every v5 CONNACK so a compliant client switches to the
+    ///    overridden interval.
+    /// 2. Enforces the overridden interval on the read-loop keep-alive
+    ///    timer instead of the client's request, so a non-compliant
+    ///    client that ignores the property still gets disconnected on
+    ///    the operator's chosen schedule rather than the client's.
+    ///
+    /// When `0` (default), the broker leaves the property unset and
+    /// honors the client's CONNECT-time keep-alive verbatim — preserving
+    /// the pre-this-knob behaviour for deployments that don't need the
+    /// override channel.
+    ///
+    /// v3.1.1 has no Server Keep Alive feature; the v4 path is unaffected
+    /// regardless of this setting.
+    pub server_keep_alive_secs: u16,
+
     /// Channel capacity for response packets flowing from read loop to
     /// write loop (per session).
     pub response_channel_capacity: usize,
@@ -409,6 +434,17 @@ impl MqttServerConfig {
     /// high frequency) justifies the per-connection memory overhead.
     pub const DEFAULT_TOPIC_ALIAS_MAX: u16 = 0;
 
+    /// Default `Server Keep Alive` override advertised in CONNACK
+    /// (0 — no override; honor the client's request).
+    ///
+    /// Disabled by default: the spec leaves keep-alive negotiation as
+    /// "client proposes, broker may override," and most deployments
+    /// trust the client's choice. Operators turn it on when fleet-wide
+    /// presence-loss detection needs a uniform cadence (e.g. to align
+    /// dashboards or rate-limit ungraceful-disconnect storms) rather
+    /// than each client's idiosyncratic value.
+    pub const DEFAULT_SERVER_KEEP_ALIVE_SECS: u16 = 0;
+
     /// Default minimum keep-alive in seconds.
     pub const DEFAULT_MIN_KEEP_ALIVE_SECS: u16 = 30;
 
@@ -430,6 +466,7 @@ impl std::fmt::Debug for MqttServerConfig {
             .field("max_session_expiry_secs", &self.max_session_expiry_secs)
             .field("max_retained_sessions", &self.max_retained_sessions)
             .field("min_keep_alive_secs", &self.min_keep_alive_secs)
+            .field("server_keep_alive_secs", &self.server_keep_alive_secs)
             .field("response_channel_capacity", &self.response_channel_capacity)
             .field("wildcard_policy", &self.wildcard_policy)
             .field(
@@ -489,6 +526,17 @@ mod tests {
         // Clients requesting 0 (disabled) or a smaller value have this
         // value forced upon them — changing it alters CONNACK behaviour.
         assert_eq!(MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS, 30);
+    }
+
+    #[test]
+    fn default_server_keep_alive_is_zero_meaning_no_override() {
+        // The default 0 preserves the pre-this-knob behaviour: the
+        // broker honors the client's CONNECT-time keep-alive request
+        // verbatim. A regression that flipped this default to a
+        // non-zero value would force every connecting client onto a
+        // broker-imposed cadence and would surface immediately in the
+        // CONNACK property assertions in the integration suite.
+        assert_eq!(MqttServerConfig::DEFAULT_SERVER_KEEP_ALIVE_SECS, 0);
     }
 
     #[test]
@@ -570,6 +618,7 @@ mod tests {
             max_session_expiry_secs: MqttServerConfig::DEFAULT_MAX_SESSION_EXPIRY_SECS,
             max_retained_sessions: MqttServerConfig::DEFAULT_MAX_RETAINED_SESSIONS,
             min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
+            server_keep_alive_secs: MqttServerConfig::DEFAULT_SERVER_KEEP_ALIVE_SECS,
             response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
             wildcard_policy: WildcardPolicy::default(),
             on_accept: None,
@@ -621,6 +670,7 @@ mod tests {
             max_session_expiry_secs: MqttServerConfig::DEFAULT_MAX_SESSION_EXPIRY_SECS,
             max_retained_sessions: MqttServerConfig::DEFAULT_MAX_RETAINED_SESSIONS,
             min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
+            server_keep_alive_secs: MqttServerConfig::DEFAULT_SERVER_KEEP_ALIVE_SECS,
             response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
             wildcard_policy: WildcardPolicy::default(),
             on_accept: Some(Arc::new(|| {})),

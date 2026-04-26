@@ -174,6 +174,7 @@ pub(crate) async fn handle_mqtt_session(
     topic_alias_max: u16,
     max_session_expiry_secs: u32,
     min_keep_alive_secs: u16,
+    server_keep_alive_secs: u16,
     response_channel_capacity: usize,
     wildcard_policy: WildcardPolicy,
     client_id_registry: Arc<ClientIdRegistry>,
@@ -193,6 +194,7 @@ pub(crate) async fn handle_mqtt_session(
         receive_max,
         topic_alias_max,
         wildcard_policy,
+        server_keep_alive_secs,
     );
 
     // --- CONNECT handshake ---
@@ -373,8 +375,26 @@ pub(crate) async fn handle_mqtt_session(
     router.replay_positions(&handle).await;
 
     // --- Concurrent read/write loops ---
+    // MQTT 5.0 §3.2.2.3.14 Server Keep Alive override: when the
+    // operator configures `server_keep_alive_secs > 0`, the broker
+    // told the client (via the matching CONNACK property in
+    // `write_connack_v5`) to use this value instead of its own
+    // CONNECT-time request. Enforce the same value on the read-loop
+    // keep-alive timer so a non-compliant client that ignores the
+    // CONNACK property still gets disconnected on the operator's
+    // chosen schedule rather than the client's. When the override is
+    // disabled (`server_keep_alive_secs == 0`, the default), fall
+    // back to the client's request as before. The `min_keep_alive_secs`
+    // floor still applies in both cases — it's a hard operator-set
+    // safety floor that catches `keep_alive = 0` (client-side disable
+    // per §3.1.2.10) and keeps the read-loop timer from spinning.
+    let effective_keep_alive = if server_keep_alive_secs > 0 {
+        server_keep_alive_secs
+    } else {
+        keep_alive
+    };
     let keep_alive_duration = std::time::Duration::from_secs_f64(
-        f64::from(keep_alive.max(min_keep_alive_secs)) * KEEP_ALIVE_FACTOR,
+        f64::from(effective_keep_alive.max(min_keep_alive_secs)) * KEEP_ALIVE_FACTOR,
     );
 
     let prefix = topic_prefix.as_deref().unwrap_or("");
