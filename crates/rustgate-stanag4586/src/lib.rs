@@ -16,11 +16,12 @@
 //!
 //! This crate implements **LOI 2-3 telemetry** — the inbound vehicle
 //! state stream that any LOI 2 deployment needs to display, log, and
-//! relay — plus the **first two LOI 4 commands** (waypoint upload via
-//! [`waypoint_command`] and sensor pointing via
-//! [`sensor_pointing_command`]). The remainder of the LOI 4 command
-//! set (GCS handover, payload control, route upload, mission abort) is
-//! deliberately out of scope and lands in follow-up PRs.
+//! relay — plus the **first three LOI 4 commands** (waypoint upload
+//! via [`waypoint_command`], sensor pointing via
+//! [`sensor_pointing_command`], and mission abort via
+//! [`mission_abort_command`]). The remainder of the LOI 4 command
+//! set (GCS handover, payload control, route upload) is deliberately
+//! out of scope and lands in follow-up PRs.
 //!
 //! # Scope
 //!
@@ -40,10 +41,10 @@
 //! # What is deliberately absent
 //!
 //! - **Remaining LOI 4+ command messages** (GCS handover, payload
-//!   control, route upload, mission abort) — separate follow-up PRs.
-//!   The first two LOI 4 commands (waypoint upload via
-//!   [`waypoint_command`] and sensor pointing via
-//!   [`sensor_pointing_command`]) ship in this crate.
+//!   control, route upload) — separate follow-up PRs. The first
+//!   three LOI 4 commands (waypoint upload via [`waypoint_command`],
+//!   sensor pointing via [`sensor_pointing_command`], and mission
+//!   abort via [`mission_abort_command`]) ship in this crate.
 //! - **Other LOI 2-3 telemetry message types** beyond vehicle
 //!   position — sensor status, payload status, system state, BIT
 //!   reports. Those use the same big-endian/typed-field approach but
@@ -76,6 +77,7 @@
 
 pub mod bit_report;
 pub mod error;
+pub mod mission_abort_command;
 pub mod payload_status;
 pub mod sensor_pointing_command;
 pub mod sensor_status;
@@ -85,6 +87,7 @@ pub mod waypoint_command;
 
 pub use bit_report::{BitReport, FaultSeverity, SubsystemId};
 pub use error::Stanag4586Error;
+pub use mission_abort_command::{AbortBehaviour, MissionAbortCommand, Priority};
 pub use payload_status::{PayloadKind, PayloadStatus, RecordingState, StreamingState};
 pub use sensor_pointing_command::{PointingMode, SensorPointingCommand};
 pub use sensor_status::{OperationalState, SensorStatus, SensorType};
