@@ -748,6 +748,38 @@ pub(crate) struct Cli {
     )]
     pub(crate) mqtt_wildcard_policy: MqttWildcardPolicy,
 
+    // -- MAVLink signing policy flags (F-72) --
+    /// Require the MAVLink v2 SIGNED INCOMPAT bit on every accepted v2
+    /// frame. Default `true` — unsigned v2 frames are rejected at the
+    /// framing layer with an `UnsignedFrameRejected` typed error and
+    /// (when an audit observer is wired) emit
+    /// `audit::mavlink_unsigned_rejected`. Set `false` only for
+    /// deployments running on a fully trusted link where end-to-end
+    /// signing is not yet available; the rejection still surfaces
+    /// through the typed error so a SIEM can correlate rollout
+    /// progress.
+    #[arg(
+        long,
+        default_value_t = true,
+        env = "RUSTGATE_MAVLINK_REQUIRE_SIGNING",
+        action = clap::ArgAction::Set,
+    )]
+    pub(crate) mavlink_require_signing: bool,
+
+    /// Allow legacy MAVLink v1 frames. Default `false` — v1 has no
+    /// signature field, so accepting v1 alongside signed v2 traffic
+    /// would hand an attacker a downgrade path. Set `true` only for
+    /// deployments with mixed fleets where some senders cannot speak
+    /// v2 yet; v1 traffic cannot be authenticated at the MAVLink layer
+    /// and operators should treat such links as untrusted.
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "RUSTGATE_MAVLINK_ALLOW_V1",
+        action = clap::ArgAction::Set,
+    )]
+    pub(crate) mavlink_allow_v1: bool,
+
     // -- Plaintext input flags --
     /// Bind address for plaintext TCP input (e.g. 0.0.0.0:8087).
     /// WARNING: connections are NOT encrypted. Use only on trusted networks.
@@ -1745,6 +1777,8 @@ define_config_file! {
     mqtt_server_keep_alive_secs: u16,
     mqtt_response_channel_capacity: usize,
     mqtt_wildcard_policy: MqttWildcardPolicy,
+    mavlink_require_signing: bool,
+    mavlink_allow_v1: bool,
     tcp_bind: Option<String>,
     udp_bind: Option<String>,
     udp_rate_limit: u32,
@@ -2175,6 +2209,8 @@ mod tests {
             "RUSTGATE_WS_MAX_BYTES_PER_SEC",
             "RUSTGATE_WS_MAX_VIOLATIONS",
             "RUSTGATE_WS_MAX_WRITE_BUFFER_BYTES",
+            "RUSTGATE_MAVLINK_REQUIRE_SIGNING",
+            "RUSTGATE_MAVLINK_ALLOW_V1",
             "RUSTGATE_TCP_BIND",
             "RUSTGATE_UDP_BIND",
             "RUSTGATE_UDP_RATE_LIMIT",
@@ -2624,6 +2660,65 @@ mod tests {
         file.apply_to(&mut cli, &matches);
         assert_eq!(cli.ws_rate_limit_max, 250);
         assert_eq!(cli.ws_rate_limit_window_secs, 45);
+    }
+
+    // ─── F-72 MAVLink signing-policy CLI flags ───────────────────────
+
+    #[test]
+    fn mavlink_signing_defaults_are_secure() {
+        // Default-secure posture: signing required, v1 rejected. A
+        // deployment that does NOTHING gets the strict policy. Pin the
+        // defaults so a refactor that flips them inverts the
+        // operational meaning of the flag.
+        let cli = Cli::try_parse_from([
+            "rustgate", "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
+        ])
+        .expect("should parse");
+        assert!(cli.mavlink_require_signing, "default: require signing");
+        assert!(!cli.mavlink_allow_v1, "default: reject v1");
+    }
+
+    #[test]
+    fn mavlink_allow_v1_overridable_via_cli() {
+        // Mixed-fleet operator escape hatch. Pin the override path so
+        // operators can opt back into v1 without rebuilding.
+        let cli = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--mavlink-allow-v1",
+            "true",
+        ])
+        .expect("should parse");
+        assert!(cli.mavlink_allow_v1);
+        // The unrelated default stays put — the two knobs are
+        // independent so an operator can opt into v1 *and* keep
+        // signing required for any v2 traffic.
+        assert!(cli.mavlink_require_signing);
+    }
+
+    #[test]
+    fn mavlink_require_signing_overridable_via_cli() {
+        // Trusted-link escape hatch. Opt out of signing without also
+        // having to opt into v1.
+        let cli = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--mavlink-require-signing",
+            "false",
+        ])
+        .expect("should parse");
+        assert!(!cli.mavlink_require_signing);
+        assert!(!cli.mavlink_allow_v1);
     }
 
     #[test]
