@@ -59,6 +59,28 @@ pub(crate) const RPC_SERVER_ROL_STREAM: &str = "server_rol_stream";
 /// for ROL state lands in a separate follow-up).
 pub(crate) const RPC_CLIENT_ROL_STREAM: &str = "client_rol_stream";
 
+/// Canonical `rpc` label used for `ServerFederateGroupsStream` audit
+/// and metric records (refs #864). The `ServerFederateGroupsStream` RPC
+/// is server-streaming: the remote peer sends a single `Subscription`
+/// and we push a stream of `FederateGroups` updates back. The
+/// observable-stub here records the subscription open with peer-auth +
+/// allowlist check + audit + metric, sends the initial groups roster,
+/// then holds the stream open without producing further updates — the
+/// routing-side machinery for incremental group-sync state lands in a
+/// separate follow-up.
+pub(crate) const RPC_SERVER_FEDERATE_GROUPS_STREAM: &str = "server_federate_groups_stream";
+
+/// Canonical `rpc` label used for `ClientFederateGroupsStream` audit
+/// and metric records (refs #864). The `ClientFederateGroupsStream` RPC
+/// is client-streaming: the remote peer pushes a stream of
+/// `FederateGroups` updates and we return one `Subscription` once they
+/// finish. Each inbound `FederateGroups` is observed individually
+/// (peer-auth + hop validation + audit + metric + callback) on top of
+/// the existing peer-group bookkeeping (count + name-length limits) the
+/// receive loop already performs. The stub does not propagate
+/// group-sync state internally yet.
+pub(crate) const RPC_CLIENT_FEDERATE_GROUPS_STREAM: &str = "client_federate_groups_stream";
+
 /// Default maximum number of groups a single federation peer can advertise.
 ///
 /// Re-exported from [`crate::config`] for backward compatibility.
@@ -119,6 +141,36 @@ fn noop_on_rol_event() -> OnRolEvent {
     Arc::new(|_rol, _peer| {})
 }
 
+/// Callback invoked when a `FederateGroups` update is received from a
+/// remote peer via the V2 `ClientFederateGroupsStream` RPC (refs #864).
+/// The second argument is the peer's CN (extracted from the mTLS client
+/// certificate).
+///
+/// Defaults to a no-op closure when not configured via
+/// [`FederationService::with_on_group_sync`] — the V2 federation
+/// transport continues to accept group-sync streams and emit audit +
+/// metrics for each update, but the payload is discarded if the
+/// deployment hasn't wired a consumer. This preserves the existing
+/// behaviour for callers that don't yet need group-sync ingress while
+/// making the hop-count + authz validation always-on for forensic
+/// completeness, mirroring the discipline established by [`OnEvent`],
+/// [`OnBlob`], and [`OnRolEvent`]. The existing per-peer group
+/// bookkeeping (count + name-length limits, in-memory `peer_groups`
+/// map) runs unchanged alongside the callback — the callback is the
+/// observation hook for downstream consumers, not a replacement for
+/// the receive-loop's group tracking.
+pub type OnGroupSync = Arc<dyn Fn(figpb::FederateGroups, String) + Send + Sync>;
+
+/// Factory for the default no-op `OnGroupSync` callback. Mirrors
+/// [`noop_on_rol_event`] / [`noop_on_blob`]: discards the group-sync
+/// update without doing any work so the call site stays an
+/// unconditional `(self.on_group_sync)(...)` rather than threading an
+/// `if let Some(...)` through the per-update hot path inside the
+/// streaming receive loop.
+fn noop_on_group_sync() -> OnGroupSync {
+    Arc::new(|_groups, _peer| {})
+}
+
 /// V2 gRPC FederatedChannel service implementation.
 ///
 /// Manages inbound federation connections, tracks per-peer outbound streams
@@ -148,6 +200,16 @@ pub struct FederationService {
     /// wants to consume ROL payloads. The callback fires per ROL event
     /// after peer-auth, hop-count, and allowlist validation pass.
     on_rol_event: OnRolEvent,
+    /// Callback for inbound `FederateGroups` updates received via
+    /// `ClientFederateGroupsStream` (refs #864). Defaults to a no-op so
+    /// existing deployments don't have to opt in; install a real
+    /// handler via [`FederationService::with_on_group_sync`] when the
+    /// receiving end wants to observe group-sync ingress. The callback
+    /// fires per inbound update after peer-auth, hop-count, and
+    /// allowlist validation pass — it is independent of the existing
+    /// per-peer group bookkeeping (count + name-length limits, in-memory
+    /// `peer_groups` map) which runs alongside.
+    on_group_sync: OnGroupSync,
     /// Maximum number of groups a single peer can advertise.
     max_groups_per_peer: usize,
     /// Maximum length of a group name in bytes.
@@ -209,6 +271,7 @@ impl FederationService {
             on_event,
             on_blob: noop_on_blob(),
             on_rol_event: noop_on_rol_event(),
+            on_group_sync: noop_on_group_sync(),
             max_groups_per_peer,
             max_group_name_length,
             allowed_peer_groups: None,
@@ -244,6 +307,26 @@ impl FederationService {
     /// Mirrors the discipline established by [`Self::with_on_blob`].
     pub fn with_on_rol_event(mut self, on_rol_event: OnRolEvent) -> Self {
         self.on_rol_event = on_rol_event;
+        self
+    }
+
+    /// Install a callback that fires when the V2
+    /// `ClientFederateGroupsStream` RPC receives a `FederateGroups`
+    /// update from a remote peer (refs #864).
+    ///
+    /// Returns `self` so the call composes with the other `with_*`
+    /// builder methods. The default callback (set by [`Self::new`] /
+    /// [`Self::with_limits`]) is a no-op that discards the payload —
+    /// the V2 transport continues to validate the hop count and
+    /// peer-allowlist authz and emit audit + metrics for every accepted
+    /// update even when the consumer isn't wired, so a deployment can
+    /// observe ingress before committing to a downstream sink. Mirrors
+    /// the discipline established by [`Self::with_on_blob`] and
+    /// [`Self::with_on_rol_event`]. The existing per-peer group
+    /// bookkeeping (count + name-length limits) runs alongside the
+    /// callback regardless of whether one is wired.
+    pub fn with_on_group_sync(mut self, on_group_sync: OnGroupSync) -> Self {
+        self.on_group_sync = on_group_sync;
         self
     }
 
@@ -454,6 +537,75 @@ impl FederationService {
             "received ROL event"
         );
         on_rol_event(rol, peer_id.to_string());
+        true
+    }
+
+    /// Hop-count validation for `FederateGroups` (refs #864). The
+    /// `FederateHops` proto field is shared with `FederatedEvent`,
+    /// `BinaryBlob`, and `Rol` — same shape, different parent message —
+    /// so this is a sibling of the existing `validate_*_hop_count`
+    /// helpers rather than a generic. Same semantics: group-sync
+    /// updates without hop metadata are treated as first-hop for
+    /// backward compat with peers that predate hop tracking.
+    fn validate_group_sync_hop_count(groups: &figpb::FederateGroups, peer_id: &str) -> bool {
+        if let Some(ref hops) = groups.federate_hops
+            && (hops.current_hops < 0 || hops.current_hops >= MAX_FEDERATION_HOPS)
+        {
+            warn!(
+                peer = %peer_id,
+                current_hops = hops.current_hops,
+                max = MAX_FEDERATION_HOPS,
+                "rejecting federated groups update: hop count exceeded"
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Apply the observable-stub hooks to a single inbound
+    /// `FederateGroups` update from `ClientFederateGroupsStream` (refs
+    /// #864). Static helper so the `tokio::spawn` drain loop in
+    /// [`Self::client_federate_groups_stream`] AND unit tests can drive
+    /// the same body — `tonic::Streaming<FederateGroups>` has no
+    /// synthetic constructor, so a per-update helper is the cleanest
+    /// way to pin the policy under test. Returns `true` when the
+    /// update passed validation and the callback fired; `false` when
+    /// it was rejected (the hop-limit gate, which emits an
+    /// `event_rejected` audit and skips the callback).
+    fn observe_inbound_group_sync(
+        on_group_sync: &OnGroupSync,
+        peer_id: &str,
+        groups: figpb::FederateGroups,
+    ) -> bool {
+        if !Self::validate_group_sync_hop_count(&groups, peer_id) {
+            rustgate_core::audit::federation_event_rejected(
+                RPC_CLIENT_FEDERATE_GROUPS_STREAM,
+                peer_id,
+                "hop_limit",
+            );
+            return false;
+        }
+
+        // Success path: increment counters and emit the audit record
+        // BEFORE invoking the callback so the forensic trail captures
+        // ingress even if a downstream consumer panics. Same ordering
+        // as SendOneEvent / SendOneBlob / ServerROLStream.
+        #[cfg(feature = "api")]
+        {
+            crate::metrics::messages_in().inc();
+            crate::metrics::messages_in_by_rpc()
+                .with_label_values(&[RPC_CLIENT_FEDERATE_GROUPS_STREAM])
+                .inc();
+        }
+        rustgate_core::audit::federation_event_received(RPC_CLIENT_FEDERATE_GROUPS_STREAM, peer_id);
+
+        debug!(
+            peer = %peer_id,
+            group_count = groups.federate_groups.len(),
+            nested_count = groups.nested_groups.len(),
+            "received federate-groups update"
+        );
+        on_group_sync(groups, peer_id.to_string());
         true
     }
 
@@ -960,18 +1112,58 @@ impl FederatedChannel for FederationService {
         &self,
         request: Request<Streaming<figpb::FederateGroups>>,
     ) -> Result<Response<figpb::Subscription>, Status> {
+        // mTLS extraction failure already emits federation_peer_rejected
+        // and returns Unauthenticated before any payload processing —
+        // matches the SendOneEvent / SendOneBlob / ServerROLStream
+        // discipline.
         let peer_id = Self::peer_id_from_request(&request)?;
-        let mut stream = request.into_inner();
+
+        // Pre-flight allowlist check on stream open. Mirrors the
+        // ServerROLStream gate so the audit reason vocabulary stays
+        // uniform across the streaming RPC suite — a peer not in the
+        // inbound allowlist must not be able to push group-sync
+        // updates, and the rejection is audited BEFORE the stream is
+        // accepted so a Byzantine peer cannot probe the system by
+        // opening a stream and sending nothing.
+        if let Some(ref allowed) = self.allowed_peer_groups
+            && !allowed.contains_key(&peer_id)
+        {
+            rustgate_core::audit::federation_event_rejected(
+                RPC_CLIENT_FEDERATE_GROUPS_STREAM,
+                &peer_id,
+                "peer_not_in_allowlist",
+            );
+            return Err(Status::permission_denied("peer not in inbound allowlist"));
+        }
 
         info!(peer = %peer_id, "client_federate_groups_stream opened (receiving groups)");
+        let mut stream = request.into_inner();
 
         let peer_groups = Arc::clone(&self.peer_groups);
+        let on_group_sync = Arc::clone(&self.on_group_sync);
         let pid = peer_id.clone();
         let max_groups = self.max_groups_per_peer;
         let max_name_len = self.max_group_name_length;
 
         drop(tokio::spawn(async move {
             while let Ok(Some(groups_msg)) = stream.message().await {
+                // Per-update observation hook: hop validation + audit +
+                // metric + callback. The existing per-peer bookkeeping
+                // (count + name-length limits) runs alongside on every
+                // accepted update — the observation hook is independent
+                // of the in-memory `peer_groups` map. A hop-limit-rejected
+                // update skips both the bookkeeping AND the callback so
+                // the in-memory state never reflects an event the
+                // forensic trail recorded as rejected.
+                let groups_msg_for_observe = groups_msg.clone();
+                if !FederationService::observe_inbound_group_sync(
+                    &on_group_sync,
+                    &pid,
+                    groups_msg_for_observe,
+                ) {
+                    continue;
+                }
+
                 let mut groups = groups_msg.federate_groups;
 
                 // Filter out group names that exceed the length limit
@@ -1131,12 +1323,52 @@ impl FederatedChannel for FederationService {
         &self,
         request: Request<figpb::Subscription>,
     ) -> Result<Response<Self::ServerFederateGroupsStreamStream>, Status> {
-        let sub = request.into_inner();
-        let peer_id = sub
-            .identity
-            .as_ref()
-            .map(|i| i.name.clone())
-            .unwrap_or_else(|| "unknown".to_string());
+        // `ServerFederateGroupsStream` is server-streaming in the proto:
+        // the peer sends one `Subscription` and we open a stream of
+        // `FederateGroups` updates back. The observable-stub here
+        // records the subscription open with the same peer-auth +
+        // allowlist + audit + metric shape as `ClientROLStream`'s open
+        // path, sends the initial groups roster, then holds the stream
+        // open without producing further updates — the routing-side
+        // machinery for incremental group-sync state lands in a
+        // separate follow-up.
+        let peer_id = Self::peer_id_from_request(&request)?;
+
+        // Allowlist check on subscription open. Mirrors the
+        // `ClientROLStream` / `ClientFederateGroupsStream` gates so the
+        // audit reason vocabulary stays uniform across the RPC suite —
+        // a peer not in the inbound allowlist must not be able to keep
+        // an outbound groups stream half-open.
+        if let Some(ref allowed) = self.allowed_peer_groups
+            && !allowed.contains_key(&peer_id)
+        {
+            rustgate_core::audit::federation_event_rejected(
+                RPC_SERVER_FEDERATE_GROUPS_STREAM,
+                &peer_id,
+                "peer_not_in_allowlist",
+            );
+            return Err(Status::permission_denied("peer not in inbound allowlist"));
+        }
+
+        // Subscription accepted: increment counter and emit the audit
+        // record before returning the stream so a peer that opens and
+        // immediately closes the connection still appears in the
+        // forensic trail. The metric counts the SUBSCRIPTION, not
+        // group-sync updates — `ServerFederateGroupsStream` doesn't
+        // RECEIVE any updates from the peer (the proto is
+        // one-Subscription-in, many-FederateGroups-out), so per-update
+        // observation isn't a meaningful shape on this side.
+        #[cfg(feature = "api")]
+        {
+            crate::metrics::messages_in().inc();
+            crate::metrics::messages_in_by_rpc()
+                .with_label_values(&[RPC_SERVER_FEDERATE_GROUPS_STREAM])
+                .inc();
+        }
+        rustgate_core::audit::federation_event_received(
+            RPC_SERVER_FEDERATE_GROUPS_STREAM,
+            &peer_id,
+        );
 
         info!(peer = %peer_id, "server_federate_groups_stream opened (sending our groups)");
 
@@ -2934,5 +3166,504 @@ mod tests {
         // Invoking the default no-op must not panic and must not
         // observe any side effects.
         (svc.on_rol_event)(figpb::Rol::default(), "peer-cn".into());
+    }
+
+    // ── ServerFederateGroupsStream + ClientFederateGroupsStream
+    //    (refs #864) ─────────────────────────────────────────────────────
+    //
+    // Observable-stub coverage for the V2 GroupSync streaming RPCs.
+    // Mirrors the ROL stub's five-test discipline:
+    //   1. routes_to_callback / subscription_open_succeeds
+    //   2. peer_not_in_allowlist  → PermissionDenied + audit reject
+    //   3. hop_limit drop         → silent drop + audit reject (only
+    //                                applies to the client-streaming
+    //                                direction; ServerFederateGroupsStream's
+    //                                Subscription has no hops field)
+    //   4. metrics increment      → both messages_in and per-RPC label
+    //   5. unauthenticated        → Unauthenticated, callback never fires
+
+    /// `OnGroupSync` callback that increments a shared atomic counter
+    /// on every invocation, plus the counter itself for assertion.
+    /// Sibling of [`counting_on_blob`] / [`counting_on_rol_event`] so
+    /// the four observable RPC test suites stay structurally identical.
+    fn counting_on_group_sync() -> (OnGroupSync, Arc<AtomicU64>) {
+        let count = Arc::new(AtomicU64::new(0));
+        let c = Arc::clone(&count);
+        let cb: OnGroupSync = Arc::new(move |_groups, _peer| {
+            c.fetch_add(1, Ordering::Relaxed);
+        });
+        (cb, count)
+    }
+
+    // ── client_federate_groups_stream tests ───────────────────────────────
+
+    /// `ClientFederateGroupsStream` per-update policy must dispatch the
+    /// inbound `FederateGroups` update to the registered
+    /// `on_group_sync` callback when hop-count validation passes. The
+    /// callback is the bridge to a future router-side group-sync
+    /// consumer; this test pins the observation-first invariant —
+    /// every accepted update reaches the callback exactly once.
+    #[tokio::test]
+    async fn client_federate_groups_stream_routes_to_callback_on_success() {
+        let (on_group_sync, count) = counting_on_group_sync();
+        let svc = FederationService::new("s".into(), vec![], noop_on_event())
+            .with_on_group_sync(on_group_sync);
+
+        let groups = figpb::FederateGroups {
+            federate_groups: vec!["Alpha".into(), "Bravo".into()],
+            ..Default::default()
+        };
+
+        let routed =
+            FederationService::observe_inbound_group_sync(&svc.on_group_sync, "peer-cn", groups);
+
+        assert!(
+            routed,
+            "valid FederateGroups update must pass the observation hook"
+        );
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "on_group_sync callback must fire exactly once for an accepted update"
+        );
+    }
+
+    /// A peer not in the inbound allowlist must be rejected at
+    /// `ClientFederateGroupsStream` open with `PermissionDenied` AND
+    /// must produce a `federation.event_rejected` audit record tagged
+    /// with `rpc=client_federate_groups_stream`,
+    /// `reason=peer_not_in_allowlist`. Mirrors the `ServerROLStream`
+    /// peer-not-in-allowlist gate.
+    // justification: the test uses `empty_streaming_request` which is gated
+    // on `feature = "api"` (depends on `http_body_util`); fips and
+    // post-quantum builds skip `api`.
+    #[cfg(feature = "api")]
+    #[tokio::test]
+    async fn client_federate_groups_stream_emits_audit_on_peer_not_in_allowlist() {
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::filter::Targets;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let buf = AuditBuf::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(buf.clone())
+            .with_filter(Targets::new().with_target("audit", tracing::Level::INFO));
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        // Allowlist contains *only* "good-cn"; "bad-cn" is rejected.
+        let mut allowed = HashMap::new();
+        allowed.insert("good-cn".to_string(), HashSet::from(["Alpha".to_string()]));
+        let (on_group_sync, count) = counting_on_group_sync();
+        let svc = FederationService::new("s".into(), vec![], noop_on_event())
+            .with_on_group_sync(on_group_sync)
+            .with_allowed_peer_groups(allowed);
+
+        let request = empty_streaming_request::<figpb::FederateGroups>(Some("bad-cn"));
+
+        let result = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            svc.client_federate_groups_stream(request).await
+        };
+
+        let err =
+            result.expect_err("group-sync stream from peer-not-in-allowlist must be rejected");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "on_group_sync callback must not fire when the stream open is rejected"
+        );
+
+        let captured = buf.snapshot_string();
+        assert!(
+            captured.contains("federation.event_rejected"),
+            "audit log must contain federation.event_rejected; got: {captured}"
+        );
+        assert!(
+            captured.contains("client_federate_groups_stream"),
+            "audit record must include rpc=client_federate_groups_stream; got: {captured}"
+        );
+        assert!(
+            captured.contains("peer_not_in_allowlist"),
+            "audit record must include reason=peer_not_in_allowlist; got: {captured}"
+        );
+    }
+
+    /// A `FederateGroups` update arriving at or beyond
+    /// `MAX_FEDERATION_HOPS` must be silently dropped at the protocol
+    /// layer (the response is a single Subscription, not a per-message
+    /// ack — the V2 protocol has no channel for "too many hops" beyond
+    /// the standard Ok/Err split). The forensic trail is the only
+    /// vantage point: `federation.event_rejected` with
+    /// `reason=hop_limit`. Mirrors the ROL stub's hop-limit pin.
+    #[tokio::test]
+    async fn client_federate_groups_stream_drops_at_hop_limit_with_audit() {
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::filter::Targets;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let buf = AuditBuf::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(buf.clone())
+            .with_filter(Targets::new().with_target("audit", tracing::Level::INFO));
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        let (on_group_sync, count) = counting_on_group_sync();
+        let svc = FederationService::new("s".into(), vec![], noop_on_event())
+            .with_on_group_sync(on_group_sync);
+
+        let groups = figpb::FederateGroups {
+            federate_groups: vec!["Alpha".into()],
+            federate_hops: Some(figpb::FederateHops {
+                current_hops: MAX_FEDERATION_HOPS,
+                max_hops: MAX_FEDERATION_HOPS + 1,
+            }),
+            ..Default::default()
+        };
+
+        let routed = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            FederationService::observe_inbound_group_sync(&svc.on_group_sync, "peer-cn", groups)
+        };
+
+        assert!(
+            !routed,
+            "hop-limit update must not pass the observation hook"
+        );
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "on_group_sync callback must not fire for a hop-dropped update"
+        );
+
+        let captured = buf.snapshot_string();
+        assert!(
+            captured.contains("federation.event_rejected"),
+            "audit log must contain federation.event_rejected for hop-limit drops; got: {captured}"
+        );
+        assert!(
+            captured.contains("client_federate_groups_stream"),
+            "audit record must include rpc=client_federate_groups_stream; got: {captured}"
+        );
+        assert!(
+            captured.contains("hop_limit"),
+            "audit record must include reason=hop_limit; got: {captured}"
+        );
+    }
+
+    /// Successful `FederateGroups` updates must increment both the
+    /// legacy `messages_in` counter and the per-RPC
+    /// `messages_in_by_rpc{rpc="client_federate_groups_stream"}` label.
+    /// Gated on `feature = "api"` because the metrics module itself
+    /// only compiles with that feature.
+    #[cfg(feature = "api")]
+    #[tokio::test]
+    async fn client_federate_groups_stream_increments_metrics_counter_per_update() {
+        let _ = crate::metrics::init();
+
+        let svc = FederationService::new("s".into(), vec![], noop_on_event());
+
+        let total_before = crate::metrics::messages_in().get();
+        let by_rpc_before = crate::metrics::messages_in_by_rpc()
+            .with_label_values(&[RPC_CLIENT_FEDERATE_GROUPS_STREAM])
+            .get();
+
+        let groups = figpb::FederateGroups {
+            federate_groups: vec!["metric-tick".into()],
+            ..Default::default()
+        };
+        let _ =
+            FederationService::observe_inbound_group_sync(&svc.on_group_sync, "peer-cn", groups);
+
+        let total_after = crate::metrics::messages_in().get();
+        let by_rpc_after = crate::metrics::messages_in_by_rpc()
+            .with_label_values(&[RPC_CLIENT_FEDERATE_GROUPS_STREAM])
+            .get();
+
+        // Parallel tests share the global registry, so `>=` rather
+        // than `==`. The guarantee is "this RPC contributed at least
+        // once".
+        assert!(
+            total_after > total_before,
+            "messages_in counter must advance on accepted ClientFederateGroupsStream update"
+        );
+        assert!(
+            by_rpc_after > by_rpc_before,
+            "messages_in_by_rpc[rpc=client_federate_groups_stream] must advance: before={by_rpc_before}, after={by_rpc_after}"
+        );
+    }
+
+    /// `ClientFederateGroupsStream` must reject any request whose
+    /// `tonic::Request` carries no mTLS client certificate (and no
+    /// test-only synthetic CN). F-44 / #759 invariant: short-circuit
+    /// with `Unauthenticated` BEFORE any payload processing.
+    // justification: uses `empty_streaming_request` which is api-feature-gated.
+    #[cfg(feature = "api")]
+    #[tokio::test]
+    async fn client_federate_groups_stream_rejects_unauthenticated() {
+        let (on_group_sync, count) = counting_on_group_sync();
+        let svc = FederationService::new("s".into(), vec![], noop_on_event())
+            .with_on_group_sync(on_group_sync);
+
+        let request = empty_streaming_request::<figpb::FederateGroups>(None);
+        let result = svc.client_federate_groups_stream(request).await;
+
+        let err = result.expect_err("RPC without mTLS cert must be refused");
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "on_group_sync callback must not fire on unauthenticated request"
+        );
+    }
+
+    // ── server_federate_groups_stream tests ───────────────────────────────
+    //
+    // `ServerFederateGroupsStream` is server-streaming — peer sends ONE
+    // Subscription, we open a stream of FederateGroups updates back.
+    // The observation stub records the subscription open with peer-auth
+    // + allowlist + audit + metric, sends the initial groups roster,
+    // then holds the stream open without producing further updates.
+    // The five tests below mirror the `ClientROLStream` shape: open
+    // path succeeds, peer-not-in-allowlist rejection at subscription
+    // open, hop-limit n/a (Subscription has no hops field, pinned via
+    // the audit record not containing a hop_limit reject), metrics
+    // increment per accepted subscription, and unauthenticated
+    // rejection.
+
+    /// `ServerFederateGroupsStream` must accept a subscription from a
+    /// known peer (no allowlist, or peer is in the allowlist) and
+    /// return a stream without erroring. The first message on the
+    /// stream is the initial groups roster — pinning that survives the
+    /// observation-stub graduation.
+    #[tokio::test]
+    async fn server_federate_groups_stream_routes_to_callback_on_success() {
+        // No allowed_peer_groups configured = open mode.
+        let svc = FederationService::new(
+            "s".into(),
+            vec!["Alpha".into(), "Bravo".into()],
+            noop_on_event(),
+        );
+
+        let mut req = Request::new(figpb::Subscription {
+            identity: Some(figpb::Identity {
+                name: "peer-cn".into(),
+                ..Default::default()
+            }),
+            filter: String::new(),
+            version: None,
+        });
+        req.extensions_mut().insert(TestPeerCn("peer-cn".into()));
+
+        let resp = svc.server_federate_groups_stream(req).await.expect(
+            "server_federate_groups_stream must succeed for an authorized peer in open mode",
+        );
+        // Pull the first message off the stream — it should be the
+        // initial groups roster. This pins that the observable-stub
+        // graduation didn't break the existing payload contract.
+        use tokio_stream::StreamExt;
+        let mut stream = resp.into_inner();
+        let msg = stream
+            .next()
+            .await
+            .expect("initial groups message must be sent on open")
+            .expect("initial message must be Ok(FederateGroups)");
+        assert_eq!(msg.federate_groups, vec!["Alpha", "Bravo"]);
+        // Drop the stream so the held-open background task stops
+        // pinning resources after the assertion.
+        drop(stream);
+    }
+
+    /// A peer not in the inbound allowlist must be rejected at
+    /// `ServerFederateGroupsStream` open with `PermissionDenied` AND
+    /// must produce a `federation.event_rejected` audit record tagged
+    /// with `rpc=server_federate_groups_stream`,
+    /// `reason=peer_not_in_allowlist`.
+    #[tokio::test]
+    async fn server_federate_groups_stream_emits_audit_on_peer_not_in_allowlist() {
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::filter::Targets;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let buf = AuditBuf::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(buf.clone())
+            .with_filter(Targets::new().with_target("audit", tracing::Level::INFO));
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        let mut allowed = HashMap::new();
+        allowed.insert("good-cn".to_string(), HashSet::from(["Alpha".to_string()]));
+        let svc = FederationService::new("s".into(), vec![], noop_on_event())
+            .with_allowed_peer_groups(allowed);
+
+        let mut req = Request::new(figpb::Subscription::default());
+        req.extensions_mut().insert(TestPeerCn("bad-cn".into()));
+
+        let result = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            svc.server_federate_groups_stream(req).await
+        };
+
+        let err = result
+            .expect_err("ServerFederateGroupsStream from peer-not-in-allowlist must be rejected");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        let captured = buf.snapshot_string();
+        assert!(
+            captured.contains("federation.event_rejected"),
+            "audit log must contain federation.event_rejected; got: {captured}"
+        );
+        assert!(
+            captured.contains("server_federate_groups_stream"),
+            "audit record must include rpc=server_federate_groups_stream; got: {captured}"
+        );
+        assert!(
+            captured.contains("peer_not_in_allowlist"),
+            "audit record must include reason=peer_not_in_allowlist; got: {captured}"
+        );
+    }
+
+    /// `ServerFederateGroupsStream` carries no per-event hop count: the
+    /// proto shape is one-Subscription-in, many-FederateGroups-out, and
+    /// `Subscription` has no `federate_hops` field. This test pins
+    /// that the hop-limit gate is **not applicable** here — opening a
+    /// stream succeeds and emits an `event_received` audit record with
+    /// no `event_rejected` counterpart. A future revision that adds a
+    /// hop-style gate to the subscription open path must update this
+    /// test deliberately.
+    #[tokio::test]
+    async fn server_federate_groups_stream_drops_at_hop_limit_with_audit() {
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::filter::Targets;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let buf = AuditBuf::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(buf.clone())
+            .with_filter(Targets::new().with_target("audit", tracing::Level::INFO));
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        let svc = FederationService::new("s".into(), vec!["Alpha".into()], noop_on_event());
+
+        let mut req = Request::new(figpb::Subscription::default());
+        req.extensions_mut().insert(TestPeerCn("peer-cn".into()));
+
+        let resp = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            svc.server_federate_groups_stream(req).await.expect(
+                "ServerFederateGroupsStream open must succeed: hop-limit gate does not apply",
+            )
+        };
+        // Drop the held-open stream so the background task stops
+        // pinning resources after the assertion.
+        drop(resp);
+
+        let captured = buf.snapshot_string();
+        // Pin "no hop_limit reject was emitted" — the gate is N/A for
+        // this RPC. A regression that wired a hop-style check into the
+        // subscription open path would surface here.
+        assert!(
+            !captured.contains("hop_limit"),
+            "ServerFederateGroupsStream must not emit a hop_limit reject (gate is N/A); got: {captured}"
+        );
+        // The `event_received` audit record IS expected on a clean
+        // open — pin it explicitly so the hop-limit test still
+        // validates the success path's forensic trail.
+        assert!(
+            captured.contains("federation.event_received"),
+            "audit log must contain federation.event_received on accepted subscription; got: {captured}"
+        );
+        assert!(
+            captured.contains("server_federate_groups_stream"),
+            "audit record must include rpc=server_federate_groups_stream; got: {captured}"
+        );
+    }
+
+    /// Successful `ServerFederateGroupsStream` opens must increment
+    /// both `messages_in` and
+    /// `messages_in_by_rpc{rpc="server_federate_groups_stream"}`. Note:
+    /// the metric counts SUBSCRIPTIONS, not FederateGroups updates,
+    /// because the proto shape is one-Subscription-in (the only thing
+    /// the peer sends) — there is no per-update observation surface on
+    /// this side until a bidirectional follow-up lands.
+    #[cfg(feature = "api")]
+    #[tokio::test]
+    async fn server_federate_groups_stream_increments_metrics_counter_per_update() {
+        let _ = crate::metrics::init();
+
+        let svc = FederationService::new("s".into(), vec!["Alpha".into()], noop_on_event());
+
+        let total_before = crate::metrics::messages_in().get();
+        let by_rpc_before = crate::metrics::messages_in_by_rpc()
+            .with_label_values(&[RPC_SERVER_FEDERATE_GROUPS_STREAM])
+            .get();
+
+        let mut req = Request::new(figpb::Subscription::default());
+        req.extensions_mut().insert(TestPeerCn("peer-cn".into()));
+        let resp = svc
+            .server_federate_groups_stream(req)
+            .await
+            .expect("server_federate_groups_stream must succeed");
+        drop(resp);
+
+        let total_after = crate::metrics::messages_in().get();
+        let by_rpc_after = crate::metrics::messages_in_by_rpc()
+            .with_label_values(&[RPC_SERVER_FEDERATE_GROUPS_STREAM])
+            .get();
+
+        assert!(
+            total_after > total_before,
+            "messages_in counter must advance on accepted ServerFederateGroupsStream subscription"
+        );
+        assert!(
+            by_rpc_after > by_rpc_before,
+            "messages_in_by_rpc[rpc=server_federate_groups_stream] must advance: before={by_rpc_before}, after={by_rpc_after}"
+        );
+    }
+
+    /// `ServerFederateGroupsStream` must reject any request whose
+    /// `tonic::Request` carries no mTLS client certificate. F-44 /
+    /// #759 invariant.
+    #[tokio::test]
+    async fn server_federate_groups_stream_rejects_unauthenticated() {
+        let svc = FederationService::new("s".into(), vec!["Alpha".into()], noop_on_event());
+
+        // Plain Request — no test-only TestPeerCn extension.
+        let result = svc
+            .server_federate_groups_stream(Request::new(figpb::Subscription::default()))
+            .await;
+
+        let err = result.expect_err("RPC without mTLS cert must be refused");
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    // ── builder + default plumbing ────────────────────────────────────────
+
+    #[test]
+    fn with_on_group_sync_overrides_default_noop() {
+        let (on_group_sync, count) = counting_on_group_sync();
+        let svc = FederationService::new("s".into(), vec![], noop_on_event())
+            .with_on_group_sync(on_group_sync);
+
+        // Drive the callback directly to confirm the override took
+        // effect — the default is a no-op that never increments.
+        (svc.on_group_sync)(figpb::FederateGroups::default(), "peer-cn".into());
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "with_on_group_sync must replace the default no-op callback"
+        );
+    }
+
+    #[test]
+    fn default_service_uses_noop_on_group_sync() {
+        let svc = FederationService::new("s".into(), vec![], noop_on_event());
+        // Invoking the default no-op must not panic and must not
+        // observe any side effects.
+        (svc.on_group_sync)(figpb::FederateGroups::default(), "peer-cn".into());
     }
 }
