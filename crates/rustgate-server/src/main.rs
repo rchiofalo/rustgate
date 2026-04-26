@@ -1058,13 +1058,20 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     {
         match (&cli.group_acl_file, &cli.acl_api_token_file) {
             (Some(acl_file), Some(token_file)) => {
-                let token = std::fs::read_to_string(token_file).map_err(|e| {
+                // Routed through the shared `read_secret_file` helper so
+                // the ACL API token file is now subject to the unified
+                // size cap, mode 0o077 perm gate, and empty-file
+                // rejection (closes #797). Operators with overly-
+                // permissive token files will see a hard error here
+                // instead of a silent passthrough.
+                let token_str = rustgate_core::read_secret_file(
+                    token_file,
+                    &rustgate_core::SecretFileOpts::default(),
+                )
+                .map_err(|e| {
                     anyhow::anyhow!("failed to read ACL API token file {token_file}: {e}")
                 })?;
-                let token = token.trim().as_bytes().to_vec();
-                if token.is_empty() {
-                    anyhow::bail!("ACL API token file {token_file} is empty");
-                }
+                let token = token_str.as_bytes().to_vec();
                 acl_api::validate_bearer_token_length(&token, "ACL API")
                     .map_err(|e| anyhow::anyhow!("{e} (from {token_file})"))?;
                 let initial_file = acl_file_parsed.unwrap_or_default();
@@ -1364,13 +1371,26 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     #[cfg(feature = "metrics")]
     {
         if let Some(ref token_file) = cli.mgmt_api_token_file {
-            let token = tokio::fs::read_to_string(token_file).await.map_err(|e| {
+            // Closes #797: route through the shared `read_secret_file`
+            // helper so the management API token file is subject to the
+            // unified perm/size/empty/UTF-8 discipline. The helper is
+            // synchronous, but the read happens once at startup —
+            // running it inside `tokio::task::spawn_blocking` would add
+            // complexity for no measurable benefit in a single-shot
+            // bring-up path.
+            let token_path = token_file.clone();
+            let token_str = tokio::task::spawn_blocking(move || {
+                rustgate_core::read_secret_file(
+                    &token_path,
+                    &rustgate_core::SecretFileOpts::default(),
+                )
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("blocking task panic: {e}"))?
+            .map_err(|e| {
                 anyhow::anyhow!("failed to read management API token file {token_file}: {e}")
             })?;
-            let token = token.trim().as_bytes().to_vec();
-            if token.is_empty() {
-                anyhow::bail!("management API token file {token_file} is empty");
-            }
+            let token = token_str.as_bytes().to_vec();
             acl_api::validate_bearer_token_length(&token, "management API")
                 .map_err(|e| anyhow::anyhow!("{e} (from {token_file})"))?;
 
@@ -2049,49 +2069,22 @@ const MAX_QUEUE_KEY_FILE_BYTES: u64 = 128;
 /// whitespace. On Unix, the file must be mode 0600/0400 and owned by
 /// the running process's effective UID.
 ///
-/// Mirrors the pattern in `rustgate-http::auth::read_secret_file`.
+/// Delegates the perm/size/empty/UTF-8 discipline to the shared
+/// [`rustgate_core::secrets::read_secret_file`] helper (closes #797);
+/// only the hex-decode + length contract specific to the 32-byte HMAC
+/// key remains here.
 fn read_queue_key_file(path: &std::path::Path) -> anyhow::Result<zeroize::Zeroizing<[u8; 32]>> {
     let display = path.display().to_string();
-    let metadata = std::fs::metadata(path)
-        .map_err(|e| anyhow::anyhow!("client-queue key file `{display}`: {e}"))?;
-
+    let mut opts = rustgate_core::SecretFileOpts {
+        max_bytes: MAX_QUEUE_KEY_FILE_BYTES,
+        ..rustgate_core::SecretFileOpts::default()
+    };
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let mode = metadata.permissions().mode();
-        if mode & 0o077 != 0 {
-            anyhow::bail!(
-                "client-queue key file `{display}` has insecure permissions {mode:#o} \
-                 (group/world-accessible); set to 0600 or 0400"
-            );
-        }
-        let file_uid = metadata.uid();
-        let proc_uid = rustix::process::geteuid().as_raw();
-        if file_uid != proc_uid {
-            anyhow::bail!(
-                "client-queue key file `{display}` is owned by uid {file_uid}, but the \
-                 running process has effective uid {proc_uid}; chown the file to the \
-                 service account"
-            );
-        }
+        opts.require_owner_uid = Some(rustix::process::geteuid().as_raw());
     }
-
-    let file_size = metadata.len();
-    if file_size > MAX_QUEUE_KEY_FILE_BYTES {
-        anyhow::bail!(
-            "client-queue key file `{display}` is too large ({file_size} bytes, \
-             max {MAX_QUEUE_KEY_FILE_BYTES})"
-        );
-    }
-
-    // Read and immediately wrap in Zeroizing so the raw hex bytes are
-    // wiped on every exit path.
-    let mut raw = zeroize::Zeroizing::new(
-        std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("client-queue key file `{display}`: {e}"))?,
-    );
-    let trimmed = zeroize::Zeroizing::new(raw.trim().to_string());
-    zeroize::Zeroize::zeroize(&mut *raw);
+    let trimmed = rustgate_core::read_secret_file(path, &opts)
+        .map_err(|e| anyhow::anyhow!("client-queue key file `{display}`: {e}"))?;
 
     if trimmed.len() != 64 {
         anyhow::bail!(

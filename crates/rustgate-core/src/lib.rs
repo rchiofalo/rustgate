@@ -25,7 +25,9 @@ pub mod peer_id;
 pub mod pem;
 pub mod protocol;
 pub mod sanitize;
+pub mod secrets;
 pub mod tasks;
 
 pub use identity::AttrValue;
 pub use peer_id::{PeerId, ServerName};
+pub use secrets::{SecretFileError, SecretFileOpts, read_secret_file};

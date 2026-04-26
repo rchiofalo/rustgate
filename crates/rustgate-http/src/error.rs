@@ -37,6 +37,14 @@ pub enum HttpError {
         source: std::io::Error,
     },
 
+    /// Secret-file load delegated to the shared
+    /// [`rustgate_core::secrets::read_secret_file`] helper failed.
+    /// Carries the structured `SecretFileError` so operators see the
+    /// specific check that tripped (size cap, permissions, ownership,
+    /// empty file) without losing detail behind a `String`.
+    #[error(transparent)]
+    SecretFile(#[from] rustgate_core::SecretFileError),
+
     /// Failed to read a TLS certificate or key file.
     #[error("failed to read TLS file `{path}` for target `{target}`: {source}")]
     TlsFile {
