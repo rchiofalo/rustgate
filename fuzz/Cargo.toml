@@ -135,3 +135,8 @@ doc = false
 name = "asterix_cat062"
 path = "fuzz_targets/asterix_cat062.rs"
 doc = false
+
+[[bin]]
+name = "asterix_cat021"
+path = "fuzz_targets/asterix_cat021.rs"
+doc = false
