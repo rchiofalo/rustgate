@@ -618,6 +618,14 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 32, env = "RUSTGATE_MQTT_RECEIVE_MAX")]
     pub(crate) mqtt_receive_max: u16,
 
+    /// MQTT 5.0 Topic Alias Maximum advertised in CONNACK (default: 0
+    /// = topic aliases disabled). Set to a non-zero cap to enable the
+    /// per-connection alias table (§3.3.2.3.4); inbound PUBLISH with
+    /// alias outside [1, cap] OR referencing an unmapped slot triggers
+    /// DISCONNECT 0x94.
+    #[arg(long, default_value_t = 0, env = "RUSTGATE_MQTT_TOPIC_ALIAS_MAX")]
+    pub(crate) mqtt_topic_alias_max: u16,
+
     /// Maximum MQTT 5.0 `Session Expiry Interval` (seconds) the broker
     /// will honor for retained sessions (default: 0 = retention OFF).
     /// Set to a positive value to enable session retention per
@@ -1655,6 +1663,7 @@ define_config_file! {
     mqtt_topic_prefix: Option<String>,
     mqtt_max_packet_size: usize,
     mqtt_receive_max: u16,
+    mqtt_topic_alias_max: u16,
     mqtt_max_session_expiry_secs: u32,
     mqtt_max_retained_sessions: usize,
     mqtt_min_keep_alive_secs: u16,

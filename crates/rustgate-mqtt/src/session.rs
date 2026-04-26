@@ -171,6 +171,7 @@ pub(crate) async fn handle_mqtt_session(
     topic_prefix: Option<String>,
     max_packet_size: usize,
     receive_max: u16,
+    topic_alias_max: u16,
     max_session_expiry_secs: u32,
     min_keep_alive_secs: u16,
     response_channel_capacity: usize,
@@ -186,7 +187,7 @@ pub(crate) async fn handle_mqtt_session(
     let peer_addr = pre.peer_addr;
     let cn = identity.cn.clone();
 
-    let mut codec = PacketCodec::new(pre.stream, max_packet_size, receive_max);
+    let mut codec = PacketCodec::new(pre.stream, max_packet_size, receive_max, topic_alias_max);
 
     // --- CONNECT handshake ---
     let outcome = match connect_handshake(
@@ -376,6 +377,7 @@ pub(crate) async fn handle_mqtt_session(
         forwarding_hooks: forwarding_hooks.as_ref(),
         retain_store: &retain_store,
         subscriptions: &subscriptions,
+        topic_alias_max,
     };
 
     // Each branch returns a matched type so the `select!` macro can
@@ -452,6 +454,23 @@ pub(crate) async fn handle_mqtt_session(
     {
         let disconnect = mqttbytes::v5::Disconnect {
             reason_code: mqttbytes::v5::DisconnectReasonCode::PacketTooLarge,
+            properties: None,
+        };
+        let _ = writer
+            .write_v5(&mqttbytes::v5::Packet::Disconnect(disconnect))
+            .await;
+    }
+
+    // MQTT 5.0 §3.14.2.1 reason code 0x94 (`TopicAliasInvalid`): same
+    // best-effort DISCONNECT contract as PacketTooLarge above. The
+    // alias resolution path in `mqtt_read_loop` surfaces this when a
+    // client sends a PUBLISH whose Topic Alias is `0`, exceeds the
+    // advertised `topic_alias_max`, or references an unmapped slot.
+    if let SessionEnd::Read(Err(MqttError::TopicAliasInvalid { .. })) = &session_end
+        && protocol == ProtocolLevel::V50
+    {
+        let disconnect = mqttbytes::v5::Disconnect {
+            reason_code: mqttbytes::v5::DisconnectReasonCode::TopicAliasInvalid,
             properties: None,
         };
         let _ = writer
@@ -1042,6 +1061,14 @@ struct ReadLoopParams<'a> {
     /// remove them. The session-end cleanup (in `handle_mqtt_session`)
     /// snapshots this when saving to the retention store.
     subscriptions: &'a Arc<parking_lot::Mutex<Vec<crate::session_store::RetainedSubscription>>>,
+    /// MQTT 5.0 §3.2.2.3.8 Topic Alias Maximum advertised in CONNACK.
+    /// Inbound v5 PUBLISHes carrying a `topic_alias` property must
+    /// reference an alias in `[1, topic_alias_max]`; outside that
+    /// range surfaces `MqttError::TopicAliasInvalid` which the
+    /// session-end handler maps to DISCONNECT 0x94. When `0`, the
+    /// feature is disabled and any PUBLISH carrying a topic alias
+    /// is rejected.
+    topic_alias_max: u16,
 }
 
 /// Outcome of the read loop. Used by the caller to decide whether to
@@ -1097,6 +1124,14 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<ReadLoopOutco
         std::collections::HashMap::new();
     let mut qos2_inflight_v4: std::collections::HashMap<u16, Qos2InflightV4> =
         std::collections::HashMap::new();
+    // MQTT 5.0 §3.3.2.3.4 per-connection Topic Alias table. Capacity
+    // is bounded by `params.topic_alias_max`. Empty when the operator
+    // has disabled the feature (cap = 0); inbound PUBLISHes carrying
+    // a topic_alias property in that case fail the
+    // `alias > params.topic_alias_max` check and emit DISCONNECT 0x94.
+    let mut topic_alias_table: std::collections::HashMap<u16, String> =
+        std::collections::HashMap::new();
+    let topic_alias_max = params.topic_alias_max;
     loop {
         let packet = match tokio::time::timeout(keep_alive, reader.read_packet()).await {
             Ok(Ok(pkt)) => pkt,
@@ -1110,7 +1145,49 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<ReadLoopOutco
         match packet {
             // --- v5 packets ---
             MqttPacket::V5(boxed) => match *boxed {
-                mqttbytes::v5::Packet::Publish(publish) => {
+                mqttbytes::v5::Packet::Publish(mut publish) => {
+                    // MQTT 5.0 §3.3.2.3.4 Topic Alias resolution. Done
+                    // BEFORE handle_publish_v5 so the handler always
+                    // sees a fully-resolved topic and stays oblivious
+                    // to the alias mechanism. Three failure modes
+                    // surface as `MqttError::TopicAliasInvalid` which
+                    // the session-end handler maps to DISCONNECT 0x94:
+                    //   1. alias = 0 (spec-reserved value)
+                    //   2. alias > topic_alias_max (out of range)
+                    //   3. empty topic + alias references an unmapped
+                    //      slot (no prior establishing PUBLISH)
+                    if let Some(alias) = publish.properties.as_ref().and_then(|p| p.topic_alias) {
+                        if alias == 0 || alias > topic_alias_max {
+                            return Err(MqttError::TopicAliasInvalid {
+                                alias,
+                                max: topic_alias_max,
+                            });
+                        }
+                        if publish.topic.is_empty() {
+                            // Reference: look up the established mapping.
+                            match topic_alias_table.get(&alias) {
+                                Some(topic) => publish.topic = topic.clone(),
+                                None => {
+                                    return Err(MqttError::TopicAliasInvalid {
+                                        alias,
+                                        max: topic_alias_max,
+                                    });
+                                }
+                            }
+                        } else {
+                            // Establish (or update) the mapping.
+                            // Spec §3.3.2.3.4: a non-empty topic with
+                            // an alias REPLACES any prior mapping for
+                            // that alias number.
+                            let _ = topic_alias_table.insert(alias, publish.topic.clone());
+                        }
+                    } else if publish.topic.is_empty() {
+                        // §3.3.2.1: topic name MUST NOT be empty if no
+                        // alias is provided. Treat as a malformed packet.
+                        return Err(MqttError::Malformed(
+                            "v5 PUBLISH with empty topic and no Topic Alias".into(),
+                        ));
+                    }
                     handle_publish_v5(
                         resp_tx,
                         identity,

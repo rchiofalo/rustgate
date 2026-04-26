@@ -39,6 +39,18 @@ pub enum MqttError {
     #[error("packet too large: {size} bytes exceeds {max} byte limit")]
     PacketTooLarge { size: usize, max: usize },
 
+    /// The client sent a v5 PUBLISH with a Topic Alias outside the
+    /// `[1, advertised_max]` range, or referenced an alias that has
+    /// not yet been established. MQTT 5.0 §3.3.2.3.4: this is a
+    /// Protocol Error and the broker MUST send DISCONNECT with reason
+    /// code 0x94 (TopicAliasInvalid) before closing the connection.
+    /// `alias=0` is the spec-reserved value and always triggers this
+    /// variant. Surfaced from the read loop so the session-end handler
+    /// can emit the matching v5 DISCONNECT before tearing down the
+    /// stream.
+    #[error("topic alias {alias} invalid (max {max})")]
+    TopicAliasInvalid { alias: u16, max: u16 },
+
     /// The client sent a malformed packet.
     #[error("malformed packet: {0}")]
     Malformed(String),
@@ -462,6 +474,7 @@ mod tests {
                 MqttError::NotAuthorized(_) => "not_authorized",
                 MqttError::InvalidTopic(_) => "invalid_topic",
                 MqttError::PacketTooLarge { .. } => "packet_too_large",
+                MqttError::TopicAliasInvalid { .. } => "topic_alias_invalid",
                 MqttError::Malformed(_) => "malformed",
                 MqttError::ConnectExpected => "connect_expected",
                 MqttError::ClientIdInUse(_) => "client_id_in_use",

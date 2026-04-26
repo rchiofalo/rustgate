@@ -274,6 +274,27 @@ pub struct MqttServerConfig {
     /// payload size in the read buffer until ack-and-route completes).
     pub receive_max: u16,
 
+    /// Maximum MQTT 5.0 `Topic Alias` value the broker will accept on
+    /// inbound PUBLISHes from this client (default: 0 = topic aliases
+    /// disabled).
+    ///
+    /// Advertised in CONNACK as MQTT 5.0 §3.2.2.3.8 `Topic Alias
+    /// Maximum`. A non-zero value enables a per-connection alias
+    /// table where the client can establish `topic="foo/bar" + alias=N`
+    /// in one PUBLISH and then send subsequent PUBLISHes with empty
+    /// topic + alias=N — useful when the topic name is long and the
+    /// PUBLISHes are frequent. Per §3.3.2.3.4, an alias outside
+    /// `[1, advertised_max]` is a Protocol Error and the broker MUST
+    /// respond with DISCONNECT reason code 0x94 (TopicAliasInvalid).
+    /// Default `0` disables the feature; any inbound PUBLISH carrying
+    /// a Topic Alias triggers DISCONNECT.
+    ///
+    /// Memory cost: O(advertised_max) per connection for the alias
+    /// table. The default of 0 is conservative; tactical deployments
+    /// with high-frequency publishers on a small set of long topics
+    /// benefit from a modest cap (8-32).
+    pub topic_alias_max: u16,
+
     /// Maximum MQTT 5.0 `Session Expiry Interval` (in seconds) the broker
     /// will honor for retained sessions (default: 0 = retention disabled).
     ///
@@ -379,6 +400,15 @@ impl MqttServerConfig {
     /// channel cap proportionally.
     pub const DEFAULT_RECEIVE_MAX: u16 = 32;
 
+    /// Default `Topic Alias Maximum` advertised in CONNACK (0 — disabled).
+    ///
+    /// Disabled by default: the feature is a bandwidth optimization
+    /// for repeated long-topic PUBLISHes, not a correctness requirement,
+    /// and most fleets don't need it. Operators turn it on by setting
+    /// a non-zero cap when their workload profile (long topics +
+    /// high frequency) justifies the per-connection memory overhead.
+    pub const DEFAULT_TOPIC_ALIAS_MAX: u16 = 0;
+
     /// Default minimum keep-alive in seconds.
     pub const DEFAULT_MIN_KEEP_ALIVE_SECS: u16 = 30;
 
@@ -396,6 +426,7 @@ impl std::fmt::Debug for MqttServerConfig {
             .field("topic_prefix", &self.topic_prefix)
             .field("max_packet_size", &self.max_packet_size)
             .field("receive_max", &self.receive_max)
+            .field("topic_alias_max", &self.topic_alias_max)
             .field("max_session_expiry_secs", &self.max_session_expiry_secs)
             .field("max_retained_sessions", &self.max_retained_sessions)
             .field("min_keep_alive_secs", &self.min_keep_alive_secs)
@@ -535,6 +566,7 @@ mod tests {
             topic_prefix: None,
             max_packet_size: 1024,
             receive_max: MqttServerConfig::DEFAULT_RECEIVE_MAX,
+            topic_alias_max: MqttServerConfig::DEFAULT_TOPIC_ALIAS_MAX,
             max_session_expiry_secs: MqttServerConfig::DEFAULT_MAX_SESSION_EXPIRY_SECS,
             max_retained_sessions: MqttServerConfig::DEFAULT_MAX_RETAINED_SESSIONS,
             min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
@@ -585,6 +617,7 @@ mod tests {
             topic_prefix: None,
             max_packet_size: 1024,
             receive_max: MqttServerConfig::DEFAULT_RECEIVE_MAX,
+            topic_alias_max: MqttServerConfig::DEFAULT_TOPIC_ALIAS_MAX,
             max_session_expiry_secs: MqttServerConfig::DEFAULT_MAX_SESSION_EXPIRY_SECS,
             max_retained_sessions: MqttServerConfig::DEFAULT_MAX_RETAINED_SESSIONS,
             min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
