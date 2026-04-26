@@ -16,9 +16,10 @@
 //!
 //! This crate implements **LOI 2-3 telemetry** — the inbound vehicle
 //! state stream that any LOI 2 deployment needs to display, log, and
-//! relay. The LOI 4+ command set (waypoint upload, sensor pointing,
-//! GCS handover) is deliberately out of scope; it lands in a follow-up
-//! PR once the receive side is exercised against real traffic.
+//! relay — plus the **first LOI 4 command** (waypoint upload). The
+//! remainder of the LOI 4 command set (sensor pointing, GCS handover,
+//! payload control, mode change) is deliberately out of scope and
+//! lands in follow-up PRs.
 //!
 //! # Scope
 //!
@@ -37,9 +38,10 @@
 //!
 //! # What is deliberately absent
 //!
-//! - **LOI 4+ command messages** (waypoint upload, sensor pointing,
-//!   GCS handover, payload control) — separate follow-up PR. The
-//!   receive side has to be exercised first.
+//! - **Remaining LOI 4+ command messages** (sensor pointing, GCS
+//!   handover, payload control, mode change) — separate follow-up
+//!   PRs. The first LOI 4 command (waypoint upload) ships in this
+//!   crate via [`waypoint_command`].
 //! - **Other LOI 2-3 telemetry message types** beyond vehicle
 //!   position — sensor status, payload status, system state, BIT
 //!   reports. Those use the same big-endian/typed-field approach but
@@ -76,6 +78,7 @@ pub mod payload_status;
 pub mod sensor_status;
 pub mod system_state;
 pub mod vehicle_position;
+pub mod waypoint_command;
 
 pub use bit_report::{BitReport, FaultSeverity, SubsystemId};
 pub use error::Stanag4586Error;
@@ -83,3 +86,4 @@ pub use payload_status::{PayloadKind, PayloadStatus, RecordingState, StreamingSt
 pub use sensor_status::{OperationalState, SensorStatus, SensorType};
 pub use system_state::{BitStatusFlags, MissionPhase, OperatingMode, SystemState};
 pub use vehicle_position::{FlightState, VehiclePosition};
+pub use waypoint_command::{CommandKind, WaypointCommand};
