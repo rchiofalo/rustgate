@@ -32,6 +32,7 @@ thiserror = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+subtle = { workspace = true }
 x509-parser = { workspace = true }
 zeroize = { workspace = true }
 fastrand = { workspace = true }

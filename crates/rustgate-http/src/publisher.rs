@@ -169,6 +169,13 @@ struct TargetState {
     name: String,
     client: reqwest::Client,
     url: String,
+    /// URL path component cached at construction time. Bound into the HMAC
+    /// canonical payload (`<timestamp>.<METHOD>.<path>.<body>`) so a
+    /// signature captured for `/alert` cannot be replayed at `/shutdown`.
+    /// Cached here (rather than re-parsing per request) because the URL is
+    /// fixed for the target's lifetime and reqwest's `Url::parse` is the
+    /// only way to get the path component cleanly.
+    url_path: String,
     method: reqwest::Method,
     format: PayloadFormat,
     auth: Option<AuthState>,
@@ -663,10 +670,21 @@ fn build_target(
         None
     };
 
+    // Cache the URL path component for HMAC canonical-payload binding.
+    // Validated at config time, so parse-failure here is unreachable in
+    // practice, but the fall-back keeps the function infallible without
+    // panicking — an empty path is a harmless tombstone that simply
+    // produces a signature that cannot match any well-formed receiver
+    // reconstruction.
+    let url_path = reqwest::Url::parse(&tc.url)
+        .map(|u| u.path().to_string())
+        .unwrap_or_default();
+
     Ok(TargetState {
         name: tc.name.clone(),
         client,
         url: tc.url.clone(),
+        url_path,
         method,
         format: tc.format.unwrap_or_default(),
         auth,
@@ -1831,10 +1849,13 @@ async fn send_request(
         builder = builder.header(name.clone(), value);
     }
 
-    // Apply authentication (needs a byte slice for HMAC computation)
+    // Apply authentication. HMAC binds the canonical request
+    // (`<timestamp>.<METHOD>.<path>.<body>`) so a captured signature
+    // cannot be replayed against a different endpoint or with a
+    // different verb (#747).
     if let Some(auth) = &target.auth {
         builder = auth
-            .apply(builder, &body)
+            .apply(builder, target.method.as_str(), &target.url_path, &body)
             .map_err(|e| (None, e.to_string(), None))?;
     }
 

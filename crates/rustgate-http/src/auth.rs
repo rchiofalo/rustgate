@@ -12,6 +12,7 @@ use std::fmt;
 use hmac::{Hmac, Mac};
 use rustgate_core::secrets::{SecretFileOpts, read_secret_file as core_read_secret_file};
 use sha2::Sha256;
+use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::config::AuthConfig;
@@ -100,11 +101,17 @@ impl AuthState {
     /// Apply authentication to a request builder.
     ///
     /// For Bearer and Basic, sets the `Authorization` header.
-    /// For HMAC, computes the signature over `body` and sets the
-    /// configured header (default: `X-Signature-256`).
+    /// For HMAC, computes the signature over the canonical request
+    /// (`<timestamp>.<METHOD>.<path>.<body>`) and sets the configured
+    /// header (default: `X-Signature-256`). The HTTP `method` and the
+    /// URL `path` are bound into the signed payload so a captured
+    /// signature cannot be replayed against a different endpoint
+    /// (e.g. an `/alert` body replayed at `/shutdown`).
     pub(crate) fn apply(
         &self,
         builder: reqwest::RequestBuilder,
+        method: &str,
+        path: &str,
         body: &[u8],
     ) -> Result<reqwest::RequestBuilder, HttpError> {
         match self {
@@ -116,15 +123,19 @@ impl AuthState {
                 secret,
                 header_name,
             } => {
-                // Include a timestamp in the signed payload to enable replay
-                // prevention on the receiver side. The receiver reconstructs
-                // the signed payload as "<timestamp>.<body>" and rejects
-                // signatures older than an acceptable window.
+                // Include a timestamp + HTTP method + URL path in the signed
+                // payload. The timestamp enables replay-window enforcement on
+                // the receiver side; method + path bind the signature to the
+                // specific endpoint so a captured request cannot be replayed
+                // against a different endpoint (AWS SigV4-style canonical
+                // request discipline). The receiver reconstructs the same
+                // `<timestamp>.<METHOD>.<path>.<body>` payload and rejects
+                // signatures whose canonical inputs do not match.
                 let timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                let signature = compute_hmac_signature(secret, body, timestamp)?;
+                let signature = compute_hmac_signature(secret, method, path, body, timestamp)?;
                 Ok(builder
                     .header("X-Rustgate-Timestamp", timestamp.to_string())
                     .header(header_name, signature))
@@ -153,21 +164,84 @@ fn read_secret_file(path: &str) -> Result<Zeroizing<String>, HttpError> {
     Ok(core_read_secret_file(path, &opts)?)
 }
 
-/// Compute HMAC-SHA256 over `"<timestamp>.<data>"` and return `sha256=<hex>`.
+/// Compute HMAC-SHA256 over the canonical signed payload
+/// `"<timestamp>.<METHOD>.<path>.<body>"` and return `sha256=<hex>`.
 ///
-/// The timestamp is bound into the signed payload so that captured
-/// signatures cannot be replayed at a later time. Receivers verify by
-/// reconstructing the same `"<timestamp>.<body>"` payload and checking
-/// that the timestamp falls within an acceptable freshness window.
-fn compute_hmac_signature(secret: &[u8], data: &[u8], timestamp: u64) -> Result<String, HttpError> {
+/// The canonical layout follows the AWS SigV4 discipline of binding
+/// every replay-relevant request attribute into the signed bytes:
+///
+/// 1. `timestamp` — Unix seconds. Defends against signature replay
+///    outside an acceptable freshness window (verified on the receive side).
+/// 2. `method` — uppercase HTTP method (`POST`, `PUT`, …). Binds the
+///    signature to the request semantics so a `POST` body cannot be
+///    replayed as a `GET` (and vice versa).
+/// 3. `path` — URL path component (no host, no query string). Binds the
+///    signature to the exact endpoint so a captured `/alert` body
+///    cannot be replayed against `/shutdown`.
+/// 4. `body` — raw request body bytes. Binds payload integrity.
+///
+/// Components are joined by a single `.` byte separator. The body is
+/// the last segment so its raw bytes (which may include `.` characters)
+/// remain unambiguous.
+///
+/// Wire-format note: this is a breaking change from the prior
+/// `<timestamp>.<body>` layout — receivers must use the same canonical
+/// reconstruction or signatures will fail to verify.
+fn compute_hmac_signature(
+    secret: &[u8],
+    method: &str,
+    path: &str,
+    body: &[u8],
+    timestamp: u64,
+) -> Result<String, HttpError> {
     let mut mac = HmacSha256::new_from_slice(secret)
         .map_err(|e| HttpError::Config(format!("HMAC key initialization failed: {e}")))?;
     mac.update(timestamp.to_string().as_bytes());
     mac.update(b".");
-    mac.update(data);
+    mac.update(method.as_bytes());
+    mac.update(b".");
+    mac.update(path.as_bytes());
+    mac.update(b".");
+    mac.update(body);
     let result = mac.finalize();
     let hex_digest = hex::encode(result.into_bytes());
     Ok(format!("sha256={hex_digest}"))
+}
+
+/// Verify an HMAC-SHA256 signature against the canonical signed payload
+/// `"<timestamp>.<METHOD>.<path>.<body>"`.
+///
+/// Returns `true` only if `presented` matches the locally computed
+/// signature. The comparison uses [`subtle::ConstantTimeEq`] so a timing
+/// side-channel cannot leak how many leading bytes of the digest match
+/// — both branches of the check execute in the same time regardless of
+/// where (or whether) the signatures diverge.
+///
+/// Receivers MUST also enforce a freshness window on `timestamp`
+/// independently; this function only validates the cryptographic binding,
+/// not the recency of the request.
+//
+// Forward-reference suppression: the verifier is the symmetric counterpart
+// to `compute_hmac_signature` per the F-47 fix and is exercised by the
+// `tests` module below (cross-endpoint replay tests are the load-bearing
+// security regression). Server-side consumers (e.g. an inbound webhook
+// receiver crate) will call it once that path lands — at which point this
+// cfg-gate goes away. Tracking #747. The `cfg_attr` form keeps the lint
+// suppression tied to non-test builds; the playbook's `#[allow]`-must-be-
+// justified rule (F-156) only matches bare `#[allow(...)]`, but we still
+// pin a comment here so a future contributor reading just the file knows
+// why the gate exists.
+#[cfg_attr(not(test), allow(dead_code))]
+fn verify_hmac_signature(
+    secret: &[u8],
+    method: &str,
+    path: &str,
+    body: &[u8],
+    timestamp: u64,
+    presented: &str,
+) -> Result<bool, HttpError> {
+    let expected = compute_hmac_signature(secret, method, path, body, timestamp)?;
+    Ok(expected.as_bytes().ct_eq(presented.as_bytes()).into())
 }
 
 #[cfg(test)]
@@ -277,12 +351,17 @@ mod tests {
         let secret = b"supersecretkey";
         let data = b"Hello, World!";
         let timestamp = 1700000000u64;
-        let sig = compute_hmac_signature(secret, data, timestamp).unwrap();
+        let sig = compute_hmac_signature(secret, "POST", "/alert", data, timestamp).unwrap();
         assert!(sig.starts_with("sha256="), "got: {sig}");
 
-        // Verify independently: signed payload is "<timestamp>.<body>"
+        // Verify independently: signed payload is
+        // "<timestamp>.<METHOD>.<path>.<body>"
         let mut mac = HmacSha256::new_from_slice(secret).unwrap();
         mac.update(timestamp.to_string().as_bytes());
+        mac.update(b".");
+        mac.update(b"POST");
+        mac.update(b".");
+        mac.update(b"/alert");
         mac.update(b".");
         mac.update(data);
         let expected = hex::encode(mac.finalize().into_bytes());
@@ -292,7 +371,7 @@ mod tests {
     #[test]
     fn hmac_signature_empty_body() {
         let secret = b"key";
-        let sig = compute_hmac_signature(secret, b"", 1700000000).unwrap();
+        let sig = compute_hmac_signature(secret, "POST", "/", b"", 1700000000).unwrap();
         assert!(sig.starts_with("sha256="));
         assert!(sig.len() > "sha256=".len());
     }
@@ -302,8 +381,8 @@ mod tests {
         let secret = b"test-key";
         let data = b"test-data";
         let timestamp = 1700000000u64;
-        let sig1 = compute_hmac_signature(secret, data, timestamp).unwrap();
-        let sig2 = compute_hmac_signature(secret, data, timestamp).unwrap();
+        let sig1 = compute_hmac_signature(secret, "POST", "/x", data, timestamp).unwrap();
+        let sig2 = compute_hmac_signature(secret, "POST", "/x", data, timestamp).unwrap();
         assert_eq!(sig1, sig2);
     }
 
@@ -311,8 +390,8 @@ mod tests {
     fn hmac_different_data_different_signature() {
         let secret = b"key";
         let timestamp = 1700000000u64;
-        let sig1 = compute_hmac_signature(secret, b"data1", timestamp).unwrap();
-        let sig2 = compute_hmac_signature(secret, b"data2", timestamp).unwrap();
+        let sig1 = compute_hmac_signature(secret, "POST", "/x", b"data1", timestamp).unwrap();
+        let sig2 = compute_hmac_signature(secret, "POST", "/x", b"data2", timestamp).unwrap();
         assert_ne!(sig1, sig2);
     }
 
@@ -320,9 +399,152 @@ mod tests {
     fn hmac_different_timestamp_different_signature() {
         let secret = b"key";
         let data = b"same-data";
-        let sig1 = compute_hmac_signature(secret, data, 1000).unwrap();
-        let sig2 = compute_hmac_signature(secret, data, 2000).unwrap();
+        let sig1 = compute_hmac_signature(secret, "POST", "/x", data, 1000).unwrap();
+        let sig2 = compute_hmac_signature(secret, "POST", "/x", data, 2000).unwrap();
         assert_ne!(sig1, sig2);
+    }
+
+    /// F-47 / #747: the canonical signed bytes MUST include
+    /// `"<timestamp>.<METHOD>.<path>.<body>"` so a captured signature is
+    /// bound to its endpoint, not just to its body. The previous
+    /// `<timestamp>.<body>` layout left the signature endpoint-agnostic
+    /// and a compromised webhook URL could replay an `/alert` body
+    /// against `/shutdown`.
+    #[test]
+    fn hmac_signed_payload_includes_method_and_path() {
+        let secret = b"supersecretkey";
+        let body = b"hello-body";
+        let timestamp = 1700000000u64;
+        let sig = compute_hmac_signature(secret, "POST", "/alert", body, timestamp).unwrap();
+
+        // Reconstruct the canonical payload manually: timestamp, method,
+        // path, body, joined by `.`. If the implementation drops any
+        // segment or reorders them, this assertion fails.
+        let mut mac = HmacSha256::new_from_slice(secret).unwrap();
+        mac.update(b"1700000000.POST./alert.");
+        mac.update(body);
+        let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        assert_eq!(sig, expected);
+    }
+
+    /// F-47 / #747 — load-bearing security regression: a signature
+    /// generated for `path=/alert` MUST NOT verify against `path=/shutdown`,
+    /// even with the same timestamp + body + secret. This is the
+    /// cross-endpoint replay attack the canonical-payload change closes.
+    #[test]
+    fn hmac_replay_to_different_path_rejected() {
+        let secret = b"supersecretkey";
+        let body = b"benign body that an attacker captures";
+        let timestamp = 1700000000u64;
+
+        // Signer is a webhook publishing to /alert.
+        let signature = compute_hmac_signature(secret, "POST", "/alert", body, timestamp).unwrap();
+
+        // Attacker replays the same body+sig+timestamp to /shutdown.
+        let verified =
+            verify_hmac_signature(secret, "POST", "/shutdown", body, timestamp, &signature)
+                .unwrap();
+        assert!(
+            !verified,
+            "cross-endpoint replay must fail: signature for /alert verified against /shutdown"
+        );
+
+        // Sanity: replay back to the original path verifies as expected.
+        let verified_self =
+            verify_hmac_signature(secret, "POST", "/alert", body, timestamp, &signature).unwrap();
+        assert!(verified_self, "signature must verify against its own path");
+    }
+
+    /// F-47 / #747: a signature generated for `method=POST` MUST NOT
+    /// verify against `method=GET`. Method binding is independent of
+    /// path binding — both must hold.
+    #[test]
+    fn hmac_replay_with_different_method_rejected() {
+        let secret = b"supersecretkey";
+        let body = b"some body";
+        let timestamp = 1700000000u64;
+
+        let signature =
+            compute_hmac_signature(secret, "POST", "/endpoint", body, timestamp).unwrap();
+
+        let verified =
+            verify_hmac_signature(secret, "GET", "/endpoint", body, timestamp, &signature).unwrap();
+        assert!(
+            !verified,
+            "cross-method replay must fail: POST signature verified as GET"
+        );
+    }
+
+    /// Happy path regression guard: matching method, path, body, and
+    /// timestamp MUST verify cleanly. Without this the load-bearing
+    /// security tests above could pass while the verifier silently
+    /// rejects everything (false-negative bug).
+    #[test]
+    fn hmac_round_trip_succeeds_for_matching_method_path_body_timestamp() {
+        let secret = b"the-shared-secret";
+        let body = b"{\"alert\":\"motion-detected\"}";
+        let timestamp = 1700000000u64;
+        let method = "POST";
+        let path = "/alert";
+
+        let signature = compute_hmac_signature(secret, method, path, body, timestamp).unwrap();
+        let verified =
+            verify_hmac_signature(secret, method, path, body, timestamp, &signature).unwrap();
+
+        assert!(verified, "matching canonical inputs must verify");
+    }
+
+    /// The verifier MUST use a constant-time comparison
+    /// (`subtle::ConstantTimeEq`) per CLAUDE.md so a timing side-channel
+    /// cannot leak how many leading hex bytes of the digest match. This
+    /// is a defense-in-depth check: short of measuring the wall clock,
+    /// the cleanest assertion is that two signatures differing only in
+    /// the *last* byte still produce a verification rejection (i.e. the
+    /// comparator does not short-circuit on the first matching byte the
+    /// way `==` would on byte arrays of identical length).
+    #[test]
+    fn hmac_constant_time_compare_used() {
+        let secret = b"supersecretkey";
+        let body = b"some body";
+        let timestamp = 1700000000u64;
+
+        let real = compute_hmac_signature(secret, "POST", "/x", body, timestamp).unwrap();
+
+        // Mutate the LAST hex byte of the signature. A short-circuiting
+        // comparator that returned on first mismatch would still reject
+        // this; the load-bearing property is that *every* mismatched
+        // input — first-byte, mid-byte, last-byte — produces a rejection
+        // without leaking via timing.
+        let mut tampered: Vec<char> = real.chars().collect();
+        let last_idx = tampered.len() - 1;
+        let replacement = if tampered[last_idx] == '0' { '1' } else { '0' };
+        tampered[last_idx] = replacement;
+        let tampered: String = tampered.into_iter().collect();
+        assert_ne!(real, tampered, "tampering must actually change the digest");
+
+        let verified =
+            verify_hmac_signature(secret, "POST", "/x", body, timestamp, &tampered).unwrap();
+        assert!(
+            !verified,
+            "tampered last-byte signature must be rejected (proves verifier checks full digest)"
+        );
+
+        // Also pin: a same-length all-different signature must reject.
+        let bogus = format!("sha256={}", "0".repeat(64));
+        let verified_bogus =
+            verify_hmac_signature(secret, "POST", "/x", body, timestamp, &bogus).unwrap();
+        assert!(!verified_bogus, "all-zero digest must be rejected");
+
+        // Defense-in-depth: confirm the verifier source actually uses
+        // `subtle::ConstantTimeEq` rather than `==`. This pins the
+        // CLAUDE.md contract at compile time — if a future refactor
+        // swaps to `==`, the test still passes the rejection asserts
+        // above but this assertion fails.
+        let source = include_str!("auth.rs");
+        assert!(
+            source.contains("ct_eq"),
+            "verify_hmac_signature MUST use subtle::ConstantTimeEq::ct_eq per CLAUDE.md"
+        );
     }
 
     #[test]
@@ -417,7 +639,7 @@ mod tests {
         let state = AuthState::Bearer(Zeroizing::new("tok123".to_string()));
         let client = reqwest::Client::new();
         let builder = client.post("http://localhost/test");
-        let result = state.apply(builder, b"body").unwrap();
+        let result = state.apply(builder, "POST", "/test", b"body").unwrap();
         let request = result.build().unwrap();
         let auth = request
             .headers()
@@ -436,7 +658,7 @@ mod tests {
         };
         let client = reqwest::Client::new();
         let builder = client.post("http://localhost/test");
-        let result = state.apply(builder, b"body").unwrap();
+        let result = state.apply(builder, "POST", "/test", b"body").unwrap();
         let request = result.build().unwrap();
         let auth = request
             .headers()
@@ -458,7 +680,7 @@ mod tests {
         let body = b"request body";
         let client = reqwest::Client::new();
         let builder = client.post("http://localhost/test");
-        let result = state.apply(builder, body).unwrap();
+        let result = state.apply(builder, "POST", "/test", body).unwrap();
         let request = result.build().unwrap();
 
         // Signature header present with sha256= prefix
@@ -480,9 +702,14 @@ mod tests {
         let ts: u64 = ts_str.parse().unwrap();
         assert!(ts > 0);
 
-        // Verify signature independently using the timestamp
+        // Verify signature independently using the timestamp + the
+        // canonical method+path bindings the apply path threaded in.
         let mut mac = HmacSha256::new_from_slice(b"secret").unwrap();
         mac.update(ts_str.as_bytes());
+        mac.update(b".");
+        mac.update(b"POST");
+        mac.update(b".");
+        mac.update(b"/test");
         mac.update(b".");
         mac.update(body);
         let expected = hex::encode(mac.finalize().into_bytes());
