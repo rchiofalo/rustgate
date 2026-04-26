@@ -61,6 +61,8 @@ impl TestServer {
             topic_prefix,
             max_packet_size: 1024 * 1024,
             receive_max: MqttServerConfig::DEFAULT_RECEIVE_MAX,
+            max_session_expiry_secs: MqttServerConfig::DEFAULT_MAX_SESSION_EXPIRY_SECS,
+            max_retained_sessions: MqttServerConfig::DEFAULT_MAX_RETAINED_SESSIONS,
             min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
             response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
             wildcard_policy,
@@ -104,6 +106,8 @@ impl TestServer {
             topic_prefix: None,
             max_packet_size: 1024 * 1024,
             receive_max: MqttServerConfig::DEFAULT_RECEIVE_MAX,
+            max_session_expiry_secs: MqttServerConfig::DEFAULT_MAX_SESSION_EXPIRY_SECS,
+            max_retained_sessions: MqttServerConfig::DEFAULT_MAX_RETAINED_SESSIONS,
             min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
             response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
             wildcard_policy: WildcardPolicy::default(),
@@ -979,6 +983,8 @@ async fn connection_limit_rejects_excess() {
         topic_prefix: None,
         max_packet_size: 1024 * 1024,
         receive_max: MqttServerConfig::DEFAULT_RECEIVE_MAX,
+        max_session_expiry_secs: MqttServerConfig::DEFAULT_MAX_SESSION_EXPIRY_SECS,
+        max_retained_sessions: MqttServerConfig::DEFAULT_MAX_RETAINED_SESSIONS,
         min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
         response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
         wildcard_policy: WildcardPolicy::default(),
@@ -1198,6 +1204,8 @@ async fn max_packet_size_rejects_oversized_publish() {
         topic_prefix: None,
         max_packet_size: SERVER_CAP, // Small — CONNECT fits, big PUBLISH won't
         receive_max: MqttServerConfig::DEFAULT_RECEIVE_MAX,
+        max_session_expiry_secs: MqttServerConfig::DEFAULT_MAX_SESSION_EXPIRY_SECS,
+        max_retained_sessions: MqttServerConfig::DEFAULT_MAX_RETAINED_SESSIONS,
         min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
         response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
         wildcard_policy: WildcardPolicy::default(),
@@ -2711,6 +2719,292 @@ async fn unsubscribe_pkid_max_u16_round_trips_in_unsuback() {
             );
         }
         other => panic!("expected UnsubAck for pkid=u16::MAX, got {other:?}"),
+    }
+
+    server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// MQTT 5.0 session retention (refs #880; follow-up to #1162)
+//
+// CONNECT with clean_start=0 + non-zero Session Expiry Interval saves
+// the session at disconnect and restores it on a subsequent reconnect
+// from the same client_id within the expiry window. Without this PR,
+// rustgate rejected clean_start=0 outright with
+// ImplementationSpecificError. With it, retention works end-to-end
+// when the operator opts in via `max_session_expiry_secs > 0`.
+// ---------------------------------------------------------------------------
+
+/// Build a test server with MQTT session retention enabled.
+fn new_test_server_with_retention(
+    ca: &TestCa,
+    router: Arc<Router>,
+    max_session_expiry_secs: u32,
+) -> TestServer {
+    let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
+    let tls_config = TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
+        .expect("tls config");
+
+    let listener = MqttListener::bind("127.0.0.1:0".parse().unwrap(), &tls_config).expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let shutdown = Arc::new(Notify::new());
+
+    let config = MqttServerConfig {
+        listener,
+        router: Arc::clone(&router),
+        connection_limit: Arc::new(Semaphore::new(100)),
+        shutdown: Arc::clone(&shutdown),
+        topic_prefix: None,
+        max_packet_size: 1024 * 1024,
+        receive_max: MqttServerConfig::DEFAULT_RECEIVE_MAX,
+        max_session_expiry_secs,
+        max_retained_sessions: MqttServerConfig::DEFAULT_MAX_RETAINED_SESSIONS,
+        min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
+        response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
+        wildcard_policy: WildcardPolicy::default(),
+        on_accept: None,
+        on_reject: None,
+        session_hooks: None,
+        forwarding_hooks: None,
+    };
+
+    drop(tokio::spawn(MqttServer::run(config)));
+
+    TestServer {
+        addr,
+        shutdown,
+        router,
+    }
+}
+
+/// Build a v5 CONNECT requesting a session with `clean_start` + the
+/// given Session Expiry Interval.
+fn build_v5_connect_with_session(
+    client_id: &str,
+    clean_start: bool,
+    session_expiry_secs: u32,
+) -> mqttbytes::v5::Connect {
+    let mut connect = mqttbytes::v5::Connect::new(client_id);
+    connect.clean_session = clean_start;
+    connect.properties = Some(mqttbytes::v5::ConnectProperties {
+        session_expiry_interval: Some(session_expiry_secs),
+        receive_maximum: None,
+        max_packet_size: None,
+        topic_alias_max: None,
+        request_response_info: None,
+        request_problem_info: None,
+        user_properties: Vec::new(),
+        authentication_method: None,
+        authentication_data: None,
+    });
+    connect
+}
+
+#[tokio::test]
+async fn session_retention_resumes_subscriptions_on_reconnect() {
+    // The headline test for #880 follow-up to #1162: client A
+    // subscribes to "alpha", disconnects with non-zero
+    // SessionExpiryInterval, reconnects with clean_start=0, and the
+    // broker MUST restore the subscription so a subsequent PUBLISH
+    // from client B reaches A WITHOUT A re-issuing SUBSCRIBE.
+    let ca = TestCa::new("MQTT Test CA");
+    let cert_a = ca.issue_client_cert("alice", &["alpha"]);
+    let cert_b = ca.issue_client_cert("bob", &["alpha"]);
+    let router = Arc::new(Router::new());
+
+    let server = new_test_server_with_retention(&ca, router, 3600);
+    let tls_a = build_client_tls_config(&cert_a.cert_pem, &cert_a.key_pem, &ca.cert_pem);
+    let tls_b = build_client_tls_config(&cert_b.cert_pem, &cert_b.key_pem, &ca.cert_pem);
+
+    // Connection 1: subscribe + disconnect cleanly with session expiry > 0.
+    {
+        let mut stream = mqtt_connect(server.addr, &tls_a).await;
+        let mut buf = BytesMut::new();
+        let connect =
+            build_v5_connect_with_session("session-resumer", true /* clean_start */, 3600);
+        write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Connect(connect)).await;
+        let connack = read_v5_packet(&mut stream, &mut buf).await;
+        match connack {
+            mqttbytes::v5::Packet::ConnAck(ca) => {
+                assert!(!ca.session_present, "first CONNECT must be a fresh session");
+                let props = ca.properties.expect("CONNACK properties");
+                assert_eq!(
+                    props.session_expiry_interval,
+                    Some(3600),
+                    "broker must echo the negotiated session expiry"
+                );
+            }
+            other => panic!("expected CONNACK, got {other:?}"),
+        }
+
+        let sub = mqttbytes::v5::Subscribe::new("alpha", mqttbytes::QoS::AtLeastOnce);
+        write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Subscribe(sub)).await;
+        let _ = read_v5_packet(&mut stream, &mut buf).await; // SUBACK
+
+        // Clean disconnect — preserves the session per spec
+        // §3.14.4 because Session Expiry Interval > 0.
+        let disc = mqttbytes::v5::Disconnect::new();
+        write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Disconnect(disc)).await;
+        // Drop stream → broker observes disconnect.
+    }
+
+    // Brief settle so the broker's session-end save lands before we reconnect.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Connection 2: reconnect with clean_start=0 — broker MUST restore.
+    let mut stream_a2 = mqtt_connect(server.addr, &tls_a).await;
+    let mut buf_a = BytesMut::new();
+    let connect =
+        build_v5_connect_with_session("session-resumer", false /* clean_start */, 3600);
+    write_v5_packet(&mut stream_a2, &mqttbytes::v5::Packet::Connect(connect)).await;
+    let connack = read_v5_packet(&mut stream_a2, &mut buf_a).await;
+    match connack {
+        mqttbytes::v5::Packet::ConnAck(ca) => {
+            assert_eq!(
+                ca.code,
+                mqttbytes::v5::ConnectReturnCode::Success,
+                "broker must accept clean_start=0 when retention is enabled"
+            );
+            assert!(
+                ca.session_present,
+                "session_present MUST be true on a successful resume (§3.2.2.1.1)"
+            );
+        }
+        other => panic!("expected CONNACK Success with session_present=true, got {other:?}"),
+    }
+
+    // Now publish from client B — A must receive WITHOUT re-subscribing.
+    let mut stream_b = mqtt_connect(server.addr, &tls_b).await;
+    let mut buf_b = BytesMut::new();
+    write_v5_packet(
+        &mut stream_b,
+        &mqttbytes::v5::Packet::Connect(mqttbytes::v5::Connect::new("session-publisher")),
+    )
+    .await;
+    let _ = read_v5_packet(&mut stream_b, &mut buf_b).await;
+
+    let publish =
+        mqttbytes::v5::Publish::new("alpha", mqttbytes::QoS::AtMostOnce, b"resumed-delivery");
+    write_v5_packet(&mut stream_b, &mqttbytes::v5::Packet::Publish(publish)).await;
+
+    let received = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_v5_packet(&mut stream_a2, &mut buf_a),
+    )
+    .await
+    .expect("resumed session MUST receive the publish without re-SUBSCRIBE");
+    match received {
+        mqttbytes::v5::Packet::Publish(p) => {
+            assert_eq!(p.topic, "alpha");
+            assert_eq!(&p.payload[..], b"resumed-delivery");
+        }
+        other => panic!(
+            "expected delivered Publish on resumed session, got {other:?} \
+             — a regression that didn't restore subscriptions would silently \
+             swallow the message here"
+        ),
+    }
+
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn session_retention_disabled_rejects_clean_start_false() {
+    // Refs #1162 contract: when retention is disabled (the default),
+    // a clean_start=0 CONNECT MUST be rejected with
+    // ImplementationSpecificError so the client can't silently
+    // believe its subscriptions will resume after disconnect.
+    let ca = TestCa::new("MQTT Test CA");
+    let cert = ca.issue_client_cert("alice", &["alpha"]);
+    let router = Arc::new(Router::new());
+
+    // Default TestServer: max_session_expiry_secs = 0 (retention OFF).
+    let server = TestServer::new(&ca, router, None);
+    let tls = build_client_tls_config(&cert.cert_pem, &cert.key_pem, &ca.cert_pem);
+
+    let mut stream = mqtt_connect(server.addr, &tls).await;
+    let mut buf = BytesMut::new();
+    let connect = build_v5_connect_with_session("rejected", false /* clean_start */, 3600);
+    write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Connect(connect)).await;
+    let packet = read_v5_packet(&mut stream, &mut buf).await;
+    match packet {
+        mqttbytes::v5::Packet::ConnAck(ca) => {
+            assert_eq!(
+                ca.code,
+                mqttbytes::v5::ConnectReturnCode::ImplementationSpecificError,
+                "retention OFF must reject clean_start=0 (preserves #1162 contract)"
+            );
+        }
+        other => panic!("expected ConnAck rejection, got {other:?}"),
+    }
+
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn session_retention_clean_start_true_discards_saved_session() {
+    // §3.1.4 server-takeover: a NEW connection from the same
+    // client_id with clean_start=1 MUST drop any saved session.
+    let ca = TestCa::new("MQTT Test CA");
+    let cert = ca.issue_client_cert("alice", &["alpha"]);
+    let router = Arc::new(Router::new());
+
+    let server = new_test_server_with_retention(&ca, router, 3600);
+    let tls = build_client_tls_config(&cert.cert_pem, &cert.key_pem, &ca.cert_pem);
+
+    // Conn 1: subscribe + disconnect (would save).
+    {
+        let mut stream = mqtt_connect(server.addr, &tls).await;
+        let mut buf = BytesMut::new();
+        write_v5_packet(
+            &mut stream,
+            &mqttbytes::v5::Packet::Connect(build_v5_connect_with_session(
+                "ts-takeover",
+                true,
+                3600,
+            )),
+        )
+        .await;
+        let _ = read_v5_packet(&mut stream, &mut buf).await;
+        write_v5_packet(
+            &mut stream,
+            &mqttbytes::v5::Packet::Subscribe(mqttbytes::v5::Subscribe::new(
+                "alpha",
+                mqttbytes::QoS::AtMostOnce,
+            )),
+        )
+        .await;
+        let _ = read_v5_packet(&mut stream, &mut buf).await;
+        write_v5_packet(
+            &mut stream,
+            &mqttbytes::v5::Packet::Disconnect(mqttbytes::v5::Disconnect::new()),
+        )
+        .await;
+    }
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Conn 2: clean_start=1 — saved session dropped, fresh start.
+    let mut stream2 = mqtt_connect(server.addr, &tls).await;
+    let mut buf = BytesMut::new();
+    write_v5_packet(
+        &mut stream2,
+        &mqttbytes::v5::Packet::Connect(build_v5_connect_with_session(
+            "ts-takeover",
+            true, /* clean_start */
+            0,
+        )),
+    )
+    .await;
+    let connack = read_v5_packet(&mut stream2, &mut buf).await;
+    match connack {
+        mqttbytes::v5::Packet::ConnAck(ca) => {
+            assert!(
+                !ca.session_present,
+                "clean_start=1 MUST start fresh — session_present MUST be false (§3.2.2.1.1)"
+            );
+        }
+        other => panic!("expected ConnAck, got {other:?}"),
     }
 
     server.shutdown();

@@ -618,6 +618,28 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 32, env = "RUSTGATE_MQTT_RECEIVE_MAX")]
     pub(crate) mqtt_receive_max: u16,
 
+    /// Maximum MQTT 5.0 `Session Expiry Interval` (seconds) the broker
+    /// will honor for retained sessions (default: 0 = retention OFF).
+    /// Set to a positive value to enable session retention per
+    /// MQTT 5.0 §3.1.2.11.2; the negotiated expiry returned in CONNACK
+    /// is `min(client_request, mqtt_max_session_expiry_secs)`.
+    /// Special value 4294967295 (u32::MAX) means "no operator cap".
+    #[arg(
+        long,
+        default_value_t = 0,
+        env = "RUSTGATE_MQTT_MAX_SESSION_EXPIRY_SECS"
+    )]
+    pub(crate) mqtt_max_session_expiry_secs: u32,
+
+    /// Hard cap on simultaneously-retained MQTT sessions (default: 1024).
+    /// Only meaningful when --mqtt-max-session-expiry-secs > 0.
+    #[arg(
+        long,
+        default_value_t = 1024,
+        env = "RUSTGATE_MQTT_MAX_RETAINED_SESSIONS"
+    )]
+    pub(crate) mqtt_max_retained_sessions: usize,
+
     /// Minimum MQTT keep-alive interval in seconds. Clients requesting 0
     /// (disabled) or a value below this floor get this value imposed.
     #[arg(long, default_value_t = 30, env = "RUSTGATE_MQTT_MIN_KEEP_ALIVE_SECS")]
@@ -1633,6 +1655,8 @@ define_config_file! {
     mqtt_topic_prefix: Option<String>,
     mqtt_max_packet_size: usize,
     mqtt_receive_max: u16,
+    mqtt_max_session_expiry_secs: u32,
+    mqtt_max_retained_sessions: usize,
     mqtt_min_keep_alive_secs: u16,
     mqtt_response_channel_capacity: usize,
     mqtt_wildcard_policy: MqttWildcardPolicy,

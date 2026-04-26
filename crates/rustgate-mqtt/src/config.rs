@@ -274,6 +274,36 @@ pub struct MqttServerConfig {
     /// payload size in the read buffer until ack-and-route completes).
     pub receive_max: u16,
 
+    /// Maximum MQTT 5.0 `Session Expiry Interval` (in seconds) the broker
+    /// will honor for retained sessions (default: 0 = retention disabled).
+    ///
+    /// When `0`, the broker advertises Session Expiry Interval = 0 in
+    /// CONNACK (regardless of what the client requested) and continues
+    /// to reject `clean_start = 0` outright — preserving the v1.0
+    /// behaviour from #1162. Set to `> 0` to enable session retention
+    /// per MQTT 5.0 §3.1.2.11.2; the negotiated expiry returned in
+    /// CONNACK is `min(client_request, max_session_expiry_secs)`.
+    /// Special value `u32::MAX` means "no operator cap" — honor the
+    /// client's request verbatim, including the spec's "never expires"
+    /// sentinel.
+    ///
+    /// Sessions consume O(subscriptions) memory per retained client
+    /// for the duration of their expiry window; pair this with
+    /// [`max_retained_sessions`](Self::max_retained_sessions) to bound
+    /// total memory footprint.
+    pub max_session_expiry_secs: u32,
+
+    /// Hard cap on the number of simultaneously-retained MQTT
+    /// sessions (default: 1024). Only meaningful when
+    /// [`max_session_expiry_secs`](Self::max_session_expiry_secs) > 0.
+    /// When the store is full, the oldest entry by disconnect time
+    /// is evicted to make room — the assumption being that recent
+    /// disconnects are more likely to reconnect than stale ones.
+    /// A new session for a client_id already in the store overwrites
+    /// the existing entry per MQTT 5.0 §3.1.4 server-takeover
+    /// semantics, regardless of the cap.
+    pub max_retained_sessions: usize,
+
     /// Minimum keep-alive interval in seconds. Clients requesting 0
     /// (disabled) or a value below this floor get this value imposed.
     pub min_keep_alive_secs: u16,
@@ -324,6 +354,20 @@ impl MqttServerConfig {
     /// Default maximum packet size: 16 MiB (matches websocket frame cap).
     pub const DEFAULT_MAX_PACKET_SIZE: usize = 16 * 1024 * 1024;
 
+    /// Default maximum `Session Expiry Interval` (0 — retention OFF).
+    ///
+    /// Disabled by default to preserve the v1.0 broker contract: a
+    /// fresh deployment that doesn't opt in via
+    /// [`max_session_expiry_secs`](Self::max_session_expiry_secs) keeps
+    /// the existing "clean_start=1 only, sessions never persist"
+    /// behaviour from before #1163. Operators turn this on
+    /// deliberately, accepting the additional memory cost +
+    /// reconnection-resumption semantics that come with it.
+    pub const DEFAULT_MAX_SESSION_EXPIRY_SECS: u32 = 0;
+
+    /// Default cap on retained sessions (1024).
+    pub const DEFAULT_MAX_RETAINED_SESSIONS: usize = 1024;
+
     /// Default `Receive Maximum` advertised in CONNACK (32).
     ///
     /// Sized to match the default `response_channel_capacity` (64) at
@@ -352,6 +396,8 @@ impl std::fmt::Debug for MqttServerConfig {
             .field("topic_prefix", &self.topic_prefix)
             .field("max_packet_size", &self.max_packet_size)
             .field("receive_max", &self.receive_max)
+            .field("max_session_expiry_secs", &self.max_session_expiry_secs)
+            .field("max_retained_sessions", &self.max_retained_sessions)
             .field("min_keep_alive_secs", &self.min_keep_alive_secs)
             .field("response_channel_capacity", &self.response_channel_capacity)
             .field("wildcard_policy", &self.wildcard_policy)
@@ -489,6 +535,8 @@ mod tests {
             topic_prefix: None,
             max_packet_size: 1024,
             receive_max: MqttServerConfig::DEFAULT_RECEIVE_MAX,
+            max_session_expiry_secs: MqttServerConfig::DEFAULT_MAX_SESSION_EXPIRY_SECS,
+            max_retained_sessions: MqttServerConfig::DEFAULT_MAX_RETAINED_SESSIONS,
             min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
             response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
             wildcard_policy: WildcardPolicy::default(),
@@ -537,6 +585,8 @@ mod tests {
             topic_prefix: None,
             max_packet_size: 1024,
             receive_max: MqttServerConfig::DEFAULT_RECEIVE_MAX,
+            max_session_expiry_secs: MqttServerConfig::DEFAULT_MAX_SESSION_EXPIRY_SECS,
+            max_retained_sessions: MqttServerConfig::DEFAULT_MAX_RETAINED_SESSIONS,
             min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
             response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
             wildcard_policy: WildcardPolicy::default(),
