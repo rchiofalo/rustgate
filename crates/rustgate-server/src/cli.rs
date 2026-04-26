@@ -653,6 +653,22 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 30, env = "RUSTGATE_MQTT_MIN_KEEP_ALIVE_SECS")]
     pub(crate) mqtt_min_keep_alive_secs: u16,
 
+    /// MQTT 5.0 Server Keep Alive override (seconds) advertised in CONNACK
+    /// per §3.2.2.3.14 (default: 0 = no override; broker honors the client's
+    /// CONNECT-time keep-alive request). When set to a positive value, the
+    /// broker advertises the value via the `Server Keep Alive` CONNACK
+    /// property and a compliant client MUST switch to that interval; the
+    /// broker also enforces the overridden interval on its read-loop
+    /// keep-alive timer so a non-compliant client that ignores the property
+    /// still gets disconnected on the operator's chosen schedule. v3.1.1 has
+    /// no Server Keep Alive feature; the v4 path is unaffected.
+    #[arg(
+        long,
+        default_value_t = 0,
+        env = "RUSTGATE_MQTT_SERVER_KEEP_ALIVE_SECS"
+    )]
+    pub(crate) mqtt_server_keep_alive_secs: u16,
+
     /// MQTT response channel capacity (per-session).
     #[arg(
         long,
@@ -1667,6 +1683,7 @@ define_config_file! {
     mqtt_max_session_expiry_secs: u32,
     mqtt_max_retained_sessions: usize,
     mqtt_min_keep_alive_secs: u16,
+    mqtt_server_keep_alive_secs: u16,
     mqtt_response_channel_capacity: usize,
     mqtt_wildcard_policy: MqttWildcardPolicy,
     tcp_bind: Option<String>,

@@ -65,6 +65,7 @@ impl TestServer {
             max_session_expiry_secs: MqttServerConfig::DEFAULT_MAX_SESSION_EXPIRY_SECS,
             max_retained_sessions: MqttServerConfig::DEFAULT_MAX_RETAINED_SESSIONS,
             min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
+            server_keep_alive_secs: MqttServerConfig::DEFAULT_SERVER_KEEP_ALIVE_SECS,
             response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
             wildcard_policy,
             on_accept: None,
@@ -111,6 +112,7 @@ impl TestServer {
             max_session_expiry_secs: MqttServerConfig::DEFAULT_MAX_SESSION_EXPIRY_SECS,
             max_retained_sessions: MqttServerConfig::DEFAULT_MAX_RETAINED_SESSIONS,
             min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
+            server_keep_alive_secs: MqttServerConfig::DEFAULT_SERVER_KEEP_ALIVE_SECS,
             response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
             wildcard_policy: WildcardPolicy::default(),
             on_accept: None,
@@ -267,14 +269,13 @@ async fn connect_and_connack() {
                  client assume the broker honors its CONNECT-time request"
             );
             // Refs #880: the remaining MQTT 5.0 §3.2.2 capability
-            // properties. The `Shared Subscription Available = 0`
-            // advertisement is the load-bearing one — silence would
-            // let the client expect features the broker doesn't
-            // actually provide (load-balanced shared delivery). The
-            // other four are explicit confirmations of capabilities
-            // that match the spec defaults — including the
-            // Subscription Identifiers flip from `0` to `1` once the
-            // propagation wiring lands (refs #880 follow-up).
+            // properties. The two `Available = 0` advertisements are
+            // the load-bearing ones — silence would let the client
+            // expect features the broker doesn't actually provide
+            // (subscription IDs, shared subscriptions). The other
+            // three (max_qos, retain_available, wildcard_available)
+            // are explicit confirmations of capabilities that match
+            // the spec defaults.
             assert_eq!(
                 props.max_qos,
                 Some(2),
@@ -1034,6 +1035,7 @@ async fn connection_limit_rejects_excess() {
         max_session_expiry_secs: MqttServerConfig::DEFAULT_MAX_SESSION_EXPIRY_SECS,
         max_retained_sessions: MqttServerConfig::DEFAULT_MAX_RETAINED_SESSIONS,
         min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
+        server_keep_alive_secs: MqttServerConfig::DEFAULT_SERVER_KEEP_ALIVE_SECS,
         response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
         wildcard_policy: WildcardPolicy::default(),
         on_accept: None,
@@ -1256,6 +1258,7 @@ async fn max_packet_size_rejects_oversized_publish() {
         max_session_expiry_secs: MqttServerConfig::DEFAULT_MAX_SESSION_EXPIRY_SECS,
         max_retained_sessions: MqttServerConfig::DEFAULT_MAX_RETAINED_SESSIONS,
         min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
+        server_keep_alive_secs: MqttServerConfig::DEFAULT_SERVER_KEEP_ALIVE_SECS,
         response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
         wildcard_policy: WildcardPolicy::default(),
         on_accept: None,
@@ -2810,6 +2813,7 @@ fn new_test_server_with_retention(
         max_session_expiry_secs,
         max_retained_sessions: MqttServerConfig::DEFAULT_MAX_RETAINED_SESSIONS,
         min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
+        server_keep_alive_secs: MqttServerConfig::DEFAULT_SERVER_KEEP_ALIVE_SECS,
         response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
         wildcard_policy: WildcardPolicy::default(),
         on_accept: None,
@@ -3097,6 +3101,7 @@ fn new_test_server_with_topic_alias_max(
         max_session_expiry_secs: MqttServerConfig::DEFAULT_MAX_SESSION_EXPIRY_SECS,
         max_retained_sessions: MqttServerConfig::DEFAULT_MAX_RETAINED_SESSIONS,
         min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
+        server_keep_alive_secs: MqttServerConfig::DEFAULT_SERVER_KEEP_ALIVE_SECS,
         response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
         wildcard_policy: WildcardPolicy::default(),
         on_accept: None,
@@ -3428,459 +3433,150 @@ async fn topic_alias_disabled_by_default_rejects_any_alias() {
 }
 
 // ---------------------------------------------------------------------------
-// Subscription Identifier propagation (refs #880)
+// MQTT 5.0 Server Keep Alive override (refs #880; §3.2.2.3.14)
+//
+// When the broker advertises Server Keep Alive on the CONNACK packet, the
+// client MUST use this value instead of the Keep Alive value the client
+// sent on CONNECT. The override is opt-in via
+// `MqttServerConfig::server_keep_alive_secs`; default 0 = no override
+// (broker honors the client's request and the property is omitted).
 // ---------------------------------------------------------------------------
-//
-// MQTT 5.0 §3.8.2.1.2 lets a SUBSCRIBE include an OPTIONAL Subscription
-// Identifier; §3.3.4.8 then says the broker MUST attach the identifier
-// of EVERY matching subscription to the resulting PUBLISH delivered to
-// that subscriber. The five tests below pin the wiring end-to-end:
-//
-//   * the headline live-PUBLISH propagation
-//   * the retain-replay path (a fresh SUBSCRIBE that triggers a
-//     replayed retained payload MUST carry the new SUBSCRIBE's id)
-//   * the no-id default (omitted property → empty Vec on the wire)
-//   * multi-attribution when one PUBLISH satisfies several
-//     subscriptions on the same client
-//   * the v3.1.1 path which has no such feature on the wire
-//
-// Together these tests are what flips the CONNACK
-// `subscription_identifiers_available` advertisement from `Some(0)` to
-// `Some(1)` in `connect_and_connack` above.
 
-/// Build a v5 SUBSCRIBE with the given Subscription Identifier.
-///
-/// `mqttbytes::v5::Subscribe::new` returns a packet with no
-/// properties; populate them explicitly so the broker sees the id.
-fn build_v5_subscribe_with_id(
-    filter: &str,
-    qos: mqttbytes::QoS,
-    id: usize,
-) -> mqttbytes::v5::Subscribe {
-    let mut sub = mqttbytes::v5::Subscribe::new(filter, qos);
-    sub.properties = Some(mqttbytes::v5::SubscribeProperties {
-        id: Some(id),
-        user_properties: Vec::new(),
-    });
-    sub
+/// Build a test server with Server Keep Alive override configured.
+fn new_test_server_with_server_keep_alive(
+    ca: &TestCa,
+    router: Arc<Router>,
+    server_keep_alive_secs: u16,
+) -> TestServer {
+    let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
+    let tls_config = TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
+        .expect("tls config");
+
+    let listener = MqttListener::bind("127.0.0.1:0".parse().unwrap(), &tls_config).expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let shutdown = Arc::new(Notify::new());
+
+    let config = MqttServerConfig {
+        listener,
+        router: Arc::clone(&router),
+        connection_limit: Arc::new(Semaphore::new(100)),
+        shutdown: Arc::clone(&shutdown),
+        topic_prefix: None,
+        max_packet_size: 1024 * 1024,
+        receive_max: MqttServerConfig::DEFAULT_RECEIVE_MAX,
+        topic_alias_max: MqttServerConfig::DEFAULT_TOPIC_ALIAS_MAX,
+        max_session_expiry_secs: MqttServerConfig::DEFAULT_MAX_SESSION_EXPIRY_SECS,
+        max_retained_sessions: MqttServerConfig::DEFAULT_MAX_RETAINED_SESSIONS,
+        min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
+        server_keep_alive_secs,
+        response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
+        wildcard_policy: WildcardPolicy::default(),
+        on_accept: None,
+        on_reject: None,
+        session_hooks: None,
+        forwarding_hooks: None,
+    };
+
+    drop(tokio::spawn(MqttServer::run(config)));
+
+    TestServer {
+        addr,
+        shutdown,
+        router,
+    }
 }
 
 #[tokio::test]
-async fn subscription_identifier_propagated_on_matching_publish() {
-    // The headline test: a v5 SUBSCRIBE with `subscription_identifier`
-    // set MUST cause every matching PUBLISH delivered to that session
-    // to carry the same identifier in its `subscription_identifiers`
-    // property (per §3.3.4.8). This is the contract that
-    // CONNACK.subscription_identifiers_available = 1 advertises.
+async fn connect_with_server_keep_alive_override_advertised_in_connack() {
+    // Refs #880: MQTT 5.0 §3.2.2.3.14 — when the operator configures a
+    // non-zero Server Keep Alive override, the broker MUST advertise the
+    // value in the matching CONNACK property. The client MUST then use
+    // the broker's value instead of the Keep Alive it sent in CONNECT.
+    // Pin the live-broker behaviour: configure a 60s override, send a
+    // CONNECT requesting 300s keep-alive, and assert the CONNACK echoes
+    // the broker's 60s override (NOT the client's 300s request). A
+    // regression that emitted the property-as-None or echoed the
+    // client's request would silently leave every fleet on the
+    // client-chosen cadence — the load-bearing guarantee of this PR.
     let ca = TestCa::new("MQTT Test CA");
-    let alice_cert = ca.issue_client_cert("alice", &["alpha"]);
-    let bob_cert = ca.issue_client_cert("bob", &["alpha"]);
+    let cert = ca.issue_client_cert("alice", &["alpha"]);
     let router = Arc::new(Router::new());
-    let server = TestServer::new(&ca, Arc::clone(&router), None);
 
-    // Subscriber connects with subscription identifier 42.
-    let bob_tls = build_client_tls_config(&bob_cert.cert_pem, &bob_cert.key_pem, &ca.cert_pem);
-    let mut bob = mqtt_connect(server.addr, &bob_tls).await;
-    let mut bob_buf = BytesMut::new();
-    write_v5_packet(
-        &mut bob,
-        &mqttbytes::v5::Packet::Connect(mqttbytes::v5::Connect::new("bob-subid")),
-    )
-    .await;
-    let _ = read_v5_packet(&mut bob, &mut bob_buf).await; // CONNACK
+    let server = new_test_server_with_server_keep_alive(&ca, router, 60);
+    let tls = build_client_tls_config(&cert.cert_pem, &cert.key_pem, &ca.cert_pem);
 
-    let sub = build_v5_subscribe_with_id("alpha", mqttbytes::QoS::AtMostOnce, 42);
-    write_v5_packet(&mut bob, &mqttbytes::v5::Packet::Subscribe(sub)).await;
-    let _ = read_v5_packet(&mut bob, &mut bob_buf).await; // SUBACK
+    let mut stream = mqtt_connect(server.addr, &tls).await;
+    let mut buf = BytesMut::new();
 
-    // Publisher fires a fresh PUBLISH on the matching topic.
-    let alice_tls =
-        build_client_tls_config(&alice_cert.cert_pem, &alice_cert.key_pem, &ca.cert_pem);
-    let mut alice = mqtt_connect(server.addr, &alice_tls).await;
-    let mut alice_buf = BytesMut::new();
-    write_v5_packet(
-        &mut alice,
-        &mqttbytes::v5::Packet::Connect(mqttbytes::v5::Connect::new("alice-subid")),
-    )
-    .await;
-    let _ = read_v5_packet(&mut alice, &mut alice_buf).await; // CONNACK
+    // Client requests a much-larger keep-alive (300s); broker MUST override.
+    let mut connect = mqttbytes::v5::Connect::new("ska-override-client");
+    connect.keep_alive = 300;
+    write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Connect(connect)).await;
 
-    let publish = mqttbytes::v5::Publish::new("alpha", mqttbytes::QoS::AtMostOnce, b"with-id");
-    write_v5_packet(&mut alice, &mqttbytes::v5::Packet::Publish(publish)).await;
-
-    let delivered = tokio::time::timeout(
-        Duration::from_secs(2),
-        read_v5_packet(&mut bob, &mut bob_buf),
-    )
-    .await
-    .expect("subscriber must receive matching PUBLISH within 2 s");
-    match delivered {
-        mqttbytes::v5::Packet::Publish(p) => {
-            assert_eq!(p.topic, "alpha");
-            assert_eq!(p.payload.as_ref(), b"with-id");
-            let props = p
+    let packet = read_v5_packet(&mut stream, &mut buf).await;
+    match packet {
+        mqttbytes::v5::Packet::ConnAck(connack) => {
+            assert_eq!(connack.code, mqttbytes::v5::ConnectReturnCode::Success);
+            let props = connack
                 .properties
-                .expect("PUBLISH MUST carry properties when id is attached (refs §3.3.4.8)");
+                .expect("v5 CONNACK MUST carry properties when broker overrides keep-alive");
             assert_eq!(
-                props.subscription_identifiers,
-                vec![42usize],
-                "broker MUST echo every matching subscription identifier on the PUBLISH"
+                props.server_keep_alive,
+                Some(60),
+                "broker MUST advertise its 60s Server Keep Alive override in CONNACK \
+                 — a regression that omitted the property OR echoed the client's \
+                 300s request would silently mislead the client into honoring its \
+                 own request instead of the broker's spec-defined override"
             );
         }
-        other => panic!("expected Publish, got {other:?}"),
+        other => panic!("expected ConnAck, got {other:?}"),
     }
 
     server.shutdown();
 }
 
 #[tokio::test]
-async fn subscription_identifier_propagated_on_retained_publish() {
-    // §3.3.4.8 second clause: retained messages delivered as a result
-    // of a fresh SUBSCRIBE MUST carry the identifier of THAT
-    // SUBSCRIBE. A regression that only attached identifiers on the
-    // live-traffic path (and silently swallowed them on the retain-
-    // replay path) would still pass the headline test above but break
-    // late-subscriber semantics — pin the retain path explicitly.
+async fn connect_default_config_omits_server_keep_alive_in_connack() {
+    // Refs #880: the default-OFF guarantee. With
+    // `server_keep_alive_secs = 0` (the default), the CONNACK MUST NOT
+    // carry the Server Keep Alive property — the spec default when
+    // absent is "no override," and silence preserves the pre-this-knob
+    // behaviour for every deployment that doesn't opt in. Pin that the
+    // baseline TestServer (which uses DEFAULT_SERVER_KEEP_ALIVE_SECS = 0)
+    // emits a CONNACK whose `server_keep_alive` is None, NOT Some(0).
+    // A regression that flipped the emit logic to always-set would leave
+    // every default deployment broadcasting "broker chose 0" which has
+    // ambiguous spec interpretation across client implementations.
     let ca = TestCa::new("MQTT Test CA");
-    let alice_cert = ca.issue_client_cert("alice", &["alpha"]);
-    let bob_cert = ca.issue_client_cert("bob", &["alpha"]);
+    let cert = ca.issue_client_cert("alice", &["alpha"]);
     let router = Arc::new(Router::new());
-    let server = TestServer::new(&ca, Arc::clone(&router), None);
 
-    // Phase 1: store a retained payload (no subscriber yet).
-    {
-        let alice_tls =
-            build_client_tls_config(&alice_cert.cert_pem, &alice_cert.key_pem, &ca.cert_pem);
-        let mut alice = mqtt_connect(server.addr, &alice_tls).await;
-        let mut alice_buf = BytesMut::new();
-        write_v5_packet(
-            &mut alice,
-            &mqttbytes::v5::Packet::Connect(mqttbytes::v5::Connect::new("alice-retain-pub")),
-        )
-        .await;
-        let _ = read_v5_packet(&mut alice, &mut alice_buf).await;
+    let server = TestServer::new(&ca, router, None);
+    let tls = build_client_tls_config(&cert.cert_pem, &cert.key_pem, &ca.cert_pem);
 
-        let mut publish =
-            mqttbytes::v5::Publish::new("alpha", mqttbytes::QoS::AtMostOnce, b"retained-with-id");
-        publish.retain = true;
-        write_v5_packet(&mut alice, &mqttbytes::v5::Packet::Publish(publish)).await;
-        // QoS 0 has no PUBACK; pause briefly to let the retain store update.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut stream = mqtt_connect(server.addr, &tls).await;
+    let mut buf = BytesMut::new();
 
-        let disc = mqttbytes::v5::Disconnect {
-            reason_code: mqttbytes::v5::DisconnectReasonCode::NormalDisconnection,
-            properties: None,
-        };
-        write_v5_packet(&mut alice, &mqttbytes::v5::Packet::Disconnect(disc)).await;
-    }
+    let mut connect = mqttbytes::v5::Connect::new("ska-default-client");
+    connect.keep_alive = 60;
+    write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Connect(connect)).await;
 
-    // Phase 2: late subscriber arrives with subscription identifier 7;
-    // the retained payload MUST carry id=7 on replay.
-    let bob_tls = build_client_tls_config(&bob_cert.cert_pem, &bob_cert.key_pem, &ca.cert_pem);
-    let mut bob = mqtt_connect(server.addr, &bob_tls).await;
-    let mut bob_buf = BytesMut::new();
-    write_v5_packet(
-        &mut bob,
-        &mqttbytes::v5::Packet::Connect(mqttbytes::v5::Connect::new("bob-retain-sub")),
-    )
-    .await;
-    let _ = read_v5_packet(&mut bob, &mut bob_buf).await; // CONNACK
-
-    let sub = build_v5_subscribe_with_id("alpha", mqttbytes::QoS::AtMostOnce, 7);
-    write_v5_packet(&mut bob, &mqttbytes::v5::Packet::Subscribe(sub)).await;
-
-    // SUBACK first (Mosquitto/HiveMQ ordering — see existing
-    // retained_publish_delivered_to_late_subscriber).
-    let suback = read_v5_packet(&mut bob, &mut bob_buf).await;
-    assert!(
-        matches!(suback, mqttbytes::v5::Packet::SubAck(_)),
-        "expected SUBACK first, got {suback:?}"
-    );
-
-    let retained = tokio::time::timeout(
-        Duration::from_secs(2),
-        read_v5_packet(&mut bob, &mut bob_buf),
-    )
-    .await
-    .expect("retained PUBLISH must be delivered after SUBACK");
-    match retained {
-        mqttbytes::v5::Packet::Publish(p) => {
-            assert_eq!(p.topic, "alpha");
-            assert_eq!(p.payload.as_ref(), b"retained-with-id");
-            assert!(
-                p.retain,
-                "retain flag MUST stay set on replay even when an id is attached"
-            );
-            let props = p
+    let packet = read_v5_packet(&mut stream, &mut buf).await;
+    match packet {
+        mqttbytes::v5::Packet::ConnAck(connack) => {
+            assert_eq!(connack.code, mqttbytes::v5::ConnectReturnCode::Success);
+            let props = connack
                 .properties
-                .expect("retained PUBLISH MUST carry properties carrying the id (refs §3.3.4.8)");
+                .expect("v5 CONNACK MUST carry properties");
             assert_eq!(
-                props.subscription_identifiers,
-                vec![7usize],
-                "retain replay MUST echo the SUBSCRIBE's identifier"
+                props.server_keep_alive, None,
+                "default config MUST omit Server Keep Alive so the client honors \
+                 its own keep-alive request — a regression that emitted Some(0) \
+                 here would have ambiguous interpretation across MQTT 5.0 client \
+                 stacks"
             );
         }
-        other => panic!("expected retained Publish, got {other:?}"),
-    }
-
-    server.shutdown();
-}
-
-#[tokio::test]
-async fn publish_without_matching_identifier_subscription_omits_identifier() {
-    // A SUBSCRIBE that did NOT include a `subscription_identifier`
-    // property MUST result in PUBLISHes whose
-    // `subscription_identifiers` field is empty (the wire-format
-    // default — `Vec::new()` is observationally identical to "no
-    // property emitted"). A regression that attached a default
-    // identifier (e.g. `0`, or a sentinel) to PUBLISHes for non-
-    // identified subscriptions would corrupt the spec contract.
-    let ca = TestCa::new("MQTT Test CA");
-    let alice_cert = ca.issue_client_cert("alice", &["alpha"]);
-    let bob_cert = ca.issue_client_cert("bob", &["alpha"]);
-    let router = Arc::new(Router::new());
-    let server = TestServer::new(&ca, Arc::clone(&router), None);
-
-    let bob_tls = build_client_tls_config(&bob_cert.cert_pem, &bob_cert.key_pem, &ca.cert_pem);
-    let mut bob = mqtt_connect(server.addr, &bob_tls).await;
-    let mut bob_buf = BytesMut::new();
-    write_v5_packet(
-        &mut bob,
-        &mqttbytes::v5::Packet::Connect(mqttbytes::v5::Connect::new("bob-noid")),
-    )
-    .await;
-    let _ = read_v5_packet(&mut bob, &mut bob_buf).await;
-
-    // SUBSCRIBE with NO subscription identifier (default constructor).
-    let sub = mqttbytes::v5::Subscribe::new("alpha", mqttbytes::QoS::AtMostOnce);
-    write_v5_packet(&mut bob, &mqttbytes::v5::Packet::Subscribe(sub)).await;
-    let _ = read_v5_packet(&mut bob, &mut bob_buf).await;
-
-    let alice_tls =
-        build_client_tls_config(&alice_cert.cert_pem, &alice_cert.key_pem, &ca.cert_pem);
-    let mut alice = mqtt_connect(server.addr, &alice_tls).await;
-    let mut alice_buf = BytesMut::new();
-    write_v5_packet(
-        &mut alice,
-        &mqttbytes::v5::Packet::Connect(mqttbytes::v5::Connect::new("alice-noid")),
-    )
-    .await;
-    let _ = read_v5_packet(&mut alice, &mut alice_buf).await;
-
-    let publish = mqttbytes::v5::Publish::new("alpha", mqttbytes::QoS::AtMostOnce, b"no-id-please");
-    write_v5_packet(&mut alice, &mqttbytes::v5::Packet::Publish(publish)).await;
-
-    let delivered = tokio::time::timeout(
-        Duration::from_secs(2),
-        read_v5_packet(&mut bob, &mut bob_buf),
-    )
-    .await
-    .expect("subscriber must receive matching PUBLISH");
-    match delivered {
-        mqttbytes::v5::Packet::Publish(p) => {
-            // The mqttbytes parser reports "no properties present" as
-            // `None`. Either shape is OK on the wire — the spec
-            // contract is "no identifier was attached", which is
-            // indistinguishable from properties being absent.
-            match p.properties {
-                None => { /* no property block emitted — equivalent to empty */ }
-                Some(props) => assert!(
-                    props.subscription_identifiers.is_empty(),
-                    "non-identified subscription MUST NOT receive identifiers; \
-                     got {:?}",
-                    props.subscription_identifiers
-                ),
-            }
-        }
-        other => panic!("expected Publish, got {other:?}"),
-    }
-
-    server.shutdown();
-}
-
-#[tokio::test]
-async fn subscription_identifier_propagated_to_multiple_subscriptions_on_one_client() {
-    // §3.3.4.8 multi-attribution clause: when a single PUBLISH matches
-    // multiple subscriptions on the same session, EVERY matching
-    // identifier MUST be attached. We subscribe twice on the same
-    // connection — once to `alpha/+` (id=10) and once to `+/red`
-    // (id=20) — then publish to `alpha/red` which matches both. The
-    // delivered PUBLISH MUST carry both identifiers (order is not
-    // spec-mandated, so we sort and assert as a set).
-    let ca = TestCa::new("MQTT Test CA");
-    let alice_cert = ca.issue_client_cert("alice", &["alpha/red"]);
-    let bob_cert = ca.issue_client_cert("bob", &["alpha/red"]);
-    let router = Arc::new(Router::new());
-    let server = TestServer::new(&ca, Arc::clone(&router), None);
-
-    let bob_tls = build_client_tls_config(&bob_cert.cert_pem, &bob_cert.key_pem, &ca.cert_pem);
-    let mut bob = mqtt_connect(server.addr, &bob_tls).await;
-    let mut bob_buf = BytesMut::new();
-    write_v5_packet(
-        &mut bob,
-        &mqttbytes::v5::Packet::Connect(mqttbytes::v5::Connect::new("bob-multi-id")),
-    )
-    .await;
-    let _ = read_v5_packet(&mut bob, &mut bob_buf).await;
-
-    // First subscription: filter `alpha/+` with id=10. Wildcard
-    // expansion picks up `alpha/red` (the cert's group).
-    let mut sub1 = build_v5_subscribe_with_id("alpha/+", mqttbytes::QoS::AtMostOnce, 10);
-    sub1.pkid = 1;
-    write_v5_packet(&mut bob, &mqttbytes::v5::Packet::Subscribe(sub1)).await;
-    let _ = read_v5_packet(&mut bob, &mut bob_buf).await;
-
-    // Second subscription: filter `+/red` with id=20. Also matches
-    // `alpha/red`.
-    let mut sub2 = build_v5_subscribe_with_id("+/red", mqttbytes::QoS::AtMostOnce, 20);
-    sub2.pkid = 2;
-    write_v5_packet(&mut bob, &mqttbytes::v5::Packet::Subscribe(sub2)).await;
-    let _ = read_v5_packet(&mut bob, &mut bob_buf).await;
-
-    // Publisher fires one PUBLISH on `alpha/red` — matches both
-    // subscriptions, MUST carry both identifiers.
-    let alice_tls =
-        build_client_tls_config(&alice_cert.cert_pem, &alice_cert.key_pem, &ca.cert_pem);
-    let mut alice = mqtt_connect(server.addr, &alice_tls).await;
-    let mut alice_buf = BytesMut::new();
-    write_v5_packet(
-        &mut alice,
-        &mqttbytes::v5::Packet::Connect(mqttbytes::v5::Connect::new("alice-multi-id")),
-    )
-    .await;
-    let _ = read_v5_packet(&mut alice, &mut alice_buf).await;
-
-    let publish =
-        mqttbytes::v5::Publish::new("alpha/red", mqttbytes::QoS::AtMostOnce, b"both-ids-please");
-    write_v5_packet(&mut alice, &mqttbytes::v5::Packet::Publish(publish)).await;
-
-    let delivered = tokio::time::timeout(
-        Duration::from_secs(2),
-        read_v5_packet(&mut bob, &mut bob_buf),
-    )
-    .await
-    .expect("multi-matching PUBLISH must arrive");
-    match delivered {
-        mqttbytes::v5::Packet::Publish(p) => {
-            let props = p.properties.expect("PUBLISH MUST carry properties");
-            let mut ids = props.subscription_identifiers.clone();
-            ids.sort_unstable();
-            assert_eq!(
-                ids,
-                vec![10usize, 20usize],
-                "both matching subscription identifiers MUST be attached \
-                 (order is not spec-mandated; sorting normalises)"
-            );
-        }
-        other => panic!("expected Publish, got {other:?}"),
-    }
-
-    server.shutdown();
-}
-
-#[tokio::test]
-async fn v311_subscribe_does_not_propagate_identifier() {
-    // MQTT 3.1.1 has no Subscription Identifier feature on the wire.
-    // A v3.1.1 subscriber MUST receive a clean v4 PUBLISH packet with
-    // no v5 properties tail — the identifier mechanism simply does
-    // not apply. This test pins that the v4 path stays byte-clean
-    // even when a v5 publisher is in the mix and the broker is
-    // happily propagating identifiers on the v5 side.
-    let ca = TestCa::new("MQTT Test CA");
-    let alice_cert = ca.issue_client_cert("alice", &["alpha"]);
-    let bob_cert = ca.issue_client_cert("bob", &["alpha"]);
-    let router = Arc::new(Router::new());
-    let server = TestServer::new(&ca, Arc::clone(&router), None);
-
-    // Bob subscribes via v3.1.1.
-    let bob_tls = build_client_tls_config(&bob_cert.cert_pem, &bob_cert.key_pem, &ca.cert_pem);
-    let mut bob = mqtt_connect(server.addr, &bob_tls).await;
-    let mut bob_buf = BytesMut::new();
-
-    // CONNECT v3.1.1.
-    let connect_v4 = mqttbytes::v4::Connect::new("bob-v311");
-    let mut connect_buf = BytesMut::new();
-    connect_v4.write(&mut connect_buf).expect("write connect");
-    bob.write_all(&connect_buf).await.expect("send connect");
-    bob.flush().await.expect("flush");
-
-    // Read CONNACK as v4.
-    loop {
-        match mqttbytes::v4::read(&mut bob_buf, 1024 * 1024) {
-            Ok(mqttbytes::v4::Packet::ConnAck(_)) => break,
-            Ok(other) => panic!("expected v4 CONNACK first, got {other:?}"),
-            Err(mqttbytes::Error::InsufficientBytes(_)) => {
-                let n = bob.read_buf(&mut bob_buf).await.expect("read");
-                assert!(n > 0, "unexpected EOF before CONNACK");
-            }
-            Err(e) => panic!("v4 parse error: {e:?}"),
-        }
-    }
-
-    let sub_v4 = mqttbytes::v4::Subscribe::new("alpha", mqttbytes::QoS::AtMostOnce);
-    let mut sub_buf = BytesMut::new();
-    sub_v4.write(&mut sub_buf).expect("write subscribe");
-    bob.write_all(&sub_buf).await.expect("send subscribe");
-    bob.flush().await.expect("flush");
-
-    // Read SUBACK.
-    loop {
-        match mqttbytes::v4::read(&mut bob_buf, 1024 * 1024) {
-            Ok(mqttbytes::v4::Packet::SubAck(_)) => break,
-            Ok(other) => panic!("expected v4 SUBACK, got {other:?}"),
-            Err(mqttbytes::Error::InsufficientBytes(_)) => {
-                let n = bob.read_buf(&mut bob_buf).await.expect("read");
-                assert!(n > 0, "unexpected EOF before SUBACK");
-            }
-            Err(e) => panic!("v4 parse error: {e:?}"),
-        }
-    }
-
-    // Publisher (v5) fires a PUBLISH that would carry identifiers on a
-    // v5 subscriber — but Bob is v3.1.1, so no identifiers propagate.
-    let alice_tls =
-        build_client_tls_config(&alice_cert.cert_pem, &alice_cert.key_pem, &ca.cert_pem);
-    let mut alice = mqtt_connect(server.addr, &alice_tls).await;
-    let mut alice_buf = BytesMut::new();
-    write_v5_packet(
-        &mut alice,
-        &mqttbytes::v5::Packet::Connect(mqttbytes::v5::Connect::new("alice-cross-protocol")),
-    )
-    .await;
-    let _ = read_v5_packet(&mut alice, &mut alice_buf).await;
-
-    let publish =
-        mqttbytes::v5::Publish::new("alpha", mqttbytes::QoS::AtMostOnce, b"cross-protocol");
-    write_v5_packet(&mut alice, &mqttbytes::v5::Packet::Publish(publish)).await;
-
-    // Bob reads as v4 — must parse cleanly as a vanilla PUBLISH with
-    // no v5 properties tail. (mqttbytes::v4::Publish has no
-    // `properties` field at all — the test passes if the v4 parse
-    // succeeds.)
-    let delivered = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            match mqttbytes::v4::read(&mut bob_buf, 1024 * 1024) {
-                Ok(p) => break p,
-                Err(mqttbytes::Error::InsufficientBytes(_)) => {
-                    let n = bob.read_buf(&mut bob_buf).await.expect("read");
-                    assert!(n > 0, "unexpected EOF awaiting v4 publish");
-                }
-                Err(e) => panic!("v4 parse error on incoming PUBLISH: {e:?}"),
-            }
-        }
-    })
-    .await
-    .expect("v3.1.1 subscriber must receive PUBLISH within 2 s");
-    match delivered {
-        mqttbytes::v4::Packet::Publish(p) => {
-            assert_eq!(p.topic, "alpha");
-            assert_eq!(p.payload.as_ref(), b"cross-protocol");
-            // The v4 wire format has no concept of subscription
-            // identifiers — the type doesn't even carry properties.
-            // Reaching this branch is the assertion: the broker did
-            // NOT splice v5-only properties onto a v4 wire frame.
-        }
-        other => panic!("expected v4 Publish, got {other:?}"),
+        other => panic!("expected ConnAck, got {other:?}"),
     }
 
     server.shutdown();

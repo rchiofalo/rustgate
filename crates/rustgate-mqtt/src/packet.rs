@@ -63,6 +63,15 @@ pub(crate) struct PacketCodec {
     /// `Wildcard Subscription Available` CONNACK property without
     /// re-plumbing every call site.
     wildcard_policy: crate::topic::WildcardPolicy,
+    /// Operator-configured Server Keep Alive override. When `> 0`
+    /// the codec advertises the value via the MQTT 5.0 §3.2.2.3.14
+    /// `Server Keep Alive` CONNACK property; when `0` the property
+    /// is omitted and the broker honors the client's CONNECT-time
+    /// request as before. Read by `write_connack_v5`; the read-loop
+    /// keep-alive enforcement uses the same value via the
+    /// `handle_mqtt_session` parameter (the codec carries it for
+    /// CONNACK emission, not for timer enforcement).
+    server_keep_alive_secs: u16,
 }
 
 impl PacketCodec {
@@ -73,6 +82,7 @@ impl PacketCodec {
         receive_max: u16,
         topic_alias_max: u16,
         wildcard_policy: crate::topic::WildcardPolicy,
+        server_keep_alive_secs: u16,
     ) -> Self {
         Self {
             stream,
@@ -83,6 +93,7 @@ impl PacketCodec {
             receive_max,
             topic_alias_max,
             wildcard_policy,
+            server_keep_alive_secs,
         }
     }
 
@@ -283,6 +294,24 @@ impl PacketCodec {
         // enabled, the broker advertises the actual cap so the client
         // knows when its session will be discarded.
         properties.session_expiry_interval = Some(negotiated_session_expiry);
+        // MQTT 5.0 §3.2.2.3.14: Server Keep Alive. The broker MAY
+        // override the client's CONNECT-time keep-alive request by
+        // advertising a different value here; the client MUST then
+        // use the returned value as the Keep Alive for the session.
+        // Asymmetry vs the other CONNACK properties: this one is set
+        // ONLY when the operator opts in via a non-zero
+        // `server_keep_alive_secs` config, so a default deployment
+        // emits silence — the spec default when absent is "no
+        // override," which matches rustgate's pre-this-knob behaviour
+        // (the broker honors the client's request). Setting it to 0
+        // would NOT mean "disable keep-alive" for the client (which
+        // is what 0 means in CONNECT) — it would mean "the broker
+        // explicitly chose 0," which is a stronger statement than
+        // we want to make on every CONNACK. Omitting the property
+        // unless configured preserves spec-compliant defaults.
+        if self.server_keep_alive_secs > 0 {
+            properties.server_keep_alive = Some(self.server_keep_alive_secs);
+        }
         let connack = mqttbytes::v5::ConnAck {
             // MQTT 5.0 §3.2.2.1.1: Session Present is `true` IFF the
             // server resumed an existing session for this client_id
@@ -1185,6 +1214,91 @@ mod tests {
                     Some(8),
                     "broker must advertise its Topic Alias Maximum so the \
                      client knows the highest accepted alias value"
+                );
+            }
+            other => panic!("expected ConnAck, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v5_connack_advertises_server_keep_alive_when_configured() {
+        // Refs #880: MQTT 5.0 §3.2.2.3.14 — Server Keep Alive.
+        // When the operator opts in via a non-zero
+        // `server_keep_alive_secs` config, the broker MUST advertise
+        // the value here so a compliant client switches to the
+        // overridden interval (the spec text is "the Client MUST use
+        // this value instead of the Keep Alive value the Client sent
+        // on CONNECT"). Pin the wire format end-to-end: build a
+        // CONNACK with the property set to 120, parse it back, assert
+        // the value survives. A regression that hard-coded the value,
+        // dropped the property, or swapped to `None` would silently
+        // leave the broker honoring the client's request even after
+        // the operator opted into the override.
+        let connack = mqttbytes::v5::ConnAck {
+            session_present: false,
+            code: mqttbytes::v5::ConnectReturnCode::Success,
+            properties: Some({
+                let mut p = mqttbytes::v5::ConnAckProperties::new();
+                p.server_keep_alive = Some(120);
+                p
+            }),
+        };
+        let mut buf = BytesMut::with_capacity(32);
+        write_v5_to_buf(&mqttbytes::v5::Packet::ConnAck(connack), &mut buf).expect("serialize");
+
+        let decoded = mqttbytes::v5::read(&mut buf, 16 * 1024).expect("parse");
+        match decoded {
+            mqttbytes::v5::Packet::ConnAck(a) => {
+                let props = a.properties.expect("properties present");
+                assert_eq!(
+                    props.server_keep_alive,
+                    Some(120),
+                    "broker must advertise its Server Keep Alive override so a \
+                     compliant client switches to the broker-imposed cadence \
+                     instead of its own CONNECT-time request"
+                );
+            }
+            other => panic!("expected ConnAck, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v5_connack_omits_server_keep_alive_when_zero() {
+        // Refs #880: the asymmetric default vs the other CONNACK
+        // properties — when `server_keep_alive_secs == 0` (the default)
+        // the broker MUST NOT advertise the property, so a compliant
+        // client falls back to honoring its own CONNECT-time keep-alive
+        // (the spec default when the property is absent). Setting the
+        // wire field to 0 explicitly would mean "the broker explicitly
+        // chose 0," a stronger statement than we want to make on every
+        // CONNACK; omission is the spec-compliant signal for "no
+        // override." Pin the absence end-to-end via a CONNACK with
+        // `server_keep_alive = None` round-tripped through the wire
+        // format. A regression that started emitting `Some(0)` here
+        // would silently flip every default deployment into "broker
+        // disables keep-alive" semantics.
+        let connack = mqttbytes::v5::ConnAck {
+            session_present: false,
+            code: mqttbytes::v5::ConnectReturnCode::Success,
+            properties: Some({
+                let mut p = mqttbytes::v5::ConnAckProperties::new();
+                // Leave server_keep_alive at its default `None`.
+                p.max_packet_size = Some(1024);
+                p
+            }),
+        };
+        let mut buf = BytesMut::with_capacity(32);
+        write_v5_to_buf(&mqttbytes::v5::Packet::ConnAck(connack), &mut buf).expect("serialize");
+
+        let decoded = mqttbytes::v5::read(&mut buf, 16 * 1024).expect("parse");
+        match decoded {
+            mqttbytes::v5::Packet::ConnAck(a) => {
+                let props = a.properties.expect("properties present");
+                assert_eq!(
+                    props.server_keep_alive, None,
+                    "broker must omit Server Keep Alive when no override is \
+                     configured so a compliant client honors its own \
+                     CONNECT-time request per the spec's absent-property default"
                 );
             }
             other => panic!("expected ConnAck, got {other:?}"),
