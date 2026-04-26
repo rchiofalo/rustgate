@@ -45,4 +45,7 @@ pub mod frame;
 
 pub use codec::MavlinkCodec;
 pub use error::MavlinkError;
-pub use frame::{MAVLINK_V1_MAGIC, MAVLINK_V2_MAGIC, MavlinkFrameCodec, MavlinkVersion};
+pub use frame::{
+    HEARTBEAT_MSG_ID, MAVLINK_V1_MAGIC, MAVLINK_V2_MAGIC, MavlinkFrameCodec, MavlinkVersion,
+    OnMavlinkHeartbeat,
+};

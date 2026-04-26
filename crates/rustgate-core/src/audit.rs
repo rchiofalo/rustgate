@@ -905,6 +905,46 @@ pub fn mavlink_v1_rejected(peer: &str) {
     );
 }
 
+/// Record a MAVLink HEARTBEAT (`MSG_ID = 0`) frame received and decoded
+/// at the framing layer.
+///
+/// Emitted by the MAVLink frame decoder in `rustgate-mavlink` whenever a
+/// v1 or v2 frame is recognised as a HEARTBEAT and its payload is large
+/// enough to surface the autopilot/vehicle-type fields. A typical drone
+/// fleet emits HEARTBEATs at 1 Hz, so this event is the wire-level
+/// presence ping a SIEM can correlate against "aircraft fell off the
+/// network" higher-level signals — distinguishing a real network
+/// partition from a payload outage where the aircraft is silent at the
+/// MAVLink layer despite a healthy TCP/UDP link.
+///
+/// `system_id` and `component_id` come from the v1/v2 header (offset 3
+/// and 4 in v1, offset 5 and 6 in v2). `autopilot` and `vehicle_type`
+/// come from the HEARTBEAT payload (offsets 5 and 4 respectively, after
+/// MAVLink's field-size-descending wire reordering — `custom_mode` is
+/// the leading u32). The autopilot enum surfaces ArduPilot vs PX4 vs
+/// Vector vs other vendors at SIEM correlation time without having to
+/// keep a dialect parser online.
+///
+/// Kept as a plain-text reference rather than a rustdoc intra-doc link
+/// because `rustgate-core` deliberately does not depend on
+/// `rustgate-mavlink` (the dependency direction is the other way).
+pub fn mavlink_heartbeat_received(
+    system_id: u8,
+    component_id: u8,
+    autopilot: u8,
+    vehicle_type: u8,
+) {
+    audit!(
+        "mavlink.heartbeat_received",
+        system_id = system_id,
+        component_id = component_id,
+        autopilot = autopilot,
+        vehicle_type = vehicle_type,
+        action = "frame_decode",
+        result = "received"
+    );
+}
+
 /// Record an MQTT will message published on behalf of a disconnecting
 /// client whose connection ended ungracefully (TLS error, keep-alive
 /// timeout, write-loop early exit, abrupt TCP close — anything that is
@@ -1254,6 +1294,20 @@ mod tests {
             mqtt_will_published("hashed-cn-12345", "fleet/red/status", "fleet/red", true);
             mqtt_will_published("hashed-cn-12345", "presence", "presence", false);
             mqtt_will_published("", "", "", false);
+        }
+
+        #[test]
+        fn test_mavlink_heartbeat_received() {
+            // Smoke-test the typical fleet-observability call shape: an
+            // ArduPilot Mega (autopilot=12) on a Quadrotor (vehicle_type=2)
+            // with system_id=42 and the autopilot's standard MAV_COMP_ID_AUTOPILOT1
+            // (component_id=1). The macro must not panic on the boundary
+            // values either — 0 across the board (an unconfigured
+            // bench-test airframe) and u8::MAX (a synthetic frame from a
+            // fuzzer or a misconfigured sender).
+            mavlink_heartbeat_received(42, 1, 12, 2);
+            mavlink_heartbeat_received(0, 0, 0, 0);
+            mavlink_heartbeat_received(u8::MAX, u8::MAX, u8::MAX, u8::MAX);
         }
     }
 }

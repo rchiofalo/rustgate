@@ -54,6 +54,7 @@
 //! the next call.
 
 use std::io;
+use std::sync::Arc;
 
 use bytes::{Buf, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
@@ -91,6 +92,54 @@ const MAVLINK_IFLAG_SIGNED: u8 = 0x01;
 /// 10 (header) + 255 (payload) + 2 (CRC) + 13 (signature) = 280.
 pub const MAX_MAVLINK_FRAME_SIZE: usize =
     MAVLINK_V2_HEADER_LEN + u8::MAX as usize + MAVLINK_CRC_LEN + MAVLINK_SIGNATURE_LEN;
+
+/// MAVLink message ID for `HEARTBEAT` (`0`).
+///
+/// Standard MAVLink dialect — every dialect inherits this ID unchanged
+/// because the spec pins HEARTBEAT to message 0 specifically so cross-
+/// dialect parsers can recognise presence pings without loading the
+/// full message catalogue.
+pub const HEARTBEAT_MSG_ID: u32 = 0;
+
+/// Wire size of a `HEARTBEAT` payload after MAVLink's field-size-
+/// descending reordering: `custom_mode` (u32) + 5 × u8 = 9 bytes.
+///
+/// v2 truncates trailing zero bytes on the wire, so the on-wire payload
+/// can be shorter — the decoder only invokes the heartbeat callback
+/// when at least the first 6 bytes (covering `custom_mode`,
+/// `vehicle_type`, `autopilot`) are present.
+const HEARTBEAT_PAYLOAD_MIN_LEN: usize = 6;
+
+/// Byte offset of the `vehicle_type` field inside the HEARTBEAT payload.
+///
+/// MAVLink reorders fields by descending size for wire encoding, so
+/// `custom_mode` (u32) lands at offset 0–3 and `type` follows at 4.
+const HEARTBEAT_TYPE_OFFSET: usize = 4;
+
+/// Byte offset of the `autopilot` field inside the HEARTBEAT payload.
+const HEARTBEAT_AUTOPILOT_OFFSET: usize = 5;
+
+/// Callback invoked once per decoded MAVLink HEARTBEAT frame
+/// (`MSG_ID = 0`).
+///
+/// Arguments are `(system_id, component_id, autopilot, vehicle_type)`
+/// — the first two come from the v1/v2 header, the latter two from the
+/// HEARTBEAT payload. The four `u8` shape mirrors the audit-event field
+/// list in `rustgate_core::audit::mavlink_heartbeat_received` so the
+/// server crate can wire a single closure that calls both.
+///
+/// Wired by the server crate to feed the
+/// `rustgate_mavlink_heartbeats_total{system_id}` Prometheus counter
+/// and emit the `mavlink.heartbeat_received` audit event. Kept as a
+/// simple `Fn(u8, u8, u8, u8)` so the `rustgate-mavlink` crate stays
+/// metrics-agnostic and does not grow a `prometheus` dependency. The
+/// callback is fired only on frames that decode cleanly and whose
+/// HEARTBEAT payload is large enough to surface every field — a frame
+/// truncated below the spec's 6-byte minimum (covering the autopilot
+/// and vehicle_type fields after `custom_mode`) does NOT invoke the
+/// callback so a malformed sender cannot generate a fake presence
+/// signal.
+pub type OnMavlinkHeartbeat = Arc<dyn Fn(u8, u8, u8, u8) + Send + Sync>;
 
 /// Protocol version of a parsed MAVLink frame.
 ///
@@ -152,7 +201,6 @@ impl MavlinkVersion {
 /// currently being reassembled. When the header arrives, the length is
 /// computed once and cached until the full payload has been read; this
 /// avoids re-parsing the header on every poll.
-#[derive(Debug)]
 pub struct MavlinkFrameCodec {
     /// Total frame length (including magic byte) once the header has
     /// been parsed. `None` until enough bytes arrive to determine the
@@ -164,6 +212,31 @@ pub struct MavlinkFrameCodec {
     /// When `false` (the default), v1 frames are rejected with
     /// [`MavlinkError::V1FrameRejected`].
     allow_v1: bool,
+    /// Optional observer fired once per successfully-decoded HEARTBEAT
+    /// frame. `None` (the default) leaves the decode hot path
+    /// untouched; the server crate installs a closure that emits the
+    /// `mavlink.heartbeat_received` audit event and increments the
+    /// `rustgate_mavlink_heartbeats_total{system_id}` Prometheus
+    /// counter under `--features metrics`.
+    on_heartbeat: Option<OnMavlinkHeartbeat>,
+}
+
+impl std::fmt::Debug for MavlinkFrameCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MavlinkFrameCodec")
+            .field("pending_total_len", &self.pending_total_len)
+            .field("require_signing", &self.require_signing)
+            .field("allow_v1", &self.allow_v1)
+            .field(
+                "on_heartbeat",
+                &if self.on_heartbeat.is_some() {
+                    "Some(<cb>)"
+                } else {
+                    "None"
+                },
+            )
+            .finish()
+    }
 }
 
 impl Default for MavlinkFrameCodec {
@@ -174,6 +247,7 @@ impl Default for MavlinkFrameCodec {
             // Operators opt back in explicitly.
             require_signing: true,
             allow_v1: false,
+            on_heartbeat: None,
         }
     }
 }
@@ -225,6 +299,29 @@ impl MavlinkFrameCodec {
     #[must_use]
     pub fn allows_v1(&self) -> bool {
         self.allow_v1
+    }
+
+    /// Install a callback fired once per successfully-decoded HEARTBEAT
+    /// frame (`MSG_ID = 0`).
+    ///
+    /// The callback receives `(system_id, component_id, autopilot,
+    /// vehicle_type)` extracted from the v1/v2 header and the HEARTBEAT
+    /// payload. See [`OnMavlinkHeartbeat`] for the operational rationale.
+    ///
+    /// `None` (the default) leaves the decode hot path untouched and
+    /// the codec performs no payload inspection beyond the framing
+    /// state machine — the cost of installing the callback is paid
+    /// only when an operator wires one in.
+    #[must_use]
+    pub fn with_on_heartbeat(mut self, cb: OnMavlinkHeartbeat) -> Self {
+        self.on_heartbeat = Some(cb);
+        self
+    }
+
+    /// Returns `true` if a HEARTBEAT observer is installed.
+    #[must_use]
+    pub fn has_heartbeat_observer(&self) -> bool {
+        self.on_heartbeat.is_some()
     }
 
     /// Parse just enough of the header to know how long the frame is.
@@ -355,8 +452,94 @@ impl Decoder for MavlinkFrameCodec {
         // a state where it thinks it is mid-frame on a buffer that no
         // longer contains one.
         self.pending_total_len = None;
-        Ok(Some(src.split_to(total)))
+        let frame = src.split_to(total);
+
+        // HEARTBEAT inspection runs only when an observer is wired —
+        // gating on `is_some()` keeps the no-observer path identical
+        // to the pre-#909 hot path (no field extraction, no callback
+        // dispatch). The header walk reads at most 7 bytes, so the
+        // observer-on path adds a handful of L1-resident loads per
+        // frame; the cost only materialises on links that wired in
+        // a Prometheus counter or audit listener.
+        if self.on_heartbeat.is_some()
+            && let Some((sys, comp, autopilot, veh)) = parse_heartbeat_fields(&frame)
+        {
+            // `is_some()` was just verified — the `if let` cannot fail
+            // here even though clippy can't prove it, but the explicit
+            // `if let` keeps the call site readable without a
+            // `.expect()` that adds noise on the success path.
+            if let Some(cb) = self.on_heartbeat.as_ref() {
+                cb(sys, comp, autopilot, veh);
+            }
+        }
+
+        Ok(Some(frame))
     }
+}
+
+/// Extract `(system_id, component_id, autopilot, vehicle_type)` from a
+/// fully-decoded MAVLink frame whose `MSG_ID` is `HEARTBEAT` (`0`).
+///
+/// Returns `None` for any non-HEARTBEAT frame, for any frame whose
+/// magic byte is not recognised (defense-in-depth — the framer
+/// guarantees a recognised magic but a future refactor could regress),
+/// and for HEARTBEAT frames whose **wire-declared** payload length
+/// (the `LEN` byte at offset 1) is below the 6-byte minimum that
+/// covers `custom_mode` (4 bytes) + `vehicle_type` + `autopilot`. The
+/// minimum-length check uses `LEN`, not the trailing-slice length,
+/// because v2 truncates trailing zero bytes on the wire — a sender
+/// that legitimately omits `base_mode`, `system_status`, and
+/// `mavlink_version` (the spec allows it) would still expose the
+/// fields the audit/metrics signal cares about.
+///
+/// Read-only by construction: takes `&[u8]` and never mutates the
+/// frame. The caller (the `Decoder::decode` impl) owns the buffer and
+/// hands it back to the framework after this returns.
+fn parse_heartbeat_fields(frame: &[u8]) -> Option<(u8, u8, u8, u8)> {
+    let first = *frame.first()?;
+    let version = MavlinkVersion::from_magic(first)?;
+
+    let (sys_off, comp_off, msgid_off, payload_off) = match version {
+        // v1: STX(0) LEN(1) SEQ(2) SYS(3) COMP(4) MSGID(5) PAYLOAD(6+)
+        MavlinkVersion::V1 => (3, 4, 5, MAVLINK_V1_HEADER_LEN),
+        // v2: STX(0) LEN(1) INCOMPAT(2) COMPAT(3) SEQ(4) SYS(5) COMP(6)
+        //     MSGID_LO(7) MSGID_MID(8) MSGID_HI(9) PAYLOAD(10+)
+        MavlinkVersion::V2 => (5, 6, 7, MAVLINK_V2_HEADER_LEN),
+    };
+
+    // Wire-declared payload length. For v2 a sender can legally
+    // truncate trailing zero bytes — the SIEM signal must trust LEN,
+    // not the trailing-slice length, because the slice also includes
+    // CRC and (for signed v2) the signature trailer.
+    let wire_payload_len = *frame.get(1)? as usize;
+    if wire_payload_len < HEARTBEAT_PAYLOAD_MIN_LEN {
+        return None;
+    }
+
+    let msgid = match version {
+        MavlinkVersion::V1 => *frame.get(msgid_off)? as u32,
+        MavlinkVersion::V2 => {
+            let lo = *frame.get(msgid_off)? as u32;
+            let mid = *frame.get(msgid_off + 1)? as u32;
+            let hi = *frame.get(msgid_off + 2)? as u32;
+            lo | (mid << 8) | (hi << 16)
+        }
+    };
+    if msgid != HEARTBEAT_MSG_ID {
+        return None;
+    }
+
+    // Defense-in-depth: the framer guarantees `frame.len() >= header +
+    // wire_payload_len + crc(+sig)`, so these accesses are within
+    // bounds. The `?` operators keep the function panic-free even if a
+    // future refactor breaks that invariant.
+    let payload = frame.get(payload_off..)?;
+    let vehicle_type = *payload.get(HEARTBEAT_TYPE_OFFSET)?;
+    let autopilot = *payload.get(HEARTBEAT_AUTOPILOT_OFFSET)?;
+    let system_id = *frame.get(sys_off)?;
+    let component_id = *frame.get(comp_off)?;
+
+    Some((system_id, component_id, autopilot, vehicle_type))
 }
 
 /// Encode a prepared MAVLink frame into the outbound buffer.
@@ -869,5 +1052,271 @@ mod tests {
         let mut buf = BytesMut::from(&[MAVLINK_V2_MAGIC, 0, 0x02][..]);
         let err = codec.decode(&mut buf).expect_err("incompat wins");
         assert!(err.to_string().contains("INCOMPAT"), "got: {err}");
+    }
+
+    // ─── HEARTBEAT observer ──────────────────────────────────────────
+
+    use std::sync::Mutex;
+
+    /// Captured heartbeat-callback invocations for use in observer
+    /// tests. Each tuple is `(system_id, component_id, autopilot,
+    /// vehicle_type)` exactly as the observer received it.
+    type HeartbeatLog = Arc<Mutex<Vec<(u8, u8, u8, u8)>>>;
+
+    /// Build a valid v1 HEARTBEAT frame with caller-controlled header
+    /// and payload fields. CRC bytes are zeroed (the framer does not
+    /// verify them). Layout matches `v1_frame` but exposes every byte
+    /// the heartbeat-callback test wants to assert on.
+    fn v1_heartbeat_frame(
+        sys: u8,
+        comp: u8,
+        msgid: u8,
+        autopilot: u8,
+        vehicle_type: u8,
+        payload_len: u8,
+    ) -> BytesMut {
+        let mut buf =
+            BytesMut::with_capacity(MAVLINK_V1_HEADER_LEN + payload_len as usize + MAVLINK_CRC_LEN);
+        buf.put_u8(MAVLINK_V1_MAGIC);
+        buf.put_u8(payload_len);
+        buf.put_u8(0); // seq
+        buf.put_u8(sys);
+        buf.put_u8(comp);
+        buf.put_u8(msgid);
+        // HEARTBEAT payload (after MAVLink size-descending field reorder):
+        //   [0..4] custom_mode (u32, zeroed in tests)
+        //   [4]    type / vehicle_type
+        //   [5]    autopilot
+        //   [6]    base_mode (zeroed in tests)
+        //   [7]    system_status (zeroed in tests)
+        //   [8]    mavlink_version (zeroed in tests)
+        for i in 0..payload_len {
+            buf.put_u8(match i as usize {
+                HEARTBEAT_TYPE_OFFSET => vehicle_type,
+                HEARTBEAT_AUTOPILOT_OFFSET => autopilot,
+                _ => 0,
+            });
+        }
+        buf.put_u16_le(0); // crc
+        buf
+    }
+
+    /// Build a valid v2 HEARTBEAT frame with caller-controlled header
+    /// + payload fields.
+    fn v2_heartbeat_frame(
+        sys: u8,
+        comp: u8,
+        msgid: u32,
+        signed: bool,
+        autopilot: u8,
+        vehicle_type: u8,
+        payload_len: u8,
+    ) -> BytesMut {
+        let sig_len = if signed { MAVLINK_SIGNATURE_LEN } else { 0 };
+        let total = MAVLINK_V2_HEADER_LEN + payload_len as usize + MAVLINK_CRC_LEN + sig_len;
+        let mut buf = BytesMut::with_capacity(total);
+        buf.put_u8(MAVLINK_V2_MAGIC);
+        buf.put_u8(payload_len);
+        buf.put_u8(if signed { MAVLINK_IFLAG_SIGNED } else { 0 }); // incompat
+        buf.put_u8(0); // compat
+        buf.put_u8(0); // seq
+        buf.put_u8(sys);
+        buf.put_u8(comp);
+        buf.put_u8((msgid & 0xFF) as u8); // msgid lo
+        buf.put_u8(((msgid >> 8) & 0xFF) as u8); // msgid mid
+        buf.put_u8(((msgid >> 16) & 0xFF) as u8); // msgid hi
+        for i in 0..payload_len {
+            buf.put_u8(match i as usize {
+                HEARTBEAT_TYPE_OFFSET => vehicle_type,
+                HEARTBEAT_AUTOPILOT_OFFSET => autopilot,
+                _ => 0,
+            });
+        }
+        buf.put_u16_le(0); // crc
+        if signed {
+            for _ in 0..MAVLINK_SIGNATURE_LEN {
+                buf.put_u8(0);
+            }
+        }
+        buf
+    }
+
+    /// Capture handle for tests that drive the HEARTBEAT observer —
+    /// keeps the boilerplate of building an `Arc<Mutex<Vec<...>>>`
+    /// plus observer closure off every test body.
+    fn capture_observer() -> (OnMavlinkHeartbeat, HeartbeatLog) {
+        let log: HeartbeatLog = Arc::new(Mutex::new(Vec::new()));
+        let log_clone = Arc::clone(&log);
+        let cb: OnMavlinkHeartbeat = Arc::new(move |sys, comp, ap, vt| {
+            log_clone
+                .lock()
+                .expect("observer mutex must not poison")
+                .push((sys, comp, ap, vt));
+        });
+        (cb, log)
+    }
+
+    #[test]
+    fn default_codec_has_no_heartbeat_observer() {
+        let codec = MavlinkFrameCodec::new();
+        assert!(
+            !codec.has_heartbeat_observer(),
+            "secure default must not install a callback"
+        );
+    }
+
+    #[test]
+    fn with_on_heartbeat_installs_observer() {
+        // Pin the builder semantics — `with_on_heartbeat(cb)` must
+        // toggle the observer flag without changing other policy
+        // defaults (signing required, v1 rejected).
+        let (cb, _log) = capture_observer();
+        let codec = MavlinkFrameCodec::new().with_on_heartbeat(cb);
+        assert!(codec.has_heartbeat_observer());
+        assert!(codec.requires_signing(), "policy defaults preserved");
+        assert!(!codec.allows_v1(), "policy defaults preserved");
+    }
+
+    #[test]
+    fn heartbeat_msg_id_zero_invokes_callback() {
+        // Feed a synthetic v2 signed HEARTBEAT and assert the observer
+        // sees the four expected u8 fields. system_id=42 (typical
+        // tactical drone), component_id=1 (MAV_COMP_ID_AUTOPILOT1),
+        // autopilot=12 (MAV_AUTOPILOT_ARDUPILOTMEGA), vehicle_type=2
+        // (MAV_TYPE_QUADROTOR) — the values the audit-log test in
+        // `rustgate-core` mirrors.
+        let (cb, log) = capture_observer();
+        let mut codec = MavlinkFrameCodec::new().with_on_heartbeat(cb);
+        let frame = v2_heartbeat_frame(42, 1, HEARTBEAT_MSG_ID, true, 12, 2, 9);
+        let mut buf = frame.clone();
+        let decoded = codec.decode(&mut buf).unwrap().expect("frame decoded");
+        assert_eq!(decoded, frame, "callback must not corrupt the frame");
+        let captured = log.lock().unwrap().clone();
+        assert_eq!(captured, vec![(42, 1, 12, 2)]);
+    }
+
+    #[test]
+    fn heartbeat_v1_invokes_callback_with_header_fields() {
+        // v1's header layout differs from v2 (sysid offset 3 vs 5) —
+        // exercise both so a future refactor that conflates the two
+        // versions fails here. Use the permissive codec since the
+        // strict default rejects v1 outright.
+        let (cb, log) = capture_observer();
+        let mut codec = MavlinkFrameCodec::new()
+            .with_allow_v1(true)
+            .with_require_signing(false)
+            .with_on_heartbeat(cb);
+        let frame = v1_heartbeat_frame(7, 200, 0, 3, 10, 9);
+        let mut buf = frame.clone();
+        let _ = codec.decode(&mut buf).unwrap().expect("frame");
+        let captured = log.lock().unwrap().clone();
+        assert_eq!(captured, vec![(7, 200, 3, 10)]);
+    }
+
+    #[test]
+    fn non_heartbeat_msg_id_does_not_invoke_callback() {
+        // STATUSTEXT (MSG_ID 253) is the canonical "operator log line"
+        // message — it shares the same wire frame shape but carries no
+        // presence semantics, so the observer must NOT fire on it. The
+        // counter is per-aircraft; treating non-HEARTBEAT frames as
+        // heartbeats would over-count presence and corrupt fleet
+        // dashboards.
+        let (cb, log) = capture_observer();
+        let mut codec = MavlinkFrameCodec::new().with_on_heartbeat(cb);
+        // Use a non-HEARTBEAT MSG_ID — STATUSTEXT (253) is the
+        // canonical example, but any non-zero value exercises the
+        // negative branch.
+        let frame = v2_heartbeat_frame(42, 1, 253, true, 12, 2, 9);
+        let mut buf = frame.clone();
+        let _ = codec.decode(&mut buf).unwrap().expect("frame decoded");
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "non-HEARTBEAT must not invoke the observer"
+        );
+    }
+
+    #[test]
+    fn malformed_heartbeat_payload_does_not_invoke_callback() {
+        // A v2 sender that legally truncates the HEARTBEAT payload
+        // below the 6-byte minimum (covering custom_mode + vehicle_type
+        // + autopilot) cannot be classified as a presence ping —
+        // invoking the callback with synthesised zero values would
+        // generate a fake `system_id=0, autopilot=0, type=0` audit
+        // event indistinguishable from a bench-test airframe.
+        let (cb, log) = capture_observer();
+        let mut codec = MavlinkFrameCodec::new().with_on_heartbeat(cb);
+        // Truncated payload: LEN = 4 (custom_mode only — no
+        // vehicle_type, no autopilot).
+        let frame = v2_heartbeat_frame(42, 1, HEARTBEAT_MSG_ID, true, 12, 2, 4);
+        let mut buf = frame.clone();
+        let _ = codec.decode(&mut buf).unwrap().expect("frame decoded");
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "truncated HEARTBEAT must not invoke the observer"
+        );
+    }
+
+    #[test]
+    fn heartbeat_observer_not_invoked_when_unset() {
+        // No observer installed — decode must complete successfully
+        // and produce no callback invocations. Pins the cost-free
+        // contract: the `Option<...>::is_some()` gate keeps the no-
+        // observer path identical to the pre-#909 hot path.
+        let mut codec = MavlinkFrameCodec::new();
+        let frame = v2_heartbeat_frame(42, 1, HEARTBEAT_MSG_ID, true, 12, 2, 9);
+        let mut buf = frame.clone();
+        let decoded = codec.decode(&mut buf).unwrap().expect("frame decoded");
+        assert_eq!(decoded, frame);
+        // No log to assert against — the test exercises the no-
+        // observer hot path by virtue of completing without panicking.
+    }
+
+    #[test]
+    fn heartbeat_observer_invoked_per_frame_in_burst() {
+        // Three HEARTBEATs back-to-back must produce three observer
+        // invocations in the order they arrived. Defends against a
+        // refactor that batches frames internally and only fires the
+        // observer for the first or last in the batch.
+        let (cb, log) = capture_observer();
+        let mut codec = MavlinkFrameCodec::new().with_on_heartbeat(cb);
+
+        let f1 = v2_heartbeat_frame(1, 1, HEARTBEAT_MSG_ID, true, 12, 2, 9);
+        let f2 = v2_heartbeat_frame(2, 1, HEARTBEAT_MSG_ID, true, 3, 10, 9);
+        let f3 = v2_heartbeat_frame(3, 1, HEARTBEAT_MSG_ID, true, 8, 14, 9);
+
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&f1);
+        buf.extend_from_slice(&f2);
+        buf.extend_from_slice(&f3);
+
+        for _ in 0..3 {
+            let _ = codec.decode(&mut buf).unwrap().expect("frame");
+        }
+
+        let captured = log.lock().unwrap().clone();
+        assert_eq!(captured, vec![(1, 1, 12, 2), (2, 1, 3, 10), (3, 1, 8, 14),]);
+    }
+
+    #[test]
+    fn parse_heartbeat_fields_returns_none_for_short_frame() {
+        // Direct unit test on the helper — `frame.first()` returning
+        // None must short-circuit cleanly. Defends against a refactor
+        // that indexes `frame[0]` without bounds-checking.
+        assert!(parse_heartbeat_fields(&[]).is_none());
+        assert!(parse_heartbeat_fields(&[0xFE]).is_none());
+    }
+
+    #[test]
+    fn parse_heartbeat_fields_returns_none_for_unknown_magic() {
+        // Defense-in-depth: even though the framer guarantees a
+        // recognised magic byte, the helper must not panic on a frame
+        // whose magic byte is neither 0xFE nor 0xFD.
+        let mut buf = BytesMut::from(&[0xAB, 9, 0, 0, 0, 0, 0, 0, 0, 0][..]);
+        // Pad out to a plausible length so the test isn't actually
+        // hitting the short-frame branch.
+        for _ in 0..10 {
+            buf.put_u8(0);
+        }
+        assert!(parse_heartbeat_fields(&buf).is_none());
     }
 }
