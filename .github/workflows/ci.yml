@@ -245,6 +245,85 @@ jobs:
           echo "Running cargo hack check at depth $DEPTH (event=${{ github.event_name }})"
           cargo hack check --feature-powerset --depth "$DEPTH" --exclude-features jemalloc,fips,otel,post-quantum --no-dev-deps
 
+  check-features-triples:
+    # Targeted three-way feature interaction coverage (issue #832 F-147).
+    # `cargo hack --feature-powerset --depth 2` (the `check-features` job
+    # above) covers C(N,1) and C(N,2) but not C(N,3); the full N=3 powerset
+    # would multiply check time by ~N (currently ~12 features under
+    # consideration → ~220 triples) which is too heavy for every PR.
+    # Instead, this job runs a curated allowlist of triples picked because
+    # they exercise distinct cross-crate wiring surfaces that have
+    # historically been the cheapest place for a three-way regression to
+    # land:
+    #   * federation+mqtt+http        — full bridge fan-out (NATS-free)
+    #   * federation+nats+websocket   — full bridge fan-out alternative
+    #   * mqtt+enrollment+est         — broker + client identity provisioning
+    #   * federation-ha+federation+nats — high-availability federation path
+    #   * mqtt+otel+full-detail       — broker with full observability
+    #   * enrollment+est+websocket    — provisioning with browser clients
+    # Each triple runs as an independent matrix entry so a failure
+    # pinpoints the offending combination in the GitHub Actions run UI
+    # rather than batching them into a single opaque step. `fail-fast` is
+    # off so all triples report; one bad triple does not mask the rest.
+    # Scope is `cargo check` (not clippy / test) — clippy and tests are
+    # already covered by the workspace-wide all-features jobs above; this
+    # job exists only to catch the rare three-way cfg-gate or feature-
+    # propagation breakage that pair-coverage misses.
+    if: github.event.pull_request.draft == false || github.event_name == 'push'
+    needs: [lint, clippy]
+    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        triple:
+          - federation,mqtt,http
+          - federation,nats,websocket
+          - mqtt,enrollment,est
+          - federation-ha,federation,nats
+          - mqtt,otel,full-detail
+          - enrollment,est,websocket
+
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40 # v2.19.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # 1.94
+        with:
+          toolchain: "1.94"
+
+      # sccache is the primary cache on self-hosted runners (shared volume,
+      # no per-job upload/download). Swatinem/rust-cache is kept only for
+      # the GitHub-hosted fallback, where sccache is not pre-installed.
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        if: vars.RUNNER_POOL != 'self-hosted'
+
+      - name: Install protoc
+        # `proto` and `otel` features pull in tonic/prost build scripts that
+        # invoke protoc; some matrix triples (mqtt+otel+full-detail) require
+        # it. No-op on self-hosted runners where protobuf-compiler is baked
+        # into the container image.
+        run: |
+          if ! command -v protoc >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          fi
+
+      - name: Check workspace with feature triple
+        # `cargo check` (not `build` or `clippy`) keeps wall-time per matrix
+        # entry under ~3 minutes on a cache-warm runner. The point is to
+        # verify cfg gates, feature unification, and dependency resolution
+        # — not to recompile the whole workspace under every triple.
+        run: |
+          echo "::group::Triple: ${{ matrix.triple }}"
+          cargo check --locked --workspace --features ${{ matrix.triple }}
+          echo "::endgroup::"
+
   test:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [lint, clippy]
