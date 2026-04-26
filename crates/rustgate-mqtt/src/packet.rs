@@ -250,15 +250,18 @@ impl PacketCodec {
             },
         );
         // MQTT 5.0 §3.2.2.3.10 Subscription Identifiers Available.
-        // rustgate doesn't support the §3.8.2.1.2 numeric ID
-        // mechanism (binds a subscription to a value the broker
-        // echoes in matching PUBLISHes via §3.3.2.3.8). Advertise
-        // 0 explicitly — the spec default when absent is 1
-        // ("supported"), so silence here would mislead a client
-        // into believing the feature is available and a SUBSCRIBE
-        // carrying `subscription_identifier` would not get the
-        // expected echo on subsequent PUBLISHes.
-        properties.subscription_identifiers_available = Some(0);
+        // rustgate now supports the §3.8.2.1.2 numeric ID mechanism
+        // (refs #880): a SUBSCRIBE may include a `Subscription
+        // Identifier` property and the broker echoes every matching
+        // identifier on the resulting PUBLISHes per §3.3.4.8. The
+        // wiring is end-to-end — `handle_subscribe_v5` captures the
+        // ID in the per-session tracker, the write loop attaches all
+        // matching IDs to outgoing v5 PUBLISHes, and the retain-
+        // replay path includes the SUBSCRIBE's ID on replayed
+        // retained messages. Advertise `1` so a v5 client knows the
+        // feature is available and does not have to fall back to
+        // user-property workarounds.
+        properties.subscription_identifiers_available = Some(1);
         // MQTT 5.0 §3.2.2.3.11 Shared Subscription Available.
         // rustgate doesn't support the §4.8.2 `$share/<group>/<topic>`
         // shared-subscription syntax. Advertise 0 explicitly — same
@@ -1196,12 +1199,12 @@ mod tests {
         //   §3.2.2.3.4  Maximum QoS                     = 2 (we support QoS 0/1/2 inbound after #1161)
         //   §3.2.2.3.5  Retain Available                = 1 (#1146)
         //   §3.2.2.3.9  Wildcard Subscription Available = 1 by default (SingleLevelOnly + Full)
-        //   §3.2.2.3.10 Subscription Identifiers Avail. = 0 (not implemented)
+        //   §3.2.2.3.10 Subscription Identifiers Avail. = 1 (refs #880 follow-up)
         //   §3.2.2.3.11 Shared Subscription Available   = 0 (not implemented)
         //
-        // The two "Available = 0" advertisements are the load-bearing
-        // signals: the spec default when those properties are absent
-        // is 1 ("supported"), so silence would mislead a client into
+        // The "Available = 0" advertisement on §3.2.2.3.11 is a
+        // load-bearing signal: the spec default when absent is 1
+        // ("supported"), so silence would mislead a client into
         // expecting features the broker doesn't actually provide.
         // Pin the wire format end-to-end via build + parse.
         let connack = mqttbytes::v5::ConnAck {
@@ -1212,7 +1215,7 @@ mod tests {
                 p.max_qos = Some(2);
                 p.retain_available = Some(1);
                 p.wildcard_subscription_available = Some(1);
-                p.subscription_identifiers_available = Some(0);
+                p.subscription_identifiers_available = Some(1);
                 p.shared_subscription_available = Some(0);
                 p
             }),
@@ -1227,8 +1230,51 @@ mod tests {
                 assert_eq!(props.max_qos, Some(2));
                 assert_eq!(props.retain_available, Some(1));
                 assert_eq!(props.wildcard_subscription_available, Some(1));
-                assert_eq!(props.subscription_identifiers_available, Some(0));
+                assert_eq!(props.subscription_identifiers_available, Some(1));
                 assert_eq!(props.shared_subscription_available, Some(0));
+            }
+            other => panic!("expected ConnAck, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v5_connack_advertises_subscription_identifiers_available_one() {
+        // Refs #880: this test pins the load-bearing flip from
+        // `Some(0)` (the pre-PR advertisement) to `Some(1)`. The
+        // `subscription_identifiers_available` property is the
+        // capability bit that gates whether a v5 client may include
+        // `subscription_identifier` on SUBSCRIBE per §3.8.2.1.2 and
+        // expect the broker to echo it on matching PUBLISHes per
+        // §3.3.4.8. Advertising `Some(0)` while ALSO propagating
+        // identifiers would be a wire-protocol contradiction: the
+        // client would believe the feature is unavailable and might
+        // never set the property, defeating the propagation work.
+        // Build a CONNACK with the property set to `1` and assert
+        // that round-trip via mqttbytes preserves the value.
+        let connack = mqttbytes::v5::ConnAck {
+            session_present: false,
+            code: mqttbytes::v5::ConnectReturnCode::Success,
+            properties: Some({
+                let mut p = mqttbytes::v5::ConnAckProperties::new();
+                p.subscription_identifiers_available = Some(1);
+                p
+            }),
+        };
+        let mut buf = BytesMut::with_capacity(32);
+        write_v5_to_buf(&mqttbytes::v5::Packet::ConnAck(connack), &mut buf).expect("serialize");
+
+        let decoded = mqttbytes::v5::read(&mut buf, 16 * 1024).expect("parse");
+        match decoded {
+            mqttbytes::v5::Packet::ConnAck(a) => {
+                let props = a.properties.expect("properties present");
+                assert_eq!(
+                    props.subscription_identifiers_available,
+                    Some(1),
+                    "subscription_identifiers_available MUST be 1 \
+                     after the propagation wiring lands; otherwise a v5 \
+                     client believes the feature is unavailable and never \
+                     sets the SUBSCRIBE property in the first place"
+                );
             }
             other => panic!("expected ConnAck, got {other:?}"),
         }
