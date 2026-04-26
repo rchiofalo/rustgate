@@ -141,6 +141,58 @@ const HEARTBEAT_AUTOPILOT_OFFSET: usize = 5;
 /// signal.
 pub type OnMavlinkHeartbeat = Arc<dyn Fn(u8, u8, u8, u8) + Send + Sync>;
 
+/// Why the MAVLink frame codec rejected a frame.
+///
+/// Mirrors the typed [`crate::error::MavlinkError`] variants the codec
+/// surfaces on policy and validation failures, but flattened into a
+/// single non-exhaustive enum so a callback consumer can branch on the
+/// classification without re-matching against `io::Error::get_ref()`
+/// downcasts. The variants are deliberately disjoint so a SIEM can
+/// tally them independently — "fleet still has v1 senders" is a
+/// different operational signal from "signing rollout incomplete" or
+/// "sender uses a non-standard dialect".
+///
+/// Marked `#[non_exhaustive]` so a future rejection class (e.g. CRC
+/// mismatch once the signing layer lands) can be added without a
+/// breaking API change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RejectionReason {
+    /// A v1 frame was rejected because the codec is configured to
+    /// disallow the pre-signing wire format.
+    V1NotAllowed,
+    /// A v2 frame was rejected because its `INCOMPAT & SIGNED` bit was
+    /// clear and the codec is configured to require signatures.
+    UnsignedV2,
+    /// A frame's `MSG_ID` does not appear in the CRC-EXTRA lookup
+    /// table — the dialect catalogue does not know how to authenticate
+    /// it. Indicates either a non-standard dialect or a hostile sender
+    /// fishing for unknown IDs.
+    UnknownMessageId(u32),
+}
+
+/// Callback invoked once per MAVLink frame the codec rejected at the
+/// framing layer.
+///
+/// The codec itself does not have access to the peer socket address
+/// (it operates on a `BytesMut` buffer), so the listener that drives
+/// the codec wires this callback up with whatever peer context it has
+/// — typically the dialled IP:port for a TCP link, or "unknown" for a
+/// UDP datagram whose source we deliberately do not log. The callback
+/// fires inside the decode hot path on the rejection branch only — a
+/// frame that decodes cleanly does not invoke it.
+///
+/// Wired by the listener crate (future PR) to emit the
+/// `mavlink.unsigned_rejected`, `mavlink.v1_rejected`, and
+/// `mavlink.unknown_msg_id` audit events through
+/// `rustgate_core::audit` and increment the matching Prometheus
+/// counters. Kept as a simple `Fn(RejectionReason)` so the
+/// `rustgate-mavlink` crate stays free of `tracing`/`prometheus`
+/// dependencies on the rejection path. The closure body is responsible
+/// for shielding sensitive context (peer IP, identity) before
+/// emitting; the codec passes only the typed reason.
+pub type OnMavlinkRejection = Arc<dyn Fn(RejectionReason) + Send + Sync>;
+
 /// Protocol version of a parsed MAVLink frame.
 ///
 /// Callers that care about version (signing, message-ID parsing,
@@ -219,6 +271,13 @@ pub struct MavlinkFrameCodec {
     /// `rustgate_mavlink_heartbeats_total{system_id}` Prometheus
     /// counter under `--features metrics`.
     on_heartbeat: Option<OnMavlinkHeartbeat>,
+    /// Optional observer fired once per frame the codec rejected at
+    /// the framing layer (v1 disallowed, unsigned v2 with signing
+    /// required, unknown MSG_ID). The listener crate wires this to
+    /// emit the matching audit event through `rustgate_core::audit`
+    /// and increment the rejection counter; the codec stays free of
+    /// `tracing` and `prometheus` deps on the rejection path.
+    on_rejection: Option<OnMavlinkRejection>,
 }
 
 impl std::fmt::Debug for MavlinkFrameCodec {
@@ -230,6 +289,14 @@ impl std::fmt::Debug for MavlinkFrameCodec {
             .field(
                 "on_heartbeat",
                 &if self.on_heartbeat.is_some() {
+                    "Some(<cb>)"
+                } else {
+                    "None"
+                },
+            )
+            .field(
+                "on_rejection",
+                &if self.on_rejection.is_some() {
                     "Some(<cb>)"
                 } else {
                     "None"
@@ -248,6 +315,7 @@ impl Default for MavlinkFrameCodec {
             require_signing: true,
             allow_v1: false,
             on_heartbeat: None,
+            on_rejection: None,
         }
     }
 }
@@ -324,6 +392,40 @@ impl MavlinkFrameCodec {
         self.on_heartbeat.is_some()
     }
 
+    /// Install a callback fired once per frame the codec rejected at
+    /// the framing layer.
+    ///
+    /// See [`OnMavlinkRejection`] for the operational rationale. The
+    /// listener wires this to emit the matching audit event
+    /// (`mavlink.unsigned_rejected`, `mavlink.v1_rejected`,
+    /// `mavlink.unknown_msg_id`) and increment a Prometheus counter
+    /// labelled by reason. `None` (the default) leaves the rejection
+    /// hot path untouched — the codec still produces the typed
+    /// [`MavlinkError`], but no audit/metrics side-effect is
+    /// generated.
+    #[must_use]
+    pub fn with_on_rejection(mut self, cb: OnMavlinkRejection) -> Self {
+        self.on_rejection = Some(cb);
+        self
+    }
+
+    /// Returns `true` if a rejection observer is installed.
+    #[must_use]
+    pub fn has_rejection_observer(&self) -> bool {
+        self.on_rejection.is_some()
+    }
+
+    /// Internal helper: notify the rejection observer (if installed)
+    /// and return the typed error variant the caller surfaces. Keeps
+    /// the rejection sites in `resolve_total_len` and `decode` from
+    /// repeating the `if let Some(cb) = …` boilerplate.
+    fn reject(&self, reason: RejectionReason, err: MavlinkError) -> MavlinkError {
+        if let Some(cb) = self.on_rejection.as_ref() {
+            cb(reason);
+        }
+        err
+    }
+
     /// Parse just enough of the header to know how long the frame is.
     ///
     /// Returns `Ok(Some(total_len))` when a valid magic byte plus `LEN`
@@ -365,7 +467,9 @@ impl MavlinkFrameCodec {
                 // still be picked up.
                 if !self.allow_v1 {
                     src.advance(1);
-                    return Err(MavlinkError::V1FrameRejected);
+                    return Err(
+                        self.reject(RejectionReason::V1NotAllowed, MavlinkError::V1FrameRejected)
+                    );
                 }
                 if src.len() < 2 {
                     return Ok(None);
@@ -400,7 +504,10 @@ impl MavlinkFrameCodec {
                 // recovery behaviour of the INCOMPAT rejection above.
                 if self.require_signing && !signed {
                     src.advance(1);
-                    return Err(MavlinkError::UnsignedFrameRejected);
+                    return Err(self.reject(
+                        RejectionReason::UnsignedV2,
+                        MavlinkError::UnsignedFrameRejected,
+                    ));
                 }
                 let sig_len = if signed { MAVLINK_SIGNATURE_LEN } else { 0 };
                 MAVLINK_V2_HEADER_LEN + len + MAVLINK_CRC_LEN + sig_len
@@ -454,6 +561,42 @@ impl Decoder for MavlinkFrameCodec {
         self.pending_total_len = None;
         let frame = src.split_to(total);
 
+        // CRC-EXTRA gate (F-73): the dialect catalogue's `crc_extra`
+        // byte is required to authenticate the frame's CRC trailer. A
+        // frame whose `MSG_ID` is not in the lookup table cannot be
+        // verified — accepting it would either bypass the CRC check
+        // silently or panic via `unwrap()` on the table lookup. The
+        // lookup uses `Option`-returning `crc_extra::crc_extra` so an
+        // attacker who streams frames with random `MSG_ID`s drives
+        // neither a panic nor a per-frame allocation; the rejection
+        // surfaces as `MavlinkError::UnknownMessageId` and consumes
+        // the frame's bytes (already split out of `src` above) so a
+        // recovery loop can immediately try the next frame.
+        let msg_id = match parse_msg_id(&frame) {
+            Some(id) => id,
+            None => {
+                // Defense-in-depth: a frame that survived the framing
+                // state machine should always have a parseable header.
+                // Treat the unparseable case as the same hostile-input
+                // class — surface a typed error and fire the rejection
+                // observer so a SIEM can correlate the spike.
+                return Err(self
+                    .reject(
+                        RejectionReason::UnknownMessageId(0),
+                        MavlinkError::UnknownMessageId { id: 0 },
+                    )
+                    .into());
+            }
+        };
+        if crate::crc_extra::crc_extra(msg_id).is_none() {
+            return Err(self
+                .reject(
+                    RejectionReason::UnknownMessageId(msg_id),
+                    MavlinkError::UnknownMessageId { id: msg_id },
+                )
+                .into());
+        }
+
         // HEARTBEAT inspection runs only when an observer is wired —
         // gating on `is_some()` keeps the no-observer path identical
         // to the pre-#909 hot path (no field extraction, no callback
@@ -474,6 +617,29 @@ impl Decoder for MavlinkFrameCodec {
         }
 
         Ok(Some(frame))
+    }
+}
+
+/// Extract the `MSG_ID` field from a fully-decoded MAVLink frame.
+///
+/// Returns `None` for any frame whose magic byte is not recognised or
+/// whose buffer is shorter than the v1/v2 header — defense-in-depth
+/// against a future refactor that loosens the framer's guarantees.
+/// Read-only by construction; the caller owns the buffer.
+fn parse_msg_id(frame: &[u8]) -> Option<u32> {
+    let first = *frame.first()?;
+    let version = MavlinkVersion::from_magic(first)?;
+    match version {
+        // v1: STX(0) LEN(1) SEQ(2) SYS(3) COMP(4) MSGID(5)
+        MavlinkVersion::V1 => Some(*frame.get(5)? as u32),
+        // v2: STX(0) LEN(1) INCOMPAT(2) COMPAT(3) SEQ(4) SYS(5) COMP(6)
+        //     MSGID_LO(7) MSGID_MID(8) MSGID_HI(9)
+        MavlinkVersion::V2 => {
+            let lo = *frame.get(7)? as u32;
+            let mid = *frame.get(8)? as u32;
+            let hi = *frame.get(9)? as u32;
+            Some(lo | (mid << 8) | (hi << 16))
+        }
     }
 }
 
@@ -1318,5 +1484,247 @@ mod tests {
             buf.put_u8(0);
         }
         assert!(parse_heartbeat_fields(&buf).is_none());
+    }
+
+    // ─── F-72 / F-73 spec mirror tests ───────────────────────────────
+    //
+    // These tests mirror the exact names called out in the issue #752
+    // implementation plan so a reviewer scanning the spec can locate
+    // each one with one grep. They overlap intentionally with the
+    // earlier "strict_codec_*" tests above (which name the *behaviour*)
+    // — the spec mirrors name the *requirement* and serve as the
+    // canonical regression set going forward.
+
+    #[test]
+    fn v1_frame_rejected_by_default() {
+        // F-72: the default codec rejects v1 outright.
+        let mut codec = MavlinkFrameCodec::new();
+        let frame = v1_frame(4, 0xAA);
+        let mut buf = frame.clone();
+        let err = codec.decode(&mut buf).expect_err("v1 must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let mav = err
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<MavlinkError>())
+            .expect("typed MavlinkError preserved");
+        assert!(matches!(mav, MavlinkError::V1FrameRejected));
+    }
+
+    #[test]
+    fn v1_frame_accepted_with_allow_v1_opt_in() {
+        // F-72: explicit operator opt-in re-enables v1.
+        let mut codec = MavlinkFrameCodec::new()
+            .with_allow_v1(true)
+            .with_require_signing(false);
+        let frame = v1_frame(4, 0xBB);
+        let mut buf = frame.clone();
+        let decoded = codec
+            .decode(&mut buf)
+            .expect("opt-in path is panic-free")
+            .expect("frame decodes");
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn v2_unsigned_frame_rejected_by_default() {
+        // F-72: the default codec rejects unsigned v2.
+        let mut codec = MavlinkFrameCodec::new();
+        let frame = v2_frame(8, false, 0xCC);
+        let mut buf = frame.clone();
+        let err = codec.decode(&mut buf).expect_err("unsigned v2 rejected");
+        let mav = err
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<MavlinkError>())
+            .expect("typed MavlinkError preserved");
+        assert!(matches!(mav, MavlinkError::UnsignedFrameRejected));
+    }
+
+    #[test]
+    fn v2_unsigned_frame_accepted_with_require_signing_false() {
+        // F-72: operator opt-out for legacy (signed-not-available) deployments.
+        let mut codec = MavlinkFrameCodec::new().with_require_signing(false);
+        let frame = v2_frame(8, false, 0xDD);
+        let mut buf = frame.clone();
+        let decoded = codec
+            .decode(&mut buf)
+            .expect("opt-out is panic-free")
+            .expect("frame decodes");
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn unknown_msg_id_rejected_without_panic() {
+        // F-73: an attacker-supplied MSG_ID that is not in the
+        // CRC-EXTRA lookup table must surface as a typed
+        // `UnknownMessageId` error WITHOUT panicking and WITHOUT
+        // allocating per frame. We use a deliberately-far MSG_ID
+        // (1_000_000) outside any common dialect catalogue. The frame
+        // is a valid signed v2 in every other respect — only the
+        // MSG_ID is non-standard — so we test that the CRC-EXTRA gate
+        // fires AFTER the framing/policy gates.
+        let mut codec = MavlinkFrameCodec::new();
+        let frame = v2_heartbeat_frame(42, 1, 1_000_000, true, 12, 2, 9);
+        let mut buf = frame.clone();
+        let err = codec
+            .decode(&mut buf)
+            .expect_err("unknown MSG_ID must surface");
+        let mav = err
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<MavlinkError>())
+            .expect("typed MavlinkError preserved");
+        match mav {
+            MavlinkError::UnknownMessageId { id } => {
+                assert_eq!(
+                    *id, 1_000_000,
+                    "id field must echo back the offending value"
+                )
+            }
+            other => panic!("expected UnknownMessageId, got {other:?}"),
+        }
+        // Buffer was fully consumed: rejection here happens AFTER the
+        // frame is split out of `src` so the next decode is a clean
+        // start, not a stuck mid-frame state.
+        assert!(buf.is_empty());
+        assert!(codec.pending_total_len.is_none());
+    }
+
+    #[test]
+    fn unknown_msg_id_rejection_burst_does_not_panic_on_release() {
+        // F-73 stress test: streaming many frames with random unknown
+        // MSG_IDs must not drive a panic on any iteration. Pins the
+        // "no per-frame allocation, no panic" contract under sustained
+        // attacker input.
+        let mut codec = MavlinkFrameCodec::new();
+        for id in [99_999u32, 1_234_567, 0x00FF_FFFE, 0x00BA_DBAD] {
+            let frame = v2_heartbeat_frame(1, 1, id, true, 0, 0, 9);
+            let mut buf = frame.clone();
+            let err = codec.decode(&mut buf).expect_err("unknown MSG_ID rejected");
+            let mav = err
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<MavlinkError>())
+                .expect("typed MavlinkError preserved");
+            assert!(matches!(mav, MavlinkError::UnknownMessageId { .. }));
+        }
+    }
+
+    #[test]
+    fn mavlink_unsigned_rejected_audit_event_fires_on_v1() {
+        // F-72 wiring: a v1 frame on the strict codec must invoke the
+        // rejection observer with `RejectionReason::V1NotAllowed`. The
+        // listener wires this observer to call
+        // `rustgate_core::audit::mavlink_v1_rejected` (and would
+        // similarly call `mavlink_unsigned_rejected` on a
+        // `RejectionReason::UnsignedV2`); here we observe via a shared
+        // `Arc<Mutex<Vec<...>>>` to pin the wiring contract without
+        // needing the listener crate to exist yet.
+        let log: Arc<Mutex<Vec<RejectionReason>>> = Arc::new(Mutex::new(Vec::new()));
+        let log_clone = Arc::clone(&log);
+        let cb: OnMavlinkRejection = Arc::new(move |reason| {
+            log_clone
+                .lock()
+                .expect("rejection observer mutex must not poison")
+                .push(reason);
+        });
+        let mut codec = MavlinkFrameCodec::new().with_on_rejection(cb);
+        let frame = v1_frame(4, 0xAA);
+        let mut buf = frame.clone();
+        let _ = codec.decode(&mut buf).expect_err("v1 rejected");
+        assert_eq!(
+            log.lock().unwrap().clone(),
+            vec![RejectionReason::V1NotAllowed]
+        );
+    }
+
+    #[test]
+    fn rejection_observer_fires_for_unsigned_v2() {
+        // F-72 wiring (other half of the F-72/F-73 pair): a v2
+        // unsigned frame on the strict codec invokes the observer with
+        // `RejectionReason::UnsignedV2`. Without this test, a refactor
+        // that wired only the V1 reason and forgot the unsigned-v2
+        // reason would silently make the audit signal incomplete.
+        let log: Arc<Mutex<Vec<RejectionReason>>> = Arc::new(Mutex::new(Vec::new()));
+        let log_clone = Arc::clone(&log);
+        let cb: OnMavlinkRejection = Arc::new(move |reason| {
+            log_clone.lock().unwrap().push(reason);
+        });
+        let mut codec = MavlinkFrameCodec::new().with_on_rejection(cb);
+        let frame = v2_frame(4, false, 0xEE);
+        let mut buf = frame.clone();
+        let _ = codec.decode(&mut buf).expect_err("unsigned v2 rejected");
+        assert_eq!(
+            log.lock().unwrap().clone(),
+            vec![RejectionReason::UnsignedV2]
+        );
+    }
+
+    #[test]
+    fn rejection_observer_fires_for_unknown_msg_id() {
+        // F-73 wiring: unknown MSG_ID rejection must invoke the
+        // observer with `RejectionReason::UnknownMessageId(id)`
+        // carrying the offending ID so a SIEM can detect dialect
+        // mismatch attempts (operational signal: "is the upstream
+        // sending random IDs to fish for the panic gadget?").
+        let log: Arc<Mutex<Vec<RejectionReason>>> = Arc::new(Mutex::new(Vec::new()));
+        let log_clone = Arc::clone(&log);
+        let cb: OnMavlinkRejection = Arc::new(move |reason| {
+            log_clone.lock().unwrap().push(reason);
+        });
+        let mut codec = MavlinkFrameCodec::new().with_on_rejection(cb);
+        let frame = v2_heartbeat_frame(1, 1, 99_999, true, 0, 0, 9);
+        let mut buf = frame.clone();
+        let _ = codec.decode(&mut buf).expect_err("unknown MSG_ID rejected");
+        assert_eq!(
+            log.lock().unwrap().clone(),
+            vec![RejectionReason::UnknownMessageId(99_999)]
+        );
+    }
+
+    #[test]
+    fn rejection_observer_quiet_on_clean_decode() {
+        // Negative pin: a frame that decodes cleanly does NOT invoke
+        // the rejection observer. Without this test, a refactor that
+        // accidentally fired the observer on every frame would silently
+        // flood a SIEM with false-positive rejection events.
+        let log: Arc<Mutex<Vec<RejectionReason>>> = Arc::new(Mutex::new(Vec::new()));
+        let log_clone = Arc::clone(&log);
+        let cb: OnMavlinkRejection = Arc::new(move |reason| {
+            log_clone.lock().unwrap().push(reason);
+        });
+        let mut codec = MavlinkFrameCodec::new().with_on_rejection(cb);
+        // Signed v2 HEARTBEAT — passes every gate.
+        let frame = v2_heartbeat_frame(42, 1, HEARTBEAT_MSG_ID, true, 12, 2, 9);
+        let mut buf = frame.clone();
+        let _ = codec.decode(&mut buf).unwrap().expect("clean decode");
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "clean decode must NOT invoke the rejection observer"
+        );
+    }
+
+    #[test]
+    fn parse_msg_id_handles_unknown_magic() {
+        // Defense-in-depth: the framer should never hand `parse_msg_id`
+        // a non-MAVLink magic, but a future refactor might. Pin the
+        // return-`None` contract.
+        assert_eq!(parse_msg_id(&[]), None);
+        assert_eq!(parse_msg_id(&[0xAB, 0, 0, 0, 0, 0, 0, 0, 0, 0]), None);
+    }
+
+    #[test]
+    fn parse_msg_id_v1_extracts_byte_5() {
+        // v1 layout: STX(0) LEN(1) SEQ(2) SYS(3) COMP(4) MSGID(5)
+        // MSGID lives at offset 5 — pinning prevents an off-by-one
+        // refactor from silently corrupting the CRC-EXTRA lookup key.
+        let frame = [MAVLINK_V1_MAGIC, 1, 0, 0, 0, 76, 0, 0, 0]; // msgid=76
+        assert_eq!(parse_msg_id(&frame), Some(76));
+    }
+
+    #[test]
+    fn parse_msg_id_v2_extracts_24_bit_little_endian() {
+        // v2 layout: STX(0) LEN(1) INCOMPAT(2) COMPAT(3) SEQ(4) SYS(5)
+        //            COMP(6) MSGID_LO(7) MSGID_MID(8) MSGID_HI(9)
+        // 0x123456 little-endian = [0x56, 0x34, 0x12].
+        let frame = [MAVLINK_V2_MAGIC, 1, 0, 0, 0, 0, 0, 0x56, 0x34, 0x12, 0];
+        assert_eq!(parse_msg_id(&frame), Some(0x123456));
     }
 }

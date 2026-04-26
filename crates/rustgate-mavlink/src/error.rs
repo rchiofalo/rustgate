@@ -2,7 +2,7 @@
 
 //! Errors produced by the MAVLink frame parser.
 //!
-//! The codec distinguishes five failure modes so that callers can
+//! The codec distinguishes six failure modes so that callers can
 //! choose different recovery strategies:
 //!
 //! - [`MavlinkError::InvalidMagic`] — byte at the current read position
@@ -29,6 +29,14 @@
 //!   require signatures. Defaults to rejection so that the operator must
 //!   explicitly permit unsigned traffic via
 //!   [`crate::frame::MavlinkFrameCodec::with_require_signing`].
+//! - [`MavlinkError::UnknownMessageId`] — a frame's `MSG_ID` field does
+//!   not appear in the codec's CRC-EXTRA lookup table. The CRC-EXTRA
+//!   byte is a per-message-ID dialect constant required to verify the
+//!   frame's CRC; without it the frame cannot be authenticated, and a
+//!   hostile sender could otherwise drive a panic via `unwrap()` on the
+//!   table lookup or pin memory by allocating per-frame on every unknown
+//!   ID. Returning a typed error keeps the rejection allocation-free and
+//!   panic-free.
 
 use std::io;
 
@@ -77,6 +85,22 @@ pub enum MavlinkError {
     /// choose a stance on v1.
     #[error("MAVLink v2 unsigned frame rejected by signing policy")]
     UnsignedFrameRejected,
+
+    /// A frame's `MSG_ID` field is not present in the CRC-EXTRA lookup
+    /// table.
+    ///
+    /// The CRC-EXTRA byte is a per-message-ID constant the dialect
+    /// catalogue defines so a v1 receiver can verify it shares the same
+    /// catalogue version as the sender (a sender that thinks `MSG_ID 23`
+    /// is `LOCAL_NED_POSITION_TARGET` will not produce the same CRC
+    /// trailer as a receiver that thinks it is `ATTITUDE_TARGET`). A
+    /// `MSG_ID` the codec does not know cannot be authenticated, so the
+    /// frame is rejected — and the lookup itself uses
+    /// `HashMap::get` returning `Option`, NOT `unwrap`-on-`get`, so an
+    /// attacker who streams frames with random `MSG_ID`s cannot panic
+    /// the decode hot path or drive an allocation per frame.
+    #[error("MAVLink frame rejected: unknown MSG_ID {id} (no CRC-EXTRA entry)")]
+    UnknownMessageId { id: u32 },
 }
 
 impl From<MavlinkError> for io::Error {
@@ -173,6 +197,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unknown_message_id_display_includes_id() {
+        // The id field is rendered with `{id}` (decimal) — operator
+        // grep-ability matters more than fixed width for this surface
+        // because dialect catalogues number message IDs in decimal.
+        assert_eq!(
+            MavlinkError::UnknownMessageId { id: 0 }.to_string(),
+            "MAVLink frame rejected: unknown MSG_ID 0 (no CRC-EXTRA entry)"
+        );
+        assert_eq!(
+            MavlinkError::UnknownMessageId { id: 9_999_999 }.to_string(),
+            "MAVLink frame rejected: unknown MSG_ID 9999999 (no CRC-EXTRA entry)"
+        );
+    }
+
     // ---- std::error::Error::source ----
 
     #[test]
@@ -193,6 +232,7 @@ mod tests {
         );
         assert!(MavlinkError::V1FrameRejected.source().is_none());
         assert!(MavlinkError::UnsignedFrameRejected.source().is_none());
+        assert!(MavlinkError::UnknownMessageId { id: 0 }.source().is_none());
     }
 
     // ---- Debug renders variant name ----
@@ -257,6 +297,13 @@ mod tests {
         let err: io::Error = MavlinkError::UnsignedFrameRejected.into();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("unsigned frame rejected"));
+    }
+
+    #[test]
+    fn from_unknown_message_id_into_io_error_is_invalid_data() {
+        let err: io::Error = MavlinkError::UnknownMessageId { id: 12345 }.into();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("unknown MSG_ID 12345"));
     }
 
     #[test]

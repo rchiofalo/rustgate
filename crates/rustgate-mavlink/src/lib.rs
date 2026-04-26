@@ -40,12 +40,14 @@
 //!   model; MAVLink is a peer wire format that routes opaquely.
 
 pub mod codec;
+pub mod crc_extra;
 pub mod error;
 pub mod frame;
 
 pub use codec::MavlinkCodec;
+pub use crc_extra::crc_extra;
 pub use error::MavlinkError;
 pub use frame::{
     HEARTBEAT_MSG_ID, MAVLINK_V1_MAGIC, MAVLINK_V2_MAGIC, MavlinkFrameCodec, MavlinkVersion,
-    OnMavlinkHeartbeat,
+    OnMavlinkHeartbeat, OnMavlinkRejection, RejectionReason,
 };
