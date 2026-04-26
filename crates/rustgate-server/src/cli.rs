@@ -1171,6 +1171,29 @@ pub(crate) struct Cli {
     )]
     pub(crate) authz_allow_unknown_obligations: bool,
 
+    /// Sustained per-CN replay rate (events per second) for
+    /// `Router::replay_positions` (issue #724). Each reconnect consumes
+    /// one token from a per-CN `TokenBucket`; when the bucket is
+    /// empty the replay is skipped and an audit event is emitted.
+    /// Default `100/sec` is permissive enough that a normal-cadence
+    /// reconnect never gets shed; combined with `burst=200` this caps
+    /// a 10×/sec flap-loop attack against a 10k-position cache to
+    /// 200 replays/sec instead of 200,000 authz evals/sec.
+    #[arg(
+        long,
+        default_value_t = 100,
+        env = "RUSTGATE_POSITION_REPLAY_RATE_PER_SEC"
+    )]
+    pub(crate) position_replay_rate_per_sec: u32,
+
+    /// Burst capacity for the per-CN replay rate limit (issue #724).
+    /// Allows short bursts above the sustained rate before the bucket
+    /// runs dry. Default `200` covers a worst-case correlated reconnect
+    /// burst (e.g. an entire fleet that briefly lost connectivity)
+    /// without limiting legitimate operator traffic.
+    #[arg(long, default_value_t = 200, env = "RUSTGATE_POSITION_REPLAY_BURST")]
+    pub(crate) position_replay_burst: u32,
+
     /// Path to a JSON file defining per-tenant connection quotas.
     ///
     /// When set, the server loads the quota configuration at startup and
@@ -1824,6 +1847,8 @@ define_config_file! {
     authz_reload_interval: u64,
     authz_fail_open: bool,
     authz_allow_unknown_obligations: bool,
+    position_replay_rate_per_sec: u32,
+    position_replay_burst: u32,
     tenant_quota_file: Option<std::path::PathBuf>,
     acl_api_token_file: Option<String>,
     mgmt_api_token_file: Option<String>,
