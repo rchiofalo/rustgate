@@ -1073,6 +1073,30 @@ pub fn store_forward_drain_panic(session_hash: &str, error: &str) {
     );
 }
 
+/// Record a position-replay request that was shed by the per-CN replay
+/// rate limiter (issue #724). `session_hash` is the PII-safe
+/// [`crate::masking::hash_cn`] rendering of the reconnecting client's
+/// CN. `attempted` is the number of cached positions that would have
+/// been considered for replay had the request been admitted; `allowed`
+/// is the number actually replayed (zero when the bucket was empty,
+/// non-zero when a partial replay was permitted before exhaustion).
+///
+/// Emitted on the deny path of `Router::replay_positions` so a SIEM can
+/// see clients that are flap-looping and driving the authz engine via
+/// uncapped reconnect-driven re-evaluation. The bucket key is the CN —
+/// per-CN isolation means one noisy client cannot starve replay for
+/// others.
+pub fn position_replay_rate_limited(session_hash: &str, attempted: u32, allowed: u32) {
+    audit!(
+        "position_replay.rate_limited",
+        session = %session_hash,
+        attempted = attempted,
+        allowed = allowed,
+        action = "rate_limit",
+        result = "shed"
+    );
+}
+
 /// Record a message being shed by per-target rate limiting.
 ///
 /// Sanitization: `target` and `source_cn` are sanitized at the audit
@@ -1434,6 +1458,15 @@ mod tests {
         fn test_rate_limit_triggered() {
             rate_limit_triggered("10.0.0.***", "/Marti/api/tls/signClient", 10);
             rate_limit_triggered("[::1]:443", "/api/endpoint", 100);
+        }
+
+        #[test]
+        fn test_position_replay_rate_limited() {
+            // Smoke: a fully-shed replay (zero allowed) and a partial replay
+            // (some tokens were available before exhaustion) must both render
+            // through the audit macro without panicking. Issue #724.
+            position_replay_rate_limited("deadbeefcafe1234", 256, 0);
+            position_replay_rate_limited("aabbccddeeff0011", 1024, 17);
         }
     }
 

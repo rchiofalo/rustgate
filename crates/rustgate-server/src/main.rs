@@ -774,7 +774,15 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
         // fail-closed mode; operators opt into fail-open via
         // `--authz-allow-unknown-obligations` /
         // `RUSTGATE_AUTHZ_ALLOW_UNKNOWN_OBLIGATIONS`.
-        .with_allow_unknown_obligations(cli.authz_allow_unknown_obligations);
+        .with_allow_unknown_obligations(cli.authz_allow_unknown_obligations)
+        // Issue #724: cap per-CN position replay events with a
+        // TokenBucket so a flap-looping client cannot drive the
+        // authz engine at an uncapped rate. Defaults
+        // (rate=100/sec, burst=200) are operator-safe.
+        .with_position_replay_limit(rustgate_transport::PositionReplayLimitConfig::new(
+            cli.position_replay_rate_per_sec,
+            cli.position_replay_burst,
+        ));
         let base = match client_queue.as_ref() {
             Some(q) => base.with_client_queue(Arc::clone(q)),
             None => base,

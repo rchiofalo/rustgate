@@ -443,6 +443,8 @@ All flags support environment variables (CLI takes precedence):
 | `--authz-policy-file` | `RUSTGATE_AUTHZ_POLICY_FILE` | — |
 | `--authz-policy-format` | `RUSTGATE_AUTHZ_POLICY_FORMAT` | `native` |
 | `--authz-fail-open` | `RUSTGATE_AUTHZ_FAIL_OPEN` | `false` |
+| `--position-replay-rate-per-sec` | `RUSTGATE_POSITION_REPLAY_RATE_PER_SEC` | `100` |
+| `--position-replay-burst` | `RUSTGATE_POSITION_REPLAY_BURST` | `200` |
 | `--tenant-quota-file` | `RUSTGATE_TENANT_QUOTA_FILE` | — |
 | `--federation-region` | `RUSTGATE_FEDERATION_REGION` | — |
 | `--mqtt-bind` | `RUSTGATE_MQTT_BIND` | — |

@@ -68,10 +68,12 @@ pub struct AuthzEvent<'a> {
     /// Stable policy identifier of the engine that produced the verdict.
     pub policy_id: &'a str,
 }
+use rustgate_core::audit;
 use rustgate_core::identity::{GroupId, Identity};
 use rustgate_core::masking::hash_cn;
 use rustgate_core::message::{Destination, MessageType, RoutableMessage};
 use rustgate_resilience::backpressure::{BackpressureGate, BackpressurePermit};
+use rustgate_resilience::token_bucket::TokenBucket;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{Instrument, debug, warn};
 
@@ -652,6 +654,55 @@ pub struct MulticastConfig {
     pub sa_auto_multicast: bool,
 }
 
+/// Per-CN position-replay rate limit (issue #724).
+///
+/// `Router::replay_positions` evaluates the Send + Receive PEP for every
+/// cached position before delivery. A client flap-looping
+/// (connect → disconnect → connect) drives the authz engine at an
+/// uncapped rate proportional to `cache_size × reconnect_rate`. This
+/// config caps replay events per CN with a [`TokenBucket`] so a single
+/// noisy client cannot drive unbounded authz work.
+///
+/// Defaults are operationally permissive — `rate=100/sec, burst=200` —
+/// so a normal-cadence reconnect is never limited, while flap-loop
+/// attacks at 10×/sec against a 10k-position cache still get bounded
+/// to 200 events/sec instead of 200,000 evals/sec.
+///
+/// One token represents one entire `replay_positions` invocation, not
+/// one cached message: keeping the granularity at the call boundary
+/// matches the attack vector (the reconnect storm) and avoids the
+/// fairness pitfalls of per-message accounting.
+#[derive(Debug, Clone, Copy)]
+pub struct PositionReplayLimitConfig {
+    /// Sustained replay events per second per CN.
+    pub rate_per_sec: u32,
+    /// Burst capacity. Allows short bursts above the sustained rate.
+    pub burst: u32,
+}
+
+impl Default for PositionReplayLimitConfig {
+    fn default() -> Self {
+        Self {
+            rate_per_sec: 100,
+            burst: 200,
+        }
+    }
+}
+
+impl PositionReplayLimitConfig {
+    /// Build the config from CLI knobs. A `rate_per_sec` of zero is
+    /// permitted but disables sustained refill — only the initial burst
+    /// will be served before the bucket empties. Operators who want to
+    /// disable the limit entirely should set both fields high enough
+    /// that real traffic stays under the cap (e.g. `u32::MAX`).
+    pub fn new(rate_per_sec: u32, burst: u32) -> Self {
+        Self {
+            rate_per_sec,
+            burst,
+        }
+    }
+}
+
 /// The central message dispatch engine with ACL, authorization, backpressure, deduplication, and store-forward support.
 pub struct Router {
     state: RwLock<State>,
@@ -690,6 +741,16 @@ pub struct Router {
     /// deployment decision fixed at startup, not a runtime-reloadable
     /// policy.
     unknown_obligation_policy: UnknownObligationPolicy,
+    /// Per-CN position-replay rate limit (issue #724). Each call to
+    /// [`Router::replay_positions`] consumes one token from the
+    /// bucket keyed by the reconnecting client's CN. The map grows
+    /// lazily on first replay and is pruned on session disconnect so
+    /// a CN-churning attacker cannot bloat the entry table.
+    replay_buckets: Mutex<HashMap<String, Arc<TokenBucket>>>,
+    /// Configuration parameters for the per-CN replay rate limiter.
+    /// Plain field (not `ArcSwap`) because the bucket map carries
+    /// the live state and is populated on demand from this config.
+    replay_limit_config: PositionReplayLimitConfig,
 }
 
 impl std::fmt::Debug for Router {
@@ -708,6 +769,7 @@ impl std::fmt::Debug for Router {
                 &(**self.quota_tracker.load()).is_some(),
             )
             .field("unknown_obligation_policy", &self.unknown_obligation_policy)
+            .field("replay_limit_config", &self.replay_limit_config)
             .finish()
     }
 }
@@ -726,6 +788,8 @@ impl Default for Router {
             multicast_config: ArcSwap::from_pointee(None),
             quota_tracker: ArcSwap::from_pointee(None),
             unknown_obligation_policy: UnknownObligationPolicy::default(),
+            replay_buckets: Mutex::new(HashMap::new()),
+            replay_limit_config: PositionReplayLimitConfig::default(),
         }
     }
 }
@@ -757,6 +821,8 @@ impl Router {
             multicast_config: ArcSwap::from_pointee(None),
             quota_tracker: ArcSwap::from_pointee(None),
             unknown_obligation_policy: UnknownObligationPolicy::default(),
+            replay_buckets: Mutex::new(HashMap::new()),
+            replay_limit_config: PositionReplayLimitConfig::default(),
         }
     }
 
@@ -794,6 +860,8 @@ impl Router {
             multicast_config: ArcSwap::from_pointee(None),
             quota_tracker: ArcSwap::from_pointee(None),
             unknown_obligation_policy: UnknownObligationPolicy::default(),
+            replay_buckets: Mutex::new(HashMap::new()),
+            replay_limit_config: PositionReplayLimitConfig::default(),
         }
     }
 
@@ -834,6 +902,8 @@ impl Router {
             multicast_config: ArcSwap::from_pointee(None),
             quota_tracker: ArcSwap::from_pointee(None),
             unknown_obligation_policy: UnknownObligationPolicy::default(),
+            replay_buckets: Mutex::new(HashMap::new()),
+            replay_limit_config: PositionReplayLimitConfig::default(),
         }
     }
 
@@ -1055,6 +1125,53 @@ impl Router {
         self.unknown_obligation_policy
     }
 
+    /// Set the per-CN [`PositionReplayLimitConfig`] used by
+    /// [`Router::replay_positions`] (issue #724). Reuses the existing
+    /// [`TokenBucket`] primitive from `rustgate-resilience` for the
+    /// per-CN gate.
+    pub fn with_position_replay_limit(mut self, config: PositionReplayLimitConfig) -> Self {
+        self.replay_limit_config = config;
+        self
+    }
+
+    /// Return the router's configured per-CN replay rate limit.
+    pub fn position_replay_limit_config(&self) -> PositionReplayLimitConfig {
+        self.replay_limit_config
+    }
+
+    /// Lazily acquire (or create) the per-CN replay [`TokenBucket`].
+    /// The map grows on first replay attempt for a given CN; entries
+    /// are pruned on session disconnect by [`Router::unregister`] so a
+    /// CN-churning attacker cannot inflate this map without bound.
+    fn replay_bucket_for(&self, cn: &str) -> Arc<TokenBucket> {
+        let mut guard = self.replay_buckets.lock();
+        if let Some(existing) = guard.get(cn) {
+            return Arc::clone(existing);
+        }
+        let bucket = Arc::new(TokenBucket::new(
+            f64::from(self.replay_limit_config.rate_per_sec),
+            Some(f64::from(self.replay_limit_config.burst)),
+        ));
+        let _ = guard.insert(cn.to_owned(), Arc::clone(&bucket));
+        bucket
+    }
+
+    /// Drop the rate-limiter bucket entry for `cn`, if any. Called from
+    /// session-disconnect paths so the per-CN map does not grow without
+    /// bound under a CN-churning attacker.
+    fn drop_replay_bucket(&self, cn: &str) {
+        let mut guard = self.replay_buckets.lock();
+        let _ = guard.remove(cn);
+    }
+
+    /// Number of currently-tracked replay rate-limit buckets. Test-only
+    /// observation used by the prune-on-disconnect regression test in
+    /// issue #724.
+    #[cfg(test)]
+    fn replay_bucket_map_len(&self) -> usize {
+        self.replay_buckets.lock().len()
+    }
+
     /// Snapshot the current quota tracker, if any.
     pub fn quota_tracker(&self) -> Option<Arc<crate::quota::TenantQuotaTracker>> {
         self.quota_tracker.load_full().as_ref().clone()
@@ -1165,6 +1282,12 @@ impl Router {
         }
         drop(state);
         self.cache.remove(cn).await;
+        // Prune the per-CN replay bucket entry (issue #724). A
+        // CN-churning attacker that opens and closes thousands of
+        // distinct CNs would otherwise inflate this map without bound;
+        // the entry's purpose is to track in-flight rate-limit state
+        // for an active session, so a graceful disconnect releases it.
+        self.drop_replay_bucket(cn);
     }
 
     /// Dynamically add a session to a group.
@@ -1868,7 +1991,42 @@ impl Router {
     /// Replay cached positions to a newly connected session.
     /// Only replays positions from clients that share at least one group
     /// with the connecting session to enforce group-level isolation.
+    ///
+    /// Per-CN rate-limited (issue #724): each invocation acquires one
+    /// token from a per-CN [`TokenBucket`]. When the bucket is empty
+    /// the replay is skipped entirely with an audit event
+    /// ([`audit::position_replay_rate_limited`]) and a warn-level log
+    /// line. This bounds the authz work a single flap-looping client
+    /// can drive — every reconnect would otherwise trigger
+    /// `2 * cache_size` PEP evaluations, so a 10k-cache and 10×/sec
+    /// reconnect = 200k authz evals/sec from one client.
     pub async fn replay_positions(&self, handle: &SessionHandle) {
+        // Per-CN admission via the shared TokenBucket primitive. The
+        // bucket is keyed by the reconnecting client's CN so a noisy
+        // client cannot starve replay for its neighbours; per-CN
+        // isolation is the security goal here. The map grows lazily on
+        // first replay and is pruned on disconnect by `unregister`.
+        if !self.replay_bucket_for(&handle.identity.cn).try_acquire() {
+            // Pre-flight count of cached positions for the audit
+            // payload. The cost is one read-lock + filter pass; the
+            // alternative (estimating from `len`) would over-count
+            // expired entries.
+            let attempted = self.cache.get_all().await.len();
+            let session_hash = hash_cn(&handle.identity.cn);
+            warn!(
+                session = %session_hash,
+                attempted = attempted,
+                rate_per_sec = self.replay_limit_config.rate_per_sec,
+                burst = self.replay_limit_config.burst,
+                "position replay rate-limited: per-CN bucket exhausted"
+            );
+            // `attempted` may exceed `u32::MAX` only on a pathological
+            // cache; clamp before the audit cast to keep the field type
+            // narrow without panicking.
+            let attempted_u32 = u32::try_from(attempted).unwrap_or(u32::MAX);
+            audit::position_replay_rate_limited(&session_hash, attempted_u32, 0);
+            return;
+        }
         let acl_guard = self.acl.load();
         let acl_ref: &Option<GroupAclPolicy> = &acl_guard;
         let authz_guard = self.authz.load();
@@ -2906,6 +3064,217 @@ mod tests {
         assert!(
             prx.try_recv().is_ok(),
             "bob should see alice's position via shared group"
+        );
+    }
+
+    // -- Per-CN replay rate limit (issue #724) ---------------------------
+
+    /// A flap-looping client must not be able to drive replay-time authz
+    /// work without bound. With burst=4 and rate=0/sec, the bucket holds
+    /// exactly 4 tokens and never refills; the 5th replay attempt must be
+    /// rate-limited.
+    #[tokio::test]
+    async fn replay_positions_consumes_tokens() {
+        let router = Router::new().with_position_replay_limit(PositionReplayLimitConfig::new(0, 4));
+
+        let alice = make_identity("alice", &["alpha"]);
+        let bob = make_identity("bob", &["alpha"]);
+        let pos = make_position(&alice, Destination::Broadcast);
+        router.cache().store(pos).await;
+
+        // First 4 replay invocations under bob's CN must each deliver
+        // alice's cached position — burst=4 means four tokens available
+        // up-front and rate=0 means no refill ever. Each call uses a
+        // fresh dual-channel pair so we can observe per-attempt delivery.
+        for i in 0..4 {
+            let (ptx, ntx, mut prx, _nrx) = make_channels(16, 16);
+            let handle = SessionHandle::new(bob.clone(), ptx, ntx);
+            router.replay_positions(&handle).await;
+            assert!(
+                prx.try_recv().is_ok(),
+                "replay attempt {i} should succeed — burst=4 covers the first four"
+            );
+        }
+
+        // 5th replay must be rate-limited. The bucket has 0 tokens left
+        // and rate=0 means no refill. A successful replay would queue
+        // alice's position on the priority channel; a shed replay leaves
+        // the channel empty.
+        let (ptx, ntx, mut prx, _nrx) = make_channels(16, 16);
+        let handle = SessionHandle::new(bob.clone(), ptx, ntx);
+        router.replay_positions(&handle).await;
+        assert!(
+            prx.try_recv().is_err(),
+            "5th replay must be shed by the per-CN bucket"
+        );
+    }
+
+    /// After waiting long enough for the bucket to refill, a subsequent
+    /// replay must succeed. Pin the refill semantics so a regression that
+    /// dropped the time-based refill (e.g. by recreating the bucket every
+    /// call) would be caught here.
+    #[tokio::test]
+    async fn replay_positions_refills_over_time() {
+        // 100/sec refill, burst=1 — drain the single token, wait 100ms (=10
+        // tokens of refill, capped at 1), then verify the next replay
+        // succeeds.
+        let router =
+            Router::new().with_position_replay_limit(PositionReplayLimitConfig::new(100, 1));
+
+        let alice = make_identity("alice", &["alpha"]);
+        let bob = make_identity("bob", &["alpha"]);
+        let pos = make_position(&alice, Destination::Broadcast);
+        router.cache().store(pos).await;
+
+        let (ptx, ntx, mut prx, _nrx) = make_channels(16, 16);
+        let handle = SessionHandle::new(bob.clone(), ptx, ntx);
+
+        // First call drains the only token and delivers the position.
+        router.replay_positions(&handle).await;
+        assert!(
+            prx.try_recv().is_ok(),
+            "first replay must deliver alice's position"
+        );
+
+        // Immediately re-attempt: no time has passed, no refill.
+        let (ptx2, ntx2, mut prx2, _nrx2) = make_channels(16, 16);
+        let handle2 = SessionHandle::new(bob.clone(), ptx2, ntx2);
+        router.replay_positions(&handle2).await;
+        assert!(
+            prx2.try_recv().is_err(),
+            "second replay must be shed before any refill"
+        );
+
+        // Wait long enough for one token to refill (100/sec → 10ms per
+        // token; 100ms is a generous margin against scheduler jitter).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let (ptx3, ntx3, mut prx3, _nrx3) = make_channels(16, 16);
+        let handle3 = SessionHandle::new(bob.clone(), ptx3, ntx3);
+        router.replay_positions(&handle3).await;
+        assert!(
+            prx3.try_recv().is_ok(),
+            "third replay must succeed after refill window"
+        );
+    }
+
+    // (Audit emission for the rate-limit path lives in
+    // `tests/position_replay_rate_limit_audit.rs` — a dedicated
+    // integration-test binary so the thread-local audit subscriber
+    // does not race other in-process tests that also emit on the
+    // `audit` target.)
+
+    /// Per-CN isolation: one client's bucket exhaustion must not affect
+    /// another client's replay. Pin this so a regression that
+    /// accidentally shared a single bucket would be caught here.
+    #[tokio::test]
+    async fn replay_positions_per_cn_isolation() {
+        let router = Router::new().with_position_replay_limit(PositionReplayLimitConfig::new(0, 1));
+
+        let alice = make_identity("alice", &["alpha"]);
+        let bob = make_identity("bob", &["alpha"]);
+        let charlie = make_identity("charlie", &["alpha"]);
+        let pos = make_position(&alice, Destination::Broadcast);
+        router.cache().store(pos).await;
+
+        // Bob exhausts his bucket (burst=1, then the next call sheds).
+        let (ptx, ntx, _prx, _nrx) = make_channels(16, 16);
+        let handle_b1 = SessionHandle::new(bob.clone(), ptx, ntx);
+        router.replay_positions(&handle_b1).await;
+
+        let (ptx, ntx, mut prx, _nrx) = make_channels(16, 16);
+        let handle_b2 = SessionHandle::new(bob.clone(), ptx, ntx);
+        router.replay_positions(&handle_b2).await;
+        assert!(
+            prx.try_recv().is_err(),
+            "bob's second replay must be shed (his bucket is empty)"
+        );
+
+        // Charlie connects with a fresh bucket: must succeed despite
+        // bob's exhaustion.
+        let (ptx, ntx, mut prx, _nrx) = make_channels(16, 16);
+        let handle_c = SessionHandle::new(charlie.clone(), ptx, ntx);
+        router.replay_positions(&handle_c).await;
+        assert!(
+            prx.try_recv().is_ok(),
+            "charlie's first replay must succeed — his bucket is independent of bob's"
+        );
+    }
+
+    /// Pin the operator-friendly default: a normal-cadence reconnect
+    /// (one replay, then occasional churn) is never rate-limited. A
+    /// regression that dropped the burst floor below 1 — or that picked
+    /// a stricter default — would shed legitimate operator traffic.
+    #[tokio::test]
+    async fn replay_positions_default_rate_permissive_for_normal_use() {
+        let router = Router::new(); // default config (rate=100, burst=200)
+
+        let alice = make_identity("alice", &["alpha"]);
+        let bob = make_identity("bob", &["alpha"]);
+        let pos = make_position(&alice, Destination::Broadcast);
+        router.cache().store(pos).await;
+
+        // A single replay must always deliver — the default must never
+        // shed the very first reconnect.
+        let (ptx, ntx, mut prx, _nrx) = make_channels(16, 16);
+        let handle = SessionHandle::new(bob.clone(), ptx, ntx);
+        router.replay_positions(&handle).await;
+        assert!(
+            prx.try_recv().is_ok(),
+            "default config must never shed the first reconnect — burst >= 1"
+        );
+
+        // Pin the default values explicitly so a future bump is at least
+        // intentional.
+        let cfg = router.position_replay_limit_config();
+        assert_eq!(
+            cfg.rate_per_sec, 100,
+            "default rate_per_sec is the documented operator-safe value"
+        );
+        assert_eq!(
+            cfg.burst, 200,
+            "default burst is the documented operator-safe value"
+        );
+    }
+
+    /// A CN-churning attacker must not be able to inflate the rate-limit
+    /// bucket map by opening many distinct CN connections. After
+    /// disconnect the bucket entry must be released; the map size must
+    /// not grow without bound across a connect/disconnect cycle.
+    #[tokio::test]
+    async fn position_replay_rate_limit_token_bucket_pruned_on_disconnect() {
+        let router = Router::new();
+
+        // Cycle three distinct CNs through register → replay → unregister
+        // and assert the map is empty afterwards. A single residual entry
+        // would be acceptable in isolation, but the security invariant is
+        // that disconnect *eventually* drains every bucket.
+        for cn in ["alice", "bob", "charlie"] {
+            let id = make_identity(cn, &["alpha"]);
+            let (ptx, ntx, _prx, _nrx) = make_channels(16, 16);
+            let handle = SessionHandle::new(id.clone(), ptx, ntx);
+            let session_id = handle.id;
+            assert!(router.register(handle).await);
+            // Force a bucket entry to materialise.
+            router
+                .replay_positions(&{
+                    let (ptx, ntx, _prx, _nrx) = make_channels(16, 16);
+                    SessionHandle::new(id.clone(), ptx, ntx)
+                })
+                .await;
+            // The bucket must exist *during* the session.
+            assert!(
+                router.replay_bucket_map_len() >= 1,
+                "bucket entry for {cn} must be tracked while the session is registered"
+            );
+            router.unregister(cn, session_id).await;
+        }
+
+        assert_eq!(
+            router.replay_bucket_map_len(),
+            0,
+            "every disconnected CN must have its replay bucket pruned — \
+             a CN-churning attacker cannot inflate the map without bound"
         );
     }
 
