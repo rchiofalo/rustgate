@@ -266,6 +266,41 @@ async fn connect_and_connack() {
                  sessions — the alternative (omit the property) would let the \
                  client assume the broker honors its CONNECT-time request"
             );
+            // Refs #880: the remaining MQTT 5.0 §3.2.2 capability
+            // properties. The two `Available = 0` advertisements are
+            // the load-bearing ones — silence would let the client
+            // expect features the broker doesn't actually provide
+            // (subscription IDs, shared subscriptions). The other
+            // three (max_qos, retain_available, wildcard_available)
+            // are explicit confirmations of capabilities that match
+            // the spec defaults.
+            assert_eq!(
+                props.max_qos,
+                Some(2),
+                "broker advertises Max QoS = 2 (#1161 added inbound QoS 2)"
+            );
+            assert_eq!(
+                props.retain_available,
+                Some(1),
+                "broker advertises Retain Available = 1 (#1146 retain store)"
+            );
+            assert_eq!(
+                props.wildcard_subscription_available,
+                Some(1),
+                "default WildcardPolicy::SingleLevelOnly → wildcard advertised as supported"
+            );
+            assert_eq!(
+                props.subscription_identifiers_available,
+                Some(0),
+                "broker MUST advertise Subscription Identifiers = 0 (not implemented) — \
+                 silence would mislead a client per §3.2.2.3.10's default-to-1 semantics"
+            );
+            assert_eq!(
+                props.shared_subscription_available,
+                Some(0),
+                "broker MUST advertise Shared Subscription = 0 (not implemented) — \
+                 silence would mislead a client per §3.2.2.3.11's default-to-1 semantics"
+            );
         }
         other => panic!("expected ConnAck, got {other:?}"),
     }

@@ -58,6 +58,11 @@ pub(crate) struct PacketCodec {
     max_packet_size: usize,
     receive_max: u16,
     topic_alias_max: u16,
+    /// Per-listener wildcard policy. Threaded through PacketCodec
+    /// so `write_connack_v5` can compute the
+    /// `Wildcard Subscription Available` CONNACK property without
+    /// re-plumbing every call site.
+    wildcard_policy: crate::topic::WildcardPolicy,
 }
 
 impl PacketCodec {
@@ -67,6 +72,7 @@ impl PacketCodec {
         max_packet_size: usize,
         receive_max: u16,
         topic_alias_max: u16,
+        wildcard_policy: crate::topic::WildcardPolicy,
     ) -> Self {
         Self {
             stream,
@@ -76,6 +82,7 @@ impl PacketCodec {
             max_packet_size,
             receive_max,
             topic_alias_max,
+            wildcard_policy,
         }
     }
 
@@ -202,6 +209,65 @@ impl PacketCodec {
         // explicit signaling beats relying on the implicit default.
         // The wire field is `u16` so no saturation needed.
         properties.topic_alias_max = Some(self.topic_alias_max);
+        // MQTT 5.0 §3.2.2.3.4 Maximum QoS. rustgate supports inbound
+        // QoS 0/1/2 (after the QoS 2 four-step from #1161), so 2 is
+        // the truthful value. The spec default when the property is
+        // absent is also 2 ("the broker supports all QoS levels"),
+        // so explicit advertisement is informational rather than
+        // load-bearing — but pinning the value end-to-end via
+        // CONNACK lets the test assertion catch a regression that
+        // accidentally degraded the broker's actual capability.
+        properties.max_qos = Some(2);
+        // MQTT 5.0 §3.2.2.3.5 Retain Available. rustgate supports
+        // retained messages (#1146 retain store + §3.3.1.3 zero-byte
+        // clear). The spec default when absent is 1 ("supported"),
+        // so this is again an explicit confirmation of capability —
+        // a regression that gutted retain handling would still let
+        // the property assertion pass, but the operational fleet
+        // would see retained messages stop replaying. The pairing
+        // with the existing retain hooks (#1153) gives the
+        // dashboards a "retain store activity is non-zero" signal
+        // that complements the CONNACK advertisement.
+        properties.retain_available = Some(1);
+        // MQTT 5.0 §3.2.2.3.9 Wildcard Subscription Available.
+        // Computed from the listener's `WildcardPolicy`:
+        //   - `Reject` → 0 (broker refuses any wildcard filter)
+        //   - `SingleLevelOnly` (default) → 1 (`+` only)
+        //   - `Full` → 1 (`+` and `#`)
+        // The MQTT 5.0 wire field is binary (supported / not), so
+        // a deployment in `SingleLevelOnly` mode advertises 1 even
+        // though `#` is rejected at SUBSCRIBE time — the per-filter
+        // SUBACK reason code (`WildcardSubscriptionsNotSupported`,
+        // 0xA2) is the precise signal the spec provides for the
+        // single-vs-full distinction. Operators can audit
+        // `mqtt_subscribes_rejected_total` to see the rejection
+        // shape if wildcard discipline is operationally relevant.
+        properties.wildcard_subscription_available = Some(
+            if matches!(self.wildcard_policy, crate::topic::WildcardPolicy::Reject) {
+                0
+            } else {
+                1
+            },
+        );
+        // MQTT 5.0 §3.2.2.3.10 Subscription Identifiers Available.
+        // rustgate doesn't support the §3.8.2.1.2 numeric ID
+        // mechanism (binds a subscription to a value the broker
+        // echoes in matching PUBLISHes via §3.3.2.3.8). Advertise
+        // 0 explicitly — the spec default when absent is 1
+        // ("supported"), so silence here would mislead a client
+        // into believing the feature is available and a SUBSCRIBE
+        // carrying `subscription_identifier` would not get the
+        // expected echo on subsequent PUBLISHes.
+        properties.subscription_identifiers_available = Some(0);
+        // MQTT 5.0 §3.2.2.3.11 Shared Subscription Available.
+        // rustgate doesn't support the §4.8.2 `$share/<group>/<topic>`
+        // shared-subscription syntax. Advertise 0 explicitly — same
+        // reasoning as Subscription Identifiers above: the spec
+        // default when absent is 1 ("supported"), so silence here
+        // would let a client expect load-balanced delivery across
+        // a `$share` group when in fact each subscriber would get
+        // every message (non-shared semantics).
+        properties.shared_subscription_available = Some(0);
         // MQTT 5.0 §3.2.2.3.2: Session Expiry Interval. The broker MAY
         // override the client's CONNECT-time request by advertising a
         // different value here; the client MUST then treat the
@@ -1117,6 +1183,52 @@ mod tests {
                     "broker must advertise its Topic Alias Maximum so the \
                      client knows the highest accepted alias value"
                 );
+            }
+            other => panic!("expected ConnAck, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v5_connack_advertises_remaining_capability_properties() {
+        // Refs #880: pin the wire format for the five remaining MQTT
+        // 5.0 §3.2.2 CONNACK capability properties advertised in the
+        // post-#1164 surface:
+        //   §3.2.2.3.4  Maximum QoS                     = 2 (we support QoS 0/1/2 inbound after #1161)
+        //   §3.2.2.3.5  Retain Available                = 1 (#1146)
+        //   §3.2.2.3.9  Wildcard Subscription Available = 1 by default (SingleLevelOnly + Full)
+        //   §3.2.2.3.10 Subscription Identifiers Avail. = 0 (not implemented)
+        //   §3.2.2.3.11 Shared Subscription Available   = 0 (not implemented)
+        //
+        // The two "Available = 0" advertisements are the load-bearing
+        // signals: the spec default when those properties are absent
+        // is 1 ("supported"), so silence would mislead a client into
+        // expecting features the broker doesn't actually provide.
+        // Pin the wire format end-to-end via build + parse.
+        let connack = mqttbytes::v5::ConnAck {
+            session_present: false,
+            code: mqttbytes::v5::ConnectReturnCode::Success,
+            properties: Some({
+                let mut p = mqttbytes::v5::ConnAckProperties::new();
+                p.max_qos = Some(2);
+                p.retain_available = Some(1);
+                p.wildcard_subscription_available = Some(1);
+                p.subscription_identifiers_available = Some(0);
+                p.shared_subscription_available = Some(0);
+                p
+            }),
+        };
+        let mut buf = BytesMut::with_capacity(64);
+        write_v5_to_buf(&mqttbytes::v5::Packet::ConnAck(connack), &mut buf).expect("serialize");
+
+        let decoded = mqttbytes::v5::read(&mut buf, 16 * 1024).expect("parse");
+        match decoded {
+            mqttbytes::v5::Packet::ConnAck(a) => {
+                let props = a.properties.expect("properties present");
+                assert_eq!(props.max_qos, Some(2));
+                assert_eq!(props.retain_available, Some(1));
+                assert_eq!(props.wildcard_subscription_available, Some(1));
+                assert_eq!(props.subscription_identifiers_available, Some(0));
+                assert_eq!(props.shared_subscription_available, Some(0));
             }
             other => panic!("expected ConnAck, got {other:?}"),
         }

@@ -187,7 +187,13 @@ pub(crate) async fn handle_mqtt_session(
     let peer_addr = pre.peer_addr;
     let cn = identity.cn.clone();
 
-    let mut codec = PacketCodec::new(pre.stream, max_packet_size, receive_max, topic_alias_max);
+    let mut codec = PacketCodec::new(
+        pre.stream,
+        max_packet_size,
+        receive_max,
+        topic_alias_max,
+        wildcard_policy,
+    );
 
     // --- CONNECT handshake ---
     let outcome = match connect_handshake(
