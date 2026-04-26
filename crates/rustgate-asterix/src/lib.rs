@@ -7,10 +7,13 @@
 //! control and surveillance systems (primary radar, secondary radar, ADS-B,
 //! multilateration, fused trackers, counter-UAS sensors). A live ASTERIX
 //! feed is a stream of *datablocks* on UDP or TCP; each datablock carries
-//! one or more *records* of a single *category*. This crate implements a
-//! decoder for **CAT-062** ("SDPS Track Messages") — the system-track
-//! update messages emitted by Surveillance Data Processing Systems and
-//! by counter-UAS radar trackers.
+//! one or more *records* of a single *category*. This crate implements
+//! decoders for **CAT-062** ("SDPS Track Messages" — system-track updates
+//! emitted by Surveillance Data Processing Systems and counter-UAS radar
+//! trackers), **CAT-021** ("ADS-B Reports" — broadcasts from Mode-S
+//! Extended Squitter transponders on commercial aircraft), and **CAT-048**
+//! ("Monoradar Target Reports" — interrogated Mode-S/SSR responses from
+//! ground primary/secondary radars).
 //!
 //! # Scope
 //!
@@ -54,18 +57,19 @@
 //!   stays free of routing concepts. A consumer wires `Cat062Track →
 //!   RoutableMessage` based on its own deployment (group derivation,
 //!   tenant scoping, CoT translation).
-//! - **Other categories.** CAT-001/002, CAT-021 (ADS-B), CAT-034/048
-//!   (radar service / Mode-S), CAT-150 (mil track) all share the
-//!   datablock framing but differ in field catalogue. They land as
-//!   sibling modules behind the same `decode_*` entry point when
-//!   operationally needed.
+//! - **Other categories.** CAT-001/002, CAT-034 (radar service),
+//!   CAT-150 (mil track) all share the datablock framing but differ
+//!   in field catalogue. They land as sibling modules behind the
+//!   same `decode_*` entry point when operationally needed.
 //! - **Field encoder direction for unsupported FRNs.** The decoder skips
 //!   over fields it does not consume (forward-compatible) but cannot
 //!   re-emit them; a future encoder PR would have to round-trip the
 //!   entire catalogue.
 
 pub mod cat021;
+pub mod cat048;
 pub mod cat062;
 
 pub use cat021::{Cat021Error, Cat021Report, decode_cat021};
-pub use cat062::{Cat062Error, Cat062Track, ModeCCode, TrackStatus, decode_cat062};
+pub use cat048::{Cat048Error, Cat048Report, PolarPosition, decode_cat048};
+pub use cat062::{Cat062Error, Cat062Track, Mode3aCode, ModeCCode, TrackStatus, decode_cat062};
