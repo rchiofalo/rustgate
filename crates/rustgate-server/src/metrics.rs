@@ -155,6 +155,8 @@ static MQTT_RETAIN_REPLAYED: OnceLock<IntCounter> = OnceLock::new();
 #[cfg(feature = "mqtt")]
 static MQTT_WILL_PUBLISHED: OnceLock<IntCounter> = OnceLock::new();
 
+static MAVLINK_HEARTBEATS: OnceLock<IntCounterVec> = OnceLock::new();
+
 #[cfg(feature = "nats")]
 static NATS_CONSUMER_PENDING: OnceLock<IntGauge> = OnceLock::new();
 #[cfg(feature = "nats")]
@@ -684,6 +686,26 @@ pub fn init() -> prometheus::Result<()> {
         registry.register(Box::new(mqtt_will_published.clone()))?;
         let _ = MQTT_WILL_PUBLISHED.set(mqtt_will_published);
     }
+
+    let mavlink_heartbeats = IntCounterVec::new(
+        Opts::new(
+            "rustgate_mavlink_heartbeats_total",
+            "MAVLink HEARTBEAT (MSG_ID 0) frames received and decoded at the \
+             framing layer, labelled by `system_id` (the v1/v2 header field). \
+             A typical drone fleet emits HEARTBEATs at 1 Hz, so the counter \
+             gives a per-aircraft presence ping at the wire level — useful \
+             for correlating 'aircraft fell off the network' SIEM events with \
+             dashboard signals like network partition or radio link drop. \
+             Cardinality is bounded by the size of the fleet (system_id is a \
+             u8, max 256 distinct values), and the counter is always-on \
+             across builds because the metric registry is shared by every \
+             rustgate process regardless of which transport listeners are \
+             wired in.",
+        ),
+        &["system_id"],
+    )?;
+    registry.register(Box::new(mavlink_heartbeats.clone()))?;
+    let _ = MAVLINK_HEARTBEATS.set(mavlink_heartbeats);
 
     #[cfg(feature = "nats")]
     {
@@ -1437,6 +1459,35 @@ pub fn mqtt_retain_replayed() -> &'static IntCounter {
 pub fn mqtt_will_published() -> &'static IntCounter {
     MQTT_WILL_PUBLISHED
         .get_or_init(|| fallback_counter("rustgate_mqtt_will_published_total", "fallback"))
+}
+
+/// Per-system_id counter for MAVLink HEARTBEAT (MSG_ID 0) frame
+/// receipts at the framing layer. The label is the wire-level
+/// `system_id` byte rendered as a decimal string (`"42"`, `"7"`,
+/// etc.) — Prometheus expects `&str`, so callers must `.to_string()`
+/// the `u8` at the call site. Cardinality is bounded by `u8::MAX + 1`
+/// (256 distinct labels), well below the per-metric limit a typical
+/// scrape-target pipeline accepts.
+///
+/// Wired from `rustgate_mavlink::OnMavlinkHeartbeat` callbacks
+/// installed under `#[cfg(feature = "metrics")]` at the future MAVLink
+/// listener wiring point — incrementing the counter once per decoded
+/// HEARTBEAT frame.
+// justification: registered at startup via `init()` for the Prometheus
+// exposition surface; the increment site lands with the MAVLink UDP/TCP
+// listener wiring (forward reference to issue #909, of which this is
+// the framing-layer half). Until then the accessor is `pub` so the
+// metric is exposed at `/metrics` immediately and operators can begin
+// shipping dashboards before the increment lights up.
+#[allow(dead_code)]
+pub fn mavlink_heartbeats() -> &'static IntCounterVec {
+    MAVLINK_HEARTBEATS.get_or_init(|| {
+        fallback_counter_vec(
+            "rustgate_mavlink_heartbeats_total",
+            "fallback",
+            &["system_id"],
+        )
+    })
 }
 
 /// Returns the JetStream consumer `num_pending` gauge if registered.
@@ -3246,6 +3297,79 @@ mod tests {
                 .with_label_values(&["broadcast", "other"])
                 .get(),
             before + 1
+        );
+    }
+
+    #[test]
+    fn mavlink_heartbeats_label_isolates_per_system_id() {
+        // Two distinct system_id labels must increment independently.
+        // Per-aircraft cardinality (the dashboard signal: "is this
+        // particular drone still emitting heartbeats?") relies on
+        // Prometheus separating the two time series — a regression
+        // that collapsed them onto a single `system_id=""` label
+        // would silently break every per-aircraft alert.
+        ensure_init();
+        let sys_a = "42";
+        let sys_b = "7";
+
+        let before_a = mavlink_heartbeats().with_label_values(&[sys_a]).get();
+        let before_b = mavlink_heartbeats().with_label_values(&[sys_b]).get();
+
+        mavlink_heartbeats().with_label_values(&[sys_a]).inc();
+        mavlink_heartbeats().with_label_values(&[sys_a]).inc();
+        mavlink_heartbeats().with_label_values(&[sys_b]).inc();
+
+        assert_eq!(
+            mavlink_heartbeats().with_label_values(&[sys_a]).get(),
+            before_a + 2,
+        );
+        assert_eq!(
+            mavlink_heartbeats().with_label_values(&[sys_b]).get(),
+            before_b + 1,
+        );
+    }
+
+    #[test]
+    fn mavlink_heartbeats_registered_under_documented_name() {
+        // The metric name and `system_id` label arity are the public
+        // dashboard-and-alerting contract; a rename or label drop
+        // would silently break PromQL queries that depend on
+        // `rustgate_mavlink_heartbeats_total{system_id="..."}`. The
+        // rendered exposition must always carry the label so the
+        // Grafana queries can join against fleet-inventory data.
+        ensure_init();
+        // Force a sample to materialise so the family appears in the
+        // gathered output. Some prometheus-rs versions omit empty
+        // CounterVec families; populating one label-value ensures the
+        // family is gathered.
+        mavlink_heartbeats().with_label_values(&["255"]).inc();
+        let families = prometheus::default_registry().gather();
+        let found = families
+            .iter()
+            .find(|m| m.name() == "rustgate_mavlink_heartbeats_total")
+            .expect("rustgate_mavlink_heartbeats_total must be registered");
+        assert_eq!(
+            found.get_field_type(),
+            prometheus::proto::MetricType::COUNTER,
+        );
+        // Force a sample to materialise so the labels are visible in
+        // the gathered families. A fresh registry has no metric
+        // children until at least one `with_label_values()` call.
+        mavlink_heartbeats().with_label_values(&["255"]).inc();
+        let families = prometheus::default_registry().gather();
+        let found = families
+            .iter()
+            .find(|m| m.name() == "rustgate_mavlink_heartbeats_total")
+            .expect("metric family must remain registered after sampling");
+        let sample = found
+            .get_metric()
+            .first()
+            .expect("counter vec must expose at least one sample after inc");
+        let labels: Vec<&str> = sample.get_label().iter().map(|l| l.name()).collect();
+        assert_eq!(
+            labels,
+            vec!["system_id"],
+            "exposition must surface the `system_id` label exactly once"
         );
     }
 
