@@ -57,11 +57,17 @@ pub(crate) struct PacketCodec {
     pub(crate) protocol: Option<ProtocolLevel>,
     max_packet_size: usize,
     receive_max: u16,
+    topic_alias_max: u16,
 }
 
 impl PacketCodec {
     /// Create a new codec wrapping the given TLS stream.
-    pub(crate) fn new(stream: TlsStream, max_packet_size: usize, receive_max: u16) -> Self {
+    pub(crate) fn new(
+        stream: TlsStream,
+        max_packet_size: usize,
+        receive_max: u16,
+        topic_alias_max: u16,
+    ) -> Self {
         Self {
             stream,
             read_buf: BytesMut::with_capacity(4096),
@@ -69,6 +75,7 @@ impl PacketCodec {
             protocol: None,
             max_packet_size,
             receive_max,
+            topic_alias_max,
         }
     }
 
@@ -187,6 +194,14 @@ impl PacketCodec {
         // has a concrete cap to self-limit against. Note `receive_max`
         // is a u16 on the wire so no saturation logic is needed.
         properties.receive_max = Some(self.receive_max);
+        // MQTT 5.0 §3.2.2.3.8: Topic Alias Maximum. Tells a compliant
+        // client the highest Topic Alias value the broker will accept
+        // on inbound PUBLISHes from this connection. The spec default
+        // when the property is absent is 0 (feature disabled), so
+        // we always advertise even when the configured cap is 0 —
+        // explicit signaling beats relying on the implicit default.
+        // The wire field is `u16` so no saturation needed.
+        properties.topic_alias_max = Some(self.topic_alias_max);
         // MQTT 5.0 §3.2.2.3.2: Session Expiry Interval. The broker MAY
         // override the client's CONNECT-time request by advertising a
         // different value here; the client MUST then treat the
@@ -1066,6 +1081,41 @@ mod tests {
                     "broker must advertise Session Expiry Interval = 0 so a \
                      compliant client knows it cannot rely on broker-side \
                      session retention"
+                );
+            }
+            other => panic!("expected ConnAck, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v5_connack_advertises_configured_topic_alias_max() {
+        // Refs #880: MQTT 5.0 §3.2.2.3.8 — Topic Alias Maximum.
+        // Tells a compliant client the highest Topic Alias value the
+        // broker will accept on inbound PUBLISHes from this connection.
+        // Always advertised (even when the value is 0) so the client
+        // gets an explicit "feature disabled" signal rather than
+        // having to fall back on the spec's implicit-default of 0.
+        let connack = mqttbytes::v5::ConnAck {
+            session_present: false,
+            code: mqttbytes::v5::ConnectReturnCode::Success,
+            properties: Some({
+                let mut p = mqttbytes::v5::ConnAckProperties::new();
+                p.topic_alias_max = Some(8);
+                p
+            }),
+        };
+        let mut buf = BytesMut::with_capacity(32);
+        write_v5_to_buf(&mqttbytes::v5::Packet::ConnAck(connack), &mut buf).expect("serialize");
+
+        let decoded = mqttbytes::v5::read(&mut buf, 16 * 1024).expect("parse");
+        match decoded {
+            mqttbytes::v5::Packet::ConnAck(a) => {
+                let props = a.properties.expect("properties present");
+                assert_eq!(
+                    props.topic_alias_max,
+                    Some(8),
+                    "broker must advertise its Topic Alias Maximum so the \
+                     client knows the highest accepted alias value"
                 );
             }
             other => panic!("expected ConnAck, got {other:?}"),

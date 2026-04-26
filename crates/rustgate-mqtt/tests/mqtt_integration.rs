@@ -61,6 +61,7 @@ impl TestServer {
             topic_prefix,
             max_packet_size: 1024 * 1024,
             receive_max: MqttServerConfig::DEFAULT_RECEIVE_MAX,
+            topic_alias_max: MqttServerConfig::DEFAULT_TOPIC_ALIAS_MAX,
             max_session_expiry_secs: MqttServerConfig::DEFAULT_MAX_SESSION_EXPIRY_SECS,
             max_retained_sessions: MqttServerConfig::DEFAULT_MAX_RETAINED_SESSIONS,
             min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
@@ -106,6 +107,7 @@ impl TestServer {
             topic_prefix: None,
             max_packet_size: 1024 * 1024,
             receive_max: MqttServerConfig::DEFAULT_RECEIVE_MAX,
+            topic_alias_max: MqttServerConfig::DEFAULT_TOPIC_ALIAS_MAX,
             max_session_expiry_secs: MqttServerConfig::DEFAULT_MAX_SESSION_EXPIRY_SECS,
             max_retained_sessions: MqttServerConfig::DEFAULT_MAX_RETAINED_SESSIONS,
             min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
@@ -248,6 +250,13 @@ async fn connect_and_connack() {
                 props.receive_max,
                 Some(MqttServerConfig::DEFAULT_RECEIVE_MAX),
                 "advertised Receive Maximum must match the server's configured value"
+            );
+            assert_eq!(
+                props.topic_alias_max,
+                Some(MqttServerConfig::DEFAULT_TOPIC_ALIAS_MAX),
+                "broker MUST advertise Topic Alias Maximum in CONNACK (§3.2.2.3.8) \
+                 so the client knows whether topic aliases are allowed and what \
+                 the highest accepted alias value is"
             );
             assert_eq!(
                 props.session_expiry_interval,
@@ -983,6 +992,7 @@ async fn connection_limit_rejects_excess() {
         topic_prefix: None,
         max_packet_size: 1024 * 1024,
         receive_max: MqttServerConfig::DEFAULT_RECEIVE_MAX,
+        topic_alias_max: MqttServerConfig::DEFAULT_TOPIC_ALIAS_MAX,
         max_session_expiry_secs: MqttServerConfig::DEFAULT_MAX_SESSION_EXPIRY_SECS,
         max_retained_sessions: MqttServerConfig::DEFAULT_MAX_RETAINED_SESSIONS,
         min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
@@ -1204,6 +1214,7 @@ async fn max_packet_size_rejects_oversized_publish() {
         topic_prefix: None,
         max_packet_size: SERVER_CAP, // Small — CONNECT fits, big PUBLISH won't
         receive_max: MqttServerConfig::DEFAULT_RECEIVE_MAX,
+        topic_alias_max: MqttServerConfig::DEFAULT_TOPIC_ALIAS_MAX,
         max_session_expiry_secs: MqttServerConfig::DEFAULT_MAX_SESSION_EXPIRY_SECS,
         max_retained_sessions: MqttServerConfig::DEFAULT_MAX_RETAINED_SESSIONS,
         min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
@@ -2757,6 +2768,7 @@ fn new_test_server_with_retention(
         topic_prefix: None,
         max_packet_size: 1024 * 1024,
         receive_max: MqttServerConfig::DEFAULT_RECEIVE_MAX,
+        topic_alias_max: MqttServerConfig::DEFAULT_TOPIC_ALIAS_MAX,
         max_session_expiry_secs,
         max_retained_sessions: MqttServerConfig::DEFAULT_MAX_RETAINED_SESSIONS,
         min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
@@ -3005,6 +3017,373 @@ async fn session_retention_clean_start_true_discards_saved_session() {
             );
         }
         other => panic!("expected ConnAck, got {other:?}"),
+    }
+
+    server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// MQTT 5.0 Topic Alias (refs #880; §3.3.2.3.4 + §3.2.2.3.8)
+//
+// When the broker advertises Topic Alias Maximum > 0, clients can:
+//   1. ESTABLISH a mapping: PUBLISH(topic="abc/def", topic_alias=N)
+//   2. REFERENCE the mapping: PUBLISH(topic="", topic_alias=N)
+// Invalid alias values (0, > advertised_max, or unmapped reference)
+// MUST trigger DISCONNECT 0x94 per §3.14.2.1. The default cap is 0
+// (feature off); any inbound alias hits the DISCONNECT path.
+// ---------------------------------------------------------------------------
+
+/// Build a test server with Topic Alias Maximum enabled.
+fn new_test_server_with_topic_alias_max(
+    ca: &TestCa,
+    router: Arc<Router>,
+    topic_alias_max: u16,
+) -> TestServer {
+    let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
+    let tls_config = TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
+        .expect("tls config");
+
+    let listener = MqttListener::bind("127.0.0.1:0".parse().unwrap(), &tls_config).expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let shutdown = Arc::new(Notify::new());
+
+    let config = MqttServerConfig {
+        listener,
+        router: Arc::clone(&router),
+        connection_limit: Arc::new(Semaphore::new(100)),
+        shutdown: Arc::clone(&shutdown),
+        topic_prefix: None,
+        max_packet_size: 1024 * 1024,
+        receive_max: MqttServerConfig::DEFAULT_RECEIVE_MAX,
+        topic_alias_max,
+        max_session_expiry_secs: MqttServerConfig::DEFAULT_MAX_SESSION_EXPIRY_SECS,
+        max_retained_sessions: MqttServerConfig::DEFAULT_MAX_RETAINED_SESSIONS,
+        min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
+        response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
+        wildcard_policy: WildcardPolicy::default(),
+        on_accept: None,
+        on_reject: None,
+        session_hooks: None,
+        forwarding_hooks: None,
+    };
+
+    drop(tokio::spawn(MqttServer::run(config)));
+
+    TestServer {
+        addr,
+        shutdown,
+        router,
+    }
+}
+
+/// Build a v5 PUBLISH carrying a Topic Alias property. Constructed via
+/// the public struct fields because `PublishProperties::_new()` is
+/// private in mqttbytes 0.6 (same constraint as the connect-properties
+/// helpers in the session-retention tests).
+fn build_v5_publish_with_alias(
+    topic: &str,
+    payload: &[u8],
+    topic_alias: u16,
+) -> mqttbytes::v5::Publish {
+    let mut publish = mqttbytes::v5::Publish::new(topic, mqttbytes::QoS::AtMostOnce, payload);
+    publish.properties = Some(mqttbytes::v5::PublishProperties {
+        payload_format_indicator: None,
+        message_expiry_interval: None,
+        topic_alias: Some(topic_alias),
+        response_topic: None,
+        correlation_data: None,
+        user_properties: Vec::new(),
+        subscription_identifiers: Vec::new(),
+        content_type: None,
+    });
+    publish
+}
+
+/// Read the next packet OR return None on stream EOF / parse error
+/// (the alias-invalid path closes the connection so the client sees
+/// either DISCONNECT first then EOF, or just EOF if the cancel-safe
+/// writer-half drop hit before the DISCONNECT made it onto the wire).
+async fn read_v5_packet_or_close(
+    stream: &mut tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+    buf: &mut BytesMut,
+) -> Option<mqttbytes::v5::Packet> {
+    loop {
+        match mqttbytes::v5::read(buf, 1024 * 1024) {
+            Ok(packet) => return Some(packet),
+            Err(mqttbytes::Error::InsufficientBytes(_)) => {}
+            Err(_) => return None,
+        }
+        match stream.read_buf(buf).await {
+            Ok(0) | Err(_) => return None,
+            Ok(_) => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn topic_alias_establish_then_reference_round_trips() {
+    // The headline test: client ESTABLISHES topic="alpha" + alias=1
+    // in one PUBLISH, then REFERENCES alias=1 with empty topic in a
+    // second PUBLISH. Both must reach the subscriber as if they had
+    // been sent with the full topic string. A regression that
+    // dropped the alias table OR didn't consult it on empty-topic
+    // PUBLISHes would silently swallow the second message.
+    let ca = TestCa::new("MQTT Test CA");
+    let pub_cert = ca.issue_client_cert("publisher", &["alpha"]);
+    let sub_cert = ca.issue_client_cert("subscriber", &["alpha"]);
+    let router = Arc::new(Router::new());
+
+    let server = new_test_server_with_topic_alias_max(&ca, router, 16);
+    let pub_tls = build_client_tls_config(&pub_cert.cert_pem, &pub_cert.key_pem, &ca.cert_pem);
+    let sub_tls = build_client_tls_config(&sub_cert.cert_pem, &sub_cert.key_pem, &ca.cert_pem);
+
+    // Subscriber connects + subscribes first.
+    let mut sub_stream = mqtt_connect(server.addr, &sub_tls).await;
+    let mut sub_buf = BytesMut::new();
+    write_v5_packet(
+        &mut sub_stream,
+        &mqttbytes::v5::Packet::Connect(mqttbytes::v5::Connect::new("alias-sub")),
+    )
+    .await;
+    let _ = read_v5_packet(&mut sub_stream, &mut sub_buf).await;
+    write_v5_packet(
+        &mut sub_stream,
+        &mqttbytes::v5::Packet::Subscribe(mqttbytes::v5::Subscribe::new(
+            "alpha",
+            mqttbytes::QoS::AtMostOnce,
+        )),
+    )
+    .await;
+    let _ = read_v5_packet(&mut sub_stream, &mut sub_buf).await;
+
+    // Publisher connects.
+    let mut pub_stream = mqtt_connect(server.addr, &pub_tls).await;
+    let mut pub_buf = BytesMut::new();
+    write_v5_packet(
+        &mut pub_stream,
+        &mqttbytes::v5::Packet::Connect(mqttbytes::v5::Connect::new("alias-pub")),
+    )
+    .await;
+    let _ = read_v5_packet(&mut pub_stream, &mut pub_buf).await;
+
+    // First PUBLISH: ESTABLISH alias=1 → topic="alpha".
+    let establish = build_v5_publish_with_alias("alpha", b"established", 1);
+    write_v5_packet(&mut pub_stream, &mqttbytes::v5::Packet::Publish(establish)).await;
+
+    // Second PUBLISH: REFERENCE alias=1, empty topic.
+    let reference = build_v5_publish_with_alias("", b"referenced", 1);
+    write_v5_packet(&mut pub_stream, &mqttbytes::v5::Packet::Publish(reference)).await;
+
+    // Subscriber receives both, in order, with the resolved topic.
+    for expected_payload in [b"established".as_slice(), b"referenced".as_slice()] {
+        let pkt = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_v5_packet(&mut sub_stream, &mut sub_buf),
+        )
+        .await
+        .expect("subscriber MUST receive both publishes including the alias-only one");
+        match pkt {
+            mqttbytes::v5::Packet::Publish(p) => {
+                assert_eq!(
+                    p.topic, "alpha",
+                    "alias-resolved PUBLISH must carry the established topic name"
+                );
+                assert_eq!(&p.payload[..], expected_payload);
+            }
+            other => panic!("expected Publish, got {other:?}"),
+        }
+    }
+
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn topic_alias_zero_triggers_disconnect_0x94() {
+    // §3.3.2.3.4: alias=0 is reserved and MUST NOT be used. The
+    // broker MUST respond with DISCONNECT 0x94 (TopicAliasInvalid)
+    // before closing — gives the client a structured diagnostic
+    // instead of a bare TCP RST.
+    let ca = TestCa::new("MQTT Test CA");
+    let cert = ca.issue_client_cert("alice", &["alpha"]);
+    let router = Arc::new(Router::new());
+
+    let server = new_test_server_with_topic_alias_max(&ca, router, 16);
+    let tls = build_client_tls_config(&cert.cert_pem, &cert.key_pem, &ca.cert_pem);
+
+    let mut stream = mqtt_connect(server.addr, &tls).await;
+    let mut buf = BytesMut::new();
+    write_v5_packet(
+        &mut stream,
+        &mqttbytes::v5::Packet::Connect(mqttbytes::v5::Connect::new("zero-alias")),
+    )
+    .await;
+    let _ = read_v5_packet(&mut stream, &mut buf).await;
+
+    // PUBLISH with alias=0 — spec-reserved, MUST be rejected.
+    let publish = build_v5_publish_with_alias("alpha", b"bad", 0);
+    write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Publish(publish)).await;
+
+    // Best-effort DISCONNECT 0x94, then close. Same cancel-safety
+    // semantics as #1158's PacketTooLarge path: accept either a
+    // structured DISCONNECT or a clean EOF, reject hung connection.
+    let next = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_v5_packet_or_close(&mut stream, &mut buf),
+    )
+    .await
+    .expect("server must DISCONNECT or close within 2 s");
+    if let Some(mqttbytes::v5::Packet::Disconnect(disc)) = next {
+        assert_eq!(
+            disc.reason_code,
+            mqttbytes::v5::DisconnectReasonCode::TopicAliasInvalid,
+            "structured DISCONNECT MUST carry reason 0x94"
+        );
+    }
+    // None or non-Disconnect (EOF) is the cancel-safety fallback — also acceptable.
+
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn topic_alias_above_max_triggers_disconnect_0x94() {
+    // Cap = 4; client uses alias=99 → out of range → DISCONNECT 0x94.
+    let ca = TestCa::new("MQTT Test CA");
+    let cert = ca.issue_client_cert("alice", &["alpha"]);
+    let router = Arc::new(Router::new());
+
+    let server = new_test_server_with_topic_alias_max(&ca, router, 4);
+    let tls = build_client_tls_config(&cert.cert_pem, &cert.key_pem, &ca.cert_pem);
+
+    let mut stream = mqtt_connect(server.addr, &tls).await;
+    let mut buf = BytesMut::new();
+    write_v5_packet(
+        &mut stream,
+        &mqttbytes::v5::Packet::Connect(mqttbytes::v5::Connect::new("over-cap")),
+    )
+    .await;
+    // Confirm the broker advertised cap=4 in CONNACK.
+    let packet = read_v5_packet(&mut stream, &mut buf).await;
+    if let mqttbytes::v5::Packet::ConnAck(ca) = packet {
+        let props = ca.properties.expect("properties");
+        assert_eq!(props.topic_alias_max, Some(4));
+    } else {
+        panic!("expected ConnAck");
+    }
+
+    let publish = build_v5_publish_with_alias("alpha", b"overcap", 99);
+    write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Publish(publish)).await;
+
+    let next = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_v5_packet_or_close(&mut stream, &mut buf),
+    )
+    .await
+    .expect("server must DISCONNECT or close within 2 s");
+    if let Some(mqttbytes::v5::Packet::Disconnect(disc)) = next {
+        assert_eq!(
+            disc.reason_code,
+            mqttbytes::v5::DisconnectReasonCode::TopicAliasInvalid,
+            "alias > cap must trigger DISCONNECT 0x94"
+        );
+    }
+
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn topic_alias_unmapped_reference_triggers_disconnect_0x94() {
+    // Client REFERENCES alias=3 with empty topic, but never
+    // ESTABLISHED a mapping for it — §3.3.2.3.4 says this is also
+    // a Protocol Error. Without this gate, an empty-topic PUBLISH
+    // would route to the empty group and silently succeed-but-go-nowhere
+    // (or worse, hit a downstream null check and panic).
+    let ca = TestCa::new("MQTT Test CA");
+    let cert = ca.issue_client_cert("alice", &["alpha"]);
+    let router = Arc::new(Router::new());
+
+    let server = new_test_server_with_topic_alias_max(&ca, router, 16);
+    let tls = build_client_tls_config(&cert.cert_pem, &cert.key_pem, &ca.cert_pem);
+
+    let mut stream = mqtt_connect(server.addr, &tls).await;
+    let mut buf = BytesMut::new();
+    write_v5_packet(
+        &mut stream,
+        &mqttbytes::v5::Packet::Connect(mqttbytes::v5::Connect::new("unmapped")),
+    )
+    .await;
+    let _ = read_v5_packet(&mut stream, &mut buf).await;
+
+    // Reference alias=3 with empty topic — never established.
+    let publish = build_v5_publish_with_alias("", b"orphan", 3);
+    write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Publish(publish)).await;
+
+    let next = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_v5_packet_or_close(&mut stream, &mut buf),
+    )
+    .await
+    .expect("server must DISCONNECT or close within 2 s");
+    if let Some(mqttbytes::v5::Packet::Disconnect(disc)) = next {
+        assert_eq!(
+            disc.reason_code,
+            mqttbytes::v5::DisconnectReasonCode::TopicAliasInvalid,
+            "unmapped alias reference must trigger DISCONNECT 0x94"
+        );
+    }
+
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn topic_alias_disabled_by_default_rejects_any_alias() {
+    // Default cap = 0 means topic aliases are OFF. ANY inbound alias
+    // (even alias=1 with a valid topic) MUST be rejected — the broker
+    // didn't advertise the capability. Pin that the default config
+    // doesn't silently accept aliases just because the property is
+    // present in the wire format.
+    let ca = TestCa::new("MQTT Test CA");
+    let cert = ca.issue_client_cert("alice", &["alpha"]);
+    let router = Arc::new(Router::new());
+
+    // Plain TestServer: topic_alias_max defaults to 0.
+    let server = TestServer::new(&ca, router, None);
+    let tls = build_client_tls_config(&cert.cert_pem, &cert.key_pem, &ca.cert_pem);
+
+    let mut stream = mqtt_connect(server.addr, &tls).await;
+    let mut buf = BytesMut::new();
+    write_v5_packet(
+        &mut stream,
+        &mqttbytes::v5::Packet::Connect(mqttbytes::v5::Connect::new("default-off")),
+    )
+    .await;
+    let packet = read_v5_packet(&mut stream, &mut buf).await;
+    if let mqttbytes::v5::Packet::ConnAck(ca) = packet {
+        let props = ca.properties.expect("properties");
+        assert_eq!(
+            props.topic_alias_max,
+            Some(0),
+            "default config MUST advertise topic_alias_max=0 so the client knows aliases are disabled"
+        );
+    } else {
+        panic!("expected ConnAck");
+    }
+
+    // Send a PUBLISH with alias=1 — broker advertised 0, so this is out of range.
+    let publish = build_v5_publish_with_alias("alpha", b"x", 1);
+    write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Publish(publish)).await;
+
+    let next = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_v5_packet_or_close(&mut stream, &mut buf),
+    )
+    .await
+    .expect("server must DISCONNECT or close within 2 s");
+    if let Some(mqttbytes::v5::Packet::Disconnect(disc)) = next {
+        assert_eq!(
+            disc.reason_code,
+            mqttbytes::v5::DisconnectReasonCode::TopicAliasInvalid,
+            "alias on a no-aliases-allowed broker must trigger DISCONNECT 0x94"
+        );
     }
 
     server.shutdown();
