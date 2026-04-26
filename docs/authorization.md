@@ -273,6 +273,241 @@ every step succeeds. A failed reload keeps the previous engine serving
 and emits an `authz.reload_failed` audit event identifying the failing
 stage (`read`, `parse`, or `compile`).
 
+## Reload semantics
+
+The hot-reload path is non-blocking and lock-free on the dataplane hot
+path. Achieving that property — sub-microsecond PEP latency under
+arbitrary reload pressure — requires accepting an explicit
+**eventual-consistency** window between the Send PEP and the Receive
+PEP. Operators authoring policy migrations need to understand the
+window so they can plan around it.
+
+This section is the load-bearing reference for issue
+[#805](https://github.com/rchiofalo/rustgate/issues/805) and the
+IMPROVEMENT-ANALYSIS.md F-14 finding.
+
+### The `ArcSwap` architecture
+
+The router holds the policy engine inside an
+`arc_swap::ArcSwap<Option<Arc<dyn PolicyEngine>>>` (see
+[`Router::authz`](../crates/rustgate-transport/src/router.rs)). Reads
+and writes do not contend:
+
+- **Readers** call `self.authz.load()` and observe whichever engine
+  was installed at the moment of that call. Each PEP site owns its own
+  guard; guards are cheap to acquire and short-lived.
+- **Writers** — `Router::swap_authz` (SIGHUP / file-watcher) and
+  `Router::clear_authz` — call `self.authz.store(Arc::new(...))` once
+  and return immediately. The previous engine `Arc` lives until the
+  last outstanding reader guard drops.
+
+There is no read-write lock. Readers do not block writers; writers do
+not block readers. Two PEP evaluations on the same message arriving
+either side of a `store` will observe two different engines. That is
+the entire surface of the eventual-consistency window — everything
+below is consequences.
+
+### The window in concrete terms
+
+Consider a single message with one direct recipient. The dispatch path
+runs two PEP evaluations: Send PEP in `route_inner`, Receive PEP in
+`send_to_session`. They each call `self.authz.load()` independently:
+
+```text
+t0   route_inner:        guard0 = self.authz.load()      -> policy vN
+t1   Send PEP @ vN:      Allow (obligations from vN)
+t2   apply_obligations:  payload mutated per vN
+t3   <SIGHUP — store(vN+1) — guard0 still holds vN>
+t4   send_to_session:    guard1 = self.authz.load()      -> policy vN+1
+t5   Receive PEP @ vN+1: Allow / Deny / Allow-with-different-obligations
+t6   try_send / drop
+```
+
+For broadcast and group fan-out the same message produces N
+independent Receive PEP evaluations, each with its own `.load()` call
+in `send_to_all` / `send_to_group`. The router does cache the
+broadcast/group authz guard once for the per-recipient loop
+(`send_to_all` snapshots `authz` outside the loop), but a multi-group
+multicast message acquires a fresh guard per group inside
+`send_to_group_excluding`. Across all those guards a SIGHUP can land
+between any two and split the dispatch decisions across two policy
+versions.
+
+The **window length** is bounded by message dispatch time:
+
+- Common case: tens of microseconds (Send PEP → all Receive PEPs land
+  within one async tick).
+- Tail: milliseconds when a recipient channel is near-full and the
+  router has yielded between fan-out iterations.
+- Pathological: bounded only by per-session backpressure timing.
+  Once a delivery enters the persistence path
+  (`persist_for_offline`), the next PEP evaluation runs at drain
+  time, which can be seconds, minutes, or longer after the original
+  Send PEP. The drain path is *not* part of the reload window — it
+  intentionally re-evaluates against current policy on every drain
+  tick (see [Hot-reload and store-and-forward](#hot-reload-and-store-and-forward)
+  below).
+
+### Compound effect on obligations
+
+rustgate **does not snapshot the obligation set at Send time and carry
+it through to Receive**. Each PEP site re-evaluates the engine
+freshly:
+
+- The Send PEP computes its own `outcome.obligations` against the
+  guard loaded in `route_inner`. Send-side obligations
+  (`MaskPoint`, `MaskPayload`) are applied to the owned envelope
+  **before** fan-out, so all recipients in the same dispatch see the
+  Send-side mutation regardless of what their per-recipient PEP
+  decides.
+- The Receive PEP computes its own `outcome.obligations` against the
+  guard loaded in `send_to_session` / `send_to_group` /
+  `send_to_all`, then stacks Receive-side obligations on top of the
+  Send-mutated envelope via
+  [`RoutedMessage::with_obligations`](../crates/rustgate-transport/src/router.rs).
+
+So the operator-visible behavior across a Send-vN, Receive-vN+1 split
+is:
+
+| Policy change | Send-side effect (vN baked in) | Receive-side effect (vN+1 fresh) |
+|---|---|---|
+| vN+1 *removes* `MaskPoint` from a rule | Already applied; coordinates remain zeroed in the delivered payload | Receive PEP under vN+1 does not re-add a mask, but the Send mutation has already happened |
+| vN+1 *adds* `MaskPoint` to a Receive rule | Send under vN did not mask | Receive under vN+1 stacks `MaskPoint` on top — coordinates are zeroed before `try_send` |
+| vN+1 *removes* `TagClassified` | n/a (TagClassified is Receive-only) | Audit record `authz.classified_delivery` is **not** emitted for vN+1 — the new policy wins |
+| vN+1 *flips Allow → Deny* on the recipient | Message already in flight from Send-vN | Receive PEP filters the recipient and emits `authz.denied`; other recipients whose PEP ran under vN may still be delivered |
+
+The conservative interpretation: **Send obligations are committed
+state**, Receive obligations are policy-current. A `MaskPoint` applied
+under vN cannot be undone if the rule is removed in vN+1 — the cleartext
+no longer exists in the in-flight envelope. Conversely, a `MaskPoint`
+added at the Receive layer in vN+1 *will* take effect on every
+recipient evaluated after the swap, even if those recipients are part
+of a fan-out that started under vN.
+
+Per-recipient obligations stack on a *clone* of the Send-side
+`Arc<RoutableMessage>` (`with_obligations` calls `Arc::make_mut` on a
+fresh clone of the envelope), so two recipients of the same broadcast
+seeing different Receive-side obligation sets do not interfere with
+each other.
+
+### Compound effect on group / ACL membership
+
+The legacy `GroupAclPolicy` is held in a parallel `ArcSwap` and
+follows the same reload model — a SIGHUP that swaps both policies
+together is two atomic stores, not one transaction. A message can
+therefore observe the new ACL with the old authz engine, or the new
+authz engine with the old ACL, depending on which `.load()` lands
+first.
+
+Group membership itself is **not** re-evaluated mid-dispatch:
+
+- Membership is derived once from the connecting client's certificate
+  OUs at session establishment and stored on `Identity.groups`.
+- `send_to_group` reads the membership snapshot from the
+  `SessionHandle` map at fan-out time, not from a live ACL or authz
+  re-check.
+- A policy change in vN+1 that *narrows the allowed set of receive
+  groups* takes effect at the Receive PEP for any recipient whose
+  delivery is still pending — but a recipient whose certificate OU is
+  unchanged remains a member of the cached set. Reload does not
+  forcibly disconnect clients whose membership is no longer policy-
+  authorized; the next per-recipient Receive PEP filters them out.
+
+The practical consequence: a reload that tightens group access denies
+*future* deliveries to the affected recipients (correct) without
+disconnecting their sessions (deliberate — operators tune that
+separately via `--authz-fail-open` and connection-policy reloads).
+
+### Hot-reload and store-and-forward
+
+Messages persisted for offline delivery are an explicit *escape* from
+the in-flight reload window. `filter_offline_messages` re-runs both
+PEPs against the current policy snapshot every time a queue is
+drained, so a tightening reload that lands while a recipient is
+offline takes full effect on drain. SA position replay
+(`replay_positions`) follows the same rule: the cached envelope is
+the pre-Send-obligation form, and the Send PEP runs again at replay
+time to actuate whatever obligations the *current* policy requires.
+
+This is the property that lets the cache-store invariants in
+`route_inner` keep the pre-mutation form: a tightening reload that
+lands between ingest and replay is honored, not bypassed.
+
+### Why this is acceptable for tactical use
+
+The alternative to eventual consistency is a router-wide read lock
+held across the whole dispatch path, including the per-recipient
+fan-out loops. That would serialize policy reloads against every
+in-flight message and would either:
+
+- Hold up reloads behind the slowest recipient (latency penalty —
+  unacceptable when policy changes carry security weight), or
+- Hold up dispatch behind reloads (availability penalty —
+  unacceptable on a tactical router whose whole point is liveness).
+
+The eventual-consistency window:
+
+- Is bounded by message dispatch time. For the common case
+  (single-tick fan-out) the window is microseconds.
+- Is fail-closed on the *new* policy for any PEP that runs after the
+  swap — a tightening change is honored on every recipient whose
+  Receive PEP has not yet run.
+- Is conservative on the *old* policy for any side-effect already
+  committed before the swap — Send-side obligations applied under
+  vN remain applied even if vN+1 would not have required them.
+
+For tactical routing this trade is the right one. Liveness wins; the
+window is short; tightening changes propagate strictly forward in
+time across the per-recipient loops.
+
+### Operator guidance
+
+For routine operational reloads:
+
+- **Trigger reloads during low-traffic windows.** A reload landing
+  between active fan-outs has no observable split. `--authz-reload-
+  interval` (default 5s) plus a quiet-window mtime touch is the
+  cleanest pattern.
+- **Correlate reload edges with denial spikes.** The
+  `audit::authz_reload_success` event (`rustgate_core::audit`) emits
+  the new `policy_id` and rule count on a successful swap;
+  `audit::authz_reload_failed` emits the failing stage. Both are
+  hash-chained when the audit log writer is configured for tamper
+  evidence. Plot reload events against
+  `rustgate_authz_decisions_total{decision="deny"}` and any spike
+  immediately after a reload is the in-flight window manifesting.
+- **Use `--authz-fail-open` for deliberate emergency reloads.** When
+  pushing a known-good intermediate policy under time pressure,
+  fail-open ensures a transient parse/compile error during the swap
+  attempt does not collapse traffic. (The default fail-closed mode is
+  still the right choice for steady state.)
+
+For zero-downtime policy migrations:
+
+- **Stage a "compatible-with-both" intermediate policy.** When moving
+  from policy A to policy C, deploy an intermediate B that allows
+  both the old and new shapes. Reload A → B at any time; later
+  reload B → C once all clients have migrated to the new identity
+  shape. This collapses the Send-vN / Receive-vN+1 hazard to a
+  no-op: B accepts whatever A accepted *and* whatever C accepts, so
+  any in-flight split between the reloads is policy-equivalent.
+- **For critical tightening changes, drain first.** If the new
+  policy must *immediately* deny a set of currently-allowed flows
+  with no in-flight overlap, the operator can either (a) disconnect
+  the affected clients before SIGHUP — store-and-forward will
+  re-evaluate on reconnect against the new policy — or (b) flush
+  the position cache and any per-CN store-and-forward queues so the
+  new policy applies cleanly to the next message wave. Both options
+  trade availability for serializability and should be reserved for
+  the cases where strict ordering matters.
+
+The eventual-consistency window is a documented and accepted property
+of the rustgate authz dataplane. Strict serializability is available
+on the persisted paths (store-and-forward, SA replay) — both
+re-evaluate against the current policy on every drain — so a policy
+that is tight enough on the persistence boundary will catch any
+stragglers from an in-flight split.
+
 ## Optional Cedar backend
 
 For operators with an existing Cedar policy corpus, rustgate can be
