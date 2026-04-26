@@ -1426,8 +1426,8 @@ pub(crate) fn start_websocket<P: NatsPublish + Send + Sync + 'static>(
     let ws_session_hooks: Option<rustgate_websocket::WsSessionHooks> = None;
 
     let ws_config = rustgate_websocket::WsListenerConfig {
-        conn_rate_limit: cli.ws_conn_rate_limit,
-        conn_rate_window: std::time::Duration::from_secs(cli.ws_conn_rate_window_secs),
+        conn_rate_limit: cli.ws_rate_limit_max,
+        conn_rate_window: std::time::Duration::from_secs(cli.ws_rate_limit_window_secs),
         max_frame_size: cli.ws_max_frame_size,
         max_message_size: cli.ws_max_message_size,
         supported_subprotocols: cli.ws_subprotocols.clone(),

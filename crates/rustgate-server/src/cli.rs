@@ -543,13 +543,33 @@ pub(crate) struct Cli {
     )]
     pub(crate) ws_max_message_size: usize,
 
-    /// WebSocket connection rate limit: max connections per window.
-    #[arg(long, default_value_t = 10, env = "RUSTGATE_WS_CONN_RATE_LIMIT")]
-    pub(crate) ws_conn_rate_limit: usize,
+    /// WebSocket per-IP connection rate limit: max accepted connections per
+    /// sliding window before further connections from the same peer IP are
+    /// rejected before TLS. Default `10` matches the pre-#756 hard-coded
+    /// behaviour. Production deployments with multi-thousand-peer fleets
+    /// should raise this in tandem with `--ws-rate-limit-window-secs`. The
+    /// legacy long form `--ws-conn-rate-limit` is retained as a visible
+    /// alias so configs from before this PR keep parsing.
+    #[arg(
+        long = "ws-rate-limit-max",
+        visible_alias = "ws-conn-rate-limit",
+        default_value_t = 10,
+        env = "RUSTGATE_WS_RATE_LIMIT_MAX"
+    )]
+    pub(crate) ws_rate_limit_max: usize,
 
-    /// WebSocket connection rate limit window in seconds.
-    #[arg(long, default_value_t = 10, env = "RUSTGATE_WS_CONN_RATE_WINDOW_SECS")]
-    pub(crate) ws_conn_rate_window_secs: u64,
+    /// WebSocket per-IP connection rate-limit window in seconds. Default `10`
+    /// matches the pre-#756 hard-coded behaviour. Tuned in tandem with
+    /// `--ws-rate-limit-max`. The legacy long form
+    /// `--ws-conn-rate-window-secs` is retained as a visible alias so
+    /// configs from before this PR keep parsing.
+    #[arg(
+        long = "ws-rate-limit-window-secs",
+        visible_alias = "ws-conn-rate-window-secs",
+        default_value_t = 10,
+        env = "RUSTGATE_WS_RATE_LIMIT_WINDOW_SECS"
+    )]
+    pub(crate) ws_rate_limit_window_secs: u64,
 
     /// Comma-separated list of WebSocket subprotocol tokens the server
     /// advertises during the upgrade handshake, in server-preference order.
@@ -1670,8 +1690,8 @@ define_config_file! {
     ws_max_write_buffer_bytes: usize,
     ws_max_frame_size: usize,
     ws_max_message_size: usize,
-    ws_conn_rate_limit: usize,
-    ws_conn_rate_window_secs: u64,
+    ws_rate_limit_max: usize,
+    ws_rate_limit_window_secs: u64,
     ws_subprotocols: Vec<String>,
     ws_ping_interval_secs: u64,
     ws_pong_timeout_secs: u64,
@@ -2393,6 +2413,120 @@ mod tests {
             rustgate_websocket::DEFAULT_MAX_WRITE_BUFFER_BYTES,
             "cli.rs default must stay in sync with rustgate_websocket"
         );
+    }
+
+    // ── F-59: --ws-rate-limit-max / --ws-rate-limit-window-secs ───────
+    //
+    // Pin the new canonical flag names introduced for #756, plus the
+    // backward-compat aliases (`--ws-conn-rate-limit`,
+    // `--ws-conn-rate-window-secs`) that #1bec522 shipped before this PR.
+    // Defaults must match the pre-#756 hard-coded constants in
+    // `rustgate_websocket::{DEFAULT_CONN_RATE_LIMIT, DEFAULT_CONN_RATE_WINDOW}`
+    // so deployments that do not set the knobs see no behaviour change.
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn ws_listener_config_default_rate_limit_matches_pre_pr_constants() {
+        // The shipped default in `WsListenerConfig::default()` is the
+        // contract; the CLI default must echo it exactly.
+        let cfg = rustgate_websocket::WsListenerConfig::default();
+        assert_eq!(cfg.conn_rate_limit, 10, "pre-#756 const = 10");
+        assert_eq!(
+            cfg.conn_rate_window,
+            std::time::Duration::from_secs(10),
+            "pre-#756 const = 10s"
+        );
+
+        let cli = Cli::try_parse_from([
+            "rustgate", "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
+        ])
+        .expect("should parse");
+        assert_eq!(cli.ws_rate_limit_max, cfg.conn_rate_limit);
+        assert_eq!(
+            cli.ws_rate_limit_window_secs,
+            cfg.conn_rate_window.as_secs()
+        );
+    }
+
+    #[test]
+    fn ws_listener_config_rate_limit_overridable_via_cli() {
+        // Production deployments (1000-peer fleets) must be able to raise
+        // the cap without recompile. Pin both flags accept overrides.
+        let cli = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--ws-rate-limit-max",
+            "200",
+            "--ws-rate-limit-window-secs",
+            "30",
+        ])
+        .expect("should parse");
+        assert_eq!(cli.ws_rate_limit_max, 200);
+        assert_eq!(cli.ws_rate_limit_window_secs, 30);
+    }
+
+    #[test]
+    fn ws_rate_limit_legacy_aliases_still_parse() {
+        // `--ws-conn-rate-limit` / `--ws-conn-rate-window-secs` are the
+        // pre-#756 names. They are retained as `visible_alias` so configs
+        // baked into ops scripts before this PR keep working.
+        let cli = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--ws-conn-rate-limit",
+            "50",
+            "--ws-conn-rate-window-secs",
+            "20",
+        ])
+        .expect("legacy aliases must still parse");
+        assert_eq!(cli.ws_rate_limit_max, 50);
+        assert_eq!(cli.ws_rate_limit_window_secs, 20);
+    }
+
+    #[test]
+    fn ws_rate_limit_toml_key_overrides_default() {
+        // The TOML key must match the new field name (`ws-rate-limit-max`).
+        // This is the operationally-additive path for deployments that
+        // express rustgate config via a config file rather than flags.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let cert = dir.path().join("c.pem");
+        let key = dir.path().join("k.pem");
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&cert, "").expect("write cert");
+        std::fs::write(&key, "").expect("write key");
+        std::fs::write(&ca, "").expect("write ca");
+
+        let cert_s = cert.to_str().unwrap();
+        let key_s = key.to_str().unwrap();
+        let ca_s = ca.to_str().unwrap();
+
+        let cfg = dir.path().join("ws.toml");
+        std::fs::write(
+            &cfg,
+            format!(
+                "cert = \"{cert_s}\"\nkey = \"{key_s}\"\nca = \"{ca_s}\"\n\
+                 ws-rate-limit-max = 250\nws-rate-limit-window-secs = 45\n"
+            ),
+        )
+        .expect("write");
+
+        let file = load_config_file(cfg.to_str().unwrap()).expect("load");
+        let matches = Cli::command()
+            .get_matches_from(["rustgate", "--cert", cert_s, "--key", key_s, "--ca", ca_s]);
+        let mut cli = Cli::from_arg_matches(&matches).expect("parse");
+        file.apply_to(&mut cli, &matches);
+        assert_eq!(cli.ws_rate_limit_max, 250);
+        assert_eq!(cli.ws_rate_limit_window_secs, 45);
     }
 
     #[test]
