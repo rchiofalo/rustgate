@@ -11,4 +11,5 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+bytes = { workspace = true }
 thiserror = { workspace = true }

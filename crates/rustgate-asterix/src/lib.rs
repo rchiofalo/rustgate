@@ -48,10 +48,13 @@
 //!   (typically address `224.x.x.x` per local ANSP convention) but
 //!   binding the socket and feeding the decoder is the next PR — this
 //!   crate is a pure decode library with no I/O.
-//! - **Encoder direction.** Production rustgate ingests ASTERIX, it does
-//!   not synthesise it. A receive-only codec halves the surface area and
-//!   removes the entire "what time/precision/bit-mask did the upstream
-//!   sender use?" class of interop bugs.
+//! - **Encoder direction (CAT-062, CAT-048).** Production rustgate
+//!   ingests these categories rather than synthesising them. A
+//!   receive-only codec halves the surface area and removes the
+//!   entire "what time/precision/bit-mask did the upstream sender
+//!   use?" class of interop bugs. (CAT-021 has both directions: see
+//!   [`cat021::encode_cat021`] for the forwarding-with-modification
+//!   use-case the ADS-B path needs.)
 //! - **Mapping to `rustgate_core::message::RoutableMessage` / Entity.**
 //!   That belongs in the integration layer (issue #847) so this crate
 //!   stays free of routing concepts. A consumer wires `Cat062Track →
@@ -70,6 +73,8 @@ pub mod cat021;
 pub mod cat048;
 pub mod cat062;
 
-pub use cat021::{Cat021Error, Cat021Report, decode_cat021};
+pub use cat021::{
+    Cat021EncodeError, Cat021Error, Cat021Report, decode_cat021, encode_cat021, encode_cat021_into,
+};
 pub use cat048::{Cat048Error, Cat048Report, PolarPosition, decode_cat048};
 pub use cat062::{Cat062Error, Cat062Track, Mode3aCode, ModeCCode, TrackStatus, decode_cat062};

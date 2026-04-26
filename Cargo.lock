@@ -3159,6 +3159,7 @@ dependencies = [
 name = "rustgate-asterix"
 version = "0.8.0"
 dependencies = [
+ "bytes",
  "thiserror 2.0.18",
 ]
 

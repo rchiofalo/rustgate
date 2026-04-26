@@ -1,6 +1,6 @@
 // Copyright © 2026 Roberto Chiofalo.
 
-//! ASTERIX CAT-021 (ADS-B Reports) decoder.
+//! ASTERIX CAT-021 (ADS-B Reports) codec.
 //!
 //! CAT-021 carries Automatic Dependent Surveillance-Broadcast (ADS-B)
 //! reports — the surveillance broadcasts emitted by every commercial
@@ -15,12 +15,28 @@
 //! extension bits) so the same datablock structure applies — only the
 //! per-FRN field set differs per Eurocontrol's CAT-021 UAP. This
 //! module handles the issue-#1121 minimum-viable subset of fields:
-//! Target Address (the 24-bit ICAO aircraft identifier), Position
-//! WGS-84, Time of Applicability for Position, Flight Level, and
-//! Target Identification (callsign). All other UAP entries are
-//! recognised by length and skipped, so a real-world CAT-021
-//! datablock with any subset of the documented fields decodes
+//! Data Source ID, Target Address (the 24-bit ICAO aircraft
+//! identifier), Position WGS-84, Time of Applicability for Position,
+//! Flight Level, and Target Identification (callsign). All other UAP
+//! entries are recognised by length and skipped, so a real-world
+//! CAT-021 datablock with any subset of the documented fields decodes
 //! cleanly without rejection.
+//!
+//! # Encode direction
+//!
+//! [`encode_cat021`] and [`encode_cat021_into`] re-emit a
+//! [`Cat021Report`] (or a slice of them) as a CAT-021 datablock.
+//! The encoder is the byte-exact inverse of [`decode_cat021`] for the
+//! MVP fields: only the FSPEC bits whose corresponding `Option` field
+//! is `Some(...)` are set, and the field ordering walks FRNs 1..=48 in
+//! ascending order to match the wire UAP. This gives a round-trip
+//! self-stability invariant: a `Cat021Report` decoded from N bytes,
+//! when re-encoded, produces a datablock that decodes back to a
+//! `Cat021Report` with the same `Some(...)` field set. The encoder is
+//! useful for forwarding-with-modification deployments (e.g. masking
+//! the `target_address` before re-broadcasting to a less-privileged
+//! consumer) and for integration tests that need to assert the byte
+//! sequence rustgate would write back to a downstream feed.
 //!
 //! # Spec version
 //!
@@ -48,6 +64,19 @@ const MIN_DATABLOCK_LEN: usize = 4;
 /// subset of the other items depending on the message type.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Cat021Report {
+    /// I021/010 — Data Source Identifier. Two bytes packed as
+    /// (SAC: u8) << 8 | (SIC: u8): the System Area Code identifies
+    /// the geographic / administrative area the source belongs to,
+    /// the System Identification Code identifies the specific
+    /// emitting station within that area. Together they form a
+    /// 16-bit "which sensor produced this report" tag that a fused
+    /// tracker uses to attribute ADS-B reports back to the
+    /// individual ground receivers in a multi-receiver deployment.
+    /// Stored as a packed `u16` so [`encode_cat021`] can re-emit
+    /// the exact two-byte wire pair without losing the SAC/SIC
+    /// boundary; the high byte is SAC, the low byte is SIC.
+    pub data_source_id: Option<u16>,
+
     /// I021/080 — Target Address. The 24-bit ICAO aircraft identifier
     /// (a.k.a. "Mode-S address" or "hex code"). This is the canonical
     /// identifier for an ADS-B-emitting aircraft and persists across
@@ -243,7 +272,7 @@ fn decode_field(
     report: &mut Cat021Report,
 ) -> Result<usize, Cat021Error> {
     match frn {
-        1 => skip_fixed(record, cursor, 2, 10), // I021/010 Data Source ID
+        1 => decode_data_source_id(record, cursor, report),
         2 => skip_extended(record, cursor, 40), // I021/040 Target Report Descriptor
         3 => skip_fixed(record, cursor, 2, 161), // I021/161 Track Number
         4 => skip_fixed(record, cursor, 1, 15), // I021/015 Service ID
@@ -295,6 +324,19 @@ fn decode_field(
 }
 
 // ── Per-field decoders ───────────────────────────────────────────────
+
+fn decode_data_source_id(
+    record: &[u8],
+    cursor: usize,
+    report: &mut Cat021Report,
+) -> Result<usize, Cat021Error> {
+    // I021/010 — fixed 2 bytes, SAC (high) + SIC (low) packed into a
+    // single u16 so the encoder can round-trip the exact wire pair.
+    let bytes = take_fixed(record, cursor, 2, 10)?;
+    let id = (u16::from(bytes[0]) << 8) | u16::from(bytes[1]);
+    report.data_source_id = Some(id);
+    Ok(cursor.saturating_add(2))
+}
 
 fn decode_time_of_day(
     record: &[u8],
@@ -493,6 +535,354 @@ fn take_fixed(record: &[u8], cursor: usize, n: usize, item: u16) -> Result<&[u8]
     Ok(&record[cursor..end])
 }
 
+// ── Encode side ──────────────────────────────────────────────────────
+
+/// CAT-021 encode failure modes. Distinct from [`Cat021Error`] because
+/// encode and decode have non-overlapping failure surfaces: decode
+/// surfaces wire-shape problems (truncated buffers, declared length
+/// vs supplied bytes), encode surfaces *value-domain* problems (a
+/// caller-supplied value that does not fit the wire field's bit width
+/// or alphabet). Keeping them separate means a downstream pipeline
+/// that does decode → mutate → encode can match on exactly the
+/// failure mode that arose without parsing string messages.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum Cat021EncodeError {
+    /// I021/080 Target Address is a 24-bit ICAO field but the type-
+    /// level container is `u32` (no native `u24`). A caller-supplied
+    /// value with any of the high 8 bits set cannot be encoded
+    /// without truncation; surface it as a typed error rather than
+    /// silently masking off the high byte.
+    #[error("I021/080 target address {value:#010x} exceeds 24-bit ICAO field width")]
+    TargetAddressOutOfRange {
+        /// The offending caller-supplied value.
+        value: u32,
+    },
+
+    /// I021/170 Target Identification packs 8 characters of the ICAO
+    /// Annex 10 6-bit alphabet (uppercase A–Z, digits 0–9, space) into
+    /// 6 bytes. A caller-supplied string that is longer than 8
+    /// characters or contains a character outside the alphabet (for
+    /// example a lowercase letter, an accented character, or a hyphen)
+    /// cannot be encoded losslessly; surface it as a typed error so
+    /// the upstream component can decide whether to upper-case, drop,
+    /// or substitute the offending characters.
+    #[error(
+        "I021/170 target identification {value:?} cannot be encoded in ICAO Annex 10 6-bit alphabet ({reason})"
+    )]
+    UnencodableIdentification {
+        /// The offending caller-supplied callsign.
+        value: String,
+        /// Static description of why the value was rejected.
+        reason: &'static str,
+    },
+
+    /// The ASTERIX LEN header is a 16-bit big-endian field; a
+    /// datablock larger than `u16::MAX` (65 535) bytes cannot be
+    /// emitted with a valid length header. The wire-level UDP MTU
+    /// keeps real datablocks well under 1500 bytes, but a caller
+    /// that batches a very large slice of reports into one datablock
+    /// can hit this ceiling — surface it explicitly so the caller
+    /// fragments the slice rather than emit a corrupt header.
+    #[error("ASTERIX datablock would be {len} bytes, exceeds 16-bit LEN field max ({max})")]
+    DatablockTooLarge {
+        /// The would-be datablock byte length.
+        len: usize,
+        /// The maximum representable byte length (`u16::MAX`).
+        max: usize,
+    },
+}
+
+/// Encode a slice of CAT-021 reports as a single ASTERIX datablock.
+///
+/// The output is `[CAT (1 byte = 21)] [LEN (2 bytes BE)] [record_1
+/// FSPEC + fields] [record_2 ...]`. Single-record datablocks are the
+/// typical case but the encoder accepts an arbitrary slice for parity
+/// with [`decode_cat021`]'s multi-record support.
+///
+/// FSPEC bits are set ONLY for fields whose `Option` on the input is
+/// `Some(...)`; fields that are `None` neither set their FSPEC bit
+/// nor occupy bytes in the record. A default `Cat021Report` (all
+/// `None`) emits a record consisting of a single zero FSPEC octet.
+///
+/// # Errors
+///
+/// Returns [`Cat021EncodeError`] on out-of-range field values; see
+/// the error variants for the full list.
+pub fn encode_cat021(reports: &[Cat021Report]) -> Result<Vec<u8>, Cat021EncodeError> {
+    let mut buf = bytes::BytesMut::new();
+    encode_cat021_into(reports, &mut buf)?;
+    Ok(buf.to_vec())
+}
+
+/// Zero-extra-allocation variant of [`encode_cat021`] that appends to
+/// a caller-owned [`bytes::BytesMut`]. Useful for batch encoders that
+/// reuse a single output buffer across many datablocks.
+///
+/// On error the buffer is left in an unspecified state — the caller
+/// should treat the buffer as poisoned and either truncate it back to
+/// the pre-call length (capture `buf.len()` before the call) or drop
+/// it entirely. The output is appended to whatever was already in
+/// `buf`; the encoder does not pre-clear.
+pub fn encode_cat021_into(
+    reports: &[Cat021Report],
+    buf: &mut bytes::BytesMut,
+) -> Result<(), Cat021EncodeError> {
+    use bytes::BufMut;
+
+    let start = buf.len();
+    // Reserve the 3-byte header (CAT + LEN). LEN is patched in once
+    // we know the total size — emitting the records first lets us
+    // avoid a two-pass walk over the report slice.
+    buf.put_u8(CAT_021);
+    buf.put_u8(0);
+    buf.put_u8(0);
+
+    for report in reports {
+        encode_record(report, buf)?;
+    }
+
+    let total = buf.len().saturating_sub(start);
+    if total > usize::from(u16::MAX) {
+        return Err(Cat021EncodeError::DatablockTooLarge {
+            len: total,
+            max: usize::from(u16::MAX),
+        });
+    }
+    let len_bytes = (total as u16).to_be_bytes();
+    buf[start.saturating_add(1)] = len_bytes[0];
+    buf[start.saturating_add(2)] = len_bytes[1];
+    Ok(())
+}
+
+fn encode_record(
+    report: &Cat021Report,
+    buf: &mut bytes::BytesMut,
+) -> Result<(), Cat021EncodeError> {
+    use bytes::BufMut;
+
+    // Walk FRN 1..=48 and collect the FRNs whose `Option` field is
+    // `Some(...)`. The MVP set covers FRNs 1, 5, 6, 11, 21, 29.
+    // Everything else stays `None` for now (decode skips them and
+    // the struct has no field for them); a future extension that
+    // adds (e.g.) Geometric Height as a struct field would also add
+    // its FRN here and a matching arm in `encode_field`.
+    let mut frns: Vec<usize> = Vec::with_capacity(6);
+    if report.data_source_id.is_some() {
+        frns.push(1);
+    }
+    if report.time_of_day_seconds.is_some() {
+        frns.push(5);
+    }
+    if report.position_wgs84.is_some() {
+        frns.push(6);
+    }
+    if report.target_address.is_some() {
+        frns.push(11);
+    }
+    if report.flight_level.is_some() {
+        frns.push(21);
+    }
+    if report.target_identification.is_some() {
+        frns.push(29);
+    }
+
+    let fspec = compute_fspec(&frns);
+    buf.put_slice(&fspec);
+
+    // Emit fields in ascending FRN order so the encoder mirrors
+    // `decode_record`'s walk; a downstream decode then sees fields
+    // in the same order it expects.
+    if let Some(id) = report.data_source_id {
+        buf.put_u16(id);
+    }
+    if let Some(secs) = report.time_of_day_seconds {
+        encode_time_of_day(secs, buf);
+    }
+    if let Some(pos) = report.position_wgs84 {
+        encode_position_wgs84(pos, buf);
+    }
+    if let Some(addr) = report.target_address {
+        encode_target_address(addr, buf)?;
+    }
+    if let Some(fl) = report.flight_level {
+        encode_flight_level(fl, buf);
+    }
+    if let Some(ref id) = report.target_identification {
+        encode_target_identification(id, buf)?;
+    }
+
+    Ok(())
+}
+
+/// Compute the FSPEC octet chain for a set of FRNs, the inverse of
+/// [`parse_fspec`]. The input does not need to be sorted; the output
+/// is the canonical bit pattern with FX bits set on every non-final
+/// octet. An empty input list yields a single `0x00` octet (record
+/// declares no fields).
+fn compute_fspec(frns: &[usize]) -> Vec<u8> {
+    let max_frn = frns.iter().copied().max().unwrap_or(0);
+    let octets_needed = if max_frn == 0 { 1 } else { max_frn.div_ceil(7) };
+    let mut out = vec![0u8; octets_needed];
+    for &frn in frns {
+        if frn == 0 {
+            continue;
+        }
+        let octet = (frn - 1) / 7;
+        let pos_in_octet = (frn - 1) % 7;
+        let bit_shift = 7 - pos_in_octet;
+        if let Some(slot) = out.get_mut(octet) {
+            *slot |= 1 << bit_shift;
+        }
+    }
+    let last = octets_needed.saturating_sub(1);
+    for octet in out.iter_mut().take(last) {
+        *octet |= 0x01;
+    }
+    out
+}
+
+fn encode_time_of_day(seconds: f64, buf: &mut bytes::BytesMut) {
+    use bytes::BufMut;
+    // I021/071 — 3 bytes unsigned 24-bit, LSB = 1/128 s. Saturate
+    // negatives to 0 and overflow to the 24-bit ceiling so a caller
+    // that passes garbage time gets the closest representable wire
+    // value rather than a panic. The decoder only emits values in
+    // `[0.0, 86_400.0)` so a healthy round-trip never exercises the
+    // saturation.
+    let raw_f = (seconds * 128.0).round();
+    let raw = if raw_f.is_nan() || raw_f < 0.0 {
+        0u32
+    } else if raw_f > f64::from(0x00FF_FFFF_u32) {
+        0x00FF_FFFF
+    } else {
+        raw_f as u32
+    };
+    buf.put_u8(((raw >> 16) & 0xFF) as u8);
+    buf.put_u8(((raw >> 8) & 0xFF) as u8);
+    buf.put_u8((raw & 0xFF) as u8);
+}
+
+fn encode_position_wgs84(pos: WgsPosition, buf: &mut bytes::BytesMut) {
+    use bytes::BufMut;
+    // I021/130 — 6 bytes: lat (i24 BE) + lon (i24 BE), LSB = 180 / 2^23 deg.
+    let lsb = 180.0_f64 / f64::from(1u32 << 23);
+    let lat = pack_i24(pos.latitude_deg, lsb);
+    let lon = pack_i24(pos.longitude_deg, lsb);
+    buf.put_u8(((lat >> 16) & 0xFF) as u8);
+    buf.put_u8(((lat >> 8) & 0xFF) as u8);
+    buf.put_u8((lat & 0xFF) as u8);
+    buf.put_u8(((lon >> 16) & 0xFF) as u8);
+    buf.put_u8(((lon >> 8) & 0xFF) as u8);
+    buf.put_u8((lon & 0xFF) as u8);
+}
+
+/// Pack a degrees value into a 24-bit signed integer, the inverse of
+/// the `(i24 << 8) >> 8` decode trick. Values that exceed the i24
+/// range saturate at the i24 endpoints so a NaN / out-of-range input
+/// produces the closest representable wire value rather than a panic.
+fn pack_i24(value_deg: f64, lsb: f64) -> u32 {
+    let raw = (value_deg / lsb).round();
+    let i24_min = -8_388_608_f64;
+    let i24_max = 8_388_607_f64;
+    let clamped = if raw.is_nan() {
+        0
+    } else if raw < i24_min {
+        i24_min as i32
+    } else if raw > i24_max {
+        i24_max as i32
+    } else {
+        raw as i32
+    };
+    // Mask to 24 bits so a negative i32 lays out as two's-complement
+    // i24 in the low 24 bits (the upper byte is discarded by the
+    // wire-byte emit above).
+    (clamped as u32) & 0x00FF_FFFF
+}
+
+fn encode_target_address(addr: u32, buf: &mut bytes::BytesMut) -> Result<(), Cat021EncodeError> {
+    use bytes::BufMut;
+    if addr > 0x00FF_FFFF {
+        return Err(Cat021EncodeError::TargetAddressOutOfRange { value: addr });
+    }
+    buf.put_u8(((addr >> 16) & 0xFF) as u8);
+    buf.put_u8(((addr >> 8) & 0xFF) as u8);
+    buf.put_u8((addr & 0xFF) as u8);
+    Ok(())
+}
+
+fn encode_flight_level(fl: f64, buf: &mut bytes::BytesMut) {
+    use bytes::BufMut;
+    // I021/145 — 2 bytes signed 16-bit BE, LSB = 0.25 FL.
+    let raw_f = (fl / 0.25).round();
+    let i16_min = f64::from(i16::MIN);
+    let i16_max = f64::from(i16::MAX);
+    let clamped = if raw_f.is_nan() {
+        0i16
+    } else if raw_f < i16_min {
+        i16::MIN
+    } else if raw_f > i16_max {
+        i16::MAX
+    } else {
+        raw_f as i16
+    };
+    buf.put_i16(clamped);
+}
+
+fn encode_target_identification(
+    callsign: &str,
+    buf: &mut bytes::BytesMut,
+) -> Result<(), Cat021EncodeError> {
+    use bytes::BufMut;
+    // I021/170 — 6 bytes, 8 chars × 6 bits in ICAO Annex 10 alphabet.
+    if callsign.chars().count() > 8 {
+        return Err(Cat021EncodeError::UnencodableIdentification {
+            value: callsign.to_string(),
+            reason: "longer than 8 characters",
+        });
+    }
+    // Build the 8-char fixed-width buffer: encode each char to its
+    // 6-bit code, pad with the 6-bit space code (0x20) for callsigns
+    // shorter than 8 chars. A failed encode short-circuits with an
+    // unencodable-character error.
+    let mut codes: [u8; 8] = [0x20; 8];
+    for (i, ch) in callsign.chars().enumerate() {
+        codes[i] = encode_icao_6bit_char(ch).ok_or_else(|| {
+            Cat021EncodeError::UnencodableIdentification {
+                value: callsign.to_string(),
+                reason: "character not in ICAO Annex 10 6-bit alphabet (only A-Z, 0-9, space)",
+            }
+        })?;
+    }
+    let bits: u64 = (u64::from(codes[0]) << 42)
+        | (u64::from(codes[1]) << 36)
+        | (u64::from(codes[2]) << 30)
+        | (u64::from(codes[3]) << 24)
+        | (u64::from(codes[4]) << 18)
+        | (u64::from(codes[5]) << 12)
+        | (u64::from(codes[6]) << 6)
+        | u64::from(codes[7]);
+    buf.put_u8(((bits >> 40) & 0xFF) as u8);
+    buf.put_u8(((bits >> 32) & 0xFF) as u8);
+    buf.put_u8(((bits >> 24) & 0xFF) as u8);
+    buf.put_u8(((bits >> 16) & 0xFF) as u8);
+    buf.put_u8(((bits >> 8) & 0xFF) as u8);
+    buf.put_u8((bits & 0xFF) as u8);
+    Ok(())
+}
+
+/// Inverse of [`decode_icao_6bit_char`]. Returns `None` for any
+/// character outside the documented alphabet (uppercase A-Z, digits
+/// 0-9, ASCII space) so the caller can surface a typed
+/// [`Cat021EncodeError::UnencodableIdentification`].
+fn encode_icao_6bit_char(ch: char) -> Option<u8> {
+    match ch {
+        'A'..='Z' => Some(0x01 + (ch as u8 - b'A')),
+        '0'..='9' => Some(0x30 + (ch as u8 - b'0')),
+        ' ' => Some(0x20),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used, unused_results)]
 mod tests {
@@ -598,8 +988,14 @@ mod tests {
         let datablock = build_datablock(&record);
         let reports = decode_cat021(&datablock).expect("decode minimal");
         assert_eq!(reports.len(), 1);
-        // None of our decoded fields should be populated.
-        assert_eq!(reports[0], Cat021Report::default());
+        // Only the data source ID should be populated; every other
+        // decoded field should remain `None` so the round-trip
+        // re-emits exactly FRN 1.
+        let expected = Cat021Report {
+            data_source_id: Some(0x1234),
+            ..Cat021Report::default()
+        };
+        assert_eq!(reports[0], expected);
     }
 
     #[test]
@@ -765,6 +1161,7 @@ mod tests {
         let reports = decode_cat021(&datablock).expect("decode full record");
         assert_eq!(reports.len(), 1);
         let r = &reports[0];
+        assert_eq!(r.data_source_id, Some(0x1234));
         assert_eq!(r.target_address, Some(0x00A1_B2C3));
         assert_eq!(r.time_of_day_seconds, Some(1.0));
         assert!(r.position_wgs84.is_some());
@@ -790,5 +1187,267 @@ mod tests {
             // Either Ok or Err — never panic.
             let _ = decode_cat021(&input);
         }
+    }
+
+    // ── Encoder tests ────────────────────────────────────────────
+
+    #[test]
+    fn encode_minimal_record_round_trips_through_decode() {
+        // Pin: a record carrying only the target address must
+        // re-decode to the same `Some(target_address)` and every
+        // other field must remain `None`. This is the load-bearing
+        // round-trip self-stability invariant — the FSPEC must NOT
+        // accidentally set bits for `None` fields.
+        let report = Cat021Report {
+            target_address: Some(0x00AB_CDEF),
+            ..Cat021Report::default()
+        };
+        let bytes = encode_cat021(std::slice::from_ref(&report)).expect("encode minimal");
+        let decoded = decode_cat021(&bytes).expect("decode roundtrip");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0], report);
+    }
+
+    #[test]
+    fn encode_full_mvp_record_round_trips_through_decode() {
+        // Pin: every MVP field set, encode, decode, equality. This
+        // is the "all six FSPEC bits set" path that exercises the
+        // emit-in-ascending-FRN-order discipline.
+        let report = Cat021Report {
+            data_source_id: Some(0x4201),
+            time_of_day_seconds: Some(1.0),
+            position_wgs84: Some(WgsPosition {
+                latitude_deg: 22.5,
+                longitude_deg: -1.40625,
+            }),
+            target_address: Some(0x00A1_B2C3),
+            flight_level: Some(375.0),
+            target_identification: Some("TEST".to_string()),
+        };
+        let bytes = encode_cat021(std::slice::from_ref(&report)).expect("encode full");
+        let decoded = decode_cat021(&bytes).expect("decode full");
+        assert_eq!(decoded.len(), 1);
+        let r = &decoded[0];
+        assert_eq!(r.data_source_id, Some(0x4201));
+        assert_eq!(r.target_address, Some(0x00A1_B2C3));
+        assert_eq!(r.flight_level, Some(375.0));
+        assert_eq!(r.target_identification.as_deref(), Some("TEST"));
+        assert_eq!(r.time_of_day_seconds, Some(1.0));
+        let pos = r.position_wgs84.expect("position present");
+        let lsb = 180.0_f64 / f64::from(1u32 << 23);
+        assert!((pos.latitude_deg - 22.5).abs() < lsb * 2.0);
+        assert!((pos.longitude_deg - (-1.40625)).abs() < lsb * 2.0);
+    }
+
+    #[test]
+    fn encode_multiple_records_in_one_datablock() {
+        // Pin: a slice of N reports emits a single datablock whose
+        // LEN covers all N records and decodes back to N reports
+        // with the per-record FSPEC bits preserved.
+        let reports = vec![
+            Cat021Report {
+                target_address: Some(0x00_AA_AA_AA),
+                ..Cat021Report::default()
+            },
+            Cat021Report {
+                target_address: Some(0x00_BB_BB_BB),
+                flight_level: Some(100.0),
+                ..Cat021Report::default()
+            },
+            Cat021Report {
+                data_source_id: Some(0x1234),
+                target_address: Some(0x00_CC_CC_CC),
+                ..Cat021Report::default()
+            },
+        ];
+        let bytes = encode_cat021(&reports).expect("encode multi");
+        let decoded = decode_cat021(&bytes).expect("decode multi");
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded[0].target_address, Some(0x00_AA_AA_AA));
+        assert_eq!(decoded[1].target_address, Some(0x00_BB_BB_BB));
+        assert_eq!(decoded[1].flight_level, Some(100.0));
+        assert_eq!(decoded[2].target_address, Some(0x00_CC_CC_CC));
+        assert_eq!(decoded[2].data_source_id, Some(0x1234));
+    }
+
+    #[test]
+    fn encode_fspec_chain_extends_when_high_frn_set() {
+        // FRN 21 (flight_level) sits in the third FSPEC octet
+        // (FRNs 15..=21). Setting only FRN 21 must produce a
+        // 3-octet FSPEC chain: octets 0 and 1 carry FX bits set
+        // (their only purpose is to chain to the next octet),
+        // octet 2 carries the FRN 21 bit and FX clear.
+        let report = Cat021Report {
+            flight_level: Some(0.0),
+            ..Cat021Report::default()
+        };
+        let bytes = encode_cat021(&[report]).expect("encode fl-only");
+        // [CAT][LEN_hi][LEN_lo][fspec0][fspec1][fspec2][fl_hi][fl_lo]
+        assert_eq!(bytes.len(), 3 + 3 + 2);
+        assert_eq!(bytes[0], CAT_021);
+        // Three FSPEC octets at offsets 3..6:
+        let fspec0 = bytes[3];
+        let fspec1 = bytes[4];
+        let fspec2 = bytes[5];
+        assert_eq!(fspec0 & 0x01, 0x01, "FSPEC octet 0 must chain (FX=1)");
+        assert_eq!(fspec1 & 0x01, 0x01, "FSPEC octet 1 must chain (FX=1)");
+        assert_eq!(fspec2 & 0x01, 0x00, "FSPEC octet 2 must terminate (FX=0)");
+        // FRN 21 sits at (21-1) % 7 = 6 → bit shift 7 - 6 = 1.
+        assert_eq!(fspec2 & (1 << 1), 0x02, "FRN 21 bit must be set");
+        // Round-trip must preserve the field.
+        let decoded = decode_cat021(&bytes).expect("decode fl-only");
+        assert_eq!(decoded[0].flight_level, Some(0.0));
+    }
+
+    #[test]
+    fn encode_target_address_out_of_range_returns_err() {
+        // Pin: a value with any of the high 8 bits set is rejected
+        // rather than silently masked. 0x0100_0000 is the smallest
+        // 25-bit value.
+        let report = Cat021Report {
+            target_address: Some(0x0100_0000),
+            ..Cat021Report::default()
+        };
+        let err = encode_cat021(&[report]).expect_err("must reject 25-bit address");
+        assert_eq!(
+            err,
+            Cat021EncodeError::TargetAddressOutOfRange { value: 0x0100_0000 }
+        );
+    }
+
+    #[test]
+    fn encode_unencodable_identification_returns_err() {
+        // Lowercase character — not in the ICAO Annex 10 6-bit alphabet.
+        let report = Cat021Report {
+            target_identification: Some("ual437".to_string()),
+            ..Cat021Report::default()
+        };
+        let err = encode_cat021(&[report]).expect_err("must reject lowercase");
+        match err {
+            Cat021EncodeError::UnencodableIdentification { value, .. } => {
+                assert_eq!(value, "ual437");
+            }
+            other => panic!("expected UnencodableIdentification, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_pads_short_callsign_with_six_bit_space() {
+        // A 4-character callsign must encode to 6 wire bytes
+        // (8 chars × 6 bits) with the trailing 4 slots padded with
+        // the ICAO 6-bit space (0x20). The decoder's
+        // `trim_end()` then strips that padding back out, so the
+        // round-trip yields the original 4-character string with
+        // no trailing spaces.
+        let report = Cat021Report {
+            target_identification: Some("UAL4".to_string()),
+            ..Cat021Report::default()
+        };
+        let bytes = encode_cat021(&[report]).expect("encode short callsign");
+        // [CAT][LEN_hi][LEN_lo][fspec0..4][6 bytes]
+        // FRN 29 → (29-1) / 7 = 4 → octet index 4 → 5 octets
+        // total in the chain (octets 0..=3 chain via FX, octet 4
+        // carries FRN 29 and terminates). Then 6 bytes of callsign.
+        assert_eq!(bytes.len(), 3 + 5 + 6);
+        let decoded = decode_cat021(&bytes).expect("decode short callsign");
+        assert_eq!(
+            decoded[0].target_identification.as_deref(),
+            Some("UAL4"),
+            "padded space must be trimmed by decoder"
+        );
+    }
+
+    #[test]
+    fn encode_record_with_no_fields_set_emits_zero_fspec() {
+        // The default `Cat021Report` (all `None`) must emit a record
+        // consisting of a single 0x00 FSPEC octet with no following
+        // field data. The whole datablock is therefore 4 bytes:
+        // CAT(1) + LEN(2) + FSPEC(1).
+        let report = Cat021Report::default();
+        let bytes = encode_cat021(std::slice::from_ref(&report)).expect("encode empty");
+        assert_eq!(bytes.len(), 4);
+        assert_eq!(bytes[0], CAT_021);
+        assert_eq!(u16::from_be_bytes([bytes[1], bytes[2]]), 4);
+        assert_eq!(bytes[3], 0x00);
+        // Round-trip must preserve the all-`None` shape.
+        let decoded = decode_cat021(&bytes).expect("decode empty");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0], report);
+    }
+
+    #[test]
+    fn encode_position_wgs84_round_trip_preserves_at_lsb_precision() {
+        // Pick a representative tactical-relevant point (San Francisco
+        // Bay area) and assert the round-trip lands within the 1-LSB
+        // precision the wire format is documented to support
+        // (180 / 2^23 deg ≈ 2.145e-5 deg).
+        let lat = 37.5_f64;
+        let lon = -122.5_f64;
+        let report = Cat021Report {
+            position_wgs84: Some(WgsPosition {
+                latitude_deg: lat,
+                longitude_deg: lon,
+            }),
+            ..Cat021Report::default()
+        };
+        let bytes = encode_cat021(&[report]).expect("encode position");
+        let decoded = decode_cat021(&bytes).expect("decode position");
+        let pos = decoded[0].position_wgs84.expect("position present");
+        let lsb = 180.0_f64 / f64::from(1u32 << 23);
+        assert!(
+            (pos.latitude_deg - lat).abs() <= lsb,
+            "lat precision: got {}, expected {} (lsb {})",
+            pos.latitude_deg,
+            lat,
+            lsb
+        );
+        assert!(
+            (pos.longitude_deg - lon).abs() <= lsb,
+            "lon precision: got {}, expected {} (lsb {})",
+            pos.longitude_deg,
+            lon,
+            lsb
+        );
+    }
+
+    #[test]
+    fn decode_data_source_id_now_populated_after_encoder_addition() {
+        // Behaviour-change pin: pre-this-PR, FRN 1 (I021/010 Data
+        // Source ID) was decoded as a length-2 skip — the wire
+        // bytes were consumed but no struct field was populated. As
+        // of this PR, the field is preserved as a packed `u16` so
+        // an encode → decode round-trip is byte-stable. Hand-built
+        // fixture: SAC = 0x42, SIC = 0x07.
+        let mut record = build_fspec(&[1]);
+        record.extend_from_slice(&[0x42, 0x07]);
+        let datablock = build_datablock(&record);
+        let reports = decode_cat021(&datablock).expect("decode data source id");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0].data_source_id,
+            Some(0x4207),
+            "SAC=0x42 + SIC=0x07 must pack as 0x4207"
+        );
+    }
+
+    #[test]
+    fn encode_into_appends_to_existing_buffer() {
+        // The `_into` variant must not pre-clear the caller's
+        // buffer. Pre-populate a `BytesMut` with some bytes, encode
+        // into it, and assert the prefix is preserved while the
+        // datablock is appended after.
+        let mut buf = bytes::BytesMut::new();
+        buf.extend_from_slice(b"PRE");
+        let report = Cat021Report {
+            target_address: Some(0x00_12_34_56),
+            ..Cat021Report::default()
+        };
+        encode_cat021_into(std::slice::from_ref(&report), &mut buf).expect("encode_into ok");
+        assert!(buf.starts_with(b"PRE"), "prefix must be preserved");
+        // The datablock starts at offset 3 (after "PRE").
+        let datablock = &buf[3..];
+        let decoded = decode_cat021(datablock).expect("decode appended datablock");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0], report);
     }
 }
