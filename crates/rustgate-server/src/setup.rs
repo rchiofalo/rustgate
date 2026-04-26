@@ -1005,7 +1005,12 @@ async fn build_federation_config(
         v2_enabled,
         v2_listen_addr,
         peers,
-        max_hops: cli.federation_max_hops,
+        // FederationConfig.max_hops is u32 for backward compat with the V1
+        // outbound metadata path; the CLI `federation_max_hops` is now `u8`
+        // (range 1..=255) since #758, so widen to u32 here. The V2 inbound
+        // service narrows back to u8 inside `FederationManager::start` —
+        // single source of truth, two consumers.
+        max_hops: u32::from(cli.federation_max_hops),
         skip_hostname_verify: cli.federation_skip_hostname_verify,
         cert_file: cli.cert.clone().into(),
         key_file: cli.key.clone().into(),

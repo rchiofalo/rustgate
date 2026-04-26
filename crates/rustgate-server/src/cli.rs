@@ -865,9 +865,21 @@ pub(crate) struct Cli {
     )]
     pub(crate) federation_skip_hostname_verify: bool,
 
-    /// Maximum federation hops before dropping a message (loop prevention).
-    #[arg(long, default_value_t = 10, env = "RUSTGATE_FEDERATION_MAX_HOPS")]
-    pub(crate) federation_max_hops: u32,
+    /// Maximum federation hops before an inbound message is dropped
+    /// (loop prevention). Closes #758. Range is `1..=255`; the default
+    /// of 8 preserves the historical inbound enforcement bound that
+    /// was previously hard-coded in `rustgate-federation::v2::server::
+    /// MAX_FEDERATION_HOPS`. Tactical topologies that need a tighter
+    /// or looser bound (e.g. star-shaped two-hub deployments at
+    /// `max_hops=3`, or multi-region meshes at `max_hops=16`) can
+    /// override here without recompiling.
+    #[arg(
+        long,
+        default_value_t = 8,
+        env = "RUSTGATE_FEDERATION_MAX_HOPS",
+        value_parser = clap::value_parser!(u8).range(1..=255)
+    )]
+    pub(crate) federation_max_hops: u8,
 
     /// Path to persistent federate store (JSON file).
     #[arg(long, env = "RUSTGATE_FEDERATION_STORE_PATH")]
@@ -1815,7 +1827,7 @@ define_config_file! {
     federation_peers_file: Option<String>,
     federation_peers_reload_interval: u64,
     federation_skip_hostname_verify: bool,
-    federation_max_hops: u32,
+    federation_max_hops: u8,
     federation_store_path: Option<String>,
     federation_trust_store_dir: Option<String>,
     federation_circuit_breaker_threshold: u32,
@@ -2307,7 +2319,11 @@ mod tests {
         assert_eq!(cli.federation_id, "rustgate-federation-1");
         assert!(cli.federation_peers_file.is_none());
         assert!(!cli.federation_skip_hostname_verify);
-        assert_eq!(cli.federation_max_hops, 10);
+        // Default is 8, matching the historical hard-coded
+        // MAX_FEDERATION_HOPS that was the inbound enforcement bound
+        // before #758. See `cli_federation_max_hops_default_eight` for
+        // the explicit pin.
+        assert_eq!(cli.federation_max_hops, 8);
         assert!(cli.federation_store_path.is_none());
     }
 
@@ -2335,6 +2351,91 @@ mod tests {
         assert_eq!(cli.federation_v2_bind.as_deref(), Some("0.0.0.0:9001"));
         assert_eq!(cli.federation_id, "my-fed-server");
         assert_eq!(cli.federation_max_hops, 5);
+    }
+
+    /// Pin the new default for `--federation-max-hops` post-#758.
+    /// Before this PR, the CLI defaulted to 10 (only used for V1
+    /// outbound metadata), while the V2 inbound bound was a separate
+    /// hard-coded constant of 8. Aligning the default to 8 unifies
+    /// the two values without changing inbound enforcement behavior.
+    #[test]
+    fn cli_federation_max_hops_default_eight() {
+        let cli = Cli::try_parse_from([
+            "rustgate", "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
+        ])
+        .expect("should parse");
+        assert_eq!(
+            cli.federation_max_hops, 8,
+            "default --federation-max-hops must be 8 (matches MAX_FEDERATION_HOPS)"
+        );
+    }
+
+    /// `--federation-max-hops <N>` must accept overrides in the
+    /// allowed `1..=255` range and round-trip through the parser.
+    #[test]
+    fn cli_federation_max_hops_override() {
+        let cli = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--federation-max-hops",
+            "16",
+        ])
+        .expect("should parse");
+        assert_eq!(cli.federation_max_hops, 16);
+    }
+
+    /// `--federation-max-hops 0` must be rejected at CLI parse time:
+    /// `0` would reject every inbound message (including the first
+    /// hop), breaking federation entirely. The clap value-range
+    /// `1..=255` is the front-line guard; this test guarantees the
+    /// validator is wired and that the failure surfaces at the CLI
+    /// layer rather than deeper in the FederationService builder.
+    #[test]
+    fn cli_federation_max_hops_rejects_zero() {
+        let result = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--federation-max-hops",
+            "0",
+        ]);
+        assert!(
+            result.is_err(),
+            "--federation-max-hops 0 must be rejected by clap (range 1..=255)"
+        );
+    }
+
+    /// `--federation-max-hops` above 255 must be rejected at CLI
+    /// parse time. The narrower `u8` type and the explicit
+    /// `value_parser!(u8).range(1..=255)` together catch operator
+    /// typos (e.g. `1000` instead of `100`) before they propagate
+    /// into the FederationService builder.
+    #[test]
+    fn cli_federation_max_hops_rejects_above_255() {
+        let result = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--federation-max-hops",
+            "256",
+        ]);
+        assert!(
+            result.is_err(),
+            "--federation-max-hops 256 must be rejected by clap (range 1..=255)"
+        );
     }
 
     #[test]

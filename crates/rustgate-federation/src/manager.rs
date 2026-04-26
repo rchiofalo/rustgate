@@ -496,6 +496,18 @@ impl FederationManager {
                 self.config.trust_peer_groups,
             );
 
+            // Closes #758: thread the configured hop limit onto the
+            // V2 inbound service. The wider `FederationConfig.max_hops`
+            // is `u32` (V1 outbound metadata uses it directly), but
+            // the V2 inbound limit is `u8` (range 1..=255). Saturate
+            // at 255 to preserve the operator's intent — a value
+            // above 255 means "effectively unlimited" in tactical
+            // topology terms — and clamp 0 to 1 so a misconfigured
+            // peers file degrades to "first-hop only" rather than
+            // breaking federation entirely. The CLI flag separately
+            // enforces 1..=255 at parse time, so this clamp only
+            // fires for direct API callers.
+            let inbound_max_hops: u8 = u8::try_from(self.config.max_hops).unwrap_or(u8::MAX).max(1);
             let service = crate::v2::server::FederationService::with_limits(
                 self.config.federate_id.clone(),
                 self.config
@@ -508,7 +520,8 @@ impl FederationManager {
                 on_event,
                 self.config.max_groups_per_peer,
                 self.config.max_group_name_length,
-            );
+            )
+            .with_max_hops(inbound_max_hops);
 
             let handle = crate::v2::server::FederationService::start(
                 self.config.v2_listen_addr,
