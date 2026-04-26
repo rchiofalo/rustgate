@@ -2055,7 +2055,27 @@ async fn handle_subscribe_v5(
                 match filter.qos {
                     mqttbytes::QoS::AtMostOnce => mqttbytes::v5::SubscribeReasonCode::QoS0,
                     mqttbytes::QoS::AtLeastOnce => mqttbytes::v5::SubscribeReasonCode::QoS1,
-                    mqttbytes::QoS::ExactlyOnce => unreachable!(),
+                    // QoS 2 SUBSCRIBEs are rejected by the upstream guard
+                    // at the top of this loop with `ImplementationSpecific`
+                    // and a `continue`. Reaching this arm would mean that
+                    // guard has been refactored away — `unreachable!()`
+                    // here would abort the broker in release profile, so
+                    // we degrade gracefully to the spec-defined catch-all
+                    // `Unspecified` (MQTT 5.0 §3.9.3 reason code 0x80 —
+                    // "the subscription is not accepted and the Server
+                    // either does not wish to reveal the reason or none of
+                    // the other Reason Codes apply") and log at debug for
+                    // forensic visibility. Refs #751.
+                    mqttbytes::QoS::ExactlyOnce => {
+                        debug!(
+                            cn = %hash_cn(&identity.cn),
+                            filter = %sanitize_for_log(&filter.path),
+                            "QoS 2 SUBSCRIBE reached post-authorize match arm; \
+                             upstream guard should have rejected — falling through \
+                             with Unspecified reason code"
+                        );
+                        mqttbytes::v5::SubscribeReasonCode::Unspecified
+                    }
                 }
             }
             Err(MqttError::InvalidTopic(_)) => {

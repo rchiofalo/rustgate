@@ -474,6 +474,65 @@ async fn subscribe_to_unauthorized_group_denied() {
     server.shutdown();
 }
 
+/// Pins the SUBSCRIBE-with-QoS-2 fall-through behaviour after #751.
+///
+/// Before the fix, the post-authorize match arm in `handle_subscribe_v5`
+/// terminated with `unreachable!()` — fragile against a refactor that
+/// might remove the upstream `QoS::ExactlyOnce` guard, and would abort
+/// the broker process in release profile if reached. After #751 both
+/// arms (the upstream guard and the post-authorize match) return a
+/// spec-correct SUBACK reason code instead of panicking.
+///
+/// This test exercises the upstream guard (the only path observable
+/// over the wire) and pins the SUBACK reason code so a future
+/// regression that downgrades QoS-2 SUBSCRIBEs to QoS-1 (rather than
+/// rejecting them) trips this assertion. The defensive
+/// `Unspecified` fall-through inside the match arm is exercised
+/// inline by code-review and the comment on the arm — there is no
+/// way to reach it via a real client without removing the upstream
+/// guard first.
+#[tokio::test]
+async fn subscribe_with_qos_exactly_once_returns_implementation_specific() {
+    let ca = TestCa::new("MQTT Test CA");
+    let client_cert = ca.issue_client_cert("alice", &["alpha"]);
+    let router = Arc::new(Router::new());
+
+    let server = TestServer::new(&ca, router, None);
+    let client_tls =
+        build_client_tls_config(&client_cert.cert_pem, &client_cert.key_pem, &ca.cert_pem);
+    let mut stream = mqtt_connect(server.addr, &client_tls).await;
+    let mut buf = BytesMut::new();
+
+    let connect = mqttbytes::v5::Connect::new("sub-qos2");
+    write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Connect(connect)).await;
+    let _ = read_v5_packet(&mut stream, &mut buf).await; // CONNACK
+
+    // SUBSCRIBE to an authorized topic, but request QoS 2 — the broker
+    // does not offer QoS 2 on subscriptions and rejects the filter
+    // with `ImplementationSpecific` (MQTT 5.0 §3.9.3 reason 0x83).
+    // The previously-unreachable arm in `handle_subscribe_v5` would
+    // only fire if this guard were removed; replacing that
+    // `unreachable!()` with a graceful `Unspecified` fall-through is
+    // the #751 fix.
+    let sub = mqttbytes::v5::Subscribe::new("alpha", mqttbytes::QoS::ExactlyOnce);
+    write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Subscribe(sub)).await;
+
+    let packet = read_v5_packet(&mut stream, &mut buf).await;
+    match packet {
+        mqttbytes::v5::Packet::SubAck(suback) => {
+            assert_eq!(
+                suback.return_codes,
+                vec![mqttbytes::v5::SubscribeReasonCode::ImplementationSpecific],
+                "QoS 2 SUBSCRIBE must be rejected with the spec-correct reason \
+                 code, not silently downgraded and not panicking"
+            );
+        }
+        other => panic!("expected SubAck with ImplementationSpecific, got {other:?}"),
+    }
+
+    server.shutdown();
+}
+
 #[tokio::test]
 async fn publish_qos0_routes_to_group() {
     let ca = TestCa::new("MQTT Test CA");
