@@ -178,6 +178,95 @@ async fn echo_prevention_source_protocol() {
     );
 }
 
+/// Regression for #748: a federated message whose `source_protocol` arrives
+/// as `"NATS"` (uppercase) must still be caught by echo prevention. A
+/// case-sensitive `==` check would let this slip through and form a
+/// publish loop with the federated peer.
+#[tokio::test]
+async fn echo_prevention_matches_uppercase_source_protocol() {
+    let server = require_nats!();
+
+    let config = test_config(server.url(), "echo-upper-test");
+    let adapter = NatsAdapter::connect(config).await.expect("connect");
+
+    let raw_client = async_nats::connect(server.url())
+        .await
+        .expect("raw connect");
+    let mut raw_sub = raw_client.subscribe("points.>").await.expect("subscribe");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut msg = position_message("track-upper", "Cyan", 37.0, -122.0);
+    msg.metadata.source_protocol = "NATS".to_string();
+
+    adapter.publisher().publish(&msg).await;
+
+    let result = timeout(Duration::from_secs(2), raw_sub.next()).await;
+    assert!(
+        result.is_err(),
+        "publisher should not emit NATS-sourced messages to NATS regardless of case"
+    );
+}
+
+/// Regression for #748: mixed-case `source_protocol` (e.g. `"Nats"`) must
+/// also be caught by echo prevention.
+#[tokio::test]
+async fn echo_prevention_matches_mixed_case() {
+    let server = require_nats!();
+
+    let config = test_config(server.url(), "echo-mixed-test");
+    let adapter = NatsAdapter::connect(config).await.expect("connect");
+
+    let raw_client = async_nats::connect(server.url())
+        .await
+        .expect("raw connect");
+    let mut raw_sub = raw_client.subscribe("points.>").await.expect("subscribe");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut msg = position_message("track-mixed", "Cyan", 37.0, -122.0);
+    msg.metadata.source_protocol = "Nats".to_string();
+
+    adapter.publisher().publish(&msg).await;
+
+    let result = timeout(Duration::from_secs(2), raw_sub.next()).await;
+    assert!(
+        result.is_err(),
+        "publisher should not emit Nats-sourced messages to NATS regardless of case"
+    );
+}
+
+/// Regression for #748: the case-insensitive echo guard must not over-match
+/// other transports. Messages from MQTT, federation, TCP etc. must still
+/// be republished onto NATS — that is the point of the bridge.
+#[tokio::test]
+async fn echo_prevention_does_not_block_non_nats_sources() {
+    let server = require_nats!();
+
+    let config = test_config(server.url(), "echo-foreign-test");
+    let adapter = NatsAdapter::connect(config).await.expect("connect");
+
+    let raw_client = async_nats::connect(server.url())
+        .await
+        .expect("raw connect");
+    let mut raw_sub = raw_client.subscribe("points.>").await.expect("subscribe");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // A message whose source_protocol contains "nats" only as a substring
+    // (or is something else entirely) must NOT be filtered.
+    let mut msg = position_message("track-mqtt", "Cyan", 37.0, -122.0);
+    msg.metadata.source_protocol = "mqtt".to_string();
+
+    adapter.publisher().publish(&msg).await;
+
+    let result = timeout(Duration::from_secs(5), raw_sub.next()).await;
+    assert!(
+        result.is_ok(),
+        "publisher must republish messages from non-NATS transports to NATS"
+    );
+}
+
 /// Verify that a subscriber ignores messages published by its own instance
 /// (X-Rustgate-Instance header echo prevention).
 #[tokio::test]
