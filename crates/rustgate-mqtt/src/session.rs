@@ -328,6 +328,16 @@ pub(crate) async fn handle_mqtt_session(
         let mut accepted: Vec<crate::session_store::RetainedSubscription> =
             Vec::with_capacity(restored_subscriptions.len());
         for sub in &restored_subscriptions {
+            // Wildcard SUBSCRIBEs leave `group` empty (refs #880 — the
+            // tracker stores the wildcard pattern in `filter` but has
+            // no single group to re-join). Skip restoration for these
+            // entries; the pre-#880 behaviour was to never save
+            // wildcard subs across disconnects, and the post-#880
+            // behaviour preserves that — the tracker just carries the
+            // wildcard for in-session identifier matching.
+            if sub.group.is_empty() {
+                continue;
+            }
             if router
                 .join_group(&identity.cn, session_id, &sub.group)
                 .await
@@ -406,6 +416,7 @@ pub(crate) async fn handle_mqtt_session(
             &mut priority_rx,
             &mut normal_rx,
             &mut resp_rx,
+            &subscriptions,
         ) => SessionEnd::Write(r),
     };
 
@@ -436,6 +447,7 @@ pub(crate) async fn handle_mqtt_session(
             &mut resp_rx,
             &mut priority_rx,
             &mut normal_rx,
+            &subscriptions,
         )
         .await;
     }
@@ -1947,8 +1959,19 @@ async fn handle_subscribe_v5(
     // defined. We send SUBACK first so the client's subscription
     // state is updated before the retained payloads land — this
     // matches Eclipse Mosquitto and HiveMQ behaviour.
-    let mut retained_to_send: Vec<(String, crate::retain::RetainedMessage, mqttbytes::QoS)> =
-        Vec::new();
+    //
+    // The fourth tuple element is the optional Subscription
+    // Identifier (refs #880) of THIS SUBSCRIBE — per §3.3.4.8 the
+    // retained PUBLISHes delivered as a result of a fresh SUBSCRIBE
+    // MUST carry the identifier from that SUBSCRIBE. Stored alongside
+    // the retained payload so the replay loop attaches it on emission
+    // without re-walking the per-session tracker.
+    let mut retained_to_send: Vec<(
+        String,
+        crate::retain::RetainedMessage,
+        mqttbytes::QoS,
+        Option<u32>,
+    )> = Vec::new();
 
     for filter in &sub.filters {
         if filter.qos == mqttbytes::QoS::ExactlyOnce {
@@ -1969,36 +1992,44 @@ async fn handle_subscribe_v5(
         {
             Ok(()) => {
                 fire_subscribe_accept(session_hooks);
-                // Track the resolved group + QoS for session-retention
-                // (refs #880). The save-at-disconnect path snapshots
-                // this list. Resolve the filter to its target group via
-                // the same path try_join_filter just used so the saved
-                // entry matches what the router knows.
-                if let Ok(group) = crate::topic::topic_to_group(&filter.path, topic_prefix) {
-                    let qos_byte: u8 = match filter.qos {
-                        mqttbytes::QoS::AtMostOnce => 0,
-                        mqttbytes::QoS::AtLeastOnce => 1,
-                        mqttbytes::QoS::ExactlyOnce => 2,
-                    };
-                    let mut tracker = subscriptions.lock();
-                    let group_owned = group.into_owned();
-                    if !tracker.iter().any(|s| s.group == group_owned) {
-                        tracker.push(crate::session_store::RetainedSubscription {
-                            group: group_owned,
-                            qos: qos_byte,
-                        });
-                    }
-                }
+                // MQTT 5.0 §3.8.2.1.2 Subscription Identifier — the
+                // OPTIONAL `id` from `SubscribeProperties` (a VBI on
+                // the wire, surfaced as `Option<usize>` by mqttbytes)
+                // must be associated with every subscription created
+                // by THIS SUBSCRIBE so the write loop can echo it back
+                // on matching PUBLISHes per §3.3.4.8. Stored as `u32`
+                // (the spec's max VBI value 268_435_455 fits in a u32);
+                // if a future client sends an ID outside that range
+                // mqttbytes parsing rejects it before reaching here.
+                let sub_id: Option<u32> = sub
+                    .properties
+                    .as_ref()
+                    .and_then(|p| p.id)
+                    .and_then(|id| u32::try_from(id).ok());
+                track_subscription(
+                    subscriptions,
+                    &filter.path,
+                    filter.qos,
+                    topic_prefix,
+                    sub_id,
+                );
                 // Collect retained messages now while the filter is
                 // confirmed-authorised; defer the actual send until
                 // after SUBACK so a slow client back-pressuring the
                 // response channel cannot block the SUBACK itself.
+                //
+                // Pass the subscription identifier through so the
+                // retain-replay PUBLISH carries it per §3.3.4.8 (the
+                // spec is explicit that retained messages delivered as
+                // the result of a new SUBSCRIBE MUST include the
+                // identifier of THAT SUBSCRIBE).
                 collect_retained_for_filter(
                     retain_store,
                     identity,
                     &filter.path,
                     filter.qos,
                     topic_prefix,
+                    sub_id,
                     &mut retained_to_send,
                 );
                 match filter.qos {
@@ -2029,7 +2060,7 @@ async fn handle_subscribe_v5(
     // Deliver retained messages AFTER SUBACK. Each PUBLISH carries
     // `retain=true` on the wire per MQTT 5.0 §3.3.1.3 so the client
     // can distinguish a fresh publication from a retained replay.
-    for (topic, retained, subscriber_qos) in retained_to_send {
+    for (topic, retained, subscriber_qos, sub_id) in retained_to_send {
         // Downgrade publisher's QoS to min(publisher_qos,
         // subscriber_qos) per MQTT 5.0 §3.8.4 ("the QoS of Payload
         // messages sent in response to a Subscription MUST be the
@@ -2039,6 +2070,22 @@ async fn handle_subscribe_v5(
         let mut publish =
             mqttbytes::v5::Publish::from_bytes(topic, effective_qos, retained.payload);
         publish.retain = true;
+        // MQTT 5.0 §3.3.4.8: retained messages delivered as a result
+        // of THIS SUBSCRIBE carry THIS SUBSCRIBE's identifier (when
+        // present). A retained replay triggered by a SUBSCRIBE that
+        // omitted the property gets no identifier (empty Vec, which
+        // is the parser's default — written-vs-omitted are
+        // observationally identical on the wire).
+        if let Some(id) = sub_id
+            && let Ok(id_usize) = usize::try_from(id)
+        {
+            let mut props = publish
+                .properties
+                .take()
+                .unwrap_or_else(empty_publish_properties);
+            props.subscription_identifiers.push(id_usize);
+            publish.properties = Some(props);
+        }
         // Pkid 0 is correct for QoS 0 retained PUBLISHes; for QoS 1
         // we currently rely on the receiver tolerating pkid 0 on a
         // retained replay (the spec allows this when the broker has
@@ -2076,8 +2123,17 @@ async fn handle_subscribe_v4(
     sub: mqttbytes::v4::Subscribe,
 ) -> Result<(), MqttError> {
     let mut return_codes = Vec::with_capacity(sub.filters.len());
-    let mut retained_to_send: Vec<(String, crate::retain::RetainedMessage, mqttbytes::QoS)> =
-        Vec::new();
+    // The fourth tuple element is unused on the v4 wire format (3.1.1
+    // has no Subscription Identifier feature) — but the
+    // `collect_retained_for_filter` helper takes a unified signature
+    // for both protocol versions, so we pass `None` and the v4 retain
+    // replay loop simply ignores it.
+    let mut retained_to_send: Vec<(
+        String,
+        crate::retain::RetainedMessage,
+        mqttbytes::QoS,
+        Option<u32>,
+    )> = Vec::new();
 
     for filter in &sub.filters {
         if filter.qos == mqttbytes::QoS::ExactlyOnce {
@@ -2109,27 +2165,19 @@ async fn handle_subscribe_v4(
                 // bookkeeping is done for symmetry so a future PR
                 // adding v3.1.1 retention doesn't have to revisit
                 // these handlers.
-                if let Ok(group) = crate::topic::topic_to_group(&filter.path, topic_prefix) {
-                    let qos_byte: u8 = match filter.qos {
-                        mqttbytes::QoS::AtMostOnce => 0,
-                        mqttbytes::QoS::AtLeastOnce => 1,
-                        mqttbytes::QoS::ExactlyOnce => 2,
-                    };
-                    let mut tracker = subscriptions.lock();
-                    let group_owned = group.into_owned();
-                    if !tracker.iter().any(|s| s.group == group_owned) {
-                        tracker.push(crate::session_store::RetainedSubscription {
-                            group: group_owned,
-                            qos: qos_byte,
-                        });
-                    }
-                }
+                // v3.1.1 has no Subscription Identifier feature;
+                // pass `None` so the tracker entry's
+                // `subscription_identifier` field is `None` and the
+                // v4 dispatch path stays observationally identical
+                // to its pre-#880 behaviour.
+                track_subscription(subscriptions, &filter.path, filter.qos, topic_prefix, None);
                 collect_retained_for_filter(
                     retain_store,
                     identity,
                     &filter.path,
                     filter.qos,
                     topic_prefix,
+                    None,
                     &mut retained_to_send,
                 );
                 mqttbytes::v4::SubscribeReasonCode::Success(filter.qos)
@@ -2151,7 +2199,13 @@ async fn handle_subscribe_v4(
 
     // Deliver retained messages after SUBACK; see `handle_subscribe_v5`
     // for the rationale on ordering and QoS downgrade.
-    for (topic, retained, subscriber_qos) in retained_to_send {
+    //
+    // The fourth tuple field is the v5 Subscription Identifier — v4
+    // has no such property on the wire, so it is discarded here. The
+    // tuple shape is unified with the v5 path so a future v3.1.1
+    // extension (e.g. via a vendor User Property) doesn't have to
+    // touch the buffer type.
+    for (topic, retained, subscriber_qos, _sub_id) in retained_to_send {
         let effective_qos = min_qos(retained.qos, subscriber_qos);
         let mut publish =
             mqttbytes::v4::Publish::from_bytes(topic, effective_qos, retained.payload);
@@ -2274,22 +2328,111 @@ fn min_qos(a: mqttbytes::QoS, b: mqttbytes::QoS) -> mqttbytes::QoS {
 /// valid group (e.g. a misconfigured prefix change) are skipped
 /// silently — the retain store is best-effort and a stale entry must
 /// not break a fresh SUBSCRIBE.
+/// Push a tracker entry for an accepted SUBSCRIBE filter (refs #880).
+///
+/// Centralises the (group + filter + qos + identifier) bookkeeping
+/// that both `handle_subscribe_v5` and `handle_subscribe_v4` share.
+/// Two distinct stored shapes:
+///
+/// - **Non-wildcard filter** — `topic_to_group` succeeds, so the
+///   tracker entry has both `group` populated (used by the session-
+///   retention save+restore path) and `filter` set to the same value
+///   (used by the write loop's identifier-attachment match).
+/// - **Wildcard filter** — `topic_to_group` rejects the wildcard
+///   characters, so `group` is left as the empty string (the session-
+///   retention path treats empty groups as no-restore-target, matching
+///   the pre-#880 behaviour where wildcard subscriptions did not
+///   round-trip through saved sessions). `filter` carries the
+///   wildcard pattern AFTER the listener's `topic_prefix` is stripped,
+///   so it is comparable directly against destination group names via
+///   `topic::filter_matches`.
+///
+/// Dedup is by `(filter, identifier)` — re-SUBSCRIBE with the same
+/// filter and same identifier is a no-op (the previous entry is
+/// retained), but re-SUBSCRIBE with the same filter and a NEW
+/// identifier creates a new entry so the write loop attaches every
+/// distinct identifier on a matching PUBLISH per §3.3.4.8.
+fn track_subscription(
+    subscriptions: &Arc<parking_lot::Mutex<Vec<crate::session_store::RetainedSubscription>>>,
+    filter_path: &str,
+    qos: mqttbytes::QoS,
+    topic_prefix: Option<&str>,
+    subscription_identifier: Option<u32>,
+) {
+    // Compute the post-strip filter regardless of wildcard status —
+    // the matcher in the write loop runs against destination groups
+    // which are themselves post-strip.
+    let stripped_filter: String = match topic_prefix {
+        Some(pfx) => match filter_path.strip_prefix(pfx) {
+            Some(rest) => rest.to_owned(),
+            // If the prefix is configured but the filter does not
+            // start with it, `try_join_filter` would have already
+            // rejected the SUBSCRIBE — reaching this branch means
+            // accepted-without-prefix-stripping, which only happens
+            // when prefix is `None` (handled in the other arm). For
+            // safety, fall back to the raw path; it just won't match
+            // anything in the post-strip group coordinate space.
+            None => filter_path.to_owned(),
+        },
+        None => filter_path.to_owned(),
+    };
+
+    // For non-wildcard filters, `topic_to_group` re-derives the same
+    // post-strip name and accepts it (the wildcard-validator inside
+    // rejects `+`/`#`). For wildcard filters, `topic_to_group` errors
+    // — we leave `group` empty so the session-retention path skips
+    // restoration of this entry (matching pre-#880 behaviour).
+    let group_owned = match crate::topic::topic_to_group(filter_path, topic_prefix) {
+        Ok(g) => g.into_owned(),
+        Err(_) => String::new(),
+    };
+
+    let qos_byte: u8 = match qos {
+        mqttbytes::QoS::AtMostOnce => 0,
+        mqttbytes::QoS::AtLeastOnce => 1,
+        mqttbytes::QoS::ExactlyOnce => 2,
+    };
+
+    let mut tracker = subscriptions.lock();
+    if !tracker.iter().any(|s| {
+        s.filter == stripped_filter && s.subscription_identifier == subscription_identifier
+    }) {
+        tracker.push(crate::session_store::RetainedSubscription {
+            group: group_owned,
+            qos: qos_byte,
+            subscription_identifier,
+            filter: stripped_filter,
+        });
+    }
+}
+
 fn collect_retained_for_filter(
     retain_store: &RetainStore,
     identity: &Identity,
     filter: &str,
     subscriber_qos: mqttbytes::QoS,
     topic_prefix: Option<&str>,
-    out: &mut Vec<(String, crate::retain::RetainedMessage, mqttbytes::QoS)>,
+    subscription_identifier: Option<u32>,
+    out: &mut Vec<(
+        String,
+        crate::retain::RetainedMessage,
+        mqttbytes::QoS,
+        Option<u32>,
+    )>,
 ) {
     for (topic, msg) in retain_store.matching(filter, topic_prefix) {
         // The auth boundary is the certificate-derived group set, same
         // as for the live PUBLISH path. Stale retained entries whose
         // topic no longer maps to a valid group are skipped — they
         // cannot leak to anyone.
+        //
+        // The subscription identifier rides with each tuple so the
+        // retain-replay loop in `handle_subscribe_v5` can attach it
+        // verbatim (refs §3.3.4.8). v4 callers pass `None` and the
+        // v4 replay loop discards it.
         match topic::topic_to_group(&topic, topic_prefix) {
             Ok(group) if identity.is_member_of(&group) => {
-                out.push((topic, msg, subscriber_qos));
+                out.push((topic, msg, subscriber_qos, subscription_identifier));
             }
             _ => {}
         }
@@ -2329,13 +2472,22 @@ async fn handle_unsubscribe_v5(
         .await
         {
             Ok(_) => {
-                // Drop the resolved-group entry from the retention
-                // tracker so a session-end save (refs #880) doesn't
-                // resurrect a subscription the client just dropped.
-                if let Ok(group) = crate::topic::topic_to_group(filter, topic_prefix) {
-                    let group_owned = group.into_owned();
-                    subscriptions.lock().retain(|s| s.group != group_owned);
-                }
+                // Drop the tracker entry for this filter so a
+                // session-end save (refs #880) doesn't resurrect a
+                // subscription the client just dropped, and so a
+                // subsequent matching PUBLISH no longer attaches the
+                // identifier of an UNSUBSCRIBEd subscription. Match
+                // by `filter` (post-strip) rather than `group` so
+                // wildcard subscriptions — which leave `group` empty
+                // — are also removed.
+                let stripped_filter: String = match topic_prefix {
+                    Some(pfx) => match filter.strip_prefix(pfx) {
+                        Some(rest) => rest.to_owned(),
+                        None => filter.clone(),
+                    },
+                    None => filter.clone(),
+                };
+                subscriptions.lock().retain(|s| s.filter != stripped_filter);
                 mqttbytes::v5::UnsubAckReason::Success
             }
             Err(_) => mqttbytes::v5::UnsubAckReason::TopicFilterInvalid,
@@ -2384,11 +2536,16 @@ async fn handle_unsubscribe_v4(
         .is_ok()
         {
             // See `handle_unsubscribe_v5` for the retention-tracker
-            // rationale (refs #880).
-            if let Ok(group) = crate::topic::topic_to_group(filter, topic_prefix) {
-                let group_owned = group.into_owned();
-                subscriptions.lock().retain(|s| s.group != group_owned);
-            }
+            // rationale (refs #880). Same filter-based match here so
+            // wildcard subscriptions are also dropped.
+            let stripped_filter: String = match topic_prefix {
+                Some(pfx) => match filter.strip_prefix(pfx) {
+                    Some(rest) => rest.to_owned(),
+                    None => filter.clone(),
+                },
+                None => filter.clone(),
+            };
+            subscriptions.lock().retain(|s| s.filter != stripped_filter);
         }
     }
 
@@ -2456,6 +2613,10 @@ async fn leave_filter(
 /// priority routed messages, then normal routed messages. Each message is
 /// written as an MQTT PUBLISH packet on the TLS stream. Terminates when
 /// all channels close.
+///
+/// The `subscriptions` tracker is consulted on every routed-message
+/// write to attach the matching MQTT 5.0 §3.8.2.1.2 Subscription
+/// Identifiers per §3.3.4.8 (refs #880).
 async fn mqtt_write_loop(
     writer: &mut PacketWriter,
     protocol: ProtocolLevel,
@@ -2463,6 +2624,7 @@ async fn mqtt_write_loop(
     priority_rx: &mut mpsc::Receiver<rustgate_transport::RoutedMessage>,
     normal_rx: &mut mpsc::Receiver<rustgate_transport::RoutedMessage>,
     resp_rx: &mut mpsc::Receiver<ResponsePacket>,
+    subscriptions: &Arc<parking_lot::Mutex<Vec<crate::session_store::RetainedSubscription>>>,
 ) -> Result<(), MqttError> {
     let mut priority_open = true;
     let mut normal_open = true;
@@ -2487,7 +2649,7 @@ async fn mqtt_write_loop(
             },
             msg = priority_rx.recv(), if priority_open => match msg {
                 Some(m) => {
-                    write_routed_message(writer, protocol, prefix, &m).await?;
+                    write_routed_message(writer, protocol, prefix, &m, subscriptions).await?;
                 }
                 None => {
                     priority_open = false;
@@ -2495,7 +2657,7 @@ async fn mqtt_write_loop(
             },
             msg = normal_rx.recv(), if normal_open => match msg {
                 Some(m) => {
-                    write_routed_message(writer, protocol, prefix, &m).await?;
+                    write_routed_message(writer, protocol, prefix, &m, subscriptions).await?;
                 }
                 None => {
                     normal_open = false;
@@ -2506,16 +2668,30 @@ async fn mqtt_write_loop(
 }
 
 /// Write a single routed message as an MQTT PUBLISH to the client.
+///
+/// On the v5 path, the per-session `subscriptions` tracker is queried
+/// for matching subscriptions whose Subscription Identifier (set on
+/// SUBSCRIBE per §3.8.2.1.2) MUST be echoed on the outgoing PUBLISH
+/// per §3.3.4.8. All matching identifiers are attached — a single
+/// PUBLISH that satisfies multiple subscriptions on the same session
+/// carries every one of their identifiers.
 async fn write_routed_message(
     writer: &mut PacketWriter,
     protocol: ProtocolLevel,
     prefix: &str,
     msg: &RoutableMessage,
+    subscriptions: &Arc<parking_lot::Mutex<Vec<crate::session_store::RetainedSubscription>>>,
 ) -> Result<(), MqttError> {
     let topic = msg_to_topic(msg, prefix);
 
     let result = match protocol {
         ProtocolLevel::V311 => {
+            // v3.1.1 has no Subscription Identifier feature; the
+            // tracker is intentionally NOT consulted here. A v4
+            // session built with handle_subscribe_v4 always stores
+            // `subscription_identifier = None` so consultation would
+            // be a no-op anyway, but skipping the lookup keeps the
+            // hot path lock-free for v4 traffic.
             let publish = mqttbytes::v4::Publish::from_bytes(
                 topic,
                 mqttbytes::QoS::AtMostOnce,
@@ -2528,11 +2704,12 @@ async fn write_routed_message(
             .await
         }
         ProtocolLevel::V50 => {
-            let publish = mqttbytes::v5::Publish::from_bytes(
+            let mut publish = mqttbytes::v5::Publish::from_bytes(
                 topic,
                 mqttbytes::QoS::AtMostOnce,
                 msg.payload.clone(),
             );
+            attach_subscription_identifiers(&mut publish, msg, subscriptions);
             tokio::time::timeout(
                 WRITE_TIMEOUT,
                 writer.write_v5(&mqttbytes::v5::Packet::Publish(publish)),
@@ -2559,6 +2736,15 @@ async fn write_routed_message(
 
 /// Flush any pending response and routed messages to the client before
 /// disconnecting. Best-effort with bounded draining.
+///
+/// Drained PUBLISHes go through the same `write_routed_message` path
+/// the live loop uses, so subscription-identifier propagation
+/// (refs #880, §3.3.4.8) is preserved through graceful shutdown.
+// justification: flush_pending mirrors mqtt_write_loop one-for-one — same
+// channels + the per-session subscription tracker. Bundling the four channels
+// into a struct would also force the live loop to wrap them, removing a layer
+// of explicit lifetime + Send checks the call sites currently rely on.
+#[allow(clippy::too_many_arguments)]
 async fn flush_pending(
     writer: &mut PacketWriter,
     protocol: ProtocolLevel,
@@ -2566,6 +2752,7 @@ async fn flush_pending(
     resp_rx: &mut mpsc::Receiver<ResponsePacket>,
     priority_rx: &mut mpsc::Receiver<rustgate_transport::RoutedMessage>,
     normal_rx: &mut mpsc::Receiver<rustgate_transport::RoutedMessage>,
+    subscriptions: &Arc<parking_lot::Mutex<Vec<crate::session_store::RetainedSubscription>>>,
 ) {
     let mut flushed = 0u32;
 
@@ -2592,7 +2779,7 @@ async fn flush_pending(
             },
         };
 
-        if write_routed_message(writer, protocol, prefix, &msg)
+        if write_routed_message(writer, protocol, prefix, &msg, subscriptions)
             .await
             .is_ok()
         {
@@ -2604,6 +2791,93 @@ async fn flush_pending(
 
     if flushed > 0 {
         debug!(flushed, "flushed pending messages before disconnect");
+    }
+}
+
+/// MQTT 5.0 §3.3.4.8 + §3.8.2.1.2 (refs #880): attach every matching
+/// subscription's identifier to an outgoing v5 PUBLISH.
+///
+/// "Matching" runs over the per-session subscription tracker keyed
+/// off `filter` (post-prefix-strip), so both exact-topic SUBSCRIBEs
+/// and wildcard SUBSCRIBEs (`+` / `#`) participate. The matcher uses
+/// `topic::filter_matches` — the same level-aware MQTT 5.0 §4.7.1
+/// matcher the SUBSCRIBE/PUBLISH path uses for wildcard expansion.
+///
+/// Destination handling:
+///
+/// - `Destination::Group(g)` is matched against every tracker entry's
+///   `filter` field. A single client may SUBSCRIBE multiple times
+///   with different identifiers; the spec requires ALL matching
+///   identifiers to ride on the PUBLISH (one identifier per matching
+///   subscription).
+/// - `Destination::Direct(_)`, `Destination::Broadcast`, and
+///   `Destination::Multicast(_)` are protocol-internal delivery
+///   shapes that do not flow through normal SUBSCRIBE filters, so no
+///   identifier attribution applies. The PUBLISH still goes out — it
+///   just has no identifiers.
+///
+/// Subscriptions whose `subscription_identifier` is `None` (the v4
+/// path or a v5 SUBSCRIBE that omitted the property) contribute
+/// nothing and are skipped silently.
+///
+/// Lock contention: the per-session tracker is touched on every
+/// PUBLISH delivery, so the critical section is kept short — clone
+/// the matching identifiers into a local `Vec` and release the lock
+/// before mutating the `Publish` properties (the mutation involves
+/// allocations the lock should not cover).
+fn attach_subscription_identifiers(
+    publish: &mut mqttbytes::v5::Publish,
+    msg: &RoutableMessage,
+    subscriptions: &Arc<parking_lot::Mutex<Vec<crate::session_store::RetainedSubscription>>>,
+) {
+    let target_group = match &msg.destination {
+        Destination::Group(g) => g.as_str(),
+        // Direct / Broadcast / Multicast deliveries do not carry
+        // SUBSCRIBE-derived identifiers — no work to do.
+        Destination::Direct(_) | Destination::Broadcast | Destination::Multicast(_) => {
+            return;
+        }
+    };
+
+    let matched_ids: Vec<usize> = {
+        let tracker = subscriptions.lock();
+        tracker
+            .iter()
+            .filter(|s| topic::filter_matches(&s.filter, target_group))
+            .filter_map(|s| s.subscription_identifier)
+            .filter_map(|id| usize::try_from(id).ok())
+            .collect()
+    };
+
+    if matched_ids.is_empty() {
+        return;
+    }
+
+    let mut props = publish
+        .properties
+        .take()
+        .unwrap_or_else(empty_publish_properties);
+    props.subscription_identifiers.extend(matched_ids);
+    publish.properties = Some(props);
+}
+
+/// Construct an empty [`mqttbytes::v5::PublishProperties`].
+///
+/// `mqttbytes 0.6.0`'s `PublishProperties` does not implement
+/// `Default`, so reaching for `unwrap_or_default()` on
+/// `Option<PublishProperties>` does not compile. This helper is the
+/// single source of truth for the explicit-zero shape so a future
+/// upstream revision can be picked up by changing only one site.
+fn empty_publish_properties() -> mqttbytes::v5::PublishProperties {
+    mqttbytes::v5::PublishProperties {
+        payload_format_indicator: None,
+        message_expiry_interval: None,
+        topic_alias: None,
+        response_topic: None,
+        correlation_data: None,
+        user_properties: Vec::new(),
+        subscription_identifiers: Vec::new(),
+        content_type: None,
     }
 }
 

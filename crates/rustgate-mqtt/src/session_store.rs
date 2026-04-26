@@ -58,6 +58,28 @@ pub(crate) struct RetainedSubscription {
     /// `mqttbytes` enum and a future protocol-version migration
     /// stays decoupled.
     pub(crate) qos: u8,
+    /// MQTT 5.0 §3.8.2.1.2 Subscription Identifier — the optional
+    /// numeric ID provided by the subscriber on SUBSCRIBE that the
+    /// broker MUST echo on every matching PUBLISH delivered to this
+    /// session (§3.3.4.8). `None` for v3.1.1 subscribers (no such
+    /// feature) and for v5 subscribers that did not include the
+    /// property. Stored as `u32` even though the wire format is a
+    /// variable-length integer (1..=268_435_455) — the conversion is
+    /// done at the wire boundary in the SUBSCRIBE handler.
+    pub(crate) subscription_identifier: Option<u32>,
+    /// Topic filter as it appears AFTER the listener's
+    /// `topic_prefix` has been stripped (so it is comparable directly
+    /// against destination group names via `topic::filter_matches`).
+    /// For non-wildcard SUBSCRIBEs this equals `group`; for wildcard
+    /// SUBSCRIBEs this carries the original wildcard pattern (e.g.
+    /// `alpha/+` or `+/red`) which `group` cannot capture.
+    ///
+    /// Used by the v5 write loop to identify EVERY tracker entry
+    /// whose filter matches the destination group of an outgoing
+    /// PUBLISH — a single PUBLISH that satisfies multiple
+    /// subscriptions on the same client must carry every matching
+    /// identifier per §3.3.4.8.
+    pub(crate) filter: String,
 }
 
 /// Saved per-client session state.
@@ -239,6 +261,8 @@ mod tests {
             subscriptions: vec![RetainedSubscription {
                 group: "alpha".into(),
                 qos: 1,
+                subscription_identifier: None,
+                filter: "alpha".into(),
             }],
             saved_at: Instant::now() - Duration::from_secs(age_secs),
             expiry_secs: secs,
@@ -265,10 +289,14 @@ mod tests {
                 RetainedSubscription {
                     group: "alpha".into(),
                     qos: 1,
+                    subscription_identifier: None,
+                    filter: "alpha".into(),
                 },
                 RetainedSubscription {
                     group: "bravo".into(),
                     qos: 0,
+                    subscription_identifier: None,
+                    filter: "bravo".into(),
                 },
             ],
             saved_at: Instant::now(),
@@ -339,6 +367,8 @@ mod tests {
             subscriptions: vec![RetainedSubscription {
                 group: "old".into(),
                 qos: 0,
+                subscription_identifier: None,
+                filter: "old".into(),
             }],
             saved_at: Instant::now(),
             expiry_secs: 60,
@@ -347,6 +377,8 @@ mod tests {
             subscriptions: vec![RetainedSubscription {
                 group: "new".into(),
                 qos: 2,
+                subscription_identifier: None,
+                filter: "new".into(),
             }],
             saved_at: Instant::now(),
             expiry_secs: 60,
