@@ -166,6 +166,8 @@ impl PacketCodec {
     pub(crate) async fn write_connack_v5(
         &mut self,
         code: mqttbytes::v5::ConnectReturnCode,
+        session_present: bool,
+        negotiated_session_expiry: u32,
     ) -> Result<(), MqttError> {
         let mut properties = mqttbytes::v5::ConnAckProperties::new();
         // Saturate at u32::MAX rather than refusing to set the property: the
@@ -189,22 +191,23 @@ impl PacketCodec {
         // override the client's CONNECT-time request by advertising a
         // different value here; the client MUST then treat the
         // returned value as authoritative for the duration of this
-        // session. rustgate currently rejects clean_start=0 sessions
-        // outright (via `PersistentSessionUnsupported` upstream of
-        // this code), so the only honest signal to send is `0` —
-        // "session ends when the network connection is closed" per
-        // §4.1. Advertising explicitly (rather than omitting the
-        // property and letting the spec default of 0 apply) gives
-        // the client a positive confirmation that this broker does
-        // not retain sessions, useful when the client has its own
-        // session-resumption logic that depends on a non-zero
-        // server expiry. A future PR that adds session persistence
-        // will compute the value from the client's CONNECT property
-        // bounded by an operator-configured max — the field is here
-        // now so that change becomes a one-line diff.
-        properties.session_expiry_interval = Some(0);
+        // session. The negotiated value is computed by the caller as
+        // `min(client_request, max_session_expiry_secs)` — when the
+        // operator configures `max_session_expiry_secs = 0` (the
+        // default), this is always `0` and rustgate's no-retention
+        // behaviour is preserved (refs #1162). When retention is
+        // enabled, the broker advertises the actual cap so the client
+        // knows when its session will be discarded.
+        properties.session_expiry_interval = Some(negotiated_session_expiry);
         let connack = mqttbytes::v5::ConnAck {
-            session_present: false,
+            // MQTT 5.0 §3.2.2.1.1: Session Present is `true` IFF the
+            // server resumed an existing session for this client_id
+            // (clean_start=0 + matching saved session within expiry
+            // window). On every other path — clean_start=1, fresh
+            // client_id, expired session, retention disabled — the
+            // flag is `false`. The caller computes the value from
+            // the connect_handshake outcome.
+            session_present,
             code,
             properties: Some(properties),
         };

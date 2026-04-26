@@ -171,11 +171,13 @@ pub(crate) async fn handle_mqtt_session(
     topic_prefix: Option<String>,
     max_packet_size: usize,
     receive_max: u16,
+    max_session_expiry_secs: u32,
     min_keep_alive_secs: u16,
     response_channel_capacity: usize,
     wildcard_policy: WildcardPolicy,
     client_id_registry: Arc<ClientIdRegistry>,
     retain_store: Arc<RetainStore>,
+    session_store: Arc<crate::session_store::SessionStore>,
     _permit: OwnedSemaphorePermit,
     session_hooks: Option<crate::config::MqttSessionHooks>,
     forwarding_hooks: Option<crate::config::MqttForwardingHooks>,
@@ -187,10 +189,12 @@ pub(crate) async fn handle_mqtt_session(
     let mut codec = PacketCodec::new(pre.stream, max_packet_size, receive_max);
 
     // --- CONNECT handshake ---
-    let (keep_alive, client_id, will) = match connect_handshake(
+    let outcome = match connect_handshake(
         &mut codec,
         &identity,
         topic_prefix.as_deref(),
+        &session_store,
+        max_session_expiry_secs,
     )
     .await
     {
@@ -200,6 +204,11 @@ pub(crate) async fn handle_mqtt_session(
             return;
         }
     };
+    let keep_alive = outcome.keep_alive;
+    let client_id = outcome.client_id;
+    let will = outcome.will;
+    let restored_subscriptions = outcome.restored_subscriptions;
+    let negotiated_session_expiry = outcome.negotiated_session_expiry;
 
     let protocol = codec.protocol.unwrap_or(ProtocolLevel::V50);
 
@@ -284,6 +293,57 @@ pub(crate) async fn handle_mqtt_session(
         rustgate_core::audit::connection_rejected(peer_addr, "tenant quota exceeded");
         return;
     }
+
+    // Per-session subscription tracker (refs #880 follow-up to #1162).
+    // Updated by SUBSCRIBE/UNSUBSCRIBE handlers as the session runs;
+    // saved to the session_store at session-end if
+    // `negotiated_session_expiry > 0`. Wrapped in a `parking_lot::Mutex`
+    // because it's mutated from `&` references inside async handlers.
+    let subscriptions: Arc<parking_lot::Mutex<Vec<crate::session_store::RetainedSubscription>>> =
+        Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+    // Restore subscriptions from a previously-saved session (set on
+    // CONNECT with clean_start=0 + matching client_id within the
+    // retention window — see `connect_handshake`). Replay the
+    // subscriptions through the same `router.join_group` path a
+    // fresh SUBSCRIBE would take so the session_id-keyed routing
+    // tables match what they would for an interactively-resubscribing
+    // client. Authz was already enforced when the original SUBSCRIBE
+    // was accepted, so we don't re-validate here — the saved set
+    // reflects what was authorized at SUBSCRIBE time, matching the
+    // MQTT 5.0 §4.1 stored-session contract.
+    if !restored_subscriptions.is_empty() {
+        // Re-join each restored group via the router. Done WITHOUT
+        // holding the tracker mutex across the await — the per-call
+        // join_group is async, and parking_lot guards are not Send.
+        // Collect the successful set first, then take the mutex once
+        // to push the entries.
+        let mut accepted: Vec<crate::session_store::RetainedSubscription> =
+            Vec::with_capacity(restored_subscriptions.len());
+        for sub in &restored_subscriptions {
+            if router
+                .join_group(&identity.cn, session_id, &sub.group)
+                .await
+            {
+                accepted.push(sub.clone());
+            } else {
+                debug!(
+                    cn = %hash_cn(&cn),
+                    group = %sanitize_for_log(&sub.group),
+                    "MQTT session-resume: router rejected restored subscription (per-CN cap?)"
+                );
+            }
+        }
+        let restored_count = accepted.len();
+        subscriptions.lock().extend(accepted);
+        debug!(
+            transport = TRANSPORT_LABEL,
+            cn = %hash_cn(&cn),
+            restored = restored_count,
+            "MQTT session subscriptions restored from retention store"
+        );
+    }
+
     for pending in buffered {
         let (msg, audit) = pending.into_parts();
         if handle.send(Arc::new(msg)).await.is_err() {
@@ -315,6 +375,7 @@ pub(crate) async fn handle_mqtt_session(
         session_hooks: session_hooks.as_ref(),
         forwarding_hooks: forwarding_hooks.as_ref(),
         retain_store: &retain_store,
+        subscriptions: &subscriptions,
     };
 
     // Each branch returns a matched type so the `select!` macro can
@@ -407,6 +468,31 @@ pub(crate) async fn handle_mqtt_session(
     // identical for consistency.
     if publish_will && let Some(w) = will.as_ref() {
         publish_will_message(&router, &identity, &retain_store, session_hooks.as_ref(), w).await;
+    }
+
+    // Save the session to the retention store BEFORE unregistering so
+    // the saved subscription set reflects what was actually active at
+    // the moment of disconnect (refs #880 follow-up to #1162). Skipped
+    // when negotiated_session_expiry is 0 (operator opted out OR client
+    // didn't request retention) and when client_id is empty (the spec
+    // permits an empty client_id at CONNECT time but says it MUST be
+    // treated as a clean start with no resumability — §3.1.3.1).
+    if negotiated_session_expiry > 0 && !client_id.is_empty() {
+        let saved_subs = subscriptions.lock().clone();
+        let saved = crate::session_store::RetainedSession {
+            subscriptions: saved_subs,
+            saved_at: std::time::Instant::now(),
+            expiry_secs: negotiated_session_expiry,
+        };
+        let stored = session_store.save(client_id.clone(), saved);
+        debug!(
+            transport = TRANSPORT_LABEL,
+            cn = %hash_cn(&cn),
+            client_id = %sanitize_for_log(&client_id),
+            stored,
+            expiry_secs = negotiated_session_expiry,
+            "MQTT session saved to retention store"
+        );
     }
 
     router.unregister(&cn, session_id).await;
@@ -555,15 +641,45 @@ fn validate_will(
 /// the same authz rules as a live PUBLISH, and sends CONNACK. Returns
 /// the negotiated keep-alive value, the client ID, and the validated
 /// will (if any).
+/// Outcome of a successful CONNECT handshake. Carries the negotiated
+/// keep-alive, client_id, will, plus the session-retention bookkeeping
+/// that downstream code uses to restore subscriptions and decide
+/// whether to save them back at session end (refs #880 follow-up to
+/// #1162 / #1163).
+struct ConnectOutcome {
+    keep_alive: u16,
+    client_id: String,
+    will: Option<Will>,
+    /// Subscriptions restored from a previously-saved session
+    /// (clean_start=0 + matching client_id within retention window).
+    /// Empty when nothing was restored — fresh session or
+    /// retention-disabled deployment.
+    restored_subscriptions: Vec<crate::session_store::RetainedSubscription>,
+    /// Negotiated `Session Expiry Interval` advertised in CONNACK
+    /// per MQTT 5.0 §3.2.2.3.2. Computed as
+    /// `min(client_request, max_session_expiry_secs)`. When `> 0` the
+    /// broker MUST save the session at disconnect for restoration
+    /// within the window. v3.1.1 doesn't have the property; the v4
+    /// path always returns `0`.
+    negotiated_session_expiry: u32,
+}
+
 async fn connect_handshake(
     codec: &mut PacketCodec,
     identity: &Identity,
     topic_prefix: Option<&str>,
-) -> Result<(u16, String, Option<Will>), MqttError> {
+    session_store: &crate::session_store::SessionStore,
+    max_session_expiry_secs: u32,
+) -> Result<ConnectOutcome, MqttError> {
     let packet = codec.read_packet().await?;
 
     match packet {
         MqttPacket::V4(mqttbytes::v4::Packet::Connect(connect)) => {
+            // v3.1.1 retention is intentionally out of scope for this PR.
+            // The v4 protocol has no SessionExpiryInterval, so a clean_session=0
+            // session would persist forever until takeover — different
+            // semantics from v5's TTL-based model and worth a separate PR
+            // with its own test discipline. Continue to reject as before.
             if !connect.clean_session {
                 codec
                     .write_connack_v4(mqttbytes::v4::ConnectReturnCode::RefusedProtocolVersion)
@@ -571,14 +687,6 @@ async fn connect_handshake(
                 return Err(MqttError::PersistentSessionUnsupported);
             }
 
-            // Validate the optional will payload BEFORE accepting the
-            // connection — a will targeting an unauthorised group must
-            // refuse the CONNECT, not silently drop the will at session
-            // end. MQTT 3.1.1 has no dedicated `TopicNameInvalid`
-            // CONNACK code; collapse both topic-syntax errors and
-            // group-membership rejections to `NotAuthorized`, the
-            // closest spec-defined code for an authorization failure
-            // at handshake.
             let will = match connect.last_will.as_ref() {
                 None => None,
                 Some(lw) => match validate_will(
@@ -613,46 +721,81 @@ async fn connect_handshake(
             codec
                 .write_connack_v4(mqttbytes::v4::ConnectReturnCode::Success)
                 .await?;
-            Ok((connect.keep_alive, client_id, will))
+            Ok(ConnectOutcome {
+                keep_alive: connect.keep_alive,
+                client_id,
+                will,
+                restored_subscriptions: Vec::new(),
+                negotiated_session_expiry: 0,
+            })
         }
         MqttPacket::V5(boxed) => {
             if let mqttbytes::v5::Packet::Connect(connect) = *boxed {
-                if !connect.clean_session {
+                let client_id = connect.client_id.clone();
+                let requested_expiry = connect
+                    .properties
+                    .as_ref()
+                    .and_then(|p| p.session_expiry_interval)
+                    .unwrap_or(0);
+                // Negotiation per §3.2.2.3.2: clamp to the operator's max.
+                // u32::MAX in either input means "no cap"; min(MAX, x) = x
+                // and min(y, MAX) = y so the formula handles the spec's
+                // "never expires" sentinel correctly without a special case.
+                let negotiated_expiry = requested_expiry.min(max_session_expiry_secs);
+
+                // §3.1.2.4 clean_start handling combined with retention:
+                // - clean_start=1 + retention enabled + saved entry exists:
+                //   discard the saved entry (server-takeover semantics from
+                //   §3.1.4); start fresh.
+                // - clean_start=0 + retention enabled + saved entry exists:
+                //   restore subscriptions, set session_present=true.
+                // - clean_start=0 + (retention disabled OR no saved entry):
+                //   we cannot honor the resume request. With retention
+                //   disabled we reject as before (#1162 contract). With
+                //   retention enabled but no saved entry, we accept as a
+                //   FRESH session (session_present=false) per §3.1.2.4
+                //   which says the server MAY treat this as a clean start.
+                let mut restored: Vec<crate::session_store::RetainedSubscription> = Vec::new();
+                let mut session_present = false;
+                if connect.clean_session {
+                    // clean_start=1: drop any prior saved state.
+                    if !client_id.is_empty() {
+                        let _ = session_store.take(&client_id);
+                    }
+                } else if !session_store.is_enabled() {
+                    // clean_start=0 + retention OFF — preserve the #1162
+                    // contract: reject explicitly.
                     codec
                         .write_connack_v5(
                             mqttbytes::v5::ConnectReturnCode::ImplementationSpecificError,
+                            false,
+                            0,
                         )
                         .await?;
                     return Err(MqttError::PersistentSessionUnsupported);
-                }
-
-                // MQTT 5.0 §3.1.2.11.2: log when a client requests a
-                // non-zero Session Expiry Interval. rustgate doesn't
-                // retain sessions yet — the broker advertises 0 in
-                // CONNACK to clamp the client's expectation per
-                // §3.2.2.3.2 — but a fleet emitting non-zero values
-                // is the operational signal that "session
-                // persistence" is the next concrete need. The log
-                // line is at debug level (one per CONNECT, low
-                // volume) and uses sanitize_for_log on the client
-                // id so a hostile client_id string can't poison
-                // the log feed.
-                if let Some(props) = connect.properties.as_ref()
-                    && let Some(req) = props.session_expiry_interval
-                    && req != 0
+                } else if !client_id.is_empty()
+                    && let Some(saved) = session_store.take(&client_id)
                 {
                     debug!(
                         cn = %hash_cn(&identity.cn),
-                        client_id = %sanitize_for_log(&connect.client_id),
-                        requested_session_expiry_secs = req,
-                        "client requested non-zero MQTT 5.0 Session Expiry Interval; broker is clamping to 0 (sessions are not retained — refs #880)"
+                        client_id = %sanitize_for_log(&client_id),
+                        restored_subscriptions = saved.subscriptions.len(),
+                        "MQTT v5.0 session resumed from retention store"
+                    );
+                    restored = saved.subscriptions;
+                    session_present = true;
+                }
+
+                if requested_expiry != negotiated_expiry {
+                    debug!(
+                        cn = %hash_cn(&identity.cn),
+                        client_id = %sanitize_for_log(&client_id),
+                        requested_session_expiry_secs = requested_expiry,
+                        negotiated_session_expiry_secs = negotiated_expiry,
+                        "MQTT v5.0 Session Expiry Interval clamped by operator config"
                     );
                 }
 
-                // MQTT 5.0 has dedicated reason codes — distinguish
-                // syntax errors (`TopicNameInvalid`) from authorization
-                // failures (`NotAuthorized`) so the client gets a
-                // precise diagnostic per §3.2.2.2.
                 let will = match connect.last_will.as_ref() {
                     None => None,
                     Some(lw) => match validate_will(
@@ -668,33 +811,49 @@ async fn connect_handshake(
                             codec
                                 .write_connack_v5(
                                     mqttbytes::v5::ConnectReturnCode::TopicNameInvalid,
+                                    false,
+                                    0,
                                 )
                                 .await?;
                             return Err(MqttError::WillRejected(reason));
                         }
                         WillValidation::NotAuthorized(reason) => {
                             codec
-                                .write_connack_v5(mqttbytes::v5::ConnectReturnCode::NotAuthorized)
+                                .write_connack_v5(
+                                    mqttbytes::v5::ConnectReturnCode::NotAuthorized,
+                                    false,
+                                    0,
+                                )
                                 .await?;
                             return Err(MqttError::WillRejected(reason));
                         }
                     },
                 };
 
-                let client_id = connect.client_id.clone();
-
                 debug!(
                     cn = %hash_cn(&identity.cn),
                     client_id = %sanitize_for_log(&client_id),
                     keep_alive = connect.keep_alive,
                     will = will.is_some(),
+                    session_present,
+                    negotiated_session_expiry_secs = negotiated_expiry,
                     "MQTT v5.0 CONNECT accepted"
                 );
 
                 codec
-                    .write_connack_v5(mqttbytes::v5::ConnectReturnCode::Success)
+                    .write_connack_v5(
+                        mqttbytes::v5::ConnectReturnCode::Success,
+                        session_present,
+                        negotiated_expiry,
+                    )
                     .await?;
-                Ok((connect.keep_alive, client_id, will))
+                Ok(ConnectOutcome {
+                    keep_alive: connect.keep_alive,
+                    client_id,
+                    will,
+                    restored_subscriptions: restored,
+                    negotiated_session_expiry: negotiated_expiry,
+                })
             } else {
                 Err(MqttError::ConnectExpected)
             }
@@ -878,6 +1037,11 @@ struct ReadLoopParams<'a> {
     /// task does not own a refcount of its own — the parent handle
     /// outlives the read loop by construction.
     retain_store: &'a RetainStore,
+    /// Per-session subscription tracker (refs #880). SUBSCRIBE handlers
+    /// push successfully-authorized filters; UNSUBSCRIBE handlers
+    /// remove them. The session-end cleanup (in `handle_mqtt_session`)
+    /// snapshots this when saving to the retention store.
+    subscriptions: &'a Arc<parking_lot::Mutex<Vec<crate::session_store::RetainedSubscription>>>,
 }
 
 /// Outcome of the read loop. Used by the caller to decide whether to
@@ -983,6 +1147,7 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<ReadLoopOutco
                         wildcard_policy,
                         session_hooks,
                         retain_store,
+                        params.subscriptions,
                         sub,
                     )
                     .await?;
@@ -995,6 +1160,7 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<ReadLoopOutco
                         session_id,
                         topic_prefix,
                         wildcard_policy,
+                        params.subscriptions,
                         unsub,
                     )
                     .await?;
@@ -1086,6 +1252,7 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<ReadLoopOutco
                         wildcard_policy,
                         session_hooks,
                         retain_store,
+                        params.subscriptions,
                         sub,
                     )
                     .await?;
@@ -1098,6 +1265,7 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<ReadLoopOutco
                         session_id,
                         topic_prefix,
                         wildcard_policy,
+                        params.subscriptions,
                         unsub,
                     )
                     .await?;
@@ -1685,6 +1853,7 @@ async fn handle_subscribe_v5(
     wildcard_policy: WildcardPolicy,
     session_hooks: Option<&crate::config::MqttSessionHooks>,
     retain_store: &RetainStore,
+    subscriptions: &Arc<parking_lot::Mutex<Vec<crate::session_store::RetainedSubscription>>>,
     sub: mqttbytes::v5::Subscribe,
 ) -> Result<(), MqttError> {
     let mut return_codes = Vec::with_capacity(sub.filters.len());
@@ -1717,6 +1886,26 @@ async fn handle_subscribe_v5(
         {
             Ok(()) => {
                 fire_subscribe_accept(session_hooks);
+                // Track the resolved group + QoS for session-retention
+                // (refs #880). The save-at-disconnect path snapshots
+                // this list. Resolve the filter to its target group via
+                // the same path try_join_filter just used so the saved
+                // entry matches what the router knows.
+                if let Ok(group) = crate::topic::topic_to_group(&filter.path, topic_prefix) {
+                    let qos_byte: u8 = match filter.qos {
+                        mqttbytes::QoS::AtMostOnce => 0,
+                        mqttbytes::QoS::AtLeastOnce => 1,
+                        mqttbytes::QoS::ExactlyOnce => 2,
+                    };
+                    let mut tracker = subscriptions.lock();
+                    let group_owned = group.into_owned();
+                    if !tracker.iter().any(|s| s.group == group_owned) {
+                        tracker.push(crate::session_store::RetainedSubscription {
+                            group: group_owned,
+                            qos: qos_byte,
+                        });
+                    }
+                }
                 // Collect retained messages now while the filter is
                 // confirmed-authorised; defer the actual send until
                 // after SUBACK so a slow client back-pressuring the
@@ -1800,6 +1989,7 @@ async fn handle_subscribe_v4(
     wildcard_policy: WildcardPolicy,
     session_hooks: Option<&crate::config::MqttSessionHooks>,
     retain_store: &RetainStore,
+    subscriptions: &Arc<parking_lot::Mutex<Vec<crate::session_store::RetainedSubscription>>>,
     sub: mqttbytes::v4::Subscribe,
 ) -> Result<(), MqttError> {
     let mut return_codes = Vec::with_capacity(sub.filters.len());
@@ -1827,6 +2017,30 @@ async fn handle_subscribe_v4(
         {
             Ok(()) => {
                 fire_subscribe_accept(session_hooks);
+                // See handle_subscribe_v5 for the retention-tracker
+                // rationale (refs #880). v3.1.1 doesn't support
+                // session retention via the new infrastructure (we
+                // continue to reject clean_session=0 outright in
+                // connect_handshake), so the tracker mutation is
+                // operationally a no-op for v4 — but the same
+                // bookkeeping is done for symmetry so a future PR
+                // adding v3.1.1 retention doesn't have to revisit
+                // these handlers.
+                if let Ok(group) = crate::topic::topic_to_group(&filter.path, topic_prefix) {
+                    let qos_byte: u8 = match filter.qos {
+                        mqttbytes::QoS::AtMostOnce => 0,
+                        mqttbytes::QoS::AtLeastOnce => 1,
+                        mqttbytes::QoS::ExactlyOnce => 2,
+                    };
+                    let mut tracker = subscriptions.lock();
+                    let group_owned = group.into_owned();
+                    if !tracker.iter().any(|s| s.group == group_owned) {
+                        tracker.push(crate::session_store::RetainedSubscription {
+                            group: group_owned,
+                            qos: qos_byte,
+                        });
+                    }
+                }
                 collect_retained_for_filter(
                     retain_store,
                     identity,
@@ -2015,6 +2229,7 @@ async fn handle_unsubscribe_v5(
     session_id: u64,
     topic_prefix: Option<&str>,
     wildcard_policy: WildcardPolicy,
+    subscriptions: &Arc<parking_lot::Mutex<Vec<crate::session_store::RetainedSubscription>>>,
     unsub: mqttbytes::v5::Unsubscribe,
 ) -> Result<(), MqttError> {
     let mut reasons = Vec::with_capacity(unsub.filters.len());
@@ -2030,7 +2245,16 @@ async fn handle_unsubscribe_v5(
         )
         .await
         {
-            Ok(_) => mqttbytes::v5::UnsubAckReason::Success,
+            Ok(_) => {
+                // Drop the resolved-group entry from the retention
+                // tracker so a session-end save (refs #880) doesn't
+                // resurrect a subscription the client just dropped.
+                if let Ok(group) = crate::topic::topic_to_group(filter, topic_prefix) {
+                    let group_owned = group.into_owned();
+                    subscriptions.lock().retain(|s| s.group != group_owned);
+                }
+                mqttbytes::v5::UnsubAckReason::Success
+            }
             Err(_) => mqttbytes::v5::UnsubAckReason::TopicFilterInvalid,
         };
         reasons.push(reason);
@@ -2060,11 +2284,12 @@ async fn handle_unsubscribe_v4(
     session_id: u64,
     topic_prefix: Option<&str>,
     wildcard_policy: WildcardPolicy,
+    subscriptions: &Arc<parking_lot::Mutex<Vec<crate::session_store::RetainedSubscription>>>,
     unsub: mqttbytes::v4::Unsubscribe,
 ) -> Result<(), MqttError> {
     for filter in &unsub.topics {
         // MQTT 3.1.1 UNSUBACK has no reason codes — failures are silent.
-        let _ = leave_filter(
+        if leave_filter(
             identity,
             router,
             session_id,
@@ -2072,7 +2297,16 @@ async fn handle_unsubscribe_v4(
             topic_prefix,
             wildcard_policy,
         )
-        .await;
+        .await
+        .is_ok()
+        {
+            // See `handle_unsubscribe_v5` for the retention-tracker
+            // rationale (refs #880).
+            if let Ok(group) = crate::topic::topic_to_group(filter, topic_prefix) {
+                let group_owned = group.into_owned();
+                subscriptions.lock().retain(|s| s.group != group_owned);
+            }
+        }
     }
 
     let unsuback = mqttbytes::v4::UnsubAck { pkid: unsub.pkid };

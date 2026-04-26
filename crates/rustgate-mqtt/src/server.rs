@@ -34,6 +34,8 @@ impl MqttServer {
             topic_prefix,
             max_packet_size,
             receive_max,
+            max_session_expiry_secs,
+            max_retained_sessions,
             min_keep_alive_secs,
             response_channel_capacity,
             wildcard_policy,
@@ -51,9 +53,51 @@ impl MqttServer {
         // spec rather than something a deployment turns on/off.
         let retain_store = RetainStore::new();
 
+        // One session-retention store per server (refs #880 +
+        // follow-up to #1162). When `max_session_expiry_secs == 0`
+        // this is a cheap no-op surface — `is_enabled()` returns
+        // false and every save/take short-circuits — so deployments
+        // that don't enable retention pay near-zero cost. When
+        // enabled, a background reaper task sweeps expired entries
+        // every 30 s so the store doesn't grow without bound between
+        // disconnects and reconnects beyond the configured TTL.
+        let session_store =
+            crate::session_store::SessionStore::new(if max_session_expiry_secs > 0 {
+                max_retained_sessions
+            } else {
+                0
+            });
+        if session_store.is_enabled() {
+            let store_for_reaper = Arc::clone(&session_store);
+            let shutdown_for_reaper = Arc::clone(&shutdown);
+            drop(tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {
+                            let dropped = store_for_reaper.reap_expired();
+                            if dropped > 0 {
+                                info!(
+                                    transport = TRANSPORT_LABEL,
+                                    dropped,
+                                    remaining = store_for_reaper.len(),
+                                    "MQTT session retention reaper sweep",
+                                );
+                            }
+                        }
+                        () = shutdown_for_reaper.notified() => {
+                            break;
+                        }
+                    }
+                }
+            }));
+        }
+
         info!(
             transport = TRANSPORT_LABEL,
             addr = ?listener.local_addr().ok(),
+            session_retention_enabled = session_store.is_enabled(),
             "MQTT server started",
         );
 
@@ -90,6 +134,7 @@ impl MqttServer {
                             let prefix = topic_prefix.clone();
                             let registry = Arc::clone(&client_id_registry);
                             let retain = Arc::clone(&retain_store);
+                            let sessions = Arc::clone(&session_store);
                             let hooks = session_hooks.clone();
                             let forwarding = forwarding_hooks.clone();
                             drop(tokio::spawn(handle_mqtt_session(
@@ -98,11 +143,13 @@ impl MqttServer {
                                 prefix,
                                 max_packet_size,
                                 receive_max,
+                                max_session_expiry_secs,
                                 min_keep_alive_secs,
                                 response_channel_capacity,
                                 wildcard_policy,
                                 registry,
                                 retain,
+                                sessions,
                                 permit,
                                 hooks,
                                 forwarding,
@@ -181,6 +228,8 @@ mod tests {
             topic_prefix: None,
             max_packet_size: MqttServerConfig::DEFAULT_MAX_PACKET_SIZE,
             receive_max: MqttServerConfig::DEFAULT_RECEIVE_MAX,
+            max_session_expiry_secs: MqttServerConfig::DEFAULT_MAX_SESSION_EXPIRY_SECS,
+            max_retained_sessions: MqttServerConfig::DEFAULT_MAX_RETAINED_SESSIONS,
             min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
             response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
             wildcard_policy: WildcardPolicy::default(),
@@ -321,6 +370,8 @@ mod tests {
             topic_prefix: None,
             max_packet_size: MqttServerConfig::DEFAULT_MAX_PACKET_SIZE,
             receive_max: MqttServerConfig::DEFAULT_RECEIVE_MAX,
+            max_session_expiry_secs: MqttServerConfig::DEFAULT_MAX_SESSION_EXPIRY_SECS,
+            max_retained_sessions: MqttServerConfig::DEFAULT_MAX_RETAINED_SESSIONS,
             min_keep_alive_secs: MqttServerConfig::DEFAULT_MIN_KEEP_ALIVE_SECS,
             response_channel_capacity: MqttServerConfig::DEFAULT_RESPONSE_CHANNEL_CAPACITY,
             wildcard_policy: WildcardPolicy::default(),

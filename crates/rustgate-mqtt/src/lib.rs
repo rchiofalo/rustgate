@@ -31,6 +31,7 @@ mod packet;
 mod retain;
 mod server;
 mod session;
+mod session_store;
 mod topic;
 
 /// Canonical value of the `transport` structured-log field emitted by every

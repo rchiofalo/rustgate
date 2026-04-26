@@ -1646,6 +1646,8 @@ pub(crate) fn start_mqtt<P: NatsPublish + Send + Sync + 'static>(
         topic_prefix: cli.mqtt_topic_prefix.clone(),
         max_packet_size: cli.mqtt_max_packet_size,
         receive_max: cli.mqtt_receive_max,
+        max_session_expiry_secs: cli.mqtt_max_session_expiry_secs,
+        max_retained_sessions: cli.mqtt_max_retained_sessions,
         min_keep_alive_secs: cli.mqtt_min_keep_alive_secs,
         response_channel_capacity: cli.mqtt_response_channel_capacity,
         wildcard_policy: cli.mqtt_wildcard_policy.into(),
