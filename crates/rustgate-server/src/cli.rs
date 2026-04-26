@@ -66,6 +66,19 @@ fn parse_nonzero_usize(s: &str) -> Result<usize, String> {
     Ok(n)
 }
 
+/// Validate a positive u64 (must be >= 1).
+///
+/// Used by knobs that express a duration in seconds — zero would mean
+/// "fire the timeout immediately on every connection," which is never
+/// what an operator intends.
+fn parse_nonzero_u64(s: &str) -> Result<u64, String> {
+    let n: u64 = s.parse().map_err(|e| format!("{e}"))?;
+    if n == 0 {
+        return Err("must be at least 1".into());
+    }
+    Ok(n)
+}
+
 /// Minimum write buffer size: 64 KiB.
 const WS_WRITE_BUFFER_MIN: usize = 65_536;
 /// Maximum write buffer size: 64 MiB.
@@ -465,6 +478,31 @@ pub(crate) struct Cli {
     /// wait until a handshake slot becomes available.
     #[arg(long, default_value_t = 100, env = "RUSTGATE_MAX_HANDSHAKES", value_parser = parse_nonzero_usize)]
     pub(crate) max_concurrent_handshakes: usize,
+
+    /// Maximum number of seconds the server will wait for a TAK client
+    /// to complete protocol-version negotiation (the 0xBF-framed
+    /// TakControl request).
+    ///
+    /// Healthy negotiations finish in well under a second. Combined
+    /// with `--max-concurrent-handshakes`, a generous timeout lets a
+    /// mass slow-negotiate attack park every handshake slot for the
+    /// full window. F-65 reduced the default from 30s to 10s; lower it
+    /// further on tactical deployments where every client is on the
+    /// LAN, raise it only when slow links demand it.
+    ///
+    /// The literal default mirrors
+    /// `rustgate_proto::NEGOTIATION_TIMEOUT_DEFAULT_SECS`, which the
+    /// `cli_negotiation_timeout_default_matches_proto_const` test
+    /// asserts when the `proto` feature is on. We keep the literal so
+    /// the CLI compiles on featureless builds where `rustgate-proto`
+    /// is absent from the dependency graph.
+    #[arg(
+        long,
+        default_value_t = 10,
+        env = "RUSTGATE_NEGOTIATION_TIMEOUT_SECS",
+        value_parser = parse_nonzero_u64,
+    )]
+    pub(crate) negotiation_timeout_secs: u64,
 
     /// Global admission-control high-water mark in bytes. The router tracks
     /// total in-flight queued bytes across all sessions; when the counter
@@ -1680,6 +1718,7 @@ define_config_file! {
     max_connections: usize,
     shutdown_drain_timeout: u64,
     max_concurrent_handshakes: usize,
+    negotiation_timeout_secs: u64,
     max_queued_bytes: usize,
     max_queued_bytes_low_water: Option<usize>,
     backpressure_resume_dwell_ms: u64,
@@ -1955,6 +1994,63 @@ mod tests {
         assert_eq!(cli.bind, "0.0.0.0:4433");
         assert_eq!(cli.max_connections, 1024);
         assert_eq!(cli.max_concurrent_handshakes, 100);
+        // F-65: pin the default at 10s so a future change cannot
+        // silently re-introduce the 30s slow-negotiate window.
+        assert_eq!(cli.negotiation_timeout_secs, 10);
+    }
+
+    #[test]
+    fn cli_negotiation_timeout_override() {
+        let cli = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--negotiation-timeout-secs",
+            "5",
+        ])
+        .expect("should parse");
+        assert_eq!(cli.negotiation_timeout_secs, 5);
+    }
+
+    #[test]
+    fn cli_rejects_zero_negotiation_timeout() {
+        // Zero would short-circuit every negotiation and is never the
+        // operator intent; `parse_nonzero_u64` enforces the floor.
+        let result = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--negotiation-timeout-secs",
+            "0",
+        ]);
+        assert!(result.is_err(), "zero timeout must be rejected");
+    }
+
+    #[cfg(feature = "proto")]
+    #[test]
+    fn cli_negotiation_timeout_default_matches_proto_const() {
+        // The CLI carries the literal default `10` so it compiles
+        // without `--features proto`. When `proto` is on, that literal
+        // must agree with `rustgate_proto::NEGOTIATION_TIMEOUT_DEFAULT_SECS`
+        // so a single-source bump in the proto crate is reflected at
+        // the binary surface.
+        let cli = Cli::try_parse_from([
+            "rustgate", "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
+        ])
+        .expect("should parse");
+        assert_eq!(
+            cli.negotiation_timeout_secs,
+            rustgate_proto::NEGOTIATION_TIMEOUT_DEFAULT_SECS,
+            "CLI default must mirror the proto crate's authoritative const",
+        );
     }
 
     #[test]
@@ -2073,6 +2169,7 @@ mod tests {
             "RUSTGATE_METRICS_BIND",
             "RUSTGATE_MAX_CONNECTIONS",
             "RUSTGATE_MAX_HANDSHAKES",
+            "RUSTGATE_NEGOTIATION_TIMEOUT_SECS",
             "RUSTGATE_WEBSOCKET_BIND",
             "RUSTGATE_WS_MAX_FRAMES_PER_SEC",
             "RUSTGATE_WS_MAX_BYTES_PER_SEC",

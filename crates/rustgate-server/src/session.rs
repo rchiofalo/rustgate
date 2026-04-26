@@ -90,6 +90,18 @@ pub(crate) struct SessionDeps<P: NatsPublish> {
     pub(crate) circuit_breaker_threshold: u32,
     /// Optional per-session CoT delta encoding for outbound XML sessions.
     pub(crate) delta_config: DeltaConfig,
+    /// Maximum time to wait for a TAK client to complete protocol
+    /// negotiation. Sourced from the CLI/env (F-65). Only consulted
+    /// under `#[cfg(feature = "proto")]`; carried unconditionally so
+    /// the struct shape is feature-stable across builds.
+    // justification: only read inside the `#[cfg(feature = "proto")]`
+    // negotiation branch in `handle_session`. Featureless builds still
+    // construct the field at the call site (single source of truth for
+    // the CLI knob), but never consume it; gating the field would
+    // force conditional initialisation in `main.rs` and lose that
+    // single-source guarantee.
+    #[allow(dead_code)]
+    pub(crate) negotiation_timeout: std::time::Duration,
     /// Per-identity metrics configuration: allowlist for label
     /// bucketing plus the Tier 2 enable flag.
     #[cfg(feature = "metrics")]
@@ -218,7 +230,9 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
     let (final_codec, read_buf): (Arc<dyn Codec>, _) = match deps.framing {
         #[cfg(feature = "proto")]
         Framing::TakNegotiate => {
-            match negotiate_tak_protocol(&mut reader, &mut writer, &cn).await {
+            match negotiate_tak_protocol(&mut reader, &mut writer, &cn, deps.negotiation_timeout)
+                .await
+            {
                 Ok((codec, buf)) => {
                     let protocol = codec.protocol_id();
                     #[cfg(feature = "metrics")]
@@ -309,13 +323,20 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
 /// client's response. If 0xBF (protobuf magic), completes the handshake and
 /// upgrades to protobuf. Otherwise, stays XML.
 ///
+/// `negotiation_timeout` bounds the read of the protobuf TakControl
+/// frame after the magic byte is observed. F-65 wired this through so
+/// operators can shrink the slow-negotiate window below the legacy 30s
+/// without recompiling.
+///
 /// Returns the negotiated codec and any buffered read bytes.
 #[cfg(feature = "proto")]
 async fn negotiate_tak_protocol(
     reader: &mut rustgate_transport::SessionReader,
     writer: &mut rustgate_transport::SessionWriter,
     cn: &str,
+    negotiation_timeout: std::time::Duration,
 ) -> std::io::Result<(Arc<dyn Codec>, tokio_util::bytes::BytesMut)> {
+    use rustgate_core::sanitize::sanitize_for_log;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_util::bytes::BufMut;
 
@@ -341,7 +362,26 @@ async fn negotiate_tak_protocol(
     if peek[0] == 0xBF {
         // Client is requesting protobuf upgrade.
         // Magic byte already consumed; read_tak_request handles varint + payload + validation.
-        let version = rustgate_proto::read_tak_request(reader).await?;
+        let version = match rustgate_proto::read_tak_request_with_timeout(
+            reader,
+            negotiation_timeout,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                // F-64: surface a sanitized rejection trail. The CN is
+                // user-controlled (cert subject), so route it through
+                // `sanitize_for_log` to neutralize CR/LF log-forging
+                // before it lands in the structured field.
+                tracing::warn!(
+                    cn = %sanitize_for_log(cn),
+                    error = %e,
+                    "rejected protobuf negotiation request"
+                );
+                return Err(e);
+            }
+        };
 
         tracing::info!(cn = %cn, ?version, "client requested protobuf upgrade");
 

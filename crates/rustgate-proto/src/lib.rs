@@ -36,8 +36,9 @@ pub use codec::TakFrameCodec;
 pub use convert::{proto_to_xml, xml_to_proto};
 pub use error::ProtoError;
 pub use negotiate::{
-    MAX_PROTO_VERSION, MIN_PROTO_VERSION, NegotiatedVersion, build_protocol_support_xml,
-    build_tak_response, parse_tak_request, read_tak_request,
+    DEFAULT_NEGOTIATION_TIMEOUT, MAX_PROTO_VERSION, MIN_PROTO_VERSION,
+    NEGOTIATION_TIMEOUT_DEFAULT_SECS, NegotiatedVersion, build_protocol_support_xml,
+    build_tak_response, parse_tak_request, read_tak_request, read_tak_request_with_timeout,
 };
 pub use proto_codec::TakProtobufCodec;
 pub use xml_full::{FullCotEvent, parse_full};
