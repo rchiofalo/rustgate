@@ -70,12 +70,14 @@
 
 #![doc(html_no_source)]
 
+pub mod bit_report;
 pub mod error;
 pub mod payload_status;
 pub mod sensor_status;
 pub mod system_state;
 pub mod vehicle_position;
 
+pub use bit_report::{BitReport, FaultSeverity, SubsystemId};
 pub use error::Stanag4586Error;
 pub use payload_status::{PayloadKind, PayloadStatus, RecordingState, StreamingState};
 pub use sensor_status::{OperationalState, SensorStatus, SensorType};
