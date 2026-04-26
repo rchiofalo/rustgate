@@ -94,8 +94,16 @@ impl NatsPublisher {
     /// With the `full-detail` feature, publishes all CoT types with full
     /// detail fields. Without it, only position messages are published.
     pub async fn publish(&self, msg: &RoutableMessage) {
-        // Echo prevention: don't re-publish messages that came from NATS
-        if msg.metadata.source_protocol == "nats" {
+        // Echo prevention: don't re-publish messages that came from NATS.
+        // Compared case-insensitively so a federated message whose
+        // `source_protocol` was normalized to "NATS" or "Nats" by an
+        // upstream peer still trips the guard. Mirrors the HTTP
+        // publisher's discipline.
+        if msg.metadata.source_protocol.eq_ignore_ascii_case("nats") {
+            tracing::debug!(
+                source_protocol = %msg.metadata.source_protocol,
+                "skipping NATS publish to prevent echo loop"
+            );
             return;
         }
 
