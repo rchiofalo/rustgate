@@ -64,6 +64,8 @@
 //!   re-emit them; a future encoder PR would have to round-trip the
 //!   entire catalogue.
 
+pub mod cat021;
 pub mod cat062;
 
+pub use cat021::{Cat021Error, Cat021Report, decode_cat021};
 pub use cat062::{Cat062Error, Cat062Track, ModeCCode, TrackStatus, decode_cat062};
