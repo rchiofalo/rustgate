@@ -22,11 +22,25 @@ use tokio_util::bytes::BufMut;
 use crate::error::ProtoError;
 use crate::{codec, tak_proto};
 
-/// Maximum time to wait for a client to complete protocol negotiation.
+/// Default timeout, in seconds, for completing protocol negotiation.
 ///
-/// If a client connects but does not send a valid negotiation frame within
-/// this window, the connection is dropped to prevent resource exhaustion.
-const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(30);
+/// Reduced from 30s to 10s as part of F-65 to mitigate slow-negotiate
+/// resource exhaustion: combined with `DEFAULT_MAX_HANDSHAKES` (~100–256
+/// concurrent slots), the prior 30s window let a mass slow-negotiate
+/// attack park every handshake slot for half a minute. A healthy TAK
+/// negotiation completes in well under a second, so 10s is comfortable
+/// for real clients while tightening the abuse window threefold.
+///
+/// Operators can override this through the server CLI
+/// (`--negotiation-timeout-secs`) or the matching env var.
+pub const NEGOTIATION_TIMEOUT_DEFAULT_SECS: u64 = 10;
+
+/// Default protocol-negotiation timeout as a [`Duration`].
+///
+/// Convenience wrapper around [`NEGOTIATION_TIMEOUT_DEFAULT_SECS`]; use
+/// this when invoking [`read_tak_request`] without a configured override.
+pub const DEFAULT_NEGOTIATION_TIMEOUT: Duration =
+    Duration::from_secs(NEGOTIATION_TIMEOUT_DEFAULT_SECS);
 
 /// Minimum protocol version supported by this server.
 pub const MIN_PROTO_VERSION: u32 = 1;
@@ -115,33 +129,47 @@ pub fn build_tak_response(version: NegotiatedVersion) -> Vec<u8> {
 /// min/max version range, and computes the intersection with the
 /// server's supported range. Returns the highest mutually supported
 /// [`NegotiatedVersion`], or an error when there is no overlap.
+///
+/// # Required fields
+///
+/// Both `min_proto_version` and `max_proto_version` MUST be present
+/// and parse as a non-zero `u32`. Pre-F-64 the parser treated an empty
+/// string (the proto3 default for unset fields) as "accepts anything"
+/// and silently mapped to the server's supported range — which let a
+/// malicious client force negotiation to [`MAX_PROTO_VERSION`] by
+/// sending two empty strings. Empty / whitespace-only values now fail
+/// fast as [`ProtoError::BlankVersion`] and the caller logs the
+/// rejection (with a `sanitize_for_log`-cleaned peer identifier in the
+/// session-layer wrapper).
 pub fn parse_tak_request(proto_bytes: &[u8]) -> Result<NegotiatedVersion, ProtoError> {
     let tak_message = tak_proto::TakMessage::decode(proto_bytes)?;
     let control = tak_message
         .tak_control
         .ok_or(ProtoError::MissingField("takControl"))?;
 
-    // Empty strings (proto3 default) are treated as "accepts anything"
-    // for backward compatibility with clients that omit version fields.
-    let client_min: u32 = if control.min_proto_version.is_empty() {
-        MIN_PROTO_VERSION
-    } else {
-        control
-            .min_proto_version
-            .parse()
-            .map_err(|_| ProtoError::MissingField("invalid min_proto_version"))?
-    };
-
-    let client_max: u32 = if control.max_proto_version.is_empty() {
-        MAX_PROTO_VERSION
-    } else {
-        control
-            .max_proto_version
-            .parse()
-            .map_err(|_| ProtoError::MissingField("invalid max_proto_version"))?
-    };
+    let client_min = parse_required_version(&control.min_proto_version, "min_proto_version")?;
+    let client_max = parse_required_version(&control.max_proto_version, "max_proto_version")?;
 
     negotiate_version(client_min, client_max)
+}
+
+/// Parse a TakControl version field, rejecting blank or unparseable input.
+///
+/// Returns [`ProtoError::BlankVersion`] when the field is empty or
+/// whitespace-only, and [`ProtoError::MissingField`] when the field is
+/// non-blank but does not parse as a `u32`. Both branches are kept
+/// distinct so the audit trail can tell "client omitted the field" from
+/// "client sent garbage".
+fn parse_required_version(raw: &str, field: &'static str) -> Result<u32, ProtoError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(ProtoError::BlankVersion(field));
+    }
+    trimmed.parse::<u32>().map_err(|_| match field {
+        "min_proto_version" => ProtoError::MissingField("invalid min_proto_version"),
+        "max_proto_version" => ProtoError::MissingField("invalid max_proto_version"),
+        _ => ProtoError::MissingField("invalid proto version field"),
+    })
 }
 
 /// Compute the highest mutually supported version from a client's
@@ -174,15 +202,29 @@ fn negotiate_version(client_min: u32, client_max: u32) -> Result<NegotiatedVersi
 ///
 /// Maximum frame size: 16 MB (same as TakFrameCodec).
 ///
-/// A `NEGOTIATION_TIMEOUT` is enforced around the entire read so that a
-/// slow or malicious client cannot hold the connection open indefinitely
-/// during protocol negotiation.
+/// The default timeout ([`DEFAULT_NEGOTIATION_TIMEOUT`], 10 s) is enforced
+/// around the entire read so a slow or malicious client cannot hold the
+/// connection open indefinitely. Use [`read_tak_request_with_timeout`]
+/// to override the bound from a configured value.
 ///
 /// Returns the [`NegotiatedVersion`] selected by version range intersection.
 pub async fn read_tak_request(
     reader: &mut (impl tokio::io::AsyncRead + Unpin),
 ) -> io::Result<NegotiatedVersion> {
-    timeout(NEGOTIATION_TIMEOUT, read_tak_request_inner(reader))
+    read_tak_request_with_timeout(reader, DEFAULT_NEGOTIATION_TIMEOUT).await
+}
+
+/// Variant of [`read_tak_request`] that takes an explicit timeout.
+///
+/// Exposed so the server can thread its CLI/env-configurable
+/// `--negotiation-timeout-secs` value through to the per-connection
+/// negotiation read without changing call sites that are happy with
+/// the default bound.
+pub async fn read_tak_request_with_timeout(
+    reader: &mut (impl tokio::io::AsyncRead + Unpin),
+    deadline: Duration,
+) -> io::Result<NegotiatedVersion> {
+    timeout(deadline, read_tak_request_inner(reader))
         .await
         .map_err(|_| {
             io::Error::new(
@@ -423,21 +465,94 @@ mod tests {
     }
 
     #[test]
-    fn parse_tak_request_accepts_empty_version() {
-        // Some clients send empty version strings (proto3 default).
-        // Empty strings are treated as "accepts anything", so the
-        // server selects the highest version it supports (V2).
+    fn parse_tak_request_rejects_empty_min_proto_version() {
+        // Pre-F-64 the parser silently mapped empty `min_proto_version`
+        // to the server's MIN, which combined with empty
+        // `max_proto_version` let a malicious client force negotiation
+        // to MAX_PROTO_VERSION without ever spelling it out on the
+        // wire. The hardened parser rejects blank values explicitly.
         let msg = tak_proto::TakMessage {
             tak_control: Some(tak_proto::TakControl {
                 min_proto_version: String::new(),
+                max_proto_version: "2".into(),
+                contact_uid: String::new(),
+            }),
+            cot_event: None,
+        };
+        let bytes = msg.encode_to_vec();
+        let err = parse_tak_request(&bytes).expect_err("empty min must be rejected");
+        assert!(
+            matches!(err, ProtoError::BlankVersion("min_proto_version")),
+            "expected BlankVersion(min_proto_version), got {err:?}",
+        );
+    }
+
+    #[test]
+    fn parse_tak_request_rejects_empty_max_proto_version() {
+        // F-64 mirror of the min-side test: with an empty
+        // `max_proto_version`, the legacy parser substituted the
+        // server's MAX, opening the same forced-upgrade vector.
+        let msg = tak_proto::TakMessage {
+            tak_control: Some(tak_proto::TakControl {
+                min_proto_version: "1".into(),
                 max_proto_version: String::new(),
                 contact_uid: String::new(),
             }),
             cot_event: None,
         };
         let bytes = msg.encode_to_vec();
-        let version = parse_tak_request(&bytes).expect("empty version should be accepted");
+        let err = parse_tak_request(&bytes).expect_err("empty max must be rejected");
+        assert!(
+            matches!(err, ProtoError::BlankVersion("max_proto_version")),
+            "expected BlankVersion(max_proto_version), got {err:?}",
+        );
+    }
+
+    #[test]
+    fn parse_tak_request_rejects_whitespace_only_version_strings() {
+        // Trim guards against an attacker sending only whitespace to
+        // dodge a naive `is_empty()` check; whitespace-only strings are
+        // treated identically to empty.
+        let msg = tak_proto::TakMessage {
+            tak_control: Some(tak_proto::TakControl {
+                min_proto_version: "   ".into(),
+                max_proto_version: "\t\n".into(),
+                contact_uid: String::new(),
+            }),
+            cot_event: None,
+        };
+        let bytes = msg.encode_to_vec();
+        let err = parse_tak_request(&bytes).expect_err("whitespace-only versions must be rejected");
+        assert!(
+            matches!(err, ProtoError::BlankVersion("min_proto_version")),
+            "first blank field reported should be min_proto_version, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn parse_tak_request_accepts_valid_version_strings() {
+        // Happy-path regression guard: the F-64 hardening must not
+        // break legitimate clients that populate both fields.
+        let msg = tak_proto::TakMessage {
+            tak_control: Some(tak_proto::TakControl {
+                min_proto_version: "1".into(),
+                max_proto_version: "2".into(),
+                contact_uid: "well-behaved-client".into(),
+            }),
+            cot_event: None,
+        };
+        let bytes = msg.encode_to_vec();
+        let version = parse_tak_request(&bytes).expect("valid versions should negotiate");
         assert_eq!(version, NegotiatedVersion::V2);
+    }
+
+    #[test]
+    fn negotiation_timeout_default_is_ten_seconds() {
+        // F-65: pin the configured default so a future change cannot
+        // silently re-introduce the 30s window. The CLI wires this
+        // const into the per-connection negotiation read.
+        assert_eq!(NEGOTIATION_TIMEOUT_DEFAULT_SECS, 10);
+        assert_eq!(DEFAULT_NEGOTIATION_TIMEOUT, Duration::from_secs(10));
     }
 
     #[test]

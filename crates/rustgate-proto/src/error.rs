@@ -17,6 +17,18 @@ pub enum ProtoError {
     #[error("missing field: {0}")]
     MissingField(&'static str),
 
+    /// A required protocol-negotiation version string was absent or
+    /// blank (empty / whitespace-only) on the wire.
+    ///
+    /// Pre-F-64, `parse_tak_request` silently mapped an empty
+    /// `min_proto_version` / `max_proto_version` to the server's
+    /// supported range, which let a malicious client force negotiation
+    /// to `MAX_PROTO_VERSION` by sending empty strings. The server now
+    /// requires both fields to be explicitly populated and parseable;
+    /// blank values surface as this typed error.
+    #[error("missing or blank protocol-negotiation field: {0}")]
+    BlankVersion(&'static str),
+
     #[error("invalid timestamp: {0}")]
     InvalidTimestamp(String),
 

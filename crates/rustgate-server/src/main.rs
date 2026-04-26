@@ -1566,6 +1566,9 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
                                 cache_size: cli.cot_delta_cache_size,
                                 epsilon_meters: cli.cot_delta_epsilon_meters,
                             },
+                            negotiation_timeout: std::time::Duration::from_secs(
+                                cli.negotiation_timeout_secs,
+                            ),
                             #[cfg(feature = "metrics")]
                             metrics_identity: Arc::clone(&metrics_identity),
                         };

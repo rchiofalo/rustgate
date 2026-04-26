@@ -395,7 +395,12 @@ fn parse_tak_request_accepts_valid_v1() {
 }
 
 #[test]
-fn parse_tak_request_accepts_empty_versions() {
+fn parse_tak_request_rejects_empty_versions() {
+    // F-64 hardening: empty `min_proto_version` / `max_proto_version`
+    // used to silently map to the server's supported range, which let a
+    // malicious client force negotiation to MAX_PROTO_VERSION by
+    // sending two empty strings. Both blank fields are now rejected as
+    // a typed protocol error.
     let msg = tak_proto::TakMessage {
         tak_control: Some(tak_proto::TakControl {
             min_proto_version: String::new(),
@@ -404,8 +409,7 @@ fn parse_tak_request_accepts_empty_versions() {
         }),
         cot_event: None,
     };
-    let version = parse_tak_request(&msg.encode_to_vec()).unwrap();
-    assert_eq!(version, NegotiatedVersion::V2);
+    assert!(parse_tak_request(&msg.encode_to_vec()).is_err());
 }
 
 #[test]
