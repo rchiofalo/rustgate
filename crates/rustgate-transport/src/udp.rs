@@ -9,8 +9,9 @@
 //! ## Security hardening
 //!
 //! - **Per-IP rate limiting** — configurable packets-per-second threshold
-//!   prevents flooding from a single source. Uses the existing
-//!   `ConnRateLimiter` from `rustgate-resilience` keyed by IP.
+//!   prevents flooding from a single source. Uses the unified
+//!   [`SlidingWindowLimiter`] from `rustgate-resilience` keyed by IP
+//!   with the `"connection"` audit category.
 //! - **Source CIDR allowlist** — optional list of authorized source IP
 //!   prefixes. When configured, packets from unlisted IPs are silently
 //!   dropped.
@@ -33,7 +34,7 @@ use rustgate_core::constants::PLAINTEXT_GROUP;
 use rustgate_core::identity::Identity;
 use rustgate_core::message::RoutableMessage;
 use rustgate_cot::MessageBuilder;
-use rustgate_resilience::conn_rate_limiter::ConnRateLimiter;
+use rustgate_resilience::SlidingWindowLimiter;
 use rustgate_transport_types::{Router, SessionHandle};
 use tokio::net::UdpSocket;
 use tokio::sync::{Notify, mpsc};
@@ -265,7 +266,11 @@ impl UdpInput {
         // Build the per-IP rate limiter if configured.
         let rate_limiter = config.max_pps.map(|pps| {
             tracing::info!(max_pps = pps, "UDP per-IP rate limiting enabled");
-            ConnRateLimiter::new(pps, std::time::Duration::from_secs(1))
+            // UDP datagrams are connectionless but the limiter still
+            // serves to gate per-source-IP arrival rate; tag with
+            // "connection" for SIEM continuity with the TLS listeners.
+            SlidingWindowLimiter::new(pps, std::time::Duration::from_secs(1), "connection")
+                .with_ipv6_64_collapse(true)
         });
 
         // LRU cache of known source IPs, bounded to prevent memory exhaustion.

@@ -18,12 +18,12 @@ use bytes::Bytes;
 use http_body_util::Full;
 use hyper::{Request, Response, StatusCode};
 use rustgate_core::b64;
+use rustgate_resilience::SlidingWindowLimiter;
 
 use crate::auth::Credentials;
 use crate::cms_bag;
 use crate::error::EnrollmentError;
 use crate::handlers::util::build_response;
-use crate::ratelimit::RateLimiter;
 use crate::server::RateLimitCallback;
 use crate::signing::CsrSigner;
 
@@ -73,7 +73,7 @@ pub async fn handle_simpleenroll(
     peer: SocketAddr,
     signer: &CsrSigner,
     credentials: &Credentials,
-    sign_limiter: &RateLimiter,
+    sign_limiter: &SlidingWindowLimiter,
     on_rate_limit: Option<&RateLimitCallback>,
 ) -> Response<Full<Bytes>> {
     let (body, username) = match validate_and_read_body(
@@ -111,7 +111,7 @@ pub async fn handle_simplereenroll(
     peer: SocketAddr,
     signer: &CsrSigner,
     credentials: &Credentials,
-    sign_limiter: &RateLimiter,
+    sign_limiter: &SlidingWindowLimiter,
     on_rate_limit: Option<&RateLimitCallback>,
 ) -> Response<Full<Bytes>> {
     let (body, username) = match validate_and_read_body(
@@ -200,12 +200,14 @@ async fn validate_and_read_body<'a>(
     req: Request<hyper::body::Incoming>,
     peer: SocketAddr,
     credentials: &'a Credentials,
-    sign_limiter: &RateLimiter,
+    sign_limiter: &SlidingWindowLimiter,
     on_rate_limit: Option<&RateLimitCallback>,
     endpoint: &str,
 ) -> Result<(Vec<u8>, &'a str), Response<Full<Bytes>>> {
     // Rate limit check (before auth to prevent work amplification).
-    if !sign_limiter.check(peer.ip()) {
+    // The SlidingWindowLimiter emits the structured audit event
+    // internally on rejection (category = "request").
+    if sign_limiter.is_limited(peer.ip()) {
         if let Some(cb) = on_rate_limit {
             cb();
         }

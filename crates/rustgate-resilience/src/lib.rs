@@ -24,8 +24,14 @@
 //!   retry policies.
 //! - [`token_bucket`] — per-target token-bucket rate limiter with lazy
 //!   refill. Fail-open on mutex poisoning to match workspace convention.
-//! - [`conn_rate_limiter`] — per-IP sliding-window connection rate limiter
-//!   used by plaintext-protocol listeners (MQTT, WebSocket).
+//! - [`sliding_window`] — generic per-key sliding-window rate limiter
+//!   with configurable audit category. Used by plaintext-protocol
+//!   listeners (MQTT, WebSocket, UDP) keyed by IP for connection
+//!   admission, and by enrollment endpoints keyed by IP for request
+//!   admission.
+//! - [`conn_rate_limiter`] — DEPRECATED: thin shim around
+//!   [`sliding_window::SlidingWindowLimiter`] kept for one PR cycle so
+//!   existing call sites compile during the migration.
 //!
 //! ## Feature flags
 //!
@@ -38,4 +44,7 @@ pub mod circuit;
 pub mod conn_rate_limiter;
 pub mod reconnect;
 pub mod retry;
+pub mod sliding_window;
 pub mod token_bucket;
+
+pub use sliding_window::SlidingWindowLimiter;

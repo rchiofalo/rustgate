@@ -3258,6 +3258,7 @@ dependencies = [
  "rcgen",
  "ring",
  "rustgate-core",
+ "rustgate-resilience",
  "rustgate-test-utils",
  "rustls",
  "rustls-pki-types",
@@ -3442,9 +3443,12 @@ name = "rustgate-resilience"
 version = "0.8.0"
 dependencies = [
  "fastrand",
+ "parking_lot",
+ "rustgate-core",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

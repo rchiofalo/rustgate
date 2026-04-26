@@ -16,10 +16,13 @@ workspace = true
 metrics = []
 
 [dependencies]
+rustgate-core = { workspace = true }
 tokio = { workspace = true, features = ["macros", "sync", "rt", "time"] }
+parking_lot = { workspace = true }
 fastrand = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "sync", "time", "test-util"] }
+tracing-subscriber = { workspace = true }

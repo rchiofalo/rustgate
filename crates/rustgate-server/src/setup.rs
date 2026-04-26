@@ -734,13 +734,14 @@ pub(crate) async fn start_enrollment(
         enrollment_server = enrollment_server.with_rate_limit_callback(std::sync::Arc::new(|| {
             crate::metrics::enrollment_rate_limited().inc();
         }));
-        // Issue #767 / F-41: expose rate-limiter mutex poison as a
-        // dedicated counter so operators can alert separately from
-        // rate-limit rejections (both surface as HTTP 503 otherwise).
-        enrollment_server =
-            enrollment_server.with_rate_limit_poison_callback(std::sync::Arc::new(|| {
-                crate::metrics::enrollment_rate_limit_poison().inc();
-            }));
+        // Issue #767 / F-41 was the per-call poison metric for the
+        // previous std::sync::Mutex-backed RateLimiter that fail-closed
+        // on poison. After #798 the unified `SlidingWindowLimiter` uses
+        // `parking_lot::Mutex` (no poisoning), so the
+        // `rustgate_enrollment_rate_limit_poison_total` counter stays
+        // permanently zero. The metric is preserved at registration time
+        // so operator dashboards do not break, but no callback is wired
+        // here — there is no poison signal to surface.
     }
 
     tracing::info!(
