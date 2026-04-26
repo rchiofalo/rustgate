@@ -16,12 +16,13 @@
 //!
 //! This crate implements **LOI 2-3 telemetry** — the inbound vehicle
 //! state stream that any LOI 2 deployment needs to display, log, and
-//! relay — plus the **first three LOI 4 commands** (waypoint upload
+//! relay — plus the **first four LOI 4 commands** (waypoint upload
 //! via [`waypoint_command`], sensor pointing via
-//! [`sensor_pointing_command`], and mission abort via
-//! [`mission_abort_command`]). The remainder of the LOI 4 command
-//! set (GCS handover, payload control, route upload) is deliberately
-//! out of scope and lands in follow-up PRs.
+//! [`sensor_pointing_command`], mission abort via
+//! [`mission_abort_command`], and GCS handover via
+//! [`gcs_handover_command`]). The remainder of the LOI 4 command set
+//! (payload control, route upload) is deliberately out of scope and
+//! lands in follow-up PRs.
 //!
 //! # Scope
 //!
@@ -40,11 +41,12 @@
 //!
 //! # What is deliberately absent
 //!
-//! - **Remaining LOI 4+ command messages** (GCS handover, payload
-//!   control, route upload) — separate follow-up PRs. The first
-//!   three LOI 4 commands (waypoint upload via [`waypoint_command`],
-//!   sensor pointing via [`sensor_pointing_command`], and mission
-//!   abort via [`mission_abort_command`]) ship in this crate.
+//! - **Remaining LOI 4+ command messages** (payload control, route
+//!   upload) — separate follow-up PRs. The first four LOI 4 commands
+//!   (waypoint upload via [`waypoint_command`], sensor pointing via
+//!   [`sensor_pointing_command`], mission abort via
+//!   [`mission_abort_command`], and GCS handover via
+//!   [`gcs_handover_command`]) ship in this crate.
 //! - **Other LOI 2-3 telemetry message types** beyond vehicle
 //!   position — sensor status, payload status, system state, BIT
 //!   reports. Those use the same big-endian/typed-field approach but
@@ -77,6 +79,7 @@
 
 pub mod bit_report;
 pub mod error;
+pub mod gcs_handover_command;
 pub mod mission_abort_command;
 pub mod payload_status;
 pub mod sensor_pointing_command;
@@ -87,6 +90,7 @@ pub mod waypoint_command;
 
 pub use bit_report::{BitReport, FaultSeverity, SubsystemId};
 pub use error::Stanag4586Error;
+pub use gcs_handover_command::{GcsHandoverCommand, HandoverKind};
 pub use mission_abort_command::{AbortBehaviour, MissionAbortCommand, Priority};
 pub use payload_status::{PayloadKind, PayloadStatus, RecordingState, StreamingState};
 pub use sensor_pointing_command::{PointingMode, SensorPointingCommand};
