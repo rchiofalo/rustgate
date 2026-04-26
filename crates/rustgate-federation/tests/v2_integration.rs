@@ -180,8 +180,9 @@ async fn get_identity_returns_server_info() {
 async fn health_check_returns_serving() {
     // mTLS is required for any RPC that calls `peer_id_from_request`
     // — health_check, send_one_event, server_event_stream,
-    // binary_message_stream, server_rol_stream, and
-    // client_federate_groups_stream. See F-44 / #759.
+    // binary_message_stream, server_rol_stream,
+    // client_federate_groups_stream, and server_federate_groups_stream.
+    // See F-44 / #759.
     let fixtures =
         start_mtls_server("health-server", vec![], noop_on_event(), "health-client").await;
     let mut client = mtls_client(&fixtures).await;
@@ -232,16 +233,21 @@ async fn send_one_event_triggers_callback() {
 
 #[tokio::test]
 async fn server_federate_groups_stream_returns_groups() {
-    let addr = start_server(
+    // `ServerFederateGroupsStream` now extracts the peer CN via
+    // `peer_id_from_request` for the observable-stub gating (audit +
+    // metric + allowlist), so the open path requires a real mTLS
+    // client cert — same shape as `health_check`, `client_rol_stream`,
+    // etc. See F-44 / #759 and the observable-stub graduation in
+    // refs #864.
+    let fixtures = start_mtls_server(
         "groups-server",
         vec!["Alpha".into(), "Bravo".into()],
         noop_on_event(),
+        "groups-client",
     )
     .await;
 
-    let mut client = FederatedChannelClient::connect(addr)
-        .await
-        .expect("connect");
+    let mut client = mtls_client(&fixtures).await;
 
     let sub = figpb::Subscription {
         identity: Some(figpb::Identity {
