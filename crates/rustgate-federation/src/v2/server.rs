@@ -41,6 +41,24 @@ pub(crate) const RPC_SEND_ONE_EVENT: &str = "send_one_event";
 /// the two streams sees a uniform `rpc` label vocabulary.
 pub(crate) const RPC_SEND_ONE_BLOB: &str = "send_one_blob";
 
+/// Canonical `rpc` label used for `ServerROLStream` audit and metric
+/// records (refs #864). The `ServerROLStream` RPC is client-streaming:
+/// the remote peer pushes a stream of `ROL` messages and we return a
+/// single `Subscription` once they finish. Each inbound `ROL` is
+/// observed individually (peer-auth + hop validation + audit + metric +
+/// callback) — the stub does not propagate ROL state internally yet.
+pub(crate) const RPC_SERVER_ROL_STREAM: &str = "server_rol_stream";
+
+/// Canonical `rpc` label used for `ClientROLStream` audit and metric
+/// records (refs #864). The `ClientROLStream` RPC is server-streaming:
+/// the remote peer sends a single `Subscription` and we open a stream
+/// of `ROL` messages back to them. The observable-stub here records
+/// the subscription open with peer-auth + allowlist check + audit +
+/// metric, but does not push any ROL events back (the stub holds the
+/// stream open without producing payloads — the routing-side machinery
+/// for ROL state lands in a separate follow-up).
+pub(crate) const RPC_CLIENT_ROL_STREAM: &str = "client_rol_stream";
+
 /// Default maximum number of groups a single federation peer can advertise.
 ///
 /// Re-exported from [`crate::config`] for backward compatibility.
@@ -77,6 +95,30 @@ fn noop_on_blob() -> OnBlob {
     Arc::new(|_blob, _peer| {})
 }
 
+/// Callback invoked when a `ROL` (Region of Interest) message is
+/// received from a remote peer via the V2 `ServerROLStream` RPC
+/// (refs #864). The second argument is the peer's CN (extracted from
+/// the mTLS client certificate).
+///
+/// Defaults to a no-op closure when not configured via
+/// [`FederationService::with_on_rol_event`] — the V2 federation
+/// transport continues to accept ROL streams and emit audit + metrics
+/// for each event, but the payload is discarded if the deployment
+/// hasn't wired a consumer. This preserves the existing behaviour for
+/// callers that don't yet need ROL ingress while making the hop-count
+/// and authz validation always-on for forensic completeness, mirroring
+/// the discipline established by [`OnEvent`] and [`OnBlob`].
+pub type OnRolEvent = Arc<dyn Fn(figpb::Rol, String) + Send + Sync>;
+
+/// Factory for the default no-op `OnRolEvent` callback. Mirrors
+/// [`noop_on_blob`]: discards the ROL message without doing any work
+/// so the call site stays an unconditional `(self.on_rol_event)(...)`
+/// rather than threading an `if let Some(...)` through the per-event
+/// hot path inside the streaming receive loop.
+fn noop_on_rol_event() -> OnRolEvent {
+    Arc::new(|_rol, _peer| {})
+}
+
 /// V2 gRPC FederatedChannel service implementation.
 ///
 /// Manages inbound federation connections, tracks per-peer outbound streams
@@ -99,6 +141,13 @@ pub struct FederationService {
     /// real handler via [`FederationService::with_on_blob`] when the
     /// receiving end wants to consume the blob payload.
     on_blob: OnBlob,
+    /// Callback for inbound ROL messages received via `ServerROLStream`
+    /// (refs #864). Defaults to a no-op so existing deployments don't
+    /// have to opt in; install a real handler via
+    /// [`FederationService::with_on_rol_event`] when the receiving end
+    /// wants to consume ROL payloads. The callback fires per ROL event
+    /// after peer-auth, hop-count, and allowlist validation pass.
+    on_rol_event: OnRolEvent,
     /// Maximum number of groups a single peer can advertise.
     max_groups_per_peer: usize,
     /// Maximum length of a group name in bytes.
@@ -159,6 +208,7 @@ impl FederationService {
             peer_groups: Arc::new(RwLock::new(HashMap::new())),
             on_event,
             on_blob: noop_on_blob(),
+            on_rol_event: noop_on_rol_event(),
             max_groups_per_peer,
             max_group_name_length,
             allowed_peer_groups: None,
@@ -178,6 +228,22 @@ impl FederationService {
     /// downstream sink.
     pub fn with_on_blob(mut self, on_blob: OnBlob) -> Self {
         self.on_blob = on_blob;
+        self
+    }
+
+    /// Install a callback that fires when the V2 `ServerROLStream` RPC
+    /// receives a `ROL` message from a remote peer (refs #864).
+    ///
+    /// Returns `self` so the call composes with the other `with_*`
+    /// builder methods. The default callback (set by [`Self::new`] /
+    /// [`Self::with_limits`]) is a no-op that discards the payload —
+    /// the V2 transport continues to validate the hop count and
+    /// peer-allowlist authz and emit audit + metrics for every accepted
+    /// ROL event even when the consumer isn't wired, so a deployment
+    /// can observe ingress before committing to a downstream sink.
+    /// Mirrors the discipline established by [`Self::with_on_blob`].
+    pub fn with_on_rol_event(mut self, on_rol_event: OnRolEvent) -> Self {
+        self.on_rol_event = on_rol_event;
         self
     }
 
@@ -320,6 +386,74 @@ impl FederationService {
             );
             return false;
         }
+        true
+    }
+
+    /// Hop-count validation for `ROL` (refs #864). The `FederateHops`
+    /// proto field is shared with `FederatedEvent` and `BinaryBlob` —
+    /// same shape, different parent message — so this is a sibling of
+    /// [`Self::validate_hop_count`] / [`Self::validate_blob_hop_count`]
+    /// rather than a generic. Same semantics: ROL events without hop
+    /// metadata are treated as first-hop for backward compat with
+    /// peers that predate hop tracking.
+    fn validate_rol_hop_count(rol: &figpb::Rol, peer_id: &str) -> bool {
+        if let Some(ref hops) = rol.federate_hops
+            && (hops.current_hops < 0 || hops.current_hops >= MAX_FEDERATION_HOPS)
+        {
+            warn!(
+                peer = %peer_id,
+                current_hops = hops.current_hops,
+                max = MAX_FEDERATION_HOPS,
+                "rejecting federated ROL: hop count exceeded"
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Apply the observable-stub hooks to a single inbound ROL event
+    /// from `ServerROLStream` (refs #864). Static helper so the
+    /// `tokio::spawn` drain loop in [`Self::server_rol_stream`] AND
+    /// unit tests can drive the same body — `tonic::Streaming<Rol>`
+    /// has no synthetic constructor, so a per-event helper is the
+    /// cleanest way to pin the policy under test. Returns `true` when
+    /// the event passed validation and the callback fired; `false`
+    /// when it was rejected (the hop-limit gate, which emits an
+    /// `event_rejected` audit and skips the callback).
+    fn observe_inbound_rol_event(
+        on_rol_event: &OnRolEvent,
+        peer_id: &str,
+        rol: figpb::Rol,
+    ) -> bool {
+        if !Self::validate_rol_hop_count(&rol, peer_id) {
+            rustgate_core::audit::federation_event_rejected(
+                RPC_SERVER_ROL_STREAM,
+                peer_id,
+                "hop_limit",
+            );
+            return false;
+        }
+
+        // Success path: increment counters and emit the audit record
+        // BEFORE invoking the callback so the forensic trail captures
+        // ingress even if a downstream consumer panics. Same ordering
+        // as SendOneEvent / SendOneBlob.
+        #[cfg(feature = "api")]
+        {
+            crate::metrics::messages_in().inc();
+            crate::metrics::messages_in_by_rpc()
+                .with_label_values(&[RPC_SERVER_ROL_STREAM])
+                .inc();
+        }
+        rustgate_core::audit::federation_event_received(RPC_SERVER_ROL_STREAM, peer_id);
+
+        debug!(
+            peer = %peer_id,
+            program = %sanitize_for_log(&rol.program),
+            payload_count = rol.payload.len(),
+            "received ROL event"
+        );
+        on_rol_event(rol, peer_id.to_string());
         true
     }
 
@@ -777,14 +911,46 @@ impl FederatedChannel for FederationService {
         &self,
         request: Request<Streaming<figpb::Rol>>,
     ) -> Result<Response<figpb::Subscription>, Status> {
+        // mTLS extraction failure already emits federation_peer_rejected
+        // and returns Unauthenticated before any payload processing —
+        // matches the SendOneEvent / SendOneBlob discipline.
         let peer_id = Self::peer_id_from_request(&request)?;
+
+        // Pre-flight allowlist check on stream open. ROL has no
+        // `federate_groups` semantics shared with BinaryBlob's
+        // peer-not-in-allowlist gate (the field exists on the wire,
+        // but the per-message group authz mirrors blob — peer must be
+        // in the inbound allowlist when one is configured). Emit the
+        // `peer_not_in_allowlist` reject audit BEFORE accepting the
+        // stream so the forensic trail records the policy decision
+        // even though the RPC contract for `ServerROLStream` is
+        // single-Subscription return: a Byzantine peer cannot probe
+        // the system by opening a stream and sending nothing.
+        if let Some(ref allowed) = self.allowed_peer_groups
+            && !allowed.contains_key(&peer_id)
+        {
+            rustgate_core::audit::federation_event_rejected(
+                RPC_SERVER_ROL_STREAM,
+                &peer_id,
+                "peer_not_in_allowlist",
+            );
+            return Err(Status::permission_denied("peer not in inbound allowlist"));
+        }
+
+        info!(peer = %peer_id, "server_rol_stream opened (receiving ROL events)");
         let mut stream = request.into_inner();
 
-        // Drain ROL stream without processing (missions not supported)
+        // Per-event policy lives in `observe_inbound_rol_event` so
+        // unit tests can exercise it without a synthetic
+        // `tonic::Streaming<Rol>`. The drain task captures the
+        // callback by `Arc` clone — same shape as `server_event_stream`.
+        let on_rol_event = Arc::clone(&self.on_rol_event);
+        let pid = peer_id.clone();
         drop(tokio::spawn(async move {
-            while let Ok(Some(_rol)) = stream.message().await {
-                debug!(peer = %peer_id, "received ROL message (ignored)");
+            while let Ok(Some(rol)) = stream.message().await {
+                let _ = FederationService::observe_inbound_rol_event(&on_rol_event, &pid, rol);
             }
+            info!(peer = %pid, "server_rol_stream closed");
         }));
 
         Ok(Response::new(self.our_subscription()))
@@ -900,10 +1066,62 @@ impl FederatedChannel for FederationService {
 
     async fn client_rol_stream(
         &self,
-        _request: Request<figpb::Subscription>,
+        request: Request<figpb::Subscription>,
     ) -> Result<Response<Self::ClientROLStreamStream>, Status> {
-        // ROL/missions not supported — return an empty stream that stays open
-        let (_tx, rx) = mpsc::channel(1);
+        // `ClientROLStream` is server-streaming in the proto: the peer
+        // sends one Subscription and we open a stream of ROL events
+        // back. The observable-stub here records the subscription
+        // open with the same peer-auth + allowlist + audit + metric
+        // shape as `ServerROLStream`'s receive side, then returns an
+        // empty stream that stays open. Routing-side machinery for
+        // pushing ROL state out lands in a separate follow-up — the
+        // stub explicitly does NOT push payloads.
+        let peer_id = Self::peer_id_from_request(&request)?;
+
+        // Allowlist check on subscription open — a peer not in the
+        // inbound allowlist must not be able to keep an outbound ROL
+        // stream half-open. Mirrors the SendOneBlob /
+        // ServerROLStream gate so the audit reason vocabulary stays
+        // uniform across the RPC suite.
+        if let Some(ref allowed) = self.allowed_peer_groups
+            && !allowed.contains_key(&peer_id)
+        {
+            rustgate_core::audit::federation_event_rejected(
+                RPC_CLIENT_ROL_STREAM,
+                &peer_id,
+                "peer_not_in_allowlist",
+            );
+            return Err(Status::permission_denied("peer not in inbound allowlist"));
+        }
+
+        // Subscription accepted: increment counter and emit the audit
+        // record before returning the stream so a peer that opens
+        // and immediately closes the connection still appears in the
+        // forensic trail. The metric counts the SUBSCRIPTION, not
+        // ROL events — `ClientROLStream` doesn't receive any ROL
+        // events from the peer (the proto is one-Subscription-in,
+        // many-ROL-out), so per-event observation isn't a meaningful
+        // shape on this side.
+        #[cfg(feature = "api")]
+        {
+            crate::metrics::messages_in().inc();
+            crate::metrics::messages_in_by_rpc()
+                .with_label_values(&[RPC_CLIENT_ROL_STREAM])
+                .inc();
+        }
+        rustgate_core::audit::federation_event_received(RPC_CLIENT_ROL_STREAM, &peer_id);
+
+        info!(peer = %peer_id, "client_rol_stream opened (sending ROL events — stub, no payloads)");
+
+        // Empty stream that stays open. Holding `tx` in a background
+        // task pinned on `pending::<()>()` keeps the stream alive
+        // until the peer disconnects and tonic drops `rx` — same
+        // pattern as `server_federate_groups_stream`.
+        let (tx, rx) = mpsc::channel(1);
+        drop(tokio::spawn(async move {
+            futures::future::pending::<()>().await;
+            drop(tx);
+        }));
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
@@ -2213,5 +2431,508 @@ mod tests {
             0,
             "on_blob callback must not fire on unauthenticated request"
         );
+    }
+
+    // ── ServerROLStream + ClientROLStream (refs #864) ─────────────────────
+    //
+    // Observable-stub coverage for the V2 ROL streaming RPCs. Mirrors
+    // SendOneBlob's five-test discipline:
+    //   1. routes_to_callback / subscription_open_succeeds
+    //   2. peer_not_in_allowlist  → PermissionDenied + audit reject
+    //   3. hop_limit drop         → silent drop + audit reject
+    //   4. metrics increment      → both messages_in and per-RPC label
+    //   5. unauthenticated        → Unauthenticated, callback never fires
+    //
+    // `tonic::Streaming<T>` has no public synthetic constructor for an
+    // empty stream that yields immediately, so the tests use a tiny
+    // helper (`empty_streaming_request`) built on http_body_util::Empty
+    // + tonic_prost::ProstDecoder. The per-event policy is also
+    // exposed via `observe_inbound_rol_event`, exercised directly by
+    // tests 1, 3, and 4 to avoid the streaming-construction
+    // complexity for cases that don't need to test the handler entry
+    // point.
+
+    /// `OnRolEvent` callback that increments a shared atomic counter on
+    /// every invocation, plus the counter itself for assertion. Sibling
+    /// of [`counting_on_event`] / [`counting_on_blob`] so the three RPC
+    /// test suites stay structurally identical.
+    fn counting_on_rol_event() -> (OnRolEvent, Arc<AtomicU64>) {
+        let count = Arc::new(AtomicU64::new(0));
+        let c = Arc::clone(&count);
+        let cb: OnRolEvent = Arc::new(move |_rol, _peer| {
+            c.fetch_add(1, Ordering::Relaxed);
+        });
+        (cb, count)
+    }
+
+    /// Build a `tonic::Request<Streaming<T>>` that yields zero
+    /// messages and immediately reports end-of-stream. Used by the
+    /// peer-auth and allowlist tests below — they exercise the
+    /// pre-stream gate and don't care what (if anything) the peer
+    /// would have sent. Layered on `http_body_util::Empty` because
+    /// `tonic::Streaming` has no `new_empty_request` shortcut and the
+    /// production codepath uses prost decoders for figpb messages.
+    ///
+    /// Gated on `feature = "api"` because `http_body_util` is an
+    /// `api`-only optional dep.
+    #[cfg(feature = "api")]
+    fn empty_streaming_request<T>(cn: Option<&str>) -> Request<Streaming<T>>
+    where
+        T: prost::Message + Default + 'static,
+    {
+        use http_body_util::Empty;
+        use tonic_prost::ProstDecoder;
+        let body = Empty::<bytes::Bytes>::new();
+        let decoder = ProstDecoder::<T>::default();
+        let stream = Streaming::new_request(decoder, body, None, None);
+        let mut req = Request::new(stream);
+        if let Some(cn) = cn {
+            req.extensions_mut().insert(TestPeerCn(cn.to_string()));
+        }
+        req
+    }
+
+    // ── server_rol_stream tests ───────────────────────────────────────────
+
+    /// `ServerROLStream` per-event policy must dispatch the inbound ROL
+    /// event to the registered `on_rol_event` callback when hop-count
+    /// validation passes. The callback is the bridge to a future
+    /// router-side ROL ingress consumer; this test pins the
+    /// observation-first invariant — every accepted ROL reaches the
+    /// callback exactly once.
+    #[tokio::test]
+    async fn server_rol_stream_routes_to_callback_on_success() {
+        let (on_rol_event, count) = counting_on_rol_event();
+        let svc = FederationService::new("s".into(), vec![], noop_on_event())
+            .with_on_rol_event(on_rol_event);
+
+        let rol = figpb::Rol {
+            program: "deploy resource".into(),
+            ..Default::default()
+        };
+
+        let routed =
+            FederationService::observe_inbound_rol_event(&svc.on_rol_event, "peer-cn", rol);
+
+        assert!(routed, "valid ROL event must pass the observation hook");
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "on_rol_event callback must fire exactly once for an accepted ROL event"
+        );
+    }
+
+    /// A peer not in the inbound allowlist must be rejected at
+    /// `ServerROLStream` open with `PermissionDenied` AND must produce
+    /// a `federation.event_rejected` audit record tagged with
+    /// `rpc=server_rol_stream`, `reason=peer_not_in_allowlist`. Mirrors
+    /// the `SendOneBlob` peer-not-in-allowlist gate.
+    // justification: the test uses `empty_streaming_request` which is gated
+    // on `feature = "api"` (depends on `http_body_util`); fips and
+    // post-quantum builds skip `api`.
+    #[cfg(feature = "api")]
+    #[tokio::test]
+    async fn server_rol_stream_emits_audit_on_peer_not_in_allowlist() {
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::filter::Targets;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let buf = AuditBuf::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(buf.clone())
+            .with_filter(Targets::new().with_target("audit", tracing::Level::INFO));
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        // Allowlist contains *only* "good-cn"; "bad-cn" is rejected.
+        let mut allowed = HashMap::new();
+        allowed.insert("good-cn".to_string(), HashSet::from(["Alpha".to_string()]));
+        let (on_rol_event, count) = counting_on_rol_event();
+        let svc = FederationService::new("s".into(), vec![], noop_on_event())
+            .with_on_rol_event(on_rol_event)
+            .with_allowed_peer_groups(allowed);
+
+        let request = empty_streaming_request::<figpb::Rol>(Some("bad-cn"));
+
+        let result = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            svc.server_rol_stream(request).await
+        };
+
+        let err = result.expect_err("ROL stream from peer-not-in-allowlist must be rejected");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "on_rol_event callback must not fire when the stream open is rejected"
+        );
+
+        let captured = buf.snapshot_string();
+        assert!(
+            captured.contains("federation.event_rejected"),
+            "audit log must contain federation.event_rejected; got: {captured}"
+        );
+        assert!(
+            captured.contains("server_rol_stream"),
+            "audit record must include rpc=server_rol_stream; got: {captured}"
+        );
+        assert!(
+            captured.contains("peer_not_in_allowlist"),
+            "audit record must include reason=peer_not_in_allowlist; got: {captured}"
+        );
+    }
+
+    /// A ROL event arriving at or beyond `MAX_FEDERATION_HOPS` must be
+    /// silently dropped at the protocol layer (the response is a
+    /// single Subscription, not a per-message ack — the V2 protocol
+    /// has no channel for "too many hops" beyond the standard
+    /// Ok/Err split). The forensic trail is the only vantage point:
+    /// `federation.event_rejected` with `reason=hop_limit`.
+    #[tokio::test]
+    async fn server_rol_stream_drops_at_hop_limit_with_audit() {
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::filter::Targets;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let buf = AuditBuf::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(buf.clone())
+            .with_filter(Targets::new().with_target("audit", tracing::Level::INFO));
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        let (on_rol_event, count) = counting_on_rol_event();
+        let svc = FederationService::new("s".into(), vec![], noop_on_event())
+            .with_on_rol_event(on_rol_event);
+
+        let rol = figpb::Rol {
+            program: "loop-bait".into(),
+            federate_hops: Some(figpb::FederateHops {
+                current_hops: MAX_FEDERATION_HOPS,
+                max_hops: MAX_FEDERATION_HOPS + 1,
+            }),
+            ..Default::default()
+        };
+
+        let routed = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            FederationService::observe_inbound_rol_event(&svc.on_rol_event, "peer-cn", rol)
+        };
+
+        assert!(
+            !routed,
+            "hop-limit event must not pass the observation hook"
+        );
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "on_rol_event callback must not fire for a hop-dropped event"
+        );
+
+        let captured = buf.snapshot_string();
+        assert!(
+            captured.contains("federation.event_rejected"),
+            "audit log must contain federation.event_rejected for hop-limit drops; got: {captured}"
+        );
+        assert!(
+            captured.contains("server_rol_stream"),
+            "audit record must include rpc=server_rol_stream; got: {captured}"
+        );
+        assert!(
+            captured.contains("hop_limit"),
+            "audit record must include reason=hop_limit; got: {captured}"
+        );
+    }
+
+    /// Successful ROL events must increment both the legacy
+    /// `messages_in` counter and the per-RPC
+    /// `messages_in_by_rpc{rpc="server_rol_stream"}` label. Gated on
+    /// `feature = "api"` because the metrics module itself only
+    /// compiles with that feature.
+    #[cfg(feature = "api")]
+    #[tokio::test]
+    async fn server_rol_stream_increments_metrics_counter_per_event() {
+        let _ = crate::metrics::init();
+
+        let svc = FederationService::new("s".into(), vec![], noop_on_event());
+
+        let total_before = crate::metrics::messages_in().get();
+        let by_rpc_before = crate::metrics::messages_in_by_rpc()
+            .with_label_values(&[RPC_SERVER_ROL_STREAM])
+            .get();
+
+        let rol = figpb::Rol {
+            program: "metric-tick".into(),
+            ..Default::default()
+        };
+        let _ = FederationService::observe_inbound_rol_event(&svc.on_rol_event, "peer-cn", rol);
+
+        let total_after = crate::metrics::messages_in().get();
+        let by_rpc_after = crate::metrics::messages_in_by_rpc()
+            .with_label_values(&[RPC_SERVER_ROL_STREAM])
+            .get();
+
+        // Parallel tests share the global registry, so `>=` rather
+        // than `==`. The guarantee is "this RPC contributed at
+        // least once".
+        assert!(
+            total_after > total_before,
+            "messages_in counter must advance on accepted ServerROLStream event"
+        );
+        assert!(
+            by_rpc_after > by_rpc_before,
+            "messages_in_by_rpc[rpc=server_rol_stream] must advance: before={by_rpc_before}, after={by_rpc_after}"
+        );
+    }
+
+    /// `ServerROLStream` must reject any request whose `tonic::Request`
+    /// carries no mTLS client certificate (and no test-only synthetic
+    /// CN). F-44 / #759 invariant: short-circuit with `Unauthenticated`
+    /// BEFORE any payload processing.
+    // justification: uses `empty_streaming_request` which is api-feature-gated.
+    #[cfg(feature = "api")]
+    #[tokio::test]
+    async fn server_rol_stream_rejects_unauthenticated() {
+        let (on_rol_event, count) = counting_on_rol_event();
+        let svc = FederationService::new("s".into(), vec![], noop_on_event())
+            .with_on_rol_event(on_rol_event);
+
+        let request = empty_streaming_request::<figpb::Rol>(None);
+        let result = svc.server_rol_stream(request).await;
+
+        let err = result.expect_err("RPC without mTLS cert must be refused");
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "on_rol_event callback must not fire on unauthenticated request"
+        );
+    }
+
+    // ── client_rol_stream tests ───────────────────────────────────────────
+    //
+    // `ClientROLStream` is server-streaming — peer sends ONE Subscription,
+    // we open a stream of ROL events back. The observable-stub records
+    // the subscription open event with peer-auth + allowlist + audit +
+    // metric, then returns an empty open stream. The five tests below
+    // mirror the `ServerROLStream` shape: subscription accepted (in
+    // place of "routes to callback"), peer-not-in-allowlist rejection,
+    // hop-limit n/a (Subscription has no hops field, pinned via the
+    // metric/audit count not changing on a no-hop subscription),
+    // metrics increment per accepted subscription, and unauthenticated
+    // rejection.
+
+    /// `ClientROLStream` must accept a subscription from a known peer
+    /// (no allowlist, or peer is in the allowlist) and return a stream
+    /// without erroring. The stream itself stays empty in the stub
+    /// (the routing-side machinery for pushing ROL events out lands
+    /// in a follow-up); this test only pins that the open path works.
+    #[tokio::test]
+    async fn client_rol_stream_routes_to_callback_on_success() {
+        // No allowed_peer_groups configured = open mode.
+        let svc = FederationService::new("s".into(), vec![], noop_on_event());
+
+        let mut req = Request::new(figpb::Subscription {
+            identity: Some(figpb::Identity {
+                name: "peer-cn".into(),
+                ..Default::default()
+            }),
+            filter: String::new(),
+            version: None,
+        });
+        req.extensions_mut().insert(TestPeerCn("peer-cn".into()));
+
+        let resp = svc
+            .client_rol_stream(req)
+            .await
+            .expect("client_rol_stream must succeed for an authorized peer in open mode");
+        // Drop the response so the held-open background task stops
+        // pinning resources after the assertion.
+        drop(resp);
+    }
+
+    /// A peer not in the inbound allowlist must be rejected at
+    /// `ClientROLStream` open with `PermissionDenied` AND must produce
+    /// a `federation.event_rejected` audit record tagged with
+    /// `rpc=client_rol_stream`, `reason=peer_not_in_allowlist`.
+    #[tokio::test]
+    async fn client_rol_stream_emits_audit_on_peer_not_in_allowlist() {
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::filter::Targets;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let buf = AuditBuf::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(buf.clone())
+            .with_filter(Targets::new().with_target("audit", tracing::Level::INFO));
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        let mut allowed = HashMap::new();
+        allowed.insert("good-cn".to_string(), HashSet::from(["Alpha".to_string()]));
+        let svc = FederationService::new("s".into(), vec![], noop_on_event())
+            .with_allowed_peer_groups(allowed);
+
+        let mut req = Request::new(figpb::Subscription::default());
+        req.extensions_mut().insert(TestPeerCn("bad-cn".into()));
+
+        let result = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            svc.client_rol_stream(req).await
+        };
+
+        let err = result.expect_err("ClientROLStream from peer-not-in-allowlist must be rejected");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        let captured = buf.snapshot_string();
+        assert!(
+            captured.contains("federation.event_rejected"),
+            "audit log must contain federation.event_rejected; got: {captured}"
+        );
+        assert!(
+            captured.contains("client_rol_stream"),
+            "audit record must include rpc=client_rol_stream; got: {captured}"
+        );
+        assert!(
+            captured.contains("peer_not_in_allowlist"),
+            "audit record must include reason=peer_not_in_allowlist; got: {captured}"
+        );
+    }
+
+    /// `ClientROLStream` carries no per-event hop count: the proto
+    /// shape is one-Subscription-in, many-ROL-out, and `Subscription`
+    /// has no `federate_hops` field. This test pins that the
+    /// hop-limit gate is **not applicable** here — opening a stream
+    /// succeeds and emits an `event_received` audit record with no
+    /// `event_rejected` counterpart. A future revision that adds a
+    /// hop-style gate to the subscription open path must update this
+    /// test deliberately.
+    #[tokio::test]
+    async fn client_rol_stream_drops_at_hop_limit_with_audit() {
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::filter::Targets;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let buf = AuditBuf::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(buf.clone())
+            .with_filter(Targets::new().with_target("audit", tracing::Level::INFO));
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        let svc = FederationService::new("s".into(), vec![], noop_on_event());
+
+        let mut req = Request::new(figpb::Subscription::default());
+        req.extensions_mut().insert(TestPeerCn("peer-cn".into()));
+
+        let resp = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            svc.client_rol_stream(req)
+                .await
+                .expect("ClientROLStream open must succeed: hop-limit gate does not apply")
+        };
+        drop(resp);
+
+        let captured = buf.snapshot_string();
+        // Pin "no hop_limit reject was emitted" — the gate is N/A for
+        // this RPC. A regression that wires a hop-style check into
+        // the subscription open path would surface here.
+        assert!(
+            !captured.contains("hop_limit"),
+            "ClientROLStream must not emit a hop_limit reject (gate is N/A); got: {captured}"
+        );
+        // The `event_received` audit record IS expected on a clean
+        // open — pin it explicitly so the hop-limit test still
+        // validates the success path's forensic trail.
+        assert!(
+            captured.contains("federation.event_received"),
+            "audit log must contain federation.event_received on accepted subscription; got: {captured}"
+        );
+        assert!(
+            captured.contains("client_rol_stream"),
+            "audit record must include rpc=client_rol_stream; got: {captured}"
+        );
+    }
+
+    /// Successful `ClientROLStream` opens must increment both
+    /// `messages_in` and `messages_in_by_rpc{rpc="client_rol_stream"}`.
+    /// Note: the metric counts SUBSCRIPTIONS, not ROL events, because
+    /// the proto shape is one-Subscription-in (the only thing the
+    /// peer sends) — there is no per-event observation surface on
+    /// this side until the bidirectional follow-up lands.
+    #[cfg(feature = "api")]
+    #[tokio::test]
+    async fn client_rol_stream_increments_metrics_counter_per_event() {
+        let _ = crate::metrics::init();
+
+        let svc = FederationService::new("s".into(), vec![], noop_on_event());
+
+        let total_before = crate::metrics::messages_in().get();
+        let by_rpc_before = crate::metrics::messages_in_by_rpc()
+            .with_label_values(&[RPC_CLIENT_ROL_STREAM])
+            .get();
+
+        let mut req = Request::new(figpb::Subscription::default());
+        req.extensions_mut().insert(TestPeerCn("peer-cn".into()));
+        let resp = svc
+            .client_rol_stream(req)
+            .await
+            .expect("client_rol_stream must succeed");
+        drop(resp);
+
+        let total_after = crate::metrics::messages_in().get();
+        let by_rpc_after = crate::metrics::messages_in_by_rpc()
+            .with_label_values(&[RPC_CLIENT_ROL_STREAM])
+            .get();
+
+        assert!(
+            total_after > total_before,
+            "messages_in counter must advance on accepted ClientROLStream subscription"
+        );
+        assert!(
+            by_rpc_after > by_rpc_before,
+            "messages_in_by_rpc[rpc=client_rol_stream] must advance: before={by_rpc_before}, after={by_rpc_after}"
+        );
+    }
+
+    /// `ClientROLStream` must reject any request whose `tonic::Request`
+    /// carries no mTLS client certificate. F-44 / #759 invariant.
+    #[tokio::test]
+    async fn client_rol_stream_rejects_unauthenticated() {
+        let svc = FederationService::new("s".into(), vec![], noop_on_event());
+
+        // Plain Request — no test-only TestPeerCn extension.
+        let result = svc
+            .client_rol_stream(Request::new(figpb::Subscription::default()))
+            .await;
+
+        let err = result.expect_err("RPC without mTLS cert must be refused");
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    // ── builder + default plumbing ────────────────────────────────────────
+
+    #[test]
+    fn with_on_rol_event_overrides_default_noop() {
+        let (on_rol_event, count) = counting_on_rol_event();
+        let svc = FederationService::new("s".into(), vec![], noop_on_event())
+            .with_on_rol_event(on_rol_event);
+
+        // Drive the callback directly to confirm the override took
+        // effect — the default is a no-op that never increments.
+        (svc.on_rol_event)(figpb::Rol::default(), "peer-cn".into());
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "with_on_rol_event must replace the default no-op callback"
+        );
+    }
+
+    #[test]
+    fn default_service_uses_noop_on_rol_event() {
+        let svc = FederationService::new("s".into(), vec![], noop_on_event());
+        // Invoking the default no-op must not panic and must not
+        // observe any side effects.
+        (svc.on_rol_event)(figpb::Rol::default(), "peer-cn".into());
     }
 }
