@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use rustgate_core::message::Metadata;
+use rustgate_core::secrets::{SecretFileOpts, read_secret_file};
 use rustgate_core::{PeerId, audit};
 use rustls::RootCertStore;
 #[cfg(feature = "v2")]
@@ -264,13 +265,18 @@ impl FederationManager {
             }
         }
 
-        // Read TLS certificate material
+        // Read TLS certificate material. The private key is secret
+        // material — route through the shared `read_secret_file` helper
+        // for the unified perm/size/empty/UTF-8 discipline. The 16 KiB
+        // cap covers RSA-4096 PKCS#8 PEM with comfortable headroom; the
+        // 8 KiB token default is too tight for some private-key formats.
         let cert_pem = std::fs::read_to_string(&self.config.cert_file)
             .map_err(|e| anyhow::anyhow!("read cert file: {e}"))?;
-        let key_pem = zeroize::Zeroizing::new(
-            std::fs::read_to_string(&self.config.key_file)
-                .map_err(|e| anyhow::anyhow!("read key file: {e}"))?,
-        );
+        let key_pem = read_secret_file(
+            &self.config.key_file,
+            &SecretFileOpts::with_max_bytes(16 * 1024),
+        )
+        .map_err(|e| anyhow::anyhow!("read key file: {e}"))?;
         let ca_pem = std::fs::read_to_string(&self.config.ca_file)
             .map_err(|e| anyhow::anyhow!("read CA file: {e}"))?;
 
@@ -1802,12 +1808,28 @@ impl FederationManager {
 }
 
 #[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     use super::*;
     use crate::config::{FederationConfig, PeerConfig, RoutingMode};
+
+    /// Write a private-key PEM to disk with mode 0o600 so it satisfies
+    /// the strict `read_secret_file` permissions gate that
+    /// `FederationManager::start` now enforces (closes #797). On non-
+    /// Unix the chmod is a no-op — the helper skips the perm check
+    /// there.
+    fn write_secret_pem(path: &Path, contents: &str) {
+        std::fs::write(path, contents).expect("write secret pem");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod 0o600");
+        }
+    }
 
     fn test_config() -> FederationConfig {
         FederationConfig {
@@ -1943,7 +1965,7 @@ mod tests {
         let ca_path = tmp.path().join("ca.pem");
 
         std::fs::write(&cert_path, &server_cert.cert_pem).expect("write cert");
-        std::fs::write(&key_path, &server_cert.key_pem).expect("write key");
+        write_secret_pem(&key_path, &server_cert.key_pem);
         std::fs::write(&ca_path, &ca.cert_pem).expect("write ca");
 
         let config = FederationConfig {
@@ -1980,7 +2002,7 @@ mod tests {
         let ca_path = tmp.path().join("ca.pem");
 
         std::fs::write(&cert_path, &server_cert.cert_pem).expect("write cert");
-        std::fs::write(&key_path, &server_cert.key_pem).expect("write key");
+        write_secret_pem(&key_path, &server_cert.key_pem);
         std::fs::write(&ca_path, &ca.cert_pem).expect("write ca");
 
         let config = FederationConfig {
@@ -2021,7 +2043,7 @@ mod tests {
         let ca_path = tmp.path().join("ca.pem");
 
         std::fs::write(&cert_path, &client_cert.cert_pem).expect("write cert");
-        std::fs::write(&key_path, &client_cert.key_pem).expect("write key");
+        write_secret_pem(&key_path, &client_cert.key_pem);
         std::fs::write(&ca_path, &ca.cert_pem).expect("write ca");
 
         let config = FederationConfig {
@@ -2072,7 +2094,7 @@ mod tests {
         let ca_path = tmp.path().join("ca.pem");
 
         std::fs::write(&cert_path, &client_cert.cert_pem).expect("write cert");
-        std::fs::write(&key_path, &client_cert.key_pem).expect("write key");
+        write_secret_pem(&key_path, &client_cert.key_pem);
         std::fs::write(&ca_path, &ca.cert_pem).expect("write ca");
 
         let mut disabled = test_peer_config("disabled-peer", vec!["Alpha".into()]);
@@ -2125,7 +2147,7 @@ mod tests {
         let ca_path = tmp.path().join("ca.pem");
 
         std::fs::write(&cert_path, &client_cert.cert_pem).expect("write cert");
-        std::fs::write(&key_path, &client_cert.key_pem).expect("write key");
+        write_secret_pem(&key_path, &client_cert.key_pem);
         std::fs::write(&ca_path, &ca.cert_pem).expect("write ca");
 
         let mut bad_addr = test_peer_config("bad-peer", vec!["Alpha".into()]);
@@ -2166,7 +2188,7 @@ mod tests {
         std::fs::create_dir_all(&trust_dir).expect("create trust dir");
 
         std::fs::write(&cert_path, &server_cert.cert_pem).expect("write cert");
-        std::fs::write(&key_path, &server_cert.key_pem).expect("write key");
+        write_secret_pem(&key_path, &server_cert.key_pem);
         std::fs::write(&ca_path, &ca.cert_pem).expect("write ca");
 
         // Write an additional CA to the trust store directory
@@ -2212,7 +2234,7 @@ mod tests {
         let trust_dir = tmp.path().join("empty-trust-store");
 
         std::fs::write(&cert_path, &server_cert.cert_pem).expect("write cert");
-        std::fs::write(&key_path, &server_cert.key_pem).expect("write key");
+        write_secret_pem(&key_path, &server_cert.key_pem);
         std::fs::write(&ca_path, &ca.cert_pem).expect("write ca");
 
         // Empty trust store dir (will be created by TrustStore::load_from_directory)
@@ -2512,7 +2534,7 @@ mod tests {
         let ca_path = tmp.path().join("ca.pem");
 
         std::fs::write(&cert_path, &client_cert.cert_pem).expect("write cert");
-        std::fs::write(&key_path, &client_cert.key_pem).expect("write key");
+        write_secret_pem(&key_path, &client_cert.key_pem);
         std::fs::write(&ca_path, &ca.cert_pem).expect("write ca");
 
         // Create a manager with several peers to churn through.

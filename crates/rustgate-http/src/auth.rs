@@ -10,6 +10,7 @@
 use std::fmt;
 
 use hmac::{Hmac, Mac};
+use rustgate_core::secrets::{SecretFileOpts, read_secret_file as core_read_secret_file};
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
@@ -132,81 +133,24 @@ impl AuthState {
     }
 }
 
-/// Maximum secret file size (8 KiB) — prevents accidentally loading a log
-/// file or binary blob as a secret.
-const MAX_SECRET_FILE_BYTES: usize = 8 * 1024;
-
-/// Read a secret file, trim whitespace, wrap in [`Zeroizing`].
+/// Read a secret file via the shared
+/// [`rustgate_core::secrets::read_secret_file`] helper.
+///
+/// Uses the strict default policy — 8 KiB cap, mode 0o077 permissions
+/// gate, empty-file rejection, trailing-whitespace trim — and additionally
+/// binds the file's owner UID to the running process's effective UID so
+/// a "secret dropped by `root`, service running as `rustgate`" misconfig
+/// surfaces as a hard error rather than a silent read.
 ///
 /// Uses blocking I/O because secret loading only happens at startup
 /// during publisher initialization, not on the hot path.
-///
-/// Rejects empty secrets (after trimming) and files larger than 8 KiB.
 fn read_secret_file(path: &str) -> Result<Zeroizing<String>, HttpError> {
-    // Read metadata once — used for size pre-check and (on Unix) permission
-    // validation. This avoids loading a multi-GB file into memory before
-    // discovering it exceeds the 8 KiB limit.
-    let metadata = std::fs::metadata(path).map_err(|e| HttpError::SecretRead {
-        path: path.to_string(),
-        source: e,
-    })?;
-
-    // Reject group/world-readable secret files on Unix. Secrets should
-    // only be readable by their owner (mode 0600 or 0400). Also verify
-    // the file is owned by the running process — a file with tight
-    // permissions but a different owner is a misconfiguration (e.g.
-    // secret dropped by `root` but the service runs as `rustgate`),
-    // and the read would still succeed silently without the check.
+    let mut opts = SecretFileOpts::default();
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let mode = metadata.permissions().mode();
-        if mode & 0o077 != 0 {
-            return Err(HttpError::Config(format!(
-                "secret file `{path}` has insecure permissions {mode:#o} \
-                 (group/world-accessible); set to 0600 or 0400"
-            )));
-        }
-        let file_uid = metadata.uid();
-        let proc_uid = rustix::process::geteuid().as_raw();
-        if file_uid != proc_uid {
-            return Err(HttpError::Config(format!(
-                "secret file `{path}` is owned by uid {file_uid}, but the \
-                 running process has effective uid {proc_uid}; chown the \
-                 file to the service account"
-            )));
-        }
+        opts.require_owner_uid = Some(rustix::process::geteuid().as_raw());
     }
-
-    // Pre-check file size via metadata before reading. Prevents loading a
-    // multi-GB log file into memory if the operator mis-pointed the path.
-    let file_size = metadata.len();
-    if file_size > MAX_SECRET_FILE_BYTES as u64 {
-        return Err(HttpError::Config(format!(
-            "secret file `{path}` is too large ({file_size} bytes, max {MAX_SECRET_FILE_BYTES})"
-        )));
-    }
-
-    // Wrap in Zeroizing immediately so raw content is wiped on all exit paths
-    let mut content =
-        Zeroizing::new(
-            std::fs::read_to_string(path).map_err(|e| HttpError::SecretRead {
-                path: path.to_string(),
-                source: e,
-            })?,
-        );
-
-    let trimmed = Zeroizing::new(content.trim().to_string());
-    // Wipe raw content now that we have the trimmed version
-    zeroize::Zeroize::zeroize(&mut *content);
-
-    if trimmed.is_empty() {
-        return Err(HttpError::Config(format!(
-            "secret file `{path}` is empty after trimming whitespace"
-        )));
-    }
-
-    Ok(trimmed)
+    Ok(core_read_secret_file(path, &opts)?)
 }
 
 /// Compute HMAC-SHA256 over `"<timestamp>.<data>"` and return `sha256=<hex>`.
@@ -442,9 +386,17 @@ mod tests {
         // Set world-readable permissions (0644)
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let err = read_secret_file(path.to_str().unwrap()).unwrap_err();
+        // The shared helper renders "overly-permissive Unix mode <octal>";
+        // both that phrase and the literal mode bits are part of the
+        // operator-facing contract that downstream alerts grep for.
+        let rendered = err.to_string();
         assert!(
-            err.to_string().contains("insecure permissions"),
-            "got: {err}"
+            rendered.contains("overly-permissive Unix mode"),
+            "expected unified perm-check phrasing, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("0o644"),
+            "expected actual mode in error, got: {rendered}"
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -453,10 +405,10 @@ mod tests {
     fn rejects_empty_secret_file() {
         let path = write_temp_secret("empty-secret", "   \n\t  ");
         let err = read_secret_file(&path).unwrap_err();
-        assert!(
-            err.to_string().contains("empty after trimming"),
-            "got: {err}"
-        );
+        // The shared helper's `Empty` variant renders "is empty (after
+        // optional newline trim)" — pin the canonical phrase so a
+        // future tweak to the helper's Display string trips this test.
+        assert!(err.to_string().contains("is empty"), "got: {err}");
         let _ = std::fs::remove_file(&path);
     }
 

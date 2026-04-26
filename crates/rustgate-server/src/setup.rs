@@ -666,11 +666,21 @@ pub(crate) async fn start_enrollment(
         anyhow::anyhow!("--enrollment-password is required when --enrollment-bind is set")
     })?;
 
-    let ca_key_pem = zeroize::Zeroizing::new(
-        tokio::fs::read_to_string(ca_key_path)
-            .await
-            .context("reading CA private key for enrollment")?,
-    );
+    // Closes #797: the CA private key is the most sensitive on-disk
+    // material rustgate handles — route it through the shared
+    // `read_secret_file` helper so the unified mode 0o077 perm gate,
+    // size cap, and Zeroizing wrap apply universally. The 16 KiB cap
+    // covers RSA-4096 PKCS#8 PEM with comfortable headroom.
+    let ca_key_path_owned = ca_key_path.to_string();
+    let ca_key_pem = tokio::task::spawn_blocking(move || {
+        rustgate_core::read_secret_file(
+            &ca_key_path_owned,
+            &rustgate_core::SecretFileOpts::with_max_bytes(16 * 1024),
+        )
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("blocking task panic: {e}"))?
+    .context("reading CA private key for enrollment")?;
 
     let signer =
         rustgate_enrollment::CsrSigner::from_pem(ca_pem, &ca_key_pem, &cli.ca_organization)
@@ -874,22 +884,29 @@ pub(crate) async fn start_metrics(
     // Load the optional metrics bearer token from file. When set,
     // requests to `/metrics` must present this token; when unset the
     // endpoint remains unauthenticated for backward compatibility.
-    let metrics_token: Option<Arc<zeroize::Zeroizing<Vec<u8>>>> =
-        if let Some(ref token_file) = cli.metrics_token_file {
-            let raw = tokio::fs::read_to_string(token_file).await.map_err(|e| {
-                anyhow::anyhow!("failed to read metrics token file {token_file}: {e}")
-            })?;
-            let token = raw.trim().as_bytes().to_vec();
-            if token.is_empty() {
-                anyhow::bail!("metrics token file {token_file} is empty");
-            }
-            crate::acl_api::validate_bearer_token_length(&token, "metrics bearer")
-                .map_err(|e| anyhow::anyhow!("{e} (from {token_file})"))?;
-            tracing::info!("metrics endpoint authentication enabled via --metrics-token-file");
-            Some(Arc::new(zeroize::Zeroizing::new(token)))
-        } else {
-            None
-        };
+    let metrics_token: Option<Arc<zeroize::Zeroizing<Vec<u8>>>> = if let Some(ref token_file) =
+        cli.metrics_token_file
+    {
+        // Closes #797: route through the shared `read_secret_file`
+        // helper so the metrics bearer-token file is subject to the
+        // unified perm/size/empty/UTF-8 discipline. Run on a
+        // blocking worker because the helper is synchronous; the
+        // overhead is one-shot at startup.
+        let token_path = token_file.clone();
+        let token_str = tokio::task::spawn_blocking(move || {
+            rustgate_core::read_secret_file(&token_path, &rustgate_core::SecretFileOpts::default())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("blocking task panic: {e}"))?
+        .map_err(|e| anyhow::anyhow!("failed to read metrics token file {token_file}: {e}"))?;
+        let token = token_str.as_bytes().to_vec();
+        crate::acl_api::validate_bearer_token_length(&token, "metrics bearer")
+            .map_err(|e| anyhow::anyhow!("{e} (from {token_file})"))?;
+        tracing::info!("metrics endpoint authentication enabled via --metrics-token-file");
+        Some(Arc::new(zeroize::Zeroizing::new(token)))
+    } else {
+        None
+    };
 
     if let Some(ref metrics_bind) = cli.metrics_bind {
         let bind_addr: std::net::SocketAddr = metrics_bind

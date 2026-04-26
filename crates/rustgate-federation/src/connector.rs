@@ -14,6 +14,7 @@ use rustgate_core::constants::HANDSHAKE_TIMEOUT;
 use rustgate_core::identity::Identity;
 use rustgate_core::net::configure_tactical_socket;
 use rustgate_core::pem::{parse_ca_store, parse_certs, parse_key};
+use rustgate_core::secrets::{SecretFileOpts, read_secret_file};
 use rustgate_transport::extract_identity;
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
@@ -84,10 +85,15 @@ impl PeerConnector {
     ) -> anyhow::Result<Self> {
         let cert_pem = std::fs::read_to_string(cert)
             .with_context(|| format!("reading federation cert from {}", cert.display()))?;
-        let key_pem = Zeroizing::new(
-            std::fs::read_to_string(key)
-                .with_context(|| format!("reading federation key from {}", key.display()))?,
-        );
+        // The federation client key is secret material — route through the
+        // shared `read_secret_file` helper so the size cap, mode 0o077
+        // permissions gate, and `Zeroizing<String>` wrapping are unified
+        // with every other secret reader in the workspace. PEM keys can
+        // exceed the default 8 KiB token cap when wrapped with
+        // certificate metadata, so widen the cap to 16 KiB which still
+        // bounds RAM but covers RSA-4096 / ed25519 / EC P-384 PKCS#8.
+        let key_pem = read_secret_file(key, &SecretFileOpts::with_max_bytes(16 * 1024))
+            .with_context(|| format!("reading federation key from {}", key.display()))?;
         let ca_pem = std::fs::read_to_string(ca)
             .with_context(|| format!("reading federation CA from {}", ca.display()))?;
 

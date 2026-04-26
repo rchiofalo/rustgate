@@ -83,6 +83,12 @@ pub enum ClientError {
     #[error("certificate parse error: {0}")]
     CertParse(String),
 
+    /// Secret-file load failed (private key on disk failed the
+    /// shared `rustgate_core::secrets::read_secret_file` checks —
+    /// size cap, mode 0o077 permission gate, owner UID, or empty file).
+    #[error(transparent)]
+    SecretFile(#[from] rustgate_core::SecretFileError),
+
     /// Connect timed out.
     #[error("connect timed out after {0:?}")]
     ConnectTimeout(Duration),

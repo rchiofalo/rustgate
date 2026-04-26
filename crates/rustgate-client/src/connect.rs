@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use rustgate_core::net::configure_tactical_socket;
+use rustgate_core::secrets::{SecretFileOpts, read_secret_file};
 use rustls_pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -109,8 +110,21 @@ async fn dial_inner(config: &ClientConfig) -> Result<Stream> {
 fn build_tls_config(material: &TlsMaterial) -> Result<rustls::ClientConfig> {
     let (cert_pem, key_pem, ca_pem) = match material {
         TlsMaterial::PemFiles { cert, key, ca } => {
+            // Cert and CA are public PEM material — direct std::fs::read
+            // is fine. The private key, however, is secret material and
+            // must funnel through the shared `read_secret_file` helper
+            // for the unified perm/size/empty/UTF-8 discipline. The
+            // 16 KiB cap covers RSA-4096 PKCS#8 PEM with comfortable
+            // headroom while still bounding RAM if the configured path
+            // is mis-pointed at a log file.
             let c = std::fs::read(cert)?;
-            let k = zeroize::Zeroizing::new(std::fs::read(key)?);
+            let k_str = read_secret_file(key, &SecretFileOpts::with_max_bytes(16 * 1024))?;
+            // Convert Zeroizing<String> to Zeroizing<Vec<u8>> for the
+            // PEM parser (which takes &[u8]). std::mem::take leaves an
+            // empty String behind that the original Zeroizing wrapper
+            // wipes on drop.
+            let mut k_str = k_str;
+            let k = zeroize::Zeroizing::new(std::mem::take(&mut *k_str).into_bytes());
             let a = std::fs::read(ca)?;
             (c, k, a)
         }
@@ -296,11 +310,16 @@ mod tests {
     }
 
     #[test]
-    fn build_tls_config_missing_key_file_returns_io_error() {
-        // Complements `build_tls_config_missing_cert_file_returns_io_error`:
-        // if the key path does not resolve, std::fs::read propagates
-        // `NotFound` through `?` into `ClientError::Io` — the same branch
-        // as the cert path but via the `key` field of `TlsMaterial::PemFiles`.
+    fn build_tls_config_missing_key_file_returns_secret_file_error() {
+        // After unification (closes #797) the key path goes through
+        // `rustgate_core::secrets::read_secret_file`, so a missing key
+        // file surfaces as `ClientError::SecretFile(NotReadable {..})`
+        // instead of the bare `ClientError::Io(NotFound)` that the
+        // pre-refactor `std::fs::read` produced. The underlying
+        // `io::ErrorKind::NotFound` is still observable via the
+        // `source: std::io::Error` field on `NotReadable`, so the
+        // diagnostic remains lossless — just routed through the
+        // structured wrapper that also carries the path.
         let (ca, client) = fixture();
         let mut cert_f = NamedTempFile::new().unwrap();
         let mut ca_f = NamedTempFile::new().unwrap();
@@ -313,14 +332,21 @@ mod tests {
             ca: ca_f.path().to_path_buf(),
         };
         match build_tls_config(&material) {
-            Err(ClientError::Io(io_err)) => {
+            Err(ClientError::SecretFile(rustgate_core::SecretFileError::NotReadable {
+                path,
+                source,
+            })) => {
+                assert!(
+                    path.contains("rustgate-client-key.pem"),
+                    "path field must echo the configured path, got {path}",
+                );
                 assert_eq!(
-                    io_err.kind(),
+                    source.kind(),
                     std::io::ErrorKind::NotFound,
-                    "missing key file must surface NotFound, got {io_err:?}",
+                    "source io::Error must preserve NotFound kind, got {source:?}",
                 );
             }
-            other => panic!("expected Io(NotFound), got {other:?}"),
+            other => panic!("expected SecretFile(NotReadable {{..}}), got {other:?}"),
         }
     }
 
