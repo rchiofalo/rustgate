@@ -153,8 +153,8 @@ fn main() -> anyhow::Result<()> {
             match rustgate_core::audit_chain::verify_audit_log(std::path::Path::new(file)) {
                 Ok(report) => {
                     println!(
-                        "audit log OK: {} records verified, tip={}",
-                        report.records, report.tip
+                        "audit log OK: {} records verified, tip={}, tip_seq={}",
+                        report.records, report.tip, report.tip_seq
                     );
                     return Ok(());
                 }
