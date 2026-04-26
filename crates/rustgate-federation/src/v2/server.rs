@@ -36,6 +36,11 @@ pub const MAX_FEDERATION_HOPS: i64 = 8;
 /// tests without re-deriving the string.
 pub(crate) const RPC_SEND_ONE_EVENT: &str = "send_one_event";
 
+/// Canonical `rpc` label used for `SendOneBlob` audit and metric records
+/// (refs #864). Mirrors `RPC_SEND_ONE_EVENT` so a SIEM dashboard joining
+/// the two streams sees a uniform `rpc` label vocabulary.
+pub(crate) const RPC_SEND_ONE_BLOB: &str = "send_one_blob";
+
 /// Default maximum number of groups a single federation peer can advertise.
 ///
 /// Re-exported from [`crate::config`] for backward compatibility.
@@ -48,6 +53,29 @@ pub const DEFAULT_MAX_GROUP_NAME_LENGTH: usize = crate::config::DEFAULT_MAX_GROU
 
 /// Callback invoked when a FederatedEvent is received from a remote peer.
 pub type OnEvent = Arc<dyn Fn(figpb::FederatedEvent, String) + Send + Sync>;
+
+/// Callback invoked when a BinaryBlob is received from a remote peer
+/// via the `SendOneBlob` unary RPC (refs #864). The second argument
+/// is the peer's CN (extracted from the mTLS client certificate).
+///
+/// Defaults to a no-op closure when not configured via
+/// [`FederationService::with_on_blob`] — the V2 federation transport
+/// continues to accept binary-blob RPCs and emit audit + metrics for
+/// each one, but the payload is discarded if the deployment hasn't
+/// wired a consumer. This preserves the existing behaviour for
+/// callers that don't yet need binary-blob ingress while making the
+/// hop-count + authz validation always-on for forensic completeness.
+pub type OnBlob = Arc<dyn Fn(figpb::BinaryBlob, String) + Send + Sync>;
+
+/// Factory for the default no-op `OnBlob` callback. Discards the
+/// blob without doing any work — chosen over `Option<OnBlob>` so
+/// the call site stays an unconditional `(self.on_blob)(...)`
+/// rather than threading an `if let Some(...)` through the hot
+/// path. The Arc allocation is one-time per FederationService
+/// instance.
+fn noop_on_blob() -> OnBlob {
+    Arc::new(|_blob, _peer| {})
+}
 
 /// V2 gRPC FederatedChannel service implementation.
 ///
@@ -66,6 +94,11 @@ pub struct FederationService {
     peer_groups: Arc<RwLock<HashMap<String, Vec<String>>>>,
     /// Callback for inbound events.
     on_event: OnEvent,
+    /// Callback for inbound binary blobs (refs #864). Defaults to a
+    /// no-op so existing deployments don't have to opt in; install a
+    /// real handler via [`FederationService::with_on_blob`] when the
+    /// receiving end wants to consume the blob payload.
+    on_blob: OnBlob,
     /// Maximum number of groups a single peer can advertise.
     max_groups_per_peer: usize,
     /// Maximum length of a group name in bytes.
@@ -125,10 +158,27 @@ impl FederationService {
             outbound_streams: Arc::new(RwLock::new(HashMap::new())),
             peer_groups: Arc::new(RwLock::new(HashMap::new())),
             on_event,
+            on_blob: noop_on_blob(),
             max_groups_per_peer,
             max_group_name_length,
             allowed_peer_groups: None,
         }
+    }
+
+    /// Install a callback that fires when the V2 `SendOneBlob` RPC
+    /// receives a `BinaryBlob` from a remote peer (refs #864).
+    ///
+    /// Returns `self` so the call composes with the other
+    /// `with_*` builder methods. The default callback (set by
+    /// [`Self::new`] / [`Self::with_limits`]) is a no-op that
+    /// discards the payload — the V2 transport continues to validate
+    /// the hop count and peer-allowlist authz and emit audit + metrics
+    /// for every accepted blob even when the consumer isn't wired,
+    /// so a deployment can observe ingress before committing to a
+    /// downstream sink.
+    pub fn with_on_blob(mut self, on_blob: OnBlob) -> Self {
+        self.on_blob = on_blob;
+        self
     }
 
     /// Configure per-peer inbound group allowlists.
@@ -245,6 +295,28 @@ impl FederationService {
                 current_hops = hops.current_hops,
                 max = MAX_FEDERATION_HOPS,
                 "rejecting federated event: hop count exceeded"
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Hop-count validation for `BinaryBlob` (refs #864). The
+    /// `FederateHops` proto field shape is the same as on
+    /// `FederatedEvent` (it's a sibling message), but the field
+    /// reference is on a different parent type so this gets its own
+    /// helper rather than a generic over the parent. Same semantics
+    /// as [`Self::validate_hop_count`]: blobs without hop metadata
+    /// are treated as first-hop for backward compat.
+    fn validate_blob_hop_count(blob: &figpb::BinaryBlob, peer_id: &str) -> bool {
+        if let Some(ref hops) = blob.federate_hops
+            && (hops.current_hops < 0 || hops.current_hops >= MAX_FEDERATION_HOPS)
+        {
+            warn!(
+                peer = %peer_id,
+                current_hops = hops.current_hops,
+                max = MAX_FEDERATION_HOPS,
+                "rejecting federated blob: hop count exceeded"
             );
             return false;
         }
@@ -530,9 +602,65 @@ impl FederatedChannel for FederationService {
 
     async fn send_one_blob(
         &self,
-        _request: Request<figpb::BinaryBlob>,
+        request: Request<figpb::BinaryBlob>,
     ) -> Result<Response<figpb::Empty>, Status> {
-        // Binary blobs not supported in this implementation
+        // mTLS extraction failure already emits federation_peer_rejected
+        // and returns Unauthenticated — no extra audit here.
+        let peer_id = Self::peer_id_from_request(&request)?;
+        let blob = request.into_inner();
+
+        // Hop-count validation (refs #864): mirrors `send_one_event` —
+        // a blob arriving at or beyond the hop limit is silently
+        // dropped at the protocol layer (BinaryBlob has no per-RPC
+        // signal channel for "too many hops" beyond the standard
+        // success/error split, so the audit is the only forensic
+        // vantage point).
+        if !Self::validate_blob_hop_count(&blob, &peer_id) {
+            rustgate_core::audit::federation_event_rejected(
+                RPC_SEND_ONE_BLOB,
+                &peer_id,
+                "hop_limit",
+            );
+            return Ok(Response::new(figpb::Empty {}));
+        }
+
+        // Authz: peer must be in the allowlist when one is configured.
+        // BinaryBlob carries no `federate_groups` field of its own
+        // (unlike FederatedEvent), so the only check is "is this peer
+        // allowed to talk to us at all" — split out so the rejection
+        // audit token matches what the SendOneEvent path emits for
+        // the same condition (`peer_not_in_allowlist`).
+        if let Some(ref allowed) = self.allowed_peer_groups
+            && !allowed.contains_key(&peer_id)
+        {
+            rustgate_core::audit::federation_event_rejected(
+                RPC_SEND_ONE_BLOB,
+                &peer_id,
+                "peer_not_in_allowlist",
+            );
+            return Err(Status::permission_denied("peer not in inbound allowlist"));
+        }
+
+        // Success path: increment counters and emit the audit record
+        // BEFORE invoking the callback so the forensic trail captures
+        // ingress even if the downstream consumer panics. Same
+        // ordering as the SendOneEvent path for consistency.
+        #[cfg(feature = "api")]
+        {
+            crate::metrics::messages_in().inc();
+            crate::metrics::messages_in_by_rpc()
+                .with_label_values(&[RPC_SEND_ONE_BLOB])
+                .inc();
+        }
+        rustgate_core::audit::federation_event_received(RPC_SEND_ONE_BLOB, &peer_id);
+
+        debug!(
+            peer = %peer_id,
+            blob_type = ?blob.r#type,
+            blob_bytes = blob.data.len(),
+            "received single blob"
+        );
+        (self.on_blob)(blob, peer_id);
         Ok(Response::new(figpb::Empty {}))
     }
 
@@ -862,6 +990,19 @@ mod tests {
         (cb, count)
     }
 
+    /// Sibling of [`counting_on_event`] for the SendOneBlob path
+    /// (refs #864). Returns an `OnBlob` callback that increments a
+    /// shared atomic counter on every invocation, plus the counter
+    /// itself for assertion.
+    fn counting_on_blob() -> (OnBlob, Arc<AtomicU64>) {
+        let count = Arc::new(AtomicU64::new(0));
+        let c = Arc::clone(&count);
+        let cb: OnBlob = Arc::new(move |_blob, _peer| {
+            c.fetch_add(1, Ordering::Relaxed);
+        });
+        (cb, count)
+    }
+
     #[test]
     fn service_debug_output() {
         let svc =
@@ -1041,13 +1182,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_one_blob_returns_empty() {
-        let svc = FederationService::new("s".into(), vec![], noop_on_event());
+    async fn send_one_blob_routes_to_callback_on_success() {
+        // Refs #864: the SendOneBlob handler MUST invoke the
+        // installed `on_blob` callback exactly once per accepted
+        // blob, mirroring SendOneEvent's per-event callback contract.
+        // A regression that dropped the callback wiring would
+        // silently swallow every binary blob without surfacing.
+        let (on_blob, count) = counting_on_blob();
+        let svc = FederationService::new("s".into(), vec![], noop_on_event()).with_on_blob(on_blob);
+
+        let blob = figpb::BinaryBlob {
+            r#type: figpb::BinaryTypes::Image as i32,
+            data: b"\x89PNG\r\n\x1a\n... fake PNG header".to_vec(),
+            filename: "screenshot.png".into(),
+            timestamp: 1_700_000_000,
+            description: "test image".into(),
+            ..Default::default()
+        };
+
         let resp = svc
-            .send_one_blob(Request::new(figpb::BinaryBlob::default()))
+            .send_one_blob(request_with_peer_cn(blob, "peer-cn"))
             .await
-            .expect("send_one_blob");
+            .expect("send_one_blob must succeed for an authorized peer");
         let _ = resp.into_inner();
+
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "on_blob callback must fire exactly once for an accepted blob"
+        );
     }
 
     #[tokio::test]
@@ -1864,6 +2027,191 @@ mod tests {
             count.load(Ordering::Relaxed),
             0,
             "router callback must not fire on unauthenticated request"
+        );
+    }
+
+    // ── SendOneBlob (refs #864) ───────────────────────────────────────────
+    //
+    // Parallel coverage to the SendOneEvent test set above. Each test
+    // pins one of the four spec edge cases:
+    //   1. peer_not_in_allowlist → PermissionDenied + audit reject
+    //   2. hop-limit drop        → Ok(Empty) + audit reject (no client
+    //                              channel for hop signals)
+    //   3. metrics increment     → both messages_in and per-RPC label
+    //   4. unauthenticated       → Unauthenticated, callback never fires
+
+    #[tokio::test]
+    async fn send_one_blob_emits_audit_on_peer_not_in_allowlist() {
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::filter::Targets;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let buf = AuditBuf::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(buf.clone())
+            .with_filter(Targets::new().with_target("audit", tracing::Level::INFO));
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        // Allowlist contains *only* "good-cn"; "bad-cn" is rejected.
+        let mut allowed = HashMap::new();
+        allowed.insert("good-cn".to_string(), HashSet::from(["Alpha".to_string()]));
+        let (on_blob, count) = counting_on_blob();
+        let svc = FederationService::new("s".into(), vec![], noop_on_event())
+            .with_on_blob(on_blob)
+            .with_allowed_peer_groups(allowed);
+
+        let blob = figpb::BinaryBlob {
+            data: b"unauthorized blob".to_vec(),
+            ..Default::default()
+        };
+
+        let result = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            svc.send_one_blob(request_with_peer_cn(blob, "bad-cn"))
+                .await
+        };
+
+        let err = result.expect_err("blob from peer-not-in-allowlist must be rejected");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "on_blob callback must not fire for a rejected blob"
+        );
+
+        let captured = buf.snapshot_string();
+        assert!(
+            captured.contains("federation.event_rejected"),
+            "audit log must contain federation.event_rejected; got: {captured}"
+        );
+        assert!(
+            captured.contains("send_one_blob"),
+            "audit record must include rpc=send_one_blob; got: {captured}"
+        );
+        assert!(
+            captured.contains("peer_not_in_allowlist"),
+            "audit record must include reason=peer_not_in_allowlist; got: {captured}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_one_blob_drops_at_hop_limit_with_audit() {
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::filter::Targets;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let buf = AuditBuf::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(buf.clone())
+            .with_filter(Targets::new().with_target("audit", tracing::Level::INFO));
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        let (on_blob, count) = counting_on_blob();
+        let svc = FederationService::new("s".into(), vec![], noop_on_event()).with_on_blob(on_blob);
+
+        // Blob arrives already at the hop limit — the V2 protocol
+        // cannot signal hop drops to the sender (BinaryBlob → Empty
+        // has no error channel for "too many hops"), so the handler
+        // returns Ok(Empty) AND emits an audit reject record. The
+        // forensic trail is the only vantage point.
+        let blob = figpb::BinaryBlob {
+            data: b"too-many-hops".to_vec(),
+            federate_hops: Some(figpb::FederateHops {
+                current_hops: MAX_FEDERATION_HOPS,
+                max_hops: MAX_FEDERATION_HOPS + 1,
+            }),
+            ..Default::default()
+        };
+
+        let result = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            svc.send_one_blob(request_with_peer_cn(blob, "peer-cn"))
+                .await
+        };
+
+        let resp = result.expect("hop-limit drop returns Ok(Empty), not an error");
+        let _ = resp.into_inner();
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "on_blob callback must not fire for a hop-dropped blob"
+        );
+
+        let captured = buf.snapshot_string();
+        assert!(
+            captured.contains("federation.event_rejected"),
+            "audit log must contain federation.event_rejected for hop-limit drops; got: {captured}"
+        );
+        assert!(
+            captured.contains("send_one_blob"),
+            "audit record must include rpc=send_one_blob; got: {captured}"
+        );
+        assert!(
+            captured.contains("hop_limit"),
+            "audit record must include reason=hop_limit; got: {captured}"
+        );
+    }
+
+    #[cfg(feature = "api")]
+    #[tokio::test]
+    async fn send_one_blob_increments_metrics_counter() {
+        let _ = crate::metrics::init();
+
+        let svc = FederationService::new("s".into(), vec![], noop_on_event());
+
+        let total_before = crate::metrics::messages_in().get();
+        let by_rpc_before = crate::metrics::messages_in_by_rpc()
+            .with_label_values(&[RPC_SEND_ONE_BLOB])
+            .get();
+
+        let blob = figpb::BinaryBlob {
+            data: b"metric-blob".to_vec(),
+            ..Default::default()
+        };
+        let _ = svc
+            .send_one_blob(request_with_peer_cn(blob, "peer-cn"))
+            .await
+            .expect("send_one_blob must succeed");
+
+        let total_after = crate::metrics::messages_in().get();
+        let by_rpc_after = crate::metrics::messages_in_by_rpc()
+            .with_label_values(&[RPC_SEND_ONE_BLOB])
+            .get();
+
+        assert!(
+            total_after > total_before,
+            "messages_in counter must advance on accepted SendOneBlob"
+        );
+        assert!(
+            by_rpc_after > by_rpc_before,
+            "messages_in_by_rpc[rpc=send_one_blob] must advance: before={by_rpc_before}, after={by_rpc_after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_one_blob_rejects_unauthenticated() {
+        // Same F-44 / #759 invariant as SendOneEvent: a request
+        // without a verified mTLS peer identity MUST short-circuit
+        // with `Unauthenticated` BEFORE any payload processing or
+        // callback dispatch.
+        let (on_blob, count) = counting_on_blob();
+        let svc = FederationService::new("s".into(), vec![], noop_on_event()).with_on_blob(on_blob);
+
+        let blob = figpb::BinaryBlob {
+            data: b"no-cn".to_vec(),
+            ..Default::default()
+        };
+        // Plain Request — no test-only TestPeerCn extension.
+        let result = svc.send_one_blob(Request::new(blob)).await;
+
+        let err = result.expect_err("RPC without mTLS cert must be refused");
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "on_blob callback must not fire on unauthenticated request"
         );
     }
 }
