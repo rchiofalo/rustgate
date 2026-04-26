@@ -7,10 +7,10 @@ use std::net::SocketAddr;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{Request, Response, StatusCode};
+use rustgate_resilience::SlidingWindowLimiter;
 
 use super::util::{build_response, extract_param};
 use crate::auth::Credentials;
-use crate::ratelimit::RateLimiter;
 use crate::response;
 use crate::server::RateLimitCallback;
 use crate::signing::CsrSigner;
@@ -31,18 +31,17 @@ pub(crate) async fn handle_sign_client_v1(
     peer: SocketAddr,
     signer: &CsrSigner,
     credentials: &Credentials,
-    sign_limiter: &RateLimiter,
+    sign_limiter: &SlidingWindowLimiter,
     on_rate_limit: Option<&RateLimitCallback>,
 ) -> Response<Full<Bytes>> {
-    // Rate limit before doing any work
-    if !sign_limiter.check(peer.ip()) {
+    // Rate limit before doing any work. The SlidingWindowLimiter
+    // emits the structured `security.rate_limited` audit event
+    // internally on rejection (with `endpoint = self.category()`
+    // = "request"), so the previous explicit caller-side audit
+    // call is no longer needed.
+    if sign_limiter.is_limited(peer.ip()) {
         let masked_peer = rustgate_core::masking::mask_ip(&peer.to_string());
         tracing::warn!(peer = %masked_peer, "CSR signing rate limited");
-        rustgate_core::audit::rate_limit_triggered(
-            &masked_peer,
-            "/Marti/api/tls/signClient",
-            sign_limiter.max_requests(),
-        );
         if let Some(cb) = on_rate_limit {
             cb();
         }
@@ -160,18 +159,15 @@ pub(crate) async fn handle_sign_client_v2(
     peer: SocketAddr,
     signer: &CsrSigner,
     credentials: &Credentials,
-    sign_limiter: &RateLimiter,
+    sign_limiter: &SlidingWindowLimiter,
     on_rate_limit: Option<&RateLimitCallback>,
 ) -> Response<Full<Bytes>> {
-    // Rate limit before doing any work
-    if !sign_limiter.check(peer.ip()) {
+    // Rate limit before doing any work. Audit emission lives inside
+    // `SlidingWindowLimiter` (category = "request"); no caller-side
+    // call is needed.
+    if sign_limiter.is_limited(peer.ip()) {
         let masked_peer = rustgate_core::masking::mask_ip(&peer.to_string());
         tracing::warn!(peer = %masked_peer, "CSR signing rate limited");
-        rustgate_core::audit::rate_limit_triggered(
-            &masked_peer,
-            "/Marti/api/tls/signClient/v2",
-            sign_limiter.max_requests(),
-        );
         if let Some(cb) = on_rate_limit {
             cb();
         }

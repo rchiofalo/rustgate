@@ -925,14 +925,15 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(enrollment_rate_limited.clone()))?;
     let _ = ENROLLMENT_RATE_LIMITED.set(enrollment_rate_limited);
 
-    // Increments once per request observed while the rate-limiter mutex
-    // is poisoned (see `rustgate-enrollment::ratelimit` / issue #767).
-    // A non-zero value means a panic previously occurred while holding
-    // the lock and all CSR requests are now being rejected fail-closed;
-    // alert on any non-zero sample and restart the process.
+    // Pre-#798 this counter incremented per request observed while the
+    // std::sync::Mutex-backed RateLimiter was poisoned (issue #767).
+    // The unified `SlidingWindowLimiter` uses `parking_lot::Mutex`
+    // which does not poison; the counter is retained at registration
+    // time so operator dashboards do not 404, but it remains
+    // permanently zero. Operators may safely retire the alert.
     let enrollment_rate_limit_poison = IntCounter::with_opts(Opts::new(
         "rustgate_enrollment_rate_limit_poison_total",
-        "CSR signing requests observed while the rate-limiter mutex is poisoned (fail-closed)",
+        "Pre-#798 enrollment rate-limiter mutex poison counter (now permanently zero — parking_lot::Mutex does not poison)",
     ))?;
     registry.register(Box::new(enrollment_rate_limit_poison.clone()))?;
     let _ = ENROLLMENT_RATE_LIMIT_POISON.set(enrollment_rate_limit_poison);
@@ -1637,10 +1638,26 @@ pub fn enrollment_rate_limited() -> &'static IntCounter {
 
 /// Counter for CSR signing requests observed while the enrollment
 /// server's rate-limiter state mutex is poisoned (issue #767 / F-41).
-/// Any non-zero sample indicates a prior panic while holding the lock
-/// and the limiter is now fail-closed — every subsequent CSR request
-/// is rejected with HTTP 503. Alert on non-zero and restart.
+///
+/// Pre-#798 a non-zero sample indicated a prior panic while holding
+/// the lock and the limiter was fail-closed. After the unification of
+/// the rate limiter onto `parking_lot::Mutex` in #798, the underlying
+/// lock can no longer poison and this counter remains permanently
+/// zero. The accessor is retained so the metric registration stays
+/// reachable and external dashboards / Prometheus rules that scrape
+/// this counter continue to find it (returning a zero sample is the
+/// strongest possible "no poison ever observed" signal).
+// justification: the metric stays registered for dashboard
+// compatibility — the counter is permanently zero post-#798 because
+// `parking_lot::Mutex` does not poison, and no internal call site
+// touches it any longer. Removing the accessor would force
+// downstream consumers (Grafana panels, alert rules) to update at
+// the same time as this PR; keeping it is the operationally
+// additive choice. The `dead_code` warning fires precisely because
+// of this no-internal-caller property; suppressing it documents the
+// trade-off explicitly.
 #[cfg(feature = "enrollment")]
+#[allow(dead_code)]
 pub fn enrollment_rate_limit_poison() -> &'static IntCounter {
     ENROLLMENT_RATE_LIMIT_POISON
         .get_or_init(|| fallback_counter("rustgate_enrollment_rate_limit_poison_total", "fallback"))

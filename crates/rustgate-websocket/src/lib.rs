@@ -30,7 +30,7 @@ use rustgate_core::constants::HANDSHAKE_TIMEOUT;
 use rustgate_core::error::{Result, TransportError};
 use rustgate_core::identity::Identity;
 use rustgate_core::net::configure_tactical_socket;
-use rustgate_resilience::conn_rate_limiter::ConnRateLimiter;
+use rustgate_resilience::SlidingWindowLimiter;
 use rustgate_transport::{TlsConfig, extract_identity};
 pub use server::{
     DEFAULT_MAX_WRITE_BUFFER_BYTES, OnFederationForward, OnHttpForward, OnNatsPublish,
@@ -141,7 +141,7 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 pub struct WsListener {
     tcp: TcpListener,
     tls: TlsAcceptor,
-    conn_rate: ConnRateLimiter,
+    conn_rate: SlidingWindowLimiter,
     max_frame_size: usize,
     max_message_size: usize,
     /// Ordered list of WebSocket subprotocol tokens the server advertises.
@@ -284,7 +284,12 @@ impl WsListener {
         Ok(Self {
             tcp,
             tls,
-            conn_rate: ConnRateLimiter::new(config.conn_rate_limit, config.conn_rate_window),
+            conn_rate: SlidingWindowLimiter::new(
+                config.conn_rate_limit,
+                config.conn_rate_window,
+                "connection",
+            )
+            .with_ipv6_64_collapse(true),
             max_frame_size: config.max_frame_size,
             max_message_size: config.max_message_size,
             supported_subprotocols: config.supported_subprotocols.into(),
@@ -565,7 +570,12 @@ mod tests {
 
     #[test]
     fn rate_limit_allows_under_threshold() {
-        let limiter = ConnRateLimiter::new(DEFAULT_CONN_RATE_LIMIT, DEFAULT_CONN_RATE_WINDOW);
+        let limiter = SlidingWindowLimiter::new(
+            DEFAULT_CONN_RATE_LIMIT,
+            DEFAULT_CONN_RATE_WINDOW,
+            "connection",
+        )
+        .with_ipv6_64_collapse(true);
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
         for _ in 0..DEFAULT_CONN_RATE_LIMIT - 1 {
@@ -575,7 +585,12 @@ mod tests {
 
     #[test]
     fn rate_limit_blocks_at_threshold() {
-        let limiter = ConnRateLimiter::new(DEFAULT_CONN_RATE_LIMIT, DEFAULT_CONN_RATE_WINDOW);
+        let limiter = SlidingWindowLimiter::new(
+            DEFAULT_CONN_RATE_LIMIT,
+            DEFAULT_CONN_RATE_WINDOW,
+            "connection",
+        )
+        .with_ipv6_64_collapse(true);
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
         for _ in 0..DEFAULT_CONN_RATE_LIMIT {
@@ -588,7 +603,12 @@ mod tests {
 
     #[test]
     fn rate_limit_isolates_ips() {
-        let limiter = ConnRateLimiter::new(DEFAULT_CONN_RATE_LIMIT, DEFAULT_CONN_RATE_WINDOW);
+        let limiter = SlidingWindowLimiter::new(
+            DEFAULT_CONN_RATE_LIMIT,
+            DEFAULT_CONN_RATE_WINDOW,
+            "connection",
+        )
+        .with_ipv6_64_collapse(true);
         let ip_a: IpAddr = "10.0.0.1".parse().unwrap();
         let ip_b: IpAddr = "10.0.0.2".parse().unwrap();
 
@@ -605,7 +625,8 @@ mod tests {
     #[test]
     fn rate_limit_window_expiry() {
         // Tiny window so we can sleep through it.
-        let limiter = ConnRateLimiter::new(1, Duration::from_millis(1));
+        let limiter = SlidingWindowLimiter::new(1, Duration::from_millis(1), "connection")
+            .with_ipv6_64_collapse(true);
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
         assert!(!limiter.is_limited(ip));

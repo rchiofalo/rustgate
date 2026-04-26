@@ -16,6 +16,7 @@ fips = ["rcgen/fips"]
 
 [dependencies]
 rustgate-core = { workspace = true, features = ["pem"] }
+rustgate-resilience = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }

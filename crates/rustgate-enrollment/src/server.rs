@@ -34,13 +34,14 @@ use rustgate_core::net::configure_tactical_socket;
 /// distinctly from the core constant to avoid shadowing ambiguity.
 const ENROLLMENT_HTTP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
+use rustgate_resilience::SlidingWindowLimiter;
+
 use crate::auth::Credentials;
 use crate::contacts::ContactsProvider;
 use crate::datapackage::DataPackageStore;
 use crate::error::EnrollmentError;
 use crate::handlers::util::build_response;
 use crate::handlers::{api, packages, revoke, sign};
-use crate::ratelimit::{PoisonCallback, RateLimiter};
 use crate::revocation::RevocationStore;
 use crate::signing::CsrSigner;
 
@@ -62,12 +63,8 @@ pub struct EnrollmentServer {
     contacts_provider: Option<ContactsProvider>,
     packages: Option<Arc<DataPackageStore>>,
     revocation: Option<Arc<RevocationStore>>,
-    sign_limiter: Arc<RateLimiter>,
+    sign_limiter: Arc<SlidingWindowLimiter>,
     on_rate_limit: Option<RateLimitCallback>,
-    /// Callback fired when the rate-limiter state mutex is poisoned.
-    /// Held here (rather than only on the limiter) so `with_rate_limit`
-    /// can rebuild the limiter without dropping the subscription.
-    on_rate_limit_poison: Option<PoisonCallback>,
     /// Whether EST (RFC 7030) endpoints are enabled at runtime.
     #[cfg(feature = "est")]
     est_enabled: bool,
@@ -93,12 +90,12 @@ impl EnrollmentServer {
             contacts_provider: None,
             packages: None,
             revocation: None,
-            sign_limiter: Arc::new(RateLimiter::new(
+            sign_limiter: Arc::new(SlidingWindowLimiter::new(
                 DEFAULT_SIGN_RATE_LIMIT,
                 DEFAULT_SIGN_RATE_WINDOW,
+                "request",
             )),
             on_rate_limit: None,
-            on_rate_limit_poison: None,
             #[cfg(feature = "est")]
             est_enabled: false,
         }
@@ -110,11 +107,7 @@ impl EnrollmentServer {
     /// from any single IP within `window`. Wired from the
     /// `--enrollment-rate-limit` CLI flag in the server binary.
     pub fn with_rate_limit(mut self, max_requests: usize, window: Duration) -> Self {
-        let mut limiter = RateLimiter::new(max_requests, window);
-        if let Some(cb) = self.on_rate_limit_poison.clone() {
-            limiter = limiter.with_poison_callback(cb);
-        }
-        self.sign_limiter = Arc::new(limiter);
+        self.sign_limiter = Arc::new(SlidingWindowLimiter::new(max_requests, window, "request"));
         self
     }
 
@@ -123,30 +116,6 @@ impl EnrollmentServer {
     /// binary to increment a Prometheus counter.
     pub fn with_rate_limit_callback(mut self, cb: RateLimitCallback) -> Self {
         self.on_rate_limit = Some(cb);
-        self
-    }
-
-    /// Register a callback fired whenever the rate-limiter state mutex
-    /// is observed as poisoned (issue #767 / F-41). Poison indicates a
-    /// prior panic while holding the lock; the limiter now fails-closed
-    /// on poison rather than trusting a potentially corrupted map.
-    /// Operators wire this to a Prometheus counter so a single poison
-    /// event is surfaced and can drive an alert — a fail-closed limiter
-    /// manifests as 503s for every CSR request, so the metric is the
-    /// quickest diagnostic.
-    ///
-    /// Safe to call in any order relative to [`Self::with_rate_limit`]:
-    /// the existing limiter's configured `max_requests` and `window`
-    /// are preserved when the poison callback is attached.
-    #[must_use]
-    pub fn with_rate_limit_poison_callback(mut self, cb: PoisonCallback) -> Self {
-        self.on_rate_limit_poison = Some(Arc::clone(&cb));
-        let (max_requests, window) = {
-            let l = &self.sign_limiter;
-            (l.max_requests(), l.window())
-        };
-        self.sign_limiter =
-            Arc::new(RateLimiter::new(max_requests, window).with_poison_callback(cb));
         self
     }
 
@@ -367,7 +336,7 @@ async fn handle_request(
     contacts: Option<&ContactsProvider>,
     packages: Option<&DataPackageStore>,
     revocation: Option<&RevocationStore>,
-    sign_limiter: &RateLimiter,
+    sign_limiter: &SlidingWindowLimiter,
     on_rate_limit: Option<&RateLimitCallback>,
     #[cfg(feature = "est")] est_enabled: bool,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -483,7 +452,7 @@ async fn route_est(
     peer: SocketAddr,
     signer: &CsrSigner,
     credentials: &Credentials,
-    sign_limiter: &RateLimiter,
+    sign_limiter: &SlidingWindowLimiter,
     on_rate_limit: Option<&RateLimitCallback>,
     path: &str,
 ) -> Response<Full<Bytes>> {
@@ -600,19 +569,20 @@ mod tests {
             server.on_rate_limit.is_none(),
             "on_rate_limit must default to None"
         );
-        assert!(
-            server.on_rate_limit_poison.is_none(),
-            "on_rate_limit_poison must default to None"
-        );
         assert_eq!(
-            server.sign_limiter.max_requests(),
+            server.sign_limiter.max(),
             DEFAULT_SIGN_RATE_LIMIT,
-            "default sign_limiter.max_requests must match DEFAULT_SIGN_RATE_LIMIT"
+            "default sign_limiter.max must match DEFAULT_SIGN_RATE_LIMIT"
         );
         assert_eq!(
             server.sign_limiter.window(),
             DEFAULT_SIGN_RATE_WINDOW,
             "default sign_limiter.window must match DEFAULT_SIGN_RATE_WINDOW"
+        );
+        assert_eq!(
+            server.sign_limiter.category(),
+            "request",
+            "enrollment limiter audit category must be `request` post-#798"
         );
     }
 
@@ -682,50 +652,12 @@ mod tests {
         // a strict operator-configured limit.
         let server = build_server_for_tests().with_rate_limit(7, Duration::from_secs(30));
 
-        assert_eq!(server.sign_limiter.max_requests(), 7);
+        assert_eq!(server.sign_limiter.max(), 7);
         assert_eq!(server.sign_limiter.window(), Duration::from_secs(30));
-    }
-
-    #[test]
-    fn with_rate_limit_poison_callback_preserves_existing_rate_limit_regardless_of_call_order() {
-        // The doc-comment on `with_rate_limit_poison_callback`
-        // explicitly advertises: "Safe to call in any order relative
-        // to `with_rate_limit`: the existing limiter's configured
-        // `max_requests` and `window` are preserved when the poison
-        // callback is attached." This test pins both orderings so a
-        // future refactor cannot silently regress to "rebuild with
-        // DEFAULT_SIGN_RATE_LIMIT/WINDOW whenever the poison callback
-        // is attached", which would silently reset an operator's
-        // strict override.
-        //
-        // Order 1: poison_callback first (defaults preserved)
-        let cb: PoisonCallback = Arc::new(|| {});
-        let server = build_server_for_tests().with_rate_limit_poison_callback(Arc::clone(&cb));
         assert_eq!(
-            server.sign_limiter.max_requests(),
-            DEFAULT_SIGN_RATE_LIMIT,
-            "defaults preserved when poison callback attached first"
-        );
-        assert_eq!(
-            server.sign_limiter.window(),
-            DEFAULT_SIGN_RATE_WINDOW,
-            "defaults preserved when poison callback attached first"
-        );
-
-        // Order 2: with_rate_limit first, then poison_callback
-        // (custom rate limit preserved, not clobbered by defaults)
-        let server = build_server_for_tests()
-            .with_rate_limit(3, Duration::from_secs(15))
-            .with_rate_limit_poison_callback(Arc::clone(&cb));
-        assert_eq!(
-            server.sign_limiter.max_requests(),
-            3,
-            "custom max_requests preserved when poison callback attached after with_rate_limit"
-        );
-        assert_eq!(
-            server.sign_limiter.window(),
-            Duration::from_secs(15),
-            "custom window preserved when poison callback attached after with_rate_limit"
+            server.sign_limiter.category(),
+            "request",
+            "category label must be preserved across rebuilds"
         );
     }
 

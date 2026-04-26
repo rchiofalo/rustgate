@@ -40,7 +40,7 @@ use rustls_pki_types::pem::PemObject;
 /// the 4th attempt inside the window is rejected before TLS handshake.
 ///
 /// We use the `conn_rate` arm of the listener directly — the in-process
-/// `ConnRateLimiter` is the same struct the accept-loop consults, and a
+/// `SlidingWindowLimiter` is the same struct the accept-loop consults, and a
 /// network-driven test would otherwise need to choreograph 4 simultaneous
 /// TLS clients to land inside one window which is flaky on slow CI.
 #[test]
@@ -48,13 +48,14 @@ fn ws_rate_limit_actually_enforces_configured_max() {
     use std::net::IpAddr;
     use std::time::Duration;
 
-    use rustgate_resilience::conn_rate_limiter::ConnRateLimiter;
+    use rustgate_resilience::SlidingWindowLimiter;
 
-    // The ConnRateLimiter is what `WsListenerConfig::conn_rate_limit` /
+    // The SlidingWindowLimiter is what `WsListenerConfig::conn_rate_limit` /
     // `conn_rate_window` is threaded into at `WsListener::bind_with_config`
     // construction. Pin the contract: 3 allowed, 4th rejected, all
     // attempts inside one window from the same IP.
-    let limiter = ConnRateLimiter::new(3, Duration::from_secs(10));
+    let limiter = SlidingWindowLimiter::new(3, Duration::from_secs(10), "connection")
+        .with_ipv6_64_collapse(true);
     let ip: IpAddr = "10.0.0.42".parse().unwrap();
 
     assert!(!limiter.is_limited(ip), "1st attempt should pass");

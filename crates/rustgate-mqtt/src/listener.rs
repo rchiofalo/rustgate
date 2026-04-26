@@ -20,7 +20,7 @@ use rustgate_core::constants::HANDSHAKE_TIMEOUT;
 use rustgate_core::error::{Result, TransportError};
 use rustgate_core::identity::Identity;
 use rustgate_core::net::configure_tactical_socket;
-use rustgate_resilience::conn_rate_limiter::ConnRateLimiter;
+use rustgate_resilience::SlidingWindowLimiter;
 use rustgate_transport::{TlsConfig, extract_identity};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
@@ -58,7 +58,7 @@ const CONN_RATE_WINDOW: Duration = Duration::from_secs(10);
 pub struct MqttListener {
     tcp: TcpListener,
     acceptor: TlsAcceptor,
-    conn_rate: ConnRateLimiter,
+    conn_rate: SlidingWindowLimiter,
 }
 
 impl std::fmt::Debug for MqttListener {
@@ -91,7 +91,8 @@ impl MqttListener {
         Ok(Self {
             tcp,
             acceptor,
-            conn_rate: ConnRateLimiter::new(CONN_RATE_LIMIT, CONN_RATE_WINDOW),
+            conn_rate: SlidingWindowLimiter::new(CONN_RATE_LIMIT, CONN_RATE_WINDOW, "connection")
+                .with_ipv6_64_collapse(true),
         })
     }
 
