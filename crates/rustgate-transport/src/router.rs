@@ -71,6 +71,65 @@ pub type AuthzObserver = Arc<dyn Fn(&AuthzEvent<'_>) + Send + Sync>;
 /// alert on the drop rate.
 pub type OnMulticastOversizeDropped = Arc<dyn Fn() + Send + Sync>;
 
+/// Callback invoked once per call to [`Router::route_for_egress`] after
+/// the message reached its terminal fan-out path. The first argument is
+/// a small fixed-vocabulary destination label (`"direct"`, `"group"`,
+/// `"broadcast"`, `"multicast"`); the second is the number of recipient
+/// sessions the router actually attempted to deliver to (zero on
+/// no-subscribers paths). Wired by the server binary to feed the
+/// `rustgate_router_fanout_total{destination}` counter and the
+/// `rustgate_router_fanout_subscribers` histogram. Closes #768.
+pub type OnFanout = Arc<dyn Fn(&'static str, u64) + Send + Sync>;
+
+/// Callback invoked once per recipient that the router skipped after
+/// the message was admitted into the routing pipeline. The single
+/// argument is one of the documented `reason` labels:
+/// `"no_subscribers"`, `"backpressure"`, `"acl_denied"`,
+/// `"authz_denied"`, `"obligation_failed"`. Wired by the server binary
+/// to feed the `rustgate_router_dropped_total{reason}` counter — the
+/// same `reason` vocabulary the audit-log emits, so SIEM correlation
+/// and Prometheus dashboards stay in lock-step. Closes #768.
+pub type OnDropped = Arc<dyn Fn(&'static str) + Send + Sync>;
+
+/// Callback invoked once per Send and Receive PEP evaluation by the
+/// router. Arguments are the small fixed-vocabulary direction label
+/// (`"send"` or `"receive"`), the decision label (`"allow"`, `"deny"`,
+/// `"fail_open"`), and the wall-clock evaluation latency in seconds.
+/// Wired by the server binary to feed the
+/// `rustgate_pep_send_decisions_total{decision}` /
+/// `rustgate_pep_receive_decisions_total{decision}` counters and the
+/// `rustgate_pep_evaluation_seconds` histogram. Closes #768.
+pub type OnPepDecision = Arc<dyn Fn(&'static str, &'static str, f64) + Send + Sync>;
+
+/// Callback invoked once per data-plane obligation that the router
+/// successfully applied to an outbound copy. The argument is one of
+/// the documented `kind` labels: `"mask_point"`, `"mask_payload"`,
+/// `"tag_classified"`, `"audit_extended"`, `"unknown"`. Wired by the
+/// server binary to feed the
+/// `rustgate_obligation_applied_total{kind}` counter so operators can
+/// correlate the audit-log obligation rate with the data-plane
+/// actuation rate. Closes #768.
+pub type OnObligationApplied = Arc<dyn Fn(&'static str) + Send + Sync>;
+
+/// Map an [`Obligation`] variant to the small fixed-vocabulary label
+/// used by the `rustgate_obligation_applied_total{kind}` counter. The
+/// `_` arm covers the `#[non_exhaustive]` contract on the authz crate's
+/// [`Obligation`] enum: a future variant the transport build does not
+/// recognise renders as `"unknown"` so cardinality stays bounded
+/// regardless of which authz version is deployed. Closes #768.
+fn obligation_kind_label(obligation: &Obligation) -> &'static str {
+    match obligation {
+        Obligation::MaskPoint => "mask_point",
+        Obligation::MaskPayload => "mask_payload",
+        Obligation::TagClassified => "tag_classified",
+        Obligation::AuditExtended => "audit_extended",
+        // `#[non_exhaustive]` — bucket future variants under a single
+        // label so a new authz release cannot grow Prometheus
+        // cardinality without an explicit transport change.
+        _ => "unknown",
+    }
+}
+
 /// Event emitted by the Router PEP for every authz evaluation.
 #[derive(Debug)]
 pub struct AuthzEvent<'a> {
@@ -828,6 +887,30 @@ pub struct Router {
     /// installed and replaced after construction without any lock on
     /// the routing hot path. Closes #741.
     on_multicast_oversize_dropped: ArcSwap<Option<OnMulticastOversizeDropped>>,
+    /// Optional callback fired once per [`Router::route_for_egress`]
+    /// call after the message reached its terminal fan-out site. Wired
+    /// by the server binary to feed the
+    /// `rustgate_router_fanout_total{destination}` counter and the
+    /// `rustgate_router_fanout_subscribers` histogram. Hot-reloadable
+    /// via `ArcSwap`. Closes #768.
+    on_fanout: ArcSwap<Option<OnFanout>>,
+    /// Optional callback fired once per recipient skipped or dropped
+    /// after the message was admitted. Wired by the server binary to
+    /// feed the `rustgate_router_dropped_total{reason}` counter.
+    /// Hot-reloadable via `ArcSwap`. Closes #768.
+    on_dropped: ArcSwap<Option<OnDropped>>,
+    /// Optional callback fired once per Send / Receive PEP evaluation.
+    /// Wired by the server binary to feed the
+    /// `rustgate_pep_send_decisions_total` /
+    /// `rustgate_pep_receive_decisions_total` counters and the
+    /// `rustgate_pep_evaluation_seconds` histogram. Hot-reloadable via
+    /// `ArcSwap`. Closes #768.
+    on_pep_decision: ArcSwap<Option<OnPepDecision>>,
+    /// Optional callback fired once per data-plane obligation actually
+    /// applied to an outbound message. Wired by the server binary to
+    /// feed the `rustgate_obligation_applied_total{kind}` counter.
+    /// Hot-reloadable via `ArcSwap`. Closes #768.
+    on_obligation_applied: ArcSwap<Option<OnObligationApplied>>,
 }
 
 impl std::fmt::Debug for Router {
@@ -855,6 +938,19 @@ impl std::fmt::Debug for Router {
                 "on_multicast_oversize_dropped_installed",
                 &(**self.on_multicast_oversize_dropped.load()).is_some(),
             )
+            .field("on_fanout_installed", &(**self.on_fanout.load()).is_some())
+            .field(
+                "on_dropped_installed",
+                &(**self.on_dropped.load()).is_some(),
+            )
+            .field(
+                "on_pep_decision_installed",
+                &(**self.on_pep_decision.load()).is_some(),
+            )
+            .field(
+                "on_obligation_applied_installed",
+                &(**self.on_obligation_applied.load()).is_some(),
+            )
             .finish()
     }
 }
@@ -877,6 +973,10 @@ impl Default for Router {
             replay_buckets: Mutex::new(HashMap::new()),
             replay_limit_config: PositionReplayLimitConfig::default(),
             on_multicast_oversize_dropped: ArcSwap::from_pointee(None),
+            on_fanout: ArcSwap::from_pointee(None),
+            on_dropped: ArcSwap::from_pointee(None),
+            on_pep_decision: ArcSwap::from_pointee(None),
+            on_obligation_applied: ArcSwap::from_pointee(None),
         }
     }
 }
@@ -912,6 +1012,10 @@ impl Router {
             replay_buckets: Mutex::new(HashMap::new()),
             replay_limit_config: PositionReplayLimitConfig::default(),
             on_multicast_oversize_dropped: ArcSwap::from_pointee(None),
+            on_fanout: ArcSwap::from_pointee(None),
+            on_dropped: ArcSwap::from_pointee(None),
+            on_pep_decision: ArcSwap::from_pointee(None),
+            on_obligation_applied: ArcSwap::from_pointee(None),
         }
     }
 
@@ -953,6 +1057,10 @@ impl Router {
             replay_buckets: Mutex::new(HashMap::new()),
             replay_limit_config: PositionReplayLimitConfig::default(),
             on_multicast_oversize_dropped: ArcSwap::from_pointee(None),
+            on_fanout: ArcSwap::from_pointee(None),
+            on_dropped: ArcSwap::from_pointee(None),
+            on_pep_decision: ArcSwap::from_pointee(None),
+            on_obligation_applied: ArcSwap::from_pointee(None),
         }
     }
 
@@ -997,6 +1105,10 @@ impl Router {
             replay_buckets: Mutex::new(HashMap::new()),
             replay_limit_config: PositionReplayLimitConfig::default(),
             on_multicast_oversize_dropped: ArcSwap::from_pointee(None),
+            on_fanout: ArcSwap::from_pointee(None),
+            on_dropped: ArcSwap::from_pointee(None),
+            on_pep_decision: ArcSwap::from_pointee(None),
+            on_obligation_applied: ArcSwap::from_pointee(None),
         }
     }
 
@@ -1093,7 +1205,8 @@ impl Router {
     ) -> rustgate_authz::DecisionOutcome {
         let start = std::time::Instant::now();
         let outcome = engine.evaluate(subject, resource, action);
-        let eval_nanos = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let elapsed = start.elapsed();
+        let eval_nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
         let observer_guard = self.authz_observer.load();
         if let Some(observer) = (**observer_guard).as_ref() {
             let ev = AuthzEvent {
@@ -1105,6 +1218,26 @@ impl Router {
             };
             observer(&ev);
         }
+        // Closes #768: emit per-PEP-decision metric event. The
+        // direction label collapses Send and Receive arms onto a small
+        // fixed vocabulary because Prometheus cardinality budgets must
+        // not depend on which authz actions a particular policy
+        // mentions. Federate / Publish / Subscribe (and any future
+        // `#[non_exhaustive]` variants) are not exercised by the
+        // router PEP today — they are still emitted here so a future
+        // policy that returns one will be observable on the histogram
+        // without needing a transport-side rebuild.
+        let direction = match action {
+            AuthzAction::Send => "send",
+            AuthzAction::Receive => "receive",
+            _ => "other",
+        };
+        let decision = match outcome.decision {
+            AuthzDecision::Allow => "allow",
+            AuthzDecision::Deny => "deny",
+            _ => "other",
+        };
+        self.emit_pep_decision(direction, decision, elapsed.as_secs_f64());
         outcome
     }
 
@@ -1208,6 +1341,102 @@ impl Router {
     /// behaviour is preserved (operationally additive).
     pub fn set_on_multicast_oversize_dropped(&self, cb: Option<OnMulticastOversizeDropped>) {
         self.on_multicast_oversize_dropped.store(Arc::new(cb));
+    }
+
+    /// Install (or replace) the per-fanout observer.
+    ///
+    /// The callback fires once per [`Router::route_for_egress`] call
+    /// after the router selected a terminal fan-out path. The first
+    /// argument is the small fixed-vocabulary destination label
+    /// (`"direct"`, `"group"`, `"broadcast"`, `"multicast"`); the
+    /// second is the recipient count the router actually attempted to
+    /// reach. Wired by the server binary under
+    /// `#[cfg(feature = "metrics")]` to feed
+    /// `rustgate_router_fanout_total{destination}` and
+    /// `rustgate_router_fanout_subscribers`. Closes #768.
+    pub fn set_on_fanout(&self, cb: Option<OnFanout>) {
+        self.on_fanout.store(Arc::new(cb));
+    }
+
+    /// Install (or replace) the per-recipient drop observer.
+    ///
+    /// The callback fires once per recipient or message the router
+    /// rejected after admission, with one of the documented `reason`
+    /// labels. Wired by the server binary under
+    /// `#[cfg(feature = "metrics")]` to feed the
+    /// `rustgate_router_dropped_total{reason}` counter. Closes #768.
+    pub fn set_on_dropped(&self, cb: Option<OnDropped>) {
+        self.on_dropped.store(Arc::new(cb));
+    }
+
+    /// Install (or replace) the per-PEP-decision observer.
+    ///
+    /// The callback fires once per Send and Receive PEP evaluation
+    /// with the direction label, decision label, and evaluation latency
+    /// in seconds. Wired by the server binary under
+    /// `#[cfg(feature = "metrics")]` to feed the
+    /// `rustgate_pep_send_decisions_total` /
+    /// `rustgate_pep_receive_decisions_total` counters and the
+    /// `rustgate_pep_evaluation_seconds` histogram. Closes #768.
+    pub fn set_on_pep_decision(&self, cb: Option<OnPepDecision>) {
+        self.on_pep_decision.store(Arc::new(cb));
+    }
+
+    /// Install (or replace) the per-obligation-applied observer.
+    ///
+    /// The callback fires once per data-plane obligation actually
+    /// applied to an outbound message (one of `"mask_point"`,
+    /// `"mask_payload"`, `"tag_classified"`, `"audit_extended"`,
+    /// `"unknown"`). Wired by the server binary under
+    /// `#[cfg(feature = "metrics")]` to feed the
+    /// `rustgate_obligation_applied_total{kind}` counter. Closes #768.
+    pub fn set_on_obligation_applied(&self, cb: Option<OnObligationApplied>) {
+        self.on_obligation_applied.store(Arc::new(cb));
+    }
+
+    /// Internal helper — invoke the fanout callback if installed.
+    /// Centralised so call sites stay short and the load+`is_some`
+    /// pattern is identical across direct/group/broadcast/multicast
+    /// fan-out paths.
+    fn emit_fanout(&self, destination: &'static str, subscribers: u64) {
+        let guard = self.on_fanout.load();
+        if let Some(cb) = (**guard).as_ref() {
+            cb(destination, subscribers);
+        }
+    }
+
+    /// Internal helper — invoke the drop callback if installed.
+    fn emit_dropped(&self, reason: &'static str) {
+        let guard = self.on_dropped.load();
+        if let Some(cb) = (**guard).as_ref() {
+            cb(reason);
+        }
+    }
+
+    /// Internal helper — invoke the PEP-decision callback if
+    /// installed. `direction` is `"send"` or `"receive"`; `decision`
+    /// is `"allow"`, `"deny"`, or `"fail_open"`; `eval_secs` is the
+    /// wall-clock latency in seconds.
+    fn emit_pep_decision(&self, direction: &'static str, decision: &'static str, eval_secs: f64) {
+        let guard = self.on_pep_decision.load();
+        if let Some(cb) = (**guard).as_ref() {
+            cb(direction, decision, eval_secs);
+        }
+    }
+
+    /// Internal helper — invoke the obligation-applied callback for
+    /// each obligation in `obligations`. Called once per outbound copy
+    /// after [`apply_obligations_with_limiter`] succeeds. Mirrors the
+    /// audit emission cadence so dashboards and SIEM correlation stay
+    /// consistent.
+    fn emit_obligations_applied(&self, obligations: &[Obligation]) {
+        let guard = self.on_obligation_applied.load();
+        let Some(cb) = (**guard).as_ref() else {
+            return;
+        };
+        for obligation in obligations {
+            cb(obligation_kind_label(obligation));
+        }
     }
 
     /// Attach a per-tenant quota tracker to the router.
@@ -1665,6 +1894,12 @@ impl Router {
                     "duplicate message suppressed by cross-path dedup",
                 );
                 emit_access(&msg, "dedup");
+                // Closes #768: dedup is a duplicate-path drop, not the
+                // backpressure / authz / obligation buckets the
+                // `dropped_total{reason}` counter labels. Operators who
+                // want the dedup rate already have
+                // `rustgate_dedup_hits_total`; do not double-count it
+                // under "no_subscribers" or any other reason here.
                 return None;
             }
         }
@@ -1677,6 +1912,10 @@ impl Router {
                 "message expired before delivery — dropping",
             );
             emit_access(&msg, "expired");
+            // Expiry has its own counter (`rustgate_messages_expired_total`)
+            // — keep `dropped_total{reason}` reserved for the reasons
+            // documented in the issue (no_subscribers, backpressure,
+            // acl_denied, authz_denied, obligation_failed).
             return None;
         }
 
@@ -1780,6 +2019,9 @@ impl Router {
                                 engine.policy_id(),
                             );
                             emit_access(&msg, "authz_deny");
+                            // Closes #768: a Send-PEP deny is the
+                            // canonical "authz_denied" drop bucket.
+                            self.emit_dropped("authz_denied");
                             return None;
                         }
                         // Defer application until after cache.store so the
@@ -1820,21 +2062,35 @@ impl Router {
         // message entirely: no local sessions receive it and no
         // egress forwarders are invoked. Preserving access logs as
         // `authz_obligation_failed` keeps the forensic trail.
-        if !send_obligations.is_empty()
-            && let Err(e) = apply_obligations_with_limiter(
+        if !send_obligations.is_empty() {
+            match apply_obligations_with_limiter(
                 &mut msg,
                 &send_obligations,
                 self.unknown_obligation_policy,
                 &send_policy_id,
                 Some(&self.obligation_rate_limiter),
-            )
-        {
-            debug!(
-                err = %e,
-                "send-side obligation actuation failed; dropping message"
-            );
-            emit_access(&msg, "authz_obligation_failed");
-            return None;
+            ) {
+                Ok(()) => {
+                    // Closes #768: emit one
+                    // `rustgate_obligation_applied_total{kind}` event
+                    // per applied obligation. Audit-shaped variants
+                    // (TagClassified, AuditExtended) are still
+                    // included for parity with the audit-log emission
+                    // — the metric is operationally additive and
+                    // operators correlate the rate with the audit
+                    // hash chain.
+                    self.emit_obligations_applied(&send_obligations);
+                }
+                Err(e) => {
+                    debug!(
+                        err = %e,
+                        "send-side obligation actuation failed; dropping message"
+                    );
+                    emit_access(&msg, "authz_obligation_failed");
+                    self.emit_dropped("obligation_failed");
+                    return None;
+                }
+            }
         }
 
         // Successful path: emit one access-log event per routed message.
@@ -1856,13 +2112,21 @@ impl Router {
 
         match envelope.destination.clone() {
             Destination::Direct(target) => {
-                self.send_to_session(&target.cn, envelope).await;
+                let subscribers = self.send_to_session(&target.cn, envelope).await;
+                // Closes #768: fanout observation. `subscribers` is 1
+                // for a delivered direct message, 0 for the
+                // no-live-session path (which falls through to
+                // store-forward and is counted separately by the
+                // queue metrics).
+                self.emit_fanout("direct", subscribers);
             }
             Destination::Group(group) => {
-                self.send_to_group(&group, envelope).await;
+                let subscribers = self.send_to_group(&group, envelope).await;
+                self.emit_fanout("group", subscribers);
             }
             Destination::Broadcast => {
-                self.send_to_all(envelope).await;
+                let subscribers = self.send_to_all(envelope).await;
+                self.emit_fanout("broadcast", subscribers);
             }
             Destination::Multicast(ref groups) if groups.len() > MAX_MULTICAST_GROUPS => {
                 warn!(
@@ -1887,7 +2151,8 @@ impl Router {
                 return None;
             }
             Destination::Multicast(groups) => {
-                self.send_to_multicast(&groups, envelope).await;
+                let subscribers = self.send_to_multicast(&groups, envelope).await;
+                self.emit_fanout("multicast", subscribers);
                 // Closes #738. Local fan-out has already applied
                 // per-group Send obligations to each recipient copy
                 // inside `send_to_group_excluding`; the `arc_msg`
@@ -2556,7 +2821,16 @@ impl Router {
     /// store-and-forward queue (if attached) rather than blocking. The
     /// per-session circuit breaker in `SessionHandle` will disconnect
     /// truly slow sessions after N consecutive failures.
-    async fn send_to_session(&self, cn: &str, msg: RoutedMessage) {
+    /// Deliver a direct message and return the number of recipients
+    /// the router reached. Returns `1` on a successful in-memory
+    /// `try_send`, `0` when no live session exists for the CN (the
+    /// message falls through to store-and-forward), the channel is
+    /// full or closed, or a Receive PEP / obligation fail-closed path
+    /// drops the delivery. The number is forwarded to the
+    /// `rustgate_router_fanout_subscribers` histogram so dashboards
+    /// observe the actual recipient count rather than the candidate
+    /// pool size.
+    async fn send_to_session(&self, cn: &str, msg: RoutedMessage) -> u64 {
         let handle = {
             let state = self.state.read().await;
             state.sessions.get(cn).cloned()
@@ -2605,7 +2879,11 @@ impl Router {
                             outcome.rule_id.as_deref(),
                             engine.policy_id(),
                         );
-                        return;
+                        // Closes #768: Receive-PEP deny — recipient
+                        // skipped, contributes to the authz_denied
+                        // bucket of `dropped_total`.
+                        self.emit_dropped("authz_denied");
+                        return 0;
                     }
                     let sender_cn = msg.source.cn.clone();
                     // `rule_id` is only used by `audit_classified_receive`,
@@ -2636,14 +2914,20 @@ impl Router {
                         engine.policy_id(),
                         Some(&self.obligation_rate_limiter),
                     ) {
-                        Ok(m) => m,
+                        Ok(m) => {
+                            // Closes #768: data-plane obligations
+                            // applied for this direct recipient.
+                            self.emit_obligations_applied(&outcome.obligations);
+                            m
+                        }
                         Err(e) => {
                             debug!(
                                 err = %e,
                                 session = %cn,
                                 "direct send dropped: receive obligation actuation failed"
                             );
-                            return;
+                            self.emit_dropped("obligation_failed");
+                            return 0;
                         }
                     };
                     let ctx = Some((Arc::clone(engine), outcome.obligations, rule_id, sender_cn));
@@ -2663,6 +2947,7 @@ impl Router {
                             rule_id.as_deref(),
                         );
                     }
+                    1
                 } else {
                     // Non-blocking: channel is full or closed. Persist
                     // the pre-Receive form (before `with_obligations`
@@ -2689,7 +2974,13 @@ impl Router {
                     } else {
                         debug!(session = %cn, "session channel full, persisting for offline");
                     }
+                    // Closes #768: live channel rejected the enqueue
+                    // (full or closed) — counts as a backpressure-side
+                    // drop even though the message survives via the
+                    // store-forward queue.
+                    self.emit_dropped("backpressure");
                     self.persist_for_offline(cn, &pre_receive);
+                    0
                 }
             }
             None => {
@@ -2698,7 +2989,9 @@ impl Router {
                 // reconnects; persisting a currently-denied message is
                 // acceptable because policy may change before the
                 // session returns.
+                self.emit_dropped("no_subscribers");
                 self.persist_for_offline(cn, &msg);
+                0
             }
         }
     }
@@ -2726,14 +3019,24 @@ impl Router {
         }
     }
 
-    async fn send_to_group(&self, group: &str, msg: RoutedMessage) {
+    /// Deliver a group message and return the number of recipients
+    /// the router successfully reached. `0` is returned when the
+    /// sender failed the ACL/authz Send gate or when the group has no
+    /// eligible recipients after authz/ACL filtering. The number is
+    /// fed into the `rustgate_router_fanout_subscribers` histogram so
+    /// dashboards see the actual delivered count, which is what
+    /// matters for capacity planning rather than the candidate pool.
+    async fn send_to_group(&self, group: &str, msg: RoutedMessage) -> u64 {
         if !msg.source.is_member_of(group) {
             tracing::warn!(
                 sender = %msg.source.cn,
                 group = %group,
                 "rejected cross-group message: sender not a member"
             );
-            return;
+            // Closes #768: cross-group send is an ACL-style group
+            // membership rejection — bucket under "acl_denied".
+            self.emit_dropped("acl_denied");
+            return 0;
         }
 
         let acl_guard = self.acl.load();
@@ -2748,7 +3051,8 @@ impl Router {
                 group = %group,
                 "rejected group message: sender not authorized to send"
             );
-            return;
+            self.emit_dropped("acl_denied");
+            return 0;
         }
 
         // Snapshot the optional authz engine once so the per-recipient
@@ -2768,15 +3072,23 @@ impl Router {
             let state = self.state.read().await;
             let members = match state.groups.get(group) {
                 Some(m) => m,
-                None => return,
+                None => return 0,
             };
             members
                 .iter()
                 .filter(|cn| *cn != &msg.source.cn)
                 .filter(|cn| {
-                    acl_ref
+                    let allowed = acl_ref
                         .as_ref()
-                        .is_none_or(|acl| acl.is_receive_authorized(group, cn))
+                        .is_none_or(|acl| acl.is_receive_authorized(group, cn));
+                    if !allowed {
+                        // Closes #768: per-recipient ACL deny on the
+                        // group receive side. One increment per
+                        // skipped CN keeps `dropped_total{reason}`
+                        // operationally aligned with the audit log.
+                        self.emit_dropped("acl_denied");
+                    }
+                    allowed
                 })
                 .filter_map(|cn| state.sessions.get(cn).cloned())
                 // Per-recipient authz Receive check. The Subject is built
@@ -2804,6 +3116,7 @@ impl Router {
                             outcome.rule_id.as_deref(),
                             engine.policy_id(),
                         );
+                        self.emit_dropped("authz_denied");
                         return None;
                     }
                     // Only capture `rule_id` when the recipient will
@@ -2826,6 +3139,7 @@ impl Router {
                 .collect()
         };
         let policy_id_for_obligations = authz.map(|e| e.policy_id()).unwrap_or("");
+        let mut delivered: u64 = 0;
         for (handle, obligations, rule_id) in &eligible {
             total += 1;
             // Fail-closed on unknown obligation (issue #728): skip
@@ -2838,7 +3152,10 @@ impl Router {
                 policy_id_for_obligations,
                 Some(&self.obligation_rate_limiter),
             ) {
-                Ok(d) => d,
+                Ok(d) => {
+                    self.emit_obligations_applied(obligations);
+                    d
+                }
                 Err(e) => {
                     debug!(
                         err = %e,
@@ -2847,6 +3164,7 @@ impl Router {
                         "group send skipped for recipient: obligation actuation failed"
                     );
                     dropped += 1;
+                    self.emit_dropped("obligation_failed");
                     continue;
                 }
             };
@@ -2862,8 +3180,10 @@ impl Router {
                         rule_id.as_deref(),
                     );
                 }
+                delivered += 1;
             } else {
                 dropped += 1;
+                self.emit_dropped("backpressure");
             }
         }
         if dropped > 0 {
@@ -2874,6 +3194,7 @@ impl Router {
                 "messages dropped during group send: channel full, disconnected, or obligation fail-closed"
             );
         }
+        delivered
     }
 
     /// Broadcast to all connected sessions (except sender).
@@ -2888,7 +3209,12 @@ impl Router {
     /// that fail to enqueue (channel full or closed) are dropped and
     /// counted — the per-session circuit breaker handles disconnecting
     /// persistently slow sessions.
-    async fn send_to_all(&self, msg: RoutedMessage) {
+    /// Broadcast and return the number of recipients the router
+    /// successfully delivered to. Recipients filtered out by the
+    /// Receive PEP, ACL, or obligation actuation are not counted —
+    /// the histogram observes the actual per-fanout delivery shape,
+    /// which is what capacity dashboards plot.
+    async fn send_to_all(&self, msg: RoutedMessage) -> u64 {
         let targets: Vec<SessionHandle> = {
             let state = self.state.read().await;
             state
@@ -2906,6 +3232,7 @@ impl Router {
 
         let mut dropped = 0u32;
         let mut filtered = 0u32;
+        let mut delivered: u64 = 0;
         for handle in &targets {
             // Stash the per-recipient audit context so the audit record
             // is only emitted after a successful try_send — otherwise a
@@ -2927,6 +3254,7 @@ impl Router {
                         engine.policy_id(),
                     );
                     filtered += 1;
+                    self.emit_dropped("authz_denied");
                     continue;
                 }
                 // Fail-closed on unknown obligation (issue #728):
@@ -2939,7 +3267,10 @@ impl Router {
                     engine.policy_id(),
                     Some(&self.obligation_rate_limiter),
                 ) {
-                    Ok(d) => d,
+                    Ok(d) => {
+                        self.emit_obligations_applied(&outcome.obligations);
+                        d
+                    }
                     Err(e) => {
                         debug!(
                             err = %e,
@@ -2947,6 +3278,7 @@ impl Router {
                             "broadcast send skipped for recipient: obligation actuation failed"
                         );
                         dropped += 1;
+                        self.emit_dropped("obligation_failed");
                         continue;
                     }
                 };
@@ -2966,8 +3298,10 @@ impl Router {
                         rule_id.as_deref(),
                     );
                 }
+                delivered += 1;
             } else {
                 dropped += 1;
+                self.emit_dropped("backpressure");
             }
         }
         if dropped > 0 {
@@ -2984,42 +3318,51 @@ impl Router {
                 "broadcast recipients filtered by authz policy"
             );
         }
+        delivered
     }
 
-    /// Send a message to multiple groups simultaneously.
-    ///
-    /// Collects all unique recipients across the group list and delivers
-    /// exactly once per recipient, preventing duplicate delivery when a
-    /// user belongs to more than one of the target groups.
-    async fn send_to_multicast(&self, groups: &[String], msg: RoutedMessage) {
+    /// Send a message to multiple groups simultaneously, returning
+    /// the unique recipient count after de-duplication. Each call to
+    /// [`Self::send_to_group_excluding`] increments the running total
+    /// by the number of CNs it actually delivered to in that pass —
+    /// CNs already present in `delivered` from an earlier group in
+    /// the multicast list are not double-counted.
+    async fn send_to_multicast(&self, groups: &[String], msg: RoutedMessage) -> u64 {
         if groups.is_empty() {
-            return;
+            return 0;
         }
 
         let mut delivered: HashSet<String> = HashSet::new();
+        let mut total: u64 = 0;
         for group in groups {
-            self.send_to_group_excluding(group, msg.clone(), &mut delivered)
+            total += self
+                .send_to_group_excluding(group, msg.clone(), &mut delivered)
                 .await;
         }
+        total
     }
 
     /// Deliver to a single group but skip CNs already present in
     /// `delivered`. After each successful enqueue the CN is added to
     /// the set so subsequent groups in a multicast fan-out will not
-    /// deliver twice.
+    /// deliver twice. Returns the number of recipients delivered to in
+    /// this pass — the caller in [`Self::send_to_multicast`] sums
+    /// these across the multicast group list to report a unique
+    /// recipient count to the fanout subscribers histogram.
     async fn send_to_group_excluding(
         &self,
         group: &str,
         msg: RoutedMessage,
         delivered: &mut HashSet<String>,
-    ) {
+    ) -> u64 {
         if !msg.source.is_member_of(group) {
             tracing::warn!(
                 sender = %msg.source.cn,
                 group = %group,
                 "rejected cross-group message: sender not a member"
             );
-            return;
+            self.emit_dropped("acl_denied");
+            return 0;
         }
 
         let acl_guard = self.acl.load();
@@ -3033,7 +3376,8 @@ impl Router {
                 group = %group,
                 "rejected group message: sender not authorized to send"
             );
-            return;
+            self.emit_dropped("acl_denied");
+            return 0;
         }
 
         let authz_guard = self.authz.load();
@@ -3062,7 +3406,8 @@ impl Router {
                     outcome.rule_id.as_deref(),
                     engine.policy_id(),
                 );
-                return;
+                self.emit_dropped("authz_denied");
+                return 0;
             }
             // Fail-closed on unknown obligation (issue #728): abort
             // the whole group delivery. No recipients see the
@@ -3075,7 +3420,10 @@ impl Router {
                 engine.policy_id(),
                 Some(&self.obligation_rate_limiter),
             ) {
-                Ok(m) => m,
+                Ok(m) => {
+                    self.emit_obligations_applied(&outcome.obligations);
+                    m
+                }
                 Err(e) => {
                     debug!(
                         err = %e,
@@ -3083,7 +3431,8 @@ impl Router {
                         group = %group,
                         "group send aborted: send obligation actuation failed"
                     );
-                    return;
+                    self.emit_dropped("obligation_failed");
+                    return 0;
                 }
             }
         } else {
@@ -3092,6 +3441,7 @@ impl Router {
 
         let mut dropped = 0u32;
         let mut total = 0u32;
+        let mut delivered_count: u64 = 0;
         // Collect eligible handles so the borrow on `delivered` from
         // the filter chain does not overlap with the mutable insert
         // below. We carry the rule_id alongside the obligations so the
@@ -3101,16 +3451,20 @@ impl Router {
             let state = self.state.read().await;
             let members = match state.groups.get(group) {
                 Some(m) => m,
-                None => return,
+                None => return 0,
             };
             members
                 .iter()
                 .filter(|cn| *cn != &msg.source.cn)
                 .filter(|cn| !delivered.contains(cn.as_str()))
                 .filter(|cn| {
-                    acl_ref
+                    let allowed = acl_ref
                         .as_ref()
-                        .is_none_or(|acl| acl.is_receive_authorized(group, cn))
+                        .is_none_or(|acl| acl.is_receive_authorized(group, cn));
+                    if !allowed {
+                        self.emit_dropped("acl_denied");
+                    }
+                    allowed
                 })
                 .filter_map(|cn| state.sessions.get(cn).cloned())
                 .filter_map(|handle| {
@@ -3131,6 +3485,7 @@ impl Router {
                             outcome.rule_id.as_deref(),
                             engine.policy_id(),
                         );
+                        self.emit_dropped("authz_denied");
                         return None;
                     }
                     // See send_to_group: skip rule_id capture unless
@@ -3166,7 +3521,10 @@ impl Router {
                 policy_id_for_obligations,
                 Some(&self.obligation_rate_limiter),
             ) {
-                Ok(d) => d,
+                Ok(d) => {
+                    self.emit_obligations_applied(obligations);
+                    d
+                }
                 Err(e) => {
                     debug!(
                         err = %e,
@@ -3175,6 +3533,7 @@ impl Router {
                         "multicast group send skipped for recipient: obligation actuation failed"
                     );
                     dropped += 1;
+                    self.emit_dropped("obligation_failed");
                     continue;
                 }
             };
@@ -3191,8 +3550,10 @@ impl Router {
                         rule_id.as_deref(),
                     );
                 }
+                delivered_count += 1;
             } else {
                 dropped += 1;
+                self.emit_dropped("backpressure");
             }
         }
         if dropped > 0 {
@@ -3203,6 +3564,7 @@ impl Router {
                 "messages dropped during multicast group send: channel full, disconnected, or obligation fail-closed"
             );
         }
+        delivered_count
     }
 }
 
@@ -5713,6 +6075,247 @@ mod tests {
             drop_count.load(Ordering::Relaxed),
             0,
             "successful multicast must not invoke the dropped callback",
+        );
+    }
+
+    // ── Router/PEP/obligation callback tests (issue #768) ──────────
+
+    #[tokio::test]
+    async fn fanout_callback_fires_with_destination_and_subscriber_count() {
+        // Closes #768. The fanout callback is the integration point
+        // for the `rustgate_router_fanout_total{destination}` counter
+        // and the `rustgate_router_fanout_subscribers` histogram. Pin
+        // both: the destination label is the small fixed-vocabulary
+        // string the metric layer rounds-trips into Prometheus
+        // labels, and the subscriber count is the actual delivered
+        // recipient count (post-PEP, post-ACL, post-obligation).
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let router = Router::new();
+        let alice = make_identity("alice", &["alpha"]);
+        let bob = make_identity("bob", &["alpha"]);
+        let observed_dst = Arc::new(parking_lot::Mutex::new(String::new()));
+        let observed_count = Arc::new(AtomicU64::new(u64::MAX));
+        let dst_clone = Arc::clone(&observed_dst);
+        let count_clone = Arc::clone(&observed_count);
+        router.set_on_fanout(Some(Arc::new(move |dst: &str, count: u64| {
+            *dst_clone.lock() = dst.to_string();
+            count_clone.store(count, Ordering::Relaxed);
+        })));
+        let (ptx_a, ntx_a, _prx_a, _nrx_a) = make_channels(16, 64);
+        let (ptx_b, ntx_b, mut prx_b, _nrx_b) = make_channels(16, 64);
+        router
+            .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
+            .await;
+        router
+            .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+            .await;
+
+        let msg = make_position(&alice, Destination::Group("alpha".into()));
+        router.route(msg).await;
+
+        assert_eq!(*observed_dst.lock(), "group");
+        assert_eq!(observed_count.load(Ordering::Relaxed), 1);
+        // Bob actually received the message — proves the histogram
+        // count matches the wire-level delivery.
+        let _ = prx_b.try_recv().expect("bob receives the group send");
+    }
+
+    #[tokio::test]
+    async fn dropped_callback_fires_with_no_subscribers_for_unknown_direct_target() {
+        // Closes #768. A direct send to a CN that never registered
+        // is the canonical "no_subscribers" case — the message is
+        // persisted to store-forward (or discarded if no queue).
+        // The metric label MUST be `no_subscribers` so dashboards
+        // distinguish it from `backpressure` (live channel rejected).
+        let router = Router::new();
+        let alice = make_identity("alice", &["alpha"]);
+        let dropped = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let cb_dropped = Arc::clone(&dropped);
+        router.set_on_dropped(Some(Arc::new(move |reason: &str| {
+            cb_dropped.lock().push(reason.to_string());
+        })));
+        let (ptx, ntx, _prx, _nrx) = make_channels(16, 64);
+        router
+            .register(SessionHandle::new(alice.clone(), ptx, ntx))
+            .await;
+
+        let ghost = make_identity("ghost-cn", &[]);
+        let msg = make_position(&alice, Destination::Direct((*ghost).clone()));
+        router.route(msg).await;
+
+        let reasons = dropped.lock().clone();
+        assert!(
+            reasons.iter().any(|r| r == "no_subscribers"),
+            "expected no_subscribers reason; got {reasons:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pep_decision_callback_fires_with_send_direction_on_route() {
+        // Closes #768. The Send-PEP fires once per `route_inner` for
+        // direct/group/broadcast destinations when an authz engine
+        // is installed. Without an engine the callback is silent —
+        // there is no decision to report. We use the always-allow
+        // engine so the call site is exercised but the message
+        // continues to fan-out, mirroring the production hot path.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use rustgate_authz::{
+            Action as AuthzAction, Decision as AuthzDecision, DecisionOutcome, PolicyEngine,
+            Resource as AuthzResource, Subject as AuthzSubject,
+        };
+
+        #[derive(Debug)]
+        struct AlwaysAllow;
+        impl PolicyEngine for AlwaysAllow {
+            fn evaluate(
+                &self,
+                _subject: &AuthzSubject<'_>,
+                _resource: &AuthzResource<'_>,
+                _action: AuthzAction,
+            ) -> DecisionOutcome {
+                DecisionOutcome {
+                    decision: AuthzDecision::Allow,
+                    rule_id: None,
+                    obligations: Vec::new(),
+                }
+            }
+            fn policy_id(&self) -> &str {
+                "test-always-allow"
+            }
+        }
+
+        let alice = make_identity("alice", &["alpha"]);
+        let bob = make_identity("bob", &["alpha"]);
+        let router = Router::new().with_authz(Arc::new(AlwaysAllow));
+        let send_count = Arc::new(AtomicUsize::new(0));
+        let recv_count = Arc::new(AtomicUsize::new(0));
+        let send_clone = Arc::clone(&send_count);
+        let recv_clone = Arc::clone(&recv_count);
+        router.set_on_pep_decision(Some(Arc::new(
+            move |direction: &str, decision: &str, eval_secs: f64| {
+                // The bridge converts AuthzDecision::Allow into the
+                // documented "allow" label. Pin that contract here so
+                // a regression that drifted the casing or vocabulary
+                // is caught by this test.
+                assert_eq!(decision, "allow");
+                assert!(eval_secs >= 0.0);
+                match direction {
+                    "send" => {
+                        let _ = send_clone.fetch_add(1, Ordering::Relaxed);
+                    }
+                    "receive" => {
+                        let _ = recv_clone.fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {}
+                }
+            },
+        )));
+        let (ptx_a, ntx_a, _prx_a, _nrx_a) = make_channels(16, 64);
+        let (ptx_b, ntx_b, _prx_b, _nrx_b) = make_channels(16, 64);
+        router
+            .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
+            .await;
+        router
+            .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+            .await;
+
+        let msg = make_position(&alice, Destination::Group("alpha".into()));
+        router.route(msg).await;
+
+        // For a Group destination route_inner runs Send-PEP exactly
+        // once at the top level. The Receive PEP then runs inside
+        // send_to_group for every eligible recipient (just bob here).
+        assert!(
+            send_count.load(Ordering::Relaxed) >= 1,
+            "Send-PEP must have been observed at least once"
+        );
+        assert!(
+            recv_count.load(Ordering::Relaxed) >= 1,
+            "Receive-PEP must have been observed at least once"
+        );
+    }
+
+    #[tokio::test]
+    async fn obligation_applied_callback_fires_with_kind_label() {
+        // Closes #768. Verify the obligation_applied callback fires
+        // with the documented label vocabulary when the engine
+        // returns a known data-plane obligation. Use TagClassified
+        // so the test does not depend on the rustgate-cot mask
+        // implementation — the callback fires regardless of whether
+        // the obligation is audit- or data-plane-shaped.
+        use rustgate_authz::{
+            Action as AuthzAction, Decision as AuthzDecision, DecisionOutcome, Obligation,
+            PolicyEngine, Resource as AuthzResource, Subject as AuthzSubject,
+        };
+
+        #[derive(Debug)]
+        struct AllowWithTag;
+        impl PolicyEngine for AllowWithTag {
+            fn evaluate(
+                &self,
+                _subject: &AuthzSubject<'_>,
+                _resource: &AuthzResource<'_>,
+                _action: AuthzAction,
+            ) -> DecisionOutcome {
+                DecisionOutcome {
+                    decision: AuthzDecision::Allow,
+                    rule_id: None,
+                    obligations: vec![Obligation::TagClassified],
+                }
+            }
+            fn policy_id(&self) -> &str {
+                "test-tag-classified"
+            }
+        }
+
+        let alice = make_identity("alice", &["alpha"]);
+        let bob = make_identity("bob", &["alpha"]);
+        let router = Router::new().with_authz(Arc::new(AllowWithTag));
+        let kinds = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let cb_kinds = Arc::clone(&kinds);
+        router.set_on_obligation_applied(Some(Arc::new(move |kind: &str| {
+            cb_kinds.lock().push(kind.to_string());
+        })));
+        let (ptx_a, ntx_a, _prx_a, _nrx_a) = make_channels(16, 64);
+        let (ptx_b, ntx_b, _prx_b, _nrx_b) = make_channels(16, 64);
+        router
+            .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
+            .await;
+        router
+            .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+            .await;
+
+        let msg = make_position(&alice, Destination::Group("alpha".into()));
+        router.route(msg).await;
+
+        let observed = kinds.lock().clone();
+        assert!(
+            observed.iter().any(|k| k == "tag_classified"),
+            "expected tag_classified kind label; got {observed:?}"
+        );
+    }
+
+    #[test]
+    fn obligation_kind_label_maps_known_variants() {
+        // Closes #768. The label vocabulary is load-bearing for
+        // bounded Prometheus cardinality. Pin the exact mapping so a
+        // future Obligation::Foo variant cannot silently drift onto
+        // the "unknown" bucket without a deliberate transport
+        // change.
+        use rustgate_authz::Obligation;
+        assert_eq!(obligation_kind_label(&Obligation::MaskPoint), "mask_point");
+        assert_eq!(
+            obligation_kind_label(&Obligation::MaskPayload),
+            "mask_payload"
+        );
+        assert_eq!(
+            obligation_kind_label(&Obligation::TagClassified),
+            "tag_classified"
+        );
+        assert_eq!(
+            obligation_kind_label(&Obligation::AuditExtended),
+            "audit_extended"
         );
     }
 }

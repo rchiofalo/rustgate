@@ -113,6 +113,16 @@ pub const DEFAULT_UNKNOWN_OBLIGATION_AUDIT_PER_MIN: u32 = 60;
 /// [`OnInsert`](crate::dedup::OnInsert) callback aliases.
 pub type OnObligationUnknown = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Callback invoked once per obligation actuation failure with the
+/// stable `reason` token emitted alongside the audit event. The same
+/// vocabulary as [`rustgate_core::audit::authz_obligation_failed`]:
+/// `mask_point_non_xml`, `mask_point_xml_error`,
+/// `mask_point_io_error`, `mask_point_attr_budget_exceeded`,
+/// `unknown_variant`. Wired by the server binary to feed the
+/// `rustgate_obligation_failures_total{reason}` counter under
+/// `#[cfg(feature = "metrics")]`. Closes #768.
+pub type OnObligationFailure = Arc<dyn Fn(&'static str) + Send + Sync>;
+
 /// Per-`(policy_id, variant_name)` rate limiter for
 /// [`audit::authz_obligation_unknown`] emissions plus an always-on
 /// metric callback for operator visibility.
@@ -141,6 +151,7 @@ pub struct ObligationRateLimiter {
     audit_per_min: u32,
     buckets: Mutex<HashMap<(String, String), Arc<TokenBucket>>>,
     on_unknown: Option<OnObligationUnknown>,
+    on_failure: Option<OnObligationFailure>,
 }
 
 // Custom `Debug`: `OnObligationUnknown` is `dyn Fn` and does not
@@ -153,6 +164,7 @@ impl std::fmt::Debug for ObligationRateLimiter {
             .field("audit_per_min", &self.audit_per_min)
             .field("buckets_tracked", &self.buckets.lock().len())
             .field("on_unknown_installed", &self.on_unknown.is_some())
+            .field("on_failure_installed", &self.on_failure.is_some())
             .finish()
     }
 }
@@ -173,6 +185,7 @@ impl ObligationRateLimiter {
             audit_per_min: audit_per_min.max(1),
             buckets: Mutex::new(HashMap::new()),
             on_unknown: None,
+            on_failure: None,
         }
     }
 
@@ -190,6 +203,35 @@ impl ObligationRateLimiter {
     /// callback later.
     pub fn set_on_unknown(&mut self, cb: OnObligationUnknown) {
         self.on_unknown = Some(cb);
+    }
+
+    /// Builder-style installer for the per-failure metric callback.
+    /// Wired by the server binary at startup so every obligation
+    /// actuation failure (mask_point_non_xml, mask_point_xml_error,
+    /// mask_point_io_error, mask_point_attr_budget_exceeded,
+    /// unknown_variant) feeds the
+    /// `rustgate_obligation_failures_total{reason}` counter. Closes
+    /// #768.
+    #[must_use]
+    pub fn with_on_failure(mut self, cb: OnObligationFailure) -> Self {
+        self.on_failure = Some(cb);
+        self
+    }
+
+    /// Replace the per-failure metric callback after construction.
+    pub fn set_on_failure(&mut self, cb: OnObligationFailure) {
+        self.on_failure = Some(cb);
+    }
+
+    /// Notify the per-failure callback (if installed) with the
+    /// documented stable `reason` token. Called from
+    /// [`apply_obligations_with_limiter`] after every
+    /// [`audit::authz_obligation_failed`] emission so dashboards see
+    /// the same signal the audit log records. Closes #768.
+    pub(crate) fn observe_failure(&self, reason: &'static str) {
+        if let Some(cb) = self.on_failure.as_ref() {
+            cb(reason);
+        }
     }
 
     /// Configured audit-emission cap per minute per
@@ -428,7 +470,7 @@ pub fn apply_obligations_with_limiter(
 ) -> Result<(), ObligationError> {
     for obligation in obligations {
         match obligation {
-            Obligation::MaskPoint => apply_mask_point(msg, policy_id),
+            Obligation::MaskPoint => apply_mask_point(msg, policy_id, rate_limiter),
             Obligation::MaskPayload => apply_mask_payload(msg),
             // Audit-only obligations handled at the call site.
             Obligation::TagClassified | Obligation::AuditExtended => {}
@@ -455,6 +497,14 @@ pub fn apply_obligations_with_limiter(
                         msg.destination.kind_str(),
                         policy_id,
                     );
+                }
+                // Closes #768: the unknown-variant path is also a
+                // failure path for the obligation-failures counter —
+                // the audit event already carries the
+                // `unknown_variant` reason token, so dashboards see
+                // the same vocabulary on the metric.
+                if let Some(limiter) = rate_limiter {
+                    limiter.observe_failure(audit::OBLIGATION_REASON_UNKNOWN_VARIANT);
                 }
                 match unknown_policy {
                     UnknownObligationPolicy::FailClosed => {
@@ -532,7 +582,11 @@ pub fn apply_obligations_with_limiter(
 /// `policy_id` is forwarded into both `audit::authz_obligation_failed`
 /// emissions (closes #772) so SIEM correlation can pin which engine
 /// version returned the obligation that the masker could not honour.
-fn apply_mask_point(msg: &mut RoutableMessage, policy_id: &str) {
+fn apply_mask_point(
+    msg: &mut RoutableMessage,
+    policy_id: &str,
+    rate_limiter: Option<&ObligationRateLimiter>,
+) {
     // XML-intent is decided from the payload itself: first
     // non-whitespace byte is `<`. Non-XML payloads cannot host a
     // `<point>` element — forward unmodified but still audit so
@@ -574,6 +628,9 @@ fn apply_mask_point(msg: &mut RoutableMessage, policy_id: &str) {
             msg.destination.kind_str(),
             policy_id,
         );
+        if let Some(limiter) = rate_limiter {
+            limiter.observe_failure(audit::OBLIGATION_REASON_MASK_POINT_NON_XML);
+        }
         return;
     }
 
@@ -617,6 +674,9 @@ fn apply_mask_point(msg: &mut RoutableMessage, policy_id: &str) {
                 msg.destination.kind_str(),
                 policy_id,
             );
+            if let Some(limiter) = rate_limiter {
+                limiter.observe_failure(reason);
+            }
             apply_mask_payload(msg);
         }
     }

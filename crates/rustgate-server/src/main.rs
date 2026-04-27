@@ -820,6 +820,15 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
                     metrics::authz_obligation_unknown()
                         .with_label_values(&[variant])
                         .inc();
+                }))
+                // Closes #768: wire the per-failure callback so each
+                // `authz.obligation_failed` audit emission has a
+                // matching `rustgate_obligation_failures_total{reason}`
+                // increment. Same `reason` vocabulary across both.
+                .with_on_failure(std::sync::Arc::new(|reason: &'static str| {
+                    metrics::obligation_failures_total()
+                        .with_label_values(&[reason])
+                        .inc();
                 }));
             base.with_obligation_rate_limiter(std::sync::Arc::new(limiter))
         };
@@ -855,6 +864,20 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     router.set_on_multicast_oversize_dropped(Some(std::sync::Arc::new(|| {
         metrics::multicast_oversize_dropped().inc();
     })));
+
+    // Closes #768. First-class router/PEP/obligation observability.
+    // Each callback bridges the transport's hot-path observation
+    // points to the Prometheus exposition surface. The wiring is
+    // operationally additive: builds without `--features metrics` see
+    // the previous tracing-only behaviour because the callbacks are
+    // never installed (the slots stay `None`).
+    #[cfg(feature = "metrics")]
+    {
+        router.set_on_fanout(Some(metrics::router_fanout_callback()));
+        router.set_on_dropped(Some(metrics::router_dropped_callback()));
+        router.set_on_pep_decision(Some(metrics::router_pep_decision_callback()));
+        router.set_on_obligation_applied(Some(metrics::router_obligation_applied_callback()));
+    }
 
     #[cfg(feature = "metrics")]
     if let Some(ref q) = client_queue {

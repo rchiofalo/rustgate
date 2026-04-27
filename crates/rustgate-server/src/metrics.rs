@@ -228,6 +228,22 @@ static AUTHZ_CACHE_MISSES: OnceLock<IntCounter> = OnceLock::new();
 static RELOAD_ROLLBACK: OnceLock<IntCounterVec> = OnceLock::new();
 static AUTHZ_OBLIGATION_UNKNOWN: OnceLock<IntCounterVec> = OnceLock::new();
 
+// ── Router fanout, PEP, and obligation metrics (issue #768) ─────────
+//
+// Operationally additive: every metric below is registered only when
+// `--features metrics` is on, and the router-side callbacks that feed
+// them are installed only under the same cfg gate. Builds without the
+// feature observe identical behaviour to pre-#768.
+
+static ROUTER_FANOUT_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
+static ROUTER_FANOUT_SUBSCRIBERS: OnceLock<Histogram> = OnceLock::new();
+static ROUTER_DROPPED_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
+static PEP_SEND_DECISIONS: OnceLock<IntCounterVec> = OnceLock::new();
+static PEP_RECEIVE_DECISIONS: OnceLock<IntCounterVec> = OnceLock::new();
+static PEP_EVALUATION_SECONDS: OnceLock<HistogramVec> = OnceLock::new();
+static OBLIGATION_APPLIED_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
+static OBLIGATION_FAILURES_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
+
 static ARCHIVE_BYTES: OnceLock<IntGauge> = OnceLock::new();
 static CRL_AGE_SECONDS: OnceLock<IntGauge> = OnceLock::new();
 static CERT_EXPIRY_SECONDS: OnceLock<IntGauge> = OnceLock::new();
@@ -1143,6 +1159,157 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(authz_obligation_unknown.clone()))?;
     let _ = AUTHZ_OBLIGATION_UNKNOWN.set(authz_obligation_unknown);
 
+    // ── Router fanout / PEP / obligation metrics (issue #768) ──────
+    //
+    // Bounded label vocabularies — the router callbacks installed by
+    // `setup`/`main` only emit static `&'static str` keys, so cardinality
+    // is fixed at compile time regardless of policy or workload shape.
+
+    let router_fanout_total = IntCounterVec::new(
+        Opts::new(
+            "rustgate_router_fanout_total",
+            "Number of `Router::route_for_egress` calls that reached a \
+             terminal fan-out, labelled by `destination` \
+             (`direct`, `group`, `broadcast`, `multicast`). Operators \
+             alert on a sudden imbalance between destinations or a \
+             flatlined `direct` rate against a climbing connection \
+             count (typical signal of broken store-and-forward).",
+        ),
+        &["destination"],
+    )?;
+    registry.register(Box::new(router_fanout_total.clone()))?;
+    let _ = ROUTER_FANOUT_TOTAL.set(router_fanout_total);
+
+    // Buckets cover the operationally meaningful range from a unicast
+    // direct (1) up to a fleet-wide broadcast (1000+). The 0-bucket
+    // captures the no-subscribers / fully-filtered case, which is a
+    // distinct operational signal from a small fan-out.
+    let router_fanout_subscribers = Histogram::with_opts(
+        HistogramOpts::new(
+            "rustgate_router_fanout_subscribers",
+            "Distribution of recipient counts per `Router::route_for_egress` call. \
+             Observes the number of sessions the router successfully delivered \
+             to (post-ACL, post-authz, post-obligation), NOT the candidate pool \
+             size. The 0-bucket captures fully-filtered fan-outs.",
+        )
+        .buckets(vec![0.0, 1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0]),
+    )?;
+    registry.register(Box::new(router_fanout_subscribers.clone()))?;
+    let _ = ROUTER_FANOUT_SUBSCRIBERS.set(router_fanout_subscribers);
+
+    let router_dropped_total = IntCounterVec::new(
+        Opts::new(
+            "rustgate_router_dropped_total",
+            "Recipients (or whole messages) the router dropped after \
+             admission, labelled by `reason` \
+             (`no_subscribers`, `backpressure`, `acl_denied`, \
+             `authz_denied`, `obligation_failed`). Same `reason` \
+             vocabulary the audit log emits — Prometheus dashboards and \
+             SIEM pivots stay in lock-step.",
+        ),
+        &["reason"],
+    )?;
+    registry.register(Box::new(router_dropped_total.clone()))?;
+    let _ = ROUTER_DROPPED_TOTAL.set(router_dropped_total);
+
+    let pep_send_decisions = IntCounterVec::new(
+        Opts::new(
+            "rustgate_pep_send_decisions_total",
+            "Send-PEP decisions emitted by the router, labelled by \
+             `decision` (`allow`, `deny`, `fail_open`). Sibling counter \
+             to `rustgate_pep_receive_decisions_total` — the two are \
+             kept separate so dashboards can graph allow/deny ratios by \
+             direction without pivoting on a label.",
+        ),
+        &["decision"],
+    )?;
+    registry.register(Box::new(pep_send_decisions.clone()))?;
+    let _ = PEP_SEND_DECISIONS.set(pep_send_decisions);
+
+    let pep_receive_decisions = IntCounterVec::new(
+        Opts::new(
+            "rustgate_pep_receive_decisions_total",
+            "Receive-PEP decisions emitted by the router, labelled by \
+             `decision` (`allow`, `deny`, `fail_open`). Sibling of \
+             `rustgate_pep_send_decisions_total`.",
+        ),
+        &["decision"],
+    )?;
+    registry.register(Box::new(pep_receive_decisions.clone()))?;
+    let _ = PEP_RECEIVE_DECISIONS.set(pep_receive_decisions);
+
+    // Same bucket family as the existing nanosecond histogram but in
+    // seconds — Prometheus best practice is one canonical SI unit per
+    // exposition. The floor is 50 ns so the same dashboards that read
+    // `rustgate_authz_eval_nanos` see a consistent P50 here, with a
+    // 10s ceiling to catch pathological evaluations (anything above is
+    // a bug, not a bucket worth widening for).
+    let pep_evaluation_seconds = HistogramVec::new(
+        HistogramOpts::new(
+            "rustgate_pep_evaluation_seconds",
+            "Wall-clock PEP evaluation latency in seconds, labelled by \
+             `direction` (`send`, `receive`, `other`). Covers the same \
+             call sites as `rustgate_authz_eval_nanos` but in canonical \
+             SI units; both are kept registered so existing dashboards \
+             do not break.",
+        )
+        .buckets(vec![
+            0.000_000_05,
+            0.000_000_1,
+            0.000_000_25,
+            0.000_000_5,
+            0.000_001,
+            0.000_002_5,
+            0.000_010,
+            0.000_100,
+            0.001,
+            0.010,
+            0.100,
+            1.0,
+            10.0,
+        ]),
+        &["direction"],
+    )?;
+    registry.register(Box::new(pep_evaluation_seconds.clone()))?;
+    let _ = PEP_EVALUATION_SECONDS.set(pep_evaluation_seconds);
+
+    let obligation_applied_total = IntCounterVec::new(
+        Opts::new(
+            "rustgate_obligation_applied_total",
+            "Data-plane authz obligations actually applied to outbound \
+             messages, labelled by `kind` (`mask_point`, `mask_payload`, \
+             `tag_classified`, `audit_extended`, `unknown`). One \
+             increment per applied obligation, per outbound copy — \
+             emitted alongside the existing `authz.classified_delivery` \
+             audit record so operators can correlate the metric rate \
+             with the audit trail. `unknown` is bounded by a single \
+             label value because the authz crate's `Obligation` enum \
+             is `#[non_exhaustive]` and a future variant must not grow \
+             Prometheus cardinality without an explicit transport \
+             update.",
+        ),
+        &["kind"],
+    )?;
+    registry.register(Box::new(obligation_applied_total.clone()))?;
+    let _ = OBLIGATION_APPLIED_TOTAL.set(obligation_applied_total);
+
+    let obligation_failures_total = IntCounterVec::new(
+        Opts::new(
+            "rustgate_obligation_failures_total",
+            "Obligation actuation failures encountered by the router, \
+             labelled by `reason` (`mask_point_non_xml`, \
+             `mask_point_xml_error`, `mask_point_io_error`, \
+             `mask_point_attr_budget_exceeded`, `unknown_variant`). \
+             Mirrors the `reason` field on the audit log emitted by \
+             [`rustgate_core::audit::authz_obligation_failed`] so SIEM \
+             correlation rules and Prometheus alert rules stay in \
+             lock-step. Closes #768.",
+        ),
+        &["reason"],
+    )?;
+    registry.register(Box::new(obligation_failures_total.clone()))?;
+    let _ = OBLIGATION_FAILURES_TOTAL.set(obligation_failures_total);
+
     #[cfg(feature = "jemalloc")]
     {
         let jemalloc_resident = IntGauge::with_opts(Opts::new(
@@ -1283,6 +1450,146 @@ pub fn authz_obligation_unknown() -> &'static IntCounterVec {
             "fallback",
             &["variant"],
         )
+    })
+}
+
+// ── Router fanout / PEP / obligation accessors (issue #768) ─────────
+
+/// Per-destination router-fanout counter. Wired by the server binary
+/// at startup via [`rustgate_transport::Router::set_on_fanout`] under
+/// `#[cfg(feature = "metrics")]`. Closes #768.
+pub fn router_fanout_total() -> &'static IntCounterVec {
+    ROUTER_FANOUT_TOTAL.get_or_init(|| {
+        fallback_counter_vec("rustgate_router_fanout_total", "fallback", &["destination"])
+    })
+}
+
+/// Histogram of recipient counts per fanout. Closes #768.
+pub fn router_fanout_subscribers() -> &'static Histogram {
+    ROUTER_FANOUT_SUBSCRIBERS
+        .get_or_init(|| fallback_histogram("rustgate_router_fanout_subscribers", "fallback"))
+}
+
+/// Per-reason router-drop counter. Wired by the server binary at
+/// startup via [`rustgate_transport::Router::set_on_dropped`] under
+/// `#[cfg(feature = "metrics")]`. Closes #768.
+pub fn router_dropped_total() -> &'static IntCounterVec {
+    ROUTER_DROPPED_TOTAL.get_or_init(|| {
+        fallback_counter_vec("rustgate_router_dropped_total", "fallback", &["reason"])
+    })
+}
+
+/// Send-PEP decision counter. Wired alongside
+/// [`router_fanout_total`] via `OnPepDecision` at startup.
+pub fn pep_send_decisions() -> &'static IntCounterVec {
+    PEP_SEND_DECISIONS.get_or_init(|| {
+        fallback_counter_vec(
+            "rustgate_pep_send_decisions_total",
+            "fallback",
+            &["decision"],
+        )
+    })
+}
+
+/// Receive-PEP decision counter. Sibling of
+/// [`pep_send_decisions`].
+pub fn pep_receive_decisions() -> &'static IntCounterVec {
+    PEP_RECEIVE_DECISIONS.get_or_init(|| {
+        fallback_counter_vec(
+            "rustgate_pep_receive_decisions_total",
+            "fallback",
+            &["decision"],
+        )
+    })
+}
+
+/// Per-direction PEP evaluation latency histogram (seconds).
+pub fn pep_evaluation_seconds() -> &'static HistogramVec {
+    PEP_EVALUATION_SECONDS.get_or_init(|| {
+        fallback_histogram_vec(
+            "rustgate_pep_evaluation_seconds",
+            "fallback",
+            &["direction"],
+        )
+    })
+}
+
+/// Per-kind data-plane obligation-applied counter. Closes #768.
+pub fn obligation_applied_total() -> &'static IntCounterVec {
+    OBLIGATION_APPLIED_TOTAL.get_or_init(|| {
+        fallback_counter_vec("rustgate_obligation_applied_total", "fallback", &["kind"])
+    })
+}
+
+/// Per-reason obligation actuation failure counter. The label
+/// vocabulary mirrors the `reason` field emitted by
+/// [`rustgate_core::audit::authz_obligation_failed`]. Wired by the
+/// server binary at startup via
+/// [`rustgate_transport::obligations::ObligationRateLimiter::with_on_failure`]
+/// under `#[cfg(feature = "metrics")]`. Closes #768.
+pub fn obligation_failures_total() -> &'static IntCounterVec {
+    OBLIGATION_FAILURES_TOTAL.get_or_init(|| {
+        fallback_counter_vec(
+            "rustgate_obligation_failures_total",
+            "fallback",
+            &["reason"],
+        )
+    })
+}
+
+/// Build the [`rustgate_transport::OnFanout`] callback that feeds the
+/// `rustgate_router_fanout_total{destination}` counter and the
+/// `rustgate_router_fanout_subscribers` histogram. Wired by the server
+/// binary once at startup so every fan-out observed by the router
+/// funnels into the same metrics. Closes #768.
+pub fn router_fanout_callback() -> rustgate_transport::OnFanout {
+    Arc::new(|destination: &'static str, subscribers: u64| {
+        router_fanout_total()
+            .with_label_values(&[destination])
+            .inc();
+        // `as f64` is safe — `u64::MAX` is rounded into the +inf bucket
+        // and the histogram is only ever read for distribution shape,
+        // not exact counts.
+        router_fanout_subscribers().observe(subscribers as f64);
+    })
+}
+
+/// Build the [`rustgate_transport::OnDropped`] callback that feeds the
+/// `rustgate_router_dropped_total{reason}` counter. Closes #768.
+pub fn router_dropped_callback() -> rustgate_transport::OnDropped {
+    Arc::new(|reason: &'static str| {
+        router_dropped_total().with_label_values(&[reason]).inc();
+    })
+}
+
+/// Build the [`rustgate_transport::OnPepDecision`] callback that feeds
+/// the Send/Receive PEP counters and the per-direction evaluation
+/// latency histogram. The router emits direction labels `"send"`,
+/// `"receive"`, or `"other"`; the callback maps the first two to the
+/// dedicated counter and bins everything else under the histogram so
+/// future `AuthzAction` variants stay observable without extra
+/// counters. Closes #768.
+pub fn router_pep_decision_callback() -> rustgate_transport::OnPepDecision {
+    Arc::new(
+        |direction: &'static str, decision: &'static str, eval_secs: f64| {
+            match direction {
+                "send" => pep_send_decisions().with_label_values(&[decision]).inc(),
+                "receive" => pep_receive_decisions().with_label_values(&[decision]).inc(),
+                _ => {}
+            }
+            pep_evaluation_seconds()
+                .with_label_values(&[direction])
+                .observe(eval_secs);
+        },
+    )
+}
+
+/// Build the [`rustgate_transport::OnObligationApplied`] callback that
+/// feeds the `rustgate_obligation_applied_total{kind}` counter. Closes
+/// #768.
+pub fn router_obligation_applied_callback() -> rustgate_transport::OnObligationApplied {
+    Arc::new(|kind: &'static str| {
+        obligation_applied_total().with_label_values(&[kind]).inc();
     })
 }
 
@@ -5276,6 +5583,270 @@ mod tests {
                 b_before, b_after,
                 "variant B must NOT change when only variant A was incremented",
             );
+        }
+    }
+
+    /// Closes #768. Registration tests for the router/PEP/obligation
+    /// metric family. Each test pins one operationally-load-bearing
+    /// property: the metric is reachable on `/metrics`, the documented
+    /// label arity matches what dashboards consume, and the bound
+    /// callback factories produce the documented increment shape.
+    mod router_pep_obligation_metrics {
+        use super::*;
+
+        fn family(name: &str) -> Option<prometheus::proto::MetricFamily> {
+            prometheus::default_registry()
+                .gather()
+                .into_iter()
+                .find(|mf| mf.name() == name)
+        }
+
+        #[test]
+        fn router_fanout_total_registered_with_destination_label() {
+            // Pin the metric name and label vocabulary — dashboards
+            // and SIEM rules query on `destination=` so a rename or
+            // accidental label drop would silently break ops.
+            ensure_init();
+            // Touch one bounded label value so the family is
+            // materialized and observable on `gather()`. Prometheus
+            // CounterVecs do not appear in the registry's gather
+            // output until at least one label tuple has been seen,
+            // so test order or single-test-per-process runners
+            // (nextest) would otherwise see an unmaterialized family.
+            router_fanout_total()
+                .with_label_values(&["direct"])
+                .inc_by(0);
+            let mf = family("rustgate_router_fanout_total")
+                .expect("rustgate_router_fanout_total must be registered");
+            assert_eq!(mf.get_field_type(), prometheus::proto::MetricType::COUNTER);
+            let labels: Vec<&str> = mf
+                .get_metric()
+                .first()
+                .map(|m| m.get_label().iter().map(|l| l.name()).collect())
+                .unwrap_or_default();
+            assert!(
+                labels.contains(&"destination"),
+                "must carry `destination` label, got {labels:?}"
+            );
+        }
+
+        #[test]
+        fn router_fanout_subscribers_registered_as_histogram() {
+            // The histogram is a single time series with no label arity
+            // — anything else would unintentionally fan-out cardinality.
+            ensure_init();
+            let mf = family("rustgate_router_fanout_subscribers")
+                .expect("rustgate_router_fanout_subscribers must be registered");
+            assert_eq!(
+                mf.get_field_type(),
+                prometheus::proto::MetricType::HISTOGRAM
+            );
+            assert_eq!(mf.get_metric().len(), 1, "no labels — single time series");
+        }
+
+        #[test]
+        fn router_dropped_total_registered_with_reason_label() {
+            // The `reason` vocabulary is fixed at compile time on the
+            // transport side — pin the metric name + label so a
+            // future label rename surfaces here as a test failure
+            // rather than silently breaking dashboards.
+            ensure_init();
+            // Touch the metric so the CounterVec family appears in
+            // `gather()` even when no other test has exercised it
+            // first (per-test-process runners like nextest).
+            router_dropped_total()
+                .with_label_values(&["no_subscribers"])
+                .inc_by(0);
+            let mf = family("rustgate_router_dropped_total")
+                .expect("rustgate_router_dropped_total must be registered");
+            assert_eq!(mf.get_field_type(), prometheus::proto::MetricType::COUNTER);
+            let labels: Vec<&str> = mf
+                .get_metric()
+                .first()
+                .map(|m| m.get_label().iter().map(|l| l.name()).collect())
+                .unwrap_or_default();
+            assert!(
+                labels.contains(&"reason"),
+                "must carry `reason` label, got {labels:?}"
+            );
+        }
+
+        #[test]
+        fn pep_send_and_receive_decisions_registered_independently() {
+            // Two sibling counters share the same vocabulary so
+            // dashboards can pivot direction without re-keying labels.
+            // A regression that collapsed both onto a single counter
+            // with a `direction=` label would silently break those
+            // dashboards.
+            ensure_init();
+            pep_send_decisions().with_label_values(&["allow"]).inc_by(0);
+            pep_receive_decisions()
+                .with_label_values(&["allow"])
+                .inc_by(0);
+            assert!(family("rustgate_pep_send_decisions_total").is_some());
+            assert!(family("rustgate_pep_receive_decisions_total").is_some());
+        }
+
+        #[test]
+        fn pep_evaluation_seconds_registered_with_direction_label() {
+            ensure_init();
+            pep_evaluation_seconds()
+                .with_label_values(&["send"])
+                .observe(0.0);
+            let mf = family("rustgate_pep_evaluation_seconds")
+                .expect("rustgate_pep_evaluation_seconds must be registered");
+            assert_eq!(
+                mf.get_field_type(),
+                prometheus::proto::MetricType::HISTOGRAM
+            );
+            let labels: Vec<&str> = mf
+                .get_metric()
+                .first()
+                .map(|m| m.get_label().iter().map(|l| l.name()).collect())
+                .unwrap_or_default();
+            assert!(
+                labels.contains(&"direction"),
+                "must carry `direction` label, got {labels:?}"
+            );
+        }
+
+        #[test]
+        fn obligation_applied_total_registered_with_kind_label() {
+            ensure_init();
+            obligation_applied_total()
+                .with_label_values(&["mask_point"])
+                .inc_by(0);
+            let mf = family("rustgate_obligation_applied_total")
+                .expect("rustgate_obligation_applied_total must be registered");
+            assert_eq!(mf.get_field_type(), prometheus::proto::MetricType::COUNTER);
+            let labels: Vec<&str> = mf
+                .get_metric()
+                .first()
+                .map(|m| m.get_label().iter().map(|l| l.name()).collect())
+                .unwrap_or_default();
+            assert!(
+                labels.contains(&"kind"),
+                "must carry `kind` label, got {labels:?}"
+            );
+        }
+
+        #[test]
+        fn obligation_failures_total_registered_with_reason_label() {
+            ensure_init();
+            // CounterVec families do not appear in `gather()` output
+            // until at least one label tuple has been materialized,
+            // so touch the documented vocabulary first. A regression
+            // that renamed the metric or changed its type would still
+            // surface — the find-by-name below still panics in that
+            // case.
+            obligation_failures_total()
+                .with_label_values(&["unknown_variant"])
+                .inc_by(0);
+            let mf = family("rustgate_obligation_failures_total")
+                .expect("rustgate_obligation_failures_total must be registered");
+            assert_eq!(mf.get_field_type(), prometheus::proto::MetricType::COUNTER);
+            let labels: Vec<&str> = mf
+                .get_metric()
+                .first()
+                .map(|m| m.get_label().iter().map(|l| l.name()).collect())
+                .unwrap_or_default();
+            assert!(
+                labels.contains(&"reason"),
+                "must carry `reason` label, got {labels:?}"
+            );
+        }
+
+        #[test]
+        fn router_fanout_callback_increments_counter_and_records_histogram() {
+            // End-to-end contract for the wired callback shape: the
+            // exact closure setup.rs/main.rs installs must produce a
+            // visible counter increment AND a histogram sample for the
+            // same call. A regression that touched only one would
+            // silently desync ops dashboards from the audit log.
+            ensure_init();
+            let cb = router_fanout_callback();
+            let counter_before = router_fanout_total().with_label_values(&["direct"]).get();
+            let hist_before = router_fanout_subscribers().get_sample_count();
+            cb("direct", 7);
+            let counter_after = router_fanout_total().with_label_values(&["direct"]).get();
+            let hist_after = router_fanout_subscribers().get_sample_count();
+            assert!(
+                counter_after > counter_before,
+                "counter must increment on callback fire; before={counter_before}, after={counter_after}"
+            );
+            assert!(
+                hist_after > hist_before,
+                "histogram must record sample on callback fire; before={hist_before}, after={hist_after}"
+            );
+        }
+
+        #[test]
+        fn router_dropped_callback_increments_per_reason_label() {
+            // Two distinct reasons must increment independently —
+            // collapsing them would cost operators the ability to
+            // distinguish backpressure (fixable) from authz_denied
+            // (intentional).
+            ensure_init();
+            let cb = router_dropped_callback();
+            let bp_before = router_dropped_total()
+                .with_label_values(&["backpressure"])
+                .get();
+            let authz_before = router_dropped_total()
+                .with_label_values(&["authz_denied"])
+                .get();
+            cb("backpressure");
+            cb("backpressure");
+            cb("authz_denied");
+            let bp_after = router_dropped_total()
+                .with_label_values(&["backpressure"])
+                .get();
+            let authz_after = router_dropped_total()
+                .with_label_values(&["authz_denied"])
+                .get();
+            assert_eq!(bp_after - bp_before, 2);
+            assert_eq!(authz_after - authz_before, 1);
+        }
+
+        #[test]
+        fn pep_decision_callback_routes_send_and_receive_to_distinct_counters() {
+            // The router emits direction=send for Send-PEP and
+            // direction=receive for Receive-PEP; the bridge callback
+            // routes each onto its dedicated counter. A regression
+            // that mis-routed (e.g. always to send) would silently
+            // collapse the operational signal.
+            ensure_init();
+            let cb = router_pep_decision_callback();
+            let send_before = pep_send_decisions().with_label_values(&["allow"]).get();
+            let recv_before = pep_receive_decisions().with_label_values(&["deny"]).get();
+            cb("send", "allow", 0.0);
+            cb("receive", "deny", 0.0);
+            let send_after = pep_send_decisions().with_label_values(&["allow"]).get();
+            let recv_after = pep_receive_decisions().with_label_values(&["deny"]).get();
+            assert!(send_after > send_before);
+            assert!(recv_after > recv_before);
+        }
+
+        #[test]
+        fn obligation_applied_callback_increments_per_kind_label() {
+            ensure_init();
+            let cb = router_obligation_applied_callback();
+            let mp_before = obligation_applied_total()
+                .with_label_values(&["mask_point"])
+                .get();
+            let mp_payload_before = obligation_applied_total()
+                .with_label_values(&["mask_payload"])
+                .get();
+            cb("mask_point");
+            cb("mask_payload");
+            cb("mask_point");
+            let mp_after = obligation_applied_total()
+                .with_label_values(&["mask_point"])
+                .get();
+            let mp_payload_after = obligation_applied_total()
+                .with_label_values(&["mask_payload"])
+                .get();
+            assert_eq!(mp_after - mp_before, 2);
+            assert_eq!(mp_payload_after - mp_payload_before, 1);
         }
     }
 }
