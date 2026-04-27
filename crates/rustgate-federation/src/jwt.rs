@@ -36,14 +36,23 @@ use std::num::NonZeroUsize;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use hmac::{Hmac, Mac};
 use lru::LruCache;
 use ring::signature::{self as ring_sig, KeyPair};
 use rustgate_core::b64;
+use rustgate_core::crypto::{HmacError, hmac_sha256_tag, hmac_sha256_verify};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-type HmacSha256 = Hmac<Sha256>;
+/// Map an [`HmacError`] from the shared crypto helper into the
+/// federation crate's [`JwtError`]. HS256 sign/verify failures are
+/// uniformly reported as [`JwtError::InvalidSignature`] — the helper's
+/// fail-closed empty-key path collapses into the same caller-visible
+/// outcome as a true tag mismatch (the JWT layer never legitimately
+/// passes an empty secret because `JwtAuthority::new` enforces a
+/// 32-byte minimum).
+fn map_hmac_error(_err: HmacError) -> JwtError {
+    JwtError::InvalidSignature
+}
 
 /// Minimum secret length in bytes for HMAC-SHA256 security.
 const MIN_SECRET_LENGTH: usize = 32;
@@ -196,10 +205,7 @@ impl SigningKey {
     fn sign(&self, signing_input: &[u8]) -> Result<Vec<u8>, JwtError> {
         match self {
             SigningKey::Hs256 { secret, .. } => {
-                let mut mac =
-                    HmacSha256::new_from_slice(secret).map_err(|_| JwtError::InvalidSignature)?;
-                mac.update(signing_input);
-                Ok(mac.finalize().into_bytes().to_vec())
+                hmac_sha256_tag(secret, signing_input).map_err(map_hmac_error)
             }
             SigningKey::Es256 { key_pair, .. } => {
                 // A fresh SystemRandom is effectively free — ring keeps the
@@ -249,12 +255,10 @@ impl VerificationKey {
     fn verify(&self, signing_input: &[u8], sig: &[u8]) -> Result<(), JwtError> {
         match self {
             VerificationKey::Hs256(secret) => {
-                let mut mac =
-                    HmacSha256::new_from_slice(secret).map_err(|_| JwtError::InvalidSignature)?;
-                mac.update(signing_input);
-                // Constant-time verification via the hmac crate.
-                mac.verify_slice(sig)
-                    .map_err(|_| JwtError::InvalidSignature)
+                // Constant-time verification (`subtle::ConstantTimeEq::ct_eq`)
+                // is enforced inside the shared
+                // `rustgate_core::crypto::hmac_sha256_verify` helper.
+                hmac_sha256_verify(secret, signing_input, sig).map_err(map_hmac_error)
             }
             VerificationKey::Es256(pub_key) => {
                 ring_sig::UnparsedPublicKey::new(&ring_sig::ECDSA_P256_SHA256_FIXED, pub_key)
@@ -921,7 +925,17 @@ fn generate_jti(peer_id: &str, timestamp: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::panic, clippy::unwrap_used)]
+
+    use hmac::{Hmac, Mac};
+
     use super::*;
+
+    /// Test-local alias used by the byte-for-byte regression tests
+    /// that pin the helper output against the previous inlined
+    /// `Hmac::<Sha256>::new_from_slice(...).update(...).finalize()`
+    /// pipeline.
+    type HmacSha256 = Hmac<Sha256>;
 
     fn make_authority() -> JwtAuthority {
         JwtAuthority::new(
@@ -1318,6 +1332,29 @@ mod tests {
         mac.update(data);
         let result = mac.finalize().into_bytes();
         assert_eq!(&result[..], &expected[..]);
+    }
+
+    /// Migration regression guard: closes #799. The HS256 sign/verify
+    /// pipeline now goes through `rustgate_core::crypto::hmac_sha256_*`.
+    /// Pin byte-for-byte equivalence to the previous inlined pipeline
+    /// so any future tweak to `SigningKey::sign` / `VerificationKey::verify`
+    /// cannot silently invalidate previously-issued JWT tokens
+    /// (which would manifest as a federation peer outage on rollout).
+    #[test]
+    fn hs256_sign_matches_inlined_construction() {
+        let secret = b"a-shared-secret-of-thirty-two-bytes!!".to_vec();
+        let signing_input = b"jwt.header.payload";
+        let signing_key = SigningKey::Hs256 {
+            secret: Zeroizing::new(secret.clone()),
+            kid: None,
+        };
+        let helper_sig = signing_key.sign(signing_input).unwrap();
+
+        let mut mac = HmacSha256::new_from_slice(&secret).unwrap();
+        mac.update(signing_input);
+        let inlined: Vec<u8> = mac.finalize().into_bytes().to_vec();
+
+        assert_eq!(helper_sig, inlined);
     }
 
     #[test]

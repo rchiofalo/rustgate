@@ -49,7 +49,6 @@ anyhow = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-hmac = { workspace = true }
 ring = { workspace = true }
 time = { workspace = true }
 x509-parser = { workspace = true }
@@ -81,6 +80,11 @@ criterion = { workspace = true }
 http-body = { workspace = true }
 wiremock = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Used by the byte-for-byte HS256 sign regression test in
+# `jwt::tests` and the RFC 4231 vector check. Not needed for production
+# builds — the migrated code path goes through
+# `rustgate_core::crypto::hmac_sha256_*`.
+hmac = { workspace = true }
 
 [[bench]]
 name = "convert"

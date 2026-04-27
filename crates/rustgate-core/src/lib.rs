@@ -13,6 +13,7 @@ pub mod audit_chain;
 pub mod b64;
 pub mod codec;
 pub mod constants;
+pub mod crypto;
 pub mod egress;
 pub mod encrypted;
 pub mod error;
@@ -28,6 +29,7 @@ pub mod sanitize;
 pub mod secrets;
 pub mod tasks;
 
+pub use crypto::{HmacError, hmac_sha256_tag, hmac_sha256_verify};
 pub use identity::AttrValue;
 pub use peer_id::{PeerId, ServerName};
 pub use secrets::{SecretFileError, SecretFileOpts, read_secret_file};
