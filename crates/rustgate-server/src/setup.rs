@@ -15,6 +15,8 @@ use std::time::SystemTime;
 use anyhow::Context;
 #[cfg(feature = "federation")]
 use rustgate_core::identity::Identity;
+#[cfg(feature = "federation-ha")]
+use rustgate_core::masking::hash_cn;
 #[cfg(feature = "federation")]
 use rustgate_core::message::RoutableMessage;
 #[cfg(feature = "federation")]
@@ -1112,7 +1114,7 @@ async fn setup_ha_handlers(
         let inner = Arc::clone(rwlock);
         spawn_background("federation-ha-adopt", async move {
             while let Some(peer_id) = rx.recv().await {
-                tracing::info!(peer_id = %peer_id, "adopting orphaned peer");
+                tracing::info!(peer_id = %hash_cn(peer_id.as_str()), "adopting orphaned peer");
                 let mut mgr = inner.write().await;
                 if let Err(e) = mgr.adopt_peer(&peer_id).await {
                     tracing::warn!(

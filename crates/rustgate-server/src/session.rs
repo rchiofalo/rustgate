@@ -348,7 +348,7 @@ async fn negotiate_tak_protocol(
     writer.write_all(&advert).await?;
     writer.flush().await?;
 
-    tracing::debug!(cn = %cn, "sent TakProtocolSupport advertisement");
+    tracing::debug!(cn = %hash_cn(cn), "sent TakProtocolSupport advertisement");
 
     // Step 2: Peek the first byte to determine if client wants protobuf
     let mut peek = [0u8; 1];
@@ -384,14 +384,14 @@ async fn negotiate_tak_protocol(
             }
         };
 
-        tracing::info!(cn = %cn, ?version, "client requested protobuf upgrade");
+        tracing::info!(cn = %hash_cn(cn), ?version, "client requested protobuf upgrade");
 
         // Step 3: Send TakResponse (0xBF-framed TakControl acknowledgement)
         let response = rustgate_proto::build_tak_response(version);
         writer.write_all(&response).await?;
         writer.flush().await?;
 
-        tracing::info!(cn = %cn, ?version, "protobuf negotiation complete");
+        tracing::info!(cn = %hash_cn(cn), ?version, "protobuf negotiation complete");
 
         Ok((
             Arc::new(rustgate_proto::TakProtobufCodec),
@@ -399,7 +399,7 @@ async fn negotiate_tak_protocol(
         ))
     } else {
         // Client sent XML (legacy mode). Preserve the byte we already read.
-        tracing::info!(cn = %cn, "client staying XML (no protobuf request)");
+        tracing::info!(cn = %hash_cn(cn), "client staying XML (no protobuf request)");
 
         let mut buf = tokio_util::bytes::BytesMut::with_capacity(64);
         buf.put_u8(peek[0]);
@@ -491,7 +491,7 @@ async fn read_loop(
         if let Some(t) = &ctx.throttle
             && !t.allow()
         {
-            tracing::debug!(cn = %ctx.identity.cn, "message dropped: rate limit exceeded");
+            tracing::debug!(cn = %hash_cn(&ctx.identity.cn), "message dropped: rate limit exceeded");
             #[cfg(feature = "metrics")]
             {
                 let bucket = ctx.metrics_identity.bucket(&ctx.identity.cn);
@@ -506,7 +506,7 @@ async fn read_loop(
         if let Some(filter) = ctx.replay_filter
             && filter.is_replay(&payload)
         {
-            tracing::debug!(cn = %ctx.identity.cn, "message dropped: replay detected");
+            tracing::debug!(cn = %hash_cn(&ctx.identity.cn), "message dropped: replay detected");
             #[cfg(feature = "metrics")]
             metrics::messages_replayed().inc();
             continue;
@@ -955,7 +955,7 @@ async fn run_plaintext_session_loops<P: NatsPublish>(
                 if let Some(t) = &throttle
                     && !t.allow()
                 {
-                    tracing::debug!(cn = %identity.cn, "message dropped: rate limit exceeded");
+                    tracing::debug!(cn = %hash_cn(&identity.cn), "message dropped: rate limit exceeded");
                     #[cfg(feature = "metrics")]
                     {
                         let bucket = metrics_identity.bucket(&identity.cn);
@@ -970,7 +970,7 @@ async fn run_plaintext_session_loops<P: NatsPublish>(
                 if let Some(filter) = replay_filter
                     && filter.is_replay(&payload)
                 {
-                    tracing::debug!(cn = %identity.cn, "message dropped: replay detected");
+                    tracing::debug!(cn = %hash_cn(&identity.cn), "message dropped: replay detected");
                     #[cfg(feature = "metrics")]
                     metrics::messages_replayed().inc();
                     continue;

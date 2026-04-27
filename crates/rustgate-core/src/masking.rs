@@ -553,4 +553,85 @@ mod tests {
         let _: String = mask_credential("password");
         let _: String = hash_cn("alice");
     }
+
+    // ── F-30 (#773) log-field cardinality cap ────────────────────────
+    //
+    // The following tests pin the contract that `hash_cn` is the
+    // cardinality-cap primitive for operational `info!`/`debug!`/`trace!`
+    // log fields carrying user-controlled CNs or peer ids. The
+    // boundary discipline is documented in the call sites: error/warn
+    // logs keep the raw value for forensic correlation (already
+    // sanitized at the audit boundary per #1197); operational logs at
+    // info/debug pass the value through `hash_cn` before it reaches a
+    // structured field. This caps the SIEM index cardinality at the
+    // bounded fleet-CN count rather than the unbounded
+    // attacker-controlled value count.
+
+    #[test]
+    fn hash_identity_idempotent_through_log_field() {
+        // The same CN, hashed at multiple log-emission sites in the
+        // same process, must produce the same correlation token. This
+        // is the property a SIEM relies on when grouping events by
+        // `cn` field — every emission of identity X must collapse to
+        // a single index entry, otherwise the cardinality cap is
+        // defeated. The previous `hash_cn_is_stable_and_truncated`
+        // test pins this for two adjacent calls; this test pins the
+        // contract across many calls and many distinct identities,
+        // matching the realistic operator query "find all log events
+        // for this hashed CN" pattern.
+        for cn in [
+            "alice",
+            "bob@example.test",
+            "device-007.uas.fleet",
+            "tenant-a/group-b/cn-c",
+            "",
+            "🔒",
+            "very-long-cn-".repeat(32).as_str(),
+        ] {
+            let first = hash_cn(cn);
+            // Hash 50 more times, including with different `&str`
+            // bindings (owned vs borrowed) — the public contract
+            // accepts `&str` so all of these must resolve to the same
+            // 12-char hex token regardless of binding source.
+            for _ in 0..50 {
+                assert_eq!(
+                    hash_cn(cn),
+                    first,
+                    "hash_cn({cn:?}) must be idempotent across repeated calls"
+                );
+                let owned = cn.to_string();
+                assert_eq!(
+                    hash_cn(&owned),
+                    first,
+                    "hash_cn for {cn:?} must agree between owned and borrowed bindings"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hash_identity_collision_resistance_smoke() {
+        // 1000 distinct CNs must produce 1000 distinct hashes in the
+        // smoke-test set. This is a smoke check for the 48-bit
+        // truncation collision risk: by the birthday bound the
+        // expected first collision is around 2^24 ≈ 16 million inputs
+        // (so 1000 inputs is safely below the threshold), and a
+        // regression to a much shorter truncation (e.g. first 8 bits)
+        // would collapse the smoke set into ~256 buckets and trip
+        // here. Pins the operational contract that an attacker
+        // churning a few thousand CNs will not collapse the SIEM
+        // index by accident — they would have to mount a deliberate
+        // 48-bit preimage attack.
+        use std::collections::HashSet;
+        let hashes: HashSet<String> = (0..1000)
+            .map(|i| hash_cn(&format!("client-{i:04}@fleet.example.test")))
+            .collect();
+        assert_eq!(
+            hashes.len(),
+            1000,
+            "1000 distinct CNs must produce 1000 distinct hashes; \
+             got {} unique buckets — the truncation may have narrowed",
+            hashes.len()
+        );
+    }
 }

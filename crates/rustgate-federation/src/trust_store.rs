@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use rustgate_core::masking::hash_cn;
 use rustls::RootCertStore;
 use rustls_pki_types::CertificateDer;
 use serde::{Deserialize, Serialize};
@@ -124,7 +125,7 @@ impl TrustStore {
                 Ok(pem_data) => match store.add_certificate_from_pem(&pem_data) {
                     Ok(cert_info) => {
                         debug!(
-                            cn = %cert_info.common_name,
+                            cn = %hash_cn(&cert_info.common_name),
                             path = %path.display(),
                             "loaded certificate"
                         );
@@ -192,7 +193,7 @@ impl TrustStore {
             warn!(cn = %cn, error = %e, "failed to persist certificate to disk");
         }
 
-        info!(cn = %cn, "added certificate to trust store");
+        info!(cn = %hash_cn(&cn), "added certificate to trust store");
         Ok(cert_info)
     }
 
@@ -226,7 +227,7 @@ impl TrustStore {
                 }
             }
 
-            info!(cn = %cn, "removed certificate from trust store");
+            info!(cn = %hash_cn(cn), "removed certificate from trust store");
         }
 
         Ok(removed)
