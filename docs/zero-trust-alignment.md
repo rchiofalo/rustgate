@@ -1,22 +1,54 @@
 # DoD Zero Trust Seven Pillars — Alignment Mapping
 
-This document maps rustgate's implemented security controls to the seven
-pillars of the DoD Zero Trust Architecture (DoD ZTA v2.0, DISA/NSA,
-November 2022), identifies gaps, and lists the implementation work
-tracked against each pillar. The ZTA 2.0 framework defines 152
+## What this document is
+
+A customer-facing alignment mapping showing how rustgate's existing
+capabilities relate to the DoD Zero Trust Architecture (DoD ZTA v2.0,
+DISA/NSA, November 2022) Seven Pillars (User, Device, Application,
+Data, Network, Automation, Visibility), what gaps exist, and the
+GitHub issues tracking each gap. The ZTA 2.0 framework defines 152
 activities across the seven pillars, with FY2027 as the DoD-wide
 compliance mandate for all DoD components.
 
-This is not a marketing overview. Capabilities marked "implemented" can
-be traced to source in the repository; capabilities marked "gap" are
-either planned (with a tracking issue) or explicitly out-of-scope for
-this codebase (e.g., MDM integration, which is the province of the
-hosting platform, not the message gateway).
+## Audience
 
-Related docs: [`security-posture.md`](security-posture.md) (NIST 800-53
-SC/IA/AC control mapping), [`threat-model.md`](threat-model.md) (STRIDE
-analysis and trust boundaries), [`federation.md`](federation.md) (peer
-authentication and forwarding controls).
+- **Customer evaluators** running a procurement-stage capability
+  matrix against rustgate.
+- **Accreditation auditors** preparing an ATO / cATO package and
+  needing a control-by-control feature-to-requirement crosswalk.
+- **rustgate operators** deciding which compensating controls the
+  hosting platform must supply (e.g., MFA front-ends, MDM, DLP).
+
+## What this document does NOT claim
+
+This is **informational only**. rustgate carries **no formal compliance
+certification** against DoD ZTA, FedRAMP, FISMA, CMMC, or any other
+framework. Formal accreditation requires an independent assessment
+(third-party assessor or government-led C&A package) — this document
+is not a substitute for that assessment.
+
+The mapping below is honest about gaps. Capabilities marked
+"implemented" can be traced to source in the repository; capabilities
+marked "gap" are either planned (with a tracking issue) or explicitly
+out-of-scope for this codebase (e.g., MDM integration, which is the
+province of the hosting platform, not the message gateway).
+
+## Related documents
+
+- [`../SECURITY.md`](../SECURITY.md) — overall security posture and
+  vulnerability disclosure process.
+- [`threat-model.md`](threat-model.md) — STRIDE analysis and trust
+  boundaries.
+- [`authorization.md`](authorization.md) — group ACL + Cedar ABAC
+  reference.
+- [`concurrency-model.md`](concurrency-model.md) — locking, hot-reload,
+  and shutdown invariants.
+- [`runbooks/audit-chain-corruption.md`](runbooks/audit-chain-corruption.md)
+  — operator response to a tampered or torn audit chain.
+- [`security-posture.md`](security-posture.md) — companion NIST 800-53
+  SC/IA/AC control inventory.
+- [`federation.md`](federation.md) — peer authentication and forwarding
+  controls.
 
 ---
 
@@ -264,8 +296,8 @@ to DLP enforcement that follows the data across trust boundaries.
   `Metadata` struct carries `received_at`, `source_protocol`,
   `message_type`, and `ttl`, but no `classification: Option<String>`
   field. CAPCO format ("TS/SCI", "S//NOFORN") cannot be stamped on
-  messages at the gateway today. Tracked in issue #872 (this PR —
-  scoped out of the initial docs-only phase).
+  messages at the gateway today. Tracked in issue #849 (Classification
+  Marking Engine, CAPCO format).
 - **DLP enforcement** — there is no content-inspection layer that
   blocks classified data from crossing a boundary based on detected
   patterns (regex, ML-based PII detection). Deployments requiring DLP
@@ -459,8 +491,8 @@ across all authentication, authorization, and data flow events.
   — federation forwards do not thread a W3C trace context header, so
   a CoT event traversing two federated peers generates two disjoint
   traces in the OpenTelemetry backend rather than a single
-  end-to-end span chain. Tracked in the follow-up implementation
-  phase of this issue.
+  end-to-end span chain. Tracked in issue #852 (W3C Distributed Trace
+  Context propagation across federation).
 - **Behavioral analytics** — audit events are structured, but no
   built-in UEBA (User and Entity Behavior Analytics) module
   fingerprints baseline behavior and flags deviations. SIEM
@@ -532,20 +564,92 @@ structured telemetry; analytics and response are SIEM-layer concerns.
 
 ---
 
-## Ongoing work
+## NIST 800-53 control mapping
 
-- **Issue #856** — Hardware-rooted identity (TPM, PKCS#11, YubiKey)
-  will close Pillar 2's TPM attestation gap.
-- **Issue #857** — Cross-domain content inspection guard, addressing
-  Pillar 4's DLP gap.
-- **Issue #952** — Ed25519 JWT + JWKS URL + `kid` rotation state
-  machine (part 1 landed; part 2 and part 3 tracked in follow-up
-  PRs) — closes the JWKS fetching gap in Pillar 1.
-- **W3C traceparent propagation across federation** — tracked in
-  the follow-up implementation phase of this issue; closes the
-  cross-federation trace correlation gap in Pillar 7.
-- **Classification tagging on `Metadata`** — adds
-  `classification: Option<String>` to `RoutableMessage::Metadata`,
-  surfaced to Cedar policies as an ABAC attribute and preserved
-  across federation hops. Implementation phase of this issue,
-  closes Pillar 4 tagging gap.
+A summary cross-reference of the most operationally relevant NIST
+800-53 Rev 5 controls and the rustgate features that satisfy them.
+This is a digest of the more detailed inventory in
+[`security-posture.md`](security-posture.md).
+
+| Control | Title | rustgate feature |
+|---|---|---|
+| AC-3 | Access Enforcement | Group ACL deny-first policy + Cedar ABAC PEP hooks (Send + Receive) |
+| AC-4 | Information Flow Enforcement | Per-message authorization, federation hop-count cap, peer allowlist |
+| AC-6 | Least Privilege | Group ACL opt-in membership, per-tenant quota by cert Organization |
+| AU-2 | Audit Events | 28+ structured event types via `rustgate-core::audit` |
+| AU-3 | Content of Audit Records | Canonical JSON ordering, event-typed fields, hashed CN correlation |
+| AU-9 | Protection of Audit Information | SHA-256 hash chain, sealed terminator, torn-write recovery |
+| AU-10 | Non-repudiation | Hash-chained audit log; tip anchor for cross-restart continuity |
+| AU-11 | Audit Record Retention | Configurable retention; encrypted at-rest archives |
+| IA-2 | Identification and Authentication (Users) | mTLS client certificates, SPIFFE workload identity, JWT for federation peers |
+| IA-3 | Device Identification and Authentication | Cert-bound SHA-256 fingerprint per connection, recorded in every audit event |
+| IA-4 | Identifier Management | Enrollment server (PKCS#12, EST/RFC 7030), CRL, OCSP stapling |
+| IA-5 | Authenticator Management | `Zeroizing<T>` private-key handling, redacted `Debug` impls, key rotation via `KeyRing` |
+| SC-7 | Boundary Protection | Backpressure gate, per-IP rate limiter, plaintext listener allowlist gate |
+| SC-8 | Transmission Confidentiality | mTLS (TLS 1.2+), no plaintext fallback path on the federation/client surface |
+| SC-12 | Cryptographic Key Management | HKDF-SHA256 per-archive subkeys, per-key expiration, rotation via `KeyRing` |
+| SC-13 | Cryptographic Protection | rustls + aws-lc-rs (FIPS-validated under `--fips-required`), ChaCha20-Poly1305 AEAD at rest |
+| SC-28 | Protection of Information at Rest | Encrypted archive format v2 (per-chunk AAD, sealed terminator) |
+
+For the full per-control inventory, including the controls that are
+explicitly out of scope (e.g., physical-environment controls
+PE-* delegated to the hosting facility), see
+[`security-posture.md`](security-posture.md).
+
+---
+
+## Gap remediation roadmap
+
+Each gap surfaced in the per-pillar mapping above is tracked against
+a GitHub issue. This document is intentionally **informational only**:
+no gap below is a commitment to a delivery date, and the absence of a
+gap row does not constitute a certification claim.
+
+| Gap | Pillar | Tracking issue |
+|---|---|---|
+| Hardware-rooted identity (TPM / PKCS#11 / YubiKey / CAC/PIV) | User, Device | [#856](https://github.com/rchiofalo/rustgate/issues/856) — `feat(enrollment): Hardware-rooted identity — TPM, PKCS#11, YubiKey` |
+| Classification tagging (CAPCO format) on `RoutableMessage::Metadata` | Data | [#849](https://github.com/rchiofalo/rustgate/issues/849) — `feat: Classification Marking Engine (CAPCO format)` |
+| W3C `traceparent` propagation across federation hops | Visibility | [#852](https://github.com/rchiofalo/rustgate/issues/852) — `feat: W3C Distributed Trace Context propagation across federation` |
+| Kubernetes operator + one-command deployment (closes platform-side gaps in Network and Automation pillars) | Network, Automation | [#874](https://github.com/rchiofalo/rustgate/issues/874) — `feat: Kubernetes operator + one-command deployment` |
+| Cross-domain content inspection / DLP guard | Data | [#857](https://github.com/rchiofalo/rustgate/issues/857) — Cross-domain content inspection guard |
+| Ed25519 JWT + JWKS URL + `kid` rotation state machine (parts 2 and 3) | User | [#952](https://github.com/rchiofalo/rustgate/issues/952) — JWKS fetching and rotation |
+| DevSecOps packaging — Iron Bank, Zarf, cATO evidence | Application | [#871](https://github.com/rchiofalo/rustgate/issues/871) — DevSecOps packaging |
+
+Out-of-scope items — by design, not by omission — include MDM
+integration, SDN controller integration, behavioral analytics (UEBA),
+and SOAR playbook orchestration. rustgate emits the structured
+telemetry these systems consume; the systems themselves are the
+hosting platform's responsibility.
+
+---
+
+## References
+
+- DISA / NSA, *Department of Defense Zero Trust Reference Architecture
+  Version 2.0*, July 2022. The authoritative source for the
+  Seven Pillars taxonomy and the 152-activity catalog.
+- DoD CIO, *DoD Zero Trust Strategy*, October 2022. The FY2027
+  compliance mandate.
+- DoD CIO, *DoD Zero Trust Capability Execution Roadmap (COA 1)*,
+  January 2023. Activity-by-activity sequencing guidance.
+- NIST SP 800-207, *Zero Trust Architecture*, August 2020. The
+  foundational tenets cited by the DoD ZTA Reference Architecture.
+- NIST SP 800-53 Rev 5, *Security and Privacy Controls for
+  Information Systems and Organizations*. The control-family
+  reference used in the per-pillar NIST mappings above.
+- CNSSI 1253, *Security Categorization and Control Selection for
+  National Security Systems*. The DoD overlay applied to NIST 800-53
+  for national-security workloads.
+
+---
+
+## Disclaimer
+
+This mapping is **informational only**. It documents how rustgate's
+implemented features relate to the DoD ZTA v2.0 Seven Pillars; it does
+**not** assert formal compliance, certification, or accreditation.
+A production deployment seeking ATO, cATO, or any equivalent
+authorization decision must commission an independent assessment
+covering the deployment as a whole — software, hosting platform,
+operational procedures, and supply chain. rustgate is one component
+of such a system, not the whole.
