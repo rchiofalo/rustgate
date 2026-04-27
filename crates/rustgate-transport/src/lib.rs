@@ -76,7 +76,7 @@ pub use rustls::server::ResolvesServerCert;
 pub use rustls::server::danger::ClientCertVerifier;
 pub use session::{AuthenticatedSession, SessionReader, SessionWriter};
 pub use store_forward::{
-    ClientQueue, DEFAULT_CLIENT_QUEUE_MAX_BYTES, QueueStats, StoreForwardError,
+    ClientQueue, DEFAULT_CLIENT_QUEUE_MAX_BYTES, OnDrainObservation, QueueStats, StoreForwardError,
 };
 pub use throttle::{ClientThrottle, ThrottleConfig};
 pub use verifier::{DynamicCertVerifier, RootStoreProvider};

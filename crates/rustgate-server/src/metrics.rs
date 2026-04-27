@@ -182,6 +182,14 @@ static CLIENT_QUEUE_ENQUEUES: OnceLock<IntCounter> = OnceLock::new();
 static CLIENT_QUEUE_WRITER_DROPS: OnceLock<IntCounter> = OnceLock::new();
 static CLIENT_QUEUE_EXPIRED: OnceLock<IntCounter> = OnceLock::new();
 static CLIENT_QUEUE_SKIPPED_UNSUPPORTED: OnceLock<IntCounter> = OnceLock::new();
+/// Per-message dwell time distribution for store-forward drain. Issue
+/// #729 — observed once per drained message with the value
+/// `drain_time - queued_at`. Operationally answers "how long did
+/// messages actually sit in the offline queue?" without conflating
+/// that with `received_at`, which is the original origin time and
+/// would inflate dwell on messages that rode multiple transports
+/// before queueing.
+static STORE_FORWARD_DWELL_SECONDS: OnceLock<Histogram> = OnceLock::new();
 
 #[cfg(feature = "federation")]
 static FEDERATION_PEER_QUEUE_BYTES: OnceLock<prometheus::IntGaugeVec> = OnceLock::new();
@@ -855,6 +863,28 @@ pub fn init() -> prometheus::Result<()> {
     ))?;
     registry.register(Box::new(client_queue_skipped_unsupported.clone()))?;
     let _ = CLIENT_QUEUE_SKIPPED_UNSUPPORTED.set(client_queue_skipped_unsupported);
+
+    // Issue #729: per-message dwell histogram. Buckets cover the
+    // operationally meaningful range from sub-second (a client that
+    // briefly disconnected during a TCP retransmit storm) up to ~6h
+    // (an extended outage). The 1s floor keeps the head of the
+    // distribution from collapsing into the implicit 0 bucket on
+    // healthy reconnects; the 21600s ceiling matches the longest
+    // outages we expect to observe before the operator manually
+    // discards the queue. Anything above 6h almost certainly means
+    // queue retention policy is misconfigured — a separate signal
+    // from "messages ride a long but bounded outage", which is what
+    // this histogram is here to characterize.
+    let store_forward_dwell_seconds = Histogram::with_opts(
+        HistogramOpts::new(
+            "rustgate_store_forward_dwell_seconds",
+            "Per-message dwell time spent in the store-forward offline queue \
+             (drain_time - queued_at), in seconds",
+        )
+        .buckets(vec![1.0, 10.0, 60.0, 300.0, 1800.0, 7200.0, 21600.0]),
+    )?;
+    registry.register(Box::new(store_forward_dwell_seconds.clone()))?;
+    let _ = STORE_FORWARD_DWELL_SECONDS.set(store_forward_dwell_seconds);
 
     #[cfg(feature = "federation")]
     {
@@ -1759,6 +1789,23 @@ pub fn client_queue_expired() -> Option<&'static IntCounter> {
 /// Returns the client-queue skipped-non-direct-on-reopen counter.
 pub fn client_queue_skipped_unsupported() -> Option<&'static IntCounter> {
     CLIENT_QUEUE_SKIPPED_UNSUPPORTED.get()
+}
+
+/// Returns the per-message store-forward dwell histogram (issue #729).
+///
+/// Falls back to a non-registered fallback when `init()` was not
+/// called (so the accessor is safe in tests) but in production this is
+/// `Some` whenever the metrics layer has been initialized. Observing
+/// against the fallback is a no-op for `/metrics` consumers but keeps
+/// the call site straightforward — the same shape the other
+/// `&'static Histogram` accessors use.
+pub fn store_forward_dwell_seconds() -> &'static Histogram {
+    STORE_FORWARD_DWELL_SECONDS.get_or_init(|| {
+        fallback_histogram(
+            "rustgate_store_forward_dwell_seconds",
+            "Per-message dwell time spent in the store-forward offline queue, in seconds",
+        )
+    })
 }
 
 /// Spawn a background task that periodically samples the given client
