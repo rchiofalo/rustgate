@@ -46,7 +46,10 @@ use rustgate_authz::{
 };
 use smol_str::SmolStr;
 
-use crate::obligations::{UnknownObligationPolicy, apply_obligations, obligations_mutate_payload};
+use crate::obligations::{
+    ObligationRateLimiter, UnknownObligationPolicy, apply_obligations_with_limiter,
+    obligations_mutate_payload,
+};
 
 /// Callback invoked after every authz evaluation so operators can wire
 /// the engine into metrics and audit without making `rustgate-transport`
@@ -197,23 +200,40 @@ impl RoutedMessage {
     ///
     /// # Unknown obligations
     ///
-    /// `unknown_policy` is forwarded to [`apply_obligations`]. Under
-    /// [`UnknownObligationPolicy::FailClosed`] an unknown variant
+    /// `unknown_policy` is forwarded to [`apply_obligations_with_limiter`].
+    /// Under [`UnknownObligationPolicy::FailClosed`] an unknown variant
     /// produces [`crate::obligations::ObligationError::Unknown`] and
     /// the caller must drop this delivery rather than fall back to
     /// the unmutated payload — a stale transport against a newer
     /// policy would otherwise silently deliver bytes the policy
     /// author believed were being masked. See issue #728.
+    ///
+    /// `policy_id` and `rate_limiter` are forwarded to the unknown-
+    /// variant audit-flood guard added in issue #769. Empty
+    /// `policy_id` and `None` limiter restore pre-#769 behaviour
+    /// (every encounter audited, no metric callback) and are used by
+    /// callers without engine context.
+    ///
+    /// [`apply_obligations_with_limiter`]:
+    ///     crate::obligations::apply_obligations_with_limiter
     pub(crate) fn with_obligations(
         &self,
         obligations: &[Obligation],
         unknown_policy: UnknownObligationPolicy,
+        policy_id: &str,
+        rate_limiter: Option<&ObligationRateLimiter>,
     ) -> Result<Self, crate::obligations::ObligationError> {
         if !obligations_mutate_payload(obligations) {
             return Ok(self.clone());
         }
         let mut msg = (*self.msg).clone();
-        apply_obligations(&mut msg, obligations, unknown_policy)?;
+        apply_obligations_with_limiter(
+            &mut msg,
+            obligations,
+            unknown_policy,
+            policy_id,
+            rate_limiter,
+        )?;
         Ok(Self {
             msg: Arc::new(msg),
             _permit: self._permit.clone(),
@@ -741,6 +761,14 @@ pub struct Router {
     /// deployment decision fixed at startup, not a runtime-reloadable
     /// policy.
     unknown_obligation_policy: UnknownObligationPolicy,
+    /// Per-`(policy_id, variant_name)` rate limiter that gates
+    /// [`audit::authz_obligation_unknown`] emissions and feeds the
+    /// `rustgate_authz_obligation_unknown_total` metric (issue #769).
+    /// Defaults to a limiter with the documented per-minute cap and no
+    /// metric callback. The server binary installs the metric callback
+    /// during startup; the rate-limiter map persists across reloads
+    /// and is pruned by `forget_policy` when the engine swaps.
+    obligation_rate_limiter: Arc<ObligationRateLimiter>,
     /// Per-CN position-replay rate limit (issue #724). Each call to
     /// [`Router::replay_positions`] consumes one token from the
     /// bucket keyed by the reconnecting client's CN. The map grows
@@ -769,6 +797,10 @@ impl std::fmt::Debug for Router {
                 &(**self.quota_tracker.load()).is_some(),
             )
             .field("unknown_obligation_policy", &self.unknown_obligation_policy)
+            .field(
+                "obligation_audit_per_min",
+                &self.obligation_rate_limiter.audit_per_min(),
+            )
             .field("replay_limit_config", &self.replay_limit_config)
             .finish()
     }
@@ -788,6 +820,7 @@ impl Default for Router {
             multicast_config: ArcSwap::from_pointee(None),
             quota_tracker: ArcSwap::from_pointee(None),
             unknown_obligation_policy: UnknownObligationPolicy::default(),
+            obligation_rate_limiter: Arc::new(ObligationRateLimiter::default()),
             replay_buckets: Mutex::new(HashMap::new()),
             replay_limit_config: PositionReplayLimitConfig::default(),
         }
@@ -821,6 +854,7 @@ impl Router {
             multicast_config: ArcSwap::from_pointee(None),
             quota_tracker: ArcSwap::from_pointee(None),
             unknown_obligation_policy: UnknownObligationPolicy::default(),
+            obligation_rate_limiter: Arc::new(ObligationRateLimiter::default()),
             replay_buckets: Mutex::new(HashMap::new()),
             replay_limit_config: PositionReplayLimitConfig::default(),
         }
@@ -860,6 +894,7 @@ impl Router {
             multicast_config: ArcSwap::from_pointee(None),
             quota_tracker: ArcSwap::from_pointee(None),
             unknown_obligation_policy: UnknownObligationPolicy::default(),
+            obligation_rate_limiter: Arc::new(ObligationRateLimiter::default()),
             replay_buckets: Mutex::new(HashMap::new()),
             replay_limit_config: PositionReplayLimitConfig::default(),
         }
@@ -902,6 +937,7 @@ impl Router {
             multicast_config: ArcSwap::from_pointee(None),
             quota_tracker: ArcSwap::from_pointee(None),
             unknown_obligation_policy: UnknownObligationPolicy::default(),
+            obligation_rate_limiter: Arc::new(ObligationRateLimiter::default()),
             replay_buckets: Mutex::new(HashMap::new()),
             replay_limit_config: PositionReplayLimitConfig::default(),
         }
@@ -939,13 +975,33 @@ impl Router {
     }
 
     /// Atomically replace the installed policy engine.
+    ///
+    /// Forgets any unknown-obligation rate-limit buckets owned by the
+    /// previously-installed policy_id (issue #769) so map growth is
+    /// bounded across reloads and a fresh policy is not pre-suppressed
+    /// by the previous policy's audit-rate state. The new policy's own
+    /// buckets are created lazily on first unknown-variant encounter.
     pub fn swap_authz(&self, engine: Arc<dyn PolicyEngine>) {
+        let previous_policy_id = (**self.authz.load())
+            .as_ref()
+            .map(|e| e.policy_id().to_owned());
         self.authz.store(Arc::new(Some(engine)));
+        if let Some(prev) = previous_policy_id {
+            self.obligation_rate_limiter.forget_policy(&prev);
+        }
     }
 
     /// Remove the installed policy engine, reverting to ACL-only mode.
+    /// Drops any rate-limit buckets owned by the prior policy_id (issue
+    /// #769).
     pub fn clear_authz(&self) {
+        let previous_policy_id = (**self.authz.load())
+            .as_ref()
+            .map(|e| e.policy_id().to_owned());
         self.authz.store(Arc::new(None));
+        if let Some(prev) = previous_policy_id {
+            self.obligation_rate_limiter.forget_policy(&prev);
+        }
     }
 
     /// Snapshot the current policy engine, if any.
@@ -1123,6 +1179,28 @@ impl Router {
     /// Return the router's configured [`UnknownObligationPolicy`].
     pub fn unknown_obligation_policy(&self) -> UnknownObligationPolicy {
         self.unknown_obligation_policy
+    }
+
+    /// Override the router's [`ObligationRateLimiter`] at construction
+    /// time (issue #769).
+    ///
+    /// The default limiter caps audit emissions at
+    /// [`crate::obligations::DEFAULT_UNKNOWN_OBLIGATION_AUDIT_PER_MIN`]
+    /// per minute per `(policy_id, variant_name)` pair and has no
+    /// metric callback. Operators with a Prometheus registry will
+    /// build a limiter with [`ObligationRateLimiter::with_on_unknown`]
+    /// and pass it here so the
+    /// `rustgate_authz_obligation_unknown_total` counter sees every
+    /// encounter regardless of the audit-rate-limit verdict.
+    #[must_use]
+    pub fn with_obligation_rate_limiter(mut self, limiter: Arc<ObligationRateLimiter>) -> Self {
+        self.obligation_rate_limiter = limiter;
+        self
+    }
+
+    /// Borrow the router's [`ObligationRateLimiter`].
+    pub fn obligation_rate_limiter(&self) -> &Arc<ObligationRateLimiter> {
+        &self.obligation_rate_limiter
     }
 
     /// Set the per-CN [`PositionReplayLimitConfig`] used by
@@ -1575,6 +1653,12 @@ impl Router {
         // pre-mutation form gives late joiners the obligation set that
         // matches policy at replay time, not the one frozen at ingest.
         let mut send_obligations: Vec<Obligation> = Vec::new();
+        // Captured alongside `send_obligations` so the per-(policy_id,
+        // variant) audit-rate limiter (issue #769) keys on the engine
+        // that produced the obligation list, not whichever engine is
+        // current at apply time. `String` so the value survives the
+        // `authz_guard` drop.
+        let mut send_policy_id: String = String::new();
         {
             let authz_guard = self.authz.load();
             if let Some(engine) = (**authz_guard).as_ref() {
@@ -1621,6 +1705,7 @@ impl Router {
                         // Defer application until after cache.store so the
                         // replay cache holds the pre-obligation payload.
                         send_obligations = outcome.obligations;
+                        send_policy_id = engine.policy_id().to_owned();
                     }
                 }
             }
@@ -1656,8 +1741,13 @@ impl Router {
         // egress forwarders are invoked. Preserving access logs as
         // `authz_obligation_failed` keeps the forensic trail.
         if !send_obligations.is_empty()
-            && let Err(e) =
-                apply_obligations(&mut msg, &send_obligations, self.unknown_obligation_policy)
+            && let Err(e) = apply_obligations_with_limiter(
+                &mut msg,
+                &send_obligations,
+                self.unknown_obligation_policy,
+                &send_policy_id,
+                Some(&self.obligation_rate_limiter),
+            )
         {
             debug!(
                 err = %e,
@@ -1881,10 +1971,12 @@ impl Router {
                     // queue is not re-updated — the message is simply
                     // removed from the pending delivery set.
                     if !send_outcome.obligations.is_empty()
-                        && let Err(e) = apply_obligations(
+                        && let Err(e) = apply_obligations_with_limiter(
                             &mut msg,
                             &send_outcome.obligations,
                             self.unknown_obligation_policy,
+                            engine.policy_id(),
+                            Some(&self.obligation_rate_limiter),
                         )
                     {
                         debug!(
@@ -1896,10 +1988,12 @@ impl Router {
                         return None;
                     }
                     if !recv_outcome.obligations.is_empty()
-                        && let Err(e) = apply_obligations(
+                        && let Err(e) = apply_obligations_with_limiter(
                             &mut msg,
                             &recv_outcome.obligations,
                             self.unknown_obligation_policy,
+                            engine.policy_id(),
+                            Some(&self.obligation_rate_limiter),
                         )
                     {
                         debug!(
@@ -2086,10 +2180,12 @@ impl Router {
                 // skip this cached position for this recipient
                 // rather than replay a partially-mutated payload.
                 if !send_outcome.obligations.is_empty()
-                    && let Err(e) = apply_obligations(
+                    && let Err(e) = apply_obligations_with_limiter(
                         &mut msg,
                         &send_outcome.obligations,
                         self.unknown_obligation_policy,
+                        engine.policy_id(),
+                        Some(&self.obligation_rate_limiter),
                     )
                 {
                     debug!(
@@ -2112,10 +2208,12 @@ impl Router {
                     continue;
                 }
                 if !recv_outcome.obligations.is_empty()
-                    && let Err(e) = apply_obligations(
+                    && let Err(e) = apply_obligations_with_limiter(
                         &mut msg,
                         &recv_outcome.obligations,
                         self.unknown_obligation_policy,
+                        engine.policy_id(),
+                        Some(&self.obligation_rate_limiter),
                     )
                 {
                     debug!(
@@ -2317,9 +2415,12 @@ impl Router {
                     // actuate the policy now, and it will not be
                     // able to actuate it on drain either — persisting
                     // would only defer the same fail-closed decision.
-                    let msg = match msg
-                        .with_obligations(&outcome.obligations, self.unknown_obligation_policy)
-                    {
+                    let msg = match msg.with_obligations(
+                        &outcome.obligations,
+                        self.unknown_obligation_policy,
+                        engine.policy_id(),
+                        Some(&self.obligation_rate_limiter),
+                    ) {
                         Ok(m) => m,
                         Err(e) => {
                             debug!(
@@ -2509,13 +2610,19 @@ impl Router {
                 })
                 .collect()
         };
+        let policy_id_for_obligations = authz.map(|e| e.policy_id()).unwrap_or("");
         for (handle, obligations, rule_id) in &eligible {
             total += 1;
             // Fail-closed on unknown obligation (issue #728): skip
             // this recipient. The audit event is emitted inside
-            // `apply_obligations`; the dropped counter catches the
-            // operational signal.
-            let delivery = match msg.with_obligations(obligations, self.unknown_obligation_policy) {
+            // `apply_obligations_with_limiter`; the dropped counter
+            // catches the operational signal.
+            let delivery = match msg.with_obligations(
+                obligations,
+                self.unknown_obligation_policy,
+                policy_id_for_obligations,
+                Some(&self.obligation_rate_limiter),
+            ) {
                 Ok(d) => d,
                 Err(e) => {
                     debug!(
@@ -2611,9 +2718,12 @@ impl Router {
                 // skip this recipient. Count as dropped rather than
                 // filtered because filtered is authz-denied and this
                 // is post-authz.
-                let delivery = match msg
-                    .with_obligations(&outcome.obligations, self.unknown_obligation_policy)
-                {
+                let delivery = match msg.with_obligations(
+                    &outcome.obligations,
+                    self.unknown_obligation_policy,
+                    engine.policy_id(),
+                    Some(&self.obligation_rate_limiter),
+                ) {
                     Ok(d) => d,
                     Err(e) => {
                         debug!(
@@ -2744,7 +2854,12 @@ impl Router {
             // message — the sender-side obligation must be actuated
             // uniformly per the policy author's intent, so fanning
             // out partial bytes would defeat the policy.
-            match msg.with_obligations(&outcome.obligations, self.unknown_obligation_policy) {
+            match msg.with_obligations(
+                &outcome.obligations,
+                self.unknown_obligation_policy,
+                engine.policy_id(),
+                Some(&self.obligation_rate_limiter),
+            ) {
                 Ok(m) => m,
                 Err(e) => {
                     debug!(
@@ -2821,6 +2936,7 @@ impl Router {
                 })
                 .collect()
         };
+        let policy_id_for_obligations = authz.map(|e| e.policy_id()).unwrap_or("");
         for (handle, obligations, rule_id) in &eligible {
             total += 1;
             // Fail-closed on unknown obligation (issue #728): skip
@@ -2829,7 +2945,12 @@ impl Router {
             // fan-out may still attempt this CN under its own
             // per-group Receive rules — on the off chance its
             // obligation list is actuable on this transport build.
-            let delivery = match msg.with_obligations(obligations, self.unknown_obligation_policy) {
+            let delivery = match msg.with_obligations(
+                obligations,
+                self.unknown_obligation_policy,
+                policy_id_for_obligations,
+                Some(&self.obligation_rate_limiter),
+            ) {
                 Ok(d) => d,
                 Err(e) => {
                     debug!(

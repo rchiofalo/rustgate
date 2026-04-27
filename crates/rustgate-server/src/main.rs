@@ -783,6 +783,22 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
             cli.position_replay_rate_per_sec,
             cli.position_replay_burst,
         ));
+        // Issue #769: install the unknown-obligation rate limiter
+        // with the metric callback so
+        // `rustgate_authz_obligation_unknown_total{variant=...}`
+        // observes every encounter regardless of audit-log
+        // suppression. Without `metrics`, the default limiter (no
+        // callback) still applies the audit-rate cap.
+        #[cfg(feature = "metrics")]
+        let base = {
+            let limiter = rustgate_transport::obligations::ObligationRateLimiter::default()
+                .with_on_unknown(std::sync::Arc::new(|variant: &str| {
+                    metrics::authz_obligation_unknown()
+                        .with_label_values(&[variant])
+                        .inc();
+                }));
+            base.with_obligation_rate_limiter(std::sync::Arc::new(limiter))
+        };
         let base = match client_queue.as_ref() {
             Some(q) => base.with_client_queue(Arc::clone(q)),
             None => base,

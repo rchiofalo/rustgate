@@ -1584,6 +1584,7 @@ dependencies = [
 name = "rustgate-asterix"
 version = "0.8.0"
 dependencies = [
+ "bytes",
  "thiserror 2.0.18",
 ]
 
@@ -1613,12 +1614,14 @@ dependencies = [
  "chacha20poly1305",
  "hex",
  "hkdf",
+ "hmac",
  "rustls",
  "rustls-pki-types",
  "serde",
  "serde_json",
  "sha2",
  "socket2",
+ "subtle",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -1643,7 +1646,6 @@ dependencies = [
  "anyhow",
  "bytes",
  "futures",
- "hmac",
  "lru",
  "parking_lot",
  "prost",
@@ -1748,6 +1750,8 @@ name = "rustgate-resilience"
 version = "0.8.0"
 dependencies = [
  "fastrand",
+ "parking_lot",
+ "rustgate-core",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -1767,7 +1771,6 @@ version = "0.8.0"
 dependencies = [
  "arc-swap",
  "bytes",
- "hmac",
  "lru",
  "parking_lot",
  "redb",
@@ -1782,7 +1785,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "smol_str",
- "subtle",
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",

@@ -75,11 +75,187 @@
 //! DEBUG so a high-rate stream of bad payloads cannot amplify into a
 //! logging DoS.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use bytes::Bytes;
+use parking_lot::Mutex;
 use rustgate_authz::Obligation;
 use rustgate_core::audit;
 use rustgate_core::masking::hash_cn;
 use rustgate_core::message::{MessageType, RoutableMessage};
+use rustgate_resilience::token_bucket::TokenBucket;
+
+/// Default audit-emission cap for the unknown-variant rate limiter:
+/// 60 emissions per minute per `(policy_id, variant_name)` pair.
+///
+/// Sized for human-readable forensic browsing. A misconfigured policy
+/// pushing an unknown obligation on every routed message would otherwise
+/// emit one [`audit::authz_obligation_unknown`] event per delivery,
+/// flooding the hash-chained audit log; the cap pins audit volume to a
+/// once-per-second cadence per `(policy_id, variant)` pair while the
+/// always-on [`OnObligationUnknown`] metric callback preserves the
+/// operator-visible rate signal regardless of audit suppression.
+pub const DEFAULT_UNKNOWN_OBLIGATION_AUDIT_PER_MIN: u32 = 60;
+
+/// Callback invoked once per encountered unknown-obligation variant
+/// **before** the audit-emission rate limiter runs.
+///
+/// Wired by the server binary to increment a Prometheus counter so
+/// operators can observe the true rate of unknown-variant encounters
+/// even when the audit log has been rate-limited. The callback receives
+/// the `{:?}` rendering of the variant as a `&str` so the same string is
+/// used as both the metric label (F-3b) and the audit event field.
+///
+/// Conventional cross-thread alias shape (`Arc<dyn Fn(&str) + Send +
+/// Sync>`) — keep in lock-step with the rest of the workspace's
+/// [`OnDuplicate`](crate::dedup::OnDuplicate) /
+/// [`OnInsert`](crate::dedup::OnInsert) callback aliases.
+pub type OnObligationUnknown = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Per-`(policy_id, variant_name)` rate limiter for
+/// [`audit::authz_obligation_unknown`] emissions plus an always-on
+/// metric callback for operator visibility.
+///
+/// # Why this exists
+///
+/// A misconfigured policy that returns an unknown obligation variant on
+/// every routed message would, pre-this-fix, emit one audit record per
+/// delivery. At even modest message rates that floods the hash-chained
+/// audit file with effectively duplicate forensic noise and blows past
+/// the disk budget. The dispatcher uses one [`TokenBucket`] per
+/// `(policy_id, variant_name)` pair so two distinct broken variants
+/// each retain their own audit allotment, and a policy reload (which
+/// changes `policy_id`) re-arms the bucket so the new policy's
+/// emissions are not pre-suppressed by the old policy's history.
+///
+/// # Counter ordering (F-3b)
+///
+/// The metric callback fires **before** the rate-limit gate. Operators
+/// see the true encounter rate via the `rustgate_authz_obligation_unknown_total`
+/// counter even when the audit log has been silenced for that key. The
+/// counter is the load-bearing visibility signal; the audit log is the
+/// forensic detail captured at most `audit_per_min` times per minute
+/// per key.
+pub struct ObligationRateLimiter {
+    audit_per_min: u32,
+    buckets: Mutex<HashMap<(String, String), Arc<TokenBucket>>>,
+    on_unknown: Option<OnObligationUnknown>,
+}
+
+// Custom `Debug`: `OnObligationUnknown` is `dyn Fn` and does not
+// implement `Debug`, so the derive cannot be used. We project the
+// callback to "installed/missing" so Debug output stays useful for
+// operator diagnostics without leaking the closure's captures.
+impl std::fmt::Debug for ObligationRateLimiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObligationRateLimiter")
+            .field("audit_per_min", &self.audit_per_min)
+            .field("buckets_tracked", &self.buckets.lock().len())
+            .field("on_unknown_installed", &self.on_unknown.is_some())
+            .finish()
+    }
+}
+
+impl ObligationRateLimiter {
+    /// Create a rate limiter with the given per-minute audit cap per
+    /// `(policy_id, variant)` pair.
+    ///
+    /// `audit_per_min` is the maximum
+    /// [`audit::authz_obligation_unknown`] emissions per minute per
+    /// key. Values above 1 produce a token bucket sized to the cap with
+    /// the burst floor enforced by [`TokenBucket::new`]. A value of 0
+    /// is clamped to 1 so the dispatcher always emits at least the
+    /// first audit record per key (operators must always see the
+    /// signal at least once).
+    pub fn new(audit_per_min: u32) -> Self {
+        Self {
+            audit_per_min: audit_per_min.max(1),
+            buckets: Mutex::new(HashMap::new()),
+            on_unknown: None,
+        }
+    }
+
+    /// Builder-style installer for the metric callback. Wired once at
+    /// startup by the server binary to bridge unknown-variant
+    /// encounters to the Prometheus counter.
+    #[must_use]
+    pub fn with_on_unknown(mut self, cb: OnObligationUnknown) -> Self {
+        self.on_unknown = Some(cb);
+        self
+    }
+
+    /// Replace the metric callback after construction. Used by setup
+    /// code that builds the limiter at one site and registers the
+    /// callback later.
+    pub fn set_on_unknown(&mut self, cb: OnObligationUnknown) {
+        self.on_unknown = Some(cb);
+    }
+
+    /// Configured audit-emission cap per minute per
+    /// `(policy_id, variant)` pair.
+    pub fn audit_per_min(&self) -> u32 {
+        self.audit_per_min
+    }
+
+    /// Drop the audit-rate-limiter entries owned by `policy_id`. Called
+    /// on policy reload so a freshly-installed policy's first
+    /// unknown-variant encounters always produce an audit record (the
+    /// previous policy's bucket carry-over would otherwise pre-suppress
+    /// new emissions). No-op when no bucket has ever been created for
+    /// the id.
+    pub fn forget_policy(&self, policy_id: &str) {
+        let mut guard = self.buckets.lock();
+        guard.retain(|(pid, _), _| pid != policy_id);
+    }
+
+    /// Increment the metric counter (always) and return `true` when the
+    /// audit log emission is allowed by the per-key token bucket.
+    ///
+    /// The metric callback fires once per call regardless of the
+    /// bucket's verdict. The bucket fires once per call and consumes
+    /// one token if available; rejected calls do not record (matching
+    /// [`TokenBucket::try_acquire`] semantics). Returns `true` when the
+    /// caller should emit [`audit::authz_obligation_unknown`].
+    fn observe_unknown(&self, policy_id: &str, variant: &str) -> bool {
+        // F-3b: counter increment happens FIRST and unconditionally.
+        // Operators must see the encounter rate via Prometheus even
+        // when the audit log has been silenced for this key.
+        if let Some(cb) = self.on_unknown.as_ref() {
+            cb(variant);
+        }
+        // F-3a: per-key audit rate limit. Token bucket sized so the
+        // refill rate is `audit_per_min / 60` tokens/sec, burst equal
+        // to the per-minute cap (allowing a one-minute burst at
+        // startup).
+        let bucket = self.bucket_for(policy_id, variant);
+        bucket.try_acquire()
+    }
+
+    /// Lazily acquire (or create) the per-`(policy_id, variant)`
+    /// bucket. Map grows on first encounter; pruned by
+    /// [`Self::forget_policy`] on policy reload.
+    fn bucket_for(&self, policy_id: &str, variant: &str) -> Arc<TokenBucket> {
+        let key = (policy_id.to_owned(), variant.to_owned());
+        let mut guard = self.buckets.lock();
+        if let Some(existing) = guard.get(&key) {
+            return Arc::clone(existing);
+        }
+        // Refill rate = audit_per_min / 60 tokens/sec. Burst capacity
+        // = audit_per_min so a brand-new key sees the full per-minute
+        // allotment immediately, then refills at the steady-state rate.
+        let per_min = f64::from(self.audit_per_min);
+        let bucket = Arc::new(TokenBucket::new(per_min / 60.0, Some(per_min)));
+        let _ = guard.insert(key, Arc::clone(&bucket));
+        bucket
+    }
+}
+
+impl Default for ObligationRateLimiter {
+    fn default() -> Self {
+        Self::new(DEFAULT_UNKNOWN_OBLIGATION_AUDIT_PER_MIN)
+    }
+}
 
 /// Policy for handling an [`Obligation`] variant this transport build
 /// cannot actuate.
@@ -205,10 +381,50 @@ pub(crate) fn obligations_mutate_payload(obligations: &[Obligation]) -> bool {
 /// the legacy pre-issue #728 fail-open behaviour and is kept only as
 /// an operational opt-out for deliberate version skew during rolling
 /// upgrades.
+///
+/// This entrypoint is the back-compat shim used by the fuzz target
+/// and any caller that has no `policy_id`/limiter context. Audit
+/// emissions for unknown variants are NOT rate-limited under this
+/// path; production callers should prefer
+/// [`apply_obligations_with_limiter`] so the per-`(policy_id, variant)`
+/// audit-flood guard (issue #769) takes effect.
 pub fn apply_obligations(
     msg: &mut RoutableMessage,
     obligations: &[Obligation],
     unknown_policy: UnknownObligationPolicy,
+) -> Result<(), ObligationError> {
+    apply_obligations_with_limiter(msg, obligations, unknown_policy, "", None)
+}
+
+/// Production entrypoint that threads the policy id and an optional
+/// per-`(policy_id, variant)` rate limiter through to the unknown-variant
+/// audit and metric path (issue #769).
+///
+/// Behaviour is identical to [`apply_obligations`] for known variants.
+/// On an unknown variant:
+///
+/// 1. The dispatcher's [`OnObligationUnknown`] callback fires with the
+///    `{:?}` rendering of the variant (F-3b: always-on counter input,
+///    fires before the rate-limit check so operators see the true
+///    encounter rate).
+/// 2. The per-`(policy_id, variant)` token bucket is consulted (F-3a).
+///    If a token is available, [`audit::authz_obligation_unknown`] is
+///    emitted; if not, the audit emission is silently dropped — the
+///    metric counter has already captured the encounter for the
+///    operator dashboard.
+/// 3. The configured [`UnknownObligationPolicy`] decides whether to
+///    fail-closed or continue.
+///
+/// `policy_id` should be the engine's stable id (see
+/// [`rustgate_authz::PolicyEngine::policy_id`]). An empty string is
+/// accepted for callers without engine context — those calls all share
+/// a single bucket key.
+pub fn apply_obligations_with_limiter(
+    msg: &mut RoutableMessage,
+    obligations: &[Obligation],
+    unknown_policy: UnknownObligationPolicy,
+    policy_id: &str,
+    rate_limiter: Option<&ObligationRateLimiter>,
 ) -> Result<(), ObligationError> {
     for obligation in obligations {
         match obligation {
@@ -222,12 +438,23 @@ pub fn apply_obligations(
             // the forensic trail.
             other => {
                 let variant_repr = format!("{other:?}");
-                audit::authz_obligation_unknown(
-                    &msg.source.cn,
-                    &variant_repr,
-                    &msg.metadata.source_protocol,
-                    msg.destination.kind_str(),
-                );
+                // Ordering is critical (F-3a + F-3b, issue #769):
+                //   1. Counter increment via `observe_unknown` (always).
+                //   2. Audit emission (only when token available).
+                // A regression that audited unconditionally would
+                // re-introduce the audit-flood vector this PR closes.
+                let emit_audit = match rate_limiter {
+                    Some(limiter) => limiter.observe_unknown(policy_id, &variant_repr),
+                    None => true,
+                };
+                if emit_audit {
+                    audit::authz_obligation_unknown(
+                        &msg.source.cn,
+                        &variant_repr,
+                        &msg.metadata.source_protocol,
+                        msg.destination.kind_str(),
+                    );
+                }
                 match unknown_policy {
                     UnknownObligationPolicy::FailClosed => {
                         // WARN-level operational log: the policy
@@ -806,5 +1033,165 @@ mod tests {
         let s = format!("{err}");
         assert!(s.contains("unknown authz obligation variant"));
         assert!(s.contains("TransformPayload"));
+    }
+
+    // ── Issue #769: per-(policy_id, variant) audit rate limiter ─────
+    //
+    // `Obligation` is `#[non_exhaustive]` — we cannot construct a
+    // synthetic unknown variant from outside `rustgate-authz`. The
+    // rate-limit + counter path is a self-contained dispatcher
+    // primitive (`ObligationRateLimiter`) so the tests pin its
+    // observable shape directly. The dispatcher integration with
+    // `apply_obligations_with_limiter` is exercised by the existing
+    // known-variant tests above (which must not regress under the new
+    // optional rate-limiter parameter).
+
+    /// F-3a: emitting many unknown encounters MUST cap audit
+    /// authorization at the per-key threshold (default 60/min).
+    /// `observe_unknown` returns `true` only when the audit log
+    /// emission is permitted by the bucket — counting `true`
+    /// returns is the audit allotment.
+    #[test]
+    fn obligation_unknown_audit_rate_limited_after_threshold() {
+        let limiter = ObligationRateLimiter::new(60);
+        let allowed = (0..100)
+            .filter(|_| limiter.observe_unknown("policy-a", "TransformPayload"))
+            .count();
+        assert!(
+            allowed <= 60,
+            "audit allotment must cap at audit_per_min; observed {allowed}/100 emissions"
+        );
+        // The first burst is sized to the per-minute cap; we expect
+        // exactly that many tokens consumed.
+        assert_eq!(
+            allowed, 60,
+            "the first burst should consume the full audit_per_min allotment"
+        );
+    }
+
+    /// F-3b: the metric callback fires for every unknown encounter
+    /// regardless of the audit-rate-limit verdict. Operators page on
+    /// the counter, not the audit log; the counter MUST reflect the
+    /// true rate even when audit emissions are silenced.
+    #[test]
+    fn obligation_unknown_metric_counts_all_emissions_not_just_audited() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_for_cb = Arc::clone(&counter);
+        let limiter = ObligationRateLimiter::new(60).with_on_unknown(Arc::new(move |_variant| {
+            let _ = counter_for_cb.fetch_add(1, Ordering::SeqCst);
+        }));
+        for _ in 0..100 {
+            let _ = limiter.observe_unknown("policy-a", "TransformPayload");
+        }
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            100,
+            "counter callback must fire for every encounter, regardless of audit rate-limit"
+        );
+    }
+
+    /// F-3a key isolation: saturating one `(policy_id, variant)` key
+    /// MUST NOT consume the bucket of another. A misconfigured
+    /// `Variant=A` policy cannot suppress audit emission for a
+    /// genuine `Variant=B` encounter that arrives during the same
+    /// minute.
+    #[test]
+    fn obligation_unknown_per_variant_isolation() {
+        let limiter = ObligationRateLimiter::new(60);
+        // Saturate variant A — consumes its bucket entirely.
+        let a_allowed = (0..60)
+            .filter(|_| limiter.observe_unknown("policy-a", "VariantA"))
+            .count();
+        assert_eq!(a_allowed, 60, "variant A burst must consume full bucket");
+        // A's bucket is now empty.
+        assert!(
+            !limiter.observe_unknown("policy-a", "VariantA"),
+            "variant A must be rate-limited after saturation"
+        );
+        // Variant B starts with a fresh bucket — its full allotment
+        // must be available even though A is saturated.
+        let b_allowed = (0..60)
+            .filter(|_| limiter.observe_unknown("policy-a", "VariantB"))
+            .count();
+        assert_eq!(
+            b_allowed, 60,
+            "variant B must retain its own allotment despite A's saturation"
+        );
+    }
+
+    /// Policy reload (different `policy_id`) MUST start a fresh
+    /// bucket: the per-key map is keyed on `(policy_id, variant)`,
+    /// not just `variant`. A regression that keyed on variant alone
+    /// would let the previous policy's saturated bucket pre-suppress
+    /// the new policy's first-minute audit emissions.
+    #[test]
+    fn obligation_unknown_per_policy_isolation() {
+        let limiter = ObligationRateLimiter::new(60);
+        // Saturate policy A's bucket for the variant.
+        for _ in 0..60 {
+            assert!(limiter.observe_unknown("policy-a", "TransformPayload"));
+        }
+        assert!(!limiter.observe_unknown("policy-a", "TransformPayload"));
+        // Policy B (e.g. after a reload) starts fresh.
+        for i in 0..60 {
+            assert!(
+                limiter.observe_unknown("policy-b", "TransformPayload"),
+                "policy B emission #{i} must be allowed (independent bucket)"
+            );
+        }
+    }
+
+    /// `forget_policy` drops every bucket owned by the given policy_id
+    /// so a reload re-arms emission for that policy without affecting
+    /// other policies' state.
+    #[test]
+    fn obligation_unknown_forget_policy_clears_only_that_policy() {
+        let limiter = ObligationRateLimiter::new(60);
+        // Saturate policy A's bucket.
+        for _ in 0..60 {
+            assert!(limiter.observe_unknown("policy-a", "X"));
+        }
+        assert!(!limiter.observe_unknown("policy-a", "X"));
+        // Saturate policy B's bucket.
+        for _ in 0..60 {
+            assert!(limiter.observe_unknown("policy-b", "X"));
+        }
+        assert!(!limiter.observe_unknown("policy-b", "X"));
+
+        limiter.forget_policy("policy-a");
+
+        // Policy A re-armed: full allotment available again.
+        assert!(limiter.observe_unknown("policy-a", "X"));
+        // Policy B untouched: still rate-limited.
+        assert!(!limiter.observe_unknown("policy-b", "X"));
+    }
+
+    /// Default-constructed limiter uses the documented per-minute cap.
+    /// A change to the default constant is a documentation/operator
+    /// surface change and must be visible at test time.
+    #[test]
+    fn obligation_rate_limiter_default_audit_per_min() {
+        let limiter = ObligationRateLimiter::default();
+        assert_eq!(
+            limiter.audit_per_min(),
+            DEFAULT_UNKNOWN_OBLIGATION_AUDIT_PER_MIN
+        );
+        assert_eq!(DEFAULT_UNKNOWN_OBLIGATION_AUDIT_PER_MIN, 60);
+    }
+
+    /// `audit_per_min(0)` is clamped to 1: the dispatcher must always
+    /// emit at least the first audit record per key so a forensic
+    /// signal is never fully suppressed.
+    #[test]
+    fn obligation_rate_limiter_zero_per_min_is_clamped_to_one() {
+        let limiter = ObligationRateLimiter::new(0);
+        assert_eq!(limiter.audit_per_min(), 1);
+        assert!(
+            limiter.observe_unknown("p", "v"),
+            "first emission must always be allowed, even with audit_per_min=0 (clamped to 1)"
+        );
+        assert!(!limiter.observe_unknown("p", "v"));
     }
 }

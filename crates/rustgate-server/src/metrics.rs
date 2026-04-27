@@ -205,6 +205,7 @@ static AUTHZ_POLICY_RULES: OnceLock<IntGauge> = OnceLock::new();
 static AUTHZ_CACHE_HITS: OnceLock<IntCounter> = OnceLock::new();
 static AUTHZ_CACHE_MISSES: OnceLock<IntCounter> = OnceLock::new();
 static RELOAD_ROLLBACK: OnceLock<IntCounterVec> = OnceLock::new();
+static AUTHZ_OBLIGATION_UNKNOWN: OnceLock<IntCounterVec> = OnceLock::new();
 
 static ARCHIVE_BYTES: OnceLock<IntGauge> = OnceLock::new();
 static CRL_AGE_SECONDS: OnceLock<IntGauge> = OnceLock::new();
@@ -1057,6 +1058,24 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(reload_rollback.clone()))?;
     let _ = RELOAD_ROLLBACK.set(reload_rollback);
 
+    // Issue #769 (F-3b): unknown-obligation encounter counter. The
+    // sibling per-(policy_id, variant) audit-rate-limiter (F-3a)
+    // suppresses repeated audit-log emissions for a misconfigured
+    // policy that returns the same unknown variant on every routed
+    // message; this counter increments on EVERY encounter regardless
+    // of audit suppression so operator dashboards see the true rate.
+    // Operators page on `rate(rustgate_authz_obligation_unknown_total[5m])`.
+    let authz_obligation_unknown = IntCounterVec::new(
+        Opts::new(
+            "rustgate_authz_obligation_unknown_total",
+            "Unknown authz obligation variants encountered by the transport, \
+             labelled by `{:?}` rendering of the variant (issue #769)",
+        ),
+        &["variant"],
+    )?;
+    registry.register(Box::new(authz_obligation_unknown.clone()))?;
+    let _ = AUTHZ_OBLIGATION_UNKNOWN.set(authz_obligation_unknown);
+
     #[cfg(feature = "jemalloc")]
     {
         let jemalloc_resident = IntGauge::with_opts(Opts::new(
@@ -1184,6 +1203,26 @@ pub fn authz_reloads() -> &'static IntCounterVec {
 pub fn reload_rollback() -> &'static IntCounterVec {
     RELOAD_ROLLBACK.get_or_init(|| {
         fallback_counter_vec("rustgate_reload_rollback_total", "fallback", &["subsystem"])
+    })
+}
+
+/// Unknown-obligation encounter counter (issue #769, F-3b).
+///
+/// Incremented once per encounter at the
+/// [`rustgate_transport::obligations::ObligationRateLimiter`] callback
+/// boundary, **before** the per-`(policy_id, variant)` audit-rate-limit
+/// gate. The counter therefore reflects every unknown-variant
+/// encounter, not just the audit emissions that survived rate-limiting.
+/// Wired into the transport via
+/// [`rustgate_transport::obligations::ObligationRateLimiter::with_on_unknown`]
+/// at server startup.
+pub fn authz_obligation_unknown() -> &'static IntCounterVec {
+    AUTHZ_OBLIGATION_UNKNOWN.get_or_init(|| {
+        fallback_counter_vec(
+            "rustgate_authz_obligation_unknown_total",
+            "fallback",
+            &["variant"],
+        )
     })
 }
 
@@ -4944,6 +4983,94 @@ mod tests {
             assert_eq!(
                 crl_before, crl_after,
                 "crl subsystem must NOT change when only acl was recorded",
+            );
+        }
+    }
+
+    /// Closes #769 (F-3b). Pins the documented Prometheus name and the
+    /// single `variant` label dimension. Operators page on
+    /// `rate(rustgate_authz_obligation_unknown_total[5m])`; a rename or
+    /// relabelling silently breaks every deployed alert.
+    ///
+    /// Probes via the `authz_obligation_unknown()` accessor for the
+    /// same `OnceLock` race-tolerance reasons as the reload-rollback
+    /// counter test above.
+    mod authz_obligation_unknown_counter {
+        use prometheus::core::Collector;
+
+        use super::*;
+
+        const EXPECTED_NAME: &str = "rustgate_authz_obligation_unknown_total";
+        const EXPECTED_LABEL: &str = "variant";
+
+        #[test]
+        fn obligation_unknown_registered_under_documented_name() {
+            ensure_init();
+            let family = authz_obligation_unknown();
+            let descs = family.desc();
+            let desc = descs
+                .into_iter()
+                .next()
+                .expect("metric must carry at least one Desc");
+            assert_eq!(
+                desc.fq_name, EXPECTED_NAME,
+                "{EXPECTED_NAME} must be registered under the documented \
+                 name; a SIEM rule on \
+                 `rate({EXPECTED_NAME}{{{EXPECTED_LABEL}=\"...\"}}[5m])` \
+                 would silently break if this drifts. Got: {}",
+                desc.fq_name,
+            );
+            assert_eq!(
+                desc.variable_labels,
+                vec![EXPECTED_LABEL.to_string()],
+                "{EXPECTED_NAME} must carry exactly one label \
+                 ({EXPECTED_LABEL}); a future refactor that changes the label set \
+                 would invalidate every dashboard PromQL query. Got: {:?}",
+                desc.variable_labels,
+            );
+        }
+
+        #[test]
+        fn obligation_unknown_increments_variant_label() {
+            ensure_init();
+            // The accessor returns the registered IntCounterVec; the
+            // increment path used at runtime is the
+            // `with_label_values(&[variant]).inc()` call wired into
+            // `ObligationRateLimiter::with_on_unknown` at startup.
+            // Use a unique synthetic variant label so the assertion is
+            // invariant against any parallel test touching the
+            // documented variants.
+            let token = "__test_variant_isolated_probe__";
+            let before = authz_obligation_unknown().with_label_values(&[token]).get();
+            authz_obligation_unknown().with_label_values(&[token]).inc();
+            let after = authz_obligation_unknown().with_label_values(&[token]).get();
+            assert!(
+                after > before,
+                "increment must advance the variant time series; \
+                 before={before}, after={after}",
+            );
+        }
+
+        #[test]
+        fn obligation_unknown_distinguishes_variants() {
+            ensure_init();
+            // Distinct variant tokens must produce independent time
+            // series. A regression that collapsed labels would let one
+            // misconfigured policy mask another's signal.
+            let a = "__test_variant_A_isolated__";
+            let b = "__test_variant_B_isolated__";
+            let a_before = authz_obligation_unknown().with_label_values(&[a]).get();
+            let b_before = authz_obligation_unknown().with_label_values(&[b]).get();
+            authz_obligation_unknown().with_label_values(&[a]).inc();
+            let a_after = authz_obligation_unknown().with_label_values(&[a]).get();
+            let b_after = authz_obligation_unknown().with_label_values(&[b]).get();
+            assert!(
+                a_after > a_before,
+                "variant A must increment after its own .inc() call",
+            );
+            assert_eq!(
+                b_before, b_after,
+                "variant B must NOT change when only variant A was incremented",
             );
         }
     }
