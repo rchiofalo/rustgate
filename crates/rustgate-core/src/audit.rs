@@ -700,6 +700,77 @@ pub fn authz_classified_delivery(
     );
 }
 
+/// Stable `recovery` token emitted by [`authz_obligation_failed`] for
+/// `MaskPoint` on a payload whose `source_protocol` is in the known-binary
+/// list (e.g. MAVLink, TAK protobuf, ASTERIX). The masker is a CoT-XML
+/// control; binary framings cannot host a `<point>` element, so
+/// pass-through is correct by design and an analyst grepping the audit
+/// trail for "MaskPoint was bypassed" should be able to distinguish this
+/// from a parser-level bypass.
+pub const MASK_RECOVERY_FORWARDED_BINARY: &str = "forwarded_binary";
+
+/// Stable `recovery` token emitted by [`authz_obligation_failed`] for
+/// `MaskPoint` on a payload whose `source_protocol` claims XML/CoT but
+/// the parser failed (or the first non-whitespace byte is not `<`).
+/// "We tried but couldn't parse XML" — position MAY be in the bytes and
+/// the masker bypassed inspection. This is the higher-severity bucket
+/// for SIEM alerting.
+pub const MASK_RECOVERY_FORWARDED_UNMASKED: &str = "forwarded_unmasked";
+
+/// Stable `recovery` token emitted by [`authz_obligation_failed`] for
+/// `MaskPoint` on a payload whose `source_protocol` is not in the
+/// recognised set. Operator visibility for misconfigured upstreams that
+/// stamp arbitrary identifiers on `Metadata::source_protocol` — the
+/// router cannot tell whether the bytes might host a position field
+/// without reparsing, so it falls into a separate forensic bucket from
+/// the known-binary and known-XML cases.
+pub const MASK_RECOVERY_FORWARDED_UNKNOWN: &str = "forwarded_unknown";
+
+/// Stable `recovery` token emitted by [`authz_obligation_failed`] when
+/// the dispatcher fail-closed an XML-intent payload that tripped the
+/// masker (parse error or attribute-budget exceeded) — the payload was
+/// erased rather than forwarded unmasked.
+pub const MASK_RECOVERY_DROPPED: &str = "dropped";
+
+/// Bucket the `source_protocol` field of an inbound `RoutableMessage`
+/// into the recovery-token vocabulary used by [`authz_obligation_failed`]
+/// for the `MaskPoint` non-XML-intent path.
+///
+/// Returns one of:
+///
+/// - [`MASK_RECOVERY_FORWARDED_BINARY`] when `source_protocol` is a
+///   known binary framing (`mavlink`, `tak-protobuf`, `tak_protobuf`,
+///   `asterix`). The hyphenated and underscored TAK protobuf spellings
+///   are both accepted because [`crate::codec::Codec::protocol_id`]
+///   returns `"tak-protobuf"` while older call-sites and config keys
+///   spelled it `"tak_protobuf"`.
+/// - [`MASK_RECOVERY_FORWARDED_UNMASKED`] when `source_protocol` claims
+///   XML or CoT (`cot`, `xml`) but the payload could not be parsed
+///   (matching the pre-issue-#742 behaviour).
+/// - [`MASK_RECOVERY_FORWARDED_UNKNOWN`] for anything else — a
+///   misconfigured upstream, a transport whose identifier this build
+///   does not recognise, or the empty string.
+///
+/// Match is ASCII case-insensitive: an upstream that uppercases or
+/// title-cases the protocol identifier still bucketed correctly.
+pub fn classify_mask_recovery_for(source_protocol: &str) -> &'static str {
+    let known_binary = ["mavlink", "tak-protobuf", "tak_protobuf", "asterix"];
+    if known_binary
+        .iter()
+        .any(|k| source_protocol.eq_ignore_ascii_case(k))
+    {
+        return MASK_RECOVERY_FORWARDED_BINARY;
+    }
+    let known_xml = ["cot", "xml"];
+    if known_xml
+        .iter()
+        .any(|k| source_protocol.eq_ignore_ascii_case(k))
+    {
+        return MASK_RECOVERY_FORWARDED_UNMASKED;
+    }
+    MASK_RECOVERY_FORWARDED_UNKNOWN
+}
+
 /// Record a failure to actuate an authz obligation.
 ///
 /// Emitted by the router's obligation dispatcher when an obligation with
@@ -711,11 +782,31 @@ pub fn authz_classified_delivery(
 /// can see the policy hint was not honoured.
 ///
 /// `obligation` is the unqualified variant name (e.g. `"MaskPoint"`) and
-/// `recovery` is one of `"dropped"` or `"forwarded_unmasked"` describing
-/// what the dispatcher did in response. `destination_kind` is a stable
-/// tag produced by [`crate::message::Destination::kind_str`] so SIEM
-/// rules can distinguish a failure on a unicast direct send from one on
-/// a fan-out broadcast without inspecting the payload.
+/// `recovery` is one of the four stable tokens that form the audit
+/// vocabulary for this event:
+///
+/// - [`MASK_RECOVERY_DROPPED`] (`"dropped"`) — XML-intent payload was
+///   erased after a parse failure; fail-closed.
+/// - [`MASK_RECOVERY_FORWARDED_BINARY`] (`"forwarded_binary"`) —
+///   `source_protocol` is a known binary framing (MAVLink, TAK
+///   protobuf, ASTERIX); position masking is N/A by design.
+/// - [`MASK_RECOVERY_FORWARDED_UNMASKED`] (`"forwarded_unmasked"`) —
+///   `source_protocol` claims XML/CoT but parsing failed; the payload
+///   MAY have contained a position the masker missed.
+/// - [`MASK_RECOVERY_FORWARDED_UNKNOWN`] (`"forwarded_unknown"`) —
+///   `source_protocol` is not in the recognised set; operator
+///   visibility for misconfigured upstreams.
+///
+/// SIEM rules grep for these literal tokens — changing the strings
+/// without coordinating with the deployed dashboard set is a breaking
+/// change. Use [`classify_mask_recovery_for`] to bucket a given
+/// `source_protocol` into the binary / unmasked / unknown trio for the
+/// non-XML pass-through path.
+///
+/// `destination_kind` is a stable tag produced by
+/// [`crate::message::Destination::kind_str`] so SIEM rules can
+/// distinguish a failure on a unicast direct send from one on a
+/// fan-out broadcast without inspecting the payload.
 ///
 /// Sanitization: every `&str` parameter is sanitized at the audit
 /// boundary.
@@ -1633,6 +1724,116 @@ mod tests {
         fn test_authz_obligation_unknown() {
             authz_obligation_unknown("alice", "Quarantine", "tcp", "group");
             authz_obligation_unknown("", "", "", "");
+        }
+
+        // The `recovery` token vocabulary emitted by
+        // [`authz_obligation_failed`] for the `MaskPoint` non-XML-intent
+        // path is contractual — SIEM dashboards filter on the literal
+        // strings, so any rename is a breaking change. Pin the strings
+        // and the bucket-decision rules here so a future refactor
+        // cannot silently regress one of the three forensic cases.
+        #[test]
+        fn mask_recovery_tokens_are_stable_strings() {
+            assert_eq!(MASK_RECOVERY_FORWARDED_BINARY, "forwarded_binary");
+            assert_eq!(MASK_RECOVERY_FORWARDED_UNMASKED, "forwarded_unmasked");
+            assert_eq!(MASK_RECOVERY_FORWARDED_UNKNOWN, "forwarded_unknown");
+            assert_eq!(MASK_RECOVERY_DROPPED, "dropped");
+        }
+
+        #[test]
+        fn classify_mask_recovery_buckets_known_binary_protocols_as_forwarded_binary() {
+            // MAVLink, TAK protobuf (both spellings — `tak-protobuf` is
+            // what `Codec::protocol_id()` returns, `tak_protobuf` is
+            // what older config keys used), and ASTERIX are all binary
+            // framings that cannot host a CoT `<point>` element. The
+            // classifier must route them all to the same bucket.
+            assert_eq!(
+                classify_mask_recovery_for("mavlink"),
+                MASK_RECOVERY_FORWARDED_BINARY
+            );
+            assert_eq!(
+                classify_mask_recovery_for("tak-protobuf"),
+                MASK_RECOVERY_FORWARDED_BINARY
+            );
+            assert_eq!(
+                classify_mask_recovery_for("tak_protobuf"),
+                MASK_RECOVERY_FORWARDED_BINARY
+            );
+            assert_eq!(
+                classify_mask_recovery_for("asterix"),
+                MASK_RECOVERY_FORWARDED_BINARY
+            );
+        }
+
+        #[test]
+        fn classify_mask_recovery_buckets_xml_text_protocols_as_forwarded_unmasked() {
+            // `cot` and `xml` are the two source_protocol identifiers
+            // a payload-XML producer would stamp. A non-XML payload
+            // arriving with one of these labels means the masker was
+            // expected to apply but the bytes did not parse — the
+            // pre-issue-#742 audit token is preserved here so existing
+            // SIEM rules keyed on `forwarded_unmasked` keep firing on
+            // exactly this case.
+            assert_eq!(
+                classify_mask_recovery_for("cot"),
+                MASK_RECOVERY_FORWARDED_UNMASKED
+            );
+            assert_eq!(
+                classify_mask_recovery_for("xml"),
+                MASK_RECOVERY_FORWARDED_UNMASKED
+            );
+        }
+
+        #[test]
+        fn classify_mask_recovery_buckets_unrecognized_as_forwarded_unknown() {
+            // Anything not in the recognised binary or XML lists — a
+            // misconfigured upstream, a transport whose identifier this
+            // build does not yet recognise, or the empty string —
+            // surfaces in the operator-visibility "unknown" bucket so
+            // the higher-severity unparseable-XML case stays
+            // distinguishable.
+            assert_eq!(
+                classify_mask_recovery_for("unknown_proto_xyz"),
+                MASK_RECOVERY_FORWARDED_UNKNOWN
+            );
+            assert_eq!(
+                classify_mask_recovery_for(""),
+                MASK_RECOVERY_FORWARDED_UNKNOWN
+            );
+            // `tcp` is a transport label, not a wire-format label, so
+            // the classifier cannot tell whether the bytes were XML or
+            // binary — the unknown bucket is the correct answer.
+            assert_eq!(
+                classify_mask_recovery_for("tcp"),
+                MASK_RECOVERY_FORWARDED_UNKNOWN
+            );
+        }
+
+        #[test]
+        fn classify_mask_recovery_is_ascii_case_insensitive() {
+            // Upstream peers may title-case or uppercase the protocol
+            // identifier (e.g. a federation hop that re-stamps
+            // `MAVLink`). The classifier must bucket those identically
+            // to their lowercase form so a SIEM does not see the same
+            // event split across `forwarded_binary` and
+            // `forwarded_unknown` based purely on the upstream's
+            // casing convention.
+            assert_eq!(
+                classify_mask_recovery_for("MAVLINK"),
+                MASK_RECOVERY_FORWARDED_BINARY
+            );
+            assert_eq!(
+                classify_mask_recovery_for("MavLink"),
+                MASK_RECOVERY_FORWARDED_BINARY
+            );
+            assert_eq!(
+                classify_mask_recovery_for("TAK-Protobuf"),
+                MASK_RECOVERY_FORWARDED_BINARY
+            );
+            assert_eq!(
+                classify_mask_recovery_for("CoT"),
+                MASK_RECOVERY_FORWARDED_UNMASKED
+            );
         }
     }
 
