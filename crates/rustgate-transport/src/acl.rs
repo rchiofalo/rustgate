@@ -572,4 +572,170 @@ mod tests {
         assert!(!policy.is_send_authorized("beta", "alice"));
         assert!(!policy.is_receive_authorized("beta", "bob"));
     }
+
+    // ----------------------------------------------------------------
+    // CN normalization audit invariants (closes #723).
+    //
+    // The ACL layer is the case-insensitive matcher in the per-layer
+    // CN normalization stack. These tests pin the contract documented
+    // in `docs/identity-normalization.md`:
+    //
+    //   - ASCII lowercase is applied at BOTH allow-list construction
+    //     AND lookup time (idempotent — applying twice is a no-op).
+    //   - ASCII-only lowercase deliberately does NOT fold non-ASCII
+    //     codepoints (Turkish dotless i, German ß, etc.). This is the
+    //     conscious narrow choice; full Unicode case folding would
+    //     expand the attack surface to lookalike-collapsing transforms.
+    //   - The lookup does NOT trim or NFC-normalize the input. The
+    //     ACL trusts the Identity layer to deliver bytes consistent
+    //     with what the policy author registered.
+    //
+    // A regression that drops the lookup-side lowercase, or that adds
+    // full Unicode case folding to either side, will fail these tests
+    // locally before reaching CI.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn acl_match_is_case_insensitive_at_both_construction_and_lookup() {
+        // The ACL is the layer that owns case-insensitive matching
+        // per RFC 5280 §7.1. Construction lowercases the allow list;
+        // lookup lowercases the input. Both directions must lower
+        // for the match to be robust against a regression that drops
+        // either side.
+        let mut groups = HashMap::new();
+        groups.insert(
+            "ops".to_string(),
+            GroupAcl::new(
+                HashSet::from(["Alice".to_string()]),
+                HashSet::from(["Alice".to_string(), "BOB".to_string()]),
+            ),
+        );
+        let policy = GroupAclPolicy::new(groups);
+        // Construction lowercased `Alice` → `alice`. Lookup of
+        // `Alice`, `alice`, `ALICE`, `aLiCe` all lowercase to the
+        // same form and match.
+        for variant in ["Alice", "alice", "ALICE", "aLiCe"] {
+            assert!(
+                policy.is_send_authorized("ops", variant),
+                "case variant `{variant}` must match the case-insensitive ACL"
+            );
+        }
+        for variant in ["Bob", "bob", "BOB", "bOb"] {
+            assert!(
+                policy.is_receive_authorized("ops", variant),
+                "case variant `{variant}` must match the case-insensitive ACL"
+            );
+        }
+    }
+
+    #[test]
+    fn acl_does_not_fold_unicode_lookalikes() {
+        // **Load-bearing security test for #723.** The Turkish
+        // dotless i (`ı`, U+0131) is visually similar to ASCII `i`
+        // but is a different codepoint. ASCII-only lowercase does
+        // NOT fold the dotless-i form into ASCII `i`. A regression
+        // that swapped `to_ascii_lowercase()` for full Unicode case
+        // folding (e.g. via `unicase` or `caseless`) would silently
+        // let `alıce` match an `alice` allow list — exactly the
+        // spoofing class this audit was filed against.
+        let mut groups = HashMap::new();
+        groups.insert(
+            "ops".to_string(),
+            GroupAcl::new(
+                HashSet::from(["alice".to_string()]),
+                HashSet::from(["alice".to_string()]),
+            ),
+        );
+        let policy = GroupAclPolicy::new(groups);
+        let lookalike = "al\u{0131}ce"; // Turkish dotless i
+        assert!(
+            !policy.is_send_authorized("ops", lookalike),
+            "Unicode lookalike `alıce` must NOT match ASCII `alice` in the ACL"
+        );
+        assert!(
+            !policy.is_receive_authorized("ops", lookalike),
+            "Unicode lookalike `alıce` must NOT match ASCII `alice` in the ACL"
+        );
+    }
+
+    #[test]
+    fn acl_does_not_trim_or_nfc_normalize_input() {
+        // The ACL trusts the Identity layer to deliver bytes
+        // consistent with what the policy author registered. It
+        // does NOT trim leading / trailing whitespace and does NOT
+        // NFC-normalize NFD input. A regression that added either
+        // step would silently merge identities that the constructor
+        // and the authz Cedar engine treat as distinct, breaking the
+        // AND-composition discipline described in
+        // `docs/identity-normalization.md`.
+        let mut groups = HashMap::new();
+        groups.insert(
+            "ops".to_string(),
+            GroupAcl::new(
+                HashSet::from(["alice".to_string()]),
+                HashSet::from(["alice".to_string()]),
+            ),
+        );
+        let policy = GroupAclPolicy::new(groups);
+
+        // Whitespace must NOT be trimmed.
+        assert!(
+            !policy.is_send_authorized("ops", " alice"),
+            "ACL must NOT trim leading whitespace"
+        );
+        assert!(
+            !policy.is_send_authorized("ops", "alice "),
+            "ACL must NOT trim trailing whitespace"
+        );
+
+        // NFD encoding of café must NOT be folded to NFC. Build a
+        // policy with NFC and lookup with NFD — they differ at the
+        // byte level and the ACL must see them as different.
+        let mut groups2 = HashMap::new();
+        groups2.insert(
+            "ops".to_string(),
+            GroupAcl::new(
+                HashSet::from(["caf\u{00e9}".to_string()]), // NFC
+                HashSet::from(["caf\u{00e9}".to_string()]),
+            ),
+        );
+        let policy2 = GroupAclPolicy::new(groups2);
+        let nfd = "cafe\u{0301}";
+        assert!(
+            !policy2.is_send_authorized("ops", nfd),
+            "ACL must NOT NFC-normalize input — NFD and NFC are distinct"
+        );
+    }
+
+    #[test]
+    fn acl_already_normalized_input_consumes_without_re_normalization() {
+        // Pin the contract that ACL doesn't double-normalize. The
+        // constructor lowercases the allow list once; the lookup
+        // lowercases the input once. Feeding an already-lowercased
+        // input through the lookup is a no-op (idempotent), which is
+        // what makes the ACL safe to chain after a future Identity
+        // layer that normalizes at construction. This test pins the
+        // operational additivity.
+        let mut groups = HashMap::new();
+        groups.insert(
+            "ops".to_string(),
+            GroupAcl::new(
+                HashSet::from(["alice".to_string()]),
+                HashSet::from(["alice".to_string()]),
+            ),
+        );
+        let policy = GroupAclPolicy::new(groups);
+        // Pre-lowered input matches.
+        assert!(policy.is_send_authorized("ops", "alice"));
+        assert!(policy.is_receive_authorized("ops", "alice"));
+        // The lookup's `to_ascii_lowercase()` is idempotent on
+        // already-lowercase input — the ACL's behavior for
+        // identical pre-normalized inputs is bit-for-bit equal to
+        // the un-normalized case-mixed lookup.
+        assert_eq!(
+            policy.is_send_authorized("ops", "alice"),
+            policy.is_send_authorized("ops", "Alice"),
+            "ACL lookup must be idempotent across case variants"
+        );
+    }
 }

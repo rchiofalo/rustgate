@@ -688,4 +688,165 @@ mod tests {
         b.hash(&mut hb);
         assert_eq!(ha.finish(), hb.finish());
     }
+
+    // ----------------------------------------------------------------
+    // CN normalization audit invariants (closes #723).
+    //
+    // These tests pin the per-layer normalization contract documented
+    // in `docs/identity-normalization.md`. The headline invariants:
+    //
+    //   - `Identity::new` / `Identity::plaintext` preserve caller bytes
+    //     verbatim — no NFC, no lowercase, no trim.
+    //   - Two CNs that differ only in case construct DIFFERENT
+    //     identities at this layer. Case-insensitive matching is the
+    //     ACL layer's responsibility, not the constructor's.
+    //   - Two CNs that differ only in NFC vs NFD encoding construct
+    //     DIFFERENT identities. NFC normalization is the NATS publisher
+    //     subject sanitizer's responsibility, not the constructor's.
+    //   - Leading / trailing whitespace is preserved verbatim. CAs are
+    //     expected not to issue such CNs; if they do, the operator
+    //     wants the exact bytes in audit logs to diagnose the issuance
+    //     pipeline.
+    //   - Unicode lookalikes (Turkish dotless i U+0131 vs ASCII i)
+    //     construct DIFFERENT identities. This is the load-bearing
+    //     security test — a regression that introduced full Unicode
+    //     case folding (e.g. via `unicase` or `caseless`) would
+    //     silently let the dotless-i form match an ASCII `alice` allow
+    //     list.
+    //
+    // A future refactor that "unifies" normalization at the Identity
+    // boundary will fail these tests locally before reaching CI. See
+    // `docs/identity-normalization.md` for the full rationale.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn identity_preserves_cn_bytes_verbatim() {
+        // No NFC, no lowercase, no trim — the constructor stores the
+        // exact bytes the caller passed in. A regression that added
+        // any normalization step here would break the equality
+        // contract for the authz cache (cert-rotation-separated
+        // sessions with different CN casing would silently merge),
+        // would collapse forensic visibility (audit logs would no
+        // longer show the exact bytes the client presented), and
+        // would silently change which Cedar policies match across
+        // releases.
+        let id = Identity::new("Alice".into(), "fp".into(), BTreeSet::new()).unwrap();
+        assert_eq!(id.cn, "Alice", "Identity must preserve case verbatim");
+
+        let id_pt = Identity::plaintext("Bob.Smith".into(), BTreeSet::new()).unwrap();
+        assert_eq!(
+            id_pt.cn, "Bob.Smith",
+            "Identity::plaintext must preserve case verbatim"
+        );
+    }
+
+    #[test]
+    fn identity_does_not_lowercase_at_construction() {
+        // Two CNs differing only in case construct distinct
+        // identities. Case-insensitive matching is the ACL layer's
+        // responsibility, not the Identity constructor's. A
+        // regression that added `to_ascii_lowercase()` here would
+        // silently merge `Alice` and `alice` into the same authz
+        // cache slot.
+        let upper = Identity::new("Alice".into(), "fp".into(), BTreeSet::new()).unwrap();
+        let lower = Identity::new("alice".into(), "fp".into(), BTreeSet::new()).unwrap();
+        assert_ne!(
+            upper, lower,
+            "case-only-different CNs must construct distinct identities at the constructor"
+        );
+        assert_ne!(upper.cn, lower.cn);
+    }
+
+    #[test]
+    fn nfd_and_nfc_construct_different_identities() {
+        // NFC `caf\u{00e9}` (single codepoint U+00E9) and NFD
+        // `cafe\u{0301}` (e + combining acute, two codepoints) are
+        // different byte sequences. Without NFC normalization at
+        // Identity construction, the two are different identities.
+        // This is the deliberate divergence — pushing NFC into
+        // Identity would require every downstream callsite that
+        // compares CNs to also normalize on read, expanding the audit
+        // surface. See `docs/identity-normalization.md`.
+        let nfc = "caf\u{00e9}";
+        let nfd = "cafe\u{0301}";
+        assert_ne!(
+            nfc.as_bytes(),
+            nfd.as_bytes(),
+            "NFC and NFD of café must differ at the byte level (sanity check)"
+        );
+        let id_nfc = Identity::new(nfc.into(), "fp".into(), BTreeSet::new()).unwrap();
+        let id_nfd = Identity::new(nfd.into(), "fp".into(), BTreeSet::new()).unwrap();
+        assert_ne!(
+            id_nfc, id_nfd,
+            "NFC and NFD CNs must construct distinct identities — Identity \
+             does not NFC-normalize. A regression here would silently \
+             collapse the two byte forms into the same authz cache slot."
+        );
+        assert_eq!(
+            id_nfc.cn, nfc,
+            "NFC bytes preserved verbatim at construction"
+        );
+        assert_eq!(
+            id_nfd.cn, nfd,
+            "NFD bytes preserved verbatim at construction"
+        );
+    }
+
+    #[test]
+    fn leading_trailing_whitespace_is_preserved_verbatim() {
+        // The constructor does NOT trim. CAs are expected to issue
+        // CNs without surrounding whitespace; if a malformed CSR
+        // produces a CN with embedded spaces, the operator wants to
+        // see the exact bytes in audit logs to diagnose the issuance
+        // pipeline. Silently trimming would mask that bug.
+        let with_ws = Identity::new("  alice  ".into(), "fp".into(), BTreeSet::new()).unwrap();
+        let without_ws = Identity::new("alice".into(), "fp".into(), BTreeSet::new()).unwrap();
+        assert_eq!(
+            with_ws.cn, "  alice  ",
+            "constructor must NOT trim leading / trailing whitespace"
+        );
+        assert_ne!(
+            with_ws, without_ws,
+            "CN with surrounding whitespace must be a distinct identity from the trimmed form"
+        );
+    }
+
+    #[test]
+    fn unicode_lookalike_does_not_match_legitimate_cn() {
+        // **The load-bearing security test for #723.** The Turkish
+        // dotless i (U+0131, `ı`) is visually similar to ASCII `i`
+        // but is a different codepoint. A regression that introduced
+        // full Unicode case folding (e.g. via `unicase` or
+        // `caseless`) at the Identity layer would silently let the
+        // dotless-i form match an ASCII `alice` allow list at every
+        // downstream layer — exactly the spoofing class this audit
+        // was filed against. Pin that the two forms construct
+        // DIFFERENT identities and that the bytes are preserved
+        // verbatim through `to_ascii_lowercase()` (which does not
+        // touch non-ASCII codepoints) so the ACL layer ALSO sees them
+        // as distinct.
+        let ascii = "alice";
+        let lookalike = "al\u{0131}ce"; // Turkish dotless i
+        assert_ne!(
+            ascii.as_bytes(),
+            lookalike.as_bytes(),
+            "ASCII alice and Turkish-dotless-i lookalike must differ at the byte level"
+        );
+        let id_ascii = Identity::new(ascii.into(), "fp".into(), BTreeSet::new()).unwrap();
+        let id_lookalike = Identity::new(lookalike.into(), "fp".into(), BTreeSet::new()).unwrap();
+        assert_ne!(
+            id_ascii, id_lookalike,
+            "Unicode lookalike must NOT collapse to the ASCII identity"
+        );
+        // Belt-and-suspenders: pin that `to_ascii_lowercase()` (the
+        // ACL layer's normalization rule) also sees them as distinct.
+        // ASCII-only lowercase deliberately does not fold non-ASCII
+        // codepoints; this test traps a regression that swapped
+        // `to_ascii_lowercase()` for full Unicode case folding.
+        assert_ne!(
+            id_ascii.cn.to_ascii_lowercase(),
+            id_lookalike.cn.to_ascii_lowercase(),
+            "ASCII-only lowercase must NOT fold the Unicode lookalike into the ASCII form"
+        );
+    }
 }
