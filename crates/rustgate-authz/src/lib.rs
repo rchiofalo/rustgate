@@ -9,6 +9,15 @@
 //! a JSON parser, a compiler that produces a bucketed decision table, and
 //! a [`NativeEngine`] implementation of the [`PolicyEngine`] trait. It is
 //! not yet wired into the router — integration lands in a follow-up change.
+//!
+//! # Error handling
+//!
+//! This crate's error type is [`error::AuthzError`]; binary callers in
+//! `rustgate-server` propagate it via `?` and map it through
+//! `anyhow::Error` at the orchestration layer.
+//! [`rustgate_core::error::RustgateError`] is the boundary aggregator for
+//! the `rustgate-core` / `rustgate-transport` slice and is not
+//! automatically constructed from [`error::AuthzError`].
 
 mod cache;
 #[cfg(feature = "cedar")]

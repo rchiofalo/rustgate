@@ -6,6 +6,15 @@
 //! and PKCS#10 CSR, signs it with the server CA, and returns a client
 //! certificate. Implements the Marti-compatible certificate signing flow
 //! so TAK clients can self-provision without manual `.p12` distribution.
+//!
+//! # Error handling
+//!
+//! This crate's error type is [`error::EnrollmentError`]; binary callers
+//! in `rustgate-server` propagate it via `?` and map it through
+//! `anyhow::Error` at the orchestration layer.
+//! [`rustgate_core::error::RustgateError`] is the boundary aggregator for
+//! the `rustgate-core` / `rustgate-transport` slice and is not
+//! automatically constructed from [`error::EnrollmentError`].
 
 pub mod auth;
 #[cfg(feature = "est")]

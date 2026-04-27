@@ -23,6 +23,15 @@
 //! MQTT topics map to rustgate groups (1:1 by default, with optional prefix
 //! stripping). Authorization is enforced by the router's authz PEP on every
 //! PUBLISH and SUBSCRIBE.
+//!
+//! # Error handling
+//!
+//! Session-level failures use this crate's [`MqttError`]; the listener
+//! bring-up path returns [`rustgate_core::error::Result`] (i.e.
+//! [`rustgate_core::error::RustgateError`]). Binary callers in
+//! `rustgate-server` propagate both via `?` and surface them through
+//! `anyhow::Error` at the orchestration layer; [`MqttError`] is not
+//! automatically converted into [`rustgate_core::error::RustgateError`].
 
 mod config;
 mod error;

@@ -11,6 +11,14 @@
 //! translates at session edges:
 //! - Inbound: protobuf -> XML (before routing)
 //! - Outbound: XML -> protobuf (after routing)
+//!
+//! # Error handling
+//!
+//! This crate's error type is [`error::ProtoError`]; binary callers
+//! propagate it via `?` and map it through `anyhow::Error` at the
+//! orchestration layer. [`rustgate_core::error::RustgateError`] is the
+//! boundary aggregator for the `rustgate-core` / `rustgate-transport`
+//! slice and is not automatically constructed from [`error::ProtoError`].
 
 // Varint decoding casts u64 -> usize. On 32-bit platforms this truncation
 // could bypass frame size checks, so we require 64-bit.

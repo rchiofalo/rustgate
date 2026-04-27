@@ -7,6 +7,21 @@
 //! for the internal message envelope, [`error`] types, [`audit`] logging, and
 //! [`protocol`] framing definitions. No crate in the workspace depends on
 //! anything above `rustgate-core`.
+//!
+//! # Error handling
+//!
+//! [`error::RustgateError`] is the boundary aggregator wrapping
+//! [`error::TransportError`] / [`error::ConfigError`] / [`std::io::Error`].
+//! It is the return type used inside the `rustgate-core` /
+//! `rustgate-transport` / `rustgate-websocket` slice via the
+//! [`error::Result`] alias. Other library crates (`rustgate-http`,
+//! `rustgate-mqtt`, `rustgate-enrollment`, `rustgate-mavlink`,
+//! `rustgate-stanag4586`, `rustgate-asterix`, `rustgate-cot`,
+//! `rustgate-authz`, `rustgate-proto`, `rustgate-client`) define their
+//! own typed `*Error` enums — [`error::RustgateError`] is **not**
+//! automatically constructed from those per-crate types. Binary callers
+//! in `rustgate-server` propagate every error via `?` and surface them
+//! through `anyhow::Error` at the orchestration layer.
 
 pub mod audit;
 pub mod audit_chain;

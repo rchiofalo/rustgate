@@ -7,6 +7,17 @@
 //! orchestrates peer connections, heartbeats, circuit breakers, and message
 //! forwarding. Peer configuration is persisted via the [`store`] module and
 //! dynamic TLS trust is managed by [`trust_store::TrustStore`].
+//!
+//! # Error handling
+//!
+//! This crate does not expose a single umbrella `FederationError`; each
+//! submodule with a distinct failure surface defines its own typed enum
+//! (e.g. [`jwt::JwtError`], [`replay_persist::ReplayStoreError`]). Binary
+//! callers in `rustgate-server` propagate these via `?` and surface them
+//! through `anyhow::Error` at the orchestration layer;
+//! [`rustgate_core::error::RustgateError`] is the boundary aggregator for
+//! the `rustgate-core` / `rustgate-transport` slice and is not
+//! automatically constructed from this crate's per-submodule errors.
 
 pub mod config;
 pub mod connector;

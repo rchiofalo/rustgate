@@ -7,6 +7,17 @@
 //! This parser uses `quick-xml`, a streaming parser that does not resolve
 //! external entities or process DTD declarations. This design prevents
 //! XXE (XML External Entity) injection attacks by default.
+//!
+//! # Error handling
+//!
+//! Top-level CoT parsing returns this crate's [`ParseError`]; the
+//! masking and delta-compression submodules expose their own typed
+//! enums ([`mask::MaskError`], [`delta::DeltaError`]). Binary callers
+//! propagate these via `?` and map them through `anyhow::Error` at the
+//! orchestration layer; [`rustgate_core::error::RustgateError`] is the
+//! boundary aggregator for the `rustgate-core` / `rustgate-transport`
+//! slice and is not automatically constructed from this crate's
+//! per-submodule errors.
 
 pub mod delta;
 pub mod mask;

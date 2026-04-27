@@ -38,6 +38,15 @@
 //! - `fips` — Uses aws-lc-rs in FIPS mode for outbound TLS.
 //! - `post-quantum` — Enables post-quantum key exchange (X25519MLKEM768)
 //!   for outbound TLS connections.
+//!
+//! # Error handling
+//!
+//! This crate's error type is [`error::HttpError`]; binary callers in
+//! `rustgate-server` propagate it via `?` and map it through
+//! `anyhow::Error` at the orchestration layer.
+//! [`rustgate_core::error::RustgateError`] is the boundary aggregator for
+//! the `rustgate-core` / `rustgate-transport` slice and is not
+//! automatically constructed from [`error::HttpError`].
 
 pub(crate) mod auth;
 pub(crate) mod batch;
