@@ -1331,4 +1331,146 @@ mod tests {
             "null must also reject and name the offending key"
         );
     }
+
+    // ----------------------------------------------------------------
+    // CN normalization audit invariants (closes #723).
+    //
+    // The authz Cedar / native engine layer performs BYTE-IDENTICAL
+    // CN comparison — no NFC, no lowercase, no trim. This is the
+    // deliberate divergence from the case-insensitive ACL layer
+    // documented in `docs/identity-normalization.md`. The
+    // AND-composition of "ACL allow" + "authz allow" is the security
+    // boundary: if either layer denies, the request is rejected, so
+    // the more restrictive of the two normalization rules always wins.
+    //
+    // These tests pin the byte-exact contract. A regression that
+    // added `to_ascii_lowercase()` or `to_lowercase()` to either side
+    // of the `subject.cn` comparison would silently change which
+    // policies match across releases — there is no visible deprecation
+    // surface for that behavior change, and every existing
+    // deployment's policy meaning would shift.
+    // ----------------------------------------------------------------
+
+    /// Helper: build a `CompiledSubjectPred` with `cn_eq` only — no
+    /// other constraints — so the test isolates the CN-comparison
+    /// behavior from groups / spiffe_id / attribute matching.
+    fn compiled_pred_cn_eq(cn: &str) -> CompiledSubjectPred {
+        CompiledSubjectPred {
+            cn_eq: Some(cn.to_string()),
+            groups_any_of: vec![],
+            groups_all_of: vec![],
+            spiffe_prefix: None,
+            attribute_eq: vec![],
+        }
+    }
+
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn compiled_subject_pred_cn_eq_is_case_sensitive() {
+        // **Load-bearing security test for #723.** The compiled
+        // subject predicate's `cn_eq` performs a byte-identical
+        // comparison via `==`. A regression that added
+        // `to_ascii_lowercase()` to either side would silently change
+        // which policies match across releases — every existing
+        // deployment's policy meaning would shift without a visible
+        // deprecation surface.
+        //
+        // The deliberate divergence from the ACL layer's case-
+        // insensitive matching is documented in
+        // `docs/identity-normalization.md`: AND-composition of "ACL
+        // allow" + "authz allow" means the more restrictive layer
+        // wins, so a Cedar policy author who writes `cn_eq="alice"`
+        // gets a STRICTER match than the ACL — exactly the
+        // defense-in-depth shape #723 was filed to preserve.
+        use rustgate_core::identity::Identity;
+        let pred = compiled_pred_cn_eq("alice");
+        let id_lower = Identity::new("alice".into(), "fp".into(), BTreeSet::new()).unwrap();
+        let id_upper = Identity::new("Alice".into(), "fp".into(), BTreeSet::new()).unwrap();
+        let id_caps = Identity::new("ALICE".into(), "fp".into(), BTreeSet::new()).unwrap();
+        assert!(
+            pred.matches(&Subject::from_identity(&id_lower)),
+            "exact lowercase match — happy path"
+        );
+        assert!(
+            !pred.matches(&Subject::from_identity(&id_upper)),
+            "case-mismatched CN must NOT match — authz is byte-exact, NOT case-insensitive"
+        );
+        assert!(
+            !pred.matches(&Subject::from_identity(&id_caps)),
+            "all-uppercase CN must NOT match the lowercase policy — authz is byte-exact"
+        );
+    }
+
+    #[test]
+    fn compiled_subject_pred_cn_eq_does_not_fold_unicode_lookalikes() {
+        // The Turkish dotless i (`ı`, U+0131) is visually similar to
+        // ASCII `i` but is a different codepoint. The compiled
+        // subject predicate compares bytes — neither side normalizes
+        // — so the lookalike form must NOT match an ASCII allow
+        // entry. This is the same security invariant pinned at the
+        // Identity layer (`unicode_lookalike_does_not_match_legitimate_cn`)
+        // and the ACL layer (`acl_does_not_fold_unicode_lookalikes`):
+        // every layer must independently reject the lookalike so a
+        // regression in any one layer cannot create a spoofing path.
+        use rustgate_core::identity::Identity;
+        let pred = compiled_pred_cn_eq("alice");
+        let id = Identity::new("al\u{0131}ce".into(), "fp".into(), BTreeSet::new()).unwrap();
+        assert!(
+            !pred.matches(&Subject::from_identity(&id)),
+            "Unicode lookalike `alıce` must NOT match ASCII `alice` in the authz engine"
+        );
+    }
+
+    #[test]
+    fn compiled_subject_pred_cn_eq_does_not_trim_or_normalize_input() {
+        // The compiled subject predicate does NOT trim leading /
+        // trailing whitespace and does NOT NFC-normalize. The
+        // Identity layer is expected to deliver bytes consistent with
+        // what the policy author registered. A regression that added
+        // either step here would silently merge identities that the
+        // ACL and Identity layers treat as distinct, breaking the
+        // AND-composition discipline.
+        use rustgate_core::identity::Identity;
+        let pred = compiled_pred_cn_eq("alice");
+        let id_lead = Identity::new(" alice".into(), "fp".into(), BTreeSet::new()).unwrap();
+        assert!(
+            !pred.matches(&Subject::from_identity(&id_lead)),
+            "leading whitespace must NOT be trimmed at the authz engine"
+        );
+        let id_trail = Identity::new("alice ".into(), "fp".into(), BTreeSet::new()).unwrap();
+        assert!(
+            !pred.matches(&Subject::from_identity(&id_trail)),
+            "trailing whitespace must NOT be trimmed at the authz engine"
+        );
+
+        // NFD `cafe\u{0301}` must NOT match an NFC `caf\u{00e9}`
+        // policy — the authz engine compares bytes, not Unicode
+        // canonical equivalence.
+        let pred_nfc = compiled_pred_cn_eq("caf\u{00e9}");
+        let id_nfd = Identity::new("cafe\u{0301}".into(), "fp".into(), BTreeSet::new()).unwrap();
+        assert!(
+            !pred_nfc.matches(&Subject::from_identity(&id_nfd)),
+            "NFD subject must NOT match NFC policy — authz engine is byte-exact"
+        );
+    }
+
+    #[test]
+    fn compiled_subject_pred_already_normalized_input_consumes_without_re_normalization() {
+        // Pin the contract that the authz engine doesn't double-
+        // normalize. This is operationally additive but pins the
+        // contract so a future Identity layer that DOES normalize at
+        // construction can rely on the engine consuming the
+        // already-normalized form bit-for-bit. A regression that
+        // added a normalize-on-evaluate step here would silently
+        // change the meaning of every deployed policy — the
+        // additivity test traps that drift before review.
+        use rustgate_core::identity::Identity;
+        let pred = compiled_pred_cn_eq("alice");
+        let id = Identity::new("alice".into(), "fp".into(), BTreeSet::new()).unwrap();
+        assert!(
+            pred.matches(&Subject::from_identity(&id)),
+            "already-lowercase input must match the lowercase policy with no further transform"
+        );
+    }
 }
