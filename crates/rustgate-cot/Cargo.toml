@@ -25,6 +25,7 @@ thiserror = { workspace = true }
 criterion = { workspace = true }
 proptest = { workspace = true }
 bytes = { workspace = true }
+parking_lot = { workspace = true }
 
 [[bench]]
 name = "parse"

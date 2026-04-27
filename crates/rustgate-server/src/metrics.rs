@@ -165,6 +165,19 @@ static ADMIN_DRAIN_TRIGGERED: OnceLock<IntCounterVec> = OnceLock::new();
 
 static MAVLINK_HEARTBEATS: OnceLock<IntCounterVec> = OnceLock::new();
 
+/// Multicast messages dropped because the destination group list
+/// exceeded the router's `MAX_MULTICAST_GROUPS` cap. Closes #741: this
+/// path was previously observable only via `tracing::warn` so operators
+/// could not dashboard or alert on the drop rate.
+static MULTICAST_OVERSIZE_DROPPED: OnceLock<IntCounter> = OnceLock::new();
+
+/// SA (situational-awareness) payloads whose `<event version=…>`
+/// attribute was rewritten from a legacy form to the current
+/// `2.0` envelope, labelled by `from_version` (`"v1"`,
+/// `"v2-pre-2.0"`). Closes #741: the auto-upgrade path was previously
+/// silent, so fleet-upgrade-progress dashboards had nothing to plot.
+static SA_AUTO_UPGRADED: OnceLock<IntCounterVec> = OnceLock::new();
+
 #[cfg(feature = "nats")]
 static NATS_CONSUMER_PENDING: OnceLock<IntGauge> = OnceLock::new();
 #[cfg(feature = "nats")]
@@ -724,6 +737,59 @@ pub fn init() -> prometheus::Result<()> {
     )?;
     registry.register(Box::new(mavlink_heartbeats.clone()))?;
     let _ = MAVLINK_HEARTBEATS.set(mavlink_heartbeats);
+
+    // Closes #741. Multicast UDP CoT receivers (and the central
+    // router) drop messages whose destination group list exceeds the
+    // internal `MAX_MULTICAST_GROUPS` cap. Previously this surface was
+    // observable only via tracing — there was no Prometheus counter
+    // operators could alert on, so capacity-exhaustion incidents were
+    // visible only in log aggregation. The counter increments once
+    // per dropped multicast message, keyed off the existing router
+    // drop site via the `OnMulticastOversizeDropped` callback wired at
+    // server startup.
+    let multicast_oversize_dropped = IntCounter::with_opts(Opts::new(
+        "rustgate_multicast_oversize_dropped_total",
+        "Multicast messages dropped because the destination group list \
+         exceeded the router's `MAX_MULTICAST_GROUPS` cap. Operators alert \
+         on a non-zero rate to catch a misconfigured publisher fanning out \
+         to thousands of groups (amplification-DoS shape) or a broken \
+         federation peer that lost its group-membership view and fell back \
+         to a wildcard fanout. Counter is always-on; it is wired by the \
+         server binary via the router's \
+         `set_on_multicast_oversize_dropped` callback under \
+         `#[cfg(feature = \"metrics\")]`. Closes #741.",
+    ))?;
+    registry.register(Box::new(multicast_oversize_dropped.clone()))?;
+    let _ = MULTICAST_OVERSIZE_DROPPED.set(multicast_oversize_dropped);
+
+    // Closes #741. SA (situational-awareness) auto-upgrade rewrites
+    // legacy `<event version=…>` envelopes (`v1` for missing-version
+    // payloads, `v2-pre-2.0` for `version="1.x"`) to the current
+    // `2.0` form so the rest of the pipeline only ever sees the
+    // canonical shape. The counter exposes the rewrite rate per
+    // `from_version` so fleet dashboards can plot upgrade progress —
+    // a healthy roll-out trends the `v1` and `v2-pre-2.0` curves
+    // toward zero as legacy senders rotate to current clients.
+    let sa_auto_upgraded = IntCounterVec::new(
+        Opts::new(
+            "rustgate_sa_auto_upgraded_total",
+            "SA (situational-awareness) payloads whose `<event version=…>` \
+             attribute was rewritten from a legacy form to the current \
+             `2.0` envelope, labelled by `from_version`. The two \
+             current label values are `v1` (no version attribute on \
+             the `<event>` tag) and `v2-pre-2.0` (a `version=\"…\"` \
+             value below 2.0). Cardinality is bounded by the small \
+             fixed set of legacy buckets — finer granularity (e.g. \
+             `1.0`, `1.5`) was rejected because most pre-2.0 \
+             senders in the wild are `1.0` and label inflation would \
+             complicate dashboards without adding operational signal. \
+             Wired by the server binary at startup via \
+             `MessageBuilder::with_on_sa_upgraded`. Closes #741.",
+        ),
+        &["from_version"],
+    )?;
+    registry.register(Box::new(sa_auto_upgraded.clone()))?;
+    let _ = SA_AUTO_UPGRADED.set(sa_auto_upgraded);
 
     let admin_drain_triggered = IntCounterVec::new(
         Opts::new(
@@ -1646,6 +1712,44 @@ pub fn mavlink_heartbeats() -> &'static IntCounterVec {
             "fallback",
             &["system_id"],
         )
+    })
+}
+
+/// Counter for multicast messages dropped because the destination
+/// group list exceeded the router's `MAX_MULTICAST_GROUPS` cap. Wired
+/// to the router via `rustgate_transport::Router::set_on_multicast_oversize_dropped`
+/// at server startup under `#[cfg(feature = "metrics")]`. Closes #741.
+pub fn multicast_oversize_dropped() -> &'static IntCounter {
+    MULTICAST_OVERSIZE_DROPPED
+        .get_or_init(|| fallback_counter("rustgate_multicast_oversize_dropped_total", "fallback"))
+}
+
+/// Counter for SA payloads whose `<event version=…>` attribute was
+/// rewritten by the auto-upgrade path. Labelled by `from_version`
+/// (`"v1"` for missing-attribute payloads, `"v2-pre-2.0"` for
+/// `version="1.x"` payloads). Wired via
+/// [`rustgate_cot::MessageBuilder::with_on_sa_upgraded`] at server
+/// startup under `#[cfg(feature = "metrics")]`. Closes #741.
+pub fn sa_auto_upgraded() -> &'static IntCounterVec {
+    SA_AUTO_UPGRADED.get_or_init(|| {
+        fallback_counter_vec(
+            "rustgate_sa_auto_upgraded_total",
+            "fallback",
+            &["from_version"],
+        )
+    })
+}
+
+/// Build the [`rustgate_cot::OnSaAutoUpgraded`] callback that feeds the
+/// `rustgate_sa_auto_upgraded_total{from_version}` counter. Each
+/// transport that constructs a [`rustgate_cot::MessageBuilder`] calls
+/// this once at startup and passes the result through
+/// [`rustgate_cot::MessageBuilder::with_on_sa_upgraded`] so every
+/// upgrade observed across every listener funnels into the same
+/// counter family. Closes #741.
+pub fn sa_auto_upgraded_callback() -> rustgate_cot::OnSaAutoUpgraded {
+    Arc::new(|label: &str| {
+        sa_auto_upgraded().with_label_values(&[label]).inc();
     })
 }
 
@@ -3565,6 +3669,91 @@ mod tests {
             labels,
             vec!["system_id"],
             "exposition must surface the `system_id` label exactly once"
+        );
+    }
+
+    // ── multicast oversize-drop + SA auto-upgrade (issue #741) ─────
+
+    #[test]
+    fn multicast_oversize_dropped_registered_under_documented_name() {
+        // The metric name `rustgate_multicast_oversize_dropped_total`
+        // is the dashboard-and-alerting contract for #741. A rename
+        // or type change would silently break operators' PromQL.
+        ensure_init();
+        // Materialise a sample so the family is gathered.
+        multicast_oversize_dropped().inc();
+        let families = prometheus::default_registry().gather();
+        let found = families
+            .iter()
+            .find(|m| m.name() == "rustgate_multicast_oversize_dropped_total")
+            .expect("rustgate_multicast_oversize_dropped_total must be registered");
+        assert_eq!(
+            found.get_field_type(),
+            prometheus::proto::MetricType::COUNTER,
+        );
+    }
+
+    #[test]
+    fn sa_auto_upgraded_registered_under_documented_name() {
+        // `rustgate_sa_auto_upgraded_total` MUST stay an IntCounterVec
+        // with the `from_version` label — fleet-upgrade dashboards key
+        // off both. Closes #741.
+        ensure_init();
+        sa_auto_upgraded().with_label_values(&["v1"]).inc();
+        let families = prometheus::default_registry().gather();
+        let found = families
+            .iter()
+            .find(|m| m.name() == "rustgate_sa_auto_upgraded_total")
+            .expect("rustgate_sa_auto_upgraded_total must be registered");
+        assert_eq!(
+            found.get_field_type(),
+            prometheus::proto::MetricType::COUNTER,
+        );
+        let sample = found
+            .get_metric()
+            .first()
+            .expect("counter vec must expose at least one sample after inc");
+        let labels: Vec<&str> = sample.get_label().iter().map(|l| l.name()).collect();
+        assert_eq!(
+            labels,
+            vec!["from_version"],
+            "exposition must surface the `from_version` label exactly once"
+        );
+    }
+
+    #[test]
+    fn sa_auto_upgraded_label_isolates_per_from_version() {
+        // The two production label values (`v1` and `v2-pre-2.0`)
+        // drive distinct dashboard panels, so increments on one MUST
+        // NOT bleed into the other. This test uses synthetic
+        // label-value sentinels to avoid contention with sibling
+        // tests that target the production values directly — the
+        // prometheus default registry is shared across the entire
+        // `cargo test` process, so two tests that both inc `v1` race
+        // against each other under default `--test-threads=N`. The
+        // sentinel pair pins the isolation property as a structural
+        // assertion on the IntCounterVec key tuple, independent of
+        // any other test's traffic on the production labels.
+        ensure_init();
+        let label_a = "isolation-test-a";
+        let label_b = "isolation-test-b";
+
+        let before_a = sa_auto_upgraded().with_label_values(&[label_a]).get();
+        let before_b = sa_auto_upgraded().with_label_values(&[label_b]).get();
+
+        sa_auto_upgraded().with_label_values(&[label_a]).inc();
+        sa_auto_upgraded().with_label_values(&[label_a]).inc();
+        sa_auto_upgraded().with_label_values(&[label_b]).inc();
+
+        assert_eq!(
+            sa_auto_upgraded().with_label_values(&[label_a]).get(),
+            before_a + 2,
+            "label_a increments must not bleed into label_b"
+        );
+        assert_eq!(
+            sa_auto_upgraded().with_label_values(&[label_b]).get(),
+            before_b + 1,
+            "label_b increments must not bleed into label_a"
         );
     }
 

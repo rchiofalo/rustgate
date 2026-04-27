@@ -23,6 +23,7 @@ pub mod delta;
 pub mod mask;
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 #[cfg(feature = "fuzz")]
@@ -181,6 +182,252 @@ pub fn sa_affiliation(event_type: &str) -> Option<SaAffiliation> {
         b'x' => Some(SaAffiliation::Other),
         _ => None,
     }
+}
+
+/// Callback invoked once per CoT payload whose `<event version=…>`
+/// attribute was rewritten by [`auto_upgrade_sa_version`] from a legacy
+/// value to the current `2.0` form.
+///
+/// The single `&str` argument is the `from_version` label — one of the
+/// values returned by [`classify_legacy_sa_version`]
+/// (`"v1"`, `"v2-pre-2.0"`). The server binary wires this callback to
+/// the `rustgate_sa_auto_upgraded_total{from_version}` Prometheus
+/// counter so fleet-upgrade-progress dashboards can plot the share of
+/// senders still emitting legacy formats. Closes #741.
+///
+/// Kept as a simple `Fn(&str)` so the `rustgate-cot` crate stays
+/// metrics-agnostic and does not grow a `prometheus` dependency.
+pub type OnSaAutoUpgraded = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Current CoT event-schema version produced by the auto-upgrade path.
+///
+/// Used as the rewrite target by [`auto_upgrade_sa_version`]. Pinned to
+/// `"2.0"` because that is the canonical MITRE MP090284 envelope —
+/// the auto-upgrade flow lifts pre-2.0 payloads to this version so the
+/// rest of the routing pipeline only ever sees the modern form.
+pub const CURRENT_SA_VERSION: &str = "2.0";
+
+/// Classifies a CoT XML payload's `<event version=…>` attribute as a
+/// legacy form, returning the `from_version` label that
+/// [`auto_upgrade_sa_version`] will fire on its callback. Returns
+/// `None` for current-version (`"2.0"` or newer) payloads and for
+/// non-CoT bytes.
+///
+/// The classification is intentionally byte-level: scanning the first
+/// 4 KiB of the payload is dramatically cheaper than full XML
+/// re-parsing on every message, and the existing `parse()` path drops
+/// the version attribute entirely so a downstream call cannot recover
+/// it. The label values are stable across releases — operator
+/// dashboards key off them.
+///
+/// **Returned labels (matches the
+/// `rustgate_sa_auto_upgraded_total{from_version}` cardinality):**
+/// - `"v1"` — payload is XML but the `<event>` tag is missing a
+///   `version` attribute entirely. Common for very old TAK clients
+///   (pre-version-attribute era) and some MAVLink-bridged emitters
+///   that fabricate a minimal `<event>` shell.
+/// - `"v2-pre-2.0"` — payload carries a `version="…"` attribute whose
+///   value is below `"2.0"` (e.g. `"1.0"`, `"1.5"`, `"1.9"`). Treated
+///   as a single bucket because most pre-2.0 versions in the wild are
+///   `"1.0"` and finer cardinality would explode dashboards without
+///   adding operational signal.
+pub fn classify_legacy_sa_version(payload: &[u8]) -> Option<&'static str> {
+    let event_attrs = find_event_attrs(payload)?;
+    match find_version_attr(event_attrs) {
+        None => Some("v1"),
+        Some(v) if is_pre_2_0(v) => Some("v2-pre-2.0"),
+        Some(_) => None,
+    }
+}
+
+/// Rewrites the `<event version=…>` attribute on a CoT payload to the
+/// current value when it carries a legacy form, invoking `on_upgrade`
+/// with the `from_version` label so the caller can update its
+/// metric/audit surface. Returns the (possibly rewritten) payload.
+///
+/// The rewrite is byte-level — the function does NOT round-trip the
+/// XML through a parser. Re-parsing on every position update was
+/// rejected because the SA pipeline already runs `parse()` once
+/// downstream and a second pass would double the per-message CPU on
+/// the routing hot path. A targeted byte-level edit also preserves
+/// the original whitespace, attribute order, and namespace prefixes,
+/// which avoids gratuitous churn for downstream dedup/cache layers
+/// that key on byte identity.
+///
+/// `on_upgrade` is invoked exactly once per upgraded payload, before
+/// the rewritten bytes are returned. It is **not** invoked when the
+/// payload is already current. Closes #741.
+pub fn auto_upgrade_sa_version<F: Fn(&str)>(payload: Bytes, on_upgrade: F) -> Bytes {
+    let Some(label) = classify_legacy_sa_version(&payload) else {
+        return payload;
+    };
+    on_upgrade(label);
+    rewrite_event_version(&payload, CURRENT_SA_VERSION)
+        .map(Bytes::from)
+        .unwrap_or(payload)
+}
+
+/// Find the byte slice spanning the `<event …>` tag attributes — i.e.
+/// the bytes between `<event` and the first `>` or `/>`.
+///
+/// Returns `None` if the payload does not start with the `<event` open
+/// tag (after optional XML declaration / whitespace). The scan is
+/// bounded to the first 4 KiB so an attacker cannot make the classifier
+/// walk an arbitrarily large payload looking for the tag.
+fn find_event_attrs(payload: &[u8]) -> Option<&[u8]> {
+    const SCAN_BUDGET: usize = 4 * 1024;
+    let scan = &payload[..payload.len().min(SCAN_BUDGET)];
+    let start = find_subslice(scan, b"<event")?;
+    let after_tag_name = start + b"<event".len();
+    // The byte immediately after `<event` must be whitespace, `>`, or
+    // `/` (for self-closing) — otherwise this is a different tag like
+    // `<eventLog>`.
+    let next = scan.get(after_tag_name).copied()?;
+    if !matches!(next, b' ' | b'\t' | b'\n' | b'\r' | b'>' | b'/') {
+        return None;
+    }
+    let end = scan[after_tag_name..]
+        .iter()
+        .position(|&b| b == b'>')
+        .map(|p| after_tag_name + p)?;
+    Some(&scan[after_tag_name..end])
+}
+
+/// Locate `version="…"` (or `version='…'`) inside a slice of `<event>`
+/// attributes. Returns the value substring on hit.
+fn find_version_attr(attrs: &[u8]) -> Option<&[u8]> {
+    let key = b"version";
+    let mut i = 0;
+    while i + key.len() < attrs.len() {
+        if &attrs[i..i + key.len()] == key {
+            // Confirm word boundary on the left.
+            let left_ok = i == 0 || matches!(attrs[i - 1], b' ' | b'\t' | b'\n' | b'\r');
+            if left_ok {
+                let after = i + key.len();
+                // Skip optional whitespace then expect '='.
+                let mut j = after;
+                while j < attrs.len() && matches!(attrs[j], b' ' | b'\t') {
+                    j += 1;
+                }
+                if attrs.get(j) == Some(&b'=') {
+                    j += 1;
+                    while j < attrs.len() && matches!(attrs[j], b' ' | b'\t') {
+                        j += 1;
+                    }
+                    let quote = attrs.get(j).copied()?;
+                    if quote != b'"' && quote != b'\'' {
+                        return None;
+                    }
+                    j += 1;
+                    let end_off = attrs[j..].iter().position(|&b| b == quote)?;
+                    return Some(&attrs[j..j + end_off]);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Returns `true` when `value` parses as a CoT version strictly below
+/// `2.0`. Unparseable values are treated as **not** pre-2.0 — the
+/// payload is left alone rather than being rewritten on best-guess
+/// data.
+fn is_pre_2_0(value: &[u8]) -> bool {
+    let Ok(s) = std::str::from_utf8(value) else {
+        return false;
+    };
+    let trimmed = s.trim();
+    let mut parts = trimmed.splitn(2, '.');
+    let Some(major_str) = parts.next() else {
+        return false;
+    };
+    let Ok(major) = major_str.parse::<u32>() else {
+        return false;
+    };
+    major < 2
+}
+
+/// Rewrite the `<event version=…>` attribute (or insert one if absent)
+/// to `target`. Returns the new bytes, or `None` if the payload does
+/// not contain a recognizable `<event>` tag.
+fn rewrite_event_version(payload: &[u8], target: &str) -> Option<Vec<u8>> {
+    const SCAN_BUDGET: usize = 4 * 1024;
+    let scan_end = payload.len().min(SCAN_BUDGET);
+    let tag_start = find_subslice(&payload[..scan_end], b"<event")?;
+    let after_tag_name = tag_start + b"<event".len();
+    let next = payload.get(after_tag_name).copied()?;
+    if !matches!(next, b' ' | b'\t' | b'\n' | b'\r' | b'>' | b'/') {
+        return None;
+    }
+    let attrs_end = payload[after_tag_name..scan_end]
+        .iter()
+        .position(|&b| b == b'>')
+        .map(|p| after_tag_name + p)?;
+    let attrs_slice = &payload[after_tag_name..attrs_end];
+
+    // Locate an existing `version="…"` to splice over.
+    let mut out = Vec::with_capacity(payload.len() + target.len() + 16);
+    if let Some((rel_value_start, rel_value_end)) = find_version_value_span(attrs_slice) {
+        let abs_start = after_tag_name + rel_value_start;
+        let abs_end = after_tag_name + rel_value_end;
+        out.extend_from_slice(&payload[..abs_start]);
+        out.extend_from_slice(target.as_bytes());
+        out.extend_from_slice(&payload[abs_end..]);
+    } else {
+        // No version attribute — insert one immediately after `<event`.
+        out.extend_from_slice(&payload[..after_tag_name]);
+        out.push(b' ');
+        out.extend_from_slice(b"version=\"");
+        out.extend_from_slice(target.as_bytes());
+        out.push(b'"');
+        out.extend_from_slice(&payload[after_tag_name..]);
+    }
+    Some(out)
+}
+
+/// Returns `(value_start, value_end)` byte offsets inside an attribute
+/// slice for an existing `version="…"` (or `version='…'`) attribute.
+fn find_version_value_span(attrs: &[u8]) -> Option<(usize, usize)> {
+    let key = b"version";
+    let mut i = 0;
+    while i + key.len() < attrs.len() {
+        if &attrs[i..i + key.len()] == key {
+            let left_ok = i == 0 || matches!(attrs[i - 1], b' ' | b'\t' | b'\n' | b'\r');
+            if left_ok {
+                let after = i + key.len();
+                let mut j = after;
+                while j < attrs.len() && matches!(attrs[j], b' ' | b'\t') {
+                    j += 1;
+                }
+                if attrs.get(j) == Some(&b'=') {
+                    j += 1;
+                    while j < attrs.len() && matches!(attrs[j], b' ' | b'\t') {
+                        j += 1;
+                    }
+                    let quote = attrs.get(j).copied()?;
+                    if quote != b'"' && quote != b'\'' {
+                        return None;
+                    }
+                    j += 1;
+                    let value_start = j;
+                    let end_off = attrs[j..].iter().position(|&b| b == quote)?;
+                    return Some((value_start, value_start + end_off));
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Naive substring search bounded by `haystack.len()` — used only on
+/// payload prefixes capped at 4 KiB so the linear scan is cheap.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Origin category of a CoT `<event how>` attribute per MP090284.
@@ -459,14 +706,40 @@ fn day_of_year(month: i64, day: i64) -> i64 {
 /// types don't. `MessageBuilder` caches the group from the first position
 /// message and applies it to subsequent messages from the same session,
 /// keeping NATS group routing correct even for non-position payloads.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MessageBuilder {
     session_group: Option<String>,
+    /// Optional callback invoked once per legacy-version SA payload that
+    /// the builder upgrades to [`CURRENT_SA_VERSION`]. Wired by the
+    /// server crate to feed the
+    /// `rustgate_sa_auto_upgraded_total{from_version}` Prometheus
+    /// counter without making `rustgate-cot` depend on the metrics
+    /// layer. Closes #741.
+    on_sa_upgraded: Option<OnSaAutoUpgraded>,
+}
+
+impl std::fmt::Debug for MessageBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MessageBuilder")
+            .field("session_group", &self.session_group)
+            .field("on_sa_upgraded_installed", &self.on_sa_upgraded.is_some())
+            .finish()
+    }
 }
 
 impl MessageBuilder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Install the SA auto-upgrade observer. The callback fires once
+    /// per upgraded payload with the `from_version` label
+    /// (`"v1"` or `"v2-pre-2.0"`); see [`OnSaAutoUpgraded`] for the
+    /// operational rationale. Subsequent calls replace the previous
+    /// observer.
+    pub fn with_on_sa_upgraded(mut self, cb: OnSaAutoUpgraded) -> Self {
+        self.on_sa_upgraded = Some(cb);
+        self
     }
 
     /// Parse payload bytes and build a routable message.
@@ -476,12 +749,29 @@ impl MessageBuilder {
     /// `MessageType::Other("raw")`.
     ///
     /// `source_protocol` identifies the transport origin (e.g. `"tcp"`, `"websocket"`).
+    ///
+    /// When a [`OnSaAutoUpgraded`] callback is installed via
+    /// [`with_on_sa_upgraded`](Self::with_on_sa_upgraded), payloads
+    /// emitted with a legacy `<event version=…>` value are rewritten
+    /// to [`CURRENT_SA_VERSION`] before downstream parsing and the
+    /// callback fires once per upgrade with the `from_version` label.
     pub fn build(
         &mut self,
         identity: &Identity,
         payload: Bytes,
         source_protocol: &str,
     ) -> RoutableMessage {
+        // SA auto-upgrade: when an observer is installed, lift legacy
+        // version strings to the current envelope before parsing so
+        // downstream consumers (NATS bridge, federation) only ever see
+        // the modern shape. See #741: the upgrade was previously silent.
+        let payload = match self.on_sa_upgraded.as_ref() {
+            Some(cb) => {
+                let cb = Arc::clone(cb);
+                auto_upgrade_sa_version(payload, |label| cb(label))
+            }
+            None => payload,
+        };
         match parse(&payload) {
             Ok(cot) => {
                 if cot.source_group.is_some() {
@@ -947,5 +1237,166 @@ mod tests {
     fn how_is_spec_conformant_is_case_sensitive() {
         assert!(!how_is_spec_conformant("M-G"));
         assert!(!how_is_spec_conformant("H-E"));
+    }
+
+    // ── SA auto-upgrade (issue #741) ─────────────────────────────
+
+    #[test]
+    fn classify_legacy_sa_version_v1_when_attribute_missing() {
+        let payload = br#"<event uid="x" type="a-f-G"><point lat="0" lon="0" hae="0"/></event>"#;
+        assert_eq!(classify_legacy_sa_version(payload), Some("v1"));
+    }
+
+    #[test]
+    fn classify_legacy_sa_version_pre_2_0_when_value_below_2() {
+        let payload = br#"<event version="1.0" uid="x" type="a-f-G"><point lat="0" lon="0" hae="0"/></event>"#;
+        assert_eq!(classify_legacy_sa_version(payload), Some("v2-pre-2.0"));
+    }
+
+    #[test]
+    fn classify_legacy_sa_version_none_for_current_version() {
+        let payload =
+            br#"<event version="2.0" uid="x" type="a-f-G"><point lat="0" lon="0" hae="0"/></event>"#;
+        assert_eq!(classify_legacy_sa_version(payload), None);
+    }
+
+    #[test]
+    fn classify_legacy_sa_version_none_for_future_version() {
+        let payload =
+            br#"<event version="3.0" uid="x" type="a-f-G"><point lat="0" lon="0" hae="0"/></event>"#;
+        assert_eq!(classify_legacy_sa_version(payload), None);
+    }
+
+    #[test]
+    fn classify_legacy_sa_version_none_for_non_xml() {
+        assert_eq!(classify_legacy_sa_version(b"not xml at all"), None);
+    }
+
+    #[test]
+    fn classify_legacy_sa_version_distinguishes_eventlog() {
+        // `<eventLog>` must NOT match `<event>` — the attribute scanner
+        // requires a word boundary after the tag name.
+        let payload = br#"<eventLog uid="x"><entry/></eventLog>"#;
+        assert_eq!(classify_legacy_sa_version(payload), None);
+    }
+
+    #[test]
+    fn auto_upgrade_sa_v1_inserts_version_attribute() {
+        let observed = std::sync::Mutex::new(None::<String>);
+        let cb = |label: &str| {
+            *observed.lock().unwrap() = Some(label.to_string());
+        };
+        let payload = Bytes::from_static(
+            br#"<event uid="x" type="a-f-G"><point lat="0" lon="0" hae="0"/></event>"#,
+        );
+        let upgraded = auto_upgrade_sa_version(payload, cb);
+        assert_eq!(observed.lock().unwrap().as_deref(), Some("v1"));
+        let upgraded_str = std::str::from_utf8(&upgraded).unwrap();
+        assert!(
+            upgraded_str.contains(r#"version="2.0""#),
+            "v1 upgrade must insert version=2.0; got: {upgraded_str}"
+        );
+    }
+
+    #[test]
+    fn auto_upgrade_sa_pre_2_0_rewrites_version_attribute() {
+        let observed = std::sync::Mutex::new(None::<String>);
+        let cb = |label: &str| {
+            *observed.lock().unwrap() = Some(label.to_string());
+        };
+        let payload = Bytes::from_static(
+            br#"<event version="1.0" uid="x" type="a-f-G"><point lat="0" lon="0" hae="0"/></event>"#,
+        );
+        let upgraded = auto_upgrade_sa_version(payload, cb);
+        assert_eq!(observed.lock().unwrap().as_deref(), Some("v2-pre-2.0"));
+        let upgraded_str = std::str::from_utf8(&upgraded).unwrap();
+        assert!(
+            upgraded_str.contains(r#"version="2.0""#),
+            "pre-2.0 upgrade must rewrite to version=2.0; got: {upgraded_str}"
+        );
+        assert!(
+            !upgraded_str.contains(r#"version="1.0""#),
+            "pre-2.0 upgrade must replace the old version; got: {upgraded_str}"
+        );
+    }
+
+    #[test]
+    fn auto_upgrade_sa_no_callback_fires_when_current() {
+        let observed = std::sync::Mutex::new(0usize);
+        let cb = |_: &str| {
+            *observed.lock().unwrap() += 1;
+        };
+        let payload = Bytes::from_static(
+            br#"<event version="2.0" uid="x" type="a-f-G"><point lat="0" lon="0" hae="0"/></event>"#,
+        );
+        let after = auto_upgrade_sa_version(payload.clone(), cb);
+        assert_eq!(*observed.lock().unwrap(), 0);
+        assert_eq!(after, payload, "current-version payload must be untouched");
+    }
+
+    #[test]
+    fn sa_v1_payload_invokes_upgraded_callback_with_v1_label() {
+        // End-to-end through MessageBuilder: a v1 SA payload (no
+        // version attribute) is upgraded and the callback fires with
+        // the "v1" label exactly once.
+        let counter: Arc<parking_lot::Mutex<Vec<String>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let counter_cb = Arc::clone(&counter);
+        let cb: OnSaAutoUpgraded = Arc::new(move |label: &str| {
+            counter_cb.lock().push(label.to_string());
+        });
+
+        let id = test_identity();
+        let mut builder = MessageBuilder::new().with_on_sa_upgraded(cb);
+        // SA atom (a-f-G-U-C) without a version attribute.
+        let payload = Bytes::from_static(
+            br#"<event uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><point lat="38.0" lon="-77.0" hae="0.0"/><detail/></event>"#,
+        );
+        let _ = builder.build(&id, payload, "tcp");
+        let observed = counter.lock().clone();
+        assert_eq!(
+            observed,
+            vec!["v1".to_string()],
+            "v1 SA payload must invoke the upgrade callback exactly once with the \"v1\" label"
+        );
+    }
+
+    #[test]
+    fn sa_pre_2_0_payload_invokes_upgraded_callback_with_pre_label() {
+        let counter: Arc<parking_lot::Mutex<Vec<String>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let counter_cb = Arc::clone(&counter);
+        let cb: OnSaAutoUpgraded = Arc::new(move |label: &str| {
+            counter_cb.lock().push(label.to_string());
+        });
+
+        let id = test_identity();
+        let mut builder = MessageBuilder::new().with_on_sa_upgraded(cb);
+        let payload = Bytes::from_static(
+            br#"<event version="1.0" uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><point lat="38.0" lon="-77.0" hae="0.0"/><detail/></event>"#,
+        );
+        let _ = builder.build(&id, payload, "tcp");
+        assert_eq!(counter.lock().clone(), vec!["v2-pre-2.0".to_string()]);
+    }
+
+    #[test]
+    fn sa_current_payload_does_not_invoke_upgrade_callback() {
+        let counter: Arc<parking_lot::Mutex<Vec<String>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let counter_cb = Arc::clone(&counter);
+        let cb: OnSaAutoUpgraded = Arc::new(move |label: &str| {
+            counter_cb.lock().push(label.to_string());
+        });
+
+        let id = test_identity();
+        let mut builder = MessageBuilder::new().with_on_sa_upgraded(cb);
+        let payload = Bytes::from_static(
+            br#"<event version="2.0" uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><point lat="38.0" lon="-77.0" hae="0.0"/><detail/></event>"#,
+        );
+        let _ = builder.build(&id, payload, "tcp");
+        assert!(
+            counter.lock().is_empty(),
+            "current-version SA payload must not invoke the upgrade callback"
+        );
     }
 }

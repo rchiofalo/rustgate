@@ -465,6 +465,14 @@ async fn read_loop(
     };
     let mut framed = FramedRead::new(PrefixedReader::new(reader, prefix_opt), framed_codec);
 
+    // Closes #741. Attach the SA auto-upgrade observer so legacy
+    // `<event version=…>` payloads counted on the TLS session listener
+    // feed the shared `rustgate_sa_auto_upgraded_total{from_version}`
+    // counter.
+    #[cfg(feature = "metrics")]
+    let mut msg_builder =
+        MessageBuilder::new().with_on_sa_upgraded(crate::metrics::sa_auto_upgraded_callback());
+    #[cfg(not(feature = "metrics"))]
     let mut msg_builder = MessageBuilder::new();
 
     loop {
@@ -930,6 +938,13 @@ async fn run_plaintext_session_loops<P: NatsPublish>(
     };
     let framed_codec = FramedCodec::try_from_strategy(&codec.framing())?;
     let mut framed_read = FramedRead::new(reader, framed_codec);
+    // Closes #741. Attach the SA auto-upgrade observer so legacy
+    // `<event version=…>` payloads counted at this listener feed the
+    // shared `rustgate_sa_auto_upgraded_total{from_version}` counter.
+    #[cfg(feature = "metrics")]
+    let mut msg_builder =
+        MessageBuilder::new().with_on_sa_upgraded(crate::metrics::sa_auto_upgraded_callback());
+    #[cfg(not(feature = "metrics"))]
     let mut msg_builder = MessageBuilder::new();
 
     let write_framed_codec = FramedCodec::try_from_strategy(&codec.framing())?;

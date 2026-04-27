@@ -1530,6 +1530,12 @@ pub(crate) fn start_websocket<P: NatsPublish + Send + Sync + 'static>(
             pong_timeout: std::time::Duration::from_secs(cli.ws_pong_timeout_secs),
         },
         session_hooks: ws_session_hooks,
+        // Closes #741. WebSocket sessions feed the same SA
+        // auto-upgrade counter family as the TLS / UDP listeners.
+        #[cfg(feature = "metrics")]
+        sa_upgrade_observer: Some(crate::metrics::sa_auto_upgraded_callback()),
+        #[cfg(not(feature = "metrics"))]
+        sa_upgrade_observer: None,
         shutdown: Arc::clone(&shutdown),
     };
     let task = tokio::spawn(async move {
@@ -1847,6 +1853,13 @@ pub(crate) async fn start_udp<P: NatsPublish + Send + Sync + 'static>(
     }
 
     config.max_identities = cli.udp_max_identities;
+
+    // Closes #741. UDP datagrams feed the same SA auto-upgrade
+    // counter family as the TLS / WebSocket listeners.
+    #[cfg(feature = "metrics")]
+    {
+        config.sa_upgrade_observer = Some(crate::metrics::sa_auto_upgraded_callback());
+    }
 
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let shutdown_clone = Arc::clone(&shutdown);

@@ -65,6 +65,7 @@ impl EdgeTestServer {
             max_write_buffer_bytes,
             health_check: rustgate_websocket::health::HealthCheckConfig::DISABLED,
             session_hooks: None,
+            sa_upgrade_observer: None,
             shutdown: Arc::clone(&shutdown),
         };
 
