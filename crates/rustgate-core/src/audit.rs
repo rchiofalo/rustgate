@@ -700,6 +700,102 @@ pub fn authz_classified_delivery(
     );
 }
 
+// ── Obligation `reason` vocabulary (issue #775) ─────────────────────
+//
+// SIEM dashboards group authz-obligation failures on a stable `reason`
+// token rather than on the underlying error's `Display` form. Building
+// dashboards on `Display` is a footgun: `quick_xml::Error` (the
+// `MaskError::Xml` source) renders payload-derived tag names, the
+// prose drifts across releases, and a SIEM rule keyed on a sentence
+// fragment quietly stops firing on the next dependency upgrade. The
+// constants below pin the exact string each call-site emits so a
+// rename is a deliberate breaking change rather than an accidental
+// re-bucketing of every alerted-on event.
+//
+// Same shape as the `recovery` token vocabulary established by
+// issue #742 (see [`MASK_RECOVERY_DROPPED`] et al). Keep new variants
+// in sync with the table at the head of this section AND with the
+// CHANGELOG entry for the issue that introduced them.
+
+/// Stable `reason` token emitted by [`authz_obligation_failed`] when
+/// `MaskPoint` is attached to a payload whose first non-whitespace byte
+/// is not `<`. The CoT masker cannot apply to non-XML bytes; the
+/// dispatcher passes the payload through unmodified and emits this
+/// token alongside the [`MASK_RECOVERY_FORWARDED_BINARY`] /
+/// [`MASK_RECOVERY_FORWARDED_UNMASKED`] / [`MASK_RECOVERY_FORWARDED_UNKNOWN`]
+/// `recovery` token that further refines the bucket by `source_protocol`.
+pub const OBLIGATION_REASON_MASK_POINT_NON_XML: &str = "mask_point_non_xml";
+
+/// Stable `reason` token emitted by [`authz_obligation_failed`] when
+/// `MaskPoint` is attached to an XML-intent payload that fails to parse
+/// as XML (corresponds to `MaskError::Xml`, derived from
+/// [`rustgate_cot::mask::MaskError::kind`] returning `"xml_parse_error"`).
+/// The dispatcher fail-closes the payload — it is erased rather than
+/// forwarded unmasked — so a crafted sender that aborts the document
+/// after the `<point>` element was already copied to the writer cannot
+/// leak coordinates via pass-through recovery.
+///
+/// [`rustgate_cot::mask::MaskError::kind`]: https://docs.rs/rustgate-cot
+pub const OBLIGATION_REASON_MASK_POINT_XML_ERROR: &str = "mask_point_xml_error";
+
+/// Stable `reason` token emitted by [`authz_obligation_failed`] when
+/// the in-memory writer that hosts the masked output returns an I/O
+/// error (corresponds to `MaskError::Io`, derived from
+/// [`rustgate_cot::mask::MaskError::kind`] returning `"io_error"`). The
+/// underlying writer is a `Vec<u8>`, so this path is unreachable under
+/// normal operation; the token exists for forward-compat with future
+/// streaming writers and for the parity between the `MaskError`
+/// discriminants and the audit vocabulary.
+///
+/// [`rustgate_cot::mask::MaskError::kind`]: https://docs.rs/rustgate-cot
+pub const OBLIGATION_REASON_MASK_POINT_IO_ERROR: &str = "mask_point_io_error";
+
+/// Stable `reason` token emitted by [`authz_obligation_failed`] when a
+/// `<point>` element exceeds [`rustgate_cot::mask::MAX_POINT_ATTRIBUTES`]
+/// (corresponds to `MaskError::AttrBudgetExceeded`, derived from
+/// [`rustgate_cot::mask::MaskError::kind`] returning
+/// `"attr_budget_exceeded"`). The masker rejects the payload rather
+/// than amplifying per-recipient masking cost on a broadcast; the
+/// dispatcher fail-closes (payload erased, message type coerced).
+///
+/// [`rustgate_cot::mask::MaskError::kind`]: https://docs.rs/rustgate-cot
+/// [`rustgate_cot::mask::MAX_POINT_ATTRIBUTES`]: https://docs.rs/rustgate-cot
+pub const OBLIGATION_REASON_MASK_POINT_ATTR_BUDGET_EXCEEDED: &str =
+    "mask_point_attr_budget_exceeded";
+
+/// Stable `reason` token emitted by [`authz_obligation_unknown`] for
+/// every encountered unknown obligation variant. The audit field is
+/// constant rather than per-variant because the `obligation` field
+/// already carries the `{:?}` rendering; the `reason` field exists so
+/// SIEM rules can group all unknown-variant events under a single
+/// alerting key independent of which specific variant fired.
+pub const OBLIGATION_REASON_UNKNOWN_VARIANT: &str = "unknown_variant";
+
+/// Map a [`rustgate_cot::mask::MaskError::kind`] discriminant to the
+/// corresponding `reason` token used by [`authz_obligation_failed`].
+///
+/// `MaskError::kind()` returns one of three `&'static str` discriminants
+/// (`"xml_parse_error"`, `"io_error"`, `"attr_budget_exceeded"`); this
+/// helper performs the static `kind ⇒ reason` mapping at the
+/// audit-emission boundary so callers do not need to hard-code the
+/// translation. An unrecognised discriminant — possible only if a
+/// future `MaskError` variant lands without a companion update here —
+/// falls back to [`OBLIGATION_REASON_MASK_POINT_XML_ERROR`] (the
+/// highest-severity bucket) so a stale build cannot accidentally drop
+/// to a non-XML token and under-report the failure class.
+///
+/// [`rustgate_cot::mask::MaskError::kind`]: https://docs.rs/rustgate-cot
+pub fn obligation_reason_for_mask_error_kind(kind: &str) -> &'static str {
+    match kind {
+        "xml_parse_error" => OBLIGATION_REASON_MASK_POINT_XML_ERROR,
+        "io_error" => OBLIGATION_REASON_MASK_POINT_IO_ERROR,
+        "attr_budget_exceeded" => OBLIGATION_REASON_MASK_POINT_ATTR_BUDGET_EXCEEDED,
+        // Future MaskError variant — fail to the highest-severity
+        // bucket rather than introducing a silent third token.
+        _ => OBLIGATION_REASON_MASK_POINT_XML_ERROR,
+    }
+}
+
 /// Stable `recovery` token emitted by [`authz_obligation_failed`] for
 /// `MaskPoint` on a payload whose `source_protocol` is in the known-binary
 /// list (e.g. MAVLink, TAK protobuf, ASTERIX). The masker is a CoT-XML
@@ -781,9 +877,33 @@ pub fn classify_mask_recovery_for(source_protocol: &str) -> &'static str {
 /// pass-through for non-XML) but always emits this record so operators
 /// can see the policy hint was not honoured.
 ///
-/// `obligation` is the unqualified variant name (e.g. `"MaskPoint"`) and
-/// `recovery` is one of the four stable tokens that form the audit
-/// vocabulary for this event:
+/// `obligation` is the unqualified variant name (e.g. `"MaskPoint"`).
+///
+/// `reason` is the SIEM-grouping token drawn from the documented
+/// vocabulary at the head of the obligation-reason section:
+///
+/// - [`OBLIGATION_REASON_MASK_POINT_NON_XML`] (`"mask_point_non_xml"`)
+///   — payload's first non-whitespace byte is not `<` so the masker
+///   cannot apply.
+/// - [`OBLIGATION_REASON_MASK_POINT_XML_ERROR`] (`"mask_point_xml_error"`)
+///   — XML-intent payload trips `quick_xml`'s parser; fail-closed.
+/// - [`OBLIGATION_REASON_MASK_POINT_IO_ERROR`] (`"mask_point_io_error"`)
+///   — writer I/O error during masking; reserved for forward-compat.
+/// - [`OBLIGATION_REASON_MASK_POINT_ATTR_BUDGET_EXCEEDED`]
+///   (`"mask_point_attr_budget_exceeded"`) — `<point>` exceeded the
+///   attribute count budget; fail-closed.
+///
+/// Issue #775 introduced this static-label discipline so SIEM
+/// dashboards group on a stable token rather than the underlying
+/// error's `Display` form (which can echo payload-derived tag names
+/// from `quick_xml::Error` and drift across releases). Use
+/// [`obligation_reason_for_mask_error_kind`] at the call site to
+/// translate a [`rustgate_cot::mask::MaskError::kind`] discriminant
+/// into the matching `reason` token.
+///
+/// `recovery` is one of the four stable tokens that further refine the
+/// failure bucket — orthogonal to `reason`, since two emissions can
+/// share a `reason` while differing on `recovery`:
 ///
 /// - [`MASK_RECOVERY_DROPPED`] (`"dropped"`) — XML-intent payload was
 ///   erased after a parse failure; fail-closed.
@@ -809,18 +929,24 @@ pub fn classify_mask_recovery_for(source_protocol: &str) -> &'static str {
 /// fan-out broadcast without inspecting the payload.
 ///
 /// Sanitization: every `&str` parameter is sanitized at the audit
-/// boundary.
+/// boundary. In production the `reason` and `recovery` fields are
+/// always drawn from the documented constant vocabularies, so the
+/// sanitization step is a no-op for those — but it keeps the audit
+/// boundary uniform and protects against a future caller that forgets
+/// the constraint.
+///
+/// [`rustgate_cot::mask::MaskError::kind`]: https://docs.rs/rustgate-cot
 pub fn authz_obligation_failed(
     subject_cn: &str,
     obligation: &str,
-    error: &str,
+    reason: &str,
     recovery: &str,
     source_protocol: &str,
     destination_kind: &str,
 ) {
     let subject_cn = s(subject_cn);
     let obligation = s(obligation);
-    let error = s(error);
+    let reason = s(reason);
     let recovery = s(recovery);
     let source_protocol = s(source_protocol);
     let destination_kind = s(destination_kind);
@@ -828,7 +954,7 @@ pub fn authz_obligation_failed(
         "authz.obligation_failed",
         subject_cn = %subject_cn,
         obligation = %obligation,
-        error = %error,
+        reason = %reason,
         recovery = %recovery,
         source_protocol = %source_protocol,
         destination_kind = %destination_kind,
@@ -846,6 +972,13 @@ pub fn authz_obligation_failed(
 /// a newer authz engine can detect the skew. The event fires at most
 /// once per (obligation, subject) tuple per router instance in practice
 /// because unknown variants can only appear if the policy mentions them.
+///
+/// The structured audit record carries a stable `reason` field set to
+/// [`OBLIGATION_REASON_UNKNOWN_VARIANT`]. The token is constant rather
+/// than per-variant because the `obligation` field already carries the
+/// `{:?}` rendering of the variant; the `reason` field exists so SIEM
+/// rules can group every unknown-variant event under a single alerting
+/// key independent of which specific variant fired (issue #775).
 ///
 /// `destination_kind` mirrors the field on
 /// [`authz_obligation_failed`] so a SIEM can pivot between the two
@@ -865,10 +998,17 @@ pub fn authz_obligation_unknown(
     let obligation = s(obligation);
     let source_protocol = s(source_protocol);
     let destination_kind = s(destination_kind);
+    // `reason` is fixed: every `authz.obligation_unknown` emission
+    // surfaces the same unknown-variant case — the `obligation` field
+    // already differentiates which specific variant fired. Pinning the
+    // token here keeps the SIEM grouping key out of the call site, so
+    // a regression that forgot to pass it cannot silently change the
+    // dashboard bucket.
     audit!(
         "authz.obligation_unknown",
         subject_cn = %subject_cn,
         obligation = %obligation,
+        reason = OBLIGATION_REASON_UNKNOWN_VARIANT,
         source_protocol = %source_protocol,
         destination_kind = %destination_kind,
         action = "actuate_obligation",
@@ -1735,7 +1875,7 @@ mod tests {
             authz_obligation_failed(
                 "alice",
                 "MaskPoint",
-                "<point> attribute count exceeded masking budget of 64",
+                OBLIGATION_REASON_MASK_POINT_ATTR_BUDGET_EXCEEDED,
                 "dropped",
                 "tcp",
                 "broadcast",
@@ -1743,7 +1883,7 @@ mod tests {
             authz_obligation_failed(
                 "alice",
                 "MaskPoint",
-                "payload is not XML",
+                OBLIGATION_REASON_MASK_POINT_NON_XML,
                 "forwarded_unmasked",
                 "mqtt",
                 "direct",
@@ -1754,6 +1894,67 @@ mod tests {
         fn test_authz_obligation_unknown() {
             authz_obligation_unknown("alice", "Quarantine", "tcp", "group");
             authz_obligation_unknown("", "", "", "");
+        }
+
+        // Issue #775: SIEM dashboards group on the literal `reason`
+        // tokens. Pin the strings AND the `MaskError::kind` ⇒ reason
+        // mapping so a future refactor cannot silently re-bucket an
+        // alerted-on event. Same shape as the
+        // [`mask_recovery_tokens_are_stable_strings`] regression guard
+        // for the `recovery` vocabulary.
+        #[test]
+        fn obligation_reason_tokens_are_stable_strings() {
+            assert_eq!(OBLIGATION_REASON_MASK_POINT_NON_XML, "mask_point_non_xml");
+            assert_eq!(
+                OBLIGATION_REASON_MASK_POINT_XML_ERROR,
+                "mask_point_xml_error"
+            );
+            assert_eq!(OBLIGATION_REASON_MASK_POINT_IO_ERROR, "mask_point_io_error");
+            assert_eq!(
+                OBLIGATION_REASON_MASK_POINT_ATTR_BUDGET_EXCEEDED,
+                "mask_point_attr_budget_exceeded"
+            );
+            assert_eq!(OBLIGATION_REASON_UNKNOWN_VARIANT, "unknown_variant");
+        }
+
+        #[test]
+        fn obligation_reason_for_mask_error_kind_maps_known_discriminants() {
+            // `MaskError::kind()` returns one of three `&'static str`
+            // discriminants. Each must round-trip through the helper
+            // to the matching `reason` token; a regression that
+            // forgot a variant would either fall through to the
+            // fallback bucket (asserted in the next test) or — worse
+            // — return the wrong token.
+            assert_eq!(
+                obligation_reason_for_mask_error_kind("xml_parse_error"),
+                OBLIGATION_REASON_MASK_POINT_XML_ERROR
+            );
+            assert_eq!(
+                obligation_reason_for_mask_error_kind("io_error"),
+                OBLIGATION_REASON_MASK_POINT_IO_ERROR
+            );
+            assert_eq!(
+                obligation_reason_for_mask_error_kind("attr_budget_exceeded"),
+                OBLIGATION_REASON_MASK_POINT_ATTR_BUDGET_EXCEEDED
+            );
+        }
+
+        #[test]
+        fn obligation_reason_for_mask_error_kind_falls_back_to_xml_error() {
+            // A future `MaskError` variant whose `kind()` discriminant
+            // lands here without a companion update to the helper must
+            // bucket into the highest-severity token, not silently
+            // produce a third unknown reason. Operators are then alerted
+            // on the unfamiliar emission via existing `mask_point_xml_error`
+            // dashboards rather than missing the event entirely.
+            assert_eq!(
+                obligation_reason_for_mask_error_kind("future_variant"),
+                OBLIGATION_REASON_MASK_POINT_XML_ERROR
+            );
+            assert_eq!(
+                obligation_reason_for_mask_error_kind(""),
+                OBLIGATION_REASON_MASK_POINT_XML_ERROR
+            );
         }
 
         // The `recovery` token vocabulary emitted by
