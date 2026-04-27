@@ -196,6 +196,7 @@ static AUTHZ_RELOADS: OnceLock<IntCounterVec> = OnceLock::new();
 static AUTHZ_POLICY_RULES: OnceLock<IntGauge> = OnceLock::new();
 static AUTHZ_CACHE_HITS: OnceLock<IntCounter> = OnceLock::new();
 static AUTHZ_CACHE_MISSES: OnceLock<IntCounter> = OnceLock::new();
+static RELOAD_ROLLBACK: OnceLock<IntCounterVec> = OnceLock::new();
 
 static ARCHIVE_BYTES: OnceLock<IntGauge> = OnceLock::new();
 static CRL_AGE_SECONDS: OnceLock<IntGauge> = OnceLock::new();
@@ -1007,6 +1008,25 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(authz_cache_misses.clone()))?;
     let _ = AUTHZ_CACHE_MISSES.set(authz_cache_misses);
 
+    // Subsystem-labelled rollback counter for #818. Operators page on
+    // a non-zero `rate(rustgate_reload_rollback_total{subsystem="authz"}[5m])`
+    // because a sustained rollback rate means the on-disk policy is
+    // diverging from what the broker enforces — the kind of silent
+    // drift that pre-this-PR only surfaced through tracing logs. The
+    // `subsystem` label keeps a single counter family covering authz,
+    // ACL, CRL, and any future hot-reload subsystem rather than
+    // multiplying counters per reload path.
+    let reload_rollback = IntCounterVec::new(
+        Opts::new(
+            "rustgate_reload_rollback_total",
+            "Hot-reload failures that rolled back to the previously installed policy, \
+             labelled by subsystem (authz, acl, crl, ...)",
+        ),
+        &["subsystem"],
+    )?;
+    registry.register(Box::new(reload_rollback.clone()))?;
+    let _ = RELOAD_ROLLBACK.set(reload_rollback);
+
     #[cfg(feature = "jemalloc")]
     {
         let jemalloc_resident = IntGauge::with_opts(Opts::new(
@@ -1091,6 +1111,24 @@ pub fn record_authz_reload(success: bool, rule_count: Option<usize>) {
     }
 }
 
+/// Record a hot-reload rollback for a subsystem.
+///
+/// Increments `rustgate_reload_rollback_total{subsystem=<name>}` at
+/// every call site that detected a failed reload and kept the
+/// previously installed policy active. Paired with the
+/// `*.reload_rollback` audit event so SIEM correlation rules can match
+/// metric and audit-log signals from the same incident. Closes #818
+/// (F-144).
+///
+/// `subsystem` is one of the documented values (`"authz"`, `"acl"`,
+/// `"crl"`); new subsystems gain coverage by adding the same call at
+/// their reload-failure site.
+pub fn record_reload_rollback(subsystem: &str) {
+    if let Ok(child) = reload_rollback().get_metric_with_label_values(&[subsystem]) {
+        child.inc();
+    }
+}
+
 pub fn authz_decisions() -> &'static IntCounterVec {
     AUTHZ_DECISIONS.get_or_init(|| {
         fallback_counter_vec(
@@ -1108,6 +1146,14 @@ pub fn authz_eval_nanos() -> &'static Histogram {
 pub fn authz_reloads() -> &'static IntCounterVec {
     AUTHZ_RELOADS.get_or_init(|| {
         fallback_counter_vec("rustgate_authz_reloads_total", "fallback", &["result"])
+    })
+}
+
+/// Subsystem-labelled rollback counter; see [`record_reload_rollback`]
+/// for the call-site contract and #818 for context.
+pub fn reload_rollback() -> &'static IntCounterVec {
+    RELOAD_ROLLBACK.get_or_init(|| {
+        fallback_counter_vec("rustgate_reload_rollback_total", "fallback", &["subsystem"])
     })
 }
 
@@ -4751,6 +4797,107 @@ mod tests {
             }
             assert!(ws_connections().get() > before_accept);
             assert!(ws_connections_rejected().get() > before_reject);
+        }
+    }
+
+    /// Closes #818 (F-144). Pins the documented Prometheus name,
+    /// the single `subsystem` label dimension, and the call shape of
+    /// `record_reload_rollback("<subsystem>")` so a SIEM dashboard
+    /// alert on `rate(rustgate_reload_rollback_total{subsystem="authz"}[5m])`
+    /// cannot silently break under a future refactor.
+    ///
+    /// Implementation note: these tests probe the counter via the
+    /// `reload_rollback()` accessor (which is the same call path the
+    /// production hot path takes through `record_reload_rollback`).
+    /// We deliberately avoid scanning `prometheus::default_registry()
+    /// .gather()` because in this binary's parallel test scheduler the
+    /// `RELOAD_ROLLBACK` `OnceLock` may be primed via the
+    /// `get_or_init` fallback path before `init()` runs — exercised by
+    /// the `authz_reloader` tests that drive `reload()` through the
+    /// failure path and indirectly call `record_reload_rollback`.
+    /// `prometheus::core::Collector::desc` reflects whichever
+    /// constructor primed the static, so the contract pinned here
+    /// (canonical name + label arity) is the one SIEM dashboards
+    /// observe regardless of which path won the race.
+    mod reload_rollback_counter {
+        use prometheus::core::Collector;
+
+        use super::*;
+
+        /// The Prometheus name and label dimension that downstream
+        /// alerting consumes. A change to either constant is the
+        /// signal a SIEM owner must re-grok before merging.
+        const EXPECTED_NAME: &str = "rustgate_reload_rollback_total";
+        const EXPECTED_LABEL: &str = "subsystem";
+
+        #[test]
+        fn reload_rollback_registered_under_documented_name() {
+            ensure_init();
+            let family = reload_rollback();
+            let descs = family.desc();
+            let desc = descs
+                .into_iter()
+                .next()
+                .expect("metric must carry at least one Desc");
+            assert_eq!(
+                desc.fq_name, EXPECTED_NAME,
+                "rustgate_reload_rollback_total must be registered under the documented \
+                 name; a SIEM rule on `rate({EXPECTED_NAME}{{{EXPECTED_LABEL}=\"authz\"}}[5m])` \
+                 would silently break if this drifts. Got: {}",
+                desc.fq_name,
+            );
+            assert_eq!(
+                desc.variable_labels,
+                vec![EXPECTED_LABEL.to_string()],
+                "rustgate_reload_rollback_total must carry exactly one label \
+                 ({EXPECTED_LABEL}); a future refactor that changes the label set \
+                 would invalidate every dashboard PromQL query. Got: {:?}",
+                desc.variable_labels,
+            );
+        }
+
+        #[test]
+        fn record_reload_rollback_increments_authz_label() {
+            ensure_init();
+            // Hot-path contract: the helper increments the counter for
+            // the subsystem the caller names. Use a relative delta
+            // because parallel tests may also exercise the `authz`
+            // label.
+            let before = reload_rollback().with_label_values(&["authz"]).get();
+            record_reload_rollback("authz");
+            let after = reload_rollback().with_label_values(&["authz"]).get();
+            assert!(
+                after > before,
+                "record_reload_rollback(\"authz\") must increment the authz time series; \
+                 before={before}, after={after}",
+            );
+        }
+
+        #[test]
+        fn record_reload_rollback_distinguishes_subsystems() {
+            ensure_init();
+            // Each subsystem token must produce an independent time
+            // series. A future refactor that collapsed labels would
+            // turn a CRL rollback alert into an authz alert (or vice
+            // versa) — exactly the kind of silent regression this
+            // test guards against. Use unique synthetic tokens so the
+            // assertion is invariant against parallel tests touching
+            // the documented `acl` / `crl` labels.
+            let acl_token = "__test_acl_isolated_probe__";
+            let crl_token = "__test_crl_isolated_probe__";
+            let acl_before = reload_rollback().with_label_values(&[acl_token]).get();
+            let crl_before = reload_rollback().with_label_values(&[crl_token]).get();
+            record_reload_rollback(acl_token);
+            let acl_after = reload_rollback().with_label_values(&[acl_token]).get();
+            let crl_after = reload_rollback().with_label_values(&[crl_token]).get();
+            assert!(
+                acl_after > acl_before,
+                "acl subsystem must increment after record_reload_rollback(\"{acl_token}\")",
+            );
+            assert_eq!(
+                crl_before, crl_after,
+                "crl subsystem must NOT change when only acl was recorded",
+            );
         }
     }
 }

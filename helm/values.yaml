@@ -174,6 +174,31 @@ autoscaling:
 # Must be greater than drain timeout (110s) + preStop sleep (5s).
 terminationGracePeriodSeconds: 120
 
+# Pod-level annotations applied to the Deployment / StatefulSet template.
+# Empty by default; canary overlays (helm/values-canary.yaml) layer in
+# service-mesh and Prometheus-scrape annotations here.
+podAnnotations: {}
+
+# Deployment-strategy and probe overrides. Empty by default — the chart
+# renders its built-in rolling-update defaults and probe definitions
+# unless an overlay (e.g. helm/values-canary.yaml) supplies an override.
+#
+# - `strategy` / `minReadySeconds`: override the apps/v1 Deployment
+#   rolling-update behaviour. Used by the canary overlay to enforce
+#   1-pod surge / 0-pod unavailable / 30s min-ready windows.
+# - `lifecycle`: replace the default preStop sleep-5 with a richer
+#   drain hook (e.g. curl the management API drain endpoint). When
+#   set, the value is rendered verbatim under `containers[].lifecycle`.
+# - `readinessProbe` / `livenessProbe`: replace the chart's default
+#   probe configurations entirely. Set to a complete probe spec; the
+#   chart does not deep-merge.
+deployment:
+  strategy: {}
+  minReadySeconds: 0
+  lifecycle: {}
+  readinessProbe: {}
+  livenessProbe: {}
+
 # Spread replicas across nodes for HA. Uncomment for multi-replica deployments.
 # topologySpreadConstraints:
 #   - maxSkew: 1
