@@ -137,6 +137,22 @@ fn main() -> anyhow::Result<()> {
             println!("configuration is valid");
             return Ok(());
         }
+        Some(Command::CheckConfig {
+            ref config,
+            strict,
+            json,
+        }) => {
+            // Side-effect-free validation: the diagnostic builds and
+            // prints its own report and then surfaces the exit-code
+            // contract (0 ok, 1 invalid, 2 unreadable). We translate
+            // `2` straight to `process::exit` so the caller's wrapper
+            // can branch on the code without parsing stderr.
+            let code = diagnostics::check_config::run(config, strict, json)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            return Ok(());
+        }
         Some(Command::DecryptArchive {
             ref input,
             ref output,

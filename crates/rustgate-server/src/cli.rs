@@ -1417,6 +1417,41 @@ pub(crate) enum Command {
     PrintConfig,
     /// Validate the configuration file (parse + cross-field checks) and exit.
     ValidateConfig,
+    /// Validate a config file end-to-end without starting any
+    /// listeners, NATS connections, federation discovery, or other
+    /// I/O. Wired into CI pipelines and `helm test` to confirm a
+    /// rendered config would start cleanly before the pod is allowed
+    /// to bind ports.
+    ///
+    /// Exit codes: `0` = config valid, `1` = config invalid (loaded
+    /// but failed validation), `2` = config file unreadable (path
+    /// missing, permission denied, malformed TOML).
+    ///
+    /// Closes #793.
+    CheckConfig {
+        /// Path to the TOML config file to validate. Required even
+        /// when `--config` is also passed at the top level — the
+        /// subcommand is intentionally explicit so a misconfigured
+        /// alias cannot silently validate a different file.
+        #[arg(long, value_name = "PATH")]
+        config: std::path::PathBuf,
+        /// Additionally check that referenced cert / ACL / authz /
+        /// secret-bearing files exist and (on Unix) have
+        /// `0o077`-conforming permissions on the secret-bearing
+        /// subset (TLS key, metrics token, CA private key, archive
+        /// key). Without `--strict` the schema and cross-field
+        /// validations still run but referenced files are not
+        /// touched on disk — useful when the rendered config
+        /// outpaces materialization of the files it points at.
+        #[arg(long)]
+        strict: bool,
+        /// Emit a stable JSON document
+        /// (`{status, config_path, strict, errors, warnings}`)
+        /// instead of the human layout. Suitable for `helm test`
+        /// hooks and CI pipelines that machine-parse the result.
+        #[arg(long)]
+        json: bool,
+    },
     /// Decrypt an encrypted archive or audit log file produced when
     /// `--archive-key-file` was active. The output is written verbatim
     /// (e.g. JSONL) and can then be inspected with standard tools.
@@ -1712,7 +1747,7 @@ macro_rules! define_config_file {
             /// Apply this file's values to `cli`, overwriting only fields
             /// whose value source is `DefaultValue` (i.e. not supplied by
             /// the user on the command line or via an environment variable).
-            fn apply_to(self, cli: &mut Cli, matches: &ArgMatches) {
+            pub(crate) fn apply_to(self, cli: &mut Cli, matches: &ArgMatches) {
                 $(
                     if let Some(v) = self.$field
                         && matches!(matches.value_source(stringify!($field)), Some(ValueSource::DefaultValue) | None)
