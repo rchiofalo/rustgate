@@ -1112,6 +1112,51 @@ pub fn store_forward_drain_panic(session_hash: &str, error: &str) {
     );
 }
 
+/// Record a successful store-forward drain of one or more messages on
+/// client reconnect. Issue #729 — the dwell-time observability event.
+///
+/// `cn` is the destination (reconnecting) client's CN. `count` is the
+/// number of messages successfully decoded and returned to the router
+/// for re-delivery. `dwell_seconds_*` summarize how long those messages
+/// sat in the offline queue, computed as `drain_time - queued_at_ms`
+/// where `queued_at_ms` is the timestamp captured at admission (NOT
+/// `received_at_ms`, which would conflate live-routing time with
+/// queue-resident time on messages that rode multiple transports
+/// before falling back to store-forward). `expired_count` and
+/// `tampered_count` cover entries discarded during the same drain so
+/// the audit record reflects the full work the drain performed.
+///
+/// Emitted in addition to the per-message dwell observation fed into
+/// the `rustgate_store_forward_dwell_seconds` Prometheus histogram —
+/// the histogram supports operator dashboards (P50/P95/P99 trends),
+/// while the audit event supports SIEM correlation against a specific
+/// reconnect.
+///
+/// Sanitization: `cn` is sanitized at the audit boundary.
+pub fn store_forward_drained(
+    cn: &str,
+    count: u64,
+    dwell_seconds_mean: f64,
+    dwell_seconds_min: f64,
+    dwell_seconds_max: f64,
+    expired_count: u64,
+    tampered_count: u64,
+) {
+    let cn = s(cn);
+    audit!(
+        "store_forward.drained",
+        cn = %cn,
+        count = count,
+        dwell_seconds_mean = dwell_seconds_mean,
+        dwell_seconds_min = dwell_seconds_min,
+        dwell_seconds_max = dwell_seconds_max,
+        expired_count = expired_count,
+        tampered_count = tampered_count,
+        action = "drain_queue",
+        result = "delivered"
+    );
+}
+
 /// Record a position-replay request that was shed by the per-CN replay
 /// rate limiter (issue #724). `session_hash` is the PII-safe
 /// [`crate::masking::hash_cn`] rendering of the reconnecting client's
@@ -1605,6 +1650,17 @@ mod tests {
         fn test_store_forward_drain_panic() {
             store_forward_drain_panic("deadbeef1234", "task panicked: internal redb error");
             store_forward_drain_panic("", "");
+        }
+
+        #[test]
+        fn test_store_forward_drained() {
+            // Smoke-test the dwell-time event added in #729: it must
+            // not panic on degenerate inputs (zero count, NaN-adjacent
+            // dwell numbers) and must accept the operator-typical
+            // shape.
+            store_forward_drained("client-cn", 12, 1.5, 0.05, 4.2, 1, 0);
+            store_forward_drained("", 0, 0.0, 0.0, 0.0, 0, 0);
+            store_forward_drained("solo", 1, 0.001, 0.001, 0.001, 0, 0);
         }
     }
 

@@ -21,14 +21,27 @@
 //! not need to add `serde` to `rustgate-core`. The envelope carries
 //! enough fields to faithfully reconstruct a [`RoutableMessage`] after
 //! restart: source identity (cn, fingerprint, groups), destination,
-//! message type, source protocol, received-at timestamp, TTL, and raw
-//! payload bytes. See [`encode`] / [`decode`] for the wire layout.
+//! message type, source protocol, received-at timestamp, TTL, raw
+//! payload bytes, and — as of envelope version 2 — a `queued_at`
+//! timestamp recording when the message was admitted to the offline
+//! queue (issue #729). See [`encode`] / [`decode`] for the wire layout.
+//!
+//! # Backward compatibility
+//!
+//! Envelope **version 1** records (written by previous versions of this
+//! module before the dwell-time observability work landed) lack the
+//! `queued_at` field. On decode they fall back to `queued_at =
+//! received_at`, preserving pre-PR semantics: dwell on legacy entries is
+//! reported as the full received-to-drain interval, exactly what
+//! operators saw before this change. Version 1 records are read but
+//! never written — every new admission emits version 2.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use arc_swap::ArcSwap;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use parking_lot::Mutex;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -191,11 +204,25 @@ impl Inner {
     }
 }
 
+/// Callback invoked once per drained message with the dwell time the
+/// message spent in the offline queue, in fractional seconds.
+///
+/// `dwell_seconds` is computed as `drain_time - queued_at` (clamped at
+/// zero for clock-skew safety). Used to feed the
+/// `rustgate_store_forward_dwell_seconds` Prometheus histogram from
+/// `rustgate-server`. Issue #729.
+///
+/// The callback runs synchronously on the drain path — keep it cheap
+/// (a single `histogram.observe` is the canonical use). Spawn any
+/// blocking work via [`rustgate_core::tasks::spawn_background`] inside
+/// the closure body if needed.
+pub type OnDrainObservation = Arc<dyn Fn(f64) + Send + Sync>;
+
 /// A bounded, durable per-client message queue.
 ///
 /// Cloning a [`ClientQueue`] is cheap: internally it holds an `Arc` to
 /// the shared database and index.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ClientQueue {
     db: Arc<Database>,
     inner: Arc<Mutex<Inner>>,
@@ -206,7 +233,33 @@ pub struct ClientQueue {
     hmac_key: Arc<Zeroizing<[u8; 32]>>,
     /// Bounded sender feeding a dedicated background writer task. Keeps
     /// `enqueue` non-blocking and off the async runtime's worker threads.
-    writer_tx: mpsc::Sender<(String, RoutableMessage)>,
+    /// Tuple shape: `(destination_cn, msg, queued_at_ms)`. The
+    /// `queued_at_ms` is captured at the call site of [`Self::enqueue`]
+    /// so the recorded admission time reflects the moment the message
+    /// became the queue's responsibility — not when the writer task
+    /// happens to dequeue it (which under load could lag by hundreds of
+    /// milliseconds and skew dwell estimates downward).
+    writer_tx: mpsc::Sender<(String, RoutableMessage, i64)>,
+    /// Optional drain-time observer fed `dwell_seconds` per drained
+    /// message. Lock-free hot-swap so the metrics callback can be
+    /// installed at startup without rebuilding the queue. Issue #729.
+    on_drain_observation: Arc<ArcSwap<Option<OnDrainObservation>>>,
+}
+
+impl std::fmt::Debug for ClientQueue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Manually implemented because `OnDrainObservation` (an `Arc<dyn
+        // Fn>`) is not `Debug`. We project the visible fields and elide
+        // the callback — exposing it only as a presence boolean.
+        f.debug_struct("ClientQueue")
+            .field("path", &self.path)
+            .field("max_bytes", &self.max_bytes)
+            .field(
+                "on_drain_observation",
+                &self.on_drain_observation.load().is_some(),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl ClientQueue {
@@ -434,7 +487,7 @@ impl ClientQueue {
         let db = Arc::new(db);
         let inner = Arc::new(Mutex::new(inner));
         let (writer_tx, writer_rx) =
-            mpsc::channel::<(String, RoutableMessage)>(CLIENT_QUEUE_WRITER_CHANNEL_CAPACITY);
+            mpsc::channel::<(String, RoutableMessage, i64)>(CLIENT_QUEUE_WRITER_CHANNEL_CAPACITY);
         spawn_writer_task(
             Arc::clone(&db),
             Arc::clone(&inner),
@@ -450,6 +503,7 @@ impl ClientQueue {
             path,
             hmac_key,
             writer_tx,
+            on_drain_observation: Arc::new(ArcSwap::from_pointee(None)),
         })
     }
 
@@ -569,12 +623,25 @@ impl ClientQueue {
     /// actual `begin_write` / `commit` is performed off the async
     /// runtime by a dedicated background task.
     ///
+    /// The wall-clock instant of this call is captured as the
+    /// envelope's `queued_at` timestamp (Unix milliseconds). This is
+    /// the basis for the dwell-time observability added in #729 — it
+    /// reflects when the queue accepted custody, not when the writer
+    /// task happened to commit it (which can lag by hundreds of
+    /// milliseconds under load and would understate dwell). On drain,
+    /// the difference between `now` and `queued_at` is emitted as
+    /// `dwell_seconds` and observed by the histogram.
+    ///
     /// If the writer channel is full, the message is dropped and
     /// [`Self::writer_drops_total`] is incremented. This preserves live
     /// routing latency under pathological bursts at the cost of
     /// losing the offending offline messages.
     pub fn enqueue(&self, cn: &str, msg: &RoutableMessage) -> Result<u64, StoreForwardError> {
-        match self.writer_tx.try_send((cn.to_string(), msg.clone())) {
+        let queued_at_ms = unix_now_ms();
+        match self
+            .writer_tx
+            .try_send((cn.to_string(), msg.clone(), queued_at_ms))
+        {
             Ok(()) => {
                 let mut inner = self.inner.lock();
                 inner.enqueues = inner.enqueues.saturating_add(1);
@@ -599,6 +666,18 @@ impl ClientQueue {
                 Ok(0)
             }
         }
+    }
+
+    /// Install a callback to be invoked once per drained message with
+    /// the dwell time (fractional seconds) the message spent in the
+    /// offline queue. Used by the metrics layer to feed the
+    /// `rustgate_store_forward_dwell_seconds` Prometheus histogram.
+    ///
+    /// Hot-swappable: subsequent calls replace the previously installed
+    /// callback atomically. Pass a no-op or simply do not call this
+    /// method to disable observation.
+    pub fn set_on_drain_observation(&self, cb: OnDrainObservation) {
+        self.on_drain_observation.store(Arc::new(Some(cb)));
     }
 
     /// Total messages successfully submitted to the async writer.
@@ -660,8 +739,10 @@ impl ClientQueue {
         }
 
         let mut out: Vec<RoutableMessage> = Vec::with_capacity(seqs.len());
+        let mut dwells_secs: Vec<f64> = Vec::with_capacity(seqs.len());
         let mut expired_count: u64 = 0;
         let mut tampered_count: u64 = 0;
+        let drain_now_ms = unix_now_ms();
         let write = self
             .db
             .begin_write()
@@ -683,8 +764,8 @@ impl ClientQueue {
                     // Verify HMAC integrity before decoding.
                     match verify_hmac_envelope(&self.hmac_key, stored) {
                         Ok(msg_data) => match decode(msg_data) {
-                            Ok(msg) => {
-                                if msg_expired(&msg) {
+                            Ok(decoded) => {
+                                if msg_expired(&decoded.message) {
                                     expired_count = expired_count.saturating_add(1);
                                     debug!(
                                         seq,
@@ -696,7 +777,18 @@ impl ClientQueue {
                                     let _ = dtable
                                         .insert(seq, ())
                                         .map_err(|e| StoreForwardError::Database(e.to_string()))?;
-                                    out.push(msg);
+                                    // Compute dwell seconds as
+                                    // drain_now - queued_at, clamped at
+                                    // zero. A negative observation could
+                                    // arise from clock-backwards events
+                                    // (NTP step or VM migration); the
+                                    // histogram cannot represent
+                                    // negative values, so we floor it.
+                                    let dwell_ms =
+                                        drain_now_ms.saturating_sub(decoded.queued_at_ms).max(0);
+                                    let dwell_s = (dwell_ms as f64) / 1000.0;
+                                    dwells_secs.push(dwell_s);
+                                    out.push(decoded.message);
                                 }
                             }
                             Err(_) => {
@@ -722,6 +814,47 @@ impl ClientQueue {
             let mut inner = self.inner.lock();
             inner.expired = inner.expired.saturating_add(expired_count);
             inner.tampered = inner.tampered.saturating_add(tampered_count);
+        }
+
+        // Feed each per-message dwell observation into the histogram
+        // callback. We deliberately observe per-message rather than per
+        // batch — a 5-hour drain of 100 messages records 100 datapoints,
+        // not one — so the histogram percentiles reflect message
+        // experience, not batch experience.
+        let observe_guard = self.on_drain_observation.load();
+        if let Some(cb) = observe_guard.as_ref() {
+            for d in &dwells_secs {
+                cb(*d);
+            }
+        }
+        drop(observe_guard);
+
+        if !dwells_secs.is_empty() {
+            let total: f64 = dwells_secs.iter().sum();
+            let count = dwells_secs.len() as u64;
+            let mean = total / (count as f64);
+            // Pick out min/max for the audit event so a SIEM analyst can
+            // tell at a glance whether the batch contained a single
+            // multi-hour straggler or a uniformly delayed pile.
+            let mut min = dwells_secs[0];
+            let mut max = dwells_secs[0];
+            for d in &dwells_secs[1..] {
+                if *d < min {
+                    min = *d;
+                }
+                if *d > max {
+                    max = *d;
+                }
+            }
+            rustgate_core::audit::store_forward_drained(
+                cn,
+                count,
+                mean,
+                min,
+                max,
+                expired_count,
+                tampered_count,
+            );
         }
 
         debug!(
@@ -816,7 +949,19 @@ impl ClientQueue {
 // ── Encoding ────────────────────────────────────────────────────────
 
 /// Current envelope version tag. Bump on any incompatible wire change.
-const ENVELOPE_VERSION: u8 = 1;
+///
+/// History:
+/// - **v1**: source identity, destination, message type, source
+///   protocol, received_at_ms, ttl_secs, payload. Read-only —
+///   produced by older binaries before #729.
+/// - **v2** (current): adds `queued_at_ms` (Unix ms) immediately after
+///   `received_at_ms` so drain can compute dwell time. Issue #729.
+const ENVELOPE_VERSION: u8 = 2;
+
+/// Legacy envelope version (no `queued_at_ms`). Decoded with a fallback
+/// where `queued_at_ms = received_at_ms`, preserving pre-PR audit
+/// semantics for any messages persisted before the upgrade.
+const ENVELOPE_VERSION_V1: u8 = 1;
 
 const DEST_BROADCAST: u8 = 0;
 const DEST_GROUP: u8 = 1;
@@ -872,9 +1017,13 @@ fn get_identity(buf: &mut &[u8]) -> Option<Identity> {
     Identity::new(cn, fp, groups).ok()
 }
 
-/// Encode a [`RoutableMessage`] to the on-disk envelope format.
-pub fn encode(msg: &RoutableMessage) -> Vec<u8> {
-    let mut buf = BytesMut::with_capacity(128 + msg.payload.len());
+/// Encode a [`RoutableMessage`] together with its admission timestamp
+/// to the on-disk envelope format. Always emits the current envelope
+/// version (v2). `queued_at_ms` is the Unix-millisecond instant the
+/// message was admitted to the queue (captured at the `enqueue` call
+/// site).
+pub fn encode(msg: &RoutableMessage, queued_at_ms: i64) -> Vec<u8> {
+    let mut buf = BytesMut::with_capacity(136 + msg.payload.len());
     buf.put_u8(ENVELOPE_VERSION);
     put_identity(&mut buf, &msg.source);
 
@@ -922,6 +1071,14 @@ pub fn encode(msg: &RoutableMessage) -> Vec<u8> {
         .unwrap_or(0);
     buf.put_i64(received_at_ms);
 
+    // Issue #729: queued_at_ms records when the queue accepted custody,
+    // distinct from received_at which records when the message first
+    // entered the server. The two diverge whenever a message rides
+    // multiple transports before falling back to store-forward (e.g. a
+    // federated message that was routed live for hours before the
+    // recipient went offline).
+    buf.put_i64(queued_at_ms);
+
     match msg.metadata.ttl {
         None => buf.put_i64(-1),
         Some(d) => buf.put_i64(d.as_secs() as i64),
@@ -933,16 +1090,39 @@ pub fn encode(msg: &RoutableMessage) -> Vec<u8> {
     buf.to_vec()
 }
 
-/// Decode an envelope produced by [`encode`].
-pub fn decode(raw: &[u8]) -> Result<RoutableMessage, StoreForwardError> {
+/// Result of decoding an on-disk envelope: the [`RoutableMessage`]
+/// itself plus the `queued_at_ms` recovered from the envelope (or
+/// derived from `received_at_ms` when reading legacy v1 records).
+#[derive(Debug)]
+pub struct DecodedEnvelope {
+    /// The reconstructed message ready for re-routing.
+    pub message: RoutableMessage,
+    /// Unix milliseconds at which the message was admitted to the
+    /// store-forward queue. For envelope version 2 this is the field
+    /// captured at `enqueue` time. For envelope version 1 (legacy) this
+    /// falls back to `received_at_ms`, preserving pre-PR audit
+    /// semantics — operators with existing offline queues see dwell ==
+    /// (drain - received_at) until the queue cycles to v2-only entries.
+    pub queued_at_ms: i64,
+}
+
+/// Decode an envelope produced by [`encode`]. Accepts both v2
+/// (current) and v1 (legacy, pre-#729) envelopes.
+///
+/// On v1, `queued_at_ms` falls back to `received_at_ms` so legacy
+/// queues still produce sensible (though pessimistic) dwell numbers
+/// during the transition window.
+pub fn decode(raw: &[u8]) -> Result<DecodedEnvelope, StoreForwardError> {
     let mut buf: &[u8] = raw;
     if buf.remaining() < 1 {
         return Err(StoreForwardError::Decode);
     }
     let version = buf.get_u8();
-    if version != ENVELOPE_VERSION {
-        return Err(StoreForwardError::Decode);
-    }
+    let is_v2 = match version {
+        ENVELOPE_VERSION => true,
+        ENVELOPE_VERSION_V1 => false,
+        _ => return Err(StoreForwardError::Decode),
+    };
 
     let source = get_identity(&mut buf).ok_or(StoreForwardError::Decode)?;
 
@@ -984,6 +1164,20 @@ pub fn decode(raw: &[u8]) -> Result<RoutableMessage, StoreForwardError> {
         SystemTime::now()
     };
 
+    // Issue #729 / backward compat: v2 envelopes carry an explicit
+    // queued_at_ms; v1 envelopes did not, so we fall back to
+    // received_at_ms. This preserves the pre-PR meaning of dwell on
+    // legacy entries (it equals the full received-to-drain interval),
+    // exactly what operators saw before the upgrade.
+    let queued_at_ms = if is_v2 {
+        if buf.remaining() < 8 {
+            return Err(StoreForwardError::Decode);
+        }
+        buf.get_i64()
+    } else {
+        received_at_ms
+    };
+
     if buf.remaining() < 8 {
         return Err(StoreForwardError::Decode);
     }
@@ -1003,17 +1197,30 @@ pub fn decode(raw: &[u8]) -> Result<RoutableMessage, StoreForwardError> {
     }
     let payload = Bytes::copy_from_slice(&buf[..payload_len]);
 
-    Ok(RoutableMessage {
-        source,
-        destination,
-        payload,
-        metadata: Metadata {
-            received_at,
-            source_protocol,
-            message_type,
-            ttl,
+    Ok(DecodedEnvelope {
+        message: RoutableMessage {
+            source,
+            destination,
+            payload,
+            metadata: Metadata {
+                received_at,
+                source_protocol,
+                message_type,
+                ttl,
+            },
         },
+        queued_at_ms,
     })
+}
+
+/// Current Unix milliseconds (saturating to 0 on clocks before the
+/// epoch). Used as the default `queued_at` capture and as the
+/// `drain_now` reference when computing dwell.
+fn unix_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Result of peeking the destination CN of an encoded envelope without
@@ -1109,15 +1316,15 @@ fn spawn_writer_task(
     inner: Arc<Mutex<Inner>>,
     max_bytes: u64,
     hmac_key: Arc<Zeroizing<[u8; 32]>>,
-    mut rx: mpsc::Receiver<(String, RoutableMessage)>,
+    mut rx: mpsc::Receiver<(String, RoutableMessage, i64)>,
 ) {
     drop(tokio::spawn(async move {
-        while let Some((cn, msg)) = rx.recv().await {
+        while let Some((cn, msg, queued_at_ms)) = rx.recv().await {
             let db = Arc::clone(&db);
             let inner = Arc::clone(&inner);
             let key = Arc::clone(&hmac_key);
             let join = tokio::task::spawn_blocking(move || {
-                persist_one(&db, &inner, max_bytes, &key, &cn, &msg)
+                persist_one(&db, &inner, max_bytes, &key, &cn, &msg, queued_at_ms)
             })
             .await;
             match join {
@@ -1142,8 +1349,9 @@ fn persist_one(
     hmac_key: &[u8; 32],
     cn: &str,
     msg: &RoutableMessage,
+    queued_at_ms: i64,
 ) -> Result<(), StoreForwardError> {
-    let encoded = encode(msg);
+    let encoded = encode(msg, queued_at_ms);
 
     // Compute HMAC tag and append it to the stored data.
     let tag = compute_hmac(hmac_key, &encoded)?;
@@ -1264,14 +1472,19 @@ mod tests {
     #[test]
     fn encode_decode_roundtrip() {
         let m = msg_for("alice", "bob", b"hello");
-        let bytes = encode(&m);
+        let queued_at = 1_700_000_000_000_i64;
+        let bytes = encode(&m, queued_at);
         let back = decode(&bytes).unwrap();
-        assert_eq!(back.source.cn, "alice");
-        assert_eq!(back.payload.as_ref(), b"hello");
-        match back.destination {
+        assert_eq!(back.message.source.cn, "alice");
+        assert_eq!(back.message.payload.as_ref(), b"hello");
+        match back.message.destination {
             Destination::Direct(id) => assert_eq!(id.cn, "bob"),
             _ => panic!("wrong dest"),
         }
+        assert_eq!(
+            back.queued_at_ms, queued_at,
+            "queued_at must round-trip through encode/decode"
+        );
     }
 
     async fn wait_for_depth(q: &ClientQueue, cn: &str, expected: u64) {
@@ -1286,6 +1499,28 @@ mod tests {
             expected,
             q.stats(cn).depth
         );
+    }
+
+    /// Wait until the writer task's redb commit has landed for at
+    /// least `expected` entries in the queue table. `wait_for_depth`
+    /// returns based on the in-memory index, which is updated BEFORE
+    /// the redb commit — so a drain immediately after
+    /// `wait_for_depth` may find the rows missing on the persistent
+    /// side and silently emit no events. Polling the redb row count
+    /// closes that race.
+    async fn wait_for_persisted(q: &ClientQueue, expected: usize) {
+        for _ in 0..200 {
+            let read = q.db.begin_read().unwrap();
+            let table = read.open_table(QUEUE_TABLE).unwrap();
+            let count = table.iter().unwrap().count();
+            drop(table);
+            drop(read);
+            if count >= expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {expected} persisted entries within poll window");
     }
 
     #[tokio::test]
@@ -1313,7 +1548,7 @@ mod tests {
         // Account for HMAC tag appended to each stored envelope.
         let payload = vec![0u8; 256];
         let one = msg_for("alice", "bob", &payload);
-        let single_size = encode(&one).len() as u64 + HMAC_LEN as u64;
+        let single_size = encode(&one, 0).len() as u64 + HMAC_LEN as u64;
         let cap = single_size * 3 + 1;
         let q = ClientQueue::open(tmp.path(), cap).unwrap();
         for _ in 0..10 {
@@ -1738,5 +1973,185 @@ mod tests {
         wait_for_depth(&q, "bob", 1).await;
         let drained = q.drain("bob").unwrap();
         assert_eq!(drained.len(), 1);
+    }
+
+    // ── Issue #729: dwell-time observability ────────────────────────
+
+    // The audit-capture buffer for `drain_audit_includes_dwell_seconds`
+    // lives in `tests/store_forward_dwell_audit.rs`.
+
+    /// Locate the on-disk envelope for the freshest entry in the queue
+    /// and verify `decode` recovers a `queued_at_ms` close to the wall
+    /// clock at the moment of admission. Round-tripping through the
+    /// real writer task and redb (rather than calling `encode`
+    /// directly) pins the contract end-to-end: a behavioural change in
+    /// any of `enqueue → channel → spawn_blocking → persist_one`
+    /// surfaces here.
+    #[tokio::test]
+    async fn admission_records_queued_at_timestamp() {
+        let tmp = TempDir::new().unwrap();
+        let key = test_hmac_key();
+        let q = ClientQueue::open_with_hmac_key(tmp.path(), 1_000_000, Some(key.clone())).unwrap();
+
+        // Capture the wall clock immediately before admission so we can
+        // verify queued_at landed inside a tight window. The actual
+        // capture happens inside `enqueue` between these two reads.
+        let before_ms = unix_now_ms();
+        q.enqueue("bob", &msg_for("alice", "bob", b"dwell-probe"))
+            .unwrap();
+        wait_for_depth(&q, "bob", 1).await;
+        let after_ms = unix_now_ms();
+
+        // The in-memory index is updated BEFORE the redb commit
+        // completes (`persist_one` mutates `Inner` then issues
+        // `begin_write/commit`), so `wait_for_depth` returning does
+        // not yet imply the entry is observable via `begin_read`.
+        // Wait for redb to settle before reading the envelope back.
+        wait_for_persisted(&q, 1).await;
+        let raw = {
+            let read = q.db.begin_read().unwrap();
+            let table = read.open_table(QUEUE_TABLE).unwrap();
+            let mut iter = table.iter().unwrap();
+            let kv = iter.next().expect("redb must contain entry").unwrap();
+            kv.1.value().to_vec()
+        };
+        assert!(
+            raw.len() > HMAC_LEN,
+            "stored envelope must include HMAC tag"
+        );
+        let body = &raw[..raw.len() - HMAC_LEN];
+        let decoded = decode(body).expect("decode v2 envelope");
+
+        assert_eq!(decoded.message.payload.as_ref(), b"dwell-probe");
+        assert!(
+            decoded.queued_at_ms >= before_ms && decoded.queued_at_ms <= after_ms,
+            "queued_at_ms ({}) must fall within [{before_ms}, {after_ms}]",
+            decoded.queued_at_ms
+        );
+
+        // Verify the version byte at the head is v2 — otherwise the
+        // decoder may have silently fallen through the v1 fallback and
+        // recovered queued_at == received_at, masking a regression.
+        assert_eq!(
+            body[0], ENVELOPE_VERSION,
+            "fresh admissions must emit v2 envelopes"
+        );
+    }
+
+    // The `drain_audit_includes_dwell_seconds` test lives in
+    // `tests/store_forward_dwell_audit.rs` (integration test) rather
+    // than here in the unit-test module. Reason: when many parallel
+    // unit tests in the same binary emit audit events without any
+    // subscriber, tracing-core caches `Interest::never()` for the
+    // audit callsite globally. A subsequently-installed thread-local
+    // subscriber cannot reach the callsite because the cache
+    // short-circuits dispatch. Integration tests live in their own
+    // binary and avoid the cache-pollution interaction.
+
+    /// The drain path invokes the `OnDrainObservation` callback once
+    /// per delivered message with a non-negative `dwell_seconds`
+    /// observation. The histogram itself lives in `rustgate-server`
+    /// (transport must not depend on `prometheus`); this test pins
+    /// the contract that the histogram bucketing layer relies on —
+    /// every drain observation reaches the configured callback.
+    #[tokio::test]
+    async fn drain_dwell_histogram_observes_drain_event() {
+        let tmp = TempDir::new().unwrap();
+        let q = ClientQueue::open(tmp.path(), 1_000_000).unwrap();
+
+        // Capture every observation in a Vec so we can assert both the
+        // count and the values. parking_lot::Mutex keeps the callback
+        // body cheap (no `.unwrap()` on a poison check).
+        let observations = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<f64>::new()));
+        let observations_cb = std::sync::Arc::clone(&observations);
+        q.set_on_drain_observation(std::sync::Arc::new(move |dwell_secs| {
+            observations_cb.lock().push(dwell_secs);
+        }));
+
+        // Three messages so we can verify per-message (not per-batch)
+        // observation cardinality.
+        for i in 0..3u8 {
+            q.enqueue("bob", &msg_for("alice", "bob", &[i])).unwrap();
+        }
+        wait_for_depth(&q, "bob", 3).await;
+        // Wait until redb has committed every entry — the in-memory
+        // index is updated before the redb commit and the drain path
+        // reads from redb, so we cannot observe full delivery from
+        // depth alone.
+        wait_for_persisted(&q, 3).await;
+        let drained = q.drain("bob").unwrap();
+        assert_eq!(drained.len(), 3);
+
+        let observed = observations.lock().clone();
+        assert_eq!(
+            observed.len(),
+            3,
+            "OnDrainObservation must fire once per delivered message"
+        );
+        for d in &observed {
+            assert!(*d >= 0.0, "dwell observation must be non-negative, got {d}");
+            // Bound the upper end loosely — drains finish quickly under
+            // a fresh queue. A regression that returned `Instant::now()
+            // - UNIX_EPOCH` (50+ years) would trip this.
+            assert!(
+                *d < 60.0,
+                "dwell observation under tight test window must be \
+                 well under a minute, got {d}"
+            );
+        }
+    }
+
+    /// A v1 envelope (legacy, written before #729 added `queued_at`)
+    /// must decode cleanly with `queued_at_ms` falling back to
+    /// `received_at_ms`. This preserves pre-PR audit semantics for
+    /// existing on-disk queues during the upgrade window — operators
+    /// see dwell == (drain - received_at) on legacy entries until the
+    /// queue cycles to v2-only entries.
+    #[tokio::test]
+    async fn legacy_record_without_queued_at_falls_back_to_received_at() {
+        // Build a v1 envelope by hand — the persistence path always
+        // emits v2, so we need to reach into the encoding to construct
+        // the legacy shape. The layout matches the pre-#729 wire
+        // format byte-for-byte.
+        let received_at_ms: i64 = 1_700_000_000_000;
+        let body = {
+            let mut buf = BytesMut::new();
+            buf.put_u8(ENVELOPE_VERSION_V1);
+            put_identity(&mut buf, &ident("alice"));
+            buf.put_u8(DEST_DIRECT);
+            put_identity(&mut buf, &ident("bob"));
+            buf.put_u8(MT_CHAT);
+            put_str(&mut buf, "tcp");
+            buf.put_i64(received_at_ms);
+            // Note: NO queued_at field here — that is the entire point
+            // of the v1 layout. The decoder must NOT advance past the
+            // ttl bytes looking for one.
+            buf.put_i64(-1); // ttl: none
+            let payload = b"legacy-payload";
+            buf.put_u32(payload.len() as u32);
+            buf.put_slice(payload);
+            buf.to_vec()
+        };
+
+        let decoded = decode(&body).expect("v1 envelope must decode");
+        assert_eq!(decoded.message.payload.as_ref(), b"legacy-payload");
+        assert_eq!(decoded.message.source.cn, "alice");
+        match &decoded.message.destination {
+            Destination::Direct(id) => assert_eq!(id.cn, "bob"),
+            other => panic!("unexpected destination: {other:?}"),
+        }
+        assert_eq!(
+            decoded.queued_at_ms, received_at_ms,
+            "v1 envelopes must fall back to received_at_ms for queued_at"
+        );
+
+        // Sanity-check the fallback's downstream effect: dwell against
+        // a notional drain_now == received_at + 5 minutes is exactly
+        // 300 seconds. The test pins the legacy semantics — pre-PR,
+        // operators saw the full received-to-drain interval; that
+        // continues to hold for v1 records.
+        let drain_now_ms = received_at_ms + 300_000;
+        let dwell_ms = drain_now_ms.saturating_sub(decoded.queued_at_ms);
+        assert_eq!(dwell_ms, 300_000);
     }
 }

@@ -809,6 +809,14 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     #[cfg(feature = "metrics")]
     if let Some(ref q) = client_queue {
         metrics::spawn_client_queue_metrics_task(Arc::clone(q), Arc::clone(&metrics_identity));
+        // Issue #729: per-message dwell observation. The callback is
+        // invoked synchronously inside `ClientQueue::drain` once per
+        // returned message, so a single drain of N messages produces
+        // N histogram observations — characterizing per-message
+        // experience, not per-batch.
+        q.set_on_drain_observation(std::sync::Arc::new(|dwell_seconds| {
+            metrics::store_forward_dwell_seconds().observe(dwell_seconds);
+        }));
     }
 
     // ── Cross-path deduplication ───────────────────────────────────
