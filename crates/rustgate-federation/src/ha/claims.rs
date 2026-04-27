@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rustgate_core::masking::hash_cn;
 use tokio::sync::{Mutex, watch};
 use tracing::{debug, info, warn};
 
@@ -180,7 +181,7 @@ impl ClaimManager {
             Ok(revision) => {
                 let mut claims = self.claims.lock().await;
                 let _ = claims.insert(peer_id.to_string(), revision);
-                info!(peer_id = %peer_id, pod_id = %self.pod_id, fence = revision, "claimed peer");
+                info!(peer_id = %hash_cn(peer_id), pod_id = %self.pod_id, fence = revision, "claimed peer");
                 Some(revision)
             }
             Err(_) => {
@@ -189,11 +190,11 @@ impl ClaimManager {
                     Ok(Some(entry)) if entry.value == self.pod_id.as_bytes() => {
                         let mut claims = self.claims.lock().await;
                         let _ = claims.insert(peer_id.to_string(), entry.revision);
-                        debug!(peer_id = %peer_id, fence = entry.revision, "reclaimed own peer");
+                        debug!(peer_id = %hash_cn(peer_id), fence = entry.revision, "reclaimed own peer");
                         Some(entry.revision)
                     }
                     _ => {
-                        debug!(peer_id = %peer_id, "peer already claimed by another pod");
+                        debug!(peer_id = %hash_cn(peer_id), "peer already claimed by another pod");
                         None
                     }
                 }
@@ -231,7 +232,7 @@ impl ClaimManager {
             FederationError::storage(format!("failed to delete claim from KV: {e}"))
         })?;
 
-        info!(peer_id = %peer_id, pod_id = %self.pod_id, "released peer claim");
+        info!(peer_id = %hash_cn(peer_id), pod_id = %self.pod_id, "released peer claim");
         Ok(())
     }
 
@@ -324,7 +325,7 @@ async fn refresh_claims(
                 let mut claims = claims.lock().await;
                 if let Some(rev) = claims.get_mut(peer_id) {
                     debug!(
-                        peer_id = %peer_id,
+                        peer_id = %hash_cn(peer_id),
                         old_fence = %rev,
                         new_fence = %new_rev,
                         "refreshed claim"
@@ -352,12 +353,12 @@ async fn refresh_claims(
                     }
                     Ok(None) => {
                         // Key expired, try to reclaim
-                        debug!(peer_id = %peer_id, "claim expired during refresh, attempting reclaim");
+                        debug!(peer_id = %hash_cn(peer_id), "claim expired during refresh, attempting reclaim");
                         match kv.create(peer_id, value.clone()).await {
                             Ok(new_rev) => {
                                 let mut claims_guard = claims.lock().await;
                                 let _ = claims_guard.insert(peer_id.clone(), new_rev);
-                                debug!(peer_id = %peer_id, "reclaimed expired peer");
+                                debug!(peer_id = %hash_cn(peer_id), "reclaimed expired peer");
                             }
                             Err(_) => {
                                 let mut claims_guard = claims.lock().await;
@@ -426,7 +427,7 @@ async fn watch_expired_claims(
                 }
 
                 debug!(
-                    peer_id = %peer_id,
+                    peer_id = %hash_cn(&peer_id),
                     pod_id = %pod_id,
                     "detected expired claim, peer available for adoption"
                 );

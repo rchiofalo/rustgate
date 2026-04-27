@@ -203,13 +203,13 @@ async fn connection_loop(
         loop {
             // Check shutdown before connecting
             if *shutdown_rx.borrow() {
-                debug!(peer_id = %peer_id, "V1 client shutdown requested");
+                debug!(peer_id = %hash_cn(peer_id.as_str()), "V1 client shutdown requested");
                 return;
             }
 
             peer.set_state(PeerState::Connecting);
             info!(
-                peer_id = %peer_id,
+                peer_id = %hash_cn(peer_id.as_str()),
                 addr = %config.addr,
                 attempt = reconnect_count + 1,
                 "connecting to V1 federation peer"
@@ -257,7 +257,7 @@ async fn connection_loop(
             reconnect_count = 0;
             rustgate_core::audit::federation_peer_connected(&peer_id, &identity.cn, "outbound");
             info!(
-                peer_id = %peer_id,
+                peer_id = %hash_cn(peer_id.as_str()),
                 peer_cn = %hash_cn(&identity.cn),
                 addr = %config.addr,
                 "connected to V1 federation peer"
@@ -272,7 +272,7 @@ async fn connection_loop(
 
             if !replay_messages.is_empty() {
                 info!(
-                    peer_id = %peer_id,
+                    peer_id = %hash_cn(peer_id.as_str()),
                     replayed_count = replay_messages.len(),
                     "replaying buffered messages after reconnection"
                 );
@@ -294,7 +294,7 @@ async fn connection_loop(
             match session_result {
                 Ok(()) => {
                     rustgate_core::audit::federation_peer_disconnected(&peer_id, "clean shutdown");
-                    info!(peer_id = %peer_id, "V1 federation peer disconnected cleanly");
+                    info!(peer_id = %hash_cn(peer_id.as_str()), "V1 federation peer disconnected cleanly");
                 }
                 Err(e) => {
                     rustgate_core::audit::federation_peer_disconnected(&peer_id, &e.to_string());
@@ -323,7 +323,7 @@ async fn connection_loop(
             reconnect_count += 1;
 
             info!(
-                peer_id = %peer_id,
+                peer_id = %hash_cn(peer_id.as_str()),
                 delay = ?delay,
                 "waiting before reconnecting to V1 federation peer"
             );
@@ -345,7 +345,7 @@ async fn connection_loop(
     }
     if drained > 0 {
         debug!(
-            peer_id = %peer_id,
+            peer_id = %hash_cn(peer_id.as_str()),
             drained,
             "discarded buffered messages on V1 client exit"
         );
@@ -378,7 +378,7 @@ async fn run_session(
 
     if !replay_messages.is_empty() {
         debug!(
-            peer_id = %peer_id,
+            peer_id = %hash_cn(peer_id.as_str()),
             count = replay_messages.len(),
             "finished replaying buffered messages"
         );
@@ -399,7 +399,7 @@ async fn run_session(
                 match frame {
                     Some(Ok(data)) => {
                         if is_heartbeat(&data) {
-                            debug!(peer_id = %peer_id, "V1 heartbeat received from peer");
+                            debug!(peer_id = %hash_cn(peer_id.as_str()), "V1 heartbeat received from peer");
                             last_heartbeat_received = tokio::time::Instant::now();
                         } else {
                             peer.record_recv();
@@ -440,7 +440,7 @@ async fn run_session(
                 let buf = BytesMut::from(hb.as_ref());
                 framed.send(buf).await
                     .map_err(|e| FederationError::other(format!("heartbeat send error: {e}")))?;
-                debug!(peer_id = %peer_id, "V1 heartbeat sent to peer");
+                debug!(peer_id = %hash_cn(peer_id.as_str()), "V1 heartbeat sent to peer");
             }
 
             // Check heartbeat timeout

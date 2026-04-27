@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
+use rustgate_core::masking::hash_cn;
 use rustgate_core::message::Metadata;
 use rustgate_core::secrets::{SecretFileOpts, read_secret_file};
 use rustgate_core::{PeerId, audit};
@@ -583,7 +584,7 @@ impl FederationManager {
                 }),
                 Arc::new(move |peer_id: String, stale_fence: u64| {
                     tracing::debug!(
-                        peer_id = %peer_id,
+                        peer_id = %hash_cn(&peer_id),
                         stale_fence = stale_fence,
                         "claim lost, queuing disconnect"
                     );
@@ -621,7 +622,7 @@ impl FederationManager {
                     Some(token) => Some(token),
                     None => {
                         info!(
-                            peer_id = %peer_config.id,
+                            peer_id = %hash_cn(peer_config.id.as_str()),
                             "peer claimed by another pod, skipping"
                         );
                         continue;
@@ -673,7 +674,7 @@ impl FederationManager {
                     );
 
                     info!(
-                        peer_id = %peer_config.id,
+                        peer_id = %hash_cn(peer_config.id.as_str()),
                         addr = %addr,
                         "started V1 federation client"
                     );
@@ -711,7 +712,7 @@ impl FederationManager {
                     );
 
                     info!(
-                        peer_id = %peer_config.id,
+                        peer_id = %hash_cn(peer_config.id.as_str()),
                         addr = %addr,
                         "started V2 gRPC federation client"
                     );
@@ -911,7 +912,7 @@ impl FederationManager {
                 Ok(()) => {
                     if peer.record_success() {
                         info!(
-                            peer_id = %id,
+                            peer_id = %hash_cn(id.as_str()),
                             "circuit breaker recovered — peer is healthy again"
                         );
                         #[cfg(feature = "api")]
@@ -1087,7 +1088,7 @@ impl FederationManager {
             #[cfg(feature = "api")]
             crate::metrics::replay_restored().inc_by(restored_count as u64);
             info!(
-                peer_id = %peer_id_str,
+                peer_id = %hash_cn(&peer_id_str),
                 restored = restored_count,
                 in_memory = buf.len(),
                 "rehydrated persisted replay buffer"
@@ -1142,7 +1143,7 @@ impl FederationManager {
         if let Ok(mut buffers) = self.replay_buffers.lock()
             && buffers.remove(peer_id).is_some()
         {
-            info!(peer_id = %peer_id, "removed replay buffer for peer");
+            info!(peer_id = %hash_cn(peer_id), "removed replay buffer for peer");
         }
     }
 
@@ -1193,12 +1194,12 @@ impl FederationManager {
             match client {
                 FederationClient::V1(mut v1) => {
                     v1.shutdown().await;
-                    info!(peer_id = %id, "V1 federation client stopped");
+                    info!(peer_id = %hash_cn(id.as_str()), "V1 federation client stopped");
                 }
                 #[cfg(feature = "v2")]
                 FederationClient::V2(mut v2) => {
                     v2.shutdown().await;
-                    info!(peer_id = %id, "V2 federation client stopped");
+                    info!(peer_id = %hash_cn(id.as_str()), "V2 federation client stopped");
                 }
             }
         }
@@ -1379,7 +1380,7 @@ impl FederationManager {
                 && guard.is_duplicate(&data)
             {
                 tracing::debug!(
-                    peer_id = %peer_id,
+                    peer_id = %hash_cn(&peer_id),
                     context = %context,
                     "dropped duplicate V1 message (loop detection)"
                 );
@@ -1532,7 +1533,7 @@ impl FederationManager {
                 );
 
                 info!(
-                    peer_id = %peer_config.id,
+                    peer_id = %hash_cn(peer_config.id.as_str()),
                     addr = %addr,
                     "started V1 federation client (adoption)"
                 );
@@ -1576,7 +1577,7 @@ impl FederationManager {
                 );
 
                 info!(
-                    peer_id = %peer_config.id,
+                    peer_id = %hash_cn(peer_config.id.as_str()),
                     addr = %addr,
                     "started V2 gRPC federation client (adoption)"
                 );
@@ -1616,7 +1617,7 @@ impl FederationManager {
 
         // Already connected?
         if self.clients.contains_key(peer_id.as_str()) {
-            info!(peer_id = %peer_id, "peer already connected, skipping adoption");
+            info!(peer_id = %hash_cn(peer_id.as_str()), "peer already connected, skipping adoption");
             return Ok(());
         }
 
@@ -1630,7 +1631,7 @@ impl FederationManager {
         let fencing_token = match fencing_token {
             Some(token) => token,
             None => {
-                info!(peer_id = %peer_id, "peer claimed by another pod during adoption");
+                info!(peer_id = %hash_cn(peer_id.as_str()), "peer claimed by another pod during adoption");
                 return Ok(());
             }
         };
@@ -1639,7 +1640,7 @@ impl FederationManager {
         let delay = crate::ha::claims::ClaimManager::adopt_delay()
             + crate::ha::claims::ClaimManager::adoption_jitter();
         info!(
-            peer_id = %peer_id,
+            peer_id = %hash_cn(peer_id.as_str()),
             fence = fencing_token,
             delay_secs = delay.as_secs(),
             "waiting adoption delay before connecting"
@@ -1676,7 +1677,7 @@ impl FederationManager {
             warn!(peer_id = %peer_id, error = %e, "failed to register adopted connection");
         }
 
-        info!(peer_id = %peer_id, "peer adopted successfully");
+        info!(peer_id = %hash_cn(peer_id.as_str()), "peer adopted successfully");
         Ok(())
     }
 
@@ -1691,12 +1692,12 @@ impl FederationManager {
             match Arc::try_unwrap(client) {
                 Ok(FederationClient::V1(mut v1)) => {
                     v1.shutdown().await;
-                    info!(peer_id = %peer_id, "V1 client stopped (claim lost)");
+                    info!(peer_id = %hash_cn(peer_id.as_str()), "V1 client stopped (claim lost)");
                 }
                 #[cfg(feature = "v2")]
                 Ok(FederationClient::V2(mut v2)) => {
                     v2.shutdown().await;
-                    info!(peer_id = %peer_id, "V2 client stopped (claim lost)");
+                    info!(peer_id = %hash_cn(peer_id.as_str()), "V2 client stopped (claim lost)");
                 }
                 Err(_) => {
                     warn!(peer_id = %peer_id, "could not unwrap federation client Arc during disconnect");
@@ -1748,17 +1749,17 @@ impl FederationManager {
         }
 
         if !peer_config.enabled || !peer_config.is_outbound {
-            info!(peer_id = %id, "peer added (no outbound client started)");
+            info!(peer_id = %hash_cn(id.as_str()), "peer added (no outbound client started)");
             return Ok(());
         }
 
         if !self.running {
-            info!(peer_id = %id, "peer added; client will start when manager starts");
+            info!(peer_id = %hash_cn(id.as_str()), "peer added; client will start when manager starts");
             return Ok(());
         }
 
         self.connect_outbound_peer(&peer_config)?;
-        info!(peer_id = %id, "peer added and outbound client started");
+        info!(peer_id = %hash_cn(id.as_str()), "peer added and outbound client started");
         Ok(())
     }
 
@@ -2494,6 +2495,31 @@ mod tests {
         let status = manager.status();
         assert!(!status.ha_enabled);
         assert!(status.pod_id.is_none());
+    }
+
+    #[test]
+    fn manager_uses_shared_hash_cn_for_peer_id_log_cardinality_cap() {
+        // F-30 (#773) — The federation manager emits many
+        // `info!`/`debug!` log lines carrying `peer_id` (peer
+        // attached, replay-buffer rehydrated, peer adopted, V1/V2
+        // client started, etc.). All of these now run the value
+        // through `rustgate_core::masking::hash_cn` so the SIEM index
+        // sees a bounded set of fleet-peer hashes rather than the
+        // unbounded raw `peer_id` value space. A peer attacker
+        // controlling many federated `federate_id`s could otherwise
+        // inflate the index by emitting a unique value on every
+        // reconnect. Pin that the module's `hash_cn` import resolves
+        // to the public helper — a regression to a stray crate-local
+        // copy or to the raw `peer_id` would silently revert the cap.
+        let raw = "federate-peer-canary-007.fleet.example.test";
+        let from_module = hash_cn(raw);
+        let from_core = rustgate_core::masking::hash_cn(raw);
+        assert_eq!(
+            from_module, from_core,
+            "manager.rs must use the shared `rustgate_core::masking::hash_cn`"
+        );
+        assert_eq!(from_module.len(), 12);
+        assert!(!from_module.contains(raw));
     }
 
     #[test]

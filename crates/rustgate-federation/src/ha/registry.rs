@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use rustgate_core::masking::hash_cn;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, watch};
 use tracing::{debug, info, warn};
@@ -190,7 +191,7 @@ impl ConnectionRegistry {
         let _ = registered.insert(key, info);
 
         debug!(
-            peer_id = %peer_id,
+            peer_id = %hash_cn(peer_id),
             direction = %direction,
             pod_id = %self.pod_id,
             "registered federation connection"
@@ -212,7 +213,7 @@ impl ConnectionRegistry {
         })?;
 
         debug!(
-            peer_id = %peer_id,
+            peer_id = %hash_cn(peer_id),
             pod_id = %self.pod_id,
             "unregistered federation connection"
         );

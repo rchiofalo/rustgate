@@ -3815,4 +3815,58 @@ mod tests {
             WillValidation::NotAuthorized(_) => "NotAuthorized",
         }
     }
+
+    // ── F-30 (#773) operational log cardinality cap ─────────────────
+
+    #[test]
+    fn mqtt_session_operational_logs_hash_cn_at_info_debug_boundary() {
+        // F-30 (#773) — Pin that the MQTT session's info/debug log
+        // sites that carry a CN field run the value through the
+        // shared `rustgate_core::masking::hash_cn` helper before it
+        // reaches a structured `tracing` field. The session has many
+        // such sites (subscribe, unsubscribe, disconnect, packet-route
+        // debug arms); rather than introspect every emitted log line,
+        // pin that the module's `hash_cn` import resolves to the
+        // public helper. A regression that swapped to a crate-local
+        // copy or dropped the wrapper would defeat the SIEM
+        // index-cardinality cap and let an attacker churning CNs
+        // inflate the index by emitting unique values per request.
+        let raw = "mqtt-session-007-cardinality-canary";
+        let from_module = hash_cn(raw);
+        let from_core = rustgate_core::masking::hash_cn(raw);
+        assert_eq!(
+            from_module, from_core,
+            "session.rs must use the shared `rustgate_core::masking::hash_cn`"
+        );
+        assert_eq!(
+            from_module.len(),
+            12,
+            "hashed log token must be 12 hex chars (48 bits) — \
+             a regression that widened/narrowed the truncation \
+             would change the SIEM index cardinality bound"
+        );
+        assert!(
+            !from_module.contains(raw),
+            "hashed log token must not contain the raw CN, got {from_module}"
+        );
+        assert!(
+            from_module.chars().all(|c| c.is_ascii_hexdigit()),
+            "hashed log token must be hex-only, got {from_module:?}"
+        );
+        // Idempotence: two adjacent emissions for the same CN must
+        // collapse to a single SIEM index entry.
+        assert_eq!(
+            hash_cn(raw),
+            from_module,
+            "hash_cn must be idempotent so SIEM index entries collapse"
+        );
+        // Distinct CNs must collapse to distinct hashes (modulo the
+        // 48-bit collision risk, which is intentional).
+        assert_ne!(
+            hash_cn(raw),
+            hash_cn("different-mqtt-canary-008"),
+            "distinct CNs must produce distinct hashes; \
+             a regression collapsing them would defeat correlation"
+        );
+    }
 }
