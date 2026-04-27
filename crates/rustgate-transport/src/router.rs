@@ -1193,10 +1193,46 @@ impl Router {
         self.authz_observer.store(Arc::new(observer));
     }
 
-    /// Evaluate the installed engine, invoke the observer, and return the
-    /// [`DecisionOutcome`]. Wrapped in a helper so both the send and receive
-    /// PEPs share identical instrumentation.
-    fn authz_evaluate(
+    /// Send-PEP entry point. Evaluates the installed engine for an
+    /// outbound (sender-side) decision and returns the
+    /// [`DecisionOutcome`].
+    ///
+    /// Closes #730: split from a former `authz_evaluate(action)` so the
+    /// direction is implicit in the call site. A refactor that drops or
+    /// relabels the action enum can no longer silently route a Send
+    /// decision through the Receive PEP — the function name *is* the
+    /// PEP. The two entry points share `authz_evaluate_inner` so the
+    /// observer / metric / latency instrumentation is identical between
+    /// directions.
+    fn authz_evaluate_send(
+        &self,
+        engine: &Arc<dyn PolicyEngine>,
+        subject: &AuthzSubject<'_>,
+        resource: &AuthzResource<'_>,
+    ) -> rustgate_authz::DecisionOutcome {
+        self.authz_evaluate_inner(engine, subject, resource, AuthzAction::Send)
+    }
+
+    /// Receive-PEP entry point. Evaluates the installed engine for a
+    /// per-recipient (delivery-side) decision and returns the
+    /// [`DecisionOutcome`].
+    ///
+    /// Closes #730: paired with `authz_evaluate_send`. See that
+    /// function's doc-comment for the rationale.
+    fn authz_evaluate_receive(
+        &self,
+        engine: &Arc<dyn PolicyEngine>,
+        subject: &AuthzSubject<'_>,
+        resource: &AuthzResource<'_>,
+    ) -> rustgate_authz::DecisionOutcome {
+        self.authz_evaluate_inner(engine, subject, resource, AuthzAction::Receive)
+    }
+
+    /// Shared instrumentation for the Send and Receive PEP entry
+    /// points. Private — call `authz_evaluate_send` /
+    /// `authz_evaluate_receive` instead so the action is
+    /// type-system-anchored at the call site.
+    fn authz_evaluate_inner(
         &self,
         engine: &Arc<dyn PolicyEngine>,
         subject: &AuthzSubject<'_>,
@@ -2001,8 +2037,7 @@ impl Router {
                             // Multicast is handled above.
                             _ => AuthzResource::Broadcast,
                         };
-                        let outcome =
-                            self.authz_evaluate(engine, &subject, &resource, AuthzAction::Send);
+                        let outcome = self.authz_evaluate_send(engine, &subject, &resource);
                         if !outcome.is_allow() {
                             let (kind, id) = match dest {
                                 Destination::Direct(target) => ("direct", target.cn.as_str()),
@@ -2232,7 +2267,7 @@ impl Router {
             }
             let subject = AuthzSubject::from_identity(&arc_msg.source);
             let resource = AuthzResource::Group { group };
-            let outcome = self.authz_evaluate(engine, &subject, &resource, AuthzAction::Send);
+            let outcome = self.authz_evaluate_send(engine, &subject, &resource);
             if !outcome.is_allow() {
                 // Per-group deny is already audited inside
                 // `send_to_group_excluding` for the local fanout path —
@@ -2413,8 +2448,7 @@ impl Router {
                             AuthzResource::Broadcast
                         }
                     };
-                    let send_outcome =
-                        self.authz_evaluate(engine, &subject, &resource, AuthzAction::Send);
+                    let send_outcome = self.authz_evaluate_send(engine, &subject, &resource);
                     if !send_outcome.is_allow() {
                         debug!(
                             sender = %hash_cn(&msg.source.cn),
@@ -2425,12 +2459,8 @@ impl Router {
 
                     // Recipient Receive check
                     let recipient_subject = AuthzSubject::from_identity(recipient_identity);
-                    let recv_outcome = self.authz_evaluate(
-                        engine,
-                        &recipient_subject,
-                        &resource,
-                        AuthzAction::Receive,
-                    );
+                    let recv_outcome =
+                        self.authz_evaluate_receive(engine, &recipient_subject, &resource);
                     if !recv_outcome.is_allow() {
                         debug!(
                             sender = %hash_cn(&msg.source.cn),
@@ -2647,8 +2677,7 @@ impl Router {
             let (recv_obligations, recv_rule_id, engine_for_audit) = if let Some(engine) = authz {
                 let sender_subject = AuthzSubject::from_identity(&msg.source);
                 let resource = AuthzResource::Broadcast;
-                let send_outcome =
-                    self.authz_evaluate(engine, &sender_subject, &resource, AuthzAction::Send);
+                let send_outcome = self.authz_evaluate_send(engine, &sender_subject, &resource);
                 if !send_outcome.is_allow() {
                     // Sender is no longer allowed to send to this
                     // resource class under the current policy; drop
@@ -2678,12 +2707,8 @@ impl Router {
 
                 let recipient_subject =
                     AuthzSubject::with_hash(&handle.identity, handle.subject_hash);
-                let recv_outcome = self.authz_evaluate(
-                    engine,
-                    &recipient_subject,
-                    &resource,
-                    AuthzAction::Receive,
-                );
+                let recv_outcome =
+                    self.authz_evaluate_receive(engine, &recipient_subject, &resource);
                 if !recv_outcome.is_allow() {
                     continue;
                 }
@@ -2867,8 +2892,7 @@ impl Router {
                 let (msg, audit_ctx) = if let Some(engine) = (**authz_guard).as_ref() {
                     let subject = AuthzSubject::from_identity(&handle.identity);
                     let resource = AuthzResource::Direct { target_cn: cn };
-                    let outcome =
-                        self.authz_evaluate(engine, &subject, &resource, AuthzAction::Receive);
+                    let outcome = self.authz_evaluate_receive(engine, &subject, &resource);
                     if !outcome.is_allow() {
                         rustgate_core::audit::authz_denied(
                             handle.identity.cn.as_str(),
@@ -3104,8 +3128,7 @@ impl Router {
                     };
                     let subject = AuthzSubject::with_hash(&handle.identity, handle.subject_hash);
                     let resource = AuthzResource::Group { group };
-                    let outcome =
-                        self.authz_evaluate(engine, &subject, &resource, AuthzAction::Receive);
+                    let outcome = self.authz_evaluate_receive(engine, &subject, &resource);
                     if !outcome.is_allow() {
                         rustgate_core::audit::authz_denied(
                             handle.identity.cn.as_str(),
@@ -3241,8 +3264,7 @@ impl Router {
             let (delivery, audit_ctx) = if let Some(engine) = authz {
                 let subject = AuthzSubject::from_identity(&handle.identity);
                 let resource = AuthzResource::Broadcast;
-                let outcome =
-                    self.authz_evaluate(engine, &subject, &resource, AuthzAction::Receive);
+                let outcome = self.authz_evaluate_receive(engine, &subject, &resource);
                 if !outcome.is_allow() {
                     rustgate_core::audit::authz_denied(
                         handle.identity.cn.as_str(),
@@ -3395,7 +3417,7 @@ impl Router {
         let msg = if let Some(engine) = authz {
             let subject = AuthzSubject::from_identity(&msg.source);
             let resource = AuthzResource::Group { group };
-            let outcome = self.authz_evaluate(engine, &subject, &resource, AuthzAction::Send);
+            let outcome = self.authz_evaluate_send(engine, &subject, &resource);
             if !outcome.is_allow() {
                 rustgate_core::audit::authz_denied(
                     msg.source.cn.as_str(),
@@ -3473,8 +3495,7 @@ impl Router {
                     };
                     let subject = AuthzSubject::with_hash(&handle.identity, handle.subject_hash);
                     let resource = AuthzResource::Group { group };
-                    let outcome =
-                        self.authz_evaluate(engine, &subject, &resource, AuthzAction::Receive);
+                    let outcome = self.authz_evaluate_receive(engine, &subject, &resource);
                     if !outcome.is_allow() {
                         rustgate_core::audit::authz_denied(
                             handle.identity.cn.as_str(),
