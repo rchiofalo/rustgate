@@ -555,10 +555,15 @@ fn apply_mask_point(msg: &mut RoutableMessage) {
             recovery = recovery,
             "mask_point obligation: non-XML payload, forwarding unmasked"
         );
+        // Issue #775: SIEM dashboards group on the static `reason`
+        // token. Non-XML pass-through is its own bucket independent
+        // of which `recovery` sub-bucket the source_protocol resolves
+        // to — the recovery field still carries the binary / unmasked
+        // / unknown trio for the analyst-side drill-down.
         audit::authz_obligation_failed(
             &msg.source.cn,
             "MaskPoint",
-            "payload is not XML",
+            audit::OBLIGATION_REASON_MASK_POINT_NON_XML,
             recovery,
             &msg.metadata.source_protocol,
             msg.destination.kind_str(),
@@ -584,12 +589,15 @@ fn apply_mask_point(msg: &mut RoutableMessage) {
             // `EndEventMismatch`), and a hostile sender could otherwise
             // leak fragments of a classified payload through an
             // operator-facing DEBUG stream by deliberately malforming
-            // the XML. The same kind label is used for the audit
-            // `reason` field so the forensic trail retains enough
-            // detail for triage without persisting payload bytes.
+            // the XML. The kind discriminant is then mapped to the
+            // static `reason` vocabulary defined in `rustgate-core`
+            // (issue #775) so SIEM dashboards group on a stable token
+            // rather than the underlying error's prose.
             let error_kind = e.kind();
+            let reason = audit::obligation_reason_for_mask_error_kind(error_kind);
             tracing::debug!(
                 error_kind = %error_kind,
+                reason = reason,
                 source_protocol = %msg.metadata.source_protocol,
                 message_type = %msg.metadata.message_type,
                 "mask_point obligation: XML-intent parse failed, erasing payload"
@@ -597,7 +605,7 @@ fn apply_mask_point(msg: &mut RoutableMessage) {
             audit::authz_obligation_failed(
                 &msg.source.cn,
                 "MaskPoint",
-                error_kind,
+                reason,
                 audit::MASK_RECOVERY_DROPPED,
                 &msg.metadata.source_protocol,
                 msg.destination.kind_str(),
