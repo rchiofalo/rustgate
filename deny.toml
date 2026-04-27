@@ -4,10 +4,19 @@ all-features = true
 
 [advisories]
 ignore = [
-    # tikv-jemallocator 0.6.1 depends on paste, which is archived/unmaintained.
-    # paste is a proc-macro with no runtime code and no security surface; the
-    # advisory is informational, not a vulnerability. tikv-jemallocator has no
-    # newer release that drops paste. Remove this ignore when they do.
+    # RUSTSEC-2024-0436 — paste 1.0.15 is archived/unmaintained (closes #714).
+    # paste enters the dependency graph only when the `jemalloc` feature is
+    # enabled, via `tikv-jemalloc-ctl 0.6.1` -> `paste 1.0.15` (proc-macro).
+    # The advisory is "unmaintained" (informational), not a vulnerability:
+    # paste is a proc-macro that runs at compile time and produces no
+    # runtime code, so it carries no exploitable security surface. The
+    # latest release of `tikv-jemalloc-ctl` (0.6.1) still depends on
+    # `paste`, and there is no maintained drop-in fork in the upstream
+    # crate's tree. Replacing the dep with `pastey` (the community fork)
+    # would require a fork-and-patch of `tikv-jemalloc-ctl` itself, which
+    # is not justified for an informational advisory on a build-only
+    # macro crate. Remove this ignore when `tikv-jemalloc-ctl` ships a
+    # release that no longer pulls in `paste`.
     "RUSTSEC-2024-0436",
 ]
 
