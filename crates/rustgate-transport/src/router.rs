@@ -57,6 +57,17 @@ use crate::obligations::{
 /// [`Router::with_authz_observer`].
 pub type AuthzObserver = Arc<dyn Fn(&AuthzEvent<'_>) + Send + Sync>;
 
+/// Callback invoked once per multicast message dropped because the
+/// destination group list exceeded `MAX_MULTICAST_GROUPS` (private).
+///
+/// Wired by the server binary to feed the
+/// `rustgate_multicast_oversize_dropped_total` Prometheus counter
+/// without making `rustgate-transport` depend on `prometheus`. Closes
+/// #741: oversize-multicast drops were observable only via tracing
+/// before this callback existed, so operators could not dashboard or
+/// alert on the drop rate.
+pub type OnMulticastOversizeDropped = Arc<dyn Fn() + Send + Sync>;
+
 /// Event emitted by the Router PEP for every authz evaluation.
 #[derive(Debug)]
 pub struct AuthzEvent<'a> {
@@ -779,6 +790,15 @@ pub struct Router {
     /// Plain field (not `ArcSwap`) because the bucket map carries
     /// the live state and is populated on demand from this config.
     replay_limit_config: PositionReplayLimitConfig,
+    /// Optional callback fired once per multicast message dropped
+    /// because the destination group list exceeded
+    /// `MAX_MULTICAST_GROUPS` (private). The server binary installs this via
+    /// [`Router::set_on_multicast_oversize_dropped`] to feed the
+    /// `rustgate_multicast_oversize_dropped_total` Prometheus counter.
+    /// Hot-reloadable via `ArcSwap` so the metrics layer can be
+    /// installed and replaced after construction without any lock on
+    /// the routing hot path. Closes #741.
+    on_multicast_oversize_dropped: ArcSwap<Option<OnMulticastOversizeDropped>>,
 }
 
 impl std::fmt::Debug for Router {
@@ -802,6 +822,10 @@ impl std::fmt::Debug for Router {
                 &self.obligation_rate_limiter.audit_per_min(),
             )
             .field("replay_limit_config", &self.replay_limit_config)
+            .field(
+                "on_multicast_oversize_dropped_installed",
+                &(**self.on_multicast_oversize_dropped.load()).is_some(),
+            )
             .finish()
     }
 }
@@ -823,6 +847,7 @@ impl Default for Router {
             obligation_rate_limiter: Arc::new(ObligationRateLimiter::default()),
             replay_buckets: Mutex::new(HashMap::new()),
             replay_limit_config: PositionReplayLimitConfig::default(),
+            on_multicast_oversize_dropped: ArcSwap::from_pointee(None),
         }
     }
 }
@@ -857,6 +882,7 @@ impl Router {
             obligation_rate_limiter: Arc::new(ObligationRateLimiter::default()),
             replay_buckets: Mutex::new(HashMap::new()),
             replay_limit_config: PositionReplayLimitConfig::default(),
+            on_multicast_oversize_dropped: ArcSwap::from_pointee(None),
         }
     }
 
@@ -897,6 +923,7 @@ impl Router {
             obligation_rate_limiter: Arc::new(ObligationRateLimiter::default()),
             replay_buckets: Mutex::new(HashMap::new()),
             replay_limit_config: PositionReplayLimitConfig::default(),
+            on_multicast_oversize_dropped: ArcSwap::from_pointee(None),
         }
     }
 
@@ -940,6 +967,7 @@ impl Router {
             obligation_rate_limiter: Arc::new(ObligationRateLimiter::default()),
             replay_buckets: Mutex::new(HashMap::new()),
             replay_limit_config: PositionReplayLimitConfig::default(),
+            on_multicast_oversize_dropped: ArcSwap::from_pointee(None),
         }
     }
 
@@ -1138,6 +1166,19 @@ impl Router {
     /// Atomically replace the multicast configuration.
     pub fn set_multicast_config(&self, config: Option<MulticastConfig>) {
         self.multicast_config.store(Arc::new(config));
+    }
+
+    /// Install (or replace) the callback fired once per multicast
+    /// message dropped because the destination group list exceeded
+    /// `MAX_MULTICAST_GROUPS` (private). Pass `None` to detach.
+    ///
+    /// Closes #741: the server binary wires this to the
+    /// `rustgate_multicast_oversize_dropped_total` Prometheus counter
+    /// under `#[cfg(feature = "metrics")]`. Without metrics compiled
+    /// in the callback stays `None` and the existing tracing-only
+    /// behaviour is preserved (operationally additive).
+    pub fn set_on_multicast_oversize_dropped(&self, cb: Option<OnMulticastOversizeDropped>) {
+        self.on_multicast_oversize_dropped.store(Arc::new(cb));
     }
 
     /// Attach a per-tenant quota tracker to the router.
@@ -1791,6 +1832,16 @@ impl Router {
                     source = %envelope.source.cn,
                     "multicast group list exceeds limit, dropping message",
                 );
+                // Closes #741: notify the metrics callback so the
+                // `rustgate_multicast_oversize_dropped_total` Prometheus
+                // counter increments. The callback is a no-op when the
+                // server has not installed one (e.g. metrics feature off
+                // or test routers), preserving the previous tracing-only
+                // behaviour.
+                let cb_guard = self.on_multicast_oversize_dropped.load();
+                if let Some(cb) = (**cb_guard).as_ref() {
+                    cb();
+                }
                 // Oversize multicast is a drop: suppress egress fan-out so
                 // external sinks do not observe a message that never made
                 // it to any local recipient.
@@ -5416,5 +5467,88 @@ mod tests {
         let guard = router.multicast_config.load();
         let config = guard.as_ref().as_ref().expect("config should be set");
         assert!(config.sa_auto_multicast);
+    }
+
+    #[tokio::test]
+    async fn multicast_oversize_packet_invokes_dropped_callback() {
+        // Closes #741. Drop-callback is the integration point for the
+        // `rustgate_multicast_oversize_dropped_total` Prometheus
+        // counter; it MUST fire exactly once per dropped multicast
+        // message that exceeds `MAX_MULTICAST_GROUPS`. The "17 MiB
+        // packet" framing in the issue is shorthand — the actual
+        // oversize-drop site enforces the destination group cap, not
+        // a payload-byte cap, because UDP datagrams are bounded at
+        // 64 KiB long before they could approach 17 MiB.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let router = Router::new();
+        let alice = make_identity("alice", &["alpha"]);
+
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let drop_count_cb = Arc::clone(&drop_count);
+        router.set_on_multicast_oversize_dropped(Some(Arc::new(move || {
+            let _ = drop_count_cb.fetch_add(1, Ordering::Relaxed);
+        })));
+
+        let (ptx, ntx, _prx, _nrx) = make_channels(16, 64);
+        router
+            .register(SessionHandle::new(alice.clone(), ptx, ntx))
+            .await;
+
+        let many_groups: Vec<String> = (0..MAX_MULTICAST_GROUPS + 1)
+            .map(|i| format!("group-{i}"))
+            .collect();
+        let msg = make_position(&alice, Destination::Multicast(many_groups));
+        router.route(msg).await;
+
+        assert_eq!(
+            drop_count.load(Ordering::Relaxed),
+            1,
+            "oversize multicast must invoke the dropped callback exactly once"
+        );
+
+        // A second oversize multicast must increment again; the
+        // callback is per-drop, not edge-triggered.
+        let many_groups: Vec<String> = (0..MAX_MULTICAST_GROUPS + 1)
+            .map(|i| format!("group-{i}"))
+            .collect();
+        let msg = make_position(&alice, Destination::Multicast(many_groups));
+        router.route(msg).await;
+        assert_eq!(
+            drop_count.load(Ordering::Relaxed),
+            2,
+            "each oversize multicast must invoke the dropped callback once",
+        );
+    }
+
+    #[tokio::test]
+    async fn multicast_within_limit_does_not_invoke_dropped_callback() {
+        // Confirm the callback is silent on the success path —
+        // anything else would inflate the dashboard with false
+        // positives the moment a healthy multicast was routed.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let router = Router::new();
+        let alice = make_identity("alice", &["alpha", "bravo"]);
+
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let drop_count_cb = Arc::clone(&drop_count);
+        router.set_on_multicast_oversize_dropped(Some(Arc::new(move || {
+            let _ = drop_count_cb.fetch_add(1, Ordering::Relaxed);
+        })));
+
+        let (ptx, ntx, _prx, _nrx) = make_channels(16, 64);
+        router
+            .register(SessionHandle::new(alice.clone(), ptx, ntx))
+            .await;
+
+        let msg = make_position(
+            &alice,
+            Destination::Multicast(vec!["alpha".into(), "bravo".into()]),
+        );
+        router.route(msg).await;
+        assert_eq!(
+            drop_count.load(Ordering::Relaxed),
+            0,
+            "successful multicast must not invoke the dropped callback",
+        );
     }
 }

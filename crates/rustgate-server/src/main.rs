@@ -846,6 +846,16 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
         metrics::position_cache_size().set(size as i64);
     }));
 
+    // Closes #741. Wire the multicast oversize-drop counter so
+    // operators can dashboard / alert on the rate at which the router
+    // drops messages that exceed `MAX_MULTICAST_GROUPS`. The callback
+    // is `None` (i.e. the router falls back to its previous
+    // tracing-only behaviour) for builds without `--features metrics`.
+    #[cfg(feature = "metrics")]
+    router.set_on_multicast_oversize_dropped(Some(std::sync::Arc::new(|| {
+        metrics::multicast_oversize_dropped().inc();
+    })));
+
     #[cfg(feature = "metrics")]
     if let Some(ref q) = client_queue {
         metrics::spawn_client_queue_metrics_task(Arc::clone(q), Arc::clone(&metrics_identity));

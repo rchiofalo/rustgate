@@ -110,6 +110,12 @@ pub struct WsServerConfig {
     /// `rustgate_ws_connections_total` and `rustgate_ws_connections_rejected_total`
     /// Prometheus counters. `None` disables dispatch with no runtime cost.
     pub session_hooks: Option<WsSessionHooks>,
+    /// Optional SA auto-upgrade observer wired to the per-session
+    /// [`MessageBuilder`]. When set, every WebSocket session inherits
+    /// the callback and feeds the
+    /// `rustgate_sa_auto_upgraded_total{from_version}` Prometheus
+    /// counter. Closes #741.
+    pub sa_upgrade_observer: Option<rustgate_cot::OnSaAutoUpgraded>,
     pub shutdown: Arc<Notify>,
 }
 
@@ -150,6 +156,7 @@ impl WebSocketServer {
             max_write_buffer_bytes,
             health_check,
             session_hooks,
+            sa_upgrade_observer,
             shutdown,
         } = config;
 
@@ -201,9 +208,10 @@ impl WebSocketServer {
                             let mwb = max_write_buffer_bytes;
                             let hc = health_check;
                             let hooks = session_hooks.clone();
+                            let sa_obs = sa_upgrade_observer.clone();
                             drop(tokio::spawn(handle_ws_session(
                                 session, router, session_codec, nats, fed, http, tc, rf,
-                                cb, fps, bps, vio, mwb, hc, hooks, permit,
+                                cb, fps, bps, vio, mwb, hc, hooks, sa_obs, permit,
                             )));
                         }
                         Err(e) => {
@@ -244,6 +252,7 @@ async fn handle_ws_session(
     max_write_buffer_bytes: usize,
     health_check: HealthCheckConfig,
     session_hooks: Option<WsSessionHooks>,
+    sa_upgrade_observer: Option<rustgate_cot::OnSaAutoUpgraded>,
     _permit: OwnedSemaphorePermit,
 ) {
     let identity = session.identity_arc();
@@ -346,7 +355,7 @@ async fn handle_ws_session(
         let router = Arc::clone(&router);
         let read_last_pong = Arc::clone(&last_pong);
         tokio::select! {
-            r = ws_read_loop(ws_read, &identity, &router, nats_publish.as_ref(), fed_forward.as_ref(), http_forward.as_ref(), &throttle, &replay_filter, &mut ws_rate_limiter, read_last_pong) => r,
+            r = ws_read_loop(ws_read, &identity, &router, nats_publish.as_ref(), fed_forward.as_ref(), http_forward.as_ref(), &throttle, &replay_filter, &mut ws_rate_limiter, read_last_pong, sa_upgrade_observer.as_ref()) => r,
             r = ws_write_loop(ws_write, &mut priority_rx, &mut normal_rx, &*codec, max_write_buffer_bytes, health_check, Arc::clone(&last_pong)) => r,
         }
     };
@@ -381,8 +390,16 @@ async fn ws_read_loop(
     replay_filter: &Option<Arc<ReplayFilter>>,
     ws_rate_limiter: &mut Option<crate::rate_limit::WsRateLimiter>,
     last_pong: LastPong,
+    sa_upgrade_observer: Option<&rustgate_cot::OnSaAutoUpgraded>,
 ) -> Result<(), String> {
-    let mut msg_builder = MessageBuilder::new();
+    // Closes #741. The SA auto-upgrade observer is wired here so
+    // legacy `<event version=…>` payloads received over WebSocket
+    // feed the same `rustgate_sa_auto_upgraded_total{from_version}`
+    // counter as the TLS and UDP listeners.
+    let mut msg_builder = match sa_upgrade_observer {
+        Some(cb) => MessageBuilder::new().with_on_sa_upgraded(Arc::clone(cb)),
+        None => MessageBuilder::new(),
+    };
 
     loop {
         let frame = match tokio::time::timeout(READ_TIMEOUT, ws_read.next()).await {
@@ -721,6 +738,7 @@ mod tests {
             max_write_buffer_bytes: DEFAULT_MAX_WRITE_BUFFER_BYTES,
             health_check: HealthCheckConfig::DISABLED,
             session_hooks: None,
+            sa_upgrade_observer: None,
             shutdown,
         }
     }
@@ -1017,6 +1035,7 @@ mod tests {
                     panic!("on_connection_rejected must not fire on clean shutdown with no clients")
                 })),
             }),
+            sa_upgrade_observer: None,
             shutdown: Arc::clone(&shutdown),
         };
 
@@ -1356,6 +1375,7 @@ mod tests {
             max_write_buffer_bytes: DEFAULT_MAX_WRITE_BUFFER_BYTES,
             health_check: HealthCheckConfig::DISABLED,
             session_hooks: None,
+            sa_upgrade_observer: None,
             shutdown: Arc::clone(&shutdown),
         };
 
@@ -1421,6 +1441,7 @@ mod tests {
                 pong_timeout: Duration::from_secs(10),
             },
             session_hooks: None,
+            sa_upgrade_observer: None,
             shutdown: Arc::clone(&shutdown),
         };
 

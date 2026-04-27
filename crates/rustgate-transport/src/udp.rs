@@ -33,7 +33,7 @@ use parking_lot::Mutex;
 use rustgate_core::constants::PLAINTEXT_GROUP;
 use rustgate_core::identity::Identity;
 use rustgate_core::message::RoutableMessage;
-use rustgate_cot::MessageBuilder;
+use rustgate_cot::{MessageBuilder, OnSaAutoUpgraded};
 use rustgate_resilience::SlidingWindowLimiter;
 use rustgate_transport_types::{Router, SessionHandle};
 use tokio::net::UdpSocket;
@@ -162,7 +162,7 @@ impl FromStr for CidrPrefix {
 }
 
 /// Configuration for the UDP input listener.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UdpInputConfig {
     /// Default CN for UDP-sourced messages.
     pub cn: String,
@@ -178,6 +178,27 @@ pub struct UdpInputConfig {
     /// LRU cache. Once the cap is reached, packets from unknown source IPs
     /// are rejected to prevent memory exhaustion from spoofed sources.
     pub max_identities: usize,
+    /// Optional callback fired once per legacy-version SA payload that
+    /// the per-datagram [`MessageBuilder`] upgrades to the current
+    /// envelope. Wired by the server crate to feed
+    /// `rustgate_sa_auto_upgraded_total{from_version}`. Closes #741.
+    pub sa_upgrade_observer: Option<OnSaAutoUpgraded>,
+}
+
+impl std::fmt::Debug for UdpInputConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UdpInputConfig")
+            .field("cn", &self.cn)
+            .field("default_group", &self.default_group)
+            .field("max_pps", &self.max_pps)
+            .field("allowed_cidrs", &self.allowed_cidrs)
+            .field("max_identities", &self.max_identities)
+            .field(
+                "sa_upgrade_observer_installed",
+                &self.sa_upgrade_observer.is_some(),
+            )
+            .finish()
+    }
 }
 
 impl Default for UdpInputConfig {
@@ -188,6 +209,7 @@ impl Default for UdpInputConfig {
             max_pps: None,
             allowed_cidrs: None,
             max_identities: DEFAULT_MAX_UDP_IDENTITIES,
+            sa_upgrade_observer: None,
         }
     }
 }
@@ -218,6 +240,16 @@ impl UdpInputConfig {
     /// packets from new (unknown) source IPs are rejected.
     pub fn with_max_identities(mut self, max: usize) -> Self {
         self.max_identities = max;
+        self
+    }
+
+    /// Install the SA auto-upgrade observer. The callback fires once
+    /// per upgraded UDP datagram with the `from_version` label and is
+    /// wired to the
+    /// `rustgate_sa_auto_upgraded_total{from_version}` Prometheus
+    /// counter by the server binary. Closes #741.
+    pub fn with_sa_upgrade_observer(mut self, observer: OnSaAutoUpgraded) -> Self {
+        self.sa_upgrade_observer = Some(observer);
         self
     }
 }
@@ -287,7 +319,10 @@ impl UdpInput {
         );
 
         let mut buf = vec![0u8; MAX_DATAGRAM_SIZE];
-        let mut msg_builder = MessageBuilder::new();
+        let mut msg_builder = match config.sa_upgrade_observer.clone() {
+            Some(cb) => MessageBuilder::new().with_on_sa_upgraded(cb),
+            None => MessageBuilder::new(),
+        };
 
         // Register a single session handle for UDP so routed responses
         // have somewhere to go (they'll be silently dropped since UDP is

@@ -3243,6 +3243,7 @@ dependencies = [
  "bytes",
  "criterion",
  "lru",
+ "parking_lot",
  "proptest",
  "quick-xml",
  "rustgate-core",
