@@ -45,7 +45,6 @@ tonic = { workspace = true, features = ["codegen", "transport", "tls-ring", "tls
 tonic-prost = { workspace = true, optional = true }
 tokio-stream = { workspace = true, optional = true }
 tracing = { workspace = true }
-anyhow = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

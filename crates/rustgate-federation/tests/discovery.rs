@@ -92,7 +92,7 @@ struct StaticMockDiscovery {
 
 #[async_trait]
 impl PeerDiscovery for StaticMockDiscovery {
-    async fn discover(&self) -> anyhow::Result<Vec<PeerConfig>> {
+    async fn discover(&self) -> rustgate_federation::Result<Vec<PeerConfig>> {
         Ok(self.peers.lock().unwrap().clone())
     }
     fn backend_name(&self) -> &'static str {

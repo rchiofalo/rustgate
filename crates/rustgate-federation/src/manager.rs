@@ -23,6 +23,7 @@ use tracing::{Instrument, error, info, warn};
 use crate::config::FederationConfig;
 use crate::connector::{OutboundConnector, PeerConnector};
 use crate::dedup::MessageDedup;
+use crate::error::{FederationError, Result};
 use crate::peer::{PeerHandle, PeerStatus};
 use crate::replay_buffer::{BufferedMessage, ReplayBuffer};
 use crate::replay_persist::ReplayStore;
@@ -81,7 +82,7 @@ pub struct FederationManager {
     connector: Option<OutboundConnector>,
     v1_server: Option<V1Server>,
     #[cfg(feature = "v2")]
-    v2_server_handle: Option<JoinHandle<Result<(), tonic::transport::Error>>>,
+    v2_server_handle: Option<JoinHandle<std::result::Result<(), tonic::transport::Error>>>,
     clients: HashMap<PeerId, Arc<FederationClient>>,
     peers: HashMap<PeerId, Arc<PeerHandle>>,
     running: bool,
@@ -229,9 +230,9 @@ impl FederationManager {
     ///
     /// The `on_inbound` callback is invoked for every non-heartbeat message
     /// received from any federation peer (both inbound and outbound connections).
-    pub async fn start(&mut self, on_inbound: OnInbound) -> anyhow::Result<()> {
+    pub async fn start(&mut self, on_inbound: OnInbound) -> Result<()> {
         if self.running {
-            return Err(anyhow::anyhow!("federation manager is already running"));
+            return Err(FederationError::AlreadyRunning);
         }
 
         // Open the persistent replay store (issue #557) and rehydrate any
@@ -271,14 +272,14 @@ impl FederationManager {
         // cap covers RSA-4096 PKCS#8 PEM with comfortable headroom; the
         // 8 KiB token default is too tight for some private-key formats.
         let cert_pem = std::fs::read_to_string(&self.config.cert_file)
-            .map_err(|e| anyhow::anyhow!("read cert file: {e}"))?;
+            .map_err(|e| FederationError::io("read cert file", e))?;
         let key_pem = read_secret_file(
             &self.config.key_file,
             &SecretFileOpts::with_max_bytes(16 * 1024),
         )
-        .map_err(|e| anyhow::anyhow!("read key file: {e}"))?;
+        .map_err(|e| FederationError::other(format!("read key file: {e}")))?;
         let ca_pem = std::fs::read_to_string(&self.config.ca_file)
-            .map_err(|e| anyhow::anyhow!("read CA file: {e}"))?;
+            .map_err(|e| FederationError::io("read CA file", e))?;
 
         // Load trust store if configured. The trust store provides dynamic
         // CA management — certificates can be added/removed at runtime via
@@ -315,10 +316,10 @@ impl FederationManager {
             for cert_info in &ts.list_certificates()? {
                 if let Some(pem_bytes) = ts.get_certificate_pem(&cert_info.common_name)? {
                     let pem_str = std::str::from_utf8(&pem_bytes).map_err(|e| {
-                        anyhow::anyhow!(
+                        FederationError::other(format!(
                             "trust store certificate '{}' contains invalid UTF-8: {e}",
                             cert_info.common_name
-                        )
+                        ))
                     })?;
                     merged.push('\n');
                     merged.push_str(pem_str);
@@ -436,7 +437,7 @@ impl FederationManager {
                     }),
                     crls,
                 )
-                .map_err(|e| anyhow::anyhow!("build dynamic cert verifier: {e}"))?;
+                .map_err(|e| FederationError::other(format!("build dynamic cert verifier: {e}")))?;
 
                 let server_config =
                     tls_config.build_server_config_with_verifier(dynamic_verifier)?;
@@ -555,17 +556,22 @@ impl FederationManager {
         // ── HA initialization ─────────────────────────────────────────
         #[cfg(feature = "ha")]
         if let (Some(nats_url), Some(pod_id)) = (&self.config.ha_nats_url, &self.config.pod_id) {
-            let client = async_nats::connect(nats_url)
-                .await
-                .map_err(|e| anyhow::anyhow!("HA NATS connect to {nats_url}: {e}"))?;
+            let client = async_nats::connect(nats_url).await.map_err(|e| {
+                FederationError::HaNatsConnect {
+                    url: nats_url.clone(),
+                    detail: e.to_string(),
+                }
+            })?;
             let jetstream = async_nats::jetstream::new(client);
 
             let mut cm = crate::ha::claims::ClaimManager::new(jetstream.clone(), pod_id.clone())
                 .await
-                .map_err(|e| anyhow::anyhow!("create claim manager: {e}"))?;
+                .map_err(|e| FederationError::storage(format!("create claim manager: {e}")))?;
             let cr = crate::ha::registry::ConnectionRegistry::new(jetstream, pod_id.clone())
                 .await
-                .map_err(|e| anyhow::anyhow!("create connection registry: {e}"))?;
+                .map_err(|e| {
+                    FederationError::storage(format!("create connection registry: {e}"))
+                })?;
 
             let (adopt_tx, adopt_rx) = tokio::sync::mpsc::channel(HA_CHANNEL_CAPACITY);
             let (lost_tx, lost_rx) = tokio::sync::mpsc::channel(HA_CHANNEL_CAPACITY);
@@ -1449,30 +1455,37 @@ impl FederationManager {
     ///
     /// Requires that `start()` has been called (connector, on_inbound, etc. are set).
     /// Used by `adopt_peer()` (HA), `add_peer()`, and `swap_peers()` (hot reload).
-    pub fn connect_outbound_peer(
-        &mut self,
-        peer_config: &crate::config::PeerConfig,
-    ) -> anyhow::Result<()> {
+    pub fn connect_outbound_peer(&mut self, peer_config: &crate::config::PeerConfig) -> Result<()> {
         let connector = self
             .connector
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("connector not initialized (call start() first)"))?
+            .ok_or(FederationError::NotInitialized(
+                "connector not initialized (call start() first)",
+            ))?
             .clone();
         let on_inbound = self
             .on_inbound
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("on_inbound not set (call start() first)"))?
+            .ok_or(FederationError::NotInitialized(
+                "on_inbound not set (call start() first)",
+            ))?
             .clone();
         let v1_dedup = self
             .v1_dedup
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("v1_dedup not set (call start() first)"))?
+            .ok_or(FederationError::NotInitialized(
+                "v1_dedup not set (call start() first)",
+            ))?
             .clone();
 
-        let addr: std::net::SocketAddr = peer_config
-            .address
-            .parse()
-            .map_err(|e| anyhow::anyhow!("invalid peer address '{}': {e}", peer_config.address))?;
+        let addr: std::net::SocketAddr =
+            peer_config
+                .address
+                .parse()
+                .map_err(|e| FederationError::InvalidPeerAddress {
+                    address: peer_config.address.clone(),
+                    source: e,
+                })?;
 
         let peer = Arc::new(PeerHandle::with_circuit_breaker(
             peer_config.clone(),
@@ -1519,7 +1532,7 @@ impl FederationManager {
                 let v2_tls = self
                     .v2_tls_config
                     .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("v2_tls_config not set"))?
+                    .ok_or(FederationError::V2TlsConfigMissing)?
                     .clone();
 
                 let on_event = Self::create_v2_event_handler(
@@ -1559,10 +1572,10 @@ impl FederationManager {
                 );
             }
             other => {
-                return Err(anyhow::anyhow!(
+                return Err(FederationError::other(format!(
                     "unsupported protocol version {other} for peer {}",
                     peer_config.id
-                ));
+                )));
             }
         }
 
@@ -1575,7 +1588,7 @@ impl FederationManager {
     /// then creates a new outbound connection. Registers the connection in the
     /// HA registry.
     #[cfg(feature = "ha")]
-    pub async fn adopt_peer(&mut self, peer_id: &PeerId) -> anyhow::Result<()> {
+    pub async fn adopt_peer(&mut self, peer_id: &PeerId) -> Result<()> {
         // Find the peer config
         let peer_config = self
             .config
@@ -1583,9 +1596,7 @@ impl FederationManager {
             .iter()
             .find(|p| p.id == *peer_id && p.enabled && p.is_outbound)
             .cloned()
-            .ok_or_else(|| {
-                anyhow::anyhow!("no enabled outbound peer config found for '{peer_id}'")
-            })?;
+            .ok_or_else(|| FederationError::NoOutboundPeerConfig(peer_id.to_string()))?;
 
         // Already connected?
         if self.clients.contains_key(peer_id.as_str()) {
@@ -1597,7 +1608,7 @@ impl FederationManager {
         let fencing_token = if let Some(ref cm) = self.claim_manager {
             cm.try_claim(peer_id.as_str()).await
         } else {
-            return Err(anyhow::anyhow!("HA claim manager not initialized"));
+            return Err(FederationError::HaClaimManagerMissing);
         };
 
         let fencing_token = match fencing_token {
@@ -1707,7 +1718,7 @@ impl FederationManager {
     /// it is first disconnected and then reconnected with the new config.
     /// Disabled or inbound-only peers are stored in config but no client
     /// is started for them.
-    pub async fn add_peer(&mut self, peer_config: crate::config::PeerConfig) -> anyhow::Result<()> {
+    pub async fn add_peer(&mut self, peer_config: crate::config::PeerConfig) -> Result<()> {
         let id = peer_config.id.clone();
 
         if self.clients.contains_key(id.as_str()) {
@@ -3074,6 +3085,117 @@ mod tests {
     /// skips the audit emission. This test pins the "still forwards"
     /// guarantee so any future change to the conversion layer is caught.
     #[cfg(feature = "v2")]
+    #[tokio::test]
+    async fn connect_outbound_peer_without_start_returns_not_initialized_variant() {
+        // Construct a manager and skip `start()` — the connector,
+        // on_inbound, and v1_dedup slots are all `None`. Pin that
+        // every "uninitialized" branch maps to the typed
+        // `NotInitialized` variant rather than to the previous
+        // anyhow string. The Display string is also pinned to the
+        // verbatim pre-migration text to keep operator log greps
+        // working.
+        let mut mgr = FederationManager::new(test_config());
+        let cfg = PeerConfig {
+            id: "alpha".into(),
+            address: "10.0.0.1:9001".into(),
+            groups: vec![],
+            inbound_groups: None,
+            outbound_groups: None,
+            enabled: true,
+            is_outbound: true,
+            trust_cert_cn: None,
+            routing_mode: RoutingMode::default(),
+            protocol_version: 1,
+            jwt_token: None,
+            region: None,
+            zone: None,
+            priority: 100,
+            compression: None,
+        };
+        let err = mgr
+            .connect_outbound_peer(&cfg)
+            .expect_err("must error before start()");
+        match err {
+            crate::FederationError::NotInitialized(msg) => {
+                assert_eq!(msg, "connector not initialized (call start() first)");
+            }
+            other => panic!("expected NotInitialized variant, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_peer_with_invalid_address_returns_invalid_peer_address_variant() {
+        // `connect_outbound_peer` parses the address eagerly. With
+        // every `start()` slot populated, the next failure mode is
+        // the address parse — pin that it surfaces as the typed
+        // [`FederationError::InvalidPeerAddress`] variant carrying
+        // both the malformed input and the chained `AddrParseError`.
+        // Operators relying on the previous anyhow string can still
+        // grep "invalid peer address" in the Display rendering.
+        //
+        // Skip the start() handshake by pre-populating only the
+        // fields connect_outbound_peer reads before the parse: the
+        // connector, on_inbound, and v1_dedup. Real `start()` would
+        // do more, but the parse happens early enough that the
+        // synthetic state is sufficient for this contract test.
+        let mut mgr = FederationManager::new(test_config());
+
+        // Fabricate a connector + on_inbound + v1_dedup so the parse
+        // is reached. We intentionally do not start any real I/O.
+        use rustgate_test_utils::certs::TestCa;
+        let ca = TestCa::new("Test CA");
+        let client_cert = ca.issue_client_cert("test-client", &["Alpha"]);
+        let connector = OutboundConnector::Static(
+            PeerConnector::from_pem(
+                &client_cert.cert_pem,
+                &client_cert.key_pem,
+                &ca.cert_pem,
+                false,
+            )
+            .expect("static connector"),
+        );
+        mgr.connector = Some(connector);
+        mgr.on_inbound = Some(Arc::new(|_cn, _data| {}) as OnInbound);
+        mgr.v1_dedup = Some(Arc::new(Mutex::new(MessageDedup::new())));
+
+        let cfg = PeerConfig {
+            id: "bad-addr".into(),
+            address: "not a socket address".into(),
+            groups: vec![],
+            inbound_groups: None,
+            outbound_groups: None,
+            enabled: true,
+            is_outbound: true,
+            trust_cert_cn: None,
+            routing_mode: RoutingMode::default(),
+            protocol_version: 1,
+            jwt_token: None,
+            region: None,
+            zone: None,
+            priority: 100,
+            compression: None,
+        };
+        let err = mgr
+            .connect_outbound_peer(&cfg)
+            .expect_err("must error on bad addr");
+        match err {
+            crate::FederationError::InvalidPeerAddress {
+                ref address,
+                source: _,
+            } => {
+                assert_eq!(address, "not a socket address");
+            }
+            other => panic!("expected InvalidPeerAddress variant, got {other:?}"),
+        }
+        // Display still mentions the address, so the existing
+        // operator log greps continue to work.
+        assert!(
+            err.to_string()
+                .contains("invalid peer address 'not a socket address'"),
+            "display rendering should preserve the pre-migration prefix: {err}",
+        );
+    }
+
     #[tokio::test]
     async fn v2_handler_forwards_when_peer_groups_trusted() {
         use bytes::Bytes;

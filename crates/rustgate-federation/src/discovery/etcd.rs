@@ -24,6 +24,7 @@ use tracing::{debug, warn};
 
 use super::PeerDiscovery;
 use crate::config::{PeerConfig, RoutingMode};
+use crate::error::{FederationError, Result};
 
 /// etcd peer discovery source.
 ///
@@ -71,17 +72,19 @@ impl EtcdDiscovery {
     async fn get_or_connect<'a>(
         &'a self,
         guard: &'a mut tokio::sync::MutexGuard<'_, Option<Client>>,
-    ) -> anyhow::Result<&'a mut Client> {
+    ) -> Result<&'a mut Client> {
         if guard.is_none() {
             let client = Client::connect(self.endpoints.clone(), None)
                 .await
-                .map_err(|e| anyhow::anyhow!("failed to connect to etcd: {e}"))?;
+                .map_err(|e| {
+                    FederationError::discovery(format!("failed to connect to etcd: {e}"))
+                })?;
             **guard = Some(client);
         }
         // Safe unwrap: we just inserted `Some` above if the slot was empty.
         guard
             .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("etcd client slot unexpectedly empty"))
+            .ok_or_else(|| FederationError::discovery("etcd client slot unexpectedly empty"))
     }
 
     /// Convert an etcd key-value pair into a [`PeerConfig`]. Supports both
@@ -139,7 +142,7 @@ impl EtcdDiscovery {
 
 #[async_trait]
 impl PeerDiscovery for EtcdDiscovery {
-    async fn discover(&self) -> anyhow::Result<Vec<PeerConfig>> {
+    async fn discover(&self) -> Result<Vec<PeerConfig>> {
         let mut guard = self.client.lock().await;
         let result = async {
             let client = self.get_or_connect(&mut guard).await?;
@@ -147,7 +150,9 @@ impl PeerDiscovery for EtcdDiscovery {
             let resp = client
                 .get(self.prefix.clone(), Some(opts))
                 .await
-                .map_err(|e| anyhow::anyhow!("etcd GET {} failed: {e}", self.prefix))?;
+                .map_err(|e| {
+                    FederationError::discovery(format!("etcd GET {} failed: {e}", self.prefix))
+                })?;
             let kvs: Vec<(String, String)> = resp
                 .kvs()
                 .iter()
@@ -162,7 +167,7 @@ impl PeerDiscovery for EtcdDiscovery {
                 count = kvs.len(),
                 "etcd discovery returned peer entries"
             );
-            Ok::<_, anyhow::Error>(Self::parse_kvs(&self.prefix, &kvs))
+            Ok::<_, FederationError>(Self::parse_kvs(&self.prefix, &kvs))
         }
         .await;
 

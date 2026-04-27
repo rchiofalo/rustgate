@@ -24,6 +24,7 @@ use tokio_util::codec::Framed;
 use tracing::{debug, error, info, warn};
 
 use crate::connector::OutboundConnector;
+use crate::error::{FederationError, Result};
 use crate::heartbeat::{create_heartbeat, is_heartbeat};
 use crate::peer::{PeerHandle, PeerState};
 use crate::replay_buffer::BufferedMessage;
@@ -144,7 +145,7 @@ impl V1Client {
     /// Send a message to the remote peer.
     ///
     /// Returns an error if the send channel is full or the client is shut down.
-    pub async fn send(&self, data: Bytes) -> anyhow::Result<()> {
+    pub async fn send(&self, data: Bytes) -> Result<()> {
         let bytes_len = data.len();
         self.peer.record_enqueue(bytes_len);
         let permit = self.gate.as_ref().map(|g| Arc::new(g.acquire(bytes_len)));
@@ -157,7 +158,7 @@ impl V1Client {
                 // value (if any) drops automatically with the returned
                 // `SendError` when the caller propagates this error.
                 self.peer.record_dequeue();
-                Err(anyhow::anyhow!("V1 client send channel closed"))
+                Err(FederationError::other("V1 client send channel closed"))
             }
         }
     }
@@ -360,7 +361,7 @@ async fn run_session(
     outbound_rx: &mut mpsc::Receiver<V1Queued>,
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
     replay_messages: Vec<BufferedMessage>,
-) -> anyhow::Result<()> {
+) -> Result<()> {
     let peer_id = peer.id.clone();
     let codec = LengthPrefixedCodec::new(HeaderSize::Four);
     let mut framed = Framed::new(tls_stream, codec);
@@ -371,7 +372,7 @@ async fn run_session(
         framed
             .send(buf)
             .await
-            .map_err(|e| anyhow::anyhow!("replay send error: {e}"))?;
+            .map_err(|e| FederationError::other(format!("replay send error: {e}")))?;
         peer.record_sent();
     }
 
@@ -406,7 +407,7 @@ async fn run_session(
                         }
                     }
                     Some(Err(e)) => {
-                        return Err(anyhow::anyhow!("read error: {e}"));
+                        return Err(FederationError::other(format!("read error: {e}")));
                     }
                     None => {
                         return Ok(()); // peer closed connection
@@ -421,7 +422,7 @@ async fn run_session(
                         let buf = BytesMut::from(queued.data.as_ref());
                         peer.record_dequeue();
                         framed.send(buf).await
-                            .map_err(|e| anyhow::anyhow!("write error: {e}"))?;
+                            .map_err(|e| FederationError::other(format!("write error: {e}")))?;
                         peer.record_sent();
                         // `queued` drops here — releases the `BackpressurePermit`
                         // reservation (if any) back to the global gate.
@@ -438,17 +439,17 @@ async fn run_session(
                 let hb = create_heartbeat(&config.server_uid);
                 let buf = BytesMut::from(hb.as_ref());
                 framed.send(buf).await
-                    .map_err(|e| anyhow::anyhow!("heartbeat send error: {e}"))?;
+                    .map_err(|e| FederationError::other(format!("heartbeat send error: {e}")))?;
                 debug!(peer_id = %peer_id, "V1 heartbeat sent to peer");
             }
 
             // Check heartbeat timeout
             _ = heartbeat_check_interval.tick() => {
                 if last_heartbeat_received.elapsed() > config.heartbeat_timeout {
-                    return Err(anyhow::anyhow!(
+                    return Err(FederationError::other(format!(
                         "heartbeat timeout: no heartbeat in {:?}",
                         last_heartbeat_received.elapsed()
-                    ));
+                    )));
                 }
             }
 

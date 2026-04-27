@@ -15,6 +15,7 @@ pub mod kv;
 use std::time::SystemTime;
 
 use crate::config::RoutingMode;
+use crate::error::Result;
 
 /// Persistent information about a configured federation peer.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -71,10 +72,10 @@ pub struct FederateUpdate {
 /// Trait for federation peer persistence backends.
 pub trait FederateStore: Send + Sync {
     /// Load all federates from persistent storage.
-    fn load(&mut self) -> anyhow::Result<()>;
+    fn load(&mut self) -> Result<()>;
 
     /// Persist all federates to storage.
-    fn save(&self) -> anyhow::Result<()>;
+    fn save(&self) -> Result<()>;
 
     /// Add or replace a federate.
     fn add(&mut self, info: FederateInfo);
@@ -95,13 +96,13 @@ pub trait FederateStore: Send + Sync {
     fn remove(&mut self, id: &str) -> bool;
 
     /// Update fields on an existing federate. Returns the old address if changed.
-    fn update(&mut self, id: &str, update: FederateUpdate) -> anyhow::Result<Option<String>>;
+    fn update(&mut self, id: &str, update: FederateUpdate) -> Result<Option<String>>;
 
     /// Toggle the enabled flag.
-    fn set_enabled(&mut self, id: &str, enabled: bool) -> anyhow::Result<()>;
+    fn set_enabled(&mut self, id: &str, enabled: bool) -> Result<()>;
 
     /// Set the routing mode.
-    fn set_routing_mode(&mut self, id: &str, mode: RoutingMode) -> anyhow::Result<()>;
+    fn set_routing_mode(&mut self, id: &str, mode: RoutingMode) -> Result<()>;
 
     /// Update the last_seen timestamp.
     fn update_last_seen(&mut self, id: &str);

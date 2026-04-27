@@ -18,6 +18,7 @@ use tokio_util::bytes::BytesMut;
 use tokio_util::codec::Framed;
 use tracing::{debug, info, warn};
 
+use crate::error::{FederationError, Result};
 use crate::heartbeat::{create_heartbeat, is_heartbeat};
 
 /// Callback invoked for each non-heartbeat message received from a federation peer.
@@ -49,7 +50,7 @@ impl V1Server {
         heartbeat_timeout: Duration,
         on_message: OnMessage,
         max_message_size: Option<usize>,
-    ) -> anyhow::Result<Self> {
+    ) -> Result<Self> {
         let listener = TlsListener::bind(listen_addr, tls_config).await?;
         Self::start_with_listener(
             listener,
@@ -72,7 +73,7 @@ impl V1Server {
         heartbeat_timeout: Duration,
         on_message: OnMessage,
         max_message_size: Option<usize>,
-    ) -> anyhow::Result<Self> {
+    ) -> Result<Self> {
         let local_addr = listener.local_addr()?;
         info!(addr = %local_addr, "V1 federation server listening");
 
@@ -201,7 +202,7 @@ async fn handle_inbound_peer(
 
     // Main I/O loop: interleave reads, writes, and heartbeat checks
     let read_cn = peer_cn.clone();
-    let io_result: anyhow::Result<()> = async {
+    let io_result: Result<()> = async {
         loop {
             tokio::select! {
                 // Read from peer
@@ -216,7 +217,7 @@ async fn handle_inbound_peer(
                             }
                         }
                         Some(Err(e)) => {
-                            return Err(anyhow::anyhow!("read error: {e}"));
+                            return Err(FederationError::other(format!("read error: {e}")));
                         }
                         None => {
                             return Ok(()); // clean disconnect
@@ -229,7 +230,7 @@ async fn handle_inbound_peer(
                         Some(data) => {
                             let buf = BytesMut::from(data.as_ref());
                             if let Err(e) = framed.send(buf).await {
-                                return Err(anyhow::anyhow!("write error: {e}"));
+                                return Err(FederationError::other(format!("write error: {e}")));
                             }
                         }
                         None => {
@@ -240,10 +241,10 @@ async fn handle_inbound_peer(
                 // Check heartbeat timeout
                 _ = heartbeat_check_interval.tick() => {
                     if last_heartbeat_received.elapsed() > heartbeat_timeout {
-                        return Err(anyhow::anyhow!(
+                        return Err(FederationError::other(format!(
                             "heartbeat timeout: no heartbeat in {:?}",
                             last_heartbeat_received.elapsed()
-                        ));
+                        )));
                     }
                 }
             }

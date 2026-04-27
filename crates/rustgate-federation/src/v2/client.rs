@@ -21,6 +21,7 @@ use tracing::{debug, error, info, warn};
 use super::proto::figpb;
 use super::proto::figpb::federated_channel_client::FederatedChannelClient;
 use crate::config::CompressionKind;
+use crate::error::{FederationError, Result};
 use crate::peer::{PeerHandle, PeerState};
 use crate::provenance;
 use crate::replay_buffer::BufferedMessage;
@@ -154,7 +155,7 @@ impl V2Client {
     }
 
     /// Send a FederatedEvent to the remote peer.
-    pub async fn send(&self, event: figpb::FederatedEvent) -> anyhow::Result<()> {
+    pub async fn send(&self, event: figpb::FederatedEvent) -> Result<()> {
         use prost::Message;
         let bytes_len = event.encoded_len();
         self.peer.record_enqueue(bytes_len);
@@ -162,7 +163,7 @@ impl V2Client {
         let queued = V2Queued { event, permit };
         if self.outbound_tx.send(queued).await.is_err() {
             self.peer.record_dequeue();
-            return Err(anyhow::anyhow!("outbound channel closed"));
+            return Err(FederationError::other("outbound channel closed"));
         }
         Ok(())
     }
@@ -373,15 +374,15 @@ async fn connection_loop(
 }
 
 /// Build a tonic gRPC channel with TLS.
-async fn build_channel(address: &str, tls_config: ClientTlsConfig) -> anyhow::Result<Channel> {
+async fn build_channel(address: &str, tls_config: ClientTlsConfig) -> Result<Channel> {
     // Parse the address and ensure it has the https scheme
     let uri: Uri = format!("https://{address}")
         .parse()
-        .map_err(|e| anyhow::anyhow!("invalid address: {e}"))?;
+        .map_err(|e| FederationError::other(format!("invalid address: {e}")))?;
 
     let endpoint = Endpoint::from(uri)
         .tls_config(tls_config)
-        .map_err(|e| anyhow::anyhow!("TLS config error: {e}"))?
+        .map_err(|e| FederationError::other(format!("TLS config error: {e}")))?
         .connect_timeout(Duration::from_secs(30))
         .timeout(Duration::from_secs(300))
         // gRPC keepalive: ping every 10s, timeout after 5s, allow while idle.
@@ -393,7 +394,7 @@ async fn build_channel(address: &str, tls_config: ClientTlsConfig) -> anyhow::Re
     let channel = endpoint
         .connect()
         .await
-        .map_err(|e| anyhow::anyhow!("gRPC connect error: {e}"))?;
+        .map_err(|e| FederationError::other(format!("gRPC connect error: {e}")))?;
 
     Ok(channel)
 }
@@ -413,21 +414,21 @@ async fn run_streams(
     outbound_rx: &mut mpsc::Receiver<V2Queued>,
     shutdown_rx: &mut watch::Receiver<bool>,
     replay_messages: Vec<BufferedMessage>,
-) -> anyhow::Result<()> {
+) -> Result<()> {
     let sub = our_subscription(&config.federate_id);
 
     // --- Step 1: ServerFederateGroupsStream (receive remote groups) ---
     let mut server_groups_stream = client
         .server_federate_groups_stream(Request::new(sub.clone()))
         .await
-        .map_err(|e| anyhow::anyhow!("server_federate_groups_stream failed: {e}"))?
+        .map_err(|e| FederationError::other(format!("server_federate_groups_stream failed: {e}")))?
         .into_inner();
 
     // Wait for the first message to confirm recognition
     if let Some(first_msg) = server_groups_stream
         .message()
         .await
-        .map_err(|e| anyhow::anyhow!("failed to receive initial groups: {e}"))?
+        .map_err(|e| FederationError::other(format!("failed to receive initial groups: {e}")))?
     {
         info!(
             peer = %peer.id,
@@ -443,7 +444,9 @@ async fn run_streams(
     let _groups_resp = client
         .client_federate_groups_stream(Request::new(groups_stream))
         .await
-        .map_err(|e| anyhow::anyhow!("client_federate_groups_stream failed: {e}"))?;
+        .map_err(|e| {
+            FederationError::other(format!("client_federate_groups_stream failed: {e}"))
+        })?;
 
     // Send our initial groups
     let our_groups = figpb::FederateGroups {
@@ -459,7 +462,7 @@ async fn run_streams(
     groups_tx
         .send(our_groups)
         .await
-        .map_err(|_| anyhow::anyhow!("groups channel closed"))?;
+        .map_err(|_| FederationError::other("groups channel closed"))?;
 
     // --- Step 3: ServerEventStream (open for sending) ---
     let (send_tx, send_rx) = mpsc::channel::<figpb::FederatedEvent>(256);
@@ -468,13 +471,13 @@ async fn run_streams(
     let _send_resp = client
         .server_event_stream(Request::new(send_stream))
         .await
-        .map_err(|e| anyhow::anyhow!("server_event_stream failed: {e}"))?;
+        .map_err(|e| FederationError::other(format!("server_event_stream failed: {e}")))?;
 
     // --- Step 4: ClientEventStream (open for receiving) ---
     let mut recv_stream = client
         .client_event_stream(Request::new(sub.clone()))
         .await
-        .map_err(|e| anyhow::anyhow!("client_event_stream failed: {e}"))?
+        .map_err(|e| FederationError::other(format!("client_event_stream failed: {e}")))?
         .into_inner();
 
     // --- Connection established ---
@@ -498,7 +501,9 @@ async fn run_streams(
 
     if let Err(e) = health_result {
         warn!(peer = %peer.id, error = %e, "initial health check failed");
-        return Err(anyhow::anyhow!("initial health check failed: {e}"));
+        return Err(FederationError::other(format!(
+            "initial health check failed: {e}"
+        )));
     }
     let rtt_nanos = hc_start.elapsed().as_nanos() as u64;
     peer.record_rtt(rtt_nanos);
@@ -512,7 +517,7 @@ async fn run_streams(
             Ok(event) => {
                 if send_tx.send(event).await.is_err() {
                     warn!(peer = %peer.id, "send stream closed during replay");
-                    return Err(anyhow::anyhow!("send stream closed during replay"));
+                    return Err(FederationError::other("send stream closed during replay"));
                 }
                 peer.record_sent();
             }
@@ -551,7 +556,9 @@ async fn run_streams(
                     }
                     Err(e) => {
                         warn!(peer = %peer.id, error = %e, "receive stream error");
-                        return Err(anyhow::anyhow!("receive stream error: {e}"));
+                        return Err(FederationError::other(format!(
+                            "receive stream error: {e}"
+                        )));
                     }
                 }
             }
@@ -572,7 +579,9 @@ async fn run_streams(
                     }
                     Err(e) => {
                         warn!(peer = %peer.id, error = %e, "groups stream error");
-                        return Err(anyhow::anyhow!("groups stream error: {e}"));
+                        return Err(FederationError::other(format!(
+                            "groups stream error: {e}"
+                        )));
                     }
                 }
             }
@@ -613,7 +622,9 @@ async fn run_streams(
                     }
                     Err(e) => {
                         error!(peer = %peer.id, error = %e, "health check failed");
-                        return Err(anyhow::anyhow!("health check failed: {e}"));
+                        return Err(FederationError::other(format!(
+                            "health check failed: {e}"
+                        )));
                     }
                 }
             }

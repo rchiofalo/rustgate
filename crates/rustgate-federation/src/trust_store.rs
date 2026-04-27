@@ -15,12 +15,13 @@ use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{Context, Result};
 use rustls::RootCertStore;
 use rustls_pki_types::CertificateDer;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
+
+use crate::error::{FederationError, Result};
 
 /// Metadata about a stored certificate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,17 +90,24 @@ impl TrustStore {
         let store = Self::new(Some(dir.to_path_buf()));
 
         if !dir.exists() {
-            fs::create_dir_all(dir).with_context(|| {
-                format!("failed to create trust store directory: {}", dir.display())
+            fs::create_dir_all(dir).map_err(|e| {
+                FederationError::io(
+                    format!("failed to create trust store directory: {}", dir.display()),
+                    e,
+                )
             })?;
             return Ok(store);
         }
 
-        let entries = fs::read_dir(dir)
-            .with_context(|| format!("failed to read trust store directory: {}", dir.display()))?;
+        let entries = fs::read_dir(dir).map_err(|e| {
+            FederationError::io(
+                format!("failed to read trust store directory: {}", dir.display()),
+                e,
+            )
+        })?;
 
         for entry in entries {
-            let entry = entry?;
+            let entry = entry.map_err(|e| FederationError::io("reading trust store entry", e))?;
             let path = entry.path();
 
             if path.is_dir() {
@@ -153,7 +161,7 @@ impl TrustStore {
         // Shared helper — `parse_certs` already rejects empty inputs via
         // `ConfigError::EmptyPem`, so we lose the separate empty-check.
         let mut certs = rustgate_core::pem::parse_certs(pem_data)
-            .map_err(|e| anyhow::anyhow!("failed to parse PEM data: {e}"))?;
+            .map_err(|e| FederationError::pem("failed to parse PEM data", e))?;
 
         // Take the first certificate (safe: parse_certs guarantees non-empty).
         let der = certs.remove(0);
@@ -172,7 +180,7 @@ impl TrustStore {
             let mut certs = self
                 .certs
                 .write()
-                .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+                .map_err(|e| FederationError::lock("lock poisoned", e))?;
             let _ = certs.insert(cn.clone(), stored);
         }
         let _ = self.generation.fetch_add(1, Ordering::Release);
@@ -195,7 +203,7 @@ impl TrustStore {
         let removed = {
             let mut certs = self.certs.write().map_err(|e| {
                 error!("trust store lock poisoned — cannot remove certificate");
-                anyhow::anyhow!("trust store lock poisoned: {e}")
+                FederationError::lock("trust store lock poisoned", e)
             })?;
             certs.remove(cn).is_some()
         };
@@ -228,7 +236,7 @@ impl TrustStore {
     pub fn get_certificate_pem(&self, cn: &str) -> Result<Option<Vec<u8>>> {
         let certs = self.certs.read().map_err(|e| {
             error!("trust store lock poisoned — cannot retrieve certificate PEM");
-            anyhow::anyhow!("trust store lock poisoned: {e}")
+            FederationError::lock("trust store lock poisoned", e)
         })?;
         Ok(certs.get(cn).map(|c| c.pem.clone()))
     }
@@ -237,7 +245,7 @@ impl TrustStore {
     pub fn get_certificate_info(&self, cn: &str) -> Result<Option<CertInfo>> {
         let certs = self.certs.read().map_err(|e| {
             error!("trust store lock poisoned — cannot retrieve certificate info");
-            anyhow::anyhow!("trust store lock poisoned: {e}")
+            FederationError::lock("trust store lock poisoned", e)
         })?;
         Ok(certs.get(cn).map(|c| c.info.clone()))
     }
@@ -246,7 +254,7 @@ impl TrustStore {
     pub fn list_certificates(&self) -> Result<Vec<CertInfo>> {
         let certs = self.certs.read().map_err(|e| {
             error!("trust store lock poisoned — cannot list certificates");
-            anyhow::anyhow!("trust store lock poisoned: {e}")
+            FederationError::lock("trust store lock poisoned", e)
         })?;
         Ok(certs.values().map(|c| c.info.clone()).collect())
     }
@@ -255,7 +263,7 @@ impl TrustStore {
     pub fn count(&self) -> Result<usize> {
         let certs = self.certs.read().map_err(|e| {
             error!("trust store lock poisoned — cannot read certificate count");
-            anyhow::anyhow!("trust store lock poisoned: {e}")
+            FederationError::lock("trust store lock poisoned", e)
         })?;
         Ok(certs.len())
     }
@@ -274,7 +282,7 @@ impl TrustStore {
     pub fn is_trusted(&self, cn: &str) -> Result<bool> {
         let certs = self.certs.read().map_err(|e| {
             error!("trust store lock poisoned — cannot check certificate trust");
-            anyhow::anyhow!("trust store lock poisoned: {e}")
+            FederationError::lock("trust store lock poisoned", e)
         })?;
         Ok(certs.contains_key(cn))
     }
@@ -293,7 +301,7 @@ impl TrustStore {
             error!(
                 "trust store lock poisoned — cannot build root cert store, CA verification disabled"
             );
-            anyhow::anyhow!("trust store lock poisoned: {e}")
+            FederationError::lock("trust store lock poisoned", e)
         })?;
 
         for (cn, cert) in certs.iter() {
@@ -311,12 +319,12 @@ impl TrustStore {
         // Build the store from the base CA PEM via the shared helper; then
         // layer in per-peer certs tracked by this trust store.
         let mut store = rustgate_core::pem::parse_ca_store(base_pem)
-            .map_err(|e| anyhow::anyhow!("failed to parse base CA PEM: {e}"))?;
+            .map_err(|e| FederationError::pem("failed to parse base CA PEM", e))?;
 
         let certs = self
             .certs
             .read()
-            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+            .map_err(|e| FederationError::lock("lock poisoned", e))?;
 
         for (cn, cert) in certs.iter() {
             if let Err(e) = store.add(cert.der.clone()) {
@@ -331,7 +339,7 @@ impl TrustStore {
 /// Extract certificate metadata from DER-encoded certificate data.
 fn extract_cert_info(der: &CertificateDer<'_>) -> Result<CertInfo> {
     let (_, cert) = x509_parser::parse_x509_certificate(der.as_ref())
-        .map_err(|e| anyhow::anyhow!("failed to parse X.509 certificate: {e}"))?;
+        .map_err(|e| FederationError::X509(e.to_string()))?;
 
     let common_name = cert
         .subject()
@@ -374,11 +382,21 @@ fn extract_cert_info(der: &CertificateDer<'_>) -> Result<CertInfo> {
 /// Persist a certificate PEM to disk.
 fn persist_cert_to_disk(dir: &Path, cn: &str, pem_data: &[u8]) -> Result<()> {
     if !dir.exists() {
-        fs::create_dir_all(dir)?;
+        fs::create_dir_all(dir).map_err(|e| {
+            FederationError::io(
+                format!("failed to create trust store directory {}", dir.display()),
+                e,
+            )
+        })?;
     }
     let filename = sanitize_filename(cn);
     let path = dir.join(format!("{filename}.pem"));
-    fs::write(&path, pem_data)?;
+    fs::write(&path, pem_data).map_err(|e| {
+        FederationError::io(
+            format!("failed to write certificate to {}", path.display()),
+            e,
+        )
+    })?;
     Ok(())
 }
 

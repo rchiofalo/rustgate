@@ -28,6 +28,7 @@ pub mod dedup;
     feature = "peer-discovery-etcd"
 ))]
 pub mod discovery;
+pub mod error;
 #[cfg(feature = "ha")]
 pub mod ha;
 pub mod heartbeat;
@@ -46,3 +47,5 @@ pub mod v2;
 pub mod api;
 #[cfg(feature = "api")]
 pub mod metrics;
+
+pub use error::{FederationError, Result};
