@@ -59,6 +59,7 @@ fn api_state_construction() {
             pod_id: None,
         }),
         peer_status_fn,
+        jwks_fn: Arc::new(|| None),
     };
 
     // Verify debug formatting works
@@ -110,5 +111,6 @@ fn make_state() -> ApiState<FileStore> {
             pod_id: None,
         }),
         peer_status_fn: Arc::new(|_| None),
+        jwks_fn: Arc::new(|| None),
     }
 }

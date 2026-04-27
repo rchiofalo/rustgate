@@ -31,6 +31,14 @@
 //! ### Status
 //! - `GET /api/federation/stats`  -- aggregated statistics
 //! - `GET /api/federation/status` -- federation manager status
+//!
+//! ### JWKS (closes #760)
+//! - `GET /.well-known/jwks.json` -- RFC 7517 JSON Web Key Set
+//!   advertising the federation JWT verifier's currently-trusted public
+//!   keys. HS256 secrets are intentionally excluded from this view —
+//!   only ES256 / EdDSA public keys are published. See [`crate::jwks`]
+//!   for the key-rotation state machine and the algorithm-confusion
+//!   defense.
 
 mod handlers;
 mod helpers;
@@ -45,11 +53,13 @@ use hyper::{Method, Response, StatusCode};
 use self::handlers::{
     handle_add_certificate, handle_create_federate, handle_delete_certificate,
     handle_delete_federate, handle_enable_federate, handle_get_certificate, handle_get_connection,
-    handle_get_federate, handle_list_certificates, handle_list_connections, handle_list_federates,
-    handle_set_routing_mode, handle_stats, handle_status, handle_update_federate,
+    handle_get_federate, handle_jwks, handle_list_certificates, handle_list_connections,
+    handle_list_federates, handle_set_routing_mode, handle_stats, handle_status,
+    handle_update_federate,
 };
 use self::helpers::{json_error, percent_decode};
 pub use self::types::{CreateFederateRequest, SetRoutingModeRequest, UpdateFederateRequest};
+use crate::jwks::JwkSet;
 use crate::manager::FederationStatus;
 use crate::peer::PeerStatus;
 use crate::store::FederateStore;
@@ -57,6 +67,15 @@ use crate::trust_store::TrustStore;
 
 /// Callback type for looking up a peer's status by ID.
 pub type PeerStatusFn = Arc<dyn Fn(&str) -> Option<PeerStatus> + Send + Sync>;
+
+/// Callback type that returns the federation JWT verifier's
+/// currently-trusted JWKS. Keyed by the workspace's lock-free
+/// hot-reload pattern (see `transport::router`) so an operator can
+/// swap key material at runtime without restarting the API surface.
+/// Returning `None` (the default when JWT auth is not configured)
+/// causes `/.well-known/jwks.json` to respond with `404` so consumers
+/// can distinguish "JWKS not configured" from "empty key set".
+pub type JwkSetFn = Arc<dyn Fn() -> Option<JwkSet> + Send + Sync>;
 
 /// Shared state provided to the API handler.
 ///
@@ -72,6 +91,11 @@ pub struct ApiState<S: FederateStore> {
     pub status_fn: Arc<dyn Fn() -> FederationStatus + Send + Sync>,
     /// A closure that returns a specific peer's status by ID.
     pub peer_status_fn: PeerStatusFn,
+    /// A closure that returns the federation JWT verifier's
+    /// currently-trusted JWKS for `/.well-known/jwks.json`. Wire it
+    /// to `Arc::new(|| None)` to disable the endpoint (the handler
+    /// returns `404`). See [`crate::jwks`] for the rotation workflow.
+    pub jwks_fn: JwkSetFn,
 }
 
 impl<S: FederateStore> std::fmt::Debug for ApiState<S> {
@@ -82,9 +106,11 @@ impl<S: FederateStore> std::fmt::Debug for ApiState<S> {
 
 /// Handle a federation API request.
 ///
-/// Routes all requests under `/api/federation/` to the appropriate handler.
-/// Returns `None` if the request path does not start with `/api/federation/`,
-/// allowing the caller to fall through to other handlers.
+/// Routes all requests under `/api/federation/` to the appropriate
+/// handler, plus the cross-cutting RFC 8615 `/.well-known/jwks.json`
+/// endpoint that the JWT verifier publishes (closes #760). Returns
+/// `None` if the request path does not match either prefix, allowing
+/// the caller to fall through to other handlers.
 ///
 /// The `body` parameter should contain the pre-read request body bytes.
 pub fn handle_request<S: FederateStore>(
@@ -93,6 +119,13 @@ pub fn handle_request<S: FederateStore>(
     body: &[u8],
     state: &ApiState<S>,
 ) -> Option<Response<Full<Bytes>>> {
+    // RFC 8615 well-known prefix carries the JWKS endpoint. We honour
+    // GET only — POST/PUT against a discovery URI is meaningless and
+    // some clients probe with HEAD; falling through to 404 is fine.
+    if path == "/.well-known/jwks.json" && method == Method::GET {
+        return Some(handle_jwks(state));
+    }
+
     if !path.starts_with("/api/federation/") {
         return None;
     }
@@ -196,6 +229,7 @@ mod tests {
                 pod_id: None,
             }),
             peer_status_fn: Arc::new(|_id| None),
+            jwks_fn: Arc::new(|| None),
         }
     }
 
@@ -319,6 +353,7 @@ mod tests {
                 ha_enabled: false,
                 pod_id: None,
             }),
+            jwks_fn: Arc::new(|| None),
             peer_status_fn: Arc::new(|id| {
                 if id == "peer-1" {
                     Some(PeerStatus {
@@ -617,6 +652,7 @@ mod tests {
                 pod_id: None,
             }),
             peer_status_fn: Arc::new(|_| None),
+            jwks_fn: Arc::new(|| None),
         };
 
         let resp = handle_add_certificate(&state, &pem_bytes);
@@ -846,5 +882,106 @@ mod tests {
     fn internal_error_response_returns_500() {
         let resp = internal_error_response();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // ── JWKS endpoint tests (closes #760) ───────────────────────
+
+    /// JWKS endpoint returns 404 when no provider is wired up — the
+    /// caller can distinguish "JWKS not configured" from "empty keys".
+    #[test]
+    fn jwks_endpoint_returns_404_when_unconfigured() {
+        let state = make_state();
+        let resp = handle_request(&Method::GET, "/.well-known/jwks.json", &[], &state).expect("h");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Wired-up JWKS endpoint serves an RFC 7517 envelope with the
+    /// expected `keys` field, the right content-type, and a
+    /// `cache-control` header so verifiers don't hammer the endpoint.
+    #[test]
+    fn jwks_endpoint_serves_jwk_set_with_rfc7517_envelope() {
+        use crate::jwks::{Jwk, JwkSet};
+
+        let store = crate::store::file::FileStore::new(None);
+        let trust_store = TrustStore::new(None);
+        let jwk = Jwk {
+            kty: "EC".to_string(),
+            kid: "k-1".to_string(),
+            alg: "ES256".to_string(),
+            r#use: "sig".to_string(),
+            crv: Some("P-256".to_string()),
+            x: Some("AAAA".to_string()),
+            y: Some("BBBB".to_string()),
+        };
+        let jwks = JwkSet { keys: vec![jwk] };
+        let state = ApiState {
+            store: Arc::new(std::sync::RwLock::new(store)),
+            trust_store: Arc::new(trust_store),
+            status_fn: Arc::new(|| FederationStatus {
+                running: false,
+                v1_server_active: false,
+                v2_server_active: false,
+                total_peers: 0,
+                connected_peers: 0,
+                peers: vec![],
+                ha_enabled: false,
+                pod_id: None,
+            }),
+            peer_status_fn: Arc::new(|_| None),
+            jwks_fn: Arc::new(move || Some(jwks.clone())),
+        };
+
+        let resp = handle_request(&Method::GET, "/.well-known/jwks.json", &[], &state).expect("h");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/jwk-set+json")
+        );
+        assert!(
+            resp.headers().get("cache-control").is_some(),
+            "JWKS responses must carry a cache-control hint"
+        );
+
+        let body = body_string(resp);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).expect("JWKS body must be valid JSON");
+        let keys = parsed
+            .get("keys")
+            .and_then(|v| v.as_array())
+            .expect("JWKS must have a `keys` array");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(
+            keys[0].get("kid").and_then(|v| v.as_str()),
+            Some("k-1"),
+            "kid must round-trip through the wire"
+        );
+        assert_eq!(keys[0].get("alg").and_then(|v| v.as_str()), Some("ES256"));
+        assert_eq!(keys[0].get("kty").and_then(|v| v.as_str()), Some("EC"));
+    }
+
+    /// JWKS only responds to GET — POST / PUT against the discovery
+    /// URI must fall through to the default not-found path so a
+    /// caller cannot upload JWKS material via the public endpoint.
+    #[test]
+    fn jwks_endpoint_rejects_non_get_methods() {
+        let state = make_state();
+        // Provide a JwkSet so we know any non-GET response is purely
+        // method-driven, not "not configured".
+        let store = crate::store::file::FileStore::new(None);
+        let trust_store = TrustStore::new(None);
+        let state = ApiState {
+            store: Arc::new(std::sync::RwLock::new(store)),
+            trust_store: Arc::new(trust_store),
+            status_fn: state.status_fn.clone(),
+            peer_status_fn: state.peer_status_fn.clone(),
+            jwks_fn: Arc::new(|| Some(crate::jwks::JwkSet { keys: vec![] })),
+        };
+        let post = handle_request(&Method::POST, "/.well-known/jwks.json", &[], &state);
+        assert!(
+            post.is_none(),
+            "POST against JWKS must not match — fall through to 404"
+        );
     }
 }
