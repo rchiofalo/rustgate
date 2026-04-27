@@ -9,6 +9,13 @@ spec:
   {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
   {{- end }}
+  {{- with .Values.deployment.strategy }}
+  strategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.deployment.minReadySeconds }}
+  minReadySeconds: {{ . }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "rustgate.selectorLabels" . | nindent 6 }}
@@ -16,6 +23,10 @@ spec:
     metadata:
       labels:
         {{- include "rustgate.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
     spec:
       {{- if .Values.serviceAccount.create }}
       serviceAccountName: {{ .Values.serviceAccount.name | default (include "rustgate.fullname" .) }}
@@ -226,19 +237,27 @@ spec:
             failureThreshold: 30
             periodSeconds: 2
           livenessProbe:
+            {{- with .Values.deployment.livenessProbe }}
+            {{- toYaml . | nindent 12 }}
+            {{- else }}
             httpGet:
               path: /health/live
               port: metrics
             initialDelaySeconds: 5
             periodSeconds: 10
             failureThreshold: 3
+            {{- end }}
           readinessProbe:
+            {{- with .Values.deployment.readinessProbe }}
+            {{- toYaml . | nindent 12 }}
+            {{- else }}
             httpGet:
               path: /health/ready
               port: metrics
             initialDelaySeconds: 3
             periodSeconds: 5
             failureThreshold: 3
+            {{- end }}
           {{- else }}
           startupProbe:
             tcpSocket:
@@ -246,20 +265,32 @@ spec:
             failureThreshold: 30
             periodSeconds: 2
           livenessProbe:
+            {{- with .Values.deployment.livenessProbe }}
+            {{- toYaml . | nindent 12 }}
+            {{- else }}
             tcpSocket:
               port: tak
             initialDelaySeconds: 5
             periodSeconds: 10
+            {{- end }}
           readinessProbe:
+            {{- with .Values.deployment.readinessProbe }}
+            {{- toYaml . | nindent 12 }}
+            {{- else }}
             tcpSocket:
               port: tak
             initialDelaySeconds: 3
             periodSeconds: 5
+            {{- end }}
           {{- end }}
           lifecycle:
+            {{- with .Values.deployment.lifecycle }}
+            {{- toYaml . | nindent 12 }}
+            {{- else }}
             preStop:
               exec:
                 command: ["sleep", "5"]
+            {{- end }}
           volumeMounts:
             - name: tls-certs
               mountPath: /certs

@@ -1,0 +1,87 @@
+# Canary deployment values for rolling-update with manual gate.
+#
+# Usage:
+#   helm upgrade rustgate ./helm -f values.yaml -f values-canary.yaml
+#
+# This file overrides the default deployment strategy with a canary-
+# friendly pattern: 1-pod surge, 0-pod unavailable, 30s min-ready
+# window, preStop drain hook for in-flight connection bleed-off, and
+# tightened readiness/liveness probes for early failure detection
+# during a rollout. Closes #818 (F-142).
+#
+# This overlay assumes a 3-replica baseline (matches values-production
+# .yaml). With maxSurge=1 / maxUnavailable=0, an upgrade brings up one
+# new pod, waits 30s of `Ready=true` before counting it healthy, then
+# terminates one old pod. The cycle repeats per replica until the
+# rollout completes — at no point is the cluster below its target
+# replica count.
+#
+# preStop discipline: rustgate's own SubsystemHandle drain runs on
+# SIGTERM with a 5s grace, but the kubelet sends SIGTERM before the
+# load balancer has fully removed the pod from rotation. The preStop
+# hook bridges that gap: it best-effort-pokes a drain endpoint (the
+# `|| true` swallows the no-route case so the hook stays compatible
+# across rustgate versions that may or may not expose the drain HTTP
+# endpoint), then sleeps 5s so in-flight TLS sessions can complete
+# their last frame before the runtime tears down the listener.
+#
+# `terminationGracePeriodSeconds` is inherited from values.yaml at 120s
+# — long enough to cover the preStop sleep (5s) plus the rustgate drain
+# timeout (110s) plus container-runtime overhead.
+
+deployment:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  minReadySeconds: 30
+
+  # preStop hook drains in-flight connections before pod termination.
+  # The curl call best-effort-pokes the management API drain endpoint
+  # (the `|| true` keeps the hook portable across rustgate versions);
+  # the trailing sleep gives the load balancer / service mesh time to
+  # remove the pod from rotation before SIGTERM.
+  lifecycle:
+    preStop:
+      exec:
+        command:
+          - /bin/sh
+          - -c
+          - 'curl -fsS -X POST http://localhost:9090/api/drain || true; sleep 5'
+
+  # Liveness/readiness tightened for canary scenarios where a false
+  # negative during rollout (a pod that briefly stalls during cert
+  # warm-up but then recovers) is far less expensive than a false
+  # positive (declaring a sick pod healthy and routing user traffic
+  # at it). The baseline values.yaml settings are slightly looser to
+  # tolerate cold-start variance on un-canaried clusters.
+  readinessProbe:
+    httpGet:
+      path: /health/ready
+      port: metrics
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+
+  livenessProbe:
+    httpGet:
+      path: /health/live
+      port: metrics
+    initialDelaySeconds: 30
+    periodSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+# Annotations for service-mesh canary integration. Linkerd's
+# `proxy-await` makes the proxy hold inbound traffic until the
+# application is ready, removing a connection-refused window during
+# pod startup. The Prometheus annotations let mesh-aware scrapers
+# discover the metrics port without explicit ServiceMonitor config —
+# operators who already run the Prometheus Operator should also enable
+# `metrics.serviceMonitor.enabled` for the structured path.
+podAnnotations:
+  config.linkerd.io/proxy-await: "enabled"
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "9090"

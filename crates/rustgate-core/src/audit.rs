@@ -821,6 +821,45 @@ pub fn authz_reload_failed(path: &str, stage: &str, error: &str) {
     );
 }
 
+/// Record that a failed config hot-reload rolled back to the previously
+/// installed policy.
+///
+/// Emitted alongside [`authz_reload_failed`] (and the equivalent reload-
+/// failure helpers for other subsystems) at every call site where the
+/// new on-disk policy was rejected during validate/parse/compile and the
+/// in-memory engine therefore stays at its previous version. Pre-this-
+/// event, operators only learned about the rollback by correlating
+/// tracing logs; the explicit rollback record now gives SIEMs a single
+/// structured event to alert on.
+///
+/// `reason` is a short operator-facing description ("parse error",
+/// "rule cap exceeded", "task panicked", etc.) and is paired with the
+/// failure reason already carried by the preceding `*_reload_failed`
+/// emission. `previous_policy_id` is the id of the policy that remains
+/// in effect — operators page on a rollback they did not initiate, and
+/// the stable policy id lets them confirm which policy version is still
+/// serving traffic without scraping the next reload-success event.
+///
+/// Sanitization: `reason` and the optional `previous_policy_id` are
+/// sanitized at the audit boundary; callers do not need to wrap them.
+///
+/// The `previous_policy_id` field is rendered as the empty string when
+/// no previous policy was installed (e.g. the very first reload after
+/// startup failed), matching the convention adopted by
+/// [`authz_classified_delivery`] and [`authz_denied`] for absent rule
+/// identifiers.
+pub fn authz_reload_rollback(reason: &str, previous_policy_id: Option<&str>) {
+    let reason = s(reason);
+    let previous_policy_id = previous_policy_id.map(s).unwrap_or_default();
+    audit!(
+        "authz.reload_rollback",
+        reason = %reason,
+        previous_policy_id = %previous_policy_id,
+        action = "rollback",
+        result = "success"
+    );
+}
+
 /// Record a hash-chained audit-log discontinuity detected at startup.
 ///
 /// Emitted when the persisted anchor tip in `<audit_path>.anchor` does not
@@ -1441,6 +1480,23 @@ mod tests {
         }
     }
 
+    mod authz_reload_rollback_helper {
+        use super::*;
+
+        #[test]
+        fn test_authz_reload_rollback() {
+            // Smoke: every supported call shape (with and without a
+            // previous_policy_id) must render through the audit macro
+            // without panicking, mirroring the discipline applied to the
+            // sibling `authz_reload_failed` and `authz_reload_success`
+            // helpers.
+            authz_reload_rollback("parse error", Some("policy-2026-04-25-1"));
+            authz_reload_rollback("rule cap exceeded", Some("policy-prev"));
+            authz_reload_rollback("read error: file not found", None);
+            authz_reload_rollback("", None);
+        }
+    }
+
     mod certificate_issued {
         use super::*;
 
@@ -1826,6 +1882,84 @@ mod tests {
             assert!(
                 !cn.contains('\u{FFFD}'),
                 "no replacement codepoint should appear for already-safe input: {cn:?}"
+            );
+        }
+
+        #[test]
+        fn authz_reload_rollback_emits_documented_shape() {
+            // Pins the wire-format contract for issue #818: SIEM rules
+            // alert on `event_type == "authz.reload_rollback"` and
+            // `action == "rollback"`. A future refactor that renames
+            // either field would silently break those rules, so capture
+            // the JSON output and pin the shape end-to-end.
+            let snapshot =
+                capture_audit(|| authz_reload_rollback("parse error", Some("policy-2026-04-25-1")));
+            let event = parse_event(&snapshot, "authz.reload_rollback");
+            assert_eq!(
+                event["fields"]["event_type"]
+                    .as_str()
+                    .expect("event_type must be a JSON string"),
+                "authz.reload_rollback",
+            );
+            assert_eq!(
+                event["fields"]["action"]
+                    .as_str()
+                    .expect("action must be a JSON string"),
+                "rollback",
+            );
+            assert_eq!(
+                event["fields"]["result"]
+                    .as_str()
+                    .expect("result must be a JSON string"),
+                "success",
+            );
+            assert_eq!(
+                event["fields"]["reason"]
+                    .as_str()
+                    .expect("reason must be a JSON string"),
+                "parse error",
+            );
+            assert_eq!(
+                event["fields"]["previous_policy_id"]
+                    .as_str()
+                    .expect("previous_policy_id must be a JSON string when Some"),
+                "policy-2026-04-25-1",
+            );
+        }
+
+        #[test]
+        fn authz_reload_rollback_sanitizes_reason_and_policy_id() {
+            // The rollback emission point sees attacker-controlled data
+            // through the upstream policy file (a malicious reviewer
+            // could ship a policy file with control characters in its
+            // id, then trigger a rollback to surface the field through
+            // the rollback record). Both `reason` and
+            // `previous_policy_id` MUST sanitize at the boundary.
+            let malicious_reason = "compile failed\n\x1b[31m[FAKE ALERT]\x1b[0m";
+            let malicious_policy_id = "policy-x\r\nfake_event=injected";
+            let snapshot = capture_audit(|| {
+                authz_reload_rollback(malicious_reason, Some(malicious_policy_id))
+            });
+            let event = parse_event(&snapshot, "authz.reload_rollback");
+            let reason = event["fields"]["reason"]
+                .as_str()
+                .expect("reason must be a JSON string");
+            let policy_id = event["fields"]["previous_policy_id"]
+                .as_str()
+                .expect("previous_policy_id must be a JSON string when Some");
+            for forbidden in &['\n', '\r', '\x1b'] {
+                assert!(
+                    !reason.contains(*forbidden),
+                    "reason: forge byte {forbidden:?} must be replaced: {reason:?}"
+                );
+                assert!(
+                    !policy_id.contains(*forbidden),
+                    "policy_id: forge byte {forbidden:?} must be replaced: {policy_id:?}"
+                );
+            }
+            assert!(
+                reason.contains('\u{FFFD}') && policy_id.contains('\u{FFFD}'),
+                "sanitized fields must contain U+FFFD"
             );
         }
     }

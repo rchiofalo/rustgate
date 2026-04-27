@@ -197,6 +197,33 @@ impl AuthzReloader {
         })
     }
 
+    /// Snapshot the policy id of the currently installed engine, if
+    /// any. Used by [`Self::emit_rollback`] so the rollback audit
+    /// record names the policy version that remains in effect after a
+    /// failed reload — closes #818 (F-144).
+    fn current_policy_id(&self) -> Option<String> {
+        self.router
+            .authz_snapshot()
+            .map(|engine| engine.policy_id().to_string())
+    }
+
+    /// Emit the structured rollback audit event and increment the
+    /// `rustgate_reload_rollback_total{subsystem="authz"}` metric
+    /// at every reload-failure point in [`Self::reload`].
+    ///
+    /// `reason` is a short stage tag (`"read"`, `"parse"`, `"compile"`,
+    /// `"validate"`) so SIEM rules can distinguish drift sources at a
+    /// glance; the upstream `authz_reload_failed` event still carries
+    /// the full error text. The previous policy id is captured fresh on
+    /// each call so a concurrent admin-API mutation does not pin a
+    /// stale identifier into the audit record.
+    fn emit_rollback(&self, reason: &str) {
+        let prev = self.current_policy_id();
+        audit::authz_reload_rollback(reason, prev.as_deref());
+        #[cfg(feature = "metrics")]
+        crate::metrics::record_reload_rollback("authz");
+    }
+
     /// Re-read the policy file and swap if changed. Returns `Ok(true)`
     /// when the engine was swapped, `Ok(false)` when the file was
     /// unchanged. Errors are already audited by [`load_once`].
@@ -212,6 +239,7 @@ impl AuthzReloader {
                     "read",
                     &e.to_string(),
                 );
+                self.emit_rollback("read");
                 return Err(anyhow::anyhow!(
                     "failed to read authz policy file {}: {e}",
                     self.path.display()
@@ -238,17 +266,25 @@ impl AuthzReloader {
             Ok(rs) => rs,
             Err(e) => {
                 audit::authz_reload_failed(&path_display, "parse", &e.to_string());
+                self.emit_rollback("parse");
                 return Err(anyhow::anyhow!(
                     "failed to parse authz policy file {path_display}: {e}"
                 ));
             }
         };
         let rule_count = rule_set.rules.len();
-        check_rule_count(rule_count, &path_display)?;
+        check_rule_count(rule_count, &path_display).inspect_err(|_| {
+            // `check_rule_count` already emitted the validate-stage
+            // `authz.reload_failed`. Pair it here with the rollback
+            // record so the metric and SIEM signals match the other
+            // failure paths in this function.
+            self.emit_rollback("validate");
+        })?;
         let engine = match NativeEngine::new(rule_set) {
             Ok(eng) => eng,
             Err(e) => {
                 audit::authz_reload_failed(&path_display, "compile", &e.to_string());
+                self.emit_rollback("compile");
                 return Err(anyhow::anyhow!(
                     "failed to compile authz policy file {path_display}: {e}"
                 ));
@@ -301,6 +337,12 @@ impl AuthzReloader {
                         );
                         #[cfg(feature = "metrics")]
                         crate::metrics::record_authz_reload(false, None);
+                        // Inner `reload()` already emitted the
+                        // matching `authz.reload_rollback` audit
+                        // event and incremented
+                        // `rustgate_reload_rollback_total{subsystem="authz"}`
+                        // at the precise failure stage; do not
+                        // double-emit here.
                     }
                     Err(e) => {
                         warn!(
@@ -310,6 +352,14 @@ impl AuthzReloader {
                         );
                         #[cfg(feature = "metrics")]
                         crate::metrics::record_authz_reload(false, None);
+                        // Task-panic path: the inner `reload()` never
+                        // returned, so nothing emitted the rollback
+                        // signal yet. Fire it here against whatever
+                        // policy id is currently installed so the
+                        // operator dashboard distinguishes a panic-
+                        // rollback (rare but possible) from the
+                        // file-error rollback.
+                        reloader.emit_rollback("task_panicked");
                     }
                 }
             }

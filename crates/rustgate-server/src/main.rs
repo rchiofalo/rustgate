@@ -917,8 +917,18 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
                                 "startup",
                                 &e.to_string(),
                             );
+                            // Fail-open startup is the operational
+                            // equivalent of a rollback to "no policy
+                            // installed" — no engine was previously
+                            // loaded, so the rollback record carries
+                            // `previous_policy_id = None`. Closes
+                            // #818 (F-144).
+                            rustgate_core::audit::authz_reload_rollback("startup", None);
                             #[cfg(feature = "metrics")]
-                            metrics::record_authz_reload(false, None);
+                            {
+                                metrics::record_authz_reload(false, None);
+                                metrics::record_reload_rollback("authz");
+                            }
                             tracing::warn!(
                                 path = %authz_path,
                                 error = %e,
@@ -1015,8 +1025,15 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
                         "startup",
                         &e.to_string(),
                     );
+                    // Fail-open startup is the operational equivalent
+                    // of a rollback to "no policy installed". Closes
+                    // #818 (F-144).
+                    rustgate_core::audit::authz_reload_rollback("startup", None);
                     #[cfg(feature = "metrics")]
-                    metrics::record_authz_reload(false, None);
+                    {
+                        metrics::record_authz_reload(false, None);
+                        metrics::record_reload_rollback("authz");
+                    }
                     tracing::warn!(
                         path = %authz_path,
                         error = %e,
