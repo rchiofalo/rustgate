@@ -3288,6 +3288,7 @@ dependencies = [
 name = "rustgate-federation"
 version = "0.8.0"
 dependencies = [
+ "arc-swap",
  "async-nats",
  "async-trait",
  "bytes",

@@ -306,6 +306,46 @@ pub(crate) fn handle_status<S: FederateStore>(state: &ApiState<S>) -> Response<F
     json_ok(&status)
 }
 
+// ── JWKS handler (closes #760) ──────────────────────────────────────
+
+/// Serve the federation JWT verifier's currently-trusted JWKS at
+/// `/.well-known/jwks.json`. Returns RFC 7517 envelope `{"keys": […]}`.
+///
+/// The response body is a bare JWKS document, not the workspace's
+/// `{"data": …}` envelope used by the rest of the management API —
+/// JWKS is a public-spec endpoint that third-party JWT libraries
+/// expect to deserialize without unwrapping. The content-type is
+/// `application/jwk-set+json` per RFC 7517 §8.5.
+///
+/// When [`super::ApiState::jwks_fn`] returns `None` the endpoint
+/// responds `404 Not Found` so consumers can distinguish "JWKS not
+/// configured" (federation JWT auth disabled) from "empty key set"
+/// (configured but no asymmetric verifiers registered).
+pub(crate) fn handle_jwks<S: FederateStore>(state: &ApiState<S>) -> Response<Full<Bytes>> {
+    let Some(jwks) = (state.jwks_fn)() else {
+        return json_error(StatusCode::NOT_FOUND, "JWKS not configured");
+    };
+    let body = match serde_json::to_vec(&jwks) {
+        Ok(b) => b,
+        Err(e) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("JWKS serialization failed: {e}"),
+            );
+        }
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/jwk-set+json")
+        // RFC 8615: a discovery URI is cacheable for short windows.
+        // Five minutes balances "operator rotated a key and wants
+        // verifiers to pick it up" against "verifier hammers JWKS
+        // every request".
+        .header("cache-control", "public, max-age=300")
+        .body(Full::new(Bytes::from(body)))
+        .unwrap_or_else(|_| super::helpers::internal_error_response())
+}
+
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
@@ -404,6 +444,7 @@ mod tests {
             trust_store: Arc::new(TrustStore::new(None)),
             status_fn,
             peer_status_fn,
+            jwks_fn: Arc::new(|| None),
         }
     }
 

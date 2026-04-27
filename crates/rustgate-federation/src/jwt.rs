@@ -243,6 +243,36 @@ enum VerificationKey {
     EdDsa(Vec<u8>),
 }
 
+/// Read-only view of a verifier key, exposed for JWKS serialization.
+///
+/// The HS256 variant carries no payload — the symmetric secret never
+/// leaves [`JwtAuthority`] for any purpose, including JWKS publication.
+/// Callers that walk the verifier registry through [`JwtAuthority::verifier_views`]
+/// can still see that an HS256 entry exists (so they may surface a
+/// configuration warning) but they cannot read the secret bytes.
+#[derive(Debug)]
+pub enum VerificationKeyView<'a> {
+    /// Symmetric HS256 verifier — secret intentionally hidden.
+    Hs256,
+    /// ECDSA P-256 SEC1 uncompressed point (65 bytes).
+    Es256(&'a [u8]),
+    /// Raw Ed25519 public key (32 bytes).
+    EdDsa(&'a [u8]),
+}
+
+impl<'a> VerificationKeyView<'a> {
+    /// Re-borrow this view at its original lifetime — useful when an
+    /// `Iterator::map` collects views into a `Vec` and then needs to
+    /// hand them out to `build_jwk_set` without consuming the vector.
+    pub fn borrow(&self) -> VerificationKeyView<'a> {
+        match self {
+            VerificationKeyView::Hs256 => VerificationKeyView::Hs256,
+            VerificationKeyView::Es256(b) => VerificationKeyView::Es256(b),
+            VerificationKeyView::EdDsa(b) => VerificationKeyView::EdDsa(b),
+        }
+    }
+}
+
 impl VerificationKey {
     fn algorithm(&self) -> Algorithm {
         match self {
@@ -704,6 +734,59 @@ impl JwtAuthority {
             Ok(r) => r.entries.len(),
             Err(poisoned) => poisoned.into_inner().entries.len(),
         }
+    }
+
+    /// Walk the per-`kid` verifier registry as read-only views suitable
+    /// for JWKS serialization. The HS256 secret bytes are deliberately
+    /// hidden in [`VerificationKeyView::Hs256`] — symmetric secrets are
+    /// never exposed outside the authority.
+    ///
+    /// The returned vector owns the kid `String` keys; the views borrow
+    /// from `self` and remain valid as long as the authority does. The
+    /// `legacy_verifier` (if present) is omitted because it has no
+    /// `kid` to publish in JWKS, and HS256 secrets are filtered at the
+    /// JWKS-build step regardless.
+    pub fn verifier_views(&self) -> Vec<(String, VerificationKeyView<'_>)> {
+        self.verifiers
+            .iter()
+            .map(|(kid, key)| {
+                let view = match key {
+                    VerificationKey::Hs256(_) => VerificationKeyView::Hs256,
+                    VerificationKey::Es256(b) => VerificationKeyView::Es256(b),
+                    VerificationKey::EdDsa(b) => VerificationKeyView::EdDsa(b),
+                };
+                (kid.clone(), view)
+            })
+            .collect()
+    }
+
+    /// Look up the verifier-side algorithm for a given `kid`. Returns
+    /// `None` when the kid is not registered. Used by the JWKS module's
+    /// state-machine integration tests to assert that a kid maps to the
+    /// expected algorithm before any signature work.
+    pub fn verifier_algorithm(&self, kid: &str) -> Option<Algorithm> {
+        self.verifiers.get(kid).map(|k| k.algorithm())
+    }
+
+    /// Test-only helper: forge an HS256-signed token with a custom
+    /// `kid` header, used by the algorithm-confusion attack pin in
+    /// `crate::jwks::tests`.
+    ///
+    /// Production code does not need this — `issue()` always derives
+    /// the kid from the authority's signing key. The helper exists so
+    /// the JWKS test module can construct an attacker-shaped token
+    /// without re-importing the crate-private `SigningKey` enum.
+    #[cfg(test)]
+    pub(crate) fn test_only_forge_hs256_with_kid(
+        secret: &[u8],
+        kid: &str,
+        claims: &FederationClaims,
+    ) -> String {
+        let signing = SigningKey::Hs256 {
+            secret: Zeroizing::new(secret.to_vec()),
+            kid: Some(kid.to_string()),
+        };
+        encode(&signing, claims).expect("test-only forging path")
     }
 }
 

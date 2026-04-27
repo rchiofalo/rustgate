@@ -58,6 +58,7 @@ prometheus = { workspace = true, optional = true }
 zeroize = { workspace = true }
 redb = { workspace = true }
 parking_lot = { workspace = true }
+arc-swap = { workspace = true }
 lru = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true, optional = true }

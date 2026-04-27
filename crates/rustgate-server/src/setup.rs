@@ -1089,6 +1089,12 @@ fn wire_federation_api(
         trust_store,
         status_fn,
         peer_status_fn,
+        // JWKS not yet wired into server orchestration; the endpoint
+        // returns 404 until a follow-up patch (still under #760) plumbs
+        // a federation `JwtAuthority` to a `JwkSetFn` here. See
+        // `rustgate_federation::jwks` module docs for the rotation
+        // workflow operators will use once the wiring lands.
+        jwks_fn: Arc::new(|| None),
     });
 
     let handler: metrics::FedApiHandler = Arc::new(move |method, path, body| {

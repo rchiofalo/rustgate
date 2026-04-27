@@ -32,6 +32,7 @@ pub mod error;
 #[cfg(feature = "ha")]
 pub mod ha;
 pub mod heartbeat;
+pub mod jwks;
 pub mod jwt;
 pub mod manager;
 pub mod peer;

@@ -195,6 +195,7 @@ mod federation_gate {
                 pod_id: None,
             }),
             peer_status_fn: std::sync::Arc::new(|_| None),
+            jwks_fn: std::sync::Arc::new(|| None),
         };
 
         // Non-federation path returns None
