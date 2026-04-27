@@ -19,6 +19,7 @@ rustgate-core = { workspace = true }
 bytes = { workspace = true }
 quick-xml = { workspace = true }
 lru = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

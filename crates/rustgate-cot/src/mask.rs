@@ -47,7 +47,7 @@
 //! element in a prefix to dodge a byte-exact match. See
 //! [`strip_coordinates`] for the behaviour.
 
-use std::{fmt, io};
+use std::io;
 
 use bytes::Bytes;
 use quick_xml::Writer;
@@ -73,18 +73,21 @@ pub const MAX_POINT_ATTRIBUTES: usize = 64;
 ///
 /// Marked `#[non_exhaustive]` so adding variants (e.g. `AttrBudgetExceeded`)
 /// stays source-compatible. Callers must include a wildcard arm.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum MaskError {
     /// The payload is not well-formed XML.
-    Xml(quick_xml::Error),
+    #[error("payload is not a valid CoT document: {0}")]
+    Xml(#[source] quick_xml::Error),
     /// The in-memory writer returned an I/O error. This should be
     /// unreachable under normal operation (writes go into a `Vec<u8>`)
     /// but is surfaced rather than panicked for forward-compat.
-    Io(io::Error),
+    #[error("writer failed during CoT masking: {0}")]
+    Io(#[source] io::Error),
     /// A `<point>` element exceeded [`MAX_POINT_ATTRIBUTES`]. Rejected as
     /// a protection against crafted XML that would amplify per-recipient
     /// masking cost on a broadcast.
+    #[error("<point> attribute count exceeded masking budget of {limit}")]
     AttrBudgetExceeded {
         /// Maximum allowed attribute count.
         limit: usize,
@@ -95,7 +98,7 @@ impl MaskError {
     /// Return a short discriminant label suitable for structured logs and
     /// audit `reason` fields.
     ///
-    /// Unlike the [`fmt::Display`] impl, this method never embeds content
+    /// Unlike the [`std::fmt::Display`] impl, this method never embeds content
     /// derived from the input payload. [`quick_xml::Error`]'s own
     /// `Display` can echo payload-derived tag names (e.g.
     /// `EndEventMismatch { expected, found }`); a DEBUG log that prints
@@ -108,29 +111,6 @@ impl MaskError {
             Self::Xml(_) => "xml_parse_error",
             Self::Io(_) => "io_error",
             Self::AttrBudgetExceeded { .. } => "attr_budget_exceeded",
-        }
-    }
-}
-
-impl fmt::Display for MaskError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Xml(e) => write!(f, "payload is not a valid CoT document: {e}"),
-            Self::Io(e) => write!(f, "writer failed during CoT masking: {e}"),
-            Self::AttrBudgetExceeded { limit } => write!(
-                f,
-                "<point> attribute count exceeded masking budget of {limit}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for MaskError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Xml(e) => Some(e),
-            Self::Io(e) => Some(e),
-            Self::AttrBudgetExceeded { .. } => None,
         }
     }
 }
@@ -687,6 +667,32 @@ mod tests {
             err.to_string(),
             "<point> attribute count exceeded masking budget of 128"
         );
+    }
+
+    #[test]
+    fn xml_variant_display_prefixes_message_and_appends_source() {
+        // The Display output for Xml composes a fixed prefix with the
+        // inner quick_xml::Error rendering. The prefix is the contract
+        // operator log filters key on; the suffix is the parser's own
+        // diagnostic. Pin both shape elements: the literal prefix and
+        // the colon-space delimiter that introduces the inner error.
+        let err = strip_coordinates(b"<event><point").unwrap_err();
+        let display = err.to_string();
+        assert!(
+            display.starts_with("payload is not a valid CoT document: "),
+            "expected literal prefix, got {display:?}"
+        );
+    }
+
+    #[test]
+    fn io_variant_display_prefixes_message_and_appends_source() {
+        // Same Display-shape contract as the Xml variant — pin the
+        // literal prefix and the colon-space delimiter so a refactor
+        // that switched the message to "writer io error: …" or dropped
+        // the inner error from Display would fail here loudly.
+        let err = MaskError::from(io::Error::other("simulated"));
+        let display = err.to_string();
+        assert_eq!(display, "writer failed during CoT masking: simulated");
     }
 
     #[test]
