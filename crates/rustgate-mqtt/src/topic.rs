@@ -3,6 +3,15 @@
 //! MQTT topic ↔ rustgate group mapping, filter validation, and
 //! wildcard matching.
 //!
+//! The validators in this module ([`validate_publish_topic`],
+//! [`validate_subscribe_filter`], [`validate_topic_prefix`]) are the
+//! MQTT-side member of the workspace's sanitization helper family. Unlike
+//! the other helpers — which transform input to make it safe — these
+//! reject malformed input with `MqttError::InvalidTopic` because MQTT
+//! topic syntax is part of the wire protocol. See the matrix in
+//! [`rustgate_core::sanitize`] for how this fits alongside
+//! `sanitize_for_log`, `sanitize_nats_token`, and `sanitize_filename`.
+//!
 //! MQTT topics are UTF-8 strings with `/` as a level separator. rustgate
 //! group names are reused as-is (preserving `/`) so that a multi-level
 //! topic like `fleet/A/position` maps 1:1 to the group the certificate
@@ -489,5 +498,82 @@ mod tests {
     #[test]
     fn default_policy_is_single_level_only() {
         assert_eq!(WildcardPolicy::default(), WildcardPolicy::SingleLevelOnly);
+    }
+
+    #[test]
+    fn mqtt_topic_filter_byte_stable_for_known_inputs() {
+        // Pin the validator's accept/reject matrix for a corpus of
+        // inputs. The matrix in `rustgate_core::sanitize` documents
+        // these as *validators* (return `Result<(), MqttError>`) rather
+        // than transformers; this test pins which inputs produce `Ok`
+        // and which produce `Err` so a regression that loosened or
+        // tightened a rule fails CI immediately.
+        // Format: (input, validator, policy, expect_ok)
+        let publish_cases: &[(&str, bool)] = &[
+            ("fleet/A/position", true),
+            ("alpha", true),
+            ("a/b/c", true),
+            ("", false),
+            ("fleet/+/position", false),
+            ("fleet/#", false),
+            ("fleet/+", false),
+        ];
+        for (input, expect_ok) in publish_cases {
+            assert_eq!(
+                validate_publish_topic(input).is_ok(),
+                *expect_ok,
+                "validate_publish_topic({input:?}) expected ok={expect_ok}"
+            );
+        }
+        let subscribe_cases: &[(&str, WildcardPolicy, bool)] = &[
+            ("alpha", WildcardPolicy::Reject, true),
+            ("alpha", WildcardPolicy::SingleLevelOnly, true),
+            ("alpha", WildcardPolicy::Full, true),
+            ("fleet/+/position", WildcardPolicy::Reject, false),
+            ("fleet/+/position", WildcardPolicy::SingleLevelOnly, true),
+            ("fleet/+/position", WildcardPolicy::Full, true),
+            ("fleet/#", WildcardPolicy::Reject, false),
+            ("fleet/#", WildcardPolicy::SingleLevelOnly, false),
+            ("fleet/#", WildcardPolicy::Full, true),
+            ("fleet/A+B", WildcardPolicy::Full, false),
+            ("fleet/x#", WildcardPolicy::Full, false),
+            ("fleet/#/position", WildcardPolicy::Full, false),
+            ("", WildcardPolicy::Full, false),
+            ("alpha beta", WildcardPolicy::Full, false),
+        ];
+        for (input, policy, expect_ok) in subscribe_cases {
+            assert_eq!(
+                validate_subscribe_filter(input, *policy).is_ok(),
+                *expect_ok,
+                "validate_subscribe_filter({input:?}, {policy:?}) expected ok={expect_ok}"
+            );
+        }
+        let prefix_cases: &[(&str, bool)] = &[
+            ("rustgate/", true),
+            ("", true),
+            ("rustgate", false),
+            ("r", false),
+        ];
+        for (input, expect_ok) in prefix_cases {
+            assert_eq!(
+                validate_topic_prefix(input).is_ok(),
+                *expect_ok,
+                "validate_topic_prefix({input:?}) expected ok={expect_ok}"
+            );
+        }
+    }
+
+    #[test]
+    fn matrix_invariant_mqtt_validators_reject_rather_than_transform() {
+        // Pinned axis from the module-doc matrix in `rustgate_core::sanitize`:
+        // MQTT topic validators REJECT malformed input rather than
+        // silently transforming it (in contrast to `sanitize_filename`
+        // which would map a `/` to `_`, or `sanitize_nats_token` which
+        // would strip a control char). A regression that switched any
+        // of these validators to a transformer would silently mutate the
+        // wire-visible topic bytes seen by a subscriber.
+        assert!(validate_publish_topic("fleet/+/x").is_err());
+        assert!(validate_subscribe_filter("alpha beta", WildcardPolicy::Full).is_err());
+        assert!(validate_topic_prefix("missing-trailing-slash").is_err());
     }
 }
