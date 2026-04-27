@@ -9,16 +9,13 @@
 
 use std::fmt;
 
-use hmac::{Hmac, Mac};
+use rustgate_core::crypto::{hmac_sha256_tag, hmac_sha256_verify};
 use rustgate_core::secrets::{SecretFileOpts, read_secret_file as core_read_secret_file};
-use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::config::AuthConfig;
 use crate::error::HttpError;
-
-type HmacSha256 = Hmac<Sha256>;
 
 /// Runtime authentication state for a single target.
 ///
@@ -194,17 +191,27 @@ fn compute_hmac_signature(
     body: &[u8],
     timestamp: u64,
 ) -> Result<String, HttpError> {
-    let mut mac = HmacSha256::new_from_slice(secret)
+    // Assemble the canonical signed payload upfront. The legacy inlined
+    // path called `mac.update()` four times against pre-constant `.`
+    // separators; that produces a byte-identical HMAC input to a single
+    // pre-concatenated buffer because `Mac::update` is associative
+    // over byte sequences. Keeping the format literal here keeps the
+    // wire-format documentation in lockstep with the implementation.
+    let timestamp_bytes = timestamp.to_string();
+    let mut signed = Vec::with_capacity(
+        timestamp_bytes.len() + 1 + method.len() + 1 + path.len() + 1 + body.len(),
+    );
+    signed.extend_from_slice(timestamp_bytes.as_bytes());
+    signed.push(b'.');
+    signed.extend_from_slice(method.as_bytes());
+    signed.push(b'.');
+    signed.extend_from_slice(path.as_bytes());
+    signed.push(b'.');
+    signed.extend_from_slice(body);
+
+    let tag = hmac_sha256_tag(secret, &signed)
         .map_err(|e| HttpError::Config(format!("HMAC key initialization failed: {e}")))?;
-    mac.update(timestamp.to_string().as_bytes());
-    mac.update(b".");
-    mac.update(method.as_bytes());
-    mac.update(b".");
-    mac.update(path.as_bytes());
-    mac.update(b".");
-    mac.update(body);
-    let result = mac.finalize();
-    let hex_digest = hex::encode(result.into_bytes());
+    let hex_digest = hex::encode(tag);
     Ok(format!("sha256={hex_digest}"))
 }
 
@@ -216,6 +223,15 @@ fn compute_hmac_signature(
 /// side-channel cannot leak how many leading bytes of the digest match
 /// — both branches of the check execute in the same time regardless of
 /// where (or whether) the signatures diverge.
+///
+/// The HMAC computation itself is delegated to the shared
+/// [`rustgate_core::crypto::hmac_sha256_verify`] helper (constant-time
+/// `ct_eq` over the raw 32-byte tag); this wrapper preserves the
+/// caller-facing `sha256=<hex>` envelope contract by parsing the prefix
+/// and decoding the hex payload before handing control to the helper.
+/// We keep an explicit `ConstantTimeEq` check on the `sha256=` prefix so
+/// even malformed presented signatures (right length, wrong prefix) are
+/// rejected without timing leakage.
 ///
 /// Receivers MUST also enforce a freshness window on `timestamp`
 /// independently; this function only validates the cryptographic binding,
@@ -240,17 +256,66 @@ fn verify_hmac_signature(
     timestamp: u64,
     presented: &str,
 ) -> Result<bool, HttpError> {
-    let expected = compute_hmac_signature(secret, method, path, body, timestamp)?;
-    Ok(expected.as_bytes().ct_eq(presented.as_bytes()).into())
+    // Reconstruct the signed payload (timestamp.method.path.body) so the
+    // helper can hash it independently. This mirrors the byte sequence
+    // built by `compute_hmac_signature`.
+    let timestamp_bytes = timestamp.to_string();
+    let mut signed = Vec::with_capacity(
+        timestamp_bytes.len() + 1 + method.len() + 1 + path.len() + 1 + body.len(),
+    );
+    signed.extend_from_slice(timestamp_bytes.as_bytes());
+    signed.push(b'.');
+    signed.extend_from_slice(method.as_bytes());
+    signed.push(b'.');
+    signed.extend_from_slice(path.as_bytes());
+    signed.push(b'.');
+    signed.extend_from_slice(body);
+
+    // The presented signature must have the form `sha256=<64-hex-chars>`.
+    // Reject anything else without leaking which prefix byte diverged
+    // — the prefix comparison itself is constant-time.
+    const PREFIX: &[u8] = b"sha256=";
+    let presented_bytes = presented.as_bytes();
+    if presented_bytes.len() != PREFIX.len() + 64 {
+        return Ok(false);
+    }
+    let (prefix, hex_tag) = presented_bytes.split_at(PREFIX.len());
+    if !bool::from(prefix.ct_eq(PREFIX)) {
+        return Ok(false);
+    }
+    // Hex-decode the trailing 32 bytes worth of digest. A malformed hex
+    // payload is a verification failure, not a configuration error.
+    let presented_tag = match hex::decode(hex_tag) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(false),
+    };
+
+    // The helper's constant-time `ct_eq` is the load-bearing comparison.
+    match hmac_sha256_verify(secret, &signed, &presented_tag) {
+        Ok(()) => Ok(true),
+        Err(rustgate_core::crypto::HmacError::VerificationFailed)
+        | Err(rustgate_core::crypto::HmacError::TagLengthMismatch { .. }) => Ok(false),
+        Err(e @ rustgate_core::crypto::HmacError::InvalidKeyLength { .. }) => Err(
+            HttpError::Config(format!("HMAC key initialization failed: {e}")),
+        ),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::panic, clippy::unwrap_used)]
 
+    use hmac::{Hmac, Mac};
     use rustgate_core::b64;
+    use sha2::Sha256;
 
     use super::*;
+
+    /// Test-local alias used by the byte-for-byte regression tests
+    /// that pin the helper output against the previous inlined
+    /// `Hmac::<Sha256>::new_from_slice(...).update(...).finalize()`
+    /// pipeline.
+    type HmacSha256 = Hmac<Sha256>;
 
     /// Write content to a temp file with owner-only permissions, returning the path.
     fn write_temp_secret(name: &str, content: &str) -> String {
@@ -374,6 +439,34 @@ mod tests {
         let sig = compute_hmac_signature(secret, "POST", "/", b"", 1700000000).unwrap();
         assert!(sig.starts_with("sha256="));
         assert!(sig.len() > "sha256=".len());
+    }
+
+    /// Migration regression guard: closes #799. The HMAC pipeline now
+    /// goes through `rustgate_core::crypto::hmac_sha256_tag`. Pin
+    /// byte-for-byte equivalence to the previous inlined
+    /// `Hmac::<Sha256>::new_from_slice(...).update(...).finalize()`
+    /// path so a future tweak to `compute_hmac_signature` cannot
+    /// silently break in-flight signed webhook deliveries.
+    #[test]
+    fn compute_hmac_signature_matches_inlined_construction() {
+        let secret = b"webhook-secret";
+        let body = b"some-payload";
+        let timestamp = 1700000000u64;
+
+        let helper_sig =
+            compute_hmac_signature(secret, "POST", "/endpoint", body, timestamp).unwrap();
+
+        let mut mac = HmacSha256::new_from_slice(secret).unwrap();
+        mac.update(timestamp.to_string().as_bytes());
+        mac.update(b".");
+        mac.update(b"POST");
+        mac.update(b".");
+        mac.update(b"/endpoint");
+        mac.update(b".");
+        mac.update(body);
+        let inlined = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+
+        assert_eq!(helper_sig, inlined);
     }
 
     #[test]

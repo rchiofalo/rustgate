@@ -30,13 +30,11 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use hmac::{Hmac, Mac};
 use parking_lot::Mutex;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use rustgate_core::crypto::{HmacError, hmac_sha256_tag, hmac_sha256_verify};
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
-use sha2::Sha256;
-use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -66,17 +64,31 @@ const DELIVERED_TABLE: TableDefinition<u64, ()> = TableDefinition::new("delivere
 /// Length of the HMAC-SHA256 tag appended to each stored envelope.
 const HMAC_LEN: usize = 32;
 
-type HmacSha256 = Hmac<Sha256>;
+/// Map an [`HmacError`] from the shared helper into a
+/// [`StoreForwardError`]. The crypto helper rejects empty keys; the
+/// store-forward path always passes a 32-byte key from a generated or
+/// supplied [`Zeroizing<[u8; 32]>`], so the empty-key arm is
+/// unreachable in practice but mapped for completeness.
+fn map_hmac_error(err: HmacError) -> StoreForwardError {
+    match err {
+        HmacError::InvalidKeyLength { .. } => {
+            StoreForwardError::Database(format!("HMAC key init failed: {err}"))
+        }
+        HmacError::TagLengthMismatch { .. } | HmacError::VerificationFailed => {
+            StoreForwardError::TamperedMessage
+        }
+    }
+}
 
 /// Compute an HMAC-SHA256 tag over `data` using the given key.
 fn compute_hmac(key: &[u8; 32], data: &[u8]) -> Result<[u8; 32], StoreForwardError> {
-    let mut mac = HmacSha256::new_from_slice(key).map_err(|e| {
-        // Unreachable for a 32-byte key, but we handle it to satisfy the
-        // no-unwrap lint.
-        StoreForwardError::Database(format!("HMAC key init failed: {e}"))
-    })?;
-    mac.update(data);
-    Ok(mac.finalize().into_bytes().into())
+    let tag = hmac_sha256_tag(key, data).map_err(map_hmac_error)?;
+    let mut out = [0u8; HMAC_LEN];
+    // The helper guarantees a 32-byte tag for HMAC-SHA256; assert via
+    // length precondition rather than a fallible try_into.
+    debug_assert_eq!(tag.len(), HMAC_LEN);
+    out.copy_from_slice(&tag);
+    Ok(out)
 }
 
 /// Errors returned by [`ClientQueue`].
@@ -1057,6 +1069,11 @@ fn msg_expired(msg: &RoutableMessage) -> bool {
 
 /// Verify the HMAC tag appended to a stored envelope and return the
 /// message bytes (without the trailing tag) on success.
+///
+/// Constant-time comparison is enforced inside the shared
+/// [`rustgate_core::crypto::hmac_sha256_verify`] helper — defense-in-
+/// depth against local attackers measuring verification latency on the
+/// at-rest integrity path.
 fn verify_hmac_envelope<'a>(
     key: &[u8; 32],
     stored: &'a [u8],
@@ -1065,15 +1082,7 @@ fn verify_hmac_envelope<'a>(
         return Err(StoreForwardError::TamperedMessage);
     }
     let (msg_data, tag) = stored.split_at(stored.len() - HMAC_LEN);
-    let expected = compute_hmac(key, msg_data)?;
-    // Constant-time comparison prevents timing side-channels even in
-    // the at-rest integrity case — defense-in-depth against local
-    // attackers measuring verification latency.
-    if tag.ct_eq(&expected).into() {
-        // Tag matches — fall through to return Ok.
-    } else {
-        return Err(StoreForwardError::TamperedMessage);
-    }
+    hmac_sha256_verify(key, msg_data, tag).map_err(map_hmac_error)?;
     Ok(msg_data)
 }
 
@@ -1326,6 +1335,28 @@ mod tests {
     /// reopen with the same key.
     fn test_hmac_key() -> Zeroizing<[u8; 32]> {
         Zeroizing::new([0xAB; 32])
+    }
+
+    /// Regression guard: the migration from an inlined
+    /// `Hmac::<Sha256>::new_from_slice(...).update(...).finalize()`
+    /// pipeline to `rustgate_core::crypto::hmac_sha256_tag` MUST be
+    /// byte-identical. A divergence here would silently invalidate
+    /// every entry in any pre-migration on-disk client queue: drain
+    /// would reject every record as `TamperedMessage` and discard the
+    /// stored backlog. Pin the byte-for-byte equivalence so a future
+    /// refactor of `compute_hmac` cannot reintroduce that data-loss
+    /// regression.
+    #[test]
+    fn compute_hmac_matches_inlined_construction() {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let key = [0xAB; 32];
+        let data = b"some encoded envelope bytes";
+        let helper_tag = compute_hmac(&key, data).unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(&key).unwrap();
+        mac.update(data);
+        let inlined: [u8; 32] = mac.finalize().into_bytes().into();
+        assert_eq!(helper_tag, inlined);
     }
 
     #[tokio::test]
