@@ -34,11 +34,17 @@
 #![allow(clippy::panic, clippy::unwrap_used)]
 
 use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rustgate_test_utils::certs::{TestCa, TestCert};
 use rustgate_test_utils::tls::build_client_tls_config;
-use rustgate_transport::{CertReloader, TlsConfig, TlsListener};
+use rustgate_transport::{
+    BackpressureGate, CertReloader, DynamicCertVerifier, TlsConfig, TlsListener,
+};
+use rustls::RootCertStore;
+use rustls::pki_types::CertificateDer;
+use rustls::server::danger::ClientCertVerifier;
 use tokio::io::AsyncWriteExt;
 use tracing_subscriber::Layer;
 use tracing_subscriber::filter::Targets;
@@ -574,4 +580,167 @@ async fn reload_corrupted_cert_returns_error() {
 
     let result = reloader.reload();
     assert!(result.is_err());
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// F-50 / F-51 regression coverage (issue #814).
+//
+// The unit suite inside `verifier.rs` exercises the `ArcSwap` mechanics
+// directly; the unit suite inside `backpressure.rs` exercises the
+// `Arc::get_mut` setter contract directly. These integration tests pin
+// the same invariants from outside the modules — through the same
+// public re-exports (`rustgate_transport::DynamicCertVerifier`,
+// `rustgate_transport::BackpressureGate`) that downstream binaries
+// consume — so a refactor that broke the boundary contract would be
+// caught here even if the inline tests were tweaked alongside it.
+// ────────────────────────────────────────────────────────────────────────
+
+/// Build a `RootCertStore` containing every CA cert in the supplied
+/// list of `TestCa`s. Used to assemble the pre- and post-rotation root
+/// stores in the F-50 integration test below.
+fn root_store_from_cas(cas: &[&TestCa]) -> RootCertStore {
+    let mut store = RootCertStore::empty();
+    for ca in cas {
+        let certs: Vec<CertificateDer<'static>> =
+            rustls_pki_types::pem::PemObject::pem_slice_iter(ca.cert_pem.as_bytes())
+                .collect::<Result<Vec<_>, _>>()
+                .expect("parse CA PEM");
+        for cert in certs {
+            store.add(cert).expect("add CA cert to root store");
+        }
+    }
+    store
+}
+
+/// F-50: the public `DynamicCertVerifier::root_hint_subjects` accessor
+/// must reflect a CA added at runtime after the trust-store generation
+/// is bumped. The pre-fix verifier snapshotted the subjects vector at
+/// construction and never refreshed, so a SIGHUP reload that added a
+/// CA would leave the TLS `CertificateRequest` advertising the stale
+/// list — clients would not know the new CA was acceptable and
+/// well-behaved mTLS stacks (RFC-strict and older rustls) would
+/// decline to send a chain anchored on it.
+///
+/// This integration test goes through the same public re-export path
+/// the listener wires up (`rustgate_transport::DynamicCertVerifier` →
+/// `Arc<dyn ClientCertVerifier>`), bumps the provider generation, and
+/// asserts the hint count grows from one to two.
+#[test]
+fn root_hint_subjects_rebuilds_after_ca_rotation() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let ca_one = TestCa::new("Root Hint Rebuild CA One");
+    let ca_two = TestCa::new("Root Hint Rebuild CA Two");
+
+    let store_one = root_store_from_cas(&[&ca_one]);
+    let store_both = root_store_from_cas(&[&ca_one, &ca_two]);
+
+    // The provider closure observes generation flipping from 0 to 1 via
+    // an `AtomicU64`; the test bumps it after the initial handshake.
+    let generation = Arc::new(AtomicU64::new(0));
+    let gen_clone = Arc::clone(&generation);
+    let s_one = store_one.clone();
+    let s_both = store_both.clone();
+
+    let verifier = DynamicCertVerifier::new(
+        Box::new(move || {
+            let g = gen_clone.load(Ordering::Acquire);
+            let store = if g == 0 {
+                s_one.clone()
+            } else {
+                s_both.clone()
+            };
+            (g, store)
+        }),
+        Vec::new(),
+    )
+    .expect("build dynamic verifier");
+
+    // Up-cast to the trait the rustls listener actually consumes — this
+    // mirrors how the public surface is used by `rustgate-server::setup`
+    // and pins the integration boundary, not the inherent method.
+    let trait_obj: Arc<dyn ClientCertVerifier> = verifier.clone();
+    let before = trait_obj.root_hint_subjects().len();
+    assert_eq!(
+        before, 1,
+        "initial trust store has one CA; hint list must advertise exactly one DN"
+    );
+
+    // Rotate the trust store: bump the generation, then drive a verify
+    // cycle through `current_verifier()` — the rebuild branch refreshes
+    // both the inner `WebPkiClientVerifier` AND the `ArcSwap`-backed
+    // hint slice in lockstep.
+    generation.store(1, Ordering::Release);
+    // The cleanest way to force a rebuild from the integration side is
+    // to drive a verify call. We don't have a handy client cert here
+    // and don't need a real chain validation — calling `verify_client_cert`
+    // would itself be a separate concern. Instead, the public surface
+    // exposes `root_hint_subjects` which only returns the cached slice;
+    // a rebuild is triggered by `current_verifier()` which is internal.
+    // The trait obligation rustls actually relies on is "the server's
+    // next handshake observes the fresh hints", and the inner crate
+    // tests pin that current_verifier() drives the swap. From the
+    // integration side we go through `verify_client_cert` with an
+    // arbitrary cert — the chain validation will fail (no real chain)
+    // but the rebuild side-effect still fires.
+    let dummy_cert = CertificateDer::from(vec![0u8; 64]);
+    let _ = trait_obj.verify_client_cert(&dummy_cert, &[], rustls::pki_types::UnixTime::now());
+
+    let after = trait_obj.root_hint_subjects().len();
+    assert_eq!(
+        after, 2,
+        "post-rotation hint list must include both old and new CAs (got {after})"
+    );
+}
+
+/// F-51: `BackpressureGate::set_on_deferred` must surface a non-`Ok`
+/// result when the gate has already been cloned, instead of silently
+/// dropping the callback. Pre-fix the setter used `Arc::get_mut` +
+/// `debug_assert!` which is stripped in release builds, so a metrics
+/// callback registered after clone would be lost without log or panic.
+///
+/// The pin captures the integration-level contract: `expect_err` must
+/// succeed AND the rendered error message must name the offending
+/// setter so an operator's log grep finds the misorder.
+#[test]
+fn set_on_deferred_returns_err_after_clone() {
+    let mut gate = BackpressureGate::new(1_024);
+    // Clone the Arc — this is what production startup does when wiring
+    // the gate into both the router and the accept loop.
+    let _shared = Arc::clone(&gate);
+
+    let result = BackpressureGate::set_on_deferred(&mut gate, Arc::new(|| {}));
+    let err = result.expect_err("set_on_deferred must Err after the gate is cloned");
+
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("set_on_deferred"),
+        "error must name the setter so log greps land on the call site; got: {rendered}"
+    );
+    assert!(
+        rendered.contains("already cloned") || rendered.contains("Arc::clone"),
+        "error must explain the misorder; got: {rendered}"
+    );
+}
+
+/// F-51 happy path: `set_on_deferred` succeeds when called BEFORE any
+/// clone has been taken. This is the canonical startup ordering — wire
+/// callbacks first, then `Arc::clone` the gate into long-lived holders.
+/// Pinning the success path prevents a future "always return Err" or
+/// "stricter ordering" change from silently breaking startup
+/// configuration that has only ever been correct.
+#[test]
+fn set_on_deferred_succeeds_before_clone() {
+    let mut gate = BackpressureGate::new(1_024);
+    // No clones yet — sole owner of the Arc; the setter must succeed.
+    let result = BackpressureGate::set_on_deferred(&mut gate, Arc::new(|| {}));
+    assert!(
+        result.is_ok(),
+        "set_on_deferred must succeed when called before any Arc::clone (got {result:?})"
+    );
+
+    // Subsequent clones into accept-loop / router are still safe — the
+    // callback is already installed.
+    let _accept_loop = Arc::clone(&gate);
+    let _router = Arc::clone(&gate);
 }
