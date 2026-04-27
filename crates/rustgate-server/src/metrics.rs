@@ -252,31 +252,14 @@ static JEMALLOC_MAPPED: OnceLock<IntGauge> = OnceLock::new();
 // ── Fallback constructors ───────────────────────────────────────────
 //
 // When `init()` has not been called, accessor functions lazily create
-// an unregistered metric via `OnceLock::get_or_init()`. These helpers
-// construct the fallback without `unwrap()` or `expect()`.
+// an unregistered metric via `OnceLock::get_or_init()`. The helpers
+// live in `rustgate_core::metrics_util` so every crate following the
+// `OnceLock` + `init()` + accessor pattern shares one implementation.
 
-fn fallback_counter(name: &str, help: &str) -> IntCounter {
-    match IntCounter::with_opts(Opts::new(name, help)) {
-        Ok(c) => c,
-        // Hardcoded metric names are always valid; this branch is unreachable.
-        // If prometheus is fundamentally broken, abort cleanly rather than panic.
-        Err(_) => std::process::abort(),
-    }
-}
-
-fn fallback_gauge(name: &str, help: &str) -> IntGauge {
-    match IntGauge::with_opts(Opts::new(name, help)) {
-        Ok(g) => g,
-        Err(_) => std::process::abort(),
-    }
-}
-
-fn fallback_counter_vec(name: &str, help: &str, labels: &[&str]) -> IntCounterVec {
-    match IntCounterVec::new(Opts::new(name, help), labels) {
-        Ok(cv) => cv,
-        Err(_) => std::process::abort(),
-    }
-}
+use rustgate_core::metrics_util::{
+    fallback_counter, fallback_counter_vec, fallback_gauge, fallback_histogram,
+    fallback_histogram_vec,
+};
 
 /// Labels emitted on the `rustgate_build_info` gauge.
 ///
@@ -360,13 +343,6 @@ pub(crate) fn enabled_features() -> String {
         features.push("http");
     }
     features.join(",")
-}
-
-fn fallback_histogram_vec(name: &str, help: &str, labels: &[&str]) -> HistogramVec {
-    match HistogramVec::new(HistogramOpts::new(name, help), labels) {
-        Ok(hv) => hv,
-        Err(_) => std::process::abort(),
-    }
 }
 
 // ── Registration ────────────────────────────────────────────────────
@@ -1199,13 +1175,6 @@ pub fn init() -> prometheus::Result<()> {
     }
 
     Ok(())
-}
-
-fn fallback_histogram(name: &str, help: &str) -> Histogram {
-    match Histogram::with_opts(HistogramOpts::new(name, help)) {
-        Ok(h) => h,
-        Err(_) => std::process::abort(),
-    }
 }
 
 /// Observe an authz evaluation event emitted by the router PEP.
