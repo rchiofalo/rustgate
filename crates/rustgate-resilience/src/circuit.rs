@@ -237,14 +237,13 @@ impl CircuitBreaker {
         false
     }
 
-    /// Current state as a numeric value for metrics gauges.
-    /// 0 = closed, 1 = open, 2 = half-open.
-    // justification: compiled under `any(test, feature = "metrics")`, so the
-    // `metrics` build is a genuine production configuration. Downstream
-    // crates call this to populate the circuit-state gauge; feature-gating
-    // the allow would require mirroring the cfg on every caller.
-    #[cfg(any(test, feature = "metrics"))]
-    #[allow(dead_code)]
+    /// Current state as a numeric value.
+    ///
+    /// `0 = closed`, `1 = open`, `2 = half-open` — matches the
+    /// `STATE_CLOSED` / `STATE_OPEN` / `STATE_HALF_OPEN` constants.
+    /// Always available so downstream crates that translate to a
+    /// crate-local state enum (e.g. federation `PeerStatus`) can read
+    /// the numeric value without the `metrics` feature flag.
     pub fn state_value(&self) -> u8 {
         self.state.load(Ordering::Acquire)
     }
