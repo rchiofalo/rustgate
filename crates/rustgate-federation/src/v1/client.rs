@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
+use rustgate_core::masking::hash_cn;
 use rustgate_core::protocol::HeaderSize;
 use rustgate_resilience::backpressure::{BackpressureGate, BackpressurePermit};
 use rustgate_resilience::reconnect::{backoff_delay, should_stop_reconnecting};
@@ -256,7 +257,7 @@ async fn connection_loop(
             rustgate_core::audit::federation_peer_connected(&peer_id, &identity.cn, "outbound");
             info!(
                 peer_id = %peer_id,
-                peer_cn = %identity.cn,
+                peer_cn = %hash_cn(&identity.cn),
                 addr = %config.addr,
                 "connected to V1 federation peer"
             );

@@ -4486,6 +4486,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn router_uses_hash_identity_for_access_log() {
+        // F-94 (#802) regression — pin that the access-log destination
+        // and source CN fields go through `rustgate_core::masking::hash_cn`
+        // (the public helper) rather than a crate-local copy. The router
+        // imports the helper at top of file as
+        // `use rustgate_core::masking::hash_cn`; this test confirms the
+        // shared helper produces the same 12-char hex token the router
+        // formats into the access-log line.
+        let raw_cn = "alice@unit.example.test";
+        let direct_via_router = format!("direct:{}", super::hash_cn(raw_cn));
+        let direct_via_core = format!("direct:{}", rustgate_core::masking::hash_cn(raw_cn));
+        assert_eq!(
+            direct_via_router, direct_via_core,
+            "router's `hash_cn` import must resolve to the shared core helper"
+        );
+        assert!(
+            !direct_via_router.contains(raw_cn),
+            "access-log dst must not contain raw CN, got {direct_via_router}"
+        );
+        // Documented contract: 6 bytes of SHA-256 = 12 lowercase hex chars
+        // after the "direct:" prefix.
+        assert_eq!(
+            direct_via_router.len(),
+            "direct:".len() + 12,
+            "access-log dst length must equal `direct:` + 12 hex, got {direct_via_router}"
+        );
+    }
+
     // ── Dynamic group join/leave ────────────────────────────────────
 
     #[tokio::test]

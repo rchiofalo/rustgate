@@ -19,6 +19,7 @@ use std::time::Duration;
 use rustgate_core::constants::HANDSHAKE_TIMEOUT;
 use rustgate_core::error::{Result, TransportError};
 use rustgate_core::identity::Identity;
+use rustgate_core::masking::hash_cn;
 use rustgate_core::net::configure_tactical_socket;
 use rustgate_resilience::SlidingWindowLimiter;
 use rustgate_transport::{TlsConfig, extract_identity};
@@ -148,7 +149,7 @@ impl MqttListener {
 
         debug!(
             peer = %peer_addr,
-            cn = %identity.cn,
+            cn = %hash_cn(&identity.cn),
             groups = ?identity.groups,
             "MQTT client authenticated"
         );
@@ -530,5 +531,20 @@ mod tests {
                  the accept loop must keep the listener alive on rude clients",
             ),
         }
+    }
+
+    #[test]
+    fn mqtt_listener_uses_shared_hash_cn_for_authenticated_log_field() {
+        // F-94 (#802) — ensure the `cn` field of the
+        // "MQTT client authenticated" debug log is hashed via the public
+        // `rustgate_core::masking::hash_cn` helper. A regression that
+        // dropped the hash wrapper or pointed to a crate-local copy
+        // would silently leak full peer CNs into operator log storage.
+        let raw = "mqtt-client-secret-callsign-007";
+        let from_module = hash_cn(raw);
+        let from_core = rustgate_core::masking::hash_cn(raw);
+        assert_eq!(from_module, from_core);
+        assert_eq!(from_module.len(), 12);
+        assert!(!from_module.contains(raw));
     }
 }

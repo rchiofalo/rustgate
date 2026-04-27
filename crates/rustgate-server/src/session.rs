@@ -14,6 +14,7 @@ use futures::{SinkExt, StreamExt};
 use rustgate_core::codec::Codec;
 use rustgate_core::constants::{READ_TIMEOUT, WRITE_TIMEOUT};
 use rustgate_core::identity::Identity;
+use rustgate_core::masking::hash_cn;
 #[cfg(feature = "metrics")]
 use rustgate_core::message::Destination;
 use rustgate_core::message::RoutableMessage;
@@ -174,7 +175,7 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
     };
     let session_id = handle.id;
 
-    tracing::info!(cn = %cn, peer = %peer_addr, session_id = session_id, "connected");
+    tracing::info!(cn = %hash_cn(&cn), peer = %peer_addr, session_id = session_id, "connected");
     crate::audit::client_connected(&cn, peer_addr, &identity.fingerprint, session_id);
     // Drain any messages persisted while this CN was offline BEFORE
     // registering the handle — otherwise live traffic routed between
@@ -188,7 +189,7 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
     let filtered = before - buffered_offline.len();
     if filtered > 0 {
         tracing::info!(
-            cn = %cn,
+            cn = %hash_cn(&cn),
             filtered,
             delivered = buffered_offline.len(),
             "filtered offline messages through current ACL/authz policy"
@@ -201,7 +202,7 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
                 .with_label_values(&[tenant])
                 .inc();
         }
-        tracing::warn!(cn = %cn, "session rejected by tenant quota");
+        tracing::warn!(cn = %hash_cn(&cn), "session rejected by tenant quota");
         crate::audit::connection_rejected(peer_addr, "tenant quota exceeded");
         return;
     }
@@ -250,7 +251,7 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
                 Err(e) => {
                     #[cfg(feature = "metrics")]
                     metrics::negotiations().with_label_values(&["failed"]).inc();
-                    tracing::debug!(cn = %cn, error = %e, "negotiation failed");
+                    tracing::debug!(cn = %hash_cn(&cn), error = %e, "negotiation failed");
                     crate::audit::negotiation_result(&cn, "tak", false);
                     deps.router.unregister(&cn, session_id).await;
                     #[cfg(feature = "metrics")]
@@ -259,7 +260,7 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
                         metrics::connections_active().dec();
                     }
                     crate::audit::client_disconnected(&cn, session_id);
-                    tracing::info!(cn = %cn, "disconnected");
+                    tracing::info!(cn = %hash_cn(&cn), "disconnected");
                     return;
                 }
             }
@@ -299,7 +300,7 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
     .await;
 
     if let Err(e) = result {
-        tracing::debug!(cn = %cn, error = %e, "session error");
+        tracing::debug!(cn = %hash_cn(&cn), error = %e, "session error");
     }
 
     deps.router.unregister(&cn, session_id).await;
@@ -314,7 +315,7 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
         }
     }
     crate::audit::client_disconnected(&cn, session_id);
-    tracing::info!(cn = %cn, "disconnected");
+    tracing::info!(cn = %hash_cn(&cn), "disconnected");
 }
 
 /// TAK protocol negotiation handshake.
@@ -763,7 +764,7 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
                         let cn = identity.cn.clone();
                         let peer_addr = session.peer_addr();
 
-                        tracing::info!(cn = %cn, peer = %peer_addr, "plaintext TCP connected");
+                        tracing::info!(cn = %hash_cn(&cn), peer = %peer_addr, "plaintext TCP connected");
 
                         let (priority_tx, priority_rx) = mpsc::channel::<rustgate_transport::RoutedMessage>(
                             rustgate_transport::PRIORITY_CHANNEL_CAPACITY,
@@ -785,14 +786,14 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
                         let filtered = before - buffered_offline.len();
                         if filtered > 0 {
                             tracing::info!(
-                                cn = %cn,
+                                cn = %hash_cn(&cn),
                                 filtered,
                                 delivered = buffered_offline.len(),
                                 "filtered offline messages through current ACL/authz policy"
                             );
                         }
                         if !router.register(handle.clone()).await {
-                            tracing::warn!(cn = %cn, "connection rejected: tenant quota exceeded");
+                            tracing::warn!(cn = %hash_cn(&cn), "connection rejected: tenant quota exceeded");
                             crate::audit::connection_rejected(
                                 peer_addr,
                                 "tenant quota exceeded",
@@ -855,11 +856,11 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
                             }).await;
 
                             if let Err(e) = result {
-                                tracing::debug!(cn = %cn, error = %e, "plaintext TCP session error");
+                                tracing::debug!(cn = %hash_cn(&cn), error = %e, "plaintext TCP session error");
                             }
 
                             session_router.unregister(&cn, session_id).await;
-                            tracing::info!(cn = %cn, "plaintext TCP disconnected");
+                            tracing::info!(cn = %hash_cn(&cn), "plaintext TCP disconnected");
                         });
                     }
                     Err(e) => {
