@@ -1,6 +1,21 @@
 // Copyright © 2026 Roberto Chiofalo.
 
 //! TLS transport, session management, and message routing for rustgate.
+//!
+//! # Error handling
+//!
+//! Most fallible APIs in this crate return [`rustgate_core::error::Result`],
+//! whose error type is [`rustgate_core::error::RustgateError`] — the
+//! boundary-layer aggregator wrapping [`TransportError`] / [`ConfigError`] /
+//! [`std::io::Error`]. Specialised submodules expose their own typed enums
+//! for matchable failure modes (e.g. [`store_forward::StoreForwardError`],
+//! [`obligations::ObligationError`], [`codec::FramedCodecError`]). Binary
+//! callers map any propagated error into [`rustgate_core::error::RustgateError`]
+//! at the boundary; per-crate enums are not auto-converted into the
+//! aggregator.
+//!
+//! [`TransportError`]: rustgate_core::error::TransportError
+//! [`ConfigError`]: rustgate_core::error::ConfigError
 
 mod acl;
 /// Re-export of the relocated backpressure module for source-level

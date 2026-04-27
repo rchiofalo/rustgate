@@ -68,6 +68,18 @@
 //!   over fields it does not consume (forward-compatible) but cannot
 //!   re-emit them; a future encoder PR would have to round-trip the
 //!   entire catalogue.
+//!
+//! # Error handling
+//!
+//! This crate exposes per-category error types ([`cat021::Cat021Error`],
+//! [`cat048::Cat048Error`], [`cat062::Cat062Error`],
+//! [`cat021::Cat021EncodeError`]) rather than a single umbrella enum,
+//! mirroring the per-category decoder split. Binary callers propagate
+//! these via `?` and map them through `anyhow::Error` at the
+//! orchestration layer; the `rustgate_core::error::RustgateError`
+//! boundary aggregator (used in the `rustgate-core` /
+//! `rustgate-transport` slice) is not automatically constructed from
+//! this crate's per-category errors.
 
 pub mod cat021;
 pub mod cat048;

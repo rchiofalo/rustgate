@@ -6,6 +6,17 @@
 //! horizontal scaling. Publishes inbound messages to NATS subjects and
 //! subscribes via JetStream pull consumers for outbound delivery to
 //! connected clients with real backpressure.
+//!
+//! # Error handling
+//!
+//! This crate does not expose a single umbrella `NatsError`; each
+//! submodule with a distinct failure surface defines its own typed enum
+//! (e.g. [`NatsConfigError`], [`NatsTlsConfigError`], [`RequestError`]).
+//! Binary callers in `rustgate-server` propagate these via `?` and
+//! surface them through `anyhow::Error` at the orchestration layer;
+//! [`rustgate_core::error::RustgateError`] is the boundary aggregator for
+//! the `rustgate-core` / `rustgate-transport` slice and is not
+//! automatically constructed from this crate's per-submodule errors.
 
 pub mod config;
 pub mod jetstream;

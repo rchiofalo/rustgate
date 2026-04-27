@@ -38,6 +38,15 @@
 //!   are **not** converted to XML. The canonical-payload-is-XML invariant
 //!   documented on `Codec` only applies to codecs that target the CoT
 //!   model; MAVLink is a peer wire format that routes opaquely.
+//!
+//! # Error handling
+//!
+//! This crate's error type is [`error::MavlinkError`]; binary callers in
+//! `rustgate-server` propagate it via `?` and map it through
+//! `anyhow::Error` at the orchestration layer.
+//! [`rustgate_core::error::RustgateError`] is the boundary aggregator for
+//! the `rustgate-core` / `rustgate-transport` slice and is not
+//! automatically constructed from [`error::MavlinkError`].
 
 pub mod codec;
 pub mod crc_extra;

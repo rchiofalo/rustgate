@@ -8,6 +8,16 @@
 //!
 //! All connections require a valid client certificate; identity is extracted
 //! exclusively from the X.509 certificate, never from headers or query params.
+//!
+//! # Error handling
+//!
+//! This crate uses [`rustgate_core::error::Result`] (i.e.
+//! [`rustgate_core::error::RustgateError`]) directly — listener bring-up
+//! and identity-extraction failures surface as
+//! [`rustgate_core::error::TransportError`] variants. There is no
+//! crate-local error enum; binary callers in `rustgate-server` propagate
+//! these via `?` and surface them through `anyhow::Error` at the
+//! orchestration layer.
 
 pub mod health;
 mod rate_limit;

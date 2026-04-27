@@ -43,6 +43,15 @@
 //! per-message tag. Sent payloads go to whichever destinations the
 //! server's routing rules dictate, and subscribers receive every inbound
 //! frame on the connection.
+//!
+//! ## Error handling
+//!
+//! This crate's error type is [`ClientError`]; downstream applications
+//! propagate it via `?` and surface it through `anyhow::Error` (or their
+//! own aggregator) at their orchestration layer.
+//! [`rustgate_core::error::RustgateError`] is the boundary aggregator
+//! used inside the server's `rustgate-core` / `rustgate-transport` slice
+//! and is not automatically constructed from [`ClientError`].
 
 #![deny(missing_docs)]
 

@@ -82,6 +82,15 @@
 //! has access to the controlled spec can verify each field against
 //! their authoritative copy. See `CHANGELOG.md` for the full
 //! provenance note.
+//!
+//! # Error handling
+//!
+//! This crate's error type is [`error::Stanag4586Error`]; binary callers
+//! propagate it via `?` and map it through `anyhow::Error` at the
+//! orchestration layer. The `rustgate_core::error::RustgateError`
+//! boundary aggregator (used in the `rustgate-core` /
+//! `rustgate-transport` slice) is not automatically constructed from
+//! [`error::Stanag4586Error`].
 
 #![doc(html_no_source)]
 
