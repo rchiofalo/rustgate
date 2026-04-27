@@ -12,10 +12,13 @@
 //!    before any state mutation (position cache, access log, dispatch).
 //!    For multicast, the Send PEP runs per-group inside
 //!    `send_to_group_excluding` so that per-group policy granularity is
-//!    preserved. The subject is the *sender's* identity, the resource is
-//!    the destination, and the action is [`AuthzAction::Send`]. A deny
-//!    verdict drops the message outright with no observable side effect
-//!    beyond the audit trail.
+//!    preserved on the local fanout, AND a second per-group Send pass runs
+//!    on the egress path inside `compute_multicast_egress` so external
+//!    sinks (NATS, federation, HTTP) receive a copy with the union of
+//!    allow-side Send obligations applied (closes #738). The subject is
+//!    the *sender's* identity, the resource is the destination, and the
+//!    action is [`AuthzAction::Send`]. A deny verdict drops the message
+//!    outright with no observable side effect beyond the audit trail.
 //!
 //! 2. **Receive PEP** (`send_to_session`, `send_to_group`, `send_to_all`):
 //!    evaluated once per *recipient*. The subject is the *recipient's*
@@ -732,6 +735,32 @@ impl PositionReplayLimitConfig {
             burst,
         }
     }
+}
+
+/// Outcome of computing the egress copy for a multicast message.
+///
+/// Internal to the router — produced by `compute_multicast_egress` and
+/// consumed by the [`Destination::Multicast`] arm of `route_inner`. Closes
+/// #738: the egress copy must apply the union of allow-side Send
+/// obligations across the addressed groups (so external sinks see masked
+/// coordinates whenever any group's policy masks them) without disturbing
+/// the local fanout, which already runs per-group obligations
+/// recipient-side inside `send_to_group_excluding`.
+enum MulticastEgress {
+    /// At least one group's Send rule produced a payload-mutating
+    /// obligation; the wrapped arc is the masked egress copy.
+    Masked(Arc<RoutableMessage>),
+    /// No engine installed, or every allow outcome carried no
+    /// payload-mutating obligation. The caller forwards the original
+    /// unmodified `arc_msg` — matching the pre-#738 behaviour for the
+    /// no-policy path.
+    Unchanged,
+    /// Obligation actuation fail-closed under the configured
+    /// [`UnknownObligationPolicy`]. The caller suppresses egress so
+    /// external sinks receive nothing rather than a leaked unmasked
+    /// payload. The local fanout already happened with per-group
+    /// obligations applied recipient-side.
+    Suppressed,
 }
 
 /// The central message dispatch engine with ACL, authorization, backpressure, deduplication, and store-forward support.
@@ -1520,24 +1549,34 @@ impl Router {
     ///
     /// - `Some(arc)` — the message was admitted, Send PEP passed, any
     ///   data-plane obligations have been applied, and local fanout has
-    ///   been triggered. The returned `Arc` wraps the same mutated
-    ///   [`RoutableMessage`] that was delivered to local sessions. Egress
-    ///   forwarders receive exactly the same wire form as the in-process
-    ///   recipients.
+    ///   been triggered. For Direct/Group/Broadcast destinations the
+    ///   returned `Arc` wraps the same mutated [`RoutableMessage`] that
+    ///   was delivered to local sessions. For Multicast destinations,
+    ///   see the **Multicast egress** note below — the returned arc is
+    ///   a separate post-Send-PEP copy.
     /// - `None` — the message was dropped by the router. Specifically:
     ///   cross-path dedup matched, the TTL expired before dispatch, the
-    ///   Send PEP denied (audit record emitted), or a multicast fanout
-    ///   exceeded the internal `MAX_MULTICAST_GROUPS` cap. Callers MUST
-    ///   skip all egress dispatch in this case so no external sink
-    ///   observes a locally-dropped message.
+    ///   Send PEP denied (audit record emitted), a multicast fanout
+    ///   exceeded the internal `MAX_MULTICAST_GROUPS` cap, or multicast
+    ///   egress obligation actuation failed under
+    ///   [`UnknownObligationPolicy::FailClosed`]. Callers MUST skip all
+    ///   egress dispatch in this case so no external sink observes a
+    ///   locally-dropped message.
     ///
-    /// **Multicast caveat** — the Send PEP runs per-group inside the
-    /// multicast fanout (see `send_to_group_excluding`), so the returned
-    /// `Arc` for a `Destination::Multicast` message has NOT had any Send
-    /// obligations applied. External egress of multicast messages
-    /// therefore carries the pre-obligation payload. Closing that gap
-    /// requires a first-class `Action::Federate`/`Publish` PEP and is
-    /// tracked as a separate hardening task.
+    /// [`UnknownObligationPolicy::FailClosed`]:
+    ///     crate::obligations::UnknownObligationPolicy::FailClosed
+    ///
+    /// **Multicast egress** — the Send PEP runs per-group inside the
+    /// multicast fanout (see `send_to_group_excluding`) so per-group
+    /// policy granularity is preserved on the local fanout path. The
+    /// `Arc` returned for a [`Destination::Multicast`] message is a
+    /// *separate egress copy* that has the **union of allow-side Send
+    /// obligations across the addressed groups** applied — if any group
+    /// in the multicast list carries a `MaskPoint` (or `MaskPayload`)
+    /// rule on Send, the egress copy is masked. The local fanout copy
+    /// remains unmodified because each group's per-recipient delivery
+    /// already applies its own Send obligations inside
+    /// `send_to_group_excluding`. Closes #738.
     pub async fn route_for_egress(&self, msg: RoutableMessage) -> Option<Arc<RoutableMessage>> {
         // Two-layer flow control:
         // 1. BackpressureGate (global): limits total in-flight bytes across
@@ -1849,9 +1888,134 @@ impl Router {
             }
             Destination::Multicast(groups) => {
                 self.send_to_multicast(&groups, envelope).await;
+                // Closes #738. Local fan-out has already applied
+                // per-group Send obligations to each recipient copy
+                // inside `send_to_group_excluding`; the `arc_msg`
+                // captured above is the *unmasked* source form. Egress
+                // forwarders (NATS, federation, HTTP) MUST receive a
+                // masked copy whenever any group in the multicast list
+                // carries a `MaskPoint`/`MaskPayload` Send rule —
+                // otherwise the raw payload reaches an external sink
+                // even though every local recipient saw a masked copy.
+                //
+                // The multicast egress copy applies the *union* of
+                // allow-side Send obligations across the addressed
+                // groups: if any group masks, the egress copy is
+                // masked. This is the safe semantic — egress sinks
+                // are not group-aware, so the strictest masking wins.
+                // The local-fanout perf carve-out is preserved:
+                // `send_to_multicast` ran on the unmasked `envelope`
+                // above, and per-group obligations were applied
+                // recipient-side without re-clone-storming the
+                // common case.
+                return match self.compute_multicast_egress(&arc_msg, &groups) {
+                    MulticastEgress::Masked(arc) => Some(arc),
+                    MulticastEgress::Unchanged => Some(arc_msg),
+                    MulticastEgress::Suppressed => None,
+                };
             }
         }
         Some(arc_msg)
+    }
+
+    /// Compute the egress copy for a [`Destination::Multicast`] message
+    /// by evaluating the Send PEP per group and applying the union of
+    /// allow-side obligations to a clone of `arc_msg`.
+    ///
+    /// Returns:
+    /// - [`MulticastEgress::Masked`] when at least one group's Send
+    ///   rule produced a payload-mutating obligation; the wrapped arc
+    ///   is the masked egress form.
+    /// - [`MulticastEgress::Unchanged`] when no engine is installed or
+    ///   no allow-side group produced payload-mutating obligations;
+    ///   the caller forwards the unmodified `arc_msg`.
+    /// - [`MulticastEgress::Suppressed`] when obligation actuation
+    ///   fail-closed under the configured policy. The local fanout
+    ///   already occurred with per-group obligations applied
+    ///   recipient-side; external sinks observe nothing rather than a
+    ///   leaked copy.
+    ///
+    /// Audit emission: per-group `authz_denied` events are intentionally
+    /// NOT re-emitted here — `send_to_group_excluding` already audited
+    /// any denies on the local fanout path. Likewise `authz_classified_
+    /// delivery` is recipient-paired and stays in the Receive PEP. The
+    /// egress copy is a single artefact with no per-recipient envelope,
+    /// so the audit trail is the obligation-actuation side-effects
+    /// (e.g. `authz_obligation_failed` on actuation error) emitted by
+    /// `apply_obligations_with_limiter` itself.
+    fn compute_multicast_egress(
+        &self,
+        arc_msg: &Arc<RoutableMessage>,
+        groups: &[String],
+    ) -> MulticastEgress {
+        let authz_guard = self.authz.load();
+        let Some(engine) = (**authz_guard).as_ref() else {
+            return MulticastEgress::Unchanged;
+        };
+
+        // Collect the union of allow-side obligations across the groups.
+        // `HashSet` dedupes when two groups carry the same obligation
+        // (the common case for a uniform masking policy across a tenant).
+        let mut union: HashSet<Obligation> = HashSet::new();
+        for group in groups {
+            // Mirror `send_to_group_excluding`'s membership gate: a
+            // sender that is not a member of the group cannot Send to
+            // it on the local path either, so the group does not
+            // contribute its obligations to the egress union.
+            if !arc_msg.source.is_member_of(group) {
+                continue;
+            }
+            let subject = AuthzSubject::from_identity(&arc_msg.source);
+            let resource = AuthzResource::Group { group };
+            let outcome = self.authz_evaluate(engine, &subject, &resource, AuthzAction::Send);
+            if !outcome.is_allow() {
+                // Per-group deny is already audited inside
+                // `send_to_group_excluding` for the local fanout path —
+                // do not double-audit on the egress side. The denied
+                // group simply does not contribute obligations to the
+                // egress union.
+                continue;
+            }
+            for ob in outcome.obligations {
+                let _ = union.insert(ob);
+            }
+        }
+
+        // No allow-side obligations across any group → the unmasked
+        // `arc_msg` is already the correct egress form.
+        if union.is_empty() {
+            return MulticastEgress::Unchanged;
+        }
+
+        let obligations: Vec<Obligation> = union.into_iter().collect();
+        // Skip the clone+mutate when none of the obligations actually
+        // touch the payload (e.g. `TagClassified`-only union). Egress
+        // sinks observe the same envelope as a no-obligation routing.
+        if !obligations_mutate_payload(&obligations) {
+            return MulticastEgress::Unchanged;
+        }
+
+        let policy_id = engine.policy_id().to_owned();
+        let mut egress_msg = (**arc_msg).clone();
+        if let Err(e) = apply_obligations_with_limiter(
+            &mut egress_msg,
+            &obligations,
+            self.unknown_obligation_policy,
+            &policy_id,
+            Some(&self.obligation_rate_limiter),
+        ) {
+            // Fail-closed: drop the egress copy entirely rather than
+            // leaking the unmasked `arc_msg` to external sinks.
+            // `apply_obligations_with_limiter` already emitted the
+            // forensic record (`authz_obligation_failed`).
+            debug!(
+                err = %e,
+                source = %hash_cn(&arc_msg.source.cn),
+                "multicast egress obligation actuation failed; suppressing egress copy"
+            );
+            return MulticastEgress::Suppressed;
+        }
+        MulticastEgress::Masked(Arc::new(egress_msg))
     }
 
     /// Drain any messages persisted for this CN while it was
