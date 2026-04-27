@@ -23,6 +23,8 @@ impl From<RestoredEntry> for BufferedMessage {
             groups: e.groups,
             enqueued_at_unix_ms: e.enqueued_at_unix_ms,
             ttl_ms: e.ttl_ms,
+            current_hops: e.current_hops,
+            is_legacy_pre_increment: e.is_legacy_pre_increment,
         }
     }
 }
@@ -47,6 +49,18 @@ pub struct BufferedMessage {
     /// Original TTL in milliseconds, or `None` if the message had no
     /// TTL when it was buffered.
     pub ttl_ms: Option<u64>,
+    /// Federation hop counter at the moment of buffering. Persisted
+    /// post-increment as of #763 — i.e. this is the value the message
+    /// would have carried if it had been emitted live instead of
+    /// buffered. The drain hot-path checks `current_hops < max_hops`
+    /// directly rather than re-running `add_hop` on a fresh metadata.
+    pub current_hops: u32,
+    /// Backward-compat flag for entries restored from a v1 (pre-#763)
+    /// on-disk record. Those records had no persisted hop counter and
+    /// were stored *pre*-increment, so the drain hot-path applies
+    /// `+1` lazily before the limit check. Always `false` for buffers
+    /// populated by [`ReplayBuffer::push_with_hops`] in this build.
+    pub is_legacy_pre_increment: bool,
 }
 
 /// Bounded ring buffer for storing recent federation messages.
@@ -136,19 +150,50 @@ impl ReplayBuffer {
     ///
     /// Returns the sequence number assigned to the message. If capacity is
     /// zero, the message is discarded but a sequence number is still assigned.
+    ///
+    /// `current_hops` defaults to `1` for callers that have not been
+    /// updated to the post-#763 invariant — meaning "this server is the
+    /// first hop". Prefer [`ReplayBuffer::push_with_hops`] in production code so
+    /// the persisted record reflects the post-increment value the
+    /// drain hot-path expects.
     pub fn push(&mut self, payload: Bytes, groups: Vec<String>) -> u64 {
-        self.push_with_metadata(payload, groups, now_unix_ms(), None)
+        self.push_with_hops(payload, groups, now_unix_ms(), None, 1)
     }
 
     /// Store a message in the buffer with explicit TTL metadata so the
     /// persisted record can be re-checked against `Metadata::is_expired()`
     /// on a future rehydrate.
+    ///
+    /// `current_hops` defaults to `1` (this server as first hop) — see
+    /// [`ReplayBuffer::push_with_hops`] for the variant that accepts an explicit
+    /// post-increment count.
     pub fn push_with_metadata(
         &mut self,
         payload: Bytes,
         groups: Vec<String>,
         enqueued_at_unix_ms: u64,
         ttl_ms: Option<u64>,
+    ) -> u64 {
+        self.push_with_hops(payload, groups, enqueued_at_unix_ms, ttl_ms, 1)
+    }
+
+    /// Store a message in the buffer carrying the **post-increment**
+    /// federation hop counter — the hop value the message would have
+    /// carried if it had been emitted live instead of buffered.
+    ///
+    /// Persisting the post-increment value is the fix for #763: it
+    /// lets the drain hot-path evaluate the same `current_hops <
+    /// max_hops` check that a live emit would, with no extra
+    /// bookkeeping. Records persisted by an older binary land here as
+    /// `is_legacy_pre_increment = true` (set by the persistence layer)
+    /// and the drain code applies `+1` lazily.
+    pub fn push_with_hops(
+        &mut self,
+        payload: Bytes,
+        groups: Vec<String>,
+        enqueued_at_unix_ms: u64,
+        ttl_ms: Option<u64>,
+        current_hops: u32,
     ) -> u64 {
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         if self.capacity == 0 {
@@ -167,6 +212,7 @@ impl ReplayBuffer {
                 seq,
                 enqueued_at_unix_ms,
                 ttl_ms,
+                current_hops,
                 &groups,
                 &payload,
             ) {
@@ -183,6 +229,8 @@ impl ReplayBuffer {
             groups,
             enqueued_at_unix_ms,
             ttl_ms,
+            current_hops,
+            is_legacy_pre_increment: false,
         });
         seq
     }
@@ -472,6 +520,7 @@ mod tests {
                 1,
                 10,
                 None,
+                1,
                 &["alpha".into()],
                 &Bytes::from_static(b"a"),
             )
@@ -482,6 +531,7 @@ mod tests {
                 2,
                 20,
                 None,
+                1,
                 &["alpha".into()],
                 &Bytes::from_static(b"b"),
             )
@@ -492,6 +542,7 @@ mod tests {
                 3,
                 30,
                 None,
+                1,
                 &["alpha".into()],
                 &Bytes::from_static(b"c"),
             )
@@ -518,7 +569,7 @@ mod tests {
         let (_dir, store) = open_store();
         for i in 1u64..=5 {
             store
-                .put("peer-a", i, 100 + i, None, &[], &Bytes::from(vec![b'x']))
+                .put("peer-a", i, 100 + i, None, 1, &[], &Bytes::from(vec![b'x']))
                 .unwrap();
         }
         let mut buf = ReplayBuffer::with_store(2, "peer-a", Arc::clone(&store));

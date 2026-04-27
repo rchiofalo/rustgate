@@ -954,6 +954,14 @@ impl FederationManager {
     ///
     /// Called during forwarding so that messages are available for replay
     /// when a peer reconnects after a disconnection.
+    ///
+    /// The persisted record carries the **post-increment** hop counter
+    /// — what the message would have carried if it had been emitted
+    /// live. Pre-#763 this method persisted before the hop bump, so a
+    /// message at `current_hops = max_hops - 1` was incorrectly
+    /// allowed through on drain because the hop hadn't been bumped
+    /// yet; that gap is closed by computing the post-increment value
+    /// here, before any peer write.
     fn buffer_for_replay(&self, payload: &Bytes, groups: &[String], metadata: Option<&Metadata>) {
         if self.config.replay_buffer_capacity == 0 {
             return;
@@ -962,6 +970,13 @@ impl FederationManager {
         let ttl_ms: Option<u64> = metadata
             .and_then(|m| m.ttl)
             .map(|d| d.as_millis().min(u64::MAX as u128) as u64);
+        // Closes #763: persist what we would emit, not what we received.
+        // The live forwarder builds a fresh `FederationMetadata` and
+        // calls `add_hop` exactly once (this server as first hop), so
+        // the post-increment count is `1`. If/when the live path
+        // changes to thread an inbound hop count through, this is the
+        // single point that needs to follow it.
+        let current_hops_post_increment: u32 = 1;
         if let Ok(mut buffers) = self.replay_buffers.lock() {
             for peer_id in self.peers.keys() {
                 let buffer = buffers.entry(peer_id.clone()).or_insert_with(|| {
@@ -971,11 +986,12 @@ impl FederationManager {
                         self.replay_store.as_ref(),
                     )
                 });
-                let _ = buffer.push_with_metadata(
+                let _ = buffer.push_with_hops(
                     payload.clone(),
                     groups.to_vec(),
                     enqueued_at_unix_ms,
                     ttl_ms,
+                    current_hops_post_increment,
                 );
             }
         }

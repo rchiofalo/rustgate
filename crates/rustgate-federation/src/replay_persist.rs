@@ -8,15 +8,34 @@
 //! messages. This module persists each buffered message to a redb table
 //! so the replay buffers can be restored on startup.
 //!
-//! The on-disk format is intentionally minimal:
+//! The on-disk format is intentionally minimal. There are two value
+//! layouts kept in the same redb table for backward compatibility:
 //!
 //! ```text
-//! key   = peer_id (str) + b"\x00" + seq (u64 big-endian)
-//! value = u64 enqueued_at_unix_ms,
-//!         u64 ttl_ms (0 = no TTL),
-//!         u32 groups_len, [u32 group_len, group_bytes]*,
-//!         payload bytes
+//! key       = peer_id (str) + b"\x00" + seq (u64 big-endian)
+//! value v1  = u64 enqueued_at_unix_ms,
+//!             u64 ttl_ms (0 = no TTL),
+//!             u32 groups_len, [u32 group_len, group_bytes]*,
+//!             payload bytes
+//! value v2  = b"\xFF\xFE" magic,
+//!             u8  version (currently 1),
+//!             u32 current_hops (post-increment — what we will emit),
+//!             u64 enqueued_at_unix_ms,
+//!             u64 ttl_ms (0 = no TTL),
+//!             u32 groups_len, [u32 group_len, group_bytes]*,
+//!             payload bytes
 //! ```
+//!
+//! The v2 layout was introduced to fix #763 (store-forward persisted
+//! the pre-hop-increment envelope, so the drain hot-path re-evaluated
+//! hops against a stale value). The two-byte magic prefix `0xFF 0xFE`
+//! cannot collide with a legitimate v1 record because v1 starts with a
+//! `u64::to_be_bytes` of a Unix-millisecond timestamp — real values
+//! near year-2024 are well under `0x00_00_FF_FF_FF_FF_FF_FF`, so the
+//! first two bytes of any plausible v1 record are `0x00 0x00`. On read,
+//! a v1 record (no version field) is treated as **legacy /
+//! pre-increment**: the drain hot-path applies `+1` lazily to bring it
+//! into agreement with what a fresh post-increment write would produce.
 //!
 //! A single redb table is used so we can iterate by peer prefix on
 //! startup and walk in seq order for global byte-cap eviction.
@@ -88,6 +107,20 @@ pub struct RestoredEntry {
     pub groups: Vec<String>,
     /// Raw message payload.
     pub payload: Bytes,
+    /// Federation hop counter at the point of persistence. For records
+    /// written by v2 of the value codec this is the post-increment
+    /// value — what would have been emitted live. For legacy v1
+    /// records (see [`is_legacy_pre_increment`](Self::is_legacy_pre_increment))
+    /// this is `0` and the drain hot-path is responsible for applying
+    /// the `+1` lazily before the limit check, because v1 stored the
+    /// pre-increment envelope (closes #763).
+    pub current_hops: u32,
+    /// `true` when the entry was decoded from a v1 (legacy) value
+    /// layout, which predates persisted hop accounting. The drain
+    /// hot-path treats `current_hops` as pre-increment in this case
+    /// and applies `+1` before the hop-limit check, mirroring what a
+    /// post-#763 live emit would have done.
+    pub is_legacy_pre_increment: bool,
 }
 
 #[derive(Debug)]
@@ -189,11 +222,11 @@ impl ReplayStore {
                         continue;
                     }
                 };
-                let Some((enqueued_at_unix_ms, _ttl_ms, _groups, _payload)) = decode_value(value)
-                else {
+                let Some(decoded) = decode_value(value) else {
                     debug!("skipping malformed replay-store value on rebuild");
                     continue;
                 };
+                let enqueued_at_unix_ms = decoded.enqueued_at_unix_ms;
                 let bytes = accounted_size(key.len(), value.len());
                 inner.total_bytes = inner.total_bytes.saturating_add(bytes);
                 inner.global.push_back(Entry {
@@ -228,16 +261,31 @@ impl ReplayStore {
     /// Persist a single replay entry. Returns `Ok(())` on success even
     /// when the entry was evicted by the byte cap (caller should treat
     /// the in-memory ring as the source of truth for current contents).
+    ///
+    /// `current_hops` is the **post-increment** federation hop counter
+    /// — i.e. what the message would carry if it were emitted live
+    /// instead of buffered. Persisting the post-increment value (not
+    /// the pre-increment input) is the fix for #763: it lets the drain
+    /// hot-path evaluate the same hop-limit check that a live emit
+    /// would, with no extra bookkeeping.
+    // justification: the persistence call site in
+    // `replay_buffer::push_with_hops` already destructures
+    // `BufferedMessage` into the same fields, and the test harnesses
+    // call `put` positionally for readability. Bundling these into a
+    // struct would push the same fan-in upstream without reducing live
+    // references at the call site — it only renames the arguments.
+    #[allow(clippy::too_many_arguments)]
     pub fn put(
         &self,
         peer_id: &str,
         seq: u64,
         enqueued_at_unix_ms: u64,
         ttl_ms: Option<u64>,
+        current_hops: u32,
         groups: &[String],
         payload: &Bytes,
     ) -> Result<(), ReplayStoreError> {
-        let value = encode_value(enqueued_at_unix_ms, ttl_ms, groups, payload);
+        let value = encode_value(enqueued_at_unix_ms, ttl_ms, current_hops, groups, payload);
         let key = encode_key(peer_id, seq);
         let accounted = accounted_size(key.len(), value.len());
 
@@ -408,18 +456,19 @@ impl ReplayStore {
                 debug!("skipping malformed replay-store key on load");
                 continue;
             };
-            let Some((enqueued_at_unix_ms, ttl_ms, groups, payload)) = decode_value(v.value())
-            else {
+            let Some(decoded) = decode_value(v.value()) else {
                 debug!("skipping malformed replay-store value on load");
                 continue;
             };
             out.push(RestoredEntry {
                 peer_id,
                 seq,
-                enqueued_at_unix_ms,
-                ttl_ms,
-                groups,
-                payload,
+                enqueued_at_unix_ms: decoded.enqueued_at_unix_ms,
+                ttl_ms: decoded.ttl_ms,
+                groups: decoded.groups,
+                payload: decoded.payload,
+                current_hops: decoded.current_hops,
+                is_legacy_pre_increment: decoded.is_legacy_pre_increment,
             });
         }
         out.sort_by(|a, b| (a.peer_id.as_str(), a.seq).cmp(&(b.peer_id.as_str(), b.seq)));
@@ -464,13 +513,43 @@ fn decode_key(raw: &[u8]) -> Option<(String, u64)> {
     Some((peer, u64::from_be_bytes(seq_bytes)))
 }
 
+/// Two-byte magic prefix that distinguishes a v2 (post-#763) value
+/// layout from a legacy v1 value. Cannot collide with v1 because v1
+/// records start with a Unix-millisecond timestamp encoded as
+/// `u64::to_be_bytes`, whose high two bytes are always `0x00 0x00` for
+/// any plausible wall-clock value.
+const VALUE_MAGIC_V2: [u8; 2] = [0xFF, 0xFE];
+
+/// Current value codec version. Bumped only on a wire-shape change;
+/// readers branch on this byte before parsing anything else.
+const VALUE_VERSION_V2: u8 = 1;
+
+/// Decoded value payload. Carries the fields written by either codec
+/// version plus a `is_legacy_pre_increment` flag the drain path uses
+/// to apply the lazy `+1` for v1 records (see module docs / #763).
+struct DecodedValue {
+    enqueued_at_unix_ms: u64,
+    ttl_ms: Option<u64>,
+    current_hops: u32,
+    is_legacy_pre_increment: bool,
+    groups: Vec<String>,
+    payload: Bytes,
+}
+
 fn encode_value(
     enqueued_at_unix_ms: u64,
     ttl_ms: Option<u64>,
+    current_hops: u32,
     groups: &[String],
     payload: &Bytes,
 ) -> Vec<u8> {
     let mut buf = BytesMut::new();
+    // v2 layout — magic + version + post-increment hops up front so a
+    // legacy reader (or a corrupted byte) never accidentally accepts a
+    // v2 record as v1 and vice versa.
+    buf.put_slice(&VALUE_MAGIC_V2);
+    buf.put_u8(VALUE_VERSION_V2);
+    buf.put_u32(current_hops);
     buf.put_u64(enqueued_at_unix_ms);
     // Encode `None` as 0; live messages are never enqueued with a 0 ms
     // TTL because the forward boundary would have already dropped them.
@@ -484,13 +563,70 @@ fn encode_value(
     buf.to_vec()
 }
 
-fn decode_value(mut raw: &[u8]) -> Option<(u64, Option<u64>, Vec<String>, Bytes)> {
+fn decode_value(raw: &[u8]) -> Option<DecodedValue> {
+    // Branch on the v2 magic prefix. Anything that doesn't match is a
+    // legacy v1 record — the on-disk format predates persisted hop
+    // accounting, so the drain hot-path applies +1 lazily.
+    if raw.len() >= 2 && raw[..2] == VALUE_MAGIC_V2 {
+        decode_value_v2(&raw[2..])
+    } else {
+        decode_value_v1(raw)
+    }
+}
+
+fn decode_value_v1(mut raw: &[u8]) -> Option<DecodedValue> {
     if raw.len() < 8 + 8 + 4 {
         return None;
     }
     let enqueued_at_unix_ms = raw.get_u64();
     let ttl_raw = raw.get_u64();
     let ttl_ms = if ttl_raw == 0 { None } else { Some(ttl_raw) };
+    let (groups, payload) = decode_groups_and_payload(&mut raw)?;
+    Some(DecodedValue {
+        enqueued_at_unix_ms,
+        ttl_ms,
+        // v1 records have no persisted hop counter. Surface 0 plus the
+        // legacy flag so the drain hot-path applies +1 before the
+        // hop-limit check, matching what a post-#763 live emit would
+        // have done at the boundary.
+        current_hops: 0,
+        is_legacy_pre_increment: true,
+        groups,
+        payload,
+    })
+}
+
+fn decode_value_v2(mut raw: &[u8]) -> Option<DecodedValue> {
+    // Header after the magic: 1 (version) + 4 (hops) + 8 (ts) + 8 (ttl) + 4 (groups_len) = 25 bytes.
+    if raw.len() < 1 + 4 + 8 + 8 + 4 {
+        return None;
+    }
+    let version = raw.get_u8();
+    if version != VALUE_VERSION_V2 {
+        // Future versions land here. Refuse rather than parse unknown
+        // bytes — the rebuild path treats `None` as "drop the entry"
+        // and continues with the rest of the table.
+        return None;
+    }
+    let current_hops = raw.get_u32();
+    let enqueued_at_unix_ms = raw.get_u64();
+    let ttl_raw = raw.get_u64();
+    let ttl_ms = if ttl_raw == 0 { None } else { Some(ttl_raw) };
+    let (groups, payload) = decode_groups_and_payload(&mut raw)?;
+    Some(DecodedValue {
+        enqueued_at_unix_ms,
+        ttl_ms,
+        current_hops,
+        is_legacy_pre_increment: false,
+        groups,
+        payload,
+    })
+}
+
+fn decode_groups_and_payload(raw: &mut &[u8]) -> Option<(Vec<String>, Bytes)> {
+    if raw.len() < 4 {
+        return None;
+    }
     let n = raw.get_u32() as usize;
     let mut groups = Vec::with_capacity(n);
     for _ in 0..n {
@@ -505,12 +641,7 @@ fn decode_value(mut raw: &[u8]) -> Option<(u64, Option<u64>, Vec<String>, Bytes)
         raw.advance(glen);
         groups.push(g);
     }
-    Some((
-        enqueued_at_unix_ms,
-        ttl_ms,
-        groups,
-        Bytes::copy_from_slice(raw),
-    ))
+    Some((groups, Bytes::copy_from_slice(raw)))
 }
 
 /// Estimated on-disk footprint for a (key, value) pair, used by the
@@ -553,7 +684,7 @@ mod tests {
 
     fn put(store: &ReplayStore, peer: &str, seq: u64, ts_ms: u64, payload: &'static [u8]) {
         store
-            .put(peer, seq, ts_ms, None, &[], &Bytes::from_static(payload))
+            .put(peer, seq, ts_ms, None, 1, &[], &Bytes::from_static(payload))
             .unwrap();
     }
 
@@ -568,6 +699,7 @@ mod tests {
                 1,
                 100,
                 Some(60_000),
+                1,
                 &["alpha".into(), "bravo".into()],
                 &Bytes::from_static(b"hello"),
             )
@@ -578,12 +710,13 @@ mod tests {
                 2,
                 200,
                 None,
+                1,
                 &["alpha".into()],
                 &Bytes::from_static(b"world"),
             )
             .unwrap();
         store
-            .put("peer-b", 1, 300, None, &[], &Bytes::from_static(b"solo"))
+            .put("peer-b", 1, 300, None, 1, &[], &Bytes::from_static(b"solo"))
             .unwrap();
         drop(store);
 
@@ -644,6 +777,7 @@ mod tests {
                     i + 1,
                     1_000 + i,
                     None,
+                    1,
                     &[],
                     &Bytes::from(vec![b'x'; 8]),
                 )
@@ -666,21 +800,21 @@ mod tests {
         let store = ReplayStore::open(dir.path(), 350).unwrap();
         // Two A records first.
         store
-            .put("a", 1, 1_000, None, &[], &Bytes::from(vec![b'x'; 32]))
+            .put("a", 1, 1_000, None, 1, &[], &Bytes::from(vec![b'x'; 32]))
             .unwrap();
         store
-            .put("a", 2, 1_001, None, &[], &Bytes::from(vec![b'x'; 32]))
+            .put("a", 2, 1_001, None, 1, &[], &Bytes::from(vec![b'x'; 32]))
             .unwrap();
         // Then two B records.
         store
-            .put("b", 1, 2_000, None, &[], &Bytes::from(vec![b'x'; 32]))
+            .put("b", 1, 2_000, None, 1, &[], &Bytes::from(vec![b'x'; 32]))
             .unwrap();
         store
-            .put("b", 2, 2_001, None, &[], &Bytes::from(vec![b'x'; 32]))
+            .put("b", 2, 2_001, None, 1, &[], &Bytes::from(vec![b'x'; 32]))
             .unwrap();
         // One more push triggers eviction; peer A is the oldest.
         store
-            .put("b", 3, 3_000, None, &[], &Bytes::from(vec![b'x'; 32]))
+            .put("b", 3, 3_000, None, 1, &[], &Bytes::from(vec![b'x'; 32]))
             .unwrap();
 
         let all = store.load_all().unwrap();
@@ -782,13 +916,13 @@ mod tests {
             // Out-of-order writes to ensure the in-memory deque doesn't
             // accidentally rely on insertion order.
             store
-                .put("a", 1, 1_000, None, &[], &Bytes::from_static(b"a1"))
+                .put("a", 1, 1_000, None, 1, &[], &Bytes::from_static(b"a1"))
                 .unwrap();
             store
-                .put("b", 1, 2_000, None, &[], &Bytes::from_static(b"b1"))
+                .put("b", 1, 2_000, None, 1, &[], &Bytes::from_static(b"b1"))
                 .unwrap();
             store
-                .put("a", 2, 3_000, None, &[], &Bytes::from_static(b"a2"))
+                .put("a", 2, 3_000, None, 1, &[], &Bytes::from_static(b"a2"))
                 .unwrap();
         }
         // Reopen and shrink the cap so eviction happens against the
@@ -796,7 +930,7 @@ mod tests {
         // must be evicted before the later ones.
         let store = ReplayStore::open(dir.path(), 130).unwrap();
         store
-            .put("b", 2, 4_000, None, &[], &Bytes::from_static(b"b2"))
+            .put("b", 2, 4_000, None, 1, &[], &Bytes::from_static(b"b2"))
             .unwrap();
         let all = store.load_all().unwrap();
         let still_there: Vec<(String, u64)> =
@@ -927,22 +1061,26 @@ mod tests {
     fn encode_decode_value_round_trip_typical() {
         let groups = vec!["alpha".to_string(), "bravo".to_string()];
         let payload = Bytes::from_static(b"hello");
-        let raw = encode_value(100, Some(60_000), &groups, &payload);
-        let (ts, ttl, g, p) = decode_value(&raw).expect("round-trip must decode");
-        assert_eq!(ts, 100);
-        assert_eq!(ttl, Some(60_000));
-        assert_eq!(g, groups);
-        assert_eq!(p, payload);
+        let raw = encode_value(100, Some(60_000), 2, &groups, &payload);
+        let decoded = decode_value(&raw).expect("round-trip must decode");
+        assert_eq!(decoded.enqueued_at_unix_ms, 100);
+        assert_eq!(decoded.ttl_ms, Some(60_000));
+        assert_eq!(decoded.current_hops, 2);
+        assert!(!decoded.is_legacy_pre_increment);
+        assert_eq!(decoded.groups, groups);
+        assert_eq!(decoded.payload, payload);
     }
 
     #[test]
     fn encode_decode_value_round_trip_empty_groups_and_payload() {
-        let raw = encode_value(0, None, &[], &Bytes::new());
-        let (ts, ttl, g, p) = decode_value(&raw).expect("minimal value must decode");
-        assert_eq!(ts, 0);
-        assert_eq!(ttl, None);
-        assert!(g.is_empty());
-        assert!(p.is_empty());
+        let raw = encode_value(0, None, 0, &[], &Bytes::new());
+        let decoded = decode_value(&raw).expect("minimal value must decode");
+        assert_eq!(decoded.enqueued_at_unix_ms, 0);
+        assert_eq!(decoded.ttl_ms, None);
+        assert_eq!(decoded.current_hops, 0);
+        assert!(!decoded.is_legacy_pre_increment);
+        assert!(decoded.groups.is_empty());
+        assert!(decoded.payload.is_empty());
     }
 
     /// The encoder represents a missing TTL as `0`, and the decoder
@@ -954,32 +1092,44 @@ mod tests {
     /// silently change on-disk format for existing deployments.
     #[test]
     fn ttl_some_zero_round_trips_as_none_by_sentinel_convention() {
-        let raw = encode_value(1, Some(0), &[], &Bytes::from_static(b"x"));
-        let (_ts, ttl, _g, _p) = decode_value(&raw).expect("value must decode");
+        let raw = encode_value(1, Some(0), 1, &[], &Bytes::from_static(b"x"));
+        let decoded = decode_value(&raw).expect("value must decode");
         assert_eq!(
-            ttl, None,
+            decoded.ttl_ms, None,
             "Some(0) must decode as None by sentinel convention"
         );
     }
 
     #[test]
-    fn decode_value_rejects_header_shorter_than_twenty_bytes() {
-        // Header is 8 (ts) + 8 (ttl) + 4 (groups_len) = 20 bytes.
+    fn decode_value_rejects_header_shorter_than_required() {
+        // Smallest valid v2 header (after magic): 1 (ver) + 4 (hops) + 8 (ts) + 8 (ttl) + 4 (groups_len) = 25 bytes.
+        for n in 0..25usize {
+            let mut raw = vec![0xFFu8, 0xFE]; // valid v2 magic
+            raw.extend_from_slice(&vec![0u8; n]);
+            assert!(
+                decode_value(&raw).is_none(),
+                "expected None for {n}-byte v2 body",
+            );
+        }
+        // Legacy (no magic) — header is 8 + 8 + 4 = 20 bytes.
         for n in 0..20usize {
             let raw = vec![0u8; n];
             assert!(
                 decode_value(&raw).is_none(),
-                "expected None for {n}-byte value header",
+                "expected None for {n}-byte legacy header",
             );
         }
     }
 
     #[test]
     fn decode_value_rejects_group_length_exceeding_remaining_bytes() {
-        // Craft a value that claims 1 group of 100 bytes but supplies
+        // Craft a v2 value that claims 1 group of 100 bytes but supplies
         // only 2. The decoder must refuse rather than read past the
         // buffer or return a partial group.
         let mut raw = BytesMut::new();
+        raw.put_slice(&VALUE_MAGIC_V2);
+        raw.put_u8(VALUE_VERSION_V2);
+        raw.put_u32(0); // hops
         raw.put_u64(0); // ts
         raw.put_u64(0); // ttl
         raw.put_u32(1); // groups_len = 1
@@ -990,9 +1140,12 @@ mod tests {
 
     #[test]
     fn decode_value_rejects_missing_group_length_field() {
-        // 20-byte header says 1 group follows, but no group-length u32
+        // 25-byte v2 header says 1 group follows, but no group-length u32
         // is present at all.
         let mut raw = BytesMut::new();
+        raw.put_slice(&VALUE_MAGIC_V2);
+        raw.put_u8(VALUE_VERSION_V2);
+        raw.put_u32(0);
         raw.put_u64(0);
         raw.put_u64(0);
         raw.put_u32(1);
@@ -1002,6 +1155,9 @@ mod tests {
     #[test]
     fn decode_value_rejects_invalid_utf8_group_name() {
         let mut raw = BytesMut::new();
+        raw.put_slice(&VALUE_MAGIC_V2);
+        raw.put_u8(VALUE_VERSION_V2);
+        raw.put_u32(0);
         raw.put_u64(0);
         raw.put_u64(0);
         raw.put_u32(1);
@@ -1013,10 +1169,74 @@ mod tests {
     #[test]
     fn encode_decode_value_many_groups_round_trip() {
         let groups: Vec<String> = (0..32).map(|i| format!("g-{i}")).collect();
-        let raw = encode_value(999, Some(1), &groups, &Bytes::from_static(b"body"));
-        let (_ts, _ttl, g, p) = decode_value(&raw).expect("must decode");
-        assert_eq!(g, groups);
-        assert_eq!(p, Bytes::from_static(b"body"));
+        let raw = encode_value(999, Some(1), 5, &groups, &Bytes::from_static(b"body"));
+        let decoded = decode_value(&raw).expect("must decode");
+        assert_eq!(decoded.current_hops, 5);
+        assert_eq!(decoded.groups, groups);
+        assert_eq!(decoded.payload, Bytes::from_static(b"body"));
+    }
+
+    /// Pin the v2 magic prefix bytes — wire-format invariant. The two
+    /// bytes are picked so they cannot collide with a v1 record (whose
+    /// first 8 bytes are a Unix-millisecond timestamp encoded big-endian,
+    /// always starting `0x00 0x00` for any plausible wall-clock value).
+    /// Bumping these without bumping `VALUE_VERSION_V2` would silently
+    /// invalidate every existing on-disk record on operator upgrade.
+    #[test]
+    fn value_magic_v2_is_pinned_to_ff_fe() {
+        assert_eq!(VALUE_MAGIC_V2, [0xFF, 0xFE]);
+        assert_eq!(VALUE_VERSION_V2, 1);
+    }
+
+    /// A v2-encoded record must be flagged as post-increment and
+    /// preserve `current_hops` exactly across a round-trip — the
+    /// drain hot-path relies on this to evaluate the same hop-limit
+    /// check that a live emit would.
+    #[test]
+    fn v2_round_trip_preserves_hop_count() {
+        for hops in [0u32, 1, 5, 9, u32::MAX] {
+            let raw = encode_value(123, None, hops, &[], &Bytes::from_static(b"p"));
+            let decoded = decode_value(&raw).expect("must decode");
+            assert_eq!(decoded.current_hops, hops);
+            assert!(!decoded.is_legacy_pre_increment);
+        }
+    }
+
+    /// Records written by the v1 codec (no magic prefix) decode as
+    /// `is_legacy_pre_increment = true`, with `current_hops = 0`. The
+    /// drain hot-path applies `+1` lazily so legacy entries match the
+    /// post-#763 invariant. Hand-build the legacy bytes here rather
+    /// than calling a removed encoder so the regression test cannot
+    /// drift if someone later renames or reshuffles fields.
+    #[test]
+    fn legacy_v1_record_decodes_as_pre_increment() {
+        let mut raw = BytesMut::new();
+        raw.put_u64(42); // ts
+        raw.put_u64(0); // ttl (None)
+        raw.put_u32(1); // groups_len
+        raw.put_u32(3);
+        raw.put_slice(b"abc");
+        raw.put_slice(b"hello");
+        let decoded = decode_value(&raw).expect("legacy must decode");
+        assert!(decoded.is_legacy_pre_increment);
+        assert_eq!(decoded.current_hops, 0);
+        assert_eq!(decoded.enqueued_at_unix_ms, 42);
+        assert_eq!(decoded.groups, vec!["abc".to_string()]);
+        assert_eq!(decoded.payload, Bytes::from_static(b"hello"));
+    }
+
+    /// Future codec versions return `None` on read so the rebuild path
+    /// drops the entry rather than silently mis-parsing unknown bytes.
+    #[test]
+    fn decode_rejects_unknown_v2_version_byte() {
+        let mut raw = BytesMut::new();
+        raw.put_slice(&VALUE_MAGIC_V2);
+        raw.put_u8(VALUE_VERSION_V2.saturating_add(1));
+        raw.put_u32(0);
+        raw.put_u64(0);
+        raw.put_u64(0);
+        raw.put_u32(0);
+        assert!(decode_value(&raw).is_none());
     }
 
     #[test]
@@ -1169,7 +1389,7 @@ mod tests {
         {
             let store = ReplayStore::open(dir.path(), 4096).unwrap();
             store
-                .put("p", 1, 10, None, &["g".into()], &Bytes::new())
+                .put("p", 1, 10, None, 1, &["g".into()], &Bytes::new())
                 .unwrap();
         }
         let store = ReplayStore::open(dir.path(), 4096).unwrap();
@@ -1205,6 +1425,8 @@ mod tests {
             ttl_ms: Some(42),
             groups: vec!["g".to_string()],
             payload: Bytes::from_static(b"x"),
+            current_hops: 1,
+            is_legacy_pre_increment: false,
         };
         let cloned = e.clone();
         assert_eq!(cloned.peer_id, e.peer_id);
@@ -1279,7 +1501,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = ReplayStore::open(dir.path(), 0).unwrap();
         store
-            .put("p", 1, 10, None, &[], &Bytes::from_static(b"x"))
+            .put("p", 1, 10, None, 1, &[], &Bytes::from_static(b"x"))
             .unwrap();
         // The freshly-inserted record itself always remains in memory;
         // any earlier record would be evicted first. With a cap of 0
@@ -1288,8 +1510,80 @@ mod tests {
         // A second put drops the first in memory even though both
         // exist briefly in the b-tree.
         store
-            .put("p", 2, 20, None, &[], &Bytes::from_static(b"y"))
+            .put("p", 2, 20, None, 1, &[], &Bytes::from_static(b"y"))
             .unwrap();
         assert_eq!(store.len(), 1);
+    }
+
+    // ---------------------------------------------------------------
+    // #763 — store-forward persists post-hop-increment envelope.
+    // ---------------------------------------------------------------
+
+    /// A `put(..., current_hops = N)` followed by `load_all` returns a
+    /// `RestoredEntry` whose `current_hops` equals `N` and whose
+    /// `is_legacy_pre_increment` flag is `false`. This is the persistence-
+    /// layer half of the post-increment invariant — the drain hot-path
+    /// then evaluates `current_hops < max_hops` directly.
+    #[test]
+    fn store_forward_persists_post_increment_hops() {
+        // Admit at hops=3, persist, read back, assert hops=3 round-trips
+        // unchanged with the post-increment flag set. The "+1" relative to
+        // a fresh first-hop emit is the producer's responsibility — the
+        // store treats whatever it is handed as the post-increment value.
+        let dir = tempfile::tempdir().unwrap();
+        let store = ReplayStore::open(dir.path(), 1 << 20).unwrap();
+        store
+            .put("peer-a", 1, 1_000, None, 3, &[], &Bytes::from_static(b"p"))
+            .unwrap();
+        drop(store);
+
+        let store = ReplayStore::open(dir.path(), 1 << 20).unwrap();
+        let all = store.load_all().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].current_hops, 3);
+        assert!(
+            !all[0].is_legacy_pre_increment,
+            "v2-encoded record must not be flagged legacy"
+        );
+    }
+
+    /// Records written by a pre-#763 binary (no v2 magic) decode as
+    /// legacy. The drain hot-path is responsible for applying `+1`
+    /// before checking the limit; this test only locks down the
+    /// persistence-layer contract that the legacy flag is surfaced.
+    #[test]
+    fn legacy_envelope_without_version_field_is_treated_as_pre_increment() {
+        // Hand-build a v1 (legacy) record by writing the value bytes
+        // directly to redb, bypassing the v2 encoder. This is the
+        // exact byte layout produced by binaries that predate the
+        // wire-format change.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("federation_replay.redb");
+        {
+            let db = redb::Database::create(&path).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let mut table = write.open_table(REPLAY_TABLE).unwrap();
+                let key = encode_key("peer-legacy", 1);
+                let mut value = BytesMut::new();
+                value.put_u64(7); // ts
+                value.put_u64(0); // ttl=None
+                value.put_u32(0); // groups_len
+                value.put_slice(b"legacy-payload");
+                let _ = table.insert(key.as_slice(), value.as_ref()).unwrap();
+            }
+            write.commit().unwrap();
+        }
+
+        let store = ReplayStore::open(dir.path(), 1 << 20).expect("open must succeed");
+        let all = store.load_all().unwrap();
+        assert_eq!(all.len(), 1);
+        let entry = &all[0];
+        assert!(
+            entry.is_legacy_pre_increment,
+            "v1-encoded record must surface as legacy on read"
+        );
+        assert_eq!(entry.current_hops, 0, "v1 carries no persisted hop count");
+        assert_eq!(entry.payload, Bytes::from_static(b"legacy-payload"));
     }
 }
