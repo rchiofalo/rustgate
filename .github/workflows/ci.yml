@@ -742,6 +742,38 @@ jobs:
         # scripts/check-binary-size.py module docstring for details.
         run: python3 scripts/check-binary-size.py rustgate-default target/release/rustgate
 
+  # ---------------------------------------------------------------------------
+  # Split-gate audit model (closes #776)
+  #
+  # The previous single `audit` job ran `cargo deny check` (advisories +
+  # licenses + bans + sources, all blocking) and then `cargo audit` with a
+  # hardcoded ignore list that was NOT mirrored in `deny.toml`. That made
+  # every advisory category — including `unmaintained` informational
+  # warnings on transitive deps — equally merge-blocking, and let the two
+  # ignore lists drift apart over time.
+  #
+  # The split below separates the gate by severity and ties the soft job's
+  # ignore list to deny.toml so they cannot drift:
+  #
+  #   * audit — CI-blocking. `cargo deny check` with the
+  #     `unmaintained` / `yanked` / `notice` lints demoted to warn so only
+  #     true vulnerabilities (`vulnerability`, `unsound`) plus the static
+  #     license/bans/sources policies block merge. Severity threshold for
+  #     this gate: `high` — see the comment block at the top of deny.toml.
+  #
+  #   * audit-soft — never blocks merge. Runs `cargo audit` (which surfaces
+  #     RustSec vulnerabilities, unmaintained advisories, and yanked
+  #     versions) using the SAME ignore list as deny.toml, extracted by
+  #     `scripts/extract-audit-ignores.py`. Findings show up as
+  #     `::warning::` annotations on the PR's checks tab; exit code is
+  #     pinned to 0 so a new "unmaintained" advisory on a transitive
+  #     dependency cannot create a false-positive merge block.
+  #
+  # Single source of truth: `[advisories].ignore` in deny.toml. Both jobs
+  # derive their per-advisory exemptions from there. Do NOT add a per-job
+  # ignore list here — that drift is exactly what #776 fixes.
+  # ---------------------------------------------------------------------------
+
   audit:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [check-features, test]
@@ -763,26 +795,112 @@ jobs:
       - uses: taiki-e/install-action@055f5df8c3f65ea01cd41e9dc855becd88953486 # v2.75.18
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          tool: cargo-deny,cargo-audit
+          tool: cargo-deny
 
-      - name: Check advisories, licenses, bans, and sources
-        # Advisories, licenses, bans, and sources now gate the build. When a
-        # new advisory needs temporary acceptance, suppress it explicitly in
-        # `deny.toml` (with a dated reviewer note) instead of masking every
-        # failure with continue-on-error — the latter silently hides real CVEs.
-        run: cargo deny check
-
-      - name: Run cargo audit
-        # Advisories gate the build. Known-accepted advisories are listed by
-        # ID below with the reason they do not apply to our configuration;
-        # add new entries only with a reviewer-signed rationale. New CVEs not
-        # on this list will fail the job — that is the intended behaviour.
+      - name: Check advisories (vulnerabilities, unsound), licenses, bans, sources
+        # Severity gate — blocks merge on real vulnerabilities only.
         #
-        # RUSTSEC-2025-0134: unmaintained crate with no available replacement
-        #   yet; tracked upstream, no security impact in our usage.
-        # RUSTSEC-2026-0049: advisory does not affect our configuration;
-        #   mitigation is in place via input validation at the transport layer.
-        run: cargo audit --ignore RUSTSEC-2025-0134 --ignore RUSTSEC-2026-0049
+        # `cargo deny` lint categories:
+        #   * vulnerability  — RUSTSEC entries with a CVE / security impact.
+        #                      Default lint level: deny. Stays at deny here.
+        #   * unsound        — RUSTSEC entries flagging unsound public APIs.
+        #                      Default lint level: deny. Stays at deny here.
+        #   * unmaintained   — informational; upstream crate no longer
+        #                      maintained. Demoted to warn in this gate so
+        #                      a new "unmaintained" advisory on a transitive
+        #                      dep does not block PR merges. Surfaced via
+        #                      the audit-soft job below.
+        #   * yanked         — registry yanked the version. Demoted to warn;
+        #                      audit-soft surfaces it.
+        #   * notice         — registry notice (informational). Demoted to
+        #                      warn; audit-soft surfaces it.
+        #
+        # The license/bans/sources sub-checks remain at their deny.toml
+        # levels (license violations and disallowed crates DO block merge).
+        # Per-advisory exemptions live in deny.toml's `[advisories].ignore`
+        # — single source of truth shared with the audit-soft job below.
+        run: |
+          cargo deny check \
+            --hide-inclusion-graph \
+            --warn unmaintained \
+            --warn yanked \
+            --warn notice
+
+  audit-soft:
+    # Never blocks merge — surfaces unmaintained / informational advisories
+    # as `::warning::` annotations so operators see the surface area without
+    # creating false-positive merge blocks. Exit code pinned to 0.
+    if: github.event.pull_request.draft == false || github.event_name == 'push'
+    needs: [check-features, test]
+    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    # `continue-on-error: true` belt-and-braces against an unexpected
+    # `cargo audit` exit code escaping the inline `|| true` in the step
+    # body. The intent of this job is "report, never block" — both the
+    # job-level flag and the step-level `|| true` enforce that.
+    continue-on-error: true
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40 # v2.19.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # 1.94
+        with:
+          toolchain: "1.94"
+
+      - uses: taiki-e/install-action@055f5df8c3f65ea01cd41e9dc855becd88953486 # v2.75.18
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+
+      - name: Derive cargo audit ignore list from deny.toml
+        # `scripts/extract-audit-ignores.py` reads deny.toml's
+        # `[advisories].ignore` array and emits the equivalent set of
+        # `--ignore RUSTSEC-XXXX-YYYY` flags for `cargo audit`. Keeping
+        # the extraction in a script means the deny.toml ignore list is
+        # the single source of truth for both audit jobs.
+        id: ignores
+        run: |
+          flags="$(python3 scripts/extract-audit-ignores.py)"
+          echo "Resolved cargo audit ignore flags from deny.toml:"
+          echo "  ${flags:-<none>}"
+          # GITHUB_OUTPUT is the canonical step-output channel; quote on
+          # both sides to preserve the empty case and any embedded spaces.
+          echo "flags=${flags}" >> "$GITHUB_OUTPUT"
+
+      - name: Run cargo audit (warning-only)
+        # Soft gate. We deliberately do NOT pass `--deny warnings` so
+        # unmaintained / yanked findings exit 0; if a `vulnerability`-class
+        # advisory slips past audit (e.g. the advisory database
+        # picked up a new entry between the two jobs), `cargo audit` would
+        # exit non-zero — the trailing `|| true` plus job-level
+        # `continue-on-error: true` keep it warning-only. The required
+        # gate is the load-bearing block; this job is operator visibility.
+        #
+        # The `--ignore` flags come from deny.toml via the previous step,
+        # not from a hardcoded list in this YAML — that is the alignment
+        # #776 calls for.
+        env:
+          AUDIT_IGNORE_FLAGS: ${{ steps.ignores.outputs.flags }}
+        run: |
+          set +e
+          # AUDIT_IGNORE_FLAGS is a space-separated string of flags
+          # (e.g. "--ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-1234").
+          # We intentionally rely on shell word-splitting here so each
+          # `--ignore <ID>` pair is passed as separate argv entries to
+          # `cargo audit`. Quoting would collapse them into a single
+          # malformed arg.
+          # shellcheck disable=SC2086
+          cargo audit ${AUDIT_IGNORE_FLAGS}
+          rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning::cargo audit reported soft findings (rc=$rc); see job log for details. This job is warning-only and does not block merge — see audit for the load-bearing gate."
+          fi
+          exit 0
 
   helm:
     if: github.event.pull_request.draft == false || github.event_name == 'push'

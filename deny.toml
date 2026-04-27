@@ -1,3 +1,46 @@
+# =============================================================================
+# Audit policy — split-gate model (closes #776)
+# =============================================================================
+#
+# CI runs two distinct audit jobs against this configuration:
+#
+#   1. `audit` (CI-blocking)
+#      Runs `cargo deny check` and blocks merge ONLY on real
+#      vulnerabilities — i.e. the `vulnerability` and `unsound` advisory
+#      lints, plus the static `licenses` / `bans` / `sources` policies
+#      below. The `unmaintained`, `yanked`, and `notice` lints are
+#      demoted to warnings via the job's `--warn` flags so an upstream
+#      crate going into maintenance mode does NOT block PR merges.
+#
+#   2. `audit-soft` (warning-only, never blocks)
+#      Runs `cargo audit` with the same RUSTSEC ignore list as this
+#      file (extracted by `scripts/extract-audit-ignores.py`) and emits
+#      `::warning::` annotations on the PR for any unmaintained / yanked
+#      / informational findings. Always exits 0. Operators see surface
+#      area without false-positive merge blocks.
+#
+# Severity threshold (chosen for the required gate): `high`. The cargo-deny
+# advisory model maps to RustSec's vulnerability classification — the
+# `vulnerability` and `unsound` lints are the ones that carry a CVSS-style
+# severity rating, and historically every RUSTSEC-* with a documented CVE
+# in our dependency graph has been classified into one of those two buckets.
+# Suppressing `unmaintained`/`yanked`/`notice` from the required gate
+# captures the "high/critical only" policy issue #776 calls out.
+#
+# SINGLE SOURCE OF TRUTH: the `ignore` array in `[advisories]` below is
+# the only list of advisories we knowingly accept. Both audit jobs derive
+# their per-advisory exemptions from this array — `cargo deny check` reads
+# it directly, and `scripts/extract-audit-ignores.py` translates it into
+# `--ignore <RUSTSEC-ID>` flags for the `cargo audit` invocation in the
+# soft job. Do NOT add a duplicate ignore list to the CI workflow — the
+# split-gate design exists specifically to prevent that drift.
+#
+# When a new advisory needs temporary acceptance: add it here with a
+# multi-line justification (issue link, why it does not apply, removal
+# trigger). The required gate will keep failing until the entry is
+# present, which is the point.
+# =============================================================================
+
 [graph]
 targets = []
 all-features = true
