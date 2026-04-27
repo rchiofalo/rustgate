@@ -51,16 +51,17 @@ pub type AclApiHandler = Arc<
 /// Type-erased management API handler.
 ///
 /// When set, the metrics server delegates requests under `/api/cert/`,
-/// `/api/crl/`, `/api/dedup/`, `/api/clients/`, and `/api/reload` to
-/// this handler. Returns `None` when the path does not match any
-/// management-API route so the caller can fall through to the next
-/// handler or the default 404.
+/// `/api/crl/`, `/api/dedup/`, `/api/clients/`, `/api/dlq/`,
+/// `/api/reload`, and `/api/drain` to this handler. Returns `None`
+/// when the path does not match any management-API route so the
+/// caller can fall through to the next handler or the default 404.
 ///
 /// Unlike [`AclApiHandler`], the management API exposes mutating
-/// endpoints (`POST /api/clients/{cn}/disconnect`, `POST /api/reload`)
-/// that need to `.await` on the router or the reload path. The handler
-/// returns a boxed `Future` so the dispatcher in [`serve`] can await
-/// without forcing the inner handler to `block_on` a runtime.
+/// endpoints (`POST /api/clients/{cn}/disconnect`, `POST /api/reload`,
+/// `POST /api/drain`) that need to `.await` on the router or the
+/// reload path. The handler returns a boxed `Future` so the
+/// dispatcher in [`serve`] can await without forcing the inner
+/// handler to `block_on` a runtime.
 pub type MgmtApiHandler = Arc<
     dyn Fn(
             &hyper::Method,
@@ -154,6 +155,13 @@ static MQTT_RETAIN_CLEARED: OnceLock<IntCounter> = OnceLock::new();
 static MQTT_RETAIN_REPLAYED: OnceLock<IntCounter> = OnceLock::new();
 #[cfg(feature = "mqtt")]
 static MQTT_WILL_PUBLISHED: OnceLock<IntCounter> = OnceLock::new();
+
+/// Operator-initiated graceful drain trigger. Labelled by `source` so
+/// SIEM and dashboards can distinguish API-driven drains (Kubernetes
+/// preStop hook firing `POST /api/drain`) from any future surface
+/// (e.g. a SIGUSR2 handler) that fans into the same shutdown `Notify`.
+/// Closes #791.
+static ADMIN_DRAIN_TRIGGERED: OnceLock<IntCounterVec> = OnceLock::new();
 
 static MAVLINK_HEARTBEATS: OnceLock<IntCounterVec> = OnceLock::new();
 
@@ -716,6 +724,23 @@ pub fn init() -> prometheus::Result<()> {
     )?;
     registry.register(Box::new(mavlink_heartbeats.clone()))?;
     let _ = MAVLINK_HEARTBEATS.set(mavlink_heartbeats);
+
+    let admin_drain_triggered = IntCounterVec::new(
+        Opts::new(
+            "rustgate_admin_drain_triggered_total",
+            "Operator-initiated graceful drain triggers, labelled by \
+             `source`. `source=\"api\"` covers `POST /api/drain` invoked by \
+             the Kubernetes preStop hook (closes #791); the label exists so \
+             SIEM and dashboards can attribute API-initiated drains \
+             separately from SIGTERM-initiated drains, which would otherwise \
+             collapse into one indistinguishable stream during a rolling \
+             upgrade. Cardinality is bounded — only a small fixed set of \
+             documented source tokens is ever emitted.",
+        ),
+        &["source"],
+    )?;
+    registry.register(Box::new(admin_drain_triggered.clone()))?;
+    let _ = ADMIN_DRAIN_TRIGGERED.set(admin_drain_triggered);
 
     #[cfg(feature = "nats")]
     {
@@ -1575,6 +1600,24 @@ pub fn mqtt_retain_replayed() -> &'static IntCounter {
 pub fn mqtt_will_published() -> &'static IntCounter {
     MQTT_WILL_PUBLISHED
         .get_or_init(|| fallback_counter("rustgate_mqtt_will_published_total", "fallback"))
+}
+
+/// Per-source counter for operator-initiated graceful drain triggers
+/// (`POST /api/drain` from the Kubernetes preStop hook, closes #791).
+///
+/// The `source` label is a short token like `"api"` for the management
+/// endpoint. The fallback constructor preserves the same shape so the
+/// accessor is safe to call before [`init`] runs — required by the
+/// crate-wide convention that fallback metrics keep the same label
+/// dimensionality.
+pub fn admin_drain_triggered() -> &'static IntCounterVec {
+    ADMIN_DRAIN_TRIGGERED.get_or_init(|| {
+        fallback_counter_vec(
+            "rustgate_admin_drain_triggered_total",
+            "fallback",
+            &["source"],
+        )
+    })
 }
 
 /// Per-system_id counter for MAVLink HEARTBEAT (MSG_ID 0) frame
@@ -2870,21 +2913,24 @@ pub async fn serve(
                                     .unwrap_or_else(|_| internal_error_response()));
                             }
                             // Delegate /api/cert/, /api/crl/, /api/dedup/,
-                            // /api/clients/, and /api/reload paths to the
-                            // management handler. Runs before the generic
-                            // handler so unknown suffixes under these
-                            // prefixes produce the handler's structured
-                            // 401/404/405 envelope rather than the bare
-                            // 404 below. The handler is async because
-                            // disconnect/reload need to `.await` on the
-                            // router and reload futures.
+                            // /api/clients/, /api/dlq/, /api/reload, and
+                            // /api/drain paths to the management handler.
+                            // Runs before the generic handler so unknown
+                            // suffixes under these prefixes produce the
+                            // handler's structured 401/404/405 envelope
+                            // rather than the bare 404 below. The handler
+                            // is async because disconnect/reload/drain
+                            // need to `.await` on the router and reload
+                            // futures.
                             {
                                 let path_str = req.uri().path();
                                 if (path_str.starts_with("/api/cert/")
                                     || path_str.starts_with("/api/crl/")
                                     || path_str.starts_with("/api/dedup/")
                                     || path_str.starts_with("/api/clients/")
-                                    || path_str == "/api/reload")
+                                    || path_str.starts_with("/api/dlq/")
+                                    || path_str == "/api/reload"
+                                    || path_str == "/api/drain")
                                     && let Some(handler) = mgmt_api.get()
                                 {
                                     let method = req.method().clone();
