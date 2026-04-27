@@ -324,6 +324,76 @@ jobs:
           cargo check --locked --workspace --features ${{ matrix.triple }}
           echo "::endgroup::"
 
+  msrv:
+    # MSRV verification gate (issue #783). The workspace declares
+    # `rust-version = "1.94"` in the root Cargo.toml, but until this job
+    # landed nothing in CI actually verified the claim — a PR that
+    # introduced a feature requiring rust 1.95 would compile fine on the
+    # current toolchain (every other job pins `1.94` exactly today, but
+    # that is brittle: a future bump of the workspace toolchain pin in
+    # `rust-toolchain.toml` to a newer compiler would silently mask MSRV
+    # regressions in the rest of CI). This job pins the exact MSRV via
+    # `dtolnay/rust-toolchain` and runs `cargo check` against the same
+    # production feature set as the `check-features` and `clippy` jobs,
+    # so any new feature, syntax, or stdlib API that requires a
+    # toolchain newer than 1.94 fails here loudly.
+    #
+    # Compilation only — no tests, no clippy. Tests would ~3x the wall
+    # time without buying additional MSRV coverage (test failures are
+    # caught by the `test` job on the workspace toolchain), and clippy
+    # lints evolve between releases so a new clippy warning in 1.94 vs
+    # 1.95 would be a false MSRV positive.
+    if: github.event.pull_request.draft == false || github.event_name == 'push'
+    needs: [lint, clippy]
+    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40 # v2.19.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # 1.94
+        with:
+          toolchain: "1.94"
+
+      # sccache is the primary cache on self-hosted runners (shared volume,
+      # no per-job upload/download). Swatinem/rust-cache is kept only for
+      # the GitHub-hosted fallback, where sccache is not pre-installed.
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        if: vars.RUNNER_POOL != 'self-hosted'
+
+      - name: Install protoc
+        # Required by the `proto` and `otel` features, which the production
+        # feature set below depends on. No-op on self-hosted runners where
+        # protobuf-compiler is baked into the container image; apt-get
+        # install on the GitHub-hosted fallback.
+        run: |
+          if ! command -v protoc >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          fi
+
+      - name: Verify rust toolchain version
+        # Defensive sanity check: fails the job loudly if `dtolnay/rust-toolchain`
+        # ever silently installs a different version. The version string
+        # must contain "1.94" — anything else means MSRV verification is not
+        # actually happening on this runner.
+        run: |
+          rustc --version
+          rustc --version | grep -F '1.94' >/dev/null
+
+      - name: Cargo check at MSRV (production feature set)
+        # Feature set must stay in sync with the `clippy`, `check-features`,
+        # and `test` jobs above so MSRV coverage matches what we actually
+        # ship. Drift between this list and those jobs creates MSRV blind
+        # spots — a feature only checked here would not be MSRV-verified
+        # if it were ever removed from this list, and a feature only
+        # checked elsewhere would not be MSRV-verified at all.
+        run: cargo check --locked --workspace --features nats,enrollment,est,proto,full-detail,metrics,federation,federation-ha,websocket,mqtt,otel,http
+
   test:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [lint, clippy]
