@@ -219,6 +219,44 @@ pub(crate) fn post_disconnect_cooldown(reconnect_delay: Duration) -> Duration {
     cooldown.max(min_cooldown)
 }
 
+/// Decision returned by [`drain_decision_for`] for a single buffered
+/// message on the V2 reconnect-replay path.
+///
+/// Split out so the policy is testable without standing up a full gRPC
+/// session — `tonic::Streaming` has no synthetic constructor and the
+/// drain hot-path's correctness is purely a function of the buffered
+/// envelope and the configured `max_hops`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DrainDecision {
+    /// Forward the message with this post-increment hop count.
+    Emit { effective_hops: u32 },
+    /// Drop the message at the hop-limit boundary (audit emitted by
+    /// the caller).
+    Drop { effective_hops: u32 },
+}
+
+/// Decide whether a buffered message should be re-emitted or dropped
+/// at the hop limit on the V2 reconnect-replay path. Closes #763.
+///
+/// `current_hops` on the buffered envelope is the **post-increment**
+/// value (what the message would have carried if it had been emitted
+/// live instead of buffered). For records written by binaries that
+/// predate this change (`is_legacy_pre_increment = true`), apply
+/// `+1` lazily here so legacy entries match the post-#763 invariant
+/// without rewriting the on-disk store.
+pub(crate) fn drain_decision_for(msg: &BufferedMessage, max_hops: u32) -> DrainDecision {
+    let effective_hops = if msg.is_legacy_pre_increment {
+        msg.current_hops.saturating_add(1)
+    } else {
+        msg.current_hops
+    };
+    if effective_hops >= max_hops {
+        DrainDecision::Drop { effective_hops }
+    } else {
+        DrainDecision::Emit { effective_hops }
+    }
+}
+
 /// Main connection loop with automatic reconnection.
 async fn connection_loop(
     peer: Arc<PeerHandle>,
@@ -509,24 +547,58 @@ async fn run_streams(
     peer.record_rtt(rtt_nanos);
     debug!(peer = %peer.id, rtt_ns = rtt_nanos, "initial health check passed");
 
-    // Replay buffered messages after handshake completes
+    // Replay buffered messages after handshake completes. See
+    // [`drain_decision_for`] for the hop-limit policy (closes #763).
     for msg in &replay_messages {
-        let mut metadata = crate::provenance::FederationMetadata::new(config.max_hops);
-        metadata.add_hop(&config.federate_id, &config.federate_id);
-        match crate::v2::convert::xml_to_federated_event(&msg.payload, &metadata) {
-            Ok(event) => {
-                if send_tx.send(event).await.is_err() {
-                    warn!(peer = %peer.id, "send stream closed during replay");
-                    return Err(FederationError::other("send stream closed during replay"));
-                }
-                peer.record_sent();
-            }
-            Err(e) => {
+        match drain_decision_for(msg, config.max_hops) {
+            DrainDecision::Drop { effective_hops } => {
                 warn!(
                     peer = %peer.id,
-                    error = %e,
-                    "failed to convert buffered message for V2 replay, skipping"
+                    current_hops = effective_hops,
+                    max_hops = config.max_hops,
+                    legacy_pre_increment = msg.is_legacy_pre_increment,
+                    "dropping buffered message at hop limit on drain"
                 );
+                rustgate_core::audit::federation_event_rejected(
+                    "v2.replay_drain",
+                    peer.id.as_str(),
+                    "hop_limit",
+                );
+                continue;
+            }
+            DrainDecision::Emit { effective_hops } => {
+                // Reconstruct provenance so a live hop chain carries
+                // through even though the only field varying across
+                // peers is `current_hops`. The provenance vector lists
+                // only this server because the store-forward layer
+                // does not persist per-server breadcrumbs — that would
+                // balloon the on-disk footprint without adding
+                // forensic value the audit trail does not already
+                // capture.
+                let metadata = crate::provenance::FederationMetadata {
+                    provenance: vec![crate::provenance::FederateProvenance {
+                        server_id: rustgate_core::PeerId::new(&config.federate_id),
+                        server_name: rustgate_core::ServerName::new(&config.federate_id),
+                    }],
+                    current_hops: effective_hops,
+                    max_hops: config.max_hops,
+                };
+                match crate::v2::convert::xml_to_federated_event(&msg.payload, &metadata) {
+                    Ok(event) => {
+                        if send_tx.send(event).await.is_err() {
+                            warn!(peer = %peer.id, "send stream closed during replay");
+                            return Err(FederationError::other("send stream closed during replay"));
+                        }
+                        peer.record_sent();
+                    }
+                    Err(e) => {
+                        warn!(
+                            peer = %peer.id,
+                            error = %e,
+                            "failed to convert buffered message for V2 replay, skipping"
+                        );
+                    }
+                }
             }
         }
     }
@@ -643,8 +715,9 @@ async fn run_streams(
 }
 
 #[cfg(test)]
-#[allow(unused_results)]
 mod tests {
+    #![allow(unused_results, clippy::panic, clippy::unwrap_used)]
+
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
@@ -879,5 +952,249 @@ mod tests {
     fn compression_encoding_maps_zstd_to_tonic_zstd() {
         let got = compression_encoding(CompressionKind::Zstd);
         assert_eq!(got, tonic::codec::CompressionEncoding::Zstd);
+    }
+
+    // -------------------------------------------------------------------
+    // V2 reconnect-replay drain — closes #763.
+    // -------------------------------------------------------------------
+    //
+    // The persisted envelope carries the post-increment hop count (what
+    // the message would have carried if it had been emitted live instead
+    // of buffered). Tests below pin the drain hot-path's hop policy:
+    //
+    // 1. A message at the boundary (`current_hops = max_hops - 1` is the
+    //    last accepted; `current_hops = max_hops` is dropped).
+    // 2. A message below the boundary is forwarded verbatim.
+    // 3. Legacy v1 records (no version field, stored pre-increment) are
+    //    treated as pre-increment: drain applies +1 lazily before the
+    //    limit check.
+    // 4. The drop path emits a structured audit record with
+    //    `reason=hop_limit` so the forensic trail captures the boundary
+    //    hit (mirrors the live SendOneEvent rejection path).
+
+    fn buffered(payload: &'static [u8], current_hops: u32, legacy: bool) -> BufferedMessage {
+        BufferedMessage {
+            seq: 1,
+            payload: bytes::Bytes::from_static(payload),
+            groups: vec![],
+            enqueued_at_unix_ms: 0,
+            ttl_ms: None,
+            current_hops,
+            is_legacy_pre_increment: legacy,
+        }
+    }
+
+    #[test]
+    fn drain_rejects_message_at_hop_limit() {
+        // Persist at hops = MAX_HOPS - 1 + 1 = MAX_HOPS (post-increment),
+        // drain, assert dropped. Same boundary as the live SendOneEvent
+        // path: `current_hops >= max_hops` is rejected.
+        let max_hops: u32 = 8;
+        let msg = buffered(b"at-limit", max_hops, false);
+        match drain_decision_for(&msg, max_hops) {
+            DrainDecision::Drop { effective_hops } => {
+                assert_eq!(effective_hops, max_hops);
+            }
+            DrainDecision::Emit { .. } => {
+                panic!("expected drop at hops = max_hops, got emit");
+            }
+        }
+    }
+
+    #[test]
+    fn drain_accepts_message_below_hop_limit() {
+        // Persist at hops = MAX_HOPS - 2 (post-increment), drain, assert
+        // accepted. One step below the boundary survives — the live
+        // path inclusively accepts up to `max_hops - 1`.
+        let max_hops: u32 = 8;
+        let msg = buffered(b"below-limit", max_hops - 2, false);
+        match drain_decision_for(&msg, max_hops) {
+            DrainDecision::Emit { effective_hops } => {
+                assert_eq!(effective_hops, max_hops - 2);
+            }
+            DrainDecision::Drop { .. } => {
+                panic!("expected emit below hop limit, got drop");
+            }
+        }
+    }
+
+    #[test]
+    fn drain_accepts_message_at_one_below_limit_inclusive() {
+        // The exact `max_hops - 1` boundary: emit is the last value that
+        // survives. A message at this point on the next hop would land
+        // at `max_hops`, which the receiving peer rejects. The drain
+        // hot-path mirrors that — `effective_hops < max_hops` is the
+        // sole gate.
+        let max_hops: u32 = 8;
+        let msg = buffered(b"one-below", max_hops - 1, false);
+        match drain_decision_for(&msg, max_hops) {
+            DrainDecision::Emit { effective_hops } => {
+                assert_eq!(effective_hops, max_hops - 1);
+            }
+            DrainDecision::Drop { .. } => {
+                panic!("expected emit at hops = max_hops - 1");
+            }
+        }
+    }
+
+    #[test]
+    fn drain_legacy_envelope_applies_plus_one_lazily() {
+        // A legacy v1 record persisted as pre-increment with
+        // current_hops = MAX_HOPS - 1 must be evaluated as if it were
+        // MAX_HOPS post-increment — i.e. dropped. This locks down the
+        // backward-compat fallback the issue calls for: existing
+        // on-disk records from before the wire-format change still
+        // honor the hop-limit boundary on drain.
+        let max_hops: u32 = 8;
+        let msg = buffered(b"legacy-at-boundary", max_hops - 1, true);
+        match drain_decision_for(&msg, max_hops) {
+            DrainDecision::Drop { effective_hops } => {
+                assert_eq!(
+                    effective_hops, max_hops,
+                    "legacy +1 must surface as max_hops",
+                );
+            }
+            DrainDecision::Emit { .. } => {
+                panic!("expected drop after legacy +1 lift to max_hops");
+            }
+        }
+        // And a legacy record one step below the boundary is still
+        // emitted, to prove the +1 isn't applied unconditionally.
+        let safe = buffered(b"legacy-safe", max_hops - 2, true);
+        match drain_decision_for(&safe, max_hops) {
+            DrainDecision::Emit { effective_hops } => {
+                assert_eq!(effective_hops, max_hops - 1);
+            }
+            DrainDecision::Drop { .. } => {
+                panic!("expected legacy emit when post-+1 is below max_hops");
+            }
+        }
+    }
+
+    /// Build a tracing subscriber that captures `target = "audit"`
+    /// records into a shared byte buffer. The callsite emits the audit
+    /// inline at the drain drop site, so we set this up as the default
+    /// subscriber for the duration of the test, fire one explicit
+    /// `federation_event_rejected`, and assert the structured fields
+    /// land in the captured output. (Calling the helper directly
+    /// rather than going through the full gRPC client keeps the test
+    /// independent of the tonic streaming surface, which has no
+    /// synthetic constructor.)
+    #[test]
+    fn audit_emits_hop_limit_on_drain_drop() {
+        use std::io::Write;
+        use std::sync::Mutex as StdMutex;
+
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::filter::Targets;
+        use tracing_subscriber::fmt::MakeWriter;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct AuditBuf(Arc<StdMutex<Vec<u8>>>);
+
+        impl AuditBuf {
+            fn snapshot_string(&self) -> String {
+                String::from_utf8_lossy(&self.0.lock().expect("buf").clone()).to_string()
+            }
+        }
+
+        impl Write for AuditBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("buf").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> MakeWriter<'a> for AuditBuf {
+            type Writer = AuditBuf;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = AuditBuf::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(buf.clone())
+            .with_filter(Targets::new().with_target("audit", tracing::Level::INFO));
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        // Pre-condition: drain decides to drop a message at the hop
+        // boundary. The audit emission lives at the call site in
+        // `run_streams`, so we trigger it inline with the same args
+        // that the call site would pass.
+        let max_hops: u32 = 8;
+        let msg = buffered(b"audit-at-limit", max_hops, false);
+        match drain_decision_for(&msg, max_hops) {
+            DrainDecision::Drop { .. } => {}
+            DrainDecision::Emit { .. } => {
+                panic!("test fixture must produce a drop");
+            }
+        }
+
+        let _guard = tracing::subscriber::set_default(subscriber);
+        rustgate_core::audit::federation_event_rejected(
+            "v2.replay_drain",
+            "test-peer",
+            "hop_limit",
+        );
+        drop(_guard);
+
+        let captured = buf.snapshot_string();
+        assert!(
+            captured.contains("federation.event_rejected"),
+            "audit log must contain federation.event_rejected; got: {captured}"
+        );
+        assert!(
+            captured.contains("v2.replay_drain"),
+            "audit record must label the rpc=v2.replay_drain context; got: {captured}"
+        );
+        assert!(
+            captured.contains("hop_limit"),
+            "audit record must carry reason=hop_limit; got: {captured}"
+        );
+        assert!(
+            captured.contains("test-peer"),
+            "audit record must include peer_cn=test-peer; got: {captured}"
+        );
+    }
+
+    #[test]
+    fn store_forward_persists_post_increment_hops() {
+        // Buffer-layer view of the same property tested at the
+        // persistence layer: a `push_with_hops(..., N)` returns a
+        // `BufferedMessage` whose `current_hops` equals `N` and whose
+        // legacy flag is false. Pin both the in-memory ring contents
+        // and the disk image so a later rewrite of the buffer plumbing
+        // can't silently regress the post-increment invariant.
+        use std::sync::Arc;
+
+        use crate::replay_buffer::ReplayBuffer;
+        use crate::replay_persist::ReplayStore;
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = Arc::new(ReplayStore::open(dir.path(), 1 << 20).expect("open"));
+        let mut buf = ReplayBuffer::with_store(10, "peer-a", Arc::clone(&store));
+        // Admit at hops=3 (post-increment). The drain path will see 3.
+        let _ = buf.push_with_hops(
+            bytes::Bytes::from_static(b"hop-3"),
+            vec!["alpha".into()],
+            42,
+            None,
+            3,
+        );
+        let in_mem = buf.all_messages();
+        assert_eq!(in_mem.len(), 1);
+        assert_eq!(in_mem[0].current_hops, 3);
+        assert!(!in_mem[0].is_legacy_pre_increment);
+
+        let on_disk = store.load_all().expect("load");
+        assert_eq!(on_disk.len(), 1);
+        assert_eq!(on_disk[0].current_hops, 3);
+        assert!(!on_disk[0].is_legacy_pre_increment);
     }
 }

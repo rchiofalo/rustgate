@@ -159,6 +159,7 @@ fn expired_ttl_records_are_skipped_on_rehydrate() {
             1,
             1, // year 1970
             Some(1),
+            1,
             &[],
             &Bytes::from_static(b"stale"),
         )
@@ -174,6 +175,7 @@ fn expired_ttl_records_are_skipped_on_rehydrate() {
             2,
             now_ms,
             Some(60_000),
+            1,
             &[],
             &Bytes::from_static(b"fresh"),
         )
