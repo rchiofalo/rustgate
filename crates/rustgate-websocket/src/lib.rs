@@ -29,6 +29,7 @@ use std::time::Duration;
 use rustgate_core::constants::HANDSHAKE_TIMEOUT;
 use rustgate_core::error::{Result, TransportError};
 use rustgate_core::identity::Identity;
+use rustgate_core::masking::hash_cn;
 use rustgate_core::net::configure_tactical_socket;
 use rustgate_resilience::SlidingWindowLimiter;
 use rustgate_transport::{TlsConfig, extract_identity};
@@ -378,7 +379,7 @@ impl WsListener {
 
             debug!(
                 peer_addr = %peer_addr,
-                cn = %identity.cn,
+                cn = %hash_cn(&identity.cn),
                 groups = ?identity.groups,
                 "client authenticated"
             );
@@ -460,7 +461,7 @@ impl WsListener {
 
             debug!(
                 peer_addr = %peer_addr,
-                cn = %identity.cn,
+                cn = %hash_cn(&identity.cn),
                 subprotocol = ?negotiated_subprotocol,
                 "WebSocket session established"
             );

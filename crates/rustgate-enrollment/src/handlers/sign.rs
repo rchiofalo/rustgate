@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{Request, Response, StatusCode};
+use rustgate_core::sanitize::sanitize_for_log;
 use rustgate_resilience::SlidingWindowLimiter;
 
 use super::util::{build_response, extract_param};
@@ -82,6 +83,12 @@ pub(crate) async fn handle_sign_client_v1(
         .take(128)
         .collect();
 
+    // `client_uid` is attacker-controlled query-param bytes (truncated
+    // to 128 chars but not stripped of CR/LF or other control
+    // characters). Sanitize once here for use in structured-log fields;
+    // the audit emissions are sanitized at the audit boundary (#1197).
+    let client_uid_log = sanitize_for_log(&client_uid);
+
     // Read body (64KB limit)
     let limited = Limited::new(req.into_body(), 65536);
     let body = match limited.collect().await {
@@ -113,7 +120,7 @@ pub(crate) async fn handle_sign_client_v1(
             tracing::warn!(
                 error = %e,
                 username = %username,
-                client_uid = %client_uid,
+                client_uid = %client_uid_log,
                 "CSR signing failed"
             );
             return build_response(
@@ -130,7 +137,7 @@ pub(crate) async fn handle_sign_client_v1(
             tracing::warn!(
                 error = %e,
                 username = %username,
-                client_uid = %client_uid,
+                client_uid = %client_uid_log,
                 "PKCS#12 bundle creation failed"
             );
             return build_response(
@@ -145,7 +152,7 @@ pub(crate) async fn handle_sign_client_v1(
     rustgate_core::audit::enrollment_certificate_issued(username, &client_uid, "pkcs12");
     tracing::info!(
         username = %username,
-        client_uid = %client_uid,
+        client_uid = %client_uid_log,
         format = "pkcs12",
         "signed client certificate (v1)"
     );
@@ -209,6 +216,12 @@ pub(crate) async fn handle_sign_client_v2(
         .chars()
         .take(128)
         .collect();
+    // Truncation alone does not neutralize CR/LF or other control
+    // characters, so sanitize before use in structured-log fields.
+    // (Audit emission paths are sanitized at the audit boundary by
+    // #1197; this is operational defense-in-depth for the tracing
+    // call sites.)
+    let client_uid_log = sanitize_for_log(&client_uid);
 
     // Content negotiation (check before consuming body)
     let wants_xml = req
@@ -252,7 +265,7 @@ pub(crate) async fn handle_sign_client_v2(
             tracing::warn!(
                 error = %e,
                 username = %username,
-                client_uid = %client_uid,
+                client_uid = %client_uid_log,
                 "CSR signing failed"
             );
             return build_response(
@@ -279,7 +292,7 @@ pub(crate) async fn handle_sign_client_v2(
     rustgate_core::audit::enrollment_certificate_issued(username, &client_uid, "v2");
     tracing::info!(
         username = %username,
-        client_uid = %client_uid,
+        client_uid = %client_uid_log,
         format = %content_type,
         "signed client certificate"
     );

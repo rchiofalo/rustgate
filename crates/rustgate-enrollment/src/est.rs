@@ -18,6 +18,7 @@ use bytes::Bytes;
 use http_body_util::Full;
 use hyper::{Request, Response, StatusCode};
 use rustgate_core::b64;
+use rustgate_core::sanitize::sanitize_for_log;
 use rustgate_resilience::SlidingWindowLimiter;
 
 use crate::auth::Credentials;
@@ -134,9 +135,13 @@ pub async fn handle_simplereenroll(
     match extract_csr_cn(&body) {
         Ok(Some(csr_cn)) => {
             if !csr_cn.eq_ignore_ascii_case(username) {
+                // username is from validated Basic Auth (constrained
+                // table-of-credentials lookup) so it is safe; csr_cn is
+                // attacker-controlled CSR subject CN bytes — sanitize
+                // before they enter the structured-log field.
                 tracing::warn!(
                     client_cn = %username,
-                    requested_cn = %csr_cn,
+                    requested_cn = %sanitize_for_log(&csr_cn),
                     "re-enrollment identity mismatch: client cannot change CN",
                 );
                 return build_response(

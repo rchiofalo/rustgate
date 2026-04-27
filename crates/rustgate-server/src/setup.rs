@@ -19,6 +19,8 @@ use rustgate_core::identity::Identity;
 use rustgate_core::message::RoutableMessage;
 #[cfg(feature = "federation")]
 use rustgate_core::message::{Destination, Metadata};
+#[cfg(feature = "federation")]
+use rustgate_core::sanitize::sanitize_for_log;
 use rustgate_core::tasks::SubsystemHandle;
 // Used only inside feature-gated subsystem setup functions (nats,
 // enrollment, metrics, federation*). The websocket and UDP setup paths
@@ -1187,7 +1189,17 @@ pub(crate) async fn start_federation(
             let identity = match Identity::plaintext(peer_cn.clone(), BTreeSet::new()) {
                 Ok(id) => id,
                 Err(e) => {
-                    tracing::warn!(peer_cn = %peer_cn, error = %e, "invalid federation peer identity");
+                    // peer_cn here may not yet be a valid Identity (the
+                    // construction failed, so the cert-extraction
+                    // sanitization performed by `Identity::plaintext`
+                    // hasn't run). Sanitize the bytes before they enter
+                    // the structured-log field to neutralise CR/LF
+                    // log-forging from a malicious federation peer.
+                    tracing::warn!(
+                        peer_cn = %sanitize_for_log(&peer_cn),
+                        error = %e,
+                        "invalid federation peer identity",
+                    );
                     return;
                 }
             };

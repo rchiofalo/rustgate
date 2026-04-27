@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rustgate_core::error::{Result, TransportError};
+use rustgate_core::masking::hash_cn;
 use rustgate_core::net::configure_tactical_socket;
 use tokio::net::{TcpListener, ToSocketAddrs};
 use tokio::sync::Semaphore;
@@ -236,7 +237,7 @@ impl TlsListener {
 
             debug!(
                 peer_addr = %peer_addr,
-                cn = %identity.cn,
+                cn = %hash_cn(&identity.cn),
                 groups = ?identity.groups,
                 "client authenticated"
             );

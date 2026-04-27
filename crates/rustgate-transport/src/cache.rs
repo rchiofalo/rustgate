@@ -64,6 +64,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use rustgate_core::masking::hash_cn;
 use rustgate_core::message::RoutableMessage;
 use tokio::sync::RwLock;
 
@@ -181,7 +182,7 @@ impl PositionCache {
                     .map(|(cn, _)| cn.clone())
                 {
                     tracing::warn!(
-                        evicted_cn = %oldest_cn,
+                        evicted_cn = %hash_cn(&oldest_cn),
                         size = entries.len(),
                         max = self.max_entries,
                         "position cache at capacity, evicting oldest entry",

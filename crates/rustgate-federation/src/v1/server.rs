@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use rustgate_core::masking::hash_cn;
 use rustgate_core::protocol::HeaderSize;
 use rustgate_transport::{LengthPrefixedCodec, TlsConfig, TlsListener};
 use tokio::sync::mpsc;
@@ -127,7 +128,7 @@ async fn accept_loop(
                         let peer_cn = session.identity().cn.clone();
                         let peer_addr = session.peer_addr();
                         info!(
-                            peer_cn = %peer_cn,
+                            peer_cn = %hash_cn(&peer_cn),
                             peer_addr = %peer_addr,
                             "V1 federation peer connected (inbound)"
                         );
@@ -208,7 +209,7 @@ async fn handle_inbound_peer(
                     match frame {
                         Some(Ok(data)) => {
                             if is_heartbeat(&data) {
-                                debug!(peer_cn = %read_cn, "V1 heartbeat received");
+                                debug!(peer_cn = %hash_cn(&read_cn), "V1 heartbeat received");
                                 last_heartbeat_received = tokio::time::Instant::now();
                             } else {
                                 on_message(read_cn.clone(), data.freeze());
@@ -255,14 +256,14 @@ async fn handle_inbound_peer(
     match io_result {
         Ok(()) => {
             info!(
-                peer_cn = %peer_cn,
+                peer_cn = %hash_cn(&peer_cn),
                 peer_addr = %peer_addr,
                 "V1 federation peer disconnected cleanly"
             );
         }
         Err(e) => {
             warn!(
-                peer_cn = %peer_cn,
+                peer_cn = %hash_cn(&peer_cn),
                 peer_addr = %peer_addr,
                 error = %e,
                 "V1 federation peer disconnected with error"
@@ -476,5 +477,23 @@ mod tests {
         on_msg2("peer2".into(), Bytes::from("data2"));
 
         assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn v1_server_uses_shared_hash_cn_for_peer_logs() {
+        // F-94 (#802) — pin that this module imports the shared
+        // `rustgate_core::masking::hash_cn` helper. The accept loop and
+        // per-connection lifecycle logs above all wrap `peer_cn` with
+        // `hash_cn(...)` so a malicious or PII-bearing peer CN never
+        // reaches the structured-log fields. This test confirms the
+        // identifier resolves to the public helper rather than a stray
+        // crate-local copy that would silently revert the masking on
+        // any future refactor.
+        let raw = "v1-peer-secret-callsign-007";
+        let from_module = hash_cn(raw);
+        let from_core = rustgate_core::masking::hash_cn(raw);
+        assert_eq!(from_module, from_core);
+        assert_eq!(from_module.len(), 12);
+        assert!(!from_module.contains(raw));
     }
 }

@@ -450,6 +450,76 @@ mod tests {
         );
     }
 
+    // ── F-94 (#802) public-API contract regression coverage ──────────
+    //
+    // The following four tests pin the *public* hash-correlation contract
+    // expected by other crates that have migrated from the formerly-private
+    // `rustgate_transport::router::hash_cn` to the shared
+    // `rustgate_core::masking::hash_cn`. They are deliberately named with the
+    // F-94 spelling so a future reorg / rename catches the migration
+    // breakage at the test level (the names are quoted in the issue body).
+
+    #[test]
+    fn hash_identity_returns_hex_with_documented_length() {
+        // 48 bits of SHA-256 truncation = 12 hex chars. Pin the documented
+        // length so a regression that widened (more disclosure) or
+        // narrowed (more collisions) the truncation trips here.
+        let h = hash_cn("alice");
+        assert_eq!(h.len(), 12);
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn hash_identity_is_deterministic() {
+        // Same input must always produce the same correlation token — the
+        // whole point of hashing for log correlation.
+        assert_eq!(hash_cn("alice"), hash_cn("alice"));
+        assert_eq!(hash_cn(""), hash_cn(""));
+        let long = "x".repeat(4096);
+        assert_eq!(hash_cn(&long), hash_cn(&long));
+    }
+
+    #[test]
+    fn hash_identity_distinguishes_different_inputs() {
+        // Distinct CNs must produce distinct correlation tokens (modulo the
+        // 48-bit collision risk, which is acceptable for an audit trail).
+        // A regression to a fixed-output fold (e.g. `cn.len() % 256`) would
+        // collapse alice/bob into the same hash.
+        assert_ne!(hash_cn("alice"), hash_cn("bob"));
+        assert_ne!(hash_cn("a"), hash_cn("aa"));
+    }
+
+    #[test]
+    fn hash_identity_handles_pathological_inputs() {
+        // Empty, very long, and control-char-laden inputs must all produce
+        // a 12-char hex token without panicking. CNs come from
+        // attacker-controlled X.509 subjects (extracted by the cert
+        // parser) so the sanitizer-of-last-resort must not be the place
+        // that crashes the process.
+        let pathological = [
+            "".to_string(),
+            "x".repeat(1_048_576), // 1 MiB
+            "\0\0\0\0".to_string(),
+            "\r\n\r\n\u{007f}\u{0001}\u{0008}".to_string(),
+            "evil\nlog\rinjection\x00attempt".to_string(),
+            "\u{4e16}\u{754c}\u{0001}\u{007f}".to_string(),
+        ];
+        for cn in &pathological {
+            let h = hash_cn(cn);
+            assert_eq!(
+                h.len(),
+                12,
+                "pathological input must still produce 12-char hex, got {h:?} for input of len {}",
+                cn.len()
+            );
+            assert!(
+                h.chars().all(|c| c.is_ascii_hexdigit()),
+                "pathological input must produce hex-only output, got {h:?} for input of len {}",
+                cn.len()
+            );
+        }
+    }
+
     #[test]
     fn hash_cn_handles_large_inputs_above_sha256_block_boundary_without_panic() {
         // SHA-256 processes 64-byte blocks internally. Test inputs well

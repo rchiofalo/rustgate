@@ -12,6 +12,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use rustgate_core::constants::HANDSHAKE_TIMEOUT;
 use rustgate_core::identity::Identity;
+use rustgate_core::masking::hash_cn;
 use rustgate_core::net::configure_tactical_socket;
 use rustgate_core::pem::{parse_ca_store, parse_certs, parse_key};
 use rustgate_core::secrets::{SecretFileOpts, read_secret_file};
@@ -176,7 +177,7 @@ impl PeerConnector {
 
         debug!(
             peer_addr = %addr,
-            cn = %identity.cn,
+            cn = %hash_cn(&identity.cn),
             groups = ?identity.groups,
             "federation peer authenticated"
         );
@@ -332,7 +333,7 @@ impl DynamicPeerConnector {
 
         debug!(
             peer_addr = %addr,
-            cn = %identity.cn,
+            cn = %hash_cn(&identity.cn),
             groups = ?identity.groups,
             "federation peer authenticated"
         );
