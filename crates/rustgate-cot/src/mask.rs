@@ -10,11 +10,40 @@
 //! with the `<point>` element's `lat`, `lon`, and `hae` attributes zeroed.
 //!
 //! The obligation is named `MaskPoint` (not `MaskGeo`) to reflect its
-//! actual scope: only the `<point>` element is touched. Free-form
-//! geographic references inside `<detail>` children, the event `uid`,
-//! or envelope metadata are NOT scrubbed by this obligation. Policy
-//! authors who need stronger leak prevention should use `MaskPayload`
-//! (which empties the body entirely) or deny delivery outright.
+//! actual scope at the [`MaskDetailLevel::Coarse`] (default) tier: only
+//! the `<point>` element is touched. Free-form geographic references
+//! inside `<detail>` children, the event `uid`, or envelope metadata
+//! are NOT scrubbed by this tier. Policy authors who need stronger leak
+//! prevention should either select a stricter
+//! [`MaskDetailLevel`] via [`strip_coordinates_with_level`], use
+//! `MaskPayload` (which empties the body entirely), or deny delivery
+//! outright.
+//!
+//! # Detail levels (refs #882)
+//!
+//! [`MaskDetailLevel`] selects how aggressively secondary
+//! position-bearing fields are scrubbed:
+//!
+//! - **[`MaskDetailLevel::Coarse`]** (default, [`strip_coordinates`])
+//!   masks only `<point lat lon hae />`. This is the legacy behaviour
+//!   and the most permissive level — secondary fields like
+//!   `<contact callsign>`, `<__group>`, `<takv platform>`, and any
+//!   custom `lat`/`lon`-named attributes are passed through untouched.
+//! - **[`MaskDetailLevel::Medium`]** also redacts `<contact callsign>`
+//!   (callsigns are identity-linked to position) and `<__group>`
+//!   attributes (unit affiliation reveals tactical sector membership).
+//! - **[`MaskDetailLevel::Strict`]** further redacts `<takv platform>`
+//!   (TAK device platform identifies the operator's hardware family),
+//!   `<status battery>` (battery level can be operationally signalling),
+//!   and any attribute on any element whose name (case-insensitively)
+//!   contains `lat`, `lon`, `alt`, `pos`, or `loc` — closing the
+//!   "callsign-like custom field" hole that motivated the issue.
+//!
+//! A single redacted attribute value is replaced with the static byte
+//! string `[REDACTED]` rather than the empty string so a downstream
+//! consumer can distinguish "operator masked this" from "sender omitted
+//! this", and so a CoT parser that strips empty attributes does not
+//! silently drop the redaction signal.
 //!
 //! # Design
 //!
@@ -57,6 +86,18 @@ use quick_xml::reader::Reader;
 /// Attribute value written in place of real coordinates.
 const MASKED_VALUE: &[u8] = b"0.0";
 
+/// Attribute value written in place of secondary position-bearing
+/// fields (callsign, group affiliation, takv platform, custom lat/lon
+/// attributes) when the configured [`MaskDetailLevel`] redacts them.
+///
+/// The literal `[REDACTED]` is preferred over the empty string so a
+/// downstream consumer can distinguish "operator masked this" from
+/// "sender omitted this", and so a permissive parser that drops empty
+/// attribute values does not silently lose the masking signal. The
+/// brackets are inert in CoT XML (no entity expansion, no element
+/// nesting) — schema validity is preserved.
+const REDACTED_VALUE: &[u8] = b"[REDACTED]";
+
 /// Upper bound on `<point>` attribute count.
 ///
 /// Spec-conforming CoT `<point>` uses 5 attributes (`lat`, `lon`, `hae`,
@@ -65,6 +106,100 @@ const MASKED_VALUE: &[u8] = b"0.0";
 /// broadcast. [`strip_coordinates`] returns
 /// [`MaskError::AttrBudgetExceeded`] when the cap is hit.
 pub const MAX_POINT_ATTRIBUTES: usize = 64;
+
+/// Per-element attribute-count cap applied to every element the masker
+/// inspects under [`MaskDetailLevel::Medium`] / [`MaskDetailLevel::Strict`].
+///
+/// Same cost-amplification protection as [`MAX_POINT_ATTRIBUTES`] but
+/// applied to the broader set of elements the stricter levels touch
+/// (`<contact>`, `<__group>`, `<takv>`, `<status>`, plus any custom
+/// element under Strict). Crafted XML packing 10 000 attributes onto a
+/// single `<contact>` element would otherwise force the masker to
+/// allocate and re-emit each one — the cap fail-closes via
+/// [`MaskError::AttrBudgetExceeded`] instead.
+pub const MAX_DETAIL_ATTRIBUTES: usize = 64;
+
+/// Operator-selected aggressiveness for [`strip_coordinates_with_level`].
+///
+/// Refs #882 (point masking detail leakage). The CoT spec leaves
+/// secondary position-bearing fields untouched by the legacy
+/// [`Coarse`](Self::Coarse) masker — a receiver who sees a masked
+/// `<point />` but a clear `<contact callsign>` or `<__group>` may
+/// still extract operationally sensitive metadata. The level lets an
+/// operator select how aggressively those secondary fields are
+/// scrubbed without committing to the all-or-nothing
+/// `Obligation::MaskPayload`.
+///
+/// **The default is [`Coarse`](Self::Coarse).** [`strip_coordinates`]
+/// dispatches to this level for backward compatibility with every
+/// caller that does not opt into a stricter tier.
+///
+/// **Ordering is informational, not numeric.** Adding variants must
+/// preserve the meaning that each successive variant is a *superset*
+/// of redactions applied by all earlier variants — a Strict deployment
+/// MUST scrub every field a Medium deployment scrubs, plus its own
+/// additions. The ordering is encoded by `Medium`,
+/// `Strict`, etc. — match exhaustively at call sites
+/// rather than comparing variants by integer rank, since the enum is
+/// `#[non_exhaustive]` and a future tier may sit between two existing
+/// ones.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum MaskDetailLevel {
+    /// Default level. Masks only `<point lat lon hae />`. Secondary
+    /// position-bearing fields (`<contact callsign>`, `<__group>`,
+    /// `<takv>`, `<status battery>`, custom lat/lon-named attributes)
+    /// are passed through untouched.
+    ///
+    /// This is the legacy pre-#882 behaviour. Choose this level when
+    /// the receiver is trusted to handle callsign / group / device
+    /// metadata, and operational policy explicitly tolerates that
+    /// metadata reaching them.
+    #[default]
+    Coarse,
+    /// Coarse plus `<contact callsign>` and `<__group>` attributes.
+    ///
+    /// Callsigns are identity-linked to position — a receiver who
+    /// knows "ALPHA-1 is at the masked position" can derive sector
+    /// membership over time even without raw coordinates. `<__group>`
+    /// carries unit affiliation (e.g. colour-coded teams) which
+    /// likewise reveals tactical structure. Choose this level when
+    /// the receiver should see the event shape but neither the
+    /// operator's identity nor unit affiliation.
+    Medium,
+    /// Medium plus `<takv platform>`, `<status battery>`, and any
+    /// attribute on any element whose name contains (case-insensitively)
+    /// `lat`, `lon`, `alt`, `pos`, or `loc`.
+    ///
+    /// `<takv platform>` reveals the operator's TAK device family
+    /// (ATAK-CIV, WinTAK, iTAK), which can be operationally signalling
+    /// in a fleet that uses platform-specific roles. `<status battery>`
+    /// can correlate with patrol duration. The custom-attribute pass
+    /// closes the "callsign-like operator-defined field" hole — a
+    /// vendor-specific `<x my_lat="…">` would otherwise leak a position
+    /// the masker did not know to look for.
+    ///
+    /// Choose this level when the receiver should see only the
+    /// envelope and event type — no identity, no unit affiliation,
+    /// no device-derived signal.
+    Strict,
+}
+
+impl MaskDetailLevel {
+    /// Return `true` when this level redacts `<contact callsign>` and
+    /// `<__group>` attributes. True for [`Medium`](Self::Medium) and
+    /// [`Strict`](Self::Strict), false for [`Coarse`](Self::Coarse).
+    pub fn redacts_callsign_and_group(self) -> bool {
+        matches!(self, Self::Medium | Self::Strict)
+    }
+
+    /// Return `true` when this level redacts `<takv>`, `<status>`, and
+    /// custom lat/lon-named attributes. True for
+    /// [`Strict`](Self::Strict) only.
+    pub fn redacts_takv_and_custom(self) -> bool {
+        matches!(self, Self::Strict)
+    }
+}
 
 /// Error returned by [`strip_coordinates`] when masking fails.
 ///
@@ -152,15 +287,98 @@ impl From<io::Error> for MaskError {
 /// cannot begin with a character whose case fold escapes ASCII in a
 /// way that would collide with "point".
 fn is_point_tag(name: &[u8]) -> bool {
-    let local = match name.iter().rposition(|b| *b == b':') {
+    local_name(name).eq_ignore_ascii_case(b"point")
+}
+
+/// Strip the namespace prefix from a qualified XML name and return the
+/// local part. Used by every `is_*_tag` predicate so a namespaced
+/// variant cannot bypass the matcher.
+fn local_name(name: &[u8]) -> &[u8] {
+    match name.iter().rposition(|b| *b == b':') {
         Some(idx) => &name[idx + 1..],
         None => name,
-    };
-    local.eq_ignore_ascii_case(b"point")
+    }
+}
+
+/// Return `true` when `name` is a `<contact>` element (case-insensitive,
+/// namespace-tolerant). Used by [`MaskDetailLevel::Medium`] and stricter
+/// to redact `<contact callsign="…">` attributes.
+fn is_contact_tag(name: &[u8]) -> bool {
+    local_name(name).eq_ignore_ascii_case(b"contact")
+}
+
+/// Return `true` when `name` is a `<__group>` element (case-insensitive,
+/// namespace-tolerant). The double underscore prefix is part of the
+/// element name in spec CoT — it does NOT denote a namespace.
+fn is_group_affiliation_tag(name: &[u8]) -> bool {
+    local_name(name).eq_ignore_ascii_case(b"__group")
+}
+
+/// Return `true` when `name` is a `<takv>` element (case-insensitive,
+/// namespace-tolerant). Used by [`MaskDetailLevel::Strict`] to redact
+/// platform / version metadata that identifies the operator's TAK
+/// device family.
+fn is_takv_tag(name: &[u8]) -> bool {
+    local_name(name).eq_ignore_ascii_case(b"takv")
+}
+
+/// Return `true` when `name` is a `<status>` element (case-insensitive,
+/// namespace-tolerant). Used by [`MaskDetailLevel::Strict`] to redact
+/// the `battery` attribute, which can correlate with patrol duration.
+fn is_status_tag(name: &[u8]) -> bool {
+    local_name(name).eq_ignore_ascii_case(b"status")
+}
+
+/// Substrings that identify a position-bearing attribute *name* (not
+/// value). Matched case-insensitively as a substring on the attribute
+/// key — `my_lat`, `LATITUDE`, `geoLOC`, and `pos_x` all match. Pure
+/// ASCII; an attribute whose name escapes ASCII through a non-Latin
+/// script falls outside CoT spec and would not be mistaken for one of
+/// these tokens by a well-behaved sender.
+const POSITION_ATTR_TOKENS: &[&[u8]] = &[b"lat", b"lon", b"alt", b"pos", b"loc"];
+
+/// Return `true` when `attr_name` contains (case-insensitively) any of
+/// the [`POSITION_ATTR_TOKENS`]. Used by
+/// [`MaskDetailLevel::Strict`] to redact the value of any custom
+/// attribute whose name suggests a position field.
+///
+/// The match is a substring scan rather than equality so a vendor
+/// extension like `my_lat` or `pos_estimated_x` is also caught — the
+/// motivating concern for #882's Strict tier is that operator-defined
+/// custom fields might re-introduce position data the masker did not
+/// know to look for.
+fn attr_name_is_position_like(attr_name: &[u8]) -> bool {
+    if attr_name.is_empty() {
+        return false;
+    }
+    // ASCII-fold once, then scan for each token. A 64-byte stack
+    // buffer covers every plausible attribute name (XML allows much
+    // longer, but real-world CoT attribute keys are short); attribute
+    // keys exceeding the buffer are still checked, just via a heap
+    // copy — preserving correctness for crafted inputs.
+    if attr_name.len() <= 64 {
+        let mut buf = [0u8; 64];
+        for (i, b) in attr_name.iter().enumerate() {
+            buf[i] = b.to_ascii_lowercase();
+        }
+        let lc = &buf[..attr_name.len()];
+        return POSITION_ATTR_TOKENS
+            .iter()
+            .any(|tok| lc.windows(tok.len()).any(|w| w == *tok));
+    }
+    let lc: Vec<u8> = attr_name.iter().map(|b| b.to_ascii_lowercase()).collect();
+    POSITION_ATTR_TOKENS
+        .iter()
+        .any(|tok| lc.windows(tok.len()).any(|w| w == *tok))
 }
 
 /// Return a copy of `xml` with every `<point>` element's `lat`, `lon`,
-/// and `hae` attributes overwritten with `"0.0"`.
+/// and `hae` attributes overwritten with `"0.0"` at
+/// [`MaskDetailLevel::Coarse`].
+///
+/// This is the legacy entrypoint preserved for backward compatibility
+/// with every caller pre-#882. Equivalent to
+/// `strip_coordinates_with_level(xml, MaskDetailLevel::Coarse)`.
 ///
 /// Attributes other than the three coordinate fields are preserved on the
 /// same element. Elements other than `<point>` are passed through
@@ -183,11 +401,66 @@ fn is_point_tag(name: &[u8]) -> bool {
 /// has been emitted must not leak coordinates via pass-through
 /// recovery.
 pub fn strip_coordinates(xml: &[u8]) -> Result<Bytes, MaskError> {
+    strip_coordinates_with_level(xml, MaskDetailLevel::Coarse)
+}
+
+/// Like [`strip_coordinates`] but applies the operator-selected
+/// [`MaskDetailLevel`].
+///
+/// Refs #882 (point masking detail leakage). The Coarse-level legacy
+/// behaviour zeroed `<point lat lon hae />` only, leaving secondary
+/// position-bearing fields (`<contact callsign>`, `<__group>`,
+/// `<takv platform>`, `<status battery>`, custom lat/lon-named
+/// attributes) intact for receivers to extract operationally
+/// sensitive metadata from. This entrypoint lets the caller select a
+/// stricter level without committing to the all-or-nothing
+/// `MaskPayload`.
+///
+/// At [`MaskDetailLevel::Medium`]:
+/// - Every `<contact>` element's `callsign` attribute (case-insensitive)
+///   is replaced with `[REDACTED]`.
+/// - Every `<__group>` element's `name` and `role` attributes are
+///   replaced with `[REDACTED]`.
+///
+/// At [`MaskDetailLevel::Strict`] (in addition to the Medium scrubs):
+/// - Every `<takv>` element's `platform` and `version` attributes are
+///   replaced with `[REDACTED]`.
+/// - Every `<status>` element's `battery` attribute is replaced with
+///   `[REDACTED]`.
+/// - On every element, any attribute whose **name** contains (case-
+///   insensitively) any of `lat`, `lon`, `alt`, `pos`, `loc` has its
+///   value replaced with `[REDACTED]`. The match is a substring scan
+///   so vendor extensions like `my_lat` and `pos_estimated_x` are
+///   covered. The three canonical `<point>` coordinate attributes
+///   (`lat`, `lon`, `hae`) are still zeroed to `0.0` rather than
+///   `[REDACTED]` because downstream parsers expect numeric values
+///   there — the Coarse-level shape is preserved on the spec elements.
+///
+/// All non-redacted attributes survive in their original byte form
+/// and order; non-target elements pass through byte-for-byte; XML
+/// declarations, comments, processing instructions, and CDATA are
+/// preserved. The matching for every target element is case-
+/// insensitive and namespace-prefix-tolerant.
+///
+/// # Errors
+///
+/// Same fail-closed contract as [`strip_coordinates`]:
+/// [`MaskError::Xml`] for XML-intent payloads that trip the parser,
+/// [`MaskError::AttrBudgetExceeded`] for crafted XML packing more than
+/// [`MAX_POINT_ATTRIBUTES`] (on `<point>`) or [`MAX_DETAIL_ATTRIBUTES`]
+/// (on every other element the level inspects) attributes onto a
+/// single tag.
+pub fn strip_coordinates_with_level(
+    xml: &[u8],
+    level: MaskDetailLevel,
+) -> Result<Bytes, MaskError> {
     // Fast-path: no XML intent → verbatim. A single-pass scan for the
     // first non-whitespace byte avoids allocating a Reader for non-XML
     // payloads (binary protocols, plain text). Valid XML must start
     // with `<` after optional leading whitespace; anything else cannot
-    // contain a `<point>` element we need to mask.
+    // contain a `<point>` element we need to mask. The fast-path is
+    // identical across every level — non-XML cannot host any of the
+    // secondary fields either.
     if xml
         .iter()
         .find(|b| !b.is_ascii_whitespace())
@@ -203,28 +476,80 @@ pub fn strip_coordinates(xml: &[u8]) -> Result<Bytes, MaskError> {
     reader.config_mut().trim_text(false);
 
     // Pre-size to the input length — masking never grows the document by
-    // more than a handful of bytes, so this avoids reallocation on
-    // typical inputs.
+    // more than a handful of bytes (Coarse) or by ~16 bytes per redacted
+    // attribute (Medium/Strict, where `[REDACTED]` is 10 bytes plus the
+    // value-length delta). Reallocation on extreme stricter-tier inputs
+    // is acceptable; the +0% Coarse path remains the typical case.
     let mut out = Vec::with_capacity(xml.len());
     let mut writer = Writer::new(&mut out);
     let mut buf = Vec::new();
 
-    // `<point>` matching is delegated to `is_point_tag` so case and
-    // namespace variants do not bypass the masker. The authz engine
-    // presents `MaskPoint` as a data-plane leak-prevention control;
-    // accepting only one exact casing would let a sender dodge the
-    // mask by emitting `<Point>` or `<cot:point>`.
+    // Element matching is delegated to the `is_*_tag` predicates so
+    // case and namespace variants do not bypass the masker. The authz
+    // engine presents `MaskPoint` as a data-plane leak-prevention
+    // control; accepting only one exact casing would let a sender
+    // dodge the mask by emitting `<Point>` or `<cot:point>`.
+    //
+    // Order matters: `<point>` is its own coordinate-zeroing path (still
+    // Coarse-shape on its three numeric attributes). Strict adds a
+    // pass-by-attribute-name check for custom position-like fields so
+    // a vendor extension is covered even on a non-target element.
     loop {
         let event = reader.read_event_into(&mut buf)?;
         match event {
             Event::Eof => break,
-            Event::Start(ref e) if is_point_tag(e.name().as_ref()) => {
-                let masked = mask_point_attrs(e)?;
-                writer.write_event(Event::Start(masked))?;
+            Event::Start(ref e) | Event::Empty(ref e) if is_point_tag(e.name().as_ref()) => {
+                let masked = mask_point_attrs(e, level)?;
+                let copy = match event {
+                    Event::Start(_) => Event::Start(masked),
+                    Event::Empty(_) => Event::Empty(masked),
+                    // Unreachable — the outer arm guards on Start|Empty.
+                    _ => unreachable!("guarded by outer match arm"),
+                };
+                writer.write_event(copy)?;
             }
-            Event::Empty(ref e) if is_point_tag(e.name().as_ref()) => {
-                let masked = mask_point_attrs(e)?;
-                writer.write_event(Event::Empty(masked))?;
+            Event::Start(ref e) | Event::Empty(ref e)
+                if level.redacts_callsign_and_group()
+                    && (is_contact_tag(e.name().as_ref())
+                        || is_group_affiliation_tag(e.name().as_ref())) =>
+            {
+                let masked = mask_detail_attrs(e, level)?;
+                let copy = match event {
+                    Event::Start(_) => Event::Start(masked),
+                    Event::Empty(_) => Event::Empty(masked),
+                    _ => unreachable!("guarded by outer match arm"),
+                };
+                writer.write_event(copy)?;
+            }
+            Event::Start(ref e) | Event::Empty(ref e)
+                if level.redacts_takv_and_custom()
+                    && (is_takv_tag(e.name().as_ref()) || is_status_tag(e.name().as_ref())) =>
+            {
+                let masked = mask_detail_attrs(e, level)?;
+                let copy = match event {
+                    Event::Start(_) => Event::Start(masked),
+                    Event::Empty(_) => Event::Empty(masked),
+                    _ => unreachable!("guarded by outer match arm"),
+                };
+                writer.write_event(copy)?;
+            }
+            Event::Start(ref e) | Event::Empty(ref e) if level.redacts_takv_and_custom() => {
+                // Strict-only: scan every other element for an attribute
+                // whose NAME is position-like (lat/lon/alt/pos/loc as a
+                // substring). If at least one such attribute is found,
+                // re-emit the element with those values redacted; if not,
+                // fall through to byte-for-byte pass-through.
+                if any_attr_name_is_position_like(e)? {
+                    let masked = mask_detail_attrs(e, level)?;
+                    let copy = match event {
+                        Event::Start(_) => Event::Start(masked),
+                        Event::Empty(_) => Event::Empty(masked),
+                        _ => unreachable!("guarded by outer match arm"),
+                    };
+                    writer.write_event(copy)?;
+                } else {
+                    writer.write_event(event)?;
+                }
             }
             other => writer.write_event(other)?,
         }
@@ -285,10 +610,19 @@ pub fn strip_coordinates(xml: &[u8]) -> Result<Bytes, MaskError> {
     Ok(Bytes::from(out))
 }
 
-/// Build a new start tag with the coordinate attributes replaced. The
-/// original qualified tag name is preserved byte-for-byte: if the input
-/// was `<cot:Point …/>`, the output is `<cot:Point lat="0.0" …/>`. All
-/// non-coordinate attributes are preserved in their original order.
+/// Build a new `<point>` start tag with the coordinate attributes
+/// replaced. The original qualified tag name is preserved byte-for-byte:
+/// if the input was `<cot:Point …/>`, the output is
+/// `<cot:Point lat="0.0" …/>`. Non-coordinate attributes are preserved
+/// in their original order.
+///
+/// At [`MaskDetailLevel::Strict`], any non-coordinate attribute on
+/// `<point>` whose name is position-like (substring scan against
+/// [`POSITION_ATTR_TOKENS`]) ALSO has its value redacted to
+/// `[REDACTED]`. This closes the case where a vendor extension stamps
+/// a custom `<point my_lat="…">` on the spec element itself. The three
+/// canonical numeric attributes still receive `0.0` rather than
+/// `[REDACTED]` so a numeric parser does not error on the spec shape.
 ///
 /// Returns [`MaskError::AttrBudgetExceeded`] if more than
 /// [`MAX_POINT_ATTRIBUTES`] attributes are present — this bounds the CPU
@@ -304,7 +638,10 @@ pub fn strip_coordinates(xml: &[u8]) -> Result<Bytes, MaskError> {
 /// conversion is an invariant check, not a hot-path cost. On the
 /// unreachable path where it fails, we surface a [`MaskError::Xml`]
 /// rather than panic.
-fn mask_point_attrs(src: &BytesStart<'_>) -> Result<BytesStart<'static>, MaskError> {
+fn mask_point_attrs(
+    src: &BytesStart<'_>,
+    level: MaskDetailLevel,
+) -> Result<BytesStart<'static>, MaskError> {
     // Preserve the original qualified name (including any namespace
     // prefix and casing) so receivers that round-trip the event see
     // the same element shape they would have seen pre-mask.
@@ -326,12 +663,115 @@ fn mask_point_attrs(src: &BytesStart<'_>) -> Result<BytesStart<'static>, MaskErr
             b"lat" | b"lon" | b"hae" => {
                 masked.push_attribute((key_bytes, MASKED_VALUE));
             }
+            _ if level.redacts_takv_and_custom() && attr_name_is_position_like(key_bytes) => {
+                // Strict-only: a custom position-like attribute on
+                // `<point>` itself (e.g. `<point my_lat="…">`) gets
+                // the bracket-style redaction, distinguishing it from
+                // the spec coordinate-zeroing path.
+                masked.push_attribute((key_bytes, REDACTED_VALUE));
+            }
             _ => {
                 masked.push_attribute((key_bytes, attr.value.as_ref()));
             }
         }
     }
     Ok(masked)
+}
+
+/// Build a new start tag for a non-`<point>` element the configured
+/// [`MaskDetailLevel`] redacts. The element's qualified name is
+/// preserved; per-attribute redaction is applied as documented on
+/// [`strip_coordinates_with_level`].
+///
+/// Per-element attribute count is capped at [`MAX_DETAIL_ATTRIBUTES`]
+/// — same cost-amplification protection [`MAX_POINT_ATTRIBUTES`]
+/// gives `<point>`, applied to the broader element set the stricter
+/// levels touch. Trips fail-closed via [`MaskError::AttrBudgetExceeded`].
+fn mask_detail_attrs(
+    src: &BytesStart<'_>,
+    level: MaskDetailLevel,
+) -> Result<BytesStart<'static>, MaskError> {
+    let name_bytes = src.name();
+    let name_str = std::str::from_utf8(name_bytes.as_ref())
+        .map_err(|e| MaskError::Xml(quick_xml::Error::Encoding(e.into())))?;
+    let element_name = name_bytes.as_ref().to_vec();
+    let mut masked = BytesStart::new(name_str.to_owned());
+    let mut count = 0usize;
+    for attr in src.attributes() {
+        let attr = attr?;
+        count += 1;
+        if count > MAX_DETAIL_ATTRIBUTES {
+            return Err(MaskError::AttrBudgetExceeded {
+                limit: MAX_DETAIL_ATTRIBUTES,
+            });
+        }
+        let key_bytes = attr.key.as_ref();
+        if attr_should_be_redacted_on_element(&element_name, key_bytes, level) {
+            masked.push_attribute((key_bytes, REDACTED_VALUE));
+        } else {
+            masked.push_attribute((key_bytes, attr.value.as_ref()));
+        }
+    }
+    Ok(masked)
+}
+
+/// Decide whether `attr_name` on an element named `element_name` should
+/// be redacted under the configured `level`. Centralised so the
+/// per-element / per-attribute decision table is documented in one
+/// place rather than scattered across the dispatcher arms.
+fn attr_should_be_redacted_on_element(
+    element_name: &[u8],
+    attr_name: &[u8],
+    level: MaskDetailLevel,
+) -> bool {
+    // Strict's custom-attribute scan applies on every element.
+    if level.redacts_takv_and_custom() && attr_name_is_position_like(attr_name) {
+        return true;
+    }
+    // Medium / Strict: spec-element attributes get specific names redacted.
+    if level.redacts_callsign_and_group() {
+        if is_contact_tag(element_name) && attr_name.eq_ignore_ascii_case(b"callsign") {
+            return true;
+        }
+        if is_group_affiliation_tag(element_name)
+            && (attr_name.eq_ignore_ascii_case(b"name") || attr_name.eq_ignore_ascii_case(b"role"))
+        {
+            return true;
+        }
+    }
+    // Strict-only: takv platform/version, status battery.
+    if level.redacts_takv_and_custom() {
+        if is_takv_tag(element_name)
+            && (attr_name.eq_ignore_ascii_case(b"platform")
+                || attr_name.eq_ignore_ascii_case(b"version"))
+        {
+            return true;
+        }
+        if is_status_tag(element_name) && attr_name.eq_ignore_ascii_case(b"battery") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Return `true` if `e` has at least one attribute whose name matches
+/// [`attr_name_is_position_like`]. Used by the Strict pass to decide
+/// whether to allocate a re-emitted element or pass the original
+/// through byte-for-byte.
+///
+/// The cap [`MAX_DETAIL_ATTRIBUTES`] is intentionally NOT applied here
+/// — the scan only inspects names and stops at the first hit, so the
+/// hot path stays cheap. The cap is enforced at re-emission time in
+/// [`mask_detail_attrs`] when the element is rewritten, which is the
+/// only place where the per-attribute allocation cost matters.
+fn any_attr_name_is_position_like(e: &BytesStart<'_>) -> Result<bool, MaskError> {
+    for attr in e.attributes() {
+        let attr = attr?;
+        if attr_name_is_position_like(attr.key.as_ref()) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -917,5 +1357,430 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── MaskDetailLevel coverage (refs #882) ─────────────────────────
+
+    /// Sample CoT carrying a callsign, group affiliation, takv platform,
+    /// status battery, and a custom `<x my_lat="…">` attribute. Used
+    /// by the level-aware tests below so each tier is exercised
+    /// against the same input.
+    const RICH_COT: &str = r#"<event uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><point lat="38.8977" lon="-77.0365" hae="125.4"/><detail><contact callsign="ALPHA-1"/><__group name="Cyan" role="Team Lead"/><takv version="4.10.1" platform="ATAK-CIV"/><status battery="73"/><x my_lat="37.7" my_lon="-122.4"/></detail></event>"#;
+
+    #[test]
+    fn coarse_masks_point_only() {
+        // Happy-path regression of the legacy behaviour: at the
+        // default MaskDetailLevel::Coarse only `<point>` is touched.
+        // Every secondary field listed in #882 must remain intact.
+        let out =
+            strip_coordinates_with_level(RICH_COT.as_bytes(), MaskDetailLevel::Coarse).unwrap();
+        let s = std::str::from_utf8(&out).unwrap();
+        // Point coordinates zeroed.
+        assert!(s.contains(r#"lat="0.0""#), "lat not zeroed: {s}");
+        assert!(s.contains(r#"lon="0.0""#), "lon not zeroed: {s}");
+        assert!(s.contains(r#"hae="0.0""#), "hae not zeroed: {s}");
+        assert!(!s.contains("38.8977"), "raw lat leaked: {s}");
+        // Secondary fields untouched at Coarse — the legacy behaviour.
+        assert!(
+            s.contains(r#"callsign="ALPHA-1""#),
+            "Coarse must not redact callsign: {s}"
+        );
+        assert!(
+            s.contains(r#"name="Cyan""#),
+            "Coarse must not redact group name: {s}"
+        );
+        assert!(
+            s.contains(r#"role="Team Lead""#),
+            "Coarse must not redact group role: {s}"
+        );
+        assert!(
+            s.contains(r#"platform="ATAK-CIV""#),
+            "Coarse must not redact takv platform: {s}"
+        );
+        assert!(
+            s.contains(r#"battery="73""#),
+            "Coarse must not redact status battery: {s}"
+        );
+        assert!(
+            s.contains(r#"my_lat="37.7""#),
+            "Coarse must not redact custom lat-named attribute: {s}"
+        );
+    }
+
+    #[test]
+    fn coarse_does_not_mask_callsign() {
+        // Regression-pin the negative half of the contract: a payload
+        // carrying only a callsign (no point, no other detail) must
+        // pass through under Coarse byte-for-byte. A future tier-leak
+        // bug where Coarse silently picked up Medium's callsign scrub
+        // would fail this test.
+        let xml = r#"<event uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><detail><contact callsign="ALPHA-1"/></detail></event>"#;
+        let out = strip_coordinates_with_level(xml.as_bytes(), MaskDetailLevel::Coarse).unwrap();
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(
+            s.contains(r#"callsign="ALPHA-1""#),
+            "Coarse must leave callsign alone: {s}"
+        );
+    }
+
+    #[test]
+    fn medium_also_masks_callsign() {
+        // Refs #882 sub-item: callsign reveals identity which is
+        // identity-linked to position. Medium must redact the
+        // callsign attribute on every <contact> element.
+        let xml = r#"<event uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><point lat="38.8977" lon="-77.0365" hae="125.4"/><detail><contact callsign="ALPHA-1"/></detail></event>"#;
+        let out = strip_coordinates_with_level(xml.as_bytes(), MaskDetailLevel::Medium).unwrap();
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(s.contains(r#"lat="0.0""#), "point still masked: {s}");
+        assert!(
+            !s.contains("ALPHA-1"),
+            "Medium must redact callsign value: {s}"
+        );
+        assert!(
+            s.contains(r#"callsign="[REDACTED]""#),
+            "expected callsign=[REDACTED] under Medium: {s}"
+        );
+    }
+
+    #[test]
+    fn medium_also_masks_group_affiliation() {
+        // Refs #882 sub-item: <__group> carries unit affiliation
+        // (colour-coded teams in TAK), which reveals tactical
+        // structure even without raw coordinates.
+        let xml = r#"<event uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><point lat="38.8977" lon="-77.0365" hae="125.4"/><detail><__group name="Cyan" role="Team Lead"/></detail></event>"#;
+        let out = strip_coordinates_with_level(xml.as_bytes(), MaskDetailLevel::Medium).unwrap();
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(!s.contains("Cyan"), "Medium must redact group name: {s}");
+        assert!(
+            !s.contains("Team Lead"),
+            "Medium must redact group role: {s}"
+        );
+        assert!(
+            s.contains(r#"name="[REDACTED]""#),
+            "expected name=[REDACTED] under Medium: {s}"
+        );
+        assert!(
+            s.contains(r#"role="[REDACTED]""#),
+            "expected role=[REDACTED] under Medium: {s}"
+        );
+    }
+
+    #[test]
+    fn medium_does_not_mask_takv_or_battery() {
+        // Medium is a strict subset of Strict — it must NOT scrub
+        // the Strict-only fields, so a deployment that picked
+        // Medium gets exactly what the docstring promised.
+        let xml = r#"<event uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><detail><takv version="4.10.1" platform="ATAK-CIV"/><status battery="73"/></detail></event>"#;
+        let out = strip_coordinates_with_level(xml.as_bytes(), MaskDetailLevel::Medium).unwrap();
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(
+            s.contains(r#"platform="ATAK-CIV""#),
+            "Medium must not redact takv platform: {s}"
+        );
+        assert!(
+            s.contains(r#"battery="73""#),
+            "Medium must not redact battery: {s}"
+        );
+    }
+
+    #[test]
+    fn strict_masks_takv_platform() {
+        // Refs #882 sub-item: <takv platform> identifies the operator's
+        // TAK device family (ATAK-CIV, WinTAK, iTAK), which can be
+        // operationally signalling in a fleet using platform-specific
+        // roles.
+        let xml = r#"<event uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><detail><takv version="4.10.1" platform="ATAK-CIV"/></detail></event>"#;
+        let out = strip_coordinates_with_level(xml.as_bytes(), MaskDetailLevel::Strict).unwrap();
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(
+            !s.contains("ATAK-CIV"),
+            "Strict must redact takv platform: {s}"
+        );
+        assert!(
+            !s.contains("4.10.1"),
+            "Strict must redact takv version: {s}"
+        );
+        assert!(
+            s.contains(r#"platform="[REDACTED]""#),
+            "expected platform=[REDACTED] under Strict: {s}"
+        );
+    }
+
+    #[test]
+    fn strict_masks_status_battery() {
+        // Battery level can correlate with patrol duration —
+        // operationally signalling under a sufficiently aggressive
+        // threat model.
+        let xml = r#"<event uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><detail><status battery="73"/></detail></event>"#;
+        let out = strip_coordinates_with_level(xml.as_bytes(), MaskDetailLevel::Strict).unwrap();
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(!s.contains("73"), "Strict must redact battery: {s}");
+        assert!(
+            s.contains(r#"battery="[REDACTED]""#),
+            "expected battery=[REDACTED] under Strict: {s}"
+        );
+    }
+
+    #[test]
+    fn strict_masks_custom_lat_attr() {
+        // Refs #882: a vendor extension stamping a custom `<x my_lat>`
+        // / `<x my_lon>` attribute would otherwise leak position the
+        // masker did not know to look for. Strict's substring scan on
+        // `lat`/`lon`/`alt`/`pos`/`loc` covers vendor-defined names.
+        let xml = r#"<event uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><detail><x my_lat="37.7" my_lon="-122.4" my_alt="42" pos_x="100" geo_loc="san_fran"/></detail></event>"#;
+        let out = strip_coordinates_with_level(xml.as_bytes(), MaskDetailLevel::Strict).unwrap();
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(!s.contains("37.7"), "Strict must redact my_lat: {s}");
+        assert!(!s.contains("-122.4"), "Strict must redact my_lon: {s}");
+        assert!(
+            !s.contains(r#"my_alt="42""#),
+            "Strict must redact my_alt: {s}"
+        );
+        assert!(
+            !s.contains(r#"pos_x="100""#),
+            "Strict must redact pos_x: {s}"
+        );
+        assert!(
+            !s.contains("san_fran"),
+            "Strict must redact geo_loc value: {s}"
+        );
+        // Each redacted attribute keeps its NAME so a downstream
+        // consumer can see the field existed.
+        assert!(
+            s.contains(r#"my_lat="[REDACTED]""#),
+            "my_lat name preserved: {s}"
+        );
+        assert!(
+            s.contains(r#"my_lon="[REDACTED]""#),
+            "my_lon name preserved: {s}"
+        );
+    }
+
+    #[test]
+    fn strict_masks_uppercase_custom_lat_attr() {
+        // Substring match must be ASCII-case-insensitive — uppercased
+        // and mixed-case vendor attributes must also be redacted.
+        let xml = r#"<event uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><detail><x LATITUDE="38.0" Longitude="-77.0"/></detail></event>"#;
+        let out = strip_coordinates_with_level(xml.as_bytes(), MaskDetailLevel::Strict).unwrap();
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(!s.contains("38.0"), "Strict must redact LATITUDE: {s}");
+        assert!(!s.contains("-77.0"), "Strict must redact Longitude: {s}");
+    }
+
+    #[test]
+    fn strict_does_not_redact_unrelated_attributes() {
+        // The substring scan must match position tokens only — `loc`
+        // (and `pos`, `alt`, etc.) is permissive enough that a
+        // legitimate non-position field could collide. Pin the cases
+        // that DO match (so the contract is documented) and the cases
+        // that do NOT.
+        let xml = r#"<event uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><detail><x team="Alpha" status_ok="true" foo="bar"/></detail></event>"#;
+        let out = strip_coordinates_with_level(xml.as_bytes(), MaskDetailLevel::Strict).unwrap();
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(
+            s.contains(r#"team="Alpha""#),
+            "Strict must not redact unrelated `team`: {s}"
+        );
+        assert!(
+            s.contains(r#"foo="bar""#),
+            "Strict must not redact unrelated `foo`: {s}"
+        );
+    }
+
+    #[test]
+    fn strict_includes_every_medium_redaction() {
+        // Strict is a documented superset of Medium. A payload that
+        // exercises every Medium field at Strict-level must produce
+        // the same redactions as Medium for those fields, plus the
+        // Strict-only ones.
+        let xml = r#"<event uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><detail><contact callsign="ALPHA-1"/><__group name="Cyan"/></detail></event>"#;
+        let out = strip_coordinates_with_level(xml.as_bytes(), MaskDetailLevel::Strict).unwrap();
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(
+            !s.contains("ALPHA-1"),
+            "Strict must redact callsign (inherited from Medium): {s}"
+        );
+        assert!(
+            !s.contains("Cyan"),
+            "Strict must redact group name (inherited from Medium): {s}"
+        );
+    }
+
+    #[test]
+    fn byte_stable_for_inputs_with_no_secondary_fields() {
+        // A payload with only a `<point>` and no secondary fields
+        // should produce IDENTICAL bytes under Coarse/Medium/Strict
+        // — no level-specific scrub fires, so the new Medium/Strict
+        // code paths must not regress the byte-stable invariant.
+        let xml = r#"<event uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><point lat="38.8977" lon="-77.0365" hae="125.4"/></event>"#;
+        let coarse = strip_coordinates_with_level(xml.as_bytes(), MaskDetailLevel::Coarse).unwrap();
+        let medium = strip_coordinates_with_level(xml.as_bytes(), MaskDetailLevel::Medium).unwrap();
+        let strict = strip_coordinates_with_level(xml.as_bytes(), MaskDetailLevel::Strict).unwrap();
+        assert_eq!(
+            coarse, medium,
+            "Medium must byte-match Coarse on no-detail input"
+        );
+        assert_eq!(
+            coarse, strict,
+            "Strict must byte-match Coarse on no-detail input"
+        );
+    }
+
+    #[test]
+    fn strip_coordinates_default_is_coarse() {
+        // The legacy entrypoint must dispatch to Coarse for backward
+        // compatibility. A regression that flipped the default to
+        // Medium would silently change the wire shape on every
+        // existing caller.
+        let coarse =
+            strip_coordinates_with_level(RICH_COT.as_bytes(), MaskDetailLevel::Coarse).unwrap();
+        let legacy = strip_coordinates(RICH_COT.as_bytes()).unwrap();
+        assert_eq!(
+            legacy, coarse,
+            "strip_coordinates() must equal strip_coordinates_with_level(_, Coarse)"
+        );
+    }
+
+    #[test]
+    fn mask_detail_level_default_is_coarse() {
+        // Pin the documented default — the `Default` derive uses
+        // `Coarse`, so a deployment that calls `MaskDetailLevel::default()`
+        // gets the legacy behaviour out of the box.
+        assert_eq!(MaskDetailLevel::default(), MaskDetailLevel::Coarse);
+    }
+
+    #[test]
+    fn mask_detail_level_redacts_predicates_match_documented_tier_table() {
+        // Pin the per-tier predicate table so a refactor that
+        // accidentally swapped two arms (e.g. Medium suddenly
+        // returned true for `redacts_takv_and_custom`) is caught
+        // here rather than at a much-later integration test that
+        // would just see "wrong fields redacted".
+        assert!(!MaskDetailLevel::Coarse.redacts_callsign_and_group());
+        assert!(!MaskDetailLevel::Coarse.redacts_takv_and_custom());
+        assert!(MaskDetailLevel::Medium.redacts_callsign_and_group());
+        assert!(!MaskDetailLevel::Medium.redacts_takv_and_custom());
+        assert!(MaskDetailLevel::Strict.redacts_callsign_and_group());
+        assert!(MaskDetailLevel::Strict.redacts_takv_and_custom());
+    }
+
+    #[test]
+    fn medium_handles_namespaced_contact_element() {
+        // `<contact>` matching is namespace-prefix-tolerant for the
+        // same reason `<point>` is — a sender that wraps the element
+        // in a namespace prefix must NOT bypass the masker.
+        let xml = r#"<event xmlns:cot="urn:cot" uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><detail><cot:contact callsign="ALPHA-1"/></detail></event>"#;
+        let out = strip_coordinates_with_level(xml.as_bytes(), MaskDetailLevel::Medium).unwrap();
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(
+            !s.contains("ALPHA-1"),
+            "namespaced contact must still redact callsign: {s}"
+        );
+    }
+
+    #[test]
+    fn medium_handles_uppercase_contact_element() {
+        // Element-name matching is ASCII-case-insensitive — same
+        // contract as `<point>`. Pin the case-variant bypass.
+        let xml = r#"<event uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><detail><Contact callsign="ALPHA-1"/></detail></event>"#;
+        let out = strip_coordinates_with_level(xml.as_bytes(), MaskDetailLevel::Medium).unwrap();
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(
+            !s.contains("ALPHA-1"),
+            "uppercase Contact must still redact callsign: {s}"
+        );
+    }
+
+    #[test]
+    fn detail_attr_budget_caps_per_element() {
+        // A crafted <contact> element packed with > MAX_DETAIL_ATTRIBUTES
+        // attributes must trip the same fail-closed cap as <point>.
+        // Pre-this-PR a `<contact>` with thousands of attributes would
+        // amplify per-recipient masking cost; the cap closes that.
+        let mut xml = String::from(
+            r#"<event uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><detail><contact callsign="ALPHA-1""#,
+        );
+        for i in 0..=MAX_DETAIL_ATTRIBUTES {
+            xml.push_str(&format!(r#" x{i}="v""#));
+        }
+        xml.push_str("/></detail></event>");
+        let err =
+            strip_coordinates_with_level(xml.as_bytes(), MaskDetailLevel::Medium).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                MaskError::AttrBudgetExceeded {
+                    limit: MAX_DETAIL_ATTRIBUTES,
+                }
+            ),
+            "expected AttrBudgetExceeded, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn medium_xml_intent_malformed_payload_is_rejected() {
+        // Same fail-closed contract as Coarse: an XML-intent payload
+        // that trips the parser must NOT fall back to pass-through,
+        // even at a stricter level. A regression that handled the
+        // Medium/Strict scrub with a different recovery path could
+        // re-introduce a coordinate-leak via partial parse.
+        let malformed = br#"<event><point lat="38.8977" lon="-77.0365" hae="125.4"/><contact callsign="ALPHA-1"/><unterminated"#;
+        let err = strip_coordinates_with_level(malformed, MaskDetailLevel::Medium).unwrap_err();
+        assert!(
+            matches!(err, MaskError::Xml(_)),
+            "expected Xml, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn strict_self_stable_on_redacted_output() {
+        // The defensive output round-trip in strip_coordinates_with_level
+        // must also pass under Strict — a buggy `[REDACTED]` re-emit that
+        // produced bytes the next pass cannot read would break the
+        // documented self-stability contract.
+        let first =
+            strip_coordinates_with_level(RICH_COT.as_bytes(), MaskDetailLevel::Strict).unwrap();
+        // Pass 2 must not error.
+        let second = strip_coordinates_with_level(&first, MaskDetailLevel::Strict).unwrap();
+        // And idempotence on the strict pass: re-applying Strict to
+        // already-Strict-masked output must not drift.
+        assert_eq!(first, second, "Strict must be idempotent on its own output");
+    }
+
+    #[test]
+    fn medium_at_attribute_budget_is_accepted() {
+        // Inverse of the over-budget test: exactly MAX_DETAIL_ATTRIBUTES
+        // attributes on `<contact>` must succeed. Cap is exclusive at
+        // the upper bound.
+        let mut xml = String::from(
+            r#"<event uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><detail><contact callsign="ALPHA-1""#,
+        );
+        // 1 existing attr (callsign), pad up to the cap.
+        for i in 0..MAX_DETAIL_ATTRIBUTES - 1 {
+            xml.push_str(&format!(r#" x{i}="v""#));
+        }
+        xml.push_str("/></detail></event>");
+        assert!(
+            strip_coordinates_with_level(xml.as_bytes(), MaskDetailLevel::Medium).is_ok(),
+            "exactly MAX_DETAIL_ATTRIBUTES must succeed under Medium"
+        );
+    }
+
+    #[test]
+    fn point_inside_strict_with_custom_lat_attr_redacts_custom_attr_only() {
+        // Strict on `<point my_lat="…">`: the spec coordinates still
+        // get the `0.0` numeric mask, but the custom position-named
+        // attribute gets bracketed redaction. This is the documented
+        // shape — pin it so a refactor that unified the two paths
+        // does not silently change the wire format.
+        let xml = r#"<event uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><point lat="38.8977" lon="-77.0365" hae="125.4" my_lat="37.7"/></event>"#;
+        let out = strip_coordinates_with_level(xml.as_bytes(), MaskDetailLevel::Strict).unwrap();
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(s.contains(r#"lat="0.0""#), "spec lat zeroed: {s}");
+        assert!(
+            s.contains(r#"my_lat="[REDACTED]""#),
+            "custom my_lat redacted: {s}"
+        );
+        assert!(!s.contains("37.7"), "raw custom lat leaked: {s}");
     }
 }
