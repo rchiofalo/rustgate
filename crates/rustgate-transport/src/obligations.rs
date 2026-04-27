@@ -57,7 +57,11 @@
 //! - Payload does not announce itself as XML (first non-whitespace byte
 //!   is not `<`) → forward unmodified. The masker is named for CoT; a
 //!   policy that attaches it to a MAVLink or protobuf stream is a
-//!   mis-configuration, not a leak.
+//!   mis-configuration, not a leak. The audit `recovery` token is
+//!   refined by `source_protocol` so an analyst can distinguish a
+//!   legitimate binary framing (MAVLink, TAK protobuf, ASTERIX) from a
+//!   genuinely unparseable XML payload — see
+//!   [`rustgate_core::audit::classify_mask_recovery_for`].
 //! - Payload starts with `<` but fails to parse or trips the attribute
 //!   budget → **fail-closed**: empty the body and coerce the message
 //!   type to `Other("masked")`, the same state [`Obligation::MaskPayload`]
@@ -268,8 +272,20 @@ pub fn apply_obligations(
 ///    through unmodified. `MaskPoint` is a CoT-specific control; a
 ///    policy attached to a MAVLink/protobuf stream is a
 ///    mis-configuration and the dispatcher must not silently drop the
-///    traffic. An audit record is still emitted with
-///    `recovery = "forwarded_unmasked"`.
+///    traffic. The audit `recovery` token is refined by
+///    `source_protocol` so an analyst can distinguish three forensic
+///    buckets (see [`audit::classify_mask_recovery_for`]):
+///
+///    - `recovery = "forwarded_binary"` — known binary framing
+///      (MAVLink, TAK protobuf, ASTERIX); position masking is N/A by
+///      design.
+///    - `recovery = "forwarded_unmasked"` — `source_protocol` claims
+///      XML/CoT but the payload could not be parsed (matches the
+///      pre-issue-#742 label, so SIEM dashboards keyed on this token
+///      keep working).
+///    - `recovery = "forwarded_unknown"` — `source_protocol` is not in
+///      the recognised set; surfaces misconfigured upstreams without
+///      conflating them with the higher-severity unparseable-XML case.
 ///
 /// 2. **XML-intent parse failure** (payload starts with `<` but
 ///    quick_xml errors, or the `<point>` attribute budget is exceeded)
@@ -296,16 +312,27 @@ fn apply_mask_point(msg: &mut RoutableMessage) {
         .is_some_and(|b| *b == b'<');
 
     if !is_xml_intent {
+        // Refine the recovery token by the inbound `source_protocol`
+        // so the audit trail distinguishes "binary framing where
+        // masking is N/A by design" from "XML-text framing where the
+        // masker should have caught this" from "unrecognised
+        // upstream, operator should investigate". Pre-issue-#742 the
+        // dispatcher emitted the same `forwarded_unmasked` token for
+        // every non-XML payload, which collapsed three forensic cases
+        // into one audit string and forced operators to re-derive the
+        // distinction from the `source_protocol` field manually.
+        let recovery = audit::classify_mask_recovery_for(&msg.metadata.source_protocol);
         tracing::debug!(
             source_protocol = %msg.metadata.source_protocol,
             message_type = %msg.metadata.message_type,
+            recovery = recovery,
             "mask_point obligation: non-XML payload, forwarding unmasked"
         );
         audit::authz_obligation_failed(
             &msg.source.cn,
             "MaskPoint",
             "payload is not XML",
-            "forwarded_unmasked",
+            recovery,
             &msg.metadata.source_protocol,
             msg.destination.kind_str(),
         );
@@ -344,7 +371,7 @@ fn apply_mask_point(msg: &mut RoutableMessage) {
                 &msg.source.cn,
                 "MaskPoint",
                 error_kind,
-                "dropped",
+                audit::MASK_RECOVERY_DROPPED,
                 &msg.metadata.source_protocol,
                 msg.destination.kind_str(),
             );
@@ -395,6 +422,20 @@ mod tests {
         }
     }
 
+    /// Variant of `sample_msg` that lets the caller pin
+    /// `source_protocol`. Used by the issue-#742 recovery-bucket tests
+    /// that assert the dispatcher passes a binary payload through
+    /// unchanged regardless of which binary framing it is labelled as.
+    fn sample_msg_with_protocol(
+        payload: &'static [u8],
+        message_type: MessageType,
+        source_protocol: &str,
+    ) -> RoutableMessage {
+        let mut m = sample_msg(payload, message_type);
+        m.metadata.source_protocol = source_protocol.to_string();
+        m
+    }
+
     /// Apply obligations under the default fail-closed policy.
     ///
     /// All existing tests exercise known obligation variants only,
@@ -426,6 +467,103 @@ mod tests {
         assert_eq!(msg.payload.as_ref(), b"not xml at all");
         // Message type unchanged: masking is a payload-level op.
         assert_eq!(msg.metadata.message_type, MessageType::Chat);
+    }
+
+    // Issue #742: the audit `recovery` token for the non-XML pass-
+    // through path is bucketed by `source_protocol`. The audit-emission
+    // shape is pinned by the integration test
+    // `tests/mask_point_recovery_audit.rs` (separate binary so the
+    // tracing callsite Interest cache does not race other tests in
+    // this crate). The tests below pin the side-effect contract: a
+    // binary-labelled payload must survive `apply_mask_point` byte-for-
+    // byte regardless of which binary framing the payload claims to
+    // be, so a future refactor cannot accidentally start mutating
+    // MAVLink / TAK protobuf / ASTERIX bytes while still emitting the
+    // expected audit token.
+
+    #[test]
+    fn mask_point_on_mavlink_payload_passes_through_unchanged() {
+        // A MAVLink frame is a binary payload that cannot host a CoT
+        // `<point>` element. Pre-issue-#742 the dispatcher already
+        // passed it through unmodified; this test pins that
+        // invariant against a future regression where the dispatcher
+        // might start "trying anyway" on a binary-labelled payload.
+        let frame: &'static [u8] = &[0xFD, 0x09, 0x00, 0x00, 0x00, 0x01, 0x01];
+        let mut msg = sample_msg_with_protocol(frame, MessageType::Mavlink, "mavlink");
+        let before = msg.payload.clone();
+        apply(&mut msg, &[Obligation::MaskPoint]);
+        assert_eq!(msg.payload, before, "mavlink payload must not be mutated");
+        assert_eq!(msg.metadata.message_type, MessageType::Mavlink);
+    }
+
+    #[test]
+    fn mask_point_on_tak_protobuf_payload_passes_through_unchanged() {
+        // TAK protobuf frames start with the 0xBF magic byte. Same
+        // pass-through invariant as MAVLink. The hyphenated and
+        // underscored protocol-id spellings are exercised by the
+        // classifier unit tests in `rustgate-core::audit::tests`; here
+        // we pin the side-effect contract for the dispatcher itself.
+        let frame: &'static [u8] = &[0xBF, 0x01, 0x02, 0x03];
+        let mut msg =
+            sample_msg_with_protocol(frame, MessageType::Other("binary".into()), "tak-protobuf");
+        let before = msg.payload.clone();
+        apply(&mut msg, &[Obligation::MaskPoint]);
+        assert_eq!(
+            msg.payload, before,
+            "tak-protobuf payload must not be mutated"
+        );
+    }
+
+    #[test]
+    fn mask_point_on_asterix_payload_passes_through_unchanged() {
+        // ASTERIX surveillance frames are a binary wire format. Same
+        // pass-through invariant.
+        let frame: &'static [u8] = &[0x3E, 0x00, 0x10, 0x00];
+        let mut msg =
+            sample_msg_with_protocol(frame, MessageType::Other("surveillance".into()), "asterix");
+        let before = msg.payload.clone();
+        apply(&mut msg, &[Obligation::MaskPoint]);
+        assert_eq!(msg.payload, before, "asterix payload must not be mutated");
+    }
+
+    #[test]
+    fn mask_point_on_unparseable_cot_passes_through_unchanged() {
+        // `source_protocol = cot` plus a non-XML-intent first byte
+        // means the upstream said this would be CoT but the bytes are
+        // not in a parseable shape. Position MAY be in the bytes —
+        // the audit token (`forwarded_unmasked`, pinned by the
+        // integration test) reflects that severity. The side-effect
+        // contract is identical to the binary case: pass through
+        // unmodified, do NOT fail-closed (that path is reserved for
+        // XML-intent payloads where the parser actually started).
+        let mut msg =
+            sample_msg_with_protocol(b"truncated-cot-payload", MessageType::Position, "cot");
+        let before = msg.payload.clone();
+        apply(&mut msg, &[Obligation::MaskPoint]);
+        assert_eq!(
+            msg.payload, before,
+            "non-XML-intent cot payload must not be erased"
+        );
+        assert_eq!(msg.metadata.message_type, MessageType::Position);
+    }
+
+    #[test]
+    fn mask_point_on_unrecognized_protocol_passes_through_unchanged() {
+        // An unrecognised `source_protocol` is bucketed into the
+        // `forwarded_unknown` audit token. The side-effect contract
+        // is the same as for the recognised binary and XML cases:
+        // pass through unmodified, never silently drop.
+        let mut msg = sample_msg_with_protocol(
+            b"some random bytes",
+            MessageType::Other("blob".into()),
+            "unknown_proto_xyz",
+        );
+        let before = msg.payload.clone();
+        apply(&mut msg, &[Obligation::MaskPoint]);
+        assert_eq!(
+            msg.payload, before,
+            "unrecognised-protocol payload must not be mutated"
+        );
     }
 
     #[test]
