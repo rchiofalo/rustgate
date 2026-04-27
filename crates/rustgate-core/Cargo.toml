@@ -16,12 +16,17 @@ fuzz = ["dep:arbitrary"]
 # this feature in crates that previously rolled their own PEM parsing so
 # they share a single error mapping via `rustgate_core::pem`.
 pem = ["dep:rustls", "dep:rustls-pki-types"]
+# Shared Prometheus fallback constructors used by every crate that
+# follows the `OnceLock` + `init()` + accessor metrics pattern. See
+# `rustgate_core::metrics_util` and `rules/shared-infrastructure.md`.
+metrics = ["dep:prometheus"]
 
 [dependencies]
 arbitrary = { workspace = true, optional = true }
 arc-swap = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
+prometheus = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }
 serde = { workspace = true }

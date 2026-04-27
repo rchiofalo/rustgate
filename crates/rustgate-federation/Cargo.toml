@@ -17,7 +17,7 @@ ignored = ["prost-types", "tonic-prost"]  # runtime deps for generated gRPC code
 default = []
 v2 = ["dep:tonic", "dep:tonic-prost", "dep:tokio-stream", "dep:prost-types", "dep:prost-build", "dep:tonic-build", "dep:tonic-prost-build", "dep:rustgate-proto"]
 ha = ["dep:async-nats"]
-api = ["dep:hyper", "dep:http-body-util", "dep:prometheus"]
+api = ["dep:hyper", "dep:http-body-util", "dep:prometheus", "rustgate-core/metrics"]
 fips = ["rustls/aws_lc_rs", "rustls/fips", "tonic?/tls-aws-lc"]
 post-quantum = ["rustls/aws_lc_rs", "rustls/prefer-post-quantum", "tonic?/tls-aws-lc"]
 # Dynamic peer discovery backends (issue #571). Each backend is independently

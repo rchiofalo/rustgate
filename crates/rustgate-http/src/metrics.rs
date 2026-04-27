@@ -27,34 +27,15 @@ static RESPONSE_BODIES_CAPTURED: OnceLock<IntCounterVec> = OnceLock::new();
 static BATCHES_FLUSHED: OnceLock<IntCounterVec> = OnceLock::new();
 
 // ── Fallback constructors ──────────────────────────────────────────
+//
+// When `init()` has not been called, accessor functions lazily create
+// an unregistered metric via `OnceLock::get_or_init()`. The helpers
+// live in `rustgate_core::metrics_util` so every crate following the
+// `OnceLock` + `init()` + accessor pattern shares one implementation.
 
-fn fallback_counter_vec(name: &str, help: &str, labels: &[&str]) -> IntCounterVec {
-    match IntCounterVec::new(Opts::new(name, help), labels) {
-        Ok(cv) => cv,
-        Err(_) => std::process::abort(),
-    }
-}
-
-fn fallback_gauge(name: &str, help: &str) -> IntGauge {
-    match IntGauge::with_opts(Opts::new(name, help)) {
-        Ok(g) => g,
-        Err(_) => std::process::abort(),
-    }
-}
-
-fn fallback_gauge_vec(name: &str, help: &str, labels: &[&str]) -> IntGaugeVec {
-    match IntGaugeVec::new(Opts::new(name, help), labels) {
-        Ok(gv) => gv,
-        Err(_) => std::process::abort(),
-    }
-}
-
-fn fallback_histogram(name: &str, help: &str) -> Histogram {
-    match Histogram::with_opts(HistogramOpts::new(name, help)) {
-        Ok(h) => h,
-        Err(_) => std::process::abort(),
-    }
-}
+use rustgate_core::metrics_util::{
+    fallback_counter_vec, fallback_gauge, fallback_gauge_vec, fallback_histogram,
+};
 
 // ── Registration ───────────────────────────────────────────────────
 

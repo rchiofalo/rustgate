@@ -3218,6 +3218,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "prometheus",
  "proptest",
  "rcgen",
  "rustls",
