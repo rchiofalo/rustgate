@@ -183,6 +183,7 @@ fn audit_obligation_failed_emits_static_reason_label_for_io_error() {
             audit::MASK_RECOVERY_DROPPED,
             "cot",
             "broadcast",
+            "policy-v1",
         );
     });
 
@@ -264,7 +265,13 @@ fn audit_obligation_failed_emits_static_reason_label_for_attr_budget_exceeded() 
 #[test]
 fn audit_obligation_unknown_emits_static_reason_label() {
     let log = capture_audit(|| {
-        audit::authz_obligation_unknown("alice", "TransformPayload", "cot", "broadcast");
+        audit::authz_obligation_unknown(
+            "alice",
+            "TransformPayload",
+            "cot",
+            "broadcast",
+            "policy-v1",
+        );
     });
 
     assert!(

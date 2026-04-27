@@ -428,7 +428,7 @@ pub fn apply_obligations_with_limiter(
 ) -> Result<(), ObligationError> {
     for obligation in obligations {
         match obligation {
-            Obligation::MaskPoint => apply_mask_point(msg),
+            Obligation::MaskPoint => apply_mask_point(msg, policy_id),
             Obligation::MaskPayload => apply_mask_payload(msg),
             // Audit-only obligations handled at the call site.
             Obligation::TagClassified | Obligation::AuditExtended => {}
@@ -453,6 +453,7 @@ pub fn apply_obligations_with_limiter(
                         &variant_repr,
                         &msg.metadata.source_protocol,
                         msg.destination.kind_str(),
+                        policy_id,
                     );
                 }
                 match unknown_policy {
@@ -527,7 +528,11 @@ pub fn apply_obligations_with_limiter(
 /// hostile or mis-configured sender cannot amplify a single bad
 /// payload into thousands of WARN records per second. Audit records
 /// carry the forensic detail.
-fn apply_mask_point(msg: &mut RoutableMessage) {
+///
+/// `policy_id` is forwarded into both `audit::authz_obligation_failed`
+/// emissions (closes #772) so SIEM correlation can pin which engine
+/// version returned the obligation that the masker could not honour.
+fn apply_mask_point(msg: &mut RoutableMessage, policy_id: &str) {
     // XML-intent is decided from the payload itself: first
     // non-whitespace byte is `<`. Non-XML payloads cannot host a
     // `<point>` element — forward unmodified but still audit so
@@ -567,6 +572,7 @@ fn apply_mask_point(msg: &mut RoutableMessage) {
             recovery,
             &msg.metadata.source_protocol,
             msg.destination.kind_str(),
+            policy_id,
         );
         return;
     }
@@ -609,6 +615,7 @@ fn apply_mask_point(msg: &mut RoutableMessage) {
                 audit::MASK_RECOVERY_DROPPED,
                 &msg.metadata.source_protocol,
                 msg.destination.kind_str(),
+                policy_id,
             );
             apply_mask_payload(msg);
         }
