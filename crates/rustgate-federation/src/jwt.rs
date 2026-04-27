@@ -758,6 +758,25 @@ pub enum JwtError {
     InvalidKid,
 }
 
+// Why this `Display` is not migrated to `#[derive(thiserror::Error)]`:
+//
+// The `UnknownKid(String)` variant renders two distinct messages
+// depending on whether the kid is empty (the "no kid header at all"
+// path constructs `UnknownKid(String::new())` from `decode()`) or
+// non-empty (a real kid that did not resolve in the verifier
+// registry). thiserror's `#[error("...")]` attribute is a single
+// format string per variant — there is no template form that can
+// branch on field content, and operator log-correlation tooling
+// already greps for both literal strings, so byte-stable output
+// rules out a single "unknown kid: {kid}" template (it would render
+// "unknown kid: " with a trailing space for the empty case).
+//
+// Splitting into `MissingKid` + `UnknownKid(String)` would let
+// thiserror handle this cleanly, but that is a breaking change to
+// this crate's public error variants and is intentionally out of
+// scope for the Display-impl migration. The manual `Display` and
+// `Error` impls below are documented and pinned by `Display` tests
+// in the in-file test module.
 impl std::fmt::Display for JwtError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1990,5 +2009,94 @@ mod tests {
             .with_hs256_verifier("peer-b", b"too-short".to_vec())
             .expect_err("must reject short");
         assert!(matches!(err, JwtError::SecretTooShort { .. }));
+    }
+
+    // --- JwtError Display tests ---
+    //
+    // JwtError keeps a manual `impl Display` because `UnknownKid(String)`
+    // renders two distinct messages depending on whether the inner kid
+    // is empty (no `kid` header at all) or non-empty (a real kid that
+    // did not resolve in the verifier registry). thiserror's
+    // `#[error("...")]` attribute is one format string per variant,
+    // with no template form that branches on field content. Splitting
+    // the variant into `MissingKid` + `UnknownKid(String)` would let
+    // thiserror handle this cleanly, but is a breaking change to the
+    // public error API and intentionally out of scope here. These
+    // tests pin every variant's output so any future refactor of the
+    // manual Display fails loudly rather than silently breaking
+    // operator log-correlation tooling.
+    //
+    // See `impl Display for JwtError` for the rationale doc-comment.
+
+    #[test]
+    fn jwt_error_simple_variants_display_byte_stable() {
+        assert_eq!(JwtError::Expired.to_string(), "token expired");
+        assert_eq!(
+            JwtError::IssuedInFuture.to_string(),
+            "token issued in the future"
+        );
+        assert_eq!(JwtError::InvalidSignature.to_string(), "invalid signature");
+        assert_eq!(JwtError::Malformed.to_string(), "malformed token");
+        assert_eq!(JwtError::InvalidIssuer.to_string(), "invalid issuer");
+        assert_eq!(JwtError::Revoked.to_string(), "token revoked");
+        assert_eq!(JwtError::ClockError.to_string(), "system clock error");
+        assert_eq!(JwtError::InvalidKey.to_string(), "invalid key material");
+    }
+
+    #[test]
+    fn jwt_error_serialization_error_display_includes_msg() {
+        let err = JwtError::SerializationError("bad json at line 1".to_string());
+        assert_eq!(err.to_string(), "serialization error: bad json at line 1");
+    }
+
+    #[test]
+    fn jwt_error_secret_too_short_display_includes_min_and_actual() {
+        let err = JwtError::SecretTooShort { min: 32, actual: 8 };
+        assert_eq!(err.to_string(), "secret too short: need 32 bytes, got 8");
+    }
+
+    #[test]
+    fn jwt_error_unsupported_algorithm_display_includes_alg() {
+        let err = JwtError::UnsupportedAlgorithm("RS256".to_string());
+        assert_eq!(err.to_string(), "unsupported algorithm: RS256");
+    }
+
+    #[test]
+    fn jwt_error_unknown_kid_display_branches_on_emptiness() {
+        // Empty kid → "no kid header at all" path.
+        let err = JwtError::UnknownKid(String::new());
+        assert_eq!(
+            err.to_string(),
+            "token has no kid and no legacy verifier is configured"
+        );
+        // Non-empty kid → "kid did not resolve in registry" path. This
+        // branching is exactly why JwtError keeps a manual Display.
+        let err = JwtError::UnknownKid("peer-a".to_string());
+        assert_eq!(err.to_string(), "unknown kid: peer-a");
+    }
+
+    #[test]
+    fn jwt_error_algorithm_mismatch_display_names_both_algorithms() {
+        let err = JwtError::AlgorithmMismatch {
+            header: Algorithm::Hs256,
+            key: Algorithm::Es256,
+        };
+        assert_eq!(
+            err.to_string(),
+            "token alg HS256 does not match key alg ES256 for selected kid"
+        );
+    }
+
+    #[test]
+    fn jwt_error_invalid_kid_display_embeds_max_length() {
+        // The literal `MAX_KID_LENGTH` is interpolated into the
+        // message — pin the rendered text against the constant rather
+        // than a hard-coded number so a deliberate cap change updates
+        // both sides together.
+        let err = JwtError::InvalidKid;
+        assert_eq!(
+            err.to_string(),
+            format!("kid must be non-empty, <= {MAX_KID_LENGTH} bytes, and printable ASCII")
+        );
     }
 }

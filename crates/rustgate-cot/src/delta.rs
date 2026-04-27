@@ -138,29 +138,20 @@ pub struct CotPoint {
 }
 
 /// Errors produced by the delta encoder/decoder.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum DeltaError {
     /// The payload could not be parsed as CoT XML.
+    #[error("payload is not CoT XML")]
     NotCot,
     /// The cached snapshot referenced by a delta is missing, so the delta
     /// cannot be reconstructed into a full event.
+    #[error("no cached snapshot for uid")]
     MissingCache,
     /// The XML was syntactically valid but did not carry a `uid` attribute
     /// on the `<event>` element.
+    #[error("event has no uid attribute")]
     MissingUid,
 }
-
-impl std::fmt::Display for DeltaError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DeltaError::NotCot => f.write_str("payload is not CoT XML"),
-            DeltaError::MissingCache => f.write_str("no cached snapshot for uid"),
-            DeltaError::MissingUid => f.write_str("event has no uid attribute"),
-        }
-    }
-}
-
-impl std::error::Error for DeltaError {}
 
 /// Output of [`DeltaEncoder::encode`].
 #[derive(Debug, Clone)]
@@ -1149,5 +1140,48 @@ mod tests {
         // — it's just a cache update, not capacity pressure.
         let _ = enc.encode(&full_event("U3", 35.0, -119.0, "t2"));
         assert_eq!(enc.stats().evicted, 1);
+    }
+
+    // --- DeltaError Display / Error-trait tests ---
+    //
+    // These pin the byte-stable Display output of every variant so a
+    // future refactor that breaks operator log-correlation tooling
+    // fails loudly here rather than silently in production grep
+    // pipelines. A migration to `#[derive(thiserror::Error)]` must
+    // preserve the exact wording.
+
+    #[test]
+    fn delta_error_not_cot_display_is_byte_stable() {
+        assert_eq!(DeltaError::NotCot.to_string(), "payload is not CoT XML");
+    }
+
+    #[test]
+    fn delta_error_missing_cache_display_is_byte_stable() {
+        assert_eq!(
+            DeltaError::MissingCache.to_string(),
+            "no cached snapshot for uid"
+        );
+    }
+
+    #[test]
+    fn delta_error_missing_uid_display_is_byte_stable() {
+        assert_eq!(
+            DeltaError::MissingUid.to_string(),
+            "event has no uid attribute"
+        );
+    }
+
+    #[test]
+    fn delta_error_implements_std_error_trait() {
+        // The thiserror derive synthesises `std::error::Error`; pin
+        // the bound here so a regression that removed the derive
+        // (or otherwise dropped the impl) fails at test-compile
+        // time rather than at a distant downstream call site.
+        use std::error::Error;
+        fn assert_error<T: Error>(_: &T) {}
+        let err = DeltaError::NotCot;
+        assert_error(&err);
+        // No source error is wrapped by any DeltaError variant.
+        assert!(err.source().is_none());
     }
 }

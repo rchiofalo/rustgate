@@ -23,30 +23,21 @@ pub use routable_message::{
 use super::proto;
 
 /// Errors that can occur during format conversion.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ConvertError {
     /// XML parsing failed.
+    #[error("xml parse error: {0}")]
     Xml(String),
     /// A required field was missing in the source data.
+    #[error("missing required field: {0}")]
     MissingField(&'static str),
     /// A field value is invalid.
+    #[error("invalid field: {0}")]
     InvalidField(String),
     /// Timestamp conversion failed.
+    #[error("invalid timestamp: {0}")]
     InvalidTimestamp(String),
 }
-
-impl std::fmt::Display for ConvertError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Xml(msg) => write!(f, "xml parse error: {msg}"),
-            Self::MissingField(field) => write!(f, "missing required field: {field}"),
-            Self::InvalidField(msg) => write!(f, "invalid field: {msg}"),
-            Self::InvalidTimestamp(msg) => write!(f, "invalid timestamp: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for ConvertError {}
 
 impl From<rustgate_proto::ProtoError> for ConvertError {
     fn from(e: rustgate_proto::ProtoError) -> Self {
@@ -191,6 +182,11 @@ mod tests {
     }
 
     // --- ConvertError Display / Error-trait tests ---
+    //
+    // ConvertError uses `#[derive(thiserror::Error)]`. These tests pin
+    // the byte-stable Display output of every variant so a future
+    // refactor that breaks operator log-correlation tooling fails
+    // here loudly rather than silently in production grep pipelines.
 
     #[test]
     fn convert_error_xml_display_renders_parse_context() {
