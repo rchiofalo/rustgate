@@ -261,6 +261,11 @@ const MAX_TOKEN_LENGTH: usize = 256;
 ///
 /// Returns `Cow::Borrowed` on the fast path (input already valid) and
 /// `Cow::Owned` when any transformation was needed.
+///
+/// This is one of four sanitization helpers in the workspace; see the
+/// matrix in [`rustgate_core::sanitize`] for the full set of helpers
+/// and the rationale for why their rules differ. Output bytes for any
+/// given input are pinned by `sanitize_nats_token_byte_stable_for_known_inputs`.
 fn sanitize_nats_token(s: &str) -> Option<Cow<'_, str>> {
     if s.is_empty() {
         return None;
@@ -419,6 +424,78 @@ mod tests {
         assert_eq!(
             sanitize_nats_token("admin.*.>\x00\u{0430}team").as_deref(),
             Some("admin__team")
+        );
+    }
+
+    #[test]
+    fn sanitize_nats_token_byte_stable_for_known_inputs() {
+        // Pins the exact output bytes for a corpus of inputs spanning
+        // every documented behavior class of `sanitize_nats_token`. The
+        // matrix in `rustgate_core::sanitize` claims byte-stable output;
+        // any wire-visible change to a NATS subject token here would
+        // break downstream subscribers that filter on these subjects.
+        let cases: &[(&str, Option<&str>)] = &[
+            ("plain", Some("plain")),
+            ("__ANON__", Some("__ANON__")),
+            ("track-uid-123", Some("track-uid-123")),
+            ("group.subgroup", Some("group_subgroup")),
+            ("a.b.c.d", Some("a_b_c_d")),
+            ("group*", Some("group")),
+            ("a>b", Some("ab")),
+            ("a\nb", Some("ab")),
+            ("a\tb", Some("ab")),
+            ("a\x7Fb", Some("ab")),
+            ("caf\u{00e9}", Some("caf")),
+            ("caf\u{0065}\u{0301}", Some("caf")),
+            ("\u{1F600}hello", Some("hello")),
+            ("a\u{0430}b", Some("ab")),
+            ("", None),
+            (">", None),
+            ("...", Some("___")),
+            ("admin.*.>\x00\u{0430}team", Some("admin__team")),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                sanitize_nats_token(input).as_deref(),
+                *expected,
+                "byte-stable output regression for input {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn matrix_invariant_sanitize_nats_token_does_nfc_normalize() {
+        // Pinned axis from the module-doc matrix in `rustgate_core::sanitize`:
+        // `sanitize_nats_token` DOES NFC-normalize (in contrast to
+        // `sanitize_for_log`). Inputs that are NFC/NFD variants of the
+        // same logical string must produce identical output. A regression
+        // that dropped the `.nfc()` step would let a Unicode-equivalence
+        // spoof on the input side slip through to the NATS subject.
+        let nfd = "caf\u{0065}\u{0301}\u{0061}"; // "caféa" with combining acute
+        let nfc = "caf\u{00e9}\u{0061}"; // same in NFC
+        assert_ne!(
+            nfd, nfc,
+            "NFD and NFC variants must differ at the byte level"
+        );
+        assert_eq!(
+            sanitize_nats_token(nfd).as_deref(),
+            sanitize_nats_token(nfc).as_deref(),
+            "NFC normalization must collapse equivalent forms"
+        );
+    }
+
+    #[test]
+    fn matrix_invariant_sanitize_nats_token_strips_non_ascii() {
+        // Pinned axis from the module-doc matrix: `sanitize_nats_token`
+        // STRIPS non-ASCII (in contrast to `sanitize_for_log` which
+        // preserves it). This is structural — NATS subjects must be
+        // ASCII-safe — so a regression here would produce subjects the
+        // NATS server rejects.
+        assert_eq!(sanitize_nats_token("\u{4e16}\u{754c}").as_deref(), None);
+        assert_eq!(
+            sanitize_nats_token("a\u{1F600}b").as_deref(),
+            Some("ab"),
+            "non-ASCII characters must be dropped, not replaced"
         );
     }
 }

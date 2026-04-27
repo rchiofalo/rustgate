@@ -4,6 +4,72 @@
 //!
 //! Provides functions that make user-controlled strings safe for
 //! inclusion in structured log fields and other output formats.
+//!
+//! # Sanitization Helper Matrix
+//!
+//! Several sanitization helpers exist across the workspace. They share a
+//! common design pressure — *make untrusted input safe for one specific
+//! destination* — but each destination imposes its own constraints, so
+//! the helpers cannot share a single implementation core. This matrix
+//! documents the divergences explicitly so a future change to one
+//! helper triggers a deliberate decision rather than silent drift.
+//!
+//! | Helper | Crate | Destination | Control chars | Non-ASCII | NFC | Length cap | Returns | Trust model |
+//! |---|---|---|---|---|---|---|---|---|
+//! | [`sanitize_for_log`] | `rustgate-core` | log field | replace with `U+FFFD` (incl. CSI body) | preserved as-is | no | none | `String` | untrusted |
+//! | `sanitize_nats_token` | `rustgate-nats` | NATS subject token | strip (drop) | strip | yes | 256 bytes | `Option<Cow<str>>` | untrusted |
+//! | `sanitize_filename` | `rustgate-federation` | filesystem path component | replace with `_` | replace with `_` | no | none | `String` | untrusted |
+//! | `validate_publish_topic` / `validate_subscribe_filter` | `rustgate-mqtt` | MQTT topic / topic filter | reject (error) | reject (error) | no | 255 bytes | `Result<(), MqttError>` | untrusted |
+//!
+//! ## Why the helpers diverge
+//!
+//! - **`sanitize_for_log`** replaces with `U+FFFD` rather than stripping
+//!   so the position of every removed byte is still visible in logs —
+//!   important for forensic correlation. It preserves arbitrary
+//!   non-control Unicode because legitimate certificate CNs may contain
+//!   non-Latin scripts. It does **not** NFC-normalize because the log
+//!   line is consumed by humans and pipelines that handle Unicode-
+//!   equivalent forms identically; normalizing would only mask that the
+//!   raw bytes on the wire were unusual.
+//! - **`sanitize_nats_token`** must produce a string that satisfies NATS
+//!   subject syntax (printable ASCII, no `.`, no `*`, no `>`). It
+//!   *strips* rather than replaces because every output character must
+//!   be a valid token character — `U+FFFD` is non-ASCII and NATS would
+//!   reject it. NFC normalization closes a Unicode-equivalence spoofing
+//!   gap (see `shared-infrastructure.md`'s "Unicode Normalization
+//!   Defense") before ASCII filtering, so NFC variants of a
+//!   confusable character collapse to the same post-strip output.
+//! - **`sanitize_filename`** must produce a string that the OS will
+//!   accept as a path component, but the rules vary across filesystems.
+//!   The conservative choice is `[A-Za-z0-9._-]` and replace everything
+//!   else with `_`. It does not NFC-normalize because the input has
+//!   already been audited (it comes from a parsed certificate CN, not
+//!   a free-form network field).
+//! - **MQTT topic validators** reject rather than transform because MQTT
+//!   topic syntax is part of the wire protocol — if a client publishes
+//!   with an invalid topic, the right answer is `MALFORMED_PACKET`, not
+//!   silent munging of the topic. The validator is a *validator*, not a
+//!   *sanitizer*; it appears here only so callers know which family it
+//!   belongs to.
+//!
+//! ## Untrusted vs operator-controlled input
+//!
+//! All four helpers operate on **untrusted** input — values that came in
+//! from a network peer (a TLS certificate CN, a publish topic, a NATS
+//! group hint) and must be neutralized before being passed to a
+//! destination that interprets the bytes (a log line, a NATS subject,
+//! a filesystem path, the MQTT wire codec). For operator-controlled
+//! values (CLI flags, config fields parsed from the operator's TOML),
+//! validation at parse time is preferred and these runtime sanitizers
+//! should not appear on the hot path.
+//!
+//! ## Byte-stability guarantee
+//!
+//! Each helper is pinned by `*_byte_stable_for_known_inputs` regression
+//! tests in its home crate so that any change to the output for a
+//! captured input fails CI. This guarantee means downstream pipelines
+//! (log parsers, NATS subscribers, file scanners) can rely on the
+//! output bytes being stable across rustgate releases.
 
 /// Sanitize a string for safe inclusion in structured log fields.
 ///
@@ -319,6 +385,70 @@ mod tests {
         // be absent from the output.
         assert!(!out.contains('\n'), "newline leaked: {out:?}");
         assert!(!out.contains('\x1b'), "ESC leaked: {out:?}");
+    }
+
+    #[test]
+    fn sanitize_for_log_byte_stable_for_known_inputs() {
+        // Pins the exact output bytes for a corpus of inputs spanning
+        // every documented behavior class. A regression on any line of
+        // this table indicates a wire-visible behavior change — the
+        // matrix in the module docs claims byte-stable output, and the
+        // log pipelines downstream depend on it.
+        let cases: &[(&str, &str)] = &[
+            ("plain", "plain"),
+            ("alice\nbob", "alice\u{FFFD}bob"),
+            ("a\tb", "a\u{FFFD}b"),
+            ("\x1b[31mRED\x1b[0m", "\u{FFFD}RED\u{FFFD}"),
+            ("\u{9B}1;31m", "\u{FFFD}"),
+            ("caf\u{00e9}", "caf\u{00e9}"),
+            ("caf\u{0065}\u{0301}", "caf\u{0065}\u{0301}"),
+            ("\u{1F600}smile", "\u{1F600}smile"),
+            ("a.b.c", "a.b.c"),
+            ("group*", "group*"),
+            ("group>tail", "group>tail"),
+            ("a/b", "a/b"),
+            ("\u{202E}rtl", "\u{202E}rtl"),
+            ("", ""),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                sanitize_for_log(input),
+                *expected,
+                "byte-stable output regression for input {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn matrix_invariant_sanitize_for_log_does_not_nfc_normalize() {
+        // Pinned axis from the module-doc matrix: `sanitize_for_log` does
+        // NOT NFC-normalize. NFD "café" (e + combining acute) must come
+        // out byte-identical. If a future change accidentally adds NFC
+        // normalization here, the NATS helper's "we do NFC, the log
+        // helper does not" promise in the matrix becomes false.
+        let nfd = "caf\u{0065}\u{0301}";
+        let nfc = "caf\u{00e9}";
+        assert_ne!(nfd, nfc, "NFD and NFC of 'café' must differ at byte level");
+        assert_eq!(
+            sanitize_for_log(nfd),
+            nfd,
+            "sanitize_for_log must preserve NFD bytes"
+        );
+        assert_eq!(
+            sanitize_for_log(nfc),
+            nfc,
+            "sanitize_for_log must preserve NFC bytes"
+        );
+    }
+
+    #[test]
+    fn matrix_invariant_sanitize_for_log_preserves_non_ascii() {
+        // Pinned axis from the module-doc matrix: `sanitize_for_log`
+        // preserves non-ASCII (in contrast to `sanitize_nats_token` which
+        // strips it). A regression would re-introduce data loss for
+        // non-Latin CNs.
+        assert_eq!(sanitize_for_log("\u{4e16}\u{754c}"), "\u{4e16}\u{754c}");
+        assert_eq!(sanitize_for_log("\u{1F600}"), "\u{1F600}");
     }
 
     #[test]

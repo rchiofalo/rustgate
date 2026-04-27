@@ -402,6 +402,24 @@ fn persist_cert_to_disk(dir: &Path, cn: &str, pem_data: &[u8]) -> Result<()> {
 }
 
 /// Sanitize a certificate common name for use as a filename.
+///
+/// Replaces every character that is not alphanumeric, `-`, `_`, or `.`
+/// with a single underscore. This produces a filename that is safe on
+/// every common filesystem (POSIX, NTFS, FAT, APFS) without depending
+/// on path-quoting at the syscall site.
+///
+/// This is one of four sanitization helpers in the workspace; see the
+/// matrix in [`rustgate_core::sanitize`] for the full set of helpers
+/// and the rationale for why their rules differ. Output bytes for any
+/// given input are pinned by `sanitize_filename_byte_stable_for_known_inputs`.
+///
+/// Note that `c.is_alphanumeric()` accepts non-ASCII alphanumerics
+/// (e.g. the Cyrillic 'а', U+0430). This is intentional: a CN that
+/// legitimately contains non-Latin script should round-trip through
+/// the trust-store layout without losing identifying information. The
+/// CN itself has already been authenticated by the certificate-issuance
+/// path before reaching this helper, so there is no Unicode-equivalence
+/// spoofing surface to defend against here.
 fn sanitize_filename(cn: &str) -> String {
     cn.chars()
         .map(|c| {
@@ -766,6 +784,58 @@ mod tests {
         assert_eq!(sanitize_filename("My CA/Root"), "My_CA_Root");
         assert_eq!(sanitize_filename("cert with spaces"), "cert_with_spaces");
         assert_eq!(sanitize_filename("a@b#c$d"), "a_b_c_d");
+    }
+
+    #[test]
+    fn sanitize_filename_byte_stable_for_known_inputs() {
+        // Pins the exact output bytes for a corpus of inputs spanning
+        // every documented behavior class of `sanitize_filename`. The
+        // matrix in `rustgate_core::sanitize` claims byte-stable output;
+        // a wire-visible change here would rename existing trust-store
+        // files on disk and break operator-facing trust layouts.
+        let cases: &[(&str, &str)] = &[
+            ("plain", "plain"),
+            ("my-cert.pem", "my-cert.pem"),
+            ("My CA/Root", "My_CA_Root"),
+            ("cert with spaces", "cert_with_spaces"),
+            ("a@b#c$d", "a_b_c_d"),
+            // Path-traversal attempt collapses to underscores.
+            ("../etc/passwd", ".._etc_passwd"),
+            // Control char becomes underscore (NOT U+FFFD — distinguishes
+            // from `sanitize_for_log`).
+            ("a\nb", "a_b"),
+            ("a\tb", "a_b"),
+            // Non-ASCII alphanumeric is preserved (CN with non-Latin
+            // script must round-trip).
+            ("caf\u{00e9}", "caf\u{00e9}"),
+            // Underscore and dot pass through.
+            ("_..__", "_..__"),
+            ("", ""),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                sanitize_filename(input),
+                *expected,
+                "byte-stable output regression for input {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn matrix_invariant_sanitize_filename_uses_underscore_not_u_fffd() {
+        // Pinned axis from the module-doc matrix in `rustgate_core::sanitize`:
+        // `sanitize_filename` REPLACES with `_`, NOT with `U+FFFD`. The
+        // matrix claim "filename helper uses '_' as the replacement
+        // character" is wire-visible — a regression that switched to
+        // `U+FFFD` would create non-ASCII filenames (legal on most
+        // filesystems, but a behavior change downstream tooling would
+        // not expect).
+        let out = sanitize_filename("a/b");
+        assert!(
+            !out.contains('\u{FFFD}'),
+            "filename must not contain U+FFFD, got {out:?}"
+        );
+        assert_eq!(out, "a_b");
     }
 
     #[test]
