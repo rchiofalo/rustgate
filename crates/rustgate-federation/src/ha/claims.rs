@@ -19,11 +19,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
 use tokio::sync::{Mutex, watch};
 use tracing::{debug, info, warn};
 
 use super::{ADOPT_DELAY_SECS, CLAIM_TTL_SECS, MAX_ADOPT_JITTER_MS, REFRESH_INTERVAL_SECS};
+use crate::error::{FederationError, Result};
 
 const CLAIM_BUCKET: &str = "federation-claims";
 
@@ -73,7 +73,11 @@ impl ClaimManager {
                 ..Default::default()
             })
             .await
-            .context("failed to create federation-claims KV bucket")?;
+            .map_err(|e| {
+                FederationError::storage(format!(
+                    "failed to create federation-claims KV bucket: {e}"
+                ))
+            })?;
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -223,10 +227,9 @@ impl ClaimManager {
         let _ = claims.remove(peer_id);
         drop(claims);
 
-        self.kv
-            .delete(peer_id)
-            .await
-            .context("failed to delete claim from KV")?;
+        self.kv.delete(peer_id).await.map_err(|e| {
+            FederationError::storage(format!("failed to delete claim from KV: {e}"))
+        })?;
 
         info!(peer_id = %peer_id, pod_id = %self.pod_id, "released peer claim");
         Ok(())
@@ -382,7 +385,10 @@ async fn watch_expired_claims(
 ) -> Result<()> {
     use futures::StreamExt;
 
-    let mut watcher = kv.watch_all().await.context("failed to start KV watch")?;
+    let mut watcher = kv
+        .watch_all()
+        .await
+        .map_err(|e| FederationError::storage(format!("failed to start KV watch: {e}")))?;
 
     loop {
         tokio::select! {

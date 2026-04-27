@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use crate::config::RoutingMode;
+use crate::error::{FederationError, Result};
 use crate::store::{FederateInfo, FederateStore, FederateUpdate};
 
 /// File-backed federate store using JSON serialization.
@@ -33,7 +34,7 @@ impl FileStore {
 }
 
 impl FederateStore for FileStore {
-    fn load(&mut self) -> anyhow::Result<()> {
+    fn load(&mut self) -> Result<()> {
         let Some(path) = &self.path else {
             return Ok(());
         };
@@ -42,8 +43,11 @@ impl FederateStore for FileStore {
             return Ok(());
         }
 
-        let data = std::fs::read_to_string(path)?;
-        let entries: Vec<FederateInfo> = serde_json::from_str(&data)?;
+        let data = std::fs::read_to_string(path).map_err(|e| {
+            FederationError::io(format!("reading federate store from {}", path.display()), e)
+        })?;
+        let entries: Vec<FederateInfo> = serde_json::from_str(&data)
+            .map_err(|e| FederationError::serde("parsing federate store JSON", e))?;
 
         self.federates.clear();
         for mut entry in entries {
@@ -61,7 +65,7 @@ impl FederateStore for FileStore {
         Ok(())
     }
 
-    fn save(&self) -> anyhow::Result<()> {
+    fn save(&self) -> Result<()> {
         let Some(path) = &self.path else {
             return Ok(());
         };
@@ -70,12 +74,20 @@ impl FederateStore for FileStore {
         if let Some(parent) = path.parent()
             && !parent.exists()
         {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent).map_err(|e| {
+                FederationError::io(
+                    format!("creating federate store parent {}", parent.display()),
+                    e,
+                )
+            })?;
         }
 
         let entries: Vec<&FederateInfo> = self.federates.values().collect();
-        let data = serde_json::to_string_pretty(&entries)?;
-        std::fs::write(path, data)?;
+        let data = serde_json::to_string_pretty(&entries)
+            .map_err(|e| FederationError::serde("serializing federate store", e))?;
+        std::fs::write(path, data).map_err(|e| {
+            FederationError::io(format!("writing federate store to {}", path.display()), e)
+        })?;
 
         Ok(())
     }
@@ -112,11 +124,11 @@ impl FederateStore for FileStore {
         self.federates.remove(id).is_some()
     }
 
-    fn update(&mut self, id: &str, update: FederateUpdate) -> anyhow::Result<Option<String>> {
+    fn update(&mut self, id: &str, update: FederateUpdate) -> Result<Option<String>> {
         let info = self
             .federates
             .get_mut(id)
-            .ok_or_else(|| anyhow::anyhow!("federate not found: {id}"))?;
+            .ok_or_else(|| FederationError::PeerNotFound(id.to_string()))?;
 
         let old_address = if let Some(addr) = update.address {
             let old = info.address.clone();
@@ -145,20 +157,20 @@ impl FederateStore for FileStore {
         Ok(old_address)
     }
 
-    fn set_enabled(&mut self, id: &str, enabled: bool) -> anyhow::Result<()> {
+    fn set_enabled(&mut self, id: &str, enabled: bool) -> Result<()> {
         let info = self
             .federates
             .get_mut(id)
-            .ok_or_else(|| anyhow::anyhow!("federate not found: {id}"))?;
+            .ok_or_else(|| FederationError::PeerNotFound(id.to_string()))?;
         info.enabled = enabled;
         Ok(())
     }
 
-    fn set_routing_mode(&mut self, id: &str, mode: RoutingMode) -> anyhow::Result<()> {
+    fn set_routing_mode(&mut self, id: &str, mode: RoutingMode) -> Result<()> {
         let info = self
             .federates
             .get_mut(id)
-            .ok_or_else(|| anyhow::anyhow!("federate not found: {id}"))?;
+            .ok_or_else(|| FederationError::PeerNotFound(id.to_string()))?;
         info.routing_mode = mode;
         Ok(())
     }
@@ -182,6 +194,7 @@ impl FederateStore for FileStore {
 }
 
 #[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -282,6 +295,50 @@ mod tests {
         let mut store = FileStore::new(None);
         let result = store.update("nope", FederateUpdate::default());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn update_nonexistent_returns_peer_not_found_variant() {
+        // The migration from anyhow → typed errors makes the
+        // "federate not found" failure mode load-bearing: the REST
+        // API in `crates/rustgate-federation/src/api/handlers.rs`
+        // surfaces a 404 by formatting the error string. Pin that
+        // the typed variant carries the missing id verbatim so the
+        // operator-visible response stays stable.
+        let mut store = FileStore::new(None);
+        let err = store
+            .update("missing-peer", FederateUpdate::default())
+            .expect_err("should error for missing peer");
+        match err {
+            crate::FederationError::PeerNotFound(id) => {
+                assert_eq!(id, "missing-peer");
+            }
+            other => panic!("expected PeerNotFound variant, got {other:?}"),
+        }
+        // Also pin the Display rendering — that is what the REST API
+        // emits to the operator and what existing log greps target.
+        let err = store
+            .update("missing-peer", FederateUpdate::default())
+            .expect_err("should error for missing peer");
+        assert_eq!(err.to_string(), "federate not found: missing-peer");
+    }
+
+    #[test]
+    fn set_enabled_nonexistent_returns_peer_not_found_variant() {
+        let mut store = FileStore::new(None);
+        let err = store
+            .set_enabled("ghost", true)
+            .expect_err("should error for missing peer");
+        assert!(matches!(err, crate::FederationError::PeerNotFound(ref id) if id == "ghost"));
+    }
+
+    #[test]
+    fn set_routing_mode_nonexistent_returns_peer_not_found_variant() {
+        let mut store = FileStore::new(None);
+        let err = store
+            .set_routing_mode("ghost", RoutingMode::Broadcast)
+            .expect_err("should error for missing peer");
+        assert!(matches!(err, crate::FederationError::PeerNotFound(ref id) if id == "ghost"));
     }
 
     #[test]

@@ -32,6 +32,7 @@ use tracing::{debug, warn};
 
 use super::PeerDiscovery;
 use crate::config::{PeerConfig, RoutingMode};
+use crate::error::{FederationError, Result};
 
 /// Default peer-discovery routing configuration applied to every peer
 /// returned by this backend. Operators that need non-default groups or
@@ -68,13 +69,14 @@ impl DnsSdDiscovery {
     /// Starts a background `ServiceDaemon` thread, begins browsing for
     /// `service_type`, and returns an error if either step fails. The
     /// daemon continues running until this struct is dropped.
-    pub fn new(service_type: impl Into<String>) -> anyhow::Result<Self> {
+    pub fn new(service_type: impl Into<String>) -> Result<Self> {
         let service_type = service_type.into();
-        let daemon = ServiceDaemon::new()
-            .map_err(|e| anyhow::anyhow!("failed to start mdns-sd service daemon: {e}"))?;
-        let receiver = daemon
-            .browse(&service_type)
-            .map_err(|e| anyhow::anyhow!("failed to browse {service_type} via mdns-sd: {e}"))?;
+        let daemon = ServiceDaemon::new().map_err(|e| {
+            FederationError::discovery(format!("failed to start mdns-sd service daemon: {e}"))
+        })?;
+        let receiver = daemon.browse(&service_type).map_err(|e| {
+            FederationError::discovery(format!("failed to browse {service_type} via mdns-sd: {e}"))
+        })?;
         Ok(Self {
             service_type,
             daemon,
@@ -176,12 +178,11 @@ impl Drop for DnsSdDiscovery {
 
 #[async_trait]
 impl PeerDiscovery for DnsSdDiscovery {
-    async fn discover(&self) -> anyhow::Result<Vec<PeerConfig>> {
+    async fn discover(&self) -> Result<Vec<PeerConfig>> {
         self.drain_events();
-        let instances = self
-            .instances
-            .lock()
-            .map_err(|_| anyhow::anyhow!("dns-sd discovery instance map lock poisoned"))?;
+        let instances = self.instances.lock().map_err(|_| {
+            FederationError::discovery("dns-sd discovery instance map lock poisoned")
+        })?;
         Ok(instances.values().cloned().collect())
     }
 

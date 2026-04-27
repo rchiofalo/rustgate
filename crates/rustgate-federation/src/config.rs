@@ -43,13 +43,13 @@ impl std::fmt::Display for Protocol {
 }
 
 impl std::str::FromStr for Protocol {
-    type Err = anyhow::Error;
+    type Err = crate::FederationError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "v1" => Ok(Protocol::V1),
             "v2" => Ok(Protocol::V2),
-            other => Err(anyhow::anyhow!("unknown federation protocol: {other}")),
+            other => Err(crate::FederationError::UnknownProtocol(other.to_string())),
         }
     }
 }
@@ -349,7 +349,7 @@ fn default_priority() -> u32 {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -440,6 +440,37 @@ mod tests {
     fn protocol_parse_error_message_contains_input() {
         let err = "v3".parse::<Protocol>().expect_err("should fail for v3");
         assert!(err.to_string().contains("v3"));
+    }
+
+    #[test]
+    fn protocol_parse_error_is_unknown_protocol_variant() {
+        // The migration from anyhow → typed errors must surface the
+        // specific [`FederationError::UnknownProtocol`] variant so
+        // callers in the binary tier can pattern-match on it instead
+        // of grepping the Display string. The lowercased input is
+        // preserved verbatim in the variant payload (see `from_str`).
+        let err = "v3".parse::<Protocol>().expect_err("should fail for v3");
+        match err {
+            crate::FederationError::UnknownProtocol(value) => {
+                assert_eq!(value, "v3");
+            }
+            other => panic!("expected UnknownProtocol variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn protocol_parse_error_lowercases_input_in_variant_payload() {
+        // FromStr lowercases its argument before matching, so the
+        // typed variant must also carry the lowercased token —
+        // otherwise a caller matching on `UnknownProtocol("V3")`
+        // would silently miss the same input as `"v3"`.
+        let err = "V3".parse::<Protocol>().expect_err("should fail for V3");
+        match err {
+            crate::FederationError::UnknownProtocol(value) => {
+                assert_eq!(value, "v3", "FromStr stores the lowercased token");
+            }
+            other => panic!("expected UnknownProtocol variant, got {other:?}"),
+        }
     }
 
     #[test]

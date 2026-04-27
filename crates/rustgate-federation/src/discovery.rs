@@ -36,6 +36,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use crate::config::PeerConfig;
+use crate::error::Result;
 use crate::manager::FederationManager;
 
 #[cfg(feature = "peer-discovery-consul")]
@@ -62,7 +63,7 @@ pub trait PeerDiscovery: Send + Sync + 'static {
     /// peers that should currently be configured; the reconciler diffs it
     /// against the manager's active peers and applies adds/removes via
     /// `swap_peers`.
-    async fn discover(&self) -> anyhow::Result<Vec<PeerConfig>>;
+    async fn discover(&self) -> Result<Vec<PeerConfig>>;
 
     /// Human-readable name of this backend, used for logging.
     ///
@@ -281,10 +282,12 @@ mod tests {
 
     #[async_trait]
     impl PeerDiscovery for MockDiscovery {
-        async fn discover(&self) -> anyhow::Result<Vec<PeerConfig>> {
+        async fn discover(&self) -> Result<Vec<PeerConfig>> {
             *self.calls.lock().unwrap() += 1;
             if *self.fail.lock().unwrap() {
-                anyhow::bail!("simulated discovery failure");
+                return Err(crate::FederationError::discovery(
+                    "simulated discovery failure",
+                ));
             }
             Ok(self.peers.lock().unwrap().clone())
         }
@@ -338,6 +341,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discover_failure_returns_typed_discovery_variant() {
+        // Pin the typed-error contract on the trait surface: the
+        // mock backend's failure path returns a
+        // [`FederationError::Discovery`] with the documented message.
+        // The reconciler swallows this variant by design (logged + retried),
+        // so this test intercepts the trait return directly to make sure
+        // the migration from `anyhow::bail!` → typed variant did not
+        // silently change the failure-mode shape downstream callers
+        // (e.g. external `PeerDiscovery` impls) match on.
+        let mock = MockDiscovery::new(vec![peer("alpha", "127.0.0.1:9100")]);
+        *mock.fail.lock().unwrap() = true;
+        let err = mock
+            .discover()
+            .await
+            .expect_err("mock should error when fail flag is set");
+        match err {
+            crate::FederationError::Discovery(msg) => {
+                assert_eq!(msg, "simulated discovery failure");
+            }
+            other => panic!("expected Discovery variant, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn reconciler_loop_exits_on_shutdown() {
         let mgr = Arc::new(RwLock::new(FederationManager::new(test_config())));
         let mock = Arc::new(MockDiscovery::new(vec![]));
@@ -367,7 +394,7 @@ mod tests {
 
     #[async_trait]
     impl PeerDiscovery for DefaultBackendDiscovery {
-        async fn discover(&self) -> anyhow::Result<Vec<PeerConfig>> {
+        async fn discover(&self) -> Result<Vec<PeerConfig>> {
             Ok(vec![])
         }
         // backend_name() intentionally omitted — relies on trait default.

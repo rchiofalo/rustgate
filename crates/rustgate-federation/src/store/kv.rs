@@ -12,10 +12,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
-use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
 use crate::config::RoutingMode;
+use crate::error::{FederationError, Result};
 use crate::store::{FederateInfo, FederateStore, FederateUpdate};
 
 const KV_BUCKET: &str = "federation-peers";
@@ -64,7 +64,11 @@ impl KvStore {
                 ..Default::default()
             })
             .await
-            .context("failed to create federation-peers KV bucket")?;
+            .map_err(|e| {
+                FederationError::storage(format!(
+                    "failed to create federation-peers KV bucket: {e}"
+                ))
+            })?;
 
         Ok(Self {
             kv,
@@ -116,7 +120,10 @@ impl KvStore {
         let mut keys = Vec::new();
         {
             use futures::StreamExt;
-            let mut key_stream = self.kv.keys().await.context("failed to list KV keys")?;
+            let mut key_stream =
+                self.kv.keys().await.map_err(|e| {
+                    FederationError::storage(format!("failed to list KV keys: {e}"))
+                })?;
             while let Some(result) = key_stream.next().await {
                 if let Ok(key) = result {
                     keys.push(key);
@@ -142,7 +149,7 @@ impl KvStore {
         let mut federates = self
             .federates
             .write()
-            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+            .map_err(|e| FederationError::lock("lock poisoned", e))?;
         *federates = loaded;
 
         info!(count, "loaded federates from KV store");
@@ -151,7 +158,8 @@ impl KvStore {
 
     /// Write a federate to the KV bucket.
     fn put_kv(&self, info: &FederateInfo) -> Result<()> {
-        let data = serde_json::to_vec(info).context("failed to serialize federate")?;
+        let data = serde_json::to_vec(info)
+            .map_err(|e| FederationError::serde("failed to serialize federate", e))?;
         let kv = self.kv.clone();
         let key = info.id.clone();
         // Fire-and-forget async write
@@ -265,11 +273,11 @@ impl FederateStore for KvStore {
         let mut federates = self
             .federates
             .write()
-            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+            .map_err(|e| FederationError::lock("lock poisoned", e))?;
 
         let info = federates
             .get_mut(id)
-            .ok_or_else(|| anyhow::anyhow!("federate not found: {id}"))?;
+            .ok_or_else(|| FederationError::PeerNotFound(id.to_string()))?;
 
         let old_address = if let Some(addr) = update.address {
             let old = info.address.clone();
@@ -302,11 +310,11 @@ impl FederateStore for KvStore {
         let mut federates = self
             .federates
             .write()
-            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+            .map_err(|e| FederationError::lock("lock poisoned", e))?;
 
         let info = federates
             .get_mut(id)
-            .ok_or_else(|| anyhow::anyhow!("federate not found: {id}"))?;
+            .ok_or_else(|| FederationError::PeerNotFound(id.to_string()))?;
 
         info.enabled = enabled;
         let info_clone = info.clone();
@@ -322,11 +330,11 @@ impl FederateStore for KvStore {
         let mut federates = self
             .federates
             .write()
-            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+            .map_err(|e| FederationError::lock("lock poisoned", e))?;
 
         let info = federates
             .get_mut(id)
-            .ok_or_else(|| anyhow::anyhow!("federate not found: {id}"))?;
+            .ok_or_else(|| FederationError::PeerNotFound(id.to_string()))?;
 
         info.routing_mode = mode;
         let info_clone = info.clone();
@@ -384,7 +392,10 @@ async fn watch_loop(
 ) -> Result<()> {
     use futures::StreamExt;
 
-    let mut watcher = kv.watch_all().await.context("failed to start KV watch")?;
+    let mut watcher = kv
+        .watch_all()
+        .await
+        .map_err(|e| FederationError::storage(format!("failed to start KV watch: {e}")))?;
 
     loop {
         tokio::select! {

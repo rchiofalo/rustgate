@@ -9,7 +9,6 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::Context;
 use rustgate_core::constants::HANDSHAKE_TIMEOUT;
 use rustgate_core::identity::Identity;
 use rustgate_core::masking::hash_cn;
@@ -24,6 +23,8 @@ use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use tracing::debug;
 use zeroize::Zeroizing;
+
+use crate::error::{FederationError, Result};
 
 /// Outbound connector that supports both static and dynamic TLS configurations.
 ///
@@ -44,7 +45,7 @@ impl OutboundConnector {
         &self,
         addr: SocketAddr,
         server_name: &str,
-    ) -> anyhow::Result<(tokio_rustls::client::TlsStream<TcpStream>, Arc<Identity>)> {
+    ) -> Result<(tokio_rustls::client::TlsStream<TcpStream>, Arc<Identity>)> {
         match self {
             Self::Static(c) => c.connect(addr, server_name).await,
             Self::Dynamic(c) => c.connect(addr, server_name).await,
@@ -78,14 +79,13 @@ impl PeerConnector {
     /// * `ca` - Path to the CA certificate PEM file for verifying server certs
     /// * `skip_hostname_verify` - If true, skip TLS hostname verification
     ///   (useful when federation peers use certificate CNs that don't match their hostname)
-    pub fn new(
-        cert: &Path,
-        key: &Path,
-        ca: &Path,
-        skip_hostname_verify: bool,
-    ) -> anyhow::Result<Self> {
-        let cert_pem = std::fs::read_to_string(cert)
-            .with_context(|| format!("reading federation cert from {}", cert.display()))?;
+    pub fn new(cert: &Path, key: &Path, ca: &Path, skip_hostname_verify: bool) -> Result<Self> {
+        let cert_pem = std::fs::read_to_string(cert).map_err(|e| {
+            FederationError::io(
+                format!("reading federation cert from {}", cert.display()),
+                e,
+            )
+        })?;
         // The federation client key is secret material — route through the
         // shared `read_secret_file` helper so the size cap, mode 0o077
         // permissions gate, and `Zeroizing<String>` wrapping are unified
@@ -93,10 +93,16 @@ impl PeerConnector {
         // exceed the default 8 KiB token cap when wrapped with
         // certificate metadata, so widen the cap to 16 KiB which still
         // bounds RAM but covers RSA-4096 / ed25519 / EC P-384 PKCS#8.
-        let key_pem = read_secret_file(key, &SecretFileOpts::with_max_bytes(16 * 1024))
-            .with_context(|| format!("reading federation key from {}", key.display()))?;
-        let ca_pem = std::fs::read_to_string(ca)
-            .with_context(|| format!("reading federation CA from {}", ca.display()))?;
+        let key_pem =
+            read_secret_file(key, &SecretFileOpts::with_max_bytes(16 * 1024)).map_err(|e| {
+                FederationError::other(format!(
+                    "reading federation key from {}: {e}",
+                    key.display()
+                ))
+            })?;
+        let ca_pem = std::fs::read_to_string(ca).map_err(|e| {
+            FederationError::io(format!("reading federation CA from {}", ca.display()), e)
+        })?;
 
         Self::from_pem(&cert_pem, &key_pem, &ca_pem, skip_hostname_verify)
     }
@@ -110,12 +116,13 @@ impl PeerConnector {
         key_pem: &str,
         ca_pem: &str,
         skip_hostname_verify: bool,
-    ) -> anyhow::Result<Self> {
-        let certs =
-            parse_certs(cert_pem.as_bytes()).context("loading federation client certificate")?;
-        let key = parse_key(key_pem.as_bytes()).context("loading federation client key")?;
-        let root_store =
-            parse_ca_store(ca_pem.as_bytes()).context("loading federation CA store")?;
+    ) -> Result<Self> {
+        let certs = parse_certs(cert_pem.as_bytes())
+            .map_err(|e| FederationError::pem("loading federation client certificate", e))?;
+        let key = parse_key(key_pem.as_bytes())
+            .map_err(|e| FederationError::pem("loading federation client key", e))?;
+        let root_store = parse_ca_store(ca_pem.as_bytes())
+            .map_err(|e| FederationError::pem("loading federation CA store", e))?;
 
         let config = if skip_hostname_verify {
             build_config_no_hostname_verify(root_store, certs, key)?
@@ -140,30 +147,30 @@ impl PeerConnector {
         &self,
         addr: SocketAddr,
         server_name: &str,
-    ) -> anyhow::Result<(tokio_rustls::client::TlsStream<TcpStream>, Arc<Identity>)> {
+    ) -> Result<(tokio_rustls::client::TlsStream<TcpStream>, Arc<Identity>)> {
         debug!(peer_addr = %addr, server_name = %server_name, "connecting to federation peer");
 
         let tcp = timeout(HANDSHAKE_TIMEOUT, TcpStream::connect(addr))
             .await
             .map_err(|_| {
-                anyhow::anyhow!("TCP connect to {addr} timed out after {HANDSHAKE_TIMEOUT:?}")
+                FederationError::timeout(format!("TCP connect to {addr}"), HANDSHAKE_TIMEOUT)
             })?
-            .map_err(|e| anyhow::anyhow!("TCP connect to {addr}: {e}"))?;
+            .map_err(|e| FederationError::io(format!("TCP connect to {addr}"), e))?;
 
         configure_tactical_socket(&tcp);
 
         let sni: ServerName<'static> = server_name
             .to_string()
             .try_into()
-            .map_err(|_| anyhow::anyhow!("invalid server name: {server_name}"))?;
+            .map_err(|_| FederationError::InvalidServerName(server_name.to_string()))?;
 
         let connector = TlsConnector::from(Arc::clone(&self.client_config));
         let tls_stream = timeout(HANDSHAKE_TIMEOUT, connector.connect(sni, tcp))
             .await
             .map_err(|_| {
-                anyhow::anyhow!("TLS handshake with {addr} timed out after {HANDSHAKE_TIMEOUT:?}")
+                FederationError::timeout(format!("TLS handshake with {addr}"), HANDSHAKE_TIMEOUT)
             })?
-            .map_err(|e| anyhow::anyhow!("TLS handshake with {addr}: {e}"))?;
+            .map_err(|e| FederationError::io(format!("TLS handshake with {addr}"), e))?;
 
         let kx_group = tls_stream
             .get_ref()
@@ -172,8 +179,9 @@ impl PeerConnector {
             .map(|g| g.name());
         debug!(peer_addr = %addr, kx_group = ?kx_group, "TLS handshake completed");
 
-        let identity = extract_server_identity(&tls_stream)
-            .with_context(|| format!("extracting identity from peer at {addr}"))?;
+        let identity = extract_server_identity(&tls_stream).map_err(|e| {
+            FederationError::other(format!("extracting identity from peer at {addr}: {e}"))
+        })?;
 
         debug!(
             peer_addr = %addr,
@@ -231,10 +239,11 @@ impl DynamicPeerConnector {
         key_pem: &str,
         provider: OutboundRootStoreProvider,
         skip_hostname_verify: bool,
-    ) -> anyhow::Result<Self> {
-        let certs =
-            parse_certs(cert_pem.as_bytes()).context("loading federation client certificate")?;
-        let key = parse_key(key_pem.as_bytes()).context("loading federation client key")?;
+    ) -> Result<Self> {
+        let certs = parse_certs(cert_pem.as_bytes())
+            .map_err(|e| FederationError::pem("loading federation client certificate", e))?;
+        let key = parse_key(key_pem.as_bytes())
+            .map_err(|e| FederationError::pem("loading federation client key", e))?;
         let key_der = Zeroizing::new(key.secret_der().to_vec());
 
         let (initial_gen, root_store) = provider();
@@ -254,13 +263,13 @@ impl DynamicPeerConnector {
     }
 
     /// Get the current client config, rebuilding if generation changed.
-    fn current_config(&self) -> anyhow::Result<Arc<rustls::ClientConfig>> {
+    fn current_config(&self) -> Result<Arc<rustls::ClientConfig>> {
         let (current_gen, root_store) = (self.provider)();
 
         let mut cached = self
             .cached
             .lock()
-            .map_err(|e| anyhow::anyhow!("DynamicPeerConnector lock poisoned: {e}"))?;
+            .map_err(|e| FederationError::lock("DynamicPeerConnector lock poisoned", e))?;
 
         if cached.0 == current_gen {
             return Ok(Arc::clone(&cached.1));
@@ -273,7 +282,7 @@ impl DynamicPeerConnector {
         );
 
         let key = PrivateKeyDer::try_from((*self.key_der).clone())
-            .map_err(|e| anyhow::anyhow!("re-parse private key: {e}"))?;
+            .map_err(|e| FederationError::other(format!("re-parse private key: {e}")))?;
 
         let config = if self.skip_hostname_verify {
             build_config_no_hostname_verify(root_store, self.certs.clone(), key)?
@@ -294,7 +303,7 @@ impl DynamicPeerConnector {
         &self,
         addr: SocketAddr,
         server_name: &str,
-    ) -> anyhow::Result<(tokio_rustls::client::TlsStream<TcpStream>, Arc<Identity>)> {
+    ) -> Result<(tokio_rustls::client::TlsStream<TcpStream>, Arc<Identity>)> {
         let config = self.current_config()?;
 
         debug!(peer_addr = %addr, server_name = %server_name, "connecting to federation peer (dynamic)");
@@ -302,24 +311,24 @@ impl DynamicPeerConnector {
         let tcp = timeout(HANDSHAKE_TIMEOUT, TcpStream::connect(addr))
             .await
             .map_err(|_| {
-                anyhow::anyhow!("TCP connect to {addr} timed out after {HANDSHAKE_TIMEOUT:?}")
+                FederationError::timeout(format!("TCP connect to {addr}"), HANDSHAKE_TIMEOUT)
             })?
-            .map_err(|e| anyhow::anyhow!("TCP connect to {addr}: {e}"))?;
+            .map_err(|e| FederationError::io(format!("TCP connect to {addr}"), e))?;
 
         configure_tactical_socket(&tcp);
 
         let sni: ServerName<'static> = server_name
             .to_string()
             .try_into()
-            .map_err(|_| anyhow::anyhow!("invalid server name: {server_name}"))?;
+            .map_err(|_| FederationError::InvalidServerName(server_name.to_string()))?;
 
         let connector = TlsConnector::from(config);
         let tls_stream = timeout(HANDSHAKE_TIMEOUT, connector.connect(sni, tcp))
             .await
             .map_err(|_| {
-                anyhow::anyhow!("TLS handshake with {addr} timed out after {HANDSHAKE_TIMEOUT:?}")
+                FederationError::timeout(format!("TLS handshake with {addr}"), HANDSHAKE_TIMEOUT)
             })?
-            .map_err(|e| anyhow::anyhow!("TLS handshake with {addr}: {e}"))?;
+            .map_err(|e| FederationError::io(format!("TLS handshake with {addr}"), e))?;
 
         let kx_group = tls_stream
             .get_ref()
@@ -328,8 +337,9 @@ impl DynamicPeerConnector {
             .map(|g| g.name());
         debug!(peer_addr = %addr, kx_group = ?kx_group, "TLS handshake completed");
 
-        let identity = extract_server_identity(&tls_stream)
-            .with_context(|| format!("extracting identity from peer at {addr}"))?;
+        let identity = extract_server_identity(&tls_stream).map_err(|e| {
+            FederationError::other(format!("extracting identity from peer at {addr}: {e}"))
+        })?;
 
         debug!(
             peer_addr = %addr,
@@ -348,18 +358,18 @@ impl DynamicPeerConnector {
 /// the CN, groups (from OU fields), and fingerprint.
 fn extract_server_identity(
     tls_stream: &tokio_rustls::client::TlsStream<TcpStream>,
-) -> anyhow::Result<Identity> {
+) -> Result<Identity> {
     let (_, client_conn) = tls_stream.get_ref();
 
-    let certs = client_conn
-        .peer_certificates()
-        .ok_or_else(|| anyhow::anyhow!("no server certificate presented"))?;
+    let certs = client_conn.peer_certificates().ok_or_else(|| {
+        FederationError::IdentityExtraction("no server certificate presented".into())
+    })?;
 
-    let server_cert = certs
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("empty server certificate chain"))?;
+    let server_cert = certs.first().ok_or_else(|| {
+        FederationError::IdentityExtraction("empty server certificate chain".into())
+    })?;
 
-    extract_identity(server_cert).map_err(|e| anyhow::anyhow!("identity extraction failed: {e}"))
+    extract_identity(server_cert).map_err(|e| FederationError::IdentityExtraction(e.to_string()))
 }
 
 /// Build a standard ClientConfig with hostname verification enabled.
@@ -367,11 +377,11 @@ fn build_config_with_hostname_verify(
     root_store: RootCertStore,
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
-) -> anyhow::Result<rustls::ClientConfig> {
+) -> Result<rustls::ClientConfig> {
     rustls::ClientConfig::builder()
         .with_root_certificates(root_store)
         .with_client_auth_cert(certs, key)
-        .map_err(|e| anyhow::anyhow!("invalid client certificate: {e}"))
+        .map_err(|e| FederationError::tls("invalid client certificate", e))
 }
 
 /// Build a ClientConfig that skips hostname verification but still
@@ -384,14 +394,14 @@ fn build_config_no_hostname_verify(
     root_store: RootCertStore,
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
-) -> anyhow::Result<rustls::ClientConfig> {
+) -> Result<rustls::ClientConfig> {
     let verifier = NoHostnameVerifier::new(root_store);
 
     let config = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(verifier))
         .with_client_auth_cert(certs, key)
-        .map_err(|e| anyhow::anyhow!("invalid client certificate: {e}"))?;
+        .map_err(|e| FederationError::tls("invalid client certificate", e))?;
 
     Ok(config)
 }
@@ -424,7 +434,7 @@ impl rustls::client::danger::ServerCertVerifier for NoHostnameVerifier {
         server_name: &ServerName<'_>,
         ocsp_response: &[u8],
         now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         // Delegate to the standard WebPKI verifier for full chain validation.
         // The verifier checks both the certificate chain AND hostname match.
         // We catch only the hostname mismatch error and allow it through,
@@ -463,7 +473,7 @@ impl rustls::client::danger::ServerCertVerifier for NoHostnameVerifier {
         message: &[u8],
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         let provider = rustls::crypto::CryptoProvider::get_default()
             .ok_or_else(|| rustls::Error::General("no crypto provider installed".to_string()))?;
         rustls::crypto::verify_tls12_signature(
@@ -479,7 +489,7 @@ impl rustls::client::danger::ServerCertVerifier for NoHostnameVerifier {
         message: &[u8],
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         let provider = rustls::crypto::CryptoProvider::get_default()
             .ok_or_else(|| rustls::Error::General("no crypto provider installed".to_string()))?;
         rustls::crypto::verify_tls13_signature(

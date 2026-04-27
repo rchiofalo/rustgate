@@ -9,10 +9,11 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, watch};
 use tracing::{debug, info, warn};
+
+use crate::error::{FederationError, Result};
 
 const CONN_BUCKET: &str = "federation-connections";
 const CONN_TTL_SECS: u64 = 30;
@@ -104,7 +105,11 @@ impl ConnectionRegistry {
                 ..Default::default()
             })
             .await
-            .context("failed to create federation-connections KV bucket")?;
+            .map_err(|e| {
+                FederationError::storage(format!(
+                    "failed to create federation-connections KV bucket: {e}"
+                ))
+            })?;
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -173,14 +178,13 @@ impl ConnectionRegistry {
             fencing_token,
         };
 
-        let data = serde_json::to_vec(&info).context("failed to serialize connection info")?;
+        let data = serde_json::to_vec(&info)
+            .map_err(|e| FederationError::serde("failed to serialize connection info", e))?;
         let key = format!("{}.{}", self.pod_id, peer_id);
 
-        let _ = self
-            .kv
-            .put(&key, data.into())
-            .await
-            .context("failed to register connection in KV")?;
+        let _ = self.kv.put(&key, data.into()).await.map_err(|e| {
+            FederationError::storage(format!("failed to register connection in KV: {e}"))
+        })?;
 
         let mut registered = self.registered.lock().await;
         let _ = registered.insert(key, info);
@@ -203,10 +207,9 @@ impl ConnectionRegistry {
         let _ = registered.remove(&key);
         drop(registered);
 
-        self.kv
-            .delete(&key)
-            .await
-            .context("failed to unregister connection from KV")?;
+        self.kv.delete(&key).await.map_err(|e| {
+            FederationError::storage(format!("failed to unregister connection from KV: {e}"))
+        })?;
 
         debug!(
             peer_id = %peer_id,
@@ -224,11 +227,9 @@ impl ConnectionRegistry {
         let mut keys = Vec::new();
         {
             use futures::StreamExt;
-            let mut key_stream = self
-                .kv
-                .keys()
-                .await
-                .context("failed to list connection keys")?;
+            let mut key_stream = self.kv.keys().await.map_err(|e| {
+                FederationError::storage(format!("failed to list connection keys: {e}"))
+            })?;
             while let Some(result) = key_stream.next().await {
                 if let Ok(key) = result {
                     keys.push(key);
@@ -451,7 +452,7 @@ mod tests {
             "\"both\"",
             "\"none\"",
         ] {
-            let result: Result<Direction, _> = serde_json::from_str(hostile);
+            let result: std::result::Result<Direction, _> = serde_json::from_str(hostile);
             assert!(
                 result.is_err(),
                 "expected serde rejection of hostile Direction wire value {hostile}, got Ok"

@@ -23,6 +23,7 @@ use tracing::debug;
 
 use super::PeerDiscovery;
 use crate::config::{PeerConfig, RoutingMode};
+use crate::error::{FederationError, Result};
 
 /// Default HTTP timeout for catalog requests.
 ///
@@ -74,13 +75,15 @@ impl ConsulDiscovery {
     /// `http://127.0.0.1:8500` — without a trailing slash. `service` is the
     /// Consul service name to query; discovered nodes registered under that
     /// name become federation peers.
-    pub fn new(base_url: impl Into<String>, service: impl Into<String>) -> anyhow::Result<Self> {
+    pub fn new(base_url: impl Into<String>, service: impl Into<String>) -> Result<Self> {
         let base_url = base_url.into();
         let service = service.into();
         let http = reqwest::Client::builder()
             .timeout(DEFAULT_HTTP_TIMEOUT)
             .build()
-            .map_err(|e| anyhow::anyhow!("failed to build consul HTTP client: {e}"))?;
+            .map_err(|e| {
+                FederationError::discovery(format!("failed to build consul HTTP client: {e}"))
+            })?;
         Ok(Self {
             base_url,
             service,
@@ -132,7 +135,7 @@ impl ConsulDiscovery {
 
 #[async_trait]
 impl PeerDiscovery for ConsulDiscovery {
-    async fn discover(&self) -> anyhow::Result<Vec<PeerConfig>> {
+    async fn discover(&self) -> Result<Vec<PeerConfig>> {
         let url = self.catalog_url();
         debug!(url = %url, "querying consul catalog");
         let entries: Vec<CatalogEntry> = self
@@ -140,12 +143,16 @@ impl PeerDiscovery for ConsulDiscovery {
             .get(&url)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("consul GET {url} failed: {e}"))?
+            .map_err(|e| FederationError::discovery(format!("consul GET {url} failed: {e}")))?
             .error_for_status()
-            .map_err(|e| anyhow::anyhow!("consul returned error for {url}: {e}"))?
+            .map_err(|e| {
+                FederationError::discovery(format!("consul returned error for {url}: {e}"))
+            })?
             .json()
             .await
-            .map_err(|e| anyhow::anyhow!("failed to parse consul catalog response: {e}"))?;
+            .map_err(|e| {
+                FederationError::discovery(format!("failed to parse consul catalog response: {e}"))
+            })?;
 
         Ok(entries.iter().map(Self::entry_to_peer).collect())
     }
