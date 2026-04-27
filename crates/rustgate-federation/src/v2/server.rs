@@ -22,13 +22,21 @@ use super::proto::figpb;
 use super::proto::figpb::federated_channel_server::FederatedChannel;
 use crate::provenance;
 
-/// Maximum number of federation hops before an inbound message is dropped.
+/// Default maximum number of federation hops before an inbound message
+/// is dropped (closes #758).
 ///
 /// Prevents routing loops between misconfigured federation peers.
 /// Messages arriving with `current_hops` at or exceeding this limit are
 /// silently discarded with a warning log.
-// TODO: make configurable via FederationService builder (currently hardcoded)
-pub const MAX_FEDERATION_HOPS: i64 = 8;
+///
+/// **This is a default-only fallback.** The active limit lives on a
+/// private `max_hops` field of `FederationService` and can be tuned
+/// per-deployment via [`FederationService::with_max_hops`] (CLI flag
+/// `--federation-max-hops`, env `RUSTGATE_FEDERATION_MAX_HOPS`). The
+/// constant remains exported for tests and external callers that want
+/// to assert against the workspace-default boundary without duplicating
+/// the literal `8`.
+pub const MAX_FEDERATION_HOPS: u8 = 8;
 
 /// Canonical `rpc` label used for `SendOneEvent` audit and metric records.
 ///
@@ -220,6 +228,17 @@ pub struct FederationService {
     /// claim groups not in the peer's allowlist. When `None`, all groups
     /// are accepted (backward-compatible open mode).
     allowed_peer_groups: Option<Arc<HashMap<String, HashSet<String>>>>,
+    /// Maximum number of federation hops before an inbound message is
+    /// dropped (closes #758). Defaults to [`MAX_FEDERATION_HOPS`] (8);
+    /// override via [`FederationService::with_max_hops`] for tactical
+    /// topologies that need a tighter or looser loop-prevention bound.
+    /// Range is `1..=255`; the type is `u8` because the value never
+    /// needs to exceed 255 hops in practice and the narrower range
+    /// catches operator typos at the CLI layer (`clap::value_parser!(u8)`).
+    /// Compared against the wire field `FederateHops::current_hops` (i64)
+    /// after a widening cast — values above 255 are always rejected
+    /// because they would exceed any configured `max_hops`.
+    max_hops: u8,
 }
 
 impl std::fmt::Debug for FederationService {
@@ -230,6 +249,7 @@ impl std::fmt::Debug for FederationService {
             .field("groups", &self.groups)
             .field("max_groups_per_peer", &self.max_groups_per_peer)
             .field("max_group_name_length", &self.max_group_name_length)
+            .field("max_hops", &self.max_hops)
             .field(
                 "allowed_peer_groups_configured",
                 &self.allowed_peer_groups.is_some(),
@@ -275,6 +295,7 @@ impl FederationService {
             max_groups_per_peer,
             max_group_name_length,
             allowed_peer_groups: None,
+            max_hops: MAX_FEDERATION_HOPS,
         }
     }
 
@@ -341,6 +362,41 @@ impl FederationService {
         peer_groups: HashMap<String, HashSet<String>>,
     ) -> Self {
         self.allowed_peer_groups = Some(Arc::new(peer_groups));
+        self
+    }
+
+    /// Configure the inbound federation hop limit (closes #758).
+    ///
+    /// Defaults to [`MAX_FEDERATION_HOPS`] (8). Set this when the local
+    /// topology demands a tighter or looser loop-prevention bound — a
+    /// star-shaped two-hub deployment can comfortably run with `max_hops
+    /// = 3`, while a multi-region mesh with intentional indirection
+    /// might need `max_hops = 16`.
+    ///
+    /// **Validation:** `max_hops` must be in `1..=255`. A `0` argument
+    /// is a programming error (it would reject every inbound message,
+    /// including the first hop, breaking federation entirely):
+    ///
+    /// - In **debug** builds, `with_max_hops(0)` panics so the bug
+    ///   surfaces during development.
+    /// - In **release** builds, `with_max_hops(0)` saturates to `1`
+    ///   so a misconfigured operator deployment degrades to "first-hop
+    ///   only" rather than "no federation". The `--federation-max-hops`
+    ///   CLI flag separately rejects `0` at parse time via
+    ///   `clap::value_parser!(u8).range(1..=255)`, so this fallback
+    ///   only fires for direct API callers that bypass the CLI.
+    ///
+    /// Returns `self` so the call composes with the other `with_*`
+    /// builder methods, matching the established shape of
+    /// [`Self::with_on_blob`], [`Self::with_on_rol_event`], and
+    /// [`Self::with_on_group_sync`].
+    pub fn with_max_hops(mut self, max_hops: u8) -> Self {
+        debug_assert!(
+            max_hops > 0,
+            "FederationService::with_max_hops(0) would reject every inbound \
+             message; pass a value in 1..=255 (default {MAX_FEDERATION_HOPS})"
+        );
+        self.max_hops = max_hops.max(1);
         self
     }
 
@@ -431,18 +487,27 @@ impl FederationService {
 
     /// Validate that an inbound event's hop count is within limits.
     ///
-    /// Returns `Ok(())` if the event should be processed, or `Err(peer_id)`
-    /// if the hop count is invalid (negative or at/above `MAX_FEDERATION_HOPS`).
+    /// Returns `true` if the event should be processed, or `false`
+    /// if the hop count is invalid (negative or at/above `max_hops`).
     /// Events without hop metadata are allowed (treated as first-hop for
     /// backward compat with peers that predate hop tracking).
-    fn validate_hop_count(event: &figpb::FederatedEvent, peer_id: &str) -> bool {
+    ///
+    /// Static helper (closes #758): the `max_hops` argument is the
+    /// configured limit on the parent [`FederationService`] — passed
+    /// in explicitly so the helper stays callable from spawned tasks
+    /// that capture only specific fields rather than the whole `&self`.
+    /// The wire `current_hops` is `i64` (per-proto), so the comparison
+    /// widens `max_hops` to `i64`; the negative-hops branch separately
+    /// catches malformed peers.
+    fn validate_hop_count(event: &figpb::FederatedEvent, peer_id: &str, max_hops: u8) -> bool {
+        let max_hops_i64 = i64::from(max_hops);
         if let Some(ref hops) = event.federate_hops
-            && (hops.current_hops < 0 || hops.current_hops >= MAX_FEDERATION_HOPS)
+            && (hops.current_hops < 0 || hops.current_hops >= max_hops_i64)
         {
             warn!(
                 peer = %peer_id,
                 current_hops = hops.current_hops,
-                max = MAX_FEDERATION_HOPS,
+                max = max_hops_i64,
                 "rejecting federated event: hop count exceeded"
             );
             return false;
@@ -457,14 +522,15 @@ impl FederationService {
     /// helper rather than a generic over the parent. Same semantics
     /// as [`Self::validate_hop_count`]: blobs without hop metadata
     /// are treated as first-hop for backward compat.
-    fn validate_blob_hop_count(blob: &figpb::BinaryBlob, peer_id: &str) -> bool {
+    fn validate_blob_hop_count(blob: &figpb::BinaryBlob, peer_id: &str, max_hops: u8) -> bool {
+        let max_hops_i64 = i64::from(max_hops);
         if let Some(ref hops) = blob.federate_hops
-            && (hops.current_hops < 0 || hops.current_hops >= MAX_FEDERATION_HOPS)
+            && (hops.current_hops < 0 || hops.current_hops >= max_hops_i64)
         {
             warn!(
                 peer = %peer_id,
                 current_hops = hops.current_hops,
-                max = MAX_FEDERATION_HOPS,
+                max = max_hops_i64,
                 "rejecting federated blob: hop count exceeded"
             );
             return false;
@@ -479,14 +545,15 @@ impl FederationService {
     /// rather than a generic. Same semantics: ROL events without hop
     /// metadata are treated as first-hop for backward compat with
     /// peers that predate hop tracking.
-    fn validate_rol_hop_count(rol: &figpb::Rol, peer_id: &str) -> bool {
+    fn validate_rol_hop_count(rol: &figpb::Rol, peer_id: &str, max_hops: u8) -> bool {
+        let max_hops_i64 = i64::from(max_hops);
         if let Some(ref hops) = rol.federate_hops
-            && (hops.current_hops < 0 || hops.current_hops >= MAX_FEDERATION_HOPS)
+            && (hops.current_hops < 0 || hops.current_hops >= max_hops_i64)
         {
             warn!(
                 peer = %peer_id,
                 current_hops = hops.current_hops,
-                max = MAX_FEDERATION_HOPS,
+                max = max_hops_i64,
                 "rejecting federated ROL: hop count exceeded"
             );
             return false;
@@ -507,8 +574,9 @@ impl FederationService {
         on_rol_event: &OnRolEvent,
         peer_id: &str,
         rol: figpb::Rol,
+        max_hops: u8,
     ) -> bool {
-        if !Self::validate_rol_hop_count(&rol, peer_id) {
+        if !Self::validate_rol_hop_count(&rol, peer_id, max_hops) {
             rustgate_core::audit::federation_event_rejected(
                 RPC_SERVER_ROL_STREAM,
                 peer_id,
@@ -547,14 +615,19 @@ impl FederationService {
     /// helpers rather than a generic. Same semantics: group-sync
     /// updates without hop metadata are treated as first-hop for
     /// backward compat with peers that predate hop tracking.
-    fn validate_group_sync_hop_count(groups: &figpb::FederateGroups, peer_id: &str) -> bool {
+    fn validate_group_sync_hop_count(
+        groups: &figpb::FederateGroups,
+        peer_id: &str,
+        max_hops: u8,
+    ) -> bool {
+        let max_hops_i64 = i64::from(max_hops);
         if let Some(ref hops) = groups.federate_hops
-            && (hops.current_hops < 0 || hops.current_hops >= MAX_FEDERATION_HOPS)
+            && (hops.current_hops < 0 || hops.current_hops >= max_hops_i64)
         {
             warn!(
                 peer = %peer_id,
                 current_hops = hops.current_hops,
-                max = MAX_FEDERATION_HOPS,
+                max = max_hops_i64,
                 "rejecting federated groups update: hop count exceeded"
             );
             return false;
@@ -576,8 +649,9 @@ impl FederationService {
         on_group_sync: &OnGroupSync,
         peer_id: &str,
         groups: figpb::FederateGroups,
+        max_hops: u8,
     ) -> bool {
-        if !Self::validate_group_sync_hop_count(&groups, peer_id) {
+        if !Self::validate_group_sync_hop_count(&groups, peer_id, max_hops) {
             rustgate_core::audit::federation_event_rejected(
                 RPC_CLIENT_FEDERATE_GROUPS_STREAM,
                 peer_id,
@@ -813,7 +887,7 @@ impl FederatedChannel for FederationService {
         let peer_id = Self::peer_id_from_request(&request)?;
         let event = request.into_inner();
 
-        if !Self::validate_hop_count(&event, &peer_id) {
+        if !Self::validate_hop_count(&event, &peer_id, self.max_hops) {
             // Hop-count rejection is observable at the audit layer so the
             // forensic trail records the policy decision even though the
             // RPC contract returns Empty (the V2 protocol cannot signal
@@ -901,7 +975,7 @@ impl FederatedChannel for FederationService {
         // signal channel for "too many hops" beyond the standard
         // success/error split, so the audit is the only forensic
         // vantage point).
-        if !Self::validate_blob_hop_count(&blob, &peer_id) {
+        if !Self::validate_blob_hop_count(&blob, &peer_id, self.max_hops) {
             rustgate_core::audit::federation_event_rejected(
                 RPC_SEND_ONE_BLOB,
                 &peer_id,
@@ -981,6 +1055,12 @@ impl FederatedChannel for FederationService {
         let on_event = Arc::clone(&self.on_event);
         let allowed = self.allowed_peer_groups.clone();
         let pid = peer_id.clone();
+        // Capture the configured hop limit by value (u8 is Copy) so the
+        // spawned drain task does not need a `self` reference. The
+        // limit is fixed at the time the stream is opened — a SIGHUP
+        // that swaps the limit affects subsequent stream opens, not
+        // streams already in progress.
+        let max_hops = self.max_hops;
 
         const MAX_CONSECUTIVE_VIOLATIONS: u32 = 10;
 
@@ -988,7 +1068,7 @@ impl FederatedChannel for FederationService {
             let mut consecutive_violations: u32 = 0;
 
             while let Ok(Some(event)) = stream.message().await {
-                if !FederationService::validate_hop_count(&event, &pid) {
+                if !FederationService::validate_hop_count(&event, &pid, max_hops) {
                     continue;
                 }
 
@@ -1098,9 +1178,15 @@ impl FederatedChannel for FederationService {
         // callback by `Arc` clone — same shape as `server_event_stream`.
         let on_rol_event = Arc::clone(&self.on_rol_event);
         let pid = peer_id.clone();
+        let max_hops = self.max_hops;
         drop(tokio::spawn(async move {
             while let Ok(Some(rol)) = stream.message().await {
-                let _ = FederationService::observe_inbound_rol_event(&on_rol_event, &pid, rol);
+                let _ = FederationService::observe_inbound_rol_event(
+                    &on_rol_event,
+                    &pid,
+                    rol,
+                    max_hops,
+                );
             }
             info!(peer = %pid, "server_rol_stream closed");
         }));
@@ -1144,6 +1230,7 @@ impl FederatedChannel for FederationService {
         let pid = peer_id.clone();
         let max_groups = self.max_groups_per_peer;
         let max_name_len = self.max_group_name_length;
+        let max_hops = self.max_hops;
 
         drop(tokio::spawn(async move {
             while let Ok(Some(groups_msg)) = stream.message().await {
@@ -1160,6 +1247,7 @@ impl FederatedChannel for FederationService {
                     &on_group_sync,
                     &pid,
                     groups_msg_for_observe,
+                    max_hops,
                 ) {
                     continue;
                 }
@@ -1814,7 +1902,7 @@ mod tests {
                 ..Default::default()
             }),
             federate_hops: Some(figpb::FederateHops {
-                current_hops: MAX_FEDERATION_HOPS + 1,
+                current_hops: i64::from(MAX_FEDERATION_HOPS) + 1,
                 max_hops: 20,
             }),
             ..Default::default()
@@ -1843,7 +1931,7 @@ mod tests {
                 ..Default::default()
             }),
             federate_hops: Some(figpb::FederateHops {
-                current_hops: MAX_FEDERATION_HOPS - 1,
+                current_hops: i64::from(MAX_FEDERATION_HOPS) - 1,
                 max_hops: 20,
             }),
             ..Default::default()
@@ -1961,7 +2049,7 @@ mod tests {
                 ..Default::default()
             }),
             federate_hops: Some(figpb::FederateHops {
-                current_hops: MAX_FEDERATION_HOPS,
+                current_hops: i64::from(MAX_FEDERATION_HOPS),
                 max_hops: 20,
             }),
             ..Default::default()
@@ -1990,7 +2078,7 @@ mod tests {
                 ..Default::default()
             }),
             federate_hops: Some(figpb::FederateHops {
-                current_hops: MAX_FEDERATION_HOPS - 1,
+                current_hops: i64::from(MAX_FEDERATION_HOPS) - 1,
                 max_hops: 20,
             }),
             ..Default::default()
@@ -2569,8 +2657,8 @@ mod tests {
         let blob = figpb::BinaryBlob {
             data: b"too-many-hops".to_vec(),
             federate_hops: Some(figpb::FederateHops {
-                current_hops: MAX_FEDERATION_HOPS,
-                max_hops: MAX_FEDERATION_HOPS + 1,
+                current_hops: i64::from(MAX_FEDERATION_HOPS),
+                max_hops: i64::from(MAX_FEDERATION_HOPS) + 1,
             }),
             ..Default::default()
         };
@@ -2743,8 +2831,12 @@ mod tests {
             ..Default::default()
         };
 
-        let routed =
-            FederationService::observe_inbound_rol_event(&svc.on_rol_event, "peer-cn", rol);
+        let routed = FederationService::observe_inbound_rol_event(
+            &svc.on_rol_event,
+            "peer-cn",
+            rol,
+            svc.max_hops,
+        );
 
         assert!(routed, "valid ROL event must pass the observation hook");
         assert_eq!(
@@ -2840,15 +2932,20 @@ mod tests {
         let rol = figpb::Rol {
             program: "loop-bait".into(),
             federate_hops: Some(figpb::FederateHops {
-                current_hops: MAX_FEDERATION_HOPS,
-                max_hops: MAX_FEDERATION_HOPS + 1,
+                current_hops: i64::from(MAX_FEDERATION_HOPS),
+                max_hops: i64::from(MAX_FEDERATION_HOPS) + 1,
             }),
             ..Default::default()
         };
 
         let routed = {
             let _guard = tracing::subscriber::set_default(subscriber);
-            FederationService::observe_inbound_rol_event(&svc.on_rol_event, "peer-cn", rol)
+            FederationService::observe_inbound_rol_event(
+                &svc.on_rol_event,
+                "peer-cn",
+                rol,
+                svc.max_hops,
+            )
         };
 
         assert!(
@@ -2897,7 +2994,12 @@ mod tests {
             program: "metric-tick".into(),
             ..Default::default()
         };
-        let _ = FederationService::observe_inbound_rol_event(&svc.on_rol_event, "peer-cn", rol);
+        let _ = FederationService::observe_inbound_rol_event(
+            &svc.on_rol_event,
+            "peer-cn",
+            rol,
+            svc.max_hops,
+        );
 
         let total_after = crate::metrics::messages_in().get();
         let by_rpc_after = crate::metrics::messages_in_by_rpc()
@@ -3214,8 +3316,12 @@ mod tests {
             ..Default::default()
         };
 
-        let routed =
-            FederationService::observe_inbound_group_sync(&svc.on_group_sync, "peer-cn", groups);
+        let routed = FederationService::observe_inbound_group_sync(
+            &svc.on_group_sync,
+            "peer-cn",
+            groups,
+            svc.max_hops,
+        );
 
         assert!(
             routed,
@@ -3317,15 +3423,20 @@ mod tests {
         let groups = figpb::FederateGroups {
             federate_groups: vec!["Alpha".into()],
             federate_hops: Some(figpb::FederateHops {
-                current_hops: MAX_FEDERATION_HOPS,
-                max_hops: MAX_FEDERATION_HOPS + 1,
+                current_hops: i64::from(MAX_FEDERATION_HOPS),
+                max_hops: i64::from(MAX_FEDERATION_HOPS) + 1,
             }),
             ..Default::default()
         };
 
         let routed = {
             let _guard = tracing::subscriber::set_default(subscriber);
-            FederationService::observe_inbound_group_sync(&svc.on_group_sync, "peer-cn", groups)
+            FederationService::observe_inbound_group_sync(
+                &svc.on_group_sync,
+                "peer-cn",
+                groups,
+                svc.max_hops,
+            )
         };
 
         assert!(
@@ -3374,8 +3485,12 @@ mod tests {
             federate_groups: vec!["metric-tick".into()],
             ..Default::default()
         };
-        let _ =
-            FederationService::observe_inbound_group_sync(&svc.on_group_sync, "peer-cn", groups);
+        let _ = FederationService::observe_inbound_group_sync(
+            &svc.on_group_sync,
+            "peer-cn",
+            groups,
+            svc.max_hops,
+        );
 
         let total_after = crate::metrics::messages_in().get();
         let by_rpc_after = crate::metrics::messages_in_by_rpc()
@@ -3665,5 +3780,166 @@ mod tests {
         // Invoking the default no-op must not panic and must not
         // observe any side effects.
         (svc.on_group_sync)(figpb::FederateGroups::default(), "peer-cn".into());
+    }
+
+    // ── runtime-configurable hop limit (closes #758) ─────────────────────
+    //
+    // These five tests pin the contract for `FederationService::with_max_hops`:
+    // the override takes effect, the default falls back to MAX_FEDERATION_HOPS,
+    // hop validation reads the per-instance value (not the constant), the
+    // boundary is `>=` (event AT max_hops is rejected), and the `0` argument
+    // is rejected in debug / saturated to 1 in release.
+
+    /// `with_max_hops` must override the default for the instance it
+    /// returns. Pinning the field's stored value directly — no tonic
+    /// round-trip needed because the read sites all consult the same
+    /// `self.max_hops` field.
+    #[test]
+    fn with_max_hops_overrides_default() {
+        let svc = FederationService::new("s".into(), vec![], noop_on_event()).with_max_hops(16);
+        assert_eq!(
+            svc.max_hops, 16,
+            "with_max_hops must overwrite the default-8 hop limit"
+        );
+    }
+
+    /// A FederationService built without `with_max_hops` must default
+    /// to `MAX_FEDERATION_HOPS` (8). This is the migration safety
+    /// invariant — every existing deployment that did not opt into the
+    /// new builder method continues to enforce the historical limit.
+    #[test]
+    fn with_max_hops_default_is_eight() {
+        let svc = FederationService::new("s".into(), vec![], noop_on_event());
+        assert_eq!(
+            svc.max_hops, MAX_FEDERATION_HOPS,
+            "default max_hops must equal MAX_FEDERATION_HOPS for backward compatibility"
+        );
+        assert_eq!(MAX_FEDERATION_HOPS, 8, "MAX_FEDERATION_HOPS default is 8");
+    }
+
+    /// The hop-validation gate must read the per-instance `max_hops`,
+    /// not the compile-time constant. Build a service with
+    /// `max_hops=2`, send an event with `current_hops=3`, and assert
+    /// it's dropped before the callback fires. If validation still
+    /// hard-coded MAX_FEDERATION_HOPS=8, the event would slip through.
+    #[tokio::test]
+    async fn hop_validation_uses_configured_max() {
+        let (on_event, count) = counting_on_event();
+        let svc = FederationService::new("s".into(), vec![], on_event).with_max_hops(2);
+
+        let event = figpb::FederatedEvent {
+            event: Some(figpb::GeoEvent {
+                uid: "tight-limit".into(),
+                ..Default::default()
+            }),
+            federate_hops: Some(figpb::FederateHops {
+                current_hops: 3,
+                max_hops: 20,
+            }),
+            ..Default::default()
+        };
+
+        let _ = svc
+            .send_one_event(request_with_peer_cn(event, "unknown"))
+            .await
+            .expect("send_one_event returns Ok(Empty) on hop drop");
+
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "event with current_hops=3 must be rejected when max_hops=2 (boundary inclusive)"
+        );
+    }
+
+    /// Boundary semantics for the configurable limit: an event AT the
+    /// configured `max_hops` is rejected (the comparison is `>=`, not
+    /// `>`), an event one below it is accepted. Mirrors the pre-#758
+    /// `hop_count_at_exact_limit_is_rejected` /
+    /// `hop_count_one_below_limit_is_accepted` discipline against a
+    /// non-default limit so a regression that flipped the comparison
+    /// to `>` would surface here.
+    #[tokio::test]
+    async fn hop_validation_at_boundary() {
+        // Boundary case 1: current_hops == max_hops → rejected.
+        let (on_event, count_at) = counting_on_event();
+        let svc_at = FederationService::new("s".into(), vec![], on_event).with_max_hops(2);
+        let event_at = figpb::FederatedEvent {
+            event: Some(figpb::GeoEvent {
+                uid: "at".into(),
+                ..Default::default()
+            }),
+            federate_hops: Some(figpb::FederateHops {
+                current_hops: 2,
+                max_hops: 20,
+            }),
+            ..Default::default()
+        };
+        let _ = svc_at
+            .send_one_event(request_with_peer_cn(event_at, "unknown"))
+            .await
+            .expect("hop drop returns Ok(Empty)");
+        assert_eq!(
+            count_at.load(Ordering::Relaxed),
+            0,
+            "event with current_hops=2 must be rejected when max_hops=2 (>= boundary)"
+        );
+
+        // Boundary case 2: current_hops == max_hops - 1 → accepted.
+        let (on_event_below, count_below) = counting_on_event();
+        let svc_below = FederationService::new("s".into(), vec![], on_event_below).with_max_hops(2);
+        let event_below = figpb::FederatedEvent {
+            event: Some(figpb::GeoEvent {
+                uid: "below".into(),
+                ..Default::default()
+            }),
+            federate_hops: Some(figpb::FederateHops {
+                current_hops: 1,
+                max_hops: 20,
+            }),
+            ..Default::default()
+        };
+        let _ = svc_below
+            .send_one_event(request_with_peer_cn(event_below, "unknown"))
+            .await
+            .expect("send_one_event");
+        assert_eq!(
+            count_below.load(Ordering::Relaxed),
+            1,
+            "event with current_hops=1 must be accepted when max_hops=2 (one below the boundary)"
+        );
+    }
+
+    /// `with_max_hops(0)` is a programming error: it would reject every
+    /// inbound message including the first hop, breaking federation
+    /// entirely. In debug builds it must panic so the bug surfaces
+    /// during development; in release builds it must saturate to 1 so
+    /// a misconfigured deployment degrades to "first-hop only" rather
+    /// than "no federation". This test pins both branches of the
+    /// `cfg(debug_assertions)` split.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn with_max_hops_zero_rejected() {
+        let result = std::panic::catch_unwind(|| {
+            let _ = FederationService::new("s".into(), vec![], noop_on_event()).with_max_hops(0);
+        });
+        assert!(
+            result.is_err(),
+            "with_max_hops(0) must panic in debug builds"
+        );
+    }
+
+    /// Release-build counterpart of `with_max_hops_zero_rejected`. With
+    /// the panic-bypass `debug_assertions` cfg flipped off, the
+    /// builder must saturate to `max_hops=1` so federation degrades
+    /// gracefully to first-hop-only rather than tearing down with a
+    /// panic in production.
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn with_max_hops_zero_saturates_to_one_in_release() {
+        let svc = FederationService::new("s".into(), vec![], noop_on_event()).with_max_hops(0);
+        assert_eq!(
+            svc.max_hops, 1,
+            "with_max_hops(0) must saturate to 1 in release builds"
+        );
     }
 }

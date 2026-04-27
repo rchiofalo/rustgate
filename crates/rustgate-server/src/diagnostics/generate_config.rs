@@ -484,9 +484,11 @@ mod tests {
     #[test]
     fn integer_defaults_render_without_quotes() {
         let t = build_template();
-        // federation_max_hops default is 10.
+        // federation_max_hops default is 8 (closes #758 — was 10
+        // before the inbound enforcement bound was made configurable
+        // and aligned with the historical hard-coded MAX_FEDERATION_HOPS).
         assert!(
-            t.contains("#federation-max-hops = 10"),
+            t.contains("#federation-max-hops = 8"),
             "integer defaults should render as bare numeric literals"
         );
     }
@@ -561,9 +563,9 @@ mod tests {
         let fips = lookup_arg(&cmd, "fips_required").expect("fips_required arg");
         assert_eq!(format_toml_literal(fips, "true"), "true");
         assert_eq!(format_toml_literal(fips, "false"), "false");
-        // federation_max_hops is u32 — bare integer.
+        // federation_max_hops is u8 (post-#758) — bare integer.
         let hops = lookup_arg(&cmd, "federation_max_hops").expect("federation_max_hops arg");
-        assert_eq!(format_toml_literal(hops, "10"), "10");
+        assert_eq!(format_toml_literal(hops, "8"), "8");
         // Escape round-trip on a String field.
         assert_eq!(
             format_toml_literal(bind, "path with \"quote\""),
