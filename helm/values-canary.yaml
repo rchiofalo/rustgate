@@ -19,11 +19,20 @@
 # preStop discipline: rustgate's own SubsystemHandle drain runs on
 # SIGTERM with a 5s grace, but the kubelet sends SIGTERM before the
 # load balancer has fully removed the pod from rotation. The preStop
-# hook bridges that gap: it best-effort-pokes a drain endpoint (the
-# `|| true` swallows the no-route case so the hook stays compatible
-# across rustgate versions that may or may not expose the drain HTTP
-# endpoint), then sleeps 5s so in-flight TLS sessions can complete
-# their last frame before the runtime tears down the listener.
+# hook bridges that gap: it pokes the management API drain endpoint
+# `POST /api/drain` (closes #791 — the endpoint signals the same
+# shared shutdown Notify that SIGTERM does, so the existing
+# SubsystemHandle drain path runs without a separate API code path),
+# then sleeps 5s so in-flight TLS sessions can complete their last
+# frame before the runtime tears down the listener. The `|| true`
+# stays in place so the hook tolerates clusters where the
+# management API is not configured (no `--mgmt-api-token-file`
+# supplied) — in that build `/api/drain` is not registered and the
+# curl call would otherwise fail the preStop step. The drain endpoint
+# requires bearer-token auth, so deployments mounting a token secret
+# should add `-H "Authorization: Bearer $(cat /etc/rustgate/mgmt-token)"`
+# to the curl invocation; this default keeps the hook portable for
+# clusters running without the management API enabled.
 #
 # `terminationGracePeriodSeconds` is inherited from values.yaml at 120s
 # — long enough to cover the preStop sleep (5s) plus the rustgate drain
@@ -38,9 +47,13 @@ deployment:
   minReadySeconds: 30
 
   # preStop hook drains in-flight connections before pod termination.
-  # The curl call best-effort-pokes the management API drain endpoint
-  # (the `|| true` keeps the hook portable across rustgate versions);
-  # the trailing sleep gives the load balancer / service mesh time to
+  # The curl call pokes the management API drain endpoint
+  # `POST /api/drain` (closes #791 — fires the same shutdown Notify
+  # SIGTERM does, returns immediately after triggering the drain so
+  # the trailing sleep is what bounds preStop wall time). The
+  # `|| true` keeps the hook tolerant of builds without the
+  # management API enabled (no token file → endpoint not registered).
+  # The trailing sleep gives the load balancer / service mesh time to
   # remove the pod from rotation before SIGTERM.
   lifecycle:
     preStop:

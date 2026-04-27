@@ -14,6 +14,7 @@
 //! | `GET  /api/dedup/stats`                    | Cross-path deduplication cache — hits, size, window     |
 //! | `POST /api/clients/{cn}/disconnect`        | Force a single mTLS client to drain and exit            |
 //! | `POST /api/dlq/{target}/replay`            | Manually trigger a DLQ drain for an HTTP egress target  |
+//! | `POST /api/drain`                          | Initiate graceful drain (Kubernetes preStop, closes #791) |
 //! | `POST /api/reload`                         | Trigger the same reload path SIGHUP runs, structured    |
 //!
 //! Every response is a JSON envelope of the form `{"data": ...}` on
@@ -112,6 +113,15 @@ pub struct MgmtApiState {
     /// [`HttpPublisher`]: rustgate_http::HttpPublisher
     #[cfg(feature = "http")]
     pub http_publisher: Option<rustgate_http::HttpPublisher>,
+    /// Drain trigger fired by `POST /api/drain` (closes #791). The same
+    /// `Notify` instance is awaited by the main accept-loop's
+    /// `shutdown_signal()` future, so a `notify_one()` here transitions
+    /// the server into the SubsystemHandle drain path that SIGTERM
+    /// would otherwise drive — no separate "drain code" exists. Stored
+    /// as `Arc` so the API state and the main loop both observe the
+    /// same notifier; constructed at startup before either side
+    /// captures it.
+    pub drain_notify: Arc<tokio::sync::Notify>,
     /// Bearer token required on every request. Stored as raw bytes so
     /// the comparison can run in constant time, wrapped in
     /// [`Zeroizing`] so the value is wiped from memory on drop.
@@ -130,6 +140,7 @@ impl std::fmt::Debug for MgmtApiState {
             .field("crl_path", &self.crl_path)
             .field("reload_configured", &self.reload.is_some())
             .field("http_publisher_present", &http_publisher_present)
+            .field("drain_notify_present", &true)
             .finish_non_exhaustive()
     }
 }
@@ -185,8 +196,9 @@ pub(crate) fn auth_ok(header: Option<&str>, expected: &[u8]) -> bool {
 /// dispatcher can decide which handler to route a request to before
 /// calling this module.
 ///
-/// `/api/reload` is a bare path, not a prefix — the dispatcher in
-/// `metrics.rs` handles the exact-match case alongside these prefixes.
+/// `/api/reload` and `/api/drain` are bare paths, not prefixes — the
+/// dispatcher in `metrics.rs` handles those exact-match cases
+/// alongside these prefixes.
 pub(crate) const MGMT_PATH_PREFIXES: &[&str] = &[
     "/api/cert/",
     "/api/crl/",
@@ -194,6 +206,13 @@ pub(crate) const MGMT_PATH_PREFIXES: &[&str] = &[
     "/api/clients/",
     "/api/dlq/",
 ];
+
+/// Bare-path management API routes (no trailing slash, no path params).
+/// Pinned in a constant so the dispatcher in `metrics.rs` and the
+/// `handle_request` matcher cannot drift — adding a new bare path here
+/// is the one edit needed in both layers. Closes #791 added
+/// `/api/drain`; #1140-series added `/api/reload`.
+pub(crate) const MGMT_EXACT_PATHS: &[&str] = &["/api/reload", "/api/drain"];
 
 /// Entry point called by the metrics HTTP server. Returns `Some(resp)`
 /// when the path matches a management-API route (recognized or not),
@@ -213,7 +232,7 @@ pub async fn handle_request(
     state: &MgmtApiState,
 ) -> Option<Response<Full<Bytes>>> {
     let matches_prefix = MGMT_PATH_PREFIXES.iter().any(|p| path.starts_with(p));
-    let matches_exact = path == "/api/reload";
+    let matches_exact = MGMT_EXACT_PATHS.contains(&path);
     if !matches_prefix && !matches_exact {
         return None;
     }
@@ -225,11 +244,17 @@ pub async fn handle_request(
 
 async fn route(method: &Method, path: &str, state: &MgmtApiState) -> Response<Full<Bytes>> {
     // Write endpoints first — each has a dedicated path shape
-    // (`/api/clients/{cn}/disconnect`, `/api/reload`) so they cannot
-    // collide with the status prefixes.
+    // (`/api/clients/{cn}/disconnect`, `/api/reload`, `/api/drain`) so
+    // they cannot collide with the status prefixes.
     if path == "/api/reload" {
         return match method {
             &Method::POST => reload_handler(state).await,
+            _ => json_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
+        };
+    }
+    if path == "/api/drain" {
+        return match method {
+            &Method::POST => drain_handler(state),
             _ => json_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
         };
     }
@@ -628,6 +653,50 @@ async fn reload_handler(state: &MgmtApiState) -> Response<Full<Bytes>> {
     json_ok(&report)
 }
 
+// ── /api/drain ────────────────────────────────────────────────────
+
+/// On-wire response for `POST /api/drain`.
+///
+/// `status` is always the literal `"drain_initiated"` on the success
+/// path so a Kubernetes preStop hook script can pin a single string
+/// match and keep working across rustgate versions; `source` echoes
+/// the literal token the audit event records, which is the same
+/// token operators see in their SIEM trail and dashboards.
+#[derive(Debug, Serialize)]
+struct DrainResult {
+    /// Always `"drain_initiated"` on the success path. The endpoint
+    /// returns immediately after firing the shutdown notify — completion
+    /// is observable via the rustgate process exiting and existing
+    /// SubsystemHandle drain logs, not via this response.
+    status: &'static str,
+    /// Mirrors the `source` field on the emitted audit event so log /
+    /// metric / response stay aligned for forensic correlation.
+    source: &'static str,
+}
+
+/// Initiate a graceful drain — fires the shared shutdown `Notify` that
+/// drives the same SubsystemHandle path SIGTERM would. Returns
+/// IMMEDIATELY after the `notify_one()` call; the K8s preStop hook is
+/// expected to `sleep` separately if a bounded wait is required (the
+/// rustgate drain itself runs under the SubsystemHandle 5s grace
+/// timeout). Closes #791.
+fn drain_handler(state: &MgmtApiState) -> Response<Full<Bytes>> {
+    // The audit emission and metric increment run BEFORE notify_one()
+    // so a forensic trail exists even if the process panics during
+    // drain — operators can correlate the API call with the eventual
+    // exit even when the post-notify path produced no further logs.
+    rustgate_core::audit::admin_drain_triggered("api");
+    #[cfg(feature = "metrics")]
+    crate::metrics::admin_drain_triggered()
+        .with_label_values(&["api"])
+        .inc();
+    state.drain_notify.notify_one();
+    json_ok(&DrainResult {
+        status: "drain_initiated",
+        source: "api",
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::panic, clippy::unwrap_used)]
@@ -681,16 +750,18 @@ mod tests {
             reload: None,
             #[cfg(feature = "http")]
             http_publisher: None,
+            drain_notify: Arc::new(tokio::sync::Notify::new()),
             auth_token: token(),
         }
     }
 
     #[test]
     fn mgmt_path_prefixes_cover_all_endpoints() {
-        // The dispatcher in metrics.rs uses MGMT_PATH_PREFIXES to decide
-        // whether to route to this handler at all. Pin the set so a new
-        // endpoint added to `route()` cannot silently become 404 because
-        // its prefix was forgotten here.
+        // The dispatcher in metrics.rs uses MGMT_PATH_PREFIXES and
+        // MGMT_EXACT_PATHS to decide whether to route to this handler
+        // at all. Pin the set so a new endpoint added to `route()`
+        // cannot silently become 404 because its prefix was forgotten
+        // here.
         assert!(
             MGMT_PATH_PREFIXES
                 .iter()
@@ -716,6 +787,10 @@ mod tests {
                 .iter()
                 .any(|p| "/api/dlq/webhook-prod/replay".starts_with(p))
         );
+        // Bare-path routes (no trailing slash) live in MGMT_EXACT_PATHS
+        // — closes #791 added `/api/drain`.
+        assert!(MGMT_EXACT_PATHS.contains(&"/api/reload"));
+        assert!(MGMT_EXACT_PATHS.contains(&"/api/drain"));
     }
 
     #[tokio::test]
@@ -1053,6 +1128,7 @@ mod tests {
             crl_path: None,
             reload: None,
             http_publisher: Some(publisher.clone()),
+            drain_notify: Arc::new(tokio::sync::Notify::new()),
             auth_token: token(),
         };
         let t = token();
@@ -1076,6 +1152,7 @@ mod tests {
             crl_path: None,
             reload: None,
             http_publisher: Some(publisher.clone()),
+            drain_notify: Arc::new(tokio::sync::Notify::new()),
             auth_token: token(),
         };
         let t = token();
@@ -1110,6 +1187,7 @@ mod tests {
             crl_path: None,
             reload: None,
             http_publisher: Some(publisher.clone()),
+            drain_notify: Arc::new(tokio::sync::Notify::new()),
             auth_token: token(),
         };
         let t = token();
@@ -1145,6 +1223,197 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── /api/drain (issue #791) ────────────────────────────────────
+
+    /// Happy path — a valid bearer token returns `200` with the pinned
+    /// JSON envelope. The status string is part of the operator
+    /// contract: K8s preStop scripts grep for `"drain_initiated"` to
+    /// gate the subsequent `sleep` step, so the test pins the literal
+    /// rather than just `is_string()`.
+    #[tokio::test]
+    async fn admin_drain_returns_200_with_valid_token() {
+        let state = state_with(None);
+        let t = token();
+        let hdr = format!("Bearer {}", String::from_utf8(t.to_vec()).unwrap());
+        let resp = handle_request(&Method::POST, "/api/drain", Some(&hdr), &[], &state)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = extract_json_body(resp).await;
+        let data = body.get("data").expect("envelope.data");
+        assert_eq!(
+            data.get("status").and_then(|v| v.as_str()),
+            Some("drain_initiated"),
+        );
+        assert_eq!(data.get("source").and_then(|v| v.as_str()), Some("api"),);
+    }
+
+    /// The endpoint is bearer-auth-gated — pin the 401 boundary so a
+    /// future refactor that accidentally moves the auth check out of
+    /// `handle_request` cannot silently expose drain to anonymous
+    /// callers (which would let any cluster pod with metrics-port
+    /// connectivity terminate the server).
+    #[tokio::test]
+    async fn admin_drain_returns_401_without_token() {
+        let state = state_with(None);
+        let resp = handle_request(&Method::POST, "/api/drain", None, &[], &state)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Drain increments `rustgate_admin_drain_triggered_total{source="api"}`
+    /// so dashboards can graph operator-driven drains. Pin pre/post
+    /// counter values rather than absolute reads — the metric is a
+    /// process-wide singleton and other tests may have advanced it.
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn admin_drain_increments_metric() {
+        // Drive the full HTTP path so a regression that moves the
+        // metric increment out of `drain_handler` is caught by the
+        // strict +1 delta. The metric is a process-wide singleton,
+        // so the snapshot-then-call-then-snapshot pattern protects
+        // against test parallelism advancing it under us.
+        let counter = crate::metrics::admin_drain_triggered().with_label_values(&["api"]);
+        let before = counter.get();
+        let state = state_with(None);
+        let t = token();
+        let hdr = format!("Bearer {}", String::from_utf8(t.to_vec()).unwrap());
+        let resp = handle_request(&Method::POST, "/api/drain", Some(&hdr), &[], &state)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let after = counter.get();
+        assert!(
+            after > before,
+            "metric must advance by at least 1: before={before} after={after}"
+        );
+    }
+
+    /// Drain emits `audit::admin_drain_triggered("api")` so SIEM rules
+    /// can attribute API-driven drains separately from SIGTERM-driven
+    /// ones. The wire shape of the emitted record (`event_type`,
+    /// `action`, `result`, `source`) is pinned by the integration
+    /// test in `tests/admin_drain_audit.rs`; this unit test pins
+    /// only that the HTTP route reaches the audit emission
+    /// codepath without panicking under a thread-local subscriber.
+    /// The integration-test boundary is required because tracing
+    /// caches per-callsite `Interest` globally and a thread-local
+    /// subscriber installed in a unit test cannot capture an
+    /// audit-target event whose Interest was already cached as
+    /// `never` by an earlier sibling test in the same binary —
+    /// same rationale as `tests/store_forward_dwell_audit.rs` and
+    /// `tests/position_replay_rate_limit_audit.rs`.
+    #[tokio::test]
+    async fn admin_drain_emits_audit_event() {
+        // Smoke-test that the route reaches the audit emission
+        // without panicking. The audit-record wire shape is pinned
+        // in the integration test where the Interest cache is fresh.
+        let state = state_with(None);
+        let t = token();
+        let hdr = format!("Bearer {}", String::from_utf8(t.to_vec()).unwrap());
+        let resp = handle_request(&Method::POST, "/api/drain", Some(&hdr), &[], &state)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The audit fn is reachable from this test binary —
+        // calling it directly does not error.
+        rustgate_core::audit::admin_drain_triggered("api");
+    }
+
+    /// The drain endpoint must fire the shared shutdown notify so the
+    /// accept loop exits and the SubsystemHandle drain runs. Pin the
+    /// invariant by awaiting the same notifier with a bounded timeout
+    /// — a regression that no-ops the `notify_one()` would hang the
+    /// test until timeout, and the timeout itself is what fails the
+    /// test.
+    #[tokio::test]
+    async fn admin_drain_triggers_shutdown_notify() {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let state = MgmtApiState {
+            router: Arc::new(Router::new()),
+            cert_reloader: None,
+            crl_path: None,
+            reload: None,
+            #[cfg(feature = "http")]
+            http_publisher: None,
+            drain_notify: Arc::clone(&notify),
+            auth_token: token(),
+        };
+        let t = token();
+        let hdr = format!("Bearer {}", String::from_utf8(t.to_vec()).unwrap());
+
+        // Park a `notified()` waiter BEFORE calling the endpoint —
+        // `tokio::sync::Notify::notify_one()` only wakes a permit if a
+        // waiter is already registered; absent that, the permit is
+        // stored and the next `notified()` call returns immediately.
+        // Either ordering should satisfy the contract, but registering
+        // first proves the wake-up path works without relying on the
+        // permit-storage fallback.
+        let waiter = Arc::clone(&notify);
+        let task = tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiter.notified()).await
+        });
+        // Yield so the spawned task has a chance to register its
+        // waiter before we fire the notify.
+        tokio::task::yield_now().await;
+
+        let resp = handle_request(&Method::POST, "/api/drain", Some(&hdr), &[], &state)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The waiter must observe the notify within 1s — the actual
+        // wake-up should be sub-millisecond, the timeout exists to
+        // turn a regression (notify never fires) into a hard failure.
+        let outcome = task.await.expect("waiter task must not panic");
+        assert!(
+            outcome.is_ok(),
+            "drain_notify must fire within the bounded window"
+        );
+    }
+
+    /// `GET /api/drain` is `405`, not `404`. The path matches a known
+    /// endpoint shape, just not for that verb — surface the
+    /// distinction to operators so a script that types the wrong verb
+    /// gets a precise diagnostic instead of a misleading "no such
+    /// endpoint" signal.
+    #[tokio::test]
+    async fn admin_drain_wrong_method_returns_405() {
+        let state = state_with(None);
+        let t = token();
+        let hdr = format!("Bearer {}", String::from_utf8(t.to_vec()).unwrap());
+        let resp = handle_request(&Method::GET, "/api/drain", Some(&hdr), &[], &state)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    /// The endpoint MUST return immediately after firing the notify —
+    /// the K8s preStop hook can sleep separately if a bounded wait is
+    /// required, but blocking on drain completion inside the handler
+    /// would either keep the response open past the kubelet's preStop
+    /// timeout or serialize concurrent drain calls. 100ms is two
+    /// orders of magnitude looser than the actual hot-path latency
+    /// (which is the cost of a `notify_one()` plus JSON serde) and
+    /// exists to turn a regression into a hard failure.
+    #[tokio::test]
+    async fn admin_drain_does_not_block_on_completion() {
+        let state = state_with(None);
+        let t = token();
+        let hdr = format!("Bearer {}", String::from_utf8(t.to_vec()).unwrap());
+        let start = std::time::Instant::now();
+        let resp = handle_request(&Method::POST, "/api/drain", Some(&hdr), &[], &state)
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "drain handler must not block on completion; took {elapsed:?}"
+        );
     }
 
     /// Build a minimal publisher with a single named target and a

@@ -616,6 +616,14 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     let mgmt_api_slot: Arc<std::sync::OnceLock<metrics::MgmtApiHandler>> =
         Arc::new(std::sync::OnceLock::new());
 
+    // Shared shutdown notifier driven by either SIGTERM/Ctrl-C
+    // (`shutdown_signal()`) or `POST /api/drain` (closes #791). The
+    // accept loop awaits on `shutdown_signal()` which races a tokio
+    // signal handler against a `notified()` future on this `Notify`,
+    // so a `notify_one()` from the drain endpoint transitions the
+    // server into the same SubsystemHandle drain path SIGTERM would.
+    let drain_notify = Arc::new(tokio::sync::Notify::new());
+
     #[cfg(feature = "metrics")]
     let router_slot: metrics::RouterSlot = Arc::new(std::sync::OnceLock::new());
 
@@ -1519,6 +1527,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
                 reload: reload_fn,
                 #[cfg(feature = "http")]
                 http_publisher: _http_publisher.clone(),
+                drain_notify: Arc::clone(&drain_notify),
                 auth_token: zeroize::Zeroizing::new(token),
             });
             let handler: metrics::MgmtApiHandler = Arc::new(move |method, path, auth, body| {
@@ -1535,7 +1544,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
             let _ = mgmt_api_slot.set(handler);
             tracing::info!(
                 "management REST API enabled at /api/cert/, /api/crl/, /api/dedup/, \
-                 /api/clients/, /api/dlq/, and /api/reload"
+                 /api/clients/, /api/dlq/, /api/reload, and /api/drain"
             );
         }
     }
@@ -1680,7 +1689,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
                     }
                 }
             }
-            _ = shutdown_signal() => {
+            _ = shutdown_signal(Arc::clone(&drain_notify)) => {
                 tracing::info!("shutdown signal received");
                 ready.store(false, Ordering::Release);
                 #[cfg(feature = "metrics")]
@@ -1810,7 +1819,14 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
 ///
 /// K8s sends SIGTERM during pod eviction; SIGINT covers local development.
 /// On non-Unix platforms only Ctrl-C is available.
-async fn shutdown_signal() {
+/// Block until either an OS-level shutdown signal arrives (SIGTERM /
+/// Ctrl-C) or the management API fires the shared `drain_notify`
+/// (`POST /api/drain`, closes #791). Returning unblocks the accept
+/// loop's `tokio::select!`, which then drops into the existing
+/// SubsystemHandle drain path — there is no separate "API drain code".
+async fn shutdown_signal(drain_notify: Arc<tokio::sync::Notify>) {
+    let api_drain = drain_notify.notified();
+
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -1819,18 +1835,25 @@ async fn shutdown_signal() {
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => {}
                     _ = sigterm.recv() => {}
+                    _ = api_drain => {}
                 }
             }
             Err(e) => {
                 tracing::warn!(error = %e, "failed to register SIGTERM handler, falling back to Ctrl-C only");
-                let _ = tokio::signal::ctrl_c().await;
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = api_drain => {}
+                }
             }
         }
     }
 
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = api_drain => {}
+        }
     }
 }
 

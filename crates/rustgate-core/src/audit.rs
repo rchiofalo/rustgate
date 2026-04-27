@@ -1481,6 +1481,36 @@ pub fn mqtt_will_published(cn: &str, topic: &str, group: &str, retain: bool) {
     );
 }
 
+// ── Admin / lifecycle audit events ──────────────────────────────────
+
+/// Record an operator-initiated graceful drain.
+///
+/// Emitted by the management API when `POST /api/drain` fires the
+/// shared shutdown `Notify`, and reserved for any future surface
+/// (e.g. a SIGUSR2 handler) that triggers the same drain path. The
+/// `source` field discriminates the origin so SIEM and dashboards can
+/// attribute API-initiated drains separately from SIGTERM-initiated
+/// ones — pre-this-event the only signal was the SubsystemHandle log
+/// line, which collapsed both surfaces into one indistinguishable
+/// stream during a Kubernetes rolling upgrade.
+///
+/// `source` is a short token like `"api"` for the management endpoint
+/// or `"signal"` for a SIGTERM-equivalent path; SIEM rules key on this
+/// to gate alerting (an unexpected `"api"` drain at 03:00 is suspicious
+/// in a way a `"signal"` drain during a planned canary rollout is not).
+///
+/// Sanitization: `source` is sanitized at the audit boundary. Closes
+/// `#791`.
+pub fn admin_drain_triggered(source: &str) {
+    let source = s(source);
+    audit!(
+        "admin.drain_triggered",
+        source = %source,
+        action = "drain",
+        result = "initiated"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -1960,6 +1990,20 @@ mod tests {
         }
     }
 
+    mod admin {
+        use super::*;
+
+        #[test]
+        fn test_admin_drain_triggered() {
+            // Smoke-test the documented sources plus the boundary
+            // shapes (empty, oversize) the macro must not panic on.
+            admin_drain_triggered("api");
+            admin_drain_triggered("signal");
+            admin_drain_triggered("");
+            admin_drain_triggered(&"x".repeat(1024));
+        }
+    }
+
     /// Tests pinning the boundary-sanitization contract: every audit
     /// helper that takes a user-controlled `&str` MUST sanitize it
     /// internally so that a forgotten call-site wrap cannot produce a
@@ -2115,6 +2159,45 @@ mod tests {
             assert!(
                 group.contains('\u{FFFD}'),
                 "sanitized output must contain U+FFFD: {group:?}"
+            );
+        }
+
+        #[test]
+        fn audit_admin_drain_triggered_sanitizes_source() {
+            // The `source` field is in principle operator-controlled —
+            // a future SIGUSR2 handler or a misconfigured wrapper script
+            // could thread an unvetted token through. Pin that the
+            // audit boundary scrubs CR/LF and ANSI CSI even though
+            // every in-tree call site uses a safe literal today.
+            let malicious_source = "api\r\n\x1b[31m[FAKE ALERT]\x1b[0m";
+            let snapshot = capture_audit(|| admin_drain_triggered(malicious_source));
+            let event = parse_event(&snapshot, "admin.drain_triggered");
+            let source = event["fields"]["source"]
+                .as_str()
+                .expect("source must be a JSON string");
+            for forbidden in &['\n', '\r', '\x1b'] {
+                assert!(
+                    !source.contains(*forbidden),
+                    "forge byte {forbidden:?} must be replaced: {source:?}"
+                );
+            }
+            assert!(
+                source.contains('\u{FFFD}'),
+                "sanitized output must contain U+FFFD: {source:?}"
+            );
+            // Pin the action / result tokens so a SIEM rule that keys
+            // on them keeps firing across refactors.
+            assert_eq!(
+                event["fields"]["action"]
+                    .as_str()
+                    .expect("action must be a JSON string"),
+                "drain"
+            );
+            assert_eq!(
+                event["fields"]["result"]
+                    .as_str()
+                    .expect("result must be a JSON string"),
+                "initiated"
             );
         }
 
