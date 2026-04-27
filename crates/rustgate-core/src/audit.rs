@@ -928,6 +928,15 @@ pub fn classify_mask_recovery_for(source_protocol: &str) -> &'static str {
 /// distinguish a failure on a unicast direct send from one on a
 /// fan-out broadcast without inspecting the payload.
 ///
+/// `policy_id` is the stable identifier of the authz engine that produced
+/// the obligation (closes #772). SIEM correlation across rolling policy
+/// reloads needs this for forensic clarity: a `MaskPoint` failure under
+/// policy `vN` looks identical on the wire to one under `vN+1`, but the
+/// remediation may differ when the policy file itself was the regression.
+/// Empty-string call sites (callers without engine context) render the
+/// field as the empty string — same convention as
+/// [`authz_reload_rollback`]'s absent-`previous_policy_id` path.
+///
 /// Sanitization: every `&str` parameter is sanitized at the audit
 /// boundary. In production the `reason` and `recovery` fields are
 /// always drawn from the documented constant vocabularies, so the
@@ -936,6 +945,12 @@ pub fn classify_mask_recovery_for(source_protocol: &str) -> &'static str {
 /// the constraint.
 ///
 /// [`rustgate_cot::mask::MaskError::kind`]: https://docs.rs/rustgate-cot
+// justification: seven args mirror the obligation-failed schema required
+// by SIEM correlation tooling (subject CN, obligation, reason, recovery,
+// source_protocol, destination_kind, policy_id). Bundling into a struct
+// would add construction noise to every call site in the obligation hot
+// path without changing what ends up on the wire.
+#[allow(clippy::too_many_arguments)]
 pub fn authz_obligation_failed(
     subject_cn: &str,
     obligation: &str,
@@ -943,6 +958,7 @@ pub fn authz_obligation_failed(
     recovery: &str,
     source_protocol: &str,
     destination_kind: &str,
+    policy_id: &str,
 ) {
     let subject_cn = s(subject_cn);
     let obligation = s(obligation);
@@ -950,6 +966,7 @@ pub fn authz_obligation_failed(
     let recovery = s(recovery);
     let source_protocol = s(source_protocol);
     let destination_kind = s(destination_kind);
+    let policy_id = s(policy_id);
     audit!(
         "authz.obligation_failed",
         subject_cn = %subject_cn,
@@ -958,6 +975,7 @@ pub fn authz_obligation_failed(
         recovery = %recovery,
         source_protocol = %source_protocol,
         destination_kind = %destination_kind,
+        policy_id = %policy_id,
         action = "actuate_obligation",
         result = "failure"
     );
@@ -984,6 +1002,18 @@ pub fn authz_obligation_failed(
 /// [`authz_obligation_failed`] so a SIEM can pivot between the two
 /// events without custom mapping.
 ///
+/// `policy_id` is the stable identifier of the authz engine that returned
+/// the unknown variant (closes #772). SIEM correlation across rolling
+/// policy reloads pins which engine version introduced the unrecognised
+/// obligation — the audit-flood guard added in #769 already keys its
+/// per-`(policy_id, variant)` rate limiter on this same identifier, so
+/// surfacing it on the audit emission lets operators correlate the
+/// suppressed-emission rate (via the `rustgate_authz_obligation_unknown_total`
+/// counter) with the specific policy version that introduced the skew.
+/// Empty-string call sites (callers without engine context) render the
+/// field as the empty string — same convention as
+/// [`authz_obligation_failed`].
+///
 /// Sanitization: every `&str` parameter is sanitized at the audit
 /// boundary.
 ///
@@ -993,11 +1023,13 @@ pub fn authz_obligation_unknown(
     obligation: &str,
     source_protocol: &str,
     destination_kind: &str,
+    policy_id: &str,
 ) {
     let subject_cn = s(subject_cn);
     let obligation = s(obligation);
     let source_protocol = s(source_protocol);
     let destination_kind = s(destination_kind);
+    let policy_id = s(policy_id);
     // `reason` is fixed: every `authz.obligation_unknown` emission
     // surfaces the same unknown-variant case — the `obligation` field
     // already differentiates which specific variant fired. Pinning the
@@ -1011,6 +1043,7 @@ pub fn authz_obligation_unknown(
         reason = OBLIGATION_REASON_UNKNOWN_VARIANT,
         source_protocol = %source_protocol,
         destination_kind = %destination_kind,
+        policy_id = %policy_id,
         action = "actuate_obligation",
         result = "skipped"
     );
@@ -1879,6 +1912,7 @@ mod tests {
                 "dropped",
                 "tcp",
                 "broadcast",
+                "policy-v1",
             );
             authz_obligation_failed(
                 "alice",
@@ -1887,13 +1921,31 @@ mod tests {
                 "forwarded_unmasked",
                 "mqtt",
                 "direct",
+                "policy-v1",
+            );
+            // Empty `policy_id` is allowed for callers without engine
+            // context — closes #772 path-of-least-resistance regression
+            // pin so a refactor that introduces a new emission site
+            // without engine context cannot silently break the audit
+            // boundary's sanitization invariant.
+            authz_obligation_failed(
+                "alice",
+                "MaskPoint",
+                OBLIGATION_REASON_MASK_POINT_NON_XML,
+                "forwarded_unmasked",
+                "mqtt",
+                "direct",
+                "",
             );
         }
 
         #[test]
         fn test_authz_obligation_unknown() {
-            authz_obligation_unknown("alice", "Quarantine", "tcp", "group");
-            authz_obligation_unknown("", "", "", "");
+            authz_obligation_unknown("alice", "Quarantine", "tcp", "group", "policy-v1");
+            // Empty-everything emission must not panic — this is the
+            // pre-#769-rate-limiter "no engine context" callpath that
+            // shipped before issue #769; keep covering it.
+            authz_obligation_unknown("", "", "", "", "");
         }
 
         // Issue #775: SIEM dashboards group on the literal `reason`
@@ -2501,6 +2553,212 @@ mod tests {
             assert!(
                 reason.contains('\u{FFFD}') && policy_id.contains('\u{FFFD}'),
                 "sanitized fields must contain U+FFFD"
+            );
+        }
+
+        /// Issue #772: receive-time PEP audit events MUST carry a
+        /// `policy_id` field so SIEM correlation can pin which engine
+        /// version returned the deny verdict — across rolling policy
+        /// reloads, a deny under `vN` looks identical on the wire to
+        /// one under `vN+1`, but the remediation may differ.
+        ///
+        /// Pin the field name AND the literal value so a future refactor
+        /// that renames either silently breaks the SIEM contract.
+        #[test]
+        fn authz_denied_audit_includes_policy_id_field() {
+            let snapshot = capture_audit(|| {
+                authz_denied(
+                    "alice",
+                    "abc:def",
+                    "send",
+                    "group",
+                    "team-alpha",
+                    Some("rule-1"),
+                    "policy-2026-04-25-1",
+                );
+            });
+            let event = parse_event(&snapshot, "authz.denied");
+            // policy_id must be present, must be a string, and must
+            // carry the value passed at the call site (not a stand-in,
+            // not the empty string, not redacted).
+            let policy_id = event["fields"]["policy_id"]
+                .as_str()
+                .expect("policy_id must be a JSON string on receive-time PEP audits");
+            assert_eq!(
+                policy_id, "policy-2026-04-25-1",
+                "audit emission must carry the engine's policy_id verbatim",
+            );
+            // event_type, action, result, and rule_id must not have
+            // shifted in this refactor — pin the surrounding shape so
+            // any unrelated field rename surfaces here too.
+            assert_eq!(
+                event["fields"]["event_type"]
+                    .as_str()
+                    .expect("event_type must be a JSON string"),
+                "authz.denied",
+            );
+            assert_eq!(
+                event["fields"]["action"]
+                    .as_str()
+                    .expect("action must be a JSON string"),
+                "send",
+            );
+            assert_eq!(
+                event["fields"]["result"]
+                    .as_str()
+                    .expect("result must be a JSON string"),
+                "deny",
+            );
+        }
+
+        /// Closes #772: the new `policy_id` field on `authz.denied`
+        /// MUST flow through the audit boundary's sanitizer (per #1197 +
+        /// #1220). A malicious authz operator who shipped a policy file
+        /// with CR/LF bytes in its `policy_id` could otherwise split the
+        /// audit record into two log lines and inject a forged entry —
+        /// exactly the log-forging vector the boundary sanitizer
+        /// closes for every other operator-supplied field.
+        #[test]
+        fn authz_denied_sanitizes_policy_id_at_audit_boundary() {
+            let malicious_policy_id = "policy-x\r\n\x1b[31m[FAKE ALERT]\x1b[0m";
+            let snapshot = capture_audit(|| {
+                authz_denied(
+                    "alice",
+                    "abc:def",
+                    "send",
+                    "group",
+                    "team-alpha",
+                    Some("rule-1"),
+                    malicious_policy_id,
+                );
+            });
+            let event = parse_event(&snapshot, "authz.denied");
+            let policy_id = event["fields"]["policy_id"]
+                .as_str()
+                .expect("policy_id must be a JSON string");
+            for forbidden in &['\n', '\r', '\x1b'] {
+                assert!(
+                    !policy_id.contains(*forbidden),
+                    "policy_id: forge byte {forbidden:?} must be replaced: {policy_id:?}"
+                );
+            }
+            assert!(
+                policy_id.contains('\u{FFFD}'),
+                "sanitized policy_id must contain U+FFFD: {policy_id:?}"
+            );
+            // Defense in depth: the captured snapshot must remain a
+            // single JSON line. A regression that bypassed the
+            // sanitizer would split into two lines on the embedded
+            // CR/LF, and the SIEM would see a forged "FAKE ALERT"
+            // entry the sanitizer is supposed to neutralize.
+            let lines_with_event: Vec<_> = snapshot
+                .lines()
+                .filter(|l| l.contains("authz.denied"))
+                .collect();
+            assert_eq!(
+                lines_with_event.len(),
+                1,
+                "log forging must not split the record into multiple lines"
+            );
+        }
+
+        /// Issue #772: the `policy_id` field MUST also surface on the
+        /// obligation-failed sibling of `authz_denied`. The two events
+        /// are co-emitted on the same receive-time PEP path (a deny
+        /// blocks delivery; an obligation_failed signals that the
+        /// policy hint was un-actuatable) and SIEM correlation needs
+        /// the same engine-version pivot on both.
+        #[test]
+        fn authz_obligation_failed_audit_includes_policy_id_field() {
+            let snapshot = capture_audit(|| {
+                authz_obligation_failed(
+                    "alice",
+                    "MaskPoint",
+                    OBLIGATION_REASON_MASK_POINT_NON_XML,
+                    "forwarded_unmasked",
+                    "tcp",
+                    "broadcast",
+                    "policy-2026-04-25-1",
+                );
+            });
+            let event = parse_event(&snapshot, "authz.obligation_failed");
+            let policy_id = event["fields"]["policy_id"]
+                .as_str()
+                .expect("policy_id must be a JSON string on obligation_failed audit");
+            assert_eq!(
+                policy_id, "policy-2026-04-25-1",
+                "obligation_failed audit must carry policy_id verbatim",
+            );
+        }
+
+        /// Closes #772: same sanitization invariant as
+        /// `authz_denied_sanitizes_policy_id_at_audit_boundary`, applied
+        /// to the obligation-failed sibling. Pinning both pre-empts a
+        /// future contributor "fixing" only one site.
+        #[test]
+        fn authz_obligation_failed_sanitizes_policy_id_at_audit_boundary() {
+            let malicious_policy_id = "policy-x\r\nfake_event=injected";
+            let snapshot = capture_audit(|| {
+                authz_obligation_failed(
+                    "alice",
+                    "MaskPoint",
+                    OBLIGATION_REASON_MASK_POINT_NON_XML,
+                    "forwarded_unmasked",
+                    "tcp",
+                    "broadcast",
+                    malicious_policy_id,
+                );
+            });
+            let event = parse_event(&snapshot, "authz.obligation_failed");
+            let policy_id = event["fields"]["policy_id"]
+                .as_str()
+                .expect("policy_id must be a JSON string");
+            for forbidden in &['\n', '\r'] {
+                assert!(
+                    !policy_id.contains(*forbidden),
+                    "policy_id: forge byte {forbidden:?} must be replaced: {policy_id:?}"
+                );
+            }
+            assert!(
+                policy_id.contains('\u{FFFD}'),
+                "sanitized policy_id must contain U+FFFD: {policy_id:?}"
+            );
+        }
+
+        /// Issue #772: the unknown-variant sibling of
+        /// `authz_obligation_failed` MUST also carry `policy_id`.
+        /// This is the audit-flood-guarded site (#769): the rate
+        /// limiter's bucket key is `(policy_id, variant)`, so a SIEM
+        /// rule that correlates the suppressed-emission rate (via
+        /// `rustgate_authz_obligation_unknown_total`) with the
+        /// engine version that introduced the skew needs `policy_id`
+        /// on the audit emission to pivot between the two surfaces.
+        #[test]
+        fn authz_obligation_unknown_audit_includes_policy_id_field() {
+            let snapshot = capture_audit(|| {
+                authz_obligation_unknown(
+                    "alice",
+                    "FutureVariant",
+                    "tcp",
+                    "broadcast",
+                    "policy-2026-04-25-1",
+                );
+            });
+            let event = parse_event(&snapshot, "authz.obligation_unknown");
+            let policy_id = event["fields"]["policy_id"]
+                .as_str()
+                .expect("policy_id must be a JSON string on obligation_unknown audit");
+            assert_eq!(
+                policy_id, "policy-2026-04-25-1",
+                "obligation_unknown audit must carry policy_id verbatim",
+            );
+            // The static `reason` token must remain alongside —
+            // policy_id is additive, not a replacement (issue #775).
+            assert_eq!(
+                event["fields"]["reason"]
+                    .as_str()
+                    .expect("reason must be a JSON string"),
+                OBLIGATION_REASON_UNKNOWN_VARIANT,
             );
         }
     }
