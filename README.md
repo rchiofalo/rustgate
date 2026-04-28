@@ -315,6 +315,35 @@ rustgate --config /etc/rustgate/rustgate.toml validate-config
 rustgate verify-audit --file /var/log/rustgate/audit.jsonl
 ```
 
+#### Editor autocomplete via JSON Schema
+
+A JSON Schema describing the `rustgate.toml` surface ships at
+[`schemas/rustgate-v0.8.json`](schemas/rustgate-v0.8.json). Wire it into any
+JSON-Schema-aware editor for autocomplete and inline validation while editing
+your config.
+
+For VS Code with the **Even Better TOML** extension, add this to your
+`.vscode/settings.json`:
+
+```json
+{
+  "evenBetterToml.schema.associations": {
+    "**/rustgate.toml": "https://raw.githubusercontent.com/rchiofalo/rustgate/main/schemas/rustgate-v0.8.json"
+  }
+}
+```
+
+Operators building from source can regenerate the schema from the live `Cli`
+type:
+
+```bash
+cargo run -p rustgate-server --features schema -- emit-schema \
+  > schemas/rustgate-v0.8.json
+```
+
+The `emit-schema` subcommand is gated behind the `schema` feature so the
+default release build does not pull `schemars` into the runtime image.
+
 Running `rustgate` with no subcommand starts the server as before.
 
 Minimal:

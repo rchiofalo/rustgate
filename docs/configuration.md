@@ -323,6 +323,57 @@ The Helm chart uses different defaults than the CLI for framing and encoding, op
 | `framing` | `xml` | `tak-negotiate` | Production clients expect negotiation |
 | `encoding` | `raw` | `tak-protobuf` | Protobuf is more efficient for production |
 
+## Editor Autocomplete (JSON Schema)
+
+A JSON Schema describing the `rustgate.toml` surface ships at
+[`schemas/rustgate-v0.8.json`](../schemas/rustgate-v0.8.json) in the
+repository root. Wire it into any JSON-Schema-aware editor for
+autocomplete and inline validation while editing your config — every
+key, type, allowed enum value, and default is generated from the same
+`Cli` struct that powers the binary itself, so the schema cannot drift
+from the actual server's expectations.
+
+### VS Code (Even Better TOML)
+
+1. Install the **Even Better TOML** extension (publisher `tamasfe`).
+2. Add the schema association to your `.vscode/settings.json`:
+
+   ```json
+   {
+     "evenBetterToml.schema.associations": {
+       "**/rustgate.toml": "https://raw.githubusercontent.com/rchiofalo/rustgate/main/schemas/rustgate-v0.8.json"
+     }
+   }
+   ```
+
+3. Open `rustgate.toml`. Autocomplete on key names, hover-doc on each
+   key (sourced from the CLI flag's help text), and inline diagnostics
+   for unknown keys / wrong-type values become available.
+
+### Other editors
+
+The schema is plain JSON Schema 2020-12 and works with any editor that
+consumes the format — Helix and IntelliJ TOML both pick up the schema
+from a `# json.$schema = <url>` magic comment at the top of the file,
+or via per-file association lists in their respective settings.
+
+### Regenerating the schema
+
+The schema is generated from the live `ConfigFile` mirror at build
+time. Build the server with the optional `schema` feature and pipe the
+`emit-schema` subcommand into the version-tagged file:
+
+```bash
+cargo run -p rustgate-server --features schema -- emit-schema \
+  > schemas/rustgate-v0.8.json
+```
+
+The `schema` feature is opt-in so the default release image does not
+carry the `schemars` dependency. A regression test in
+`crates/rustgate-server/tests/schema_export.rs` re-runs the generator
+in CI and fails with a hint pointing at the regen command above when a
+new config field lands without a corresponding schema refresh.
+
 ## Environment Variable Examples
 
 ### Minimal

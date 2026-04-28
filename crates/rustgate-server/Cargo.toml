@@ -47,6 +47,12 @@ spiffe = ["rustgate-transport/spiffe"]
 # Enables the optional Cedar authz policy backend and `--authz-policy-format cedar`.
 cedar = ["rustgate-authz/cedar"]
 http = ["dep:rustgate-http"]
+# Emit a JSON Schema for `rustgate.toml` via the `emit-schema` subcommand
+# so operators can wire it into VS Code (Even Better TOML) or any
+# JSON-Schema-aware editor for autocomplete + inline validation. Pulls in
+# `schemars` only when this feature is enabled — the default build keeps
+# the dep tree unchanged. Issue #815, F-137.
+schema = ["dep:schemars"]
 
 [dependencies]
 arc-swap = { workspace = true }
@@ -71,6 +77,7 @@ opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 tikv-jemallocator = { workspace = true, optional = true }
 tikv-jemalloc-ctl = { workspace = true, optional = true }
+schemars = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "signal", "fs", "macros", "time", "net"] }
 tokio-util = { workspace = true }

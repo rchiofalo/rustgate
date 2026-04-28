@@ -1,0 +1,1336 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ConfigFile",
+  "description": "All-optional mirror of [`Cli`] used for TOML deserialization.",
+  "type": "object",
+  "properties": {
+    "access-log": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "acl-api-token-file": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "acl-reload-interval": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "default": null,
+      "minimum": 0
+    },
+    "archive-dir": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "archive-key-file": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "archive-max-active-bytes": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "default": null,
+      "minimum": 0
+    },
+    "archive-max-age": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "default": null,
+      "minimum": 0
+    },
+    "archive-max-size": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "default": null,
+      "minimum": 0
+    },
+    "archive-rotate-interval": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "default": null,
+      "minimum": 0
+    },
+    "audit-allow-chain-break": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
+    "audit-log": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "authz-allow-unknown-obligations": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
+    "authz-fail-open": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
+    "authz-policy-file": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "authz-policy-format": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AuthzPolicyFormat"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "authz-reload-interval": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "default": null,
+      "minimum": 0
+    },
+    "backpressure-resume-dwell-ms": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "default": null,
+      "minimum": 0
+    },
+    "bind": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "ca": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "ca-key": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "ca-organization": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "cert": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "cert-reload-interval": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "default": null,
+      "minimum": 0
+    },
+    "circuit-breaker-threshold": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "default": null,
+      "minimum": 0
+    },
+    "client-burst": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "default": null,
+      "minimum": 0
+    },
+    "client-message-rate": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "default": null,
+      "minimum": 0
+    },
+    "client-ocsp": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
+    "client-queue-dir": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "client-queue-key-file": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "client-queue-max-bytes": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "default": null,
+      "minimum": 0
+    },
+    "client-queue-wipe-on-start": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
+    "cot-delta-cache-size": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "default": null,
+      "minimum": 0
+    },
+    "cot-delta-encoding": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
+    "cot-delta-epsilon-meters": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "double",
+      "default": null
+    },
+    "crl": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "crl-validity-days": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "default": null,
+      "minimum": 0
+    },
+    "crl-warn-stale": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
+    "data-package-dir": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "dedup-cache-size": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "default": null,
+      "minimum": 0
+    },
+    "dedup-cross-tenant": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
+    "dedup-window-secs": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "default": null,
+      "minimum": 0
+    },
+    "encoding": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Encoding"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "enrollment-bind": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "enrollment-password": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "enrollment-rate-limit": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "default": null,
+      "minimum": 0
+    },
+    "enrollment-user": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "est-enabled": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
+    "federation-circuit-breaker-threshold": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "default": null,
+      "minimum": 0
+    },
+    "federation-circuit-breaker-timeout": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "default": null,
+      "minimum": 0
+    },
+    "federation-ha-nats-url": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "federation-id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "federation-max-group-name-length": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "default": null,
+      "minimum": 0
+    },
+    "federation-max-groups-per-peer": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "default": null,
+      "minimum": 0
+    },
+    "federation-max-hops": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint8",
+      "default": null,
+      "maximum": 255,
+      "minimum": 0
+    },
+    "federation-peer-discovery": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PeerDiscoveryBackend"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "federation-peer-discovery-consul-addr": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "federation-peer-discovery-consul-service": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "federation-peer-discovery-dns-sd-service": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "federation-peer-discovery-etcd-endpoints": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "federation-peer-discovery-etcd-prefix": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "federation-peer-discovery-interval": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "default": null,
+      "minimum": 0
+    },
+    "federation-peers-file": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "federation-peers-reload-interval": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "default": null,
+      "minimum": 0
+    },
+    "federation-pod-id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "federation-region": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "federation-replay-buffer-size": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "default": null,
+      "minimum": 0
+    },
+    "federation-replay-dir": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "federation-replay-max-bytes": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "default": null,
+      "minimum": 0
+    },
+    "federation-skip-hostname-verify": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
+    "federation-store-path": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "federation-trust-peer-groups": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
+    "federation-trust-store-dir": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "federation-v1-bind": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "federation-v2-bind": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "fips-required": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
+    "framing": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Framing"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "group-acl-file": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "http-config-file": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "key": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "kx-groups": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "mavlink-allow-v1": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
+    "mavlink-require-signing": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
+    "max-concurrent-handshakes": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "default": null,
+      "minimum": 0
+    },
+    "max-connections": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "default": null,
+      "minimum": 0
+    },
+    "max-queued-bytes": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "default": null,
+      "minimum": 0
+    },
+    "max-queued-bytes-low-water": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "default": null,
+      "minimum": 0
+    },
+    "metrics-bind": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "metrics-identity-allowlist": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "metrics-max-connections": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "default": null,
+      "minimum": 0
+    },
+    "metrics-per-identity": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
+    "metrics-token-file": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "mgmt-api-token-file": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "mqtt-bind": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "mqtt-max-packet-size": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "default": null,
+      "minimum": 0
+    },
+    "mqtt-max-retained-sessions": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "default": null,
+      "minimum": 0
+    },
+    "mqtt-max-session-expiry-secs": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "default": null,
+      "minimum": 0
+    },
+    "mqtt-min-keep-alive-secs": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint16",
+      "default": null,
+      "maximum": 65535,
+      "minimum": 0
+    },
+    "mqtt-receive-max": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint16",
+      "default": null,
+      "maximum": 65535,
+      "minimum": 0
+    },
+    "mqtt-response-channel-capacity": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "default": null,
+      "minimum": 0
+    },
+    "mqtt-server-keep-alive-secs": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint16",
+      "default": null,
+      "maximum": 65535,
+      "minimum": 0
+    },
+    "mqtt-topic-alias-max": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint16",
+      "default": null,
+      "maximum": 65535,
+      "minimum": 0
+    },
+    "mqtt-topic-prefix": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "mqtt-wildcard-policy": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MqttWildcardPolicy"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "nats-checkpoint-path": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "nats-credentials": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "nats-live-stream": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "nats-max-ack-pending": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64",
+      "default": null
+    },
+    "nats-max-deliver": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64",
+      "default": null
+    },
+    "nats-subscription-capacity": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "default": null,
+      "minimum": 0
+    },
+    "nats-tls-ca": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "nats-tls-cert": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "nats-tls-key": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "nats-tls-required": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
+    "nats-url": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "negotiation-timeout-secs": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "default": null,
+      "minimum": 0
+    },
+    "ocsp-stapling": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
+    "otel-endpoint": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "otel-service-name": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "otlp-metrics": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
+    "otlp-metrics-interval": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "default": null,
+      "minimum": 0
+    },
+    "package-max-age-hours": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "default": null,
+      "minimum": 0
+    },
+    "package-signature-ca": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "package-strict-signatures": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
+    "plaintext-cn": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "plaintext-group": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "position-replay-burst": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "default": null,
+      "minimum": 0
+    },
+    "position-replay-rate-per-sec": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "default": null,
+      "minimum": 0
+    },
+    "prefer-post-quantum": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
+    "replay-window": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "default": null,
+      "minimum": 0
+    },
+    "revocation-db": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "shutdown-drain-timeout": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "default": null,
+      "minimum": 0
+    },
+    "spiffe": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
+    "spiffe-refresh-interval": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "default": null,
+      "minimum": 0
+    },
+    "spiffe-trust-domain": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "spiffe-workload-api-socket": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "tcp-bind": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "tenant-quota-file": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "tls-min-version": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "udp-allowed-cidrs": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "udp-bind": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "udp-max-identities": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "default": null,
+      "minimum": 0
+    },
+    "udp-rate-limit": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "default": null,
+      "minimum": 0
+    },
+    "websocket-bind": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "ws-compression-disabled": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
+    "ws-max-bytes-per-sec": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "default": null,
+      "minimum": 0
+    },
+    "ws-max-frame-size": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "default": null,
+      "minimum": 0
+    },
+    "ws-max-frames-per-sec": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "default": null,
+      "minimum": 0
+    },
+    "ws-max-message-size": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "default": null,
+      "minimum": 0
+    },
+    "ws-max-violations": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "default": null,
+      "minimum": 0
+    },
+    "ws-max-write-buffer-bytes": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "default": null,
+      "minimum": 0
+    },
+    "ws-ping-interval-secs": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "default": null,
+      "minimum": 0
+    },
+    "ws-pong-timeout-secs": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "default": null,
+      "minimum": 0
+    },
+    "ws-rate-limit-max": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "default": null,
+      "minimum": 0
+    },
+    "ws-rate-limit-window-secs": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "default": null,
+      "minimum": 0
+    },
+    "ws-subprotocol-strict": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
+    "ws-subprotocols": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "default": null,
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "AuthzPolicyFormat": {
+      "description": "Selects which dynamic federation peer discovery backend is used.\n\n `None` (the default) disables discovery entirely; static peer\n configuration via `--federation-peers-file` remains the only source of\n truth. The other variants each map to a backend gated behind its own\n cargo feature (`peer-discovery-dns-sd`, `peer-discovery-consul`,\n `peer-discovery-etcd`); selecting a backend whose feature was not\n compiled in surfaces a startup error.\n Authz policy-file format selector.",
+      "oneOf": [
+        {
+          "description": "Native rustgate-authz JSON ruleset.",
+          "type": "string",
+          "const": "native"
+        },
+        {
+          "description": "Cedar policy corpus (requires the `cedar` feature).",
+          "type": "string",
+          "const": "cedar"
+        }
+      ]
+    },
+    "Encoding": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "raw",
+            "cot"
+          ]
+        },
+        {
+          "description": "TAK protobuf encoding (proto <-> XML at session edge). Requires --features proto.",
+          "type": "string",
+          "const": "tak-protobuf"
+        }
+      ]
+    },
+    "Framing": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "xml",
+            "length-prefixed",
+            "line"
+          ]
+        },
+        {
+          "description": "TAK protobuf binary framing (0xBF + varint length). Requires --features proto.",
+          "type": "string",
+          "const": "tak-protobuf"
+        },
+        {
+          "description": "TAK protocol negotiation: starts XML, upgrades to protobuf if the client requests it.\n This is the mode real TAK clients expect. Requires --features proto.",
+          "type": "string",
+          "const": "tak-negotiate"
+        }
+      ]
+    },
+    "MqttWildcardPolicy": {
+      "description": "MQTT SUBSCRIBE wildcard policy selector for the CLI / config file.\n\n Mirrors `rustgate_mqtt::WildcardPolicy` but is owned by the server\n crate so `rustgate-mqtt` does not need a clap dependency. A plain\n code reference is used instead of an intra-doc link because the\n `rustgate-mqtt` crate is an optional dependency that is absent from\n the default feature set used by `cargo doc --workspace --no-deps`\n on the docs-site build. The defaulting behaviour\n (`single-level-only`) matches the MQTT adapter's own default so\n operators who omit the flag get spec-conformant single-level (`+`)\n wildcards without the `#` firehose.",
+      "oneOf": [
+        {
+          "description": "Reject both `+` and `#`. Exact-topic subscriptions only.",
+          "type": "string",
+          "const": "reject"
+        },
+        {
+          "description": "Accept `+` (single-level). Reject `#` (multi-level). Default.",
+          "type": "string",
+          "const": "single-level-only"
+        },
+        {
+          "description": "Accept both `+` and `#`.",
+          "type": "string",
+          "const": "full"
+        }
+      ]
+    },
+    "PeerDiscoveryBackend": {
+      "type": "string",
+      "enum": [
+        "none",
+        "dns-sd",
+        "consul",
+        "etcd"
+      ]
+    }
+  }
+}

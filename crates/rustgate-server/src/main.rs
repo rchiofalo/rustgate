@@ -279,6 +279,11 @@ fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
+        #[cfg(feature = "schema")]
+        Some(Command::EmitSchema) => {
+            diagnostics::emit_schema::run()?;
+            return Ok(());
+        }
         None => {}
     }
 
