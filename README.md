@@ -756,6 +756,7 @@ All tests use ephemeral certificates generated at runtime via `rustgate-test-uti
 | [Performance Tuning](docs/performance-tuning.md) | Tuning guides for throughput, latency, and memory |
 | [Troubleshooting](docs/troubleshooting.md) | Common issues, diagnostics, and resolution steps |
 | [Crypto Agility](docs/crypto-agility.md) | Cryptographic algorithm selection and migration |
+| [Architecture Decision Records](docs/adr/README.md) | Non-obvious workspace decisions (locking, dependency choices, secret handling) |
 | [Runbooks](docs/runbooks/) | Operational runbooks for federation, memory, NATS |
 | [CONTRIBUTING](CONTRIBUTING.md) | Build prerequisites, code quality, and PR guidelines |
 | [CHANGELOG](CHANGELOG.md) | Release history in Keep a Changelog format |

@@ -1,0 +1,79 @@
+# Architecture Decision Records
+
+This directory holds the project's architecture decision records (ADRs).
+An ADR captures one architecturally significant decision, the
+alternatives that were weighed against it, and the consequences the
+project now lives with as a result.
+
+We use the slim Michael Nygard format. Each ADR is a short markdown
+file numbered with a four-digit prefix and a kebab-case slug
+(`0001-parking-lot-mutexes-for-sync-paths.md`). Status, context,
+decision, and consequences are spelled out so a new contributor can
+read the ADR cold and understand why the workspace looks the way it
+does.
+
+## Status legend
+
+- **Accepted** — the decision is in force and the codebase reflects it.
+- **Proposed** — under discussion, not yet implemented.
+- **Superseded by ADR XXXX** — the decision was reversed or replaced;
+  the body remains for historical context, with a forward link to the
+  replacement.
+- **Deprecated** — no longer in force; the codebase is in the middle of
+  migrating away from this decision.
+- **Documented** — the decision shipped a long time ago without a
+  written rationale; this ADR records the current state honestly,
+  including the parts of the rationale that are unclear from the source.
+
+## Index
+
+| ADR | Title | Status |
+|-----|-------|--------|
+| [0000](0000-record-architecture-decisions.md) | Record architecture decisions | Accepted |
+| [0001](0001-parking-lot-mutexes-for-sync-paths.md) | `parking_lot::Mutex` for sync hot paths | Accepted |
+| [0002](0002-tokio-rwlock-across-await.md) | `tokio::sync` locks for state held across `.await` | Accepted |
+| [0003](0003-arcswap-hot-reload.md) | `ArcSwap<Option<T>>` for hot-reloadable shared state | Accepted |
+| [0004](0004-rcgen-over-x509-cert-for-tests.md) | `rcgen` for test certificate generation | Accepted |
+| [0005](0005-tokio-tungstenite-over-soketto.md) | `tokio-tungstenite` for the WebSocket layer | Documented |
+| [0006](0006-redb-over-sled-for-store-and-forward.md) | `redb` for the per-client store-and-forward queue | Accepted |
+| [0007](0007-thiserror-everywhere-no-anyhow-in-libs.md) | `thiserror` everywhere; no `anyhow` at library boundaries | Accepted |
+| [0008](0008-once-lock-not-once-cell-lazy.md) | `std::sync::OnceLock` over `once_cell::sync::Lazy` | Accepted |
+| [0009](0009-zeroizing-and-subtle-for-secrets.md) | `Zeroizing<T>` + `subtle::ConstantTimeEq` for secrets | Accepted |
+| [0010](0010-spawn-background-and-subsystem-handle.md) | `spawn_background` + `SubsystemHandle` for task lifecycle | Accepted |
+
+## Authoring a new ADR
+
+1. Copy [`template.md`](template.md) to the next available number,
+   e.g. `0011-my-decision.md`. Slugs are kebab-case and short.
+2. Set the status to **Proposed** while the decision is under
+   discussion. Once the corresponding code lands, flip it to
+   **Accepted**.
+3. Keep the body slim — the goal is one screen of context, the
+   decision, and the consequences. Long architectural prose belongs
+   in `docs/architecture.md` or one of the other long-form documents
+   in `docs/`.
+4. Add a row to the index table above and link the new ADR from any
+   existing ADR it relates to (use a relative path:
+   `[ADR 0001](0001-parking-lot-mutexes-for-sync-paths.md)`).
+5. Reference the ADR file in the body of the commit that implements
+   the decision so the rationale travels with the change.
+
+## What does and does not belong here
+
+ADRs are for non-obvious architectural choices that future
+contributors will hit and ask "why was this picked?" — the kind of
+decision whose rationale is otherwise only visible in a commit
+message. The seed set in this directory is exactly those decisions:
+locking primitives, dependency selection in places where alternatives
+were viable, secret-handling discipline, the shutdown protocol.
+
+ADRs are not the place for:
+
+- Routine implementation details ("we extracted helper X").
+- Bug fixes or refactors that do not change a load-bearing decision.
+- Per-feature design notes — those belong in `docs/<feature>.md`.
+- Operator guidance — that belongs in `docs/runbooks/`.
+
+When in doubt, write the ADR. It is cheaper to retire a too-small ADR
+than to lose the rationale for a decision the codebase quietly relies
+on.
