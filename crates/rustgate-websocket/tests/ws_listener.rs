@@ -74,7 +74,7 @@ async fn ws_mtls_handshake_and_identity() {
     assert_eq!(reply, Message::Text("world".into()));
 
     let identity = server_handle.await.expect("server task");
-    assert_eq!(identity.cn, "alice");
+    assert_eq!(&*identity.cn, "alice");
     assert_eq!(identity.groups.len(), 2);
     assert!(identity.is_member_of("engineers"));
     assert!(identity.is_member_of("admins"));
@@ -248,8 +248,8 @@ async fn ws_accept_multiple_clients() {
     let _ws2 = ws_connect(bound_addr, &bob_tls).await;
 
     let (cn1, groups1, cn2, groups2) = server_handle.await.expect("server task");
-    assert_eq!(cn1, "alice");
+    assert_eq!(&*cn1, "alice");
     assert!(groups1.contains("alpha"));
-    assert_eq!(cn2, "bob");
+    assert_eq!(&*cn2, "bob");
     assert!(groups2.contains("bravo"));
 }

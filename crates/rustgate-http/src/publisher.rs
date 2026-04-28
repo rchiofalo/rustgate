@@ -1589,7 +1589,9 @@ async fn replay_entry(
     // and `msg.metadata` during serialization.
     let msg = rustgate_core::message::RoutableMessage {
         source: rustgate_core::identity::Identity {
-            cn: entry.source_cn.clone(),
+            // `Identity.cn` is `Arc<str>` (closes #784); convert from
+            // the DLQ entry's owned `String` via `Arc::<str>::from`.
+            cn: std::sync::Arc::<str>::from(entry.source_cn.as_str()),
             fingerprint: String::new(),
             groups: entry.source_groups.iter().cloned().collect(),
             tenant: None,
@@ -1702,7 +1704,9 @@ fn requeue_failed_entry(
     };
     let msg = rustgate_core::message::RoutableMessage {
         source: rustgate_core::identity::Identity {
-            cn: entry.source_cn.clone(),
+            // `Identity.cn` is `Arc<str>` (closes #784); convert from
+            // the DLQ entry's owned `String` via `Arc::<str>::from`.
+            cn: std::sync::Arc::<str>::from(entry.source_cn.as_str()),
             fingerprint: String::new(),
             groups: entry.source_groups.iter().cloned().collect(),
             tenant: None,
@@ -2136,7 +2140,7 @@ mod tests {
         for protocol in &["http", "HTTP", "Http", "hTTp"] {
             let msg = rustgate_core::message::RoutableMessage {
                 source: rustgate_core::identity::Identity {
-                    cn: "test".to_string(),
+                    cn: "test".into(),
                     fingerprint: Default::default(),
                     groups: Default::default(),
                     tenant: None,
@@ -2163,7 +2167,7 @@ mod tests {
     fn admission_test_msg(cn: &str) -> rustgate_core::message::RoutableMessage {
         rustgate_core::message::RoutableMessage {
             source: rustgate_core::identity::Identity {
-                cn: cn.to_string(),
+                cn: cn.into(),
                 fingerprint: Default::default(),
                 groups: Default::default(),
                 tenant: None,

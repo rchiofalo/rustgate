@@ -120,7 +120,7 @@ async fn fips_mtls_handshake() {
     assert_eq!(&buf, b"fips-resp");
 
     let identity = server_handle.await.expect("server task");
-    assert_eq!(identity.cn, "fips-operator");
+    assert_eq!(&*identity.cn, "fips-operator");
     assert!(identity.is_member_of("fips-team"));
 }
 

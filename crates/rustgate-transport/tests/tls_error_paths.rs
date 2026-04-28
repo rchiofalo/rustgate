@@ -282,7 +282,7 @@ async fn group_send_backpressure_drops_without_panic() {
     for i in 0..20 {
         let msg = RoutableMessage {
             source: (*bob).clone(),
-            destination: Destination::Group("team".to_string()),
+            destination: Destination::Group("team".into()),
             payload: Bytes::from(format!("msg-{i}")),
             metadata: Metadata {
                 received_at: SystemTime::now(),

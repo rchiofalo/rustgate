@@ -114,7 +114,10 @@ pub(crate) fn format_destination(dest: &Destination) -> String {
         Destination::Direct(id) => format!("direct:{}", id.cn),
         Destination::Broadcast => "broadcast".to_string(),
         Destination::Multicast(groups) => {
-            let joined: Vec<&str> = groups.iter().map(String::as_str).collect();
+            // `Arc<str>` is the canonical lean form for group fanout
+            // (closes #784); deref the inner `Arc<str>` to `&str` for
+            // the comma-joined wire shape.
+            let joined: Vec<&str> = groups.iter().map(|g| &**g).collect();
             format!("multicast:{}", joined.join(","))
         }
     }
@@ -217,7 +220,7 @@ mod tests {
     fn make_msg(payload: &[u8]) -> RoutableMessage {
         RoutableMessage {
             source: Identity {
-                cn: "test-cn".to_string(),
+                cn: "test-cn".into(),
                 fingerprint: Default::default(),
                 groups: {
                     let mut s = BTreeSet::new();
@@ -289,7 +292,7 @@ mod tests {
     #[test]
     fn json_destination_group() {
         let mut msg = make_msg(b"test");
-        msg.destination = Destination::Group("team-alpha".to_string());
+        msg.destination = Destination::Group("team-alpha".into());
         let (body, _) = serialize(&msg, PayloadFormat::Json, "inst").unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["destination"], "group:team-alpha");
@@ -299,7 +302,7 @@ mod tests {
     fn json_destination_direct() {
         let mut msg = make_msg(b"test");
         msg.destination = Destination::Direct(Identity {
-            cn: "target-user".to_string(),
+            cn: "target-user".into(),
             fingerprint: Default::default(),
             groups: BTreeSet::new(),
             tenant: None,
@@ -314,7 +317,7 @@ mod tests {
     #[test]
     fn json_destination_multicast() {
         let mut msg = make_msg(b"test");
-        msg.destination = Destination::Multicast(vec!["alpha".to_string(), "bravo".to_string()]);
+        msg.destination = Destination::Multicast(vec!["alpha".into(), "bravo".into()]);
         let (body, _) = serialize(&msg, PayloadFormat::Json, "inst").unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["destination"], "multicast:alpha,bravo");
@@ -504,11 +507,7 @@ mod tests {
         // to `";"`, `" "`, or URL-encoded `"%2C"` would silently
         // break every downstream parser that split on `","` to
         // recover the group list.
-        let dest = Destination::Multicast(vec![
-            "alpha".to_string(),
-            "bravo".to_string(),
-            "charlie".to_string(),
-        ]);
+        let dest = Destination::Multicast(vec!["alpha".into(), "bravo".into(), "charlie".into()]);
         let rendered = format_destination(&dest);
         assert_eq!(
             rendered, "multicast:alpha,bravo,charlie",
@@ -542,7 +541,7 @@ mod tests {
         // survives as an empty suffix rather than being silently
         // replaced (a regression that filled in a default would
         // silently route orphaned messages into a real group).
-        let dest = Destination::Group(String::new());
+        let dest = Destination::Group(String::new().into());
         let rendered = format_destination(&dest);
         assert_eq!(
             rendered, "group:",

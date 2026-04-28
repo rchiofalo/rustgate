@@ -792,7 +792,7 @@ impl MessageBuilder {
     ) -> RoutableMessage {
         let destination = match cot.destination {
             CotDestination::Broadcast => Destination::Broadcast,
-            CotDestination::Group(name) => Destination::Group(name),
+            CotDestination::Group(name) => Destination::Group(name.into()),
             CotDestination::Callsign(cn) => {
                 // Destination identities are used for routing lookup by CN only;
                 // they have no TLS session, so use the plaintext constructor.
@@ -902,7 +902,7 @@ mod tests {
         let msg = builder.build(&id, payload, "tcp");
 
         match &msg.destination {
-            Destination::Direct(target) => assert_eq!(target.cn, "bob"),
+            Destination::Direct(target) => assert_eq!(&*target.cn, "bob"),
             other => panic!("expected Direct, got {other:?}"),
         }
     }
@@ -915,7 +915,7 @@ mod tests {
         let msg = builder.build(&id, payload, "tcp");
 
         match &msg.destination {
-            Destination::Group(name) => assert_eq!(name, "alpha"),
+            Destination::Group(name) => assert_eq!(&**name, "alpha"),
             other => panic!("expected Group, got {other:?}"),
         }
     }

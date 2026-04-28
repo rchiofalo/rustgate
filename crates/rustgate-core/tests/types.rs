@@ -28,7 +28,7 @@ fn make_identity(cn: &str, fp: &str, groups: &[&str]) -> Identity {
 #[test]
 fn identity_creation_with_cn_fingerprint_groups() {
     let id = make_identity("alice", "aa:bb:cc", &["Alpha", "Bravo"]);
-    assert_eq!(id.cn, "alice");
+    assert_eq!(&*id.cn, "alice");
     assert_eq!(id.fingerprint, "aa:bb:cc");
     assert_eq!(id.groups.len(), 2);
 }
@@ -209,11 +209,11 @@ fn routable_message_with_broadcast_destination() {
 fn routable_message_with_group_destination() {
     let msg = RoutableMessage {
         source: make_source(),
-        destination: Destination::Group("team-alpha".to_string()),
+        destination: Destination::Group("team-alpha".into()),
         payload: Bytes::from_static(b"data"),
         metadata: make_metadata(),
     };
-    assert!(matches!(msg.destination, Destination::Group(ref g) if g == "team-alpha"));
+    assert!(matches!(msg.destination, Destination::Group(ref g) if &**g == "team-alpha"));
 }
 
 #[test]
@@ -225,7 +225,7 @@ fn routable_message_with_direct_destination() {
         payload: Bytes::from_static(b"secret"),
         metadata: make_metadata(),
     };
-    assert!(matches!(msg.destination, Destination::Direct(ref id) if id.cn == "bob"));
+    assert!(matches!(msg.destination, Destination::Direct(ref id) if &*id.cn == "bob"));
 }
 
 #[test]
@@ -304,7 +304,7 @@ fn routable_message_clone() {
         metadata: make_metadata(),
     };
     let cloned = msg.clone();
-    assert_eq!(cloned.source.cn, msg.source.cn);
+    assert_eq!(&*cloned.source.cn, &*msg.source.cn);
     assert_eq!(cloned.payload, msg.payload);
 }
 
@@ -314,9 +314,9 @@ fn routable_message_clone() {
 
 #[test]
 fn destination_group_name_preservation() {
-    let dest = Destination::Group("team-bravo".to_string());
+    let dest = Destination::Group("team-bravo".into());
     match &dest {
-        Destination::Group(name) => assert_eq!(name, "team-bravo"),
+        Destination::Group(name) => assert_eq!(&**name, "team-bravo"),
         other => panic!("expected Group variant, got {other:?}"),
     }
 }
@@ -335,9 +335,9 @@ fn destination_direct_identity_equality() {
 fn destination_pattern_matching_all_variants() {
     let variants: [Destination; 4] = [
         Destination::Broadcast,
-        Destination::Group("g".to_string()),
+        Destination::Group("g".into()),
         Destination::Direct(make_identity("x", "fp", &[])),
-        Destination::Multicast(vec!["a".to_string(), "b".to_string()]),
+        Destination::Multicast(vec!["a".into(), "b".into()]),
     ];
     for dest in &variants {
         match dest {
@@ -352,16 +352,16 @@ fn destination_pattern_matching_all_variants() {
 
 #[test]
 fn destination_clone_semantics() {
-    let dest = Destination::Group("ops".to_string());
+    let dest = Destination::Group("ops".into());
     let cloned = dest.clone();
-    assert!(matches!(cloned, Destination::Group(ref g) if g == "ops"));
+    assert!(matches!(cloned, Destination::Group(ref g) if &**g == "ops"));
 }
 
 #[test]
 fn destination_display() {
     assert_eq!(Destination::Broadcast.to_string(), "broadcast");
     assert_eq!(
-        Destination::Group("alpha".to_string()).to_string(),
+        Destination::Group("alpha".into()).to_string(),
         "group:alpha"
     );
     let id = make_identity("bob", "fp", &[]);

@@ -41,7 +41,7 @@ fn fast_retry_config() -> RetryConfig {
 fn make_msg(cn: &str) -> RoutableMessage {
     RoutableMessage {
         source: Identity {
-            cn: cn.to_string(),
+            cn: cn.into(),
             fingerprint: Default::default(),
             groups: {
                 let mut s = BTreeSet::new();

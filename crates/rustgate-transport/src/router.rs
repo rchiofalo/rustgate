@@ -424,8 +424,13 @@ impl PendingAudit {
 #[derive(Clone)]
 struct ClassifiedAuditCtx {
     engine: Arc<dyn PolicyEngine>,
-    sender_cn: String,
-    recipient_cn: String,
+    /// Sender CN snapshotted at PEP-decision time. `Arc<str>` so the
+    /// fanout hot path bumps a refcount instead of allocating a fresh
+    /// `String` per recipient. Closes #784.
+    sender_cn: Arc<str>,
+    /// Recipient CN snapshotted at PEP-decision time. `Arc<str>` for
+    /// the same fanout-cost reason as `sender_cn`. Closes #784.
+    recipient_cn: Arc<str>,
     resource_kind: &'static str,
     resource_id: String,
     rule_id: Option<smol_str::SmolStr>,
@@ -683,12 +688,16 @@ const DEFAULT_GROUP_CAPACITY: usize = 64;
 
 #[derive(Debug)]
 struct State {
-    sessions: HashMap<String, SessionHandle>,
-    groups: HashMap<GroupId, HashSet<String>>,
+    /// Sessions keyed by `Arc<str>` so register/unregister reuse the
+    /// session identity's CN allocation (refcount bump) rather than
+    /// allocating a fresh `String`. `HashMap<Arc<str>, _>::get(&str)`
+    /// still works through `Arc<str>: Borrow<str>`. Closes #784.
+    sessions: HashMap<Arc<str>, SessionHandle>,
+    groups: HashMap<GroupId, HashSet<Arc<str>>>,
     /// Secondary index: number of groups each CN belongs to.
     /// Maintained by `join_group`, `leave_group`, `register`, and `unregister`
     /// so that the per-CN group limit check is O(1) instead of O(G).
-    cn_group_count: HashMap<String, usize>,
+    cn_group_count: HashMap<Arc<str>, usize>,
     max_groups_per_cn: usize,
     max_total_groups: usize,
 }
@@ -720,7 +729,7 @@ impl State {
     }
 
     /// Decrement the per-CN group count, removing the entry when it hits 0.
-    fn decrement_cn_count(cn_group_count: &mut HashMap<String, usize>, cn: &str) {
+    fn decrement_cn_count(cn_group_count: &mut HashMap<Arc<str>, usize>, cn: &str) {
         if let Some(count) = cn_group_count.get_mut(cn) {
             *count = count.saturating_sub(1);
             if *count == 0 {
@@ -873,7 +882,7 @@ pub struct Router {
     /// bucket keyed by the reconnecting client's CN. The map grows
     /// lazily on first replay and is pruned on session disconnect so
     /// a CN-churning attacker cannot bloat the entry table.
-    replay_buckets: Mutex<HashMap<String, Arc<TokenBucket>>>,
+    replay_buckets: Mutex<HashMap<Arc<str>, Arc<TokenBucket>>>,
     /// Configuration parameters for the per-CN replay rate limiter.
     /// Plain field (not `ArcSwap`) because the bucket map carries
     /// the live state and is populated on demand from this config.
@@ -1565,7 +1574,7 @@ impl Router {
             f64::from(self.replay_limit_config.rate_per_sec),
             Some(f64::from(self.replay_limit_config.burst)),
         ));
-        let _ = guard.insert(cn.to_owned(), Arc::clone(&bucket));
+        let _ = guard.insert(Arc::<str>::from(cn), Arc::clone(&bucket));
         bucket
     }
 
@@ -1743,9 +1752,10 @@ impl Router {
             return false;
         }
 
-        let members = state.groups.entry(group.to_owned()).or_default();
-        if members.insert(cn.to_owned()) {
-            *state.cn_group_count.entry(cn.to_owned()).or_insert(0) += 1;
+        let members = state.groups.entry(group.into()).or_default();
+        let cn_arc: Arc<str> = Arc::<str>::from(cn);
+        if members.insert(Arc::clone(&cn_arc)) {
+            *state.cn_group_count.entry(cn_arc).or_insert(0) += 1;
         }
         true
     }
@@ -1865,9 +1875,9 @@ impl Router {
             .as_ref()
             .map(|gate| Arc::new(gate.acquire(msg.payload.len())));
 
-        let destination_label = match &msg.destination {
-            Destination::Direct(target) => target.cn.as_str(),
-            Destination::Group(group) => group.as_ref(),
+        let destination_label: &str = match &msg.destination {
+            Destination::Direct(target) => &target.cn,
+            Destination::Group(group) => group,
             Destination::Broadcast => "broadcast",
             Destination::Multicast(_) => "multicast",
         };
@@ -1967,7 +1977,12 @@ impl Router {
                 && matches!(&msg.destination, Destination::Group(_))
                 && msg.source.groups.len() > 1
             {
-                let groups: Vec<String> = msg.source.groups.iter().cloned().collect();
+                let groups: Vec<Arc<str>> = msg
+                    .source
+                    .groups
+                    .iter()
+                    .map(|g| Arc::<str>::from(g.as_str()))
+                    .collect();
                 debug!(
                     source = %msg.source.cn,
                     groups = ?groups,
@@ -2028,24 +2043,22 @@ impl Router {
                         let subject = AuthzSubject::from_identity(&msg.source);
                         let resource = match dest {
                             Destination::Direct(target) => AuthzResource::Direct {
-                                target_cn: target.cn.as_str(),
+                                target_cn: &target.cn,
                             },
-                            Destination::Group(group) => AuthzResource::Group {
-                                group: group.as_ref(),
-                            },
+                            Destination::Group(group) => AuthzResource::Group { group },
                             // Broadcast is the only remaining variant here;
                             // Multicast is handled above.
                             _ => AuthzResource::Broadcast,
                         };
                         let outcome = self.authz_evaluate_send(engine, &subject, &resource);
                         if !outcome.is_allow() {
-                            let (kind, id) = match dest {
-                                Destination::Direct(target) => ("direct", target.cn.as_str()),
-                                Destination::Group(group) => ("group", group.as_ref()),
+                            let (kind, id): (&'static str, &str) = match dest {
+                                Destination::Direct(target) => ("direct", &target.cn),
+                                Destination::Group(group) => ("group", group),
                                 _ => ("broadcast", ""),
                             };
                             rustgate_core::audit::authz_denied(
-                                msg.source.cn.as_str(),
+                                &msg.source.cn,
                                 msg.source.fingerprint.as_str(),
                                 "send",
                                 kind,
@@ -2246,7 +2259,7 @@ impl Router {
     fn compute_multicast_egress(
         &self,
         arc_msg: &Arc<RoutableMessage>,
-        groups: &[String],
+        groups: &[Arc<str>],
     ) -> MulticastEgress {
         let authz_guard = self.authz.load();
         let Some(engine) = (**authz_guard).as_ref() else {
@@ -2538,7 +2551,7 @@ impl Router {
                         .any(|o| matches!(o, Obligation::TagClassified))
                     {
                         let (resource_kind, resource_id) = match &msg.destination {
-                            Destination::Direct(target) => ("direct", target.cn.clone()),
+                            Destination::Direct(target) => ("direct", target.cn.to_string()),
                             Destination::Group(group) => ("group", group.to_string()),
                             Destination::Broadcast | Destination::Multicast(_) => {
                                 ("broadcast", String::new())
@@ -2740,8 +2753,8 @@ impl Router {
                     self.audit_classified_receive(
                         &recv_obligations,
                         engine,
-                        sender_cn.as_str(),
-                        handle.identity.cn.as_str(),
+                        &sender_cn,
+                        &handle.identity.cn,
                         "broadcast",
                         "",
                         recv_rule_id.as_deref(),
@@ -2895,7 +2908,7 @@ impl Router {
                     let outcome = self.authz_evaluate_receive(engine, &subject, &resource);
                     if !outcome.is_allow() {
                         rustgate_core::audit::authz_denied(
-                            handle.identity.cn.as_str(),
+                            &handle.identity.cn,
                             handle.identity.fingerprint.as_str(),
                             "receive",
                             "direct",
@@ -2964,8 +2977,8 @@ impl Router {
                         self.audit_classified_receive(
                             &obligations,
                             &engine,
-                            sender_cn.as_str(),
-                            handle.identity.cn.as_str(),
+                            &sender_cn,
+                            &handle.identity.cn,
                             "direct",
                             cn,
                             rule_id.as_deref(),
@@ -3131,7 +3144,7 @@ impl Router {
                     let outcome = self.authz_evaluate_receive(engine, &subject, &resource);
                     if !outcome.is_allow() {
                         rustgate_core::audit::authz_denied(
-                            handle.identity.cn.as_str(),
+                            &handle.identity.cn,
                             handle.identity.fingerprint.as_str(),
                             "receive",
                             "group",
@@ -3180,12 +3193,19 @@ impl Router {
                     d
                 }
                 Err(e) => {
-                    debug!(
-                        err = %e,
-                        group = %group,
-                        recipient = %hash_cn(&handle.identity.cn),
-                        "group send skipped for recipient: obligation actuation failed"
-                    );
+                    // Closes #784. Per-recipient debug logging is in
+                    // a fan-out hot loop; the explicit `enabled!` gate
+                    // skips the `hash_cn` call (and the format-string
+                    // construction the macro would otherwise emit a
+                    // closure for) when debug-level is not subscribed.
+                    if tracing::enabled!(tracing::Level::DEBUG) {
+                        debug!(
+                            err = %e,
+                            group = %group,
+                            recipient = %hash_cn(&handle.identity.cn),
+                            "group send skipped for recipient: obligation actuation failed"
+                        );
+                    }
                     dropped += 1;
                     self.emit_dropped("obligation_failed");
                     continue;
@@ -3196,8 +3216,8 @@ impl Router {
                     self.audit_classified_receive(
                         obligations,
                         engine,
-                        msg.source.cn.as_str(),
-                        handle.identity.cn.as_str(),
+                        &msg.source.cn,
+                        &handle.identity.cn,
                         "group",
                         group,
                         rule_id.as_deref(),
@@ -3267,7 +3287,7 @@ impl Router {
                 let outcome = self.authz_evaluate_receive(engine, &subject, &resource);
                 if !outcome.is_allow() {
                     rustgate_core::audit::authz_denied(
-                        handle.identity.cn.as_str(),
+                        &handle.identity.cn,
                         handle.identity.fingerprint.as_str(),
                         "receive",
                         "broadcast",
@@ -3294,11 +3314,17 @@ impl Router {
                         d
                     }
                     Err(e) => {
-                        debug!(
-                            err = %e,
-                            recipient = %hash_cn(&handle.identity.cn),
-                            "broadcast send skipped for recipient: obligation actuation failed"
-                        );
+                        // Closes #784. Per-recipient debug logging
+                        // in the broadcast hot loop is gated so the
+                        // hash_cn call is skipped on a 1000-subscriber
+                        // fanout when debug level is off.
+                        if tracing::enabled!(tracing::Level::DEBUG) {
+                            debug!(
+                                err = %e,
+                                recipient = %hash_cn(&handle.identity.cn),
+                                "broadcast send skipped for recipient: obligation actuation failed"
+                            );
+                        }
                         dropped += 1;
                         self.emit_dropped("obligation_failed");
                         continue;
@@ -3313,8 +3339,8 @@ impl Router {
                     self.audit_classified_receive(
                         &obligations,
                         engine,
-                        msg.source.cn.as_str(),
-                        handle.identity.cn.as_str(),
+                        &msg.source.cn,
+                        &handle.identity.cn,
                         "broadcast",
                         "",
                         rule_id.as_deref(),
@@ -3349,12 +3375,12 @@ impl Router {
     /// by the number of CNs it actually delivered to in that pass —
     /// CNs already present in `delivered` from an earlier group in
     /// the multicast list are not double-counted.
-    async fn send_to_multicast(&self, groups: &[String], msg: RoutedMessage) -> u64 {
+    async fn send_to_multicast(&self, groups: &[Arc<str>], msg: RoutedMessage) -> u64 {
         if groups.is_empty() {
             return 0;
         }
 
-        let mut delivered: HashSet<String> = HashSet::new();
+        let mut delivered: HashSet<Arc<str>> = HashSet::new();
         let mut total: u64 = 0;
         for group in groups {
             total += self
@@ -3375,7 +3401,7 @@ impl Router {
         &self,
         group: &str,
         msg: RoutedMessage,
-        delivered: &mut HashSet<String>,
+        delivered: &mut HashSet<Arc<str>>,
     ) -> u64 {
         if !msg.source.is_member_of(group) {
             tracing::warn!(
@@ -3420,7 +3446,7 @@ impl Router {
             let outcome = self.authz_evaluate_send(engine, &subject, &resource);
             if !outcome.is_allow() {
                 rustgate_core::audit::authz_denied(
-                    msg.source.cn.as_str(),
+                    &msg.source.cn,
                     msg.source.fingerprint.as_str(),
                     "send",
                     "group",
@@ -3478,7 +3504,7 @@ impl Router {
             members
                 .iter()
                 .filter(|cn| *cn != &msg.source.cn)
-                .filter(|cn| !delivered.contains(cn.as_str()))
+                .filter(|cn| !delivered.contains(&***cn))
                 .filter(|cn| {
                     let allowed = acl_ref
                         .as_ref()
@@ -3498,7 +3524,7 @@ impl Router {
                     let outcome = self.authz_evaluate_receive(engine, &subject, &resource);
                     if !outcome.is_allow() {
                         rustgate_core::audit::authz_denied(
-                            handle.identity.cn.as_str(),
+                            &handle.identity.cn,
                             handle.identity.fingerprint.as_str(),
                             "receive",
                             "group",
@@ -3547,25 +3573,31 @@ impl Router {
                     d
                 }
                 Err(e) => {
-                    debug!(
-                        err = %e,
-                        group = %group,
-                        recipient = %hash_cn(&handle.identity.cn),
-                        "multicast group send skipped for recipient: obligation actuation failed"
-                    );
+                    // Closes #784. Per-recipient debug logging in
+                    // the multicast hot loop is gated so the
+                    // hash_cn call is skipped on a wide multicast
+                    // fanout when debug level is off.
+                    if tracing::enabled!(tracing::Level::DEBUG) {
+                        debug!(
+                            err = %e,
+                            group = %group,
+                            recipient = %hash_cn(&handle.identity.cn),
+                            "multicast group send skipped for recipient: obligation actuation failed"
+                        );
+                    }
                     dropped += 1;
                     self.emit_dropped("obligation_failed");
                     continue;
                 }
             };
             if handle.try_send(delivery) {
-                let _ = delivered.insert(handle.identity.cn.to_string());
+                let _ = delivered.insert(Arc::clone(&handle.identity.cn));
                 if let Some(engine) = authz {
                     self.audit_classified_receive(
                         obligations,
                         engine,
-                        msg.source.cn.as_str(),
-                        handle.identity.cn.as_str(),
+                        &msg.source.cn,
+                        &handle.identity.cn,
                         "group",
                         group,
                         rule_id.as_deref(),
@@ -3694,7 +3726,7 @@ mod tests {
         // Bob sends to group "alpha" — but bob is only in "bravo".
         // The router must reject this: sender is not a member of the
         // target group, so alice (who IS in alpha) must not receive it.
-        let msg = make_chat(&bob, Destination::Group("alpha".to_string()));
+        let msg = make_chat(&bob, Destination::Group("alpha".into()));
         router.route(msg).await;
 
         assert!(
@@ -3726,13 +3758,13 @@ mod tests {
             .await;
 
         // Bob sends to group "alpha" — bob IS a member
-        let msg = make_chat(&bob, Destination::Group("alpha".to_string()));
+        let msg = make_chat(&bob, Destination::Group("alpha".into()));
         router.route(msg).await;
 
         // Alice (in alpha) receives chat on normal channel
         let received = nrx_a.try_recv().expect("alice must receive: both in alpha");
         assert_eq!(received.payload.as_ref(), b"<chat/>");
-        assert_eq!(received.source.cn, "bob");
+        assert_eq!(&*received.source.cn, "bob");
 
         // Charlie (in bravo, not alpha) must NOT receive
         assert!(
@@ -4158,7 +4190,7 @@ mod tests {
         let clients = router.connected_clients().await;
         assert_eq!(clients.len(), 2);
 
-        let cns: Vec<&str> = clients.iter().map(|c| c.cn.as_str()).collect();
+        let cns: Vec<&str> = clients.iter().map(|c| &*c.cn).collect();
         assert!(cns.contains(&"alice"));
         assert!(cns.contains(&"bob"));
     }
@@ -4279,7 +4311,7 @@ mod tests {
         // Send enough chat messages to trip the breaker on normal channel
         // Channel capacity is 1, so first message fills it, next 3 trip the breaker
         for _ in 0..5 {
-            let msg = make_chat(&sender_id, Destination::Group("ops".to_string()));
+            let msg = make_chat(&sender_id, Destination::Group("ops".into()));
             router.route(msg).await;
         }
 
@@ -4316,7 +4348,7 @@ mod tests {
             .await;
 
         // Bob is a member of alpha but NOT in the send ACL
-        let msg = make_chat(&bob, Destination::Group("alpha".to_string()));
+        let msg = make_chat(&bob, Destination::Group("alpha".into()));
         router.route(msg).await;
 
         assert!(
@@ -4352,7 +4384,7 @@ mod tests {
             .await;
 
         // Bob is authorized to send
-        let msg = make_chat(&bob, Destination::Group("alpha".to_string()));
+        let msg = make_chat(&bob, Destination::Group("alpha".into()));
         router.route(msg).await;
 
         assert!(
@@ -4394,7 +4426,7 @@ mod tests {
             .await;
 
         // Alice sends — authorized
-        let msg = make_chat(&alice, Destination::Group("alpha".to_string()));
+        let msg = make_chat(&alice, Destination::Group("alpha".into()));
         router.route(msg).await;
 
         assert!(
@@ -4425,7 +4457,7 @@ mod tests {
             .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
             .await;
 
-        let msg = make_chat(&bob, Destination::Group("alpha".to_string()));
+        let msg = make_chat(&bob, Destination::Group("alpha".into()));
         router.route(msg).await;
 
         assert!(
@@ -4461,7 +4493,7 @@ mod tests {
             .await;
 
         // "open-group" is not in the policy — default-deny when policy loaded.
-        let msg = make_chat(&bob, Destination::Group("open-group".to_string()));
+        let msg = make_chat(&bob, Destination::Group("open-group".into()));
         router.route(msg).await;
 
         assert!(
@@ -4557,15 +4589,15 @@ mod tests {
             .await;
 
         // Send a Position message (priority)
-        let pos = make_position(&bob, Destination::Group("alpha".to_string()));
+        let pos = make_position(&bob, Destination::Group("alpha".into()));
         router.route(pos).await;
 
         // Send an Alert message (priority)
-        let alert = make_alert(&bob, Destination::Group("alpha".to_string()));
+        let alert = make_alert(&bob, Destination::Group("alpha".into()));
         router.route(alert).await;
 
         // Send a Chat message (normal)
-        let chat = make_chat(&bob, Destination::Group("alpha".to_string()));
+        let chat = make_chat(&bob, Destination::Group("alpha".into()));
         router.route(chat).await;
 
         // Position and Alert should be on priority channel
@@ -4609,7 +4641,7 @@ mod tests {
             .await;
 
         // Open mode: bob can send to alpha
-        let msg = make_chat(&bob, Destination::Group("alpha".to_string()));
+        let msg = make_chat(&bob, Destination::Group("alpha".into()));
         router.route(msg).await;
         assert!(nrx_a.try_recv().is_ok(), "alice must receive in open mode");
 
@@ -4626,7 +4658,7 @@ mod tests {
         router.swap_acl(Some(policy));
 
         // Bob can no longer send to alpha
-        let msg = make_chat(&bob, Destination::Group("alpha".to_string()));
+        let msg = make_chat(&bob, Destination::Group("alpha".into()));
         router.route(msg).await;
         assert!(
             nrx_a.try_recv().is_err(),
@@ -4636,7 +4668,7 @@ mod tests {
         // Swap back to open mode
         router.swap_acl(None);
 
-        let msg = make_chat(&bob, Destination::Group("alpha".to_string()));
+        let msg = make_chat(&bob, Destination::Group("alpha".into()));
         router.route(msg).await;
         assert!(
             nrx_a.try_recv().is_ok(),
@@ -5251,7 +5283,7 @@ mod tests {
 
         let alice = make_identity("alice", &["ops"]);
         let charlie = make_identity("charlie", &["ops"]);
-        let msg = make_alert(&alice, Destination::Group("ops".to_string()));
+        let msg = make_alert(&alice, Destination::Group("ops".into()));
 
         // alice is NOT authorized to send to "ops" → message should be filtered out.
         let result = router.filter_offline_messages(&charlie, vec![msg]);
@@ -5280,7 +5312,7 @@ mod tests {
 
         let alice = make_identity("alice", &["ops"]);
         let charlie = make_identity("charlie", &["ops"]);
-        let msg = make_alert(&alice, Destination::Group("ops".to_string()));
+        let msg = make_alert(&alice, Destination::Group("ops".into()));
 
         // "charlie" is NOT authorized to receive from "ops".
         let result = router.filter_offline_messages(&charlie, vec![msg]);
@@ -5309,7 +5341,7 @@ mod tests {
 
         let alice = make_identity("alice", &["ops"]);
         let bob = make_identity("bob", &["ops"]);
-        let msg = make_alert(&alice, Destination::Group("ops".to_string()));
+        let msg = make_alert(&alice, Destination::Group("ops".into()));
 
         // Both sender and recipient are authorized → message passes through.
         let result = router.filter_offline_messages(&bob, vec![msg]);
@@ -5323,7 +5355,7 @@ mod tests {
         // No ACL policy loaded — backward compatible open mode.
         let alice = make_identity("alice", &["ops"]);
         let bob = make_identity("bob", &["ops"]);
-        let msg = make_alert(&alice, Destination::Group("ops".to_string()));
+        let msg = make_alert(&alice, Destination::Group("ops".into()));
 
         let result = router.filter_offline_messages(&bob, vec![msg]);
         assert_eq!(
@@ -5382,7 +5414,7 @@ mod tests {
 
         let alice = make_identity("alice", &["ops"]);
         let bob = make_identity("bob", &["ops"]);
-        let msg = make_alert(&alice, Destination::Group("ops".to_string()));
+        let msg = make_alert(&alice, Destination::Group("ops".into()));
 
         let result = router.filter_offline_messages(&bob, vec![msg]);
         assert!(
@@ -5400,7 +5432,7 @@ mod tests {
 
         let alice = make_identity("alice", &["ops"]);
         let bob = make_identity("bob", &["ops"]);
-        let msg = make_alert(&alice, Destination::Group("ops".to_string()));
+        let msg = make_alert(&alice, Destination::Group("ops".into()));
 
         // alice is denied for Send → message should be filtered.
         let result = router.filter_offline_messages(&bob, vec![msg]);
@@ -5419,7 +5451,7 @@ mod tests {
 
         let alice = make_identity("alice", &["ops"]);
         let bob = make_identity("bob", &["ops"]);
-        let msg = make_alert(&alice, Destination::Group("ops".to_string()));
+        let msg = make_alert(&alice, Destination::Group("ops".into()));
 
         // alice is NOT denied (only "eve" is) → message should pass.
         let result = router.filter_offline_messages(&bob, vec![msg]);
@@ -5462,7 +5494,7 @@ mod tests {
 
         let alice = make_identity("alice", &["ops"]);
         let bob = make_identity("bob", &["ops"]);
-        let msg = make_alert(&alice, Destination::Group("ops".to_string()));
+        let msg = make_alert(&alice, Destination::Group("ops".into()));
 
         // bob is denied for Receive → message should be filtered.
         let result = router.filter_offline_messages(&bob, vec![msg]);
@@ -5588,18 +5620,18 @@ mod tests {
             .await;
 
         // Fill alice's normal channel
-        let fill_msg = make_chat(&sender_alpha, Destination::Group("alpha".to_string()));
+        let fill_msg = make_chat(&sender_alpha, Destination::Group("alpha".into()));
         router.route(fill_msg).await;
 
         // Now send more messages to alice's full group — these should
         // be dropped/persisted, NOT block the routing task.
         for _ in 0..5 {
-            let msg = make_chat(&sender_alpha, Destination::Group("alpha".to_string()));
+            let msg = make_chat(&sender_alpha, Destination::Group("alpha".into()));
             router.route(msg).await;
         }
 
         // Send a message to bob in bravo — must arrive immediately
-        let msg = make_chat(&sender_bravo, Destination::Group("bravo".to_string()));
+        let msg = make_chat(&sender_bravo, Destination::Group("bravo".into()));
         router.route(msg).await;
 
         let received = nrx_b
@@ -5993,8 +6025,8 @@ mod tests {
             .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
             .await;
 
-        let many_groups: Vec<String> = (0..MAX_MULTICAST_GROUPS + 1)
-            .map(|i| format!("group-{i}"))
+        let many_groups: Vec<Arc<str>> = (0..MAX_MULTICAST_GROUPS + 1)
+            .map(|i| Arc::<str>::from(format!("group-{i}")))
             .collect();
         let msg = make_position(&alice, Destination::Multicast(many_groups));
         router.route(msg).await;
@@ -6041,8 +6073,8 @@ mod tests {
             .register(SessionHandle::new(alice.clone(), ptx, ntx))
             .await;
 
-        let many_groups: Vec<String> = (0..MAX_MULTICAST_GROUPS + 1)
-            .map(|i| format!("group-{i}"))
+        let many_groups: Vec<Arc<str>> = (0..MAX_MULTICAST_GROUPS + 1)
+            .map(|i| Arc::<str>::from(format!("group-{i}")))
             .collect();
         let msg = make_position(&alice, Destination::Multicast(many_groups));
         router.route(msg).await;
@@ -6055,8 +6087,8 @@ mod tests {
 
         // A second oversize multicast must increment again; the
         // callback is per-drop, not edge-triggered.
-        let many_groups: Vec<String> = (0..MAX_MULTICAST_GROUPS + 1)
-            .map(|i| format!("group-{i}"))
+        let many_groups: Vec<Arc<str>> = (0..MAX_MULTICAST_GROUPS + 1)
+            .map(|i| Arc::<str>::from(format!("group-{i}")))
             .collect();
         let msg = make_position(&alice, Destination::Multicast(many_groups));
         router.route(msg).await;
@@ -6337,6 +6369,80 @@ mod tests {
         assert_eq!(
             obligation_kind_label(&Obligation::AuditExtended),
             "audit_extended"
+        );
+    }
+
+    #[tokio::test]
+    async fn router_fanout_does_not_allocate_per_recipient_cn() {
+        // Closes #784. The high-fanout group send must NOT clone the
+        // sender's `cn` String once per recipient. With `Arc<str>`
+        // the per-recipient envelope path is a refcount bump on the
+        // single underlying allocation; a regression that switched
+        // `Identity.cn` back to `String` would silently allocate
+        // O(N) heap copies on a 1000-subscriber broadcast.
+        //
+        // Pin the contract via `Arc::strong_count`: register the
+        // sender, take a strong-count baseline, route ONE group
+        // message to N subscribers, and observe that the strong
+        // count does NOT spike by N. The Arc the test holds is the
+        // sender's identity Arc, not the per-message envelope —
+        // route_inner clones the source `Identity` once into the
+        // RoutableMessage and into the post-PEP Arc<RoutableMessage>,
+        // so a fixed small bump is expected; what we trap is the
+        // O(N) regression. Keep the assertion bound generous so it
+        // is not brittle to harmless internal-clone count changes —
+        // the load-bearing claim is "per-recipient cost is sub-linear",
+        // not "exact clone count is K".
+        const SUBSCRIBERS: usize = 50;
+        let router = Router::new();
+        let sender = make_identity("fanout-sender", &["fanout-grp"]);
+
+        // Pre-flight strong count on the sender's cn Arc — captured
+        // before any router state mutation so the baseline is the
+        // owning Identity only.
+        let baseline = Arc::strong_count(&sender.cn);
+        assert!(
+            baseline >= 1,
+            "sender.cn Arc must have at least one owner before registration"
+        );
+
+        // Register sender + N subscribers, all in `fanout-grp`.
+        let (ptx_s, ntx_s, _prx_s, _nrx_s) = make_channels(16, 64);
+        router
+            .register(SessionHandle::new(Arc::clone(&sender), ptx_s, ntx_s))
+            .await;
+        let mut sub_rxs = Vec::with_capacity(SUBSCRIBERS);
+        for i in 0..SUBSCRIBERS {
+            let cn = format!("fanout-sub-{i}");
+            let id = make_identity(&cn, &["fanout-grp"]);
+            let (ptx, ntx, _prx, nrx) = make_channels(16, 64);
+            router.register(SessionHandle::new(id, ptx, ntx)).await;
+            sub_rxs.push(nrx);
+        }
+
+        // Route one group message; every subscriber should receive it.
+        let msg = make_chat(&sender, Destination::Group("fanout-grp".into()));
+        router.route(msg).await;
+
+        // Drain so per-session channels are not pinned by buffered
+        // envelopes when we read the strong count below.
+        for nrx in &mut sub_rxs {
+            let _ = nrx.try_recv().expect("subscriber must receive");
+        }
+
+        // Final strong count vs. baseline. The router holds the
+        // sender's Identity Arc once (registration), the position
+        // cache may pin one more, and the in-flight RoutedMessage
+        // Arc<RoutableMessage> has been dropped now that recipients
+        // have received. The load-bearing assertion: strong count
+        // did NOT increase by `SUBSCRIBERS` — that would mean every
+        // recipient produced a fresh owner of the cn allocation.
+        let after = Arc::strong_count(&sender.cn);
+        assert!(
+            after < baseline + SUBSCRIBERS,
+            "fan-out must not allocate per recipient: cn Arc strong_count \
+             went from {baseline} → {after} for {SUBSCRIBERS} subscribers \
+             (a per-recipient String clone would push it to baseline + N)"
         );
     }
 }

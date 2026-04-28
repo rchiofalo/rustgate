@@ -213,7 +213,7 @@ async fn handle_inbound_peer(
                                 debug!(peer_cn = %hash_cn(&read_cn), "V1 heartbeat received");
                                 last_heartbeat_received = tokio::time::Instant::now();
                             } else {
-                                on_message(read_cn.clone(), data.freeze());
+                                on_message(read_cn.to_string(), data.freeze());
                             }
                         }
                         Some(Err(e)) => {

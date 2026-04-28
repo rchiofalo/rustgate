@@ -400,7 +400,10 @@ impl<'a> Subject<'a> {
     /// precomputed hash. Zero-work per call on the dataplane hot path.
     pub fn with_hash(id: &'a Identity, subject_hash: SubjectHash) -> Self {
         Self {
-            cn: id.cn.as_str(),
+            // `id.cn` is now `Arc<str>`; deref coercion via `&*` yields
+            // the borrowed `&str` Subject expects without paying for a
+            // clone or (unstable) `Arc::as_str` call. Closes #784.
+            cn: &id.cn,
             spiffe_id: id.spiffe_id.as_deref(),
             groups: &id.groups,
             attributes: id.attributes.as_ref(),
@@ -837,7 +840,10 @@ mod model_tests {
         // slices on the hot path.
         let id = plaintext_identity_for_subject();
         let subj = Subject::from_identity(&id);
-        assert!(std::ptr::eq(subj.cn, id.cn.as_str()));
+        // `id.cn` is `Arc<str>`; deref to the inner `str` slice and
+        // compare addresses. Subject::from_identity stores `&id.cn`
+        // (deref-coerced to `&str`), pointing at the same byte slice.
+        assert!(std::ptr::eq(subj.cn, &*id.cn));
         assert!(std::ptr::eq(subj.groups, &id.groups));
         assert!(std::ptr::eq(subj.attributes, id.attributes.as_ref()));
         assert!(std::ptr::eq(subj.fingerprint, id.fingerprint.as_str()));

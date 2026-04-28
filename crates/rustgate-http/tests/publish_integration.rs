@@ -19,7 +19,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 fn make_msg(cn: &str, protocol: &str, msg_type: MessageType) -> RoutableMessage {
     RoutableMessage {
         source: Identity {
-            cn: cn.to_string(),
+            cn: cn.into(),
             fingerprint: Default::default(),
             groups: {
                 let mut s = BTreeSet::new();

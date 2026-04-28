@@ -211,7 +211,7 @@ mod tests {
     #[tokio::test]
     async fn identity_exposes_cn_from_client_cert() {
         let (session, _peer, _client) = establish_test_session("route-client", &["alpha"]).await;
-        assert_eq!(session.identity().cn, "route-client");
+        assert_eq!(&*session.identity().cn, "route-client");
     }
 
     #[tokio::test]
@@ -232,7 +232,7 @@ mod tests {
         let arc_a = session.identity_arc();
         let arc_b = session.identity_arc();
         assert!(Arc::ptr_eq(&arc_a, &arc_b));
-        assert_eq!(arc_a.cn, "arc-client");
+        assert_eq!(&*arc_a.cn, "arc-client");
     }
 
     #[tokio::test]
@@ -250,8 +250,8 @@ mod tests {
         // ACL enforcement on the write path.
         let (session, _peer, _client) = establish_test_session("split-client", &["shared"]).await;
         let (reader, writer) = session.split();
-        assert_eq!(reader.identity().cn, "split-client");
-        assert_eq!(writer.identity().cn, "split-client");
+        assert_eq!(&*reader.identity().cn, "split-client");
+        assert_eq!(&*writer.identity().cn, "split-client");
         assert!(reader.identity().groups.contains("shared"));
         assert!(writer.identity().groups.contains("shared"));
     }

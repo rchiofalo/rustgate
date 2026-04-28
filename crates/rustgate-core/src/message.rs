@@ -6,13 +6,14 @@
 //! federation peer, or NATS subscription — is normalized into a
 //! [`RoutableMessage`] before being handed to the router.
 
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 #[cfg(feature = "fuzz")]
 use arbitrary::Arbitrary;
 use bytes::Bytes;
 
-use crate::identity::{GroupId, Identity};
+use crate::identity::Identity;
 
 /// Source protocol identifier for messages originating from federation peers.
 pub const SOURCE_FEDERATION: &str = "federation";
@@ -76,7 +77,11 @@ impl Metadata {
 #[derive(Debug, Clone)]
 pub enum Destination {
     /// Deliver to all sessions whose certificate OU includes this group.
-    Group(GroupId),
+    ///
+    /// Wrapped in `Arc<str>` so per-recipient fan-out clones are a
+    /// refcount bump rather than a heap allocation. Display / Debug /
+    /// `as_ref::<str>` are forwarded unchanged. Closes #784.
+    Group(Arc<str>),
     /// Deliver to the session whose certificate CN matches this identity.
     Direct(Identity),
     /// Deliver to all connected sessions (except the sender).
@@ -85,7 +90,7 @@ pub enum Destination {
     ///
     /// Used by SA multicast routing to fan a single message out to
     /// several groups in one routing pass.
-    Multicast(Vec<GroupId>),
+    Multicast(Vec<Arc<str>>),
 }
 
 impl Destination {
@@ -170,17 +175,18 @@ impl<'a> Arbitrary<'a> for Destination {
                 let group: String = (0..len)
                     .map(|_| u.int_in_range(b'a'..=b'z').map(|b| b as char))
                     .collect::<arbitrary::Result<_>>()?;
-                Ok(Self::Group(group))
+                Ok(Self::Group(Arc::<str>::from(group)))
             }
             2 => Ok(Self::Direct(u.arbitrary()?)),
             _ => {
                 let count = u.int_in_range(0..=4)?;
-                let groups: Vec<String> = (0..count)
+                let groups: Vec<Arc<str>> = (0..count)
                     .map(|_| {
                         let len = u.int_in_range(1..=16)?;
                         (0..len)
                             .map(|_| u.int_in_range(b'a'..=b'z').map(|b| b as char))
                             .collect::<arbitrary::Result<String>>()
+                            .map(Arc::<str>::from)
                     })
                     .collect::<arbitrary::Result<_>>()?;
                 Ok(Self::Multicast(groups))
@@ -245,7 +251,21 @@ impl std::fmt::Display for Destination {
             Self::Broadcast => f.write_str("broadcast"),
             Self::Group(g) => write!(f, "group:{g}"),
             Self::Direct(id) => write!(f, "direct:{}", id.cn),
-            Self::Multicast(groups) => write!(f, "multicast:[{}]", groups.join(",")),
+            Self::Multicast(groups) => {
+                // `Arc<str>` does not impl `Iterator::join`. Render each
+                // group with comma separators preserving the previous
+                // wire-stable shape `multicast:[a,b,c]`.
+                f.write_str("multicast:[")?;
+                let mut first = true;
+                for g in groups {
+                    if !first {
+                        f.write_str(",")?;
+                    }
+                    first = false;
+                    f.write_str(g)?;
+                }
+                f.write_str("]")
+            }
         }
     }
 }
@@ -283,12 +303,12 @@ mod tests {
     fn destination_display() {
         assert_eq!(Destination::Broadcast.to_string(), "broadcast");
         assert_eq!(
-            Destination::Group("team-alpha".to_string()).to_string(),
+            Destination::Group("team-alpha".into()).to_string(),
             "group:team-alpha"
         );
 
         let id = Identity {
-            cn: "alice".to_string(),
+            cn: std::sync::Arc::<str>::from("alice"),
             fingerprint: "abc123".to_string(),
             groups: std::collections::BTreeSet::new(),
             tenant: None,

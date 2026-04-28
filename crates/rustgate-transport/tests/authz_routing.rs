@@ -160,7 +160,7 @@ async fn no_engine_installed_behaves_as_before() {
         .route(chat(&bob, Destination::Group("alpha".into())))
         .await;
     let got = nrx_a.try_recv().expect("alice should receive");
-    assert_eq!(got.source.cn, "bob");
+    assert_eq!(&*got.source.cn, "bob");
 }
 
 #[tokio::test]
@@ -564,7 +564,7 @@ async fn allow_with_mask_payload_for_receive_strips_direct_body() {
         "message type must be coerced to other:masked"
     );
     // Envelope fields preserved for downstream rendering.
-    assert_eq!(got.source.cn, "alice");
+    assert_eq!(&*got.source.cn, "alice");
 }
 
 /// Broadcast must apply `MaskPoint` on Receive per-recipient without

@@ -36,7 +36,7 @@ proptest! {
         groups in valid_groups_strategy(),
     ) {
         let identity = Identity::new(cn.clone(), fp.clone(), groups.clone()).unwrap();
-        prop_assert_eq!(&identity.cn, &cn);
+        prop_assert_eq!(&*identity.cn, cn.as_str());
         prop_assert_eq!(&identity.fingerprint, &fp);
         prop_assert_eq!(&identity.groups, &groups);
     }
@@ -58,7 +58,7 @@ proptest! {
         groups in valid_groups_strategy(),
     ) {
         let identity = Identity::plaintext(cn.clone(), groups).unwrap();
-        prop_assert_eq!(&identity.cn, &cn);
+        prop_assert_eq!(&*identity.cn, cn.as_str());
         prop_assert!(identity.fingerprint.is_empty());
     }
 

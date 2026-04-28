@@ -41,15 +41,19 @@ pub fn routable_to_federated_event(
         }
     }
 
-    // If destination is a specific group, ensure it's in federate_groups
+    // If destination is a specific group, ensure it's in federate_groups.
+    // `Destination::Group` / `Multicast` are now `Arc<str>` for fan-out
+    // (closes #784); the wire format remains `Vec<String>`, so deref the
+    // `Arc<str>` to `&str` for the membership probe and clone bytes
+    // into a fresh `String` only when actually appending.
     match &msg.destination {
-        Destination::Group(group_id) if !event.federate_groups.contains(group_id) => {
-            event.federate_groups.push(group_id.clone());
+        Destination::Group(group_id) if !event.federate_groups.iter().any(|g| g == &**group_id) => {
+            event.federate_groups.push(group_id.to_string());
         }
         Destination::Multicast(groups) => {
             for group_id in groups {
-                if !event.federate_groups.contains(group_id) {
-                    event.federate_groups.push(group_id.clone());
+                if !event.federate_groups.iter().any(|g| g == &**group_id) {
+                    event.federate_groups.push(group_id.to_string());
                 }
             }
         }
@@ -123,7 +127,7 @@ pub fn federated_event_to_routable(
     // authorization claim — the local ACL/authz layer re-evaluates
     // delivery on the receive side.
     let destination = if event.federate_groups.len() == 1 {
-        Destination::Group(event.federate_groups[0].clone())
+        Destination::Group(event.federate_groups[0].as_str().into())
     } else {
         Destination::Broadcast
     };
@@ -284,7 +288,7 @@ mod tests {
                 spiffe_id: None,
                 attributes: std::sync::Arc::new(std::collections::BTreeMap::new()),
             },
-            destination: Destination::Group("Delta".to_string()),
+            destination: Destination::Group("Delta".into()),
             payload: Bytes::from_static(sample_xml()),
             metadata: Metadata {
                 received_at: SystemTime::now(),
@@ -305,7 +309,7 @@ mod tests {
         let event = xml_to_federated_event(sample_xml(), &empty_metadata()).expect("conversion");
         let msg = federated_event_to_routable(&event, "peer-1", "fingerprint-abc", false)
             .expect("conversion");
-        assert_eq!(msg.source.cn, "peer-1");
+        assert_eq!(&*msg.source.cn, "peer-1");
         assert_eq!(msg.source.fingerprint, "fingerprint-abc");
     }
 
@@ -336,7 +340,7 @@ mod tests {
         };
         let msg = federated_event_to_routable(&event, "peer", "fp", false).expect("conversion");
         assert!(
-            matches!(&msg.destination, Destination::Group(g) if g == "OnlyGroup"),
+            matches!(&msg.destination, Destination::Group(g) if &**g == "OnlyGroup"),
             "expected Group(OnlyGroup) destination"
         );
     }
@@ -504,7 +508,7 @@ mod tests {
         let msg = RoutableMessage {
             source: Identity::new("test-server".into(), "fp-abc".into(), source_groups)
                 .expect("valid identity"),
-            destination: Destination::Group("Alpha".to_string()),
+            destination: Destination::Group("Alpha".into()),
             payload: Bytes::from_static(sample_xml()),
             metadata: Metadata {
                 received_at: SystemTime::now(),
@@ -527,7 +531,7 @@ mod tests {
         let msg_back =
             federated_event_to_routable(&event, "peer-x", "fp-xyz", true).expect("to routable");
 
-        assert_eq!(msg_back.source.cn, "peer-x");
+        assert_eq!(&*msg_back.source.cn, "peer-x");
         assert_eq!(msg_back.metadata.source_protocol, SOURCE_FEDERATION);
         assert_eq!(msg_back.metadata.message_type, MessageType::Position);
     }

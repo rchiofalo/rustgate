@@ -765,7 +765,7 @@ async fn position_cache_replay() {
 
     // Bob should receive Alice's cached position on priority channel
     let got = bprx.try_recv().expect("bob should receive cached position");
-    assert_eq!(got.source.cn, "alice");
+    assert_eq!(&*got.source.cn, "alice");
     assert_eq!(got.metadata.message_type, MessageType::Position);
 }
 

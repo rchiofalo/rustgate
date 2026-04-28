@@ -322,7 +322,7 @@ mod tests {
         // Initially no ACL: bob can send
         let msg = rustgate_core::message::RoutableMessage {
             source: (*bob_id).clone(),
-            destination: rustgate_core::message::Destination::Group("alpha".to_string()),
+            destination: rustgate_core::message::Destination::Group("alpha".into()),
             payload: bytes::Bytes::from_static(b"<msg/>"),
             metadata: rustgate_core::message::Metadata {
                 received_at: std::time::SystemTime::now(),
@@ -341,7 +341,7 @@ mod tests {
         // Now bob IS authorized (UPDATED_ACL adds bob to senders)
         let msg = rustgate_core::message::RoutableMessage {
             source: (*bob_id).clone(),
-            destination: rustgate_core::message::Destination::Group("alpha".to_string()),
+            destination: rustgate_core::message::Destination::Group("alpha".into()),
             payload: bytes::Bytes::from_static(b"<msg2/>"),
             metadata: rustgate_core::message::Metadata {
                 received_at: std::time::SystemTime::now(),

@@ -159,7 +159,7 @@ async fn pq_mtls_handshake() {
     assert_eq!(&buf, b"pq-resp");
 
     let identity = server_handle.await.expect("server task");
-    assert_eq!(identity.cn, "pq-operator");
+    assert_eq!(&*identity.cn, "pq-operator");
     assert!(identity.is_member_of("pq-team"));
 }
 

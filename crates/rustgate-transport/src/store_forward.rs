@@ -1131,7 +1131,9 @@ pub fn decode(raw: &[u8]) -> Result<DecodedEnvelope, StoreForwardError> {
     }
     let destination = match buf.get_u8() {
         DEST_BROADCAST => Destination::Broadcast,
-        DEST_GROUP => Destination::Group(get_str(&mut buf).ok_or(StoreForwardError::Decode)?),
+        DEST_GROUP => {
+            Destination::Group(get_str(&mut buf).ok_or(StoreForwardError::Decode)?.into())
+        }
         DEST_DIRECT => {
             Destination::Direct(get_identity(&mut buf).ok_or(StoreForwardError::Decode)?)
         }
@@ -1475,10 +1477,10 @@ mod tests {
         let queued_at = 1_700_000_000_000_i64;
         let bytes = encode(&m, queued_at);
         let back = decode(&bytes).unwrap();
-        assert_eq!(back.message.source.cn, "alice");
+        assert_eq!(&*back.message.source.cn, "alice");
         assert_eq!(back.message.payload.as_ref(), b"hello");
         match back.message.destination {
-            Destination::Direct(id) => assert_eq!(id.cn, "bob"),
+            Destination::Direct(id) => assert_eq!(&*id.cn, "bob"),
             _ => panic!("wrong dest"),
         }
         assert_eq!(
@@ -1727,7 +1729,7 @@ mod tests {
         let drained = q.drain("bob").unwrap();
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].payload.as_ref(), b"hello");
-        assert_eq!(drained[0].source.cn, "alice");
+        assert_eq!(&*drained[0].source.cn, "alice");
     }
 
     #[tokio::test]
@@ -2135,9 +2137,9 @@ mod tests {
 
         let decoded = decode(&body).expect("v1 envelope must decode");
         assert_eq!(decoded.message.payload.as_ref(), b"legacy-payload");
-        assert_eq!(decoded.message.source.cn, "alice");
+        assert_eq!(&*decoded.message.source.cn, "alice");
         match &decoded.message.destination {
-            Destination::Direct(id) => assert_eq!(id.cn, "bob"),
+            Destination::Direct(id) => assert_eq!(&*id.cn, "bob"),
             other => panic!("unexpected destination: {other:?}"),
         }
         assert_eq!(

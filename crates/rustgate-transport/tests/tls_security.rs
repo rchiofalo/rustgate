@@ -202,7 +202,7 @@ async fn valid_client_cert_accepted() {
     assert_eq!(&buf, b"world");
 
     let identity = server_handle.await.expect("server task");
-    assert_eq!(identity.cn, "valid-operator");
+    assert_eq!(&*identity.cn, "valid-operator");
     assert!(identity.is_member_of("ops"));
     assert!(identity.is_member_of("admins"));
     assert!(!identity.fingerprint.is_empty());
