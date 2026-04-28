@@ -307,7 +307,7 @@ impl VerificationKey {
 
 /// Externally-sourced verifier key, materialised from a JWKS document.
 ///
-/// This is the public mirror of the crate-private [`VerificationKey`]:
+/// This is the public mirror of the crate-private `VerificationKey`:
 /// the JWKS client constructs values of this type from each
 /// `kty`/`alg`-validated JWK entry and hands them to
 /// [`JwtAuthority::install_external_verifiers`] in a `HashMap` keyed by
@@ -322,7 +322,7 @@ impl VerificationKey {
 pub enum ExternalVerifier {
     /// Symmetric HMAC-SHA256 secret. Wrapped in
     /// [`Zeroizing`] so the bytes are wiped on drop. Length must be
-    /// at least [`MIN_SECRET_LENGTH`] — checked at install time.
+    /// at least `MIN_SECRET_LENGTH` — checked at install time.
     Hs256(Zeroizing<Vec<u8>>),
     /// ECDSA P-256 public key in SEC1 uncompressed form
     /// (`0x04 || x(32) || y(32)` = 65 bytes).
@@ -333,7 +333,7 @@ pub enum ExternalVerifier {
 
 impl ExternalVerifier {
     /// Materialise the public-facing variant into the crate-private
-    /// [`VerificationKey`]. The shape is one-to-one but each branch
+    /// `VerificationKey`. The shape is one-to-one but each branch
     /// either takes ownership (Hs256) or copies a small Vec (Es256,
     /// EdDsa) so the resulting registry can live behind an `ArcSwap`
     /// without a lifetime hanging off the caller's input map.
@@ -376,7 +376,7 @@ pub struct JwtAuthority {
     verifiers: HashMap<String, VerificationKey>,
     /// Hot-reloadable verifier registry sourced from a remote JWKS
     /// endpoint (refs #952). Populated and atomically swapped by
-    /// [`crate::jwks_client::JwksClient`]; consulted by [`decode`]
+    /// `JwksClient`; consulted by [`decode`]
     /// after the static `verifiers` map has been searched. The
     /// `ArcSwap<Arc<HashMap<...>>>` shape mirrors the ACL/authz
     /// hot-reload pattern in `transport::router` — readers get a
@@ -855,7 +855,7 @@ impl JwtAuthority {
     }
 
     /// Atomically replace the external verifier registry with a fresh
-    /// snapshot. Used by [`crate::jwks_client::JwksClient`] (refs #952)
+    /// snapshot. Used by `JwksClient` (refs #952)
     /// after a successful JWKS refresh — readers see the new map on
     /// their next call to [`Self::validate`] without any locking on the
     /// hot path.

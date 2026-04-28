@@ -332,7 +332,7 @@ fn build_http_client(tls_config: Arc<rustls::ClientConfig>) -> Result<reqwest::C
 /// Visibility: `pub` rather than `pub(crate)` so integration tests
 /// can drive a single iteration over a wiremock HTTP listener
 /// (wiremock does not support TLS, but the HTTPS guard is enforced
-/// in [`validate_config`] — testing the refresh body directly is
+/// in `validate_config` — testing the refresh body directly is
 /// the only way to cover the protocol-layer invariants without an
 /// in-process TLS server). The `current` map is owned by the caller
 /// so the test can assert on the diff stream.
