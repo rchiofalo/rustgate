@@ -47,19 +47,38 @@ all-features = true
 
 [advisories]
 ignore = [
-    # RUSTSEC-2024-0436 — paste 1.0.15 is archived/unmaintained (closes #714).
-    # paste enters the dependency graph only when the `jemalloc` feature is
-    # enabled, via `tikv-jemalloc-ctl 0.6.1` -> `paste 1.0.15` (proc-macro).
-    # The advisory is "unmaintained" (informational), not a vulnerability:
-    # paste is a proc-macro that runs at compile time and produces no
-    # runtime code, so it carries no exploitable security surface. The
-    # latest release of `tikv-jemalloc-ctl` (0.6.1) still depends on
-    # `paste`, and there is no maintained drop-in fork in the upstream
-    # crate's tree. Replacing the dep with `pastey` (the community fork)
-    # would require a fork-and-patch of `tikv-jemalloc-ctl` itself, which
-    # is not justified for an informational advisory on a build-only
-    # macro crate. Remove this ignore when `tikv-jemalloc-ctl` ships a
-    # release that no longer pulls in `paste`.
+    # RUSTSEC-2024-0436 — paste 1.0.15 is archived/unmaintained.
+    # Refs #714 (original observation) and #1249 (re-investigation:
+    # confirmed paste is purely transitive, no direct use site to swap).
+    #
+    # Dependency-graph entry point: paste enters the dep graph only when
+    # the `jemalloc` feature is enabled, via the chain
+    #   rustgate-server -> tikv-jemalloc-ctl 0.6.1 -> paste 1.0.15
+    # `cargo tree --workspace -e normal --all-features -i paste` confirms
+    # this is the only path; rustgate has no direct paste dependency, no
+    # `use paste::*` import, and no `paste!` macro invocation in any
+    # workspace crate.
+    #
+    # Risk surface: the advisory is "unmaintained" (informational), not a
+    # vulnerability. paste is a proc-macro that runs at compile time and
+    # produces no runtime code, so it carries no runtime-exploitable
+    # security surface. A malicious upstream release would still need to
+    # pass our `Cargo.lock` review and `cargo deny check sources` gate
+    # before it could enter a build.
+    #
+    # Why we cannot fix this in our tree: the latest release of
+    # `tikv-jemalloc-ctl` (0.6.1) still depends on `paste`. The community
+    # fork `pastey` is a drop-in replacement for direct consumers, but
+    # tikv-jemalloc-ctl is the consumer here, not us — adopting pastey
+    # would require forking tikv-jemalloc-ctl itself. Upstream is aware:
+    # https://github.com/tikv/jemallocator/pull/130 (open, not yet
+    # merged) migrates jemallocator from `paste` to `preinterpret`. We
+    # are tracking that PR rather than carrying a downstream fork.
+    #
+    # Removal trigger: drop this ignore the next release after
+    # tikv/jemallocator#130 (or any equivalent upstream change) lands in
+    # a published `tikv-jemalloc-ctl` and we bump our pin past it. At
+    # that point `cargo tree -i paste` should return no entries.
     "RUSTSEC-2024-0436",
 ]
 
