@@ -27,6 +27,7 @@ rustgate-proto = { workspace = true, optional = true }
 rustgate-mavlink = { workspace = true, optional = true }
 arc-swap = { workspace = true }
 bytes = { workspace = true }
+dashmap = { workspace = true }
 tokio = { workspace = true, features = ["net", "io-util", "sync", "rt", "time", "macros"] }
 tokio-util = { workspace = true }
 tokio-rustls = { workspace = true }
@@ -69,4 +70,8 @@ harness = false
 
 [[bench]]
 name = "router_fanout"
+harness = false
+
+[[bench]]
+name = "dedup_contention"
 harness = false
