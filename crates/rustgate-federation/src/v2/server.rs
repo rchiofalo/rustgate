@@ -100,7 +100,14 @@ pub const DEFAULT_MAX_GROUPS_PER_PEER: usize = crate::config::DEFAULT_MAX_GROUPS
 pub const DEFAULT_MAX_GROUP_NAME_LENGTH: usize = crate::config::DEFAULT_MAX_GROUP_NAME_LENGTH;
 
 /// Callback invoked when a FederatedEvent is received from a remote peer.
-pub type OnEvent = Arc<dyn Fn(figpb::FederatedEvent, String) + Send + Sync>;
+///
+/// F-113: receives a typed [`rustgate_core::PeerId`] (the connecting
+/// peer's mTLS-cert CN) so consumers can no longer accidentally
+/// confuse it with a free-form `String` (a server name, group name,
+/// or unrelated UID). The CN is converted to `PeerId` at the gRPC
+/// boundary inside [`FederationService`]; the wire format is the
+/// bare string under TLS, exactly as before.
+pub type OnEvent = Arc<dyn Fn(figpb::FederatedEvent, rustgate_core::PeerId) + Send + Sync>;
 
 /// Callback invoked when a BinaryBlob is received from a remote peer
 /// via the `SendOneBlob` unary RPC (refs #864). The second argument
@@ -113,7 +120,7 @@ pub type OnEvent = Arc<dyn Fn(figpb::FederatedEvent, String) + Send + Sync>;
 /// wired a consumer. This preserves the existing behaviour for
 /// callers that don't yet need binary-blob ingress while making the
 /// hop-count + authz validation always-on for forensic completeness.
-pub type OnBlob = Arc<dyn Fn(figpb::BinaryBlob, String) + Send + Sync>;
+pub type OnBlob = Arc<dyn Fn(figpb::BinaryBlob, rustgate_core::PeerId) + Send + Sync>;
 
 /// Factory for the default no-op `OnBlob` callback. Discards the
 /// blob without doing any work — chosen over `Option<OnBlob>` so
@@ -138,7 +145,7 @@ fn noop_on_blob() -> OnBlob {
 /// callers that don't yet need ROL ingress while making the hop-count
 /// and authz validation always-on for forensic completeness, mirroring
 /// the discipline established by [`OnEvent`] and [`OnBlob`].
-pub type OnRolEvent = Arc<dyn Fn(figpb::Rol, String) + Send + Sync>;
+pub type OnRolEvent = Arc<dyn Fn(figpb::Rol, rustgate_core::PeerId) + Send + Sync>;
 
 /// Factory for the default no-op `OnRolEvent` callback. Mirrors
 /// [`noop_on_blob`]: discards the ROL message without doing any work
@@ -167,7 +174,7 @@ fn noop_on_rol_event() -> OnRolEvent {
 /// map) runs unchanged alongside the callback — the callback is the
 /// observation hook for downstream consumers, not a replacement for
 /// the receive-loop's group tracking.
-pub type OnGroupSync = Arc<dyn Fn(figpb::FederateGroups, String) + Send + Sync>;
+pub type OnGroupSync = Arc<dyn Fn(figpb::FederateGroups, rustgate_core::PeerId) + Send + Sync>;
 
 /// Factory for the default no-op `OnGroupSync` callback. Mirrors
 /// [`noop_on_rol_event`] / [`noop_on_blob`]: discards the group-sync
@@ -604,7 +611,8 @@ impl FederationService {
             payload_count = rol.payload.len(),
             "received ROL event"
         );
-        on_rol_event(rol, peer_id.to_string());
+        // F-113: lift the bare CN into a typed `PeerId` at the callback edge.
+        on_rol_event(rol, rustgate_core::PeerId::new(peer_id));
         true
     }
 
@@ -679,7 +687,8 @@ impl FederationService {
             nested_count = groups.nested_groups.len(),
             "received federate-groups update"
         );
-        on_group_sync(groups, peer_id.to_string());
+        // F-113: lift the bare CN into a typed `PeerId` at the callback edge.
+        on_group_sync(groups, rustgate_core::PeerId::new(peer_id));
         true
     }
 
@@ -932,7 +941,10 @@ impl FederatedChannel for FederationService {
         }
         rustgate_core::audit::federation_event_received(RPC_SEND_ONE_EVENT, &peer_id);
 
-        (self.on_event)(event, peer_id);
+        // F-113: lift the wire-format CN (`String`) into the typed
+        // `PeerId` newtype at the gRPC boundary so the OnEvent callback
+        // signature stays type-safe end to end.
+        (self.on_event)(event, rustgate_core::PeerId::new(peer_id));
         Ok(Response::new(figpb::Empty {}))
     }
 
@@ -1020,7 +1032,8 @@ impl FederatedChannel for FederationService {
             blob_bytes = blob.data.len(),
             "received single blob"
         );
-        (self.on_blob)(blob, peer_id);
+        // F-113: wrap the CN in a typed `PeerId` at the gRPC boundary.
+        (self.on_blob)(blob, rustgate_core::PeerId::new(peer_id));
         Ok(Response::new(figpb::Empty {}))
     }
 
@@ -1114,7 +1127,11 @@ impl FederatedChannel for FederationService {
 
                 // Valid event resets the violation counter
                 consecutive_violations = 0;
-                on_event(event, pid.clone());
+                // F-113: lift the bare CN into a typed `PeerId` at the
+                // callback edge — `pid` itself stays a `String` because
+                // the surrounding allowlist lookup uses `HashMap<String, _>`
+                // keys for now.
+                on_event(event, rustgate_core::PeerId::new(pid.as_str()));
             }
             info!(peer = %pid, "server_event_stream closed");
         }));

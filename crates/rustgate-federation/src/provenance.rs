@@ -45,20 +45,24 @@ impl FederationMetadata {
     /// Returns `true` if:
     /// - The message has already passed through the server with `my_server_id` (loop)
     /// - The message has exceeded the maximum hop count
-    pub fn should_drop(&self, my_server_id: &str) -> bool {
+    ///
+    /// Accepts any string-like reference (e.g. `&str`, `&String`, `&PeerId`)
+    /// via `AsRef<str>` so callers comparing against the configured
+    /// `federate_id` (still a `String` for wire compatibility) and callers
+    /// holding a typed `PeerId` both work without intermediate allocations.
+    pub fn should_drop(&self, my_server_id: impl AsRef<str>) -> bool {
         if self.current_hops >= self.max_hops {
             return true;
         }
-        self.provenance
-            .iter()
-            .any(|p| p.server_id.as_str() == my_server_id)
+        let id = my_server_id.as_ref();
+        self.provenance.iter().any(|p| p.server_id.as_str() == id)
     }
 
     /// Record a new hop through the given server.
-    pub fn add_hop(&mut self, server_id: &str, server_name: &str) {
+    pub fn add_hop(&mut self, server_id: &PeerId, server_name: &ServerName) {
         self.provenance.push(FederateProvenance {
-            server_id: PeerId::new(server_id),
-            server_name: ServerName::new(server_name),
+            server_id: server_id.clone(),
+            server_name: server_name.clone(),
         });
         self.current_hops += 1;
     }
@@ -109,11 +113,20 @@ mod tests {
         assert!(m.provenance.is_empty());
     }
 
+    /// Helper: build a typed `(PeerId, ServerName)` pair from `&str`
+    /// literals so the test bodies stay readable. The newtype constructors
+    /// are infallible.
+    fn ids(id: &str, name: &str) -> (PeerId, ServerName) {
+        (PeerId::new(id), ServerName::new(name))
+    }
+
     #[test]
     fn should_drop_on_loop() {
         let mut m = FederationMetadata::new(10);
-        m.add_hop("server-abc", "Server ABC");
-        m.add_hop("server-def", "Server DEF");
+        let (abc_id, abc_name) = ids("server-abc", "Server ABC");
+        let (def_id, def_name) = ids("server-def", "Server DEF");
+        m.add_hop(&abc_id, &abc_name);
+        m.add_hop(&def_id, &def_name);
 
         assert!(m.should_drop("server-abc"));
         assert!(m.should_drop("server-def"));
@@ -123,11 +136,14 @@ mod tests {
     #[test]
     fn should_drop_on_hop_limit() {
         let mut m = FederationMetadata::new(3);
-        m.add_hop("s1", "S1");
+        let (s1, n1) = ids("s1", "S1");
+        let (s2, n2) = ids("s2", "S2");
+        let (s3, n3) = ids("s3", "S3");
+        m.add_hop(&s1, &n1);
         assert!(!m.should_drop("unknown"));
-        m.add_hop("s2", "S2");
+        m.add_hop(&s2, &n2);
         assert!(!m.should_drop("unknown"));
-        m.add_hop("s3", "S3");
+        m.add_hop(&s3, &n3);
         // current_hops == 3, max_hops == 3 → drop
         assert!(m.should_drop("unknown"));
     }
@@ -141,13 +157,15 @@ mod tests {
     #[test]
     fn add_hop_increments() {
         let mut m = FederationMetadata::new(10);
-        m.add_hop("s1", "Server One");
+        let (s1, n1) = ids("s1", "Server One");
+        let (s2, n2) = ids("s2", "Server Two");
+        m.add_hop(&s1, &n1);
         assert_eq!(m.current_hops, 1);
         assert_eq!(m.provenance.len(), 1);
         assert_eq!(m.provenance[0].server_id.as_str(), "s1");
         assert_eq!(m.provenance[0].server_name.as_str(), "Server One");
 
-        m.add_hop("s2", "Server Two");
+        m.add_hop(&s2, &n2);
         assert_eq!(m.current_hops, 2);
         assert_eq!(m.provenance.len(), 2);
     }
@@ -185,8 +203,10 @@ mod tests {
     #[test]
     fn metadata_serde_round_trip() {
         let mut m = FederationMetadata::new(5);
-        m.add_hop("s1", "Server One");
-        m.add_hop("s2", "Server Two");
+        let (s1, n1) = ids("s1", "Server One");
+        let (s2, n2) = ids("s2", "Server Two");
+        m.add_hop(&s1, &n1);
+        m.add_hop(&s2, &n2);
 
         let json = serde_json::to_string(&m).expect("serialize");
         let parsed: FederationMetadata = serde_json::from_str(&json).expect("deserialize");
@@ -207,7 +227,8 @@ mod tests {
     #[test]
     fn should_drop_at_exact_limit() {
         let mut m = FederationMetadata::new(1);
-        m.add_hop("s1", "S1");
+        let (s1, n1) = ids("s1", "S1");
+        m.add_hop(&s1, &n1);
         // current_hops == 1, max_hops == 1 → should drop
         assert!(m.should_drop("unknown"));
     }
@@ -222,8 +243,10 @@ mod tests {
     #[test]
     fn should_not_drop_at_one_below_limit() {
         let mut m = FederationMetadata::new(3);
-        m.add_hop("s1", "S1");
-        m.add_hop("s2", "S2");
+        let (s1, n1) = ids("s1", "S1");
+        let (s2, n2) = ids("s2", "S2");
+        m.add_hop(&s1, &n1);
+        m.add_hop(&s2, &n2);
         // current_hops == 2, max_hops == 3 → should NOT drop
         assert!(!m.should_drop("unknown"));
     }
@@ -231,9 +254,12 @@ mod tests {
     #[test]
     fn provenance_chain_preserves_order() {
         let mut m = FederationMetadata::new(10);
-        m.add_hop("first", "First Server");
-        m.add_hop("second", "Second Server");
-        m.add_hop("third", "Third Server");
+        let (a, an) = ids("first", "First Server");
+        let (b, bn) = ids("second", "Second Server");
+        let (c, cn) = ids("third", "Third Server");
+        m.add_hop(&a, &an);
+        m.add_hop(&b, &bn);
+        m.add_hop(&c, &cn);
 
         assert_eq!(m.provenance[0].server_id.as_str(), "first");
         assert_eq!(m.provenance[1].server_id.as_str(), "second");
@@ -247,9 +273,12 @@ mod tests {
     #[test]
     fn should_drop_detects_loop_in_middle_of_chain() {
         let mut m = FederationMetadata::new(10);
-        m.add_hop("s1", "S1");
-        m.add_hop("s2", "S2");
-        m.add_hop("s3", "S3");
+        let (s1, n1) = ids("s1", "S1");
+        let (s2, n2) = ids("s2", "S2");
+        let (s3, n3) = ids("s3", "S3");
+        m.add_hop(&s1, &n1);
+        m.add_hop(&s2, &n2);
+        m.add_hop(&s3, &n3);
 
         // s2 is in the middle of the chain
         assert!(m.should_drop("s2"));
@@ -258,8 +287,10 @@ mod tests {
     #[test]
     fn should_drop_first_server_in_chain() {
         let mut m = FederationMetadata::new(10);
-        m.add_hop("origin", "Origin");
-        m.add_hop("relay", "Relay");
+        let (origin, on_) = ids("origin", "Origin");
+        let (relay, rn) = ids("relay", "Relay");
+        m.add_hop(&origin, &on_);
+        m.add_hop(&relay, &rn);
 
         assert!(m.should_drop("origin"));
     }
@@ -267,8 +298,10 @@ mod tests {
     #[test]
     fn should_drop_last_server_in_chain() {
         let mut m = FederationMetadata::new(10);
-        m.add_hop("origin", "Origin");
-        m.add_hop("relay", "Relay");
+        let (origin, on_) = ids("origin", "Origin");
+        let (relay, rn) = ids("relay", "Relay");
+        m.add_hop(&origin, &on_);
+        m.add_hop(&relay, &rn);
 
         assert!(m.should_drop("relay"));
     }
@@ -276,7 +309,8 @@ mod tests {
     #[test]
     fn add_hop_with_empty_strings() {
         let mut m = FederationMetadata::new(10);
-        m.add_hop("", "");
+        let (empty_id, empty_name) = ids("", "");
+        m.add_hop(&empty_id, &empty_name);
         assert_eq!(m.current_hops, 1);
         assert_eq!(m.provenance[0].server_id.as_str(), "");
         assert_eq!(m.provenance[0].server_name.as_str(), "");
@@ -285,10 +319,11 @@ mod tests {
     #[test]
     fn add_hop_with_special_characters() {
         let mut m = FederationMetadata::new(10);
-        m.add_hop(
+        let (id, name) = ids(
             "server/with-special_chars.v2",
             "Server: Special & Chars <v2>",
         );
+        m.add_hop(&id, &name);
         assert_eq!(
             m.provenance[0].server_id.as_str(),
             "server/with-special_chars.v2"
@@ -302,7 +337,8 @@ mod tests {
     #[test]
     fn add_hop_with_unicode() {
         let mut m = FederationMetadata::new(10);
-        m.add_hop("server-日本", "サーバー");
+        let (id, name) = ids("server-日本", "サーバー");
+        m.add_hop(&id, &name);
         assert_eq!(m.provenance[0].server_id.as_str(), "server-日本");
         assert_eq!(m.provenance[0].server_name.as_str(), "サーバー");
     }
@@ -368,9 +404,12 @@ mod tests {
     #[test]
     fn metadata_serde_preserves_all_fields() {
         let mut m = FederationMetadata::new(7);
-        m.add_hop("s1", "Server One");
-        m.add_hop("s2", "Server Two");
-        m.add_hop("s3", "Server Three");
+        let (s1, n1) = ids("s1", "Server One");
+        let (s2, n2) = ids("s2", "Server Two");
+        let (s3, n3) = ids("s3", "Server Three");
+        m.add_hop(&s1, &n1);
+        m.add_hop(&s2, &n2);
+        m.add_hop(&s3, &n3);
 
         let json = serde_json::to_string(&m).expect("serialize");
         let parsed: FederationMetadata = serde_json::from_str(&json).expect("deserialize");
@@ -434,7 +473,9 @@ mod tests {
     fn metadata_large_hop_chain() {
         let mut m = FederationMetadata::new(100);
         for i in 0..50 {
-            m.add_hop(&format!("server-{i}"), &format!("Server {i}"));
+            let id = PeerId::new(format!("server-{i}"));
+            let name = ServerName::new(format!("Server {i}"));
+            m.add_hop(&id, &name);
         }
         assert_eq!(m.current_hops, 50);
         assert_eq!(m.provenance.len(), 50);
@@ -445,12 +486,53 @@ mod tests {
     #[test]
     fn should_drop_checks_both_loop_and_hops() {
         let mut m = FederationMetadata::new(2);
-        m.add_hop("s1", "S1");
-        m.add_hop("s2", "S2");
+        let (s1, n1) = ids("s1", "S1");
+        let (s2, n2) = ids("s2", "S2");
+        m.add_hop(&s1, &n1);
+        m.add_hop(&s2, &n2);
 
         // Should drop for loop (s1 is in chain)
         assert!(m.should_drop("s1"));
         // Should drop for hop limit (current_hops == 2 >= max_hops == 2)
         assert!(m.should_drop("unknown"));
+    }
+
+    /// F-113: pin that `add_hop` requires typed `&PeerId` / `&ServerName`
+    /// references. A regression that broadened either parameter back to a
+    /// raw `&str` or `String` would still compile here (because
+    /// `PeerId: From<&str>`) but would silently re-allow accidental
+    /// mix-ups at every other call site.  We exercise the typed path
+    /// explicitly and assert the underlying string content is preserved
+    /// — the load-bearing contract remains "wire-format compatible".
+    #[test]
+    fn add_hop_accepts_typed_peer_id_and_server_name() {
+        let mut m = FederationMetadata::new(10);
+        let id = PeerId::new("typed-peer-id");
+        let name = ServerName::new("Typed Server Name");
+        m.add_hop(&id, &name);
+        assert_eq!(m.provenance.len(), 1);
+        assert_eq!(m.provenance[0].server_id, id);
+        assert_eq!(m.provenance[0].server_name, name);
+    }
+
+    /// F-113: `should_drop` accepts any `AsRef<str>` so callers holding
+    /// either a typed `&PeerId` or a raw `&str` (e.g. the configured
+    /// `federate_id` which still must serialize as a bare `String` on
+    /// the wire) can both query the chain without an intermediate
+    /// allocation. Pin the cross-type behaviour.
+    #[test]
+    fn should_drop_accepts_both_str_and_peer_id_callers() {
+        let mut m = FederationMetadata::new(10);
+        let (id, name) = ids("self-server", "Self");
+        m.add_hop(&id, &name);
+
+        // raw &str path
+        assert!(m.should_drop("self-server"));
+        // typed &PeerId path
+        let typed = PeerId::new("self-server");
+        assert!(m.should_drop(&typed));
+        // raw String / &String path
+        let owned: String = "self-server".to_string();
+        assert!(m.should_drop(&owned));
     }
 }

@@ -23,8 +23,14 @@ use crate::heartbeat::{create_heartbeat, is_heartbeat};
 
 /// Callback invoked for each non-heartbeat message received from a federation peer.
 ///
-/// Arguments: (peer_cn, payload_bytes)
-pub type OnMessage = Arc<dyn Fn(String, Bytes) + Send + Sync>;
+/// Arguments: (peer_cn, payload_bytes).
+///
+/// F-113: receives a typed [`rustgate_core::PeerId`] (the connecting
+/// peer's mTLS-cert CN). The conversion from the wire-format `String`
+/// (extracted at the V1 read loop) into the typed wrapper happens at
+/// the callback edge so consumers cannot accidentally treat the CN
+/// as an arbitrary `String`.
+pub type OnMessage = Arc<dyn Fn(rustgate_core::PeerId, Bytes) + Send + Sync>;
 
 /// V1 federation server that accepts inbound peer connections.
 ///
@@ -213,7 +219,15 @@ async fn handle_inbound_peer(
                                 debug!(peer_cn = %hash_cn(&read_cn), "V1 heartbeat received");
                                 last_heartbeat_received = tokio::time::Instant::now();
                             } else {
-                                on_message(read_cn.to_string(), data.freeze());
+                                // F-113: lift the bare CN (`Arc<str>` per
+                                // #1245) into a typed `PeerId` at the
+                                // callback edge. `&*read_cn` deref-coerces
+                                // the `Arc<str>` to `&str` for the
+                                // newtype constructor.
+                                on_message(
+                                    rustgate_core::PeerId::new(&*read_cn),
+                                    data.freeze(),
+                                );
                             }
                         }
                         Some(Err(e)) => {
@@ -312,7 +326,8 @@ mod tests {
         let ca = TestCa::new("Test CA");
         let tls_config = test_tls_config(&ca);
 
-        let (msg_tx, mut msg_rx) = mpsc::channel::<(String, Bytes)>(16);
+        // F-113: callback channel carries the typed `PeerId`.
+        let (msg_tx, mut msg_rx) = mpsc::channel::<(rustgate_core::PeerId, Bytes)>(16);
         let on_msg: OnMessage = Arc::new(move |cn, data| {
             let _ = msg_tx.try_send((cn, data));
         });

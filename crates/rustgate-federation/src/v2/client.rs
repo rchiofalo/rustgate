@@ -27,13 +27,21 @@ use crate::provenance;
 use crate::replay_buffer::BufferedMessage;
 
 /// Callback invoked when a FederatedEvent is received from the remote peer.
-pub type OnEvent = Arc<dyn Fn(figpb::FederatedEvent, String) + Send + Sync>;
+///
+/// F-113: receives a typed [`rustgate_core::PeerId`]. The conversion from
+/// the wire-format `String` returned by `peer_id_from_request` happens
+/// at the V2 server boundary; consumers downstream of the callback see
+/// the typed wrapper.
+pub type OnEvent = Arc<dyn Fn(figpb::FederatedEvent, rustgate_core::PeerId) + Send + Sync>;
 
 /// Callback that drains the replay buffer on reconnection (V2).
 ///
 /// Returns deduped buffered messages and clears the buffer atomically.
-/// Arguments: `(peer_id) -> Vec<BufferedMessage>`
-pub type V2ReplayDrain = Arc<dyn Fn(&str) -> Vec<BufferedMessage> + Send + Sync>;
+/// Arguments: `(peer_id) -> Vec<BufferedMessage>`.
+///
+/// F-113: takes a typed `&PeerId`; the underlying `HashMap<PeerId, _>`
+/// lookup is unchanged thanks to `PeerId: Borrow<str>`.
+pub type V2ReplayDrain = Arc<dyn Fn(&rustgate_core::PeerId) -> Vec<BufferedMessage> + Send + Sync>;
 
 /// Configuration for a V2 federation gRPC client.
 pub struct V2ClientConfig {
@@ -328,11 +336,12 @@ async fn connection_loop(
             client = client.send_compressed(enc).accept_compressed(enc);
         }
 
-        // Drain replay buffer before entering the stream loop
+        // Drain replay buffer before entering the stream loop.
+        // F-113: ReplayDrain takes `&PeerId` directly.
         let replay_messages: Vec<BufferedMessage> = config
             .replay_drain
             .as_ref()
-            .map(|drain| drain(peer.id.as_ref()))
+            .map(|drain| drain(&peer.id))
             .unwrap_or_default();
 
         if !replay_messages.is_empty() {
@@ -619,8 +628,8 @@ async fn run_streams(
                     Ok(Some(event)) => {
                         peer.record_recv();
                         peer.record_heartbeat();
-                        let pid = peer.id.to_string();
-                        (config.on_event)(event, pid);
+                        // F-113: callback receives a typed `PeerId` clone.
+                        (config.on_event)(event, peer.id.clone());
                     }
                     Ok(None) => {
                         info!(peer = %peer.id, "receive stream ended");
@@ -903,8 +912,14 @@ mod tests {
     #[test]
     fn counting_callback_increments() {
         let (on_event, count) = counting_on_event();
-        on_event(figpb::FederatedEvent::default(), "peer-1".into());
-        on_event(figpb::FederatedEvent::default(), "peer-1".into());
+        on_event(
+            figpb::FederatedEvent::default(),
+            rustgate_core::PeerId::new("peer-1"),
+        );
+        on_event(
+            figpb::FederatedEvent::default(),
+            rustgate_core::PeerId::new("peer-1"),
+        );
         assert_eq!(count.load(Ordering::Relaxed), 2);
     }
 

@@ -33,7 +33,15 @@ use crate::v1::{V1Client, V1Server};
 
 /// Callback invoked for each non-heartbeat message received from a federation peer.
 ///
-/// Arguments: (peer_id_or_cn, raw_payload_bytes)
+/// Arguments: (peer_id_or_cn, raw_payload_bytes).
+///
+/// F-113: `peer_id_or_cn` is a typed [`PeerId`] (the V2 callback site
+/// already owns the typed value via `peer.id.clone()` on the client
+/// side and via `PeerId::new(cn)` on the server side; the V1 client
+/// side passes the same typed value through `OnMessage`). Downstream
+/// consumers in `rustgate-server` extract the inner string with
+/// `peer_id.as_str()` when they need to interface with the router's
+/// existing `&str` API surface.
 ///
 /// The caller is responsible for provenance checking, format conversion,
 /// and routing the message to local clients (e.g., via the Router).
@@ -41,7 +49,7 @@ use crate::v1::{V1Client, V1Server};
 /// NOTE: Uses `Fn` (not `AsyncFn`) because `dyn AsyncFn` is not object-safe
 /// as of Rust 1.93. Async work is dispatched via `spawn_background()` inside
 /// the closure body. Revisit when `dyn AsyncFn` stabilizes for trait objects.
-pub type OnInbound = Arc<dyn Fn(String, Bytes) + Send + Sync>;
+pub type OnInbound = Arc<dyn Fn(PeerId, Bytes) + Send + Sync>;
 
 /// Capacity for HA peer adoption/loss event channels.
 ///
@@ -577,18 +585,18 @@ impl FederationManager {
             let (adopt_tx, adopt_rx) = tokio::sync::mpsc::channel(HA_CHANNEL_CAPACITY);
             let (lost_tx, lost_rx) = tokio::sync::mpsc::channel(HA_CHANNEL_CAPACITY);
             cm.set_callbacks(
-                Arc::new(move |peer_id: String| {
-                    if let Err(e) = adopt_tx.try_send(PeerId::new(peer_id)) {
+                Arc::new(move |peer_id: PeerId| {
+                    if let Err(e) = adopt_tx.try_send(peer_id) {
                         warn!(error = %e, "HA adopt channel full, dropping event");
                     }
                 }),
-                Arc::new(move |peer_id: String, stale_fence: u64| {
+                Arc::new(move |peer_id: PeerId, stale_fence: u64| {
                     tracing::debug!(
-                        peer_id = %hash_cn(&peer_id),
+                        peer_id = %hash_cn(peer_id.as_str()),
                         stale_fence = stale_fence,
                         "claim lost, queuing disconnect"
                     );
-                    if let Err(e) = lost_tx.try_send(PeerId::new(peer_id)) {
+                    if let Err(e) = lost_tx.try_send(peer_id) {
                         warn!(error = %e, "HA claim-lost channel full, dropping event");
                     }
                 }),
@@ -618,7 +626,7 @@ impl FederationManager {
             // In HA mode, only connect to peers we can claim
             #[cfg(feature = "ha")]
             let ha_fencing_token = if let Some(ref cm) = self.claim_manager {
-                match cm.try_claim(peer_config.id.as_str()).await {
+                match cm.try_claim(&peer_config.id).await {
                     Some(token) => Some(token),
                     None => {
                         info!(
@@ -738,7 +746,7 @@ impl FederationManager {
             if let Some(ref cr) = self.connection_registry
                 && let Err(e) = cr
                     .register(
-                        peer_config.id.as_str(),
+                        &peer_config.id,
                         crate::ha::registry::Direction::Outbound,
                         ha_fencing_token,
                     )
@@ -886,7 +894,14 @@ impl FederationManager {
                         None => {
                             let mut metadata =
                                 crate::provenance::FederationMetadata::new(self.config.max_hops);
-                            metadata.add_hop(&self.config.federate_id, &self.config.federate_id);
+                            // F-113: convert the configured `federate_id` (still a
+                            // bare `String` on disk for wire compatibility) into the
+                            // typed wrappers at the federation API boundary.
+                            let self_peer =
+                                rustgate_core::PeerId::new(self.config.federate_id.as_str());
+                            let self_name =
+                                rustgate_core::ServerName::new(self.config.federate_id.as_str());
+                            metadata.add_hop(&self_peer, &self_name);
                             match crate::v2::convert::xml_to_federated_event(&payload, &metadata) {
                                 Ok(e) => {
                                     v2_event = Some(e.clone());
@@ -1101,9 +1116,13 @@ impl FederationManager {
     /// Returns all messages if `since_seq` is 0 (full replay).
     /// Returns an empty vec if the peer has no replay buffer or if
     /// the buffer lock cannot be acquired.
+    ///
+    /// F-113: takes a typed [`PeerId`] reference. The lookup against
+    /// the in-memory `HashMap<PeerId, _>` is unchanged — `Borrow<str>`
+    /// on `PeerId` keeps the existing key shape working.
     pub fn replay_messages(
         &self,
-        peer_id: &str,
+        peer_id: &PeerId,
         since_seq: u64,
     ) -> Vec<crate::replay_buffer::BufferedMessage> {
         if let Ok(buffers) = self.replay_buffers.lock() {
@@ -1122,7 +1141,7 @@ impl FederationManager {
     /// messages. Returns an empty vec if the peer has no buffer.
     pub fn replay_messages_deduped(
         &self,
-        peer_id: &str,
+        peer_id: &PeerId,
     ) -> Vec<crate::replay_buffer::BufferedMessage> {
         if let Ok(buffers) = self.replay_buffers.lock() {
             buffers
@@ -1138,11 +1157,11 @@ impl FederationManager {
     ///
     /// Called when a peer is permanently disconnected or removed from
     /// configuration. Frees the memory used by its buffered messages.
-    pub fn remove_replay_buffer(&self, peer_id: &str) {
+    pub fn remove_replay_buffer(&self, peer_id: &PeerId) {
         if let Ok(mut buffers) = self.replay_buffers.lock()
             && buffers.remove(peer_id).is_some()
         {
-            info!(peer_id = %hash_cn(peer_id), "removed replay buffer for peer");
+            info!(peer_id = %hash_cn(peer_id.as_str()), "removed replay buffer for peer");
         }
     }
 
@@ -1150,7 +1169,7 @@ impl FederationManager {
     ///
     /// Called after all buffered messages have been resent on reconnection
     /// so the same messages are not replayed again on the next reconnect.
-    pub fn clear_replay_buffer(&self, peer_id: &str) {
+    pub fn clear_replay_buffer(&self, peer_id: &PeerId) {
         if let Ok(mut buffers) = self.replay_buffers.lock()
             && let Some(buf) = buffers.get_mut(peer_id)
         {
@@ -1232,8 +1251,14 @@ impl FederationManager {
     }
 
     /// Get the status snapshot for a specific peer.
-    pub fn peer_status(&self, id: &str) -> Option<PeerStatus> {
-        self.peers.get(id).map(|p| p.status())
+    ///
+    /// Accepts any string-like reference (e.g. `&str`, `&PeerId`) via
+    /// `AsRef<str>`. The internal `HashMap<PeerId, _>` lookup uses
+    /// `PeerId: Borrow<str>` so the existing `&str` callers (HTTP path
+    /// parameters bound to opaque user input) keep working without
+    /// constructing a temporary `PeerId`.
+    pub fn peer_status(&self, id: impl AsRef<str>) -> Option<PeerStatus> {
+        self.peers.get(id.as_ref()).map(|p| p.status())
     }
 
     /// Get status snapshots for all peers.
@@ -1329,7 +1354,7 @@ impl FederationManager {
     /// deduped buffered messages for that peer and clears its buffer.
     fn create_v1_replay_drain(buffers: &SharedReplayBuffers) -> crate::v1::client::ReplayDrain {
         let buffers = Arc::clone(buffers);
-        Arc::new(move |peer_id: &str| {
+        Arc::new(move |peer_id: &PeerId| {
             if let Ok(mut guard) = buffers.lock()
                 && let Some(buf) = guard.get_mut(peer_id)
             {
@@ -1349,7 +1374,7 @@ impl FederationManager {
     #[cfg(feature = "v2")]
     fn create_v2_replay_drain(buffers: &SharedReplayBuffers) -> crate::v2::client::V2ReplayDrain {
         let buffers = Arc::clone(buffers);
-        Arc::new(move |peer_id: &str| {
+        Arc::new(move |peer_id: &PeerId| {
             if let Ok(mut guard) = buffers.lock()
                 && let Some(buf) = guard.get_mut(peer_id)
             {
@@ -1374,12 +1399,12 @@ impl FederationManager {
         let dedup = Arc::clone(dedup);
         let on_inbound = Arc::clone(on_inbound);
         let context = context.to_owned();
-        Arc::new(move |peer_id, data| {
+        Arc::new(move |peer_id: PeerId, data| {
             if let Ok(mut guard) = dedup.lock()
                 && guard.is_duplicate(&data)
             {
                 tracing::debug!(
-                    peer_id = %hash_cn(&peer_id),
+                    peer_id = %hash_cn(peer_id.as_str()),
                     context = %context,
                     "dropped duplicate V1 message (loop detection)"
                 );
@@ -1436,9 +1461,12 @@ impl FederationManager {
             // block only records the attempt for the forensic trail
             // when the operator has NOT opted into peer-group trust.
             if !trust_peer_groups && !event.federate_groups.is_empty() {
+                // F-113: `peer_id` is now `PeerId`; the audit emitter takes
+                // `&str` (peer_cn / origin_cn are sanitized free-form
+                // strings on the audit side), so unwrap via `as_str()`.
                 rustgate_core::audit::federation_group_claim_rejected(
-                    &peer_id,
-                    &peer_id,
+                    peer_id.as_str(),
+                    peer_id.as_str(),
                     &event.federate_groups,
                 );
             }
@@ -1622,7 +1650,7 @@ impl FederationManager {
 
         // Try to claim the peer and get the fencing token
         let fencing_token = if let Some(ref cm) = self.claim_manager {
-            cm.try_claim(peer_id.as_str()).await
+            cm.try_claim(peer_id).await
         } else {
             return Err(FederationError::HaClaimManagerMissing);
         };
@@ -1650,7 +1678,7 @@ impl FederationManager {
         // During the delay, another pod may have claimed this peer with a
         // newer token. If so, abort adoption to avoid duplicate connections.
         if let Some(ref cm) = self.claim_manager
-            && !cm.is_token_valid(peer_id.as_str(), fencing_token).await
+            && !cm.is_token_valid(peer_id, fencing_token).await
         {
             warn!(
                 peer_id = %peer_id,
@@ -1667,7 +1695,7 @@ impl FederationManager {
         if let Some(ref cr) = self.connection_registry
             && let Err(e) = cr
                 .register(
-                    peer_id.as_str(),
+                    peer_id,
                     crate::ha::registry::Direction::Outbound,
                     Some(fencing_token),
                 )
@@ -1707,19 +1735,19 @@ impl FederationManager {
         let _ = self.peers.remove(peer_id.as_str());
 
         // Clean up the replay buffer for this peer
-        self.remove_replay_buffer(peer_id.as_str());
+        self.remove_replay_buffer(peer_id);
 
         // Unregister from connection registry / release claim (HA only)
         #[cfg(feature = "ha")]
         {
             if let Some(ref cr) = self.connection_registry
-                && let Err(e) = cr.unregister(peer_id.as_str()).await
+                && let Err(e) = cr.unregister(peer_id).await
             {
                 warn!(peer_id = %peer_id, error = %e, "failed to unregister connection");
             }
 
             if let Some(ref cm) = self.claim_manager
-                && let Err(e) = cm.release(peer_id.as_str()).await
+                && let Err(e) = cm.release(peer_id).await
             {
                 warn!(peer_id = %peer_id, error = %e, "failed to release claim");
             }
@@ -1765,11 +1793,15 @@ impl FederationManager {
     /// Remove a peer from the configuration and disconnect it cleanly.
     ///
     /// Returns `true` if the peer was present in the configured set.
-    pub async fn remove_peer(&mut self, peer_id: &str) -> bool {
-        let pid = PeerId::from(peer_id.to_string());
-        self.disconnect_peer(&pid).await;
+    ///
+    /// F-113: takes a typed [`PeerId`] reference. Operators who only have
+    /// a free-form `&str` (e.g. an HTTP path parameter sourced from user
+    /// input) construct a `PeerId` at the boundary with `PeerId::new(s)`.
+    pub async fn remove_peer(&mut self, peer_id: &PeerId) -> bool {
+        self.disconnect_peer(peer_id).await;
         let before = self.config.peers.len();
-        self.config.peers.retain(|p| p.id.as_str() != peer_id);
+        let id_str = peer_id.as_str();
+        self.config.peers.retain(|p| p.id.as_str() != id_str);
         before != self.config.peers.len()
     }
 
@@ -1787,16 +1819,19 @@ impl FederationManager {
             .map(|p| p.id.as_str().to_string())
             .collect();
 
-        let removed: Vec<String> = self
+        // Snapshot peer ids of items that have vanished from the new set.
+        // Using `PeerId` here keeps the loop body in the typed path without
+        // intermediate `String` reconstruction.
+        let removed: Vec<PeerId> = self
             .config
             .peers
             .iter()
             .filter(|p| !new_ids.contains(p.id.as_str()))
-            .map(|p| p.id.as_str().to_string())
+            .map(|p| p.id.clone())
             .collect();
         for id in removed {
             if self.remove_peer(&id).await {
-                diff.removed.push(PeerId::from(id));
+                diff.removed.push(id);
             }
         }
 
@@ -2706,10 +2741,12 @@ mod tests {
         manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()], None);
         manager.buffer_for_replay(&Bytes::from("msg2"), &["Beta".into()], None);
 
-        let msgs1 = manager.replay_messages("peer-1", 0);
+        let p1 = PeerId::new("peer-1");
+        let p2 = PeerId::new("peer-2");
+        let msgs1 = manager.replay_messages(&p1, 0);
         assert_eq!(msgs1.len(), 2);
 
-        let msgs2 = manager.replay_messages("peer-2", 0);
+        let msgs2 = manager.replay_messages(&p2, 0);
         assert_eq!(msgs2.len(), 2);
     }
 
@@ -2727,7 +2764,8 @@ mod tests {
 
         manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()], None);
 
-        let msgs = manager.replay_messages("peer-1", 0);
+        let p1 = PeerId::new("peer-1");
+        let msgs = manager.replay_messages(&p1, 0);
         assert!(msgs.is_empty());
     }
 
@@ -2744,10 +2782,11 @@ mod tests {
         let _ = manager.peers.insert("peer-1".into(), peer);
 
         manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()], None);
-        assert_eq!(manager.replay_messages("peer-1", 0).len(), 1);
+        let p1 = PeerId::new("peer-1");
+        assert_eq!(manager.replay_messages(&p1, 0).len(), 1);
 
-        manager.remove_replay_buffer("peer-1");
-        assert!(manager.replay_messages("peer-1", 0).is_empty());
+        manager.remove_replay_buffer(&p1);
+        assert!(manager.replay_messages(&p1, 0).is_empty());
     }
 
     #[test]
@@ -2764,14 +2803,15 @@ mod tests {
 
         manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()], None);
         manager.buffer_for_replay(&Bytes::from("msg2"), &["Alpha".into()], None);
-        assert_eq!(manager.replay_messages("peer-1", 0).len(), 2);
+        let p1 = PeerId::new("peer-1");
+        assert_eq!(manager.replay_messages(&p1, 0).len(), 2);
 
-        manager.clear_replay_buffer("peer-1");
-        assert!(manager.replay_messages("peer-1", 0).is_empty());
+        manager.clear_replay_buffer(&p1);
+        assert!(manager.replay_messages(&p1, 0).is_empty());
 
         // Buffer entry still exists — new messages can be buffered
         manager.buffer_for_replay(&Bytes::from("msg3"), &["Alpha".into()], None);
-        assert_eq!(manager.replay_messages("peer-1", 0).len(), 1);
+        assert_eq!(manager.replay_messages(&p1, 0).len(), 1);
     }
 
     #[test]
@@ -2790,7 +2830,8 @@ mod tests {
         manager.buffer_for_replay(&Bytes::from("msg1"), &["Alpha".into()], None); // duplicate
         manager.buffer_for_replay(&Bytes::from("msg2"), &["Beta".into()], None);
 
-        let deduped = manager.replay_messages_deduped("peer-1");
+        let p1 = PeerId::new("peer-1");
+        let deduped = manager.replay_messages_deduped(&p1);
         assert_eq!(deduped.len(), 2);
         assert_eq!(deduped[0].payload, Bytes::from("msg1"));
         assert_eq!(deduped[1].payload, Bytes::from("msg2"));
@@ -2814,14 +2855,18 @@ mod tests {
 
         let drain = FederationManager::create_v1_replay_drain(&manager.replay_buffers);
 
-        // First drain returns all messages
-        let messages = drain("peer-1");
+        // First drain returns all messages.
+        // F-113: ReplayDrain takes `&PeerId`; tests construct typed
+        // values explicitly so the closure path is exercised against
+        // the typed signature.
+        let p1 = PeerId::new("peer-1");
+        let messages = drain(&p1);
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].payload, Bytes::from("msg-a"));
         assert_eq!(messages[1].payload, Bytes::from("msg-b"));
 
         // Second drain returns empty (buffer was cleared)
-        let messages = drain("peer-1");
+        let messages = drain(&p1);
         assert!(messages.is_empty());
     }
 
@@ -2919,7 +2964,47 @@ mod tests {
     #[tokio::test]
     async fn remove_peer_returns_false_for_unknown() {
         let mut manager = FederationManager::new(test_config());
-        assert!(!manager.remove_peer("ghost").await);
+        assert!(!manager.remove_peer(&PeerId::new("ghost")).await);
+    }
+
+    /// F-113: pin that the typed-`PeerId` API surface on the manager
+    /// keeps existing per-peer storage queries working. The methods that
+    /// take `&PeerId` (`replay_messages`, `replay_messages_deduped`,
+    /// `remove_replay_buffer`, `clear_replay_buffer`, `remove_peer`) are
+    /// exercised here in a single test so a regression that broadened
+    /// any one back to `&str` (or that swapped the `HashMap<PeerId, _>`
+    /// key for `String` and dropped `Borrow<str>`) trips the suite at
+    /// the manager-API layer rather than at a far-away call site.
+    #[tokio::test]
+    async fn manager_replay_api_round_trips_through_typed_peer_id() {
+        let mut config = test_config();
+        config.replay_buffer_capacity = 100;
+        let mut manager = FederationManager::new(config);
+
+        let peer_handle = Arc::new(PeerHandle::new(test_peer_config(
+            "typed-peer",
+            vec!["Alpha".into()],
+        )));
+        let _ = manager.peers.insert("typed-peer".into(), peer_handle);
+
+        manager.buffer_for_replay(&Bytes::from("hello"), &["Alpha".into()], None);
+
+        // All three reads accept a typed `&PeerId`.
+        let pid = PeerId::new("typed-peer");
+        assert_eq!(manager.replay_messages(&pid, 0).len(), 1);
+        assert_eq!(manager.replay_messages_deduped(&pid).len(), 1);
+
+        // peer_status accepts both `&str` (HTTP-bound caller) and `&PeerId`
+        // via the `impl AsRef<str>` shim.
+        assert!(manager.peer_status("typed-peer").is_some());
+        assert!(manager.peer_status(&pid).is_some());
+        assert!(manager.peer_status("ghost").is_none());
+
+        // Mutating ops accept `&PeerId`.
+        manager.clear_replay_buffer(&pid);
+        assert_eq!(manager.replay_messages(&pid, 0).len(), 0);
+        manager.remove_replay_buffer(&pid);
+        assert!(manager.replay_messages(&pid, 0).is_empty());
     }
 
     #[tokio::test]
@@ -3079,7 +3164,7 @@ mod tests {
     async fn v2_handler_forwards_even_with_untrusted_wire_groups() {
         use bytes::Bytes;
 
-        let forwarded: Arc<std::sync::Mutex<Vec<(String, Bytes)>>> =
+        let forwarded: Arc<std::sync::Mutex<Vec<(PeerId, Bytes)>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let forwarded_clone = Arc::clone(&forwarded);
         let on_inbound: OnInbound = Arc::new(move |cn, data| {
@@ -3241,7 +3326,7 @@ mod tests {
     async fn v2_handler_forwards_when_peer_groups_trusted() {
         use bytes::Bytes;
 
-        let forwarded: Arc<std::sync::Mutex<Vec<(String, Bytes)>>> =
+        let forwarded: Arc<std::sync::Mutex<Vec<(PeerId, Bytes)>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let forwarded_clone = Arc::clone(&forwarded);
         let on_inbound: OnInbound = Arc::new(move |cn, data| {

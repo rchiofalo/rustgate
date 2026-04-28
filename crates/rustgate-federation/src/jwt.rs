@@ -588,11 +588,17 @@ impl JwtAuthority {
     }
 
     /// Issue a signed JWT for a federation peer.
-    pub fn issue(&self, peer_id: &str, groups: Vec<String>) -> Result<String, JwtError> {
+    ///
+    /// Accepts any string-like reference (e.g. `&str`, `&PeerId`) so
+    /// callers holding a typed [`rustgate_core::PeerId`] do not have to
+    /// reach for `.as_str()`. The wire-format `sub` claim still stores
+    /// the bare string exactly as provided.
+    pub fn issue(&self, peer_id: impl AsRef<str>, groups: Vec<String>) -> Result<String, JwtError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| JwtError::ClockError)?;
 
+        let peer_id = peer_id.as_ref();
         let jti = generate_jti(peer_id, now.as_secs());
 
         let claims = FederationClaims {
@@ -608,9 +614,11 @@ impl JwtAuthority {
     }
 
     /// Issue a token with a custom expiration duration.
+    ///
+    /// See [`issue`](Self::issue) for the typed-`peer_id` contract.
     pub fn issue_with_expiry(
         &self,
-        peer_id: &str,
+        peer_id: impl AsRef<str>,
         groups: Vec<String>,
         expiry: Duration,
     ) -> Result<String, JwtError> {
@@ -618,6 +626,7 @@ impl JwtAuthority {
             .duration_since(UNIX_EPOCH)
             .map_err(|_| JwtError::ClockError)?;
 
+        let peer_id = peer_id.as_ref();
         let jti = generate_jti(peer_id, now.as_secs());
 
         let claims = FederationClaims {

@@ -160,9 +160,14 @@ impl ConnectionRegistry {
     /// The `fencing_token` is the NATS KV claim revision for outbound
     /// connections. Pass `None` for inbound connections or when HA is
     /// not active.
+    ///
+    /// F-113: takes a typed [`rustgate_core::PeerId`] reference. The
+    /// derived KV key (`{pod_id}.{peer_id}`) and the JSON payload's
+    /// `peer_id` field stay byte-identical to the pre-typed version
+    /// because the underlying string is unchanged.
     pub async fn register(
         &self,
-        peer_id: &str,
+        peer_id: &rustgate_core::PeerId,
         direction: Direction,
         fencing_token: Option<u64>,
     ) -> Result<()> {
@@ -172,7 +177,7 @@ impl ConnectionRegistry {
             .as_secs();
 
         let info = ConnectionInfo {
-            peer_id: rustgate_core::PeerId::new(peer_id),
+            peer_id: peer_id.clone(),
             pod_id: self.pod_id.clone(),
             direction,
             connected_at: now,
@@ -181,7 +186,7 @@ impl ConnectionRegistry {
 
         let data = serde_json::to_vec(&info)
             .map_err(|e| FederationError::serde("failed to serialize connection info", e))?;
-        let key = format!("{}.{}", self.pod_id, peer_id);
+        let key = format!("{}.{}", self.pod_id, peer_id.as_str());
 
         let _ = self.kv.put(&key, data.into()).await.map_err(|e| {
             FederationError::storage(format!("failed to register connection in KV: {e}"))
@@ -191,7 +196,7 @@ impl ConnectionRegistry {
         let _ = registered.insert(key, info);
 
         debug!(
-            peer_id = %hash_cn(peer_id),
+            peer_id = %hash_cn(peer_id.as_str()),
             direction = %direction,
             pod_id = %self.pod_id,
             "registered federation connection"
@@ -201,8 +206,11 @@ impl ConnectionRegistry {
     }
 
     /// Unregister a federation connection.
-    pub async fn unregister(&self, peer_id: &str) -> Result<()> {
-        let key = format!("{}.{}", self.pod_id, peer_id);
+    ///
+    /// F-113: takes a typed [`rustgate_core::PeerId`] reference; the KV
+    /// key derivation is unchanged.
+    pub async fn unregister(&self, peer_id: &rustgate_core::PeerId) -> Result<()> {
+        let key = format!("{}.{}", self.pod_id, peer_id.as_str());
 
         let mut registered = self.registered.lock().await;
         let _ = registered.remove(&key);
@@ -213,7 +221,7 @@ impl ConnectionRegistry {
         })?;
 
         debug!(
-            peer_id = %hash_cn(peer_id),
+            peer_id = %hash_cn(peer_id.as_str()),
             pod_id = %self.pod_id,
             "unregistered federation connection"
         );
