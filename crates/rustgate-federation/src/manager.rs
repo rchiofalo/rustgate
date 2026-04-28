@@ -828,12 +828,11 @@ impl FederationManager {
         let mut sent = 0;
 
         // Inject flow tag for traceability (identifies which federation server
-        // processed this message and when)
+        // processed this message and when). `add_flow_tag` returns the
+        // original `Bytes` (refcount clone) when no marker is found, so the
+        // common no-op case avoids a `Vec<u8>` allocation entirely.
         #[cfg(feature = "v2")]
-        let payload = {
-            let tagged = crate::v2::convert::add_flow_tag(&payload, &self.config.federate_id);
-            Bytes::from(tagged)
-        };
+        let payload = crate::v2::convert::add_flow_tag(&payload, &self.config.federate_id);
         #[cfg(not(feature = "v2"))]
         let payload = payload;
 

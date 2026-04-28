@@ -460,12 +460,14 @@ mod tests {
     #[cfg(feature = "v2")]
     #[test]
     fn dedup_detects_duplicate_after_real_flow_tag() {
-        let original = br#"<event version="2.0" uid="S1" type="a-f-G" time="2024-01-01T00:00:00Z" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:01:00Z" how="h-g-i-g-o"><point lat="0.0" lon="0.0" hae="0.0" ce="999999" le="999999"/><detail/></event>"#;
+        use bytes::Bytes;
+
+        let original = Bytes::from_static(br#"<event version="2.0" uid="S1" type="a-f-G" time="2024-01-01T00:00:00Z" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:01:00Z" how="h-g-i-g-o"><point lat="0.0" lon="0.0" hae="0.0" ce="999999" le="999999"/><detail/></event>"#);
 
         // Simulate server-a adding a flow tag
-        let tagged_a = crate::v2::convert::add_flow_tag(original, "server-a");
+        let tagged_a = crate::v2::convert::add_flow_tag(&original, "server-a");
         // Simulate server-b adding a different flow tag to the same message
-        let tagged_b = crate::v2::convert::add_flow_tag(original, "server-b");
+        let tagged_b = crate::v2::convert::add_flow_tag(&original, "server-b");
 
         // The tagged payloads should be different bytes
         assert_ne!(tagged_a, tagged_b);
@@ -479,13 +481,15 @@ mod tests {
     #[cfg(feature = "v2")]
     #[test]
     fn dedup_passes_original_and_catches_tagged_copy() {
-        let original = br#"<event version="2.0" uid="UNIT-TEST" type="a-f-G" time="2024-06-15T10:00:00Z" start="2024-06-15T10:00:00Z" stale="2024-06-15T10:01:00Z" how="h-g-i-g-o"><point lat="0" lon="0" hae="0" ce="9" le="9"/><detail/></event>"#;
+        use bytes::Bytes;
 
-        let tagged = crate::v2::convert::add_flow_tag(original, "my-server");
+        let original = Bytes::from_static(br#"<event version="2.0" uid="UNIT-TEST" type="a-f-G" time="2024-06-15T10:00:00Z" start="2024-06-15T10:00:00Z" stale="2024-06-15T10:01:00Z" how="h-g-i-g-o"><point lat="0" lon="0" hae="0" ce="9" le="9"/><detail/></event>"#);
+
+        let tagged = crate::v2::convert::add_flow_tag(&original, "my-server");
 
         let mut dedup = MessageDedup::new();
         // Original passes through
-        assert!(!dedup.is_duplicate(original));
+        assert!(!dedup.is_duplicate(&original));
         // Tagged version of the same message is caught as duplicate
         assert!(dedup.is_duplicate(&tagged));
     }

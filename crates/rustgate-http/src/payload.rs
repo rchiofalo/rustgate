@@ -34,14 +34,20 @@ struct HttpWireMessage<'a> {
 /// Serialize a routable message into the target's configured format.
 ///
 /// Returns `(body_bytes, content_type)` ready for the HTTP request.
+///
+/// `RawXml` returns the original `Bytes` payload by ref-count clone (no
+/// copy). `Json` and `Protobuf` allocate fresh buffers and wrap them in
+/// `Bytes` once — staying on `Bytes` end-to-end means the caller can
+/// share the body across retry attempts and (where enabled) auth signing
+/// without an extra `Vec<u8> -> Bytes` round-trip allocation.
 pub(crate) fn serialize(
     msg: &RoutableMessage,
     format: PayloadFormat,
     instance_id: &str,
-) -> Result<(Vec<u8>, &'static str), HttpError> {
+) -> Result<(Bytes, &'static str), HttpError> {
     match format {
         PayloadFormat::Json => serialize_json(msg, instance_id),
-        PayloadFormat::RawXml => Ok((msg.payload.to_vec(), "application/xml")),
+        PayloadFormat::RawXml => Ok((msg.payload.clone(), "application/xml")),
         PayloadFormat::Protobuf => serialize_protobuf(msg),
     }
 }
@@ -60,14 +66,14 @@ pub(crate) fn serialize(
 // guard); duplicating the signature under `#[cfg]` would double the surface
 // area for no benefit.
 #[allow(unused_variables)]
-fn serialize_protobuf(msg: &RoutableMessage) -> Result<(Vec<u8>, &'static str), HttpError> {
+fn serialize_protobuf(msg: &RoutableMessage) -> Result<(Bytes, &'static str), HttpError> {
     #[cfg(feature = "proto")]
     {
         let proto_bytes =
             rustgate_proto::xml_to_proto(&msg.payload).map_err(|e| HttpError::ProtoConvert {
                 message: e.to_string(),
             })?;
-        Ok((proto_bytes, "application/x-protobuf"))
+        Ok((Bytes::from(proto_bytes), "application/x-protobuf"))
     }
     #[cfg(not(feature = "proto"))]
     {
@@ -80,7 +86,7 @@ fn serialize_protobuf(msg: &RoutableMessage) -> Result<(Vec<u8>, &'static str), 
 fn serialize_json(
     msg: &RoutableMessage,
     instance_id: &str,
-) -> Result<(Vec<u8>, &'static str), HttpError> {
+) -> Result<(Bytes, &'static str), HttpError> {
     let destination = format_destination(&msg.destination);
     let message_type = msg.metadata.message_type.to_string();
     let received_at = format_timestamp(msg.metadata.received_at);
@@ -99,7 +105,7 @@ fn serialize_json(
     };
 
     let body = serde_json::to_vec(&wire).map_err(|e| HttpError::Serialize { source: e })?;
-    Ok((body, "application/json"))
+    Ok((Bytes::from(body), "application/json"))
 }
 
 pub(crate) fn format_destination(dest: &Destination) -> String {
@@ -277,7 +283,7 @@ mod tests {
         let msg = make_msg(xml);
         let (body, content_type) = serialize(&msg, PayloadFormat::RawXml, "inst").unwrap();
         assert_eq!(content_type, "application/xml");
-        assert_eq!(body, xml);
+        assert_eq!(body.as_ref(), xml);
     }
 
     #[test]
@@ -546,8 +552,8 @@ mod tests {
 
     #[test]
     fn raw_xml_passthrough_preserves_binary_bytes_byte_for_byte() {
-        // The RawXml branch returns `msg.payload.to_vec()`
-        // verbatim — no re-encoding, no UTF-8 validation. This
+        // The RawXml branch returns `msg.payload.clone()` (refcount
+        // bump) verbatim — no re-encoding, no UTF-8 validation. This
         // matters because the docstring explicitly notes that CoT
         // XML may contain binary content or non-UTF-8 sequences in
         // some edge cases (embedded attachment bytes, raw
@@ -559,7 +565,8 @@ mod tests {
         let msg = make_msg(&binary);
         let (body, _) = serialize(&msg, PayloadFormat::RawXml, "inst").unwrap();
         assert_eq!(
-            body, binary,
+            body.as_ref(),
+            binary.as_slice(),
             "raw XML passthrough must return the payload bytes verbatim including non-UTF-8"
         );
     }
