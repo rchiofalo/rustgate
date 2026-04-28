@@ -197,3 +197,197 @@ chore: miscellaneous maintenance
 - All CI checks must pass before merge (branch protection enforced)
 - Update the README if the change affects user-facing behavior
 - Add or update tests for any new functionality
+
+## Contributing a new feature
+
+This is the end-to-end checklist a new contributor should follow when
+adding a feature, fixing a bug, or shipping a docs change. The steps
+below capture the discipline visible across recent merged PRs — issue
+first, branch named after the issue, conventional commits, CHANGELOG
+entry, quality gates, and a squash-only merge. If you are sending your
+first PR, follow this list in order.
+
+### 1. File a GitHub issue first
+
+Open an issue before writing code. The issue body should describe:
+
+- **The problem.** What is broken, missing, or unsafe today, and how a
+  user or operator hits it. Link the runbook, design doc, or prior PR
+  the problem was surfaced from.
+- **The proposed solution.** A short sketch of the change you intend to
+  make — which crate, which surface, and what the public-facing
+  contract becomes (config keys, CLI flags, metric names, audit event
+  names, error codes).
+- **Out-of-scope items.** Explicit list of nearby work the PR will
+  *not* do. Recent PRs frequently call this out so the reviewer knows
+  which follow-up issues are deferred (see #803, #816, #882, #909
+  for examples of multi-sub-item parent issues).
+
+Wait for triage and discussion before starting code. If you would
+rather pick from the existing backlog, browse issues labelled
+`enhancement` or one of the `coverage`/`docs`/`refactor` labels and
+ask in the issue thread before opening a PR.
+
+### 2. Branch naming
+
+Name the branch after the issue you are closing or referencing:
+
+```
+<type>/<issue-number>-<short-slug>
+```
+
+Allowed prefixes: `feat/`, `fix/`, `docs/`, `ci/`, `refactor/`,
+`perf/`, `test/`, `chore/`. Examples from recent merges:
+
+- `feat/952-jwks-rotation`
+- `fix/723-cn-normalization`
+- `docs/803-x509-stack`
+- `refactor/795-federation-circuit`
+
+For a security-flavoured change, **do not** use a `security/` prefix
+on the branch — `security` is not one of commit-lint's allowed
+conventional-commit types and the `commit-lint` job will fail. Use
+`fix/` or `feat/` for the branch name and put the security framing in
+the PR title and body instead. `SECURITY.md` covers the threat-model
+side; the branch prefix only controls the commit-lint contract.
+
+### 3. Conventional commit message
+
+Commit messages follow Conventional Commits exactly:
+
+```
+<type>(<scope>): <description>
+
+<body — what changed and why, references to issues>
+
+Closes #N
+```
+
+`<type>` must be one of: `feat`, `fix`, `docs`, `deps`, `ci`,
+`refactor`, `test`, `chore`, `style`, `perf`, `build`, `revert`. The
+`commit-lint` CI job rejects anything else.
+
+`<scope>` is the affected crate or area (e.g. `transport`,
+`federation`, `mqtt`, `authz`). It is optional for cross-cutting
+changes (`docs:`, `ci:`, `chore:`).
+
+The commit body must reference the issue with either:
+
+- `Closes #N` — when the PR fully resolves the issue. The issue
+  auto-closes on merge.
+- `Refs #N` — when the PR addresses one sub-item of a larger umbrella
+  issue (e.g. shipping `F-141` of #816 while leaving `F-139`,
+  `F-140`, `F-158` open). Do not use `Closes` if any sub-item is
+  deferred.
+
+### 4. CHANGELOG entry
+
+Every user-visible change appends an entry to `CHANGELOG.md` under
+`## [Unreleased]` in the appropriate section:
+
+- `### Added` — new features, new public API, new endpoints, new
+  metrics, new config keys.
+- `### Changed` — behaviour changes, refactors with externally
+  visible effects, doc reorganisations.
+- `### Fixed` — bug fixes (correctness, regressions, race
+  conditions).
+- `### Removed` — deleted public API, dropped features, retired flags.
+- `### Security` — vulnerability fixes, hardening, threat-model
+  changes.
+
+Match the style of recent entries: a bold lead phrase with the issue
+reference (`**<headline> (closes #N)** — …`), followed by a
+multi-paragraph description that covers the problem, the change, and
+the user-visible impact. Reviewers expect enough detail in the
+CHANGELOG that a downstream operator reading only the changelog can
+decide whether the change matters to them.
+
+### 5. Quality gates (run locally before pushing)
+
+```bash
+# Format — CI uses nightly fmt
+cargo +nightly fmt --all
+
+# Clippy — all features the workspace ships, warnings as errors
+cargo clippy --locked --workspace --all-targets \
+  --features nats,enrollment,est,proto,full-detail,metrics,federation,federation-ha,websocket,mqtt,otel,http \
+  -- -D warnings
+
+# Tests for the affected crate
+cargo test -p <affected-crate>
+
+# Workspace tests under a single thread for any change that touches
+# global Prometheus state — concurrent registration of the default
+# registry is racy and will produce false failures otherwise.
+cargo test --workspace --all-features -- --test-threads=1
+
+# Dependency audit
+cargo deny check
+```
+
+Two more checks the CI playbook-lint job enforces:
+
+- **F-156 — every `#[allow(...)]` in production code requires a
+  `// justification:` comment immediately above it** explaining why
+  the lint cannot be fixed in place. The `playbook-lint` job runs
+  `scripts/check-allow-justified.py` and fails the build with a
+  pointer to the offending line if the justification is missing. See
+  the "Allow annotations (F-156)" section above for the format.
+- **Test files** standardise on
+  `#![allow(clippy::panic, clippy::unwrap_used)]` at the top of the
+  file. This is the workspace-wide convention so test setup can
+  panic and `.unwrap()` on `Result` when convenient. The justification
+  rule does not apply to tests (see "Exemptions" above).
+
+### 6. Open the PR
+
+- **Title.** Match the commit subject — Conventional Commits format,
+  no trailing period.
+- **Body.** Three to five short paragraphs covering the same ground
+  as the issue: problem, change, user-visible impact, and any
+  follow-ups. Include `Closes #N` or `Refs #N` on its own line so the
+  GitHub issue auto-link works. Cross-link runbooks, design docs, or
+  related PRs.
+- **Cross-links to discipline docs**, where relevant:
+  - `SECURITY.md` for any security-relevant change (threat model,
+    customer-facing posture, vulnerability triage).
+  - `docs/authorization.md` for changes that touch the authz engine,
+    PEP boundaries, or obligation chaining.
+  - `docs/concurrency-model.md` for changes that introduce or modify
+    shared state, locks, or the router/dedup hot path.
+  - `docs/runbooks/audit-chain-corruption.md` for any change that
+    touches the hash-chained audit log on disk.
+  - `.claude/rules/shared-infrastructure.md` for the workspace
+    primitives (audit, masking, sanitization, resilience, socket
+    helpers). Note: this file is `.gitignore`d locally — reviewers
+    consult their own copy. Reference it by path in the PR body when
+    you have reused a primitive listed there.
+
+### 7. CI gates
+
+The required CI checks (enforced by branch protection on `main`) all
+must pass before a PR is mergeable:
+
+- `commit-lint`, `lint`, `clippy`, `check-features`, `test`,
+  `coverage`, `fips`, `post-quantum`, `audit`, `helm`, `docker` (the
+  eleven jobs listed in the *Code Quality* section above).
+- `msrv` — pins the published minimum supported Rust version (1.94)
+  and runs `cargo check` against it. A change that requires a newer
+  toolchain must bump `[workspace.package].rust-version` in the root
+  `Cargo.toml` and call out the bump in the CHANGELOG.
+- `cargo-deny` advisory checks — license, advisory, ban, and source
+  audits run as the `audit` job.
+
+### 8. Review and merge
+
+- Maintainers may request changes. Push follow-up commits to the same
+  branch — **do not force-push** rewrites of already-reviewed history
+  unless explicitly asked. CI re-runs on every push.
+- Pre-commit hook failures should be fixed and re-committed as a new
+  commit; do not amend after review has started.
+- The repo is configured for **squash-only merges**. The squashed
+  commit takes the PR title as its subject, so the title must
+  satisfy Conventional Commits and `commit-lint` on its own.
+- After merge, delete the feature branch and clean up your local
+  worktree. The squashed commit on `main` carries the `Closes #N`
+  trailer and GitHub closes the issue automatically.
