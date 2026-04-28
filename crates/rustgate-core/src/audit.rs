@@ -1811,7 +1811,7 @@ pub fn jwks_refresh_failed(url: &str, reason: &str) {
 /// Record a key being added to the active JWKS verifier registry.
 ///
 /// Emitted once per `kid` newly observed in a JWKS response and
-/// successfully registered with the [`jwt::JwtAuthority`] verifier set.
+/// successfully registered with the `JwtAuthority` verifier set.
 /// The companion [`jwks_key_removed`] event fires when a previously
 /// registered `kid` disappears from the JWKS response and is dropped
 /// from the verifier set.
@@ -1840,7 +1840,7 @@ pub fn jwks_key_added(url: &str, kid: &str, alg: &str) {
 /// Emitted when a previously registered `kid` is no longer advertised
 /// in the JWKS response and the federation JWKS client removes it from
 /// the verifier set. After removal, JWTs carrying this `kid` will
-/// fail verification with [`jwt::JwtError::UnknownKid`].
+/// fail verification with `JwtError::UnknownKid`.
 ///
 /// Removal is gated on the JWKS response itself being valid — a 5xx
 /// or network failure does NOT trigger key removal (fail-closed
