@@ -33,6 +33,8 @@ pub mod error;
 pub mod ha;
 pub mod heartbeat;
 pub mod jwks;
+#[cfg(feature = "jwks")]
+pub mod jwks_client;
 pub mod jwt;
 pub mod manager;
 pub mod peer;
