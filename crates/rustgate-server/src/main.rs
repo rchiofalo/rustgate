@@ -1863,7 +1863,29 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     }) = audit_anchor_handle.as_ref()
     {
         let tip: String = (**tip_observer.load()).clone();
-        match rustgate_core::audit_chain::write_anchor(path, &tip) {
+        // Recover the seq high-water mark by scanning the live log tail.
+        // The writer's in-memory next_seq is not exposed through the
+        // tip_observer (which only carries the chain hash), and reaching
+        // into the tracing subscriber to pull it out would couple the
+        // server's shutdown path to the subscriber internals. The tail
+        // scan is bounded by `REWIND_BUDGET` so the cost is the same
+        // whether the log is 100 KB or 100 GB. On a legacy / empty log
+        // the helper returns `(GENESIS_PREV, 1)` and we persist
+        // `tip_seq = 0` (the high-water of records *already* on disk),
+        // which the next startup interprets as "fall back to scanning
+        // the log" via the read_anchor_with_seq backward-compat path.
+        let tip_seq = match rustgate_core::audit_chain::read_chain_state(path) {
+            Ok((_, next_seq)) => next_seq.saturating_sub(1),
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "failed to recover audit chain seq for anchor; persisting tip with tip_seq=0"
+                );
+                0
+            }
+        };
+        match rustgate_core::audit_chain::write_anchor_with_seq(path, &tip, tip_seq) {
             Ok(()) => {
                 rustgate_core::audit::chain_anchor_persisted(&path.display().to_string(), &tip);
             }

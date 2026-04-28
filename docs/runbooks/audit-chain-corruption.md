@@ -238,6 +238,88 @@ contaminates the new chain with bytes that may already be inadmissible.
    off — even an empty file at the same path can mask the gap when
    reviewers pull the directory listing later.
 
+## Gap Detection (sequence numbers)
+
+Every audit record carries a strictly monotonic `seq: u64` field, and
+the anchor file (`<path>.anchor`) carries the high-water mark
+(`tip_seq=<N>` on its second line) so an external verifier can prove
+**completeness** — i.e. that no contiguous range of records was
+deleted between two known seq values — without re-walking every
+record between them.
+
+### Reading the gap signal
+
+`verify_audit_log()` returns `VerifyError::Gap { line, expected, found }`
+on the *first* missing seq it encounters; the `expected` field names the
+seq number that should have appeared, and `found` names the seq the
+verifier actually read. Equivalently, a SIEM tailing the audit stream
+that remembers the highest seq it has forwarded sees a *next* record
+whose `seq` is not exactly `prev_seq + 1`.
+
+Concrete reading:
+
+- `VerifyError::Gap { line: 4072, expected: 4071, found: 4073 }` — the
+  record that should have carried `seq = 4071` is missing. The next
+  record at line 4072 (now physically adjacent to its predecessor)
+  carries `seq = 4073`, so the deletion span is exactly seq `4071..=4072`
+  (one record, by current evidence). If multiple records were deleted
+  in a contiguous run the gap surfaces as `expected: 4071, found: M`
+  for some `M > 4072`, and the deletion span is `4071..=M-1`.
+- `VerifyError::MissingSeq { line }` — the record at this line carries
+  no `seq` field at all. This is either a pre-`seq` audit log (operator
+  upgraded without rolling the log file; see the wire-format break note
+  in `audit_chain.rs` module docs) or a hand-edited record with the seq
+  key stripped.
+- `VerifyError::InvalidSeq { line }` — the `seq` field exists but is not
+  a non-negative integer. Treat as corruption; the value was hand-edited
+  or the file is partially binary.
+
+### Anchor `tip_seq` for offline pinning
+
+`<path>.anchor` is a two-line UTF-8 file:
+
+```text
+<64-char-lowercase-hex-sha256>
+tip_seq=<decimal-u64>
+```
+
+The first line is the chain tip hash (unchanged from the legacy
+single-line format); the second line is the seq high-water mark at the
+moment the anchor was persisted. Together they let an external auditor
+prove that the on-disk log is exactly the chain that was running at
+shutdown — no in-place tampering (the hash chain) *and* no truncation
+of contiguous records up to `tip_seq` (the seq counter).
+
+A legacy single-line anchor file (one line, hash only) is still
+accepted: `read_anchor_with_seq` returns `tip_seq = 0` and the writer
+falls back to scanning the live log via `read_chain_state` to recover
+the authoritative seq value. This means upgrading the binary across the
+seq-anchor boundary is a no-op for the operator — the next clean
+shutdown writes the new two-line format on top of the old one and the
+backward-compat path is no longer exercised.
+
+### Triage path on a `Gap`
+
+A gap inside a continuous write window — no crash, no rotation event,
+no explicit `truncate` by the operator — means records were deleted
+from an append-only log. Follow the
+[Tamper or hardware corruption](#tamper-or-hardware-corruption)
+recovery procedure: stop the writer, preserve the file with metadata,
+escalate to the security team, and resume on a fresh path.
+
+If the SIEM already forwarded records past the gap (i.e. the SIEM's
+high-water mark is greater than the verifier's `expected` seq), the
+deleted records are recoverable from the SIEM's downstream copy. The
+audit log on disk cannot be repaired in place — appending to a chain
+broken by deletion would only widen the forensic gap — but the SIEM's
+copy is admissible evidence of what was emitted.
+
+If the SIEM did *not* see the deleted records (its high-water mark is
+below the verifier's `expected` seq), the records are lost. Document
+the loss span (`expected` through `found - 1`) in the operator's
+secondary log so reviewers correlating the audit window against
+in-band events know which time range has reduced fidelity.
+
 ## SIEM Alert Design
 
 The audit chain only catches what something is watching for. Two
