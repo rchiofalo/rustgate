@@ -42,6 +42,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
+use dashmap::DashMap;
 use parking_lot::Mutex;
 use rustgate_authz::{
     Action as AuthzAction, Decision as AuthzDecision, Obligation, PolicyEngine,
@@ -882,7 +883,20 @@ pub struct Router {
     /// bucket keyed by the reconnecting client's CN. The map grows
     /// lazily on first replay and is pruned on session disconnect so
     /// a CN-churning attacker cannot bloat the entry table.
-    replay_buckets: Mutex<HashMap<Arc<str>, Arc<TokenBucket>>>,
+    ///
+    /// `DashMap` shape (issue #836): the per-CN lookup runs concurrently
+    /// across every reconnecting session. The pre-#836 shape held a
+    /// single `parking_lot::Mutex<HashMap>` whose critical section
+    /// serialised every replay-rate check across all worker threads.
+    /// Under the contended micro-bench in
+    /// `benches/dedup_contention.rs` (PR #836) the
+    /// `parking_lot::Mutex<HashMap>` shape collapsed from ~9.4 Melem/s
+    /// at 8 workers to ~6.7 Melem/s at 16 workers, while the sharded
+    /// `DashMap` held ~49 Melem/s flat. The swap is a clean drop-in
+    /// here because the map is keyed entirely by CN — there is no
+    /// cross-key state (no LRU, no FIFO, no per-map sweep) that would
+    /// require a global lock to coordinate.
+    replay_buckets: DashMap<Arc<str>, Arc<TokenBucket>>,
     /// Configuration parameters for the per-CN replay rate limiter.
     /// Plain field (not `ArcSwap`) because the bucket map carries
     /// the live state and is populated on demand from this config.
@@ -979,7 +993,7 @@ impl Default for Router {
             quota_tracker: ArcSwap::from_pointee(None),
             unknown_obligation_policy: UnknownObligationPolicy::default(),
             obligation_rate_limiter: Arc::new(ObligationRateLimiter::default()),
-            replay_buckets: Mutex::new(HashMap::new()),
+            replay_buckets: DashMap::new(),
             replay_limit_config: PositionReplayLimitConfig::default(),
             on_multicast_oversize_dropped: ArcSwap::from_pointee(None),
             on_fanout: ArcSwap::from_pointee(None),
@@ -1018,7 +1032,7 @@ impl Router {
             quota_tracker: ArcSwap::from_pointee(None),
             unknown_obligation_policy: UnknownObligationPolicy::default(),
             obligation_rate_limiter: Arc::new(ObligationRateLimiter::default()),
-            replay_buckets: Mutex::new(HashMap::new()),
+            replay_buckets: DashMap::new(),
             replay_limit_config: PositionReplayLimitConfig::default(),
             on_multicast_oversize_dropped: ArcSwap::from_pointee(None),
             on_fanout: ArcSwap::from_pointee(None),
@@ -1063,7 +1077,7 @@ impl Router {
             quota_tracker: ArcSwap::from_pointee(None),
             unknown_obligation_policy: UnknownObligationPolicy::default(),
             obligation_rate_limiter: Arc::new(ObligationRateLimiter::default()),
-            replay_buckets: Mutex::new(HashMap::new()),
+            replay_buckets: DashMap::new(),
             replay_limit_config: PositionReplayLimitConfig::default(),
             on_multicast_oversize_dropped: ArcSwap::from_pointee(None),
             on_fanout: ArcSwap::from_pointee(None),
@@ -1111,7 +1125,7 @@ impl Router {
             quota_tracker: ArcSwap::from_pointee(None),
             unknown_obligation_policy: UnknownObligationPolicy::default(),
             obligation_rate_limiter: Arc::new(ObligationRateLimiter::default()),
-            replay_buckets: Mutex::new(HashMap::new()),
+            replay_buckets: DashMap::new(),
             replay_limit_config: PositionReplayLimitConfig::default(),
             on_multicast_oversize_dropped: ArcSwap::from_pointee(None),
             on_fanout: ArcSwap::from_pointee(None),
@@ -1565,25 +1579,34 @@ impl Router {
     /// The map grows on first replay attempt for a given CN; entries
     /// are pruned on session disconnect by [`Router::unregister`] so a
     /// CN-churning attacker cannot inflate this map without bound.
+    ///
+    /// Uses [`DashMap::entry`] (issue #836) so the lookup-then-insert
+    /// runs under a single shard lock, not a global mutex. The
+    /// `or_insert_with` closure constructs the [`TokenBucket`] lazily
+    /// — `dashmap` only invokes it on the vacant branch, so we do not
+    /// pay the (cheap but non-zero) `TokenBucket::new` cost on the
+    /// common-path return-existing case.
     fn replay_bucket_for(&self, cn: &str) -> Arc<TokenBucket> {
-        let mut guard = self.replay_buckets.lock();
-        if let Some(existing) = guard.get(cn) {
-            return Arc::clone(existing);
+        if let Some(existing) = self.replay_buckets.get(cn) {
+            return Arc::clone(existing.value());
         }
-        let bucket = Arc::new(TokenBucket::new(
-            f64::from(self.replay_limit_config.rate_per_sec),
-            Some(f64::from(self.replay_limit_config.burst)),
-        ));
-        let _ = guard.insert(Arc::<str>::from(cn), Arc::clone(&bucket));
-        bucket
+        let entry = self
+            .replay_buckets
+            .entry(Arc::<str>::from(cn))
+            .or_insert_with(|| {
+                Arc::new(TokenBucket::new(
+                    f64::from(self.replay_limit_config.rate_per_sec),
+                    Some(f64::from(self.replay_limit_config.burst)),
+                ))
+            });
+        Arc::clone(entry.value())
     }
 
     /// Drop the rate-limiter bucket entry for `cn`, if any. Called from
     /// session-disconnect paths so the per-CN map does not grow without
     /// bound under a CN-churning attacker.
     fn drop_replay_bucket(&self, cn: &str) {
-        let mut guard = self.replay_buckets.lock();
-        let _ = guard.remove(cn);
+        let _ = self.replay_buckets.remove(cn);
     }
 
     /// Number of currently-tracked replay rate-limit buckets. Test-only
@@ -1591,7 +1614,7 @@ impl Router {
     /// issue #724.
     #[cfg(test)]
     fn replay_bucket_map_len(&self) -> usize {
-        self.replay_buckets.lock().len()
+        self.replay_buckets.len()
     }
 
     /// Snapshot the current quota tracker, if any.
