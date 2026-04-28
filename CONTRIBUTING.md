@@ -400,6 +400,14 @@ must pass before a PR is mergeable:
   unless explicitly asked. CI re-runs on every push.
 - Pre-commit hook failures should be fixed and re-committed as a new
   commit; do not amend after review has started.
+- If your PR touches a security-critical path listed in
+  [`.github/CODEOWNERS`](.github/CODEOWNERS) (the authz engine, the
+  enrollment surface, the TLS verifier, the SPIFFE / cert-reloader /
+  quota plumbing, the encrypted-archive key ring, the hash-chained
+  audit log, the audit event vocabulary, the secret-file reader, the
+  PII masking helpers, or the federation JWT / JWKS layer), the
+  maintainer review is requested **automatically** — don't be
+  surprised when GitHub adds the review request the moment you push.
 - The repo is configured for **squash-only merges**. The squashed
   commit takes the PR title as its subject, so the title must
   satisfy Conventional Commits and `commit-lint` on its own.
