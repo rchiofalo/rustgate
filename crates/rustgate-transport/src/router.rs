@@ -13,10 +13,11 @@
 //!    For multicast, the Send PEP runs per-group inside
 //!    `send_to_group_excluding` so that per-group policy granularity is
 //!    preserved on the local fanout, AND a second per-group Send pass runs
-//!    on the egress path inside `compute_multicast_egress` so external
-//!    sinks (NATS, federation, HTTP) receive a copy with the union of
-//!    allow-side Send obligations applied (closes #738). The subject is
-//!    the *sender's* identity, the resource is the destination, and the
+//!    on the egress path inside [`crate::egress::prepare_egress_envelope`]
+//!    so external sinks (NATS, federation, HTTP, MQTT) receive a single
+//!    rendered copy with the union of allow-side Send obligations
+//!    applied (closes #738, refactored under #746). The subject is the
+//!    *sender's* identity, the resource is the destination, and the
 //!    action is [`AuthzAction::Send`]. A deny verdict drops the message
 //!    outright with no observable side effect beyond the audit trail.
 //!
@@ -50,6 +51,9 @@ use rustgate_authz::{
 };
 use smol_str::SmolStr;
 
+use crate::egress::{
+    EgressContext, EgressError, EnvelopeEvaluator, RecipientClass, prepare_egress_envelope,
+};
 use crate::obligations::{
     ObligationRateLimiter, UnknownObligationPolicy, apply_obligations_with_limiter,
     obligations_mutate_payload,
@@ -205,7 +209,7 @@ impl Drop for AuthzEvalGuard {
 /// [`Obligation`] enum: a future variant the transport build does not
 /// recognise renders as `"unknown"` so cardinality stays bounded
 /// regardless of which authz version is deployed. Closes #768.
-fn obligation_kind_label(obligation: &Obligation) -> &'static str {
+pub(crate) fn obligation_kind_label(obligation: &Obligation) -> &'static str {
     match obligation {
         Obligation::MaskPoint => "mask_point",
         Obligation::MaskPayload => "mask_payload",
@@ -891,32 +895,6 @@ impl PositionReplayLimitConfig {
             burst,
         }
     }
-}
-
-/// Outcome of computing the egress copy for a multicast message.
-///
-/// Internal to the router — produced by `compute_multicast_egress` and
-/// consumed by the [`Destination::Multicast`] arm of `route_inner`. Closes
-/// #738: the egress copy must apply the union of allow-side Send
-/// obligations across the addressed groups (so external sinks see masked
-/// coordinates whenever any group's policy masks them) without disturbing
-/// the local fanout, which already runs per-group obligations
-/// recipient-side inside `send_to_group_excluding`.
-enum MulticastEgress {
-    /// At least one group's Send rule produced a payload-mutating
-    /// obligation; the wrapped arc is the masked egress copy.
-    Masked(Arc<RoutableMessage>),
-    /// No engine installed, or every allow outcome carried no
-    /// payload-mutating obligation. The caller forwards the original
-    /// unmodified `arc_msg` — matching the pre-#738 behaviour for the
-    /// no-policy path.
-    Unchanged,
-    /// Obligation actuation fail-closed under the configured
-    /// [`UnknownObligationPolicy`]. The caller suppresses egress so
-    /// external sinks receive nothing rather than a leaked unmasked
-    /// payload. The local fanout already happened with per-group
-    /// obligations applied recipient-side.
-    Suppressed,
 }
 
 /// The central message dispatch engine with ACL, authorization, backpressure, deduplication, and store-forward support.
@@ -2361,134 +2339,57 @@ impl Router {
             Destination::Multicast(groups) => {
                 let subscribers = self.send_to_multicast(&groups, envelope).await;
                 self.emit_fanout("multicast", subscribers);
-                // Closes #738. Local fan-out has already applied
-                // per-group Send obligations to each recipient copy
-                // inside `send_to_group_excluding`; the `arc_msg`
+                // Closes #738 / #746. Local fan-out has already
+                // applied per-group Send obligations to each recipient
+                // copy inside `send_to_group_excluding`; the `arc_msg`
                 // captured above is the *unmasked* source form. Egress
-                // forwarders (NATS, federation, HTTP) MUST receive a
-                // masked copy whenever any group in the multicast list
-                // carries a `MaskPoint`/`MaskPayload` Send rule —
+                // forwarders (NATS, federation, HTTP, MQTT) MUST receive
+                // a masked copy whenever any group in the multicast
+                // list carries a `MaskPoint`/`MaskPayload` Send rule —
                 // otherwise the raw payload reaches an external sink
                 // even though every local recipient saw a masked copy.
                 //
-                // The multicast egress copy applies the *union* of
-                // allow-side Send obligations across the addressed
-                // groups: if any group masks, the egress copy is
-                // masked. This is the safe semantic — egress sinks
-                // are not group-aware, so the strictest masking wins.
-                // The local-fanout perf carve-out is preserved:
+                // The egress envelope is rendered exactly once per
+                // multicast via `prepare_egress_envelope` and the
+                // resulting `Arc<RoutableMessage>` is the form returned
+                // to every external sink. For an N-recipient multicast
+                // the obligation actuation runs once (not N times) and
+                // the `egress.obligation.applied` audit cadence is
+                // per-envelope, not per-recipient — closes #746.
+                //
+                // Deny-first across the addressed groups: if any
+                // group's Send rule denies the envelope, no external
+                // sink observes the message. Per-group denies on the
+                // local-fanout path were already audited inside
+                // `send_to_group_excluding`. The `arc_msg`-only
+                // local-fanout perf carve-out is preserved:
                 // `send_to_multicast` ran on the unmasked `envelope`
                 // above, and per-group obligations were applied
                 // recipient-side without re-clone-storming the
                 // common case.
-                return match self.compute_multicast_egress(&arc_msg, &groups) {
-                    MulticastEgress::Masked(arc) => Some(arc),
-                    MulticastEgress::Unchanged => Some(arc_msg),
-                    MulticastEgress::Suppressed => None,
+                let class = RecipientClass::Multicast(groups.clone());
+                let authz_guard = self.authz.load();
+                let engine_ref = (**authz_guard).as_ref();
+                let ctx = EgressContext {
+                    engine: engine_ref,
+                    unknown_policy: self.unknown_obligation_policy,
+                    rate_limiter: &self.obligation_rate_limiter,
+                };
+                return match prepare_egress_envelope(Arc::clone(&arc_msg), class, &ctx, self) {
+                    Ok(envelope) => Some(envelope.message),
+                    Err(EgressError::Denied { .. }) | Err(EgressError::ObligationFailed { .. }) => {
+                        // Suppress egress fan-out when the envelope is
+                        // denied or obligation actuation fail-closed.
+                        // External sinks observe nothing rather than a
+                        // leaked unmasked payload. The local fanout
+                        // already happened above with per-group
+                        // obligations applied recipient-side.
+                        None
+                    }
                 };
             }
         }
         Some(arc_msg)
-    }
-
-    /// Compute the egress copy for a [`Destination::Multicast`] message
-    /// by evaluating the Send PEP per group and applying the union of
-    /// allow-side obligations to a clone of `arc_msg`.
-    ///
-    /// Returns:
-    /// - [`MulticastEgress::Masked`] when at least one group's Send
-    ///   rule produced a payload-mutating obligation; the wrapped arc
-    ///   is the masked egress form.
-    /// - [`MulticastEgress::Unchanged`] when no engine is installed or
-    ///   no allow-side group produced payload-mutating obligations;
-    ///   the caller forwards the unmodified `arc_msg`.
-    /// - [`MulticastEgress::Suppressed`] when obligation actuation
-    ///   fail-closed under the configured policy. The local fanout
-    ///   already occurred with per-group obligations applied
-    ///   recipient-side; external sinks observe nothing rather than a
-    ///   leaked copy.
-    ///
-    /// Audit emission: per-group `authz_denied` events are intentionally
-    /// NOT re-emitted here — `send_to_group_excluding` already audited
-    /// any denies on the local fanout path. Likewise `authz_classified_
-    /// delivery` is recipient-paired and stays in the Receive PEP. The
-    /// egress copy is a single artefact with no per-recipient envelope,
-    /// so the audit trail is the obligation-actuation side-effects
-    /// (e.g. `authz_obligation_failed` on actuation error) emitted by
-    /// `apply_obligations_with_limiter` itself.
-    fn compute_multicast_egress(
-        &self,
-        arc_msg: &Arc<RoutableMessage>,
-        groups: &[Arc<str>],
-    ) -> MulticastEgress {
-        let authz_guard = self.authz.load();
-        let Some(engine) = (**authz_guard).as_ref() else {
-            return MulticastEgress::Unchanged;
-        };
-
-        // Collect the union of allow-side obligations across the groups.
-        // `HashSet` dedupes when two groups carry the same obligation
-        // (the common case for a uniform masking policy across a tenant).
-        let mut union: HashSet<Obligation> = HashSet::new();
-        for group in groups {
-            // Mirror `send_to_group_excluding`'s membership gate: a
-            // sender that is not a member of the group cannot Send to
-            // it on the local path either, so the group does not
-            // contribute its obligations to the egress union.
-            if !arc_msg.source.is_member_of(group) {
-                continue;
-            }
-            let subject = AuthzSubject::from_identity(&arc_msg.source);
-            let resource = AuthzResource::Group { group };
-            let outcome = self.authz_evaluate_send(engine, &subject, &resource);
-            if !outcome.is_allow() {
-                // Per-group deny is already audited inside
-                // `send_to_group_excluding` for the local fanout path —
-                // do not double-audit on the egress side. The denied
-                // group simply does not contribute obligations to the
-                // egress union.
-                continue;
-            }
-            for ob in outcome.obligations {
-                let _ = union.insert(ob);
-            }
-        }
-
-        // No allow-side obligations across any group → the unmasked
-        // `arc_msg` is already the correct egress form.
-        if union.is_empty() {
-            return MulticastEgress::Unchanged;
-        }
-
-        let obligations: Vec<Obligation> = union.into_iter().collect();
-        // Skip the clone+mutate when none of the obligations actually
-        // touch the payload (e.g. `TagClassified`-only union). Egress
-        // sinks observe the same envelope as a no-obligation routing.
-        if !obligations_mutate_payload(&obligations) {
-            return MulticastEgress::Unchanged;
-        }
-
-        let policy_id = engine.policy_id().to_owned();
-        let mut egress_msg = (**arc_msg).clone();
-        if let Err(e) = apply_obligations_with_limiter(
-            &mut egress_msg,
-            &obligations,
-            self.unknown_obligation_policy,
-            &policy_id,
-            Some(&self.obligation_rate_limiter),
-        ) {
-            // Fail-closed: drop the egress copy entirely rather than
-            // leaking the unmasked `arc_msg` to external sinks.
-            // `apply_obligations_with_limiter` already emitted the
-            // forensic record (`authz_obligation_failed`).
-            debug!(
-                err = %e,
-                source = %hash_cn(&arc_msg.source.cn),
-                "multicast egress obligation actuation failed; suppressing egress copy"
-            );
-            return MulticastEgress::Suppressed;
-        }
-        MulticastEgress::Masked(Arc::new(egress_msg))
     }
 
     /// Drain any messages persisted for this CN while it was
@@ -3778,6 +3679,24 @@ impl Router {
             );
         }
         delivered_count
+    }
+}
+
+/// Wire the router's instrumented Send-PEP entry point into the egress
+/// helper without exposing `authz_evaluate_send` as a public method. The
+/// helper does not know about the router's PEP instrumentation
+/// (in-flight gauge, observer callback, latency histogram); the trait
+/// indirection lets the helper stay decoupled while every
+/// envelope-rendering evaluation is observed identically to a local
+/// fan-out evaluation. Closes #746.
+impl EnvelopeEvaluator for Router {
+    fn evaluate_send(
+        &self,
+        engine: &Arc<dyn PolicyEngine>,
+        subject: &AuthzSubject<'_>,
+        resource: &AuthzResource<'_>,
+    ) -> rustgate_authz::DecisionOutcome {
+        self.authz_evaluate_send(engine, subject, resource)
     }
 }
 
@@ -6289,6 +6208,157 @@ mod tests {
             drop_count.load(Ordering::Relaxed),
             0,
             "successful multicast must not invoke the dropped callback",
+        );
+    }
+
+    /// Closes #746. Pin the deny-first / most-restrictive fold the new
+    /// `prepare_egress_envelope` helper applies for a `Multicast`
+    /// envelope: three groups, each carrying a different obligation —
+    /// the rendered envelope's `applied_obligations` is the union of
+    /// every allow-side group's obligations, and a single deny on any
+    /// addressed group vetoes the entire envelope.
+    #[tokio::test]
+    async fn prepare_egress_envelope_for_multicast_uses_most_restrictive_obligations() {
+        use rustgate_authz::{
+            Action as AuthzAction, Decision as AuthzDecision, DecisionOutcome, Obligation,
+            PolicyEngine, Resource as AuthzResource, Subject as AuthzSubject,
+        };
+
+        use crate::egress::{EgressContext, EgressError, RecipientClass, prepare_egress_envelope};
+
+        // Per-group decision table: `alpha` allows with MaskPoint,
+        // `bravo` allows with TagClassified, `charlie` allows with
+        // MaskPayload. The union must contain all three.
+        #[derive(Debug)]
+        struct PerGroup;
+        impl PolicyEngine for PerGroup {
+            fn evaluate(
+                &self,
+                _subject: &AuthzSubject<'_>,
+                resource: &AuthzResource<'_>,
+                _action: AuthzAction,
+            ) -> DecisionOutcome {
+                let group = match resource {
+                    AuthzResource::Group { group } => *group,
+                    _ => "",
+                };
+                let obligations = match group {
+                    "alpha" => vec![Obligation::MaskPoint],
+                    "bravo" => vec![Obligation::TagClassified],
+                    "charlie" => vec![Obligation::MaskPayload],
+                    _ => Vec::new(),
+                };
+                DecisionOutcome {
+                    decision: AuthzDecision::Allow,
+                    rule_id: None,
+                    obligations,
+                }
+            }
+            fn policy_id(&self) -> &str {
+                "test-746-pergroup"
+            }
+        }
+
+        let alice = make_identity("alice", &["alpha", "bravo", "charlie"]);
+        let router = Router::new().with_authz(Arc::new(PerGroup));
+
+        let msg = make_position(
+            &alice,
+            Destination::Multicast(vec!["alpha".into(), "bravo".into(), "charlie".into()]),
+        );
+        let arc_msg = Arc::new(msg);
+
+        let class =
+            RecipientClass::Multicast(vec!["alpha".into(), "bravo".into(), "charlie".into()]);
+        let authz_guard = router.authz.load();
+        let engine_ref = (**authz_guard).as_ref();
+        let ctx = EgressContext {
+            engine: engine_ref,
+            unknown_policy: router.unknown_obligation_policy,
+            rate_limiter: &router.obligation_rate_limiter,
+        };
+        let envelope = prepare_egress_envelope(Arc::clone(&arc_msg), class, &ctx, &router)
+            .expect("union path must succeed");
+
+        // Every per-group obligation must surface in the union.
+        let kinds: BTreeSet<&'static str> = envelope
+            .applied_obligations
+            .iter()
+            .map(obligation_kind_label)
+            .collect();
+        assert!(
+            kinds.contains("mask_point"),
+            "MaskPoint must be in the union, got {kinds:?}"
+        );
+        assert!(
+            kinds.contains("tag_classified"),
+            "TagClassified must be in the union, got {kinds:?}"
+        );
+        assert!(
+            kinds.contains("mask_payload"),
+            "MaskPayload must be in the union, got {kinds:?}"
+        );
+
+        // Sanity: the rendered message is not the input arc — at least
+        // one payload-mutating obligation was applied, so the helper
+        // produced a fresh `Arc<RoutableMessage>`. (Pointer-identity
+        // check; the `Arc` allocation differs even if the bytes round
+        // back to the same value.)
+        assert!(
+            !Arc::ptr_eq(&arc_msg, &envelope.message),
+            "rendered envelope must be a fresh allocation when payload-mutating obligations apply"
+        );
+
+        // Deny-first arm: a per-group deny on `bravo` vetoes the
+        // entire envelope, regardless of how many other groups would
+        // have allowed.
+        #[derive(Debug)]
+        struct DenyOnBravo;
+        impl PolicyEngine for DenyOnBravo {
+            fn evaluate(
+                &self,
+                _subject: &AuthzSubject<'_>,
+                resource: &AuthzResource<'_>,
+                _action: AuthzAction,
+            ) -> DecisionOutcome {
+                let group = match resource {
+                    AuthzResource::Group { group } => *group,
+                    _ => "",
+                };
+                if group == "bravo" {
+                    DecisionOutcome {
+                        decision: AuthzDecision::Deny,
+                        rule_id: None,
+                        obligations: Vec::new(),
+                    }
+                } else {
+                    DecisionOutcome {
+                        decision: AuthzDecision::Allow,
+                        rule_id: None,
+                        obligations: vec![Obligation::MaskPoint],
+                    }
+                }
+            }
+            fn policy_id(&self) -> &str {
+                "test-746-deny-bravo"
+            }
+        }
+
+        let router = Router::new().with_authz(Arc::new(DenyOnBravo));
+        let class =
+            RecipientClass::Multicast(vec!["alpha".into(), "bravo".into(), "charlie".into()]);
+        let authz_guard = router.authz.load();
+        let engine_ref = (**authz_guard).as_ref();
+        let ctx = EgressContext {
+            engine: engine_ref,
+            unknown_policy: router.unknown_obligation_policy,
+            rate_limiter: &router.obligation_rate_limiter,
+        };
+        let err = prepare_egress_envelope(Arc::clone(&arc_msg), class, &ctx, &router)
+            .expect_err("any per-group deny must veto the envelope");
+        assert!(
+            matches!(err, EgressError::Denied { .. }),
+            "deny-first arm must produce EgressError::Denied, got {err:?}"
         );
     }
 
