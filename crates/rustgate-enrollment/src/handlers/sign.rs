@@ -27,6 +27,12 @@ pub(crate) fn handle_tls_config(signer: &CsrSigner) -> Response<Full<Bytes>> {
 /// Same auth and CSR flow as v2, but the response is a binary PKCS#12
 /// bundle containing the signed client cert and CA cert, encrypted with
 /// the standard password ("atakatak").
+#[tracing::instrument(
+    name = "enrollment.sign_v1",
+    level = "info",
+    skip_all,
+    fields(peer = %rustgate_core::masking::mask_ip(&peer.to_string())),
+)]
 pub(crate) async fn handle_sign_client_v1(
     req: Request<hyper::body::Incoming>,
     peer: SocketAddr,
@@ -161,6 +167,12 @@ pub(crate) async fn handle_sign_client_v1(
 }
 
 /// signClient v2 — returns signed certificate as JSON or XML.
+#[tracing::instrument(
+    name = "enrollment.sign_v2",
+    level = "info",
+    skip_all,
+    fields(peer = %rustgate_core::masking::mask_ip(&peer.to_string())),
+)]
 pub(crate) async fn handle_sign_client_v2(
     req: Request<hyper::body::Incoming>,
     peer: SocketAddr,

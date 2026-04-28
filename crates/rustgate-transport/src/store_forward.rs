@@ -47,6 +47,7 @@ use parking_lot::Mutex;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use rustgate_core::crypto::{HmacError, hmac_sha256_tag, hmac_sha256_verify};
 use rustgate_core::identity::Identity;
+use rustgate_core::masking::hash_cn;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -722,6 +723,7 @@ impl ClientQueue {
     /// before the queue entry is removed, so a crash between drain and
     /// caller acknowledgement will not cause duplicate delivery on
     /// restart — the next `open` will skip delivered entries.
+    #[tracing::instrument(level = "debug", skip_all, fields(cn = %hash_cn(cn)), err)]
     pub fn drain(&self, cn: &str) -> Result<Vec<RoutableMessage>, StoreForwardError> {
         let seqs: Vec<u64> = {
             let mut inner = self.inner.lock();

@@ -116,6 +116,13 @@ pub struct CompiledPolicy {
 
 impl RuleSet {
     /// Validate and compile this rule set into a [`CompiledPolicy`].
+    #[tracing::instrument(
+        name = "authz.compile",
+        level = "info",
+        skip_all,
+        fields(version = self.version, rule_count = self.rules.len()),
+        err,
+    )]
     pub fn compile(&self) -> Result<CompiledPolicy, AuthzError> {
         validate(self)?;
 

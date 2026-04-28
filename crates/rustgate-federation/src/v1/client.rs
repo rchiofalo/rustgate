@@ -158,6 +158,12 @@ impl V1Client {
     /// Send a message to the remote peer.
     ///
     /// Returns an error if the send channel is full or the client is shut down.
+    #[tracing::instrument(
+        level = "debug",
+        skip_all,
+        fields(peer = %self.peer.id, bytes = data.len()),
+        err,
+    )]
     pub async fn send(&self, data: Bytes) -> Result<()> {
         let bytes_len = data.len();
         self.peer.record_enqueue(bytes_len);

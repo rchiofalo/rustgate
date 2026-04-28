@@ -903,6 +903,7 @@ impl FederationService {
 impl FederatedChannel for FederationService {
     // --- Unary RPCs ---
 
+    #[tracing::instrument(name = "fed.send_one_event", level = "debug", skip_all, fields(peer = tracing::field::Empty))]
     async fn send_one_event(
         &self,
         request: Request<figpb::FederatedEvent>,
@@ -910,6 +911,7 @@ impl FederatedChannel for FederationService {
         // mTLS extraction failure already emits federation_peer_rejected
         // and returns Unauthenticated — no extra audit here.
         let peer_id = Self::peer_id_from_request(&request)?;
+        let _ = tracing::Span::current().record("peer", tracing::field::display(&peer_id));
         let event = request.into_inner();
 
         if !Self::validate_hop_count(&event, &peer_id, self.max_hops) {
@@ -977,17 +979,20 @@ impl FederatedChannel for FederationService {
         }))
     }
 
+    #[tracing::instrument(name = "fed.health_check", level = "debug", skip_all, fields(peer = tracing::field::Empty))]
     async fn health_check(
         &self,
         request: Request<figpb::ClientHealth>,
     ) -> Result<Response<figpb::ServerHealth>, Status> {
         let peer_id = Self::peer_id_from_request(&request)?;
+        let _ = tracing::Span::current().record("peer", tracing::field::display(&peer_id));
         debug!(peer = %peer_id, "health check received");
         Ok(Response::new(figpb::ServerHealth {
             status: figpb::server_health::ServingStatus::Serving as i32,
         }))
     }
 
+    #[tracing::instrument(name = "fed.send_one_blob", level = "debug", skip_all, fields(peer = tracing::field::Empty))]
     async fn send_one_blob(
         &self,
         request: Request<figpb::BinaryBlob>,
@@ -995,6 +1000,7 @@ impl FederatedChannel for FederationService {
         // mTLS extraction failure already emits federation_peer_rejected
         // and returns Unauthenticated — no extra audit here.
         let peer_id = Self::peer_id_from_request(&request)?;
+        let _ = tracing::Span::current().record("peer", tracing::field::display(&peer_id));
         let blob = request.into_inner();
 
         // Hop-count validation (refs #864): mirrors `send_one_event` —
