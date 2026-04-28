@@ -280,6 +280,21 @@ The commit body must reference the issue with either:
   `F-140`, `F-158` open). Do not use `Closes` if any sub-item is
   deferred.
 
+#### Architecture Decision Records (ADRs)
+
+Non-obvious architectural decisions go in `docs/adr/`. Use the
+template at [`docs/adr/template.md`](docs/adr/template.md) — slim
+Michael Nygard format with status, context, decision, alternatives,
+and consequences. The new ADR is given the next four-digit prefix
+(see [`docs/adr/README.md`](docs/adr/README.md) for the index) and a
+kebab-case slug. Cross-reference the ADR file in the body of the
+commit that implements the decision so the rationale travels with
+the change. ADRs are for the kind of decision a future contributor
+will hit and ask "why was this picked?" — locking primitives,
+dependency choices where alternatives were viable, secret-handling
+discipline. Routine implementation details, bug fixes, and per-
+feature design notes do not need an ADR.
+
 ### 4. CHANGELOG entry
 
 Every user-visible change appends an entry to `CHANGELOG.md` under
