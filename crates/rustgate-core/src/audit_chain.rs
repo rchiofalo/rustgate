@@ -685,9 +685,37 @@ pub fn anchor_path(audit_path: &Path) -> PathBuf {
 }
 
 /// Write `tip` to `<path>.anchor` so external systems can pin the chain on
-/// rotation. The anchor file is currently unsigned; signing can be layered on
-/// top later without changing the on-disk format of the chain itself.
+/// rotation. Equivalent to [`write_anchor_with_seq`] with `tip_seq = 0`,
+/// kept for backward compatibility with callers that have no sequence
+/// number to persist (legacy code paths and the encrypted-archive sink
+/// that restarts at genesis each run).
+///
+/// New call sites that have a tip sequence number on hand should prefer
+/// [`write_anchor_with_seq`] so an external verifier can prove the
+/// completeness of the chain across the persisted anchor.
 pub fn write_anchor(audit_path: &Path, tip: &str) -> io::Result<()> {
+    write_anchor_with_seq(audit_path, tip, 0)
+}
+
+/// Write `tip` and `tip_seq` to `<path>.anchor` so external systems can
+/// pin both the chain hash *and* the sequence-number high-water mark on
+/// rotation.
+///
+/// On-disk format (UTF-8, ASCII-only payload):
+///
+/// ```text
+/// <64-char-lowercase-hex-sha256>\n
+/// tip_seq=<decimal-u64>\n
+/// ```
+///
+/// The two-line layout is intentional: a legacy reader that knows only
+/// the first line still reads the correct hash, and the `tip_seq=` prefix
+/// gives the new reader an unambiguous parse anchor that can be extended
+/// with future fields (one `key=value` per line) without breaking back-
+/// compat. A `tip_seq` of `0` is written as a literal `tip_seq=0\n` to
+/// keep the line shape identical across all chain ages — the value is
+/// the meaningful signal.
+pub fn write_anchor_with_seq(audit_path: &Path, tip: &str, tip_seq: u64) -> io::Result<()> {
     let target = anchor_path(audit_path);
     let mut f = OpenOptions::new()
         .create(true)
@@ -695,17 +723,48 @@ pub fn write_anchor(audit_path: &Path, tip: &str) -> io::Result<()> {
         .write(true)
         .open(&target)?;
     writeln!(f, "{tip}")?;
+    writeln!(f, "tip_seq={tip_seq}")?;
     f.flush()
 }
 
 /// Read a previously-persisted chain tip from `<path>.anchor`. Returns
 /// `Ok(None)` when no anchor exists (fresh install, or audit log enabled for
 /// the first time), `Ok(Some(tip))` on success, and an I/O error on any
-/// other failure. The on-disk format is a single hex string followed by
-/// optional whitespace; surrounding whitespace is trimmed. A non-64-char or
-/// non-hex payload is rejected with [`io::ErrorKind::InvalidData`] so a
-/// hand-edited or truncated anchor cannot masquerade as a valid tip.
+/// other failure.
+///
+/// Accepted on-disk formats:
+///
+/// - **Legacy** — a single 64-char hex line followed by optional
+///   whitespace. Surrounding whitespace is trimmed.
+/// - **Current** — first line is the 64-char hex tip; subsequent lines
+///   carry `key=value` extensions (e.g. `tip_seq=42`). This function
+///   discards the extensions; use [`read_anchor_with_seq`] when the
+///   sequence-number high-water mark is needed.
+///
+/// A non-64-char or non-hex first line is rejected with
+/// [`io::ErrorKind::InvalidData`] so a hand-edited or truncated anchor
+/// cannot masquerade as a valid tip.
 pub fn read_anchor(audit_path: &Path) -> io::Result<Option<String>> {
+    Ok(read_anchor_with_seq(audit_path)?.map(|(tip, _seq)| tip))
+}
+
+/// Read both the persisted chain tip and the sequence-number high-water
+/// mark from `<path>.anchor`. Returns `Ok(None)` when no anchor file
+/// exists or when the file is whitespace-only.
+///
+/// On a legacy anchor file (one line, hash only) the tip is returned with
+/// `tip_seq = 0` so callers can treat absence-of-seq as equivalent to a
+/// genesis-aligned counter and fall back to scanning the live log via
+/// [`read_chain_state`] for the authoritative seq value. This is the
+/// backward-compat path: an operator who upgrades from a build that wrote
+/// only the hash will not see a startup error from the new code.
+///
+/// The first line MUST be a valid 64-char lowercase hex SHA-256; any
+/// other shape is rejected with [`io::ErrorKind::InvalidData`]. Extension
+/// lines are tolerated in any order; an unrecognised key is silently
+/// ignored so a future writer can add keys without breaking older
+/// readers.
+pub fn read_anchor_with_seq(audit_path: &Path) -> io::Result<Option<(String, u64)>> {
     let target = anchor_path(audit_path);
     let bytes = match std::fs::read(&target) {
         Ok(b) => b,
@@ -714,17 +773,37 @@ pub fn read_anchor(audit_path: &Path) -> io::Result<Option<String>> {
     };
     let s = std::str::from_utf8(&bytes)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
+    if s.trim().is_empty() {
         return Ok(None);
     }
-    if trimmed.len() != 64 || !trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+    let mut lines = s.lines().filter(|l| !l.trim().is_empty());
+    let first = lines.next().unwrap_or("").trim();
+    if first.len() != 64 || !first.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "audit log anchor file does not contain a 64-char hex SHA-256",
         ));
     }
-    Ok(Some(trimmed.to_ascii_lowercase()))
+    let tip = first.to_ascii_lowercase();
+    // Default to 0 when no `tip_seq=` line is present — legacy anchor
+    // files and operator-edited anchors both fall through this path.
+    // The caller (`read_chain_state`) will scan the live log to recover
+    // the authoritative seq when the value is 0.
+    let mut tip_seq: u64 = 0;
+    for line in lines {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("tip_seq=") {
+            tip_seq = rest.parse::<u64>().map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("audit log anchor `tip_seq` is not a u64: {e}"),
+                )
+            })?;
+        }
+        // Unknown keys are ignored on purpose — see fn-level docs for the
+        // forward-compat rationale.
+    }
+    Ok(Some((tip, tip_seq)))
 }
 
 /// Outcome of comparing a persisted anchor tip with the live chain tip
@@ -872,7 +951,16 @@ mod tests {
         let mut anchor = f.path().as_os_str().to_os_string();
         anchor.push(".anchor");
         let contents = std::fs::read_to_string(Path::new(&anchor)).unwrap();
-        assert_eq!(contents.trim(), tip);
+        // The first non-empty line of the anchor is the tip hash; the
+        // second is the (zero) tip_seq line emitted by the new anchor
+        // format. Pin the first line to keep this test focused on the
+        // tip-roundtrip property and let `tip_seq_round_trips_through_anchor`
+        // own the seq-roundtrip property.
+        let first_line = contents
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("");
+        assert_eq!(first_line.trim(), tip);
         let _ = std::fs::remove_file(Path::new(&anchor));
     }
 
@@ -1702,5 +1790,231 @@ mod tests {
             }
             other => panic!("expected Gap, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn seq_starts_at_one_for_new_log() {
+        // The first record on a brand-new chain must carry seq=1, never
+        // 0 — a SIEM that resets its high-water mark on a process bounce
+        // would otherwise reaccept a previously-emitted record.
+        let f = NamedTempFile::new().unwrap();
+        write_records(f.path(), &[r#"{"event":"only"}"#]);
+        let seqs = seqs_of(f.path());
+        assert_eq!(seqs, vec![Some(1)]);
+        let report = verify_audit_log(f.path()).unwrap();
+        assert_eq!(report.records, 1);
+        assert_eq!(report.tip_seq, 1);
+    }
+
+    #[test]
+    fn seq_is_monotonic_across_records() {
+        // 100-record run pinning that every record's seq is exactly
+        // prev_seq + 1. The verifier's gap detector enforces the same
+        // invariant — if the writer ever skipped or repeated a number,
+        // verify_audit_log would surface the Gap before this assertion
+        // ran, but the explicit per-record check guards against a
+        // verifier-only regression that masked a writer bug.
+        let f = NamedTempFile::new().unwrap();
+        let lines: Vec<String> = (0..100)
+            .map(|i| format!(r#"{{"event":"r","n":{i}}}"#))
+            .collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        write_records(f.path(), &refs);
+        let seqs = seqs_of(f.path());
+        assert_eq!(seqs.len(), 100);
+        for (idx, seq) in seqs.iter().enumerate() {
+            // idx is 0-based, seq starts at 1.
+            let expected = (idx as u64) + 1;
+            assert_eq!(*seq, Some(expected), "record {idx}: seq was {seq:?}");
+        }
+        let report = verify_audit_log(f.path()).unwrap();
+        assert_eq!(report.records, 100);
+        assert_eq!(report.tip_seq, 100);
+    }
+
+    #[test]
+    fn seq_persists_across_writer_close_and_reopen() {
+        // Simulate a process restart: write 50 records, drop the writer
+        // (simulates close), reopen via read_chain_state, and confirm the
+        // 51st record carries seq=51 — no restart at 1, no off-by-one.
+        let f = NamedTempFile::new().unwrap();
+        let lines: Vec<String> = (0..50)
+            .map(|i| format!(r#"{{"event":"first","n":{i}}}"#))
+            .collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        write_records(f.path(), &refs);
+
+        let (tip, next_seq) = read_chain_state(f.path()).unwrap();
+        assert_eq!(next_seq, 51);
+
+        let file = OpenOptions::new().append(true).open(f.path()).unwrap();
+        let mut w = HashChainWriter::new(file, tip).with_next_seq(next_seq);
+        w.write_all(br#"{"event":"after_restart"}"#).unwrap();
+        w.write_all(b"\n").unwrap();
+        w.flush().unwrap();
+
+        let seqs = seqs_of(f.path());
+        assert_eq!(seqs.len(), 51);
+        // Last record must be seq=51 — the immediate successor.
+        assert_eq!(seqs.last(), Some(&Some(51)));
+        // And the chain still verifies end-to-end with the recovered tip.
+        let report = verify_audit_log(f.path()).unwrap();
+        assert_eq!(report.records, 51);
+        assert_eq!(report.tip_seq, 51);
+    }
+
+    #[test]
+    fn verify_audit_log_detects_seq_gap() {
+        // Manually delete a record from the middle of the file without
+        // rewriting the chain. The verifier must surface VerifyError::Gap
+        // with the exact missing seq number so an SRE can correlate the
+        // gap against the SIEM's last forwarded record.
+        let f = NamedTempFile::new().unwrap();
+        write_records(
+            f.path(),
+            &[
+                r#"{"event":"a"}"#,
+                r#"{"event":"b"}"#,
+                r#"{"event":"c"}"#,
+                r#"{"event":"d"}"#,
+            ],
+        );
+
+        // Delete the second record (seq=2). The remaining records are
+        // seq 1, 3, 4 — the verifier should fire on the seq=3 record
+        // because expected_seq is 2 (prev_seq + 1) but the record carries 3.
+        let contents = std::fs::read_to_string(f.path()).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 4);
+        let surviving = format!("{}\n{}\n{}\n", lines[0], lines[2], lines[3]);
+        std::fs::write(f.path(), surviving).unwrap();
+
+        let err = verify_audit_log(f.path()).unwrap_err();
+        match err {
+            VerifyError::Gap {
+                line,
+                expected,
+                found,
+            } => {
+                // Line 2 in the truncated file is the *original* seq=3
+                // record, now sitting where seq=2 should be.
+                assert_eq!(line, 2);
+                assert_eq!(expected, 2);
+                assert_eq!(found, 3);
+            }
+            other => panic!("expected Gap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn anchor_file_with_no_tip_seq_loads_backward_compat() {
+        // Operators upgrading from a build that wrote only the hash see
+        // an anchor file with a single line. read_anchor_with_seq must
+        // not error — it returns the tip with tip_seq = 0 so the writer
+        // (which falls back to scanning the live log via
+        // read_chain_state) still produces a contiguous seq series.
+        let f = NamedTempFile::new().unwrap();
+        let anchor = anchor_path(f.path());
+        let legacy_tip = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        // Hand-write the legacy single-line format. write_anchor_with_seq
+        // produces two lines so we cannot use it to seed this fixture.
+        std::fs::write(&anchor, format!("{legacy_tip}\n")).unwrap();
+
+        let pair = read_anchor_with_seq(f.path()).unwrap();
+        assert_eq!(pair, Some((legacy_tip.to_string(), 0)));
+
+        // And the legacy single-line read API still returns the same tip.
+        let tip_only = read_anchor(f.path()).unwrap();
+        assert_eq!(tip_only.as_deref(), Some(legacy_tip));
+
+        let _ = std::fs::remove_file(&anchor);
+    }
+
+    #[test]
+    fn tip_seq_round_trips_through_anchor() {
+        // Write 50 records, persist the anchor with tip_seq, reopen,
+        // confirm the anchor reports tip_seq=50. Pins the central
+        // sub-item-2 contract: an external verifier reading only the
+        // anchor file (no live log) can prove "no records 1..50 are
+        // missing" without scanning every record.
+        let f = NamedTempFile::new().unwrap();
+        let lines: Vec<String> = (0..50)
+            .map(|i| format!(r#"{{"event":"r","n":{i}}}"#))
+            .collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        write_records(f.path(), &refs);
+
+        let report = verify_audit_log(f.path()).unwrap();
+        assert_eq!(report.records, 50);
+        assert_eq!(report.tip_seq, 50);
+
+        // Persist the anchor with the seq high-water mark...
+        write_anchor_with_seq(f.path(), &report.tip, report.tip_seq).unwrap();
+
+        // ... and read it back as an isolated unit.
+        let pair = read_anchor_with_seq(f.path()).unwrap();
+        assert_eq!(pair, Some((report.tip.clone(), 50)));
+
+        // The legacy read_anchor API still returns the tip — extension
+        // lines are tolerated, not rejected.
+        let tip_only = read_anchor(f.path()).unwrap();
+        assert_eq!(tip_only.as_deref(), Some(report.tip.as_str()));
+
+        let _ = std::fs::remove_file(anchor_path(f.path()));
+    }
+
+    #[test]
+    fn write_anchor_emits_legacy_format_with_zero_seq() {
+        // The legacy write_anchor entry point still produces a parseable
+        // anchor — it now writes the new two-line format with tip_seq=0,
+        // which read_anchor_with_seq returns as the legacy fallback.
+        let f = NamedTempFile::new().unwrap();
+        write_records(f.path(), &[r#"{"event":"a"}"#]);
+        let tip = read_chain_tip(f.path()).unwrap();
+        write_anchor(f.path(), &tip).unwrap();
+
+        let pair = read_anchor_with_seq(f.path()).unwrap();
+        assert_eq!(pair, Some((tip.clone(), 0)));
+
+        let tip_only = read_anchor(f.path()).unwrap();
+        assert_eq!(tip_only.as_deref(), Some(tip.as_str()));
+
+        let _ = std::fs::remove_file(anchor_path(f.path()));
+    }
+
+    #[test]
+    fn anchor_with_unknown_extension_keys_is_tolerated() {
+        // Forward-compat: a future writer may add new key=value lines
+        // that today's reader does not recognise. The reader must accept
+        // the unknown line and still parse the known fields.
+        let f = NamedTempFile::new().unwrap();
+        let anchor = anchor_path(f.path());
+        let tip = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        std::fs::write(&anchor, format!("{tip}\ntip_seq=42\nfuture_field=opaque\n")).unwrap();
+
+        let pair = read_anchor_with_seq(f.path()).unwrap();
+        assert_eq!(pair, Some((tip.to_string(), 42)));
+
+        let _ = std::fs::remove_file(&anchor);
+    }
+
+    #[test]
+    fn anchor_with_invalid_tip_seq_is_rejected() {
+        // A non-u64 tip_seq value is corruption, not a forward-compat
+        // unknown field — surface InvalidData rather than silently
+        // accepting a hand-edited anchor whose seq is a sentinel.
+        let f = NamedTempFile::new().unwrap();
+        let anchor = anchor_path(f.path());
+        let tip = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        std::fs::write(&anchor, format!("{tip}\ntip_seq=not-a-number\n")).unwrap();
+
+        let err = read_anchor_with_seq(f.path()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("tip_seq"),
+            "expected `tip_seq` diagnostic, got: {err}"
+        );
+
+        let _ = std::fs::remove_file(&anchor);
     }
 }
