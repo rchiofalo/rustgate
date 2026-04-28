@@ -722,7 +722,8 @@ pub fn authz_classified_delivery(
 /// is not `<`. The CoT masker cannot apply to non-XML bytes; the
 /// dispatcher passes the payload through unmodified and emits this
 /// token alongside the [`MASK_RECOVERY_FORWARDED_BINARY`] /
-/// [`MASK_RECOVERY_FORWARDED_UNMASKED`] / [`MASK_RECOVERY_FORWARDED_UNKNOWN`]
+/// [`MASK_RECOVERY_FORWARDED_UNMASKED`] / [`MASK_RECOVERY_FORWARDED_UNKNOWN`] /
+/// [`MASK_RECOVERY_FORWARDED_PARTIAL`]
 /// `recovery` token that further refines the bucket by `source_protocol`.
 pub const OBLIGATION_REASON_MASK_POINT_NON_XML: &str = "mask_point_non_xml";
 
@@ -828,6 +829,32 @@ pub const MASK_RECOVERY_FORWARDED_UNKNOWN: &str = "forwarded_unknown";
 /// erased rather than forwarded unmasked.
 pub const MASK_RECOVERY_DROPPED: &str = "dropped";
 
+/// Stable `recovery` token emitted alongside a successful masking
+/// emission whose configured `MaskDetailLevel` is more permissive than
+/// the strictest available level — i.e. the masker stripped the
+/// `<point>` (and possibly `<contact callsign>` / `<__group>` /
+/// `<takv>` / custom lat/lon-named attributes) at the operator-selected
+/// detail level, but lower-tier secondary position-bearing fields were
+/// deliberately retained.
+///
+/// Refs #882 (point masking detail leakage). The token exists so SIEM
+/// dashboards can see that a `MaskPoint`-equivalent obligation was
+/// applied AND distinguish "Coarse" emissions from "Strict" emissions
+/// without re-deriving the level from per-payload introspection. An
+/// operator running a Medium- or Strict-level deployment that observes
+/// a `forwarded_partial` token confirms the masker is firing at the
+/// configured tier; the absence of the token under a Medium/Strict
+/// configuration is the load-bearing signal that the level is not
+/// being honoured on the data plane.
+///
+/// Coarse (default) emissions do NOT carry this token because the
+/// pre-#882 vocabulary did not surface a "mask succeeded" audit event
+/// at all — Coarse-level masking is the legacy behaviour and stays
+/// silent on the audit channel to avoid flipping the dashboard
+/// cardinality on an upgrade where the operator did not opt into a
+/// stricter level.
+pub const MASK_RECOVERY_FORWARDED_PARTIAL: &str = "forwarded_partial";
+
 /// Bucket the `source_protocol` field of an inbound `RoutableMessage`
 /// into the recovery-token vocabulary used by [`authz_obligation_failed`]
 /// for the `MaskPoint` non-XML-intent path.
@@ -916,6 +943,13 @@ pub fn classify_mask_recovery_for(source_protocol: &str) -> &'static str {
 /// - [`MASK_RECOVERY_FORWARDED_UNKNOWN`] (`"forwarded_unknown"`) —
 ///   `source_protocol` is not in the recognised set; operator
 ///   visibility for misconfigured upstreams.
+/// - [`MASK_RECOVERY_FORWARDED_PARTIAL`] (`"forwarded_partial"`) —
+///   masking applied at an operator-configured `MaskDetailLevel` more
+///   permissive than the strictest available level (refs #882). The
+///   `<point>` was zeroed and any secondary position-bearing fields
+///   covered by the configured level were redacted, but lower-tier
+///   fields (e.g. `<takv>` under `Medium`) were deliberately retained
+///   per operator threat model.
 ///
 /// SIEM rules grep for these literal tokens — changing the strings
 /// without coordinating with the deployed dashboard set is a breaking
@@ -2021,6 +2055,11 @@ mod tests {
             assert_eq!(MASK_RECOVERY_FORWARDED_UNMASKED, "forwarded_unmasked");
             assert_eq!(MASK_RECOVERY_FORWARDED_UNKNOWN, "forwarded_unknown");
             assert_eq!(MASK_RECOVERY_DROPPED, "dropped");
+            // refs #882: forwarded_partial is the 5th variant of the
+            // recovery vocabulary. Pin the literal so a refactor that
+            // renamed it (e.g. to "partial" or "forwarded_at_level")
+            // would silently break SIEM dashboards keyed on the token.
+            assert_eq!(MASK_RECOVERY_FORWARDED_PARTIAL, "forwarded_partial");
         }
 
         #[test]
@@ -2089,6 +2128,98 @@ mod tests {
             assert_eq!(
                 classify_mask_recovery_for("tcp"),
                 MASK_RECOVERY_FORWARDED_UNKNOWN
+            );
+        }
+
+        #[test]
+        fn forwarded_partial_token_is_distinct_from_other_recovery_tokens() {
+            // Refs #882: forwarded_partial is the 5th member of the
+            // recovery vocabulary. SIEM dashboards filter on these
+            // tokens directly, so two members colliding on a literal
+            // would silently re-bucket every event keyed on the
+            // collided pair. Pin uniqueness explicitly.
+            let tokens = [
+                MASK_RECOVERY_FORWARDED_BINARY,
+                MASK_RECOVERY_FORWARDED_UNMASKED,
+                MASK_RECOVERY_FORWARDED_UNKNOWN,
+                MASK_RECOVERY_DROPPED,
+                MASK_RECOVERY_FORWARDED_PARTIAL,
+            ];
+            for (i, a) in tokens.iter().enumerate() {
+                for (j, b) in tokens.iter().enumerate() {
+                    if i != j {
+                        assert_ne!(
+                            a, b,
+                            "recovery tokens {a} and {b} collide — SIEM dashboards depend on uniqueness"
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn forwarded_partial_is_emitted_as_recovery_field_value_at_medium_or_strict() {
+            // Refs #882, audit-level pin: the dispatcher emits
+            // `recovery=forwarded_partial` when masking succeeded at a
+            // configured MaskDetailLevel of Medium or Strict. The
+            // audit emission helper accepts an arbitrary &str for the
+            // `recovery` field, so the test exercises the literal
+            // round-trip through the audit subscriber to pin the
+            // wire-format shape future SIEM dashboards depend on.
+            use std::io::Write;
+            use std::sync::Mutex;
+
+            use tracing_subscriber::Layer;
+            use tracing_subscriber::filter::Targets;
+            use tracing_subscriber::fmt::MakeWriter;
+            use tracing_subscriber::layer::SubscriberExt;
+
+            #[derive(Clone, Default)]
+            struct SharedBuf(std::sync::Arc<Mutex<Vec<u8>>>);
+            impl Write for SharedBuf {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    if let Ok(mut guard) = self.0.lock() {
+                        guard.extend_from_slice(buf);
+                    }
+                    Ok(buf.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            impl<'a> MakeWriter<'a> for SharedBuf {
+                type Writer = SharedBuf;
+                fn make_writer(&'a self) -> Self::Writer {
+                    self.clone()
+                }
+            }
+            let buf = SharedBuf::default();
+            let layer = tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(buf.clone())
+                .with_filter(Targets::new().with_target("audit", tracing::Level::INFO));
+            let subscriber = tracing_subscriber::registry().with(layer);
+            let _guard = tracing::subscriber::set_default(subscriber);
+
+            authz_obligation_failed(
+                "alice",
+                "MaskPoint",
+                OBLIGATION_REASON_MASK_POINT_NON_XML,
+                MASK_RECOVERY_FORWARDED_PARTIAL,
+                "cot",
+                "broadcast",
+                "policy-v1",
+            );
+            drop(_guard);
+
+            let snapshot: Vec<u8> = match buf.0.lock() {
+                Ok(guard) => guard.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            };
+            let log = String::from_utf8_lossy(&snapshot).to_string();
+            assert!(
+                log.contains(r#""recovery":"forwarded_partial""#),
+                "expected recovery=forwarded_partial in audit, got: {log}"
             );
         }
 
