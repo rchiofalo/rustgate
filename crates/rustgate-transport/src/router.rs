@@ -1919,9 +1919,9 @@ impl Router {
             // the guard drops. The guard holds an RAII reference into the
             // currently-installed `DedupCache`; an `.await` here would let a
             // SIGHUP-driven `set_dedup(...)` swap deallocate the cache while
-            // we are still inside `check_payload`, surfacing as a torn read
+            // we are still inside `check_message`, surfacing as a torn read
             // or a use-after-free of the underlying `parking_lot::Mutex`.
-            // `check_payload` is intentionally synchronous to make the
+            // `check_message` is intentionally synchronous to make the
             // contract enforceable today by the borrow checker (a
             // `parking_lot::MutexGuard` is `!Send`, so any `.await` while it
             // is live would not compile). This comment is documentation for
@@ -1930,9 +1930,14 @@ impl Router {
             // an owned snapshot first via `(**guard).clone()` (or move the
             // awaiting work to after the scope ends) so the guard drops
             // before the suspension point. See docs/concurrency-model.md.
+            //
+            // Closes #882: `check_message` (vs. the older `check_payload`)
+            // binds the non-CoT key to (cn, time, payload-hash), so two
+            // byte-identical non-CoT payloads (e.g. MAVLink HEARTBEATs)
+            // from different senders are not collapsed into one delivery.
             let guard = self.dedup.load();
             if let Some(ref dedup) = **guard
-                && dedup.check_payload(msg.source.tenant.as_deref().unwrap_or(""), &msg.payload)
+                && dedup.check_message(&msg)
             {
                 debug!(
                     source = %msg.source.cn,
