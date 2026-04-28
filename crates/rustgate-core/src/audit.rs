@@ -1688,6 +1688,44 @@ pub fn mqtt_will_published(cn: &str, topic: &str, group: &str, retain: bool) {
     );
 }
 
+/// Record that an encrypted-archive [`crate::encrypted::KeyRing`] was loaded
+/// with an active key whose configured `not_after` is within the rotation
+/// window — the operator must rotate before the key expires or new-write
+/// admission will fail closed.
+///
+/// Emitted once per `KeyRing::from_bytes` call when the active key has a
+/// `key_expirations` entry whose remaining time is `<= 14 days`. Because
+/// every server start (and SIGHUP-driven hot reload, where applicable)
+/// re-emits the event, dashboards and SIEM rules see a steady reminder
+/// until the operator rotates — analogous to the `cert_rotation_*` family
+/// for mTLS certificates.
+///
+/// Rationale for emitting at load rather than on first use: encrypted
+/// archives are typically opened lazily (the audit log archive is opened
+/// on the first chain-write, the store-and-forward queue on the first
+/// drained message). A load-time emission gives operators a deterministic
+/// signal at startup that they will need to rotate, even before any
+/// archive write happens.
+///
+/// `kid` is the active key id; `days_remaining` is `(not_after - now) /
+/// 86_400`, rounded down. A key whose `not_after` is already in the past
+/// is reported with `days_remaining = 0` — but in that case the actual
+/// admission gate ([`crate::encrypted::KeyRing::active_key_expired_at`])
+/// will refuse new writes with [`crate::encrypted::EncryptError::ActiveKeyExpired`]
+/// regardless of whether anyone listens for this audit event.
+///
+/// Sanitization: `kid` is sanitized at the audit boundary.
+pub fn archive_key_rotation_due(kid: &str, days_remaining: i64) {
+    let kid = s(kid);
+    audit!(
+        "archive.key_rotation_due",
+        kid = %kid,
+        days_remaining = days_remaining,
+        action = "rotate_key",
+        result = "due"
+    );
+}
+
 // ── Admin / lifecycle audit events ──────────────────────────────────
 
 /// Record an operator-initiated graceful drain.

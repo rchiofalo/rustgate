@@ -19,6 +19,48 @@
 //! key still present in the file may be used to decrypt historical data,
 //! enabling key rotation without rewriting the archive.
 //!
+//! ## Key derivation
+//!
+//! Operators have three options for how a 32-byte key reaches the [`KeyRing`]:
+//!
+//! 1. **Raw hex**: a 64-character lowercase hex string under
+//!    `keys.<id>.value` (the legacy shape — pre-existing key files keep
+//!    working without modification).
+//! 2. **HKDF-SHA256** (`Derivation::HkdfSha256`): an extract-and-expand KDF
+//!    over a high-entropy root secret (KMS blob, HSM output, another rustgate
+//!    deployment's master key). HKDF does not add a work factor, so it is
+//!    only safe with at least 128 bits of entropy in the IKM.
+//! 3. **Argon2id** (`Derivation::Argon2id`): a memory-hard password hashing
+//!    function suitable for low-entropy passphrases. Uses the OWASP-default
+//!    parameters (m_cost=19 MiB, t_cost=2, p_cost=1) unless overridden.
+//!
+//! For both KDF variants the input keying material may be supplied in one of
+//! three ways via the IKM-source fields on [`Derivation`]:
+//!
+//! - inline lowercase-hex string `ikm` (development / tests; not recommended
+//!   for production secrets that should not live in a config-management blob),
+//! - reading the named environment variable (`ikm_from_env`), or
+//! - reading from a file (`ikm_from_file`) — the file is loaded via
+//!   [`crate::secrets::read_secret_file`], so it inherits the workspace's
+//!   strict permission gate (`mode 0o077` rejected on Unix), size cap
+//!   (16 KiB), and ownership-UID check.
+//!
+//! In every case the IKM lives in [`zeroize::Zeroizing`] for the duration
+//! of derivation and is wiped immediately afterward — only the derived
+//! 32-byte key persists in memory in the [`KeyRing`].
+//!
+//! ## Key expiration
+//!
+//! Each key id may carry an optional `not_after` (unix-seconds since epoch)
+//! via the `key_expirations` map. When [`KeyRing::active_key_expired_at`]
+//! returns true for the active key, [`EncryptedWriter::create`] refuses to
+//! open a new file with [`EncryptError::ActiveKeyExpired`] — historical
+//! data encrypted under the expired key is still readable, only new-write
+//! admission is gated. Loading a key file whose active key expires within
+//! 14 days emits an [`crate::audit::archive_key_rotation_due`] audit event;
+//! loading a key file with no expirations declared at all emits a
+//! `tracing::warn!` so operators are nudged toward setting rotation policy.
+//!
 //! ## File format (version 2)
 //!
 //! ```text
@@ -200,16 +242,32 @@ pub struct KeyFile {
 
 /// Key-derivation recipe for a single entry in [`KeyFile::key_derivations`].
 ///
-/// Currently supports HKDF-SHA256 (RFC 5869). HKDF is the right primitive
-/// when an operator has a high-entropy root secret (KMS blob, HSM output,
-/// another rustgate deployment's master key) and wants to derive multiple
-/// subkeys deterministically without re-provisioning. HKDF does **not**
-/// add a work factor, so it is not suitable for low-entropy passphrases —
-/// a future `Argon2id` variant will cover that use case.
+/// Two KDFs are supported, picking based on the entropy of the input:
 ///
-/// The `tag` field in the serialized form names the KDF (`"hkdf-sha256"`
-/// today). This leaves room for additional variants without breaking
-/// existing key files.
+/// - [`Derivation::HkdfSha256`] — RFC 5869 Extract-and-Expand. The right
+///   primitive when an operator has a high-entropy root secret (KMS blob,
+///   HSM output, another rustgate deployment's master key) and wants to
+///   derive multiple subkeys deterministically without re-provisioning.
+///   HKDF does **not** add a work factor, so it is not suitable for
+///   low-entropy passphrases.
+/// - [`Derivation::Argon2id`] — memory-hard password hashing. The right
+///   primitive when an operator wants to seed the archive key from a
+///   passphrase, because the work factor turns a brute-force attack on
+///   the derived key into a memory-and-CPU-bound search of the underlying
+///   passphrase space.
+///
+/// The `kdf` tag in the serialized form discriminates the variant. Adding
+/// a new variant in the future is non-breaking for existing key files
+/// because `serde(tag = "kdf")` rejects unknown tags at parse time with
+/// a clear error rather than silently falling back to a default.
+///
+/// The IKM (input keying material — passphrase or shared secret) for both
+/// variants is supplied via the `ikm` / `ikm_from_env` / `ikm_from_file`
+/// fields on each variant: inline-hex strings, environment variables, and
+/// on-disk secret files respectively. Inline hex is convenient for
+/// development but should not be used for production secrets that ought
+/// not live in config-management blobs; `ikm_from_env` and `ikm_from_file`
+/// keep the secret out of the JSON entirely.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kdf", rename_all = "kebab-case")]
 #[serde(deny_unknown_fields)]
@@ -222,11 +280,26 @@ pub enum Derivation {
     /// either `salt` or `info` produce cryptographically independent
     /// outputs.
     HkdfSha256 {
-        /// Input keying material, lowercase hex-encoded. MUST be at
-        /// least 16 bytes (128 bits) of entropy — shorter IKM defeats
-        /// the purpose of HKDF's extract stage. Loading refuses entries
-        /// below this threshold with [`EncryptError::KeyDerivation`].
-        ikm: String,
+        /// Inline IKM, lowercase-hex encoded. Mutually exclusive with
+        /// `ikm_from_env` and `ikm_from_file`; exactly one of the three
+        /// must be set. Inline IKM is convenient for development but
+        /// keeps the secret in the JSON config — production deployments
+        /// should prefer `ikm_from_env` or `ikm_from_file`. Inline IKM
+        /// MUST be at least 16 bytes (128 bits) of decoded entropy.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ikm: Option<String>,
+        /// Resolve IKM by reading the named environment variable at load
+        /// time. The variable value is wrapped in [`Zeroizing<String>`]
+        /// for the lifetime of derivation and dropped (wiped) immediately
+        /// afterward.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ikm_from_env: Option<String>,
+        /// Resolve IKM by reading the named file via
+        /// [`crate::secrets::read_secret_file`]. The file inherits the
+        /// workspace's strict permission gate (`mode 0o077` rejected on
+        /// Unix), size cap (16 KiB), and ownership-UID check.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ikm_from_file: Option<PathBuf>,
         /// Salt, lowercase hex-encoded. Empty string is permitted
         /// (RFC 5869 § 3.1 — the implementation substitutes a zero
         /// block), but a deployment-unique random salt is strongly
@@ -241,6 +314,121 @@ pub enum Derivation {
         #[serde(default)]
         info: String,
     },
+    /// Argon2id — memory-hard password hashing function (RFC 9106).
+    ///
+    /// The hybrid Argon2id variant is the OWASP-recommended default for
+    /// password-based key derivation and is the right choice when the
+    /// IKM is a low-entropy passphrase rather than a high-entropy root
+    /// secret. Output is exactly 32 bytes — the ChaCha20-Poly1305 key
+    /// length.
+    ///
+    /// Default parameters follow the OWASP cheat sheet
+    /// (m_cost=19 MiB, t_cost=2, p_cost=1); operators may override
+    /// individual fields. The salt is mandatory and must be at least 8
+    /// bytes — Argon2's security depends on a unique-per-derivation
+    /// salt, and re-using a salt across deployments enables rainbow-table
+    /// attacks against the passphrase space.
+    Argon2id {
+        /// Inline IKM, lowercase-hex encoded. See [`Derivation::HkdfSha256::ikm`]
+        /// for the full discussion.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ikm: Option<String>,
+        /// Resolve IKM from an environment variable. For passphrase-seeded
+        /// archives this is the typical operator path.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ikm_from_env: Option<String>,
+        /// Resolve IKM from a secret file. Inherits the workspace-wide
+        /// permission / ownership / size policy.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ikm_from_file: Option<PathBuf>,
+        /// Salt, lowercase hex-encoded. MUST be at least 8 bytes — the
+        /// load path refuses shorter salts with
+        /// [`EncryptError::KeyDerivation`] because Argon2's security
+        /// floor is not met without one.
+        salt: String,
+        /// Argon2 work parameter overrides. When unset, the OWASP
+        /// defaults are applied (`m_cost=19 MiB`, `t_cost=2`,
+        /// `p_cost=1`). Operators on memory-constrained hardware may
+        /// reduce `m_cost`, but doing so weakens the work factor and
+        /// shifts more risk back onto the underlying passphrase
+        /// entropy — document the deployment posture if you do.
+        #[serde(default, skip_serializing_if = "Argon2Params::is_default")]
+        params: Argon2Params,
+    },
+}
+
+/// Borrowed view over the three IKM-source fields. Internal helper used
+/// by [`resolve_ikm`] so the source enumeration logic can be shared
+/// between [`Derivation::HkdfSha256`] and [`Derivation::Argon2id`]
+/// without macro repetition.
+struct IkmRef<'a> {
+    inline: Option<&'a str>,
+    from_env: Option<&'a str>,
+    from_file: Option<&'a Path>,
+}
+
+/// Resolved `(ikm_bytes, source_label)` from an [`IkmRef`], scoped to the
+/// lifetime of one derivation. The bytes are zeroized on drop.
+struct ResolvedIkm {
+    bytes: Zeroizing<Vec<u8>>,
+    /// Short label for error messages — names the source kind without
+    /// leaking secret content. One of `"inline"`, `"env"`, `"file"`.
+    source: &'static str,
+}
+
+/// Argon2id work parameters. Defaults follow the OWASP cheat sheet for
+/// password-based KDF: `m_cost=19 MiB`, `t_cost=2`, `p_cost=1`.
+///
+/// `m_cost` is in **kibibytes** (1 KiB blocks), matching the underlying
+/// `argon2` crate's API. The default `19_456` therefore represents
+/// `19 * 1024 = 19 MiB` of working memory per derivation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Argon2Params {
+    /// Memory cost in kibibytes. Default: `19 * 1024 = 19_456` (19 MiB).
+    #[serde(default = "Argon2Params::default_m_cost")]
+    pub m_cost_kib: u32,
+    /// Time cost (iteration count). Default: `2`.
+    #[serde(default = "Argon2Params::default_t_cost")]
+    pub t_cost: u32,
+    /// Parallelism (degree of parallelism). Default: `1`.
+    #[serde(default = "Argon2Params::default_p_cost")]
+    pub p_cost: u32,
+}
+
+impl Argon2Params {
+    const DEFAULT_M_COST_KIB: u32 = 19 * 1024;
+    const DEFAULT_T_COST: u32 = 2;
+    const DEFAULT_P_COST: u32 = 1;
+
+    fn default_m_cost() -> u32 {
+        Self::DEFAULT_M_COST_KIB
+    }
+    fn default_t_cost() -> u32 {
+        Self::DEFAULT_T_COST
+    }
+    fn default_p_cost() -> u32 {
+        Self::DEFAULT_P_COST
+    }
+
+    /// True when every field equals its OWASP-default value. Used by
+    /// `skip_serializing_if` so a default `Argon2Params` round-trips
+    /// through serde without injecting noise into the on-disk JSON.
+    fn is_default(&self) -> bool {
+        self.m_cost_kib == Self::DEFAULT_M_COST_KIB
+            && self.t_cost == Self::DEFAULT_T_COST
+            && self.p_cost == Self::DEFAULT_P_COST
+    }
+}
+
+impl Default for Argon2Params {
+    fn default() -> Self {
+        Self {
+            m_cost_kib: Self::DEFAULT_M_COST_KIB,
+            t_cost: Self::DEFAULT_T_COST,
+            p_cost: Self::DEFAULT_P_COST,
+        }
+    }
 }
 
 /// Loaded key material — keys decoded into raw bytes wrapped in
@@ -332,11 +520,79 @@ impl KeyRing {
                 )));
             }
         }
-        Ok(Self {
+
+        let ring = Self {
             active_key_id: parsed.active_key_id,
             keys,
             not_after: parsed.key_expirations,
-        })
+        };
+
+        // Operator-facing rotation hygiene signals — emitted at load
+        // time so they fire on every server start (and SIGHUP-driven
+        // hot reload), giving operators a steady reminder rather than a
+        // one-shot at the moment a write actually fails closed.
+        ring.emit_rotation_signals_at_now();
+
+        Ok(ring)
+    }
+
+    /// Emit operator-facing rotation hygiene signals using the current
+    /// system clock. Helper extracted so [`Self::emit_rotation_signals_at`]
+    /// can be tested deterministically with a synthetic clock.
+    fn emit_rotation_signals_at_now(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.emit_rotation_signals_at(now);
+    }
+
+    /// Emit operator-facing rotation hygiene signals based on `now_unix_seconds`.
+    ///
+    /// Two outputs:
+    ///
+    /// 1. If the key file declares **no** expirations at all, emit a
+    ///    `tracing::warn!` asking the operator to set rotation. This is
+    ///    a hygiene nudge — pre-this-PR key files lacking expirations
+    ///    are still valid (backward-compat is preserved), but the warn
+    ///    surfaces the gap so operators graduate toward managed
+    ///    rotation.
+    /// 2. If the active key has a configured `not_after` within the
+    ///    next 14 days (inclusive of "in the past"), emit
+    ///    [`crate::audit::archive_key_rotation_due`] with `kid` and
+    ///    `days_remaining`. SIEMs key on this event to drive rotation
+    ///    runbooks.
+    ///
+    /// Public-but-doc-hidden so tests in this module can drive a synthetic
+    /// clock without touching the real system time.
+    #[doc(hidden)]
+    pub fn emit_rotation_signals_at(&self, now_unix_seconds: i64) {
+        const ROTATION_WINDOW_DAYS: i64 = 14;
+        const SECONDS_PER_DAY: i64 = 86_400;
+
+        if self.not_after.is_empty() {
+            tracing::warn!(
+                target: "rustgate_core::encrypted",
+                active_key_id = %self.active_key_id,
+                "encrypted-archive key file has no `key_expirations` set; \
+                 set `not_after` per key to enable rotation hygiene checks"
+            );
+            return;
+        }
+
+        if let Some(&not_after) = self.not_after.get(&self.active_key_id) {
+            let remaining = not_after.saturating_sub(now_unix_seconds);
+            if remaining <= ROTATION_WINDOW_DAYS * SECONDS_PER_DAY {
+                // floor(remaining / 86_400), clamped at 0 so a key whose
+                // `not_after` has already passed reports as 0 rather than
+                // a negative count. The actual admission gate
+                // ([`active_key_expired_at`]) handles the past-expiry
+                // case at write time — this audit event is purely
+                // observational.
+                let days_remaining = (remaining / SECONDS_PER_DAY).max(0);
+                crate::audit::archive_key_rotation_due(&self.active_key_id, days_remaining);
+            }
+        }
     }
 
     /// Identifier of the currently active key.
@@ -394,35 +650,31 @@ impl KeyRing {
 
 /// Evaluate a [`Derivation`] into 32 bytes of key material.
 ///
-/// Hex-decodes `ikm` and `salt` first, then runs the configured KDF.
+/// Resolves the IKM source (inline hex / env var / file) into raw bytes,
+/// applies the configured minimum-length floor, and runs the named KDF.
 /// The returned bytes are wrapped in [`Zeroizing`] so the caller's
 /// subsequent `Arc::new` keeps the secret wiped on drop.
 ///
-/// This function does not zeroize the `KeyFile` itself — the IKM hex
-/// string on the parsed `KeyFile` remains until the caller drops it.
-/// Intermediate decoded IKM is wrapped in [`Zeroizing`] so it is wiped
-/// as soon as HKDF is done with it.
+/// Intermediate decoded IKM lives in [`Zeroizing`] so it is wiped as soon
+/// as the KDF is done with it. Note that the `KeyFile` itself may still
+/// hold an inline IKM hex string until the caller drops it — operators
+/// who care about minimising in-memory secret lifetime should prefer
+/// `ikm_from_env` or `ikm_from_file` IKM sources.
 fn derive_key(id: &str, derivation: &Derivation) -> Result<Zeroizing<[u8; 32]>, EncryptError> {
     match derivation {
-        Derivation::HkdfSha256 { ikm, salt, info } => {
-            // Decode IKM and salt. IKM bytes live in `Zeroizing` so the
-            // buffer is wiped as soon as this scope ends.
-            let mut ikm_bytes: Zeroizing<Vec<u8>> =
-                Zeroizing::new(hex::decode(ikm).map_err(|e| EncryptError::KeyDerivation {
-                    id: id.to_string(),
-                    reason: format!("ikm hex decode: {e}"),
-                })?);
-            // Guard against obvious IKM weakness. 16 bytes (128 bits) is
-            // a conservative floor — HKDF does not add entropy, so a
-            // toy-sized IKM produces a toy-sized-security subkey.
-            if ikm_bytes.len() < 16 {
-                let got = ikm_bytes.len();
-                zeroize::Zeroize::zeroize(&mut *ikm_bytes);
-                return Err(EncryptError::KeyDerivation {
-                    id: id.to_string(),
-                    reason: format!("ikm must be at least 16 bytes, got {got}"),
-                });
-            }
+        Derivation::HkdfSha256 {
+            ikm,
+            ikm_from_env,
+            ikm_from_file,
+            salt,
+            info,
+        } => {
+            let ikm_ref = IkmRef {
+                inline: ikm.as_deref(),
+                from_env: ikm_from_env.as_deref(),
+                from_file: ikm_from_file.as_deref(),
+            };
+            let resolved = resolve_ikm(id, &ikm_ref, /* min_bytes */ 16)?;
 
             let salt_bytes = hex::decode(salt).map_err(|e| EncryptError::KeyDerivation {
                 id: id.to_string(),
@@ -439,7 +691,7 @@ fn derive_key(id: &str, derivation: &Derivation) -> Result<Zeroizing<[u8; 32]>, 
             } else {
                 Some(salt_bytes.as_slice())
             };
-            let hk = hkdf::Hkdf::<sha2::Sha256>::new(salt_opt, &ikm_bytes);
+            let hk = hkdf::Hkdf::<sha2::Sha256>::new(salt_opt, &resolved.bytes);
 
             let mut out = Zeroizing::new([0u8; 32]);
             hk.expand(info.as_bytes(), &mut *out)
@@ -449,7 +701,161 @@ fn derive_key(id: &str, derivation: &Derivation) -> Result<Zeroizing<[u8; 32]>, 
                 })?;
             Ok(out)
         }
+        Derivation::Argon2id {
+            ikm,
+            ikm_from_env,
+            ikm_from_file,
+            salt,
+            params,
+        } => {
+            // Argon2id accepts low-entropy passphrases by design — its
+            // memory-hard work factor is the security feature. Skip the
+            // 16-byte minimum we apply to HKDF: a 12-character ASCII
+            // passphrase is a perfectly reasonable Argon2 input. We do
+            // require at least 1 byte (an empty passphrase is almost
+            // certainly an env-var-not-set bug) and rely on the salt
+            // floor below to enforce the rest of the security posture.
+            let ikm_ref = IkmRef {
+                inline: ikm.as_deref(),
+                from_env: ikm_from_env.as_deref(),
+                from_file: ikm_from_file.as_deref(),
+            };
+            let resolved = resolve_ikm(id, &ikm_ref, /* min_bytes */ 1)?;
+
+            let salt_bytes = hex::decode(salt).map_err(|e| EncryptError::KeyDerivation {
+                id: id.to_string(),
+                reason: format!("salt hex decode: {e}"),
+            })?;
+            // Argon2 RFC 9106 § 3.1 mandates a salt of at least 8 bytes
+            // (64 bits). Re-using a salt across deployments enables
+            // rainbow-table attacks against the passphrase space, so the
+            // operator-facing floor is non-negotiable.
+            if salt_bytes.len() < 8 {
+                return Err(EncryptError::KeyDerivation {
+                    id: id.to_string(),
+                    reason: format!(
+                        "argon2id salt must be at least 8 bytes, got {}",
+                        salt_bytes.len()
+                    ),
+                });
+            }
+
+            let work =
+                argon2::Params::new(params.m_cost_kib, params.t_cost, params.p_cost, Some(32))
+                    .map_err(|e| EncryptError::KeyDerivation {
+                        id: id.to_string(),
+                        reason: format!("argon2 params: {e}"),
+                    })?;
+            let argon2 =
+                argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, work);
+
+            let mut out = Zeroizing::new([0u8; 32]);
+            argon2
+                .hash_password_into(&resolved.bytes, &salt_bytes, &mut *out)
+                .map_err(|e| EncryptError::KeyDerivation {
+                    id: id.to_string(),
+                    reason: format!("argon2id hash: {e}"),
+                })?;
+            Ok(out)
+        }
     }
+}
+
+/// Resolve an [`IkmRef`] into raw bytes wrapped in [`Zeroizing`].
+///
+/// Exactly one of the three source fields must be set; zero or more than
+/// one is a config-file error. The minimum-byte floor differs per KDF
+/// (HKDF requires at least 16 bytes — see RFC 5869's entropy assumption;
+/// Argon2id accepts shorter inputs since its work factor is the security
+/// boundary), so the caller passes its own floor.
+fn resolve_ikm(
+    id: &str,
+    field: &IkmRef<'_>,
+    min_bytes: usize,
+) -> Result<ResolvedIkm, EncryptError> {
+    let count = field.inline.is_some() as u8
+        + field.from_env.is_some() as u8
+        + field.from_file.is_some() as u8;
+    if count == 0 {
+        return Err(EncryptError::KeyDerivation {
+            id: id.to_string(),
+            reason: "no IKM source set: provide one of `ikm`, `ikm_from_env`, `ikm_from_file`"
+                .into(),
+        });
+    }
+    if count > 1 {
+        return Err(EncryptError::KeyDerivation {
+            id: id.to_string(),
+            reason:
+                "multiple IKM sources set: choose exactly one of `ikm` / `ikm_from_env` / `ikm_from_file`"
+                    .into(),
+        });
+    }
+
+    let resolved = if let Some(hex_value) = field.inline {
+        let bytes =
+            Zeroizing::new(
+                hex::decode(hex_value).map_err(|e| EncryptError::KeyDerivation {
+                    id: id.to_string(),
+                    reason: format!("ikm hex decode: {e}"),
+                })?,
+            );
+        ResolvedIkm {
+            bytes,
+            source: "inline",
+        }
+    } else if let Some(env_var) = field.from_env {
+        // Wrap the env-var value in `Zeroizing<String>` immediately and
+        // copy its bytes into a `Zeroizing<Vec<u8>>` that lives only as
+        // long as derivation needs it. The `String` is dropped before
+        // this function returns, so it does not outlive the derivation.
+        let raw = std::env::var(env_var).map_err(|e| EncryptError::KeyDerivation {
+            id: id.to_string(),
+            reason: format!("env var {env_var:?}: {e}"),
+        })?;
+        let value: Zeroizing<String> = Zeroizing::new(raw);
+        let bytes = Zeroizing::new(value.as_bytes().to_vec());
+        ResolvedIkm {
+            bytes,
+            source: "env",
+        }
+    } else if let Some(path) = field.from_file {
+        // Reuse the workspace-wide secret-file reader so this path
+        // inherits the same permission / ownership / size policy
+        // already applied to enrollment passwords and federation HMAC
+        // secrets.
+        let opts = crate::secrets::SecretFileOpts::default();
+        let value = crate::secrets::read_secret_file(path, &opts).map_err(|e| {
+            EncryptError::KeyDerivation {
+                id: id.to_string(),
+                reason: format!("ikm file: {e}"),
+            }
+        })?;
+        let bytes = Zeroizing::new(value.as_bytes().to_vec());
+        ResolvedIkm {
+            bytes,
+            source: "file",
+        }
+    } else {
+        // Unreachable given the count check above, but keeps the match
+        // exhaustive without an `unwrap`.
+        return Err(EncryptError::KeyDerivation {
+            id: id.to_string(),
+            reason: "internal: IkmRef unreachable arm".into(),
+        });
+    };
+
+    if resolved.bytes.len() < min_bytes {
+        let got = resolved.bytes.len();
+        let source = resolved.source;
+        // `resolved` drops here, zeroizing the bytes before we surface
+        // the error.
+        return Err(EncryptError::KeyDerivation {
+            id: id.to_string(),
+            reason: format!("ikm from {source} must be at least {min_bytes} bytes, got {got}"),
+        });
+    }
+    Ok(resolved)
 }
 
 /// A streaming AEAD writer that appends length-prefixed ChaCha20-Poly1305
@@ -1819,14 +2225,14 @@ mod tests {
         fn unknown_kdf_variant_is_rejected_at_parse_time() {
             // `serde(tag = "kdf")` should reject an unknown KDF name
             // with a JSON-parse-level error — not silently fall back
-            // to a default. This keeps future additions (e.g.
-            // argon2id) from being silently ignored by older binaries
-            // that don't support them.
+            // to a default. This keeps future additions (e.g. a
+            // hypothetical `scrypt` variant) from being silently
+            // ignored by older binaries that don't support them.
             let json = br#"{
                 "active_key_id": "k1",
                 "key_derivations": {
                     "k1": {
-                        "kdf": "argon2id",
+                        "kdf": "scrypt",
                         "ikm": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     }
                 }
@@ -1834,7 +2240,7 @@ mod tests {
             let err = KeyRing::from_bytes(json).expect_err("must reject unknown kdf");
             let msg = err.to_string();
             assert!(
-                msg.contains("argon2id") || msg.contains("variant"),
+                msg.contains("scrypt") || msg.contains("variant"),
                 "error should mention the unknown tag: {msg}"
             );
         }
@@ -1845,7 +2251,9 @@ mod tests {
             let _ = derivations.insert(
                 "k1".to_string(),
                 Derivation::HkdfSha256 {
-                    ikm: TEST_IKM_32.to_string(),
+                    ikm: Some(TEST_IKM_32.to_string()),
+                    ikm_from_env: None,
+                    ikm_from_file: None,
                     salt: "deadbeef".to_string(),
                     info: "rt".to_string(),
                 },
@@ -1859,11 +2267,20 @@ mod tests {
             let json = serde_json::to_vec(&kf).expect("serialize");
             let round: KeyFile = serde_json::from_slice(&json).expect("deserialize");
             match round.key_derivations.get("k1") {
-                Some(Derivation::HkdfSha256 { ikm, salt, info }) => {
-                    assert_eq!(ikm, TEST_IKM_32);
+                Some(Derivation::HkdfSha256 {
+                    ikm,
+                    ikm_from_env,
+                    ikm_from_file,
+                    salt,
+                    info,
+                }) => {
+                    assert_eq!(ikm.as_deref(), Some(TEST_IKM_32));
+                    assert!(ikm_from_env.is_none());
+                    assert!(ikm_from_file.is_none());
                     assert_eq!(salt, "deadbeef");
                     assert_eq!(info, "rt");
                 }
+                Some(other) => panic!("expected HkdfSha256 round-trip, got {other:?}"),
                 None => panic!("k1 round-trip lost"),
             }
         }
@@ -1892,6 +2309,500 @@ mod tests {
                 !json.contains("key_derivations"),
                 "empty map must be omitted: {json}"
             );
+        }
+    }
+
+    /// Tests for #883 sub-item 1: Argon2id KDF, env / file IKM sources,
+    /// rotation-due audit emission, and the no-expirations tracing warn.
+    ///
+    /// These tests pin the new behaviour shipped with the KDF + key
+    /// expiration work. The HKDF + raw-hex backward-compat surface is
+    /// covered by the pre-existing `key_derivation` and `key_expiration`
+    /// modules above.
+    mod kdf_and_rotation {
+        use super::*;
+
+        /// 32-byte hex IKM, deliberately recognizable so a reader can
+        /// tell at a glance this is test material.
+        const TEST_IKM_HEX: &str =
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        /// 16-byte hex salt — exactly meets the Argon2 minimum.
+        const TEST_SALT_HEX: &str = "00112233445566778899aabbccddeeff";
+
+        // 1. Argon2id derivation — same passphrase + salt + context
+        //    produces the same 32-byte key. Round-trip with cheap
+        //    parameters so the test is fast.
+        #[test]
+        fn argon2id_same_input_produces_same_key() {
+            // Cheap-param Argon2 so the test does not allocate 19 MiB
+            // and run for ~50ms — the determinism contract holds at
+            // any work-factor, the high values are an attacker
+            // mitigation, not a correctness invariant.
+            let json = format!(
+                r#"{{
+                    "active_key_id": "k1",
+                    "key_derivations": {{
+                        "k1": {{
+                            "kdf": "argon2id",
+                            "ikm": "{TEST_IKM_HEX}",
+                            "salt": "{TEST_SALT_HEX}",
+                            "params": {{ "m_cost_kib": 64, "t_cost": 1, "p_cost": 1 }}
+                        }}
+                    }}
+                }}"#
+            );
+            let ring_a = KeyRing::from_bytes(json.as_bytes()).expect("a");
+            let ring_b = KeyRing::from_bytes(json.as_bytes()).expect("b");
+            let key_a = ring_a.active_key().expect("a key");
+            let key_b = ring_b.active_key().expect("b key");
+            assert_eq!(&**key_a, &**key_b, "argon2id is deterministic per input");
+            // Sanity: the output is exactly the ChaCha20-Poly1305 key
+            // length the rest of the archive expects.
+            assert_eq!(key_a.len(), 32);
+        }
+
+        // 2. HKDF-SHA256 — known-answer test.
+        //    The pre-existing `hkdf_sha256_matches_rfc_5869_test_case_3`
+        //    test in `key_derivation::tests` already pins the RFC 5869
+        //    Test Case 3 vector against the standard. Here we add a
+        //    second self-consistency round-trip: same `(ikm, salt,
+        //    info)` produces the same output across two independent
+        //    `from_bytes` calls. A regression that swapped SHA-256 for
+        //    SHA-512 or that misordered Hkdf::new's arguments would
+        //    fail the RFC test; a regression that introduced
+        //    nondeterminism (e.g. mixing in a timestamp) would fail
+        //    here.
+        #[test]
+        fn hkdf_sha256_round_trip_is_deterministic() {
+            let json = format!(
+                r#"{{
+                    "active_key_id": "k1",
+                    "key_derivations": {{
+                        "k1": {{
+                            "kdf": "hkdf-sha256",
+                            "ikm": "{TEST_IKM_HEX}",
+                            "salt": "{TEST_SALT_HEX}",
+                            "info": "rustgate-archive/v1/k1"
+                        }}
+                    }}
+                }}"#
+            );
+            let ring_a = KeyRing::from_bytes(json.as_bytes()).expect("a");
+            let ring_b = KeyRing::from_bytes(json.as_bytes()).expect("b");
+            let key_a = ring_a.active_key().expect("a key");
+            let key_b = ring_b.active_key().expect("b key");
+            assert_eq!(&**key_a, &**key_b);
+        }
+
+        // 3. Key with `not_after` in the past is rejected on new write.
+        //    The active-key-expired admission gate is the core
+        //    fail-closed contract — pre-existing
+        //    `encrypted_writer_create_refuses_when_active_key_is_expired`
+        //    already covers this for the writer side; here we pin the
+        //    `active_key_expired_at` accessor directly so a regression
+        //    that decoupled the two paths would fail at the unit-level
+        //    rather than only at the integration level.
+        #[test]
+        fn active_key_with_not_after_in_past_reports_expired() {
+            let json = br#"{
+                "active_key_id": "k1",
+                "keys": {
+                    "k1": "1111111111111111111111111111111111111111111111111111111111111111"
+                },
+                "key_expirations": { "k1": 1000 }
+            }"#;
+            let ring = KeyRing::from_bytes(json).expect("ring");
+            assert!(ring.active_key_expired_at(1000));
+            assert!(ring.active_key_expired_at(2000));
+            assert!(!ring.active_key_expired_at(999));
+        }
+
+        /// `(event_type, kid, days_remaining)` extracted from an audit
+        /// event by [`EventCapture::handle_event`]. Aliased to keep
+        /// clippy's `type_complexity` lint quiet without an inline
+        /// `#[allow]` annotation.
+        type CapturedFields = (Option<String>, Option<String>, Option<i64>);
+
+        /// Local `tracing_subscriber::Layer` that captures structured
+        /// fields from events at a configurable target/level. Defined
+        /// once and reused across the warn/audit tests below — this
+        /// keeps the orphan-rule-friendly `impl Layer<S> for Self`
+        /// pattern (no `Arc<Foreign>` blanket impls).
+        struct EventCapture {
+            target_match: &'static str,
+            level_match: Option<tracing::Level>,
+            event_type_match: Option<&'static str>,
+            hits: std::sync::Mutex<Vec<CapturedFields>>,
+        }
+
+        impl EventCapture {
+            fn new(
+                target_match: &'static str,
+                level_match: Option<tracing::Level>,
+                event_type_match: Option<&'static str>,
+            ) -> Self {
+                Self {
+                    target_match,
+                    level_match,
+                    event_type_match,
+                    hits: std::sync::Mutex::new(Vec::new()),
+                }
+            }
+        }
+
+        impl EventCapture {
+            fn handle_event<S>(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) where
+                S: tracing::Subscriber,
+            {
+                let meta = event.metadata();
+                if meta.target() != self.target_match {
+                    return;
+                }
+                if let Some(level) = self.level_match
+                    && *meta.level() != level
+                {
+                    return;
+                }
+
+                struct Visit {
+                    event_type: Option<String>,
+                    kid: Option<String>,
+                    days_remaining: Option<i64>,
+                }
+                impl tracing::field::Visit for Visit {
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        match field.name() {
+                            "event_type" => self.event_type = Some(value.to_string()),
+                            "kid" => self.kid = Some(value.to_string()),
+                            _ => {}
+                        }
+                    }
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        match field.name() {
+                            "event_type" => self.event_type = Some(format!("{value:?}")),
+                            "kid" => self.kid = Some(format!("{value:?}")),
+                            _ => {}
+                        }
+                    }
+                    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+                        if field.name() == "days_remaining" {
+                            self.days_remaining = Some(value);
+                        }
+                    }
+                }
+                let mut visit = Visit {
+                    event_type: None,
+                    kid: None,
+                    days_remaining: None,
+                };
+                event.record(&mut visit);
+                if let Some(et) = self.event_type_match
+                    && visit.event_type.as_deref() != Some(et)
+                {
+                    return;
+                }
+                let mut hits = self.hits.lock().expect("event capture mutex");
+                hits.push((visit.event_type, visit.kid, visit.days_remaining));
+            }
+        }
+
+        impl<S> tracing_subscriber::Layer<S> for EventCapture
+        where
+            S: tracing::Subscriber,
+        {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                cx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                self.handle_event(event, cx);
+            }
+        }
+
+        // `tracing_subscriber::registry().with(...)` and
+        // `with_default(...)` require an owned `Layer`. We want the
+        // capture to outlive the subscriber so the test can inspect
+        // its `hits`, so we pass a `&'static EventCapture` leaked
+        // for the test's lifetime. This blanket impl forwards
+        // `Layer<S>` from the static reference to the underlying
+        // capture.
+        impl<S> tracing_subscriber::Layer<S> for &'static EventCapture
+        where
+            S: tracing::Subscriber,
+        {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                cx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                (*self).handle_event(event, cx);
+            }
+        }
+
+        // 4. Key without `not_after` loads (backward compat) and emits
+        //    a tracing warn so operators are nudged toward setting
+        //    rotation. The warn-emission is observed via the
+        //    `EventCapture` layer above filtering on
+        //    `target = "rustgate_core::encrypted"`.
+        #[test]
+        fn key_without_not_after_loads_and_emits_rotation_hygiene_warn() {
+            use tracing_subscriber::layer::SubscriberExt;
+
+            // Leak the capture into a `&'static` so the layer impl
+            // satisfies `Layer<S>: 'static` without an Arc<Foreign>
+            // blanket impl. Test-only — short-lived process means
+            // the leak is benign.
+            let layer_ref: &'static EventCapture = Box::leak(Box::new(EventCapture::new(
+                "rustgate_core::encrypted",
+                Some(tracing::Level::WARN),
+                None,
+            )));
+
+            let subscriber = tracing_subscriber::registry().with(layer_ref);
+            tracing::subscriber::with_default(subscriber, || {
+                let json = br#"{
+                    "active_key_id": "k1",
+                    "keys": { "k1": "1111111111111111111111111111111111111111111111111111111111111111" }
+                }"#;
+                let ring = KeyRing::from_bytes(json).expect("legacy key file must load");
+                assert_eq!(ring.active_key_id(), "k1");
+                // Confirm the key is usable — the warn is hygiene
+                // signalling, not a refusal.
+                assert!(ring.active_key().is_ok());
+            });
+
+            let hits = layer_ref.hits.lock().expect("warn capture mutex");
+            assert!(
+                !hits.is_empty(),
+                "loading a key file with no key_expirations must emit a tracing warn"
+            );
+        }
+
+        // 5. Active key with `not_after` ≤ 14 days from now emits the
+        //    `archive.key_rotation_due` audit event with the right
+        //    `kid` and `days_remaining`. Uses the doc-hidden
+        //    `emit_rotation_signals_at` accessor with a synthetic clock
+        //    so the test does not depend on wall-clock time.
+        #[test]
+        fn active_key_within_rotation_window_emits_rotation_due_audit() {
+            use tracing_subscriber::layer::SubscriberExt;
+
+            // Leak the capture into a `&'static` so the layer impl
+            // satisfies `Layer<S>: 'static` without an Arc<Foreign>
+            // blanket impl. Test-only — short-lived process means
+            // the leak is benign.
+            let layer_ref: &'static EventCapture = Box::leak(Box::new(EventCapture::new(
+                "audit",
+                None,
+                Some("archive.key_rotation_due"),
+            )));
+
+            // not_after is 7 days after the synthetic now.
+            let now: i64 = 1_700_000_000;
+            let not_after = now + 7 * 86_400;
+            let json = format!(
+                r#"{{
+                    "active_key_id": "k1",
+                    "keys": {{ "k1": "1111111111111111111111111111111111111111111111111111111111111111" }},
+                    "key_expirations": {{ "k1": {not_after} }}
+                }}"#
+            );
+            let ring = KeyRing::from_bytes(json.as_bytes()).expect("ring");
+
+            let subscriber = tracing_subscriber::registry().with(layer_ref);
+            tracing::subscriber::with_default(subscriber, || {
+                ring.emit_rotation_signals_at(now);
+            });
+
+            let hits = layer_ref.hits.lock().expect("audit capture mutex");
+            assert_eq!(
+                hits.len(),
+                1,
+                "exactly one rotation_due audit event must fire for a key 7 days out"
+            );
+            let (event_type, kid, days_remaining) = &hits[0];
+            assert_eq!(
+                event_type.as_deref(),
+                Some("archive.key_rotation_due"),
+                "event_type must match"
+            );
+            assert_eq!(*days_remaining, Some(7), "days_remaining must be 7");
+            assert!(
+                kid.as_ref().is_some_and(|k| k.contains("k1")),
+                "kid must name the active key: {kid:?}"
+            );
+        }
+
+        // 6. Existing test fixtures (raw hex-key path) still pass. The
+        //    full encrypted-tests module already runs against the
+        //    pre-PR shape — we re-pin the no-expirations + raw-hex
+        //    happy path here so a future refactor that mistakenly
+        //    drops backward compat trips a test in this module rather
+        //    than in the unrelated `tests::key_file_validation` block.
+        #[test]
+        fn raw_hex_key_without_expirations_or_derivations_loads_and_writes() {
+            let json = br#"{
+                "active_key_id": "k1",
+                "keys": { "k1": "1111111111111111111111111111111111111111111111111111111111111111" }
+            }"#;
+            let ring = KeyRing::from_bytes(json).expect("legacy ring");
+            assert_eq!(ring.active_key_id(), "k1");
+            assert!(ring.active_key().is_ok());
+
+            // Round-trip a small payload so the writer path is
+            // exercised end-to-end.
+            let dir = tempdir();
+            let enc_path = dir.join("legacy.enc");
+            let dec_path = dir.join("legacy.txt");
+            {
+                let mut w = EncryptedWriter::create(&enc_path, &ring).expect("writer");
+                w.write_chunk(b"legacy-fixture").expect("write");
+                w.finish().expect("finish");
+            }
+            decrypt_file(&enc_path, &dec_path, &ring).expect("decrypt");
+            assert_eq!(std::fs::read(&dec_path).unwrap(), b"legacy-fixture");
+        }
+
+        // 7. Passphrase material from `ikm_from_file` is wrapped in
+        //    `Zeroizing` for the lifetime of derivation. We cannot
+        //    directly observe memory wipe in safe Rust, but we can
+        //    pin the functional contract that the file-IKM source
+        //    produces the same key as the inline-hex IKM source for
+        //    the same plaintext. The zeroize-on-drop guarantee is
+        //    provided by `Zeroizing<T>` on the resolved-IKM buffer
+        //    (`ResolvedIkm::bytes`); the test exercises the file
+        //    path so a future refactor that accidentally swapped
+        //    `Zeroizing<Vec<u8>>` for a bare `Vec<u8>` would fail
+        //    review even if it compiled. (We avoid `ikm_from_env`
+        //    here because Rust 2024 made `std::env::set_var` unsafe
+        //    and the workspace forbids `unsafe` code.)
+        #[test]
+        fn ikm_from_file_yields_same_key_as_inline_hex() {
+            // Choose a 32-byte fixture so the inline-hex spelling
+            // is unambiguous for round-trip comparison.
+            let passphrase = b"rustgate-test-passphrase-32-byte";
+            assert_eq!(passphrase.len(), 32, "fixture must be exactly 32 bytes");
+            let inline_hex = hex::encode(passphrase);
+
+            // Write the passphrase to a 0o600 file so
+            // `read_secret_file` accepts it.
+            let dir = tempdir();
+            let secret_path = dir.join("kdf-passphrase");
+            std::fs::write(&secret_path, passphrase).expect("write secret");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&secret_path).unwrap().permissions();
+                perms.set_mode(0o600);
+                std::fs::set_permissions(&secret_path, perms).expect("chmod 0600");
+            }
+
+            let inline_json = format!(
+                r#"{{
+                    "active_key_id": "k1",
+                    "key_derivations": {{
+                        "k1": {{
+                            "kdf": "hkdf-sha256",
+                            "ikm": "{inline_hex}",
+                            "salt": "{TEST_SALT_HEX}",
+                            "info": "leak-test"
+                        }}
+                    }}
+                }}"#
+            );
+            let path_string = secret_path.display().to_string();
+            let file_json = format!(
+                r#"{{
+                    "active_key_id": "k1",
+                    "key_derivations": {{
+                        "k1": {{
+                            "kdf": "hkdf-sha256",
+                            "ikm_from_file": "{path_string}",
+                            "salt": "{TEST_SALT_HEX}",
+                            "info": "leak-test"
+                        }}
+                    }}
+                }}"#
+            );
+
+            let ring_inline = KeyRing::from_bytes(inline_json.as_bytes()).expect("inline");
+            let ring_file = KeyRing::from_bytes(file_json.as_bytes()).expect("file");
+            let key_inline = ring_inline.active_key().expect("inline key");
+            let key_file = ring_file.active_key().expect("file key");
+            assert_eq!(
+                &**key_inline, &**key_file,
+                "file IKM must produce the same derived key as inline IKM for the same plaintext"
+            );
+        }
+
+        // Bonus: HKDF / Argon2id refuse a derivation entry with no IKM
+        //    source at all, because the legacy default-string path
+        //    (empty hex decodes to zero bytes, which then fails the
+        //    16-byte floor) is no longer the only failure mode — an
+        //    operator who omits all three must hit the new
+        //    "no IKM source set" error rather than the older
+        //    less-actionable "ikm too short" message.
+        #[test]
+        fn derivation_without_any_ikm_source_is_rejected() {
+            let json = br#"{
+                "active_key_id": "k1",
+                "key_derivations": {
+                    "k1": {
+                        "kdf": "hkdf-sha256",
+                        "salt": ""
+                    }
+                }
+            }"#;
+            let err = KeyRing::from_bytes(json).expect_err("must reject");
+            match err {
+                EncryptError::KeyDerivation { id, reason } => {
+                    assert_eq!(id, "k1");
+                    assert!(
+                        reason.contains("no IKM source"),
+                        "reason should name the missing source: {reason}"
+                    );
+                }
+                other => panic!("expected KeyDerivation, got {other:?}"),
+            }
+        }
+
+        // Bonus: Argon2id with a too-short salt is rejected. The
+        //    salt floor is part of the security posture, not just
+        //    operator hygiene.
+        #[test]
+        fn argon2id_short_salt_is_rejected() {
+            let json = format!(
+                r#"{{
+                    "active_key_id": "k1",
+                    "key_derivations": {{
+                        "k1": {{
+                            "kdf": "argon2id",
+                            "ikm": "{TEST_IKM_HEX}",
+                            "salt": "0011",
+                            "params": {{ "m_cost_kib": 64, "t_cost": 1, "p_cost": 1 }}
+                        }}
+                    }}
+                }}"#
+            );
+            let err = KeyRing::from_bytes(json.as_bytes()).expect_err("must reject");
+            match err {
+                EncryptError::KeyDerivation { id, reason } => {
+                    assert_eq!(id, "k1");
+                    assert!(
+                        reason.contains("8 bytes"),
+                        "reason should cite the 8-byte floor: {reason}"
+                    );
+                }
+                other => panic!("expected KeyDerivation, got {other:?}"),
+            }
         }
     }
 }
