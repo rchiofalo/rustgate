@@ -12,6 +12,11 @@ workspace = true
 
 [features]
 fuzz = ["dep:arbitrary", "rustgate-core/fuzz"]
+# Prometheus metrics for CoT parse counters / histograms (issue #771).
+# Off by default so the no-features build of `rustgate-cot` does not pull
+# in `prometheus`. Enabled by `rustgate-server` when its own `metrics`
+# feature is on.
+metrics = ["dep:prometheus", "rustgate-core/metrics"]
 
 [dependencies]
 arbitrary = { workspace = true, optional = true }
@@ -19,6 +24,7 @@ rustgate-core = { workspace = true }
 bytes = { workspace = true }
 quick-xml = { workspace = true }
 lru = { workspace = true }
+prometheus = { workspace = true, optional = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

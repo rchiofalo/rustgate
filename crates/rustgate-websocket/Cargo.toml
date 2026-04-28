@@ -10,6 +10,15 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# Prometheus metrics for WebSocket connection / message / compression
+# / subprotocol counters and active-connection gauge (issue #771). Off
+# by default so the no-features build of `rustgate-websocket` does not
+# pull in `prometheus`. Enabled by `rustgate-server` when its own
+# `metrics` feature is on.
+metrics = ["dep:prometheus", "rustgate-core/metrics"]
+
 [dependencies]
 rustgate-core = { workspace = true }
 rustgate-cot = { workspace = true }
@@ -19,6 +28,7 @@ bytes = { workspace = true }
 flate2 = { workspace = true }
 futures = { workspace = true }
 parking_lot = { workspace = true }
+prometheus = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["net", "time", "sync", "rt", "macros"] }
 tokio-rustls = { workspace = true }
 tokio-tungstenite = { workspace = true }

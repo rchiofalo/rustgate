@@ -20,7 +20,19 @@ enrollment = ["dep:rustgate-enrollment"]
 est = ["enrollment", "rustgate-enrollment/est"]
 proto = ["dep:rustgate-proto", "rustgate-transport/proto", "rustgate-http?/proto"]
 full-detail = ["nats", "rustgate-nats/full-detail"]
-metrics = ["dep:prometheus", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "rustgate-core/metrics", "rustgate-http?/metrics"]
+metrics = [
+    "dep:prometheus",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http-body-util",
+    "rustgate-core/metrics",
+    "rustgate-authz/metrics",
+    "rustgate-cot/metrics",
+    "rustgate-proto?/metrics",
+    "rustgate-mqtt?/metrics",
+    "rustgate-websocket?/metrics",
+    "rustgate-http?/metrics",
+]
 federation = ["dep:rustgate-federation", "rustgate-federation/v2", "rustgate-federation/api"]
 federation-ha = ["federation", "rustgate-federation/ha"]
 # Sub-features selecting which dynamic peer-discovery backends the server

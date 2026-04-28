@@ -263,6 +263,33 @@ async fn handle_ws_session(
     let peer_addr = session.peer_addr();
     let cn = identity.cn.clone();
 
+    // Per-session metric instrumentation (issue #771). The active-
+    // connections gauge is decremented in the matching scope-exit
+    // path below. Compression and subprotocol counters are recorded
+    // once at session start with the bounded label vocabulary
+    // documented on `crate::metrics`.
+    #[cfg(feature = "metrics")]
+    {
+        crate::metrics::active_connections().inc();
+        let compression_label = if session.negotiated_compression().is_some() {
+            "enabled"
+        } else {
+            // Without listener-config visibility on the session, the
+            // disabled-vs-not-offered distinction collapses into a
+            // single `not_offered` bucket. Operators read the
+            // server-config dashboard panel alongside this metric to
+            // disambiguate, and the label vocabulary stays bounded.
+            "not_offered"
+        };
+        crate::metrics::compression_negotiated_total()
+            .with_label_values(&[compression_label])
+            .inc();
+        let subprotocol_label = session.negotiated_subprotocol().unwrap_or("none");
+        crate::metrics::subprotocol_selected_total()
+            .with_label_values(&[subprotocol_label])
+            .inc();
+    }
+
     info!(
         transport = TRANSPORT_LABEL,
         peer_addr = %peer_addr,
@@ -320,6 +347,10 @@ async fn handle_ws_session(
         {
             cb();
         }
+        // Mirror the gauge inc that fired at session start so the
+        // tenant-quota rejection arm does not leak a count.
+        #[cfg(feature = "metrics")]
+        crate::metrics::active_connections().dec();
         return;
     }
     if let Some(hooks) = session_hooks.as_ref()
@@ -369,6 +400,8 @@ async fn handle_ws_session(
     }
 
     router.unregister(&cn, session_id).await;
+    #[cfg(feature = "metrics")]
+    crate::metrics::active_connections().dec();
 
     info!(
         transport = TRANSPORT_LABEL,
@@ -425,6 +458,14 @@ async fn ws_read_loop(
             }
             _ => continue, // Ping auto-replied by tungstenite; frames ignored
         };
+
+        // Inbound data-frame counter (issue #771). Records text and
+        // binary frames only; control frames (Ping/Pong/Close) are
+        // not observable at the application layer.
+        #[cfg(feature = "metrics")]
+        crate::metrics::messages_total()
+            .with_label_values(&["in"])
+            .inc();
 
         // Per-connection frame/byte rate limiting
         if let Some(limiter) = ws_rate_limiter
@@ -644,6 +685,12 @@ async fn ws_write_loop(
                 // Successful send: the frame has been flushed to the
                 // underlying transport, so reset the pending counter.
                 pending_bytes = 0;
+                // Outbound data-frame counter (issue #771). Counted
+                // post-flush so failed writes do not contribute.
+                #[cfg(feature = "metrics")]
+                crate::metrics::messages_total()
+                    .with_label_values(&["out"])
+                    .inc();
             }
             Ok(Err(e)) => return Err(format!("WebSocket write error: {e}")),
             Err(_) => return Err("write timeout (slow consumer)".into()),

@@ -947,6 +947,20 @@ pub(crate) async fn start_metrics(
     #[cfg(all(feature = "http", feature = "metrics"))]
     rustgate_http::metrics::init().context("registering HTTP egress metrics")?;
 
+    // Per-crate metrics modules added under issue #771. Each registers
+    // additional metric families on top of the pre-existing
+    // `rustgate-server::metrics` surface for that crate; conflicts are
+    // avoided by deliberate naming (see the per-crate metrics-module
+    // header doc-comments for the boundary discipline).
+    rustgate_authz::metrics::init().context("registering authz metrics")?;
+    rustgate_cot::metrics::init().context("registering cot metrics")?;
+    #[cfg(feature = "proto")]
+    rustgate_proto::metrics::init().context("registering proto metrics")?;
+    #[cfg(feature = "mqtt")]
+    rustgate_mqtt::metrics::init().context("registering mqtt metrics")?;
+    #[cfg(feature = "websocket")]
+    rustgate_websocket::metrics::init().context("registering websocket metrics")?;
+
     // Load the optional CN allowlist for per-identity metric label
     // bucketing. When unset, all CNs collapse to the literal "other"
     // label, capping cardinality at 1.

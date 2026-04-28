@@ -10,10 +10,19 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# Prometheus metrics for protobuf<->XML decode counters / histograms
+# (issue #771). Off by default so the no-features build of
+# `rustgate-proto` does not pull in `prometheus`. Enabled by
+# `rustgate-server` when its own `metrics` feature is on.
+metrics = ["dep:prometheus", "rustgate-core/metrics"]
+
 [dependencies]
 rustgate-core = { workspace = true }
 bytes = { workspace = true }
 quick-xml = { workspace = true }
+prometheus = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "time"] }
 tokio-util = { workspace = true }

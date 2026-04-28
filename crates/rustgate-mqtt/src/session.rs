@@ -274,6 +274,19 @@ pub(crate) async fn handle_mqtt_session(
         "MQTT session started"
     );
 
+    // Per-session metric instrumentation (issue #771). The active-session
+    // gauge is incremented after authentication + client-ID claim and
+    // decremented in the matching scope-exit path below; the will counter
+    // increments once per CONNECT that registered a Last-Will-and-Testament
+    // — independent of whether the will eventually fires on disconnect.
+    #[cfg(feature = "metrics")]
+    {
+        crate::metrics::active_sessions().inc();
+        if will.is_some() {
+            crate::metrics::will_messages_total().inc();
+        }
+    }
+
     // Response channel: read loop produces serialized response packets,
     // write loop consumes and writes them to the TLS stream.
     let (resp_tx, mut resp_rx) = mpsc::channel::<ResponsePacket>(response_channel_capacity);
@@ -553,6 +566,8 @@ pub(crate) async fn handle_mqtt_session(
     }
 
     router.unregister(&cn, session_id).await;
+    #[cfg(feature = "metrics")]
+    crate::metrics::active_sessions().dec();
     info!(
         transport = TRANSPORT_LABEL,
         cn = %hash_cn(&cn),
@@ -973,6 +988,18 @@ fn fire_publish_accept(hooks: Option<&crate::config::MqttSessionHooks>) {
         && let Some(cb) = &h.on_publish
     {
         cb();
+    }
+}
+
+#[cfg(feature = "metrics")]
+fn qos_label(qos: mqttbytes::QoS) -> &'static str {
+    // Bounded label vocabulary for `rustgate_mqtt_publish_total{qos}`.
+    // Protocol QoS values are 0..=2 per MQTT 5.0 §3.3.1.4 — there is no
+    // future-variant axis to guard against.
+    match qos {
+        mqttbytes::QoS::AtMostOnce => "0",
+        mqttbytes::QoS::AtLeastOnce => "1",
+        mqttbytes::QoS::ExactlyOnce => "2",
     }
 }
 
@@ -1427,6 +1454,53 @@ async fn handle_publish_v5(
     qos2_inflight: &mut std::collections::HashMap<u16, Qos2InflightV5>,
     publish: mqttbytes::v5::Publish,
 ) -> Result<(), MqttError> {
+    #[cfg(feature = "metrics")]
+    let _publish_start = std::time::Instant::now();
+    #[cfg(feature = "metrics")]
+    let _publish_qos = qos_label(publish.qos);
+    #[cfg(feature = "metrics")]
+    crate::metrics::publish_total()
+        .with_label_values(&[_publish_qos])
+        .inc();
+    let result = handle_publish_v5_inner(
+        resp_tx,
+        identity,
+        router,
+        topic_prefix,
+        session_hooks,
+        forwarding_hooks,
+        retain_store,
+        qos2_inflight,
+        publish,
+    )
+    .await;
+    #[cfg(feature = "metrics")]
+    {
+        let elapsed = _publish_start.elapsed().as_secs_f64();
+        crate::metrics::publish_seconds()
+            .with_label_values(&[_publish_qos])
+            .observe(elapsed);
+    }
+    result
+}
+
+// justification: mirrors `handle_publish_v5` for the metrics-wrap split
+// so the histogram observation lives at a single return point. Inheriting
+// the same nine-argument fan-in is unavoidable — the wrapper passes
+// every argument verbatim and any restructuring would touch every
+// PUBLISH dispatch site for zero call-site reduction.
+#[allow(clippy::too_many_arguments)]
+async fn handle_publish_v5_inner(
+    resp_tx: &mpsc::Sender<ResponsePacket>,
+    identity: &Arc<Identity>,
+    router: &Router,
+    topic_prefix: Option<&str>,
+    session_hooks: Option<&crate::config::MqttSessionHooks>,
+    forwarding_hooks: Option<&crate::config::MqttForwardingHooks>,
+    retain_store: &RetainStore,
+    qos2_inflight: &mut std::collections::HashMap<u16, Qos2InflightV5>,
+    publish: mqttbytes::v5::Publish,
+) -> Result<(), MqttError> {
     if let Err(e) = topic::validate_publish_topic(&publish.topic) {
         fire_publish_reject(session_hooks);
         // For QoS 2, a syntactically invalid topic triggers a PUBREC
@@ -1727,6 +1801,53 @@ async fn ack_publish_v5(
 // would force an unrelated wrapper struct through every dispatch branch.
 #[allow(clippy::too_many_arguments)]
 async fn handle_publish_v4(
+    resp_tx: &mpsc::Sender<ResponsePacket>,
+    identity: &Arc<Identity>,
+    router: &Router,
+    topic_prefix: Option<&str>,
+    session_hooks: Option<&crate::config::MqttSessionHooks>,
+    forwarding_hooks: Option<&crate::config::MqttForwardingHooks>,
+    retain_store: &RetainStore,
+    qos2_inflight: &mut std::collections::HashMap<u16, Qos2InflightV4>,
+    publish: mqttbytes::v4::Publish,
+) -> Result<(), MqttError> {
+    #[cfg(feature = "metrics")]
+    let _publish_start = std::time::Instant::now();
+    #[cfg(feature = "metrics")]
+    let _publish_qos = qos_label(publish.qos);
+    #[cfg(feature = "metrics")]
+    crate::metrics::publish_total()
+        .with_label_values(&[_publish_qos])
+        .inc();
+    let result = handle_publish_v4_inner(
+        resp_tx,
+        identity,
+        router,
+        topic_prefix,
+        session_hooks,
+        forwarding_hooks,
+        retain_store,
+        qos2_inflight,
+        publish,
+    )
+    .await;
+    #[cfg(feature = "metrics")]
+    {
+        let elapsed = _publish_start.elapsed().as_secs_f64();
+        crate::metrics::publish_seconds()
+            .with_label_values(&[_publish_qos])
+            .observe(elapsed);
+    }
+    result
+}
+
+// justification: mirrors `handle_publish_v4` for the metrics-wrap split
+// so the histogram observation lives at a single return point. Inheriting
+// the same nine-argument fan-in is unavoidable — the wrapper passes
+// every argument verbatim and any restructuring would touch every
+// PUBLISH dispatch site for zero call-site reduction.
+#[allow(clippy::too_many_arguments)]
+async fn handle_publish_v4_inner(
     resp_tx: &mpsc::Sender<ResponsePacket>,
     identity: &Arc<Identity>,
     router: &Router,

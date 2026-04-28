@@ -10,6 +10,14 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# Prometheus metrics for MQTT publish counters / latency / session
+# gauge / will-message counter (issue #771). Off by default so the
+# no-features build of `rustgate-mqtt` does not pull in `prometheus`.
+# Enabled by `rustgate-server` when its own `metrics` feature is on.
+metrics = ["dep:prometheus", "rustgate-core/metrics"]
+
 [dependencies]
 rustgate-core = { workspace = true }
 rustgate-resilience = { workspace = true }
@@ -18,6 +26,7 @@ bytes = { workspace = true }
 mqttbytes = { version = "0.6", features = ["v5"] }
 tokio = { workspace = true, features = ["net", "time", "sync", "rt", "macros", "io-util"] }
 parking_lot = { workspace = true }
+prometheus = { workspace = true, optional = true }
 tokio-rustls = { workspace = true }
 tracing = { workspace = true }
 socket2 = { workspace = true }

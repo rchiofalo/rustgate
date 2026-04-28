@@ -196,6 +196,15 @@ impl DecisionCache {
     pub(crate) fn misses(&self) -> u64 {
         self.misses.load(Ordering::Relaxed)
     }
+
+    /// Total live entries across all shards. Used by the
+    /// `rustgate_authz_cache_size` gauge under the `metrics` feature
+    /// (issue #771). Walks every shard's lock; intended for the
+    /// per-evaluation observation site, not a hot-path read.
+    #[cfg(feature = "metrics")]
+    pub(crate) fn total_entries(&self) -> usize {
+        self.shards.iter().map(|s| s.lock().map.len()).sum()
+    }
 }
 
 #[cfg(test)]

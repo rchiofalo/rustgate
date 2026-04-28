@@ -36,6 +36,8 @@
 mod config;
 mod error;
 mod listener;
+#[cfg(feature = "metrics")]
+pub mod metrics;
 mod packet;
 mod retain;
 mod server;

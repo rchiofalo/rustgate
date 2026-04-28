@@ -25,6 +25,8 @@ pub mod cedar_backend;
 pub mod compile;
 pub mod engine;
 pub mod error;
+#[cfg(feature = "metrics")]
+pub mod metrics;
 pub mod model;
 pub mod parser;
 pub mod policy;

@@ -6,8 +6,57 @@ pub mod proto_to_xml;
 pub mod timestamp;
 pub mod xml_to_proto;
 
+#[cfg(not(feature = "metrics"))]
 pub use proto_to_xml::proto_to_xml;
+#[cfg(not(feature = "metrics"))]
 pub use xml_to_proto::xml_to_proto;
+
+// ── Metrics-instrumented wrappers ───────────────────────────────────
+//
+// Under `--features metrics`, the public `proto_to_xml` / `xml_to_proto`
+// entry points wrap the inner conversion in a stopwatch and increment
+// `rustgate_proto_decode_total{kind, result}` plus
+// `rustgate_proto_decode_seconds{kind}` for each call. The wrap is
+// feature-gated so the no-features build emits no extra instructions
+// on the hot path — it re-exports the inner functions directly.
+
+/// Convert serialized TAK protobuf bytes to CoT XML bytes.
+///
+/// Feature-gated metric wrapper that delegates to
+/// [`proto_to_xml::proto_to_xml`] and records the result.
+#[cfg(feature = "metrics")]
+pub fn proto_to_xml(proto_bytes: &[u8]) -> Result<Vec<u8>, crate::error::ProtoError> {
+    let start = std::time::Instant::now();
+    let result = proto_to_xml::proto_to_xml(proto_bytes);
+    let elapsed = start.elapsed().as_secs_f64();
+    crate::metrics::decode_seconds()
+        .with_label_values(&["proto_to_xml"])
+        .observe(elapsed);
+    let label = if result.is_ok() { "ok" } else { "err" };
+    crate::metrics::decode_total()
+        .with_label_values(&["proto_to_xml", label])
+        .inc();
+    result
+}
+
+/// Convert CoT XML bytes to serialized TAK protobuf bytes.
+///
+/// Feature-gated metric wrapper that delegates to
+/// [`xml_to_proto::xml_to_proto`] and records the result.
+#[cfg(feature = "metrics")]
+pub fn xml_to_proto(xml: &[u8]) -> Result<Vec<u8>, crate::error::ProtoError> {
+    let start = std::time::Instant::now();
+    let result = xml_to_proto::xml_to_proto(xml);
+    let elapsed = start.elapsed().as_secs_f64();
+    crate::metrics::decode_seconds()
+        .with_label_values(&["xml_to_proto"])
+        .observe(elapsed);
+    let label = if result.is_ok() { "ok" } else { "err" };
+    crate::metrics::decode_total()
+        .with_label_values(&["xml_to_proto", label])
+        .inc();
+    result
+}
 
 #[cfg(test)]
 mod tests {

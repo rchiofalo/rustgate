@@ -16,6 +16,11 @@ default = []
 # of [`PolicyEngine`] so operators with an existing Cedar policy corpus
 # can reuse it without rewriting rules in the native JSON format.
 cedar = ["dep:cedar-policy"]
+# Prometheus metrics for authz evaluation counters / histogram and the
+# decision-cache size gauge (issue #771). Off by default so the
+# no-features build of `rustgate-authz` does not pull in `prometheus`.
+# Enabled by `rustgate-server` when its own `metrics` feature is on.
+metrics = ["dep:prometheus", "rustgate-core/metrics"]
 
 [dependencies]
 rustgate-core = { workspace = true }
@@ -26,6 +31,7 @@ ahash = { workspace = true }
 parking_lot = { workspace = true }
 smol_str = { workspace = true, features = ["serde"] }
 sha2 = { workspace = true }
+prometheus = { workspace = true, optional = true }
 cedar-policy = { workspace = true, optional = true }
 tracing = { workspace = true }
 
