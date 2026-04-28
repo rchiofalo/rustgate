@@ -1086,7 +1086,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
                     #[cfg(feature = "metrics")]
                     {
                         let router_for_stats = Arc::clone(&router);
-                        drop(tokio::spawn(async move {
+                        spawn_background("authz-cache-stats", async move {
                             let mut tick = tokio::time::interval(Duration::from_secs(10));
                             let mut last_hits: u64 = 0;
                             let mut last_misses: u64 = 0;
@@ -1109,7 +1109,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
                                     last_misses = misses;
                                 }
                             }
-                        }));
+                        });
                     }
                     tracing::info!(
                         interval_secs = cli.authz_reload_interval,

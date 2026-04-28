@@ -42,6 +42,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use rustgate_core::tasks::spawn_background;
 use rustls::client::danger::HandshakeSignatureValid;
 use rustls::pki_types::{CertificateDer, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
@@ -177,7 +178,7 @@ impl ClientOcspVerifier {
 
         let weak = Arc::downgrade(&verifier);
         let fetcher_clone = fetcher;
-        drop(tokio::spawn(async move {
+        spawn_background("client-ocsp-fetcher", async move {
             while let Some((cert_fp, leaf, issuer)) = fetch_rx.recv().await {
                 let Some(this) = weak.upgrade() else {
                     return;
@@ -196,7 +197,7 @@ impl ClientOcspVerifier {
                     }
                 }
             }
-        }));
+        });
 
         verifier
     }

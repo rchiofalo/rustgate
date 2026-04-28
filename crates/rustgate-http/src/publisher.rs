@@ -16,6 +16,7 @@ use reqwest::header::HeaderName;
 use rustgate_core::b64;
 use rustgate_core::message::RoutableMessage;
 use rustgate_core::sanitize::sanitize_for_log;
+use rustgate_core::tasks::spawn_background;
 use rustgate_resilience::backpressure::{BackpressureGate, BackpressurePermit};
 use rustgate_resilience::circuit::{
     CircuitBreaker, OnStateChange, STATE_CLOSED, STATE_HALF_OPEN, STATE_OPEN,
@@ -339,16 +340,13 @@ impl HttpPublisher {
             // task, and its panic or exit does not require a
             // graceful-shutdown wait. The dedicated `drain_notify`
             // signals termination and the channel close drains any
-            // pending triggers on publisher drop. `tokio::spawn`
-            // returns a handle that we drop explicitly via
-            // `std::mem::drop` so the `let_underscore_future` lint
-            // stays clean.
-            std::mem::drop(tokio::spawn(drain_worker(
-                drain_rx,
-                drain_targets,
-                drain_dlq,
-                drain_notify_worker,
-            )));
+            // pending triggers on publisher drop. `spawn_background`
+            // is the workspace-wide helper that adds panic logging
+            // around the spawned future.
+            spawn_background(
+                "http-dlq-drain-worker",
+                drain_worker(drain_rx, drain_targets, drain_dlq, drain_notify_worker),
+            );
             Some(drain_notify)
         } else {
             // No DLQ → no drain worker spawned → no drain shutdown

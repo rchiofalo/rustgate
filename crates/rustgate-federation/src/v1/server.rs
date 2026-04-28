@@ -11,6 +11,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use rustgate_core::masking::hash_cn;
 use rustgate_core::protocol::HeaderSize;
+use rustgate_core::tasks::spawn_background;
 use rustgate_transport::{LengthPrefixedCodec, TlsConfig, TlsListener};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -146,14 +147,17 @@ async fn accept_loop(
 
                         let on_msg = Arc::clone(&on_message);
                         let uid = server_uid.clone();
-                        drop(tokio::spawn(handle_inbound_peer(
-                            session,
-                            uid,
-                            heartbeat_interval,
-                            heartbeat_timeout,
-                            on_msg,
-                            max_message_size,
-                        )));
+                        spawn_background(
+                            "federation-v1-inbound-peer",
+                            handle_inbound_peer(
+                                session,
+                                uid,
+                                heartbeat_interval,
+                                heartbeat_timeout,
+                                on_msg,
+                                max_message_size,
+                            ),
+                        );
                     }
                     Err(e) => {
                         warn!(error = %e, "failed to accept V1 federation connection");

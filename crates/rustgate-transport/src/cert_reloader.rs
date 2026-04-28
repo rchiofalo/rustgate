@@ -25,6 +25,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use rustgate_core::error::{ConfigError, Result, RustgateError};
+use rustgate_core::tasks::spawn_background;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::ResolvesServerCert;
 use rustls::sign::CertifiedKey;
@@ -224,7 +225,7 @@ impl CertReloader {
             return;
         }
         let reloader = Arc::clone(self);
-        drop(tokio::spawn(async move {
+        spawn_background("cert-reloader", async move {
             let mut tick = tokio::time::interval(interval);
             // Skip the first immediate tick — the cert was just loaded.
             let _ = tick.tick().await;
@@ -262,7 +263,7 @@ impl CertReloader {
                     rustgate_core::audit::cert_rotation_failed(&display_path, &e.to_string());
                 }
             }
-        }));
+        });
     }
 
     /// Build a [`CertifiedKey`] from raw PEM file bytes.

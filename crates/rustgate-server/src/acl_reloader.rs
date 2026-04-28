@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rustgate_core::tasks::spawn_background;
 use rustgate_transport::Router;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
@@ -158,7 +159,7 @@ impl AclReloader {
     /// [`tokio::task::spawn_blocking`] to avoid stalling the async runtime.
     pub(crate) fn spawn_watcher(self: &Arc<Self>, interval: Duration) {
         let reloader = Arc::clone(self);
-        drop(tokio::spawn(async move {
+        spawn_background("acl-reloader", async move {
             let mut tick = tokio::time::interval(interval);
             // Skip the first immediate tick -- the ACL was just loaded.
             let _ = tick.tick().await;
@@ -193,7 +194,7 @@ impl AclReloader {
                     );
                 }
             }
-        }));
+        });
     }
 
     /// Overwrite the reloader's stored hash.

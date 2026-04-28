@@ -24,6 +24,7 @@ use prometheus::{
 };
 use rustgate_core::constants::HTTP_CONNECTION_TIMEOUT;
 use rustgate_core::net::configure_tactical_socket;
+use rustgate_core::tasks::spawn_background;
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
@@ -2328,7 +2329,7 @@ pub fn spawn_client_queue_metrics_task(
     identity: Arc<MetricsIdentity>,
 ) {
     use std::collections::HashMap;
-    drop(tokio::spawn(async move {
+    spawn_background("client-queue-metrics", async move {
         let mut last_drops: u64 = 0;
         let mut last_drains: u64 = 0;
         let mut last_enqueues: u64 = 0;
@@ -2410,7 +2411,7 @@ pub fn spawn_client_queue_metrics_task(
             }
             last_skipped = skip_now;
         }
-    }));
+    });
 }
 
 /// Classify a TLS handshake error into a metric label.
@@ -3280,7 +3281,7 @@ pub async fn serve(
         let mgmt_api = Arc::clone(&mgmt_api);
         let metrics_token = metrics_token.clone();
         let router_slot = Arc::clone(&router_slot);
-        drop(tokio::spawn(async move {
+        spawn_background("metrics-http-conn", async move {
             let _permit = permit;
             let conn = hyper::server::conn::http1::Builder::new()
                 .timer(hyper_util::rt::TokioTimer::new())
@@ -3395,7 +3396,7 @@ pub async fn serve(
                 Err(_) => tracing::debug!("metrics connection timed out"),
                 Ok(Ok(())) => {}
             }
-        }));
+        });
     }
 }
 

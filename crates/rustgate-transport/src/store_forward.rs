@@ -49,6 +49,7 @@ use rustgate_core::crypto::{HmacError, hmac_sha256_tag, hmac_sha256_verify};
 use rustgate_core::identity::Identity;
 use rustgate_core::masking::hash_cn;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
+use rustgate_core::tasks::spawn_background;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -1325,7 +1326,7 @@ fn spawn_writer_task(
     hmac_key: Arc<Zeroizing<[u8; 32]>>,
     mut rx: mpsc::Receiver<(String, RoutableMessage, i64)>,
 ) {
-    drop(tokio::spawn(async move {
+    spawn_background("client-queue-writer", async move {
         while let Some((cn, msg, queued_at_ms)) = rx.recv().await {
             let db = Arc::clone(&db);
             let inner = Arc::clone(&inner);
@@ -1340,7 +1341,7 @@ fn spawn_writer_task(
                 Err(e) => warn!(error = %e, "client queue writer: join failed"),
             }
         }
-    }));
+    });
 }
 
 /// Synchronous durable write path executed inside `spawn_blocking`.
