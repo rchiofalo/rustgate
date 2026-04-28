@@ -1678,7 +1678,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
             let _ = mgmt_api_slot.set(handler);
             tracing::info!(
                 "management REST API enabled at /api/cert/, /api/crl/, /api/dedup/, \
-                 /api/clients/, /api/dlq/, /api/reload, and /api/drain"
+                 /api/clients/, /api/dlq/, /api/v1/, /api/reload, and /api/drain"
             );
         }
     }

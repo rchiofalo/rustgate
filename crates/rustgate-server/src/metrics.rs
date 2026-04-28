@@ -3342,15 +3342,17 @@ pub async fn serve(
                                     .unwrap_or_else(|_| internal_error_response()));
                             }
                             // Delegate /api/cert/, /api/crl/, /api/dedup/,
-                            // /api/clients/, /api/dlq/, /api/reload, and
-                            // /api/drain paths to the management handler.
+                            // /api/clients/, /api/dlq/, /api/v1/, /api/reload,
+                            // and /api/drain paths to the management handler.
                             // Runs before the generic handler so unknown
                             // suffixes under these prefixes produce the
                             // handler's structured 401/404/405 envelope
                             // rather than the bare 404 below. The handler
                             // is async because disconnect/reload/drain
                             // need to `.await` on the router and reload
-                            // futures.
+                            // futures. `/api/v1/` was added in #902 for
+                            // versioned endpoints (`/api/v1/crl`,
+                            // `/api/v1/dedup/stats`).
                             {
                                 let path_str = req.uri().path();
                                 if (path_str.starts_with("/api/cert/")
@@ -3358,6 +3360,7 @@ pub async fn serve(
                                     || path_str.starts_with("/api/dedup/")
                                     || path_str.starts_with("/api/clients/")
                                     || path_str.starts_with("/api/dlq/")
+                                    || path_str.starts_with("/api/v1/")
                                     || path_str == "/api/reload"
                                     || path_str == "/api/drain")
                                     && let Some(handler) = mgmt_api.get()

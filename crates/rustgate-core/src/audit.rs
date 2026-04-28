@@ -1795,6 +1795,37 @@ pub fn admin_drain_triggered(source: &str) {
     );
 }
 
+/// Record a successful management REST API access.
+///
+/// Emitted by the `/api/v1/*` read endpoints (refs #902) once
+/// authentication succeeds and the response payload is computed.
+/// `endpoint` is the operator-facing path (`"/api/v1/crl"`,
+/// `"/api/v1/dedup/stats"`); `identity` is the caller's authenticated
+/// principal — currently the literal `"bearer"` because the metrics
+/// HTTP server fronting the management API uses bearer-token auth, not
+/// mTLS, so there is no client CN to record. The field is retained as a
+/// parameter so a future mTLS-fronted variant can populate it without a
+/// breaking change to the audit shape.
+///
+/// Fires only on the success path; bearer-token failures are accounted
+/// in the standard 401 response and do NOT emit this event (callers
+/// can distinguish "operator hit the endpoint" from "someone tried to
+/// brute-force it" by absence-vs-presence in the audit trail).
+///
+/// Sanitization: both `endpoint` and `identity` are sanitized at the
+/// audit boundary via [`sanitize_for_log`]. Refs #902.
+pub fn mgmt_api_accessed(endpoint: &str, identity: &str) {
+    let endpoint = s(endpoint);
+    let identity = s(identity);
+    audit!(
+        "mgmt.api_accessed",
+        endpoint = %endpoint,
+        identity = %identity,
+        action = "access",
+        result = "success"
+    );
+}
+
 // ── JWKS refresh lifecycle (refs #952) ──────────────────────────────
 
 /// Record a successful JWKS refresh from a remote endpoint.

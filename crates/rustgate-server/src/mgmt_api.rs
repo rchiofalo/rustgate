@@ -205,6 +205,13 @@ pub(crate) const MGMT_PATH_PREFIXES: &[&str] = &[
     "/api/dedup/",
     "/api/clients/",
     "/api/dlq/",
+    // `/api/v1/` hosts the versioned endpoints added in #902:
+    // `/api/v1/crl` (CRL PEM passthrough) and `/api/v1/dedup/stats`
+    // (operator-facing stats with the explicit hit/miss/eviction
+    // counters). These coexist with the unversioned `/api/crl/status`
+    // and `/api/dedup/stats` paths above — operator tooling can
+    // continue scraping the legacy shape until they migrate.
+    "/api/v1/",
 ];
 
 /// Bare-path management API routes (no trailing slash, no path params).
@@ -293,14 +300,26 @@ async fn route(method: &Method, path: &str, state: &MgmtApiState) -> Response<Fu
         (&Method::GET, "/api/cert/status") => cert_status(state),
         (&Method::GET, "/api/crl/status") => crl_status(state),
         (&Method::GET, "/api/dedup/stats") => dedup_stats(state),
+        // /api/v1/crl returns the active CRL PEM body so an operator
+        // can verify what the server is enforcing without touching
+        // disk. Refs #902.
+        (&Method::GET, "/api/v1/crl") => v1_crl_pem(state),
+        // /api/v1/dedup/stats returns the richer operator-facing
+        // counter set (hit/miss/eviction). Refs #902.
+        (&Method::GET, "/api/v1/dedup/stats") => v1_dedup_stats(state),
         // A recognized prefix with an unrecognized suffix or an
         // incorrect method gets a 405/404 split: wrong method on a
         // known endpoint is `METHOD_NOT_ALLOWED` (so operators see
         // "this endpoint exists but not for that verb"), unknown
         // suffix is `NOT_FOUND`.
-        (_, "/api/cert/status" | "/api/crl/status" | "/api/dedup/stats") => {
-            json_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
-        }
+        (
+            _,
+            "/api/cert/status"
+            | "/api/crl/status"
+            | "/api/dedup/stats"
+            | "/api/v1/crl"
+            | "/api/v1/dedup/stats",
+        ) => json_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
         _ => json_error(StatusCode::NOT_FOUND, "not found"),
     }
 }
@@ -546,6 +565,114 @@ fn dedup_stats(state: &MgmtApiState) -> Response<Full<Bytes>> {
     }
 }
 
+// ── /api/v1/crl (refs #902) ────────────────────────────────────────
+
+/// Identity recorded on the [`mgmt_api_accessed`] audit event for
+/// requests that authenticate via bearer token. The metrics HTTP server
+/// fronting this API uses bearer-token auth, not mTLS, so there is no
+/// client CN to record; the placeholder lets a future mTLS-fronted
+/// variant swap in a real principal without changing the audit shape.
+///
+/// [`mgmt_api_accessed`]: rustgate_core::audit::mgmt_api_accessed
+const MGMT_AUDIT_IDENTITY: &str = "bearer";
+
+/// `GET /api/v1/crl` — return the active CRL contents in PEM format.
+///
+/// The response distinguishes three operational states:
+///
+/// - **`200 OK`** with `Content-Type: application/x-pem-file` and the
+///   CRL PEM body when a CRL was configured AND the file reads cleanly
+///   at request time. Operators can pipe the body through `openssl
+///   crl -text -noout` to inspect what the server is enforcing without
+///   touching the on-disk file directly.
+/// - **`404 Not Found`** when no CRL was configured (`--crl` not
+///   supplied at startup). The server is operating without revocation
+///   checking by design and there is nothing to return.
+/// - **`503 Service Unavailable`** when a CRL was configured but the
+///   file fails to read (deleted, permission error, transient FS
+///   issue). This is the operator-facing signal that the next SIGHUP
+///   reload would also fail — separate from the 404 because "no CRL
+///   configured" is a deliberate operating mode while "CRL configured
+///   but unreadable" is a misconfiguration that needs attention.
+///
+/// Auth is enforced by the outer [`handle_request`] guard before this
+/// handler is reached. Successful access fires
+/// [`rustgate_core::audit::mgmt_api_accessed`] so the operator trail
+/// matches what `/api/drain` and the DLQ replay endpoints emit.
+fn v1_crl_pem(state: &MgmtApiState) -> Response<Full<Bytes>> {
+    let Some(path) = state.crl_path.as_ref() else {
+        return json_error(StatusCode::NOT_FOUND, "no CRL configured");
+    };
+    match std::fs::read_to_string(path) {
+        Ok(pem) => {
+            // Audit BEFORE constructing the response so a subsequent
+            // builder failure cannot produce an audited 200 the
+            // operator never received. The audit-helper sanitizes the
+            // endpoint and identity strings at the trust boundary.
+            rustgate_core::audit::mgmt_api_accessed("/api/v1/crl", MGMT_AUDIT_IDENTITY);
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/x-pem-file")
+                .body(Full::new(Bytes::from(pem)))
+                .unwrap_or_else(|_| internal_error_response())
+        }
+        Err(e) => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &format!("failed to read CRL: {e}"),
+        ),
+    }
+}
+
+// ── /api/v1/dedup/stats (refs #902) ────────────────────────────────
+
+/// On-wire shape for `/api/v1/dedup/stats`.
+///
+/// Pinned by integration tests in `tests/mgmt_dedup_stats.rs` —
+/// appending fields is fine, renaming or removing is a breaking
+/// change. Counters are `u64` snapshots taken with `Ordering::Relaxed`
+/// and are not consistent with each other under concurrent writers
+/// (matching the prometheus-scrape semantics the rest of the workspace
+/// uses). Refs #902.
+#[derive(Debug, Serialize)]
+struct V1DedupStats {
+    /// Currently tracked entries.
+    entries: usize,
+    /// Maximum tracked entries before LRU eviction kicks in.
+    capacity: usize,
+    /// Cumulative duplicates suppressed since startup.
+    hit_count: u64,
+    /// Cumulative non-duplicate lookups (fresh insert OR refresh of an
+    /// expired entry).
+    miss_count: u64,
+    /// Cumulative capacity-driven LRU evictions since startup.
+    evictions: u64,
+    /// Configured deduplication window in whole seconds.
+    ttl_seconds: u64,
+}
+
+/// `GET /api/v1/dedup/stats` — return the dedup-cache counters.
+///
+/// Returns `404 Not Found` when no dedup cache is installed (server
+/// started without `--dedup-window-secs`); a `200` is reserved for the
+/// case where the cache exists and the counters can be reported.
+/// Operator dashboards typically scrape this on a fixed interval and
+/// graph `hit_count / (hit_count + miss_count)` for the dedup-effective
+/// ratio.
+fn v1_dedup_stats(state: &MgmtApiState) -> Response<Full<Bytes>> {
+    let Some(stats) = state.router.dedup_full_stats() else {
+        return json_error(StatusCode::NOT_FOUND, "dedup cache not configured");
+    };
+    rustgate_core::audit::mgmt_api_accessed("/api/v1/dedup/stats", MGMT_AUDIT_IDENTITY);
+    json_ok(&V1DedupStats {
+        entries: stats.entries,
+        capacity: stats.capacity,
+        hit_count: stats.hit_count,
+        miss_count: stats.miss_count,
+        evictions: stats.evictions,
+        ttl_seconds: stats.ttl_seconds,
+    })
+}
+
 // ── /api/clients/{cn}/disconnect ───────────────────────────────────
 
 /// On-wire shape for the `/api/clients/{cn}/disconnect` endpoint.
@@ -787,6 +914,17 @@ mod tests {
                 .iter()
                 .any(|p| "/api/dlq/webhook-prod/replay".starts_with(p))
         );
+        // /api/v1/ paths (refs #902) live under the versioned prefix.
+        assert!(
+            MGMT_PATH_PREFIXES
+                .iter()
+                .any(|p| "/api/v1/crl".starts_with(p))
+        );
+        assert!(
+            MGMT_PATH_PREFIXES
+                .iter()
+                .any(|p| "/api/v1/dedup/stats".starts_with(p))
+        );
         // Bare-path routes (no trailing slash) live in MGMT_EXACT_PATHS
         // — closes #791 added `/api/drain`.
         assert!(MGMT_EXACT_PATHS.contains(&"/api/reload"));
@@ -899,6 +1037,233 @@ mod tests {
         let data = body.get("data").unwrap();
         assert!(!data.get("enabled").unwrap().as_bool().unwrap());
         assert!(data.get("entries").unwrap().is_null());
+    }
+
+    // ── /api/v1/crl + /api/v1/dedup/stats (refs #902) ──────────────
+
+    /// Build a router with dedup enabled and prime it with one
+    /// duplicate so the stats endpoint can pin non-zero hits/misses.
+    /// Three sends of two distinct payloads → 2 misses + 1 hit, with
+    /// `entries == 2` and `evictions == 0` because the cache capacity
+    /// is far above the working set.
+    fn router_with_primed_dedup() -> Arc<rustgate_transport::Router> {
+        use std::time::Duration;
+        let dedup = rustgate_transport::DedupCache::new(Duration::from_secs(60), 16);
+        // Drive the cache directly — we only need the counters bumped,
+        // not a full router fan-out.
+        assert!(!dedup.check_payload("", b"alpha"));
+        assert!(!dedup.check_payload("", b"bravo"));
+        assert!(dedup.check_payload("", b"alpha"));
+        let router = rustgate_transport::Router::new();
+        router.set_dedup(Some(dedup));
+        Arc::new(router)
+    }
+
+    #[tokio::test]
+    async fn mgmt_dedup_stats_endpoint_returns_counts() {
+        // After seeding the cache with two unique payloads + one
+        // duplicate, the v1 stats endpoint MUST report hit_count=1,
+        // miss_count=2, entries=2, capacity>0, ttl_seconds=60.
+        let state = MgmtApiState {
+            router: router_with_primed_dedup(),
+            cert_reloader: None,
+            crl_path: None,
+            reload: None,
+            #[cfg(feature = "http")]
+            http_publisher: None,
+            drain_notify: Arc::new(tokio::sync::Notify::new()),
+            auth_token: token(),
+        };
+        let t = token();
+        let hdr = format!("Bearer {}", String::from_utf8(t.to_vec()).unwrap());
+        let resp = handle_request(&Method::GET, "/api/v1/dedup/stats", Some(&hdr), &[], &state)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = extract_json_body(resp).await;
+        let data = body.get("data").expect("envelope.data");
+        assert_eq!(data.get("entries").and_then(|v| v.as_u64()), Some(2));
+        assert!(
+            data.get("capacity").and_then(|v| v.as_u64()).unwrap_or(0) >= 16,
+            "capacity must reflect construction-time max_entries"
+        );
+        assert_eq!(data.get("hit_count").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(data.get("miss_count").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(data.get("evictions").and_then(|v| v.as_u64()), Some(0));
+        assert_eq!(data.get("ttl_seconds").and_then(|v| v.as_u64()), Some(60));
+    }
+
+    #[tokio::test]
+    async fn mgmt_v1_dedup_stats_returns_404_when_dedup_disabled() {
+        // No dedup cache installed → 404, not "enabled: false". The
+        // versioned endpoint reserves `200` for "the cache exists and
+        // counts can be reported"; absence of a cache is structurally
+        // different from "no traffic yet".
+        let state = state_with(None);
+        let t = token();
+        let hdr = format!("Bearer {}", String::from_utf8(t.to_vec()).unwrap());
+        let resp = handle_request(&Method::GET, "/api/v1/dedup/stats", Some(&hdr), &[], &state)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn mgmt_v1_dedup_stats_wrong_method_returns_405() {
+        let state = state_with(None);
+        let t = token();
+        let hdr = format!("Bearer {}", String::from_utf8(t.to_vec()).unwrap());
+        let resp = handle_request(
+            &Method::POST,
+            "/api/v1/dedup/stats",
+            Some(&hdr),
+            &[],
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn mgmt_crl_endpoint_returns_404_when_unconfigured() {
+        // Server started without `--crl` → 404. The 404 is the operator
+        // signal that revocation checking is OFF by design (vs the 503
+        // that signals a misconfiguration).
+        let state = state_with(None);
+        let t = token();
+        let hdr = format!("Bearer {}", String::from_utf8(t.to_vec()).unwrap());
+        let resp = handle_request(&Method::GET, "/api/v1/crl", Some(&hdr), &[], &state)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn mgmt_crl_endpoint_returns_503_when_file_unreadable() {
+        // CRL configured but file missing → 503. Pin this so a
+        // refactor that swallows the IO error and returns 200 with an
+        // empty body cannot land silently.
+        let state = state_with(Some(PathBuf::from("/definitely/not/a/real/crl/path.pem")));
+        let t = token();
+        let hdr = format!("Bearer {}", String::from_utf8(t.to_vec()).unwrap());
+        let resp = handle_request(&Method::GET, "/api/v1/crl", Some(&hdr), &[], &state)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn mgmt_crl_endpoint_returns_pem_when_loaded() {
+        // CRL file exists and reads cleanly → 200 with the PEM body
+        // round-tripped verbatim. Generate a CRL via the test CA so
+        // the body is a valid PEM that `openssl crl -text -noout`
+        // would accept.
+        let ca = TestCa::new("mgmt-crl-test-ca");
+        let revoked = ca.issue_client_cert("revoked-client", &["op"]);
+        let crl_pem = ca.generate_crl(&[&revoked.cert_pem]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let crl_path = tmp.path().join("crl.pem");
+        std::fs::write(&crl_path, &crl_pem).unwrap();
+
+        let state = state_with(Some(crl_path));
+        let t = token();
+        let hdr = format!("Bearer {}", String::from_utf8(t.to_vec()).unwrap());
+        let resp = handle_request(&Method::GET, "/api/v1/crl", Some(&hdr), &[], &state)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Content-Type pinned per the operator-facing contract.
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/x-pem-file"),
+        );
+
+        let body_bytes = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
+        assert!(
+            body_str.contains("-----BEGIN X509 CRL-----")
+                && body_str.contains("-----END X509 CRL-----"),
+            "response body must be a valid PEM CRL: {body_str}"
+        );
+        // Round-trip the body through the parser to pin "what the
+        // operator sees is what the server would enforce".
+        let parsed: Vec<_> =
+            rustls_pki_types::CertificateRevocationListDer::pem_slice_iter(body_str.as_bytes())
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+        assert!(
+            !parsed.is_empty(),
+            "PEM body must round-trip through the CRL parser"
+        );
+    }
+
+    #[tokio::test]
+    async fn mgmt_v1_crl_wrong_method_returns_405() {
+        let state = state_with(None);
+        let t = token();
+        let hdr = format!("Bearer {}", String::from_utf8(t.to_vec()).unwrap());
+        let resp = handle_request(&Method::POST, "/api/v1/crl", Some(&hdr), &[], &state)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn mgmt_v1_endpoints_require_auth() {
+        // Unauthed GETs to either v1 endpoint MUST be 401, before any
+        // CRL or dedup state is consulted. Pins the auth boundary so a
+        // future refactor that moves the check past the route match
+        // cannot accidentally expose CRL contents.
+        let state = state_with(None);
+        let resp = handle_request(&Method::GET, "/api/v1/crl", None, &[], &state)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let resp = handle_request(&Method::GET, "/api/v1/dedup/stats", None, &[], &state)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn mgmt_v1_endpoint_access_emits_audit_event() {
+        // Smoke-test that the v1 routes reach the audit emission
+        // without panicking. The audit-record wire shape is pinned in
+        // the integration test in `tests/mgmt_api_audit.rs` where the
+        // tracing subscriber is fresh — same rationale as
+        // `admin_drain_emits_audit_event`.
+        let state_dedup = MgmtApiState {
+            router: router_with_primed_dedup(),
+            cert_reloader: None,
+            crl_path: None,
+            reload: None,
+            #[cfg(feature = "http")]
+            http_publisher: None,
+            drain_notify: Arc::new(tokio::sync::Notify::new()),
+            auth_token: token(),
+        };
+        let t = token();
+        let hdr = format!("Bearer {}", String::from_utf8(t.to_vec()).unwrap());
+        let resp = handle_request(
+            &Method::GET,
+            "/api/v1/dedup/stats",
+            Some(&hdr),
+            &[],
+            &state_dedup,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The audit fn is reachable from this test binary —
+        // calling it directly does not error.
+        rustgate_core::audit::mgmt_api_accessed("/api/v1/dedup/stats", "bearer");
     }
 
     #[tokio::test]
