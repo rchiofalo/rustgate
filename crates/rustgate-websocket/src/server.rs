@@ -31,18 +31,22 @@ use tracing::{debug, info, warn};
 use crate::health::{HealthCheckConfig, LastPong, new_last_pong};
 use crate::{TRANSPORT_LABEL, WsListener, WsSession, WsStream};
 
-/// Fired once per successful WebSocket session registration (post-mTLS,
-/// post-upgrade, post-tenant-quota). Used by `rustgate-server` to increment
-/// the `rustgate_ws_connections_total` Prometheus counter. The crate stays
-/// metrics-agnostic — no `prometheus` dependency leaks in.
-pub type OnWsAcceptFn = Arc<dyn Fn() + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Fired once per successful WebSocket session registration (post-mTLS,
+    /// post-upgrade, post-tenant-quota). Used by `rustgate-server` to increment
+    /// the `rustgate_ws_connections_total` Prometheus counter. The crate stays
+    /// metrics-agnostic — no `prometheus` dependency leaks in.
+    pub OnWsAcceptFn
+);
 
-/// Fired once per WebSocket connection rejected on the session-handler
-/// boundary: per-IP rate limit, TLS handshake failure, identity extraction
-/// failure, upgrade handshake failure, connection-limit exhaustion, tenant
-/// quota exhaustion. Used by `rustgate-server` to increment the
-/// `rustgate_ws_connections_rejected_total` Prometheus counter.
-pub type OnWsRejectFn = Arc<dyn Fn() + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Fired once per WebSocket connection rejected on the session-handler
+    /// boundary: per-IP rate limit, TLS handshake failure, identity extraction
+    /// failure, upgrade handshake failure, connection-limit exhaustion, tenant
+    /// quota exhaustion. Used by `rustgate-server` to increment the
+    /// `rustgate_ws_connections_rejected_total` Prometheus counter.
+    pub OnWsRejectFn
+);
 
 /// Bundle of WebSocket session lifecycle callbacks.
 ///

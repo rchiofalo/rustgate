@@ -99,28 +99,36 @@ pub const DEFAULT_MAX_GROUPS_PER_PEER: usize = crate::config::DEFAULT_MAX_GROUPS
 /// Re-exported from [`crate::config`] for backward compatibility.
 pub const DEFAULT_MAX_GROUP_NAME_LENGTH: usize = crate::config::DEFAULT_MAX_GROUP_NAME_LENGTH;
 
-/// Callback invoked when a FederatedEvent is received from a remote peer.
-///
-/// F-113: receives a typed [`rustgate_core::PeerId`] (the connecting
-/// peer's mTLS-cert CN) so consumers can no longer accidentally
-/// confuse it with a free-form `String` (a server name, group name,
-/// or unrelated UID). The CN is converted to `PeerId` at the gRPC
-/// boundary inside [`FederationService`]; the wire format is the
-/// bare string under TLS, exactly as before.
-pub type OnEvent = Arc<dyn Fn(figpb::FederatedEvent, rustgate_core::PeerId) + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked when a FederatedEvent is received from a remote peer.
+    ///
+    /// F-113: receives a typed [`rustgate_core::PeerId`] (the connecting
+    /// peer's mTLS-cert CN) so consumers can no longer accidentally
+    /// confuse it with a free-form `String` (a server name, group name,
+    /// or unrelated UID). The CN is converted to `PeerId` at the gRPC
+    /// boundary inside [`FederationService`]; the wire format is the
+    /// bare string under TLS, exactly as before.
+    pub OnEvent,
+    figpb::FederatedEvent,
+    rustgate_core::PeerId
+);
 
-/// Callback invoked when a BinaryBlob is received from a remote peer
-/// via the `SendOneBlob` unary RPC (refs #864). The second argument
-/// is the peer's CN (extracted from the mTLS client certificate).
-///
-/// Defaults to a no-op closure when not configured via
-/// [`FederationService::with_on_blob`] — the V2 federation transport
-/// continues to accept binary-blob RPCs and emit audit + metrics for
-/// each one, but the payload is discarded if the deployment hasn't
-/// wired a consumer. This preserves the existing behaviour for
-/// callers that don't yet need binary-blob ingress while making the
-/// hop-count + authz validation always-on for forensic completeness.
-pub type OnBlob = Arc<dyn Fn(figpb::BinaryBlob, rustgate_core::PeerId) + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked when a BinaryBlob is received from a remote peer
+    /// via the `SendOneBlob` unary RPC (refs #864). The second argument
+    /// is the peer's CN (extracted from the mTLS client certificate).
+    ///
+    /// Defaults to a no-op closure when not configured via
+    /// [`FederationService::with_on_blob`] — the V2 federation transport
+    /// continues to accept binary-blob RPCs and emit audit + metrics for
+    /// each one, but the payload is discarded if the deployment hasn't
+    /// wired a consumer. This preserves the existing behaviour for
+    /// callers that don't yet need binary-blob ingress while making the
+    /// hop-count + authz validation always-on for forensic completeness.
+    pub OnBlob,
+    figpb::BinaryBlob,
+    rustgate_core::PeerId
+);
 
 /// Factory for the default no-op `OnBlob` callback. Discards the
 /// blob without doing any work — chosen over `Option<OnBlob>` so
@@ -132,20 +140,24 @@ fn noop_on_blob() -> OnBlob {
     Arc::new(|_blob, _peer| {})
 }
 
-/// Callback invoked when a `ROL` (Region of Interest) message is
-/// received from a remote peer via the V2 `ServerROLStream` RPC
-/// (refs #864). The second argument is the peer's CN (extracted from
-/// the mTLS client certificate).
-///
-/// Defaults to a no-op closure when not configured via
-/// [`FederationService::with_on_rol_event`] — the V2 federation
-/// transport continues to accept ROL streams and emit audit + metrics
-/// for each event, but the payload is discarded if the deployment
-/// hasn't wired a consumer. This preserves the existing behaviour for
-/// callers that don't yet need ROL ingress while making the hop-count
-/// and authz validation always-on for forensic completeness, mirroring
-/// the discipline established by [`OnEvent`] and [`OnBlob`].
-pub type OnRolEvent = Arc<dyn Fn(figpb::Rol, rustgate_core::PeerId) + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked when a `ROL` (Region of Interest) message is
+    /// received from a remote peer via the V2 `ServerROLStream` RPC
+    /// (refs #864). The second argument is the peer's CN (extracted from
+    /// the mTLS client certificate).
+    ///
+    /// Defaults to a no-op closure when not configured via
+    /// [`FederationService::with_on_rol_event`] — the V2 federation
+    /// transport continues to accept ROL streams and emit audit + metrics
+    /// for each event, but the payload is discarded if the deployment
+    /// hasn't wired a consumer. This preserves the existing behaviour for
+    /// callers that don't yet need ROL ingress while making the hop-count
+    /// and authz validation always-on for forensic completeness, mirroring
+    /// the discipline established by [`OnEvent`] and [`OnBlob`].
+    pub OnRolEvent,
+    figpb::Rol,
+    rustgate_core::PeerId
+);
 
 /// Factory for the default no-op `OnRolEvent` callback. Mirrors
 /// [`noop_on_blob`]: discards the ROL message without doing any work
@@ -156,25 +168,29 @@ fn noop_on_rol_event() -> OnRolEvent {
     Arc::new(|_rol, _peer| {})
 }
 
-/// Callback invoked when a `FederateGroups` update is received from a
-/// remote peer via the V2 `ClientFederateGroupsStream` RPC (refs #864).
-/// The second argument is the peer's CN (extracted from the mTLS client
-/// certificate).
-///
-/// Defaults to a no-op closure when not configured via
-/// [`FederationService::with_on_group_sync`] — the V2 federation
-/// transport continues to accept group-sync streams and emit audit +
-/// metrics for each update, but the payload is discarded if the
-/// deployment hasn't wired a consumer. This preserves the existing
-/// behaviour for callers that don't yet need group-sync ingress while
-/// making the hop-count + authz validation always-on for forensic
-/// completeness, mirroring the discipline established by [`OnEvent`],
-/// [`OnBlob`], and [`OnRolEvent`]. The existing per-peer group
-/// bookkeeping (count + name-length limits, in-memory `peer_groups`
-/// map) runs unchanged alongside the callback — the callback is the
-/// observation hook for downstream consumers, not a replacement for
-/// the receive-loop's group tracking.
-pub type OnGroupSync = Arc<dyn Fn(figpb::FederateGroups, rustgate_core::PeerId) + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked when a `FederateGroups` update is received from a
+    /// remote peer via the V2 `ClientFederateGroupsStream` RPC (refs #864).
+    /// The second argument is the peer's CN (extracted from the mTLS client
+    /// certificate).
+    ///
+    /// Defaults to a no-op closure when not configured via
+    /// [`FederationService::with_on_group_sync`] — the V2 federation
+    /// transport continues to accept group-sync streams and emit audit +
+    /// metrics for each update, but the payload is discarded if the
+    /// deployment hasn't wired a consumer. This preserves the existing
+    /// behaviour for callers that don't yet need group-sync ingress while
+    /// making the hop-count + authz validation always-on for forensic
+    /// completeness, mirroring the discipline established by [`OnEvent`],
+    /// [`OnBlob`], and [`OnRolEvent`]. The existing per-peer group
+    /// bookkeeping (count + name-length limits, in-memory `peer_groups`
+    /// map) runs unchanged alongside the callback — the callback is the
+    /// observation hook for downstream consumers, not a replacement for
+    /// the receive-loop's group tracking.
+    pub OnGroupSync,
+    figpb::FederateGroups,
+    rustgate_core::PeerId
+);
 
 /// Factory for the default no-op `OnGroupSync` callback. Mirrors
 /// [`noop_on_rol_event`] / [`noop_on_blob`]: discards the group-sync

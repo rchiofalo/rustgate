@@ -65,32 +65,37 @@ pub const DEFAULT_RESUME_DWELL: Duration = Duration::from_secs(1);
 /// enough to be responsive, long enough to be cheap. Not user-tunable.
 const DWELL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Callback invoked whenever the accept loop is deferred due to
-/// backpressure. Used to increment metrics counters without a hard
-/// dependency on the `metrics` feature from this crate.
-///
-/// **Must be non-blocking.** The callback fires synchronously from
-/// [`BackpressureGate::wait_for_capacity`], which in turn is awaited
-/// on the TLS accept loop. A blocking callback (e.g. one that performs
-/// synchronous I/O, acquires a heavily-contended lock, or calls into
-/// user code that does either) stalls the accept loop and breaks
-/// admission control. Safe targets: `AtomicU64::fetch_add`, Prometheus
-/// counter `inc()`, a `tracing::debug!` line. Unsafe targets: file I/O,
-/// HTTP requests, `std::sync::Mutex::lock` on a shared lock. If the
-/// callback may block, dispatch the work with
-/// `rustgate_core::tasks::spawn_background` inside the closure body.
-pub type OnDeferred = Arc<dyn Fn() + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked whenever the accept loop is deferred due to
+    /// backpressure. Used to increment metrics counters without a hard
+    /// dependency on the `metrics` feature from this crate.
+    ///
+    /// **Must be non-blocking.** The callback fires synchronously from
+    /// [`BackpressureGate::wait_for_capacity`], which in turn is awaited
+    /// on the TLS accept loop. A blocking callback (e.g. one that performs
+    /// synchronous I/O, acquires a heavily-contended lock, or calls into
+    /// user code that does either) stalls the accept loop and breaks
+    /// admission control. Safe targets: `AtomicU64::fetch_add`, Prometheus
+    /// counter `inc()`, a `tracing::debug!` line. Unsafe targets: file I/O,
+    /// HTTP requests, `std::sync::Mutex::lock` on a shared lock. If the
+    /// callback may block, dispatch the work with
+    /// `rustgate_core::tasks::spawn_background` inside the closure body.
+    pub OnDeferred
+);
 
-/// Callback invoked whenever the current queued-bytes counter changes.
-/// Used to refresh a gauge.
-///
-/// **Must be non-blocking.** This callback fires on every `add` and
-/// `sub` — i.e. potentially once per message delivered — so any blocking
-/// work compounds into observable message-path latency. Safe targets:
-/// `IntGauge::set`, atomic counter updates. If the work is not
-/// provably wait-free, dispatch it with `rustgate_core::tasks::spawn_background`
-/// from inside the closure.
-pub type OnBytesChanged = Arc<dyn Fn(usize) + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked whenever the current queued-bytes counter changes.
+    /// Used to refresh a gauge.
+    ///
+    /// **Must be non-blocking.** This callback fires on every `add` and
+    /// `sub` — i.e. potentially once per message delivered — so any blocking
+    /// work compounds into observable message-path latency. Safe targets:
+    /// `IntGauge::set`, atomic counter updates. If the work is not
+    /// provably wait-free, dispatch it with `rustgate_core::tasks::spawn_background`
+    /// from inside the closure.
+    pub OnBytesChanged,
+    usize
+);
 
 /// Returned by the three `BackpressureGate` setters (`with_resume_dwell`,
 /// `set_on_deferred`, `set_on_bytes_changed`) when they can no longer take

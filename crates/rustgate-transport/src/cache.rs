@@ -74,14 +74,17 @@ const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(15);
 /// Default maximum number of entries in the position cache.
 const DEFAULT_MAX_ENTRIES: usize = 100_000;
 
-/// Callback invoked whenever the cache's entry count changes.
-///
-/// The argument is the post-mutation size. Fires on [`PositionCache::store`]
-/// (including capacity-driven eviction), [`PositionCache::remove`], and
-/// [`PositionCache::sweep`]. Used by the server crate to feed the
-/// `rustgate_position_cache_size` Prometheus gauge; kept transport-agnostic
-/// so this crate does not leak a `prometheus` dependency.
-pub type OnCacheSize = Arc<dyn Fn(usize) + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked whenever the cache's entry count changes.
+    ///
+    /// The argument is the post-mutation size. Fires on [`PositionCache::store`]
+    /// (including capacity-driven eviction), [`PositionCache::remove`], and
+    /// [`PositionCache::sweep`]. Used by the server crate to feed the
+    /// `rustgate_position_cache_size` Prometheus gauge; kept transport-agnostic
+    /// so this crate does not leak a `prometheus` dependency.
+    pub OnCacheSize,
+    usize
+);
 
 /// Stores the most recent position report per client CN.
 pub struct PositionCache {

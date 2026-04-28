@@ -21,16 +21,20 @@ use tracing::{debug, info, warn};
 use crate::error::{FederationError, Result};
 use crate::heartbeat::{create_heartbeat, is_heartbeat};
 
-/// Callback invoked for each non-heartbeat message received from a federation peer.
-///
-/// Arguments: (peer_cn, payload_bytes).
-///
-/// F-113: receives a typed [`rustgate_core::PeerId`] (the connecting
-/// peer's mTLS-cert CN). The conversion from the wire-format `String`
-/// (extracted at the V1 read loop) into the typed wrapper happens at
-/// the callback edge so consumers cannot accidentally treat the CN
-/// as an arbitrary `String`.
-pub type OnMessage = Arc<dyn Fn(rustgate_core::PeerId, Bytes) + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked for each non-heartbeat message received from a federation peer.
+    ///
+    /// Arguments: (peer_cn, payload_bytes).
+    ///
+    /// F-113: receives a typed [`rustgate_core::PeerId`] (the connecting
+    /// peer's mTLS-cert CN). The conversion from the wire-format `String`
+    /// (extracted at the V1 read loop) into the typed wrapper happens at
+    /// the callback edge so consumers cannot accidentally treat the CN
+    /// as an arbitrary `String`.
+    pub OnMessage,
+    rustgate_core::PeerId,
+    Bytes
+);
 
 /// V1 federation server that accepts inbound peer connections.
 ///

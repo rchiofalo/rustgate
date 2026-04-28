@@ -31,23 +31,30 @@ use crate::cli::Framing;
 #[cfg(feature = "metrics")]
 use crate::metrics;
 
-/// Optional callback for forwarding messages to federation peers.
-///
-/// The closure receives `(payload, source_groups)` and spawns async work
-/// internally (fire-and-forget). Defined unconditionally so the `Option`
-/// type is available regardless of feature flags.
-///
-/// Uses `Fn` (not `AsyncFn`) because `dyn AsyncFn` is not object-safe
-/// as of Rust 1.93. Async work is dispatched via `spawn_background()`.
-pub(crate) type FedForwardFn =
-    Arc<dyn Fn(Bytes, Vec<String>, rustgate_core::message::Metadata) + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Optional callback for forwarding messages to federation peers.
+    ///
+    /// The closure receives `(payload, source_groups)` and spawns async work
+    /// internally (fire-and-forget). Defined unconditionally so the `Option`
+    /// type is available regardless of feature flags.
+    ///
+    /// Uses `Fn` (not `AsyncFn`) because `dyn AsyncFn` is not object-safe
+    /// as of Rust 1.93. Async work is dispatched via `spawn_background()`.
+    pub(crate) FedForwardFn,
+    Bytes,
+    Vec<String>,
+    rustgate_core::message::Metadata
+);
 
-/// Callback for forwarding messages to HTTP targets (fire-and-forget).
-///
-/// Uses `Fn` (not `AsyncFn`) because `dyn AsyncFn` is not object-safe
-/// as of Rust 1.94. Async work is dispatched via `spawn_background()`.
 #[cfg(feature = "http")]
-pub(crate) type HttpForwardFn = Arc<dyn Fn(rustgate_core::message::RoutableMessage) + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback for forwarding messages to HTTP targets (fire-and-forget).
+    ///
+    /// Uses `Fn` (not `AsyncFn`) because `dyn AsyncFn` is not object-safe
+    /// as of Rust 1.94. Async work is dispatched via `spawn_background()`.
+    pub(crate) HttpForwardFn,
+    rustgate_core::message::RoutableMessage
+);
 
 /// Configuration for the per-session CoT delta encoder.
 ///

@@ -54,7 +54,6 @@
 //! the next call.
 
 use std::io;
-use std::sync::Arc;
 
 use bytes::{Buf, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
@@ -119,27 +118,33 @@ const HEARTBEAT_TYPE_OFFSET: usize = 4;
 /// Byte offset of the `autopilot` field inside the HEARTBEAT payload.
 const HEARTBEAT_AUTOPILOT_OFFSET: usize = 5;
 
-/// Callback invoked once per decoded MAVLink HEARTBEAT frame
-/// (`MSG_ID = 0`).
-///
-/// Arguments are `(system_id, component_id, autopilot, vehicle_type)`
-/// — the first two come from the v1/v2 header, the latter two from the
-/// HEARTBEAT payload. The four `u8` shape mirrors the audit-event field
-/// list in `rustgate_core::audit::mavlink_heartbeat_received` so the
-/// server crate can wire a single closure that calls both.
-///
-/// Wired by the server crate to feed the
-/// `rustgate_mavlink_heartbeats_total{system_id}` Prometheus counter
-/// and emit the `mavlink.heartbeat_received` audit event. Kept as a
-/// simple `Fn(u8, u8, u8, u8)` so the `rustgate-mavlink` crate stays
-/// metrics-agnostic and does not grow a `prometheus` dependency. The
-/// callback is fired only on frames that decode cleanly and whose
-/// HEARTBEAT payload is large enough to surface every field — a frame
-/// truncated below the spec's 6-byte minimum (covering the autopilot
-/// and vehicle_type fields after `custom_mode`) does NOT invoke the
-/// callback so a malformed sender cannot generate a fake presence
-/// signal.
-pub type OnMavlinkHeartbeat = Arc<dyn Fn(u8, u8, u8, u8) + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked once per decoded MAVLink HEARTBEAT frame
+    /// (`MSG_ID = 0`).
+    ///
+    /// Arguments are `(system_id, component_id, autopilot, vehicle_type)`
+    /// — the first two come from the v1/v2 header, the latter two from the
+    /// HEARTBEAT payload. The four `u8` shape mirrors the audit-event field
+    /// list in `rustgate_core::audit::mavlink_heartbeat_received` so the
+    /// server crate can wire a single closure that calls both.
+    ///
+    /// Wired by the server crate to feed the
+    /// `rustgate_mavlink_heartbeats_total{system_id}` Prometheus counter
+    /// and emit the `mavlink.heartbeat_received` audit event. Kept as a
+    /// simple `Fn(u8, u8, u8, u8)` so the `rustgate-mavlink` crate stays
+    /// metrics-agnostic and does not grow a `prometheus` dependency. The
+    /// callback is fired only on frames that decode cleanly and whose
+    /// HEARTBEAT payload is large enough to surface every field — a frame
+    /// truncated below the spec's 6-byte minimum (covering the autopilot
+    /// and vehicle_type fields after `custom_mode`) does NOT invoke the
+    /// callback so a malformed sender cannot generate a fake presence
+    /// signal.
+    pub OnMavlinkHeartbeat,
+    u8,
+    u8,
+    u8,
+    u8
+);
 
 /// Why the MAVLink frame codec rejected a frame.
 ///
@@ -171,27 +176,30 @@ pub enum RejectionReason {
     UnknownMessageId(u32),
 }
 
-/// Callback invoked once per MAVLink frame the codec rejected at the
-/// framing layer.
-///
-/// The codec itself does not have access to the peer socket address
-/// (it operates on a `BytesMut` buffer), so the listener that drives
-/// the codec wires this callback up with whatever peer context it has
-/// — typically the dialled IP:port for a TCP link, or "unknown" for a
-/// UDP datagram whose source we deliberately do not log. The callback
-/// fires inside the decode hot path on the rejection branch only — a
-/// frame that decodes cleanly does not invoke it.
-///
-/// Wired by the listener crate (future PR) to emit the
-/// `mavlink.unsigned_rejected`, `mavlink.v1_rejected`, and
-/// `mavlink.unknown_msg_id` audit events through
-/// `rustgate_core::audit` and increment the matching Prometheus
-/// counters. Kept as a simple `Fn(RejectionReason)` so the
-/// `rustgate-mavlink` crate stays free of `tracing`/`prometheus`
-/// dependencies on the rejection path. The closure body is responsible
-/// for shielding sensitive context (peer IP, identity) before
-/// emitting; the codec passes only the typed reason.
-pub type OnMavlinkRejection = Arc<dyn Fn(RejectionReason) + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked once per MAVLink frame the codec rejected at the
+    /// framing layer.
+    ///
+    /// The codec itself does not have access to the peer socket address
+    /// (it operates on a `BytesMut` buffer), so the listener that drives
+    /// the codec wires this callback up with whatever peer context it has
+    /// — typically the dialled IP:port for a TCP link, or "unknown" for a
+    /// UDP datagram whose source we deliberately do not log. The callback
+    /// fires inside the decode hot path on the rejection branch only — a
+    /// frame that decodes cleanly does not invoke it.
+    ///
+    /// Wired by the listener crate (future PR) to emit the
+    /// `mavlink.unsigned_rejected`, `mavlink.v1_rejected`, and
+    /// `mavlink.unknown_msg_id` audit events through
+    /// `rustgate_core::audit` and increment the matching Prometheus
+    /// counters. Kept as a simple `Fn(RejectionReason)` so the
+    /// `rustgate-mavlink` crate stays free of `tracing`/`prometheus`
+    /// dependencies on the rejection path. The closure body is responsible
+    /// for shielding sensitive context (peer IP, identity) before
+    /// emitting; the codec passes only the typed reason.
+    pub OnMavlinkRejection,
+    RejectionReason
+);
 
 /// Protocol version of a parsed MAVLink frame.
 ///
@@ -746,6 +754,8 @@ impl Encoder<BytesMut> for MavlinkFrameCodec {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::panic, clippy::unwrap_used)]
+
+    use std::sync::Arc;
 
     use bytes::BufMut;
 

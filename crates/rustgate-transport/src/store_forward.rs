@@ -204,19 +204,22 @@ impl Inner {
     }
 }
 
-/// Callback invoked once per drained message with the dwell time the
-/// message spent in the offline queue, in fractional seconds.
-///
-/// `dwell_seconds` is computed as `drain_time - queued_at` (clamped at
-/// zero for clock-skew safety). Used to feed the
-/// `rustgate_store_forward_dwell_seconds` Prometheus histogram from
-/// `rustgate-server`. Issue #729.
-///
-/// The callback runs synchronously on the drain path — keep it cheap
-/// (a single `histogram.observe` is the canonical use). Spawn any
-/// blocking work via [`rustgate_core::tasks::spawn_background`] inside
-/// the closure body if needed.
-pub type OnDrainObservation = Arc<dyn Fn(f64) + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked once per drained message with the dwell time the
+    /// message spent in the offline queue, in fractional seconds.
+    ///
+    /// `dwell_seconds` is computed as `drain_time - queued_at` (clamped at
+    /// zero for clock-skew safety). Used to feed the
+    /// `rustgate_store_forward_dwell_seconds` Prometheus histogram from
+    /// `rustgate-server`. Issue #729.
+    ///
+    /// The callback runs synchronously on the drain path — keep it cheap
+    /// (a single `histogram.observe` is the canonical use). Spawn any
+    /// blocking work via [`rustgate_core::tasks::spawn_background`] inside
+    /// the closure body if needed.
+    pub OnDrainObservation,
+    f64
+);
 
 /// A bounded, durable per-client message queue.
 ///

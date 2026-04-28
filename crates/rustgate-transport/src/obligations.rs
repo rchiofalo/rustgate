@@ -98,30 +98,36 @@ use rustgate_resilience::token_bucket::TokenBucket;
 /// operator-visible rate signal regardless of audit suppression.
 pub const DEFAULT_UNKNOWN_OBLIGATION_AUDIT_PER_MIN: u32 = 60;
 
-/// Callback invoked once per encountered unknown-obligation variant
-/// **before** the audit-emission rate limiter runs.
-///
-/// Wired by the server binary to increment a Prometheus counter so
-/// operators can observe the true rate of unknown-variant encounters
-/// even when the audit log has been rate-limited. The callback receives
-/// the `{:?}` rendering of the variant as a `&str` so the same string is
-/// used as both the metric label (F-3b) and the audit event field.
-///
-/// Conventional cross-thread alias shape (`Arc<dyn Fn(&str) + Send +
-/// Sync>`) — keep in lock-step with the rest of the workspace's
-/// [`OnDuplicate`](crate::dedup::OnDuplicate) /
-/// [`OnInsert`](crate::dedup::OnInsert) callback aliases.
-pub type OnObligationUnknown = Arc<dyn Fn(&str) + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked once per encountered unknown-obligation variant
+    /// **before** the audit-emission rate limiter runs.
+    ///
+    /// Wired by the server binary to increment a Prometheus counter so
+    /// operators can observe the true rate of unknown-variant encounters
+    /// even when the audit log has been rate-limited. The callback receives
+    /// the `{:?}` rendering of the variant as a `&str` so the same string is
+    /// used as both the metric label (F-3b) and the audit event field.
+    ///
+    /// Conventional cross-thread alias shape (`Arc<dyn Fn(&str) + Send +
+    /// Sync>`) — keep in lock-step with the rest of the workspace's
+    /// [`OnDuplicate`](crate::dedup::OnDuplicate) /
+    /// [`OnInsert`](crate::dedup::OnInsert) callback aliases.
+    pub OnObligationUnknown,
+    &str
+);
 
-/// Callback invoked once per obligation actuation failure with the
-/// stable `reason` token emitted alongside the audit event. The same
-/// vocabulary as [`rustgate_core::audit::authz_obligation_failed`]:
-/// `mask_point_non_xml`, `mask_point_xml_error`,
-/// `mask_point_io_error`, `mask_point_attr_budget_exceeded`,
-/// `unknown_variant`. Wired by the server binary to feed the
-/// `rustgate_obligation_failures_total{reason}` counter under
-/// `#[cfg(feature = "metrics")]`. Closes #768.
-pub type OnObligationFailure = Arc<dyn Fn(&'static str) + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked once per obligation actuation failure with the
+    /// stable `reason` token emitted alongside the audit event. The same
+    /// vocabulary as [`rustgate_core::audit::authz_obligation_failed`]:
+    /// `mask_point_non_xml`, `mask_point_xml_error`,
+    /// `mask_point_io_error`, `mask_point_attr_budget_exceeded`,
+    /// `unknown_variant`. Wired by the server binary to feed the
+    /// `rustgate_obligation_failures_total{reason}` counter under
+    /// `#[cfg(feature = "metrics")]`. Closes #768.
+    pub OnObligationFailure,
+    &'static str
+);
 
 /// Per-`(policy_id, variant_name)` rate limiter for
 /// [`audit::authz_obligation_unknown`] emissions plus an always-on

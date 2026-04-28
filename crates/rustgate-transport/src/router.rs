@@ -55,74 +55,97 @@ use crate::obligations::{
     obligations_mutate_payload,
 };
 
-/// Callback invoked after every authz evaluation so operators can wire
-/// the engine into metrics and audit without making `rustgate-transport`
-/// depend on `prometheus`. The server binary installs one of these via
-/// [`Router::with_authz_observer`].
-pub type AuthzObserver = Arc<dyn Fn(&AuthzEvent<'_>) + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked after every authz evaluation so operators can wire
+    /// the engine into metrics and audit without making `rustgate-transport`
+    /// depend on `prometheus`. The server binary installs one of these via
+    /// [`Router::with_authz_observer`].
+    pub AuthzObserver,
+    &AuthzEvent<'_>
+);
 
-/// Callback invoked once per multicast message dropped because the
-/// destination group list exceeded `MAX_MULTICAST_GROUPS` (private).
-///
-/// Wired by the server binary to feed the
-/// `rustgate_multicast_oversize_dropped_total` Prometheus counter
-/// without making `rustgate-transport` depend on `prometheus`. Closes
-/// #741: oversize-multicast drops were observable only via tracing
-/// before this callback existed, so operators could not dashboard or
-/// alert on the drop rate.
-pub type OnMulticastOversizeDropped = Arc<dyn Fn() + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked once per multicast message dropped because the
+    /// destination group list exceeded `MAX_MULTICAST_GROUPS` (private).
+    ///
+    /// Wired by the server binary to feed the
+    /// `rustgate_multicast_oversize_dropped_total` Prometheus counter
+    /// without making `rustgate-transport` depend on `prometheus`. Closes
+    /// #741: oversize-multicast drops were observable only via tracing
+    /// before this callback existed, so operators could not dashboard or
+    /// alert on the drop rate.
+    pub OnMulticastOversizeDropped
+);
 
-/// Callback invoked once per call to [`Router::route_for_egress`] after
-/// the message reached its terminal fan-out path. The first argument is
-/// a small fixed-vocabulary destination label (`"direct"`, `"group"`,
-/// `"broadcast"`, `"multicast"`); the second is the number of recipient
-/// sessions the router actually attempted to deliver to (zero on
-/// no-subscribers paths). Wired by the server binary to feed the
-/// `rustgate_router_fanout_total{destination}` counter and the
-/// `rustgate_router_fanout_subscribers` histogram. Closes #768.
-pub type OnFanout = Arc<dyn Fn(&'static str, u64) + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked once per call to [`Router::route_for_egress`] after
+    /// the message reached its terminal fan-out path. The first argument is
+    /// a small fixed-vocabulary destination label (`"direct"`, `"group"`,
+    /// `"broadcast"`, `"multicast"`); the second is the number of recipient
+    /// sessions the router actually attempted to deliver to (zero on
+    /// no-subscribers paths). Wired by the server binary to feed the
+    /// `rustgate_router_fanout_total{destination}` counter and the
+    /// `rustgate_router_fanout_subscribers` histogram. Closes #768.
+    pub OnFanout,
+    &'static str,
+    u64
+);
 
-/// Callback invoked once per recipient that the router skipped after
-/// the message was admitted into the routing pipeline. The single
-/// argument is one of the documented `reason` labels:
-/// `"no_subscribers"`, `"backpressure"`, `"acl_denied"`,
-/// `"authz_denied"`, `"obligation_failed"`. Wired by the server binary
-/// to feed the `rustgate_router_dropped_total{reason}` counter — the
-/// same `reason` vocabulary the audit-log emits, so SIEM correlation
-/// and Prometheus dashboards stay in lock-step. Closes #768.
-pub type OnDropped = Arc<dyn Fn(&'static str) + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked once per recipient that the router skipped after
+    /// the message was admitted into the routing pipeline. The single
+    /// argument is one of the documented `reason` labels:
+    /// `"no_subscribers"`, `"backpressure"`, `"acl_denied"`,
+    /// `"authz_denied"`, `"obligation_failed"`. Wired by the server binary
+    /// to feed the `rustgate_router_dropped_total{reason}` counter — the
+    /// same `reason` vocabulary the audit-log emits, so SIEM correlation
+    /// and Prometheus dashboards stay in lock-step. Closes #768.
+    pub OnDropped,
+    &'static str
+);
 
-/// Callback invoked once per Send and Receive PEP evaluation by the
-/// router. Arguments are the small fixed-vocabulary direction label
-/// (`"send"` or `"receive"`), the decision label (`"allow"`, `"deny"`,
-/// `"fail_open"`), and the wall-clock evaluation latency in seconds.
-/// Wired by the server binary to feed the
-/// `rustgate_pep_send_decisions_total{decision}` /
-/// `rustgate_pep_receive_decisions_total{decision}` counters and the
-/// `rustgate_pep_evaluation_seconds` histogram. Closes #768.
-pub type OnPepDecision = Arc<dyn Fn(&'static str, &'static str, f64) + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked once per Send and Receive PEP evaluation by the
+    /// router. Arguments are the small fixed-vocabulary direction label
+    /// (`"send"` or `"receive"`), the decision label (`"allow"`, `"deny"`,
+    /// `"fail_open"`), and the wall-clock evaluation latency in seconds.
+    /// Wired by the server binary to feed the
+    /// `rustgate_pep_send_decisions_total{decision}` /
+    /// `rustgate_pep_receive_decisions_total{decision}` counters and the
+    /// `rustgate_pep_evaluation_seconds` histogram. Closes #768.
+    pub OnPepDecision,
+    &'static str,
+    &'static str,
+    f64
+);
 
-/// Callback invoked once per data-plane obligation that the router
-/// successfully applied to an outbound copy. The argument is one of
-/// the documented `kind` labels: `"mask_point"`, `"mask_payload"`,
-/// `"tag_classified"`, `"audit_extended"`, `"unknown"`. Wired by the
-/// server binary to feed the
-/// `rustgate_obligation_applied_total{kind}` counter so operators can
-/// correlate the audit-log obligation rate with the data-plane
-/// actuation rate. Closes #768.
-pub type OnObligationApplied = Arc<dyn Fn(&'static str) + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked once per data-plane obligation that the router
+    /// successfully applied to an outbound copy. The argument is one of
+    /// the documented `kind` labels: `"mask_point"`, `"mask_payload"`,
+    /// `"tag_classified"`, `"audit_extended"`, `"unknown"`. Wired by the
+    /// server binary to feed the
+    /// `rustgate_obligation_applied_total{kind}` counter so operators can
+    /// correlate the audit-log obligation rate with the data-plane
+    /// actuation rate. Closes #768.
+    pub OnObligationApplied,
+    &'static str
+);
 
-/// Callback invoked twice per authz evaluation: once with `+1` on
-/// entry to `authz_evaluate_send` / `authz_evaluate_receive` and once
-/// with `-1` when the `AuthzEvalGuard` RAII handle drops at the end
-/// of evaluation. The signed delta lets the consumer feed a
-/// Prometheus `IntGauge` via `add` without a separate "sub" entry
-/// point. Wired by the server binary to feed the
-/// `rustgate_authz_evaluations_in_flight` gauge so operators
-/// monitoring an `ArcSwap` policy hot-reload can see the drain time
-/// of in-flight evaluations holding the previous engine `Arc`.
-/// Closes #721.
-pub type OnAuthzInFlightChanged = Arc<dyn Fn(i64) + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked twice per authz evaluation: once with `+1` on
+    /// entry to `authz_evaluate_send` / `authz_evaluate_receive` and once
+    /// with `-1` when the `AuthzEvalGuard` RAII handle drops at the end
+    /// of evaluation. The signed delta lets the consumer feed a
+    /// Prometheus `IntGauge` via `add` without a separate "sub" entry
+    /// point. Wired by the server binary to feed the
+    /// `rustgate_authz_evaluations_in_flight` gauge so operators
+    /// monitoring an `ArcSwap` policy hot-reload can see the drain time
+    /// of in-flight evaluations holding the previous engine `Arc`.
+    /// Closes #721.
+    pub OnAuthzInFlightChanged,
+    i64
+);
 
 /// RAII handle that bumps the in-flight authz-evaluation gauge on
 /// construction and decrements it on `Drop`. Constructed at the entry

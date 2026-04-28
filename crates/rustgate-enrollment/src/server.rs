@@ -51,10 +51,12 @@ pub const DEFAULT_SIGN_RATE_LIMIT: usize = 10;
 /// Default rate limit window for CSR signing.
 pub const DEFAULT_SIGN_RATE_WINDOW: Duration = Duration::from_secs(60);
 
-/// Callback fired when a CSR signing request is rejected by the
-/// per-IP rate limiter. Wired by the server binary to a Prometheus
-/// counter; left unset in tests and embedders that do not need it.
-pub type RateLimitCallback = Arc<dyn Fn() + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback fired when a CSR signing request is rejected by the
+    /// per-IP rate limiter. Wired by the server binary to a Prometheus
+    /// counter; left unset in tests and embedders that do not need it.
+    pub RateLimitCallback
+);
 
 /// HTTPS enrollment server for client certificate provisioning.
 pub struct EnrollmentServer {

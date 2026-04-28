@@ -39,17 +39,23 @@ pub struct LagSnapshot {
     pub ack_floor_stream_seq: u64,
 }
 
-/// Callback invoked with the latest [`LagSnapshot`] each poll cycle.
-///
-/// Wired by the binary crate to publish the values as Prometheus gauges,
-/// keeping `rustgate-nats` agnostic of the metrics backend.
-pub type LagCallback = Arc<dyn Fn(LagSnapshot) + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked with the latest [`LagSnapshot`] each poll cycle.
+    ///
+    /// Wired by the binary crate to publish the values as Prometheus gauges,
+    /// keeping `rustgate-nats` agnostic of the metrics backend.
+    pub LagCallback,
+    LagSnapshot
+);
 
-/// Callback invoked with the wall-clock duration of each `consumer.info()`
-/// poll, regardless of success or failure. Wired by the binary crate to
-/// observe a Prometheus histogram so the `rustgate-nats` crate stays free
-/// of metrics dependencies.
-pub type LatencyCallback = Arc<dyn Fn(Duration) + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked with the wall-clock duration of each `consumer.info()`
+    /// poll, regardless of success or failure. Wired by the binary crate to
+    /// observe a Prometheus histogram so the `rustgate-nats` crate stays free
+    /// of metrics dependencies.
+    pub LatencyCallback,
+    Duration
+);
 
 /// Receives messages from NATS via a JetStream pull consumer and delivers
 /// them to local sessions.

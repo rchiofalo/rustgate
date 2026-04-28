@@ -26,13 +26,17 @@ use crate::peer::{PeerHandle, PeerState};
 use crate::provenance;
 use crate::replay_buffer::BufferedMessage;
 
-/// Callback invoked when a FederatedEvent is received from the remote peer.
-///
-/// F-113: receives a typed [`rustgate_core::PeerId`]. The conversion from
-/// the wire-format `String` returned by `peer_id_from_request` happens
-/// at the V2 server boundary; consumers downstream of the callback see
-/// the typed wrapper.
-pub type OnEvent = Arc<dyn Fn(figpb::FederatedEvent, rustgate_core::PeerId) + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked when a FederatedEvent is received from the remote peer.
+    ///
+    /// F-113: receives a typed [`rustgate_core::PeerId`]. The conversion from
+    /// the wire-format `String` returned by `peer_id_from_request` happens
+    /// at the V2 server boundary; consumers downstream of the callback see
+    /// the typed wrapper.
+    pub OnEvent,
+    figpb::FederatedEvent,
+    rustgate_core::PeerId
+);
 
 /// Callback that drains the replay buffer on reconnection (V2).
 ///
