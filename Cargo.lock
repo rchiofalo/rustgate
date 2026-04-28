@@ -3231,7 +3231,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "smol_str",
- "tempfile",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -3383,7 +3382,6 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tonic",
- "tonic-build",
  "tonic-prost",
  "tonic-prost-build",
  "tracing",
@@ -3438,7 +3436,6 @@ dependencies = [
  "proptest",
  "rustgate-core",
  "thiserror 2.0.18",
- "tokio",
  "tokio-util",
  "tracing",
 ]
@@ -3456,13 +3453,11 @@ dependencies = [
  "rustgate-test-utils",
  "rustgate-transport",
  "rustls",
- "rustls-pki-types",
  "socket2",
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

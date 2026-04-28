@@ -265,13 +265,17 @@ static SPIFFE_SVID_REFRESH_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 #[cfg(feature = "spiffe")]
 static SPIFFE_SVID_EXPIRY_SECONDS: OnceLock<IntGauge> = OnceLock::new();
 
-#[cfg(feature = "jemalloc")]
+// jemalloc is POSIX-only (see `tikv-jemallocator` target gate in
+// `Cargo.toml`); pair the feature flag with `not(target_os = "windows")`
+// so the per-allocator gauges only register on platforms where the
+// underlying allocator can actually run. Refs #831 (F-B).
+#[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
 static JEMALLOC_RESIDENT: OnceLock<IntGauge> = OnceLock::new();
-#[cfg(feature = "jemalloc")]
+#[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
 static JEMALLOC_ACTIVE: OnceLock<IntGauge> = OnceLock::new();
-#[cfg(feature = "jemalloc")]
+#[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
 static JEMALLOC_ALLOCATED: OnceLock<IntGauge> = OnceLock::new();
-#[cfg(feature = "jemalloc")]
+#[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
 static JEMALLOC_MAPPED: OnceLock<IntGauge> = OnceLock::new();
 
 // ── Fallback constructors ───────────────────────────────────────────
@@ -1335,7 +1339,7 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(obligation_failures_total.clone()))?;
     let _ = OBLIGATION_FAILURES_TOTAL.set(obligation_failures_total);
 
-    #[cfg(feature = "jemalloc")]
+    #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
     {
         let jemalloc_resident = IntGauge::with_opts(Opts::new(
             "rustgate_jemalloc_resident_bytes",
@@ -2161,7 +2165,7 @@ pub fn spiffe_svid_expiry_seconds() -> &'static IntGauge {
 /// reads resident, active, allocated, and mapped byte counts via
 /// `tikv-jemalloc-ctl`'s safe API. Any individual stat that fails to read
 /// is silently skipped — partial updates are still useful.
-#[cfg(feature = "jemalloc")]
+#[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
 pub fn refresh_jemalloc_stats() {
     // Epoch must be advanced before reading; stale cached values are
     // returned otherwise. Ignore errors — stats will be stale but not
@@ -3113,7 +3117,7 @@ fn handle_request(
 
             // Refresh jemalloc stats on every scrape so Prometheus sees
             // current memory values rather than stale cached counters.
-            #[cfg(feature = "jemalloc")]
+            #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
             refresh_jemalloc_stats();
 
             let encoder = TextEncoder::new();
@@ -4868,7 +4872,7 @@ mod tests {
     /// Verify that `refresh_jemalloc_stats` runs without error and populates
     /// the four gauges with non-negative values when the jemalloc allocator
     /// is active.
-    #[cfg(feature = "jemalloc")]
+    #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
     #[test]
     fn jemalloc_stats_are_populated() {
         ensure_init();

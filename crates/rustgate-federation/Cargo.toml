@@ -11,11 +11,15 @@ repository.workspace = true
 workspace = true
 
 [package.metadata.cargo-machete]
-ignored = ["prost-types", "tonic-prost"]  # runtime deps for generated gRPC code (v2 feature)
+# `prost-types` is a runtime dep for generated gRPC code under the `v2` feature.
+# `prost-build` and `tonic-prost-build` are invoked from `build.rs` (see the
+# `#[cfg(feature = "v2")]` block); cargo-machete does not parse build scripts
+# so they would otherwise be flagged as unused. Refs #831 (F-D).
+ignored = ["prost-types", "prost-build", "tonic-prost-build"]
 
 [features]
 default = []
-v2 = ["dep:tonic", "dep:tonic-prost", "dep:tokio-stream", "dep:prost-types", "dep:prost-build", "dep:tonic-build", "dep:tonic-prost-build", "dep:rustgate-proto"]
+v2 = ["dep:tonic", "dep:tonic-prost", "dep:tokio-stream", "dep:prost-types", "dep:prost-build", "dep:tonic-prost-build", "dep:rustgate-proto"]
 ha = ["dep:async-nats"]
 api = ["dep:hyper", "dep:http-body-util", "dep:prometheus", "rustgate-core/metrics"]
 fips = ["rustls/aws_lc_rs", "rustls/fips", "tonic?/tls-aws-lc"]
@@ -75,7 +79,6 @@ etcd-client = { workspace = true, optional = true }
 
 [build-dependencies]
 prost-build = { workspace = true, optional = true }
-tonic-build = { workspace = true, optional = true }
 tonic-prost-build = { workspace = true, optional = true }
 
 [dev-dependencies]
