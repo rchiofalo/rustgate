@@ -19,6 +19,12 @@ use crate::revocation::RevocationStore;
 ///
 /// Supported reasons: `key_compromise`, `ca_compromise`, `affiliation_changed`,
 /// `superseded`, `cessation_of_operation`, `privilege_withdrawn`, or `unspecified`.
+#[tracing::instrument(
+    name = "enrollment.revoke",
+    level = "info",
+    skip_all,
+    fields(peer = %rustgate_core::masking::mask_ip(&peer.to_string())),
+)]
 pub(crate) async fn handle_revoke(
     req: Request<hyper::body::Incoming>,
     peer: std::net::SocketAddr,

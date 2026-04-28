@@ -243,7 +243,7 @@ use rustgate_core::message::{Destination, MessageType, RoutableMessage};
 use rustgate_resilience::backpressure::{BackpressureGate, BackpressurePermit};
 use rustgate_resilience::token_bucket::TokenBucket;
 use tokio::sync::{RwLock, mpsc};
-use tracing::{Instrument, debug, warn};
+use tracing::{debug, warn};
 
 use crate::acl::GroupAclPolicy;
 use crate::cache::PositionCache;
@@ -309,6 +309,23 @@ fn emit_access(msg: &RoutableMessage, outcome: &'static str) {
         proto = %msg.metadata.source_protocol,
         outcome = %outcome,
     );
+}
+
+/// Static label for a [`Destination`] used in tracing spans.
+///
+/// Returns one of `"direct"`, `"group"`, `"broadcast"`, `"multicast"` —
+/// a small fixed vocabulary so per-message destination data does not
+/// inflate span field cardinality. Use this instead of formatting the
+/// destination's payload (group name, CN) into the span: the access-log
+/// target carries the high-cardinality form for forensic queries; spans
+/// carry only the kind tag.
+fn destination_kind(dest: &Destination) -> &'static str {
+    match dest {
+        Destination::Direct(_) => "direct",
+        Destination::Group(_) => "group",
+        Destination::Broadcast => "broadcast",
+        Destination::Multicast(_) => "multicast",
+    }
 }
 
 /// Envelope wrapping an `Arc<RoutableMessage>` together with a shared
@@ -1336,6 +1353,16 @@ impl Router {
     /// points. Private — call `authz_evaluate_send` /
     /// `authz_evaluate_receive` instead so the action is
     /// type-system-anchored at the call site.
+    #[tracing::instrument(
+        name = "authz_evaluate",
+        level = "debug",
+        skip_all,
+        fields(
+            subject_cn = %hash_cn(subject.cn),
+            action = ?action,
+            policy_id = %engine.policy_id(),
+        ),
+    )]
     fn authz_evaluate_inner(
         &self,
         engine: &Arc<dyn PolicyEngine>,
@@ -1737,6 +1764,14 @@ impl Router {
     /// Returns `true` if the session was accepted, `false` if it was
     /// rejected by a per-tenant quota limit. When rejected, the session
     /// is not registered and a warning is emitted.
+    #[tracing::instrument(
+        level = "debug",
+        skip_all,
+        fields(
+            cn = %hash_cn(&handle.identity.cn),
+            group_count = handle.identity.groups.len(),
+        ),
+    )]
     pub async fn register(&self, handle: SessionHandle) -> bool {
         let cn = handle.identity.cn.clone();
         let new_groups = handle.identity.groups.clone();
@@ -1815,6 +1850,11 @@ impl Router {
 
     /// Remove a session only if its ID matches the currently registered one.
     /// Prevents a stale session task from evicting a replacement.
+    #[tracing::instrument(
+        level = "debug",
+        skip_all,
+        fields(cn = %hash_cn(cn), session_id = session_id),
+    )]
     pub async fn unregister(&self, cn: &str, session_id: u64) {
         let mut state = self.state.write().await;
         if let Some(handle) = state.sessions.get(cn)
@@ -1851,6 +1891,11 @@ impl Router {
     /// SUBSCRIBE). The session must already be registered. Returns `true`
     /// if the group was joined, `false` if the session is unknown, the
     /// session ID is stale, or group limits are exceeded.
+    #[tracing::instrument(
+        level = "debug",
+        skip_all,
+        fields(cn = %hash_cn(cn), session_id = session_id, group = %group),
+    )]
     pub async fn join_group(&self, cn: &str, session_id: u64, group: &str) -> bool {
         let mut state = self.state.write().await;
 
@@ -1899,6 +1944,11 @@ impl Router {
     /// UNSUBSCRIBE). The session must already be registered. Returns `true`
     /// if the session was removed from the group (or was not a member),
     /// `false` if the session is unknown or the session ID is stale.
+    #[tracing::instrument(
+        level = "debug",
+        skip_all,
+        fields(cn = %hash_cn(cn), session_id = session_id, group = %group),
+    )]
     pub async fn leave_group(&self, cn: &str, session_id: u64, group: &str) -> bool {
         let mut state = self.state.write().await;
 
@@ -1934,6 +1984,7 @@ impl Router {
     /// other sessions. Direct messages to full channels are persisted
     /// for offline redelivery; group and broadcast messages to full
     /// channels are dropped and counted.
+    #[tracing::instrument(level = "debug", skip_all, fields(source_cn = %hash_cn(&msg.source.cn)))]
     pub async fn route(&self, msg: RoutableMessage) {
         // Thin wrapper around [`Self::route_for_egress`] for callers that
         // do not forward messages to external sinks (NATS bridge,
@@ -1985,6 +2036,16 @@ impl Router {
     /// remains unmodified because each group's per-recipient delivery
     /// already applies its own Send obligations inside
     /// `send_to_group_excluding`. Closes #738.
+    #[tracing::instrument(
+        name = "route",
+        level = "debug",
+        skip_all,
+        fields(
+            source_cn = %hash_cn(&msg.source.cn),
+            destination = %destination_kind(&msg.destination),
+            payload_bytes = msg.payload.len(),
+        ),
+    )]
     pub async fn route_for_egress(&self, msg: RoutableMessage) -> Option<Arc<RoutableMessage>> {
         // Two-layer flow control:
         // 1. BackpressureGate (global): limits total in-flight bytes across
@@ -2008,24 +2069,13 @@ impl Router {
             .as_ref()
             .map(|gate| Arc::new(gate.acquire(msg.payload.len())));
 
-        let destination_label: &str = match &msg.destination {
-            Destination::Direct(target) => &target.cn,
-            Destination::Group(group) => group,
-            Destination::Broadcast => "broadcast",
-            Destination::Multicast(_) => "multicast",
-        };
-
-        let span = tracing::debug_span!(
-            "route",
-            source_cn = %msg.source.cn,
-            destination = %destination_label,
-        );
-
-        self.route_inner(msg, permit).instrument(span).await
+        self.route_inner(msg, permit).await
     }
 
-    /// Inner routing logic, separated so the caller can `.instrument()` a span
-    /// around this future without holding an `EnteredSpan` across `.await`.
+    /// Inner routing logic, separated so [`Self::route_for_egress`] can
+    /// attach a `#[tracing::instrument]` span at the entry boundary
+    /// without bloating `route_inner`'s already-large body. The span set
+    /// by `route_for_egress` is automatically inherited by this future.
     ///
     /// Returns `Some(arc_msg)` when the message was admitted and fanned
     /// out locally (the returned `Arc` is the same form every local
@@ -2678,6 +2728,11 @@ impl Router {
     /// can drive — every reconnect would otherwise trigger
     /// `2 * cache_size` PEP evaluations, so a 10k-cache and 10×/sec
     /// reconnect = 200k authz evals/sec from one client.
+    #[tracing::instrument(
+        level = "debug",
+        skip_all,
+        fields(session_cn = %hash_cn(&handle.identity.cn)),
+    )]
     pub async fn replay_positions(&self, handle: &SessionHandle) {
         // Per-CN admission via the shared TokenBucket primitive. The
         // bucket is keyed by the reconnecting client's CN so a noisy

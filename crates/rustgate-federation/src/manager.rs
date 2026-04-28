@@ -19,7 +19,7 @@ use rustgate_core::{PeerId, audit};
 use rustls::RootCertStore;
 #[cfg(feature = "v2")]
 use tokio::task::JoinHandle;
-use tracing::{Instrument, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::config::FederationConfig;
 use crate::connector::{OutboundConnector, PeerConnector};
@@ -799,6 +799,16 @@ impl FederationManager {
     /// any peer. This guards against in-flight expiration: a message that
     /// was queued for federation but stalled (e.g. behind a slow channel
     /// or backpressured peer) past its TTL must not waste bandwidth.
+    #[tracing::instrument(
+        name = "federation_forward",
+        level = "debug",
+        skip_all,
+        fields(
+            peer_count = self.clients.len(),
+            source_groups = ?source_groups,
+            payload_bytes = payload.len(),
+        ),
+    )]
     pub async fn forward_with_metadata(
         &self,
         payload: Bytes,
@@ -818,19 +828,13 @@ impl FederationManager {
             return 0;
         }
 
-        let span = tracing::debug_span!(
-            "federation_forward",
-            peer_count = self.clients.len(),
-            source_groups = ?source_groups,
-        );
-
-        self.forward_inner(payload, source_groups, metadata)
-            .instrument(span)
-            .await
+        self.forward_inner(payload, source_groups, metadata).await
     }
 
-    /// Inner forwarding logic, separated so the caller can `.instrument()` a
-    /// span around this future without holding an `EnteredSpan` across `.await`.
+    /// Inner forwarding logic, separated so the caller's
+    /// `#[tracing::instrument]` boundary stays small. The span attached
+    /// to [`Self::forward_with_metadata`] is automatically inherited by
+    /// this future.
     async fn forward_inner(
         &self,
         payload: Bytes,

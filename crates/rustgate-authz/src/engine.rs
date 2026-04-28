@@ -137,6 +137,12 @@ fn resource_hash(resource: &Resource<'_>) -> u64 {
 }
 
 impl PolicyEngine for NativeEngine {
+    #[tracing::instrument(
+        name = "authz.evaluate",
+        level = "debug",
+        skip_all,
+        fields(action = ?action, policy_epoch = self.compiled.epoch),
+    )]
     fn evaluate(
         &self,
         subject: &Subject<'_>,

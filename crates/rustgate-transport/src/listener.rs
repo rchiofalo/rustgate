@@ -163,6 +163,7 @@ impl TlsListener {
     /// construction time. When all handshake slots are occupied, the listener
     /// still accepts TCP connections but waits for a free slot before
     /// beginning the TLS handshake.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn accept(&self) -> Result<AuthenticatedSession> {
         loop {
             let (tcp_stream, peer_addr) = match self.tcp_listener.accept().await {

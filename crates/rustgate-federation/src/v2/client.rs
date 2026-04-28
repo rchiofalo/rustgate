@@ -167,6 +167,7 @@ impl V2Client {
     }
 
     /// Send a FederatedEvent to the remote peer.
+    #[tracing::instrument(level = "debug", skip_all, fields(peer = %self.peer.id), err)]
     pub async fn send(&self, event: figpb::FederatedEvent) -> Result<()> {
         use prost::Message;
         let bytes_len = event.encoded_len();
