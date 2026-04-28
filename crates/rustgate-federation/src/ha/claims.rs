@@ -29,22 +29,29 @@ use crate::error::{FederationError, Result};
 
 const CLAIM_BUCKET: &str = "federation-claims";
 
-/// Callback invoked when a peer becomes available for adoption
-/// (its claim expired due to pod death).
-///
-/// F-113: receives a typed [`PeerId`] so downstream consumers (the HA
-/// adoption channel in `FederationManager`) cannot accidentally mix
-/// peer ids with other free-form strings (pod ids, server names).
-pub type OnPeerAvailable = Arc<dyn Fn(PeerId) + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked when a peer becomes available for adoption
+    /// (its claim expired due to pod death).
+    ///
+    /// F-113: receives a typed [`PeerId`] so downstream consumers (the HA
+    /// adoption channel in `FederationManager`) cannot accidentally mix
+    /// peer ids with other free-form strings (pod ids, server names).
+    pub OnPeerAvailable,
+    PeerId
+);
 
-/// Callback invoked when a claim is lost to another pod.
-///
-/// Arguments: `(peer_id, stale_fencing_token)`. The fencing token is the
-/// NATS KV revision that this pod held before the claim was lost.
-///
-/// F-113: receives a typed [`PeerId`] for the same reason as
-/// [`OnPeerAvailable`].
-pub type OnClaimLost = Arc<dyn Fn(PeerId, u64) + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked when a claim is lost to another pod.
+    ///
+    /// Arguments: `(peer_id, stale_fencing_token)`. The fencing token is the
+    /// NATS KV revision that this pod held before the claim was lost.
+    ///
+    /// F-113: receives a typed [`PeerId`] for the same reason as
+    /// [`OnPeerAvailable`].
+    pub OnClaimLost,
+    PeerId,
+    u64
+);
 
 /// Manages distributed peer ownership using NATS JetStream KV.
 ///

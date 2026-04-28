@@ -11,120 +11,140 @@ use tokio::sync::{Notify, Semaphore};
 use crate::listener::MqttListener;
 use crate::topic::WildcardPolicy;
 
-/// Callback invoked once per mTLS-authenticated MQTT session immediately
-/// after the permit is acquired and before the session task is spawned.
-///
-/// Wired by the server crate to feed the `rustgate_mqtt_connections_total`
-/// Prometheus counter. Kept as a simple `Fn()` so the `rustgate-mqtt`
-/// crate stays metrics-agnostic and does not grow a `prometheus`
-/// dependency.
-pub type OnMqttAccept = Arc<dyn Fn() + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked once per mTLS-authenticated MQTT session immediately
+    /// after the permit is acquired and before the session task is spawned.
+    ///
+    /// Wired by the server crate to feed the `rustgate_mqtt_connections_total`
+    /// Prometheus counter. Kept as a simple `Fn()` so the `rustgate-mqtt`
+    /// crate stays metrics-agnostic and does not grow a `prometheus`
+    /// dependency.
+    pub OnMqttAccept
+);
 
-/// Callback invoked when a TLS-authenticated MQTT connection is rejected
-/// because the shared cross-transport connection-limit semaphore is
-/// saturated.
-///
-/// Wired by the server crate to feed the
-/// `rustgate_mqtt_connections_rejected_total` Prometheus counter. Fires
-/// *after* the listener-layer rejections (TLS failure, cert validation,
-/// per-IP rate limit) because those paths return `Ok(None)` from
-/// [`MqttListener::accept`](crate::MqttListener::accept) and never reach
-/// the permit gate.
-pub type OnMqttReject = Arc<dyn Fn() + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked when a TLS-authenticated MQTT connection is rejected
+    /// because the shared cross-transport connection-limit semaphore is
+    /// saturated.
+    ///
+    /// Wired by the server crate to feed the
+    /// `rustgate_mqtt_connections_rejected_total` Prometheus counter. Fires
+    /// *after* the listener-layer rejections (TLS failure, cert validation,
+    /// per-IP rate limit) because those paths return `Ok(None)` from
+    /// [`MqttListener::accept`](crate::MqttListener::accept) and never reach
+    /// the permit gate.
+    pub OnMqttReject
+);
 
-/// Callback invoked once per MQTT PUBLISH that is authorised and handed
-/// to the router for delivery.
-///
-/// Wired by the server crate to feed the `rustgate_mqtt_publishes_total`
-/// Prometheus counter. Fires exactly once per successful PUBLISH — after
-/// topic validation, prefix mapping, and group-membership authorisation
-/// pass, and immediately before the router forwards the envelope.
-pub type OnMqttPublish = Arc<dyn Fn() + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked once per MQTT PUBLISH that is authorised and handed
+    /// to the router for delivery.
+    ///
+    /// Wired by the server crate to feed the `rustgate_mqtt_publishes_total`
+    /// Prometheus counter. Fires exactly once per successful PUBLISH — after
+    /// topic validation, prefix mapping, and group-membership authorisation
+    /// pass, and immediately before the router forwards the envelope.
+    pub OnMqttPublish
+);
 
-/// Callback invoked once per MQTT PUBLISH that is rejected by the
-/// session handler (QoS2 unsupported, invalid topic, or not authorised
-/// for the resolved group).
-///
-/// Wired by the server crate to feed the
-/// `rustgate_mqtt_publishes_rejected_total` Prometheus counter. Fires
-/// exactly once per rejected PUBLISH regardless of which validation
-/// branch triggered the refusal, so operators get a single admission-
-/// failure signal without per-reason cardinality.
-pub type OnMqttPublishReject = Arc<dyn Fn() + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked once per MQTT PUBLISH that is rejected by the
+    /// session handler (QoS2 unsupported, invalid topic, or not authorised
+    /// for the resolved group).
+    ///
+    /// Wired by the server crate to feed the
+    /// `rustgate_mqtt_publishes_rejected_total` Prometheus counter. Fires
+    /// exactly once per rejected PUBLISH regardless of which validation
+    /// branch triggered the refusal, so operators get a single admission-
+    /// failure signal without per-reason cardinality.
+    pub OnMqttPublishReject
+);
 
-/// Callback invoked once per SUBSCRIBE topic filter that is successfully
-/// bound to an authorised group.
-///
-/// Wired by the server crate to feed the `rustgate_mqtt_subscribes_total`
-/// Prometheus counter. Fires *per filter*, not per SUBSCRIBE packet — a
-/// single MQTT SUBSCRIBE with three wildcard filters may produce up to
-/// three increments — so the counter tracks actual group bindings rather
-/// than packet counts.
-pub type OnMqttSubscribe = Arc<dyn Fn() + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked once per SUBSCRIBE topic filter that is successfully
+    /// bound to an authorised group.
+    ///
+    /// Wired by the server crate to feed the `rustgate_mqtt_subscribes_total`
+    /// Prometheus counter. Fires *per filter*, not per SUBSCRIBE packet — a
+    /// single MQTT SUBSCRIBE with three wildcard filters may produce up to
+    /// three increments — so the counter tracks actual group bindings rather
+    /// than packet counts.
+    pub OnMqttSubscribe
+);
 
-/// Callback invoked once per SUBSCRIBE topic filter that is rejected by
-/// the session handler (QoS2 unsupported, filter invalid under the
-/// active wildcard policy, or not authorised for any resolved group).
-///
-/// Wired by the server crate to feed the
-/// `rustgate_mqtt_subscribes_rejected_total` Prometheus counter. Fires
-/// *per filter*, mirroring [`OnMqttSubscribe`] — a SUBSCRIBE with three
-/// filters where two are denied produces two increments on this counter
-/// and one on [`OnMqttSubscribe`].
-pub type OnMqttSubscribeReject = Arc<dyn Fn() + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked once per SUBSCRIBE topic filter that is rejected by
+    /// the session handler (QoS2 unsupported, filter invalid under the
+    /// active wildcard policy, or not authorised for any resolved group).
+    ///
+    /// Wired by the server crate to feed the
+    /// `rustgate_mqtt_subscribes_rejected_total` Prometheus counter. Fires
+    /// *per filter*, mirroring [`OnMqttSubscribe`] — a SUBSCRIBE with three
+    /// filters where two are denied produces two increments on this counter
+    /// and one on [`OnMqttSubscribe`].
+    pub OnMqttSubscribeReject
+);
 
-/// Callback invoked once per PUBLISH whose `retain=1` flag and non-empty
-/// payload caused the broker's `RetainStore` to insert or overwrite the
-/// last-known-value entry for the published topic.
-///
-/// Wired by the server crate to feed the
-/// `rustgate_mqtt_retain_stored_total` Prometheus counter. Fires AFTER
-/// authorisation succeeds and AFTER the store is updated, so the
-/// counter always reflects entries actually persisted in the cache.
-pub type OnMqttRetainStored = Arc<dyn Fn() + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked once per PUBLISH whose `retain=1` flag and non-empty
+    /// payload caused the broker's `RetainStore` to insert or overwrite the
+    /// last-known-value entry for the published topic.
+    ///
+    /// Wired by the server crate to feed the
+    /// `rustgate_mqtt_retain_stored_total` Prometheus counter. Fires AFTER
+    /// authorisation succeeds and AFTER the store is updated, so the
+    /// counter always reflects entries actually persisted in the cache.
+    pub OnMqttRetainStored
+);
 
-/// Callback invoked once per PUBLISH whose `retain=1` flag combined
-/// with a zero-byte payload caused the broker's `RetainStore` to
-/// remove the entry for the published topic, per MQTT 5.0 §3.3.1.3.
-///
-/// Wired by the server crate to feed the
-/// `rustgate_mqtt_retain_cleared_total` Prometheus counter. Fires
-/// regardless of whether an entry was actually present in the store
-/// (the spec mandates the clear semantics; the counter measures
-/// operator-issued clears, not just cache-state transitions). Pairs
-/// with [`OnMqttRetainStored`] for a complete picture of retain
-/// store mutations.
-pub type OnMqttRetainCleared = Arc<dyn Fn() + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked once per PUBLISH whose `retain=1` flag combined
+    /// with a zero-byte payload caused the broker's `RetainStore` to
+    /// remove the entry for the published topic, per MQTT 5.0 §3.3.1.3.
+    ///
+    /// Wired by the server crate to feed the
+    /// `rustgate_mqtt_retain_cleared_total` Prometheus counter. Fires
+    /// regardless of whether an entry was actually present in the store
+    /// (the spec mandates the clear semantics; the counter measures
+    /// operator-issued clears, not just cache-state transitions). Pairs
+    /// with [`OnMqttRetainStored`] for a complete picture of retain
+    /// store mutations.
+    pub OnMqttRetainCleared
+);
 
-/// Callback invoked once per retained `PUBLISH` packet replayed to a
-/// fresh subscriber on a successful `SUBSCRIBE`. Fires *per delivered
-/// retained message*, not per SUBSCRIBE packet — a single SUBSCRIBE
-/// whose filter matches three retained topics produces three
-/// increments.
-///
-/// Wired by the server crate to feed the
-/// `rustgate_mqtt_retain_replayed_total` Prometheus counter. The
-/// authorisation re-check runs before the callback fires, so the
-/// counter only ever counts replays the subscriber was actually
-/// allowed to receive — a metric used to detect retain-fan-out
-/// patterns (e.g. a wildcard subscribe expanding to thousands of
-/// retained topics) ahead of throughput-related operational issues.
-pub type OnMqttRetainReplayed = Arc<dyn Fn() + Send + Sync>;
-/// Callback invoked exactly once per will message published on a
-/// client's behalf when the connection ended ungracefully (TLS error,
-/// keep-alive timeout, write-loop early exit, abrupt TCP close — any
-/// path that is NOT a clean DISCONNECT). Fires AFTER the will payload
-/// has been routed via `Router::route_for_egress`, regardless of
-/// whether the router accepted or dropped the message — the callback
-/// records the broker's decision to fire the will, not the eventual
-/// delivery outcome.
-///
-/// Wired by the server crate to feed the
-/// `rustgate_mqtt_will_published_total` Prometheus counter. A spike on
-/// this counter typically correlates with a partition or a fleet of
-/// clients hitting their keep-alive timeout — the operational signal
-/// is "presence-loss is happening at scale, look at the network".
-pub type OnMqttWillPublished = Arc<dyn Fn() + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked once per retained `PUBLISH` packet replayed to a
+    /// fresh subscriber on a successful `SUBSCRIBE`. Fires *per delivered
+    /// retained message*, not per SUBSCRIBE packet — a single SUBSCRIBE
+    /// whose filter matches three retained topics produces three
+    /// increments.
+    ///
+    /// Wired by the server crate to feed the
+    /// `rustgate_mqtt_retain_replayed_total` Prometheus counter. The
+    /// authorisation re-check runs before the callback fires, so the
+    /// counter only ever counts replays the subscriber was actually
+    /// allowed to receive — a metric used to detect retain-fan-out
+    /// patterns (e.g. a wildcard subscribe expanding to thousands of
+    /// retained topics) ahead of throughput-related operational issues.
+    pub OnMqttRetainReplayed
+);
+rustgate_core::on_callback!(
+    /// Callback invoked exactly once per will message published on a
+    /// client's behalf when the connection ended ungracefully (TLS error,
+    /// keep-alive timeout, write-loop early exit, abrupt TCP close — any
+    /// path that is NOT a clean DISCONNECT). Fires AFTER the will payload
+    /// has been routed via `Router::route_for_egress`, regardless of
+    /// whether the router accepted or dropped the message — the callback
+    /// records the broker's decision to fire the will, not the eventual
+    /// delivery outcome.
+    ///
+    /// Wired by the server crate to feed the
+    /// `rustgate_mqtt_will_published_total` Prometheus counter. A spike on
+    /// this counter typically correlates with a partition or a fleet of
+    /// clients hitting their keep-alive timeout — the operational signal
+    /// is "presence-loss is happening at scale, look at the network".
+    pub OnMqttWillPublished
+);
 
 /// Bundle of session-level observer callbacks (publish accept/reject,
 /// subscribe accept/reject) passed through to every spawned MQTT

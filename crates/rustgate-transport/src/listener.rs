@@ -18,24 +18,32 @@ use crate::config::TlsConfig;
 use crate::extract::{ExpectedKeyUsage, extract_identity, validate_key_usage};
 use crate::session::AuthenticatedSession;
 
-/// Callback invoked when a TLS handshake fails.
-///
-/// Receives the peer address and the error message string, allowing the
-/// caller to classify and record the failure (e.g. for metrics).
-pub type OnHandshakeError = Arc<dyn Fn(SocketAddr, &str) + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked when a TLS handshake fails.
+    ///
+    /// Receives the peer address and the error message string, allowing the
+    /// caller to classify and record the failure (e.g. for metrics).
+    pub OnHandshakeError,
+    SocketAddr,
+    &str
+);
 
-/// Callback invoked once each TLS handshake completes, regardless of outcome.
-///
-/// Receives the elapsed handshake duration and an `outcome` label —
-/// `"success"` when the handshake produced a usable TLS stream, `"failure"`
-/// when the acceptor returned an error. Fired after identity extraction
-/// is *not* attempted; the boundary is the TLS layer, so a cert that fails
-/// downstream `extract_identity()` still counts as a `"success"` here.
-///
-/// Intended for histogram observation (e.g. Prometheus
-/// `rustgate_tls_handshake_duration_seconds`). The callback must not block
-/// the accept loop — keep the observation cheap.
-pub type OnHandshakeDuration = Arc<dyn Fn(Duration, &str) + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked once each TLS handshake completes, regardless of outcome.
+    ///
+    /// Receives the elapsed handshake duration and an `outcome` label —
+    /// `"success"` when the handshake produced a usable TLS stream, `"failure"`
+    /// when the acceptor returned an error. Fired after identity extraction
+    /// is *not* attempted; the boundary is the TLS layer, so a cert that fails
+    /// downstream `extract_identity()` still counts as a `"success"` here.
+    ///
+    /// Intended for histogram observation (e.g. Prometheus
+    /// `rustgate_tls_handshake_duration_seconds`). The callback must not block
+    /// the accept loop — keep the observation cheap.
+    pub OnHandshakeDuration,
+    Duration,
+    &str
+);
 
 /// Default maximum number of concurrent TLS handshakes when no limit is specified.
 pub const DEFAULT_MAX_HANDSHAKES: usize = 100;

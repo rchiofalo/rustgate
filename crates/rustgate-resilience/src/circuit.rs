@@ -20,8 +20,8 @@
 //! in flight, preventing thundering-herd against a recovering endpoint.
 
 use std::fmt;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tokio::time::Instant;
@@ -31,19 +31,23 @@ pub const STATE_CLOSED: u8 = 0;
 pub const STATE_OPEN: u8 = 1;
 pub const STATE_HALF_OPEN: u8 = 2;
 
-/// Callback fired on every state transition.
-///
-/// Receives `(old_state, new_state)` using the `STATE_*` numeric
-/// constants (0=Closed, 1=Open, 2=HalfOpen). Invoked synchronously from
-/// inside the transition code path, so implementations MUST NOT block
-/// on locks held by the caller of `record_success` / `record_failure`
-/// / `allow_request`. Dispatch heavy work via `tokio::spawn` or the
-/// workspace's `spawn_background` helper inside the callback body.
-///
-/// The primary use case is letting downstream crates react to
-/// `Open → HalfOpen` (target recovered, kick off a DLQ drain) without
-/// polling. Other transitions may be observed for metrics or audit.
-pub type OnStateChange = Arc<dyn Fn(u8, u8) + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback fired on every state transition.
+    ///
+    /// Receives `(old_state, new_state)` using the `STATE_*` numeric
+    /// constants (0=Closed, 1=Open, 2=HalfOpen). Invoked synchronously from
+    /// inside the transition code path, so implementations MUST NOT block
+    /// on locks held by the caller of `record_success` / `record_failure`
+    /// / `allow_request`. Dispatch heavy work via `tokio::spawn` or the
+    /// workspace's `spawn_background` helper inside the callback body.
+    ///
+    /// The primary use case is letting downstream crates react to
+    /// `Open → HalfOpen` (target recovered, kick off a DLQ drain) without
+    /// polling. Other transitions may be observed for metrics or audit.
+    pub OnStateChange,
+    u8,
+    u8
+);
 
 /// Per-target circuit breaker.
 ///
@@ -325,6 +329,8 @@ impl CircuitBreaker {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::panic, clippy::unwrap_used, unused_results)]
+
+    use std::sync::Arc;
 
     use super::*;
 

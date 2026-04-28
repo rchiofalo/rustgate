@@ -24,41 +24,52 @@
 //! common dependency layer so every transport crate and the server
 //! binary can reuse the same callback shapes.
 
-use std::sync::Arc;
-
 use bytes::Bytes;
 
 use crate::message::{Metadata, RoutableMessage};
+use crate::on_callback;
 
-/// Callback fired after a successful local route to hand the message
-/// off to the NATS publisher.
-///
-/// The closure spawns async work internally (fire-and-forget). A
-/// `None` value at the call site means "no NATS bridge is wired" and
-/// the transport MUST skip the fan-out.
-pub type OnNatsPublish = Arc<dyn Fn(RoutableMessage) + Send + Sync>;
+on_callback!(
+    /// Callback fired after a successful local route to hand the message
+    /// off to the NATS publisher.
+    ///
+    /// The closure spawns async work internally (fire-and-forget). A
+    /// `None` value at the call site means "no NATS bridge is wired" and
+    /// the transport MUST skip the fan-out.
+    pub OnNatsPublish,
+    RoutableMessage
+);
 
-/// Callback fired after a successful local route to hand the payload
-/// off to the federation forwarder.
-///
-/// Receives `(payload_bytes, source_groups, metadata)` — the payload
-/// is already in post-Send-PEP form (obligations such as `MaskPoint`
-/// applied), and `source_groups` is the set of the client's groups
-/// that the router considered eligible. Downstream peers use this to
-/// make their own deny/allow decisions without having to re-run the
-/// full PEP.
-pub type OnFederationForward = Arc<dyn Fn(Bytes, Vec<String>, Metadata) + Send + Sync>;
+on_callback!(
+    /// Callback fired after a successful local route to hand the payload
+    /// off to the federation forwarder.
+    ///
+    /// Receives `(payload_bytes, source_groups, metadata)` — the payload
+    /// is already in post-Send-PEP form (obligations such as `MaskPoint`
+    /// applied), and `source_groups` is the set of the client's groups
+    /// that the router considered eligible. Downstream peers use this to
+    /// make their own deny/allow decisions without having to re-run the
+    /// full PEP.
+    pub OnFederationForward,
+    Bytes,
+    Vec<String>,
+    Metadata
+);
 
-/// Callback fired after a successful local route to hand the message
-/// off to the HTTP egress publisher.
-///
-/// Same shape as [`OnNatsPublish`] — the HTTP bridge drives its own
-/// per-target channel + retry + DLQ path internally.
-pub type OnHttpForward = Arc<dyn Fn(RoutableMessage) + Send + Sync>;
+on_callback!(
+    /// Callback fired after a successful local route to hand the message
+    /// off to the HTTP egress publisher.
+    ///
+    /// Same shape as [`OnNatsPublish`] — the HTTP bridge drives its own
+    /// per-target channel + retry + DLQ path internally.
+    pub OnHttpForward,
+    RoutableMessage
+);
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;

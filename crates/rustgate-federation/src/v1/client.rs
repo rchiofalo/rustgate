@@ -29,15 +29,19 @@ use crate::heartbeat::{create_heartbeat, is_heartbeat};
 use crate::peer::{PeerHandle, PeerState};
 use crate::replay_buffer::BufferedMessage;
 
-/// Callback invoked for each non-heartbeat message received from the peer.
-///
-/// Arguments: (peer_id, payload_bytes).
-///
-/// F-113: receives a typed [`rustgate_core::PeerId`]. The wire-format
-/// boundary (`peer.id` is already a `PeerId`) constructs the value;
-/// downstream consumers gain compile-time enforcement that `peer_id`
-/// is not a free-form `String` (e.g. a CN, group name, or UID).
-pub type OnMessage = Arc<dyn Fn(rustgate_core::PeerId, Bytes) + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked for each non-heartbeat message received from the peer.
+    ///
+    /// Arguments: (peer_id, payload_bytes).
+    ///
+    /// F-113: receives a typed [`rustgate_core::PeerId`]. The wire-format
+    /// boundary (`peer.id` is already a `PeerId`) constructs the value;
+    /// downstream consumers gain compile-time enforcement that `peer_id`
+    /// is not a free-form `String` (e.g. a CN, group name, or UID).
+    pub OnMessage,
+    rustgate_core::PeerId,
+    Bytes
+);
 
 /// Callback that drains the replay buffer on reconnection.
 ///

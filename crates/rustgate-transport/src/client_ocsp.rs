@@ -50,10 +50,14 @@ use sha2::Digest;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-/// Callback invoked on a cache hit (any cached entry, regardless of status).
-pub type OnCacheHit = Arc<dyn Fn() + Send + Sync>;
-/// Callback invoked on a cache miss before a background fetch is dispatched.
-pub type OnCacheMiss = Arc<dyn Fn() + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked on a cache hit (any cached entry, regardless of status).
+    pub OnCacheHit
+);
+rustgate_core::on_callback!(
+    /// Callback invoked on a cache miss before a background fetch is dispatched.
+    pub OnCacheMiss
+);
 
 /// Trait for fetching OCSP responses for a leaf/issuer pair.
 ///

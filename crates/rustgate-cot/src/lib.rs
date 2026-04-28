@@ -184,20 +184,23 @@ pub fn sa_affiliation(event_type: &str) -> Option<SaAffiliation> {
     }
 }
 
-/// Callback invoked once per CoT payload whose `<event version=…>`
-/// attribute was rewritten by [`auto_upgrade_sa_version`] from a legacy
-/// value to the current `2.0` form.
-///
-/// The single `&str` argument is the `from_version` label — one of the
-/// values returned by [`classify_legacy_sa_version`]
-/// (`"v1"`, `"v2-pre-2.0"`). The server binary wires this callback to
-/// the `rustgate_sa_auto_upgraded_total{from_version}` Prometheus
-/// counter so fleet-upgrade-progress dashboards can plot the share of
-/// senders still emitting legacy formats. Closes #741.
-///
-/// Kept as a simple `Fn(&str)` so the `rustgate-cot` crate stays
-/// metrics-agnostic and does not grow a `prometheus` dependency.
-pub type OnSaAutoUpgraded = Arc<dyn Fn(&str) + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked once per CoT payload whose `<event version=…>`
+    /// attribute was rewritten by [`auto_upgrade_sa_version`] from a legacy
+    /// value to the current `2.0` form.
+    ///
+    /// The single `&str` argument is the `from_version` label — one of the
+    /// values returned by [`classify_legacy_sa_version`]
+    /// (`"v1"`, `"v2-pre-2.0"`). The server binary wires this callback to
+    /// the `rustgate_sa_auto_upgraded_total{from_version}` Prometheus
+    /// counter so fleet-upgrade-progress dashboards can plot the share of
+    /// senders still emitting legacy formats. Closes #741.
+    ///
+    /// Kept as a simple `Fn(&str)` so the `rustgate-cot` crate stays
+    /// metrics-agnostic and does not grow a `prometheus` dependency.
+    pub OnSaAutoUpgraded,
+    &str
+);
 
 /// Current CoT event-schema version produced by the auto-upgrade path.
 ///

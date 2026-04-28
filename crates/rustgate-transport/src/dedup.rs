@@ -62,7 +62,6 @@
 //! `--dedup-window-secs` CLI flag (a value of `0` keeps it off).
 
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -74,16 +73,21 @@ use sha2::{Digest, Sha256};
 /// Default maximum number of cached entries when no override is given.
 pub const DEFAULT_MAX_ENTRIES: usize = 100_000;
 
-/// Optional callback invoked once per suppressed duplicate so the server
-/// crate can update its Prometheus counter without `rustgate-transport`
-/// taking a direct dependency on the metrics layer.
-pub type OnDuplicate = Arc<dyn Fn() + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Optional callback invoked once per suppressed duplicate so the server
+    /// crate can update its Prometheus counter without `rustgate-transport`
+    /// taking a direct dependency on the metrics layer.
+    pub OnDuplicate
+);
 
-/// Optional callback invoked after a fresh entry is inserted into the
-/// cache. The server crate uses this to publish the current cache size
-/// as a Prometheus gauge without pulling a metrics dependency into
-/// `rustgate-transport`.
-pub type OnInsert = Arc<dyn Fn(usize) + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Optional callback invoked after a fresh entry is inserted into the
+    /// cache. The server crate uses this to publish the current cache size
+    /// as a Prometheus gauge without pulling a metrics dependency into
+    /// `rustgate-transport`.
+    pub OnInsert,
+    usize
+);
 
 /// Cache key: a 32-byte SHA-256 digest.
 type Key = [u8; 32];
@@ -438,6 +442,8 @@ fn window_truncated_millis(received_at: SystemTime, window: Duration) -> u64 {
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     fn cache(secs: u64, cap: usize) -> DedupCache {

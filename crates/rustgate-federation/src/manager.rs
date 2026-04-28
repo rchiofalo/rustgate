@@ -31,25 +31,29 @@ use crate::replay_persist::ReplayStore;
 use crate::trust_store::TrustStore;
 use crate::v1::{V1Client, V1Server};
 
-/// Callback invoked for each non-heartbeat message received from a federation peer.
-///
-/// Arguments: (peer_id_or_cn, raw_payload_bytes).
-///
-/// F-113: `peer_id_or_cn` is a typed [`PeerId`] (the V2 callback site
-/// already owns the typed value via `peer.id.clone()` on the client
-/// side and via `PeerId::new(cn)` on the server side; the V1 client
-/// side passes the same typed value through `OnMessage`). Downstream
-/// consumers in `rustgate-server` extract the inner string with
-/// `peer_id.as_str()` when they need to interface with the router's
-/// existing `&str` API surface.
-///
-/// The caller is responsible for provenance checking, format conversion,
-/// and routing the message to local clients (e.g., via the Router).
-///
-/// NOTE: Uses `Fn` (not `AsyncFn`) because `dyn AsyncFn` is not object-safe
-/// as of Rust 1.93. Async work is dispatched via `spawn_background()` inside
-/// the closure body. Revisit when `dyn AsyncFn` stabilizes for trait objects.
-pub type OnInbound = Arc<dyn Fn(PeerId, Bytes) + Send + Sync>;
+rustgate_core::on_callback!(
+    /// Callback invoked for each non-heartbeat message received from a federation peer.
+    ///
+    /// Arguments: (peer_id_or_cn, raw_payload_bytes).
+    ///
+    /// F-113: `peer_id_or_cn` is a typed [`PeerId`] (the V2 callback site
+    /// already owns the typed value via `peer.id.clone()` on the client
+    /// side and via `PeerId::new(cn)` on the server side; the V1 client
+    /// side passes the same typed value through `OnMessage`). Downstream
+    /// consumers in `rustgate-server` extract the inner string with
+    /// `peer_id.as_str()` when they need to interface with the router's
+    /// existing `&str` API surface.
+    ///
+    /// The caller is responsible for provenance checking, format conversion,
+    /// and routing the message to local clients (e.g., via the Router).
+    ///
+    /// NOTE: Uses `Fn` (not `AsyncFn`) because `dyn AsyncFn` is not object-safe
+    /// as of Rust 1.93. Async work is dispatched via `spawn_background()` inside
+    /// the closure body. Revisit when `dyn AsyncFn` stabilizes for trait objects.
+    pub OnInbound,
+    PeerId,
+    Bytes
+);
 
 /// Capacity for HA peer adoption/loss event channels.
 ///
