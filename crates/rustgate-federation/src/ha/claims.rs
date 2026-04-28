@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rustgate_core::PeerId;
 use rustgate_core::masking::hash_cn;
 use tokio::sync::{Mutex, watch};
 use tracing::{debug, info, warn};
@@ -30,13 +31,20 @@ const CLAIM_BUCKET: &str = "federation-claims";
 
 /// Callback invoked when a peer becomes available for adoption
 /// (its claim expired due to pod death).
-pub type OnPeerAvailable = Arc<dyn Fn(String) + Send + Sync>;
+///
+/// F-113: receives a typed [`PeerId`] so downstream consumers (the HA
+/// adoption channel in `FederationManager`) cannot accidentally mix
+/// peer ids with other free-form strings (pod ids, server names).
+pub type OnPeerAvailable = Arc<dyn Fn(PeerId) + Send + Sync>;
 
 /// Callback invoked when a claim is lost to another pod.
 ///
 /// Arguments: `(peer_id, stale_fencing_token)`. The fencing token is the
 /// NATS KV revision that this pod held before the claim was lost.
-pub type OnClaimLost = Arc<dyn Fn(String, u64) + Send + Sync>;
+///
+/// F-113: receives a typed [`PeerId`] for the same reason as
+/// [`OnPeerAvailable`].
+pub type OnClaimLost = Arc<dyn Fn(PeerId, u64) + Send + Sync>;
 
 /// Manages distributed peer ownership using NATS JetStream KV.
 ///
@@ -174,27 +182,32 @@ impl ClaimManager {
     /// the peer is already claimed by another pod. The fencing token is a
     /// monotonically increasing integer that prevents split-brain: a pod must
     /// hold a current token to operate on a peer.
-    pub async fn try_claim(&self, peer_id: &str) -> Option<u64> {
+    ///
+    /// F-113: takes a typed [`PeerId`] reference. The KV bucket key (a bare
+    /// string) is derived via `peer_id.as_str()` so the wire format is
+    /// unchanged.
+    pub async fn try_claim(&self, peer_id: &PeerId) -> Option<u64> {
+        let key = peer_id.as_str();
         let value = bytes::Bytes::from(self.pod_id.clone());
 
-        match self.kv.create(peer_id, value.clone()).await {
+        match self.kv.create(key, value.clone()).await {
             Ok(revision) => {
                 let mut claims = self.claims.lock().await;
-                let _ = claims.insert(peer_id.to_string(), revision);
-                info!(peer_id = %hash_cn(peer_id), pod_id = %self.pod_id, fence = revision, "claimed peer");
+                let _ = claims.insert(key.to_string(), revision);
+                info!(peer_id = %hash_cn(key), pod_id = %self.pod_id, fence = revision, "claimed peer");
                 Some(revision)
             }
             Err(_) => {
                 // Key exists — check if we already own it (e.g., from a previous run)
-                match self.kv.entry(peer_id).await {
+                match self.kv.entry(key).await {
                     Ok(Some(entry)) if entry.value == self.pod_id.as_bytes() => {
                         let mut claims = self.claims.lock().await;
-                        let _ = claims.insert(peer_id.to_string(), entry.revision);
-                        debug!(peer_id = %hash_cn(peer_id), fence = entry.revision, "reclaimed own peer");
+                        let _ = claims.insert(key.to_string(), entry.revision);
+                        debug!(peer_id = %hash_cn(key), fence = entry.revision, "reclaimed own peer");
                         Some(entry.revision)
                     }
                     _ => {
-                        debug!(peer_id = %hash_cn(peer_id), "peer already claimed by another pod");
+                        debug!(peer_id = %hash_cn(key), "peer already claimed by another pod");
                         None
                     }
                 }
@@ -205,41 +218,42 @@ impl ClaimManager {
     /// Return the fencing token (NATS KV revision) for a claimed peer.
     ///
     /// Returns `None` if this pod does not own the claim.
-    pub async fn fencing_token(&self, peer_id: &str) -> Option<u64> {
+    pub async fn fencing_token(&self, peer_id: &PeerId) -> Option<u64> {
         let claims = self.claims.lock().await;
-        claims.get(peer_id).copied()
+        claims.get(peer_id.as_str()).copied()
     }
 
     /// Check whether the given fencing token is still the current claim revision.
     ///
     /// Returns `true` if this pod still holds the claim with the given token
     /// (or a newer one). Returns `false` if the claim has been lost.
-    pub async fn is_token_valid(&self, peer_id: &str, token: u64) -> bool {
+    pub async fn is_token_valid(&self, peer_id: &PeerId, token: u64) -> bool {
         let claims = self.claims.lock().await;
-        match claims.get(peer_id) {
+        match claims.get(peer_id.as_str()) {
             Some(&current) => current >= token,
             None => false,
         }
     }
 
     /// Release a claim, allowing other pods to adopt the peer.
-    pub async fn release(&self, peer_id: &str) -> Result<()> {
+    pub async fn release(&self, peer_id: &PeerId) -> Result<()> {
+        let key = peer_id.as_str();
         let mut claims = self.claims.lock().await;
-        let _ = claims.remove(peer_id);
+        let _ = claims.remove(key);
         drop(claims);
 
-        self.kv.delete(peer_id).await.map_err(|e| {
+        self.kv.delete(key).await.map_err(|e| {
             FederationError::storage(format!("failed to delete claim from KV: {e}"))
         })?;
 
-        info!(peer_id = %hash_cn(peer_id), pod_id = %self.pod_id, "released peer claim");
+        info!(peer_id = %hash_cn(key), pod_id = %self.pod_id, "released peer claim");
         Ok(())
     }
 
     /// Check if this pod owns the claim for a peer.
-    pub async fn is_owner(&self, peer_id: &str) -> bool {
+    pub async fn is_owner(&self, peer_id: &PeerId) -> bool {
         let claims = self.claims.lock().await;
-        claims.contains_key(peer_id)
+        claims.contains_key(peer_id.as_str())
     }
 
     /// List all peers claimed by this pod.
@@ -348,7 +362,9 @@ async fn refresh_claims(
                         drop(claims_guard);
 
                         if let Some(callback) = on_claim_lost {
-                            callback(peer_id.clone(), *revision);
+                            // Convert to typed `PeerId` at the callback boundary;
+                            // local-cache keys remain `String` for HashMap lookup.
+                            callback(PeerId::new(peer_id.as_str()), *revision);
                         }
                     }
                     Ok(None) => {
@@ -435,7 +451,7 @@ async fn watch_expired_claims(
                 if let Some(callback) = on_peer_available {
                     // Fire callback with jitter delay to prevent thundering herd
                     let callback = callback.clone();
-                    let peer_id_owned = peer_id;
+                    let peer_id_owned: PeerId = PeerId::new(peer_id);
                     let jitter = ClaimManager::adoption_jitter();
                     drop(tokio::spawn(async move {
                         tokio::time::sleep(jitter).await;
@@ -487,18 +503,19 @@ mod tests {
 
     #[test]
     fn on_claim_lost_type_includes_fencing_token() {
-        // Verify the OnClaimLost callback accepts (peer_id, stale_token)
+        // Verify the OnClaimLost callback accepts (peer_id, stale_token).
+        // F-113: receiver expects a typed `PeerId`, not a free `String`.
         let called = Arc::new(std::sync::Mutex::new(None));
         let called_clone = called.clone();
 
-        let callback: OnClaimLost = Arc::new(move |peer_id: String, token: u64| {
+        let callback: OnClaimLost = Arc::new(move |peer_id: PeerId, token: u64| {
             *called_clone.lock().expect("lock") = Some((peer_id, token));
         });
 
-        callback("peer-1".to_string(), 42);
+        callback(PeerId::new("peer-1"), 42);
 
         let result = called.lock().expect("lock").take();
-        assert_eq!(result, Some(("peer-1".to_string(), 42)));
+        assert_eq!(result, Some((PeerId::new("peer-1"), 42)));
     }
 
     // ── OnPeerAvailable contract pins ──────────────────────────────────
@@ -511,18 +528,21 @@ mod tests {
     // existing test in this module silently.
 
     #[test]
-    fn on_peer_available_callback_fires_with_owned_peer_id_string() {
+    fn on_peer_available_callback_fires_with_owned_peer_id() {
+        // F-113: `OnPeerAvailable` carries a typed `PeerId`. Pin both the
+        // signature (compile-time, via the explicit `PeerId` annotation in
+        // the closure) and the round-trip identity at the callback boundary.
         let seen = Arc::new(std::sync::Mutex::new(None));
         let seen_clone = seen.clone();
 
-        let callback: OnPeerAvailable = Arc::new(move |peer_id: String| {
+        let callback: OnPeerAvailable = Arc::new(move |peer_id: PeerId| {
             *seen_clone.lock().expect("lock") = Some(peer_id);
         });
 
-        callback("orphaned-peer".to_string());
+        callback(PeerId::new("orphaned-peer"));
 
         let result = seen.lock().expect("lock").take();
-        assert_eq!(result, Some("orphaned-peer".to_string()));
+        assert_eq!(result, Some(PeerId::new("orphaned-peer")));
     }
 
     // ── Callback-bound compile-time pins ───────────────────────────────
@@ -565,7 +585,7 @@ mod tests {
         let counter = Arc::new(std::sync::Mutex::new(0u32));
         let counter_for_closure = counter.clone();
 
-        let original: OnPeerAvailable = Arc::new(move |_peer_id: String| {
+        let original: OnPeerAvailable = Arc::new(move |_peer_id: PeerId| {
             let mut guard = counter_for_closure.lock().expect("lock");
             *guard += 1;
         });
@@ -578,8 +598,8 @@ mod tests {
             "clone must bump the strong count, not wrap in an outer Arc"
         );
 
-        original("peer-A".to_string());
-        cloned("peer-B".to_string());
+        original(PeerId::new("peer-A"));
+        cloned(PeerId::new("peer-B"));
 
         let final_count = *counter.lock().expect("lock");
         assert_eq!(

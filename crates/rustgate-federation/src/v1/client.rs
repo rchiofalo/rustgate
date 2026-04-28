@@ -31,14 +31,23 @@ use crate::replay_buffer::BufferedMessage;
 
 /// Callback invoked for each non-heartbeat message received from the peer.
 ///
-/// Arguments: (peer_id, payload_bytes)
-pub type OnMessage = Arc<dyn Fn(String, Bytes) + Send + Sync>;
+/// Arguments: (peer_id, payload_bytes).
+///
+/// F-113: receives a typed [`rustgate_core::PeerId`]. The wire-format
+/// boundary (`peer.id` is already a `PeerId`) constructs the value;
+/// downstream consumers gain compile-time enforcement that `peer_id`
+/// is not a free-form `String` (e.g. a CN, group name, or UID).
+pub type OnMessage = Arc<dyn Fn(rustgate_core::PeerId, Bytes) + Send + Sync>;
 
 /// Callback that drains the replay buffer on reconnection.
 ///
 /// Returns deduped buffered messages and clears the buffer atomically.
-/// Arguments: `(peer_id) -> Vec<BufferedMessage>`
-pub type ReplayDrain = Arc<dyn Fn(&str) -> Vec<BufferedMessage> + Send + Sync>;
+/// Arguments: `(peer_id) -> Vec<BufferedMessage>`.
+///
+/// F-113: takes a typed `&PeerId`. The lookup against the
+/// `HashMap<PeerId, ReplayBuffer>` is unchanged because `PeerId`
+/// implements `Borrow<str>`.
+pub type ReplayDrain = Arc<dyn Fn(&rustgate_core::PeerId) -> Vec<BufferedMessage> + Send + Sync>;
 
 /// Configuration for a V1 federation outbound client.
 pub struct V1ClientConfig {
@@ -263,11 +272,12 @@ async fn connection_loop(
                 "connected to V1 federation peer"
             );
 
-            // Drain replay buffer for this peer (returns deduped messages and clears)
+            // Drain replay buffer for this peer (returns deduped messages and clears).
+            // F-113: ReplayDrain now takes `&PeerId`; pass the typed handle directly.
             let replay_messages: Vec<BufferedMessage> = config
                 .replay_drain
                 .as_ref()
-                .map(|drain| drain(peer_id.as_ref()))
+                .map(|drain| drain(&peer_id))
                 .unwrap_or_default();
 
             if !replay_messages.is_empty() {
@@ -403,7 +413,7 @@ async fn run_session(
                             last_heartbeat_received = tokio::time::Instant::now();
                         } else {
                             peer.record_recv();
-                            (config.on_message)(peer_id.to_string(), data.freeze());
+                            (config.on_message)(peer_id.clone(), data.freeze());
                         }
                     }
                     Some(Err(e)) => {

@@ -1198,7 +1198,13 @@ pub(crate) async fn start_federation(
     let on_inbound: rustgate_federation::manager::OnInbound = Arc::new(move |peer_cn, payload| {
         let router = Arc::clone(&router_for_fed);
         spawn_background("federation-inbound", async move {
-            let identity = match Identity::plaintext(peer_cn.clone(), BTreeSet::new()) {
+            // F-113: federation now hands us a typed `PeerId`. Materialize
+            // it as a `String` once for the `Identity::plaintext` call —
+            // the inner string is the load-bearing CN for the routable
+            // message's `source` field and `Identity::plaintext` consumes
+            // by value.
+            let peer_cn_str = peer_cn.as_str().to_string();
+            let identity = match Identity::plaintext(peer_cn_str.clone(), BTreeSet::new()) {
                 Ok(id) => id,
                 Err(e) => {
                     // peer_cn here may not yet be a valid Identity (the
@@ -1208,7 +1214,7 @@ pub(crate) async fn start_federation(
                     // the structured-log field to neutralise CR/LF
                     // log-forging from a malicious federation peer.
                     tracing::warn!(
-                        peer_cn = %sanitize_for_log(&peer_cn),
+                        peer_cn = %sanitize_for_log(&peer_cn_str),
                         error = %e,
                         "invalid federation peer identity",
                     );
