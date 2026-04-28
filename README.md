@@ -85,21 +85,21 @@ For production certificate management see [docs/tls-certificates.md](docs/tls-ce
 
 | Crate | Purpose |
 |-------|---------|
-| `rustgate-core` | Codec trait, shared types: Identity, RoutableMessage, Destination, framing strategies |
-| `rustgate-cot` | Cursor on Target XML parsing and message building |
-| `rustgate-transport` | mTLS listener, codec, session management, CRL, FIPS provider, routing engine |
-| `rustgate-websocket` | WebSocket (wss://) listener with mTLS client authentication |
-| `rustgate-mqtt` | MQTT 5.0/3.1.1 transport adapter with mTLS and dynamic subscriptions |
-| `rustgate-mavlink` | MAVLink v1/v2 wire-frame codec (listeners and signing land in follow-up PRs) |
-| `rustgate-nats` | NATS/JetStream bridge for cross-instance message delivery |
-| `rustgate-enrollment` | HTTPS certificate enrollment server (CSR signing, PKCS#12) |
-| `rustgate-proto` | Protobuf message translation (XML ↔ proto) |
-| `rustgate-authz` | Authorization engine (RBAC/ABAC, Cedar backend) |
-| `rustgate-http` | HTTP/webhook egress bridge with auth, retry, circuit breaking |
-| `rustgate-federation` | Server-to-server federation: V1 (XML), V2 (gRPC), HA, REST API |
-| `rustgate-client` | Lightweight client library for integration testing |
-| `rustgate-server` | Binary entry point, CLI, orchestration |
-| `rustgate-test-utils` | Test CA and certificate generation helpers |
+| [`rustgate-core`](crates/rustgate-core/README.md) | Codec trait, shared types: Identity, RoutableMessage, Destination, framing strategies |
+| [`rustgate-cot`](crates/rustgate-cot/README.md) | Cursor on Target XML parsing and message building |
+| [`rustgate-transport`](crates/rustgate-transport/README.md) | mTLS listener, codec, session management, CRL, FIPS provider, routing engine |
+| [`rustgate-websocket`](crates/rustgate-websocket/README.md) | WebSocket (wss://) listener with mTLS client authentication |
+| [`rustgate-mqtt`](crates/rustgate-mqtt/README.md) | MQTT 5.0/3.1.1 transport adapter with mTLS and dynamic subscriptions |
+| [`rustgate-mavlink`](crates/rustgate-mavlink/README.md) | MAVLink v1/v2 wire-frame codec (listeners and signing land in follow-up PRs) |
+| [`rustgate-nats`](crates/rustgate-nats/README.md) | NATS/JetStream bridge for cross-instance message delivery |
+| [`rustgate-enrollment`](crates/rustgate-enrollment/README.md) | HTTPS certificate enrollment server (CSR signing, PKCS#12) |
+| [`rustgate-proto`](crates/rustgate-proto/README.md) | Protobuf message translation (XML ↔ proto) |
+| [`rustgate-authz`](crates/rustgate-authz/README.md) | Authorization engine (RBAC/ABAC, Cedar backend) |
+| [`rustgate-http`](crates/rustgate-http/README.md) | HTTP/webhook egress bridge with auth, retry, circuit breaking |
+| [`rustgate-federation`](crates/rustgate-federation/README.md) | Server-to-server federation: V1 (XML), V2 (gRPC), HA, REST API |
+| [`rustgate-client`](crates/rustgate-client/README.md) | Lightweight client library for integration testing |
+| [`rustgate-server`](crates/rustgate-server/README.md) | Binary entry point, CLI, orchestration |
+| [`rustgate-test-utils`](crates/rustgate-test-utils/README.md) | Test CA and certificate generation helpers |
 
 For detailed architecture documentation see [docs/architecture.md](docs/architecture.md).
 
