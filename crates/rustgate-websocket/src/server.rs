@@ -630,7 +630,10 @@ async fn ws_write_loop(
             }
         }
 
-        let frame = Message::Binary(encoded.to_vec().into());
+        // tungstenite's `Message::Binary` carries `Bytes`; pass the codec
+        // output through directly — `encoded.to_vec().into()` would copy
+        // every outbound frame on the WebSocket fan-out hot path.
+        let frame = Message::Binary(encoded);
 
         match tokio::time::timeout(WRITE_TIMEOUT, ws_write.send(frame)).await {
             Ok(Ok(())) => {

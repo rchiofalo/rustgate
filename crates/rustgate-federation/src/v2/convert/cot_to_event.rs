@@ -6,6 +6,7 @@
 //! protobuf type, including flow-tag injection and contact-list entry
 //! generation.
 
+use bytes::Bytes;
 use rustgate_proto::{FullCotEvent, parse_full};
 
 use super::proto::figpb;
@@ -236,11 +237,15 @@ pub fn federated_event_to_xml(event: &figpb::FederatedEvent) -> Result<Vec<u8>, 
 /// If there is no `<detail>` section but `</event>` exists, a new `<detail>`
 /// section is created containing the flow tag.
 ///
-/// Returns the original bytes unchanged if neither marker is found.
-pub fn add_flow_tag(data: &[u8], source: &str) -> Vec<u8> {
+/// Returns the original `Bytes` (refcount-cloned) when no marker is found
+/// or when the payload is not valid UTF-8 — both fast paths skip the
+/// per-message `Vec<u8>` allocation that the previous `Vec<u8>`-returning
+/// signature forced. When a marker is present, builds a fresh allocation
+/// containing the spliced output and converts to `Bytes` once.
+pub fn add_flow_tag(data: &Bytes, source: &str) -> Bytes {
     let s = match std::str::from_utf8(data) {
         Ok(s) => s,
-        Err(_) => return data.to_vec(),
+        Err(_) => return data.clone(),
     };
 
     let now = time::OffsetDateTime::now_utc();
@@ -260,7 +265,7 @@ pub fn add_flow_tag(data: &[u8], source: &str) -> Vec<u8> {
         result.push_str(&s[..pos]);
         result.push_str(&flow_tag);
         result.push_str(&s[pos..]);
-        result.into_bytes()
+        Bytes::from(result.into_bytes())
     } else if let Some(pos) = s.find("</event>") {
         // No detail section — wrap flow tag in a new detail element
         let mut result = String::with_capacity(s.len() + flow_tag.len() + 17);
@@ -269,9 +274,9 @@ pub fn add_flow_tag(data: &[u8], source: &str) -> Vec<u8> {
         result.push_str(&flow_tag);
         result.push_str("</detail>");
         result.push_str(&s[pos..]);
-        result.into_bytes()
+        Bytes::from(result.into_bytes())
     } else {
-        data.to_vec()
+        data.clone()
     }
 }
 
@@ -636,9 +641,9 @@ mod tests {
 
     #[test]
     fn flow_tag_inserted_before_detail_close() {
-        let xml = b"<event><detail><contact callsign=\"A\"/></detail></event>";
-        let result = add_flow_tag(xml, "fed-server-1");
-        let s = String::from_utf8(result).expect("utf8");
+        let xml = Bytes::from_static(b"<event><detail><contact callsign=\"A\"/></detail></event>");
+        let result = add_flow_tag(&xml, "fed-server-1");
+        let s = std::str::from_utf8(&result).expect("utf8");
         assert!(s.contains("<_flow-tags_>"));
         assert!(s.contains("<source name=\"fed-server-1\""));
         assert!(s.contains("</_flow-tags_></detail>"));
@@ -646,34 +651,34 @@ mod tests {
 
     #[test]
     fn flow_tag_creates_detail_section_when_missing() {
-        let xml = b"<event><point lat=\"0\" lon=\"0\"/></event>";
-        let result = add_flow_tag(xml, "my-server");
-        let s = String::from_utf8(result).expect("utf8");
+        let xml = Bytes::from_static(b"<event><point lat=\"0\" lon=\"0\"/></event>");
+        let result = add_flow_tag(&xml, "my-server");
+        let s = std::str::from_utf8(&result).expect("utf8");
         assert!(s.contains("<detail><_flow-tags_>"));
         assert!(s.contains("</_flow-tags_></detail></event>"));
     }
 
     #[test]
     fn flow_tag_escapes_source_name() {
-        let xml = b"<event><detail></detail></event>";
-        let result = add_flow_tag(xml, "server&<>\"name");
-        let s = String::from_utf8(result).expect("utf8");
+        let xml = Bytes::from_static(b"<event><detail></detail></event>");
+        let result = add_flow_tag(&xml, "server&<>\"name");
+        let s = std::str::from_utf8(&result).expect("utf8");
         assert!(s.contains("server&amp;&lt;&gt;&quot;name"));
     }
 
     #[test]
     fn flow_tag_includes_timestamp() {
-        let xml = b"<event><detail></detail></event>";
-        let result = add_flow_tag(xml, "s");
-        let s = String::from_utf8(result).expect("utf8");
+        let xml = Bytes::from_static(b"<event><detail></detail></event>");
+        let result = add_flow_tag(&xml, "s");
+        let s = std::str::from_utf8(&result).expect("utf8");
         // Timestamp should be in RFC3339 format (contains 'T' and 'Z' or offset)
         assert!(s.contains("ts=\"20"));
     }
 
     #[test]
     fn flow_tag_no_change_for_invalid_xml() {
-        let data = b"not xml at all";
-        let result = add_flow_tag(data, "s");
+        let data = Bytes::from_static(b"not xml at all");
+        let result = add_flow_tag(&data, "s");
         assert_eq!(result, data);
     }
 

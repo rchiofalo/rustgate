@@ -1155,9 +1155,10 @@ async fn dispatch_to_target(
         return;
     }
 
-    // Serialize payload
-    let (body_vec, content_type) = match payload::serialize(msg, target.format, &target.instance_id)
-    {
+    // Serialize payload. `serialize` returns `Bytes` directly so retries
+    // and auth signing share a single allocation via ref-count clones —
+    // no `Vec<u8> -> Bytes` round-trip on the message-path hot loop.
+    let (body, content_type) = match payload::serialize(msg, target.format, &target.instance_id) {
         Ok(result) => result,
         Err(e) => {
             tracing::warn!(
@@ -1172,10 +1173,6 @@ async fn dispatch_to_target(
             return;
         }
     };
-
-    // Convert to Bytes once — Bytes::clone() is a ref-count bump, not a memcpy,
-    // so retries and auth signing can share the same allocation.
-    let body = bytes::Bytes::from(body_vec);
 
     // Batching branch: when the operator opted into `batch-enabled`, push
     // the serialized single-message body into the per-target batcher and
@@ -1630,19 +1627,17 @@ async fn replay_entry(
         return ReplayOutcome::Dropped;
     }
 
-    let (body_vec, content_type) =
-        match payload::serialize(&msg, target.format, &target.instance_id) {
-            Ok(result) => result,
-            Err(err) => {
-                tracing::warn!(
-                    target = %target.name,
-                    error = %err,
-                    "DLQ replay: payload serialization failed, dropping entry"
-                );
-                return ReplayOutcome::Dropped;
-            }
-        };
-    let body = bytes::Bytes::from(body_vec);
+    let (body, content_type) = match payload::serialize(&msg, target.format, &target.instance_id) {
+        Ok(result) => result,
+        Err(err) => {
+            tracing::warn!(
+                target = %target.name,
+                error = %err,
+                "DLQ replay: payload serialization failed, dropping entry"
+            );
+            return ReplayOutcome::Dropped;
+        }
+    };
 
     // Use the preserved delivery_id when available; fall back to a
     // fresh id for pre-migration entries that carry the
