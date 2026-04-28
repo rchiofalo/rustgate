@@ -238,7 +238,7 @@ fn bench_route_group(c: &mut Criterion) {
                     let router = Arc::clone(&router);
                     let sender = Arc::clone(&sender);
                     async move {
-                        let msg = make_chat(&sender, Destination::Group("alpha".to_string()));
+                        let msg = make_chat(&sender, Destination::Group("alpha".into()));
                         black_box(router.route_for_egress(msg).await)
                     }
                 });

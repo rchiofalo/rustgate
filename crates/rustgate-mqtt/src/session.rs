@@ -595,7 +595,7 @@ async fn publish_will_message(
 
     let msg = RoutableMessage {
         source: Identity::clone(identity),
-        destination: Destination::Group(will.group.clone()),
+        destination: Destination::Group(will.group.clone().into()),
         payload: will.payload.clone(),
         metadata: Metadata {
             received_at: SystemTime::now(),
@@ -1541,7 +1541,7 @@ async fn handle_publish_v5(
 
     let msg = RoutableMessage {
         source: Identity::clone(identity),
-        destination: Destination::Group(group.into_owned()),
+        destination: Destination::Group(group.into_owned().into()),
         payload: publish.payload.clone(),
         metadata: Metadata {
             received_at: SystemTime::now(),
@@ -1682,7 +1682,7 @@ async fn handle_pubrel_v5(
 
     let msg = RoutableMessage {
         source: Identity::clone(identity),
-        destination: Destination::Group(group),
+        destination: Destination::Group(group.into()),
         payload: publish.payload.clone(),
         metadata: Metadata {
             received_at: SystemTime::now(),
@@ -1805,7 +1805,7 @@ async fn handle_publish_v4(
 
     let msg = RoutableMessage {
         source: Identity::clone(identity),
-        destination: Destination::Group(group.into_owned()),
+        destination: Destination::Group(group.into_owned().into()),
         payload: publish.payload.clone(),
         metadata: Metadata {
             received_at: SystemTime::now(),
@@ -1912,7 +1912,7 @@ async fn handle_pubrel_v4(
 
     let msg = RoutableMessage {
         source: Identity::clone(identity),
-        destination: Destination::Group(group),
+        destination: Destination::Group(group.into()),
         payload: publish.payload.clone(),
         metadata: Metadata {
             received_at: SystemTime::now(),
@@ -2870,8 +2870,8 @@ fn attach_subscription_identifiers(
     msg: &RoutableMessage,
     subscriptions: &Arc<parking_lot::Mutex<Vec<crate::session_store::RetainedSubscription>>>,
 ) {
-    let target_group = match &msg.destination {
-        Destination::Group(g) => g.as_str(),
+    let target_group: &str = match &msg.destination {
+        Destination::Group(g) => g,
         // Direct / Broadcast / Multicast deliveries do not carry
         // SUBSCRIBE-derived identifiers — no work to do.
         Destination::Direct(_) | Destination::Broadcast | Destination::Multicast(_) => {

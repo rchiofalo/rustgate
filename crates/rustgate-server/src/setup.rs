@@ -701,8 +701,12 @@ pub(crate) async fn start_enrollment(
                 .await
                 .into_iter()
                 .map(|id| rustgate_enrollment::ContactInfo {
-                    uid: id.cn.clone(),
-                    callsign: id.cn.clone(),
+                    // `id.cn` is `Arc<str>` (closes #784); the
+                    // ContactInfo wire shape is `String`, so render
+                    // each field via the `Display` impl that `Arc<str>`
+                    // forwards to `str`.
+                    uid: id.cn.to_string(),
+                    callsign: id.cn.to_string(),
                     groups: id.groups.iter().cloned().collect(),
                     last_status: "Connected".to_string(),
                 })

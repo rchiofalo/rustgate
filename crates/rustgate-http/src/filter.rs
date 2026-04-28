@@ -140,7 +140,7 @@ mod tests {
     ) -> RoutableMessage {
         RoutableMessage {
             source: Identity {
-                cn: cn.to_string(),
+                cn: cn.into(),
                 fingerprint: Default::default(),
                 groups: groups
                     .iter()
@@ -616,9 +616,9 @@ mod tests {
         let mut base = make_msg("alice", &["alpha"], "tcp", MessageType::Position);
         base.destination = Destination::Broadcast;
         assert!(filter.matches(&base));
-        base.destination = Destination::Group("bravo".to_string());
+        base.destination = Destination::Group("bravo".into());
         assert!(filter.matches(&base));
-        base.destination = Destination::Multicast(vec!["alpha".to_string(), "bravo".to_string()]);
+        base.destination = Destination::Multicast(vec!["alpha".into(), "bravo".into()]);
         assert!(filter.matches(&base));
     }
 

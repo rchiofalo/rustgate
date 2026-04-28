@@ -37,7 +37,7 @@ fn extract_identity_no_groups() {
     let certs = parse_certs(&cert.cert_pem);
     let identity = extract_identity(certs.first().expect("no cert")).expect("extract");
 
-    assert_eq!(identity.cn, "solo-operator");
+    assert_eq!(&*identity.cn, "solo-operator");
     assert!(identity.groups.is_empty());
 }
 
@@ -90,7 +90,7 @@ async fn mtls_handshake_and_identity() {
     assert_eq!(&buf, b"world");
 
     let identity = server_handle.await.expect("server task");
-    assert_eq!(identity.cn, "alice");
+    assert_eq!(&*identity.cn, "alice");
     assert_eq!(identity.groups.len(), 2);
     assert!(identity.is_member_of("engineers"));
     assert!(identity.is_member_of("admins"));
@@ -201,8 +201,8 @@ async fn accept_multiple_clients_sequentially() {
     let _stream2 = connect(addr, &bob_config).await;
 
     let (cn1, cn2) = server_handle.await.expect("server task");
-    assert_eq!(cn1, "alice");
-    assert_eq!(cn2, "bob");
+    assert_eq!(&*cn1, "alice");
+    assert_eq!(&*cn2, "bob");
 }
 
 // ── handshake concurrency limiting ──────────────────────────────────────
@@ -244,8 +244,8 @@ async fn handshake_concurrency_limit_allows_sequential() {
     let _stream2 = connect(addr, &config).await;
 
     let (cn1, cn2) = server_handle.await.expect("server task");
-    assert_eq!(cn1, "alice");
-    assert_eq!(cn2, "alice");
+    assert_eq!(&*cn1, "alice");
+    assert_eq!(&*cn2, "alice");
 }
 
 /// With a handshake limit of 1, two simultaneous handshakes are serialized
@@ -281,10 +281,10 @@ async fn handshake_concurrency_limit_serializes_parallel_connections() {
     let _stream_a = a;
     let _stream_b = b;
 
-    let names = server_handle.await.expect("server task");
+    let names: Vec<Arc<str>> = server_handle.await.expect("server task");
     assert_eq!(names.len(), 2);
-    assert!(names.contains(&"alice".to_string()));
-    assert!(names.contains(&"bob".to_string()));
+    assert!(names.iter().any(|n| &**n == "alice"));
+    assert!(names.iter().any(|n| &**n == "bob"));
 }
 
 /// Verify the default `bind` constructor still works (backwards compatibility).
@@ -311,7 +311,7 @@ async fn bind_default_handshake_limit() {
     let _stream = connect(addr, &config).await;
 
     let cn = server_handle.await.expect("server task");
-    assert_eq!(cn, "charlie");
+    assert_eq!(&*cn, "charlie");
 }
 
 // ── TLS version enforcement ─────────────────────────────────────────────
@@ -396,7 +396,7 @@ async fn tls13_only_accepts_tls13_client() {
     stream.write_all(b"ping").await.expect("client write");
 
     let cn = server_handle.await.expect("server task");
-    assert_eq!(cn, "alice");
+    assert_eq!(&*cn, "alice");
 }
 
 // ── Key usage validation ────────────────────────────────────────────────
@@ -586,9 +586,9 @@ async fn tls_session_resumption_disabled() {
     let (id1, id2) = server_handle.await.expect("server task");
 
     // Both connections extracted valid identities.
-    assert_eq!(id1.cn, "alice");
+    assert_eq!(&*id1.cn, "alice");
     assert!(id1.is_member_of("operators"));
-    assert_eq!(id2.cn, "alice");
+    assert_eq!(&*id2.cn, "alice");
     assert!(id2.is_member_of("operators"));
     assert_eq!(id1.fingerprint, id2.fingerprint);
 }

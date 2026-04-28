@@ -80,7 +80,7 @@ async fn cross_group_message_rejected() {
         .await;
 
     // Bob tries to send to group "alpha" but is only in "beta".
-    let msg = make_chat(&bob, Destination::Group("alpha".to_string()));
+    let msg = make_chat(&bob, Destination::Group("alpha".into()));
     router.route(msg).await;
 
     assert!(
@@ -108,7 +108,7 @@ async fn sender_not_in_target_group_message_dropped() {
         .await;
 
     // Alice sends to "beta" but alice is only in "alpha".
-    let msg = make_chat(&alice, Destination::Group("beta".to_string()));
+    let msg = make_chat(&alice, Destination::Group("beta".into()));
     router.route(msg).await;
 
     assert!(
@@ -196,7 +196,7 @@ async fn per_cn_group_limit_enforced() {
         .register(SessionHandle::new(alice2.clone(), ptx_a2, ntx_a2))
         .await;
 
-    let msg = make_chat(&bob, Destination::Group("g1".to_string()));
+    let msg = make_chat(&bob, Destination::Group("g1".into()));
     router.route(msg).await;
 
     // g1 is in the first 2 groups (BTreeSet sorted), so alice should receive
@@ -225,7 +225,7 @@ async fn total_group_limit_enforced() {
         .await;
 
     // Bob sends to g3 — but g3 was never created, so nobody receives
-    let msg = make_chat(&bob, Destination::Group("g3".to_string()));
+    let msg = make_chat(&bob, Destination::Group("g3".into()));
     router.route(msg).await;
     assert!(
         nrx_b.try_recv().is_err(),
@@ -305,7 +305,7 @@ async fn send_to_empty_group_succeeds() {
         .await;
 
     // Alice is the only member, and she is the sender — effectively empty
-    let msg = make_chat(&alice, Destination::Group("phantom".to_string()));
+    let msg = make_chat(&alice, Destination::Group("phantom".into()));
     router.route(msg).await;
     // No panic, no error — test passes if we reach this point
 }
@@ -323,7 +323,7 @@ async fn send_to_nonexistent_group_succeeds() {
         .register(SessionHandle::new(alice.clone(), ptx, ntx))
         .await;
 
-    let msg = make_chat(&alice, Destination::Group("nonexistent".to_string()));
+    let msg = make_chat(&alice, Destination::Group("nonexistent".into()));
     router.route(msg).await;
 }
 
@@ -396,7 +396,7 @@ async fn duplicate_registration_cleans_old_groups() {
         .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
         .await;
 
-    let msg = make_chat(&bob, Destination::Group("alpha".to_string()));
+    let msg = make_chat(&bob, Destination::Group("alpha".into()));
     router.route(msg).await;
 
     assert!(
@@ -411,7 +411,7 @@ async fn duplicate_registration_cleans_old_groups() {
         .register(SessionHandle::new(charlie.clone(), ptx_c, ntx_c))
         .await;
 
-    let msg = make_chat(&charlie, Destination::Group("beta".to_string()));
+    let msg = make_chat(&charlie, Destination::Group("beta".into()));
     router.route(msg).await;
 
     assert!(
@@ -442,7 +442,7 @@ async fn channel_backpressure_drops_gracefully() {
 
     // Bob sends many messages to "team" — alice's channel will overflow
     for _ in 0..10 {
-        let msg = make_chat(&bob, Destination::Group("team".to_string()));
+        let msg = make_chat(&bob, Destination::Group("team".into()));
         router.route(msg).await;
     }
 

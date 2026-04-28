@@ -137,7 +137,7 @@ async fn publish_subscribe_round_trip() {
         .expect("timeout waiting for message")
         .expect("channel closed");
 
-    assert_eq!(received.source.cn, "track-1");
+    assert_eq!(&*received.source.cn, "track-1");
     assert_eq!(received.metadata.source_protocol, "nats");
     assert!(received.source.groups.contains("Cyan"));
 
@@ -345,7 +345,7 @@ async fn cross_instance_delivery() {
         .await
         .expect("B should receive within timeout")
         .expect("B channel closed");
-    assert_eq!(received.source.cn, "track-cross");
+    assert_eq!(&*received.source.cn, "track-cross");
 
     // Instance A should NOT receive its own message back
     let self_echo = timeout(Duration::from_secs(2), rx_a.recv()).await;
@@ -908,7 +908,7 @@ async fn jetstream_pull_consumer_ack_flow() {
         .await
         .expect("timeout")
         .expect("channel closed");
-    assert_eq!(received.source.cn, "track-ack");
+    assert_eq!(&*received.source.cn, "track-ack");
 
     // Give time for ACK to propagate
     tokio::time::sleep(Duration::from_millis(200)).await;

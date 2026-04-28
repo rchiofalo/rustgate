@@ -85,7 +85,10 @@ pub type OnCacheSize = Arc<dyn Fn(usize) + Send + Sync>;
 
 /// Stores the most recent position report per client CN.
 pub struct PositionCache {
-    entries: RwLock<HashMap<String, RoutableMessage>>,
+    /// Keyed by `Arc<str>` so insert/remove on the SA-replay hot path
+    /// reuse the sender's existing CN allocation (refcount bump) rather
+    /// than copying the bytes into a fresh `String`. Closes #784.
+    entries: RwLock<HashMap<Arc<str>, RoutableMessage>>,
     /// Maximum number of entries before oldest-entry eviction kicks in.
     max_entries: usize,
     /// Lock-free hot-swappable size-change observer. `None` when unset;
@@ -340,7 +343,7 @@ mod tests {
 
         let all = cache.get_all().await;
         assert_eq!(all.len(), 1);
-        assert_eq!(all[0].source.cn, "alice");
+        assert_eq!(&*all[0].source.cn, "alice");
     }
 
     #[tokio::test]
@@ -354,7 +357,7 @@ mod tests {
 
         let all = cache.get_all().await;
         assert_eq!(all.len(), 1, "expired entry should be excluded");
-        assert_eq!(all[0].source.cn, "alice");
+        assert_eq!(&*all[0].source.cn, "alice");
     }
 
     #[tokio::test]
@@ -387,7 +390,7 @@ mod tests {
         assert_eq!(cache.len().await, 1);
 
         let remaining = cache.get_all().await;
-        assert_eq!(remaining[0].source.cn, "alice");
+        assert_eq!(&*remaining[0].source.cn, "alice");
     }
 
     #[tokio::test]
@@ -483,7 +486,7 @@ mod tests {
         assert_eq!(cache.len().await, 2, "should not exceed capacity");
 
         let all = cache.get_all().await;
-        let cns: Vec<&str> = all.iter().map(|m| m.source.cn.as_str()).collect();
+        let cns: Vec<&str> = all.iter().map(|m| &*m.source.cn).collect();
         assert!(!cns.contains(&"alice"), "alice should have been evicted");
         assert!(cns.contains(&"bob"));
         assert!(cns.contains(&"charlie"));
@@ -507,7 +510,7 @@ mod tests {
         assert_eq!(cache.len().await, 2);
 
         let all = cache.get_all().await;
-        let cns: Vec<&str> = all.iter().map(|m| m.source.cn.as_str()).collect();
+        let cns: Vec<&str> = all.iter().map(|m| &*m.source.cn).collect();
         assert!(cns.contains(&"alice"));
         assert!(cns.contains(&"bob"));
     }

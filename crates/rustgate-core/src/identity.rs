@@ -79,7 +79,14 @@ pub enum IdentityError {
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct Identity {
     /// Certificate Common Name (or synthetic CN for plaintext sessions).
-    pub cn: String,
+    ///
+    /// Stored as `Arc<str>` so per-recipient fan-out cloning is a refcount
+    /// bump rather than a heap allocation. Display / Debug / `as_str` /
+    /// `Deref<Target = str>` are all forwarded by `Arc<str>` so callers
+    /// that previously took `&str` continue to work unchanged. The wire
+    /// format and external rendering are identical to the prior `String`
+    /// representation. Closes #784.
+    pub cn: Arc<str>,
     /// SHA-256 fingerprint of the presented certificate, or empty for plaintext.
     pub fingerprint: CertFingerprint,
     /// Group memberships derived from OU fields.
@@ -123,7 +130,7 @@ impl Identity {
         }
 
         Ok(Self {
-            cn,
+            cn: Arc::<str>::from(cn),
             fingerprint,
             groups,
             tenant: None,
@@ -141,7 +148,7 @@ impl Identity {
         validate_cn(&cn)?;
 
         Ok(Self {
-            cn,
+            cn: Arc::<str>::from(cn),
             fingerprint: String::new(),
             groups,
             tenant: None,
@@ -236,7 +243,7 @@ impl<'a> Arbitrary<'a> for Identity {
         }
 
         Ok(Self {
-            cn,
+            cn: Arc::<str>::from(cn),
             fingerprint,
             groups,
             tenant: None,
@@ -262,7 +269,7 @@ mod tests {
         let id = Identity::new("alice".to_string(), "aa:bb:cc".to_string(), BTreeSet::new());
         assert!(id.is_ok());
         let id = id.unwrap();
-        assert_eq!(id.cn, "alice");
+        assert_eq!(&*id.cn, "alice");
         assert_eq!(id.fingerprint, "aa:bb:cc");
     }
 
@@ -607,7 +614,7 @@ mod tests {
             .with_spiffe_id("spiffe://example/alice")
             .with_attributes(attrs.clone());
         // Original constructor fields preserved.
-        assert_eq!(id.cn, "alice");
+        assert_eq!(&*id.cn, "alice");
         assert_eq!(id.fingerprint, "fp");
         assert_eq!(id.groups, groups);
         // Each builder's effect present.
@@ -641,6 +648,61 @@ mod tests {
             Arc::strong_count(&id.attributes),
             2,
             "strong count must reflect the shared ownership after one clone"
+        );
+    }
+
+    #[test]
+    fn identity_cn_arc_str_clone_is_refcount_bump() {
+        // Closes #784. `Identity.cn` is `Arc<str>` so per-recipient
+        // fan-out clones are a refcount bump — not a fresh
+        // heap allocation as they would be if `cn` were `String`. A
+        // regression that changed `cn` back to `String` (or wrapped
+        // it in something that deep-copies on clone, e.g. a custom
+        // smart-pointer that allocates on `Clone`) would silently
+        // 1000× the allocator cost of a 1000-subscriber broadcast.
+        // Pin the contract via `Arc::strong_count`: cloning the
+        // owning `Identity` must increment the refcount on the same
+        // underlying `Arc<str>`, never produce a second allocation.
+        let id = Identity::new("alice".into(), "fp".into(), BTreeSet::new()).unwrap();
+        // Pre-clone: only the original `Identity` holds the `cn` Arc.
+        assert_eq!(
+            Arc::strong_count(&id.cn),
+            1,
+            "cn Arc must start at strong_count=1"
+        );
+
+        let cloned = id.clone();
+        assert!(
+            Arc::ptr_eq(&id.cn, &cloned.cn),
+            "Identity::clone must share the cn Arc, not re-allocate"
+        );
+        assert_eq!(
+            Arc::strong_count(&id.cn),
+            2,
+            "strong count must reflect both owners after one clone"
+        );
+
+        // A second clone bumps the refcount further. This pins that
+        // every clone is O(1) refcount work — a regression that
+        // deep-copied on second clone (e.g. via copy-on-write that
+        // forks at strong_count > 1) would surface here.
+        let cloned2 = id.clone();
+        assert!(
+            Arc::ptr_eq(&id.cn, &cloned2.cn),
+            "second clone must still share the same cn Arc"
+        );
+        assert_eq!(
+            Arc::strong_count(&id.cn),
+            3,
+            "strong count must reach 3 after two clones"
+        );
+
+        // Drop one clone — refcount returns to 2.
+        drop(cloned);
+        assert_eq!(
+            Arc::strong_count(&id.cn),
+            2,
+            "strong count must drop back to 2 after one clone is dropped"
         );
     }
 
@@ -731,11 +793,11 @@ mod tests {
         // would silently change which Cedar policies match across
         // releases.
         let id = Identity::new("Alice".into(), "fp".into(), BTreeSet::new()).unwrap();
-        assert_eq!(id.cn, "Alice", "Identity must preserve case verbatim");
+        assert_eq!(&*id.cn, "Alice", "Identity must preserve case verbatim");
 
         let id_pt = Identity::plaintext("Bob.Smith".into(), BTreeSet::new()).unwrap();
         assert_eq!(
-            id_pt.cn, "Bob.Smith",
+            &*id_pt.cn, "Bob.Smith",
             "Identity::plaintext must preserve case verbatim"
         );
     }
@@ -783,11 +845,11 @@ mod tests {
              collapse the two byte forms into the same authz cache slot."
         );
         assert_eq!(
-            id_nfc.cn, nfc,
+            &*id_nfc.cn, nfc,
             "NFC bytes preserved verbatim at construction"
         );
         assert_eq!(
-            id_nfd.cn, nfd,
+            &*id_nfd.cn, nfd,
             "NFD bytes preserved verbatim at construction"
         );
     }
@@ -802,7 +864,7 @@ mod tests {
         let with_ws = Identity::new("  alice  ".into(), "fp".into(), BTreeSet::new()).unwrap();
         let without_ws = Identity::new("alice".into(), "fp".into(), BTreeSet::new()).unwrap();
         assert_eq!(
-            with_ws.cn, "  alice  ",
+            &*with_ws.cn, "  alice  ",
             "constructor must NOT trim leading / trailing whitespace"
         );
         assert_ne!(

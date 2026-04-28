@@ -144,7 +144,7 @@ async fn crl_accepts_non_revoked_client() {
     assert_eq!(&buf, b"world");
 
     let identity = server_handle.await.expect("server task");
-    assert_eq!(identity.cn, "good-user");
+    assert_eq!(&*identity.cn, "good-user");
 }
 
 /// Multiple certificates can be revoked in a single CRL. Verifies that
@@ -374,7 +374,7 @@ async fn crl_hot_swap_rejects_newly_revoked() {
     assert_eq!(&buf, b"pong");
 
     let identity = server_handle.await.expect("server task phase 1");
-    assert_eq!(identity.cn, "revoked-user");
+    assert_eq!(&*identity.cn, "revoked-user");
 
     // ── Phase 2: Generate CRL revoking client B, rebuild config ─────────
     let crl_pem = ca.generate_crl(&[&client_b.cert_pem]);
@@ -423,7 +423,7 @@ async fn crl_hot_swap_rejects_newly_revoked() {
     assert_eq!(&buf_a, b"world");
 
     let identity_a = server_handle_a.await.expect("server task for client A");
-    assert_eq!(identity_a.cn, "good-user");
+    assert_eq!(&*identity_a.cn, "good-user");
 
     // ── Phase 4: Client B connects to CRL-enabled server — rejected ─────
     let server_handle_b = tokio::spawn(async move {

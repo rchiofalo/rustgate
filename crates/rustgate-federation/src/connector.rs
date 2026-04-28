@@ -553,7 +553,7 @@ mod tests {
 
         let (_, identity) = connector.connect(addr, "localhost").await.expect("connect");
 
-        assert_eq!(identity.cn, "localhost");
+        assert_eq!(&*identity.cn, "localhost");
         server_handle.abort();
     }
 
@@ -574,7 +574,7 @@ mod tests {
         let (_, identity) = connector.connect(addr, "localhost").await.expect("connect");
 
         // Server cert CN is "localhost"
-        assert_eq!(identity.cn, "localhost");
+        assert_eq!(&*identity.cn, "localhost");
         // Server cert has no OU groups
         assert!(identity.groups.is_empty());
         // Fingerprint should be set
@@ -604,7 +604,7 @@ mod tests {
             .await
             .expect("connect with skip hostname verify");
 
-        assert_eq!(identity.cn, "localhost");
+        assert_eq!(&*identity.cn, "localhost");
         server_handle.abort();
     }
 
@@ -822,19 +822,19 @@ mod tests {
             .connect(addr, "localhost")
             .await
             .expect("connect 1");
-        assert_eq!(id1.cn, "localhost");
+        assert_eq!(&*id1.cn, "localhost");
 
         let (_, id2) = connector
             .connect(addr, "localhost")
             .await
             .expect("connect 2");
-        assert_eq!(id2.cn, "localhost");
+        assert_eq!(&*id2.cn, "localhost");
 
         let (_, id3) = connector
             .connect(addr, "localhost")
             .await
             .expect("connect 3");
-        assert_eq!(id3.cn, "localhost");
+        assert_eq!(&*id3.cn, "localhost");
 
         handle.abort();
     }
@@ -952,7 +952,7 @@ mod tests {
                 .expect("create dynamic connector");
 
         let (_, identity) = connector.connect(addr, "localhost").await.expect("connect");
-        assert_eq!(identity.cn, "localhost");
+        assert_eq!(&*identity.cn, "localhost");
 
         server_handle.abort();
     }

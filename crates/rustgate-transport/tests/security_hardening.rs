@@ -78,26 +78,26 @@ async fn slow_consumer_cannot_block_other_sessions() {
 
     // Fill alice's normal channel to capacity so subsequent sends drop
     router
-        .route(chat(&sender, Destination::Group("team".to_string())))
+        .route(chat(&sender, Destination::Group("team".into())))
         .await;
 
     // Alice's channel (capacity 1) is now full. Send another group
     // message. This must NOT block: bob should still receive it.
     router
-        .route(chat(&sender, Destination::Group("team".to_string())))
+        .route(chat(&sender, Destination::Group("team".into())))
         .await;
 
     // Bob must have received both messages
     let msg1 = nrx_b.try_recv().expect("bob should receive first message");
-    assert_eq!(msg1.source.cn, "sender");
+    assert_eq!(&*msg1.source.cn, "sender");
     let msg2 = nrx_b.try_recv().expect("bob should receive second message");
-    assert_eq!(msg2.source.cn, "sender");
+    assert_eq!(&*msg2.source.cn, "sender");
 
     // Alice received one (capacity 1) and the second was dropped
     let alice_msg = nrx_a
         .try_recv()
         .expect("alice should receive first message");
-    assert_eq!(alice_msg.source.cn, "sender");
+    assert_eq!(&*alice_msg.source.cn, "sender");
     // The second message should have been dropped (channel was full)
     assert!(
         nrx_a.try_recv().is_err(),
@@ -128,19 +128,19 @@ async fn circuit_breaker_disconnects_persistently_slow_session() {
 
     // First message fills the channel (capacity 1)
     router
-        .route(chat(&sender, Destination::Group("team".to_string())))
+        .route(chat(&sender, Destination::Group("team".into())))
         .await;
 
     // Next 3 attempts should fail (channel full), tripping breaker on 3rd
     for _ in 0..3 {
         router
-            .route(chat(&sender, Destination::Group("team".to_string())))
+            .route(chat(&sender, Destination::Group("team".into())))
             .await;
     }
 
     // Drain the one message that was successfully delivered
     let msg = nrx.try_recv().expect("should receive the first message");
-    assert_eq!(msg.source.cn, "sender");
+    assert_eq!(&*msg.source.cn, "sender");
 
     // After the circuit breaker trips, the channel is closed.
     // Subsequent recv should return None (channel closed).

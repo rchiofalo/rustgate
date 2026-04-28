@@ -559,7 +559,7 @@ mod tests {
             .into_routable("Cyan", Bytes::from_static(b"{}"))
             .expect("valid identity");
         assert_eq!(msg.metadata.source_protocol, "nats");
-        assert_eq!(msg.source.cn, "test-uid");
+        assert_eq!(&*msg.source.cn, "test-uid");
         assert!(msg.source.groups.contains("Cyan"));
         assert!(matches!(msg.metadata.message_type, MessageType::Position));
     }
@@ -1082,7 +1082,7 @@ mod tests {
         let msg = plain_event("UNIQUE-UID", "a-f-G")
             .into_routable("", Bytes::from_static(b"{}"))
             .expect("identity");
-        assert_eq!(msg.source.cn, "UNIQUE-UID");
+        assert_eq!(&*msg.source.cn, "UNIQUE-UID");
     }
 
     #[test]
