@@ -120,6 +120,16 @@ impl NativeEngine {
             misses: self.cache.misses(),
         }
     }
+
+    /// Total live decision-cache entries across all shards.
+    ///
+    /// Used by `rustgate_authz_cache_size` (issue #771). Intended for
+    /// the per-evaluation observation site exposing the gauge — not a
+    /// hot-path read.
+    #[cfg(feature = "metrics")]
+    pub fn cache_entry_count(&self) -> usize {
+        self.cache.total_entries()
+    }
 }
 
 fn resource_hash(resource: &Resource<'_>) -> u64 {
@@ -149,6 +159,8 @@ impl PolicyEngine for NativeEngine {
         resource: &Resource<'_>,
         action: Action,
     ) -> DecisionOutcome {
+        #[cfg(feature = "metrics")]
+        let _start = std::time::Instant::now();
         let cache_key = DecisionKey {
             subject_hash: subject.subject_hash,
             resource_hash: resource_hash(resource),
@@ -156,11 +168,15 @@ impl PolicyEngine for NativeEngine {
             policy_epoch: self.compiled.epoch,
         };
         if let Some(hit) = self.cache.get(&cache_key) {
+            #[cfg(feature = "metrics")]
+            self.record_metrics(&hit, subject, _start);
             return hit;
         }
 
         let outcome = self.evaluate_uncached(subject, resource, action);
         self.cache.insert(cache_key, &outcome);
+        #[cfg(feature = "metrics")]
+        self.record_metrics(&outcome, subject, _start);
         outcome
     }
 
@@ -275,6 +291,86 @@ fn deny_from(rule: &CompiledRule) -> DecisionOutcome {
         decision: Decision::Deny,
         rule_id: Some(rule.id.clone()),
         obligations: Vec::new(),
+    }
+}
+
+#[cfg(feature = "metrics")]
+fn decision_label(d: Decision) -> &'static str {
+    // `Decision` is `#[non_exhaustive]` for downstream callers but
+    // exhaustive within this crate. A future-added variant landing
+    // within the crate must update this match (compile error here is
+    // the right signal); downstream observers see the bounded label
+    // vocabulary `allow | deny | not_applicable` and the engine
+    // chooses which existing variant maps to which label. The
+    // `not_applicable` token is reserved for a future deny-on-decline
+    // / decision-not-reached variant — there is no current variant to
+    // route there.
+    match d {
+        Decision::Allow => "allow",
+        Decision::Deny => "deny",
+    }
+}
+
+#[cfg(feature = "metrics")]
+fn subject_class(subject: &Subject<'_>) -> &'static str {
+    // Coarse identity bucketing for label cardinality control. The
+    // vocabulary is fixed so cardinality is bounded at compile time.
+    if subject.cn == rustgate_core::constants::ANONYMOUS_IDENTITY {
+        "anonymous"
+    } else if subject.fingerprint.is_empty() {
+        "other"
+    } else if subject.spiffe_id.is_some() {
+        "federated"
+    } else {
+        "tls_cn"
+    }
+}
+
+#[cfg(feature = "metrics")]
+fn obligation_label(o: &crate::model::Obligation) -> &'static str {
+    use crate::model::Obligation;
+    // `Obligation` is `#[non_exhaustive]` for downstream callers but
+    // exhaustive within this crate. A future-added variant must update
+    // this match (compile error here is the right signal); the
+    // `unknown` token is reserved on the metric vocabulary so the
+    // sibling `rustgate_obligation_applied_total` family in
+    // `rustgate-server::metrics` and this counter agree on the
+    // bounded label set.
+    match o {
+        Obligation::MaskPoint => "mask_point",
+        Obligation::MaskPayload => "mask_payload",
+        Obligation::TagClassified => "tag_classified",
+        Obligation::AuditExtended => "audit_extended",
+    }
+}
+
+#[cfg(feature = "metrics")]
+impl NativeEngine {
+    fn record_metrics(
+        &self,
+        outcome: &DecisionOutcome,
+        subject: &Subject<'_>,
+        start: std::time::Instant,
+    ) {
+        let elapsed = start.elapsed().as_secs_f64();
+        let dec = decision_label(outcome.decision);
+        crate::metrics::evaluations_total()
+            .with_label_values(&[dec, subject_class(subject)])
+            .inc();
+        crate::metrics::evaluation_seconds()
+            .with_label_values(&[dec])
+            .observe(elapsed);
+        for obligation in &outcome.obligations {
+            crate::metrics::obligations_emitted_total()
+                .with_label_values(&[obligation_label(obligation)])
+                .inc();
+        }
+        // Cache size gauge: the decision cache is sharded; set to the
+        // total live count post-insertion. Cost is one mutex per shard,
+        // bounded by the configured shard count (default 16) — well
+        // below the surrounding evaluation work.
+        let entries = self.cache.total_entries();
+        crate::metrics::cache_size().set(i64::try_from(entries).unwrap_or(i64::MAX));
     }
 }
 

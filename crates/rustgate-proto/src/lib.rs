@@ -28,6 +28,8 @@ compile_error!("rustgate-proto requires a 64-bit platform (varint decoding uses 
 pub mod codec;
 pub mod convert;
 pub mod error;
+#[cfg(feature = "metrics")]
+pub mod metrics;
 pub mod negotiate;
 pub mod proto_codec;
 pub mod xml_full;

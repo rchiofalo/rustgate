@@ -21,6 +21,8 @@
 
 pub mod delta;
 pub mod mask;
+#[cfg(feature = "metrics")]
+pub mod metrics;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -506,7 +508,27 @@ pub fn how_is_spec_conformant(how: &str) -> bool {
 }
 
 /// Parses a CoT XML byte slice into a [`CotEvent`].
+///
+/// Under the `metrics` feature, every call increments
+/// `rustgate_cot_parse_total{result}` (`ok` | `err`) and observes its
+/// wall-clock duration into `rustgate_cot_parse_seconds`. The metrics
+/// wrap is feature-gated so the no-features build emits no extra
+/// instructions on the parse hot path.
 pub fn parse(xml: &[u8]) -> Result<CotEvent, ParseError> {
+    #[cfg(feature = "metrics")]
+    let _start = std::time::Instant::now();
+    let result = parse_inner(xml);
+    #[cfg(feature = "metrics")]
+    {
+        let elapsed = _start.elapsed().as_secs_f64();
+        metrics::parse_seconds().observe(elapsed);
+        let label = if result.is_ok() { "ok" } else { "err" };
+        metrics::parse_total().with_label_values(&[label]).inc();
+    }
+    result
+}
+
+fn parse_inner(xml: &[u8]) -> Result<CotEvent, ParseError> {
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(true);
 

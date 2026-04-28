@@ -21,6 +21,8 @@
 
 pub mod compression;
 pub mod health;
+#[cfg(feature = "metrics")]
+pub mod metrics;
 mod rate_limit;
 mod server;
 
