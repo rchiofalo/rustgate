@@ -87,8 +87,6 @@ opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
-tikv-jemallocator = { workspace = true, optional = true }
-tikv-jemalloc-ctl = { workspace = true, optional = true }
 schemars = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "signal", "fs", "macros", "time", "net"] }
@@ -110,6 +108,17 @@ zeroize = { workspace = true }
 hex = { workspace = true }
 rustix = { workspace = true }
 time = { workspace = true }
+
+# `tikv-jemallocator` and `tikv-jemalloc-ctl` are POSIX-only; gating them
+# under `cfg(not(target_os = "windows"))` lets a Windows build with the
+# `jemalloc` feature flag still resolve cleanly (the dep is simply absent
+# on Windows targets) instead of failing to compile the upstream crate.
+# Linux/macOS builds with `--features jemalloc` continue to opt in via
+# the feature gate below; the dep stays optional so default builds keep
+# the system allocator. Refs #831 (F-B).
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+tikv-jemallocator = { workspace = true, optional = true }
+tikv-jemalloc-ctl = { workspace = true, optional = true }
 
 [dev-dependencies]
 rustgate-test-utils = { workspace = true }

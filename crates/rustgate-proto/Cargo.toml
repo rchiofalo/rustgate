@@ -34,3 +34,8 @@ proptest = { workspace = true }
 
 [build-dependencies]
 prost-build = { workspace = true }
+
+[package.metadata.cargo-machete]
+# `prost-build` is invoked from `build.rs` to compile the protobuf
+# definitions; cargo-machete cannot see build-script usage. Refs #831 (F-D).
+ignored = ["prost-build"]

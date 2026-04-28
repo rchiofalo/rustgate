@@ -6,7 +6,12 @@
 //! graceful shutdown logic. Subsystem initialization is delegated to [`setup`],
 //! session handling to [`session`], and CLI parsing to [`cli`].
 
-#[cfg(feature = "jemalloc")]
+// `tikv-jemallocator` is POSIX-only and the dependency is target-gated
+// under `cfg(not(target_os = "windows"))` in Cargo.toml. Mirror that
+// gate here so a Windows build that nonetheless enables the `jemalloc`
+// feature flag still compiles (it falls back to the system allocator on
+// Windows). Refs #831 (F-B).
+#[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
