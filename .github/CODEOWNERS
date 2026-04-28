@@ -1,23 +1,139 @@
-# Default owner for everything
-* @rchiofalo
+# =====================================================================
+# CODEOWNERS for rustgate
+# ---------------------------------------------------------------------
+# This file routes review requests automatically when a PR touches the
+# matching paths. GitHub adds every listed owner as a requested reviewer
+# the moment the PR is opened or the diff changes to include a matching
+# file.
+#
+# Layout: BROAD-TO-NARROW. CODEOWNERS uses a *last-match-wins* rule
+# (https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners),
+# so the catch-all goes FIRST and the path-specific overrides come AFTER.
+# A PR that touches `crates/rustgate-authz/src/engine.rs` matches both
+# the global `*` rule and the authz block; the authz block, being
+# further down, is the one that takes effect.
+#
+# Sections, in order:
+#   1. Catch-all default owner.
+#   2. Whole-crate ownership for protocol / transport / federation /
+#      server / integration crates (broad).
+#   3. Build / supply-chain & CI surface (root-level config + workflows).
+#   4. Documentation governance (CHANGELOG, CONTRIBUTING, SECURITY,
+#      LICENSE, ADR collection).
+#   5. Security-critical files within the broader crates (narrowest).
+#
+# This is currently a single-maintainer repo, so every rule routes to
+# `@rchiofalo`. The structure exists to make the security-critical
+# surface area explicit and to make a multi-reviewer expansion a
+# one-line edit per row (swap `@rchiofalo` for `@<security-team>` on
+# the relevant rows).
+#
+# Syntax reminders:
+#   - Patterns are gitignore-style. Trailing `/` matches a directory.
+#   - `*` matches everything; later, more specific patterns win.
+#   - Owners must be valid GitHub usernames or team handles.
+# =====================================================================
 
-# CI/CD and infrastructure
-.github/ @rchiofalo
-Dockerfile @rchiofalo
-helm/ @rchiofalo
-deny.toml @rchiofalo
+# ---------------------------------------------------------------------
+# 1. Catch-all default owner.
+# ---------------------------------------------------------------------
+*                                                  @rchiofalo
 
-# Core protocol and transport
-crates/rustgate-core/ @rchiofalo
-crates/rustgate-transport/ @rchiofalo
-crates/rustgate-cot/ @rchiofalo
+# ---------------------------------------------------------------------
+# 2. Whole-crate ownership.
+#    Broad ownership over each crate. Path-specific security overrides
+#    in section 5 narrow this for the highest-risk files.
+# ---------------------------------------------------------------------
+crates/rustgate-core/                              @rchiofalo
+crates/rustgate-cot/                               @rchiofalo
+crates/rustgate-authz/                             @rchiofalo
+crates/rustgate-enrollment/                        @rchiofalo
+crates/rustgate-federation/                        @rchiofalo
+crates/rustgate-http/                              @rchiofalo
+crates/rustgate-mavlink/                           @rchiofalo
+crates/rustgate-asterix/                           @rchiofalo
+crates/rustgate-stanag4586/                        @rchiofalo
+crates/rustgate-nats/                              @rchiofalo
+crates/rustgate-proto/                             @rchiofalo
+crates/rustgate-resilience/                        @rchiofalo
+crates/rustgate-transport/                         @rchiofalo
+crates/rustgate-websocket/                         @rchiofalo
+crates/rustgate-mqtt/                              @rchiofalo
+crates/rustgate-client/                            @rchiofalo
+crates/rustgate-server/                            @rchiofalo
+crates/rustgate-test-utils/                        @rchiofalo
 
-# Federation subsystem
-crates/rustgate-federation/ @rchiofalo
-crates/rustgate-proto/ @rchiofalo
+# ---------------------------------------------------------------------
+# 3. Build / supply-chain & CI surface.
+#    Changes here affect every artefact the project ships and the
+#    integrity gates that protect them. Workspace dependency edits, lint
+#    policy changes, license/advisory rules, the container image, the
+#    Helm chart, and CI workflows all live here.
+# ---------------------------------------------------------------------
+Cargo.toml                                         @rchiofalo
+Cargo.lock                                         @rchiofalo
+deny.toml                                          @rchiofalo
+clippy.toml                                        @rchiofalo
+rust-toolchain.toml                                @rchiofalo
+rustfmt.toml                                       @rchiofalo
+.github/workflows/                                 @rchiofalo
+.github/CODEOWNERS                                 @rchiofalo
+Dockerfile                                         @rchiofalo
+helm/                                              @rchiofalo
+scripts/                                           @rchiofalo
 
-# Server and integrations
-crates/rustgate-server/ @rchiofalo
-crates/rustgate-nats/ @rchiofalo
-crates/rustgate-websocket/ @rchiofalo
-crates/rustgate-enrollment/ @rchiofalo
+# ---------------------------------------------------------------------
+# 4. Documentation governance.
+#    Files that record the project's posture, contracts, and history.
+#    Architecture Decision Records under `docs/adr/` carry the workspace's
+#    binding rationale and should be reviewed alongside any change that
+#    contradicts a recorded decision.
+# ---------------------------------------------------------------------
+CHANGELOG.md                                       @rchiofalo
+CONTRIBUTING.md                                    @rchiofalo
+SECURITY.md                                        @rchiofalo
+LICENSE                                            @rchiofalo
+docs/adr/                                          @rchiofalo
+
+# =====================================================================
+# 5. Security-critical paths.
+#
+# Changes to anything in this section must be reviewed by an operator
+# with security context: the authorization engine, the certificate
+# enrollment surface, the TLS verifier, the SPIFFE workload-identity
+# integration, the per-tenant quota tracker, the encrypted-archive key
+# ring, the hash-chained audit log, the audit event vocabulary itself,
+# the workspace secret-file reader, the PII-masking helpers, and the
+# federation JWT / JWKS authentication plane.
+#
+# These are the highest-risk files in the workspace because a defect
+# here either weakens the trust boundary (identity, authz, mTLS) or
+# weakens the forensic record (audit, masking, encrypted archive). They
+# are listed individually after the whole-crate rules above so that
+# CODEOWNERS' last-match-wins behaviour routes them through this section
+# rather than through the broader crate ownership.
+# =====================================================================
+
+# Authorization engine — RBAC/ABAC, Cedar backend, PEP boundary.
+crates/rustgate-authz/                             @rchiofalo
+
+# Certificate enrollment — PKCS#12, EST (RFC 7030), CSR signing oracle.
+crates/rustgate-enrollment/                        @rchiofalo
+
+# Transport — TLS verifier, cert reloader, SPIFFE SVID, tenant quota.
+crates/rustgate-transport/src/verifier.rs          @rchiofalo
+crates/rustgate-transport/src/cert_reloader.rs     @rchiofalo
+crates/rustgate-transport/src/spiffe.rs            @rchiofalo
+crates/rustgate-transport/src/quota.rs             @rchiofalo
+
+# Core — encrypted archive key ring, hash-chained audit log, audit
+# event vocabulary, secret-file reader, PII masking helpers.
+crates/rustgate-core/src/encrypted.rs              @rchiofalo
+crates/rustgate-core/src/audit_chain.rs            @rchiofalo
+crates/rustgate-core/src/audit.rs                  @rchiofalo
+crates/rustgate-core/src/secrets.rs                @rchiofalo
+crates/rustgate-core/src/masking.rs                @rchiofalo
+
+# Federation — JWT authority + JWKS client (federation auth plane).
+crates/rustgate-federation/src/jwt.rs              @rchiofalo
+crates/rustgate-federation/src/jwks_client.rs      @rchiofalo
