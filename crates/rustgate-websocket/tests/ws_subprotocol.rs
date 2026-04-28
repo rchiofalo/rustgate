@@ -29,6 +29,18 @@ fn config_with(subprotocols: Vec<String>) -> WsListenerConfig {
     }
 }
 
+/// Build a `WsListenerConfig` with strict subprotocol enforcement opted in.
+/// Used by the strict-rejection test below; default behaviour is lenient
+/// (`subprotocol_strict = false`) per #884, which the lenient-mode test
+/// pins as the cross-version contract.
+fn strict_config_with(subprotocols: Vec<String>) -> WsListenerConfig {
+    WsListenerConfig {
+        supported_subprotocols: subprotocols,
+        subprotocol_strict: true,
+        ..WsListenerConfig::default()
+    }
+}
+
 /// Build an `IntoClientRequest` carrying the given `Sec-WebSocket-Protocol`
 /// header values. Accepts multiple values — each is appended as a separate
 /// header line so we can exercise the multi-header code path. Pass an empty
@@ -102,6 +114,19 @@ fn spawn_listener(
     rustls::ClientConfig,
     tokio::task::JoinHandle<Option<String>>,
 ) {
+    spawn_listener_with(config_with(server_protocols))
+}
+
+/// Lower-level variant that accepts a fully built `WsListenerConfig`. Lets
+/// the strict-mode test inject `subprotocol_strict = true` while the rest
+/// of the harness stays at defaults.
+fn spawn_listener_with(
+    config: WsListenerConfig,
+) -> (
+    std::net::SocketAddr,
+    rustls::ClientConfig,
+    tokio::task::JoinHandle<Option<String>>,
+) {
     let ca = TestCa::new("Test CA");
     let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
     let client_cert = ca.issue_client_cert("alice", &["engineers"]);
@@ -110,8 +135,7 @@ fn spawn_listener(
         TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem).unwrap();
 
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let listener =
-        WsListener::bind_with_config(addr, &tls_config, config_with(server_protocols)).unwrap();
+    let listener = WsListener::bind_with_config(addr, &tls_config, config).unwrap();
     let bound_addr = listener.local_addr().unwrap();
 
     let handle = tokio::spawn(async move {
@@ -201,23 +225,115 @@ async fn client_offers_none_leaves_protocol_unset() {
     assert!(server_saw.is_none());
 }
 
-/// Server advertises a list, client offers a disjoint list — server
-/// rejects the upgrade with 400. This matches every real client's
-/// expectation that "I asked for a protocol, you didn't pick one" is a
-/// fatal error, and keeps the rejection reason surfaced in server logs.
+/// **#884 default-flip pin.** Server advertises a list, client offers a
+/// disjoint list. The lenient default (the new #884 behaviour) keeps the
+/// upgrade alive: tungstenite's *client* will then surface an error
+/// because the server omitted `Sec-WebSocket-Protocol` in the response, but
+/// the *server* did not reject the upgrade. This is the right tradeoff for
+/// TAK and similar tactical clients that probe many subprotocols and fall
+/// back to native non-subprotocol framing on no-match — a strict 400 here
+/// regresses interop. See `subprotocol_no_match_strict_rejects_with_400`
+/// for the opt-in strict path.
 #[tokio::test]
-async fn disjoint_client_offer_is_rejected_with_400() {
+async fn subprotocol_no_match_lenient_completes_without_header() {
     let (addr, client_tls, handle) = spawn_listener(vec!["cot.v2".to_string()]);
     let req = request_for(addr.port(), &["proprietary.only", "also.unsupported"]);
     let err = connect_expecting_error(addr, &client_tls, req).await;
     let msg = err.to_string();
-    // tungstenite reports a 400 as `HttpFormat` / `Http` with the status.
+    // The error must NOT be a server-side 400 — instead tungstenite's
+    // client surfaces a subprotocol-error variant because the server
+    // legitimately omitted the response header. Pin both shapes: the
+    // absence of a 400 *and* the presence of subprotocol-related
+    // wording.
     assert!(
-        msg.contains("400") || msg.to_lowercase().contains("bad request"),
-        "expected a 400 Bad Request client error, got: {msg}",
+        !msg.contains("400") && !msg.to_lowercase().contains("bad request"),
+        "lenient mode must not surface a server 400; got: {msg}",
+    );
+    assert!(
+        msg.contains("SubProtocol") || msg.contains("subprotocol") || msg.contains("protocol"),
+        "expected client-side subprotocol error in lenient mode, got: {msg}",
     );
     let server_saw = handle.await.unwrap();
     assert!(server_saw.is_none());
+}
+
+/// Strict mode: the operator opted into rejecting disjoint offers with a
+/// 400. Used by deployments where every client is expected to speak one of
+/// the advertised subprotocols — a config drift then surfaces as a clean
+/// server-side 400 in logs instead of an opaque client-side protocol
+/// error.
+#[tokio::test]
+async fn subprotocol_no_match_strict_rejects_with_400() {
+    let (addr, client_tls, handle) =
+        spawn_listener_with(strict_config_with(vec!["cot.v2".to_string()]));
+    let req = request_for(addr.port(), &["proprietary.only", "also.unsupported"]);
+    let err = connect_expecting_error(addr, &client_tls, req).await;
+    let msg = err.to_string();
+    // tungstenite reports a server 400 as `HttpFormat` / `Http` with the
+    // status — match either the literal status code or the standard
+    // status reason phrase.
+    assert!(
+        msg.contains("400") || msg.to_lowercase().contains("bad request"),
+        "expected a 400 Bad Request client error in strict mode, got: {msg}",
+    );
+    let server_saw = handle.await.unwrap();
+    assert!(server_saw.is_none());
+}
+
+/// **#884 contract pin.** Per RFC 6455 §4.2.2, the server picks the first
+/// client-offered subprotocol that also appears in the server's allow-list.
+/// Client preference order wins — the server's order is a *filter*, not a
+/// strict ranking. This test pins the cross-version semantics promised in
+/// the README.
+///
+/// We pass the offers as a single comma-separated header value because
+/// tungstenite's client-side handshake stores only the *first*
+/// `Sec-WebSocket-Protocol` header value (it never folds multiple headers
+/// into one list internally), so multi-header appends would have the
+/// client reject the server's perfectly valid choice with
+/// `InvalidSubProtocol`. Real browser/Node/Python clients always emit a
+/// single comma-separated header, so the test mirrors deployment shape.
+#[tokio::test]
+async fn subprotocol_first_match_is_chosen() {
+    let (addr, client_tls, handle) = spawn_listener(vec!["bar".to_string(), "tak.v1".to_string()]);
+    let req = request_for(addr.port(), &["foo, tak.v1, bar"]);
+    let (_ws, response) = connect_with_request(addr, &client_tls, req).await;
+    assert_eq!(
+        response
+            .headers()
+            .get(header::SEC_WEBSOCKET_PROTOCOL)
+            .expect("server should echo the chosen subprotocol")
+            .to_str()
+            .unwrap(),
+        "tak.v1",
+        "client preference order wins (RFC 6455 §4.2.2)",
+    );
+    let server_saw = handle.await.unwrap();
+    assert_eq!(server_saw.as_deref(), Some("tak.v1"));
+}
+
+/// **#884 default-empty pin.** When `subprotocols` is empty (the default),
+/// the server preserves pre-#884 / pre-#1131 behaviour: no
+/// `Sec-WebSocket-Protocol` header is processed and the upgrade always
+/// succeeds. Every existing deployment that did not configure the
+/// subprotocol list must continue to work uncompressed.
+#[tokio::test]
+async fn subprotocols_default_empty_preserves_existing_behavior() {
+    let (addr, client_tls, handle) = spawn_listener(Vec::new());
+    let req = request_for(addr.port(), &[]); // no Sec-WebSocket-Protocol either
+    let (_ws, response) = connect_with_request(addr, &client_tls, req).await;
+    assert!(
+        response
+            .headers()
+            .get(header::SEC_WEBSOCKET_PROTOCOL)
+            .is_none(),
+        "default-empty config must not emit a Sec-WebSocket-Protocol header",
+    );
+    let server_saw = handle.await.unwrap();
+    assert!(
+        server_saw.is_none(),
+        "default-empty config must not record a negotiated subprotocol",
+    );
 }
 
 /// RFC 7230 §3.2.2: a list-valued header may be folded into one
