@@ -3356,6 +3356,7 @@ dependencies = [
  "mdns-sd",
  "parking_lot",
  "prometheus",
+ "proptest",
  "prost",
  "prost-build",
  "prost-types",
@@ -3432,6 +3433,7 @@ name = "rustgate-mavlink"
 version = "0.8.0"
 dependencies = [
  "bytes",
+ "proptest",
  "rustgate-core",
  "thiserror 2.0.18",
  "tokio",
@@ -3488,6 +3490,7 @@ name = "rustgate-proto"
 version = "0.8.0"
 dependencies = [
  "bytes",
+ "proptest",
  "prost",
  "prost-build",
  "quick-xml",

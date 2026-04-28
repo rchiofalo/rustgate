@@ -391,6 +391,48 @@ impl TestCa {
         }
     }
 
+    /// Issue a client certificate that expires `seconds_remaining` seconds
+    /// from now.
+    ///
+    /// Useful for negative integration tests that need to drive a real
+    /// mTLS handshake with a cert that will expire mid-session, so the
+    /// test can pin whatever the current expiry-mid-session policy is
+    /// (fail-closed via cert-reloader, or grandfathered until handshake
+    /// renegotiation, or anywhere in between). Refs #789 / F-134.
+    pub fn issue_near_expiry_client_cert(
+        &self,
+        cn: &str,
+        groups: &[&str],
+        seconds_remaining: i64,
+    ) -> TestCert {
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::NoCa;
+        params
+            .extended_key_usages
+            .push(ExtendedKeyUsagePurpose::ClientAuth);
+
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, cn);
+        if !groups.is_empty() {
+            dn.push(DnType::OrganizationalUnitName, groups.join(","));
+        }
+        params.distinguished_name = dn;
+
+        let now = OffsetDateTime::now_utc();
+        params.not_before = now - TimeDuration::minutes(1);
+        params.not_after = now + TimeDuration::seconds(seconds_remaining);
+
+        let key_pair = KeyPair::generate().expect("failed to generate key pair");
+        let cert = params
+            .signed_by(&key_pair, &self.issuer)
+            .expect("failed to sign near-expiry client cert");
+
+        TestCert {
+            cert_pem: cert.pem(),
+            key_pem: key_pair.serialize_pem(),
+        }
+    }
+
     /// Issue a client certificate with the given CN and OU fields.
     ///
     /// CN becomes the user identity, OU fields become group memberships.
