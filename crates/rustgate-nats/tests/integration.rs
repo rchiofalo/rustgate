@@ -91,6 +91,29 @@ async fn register_session(
     prx
 }
 
+/// Like [`register_session`] but returns BOTH the priority and the
+/// normal-channel receivers. Tests that exercise Send-PEP obligations
+/// which rewrite `metadata.message_type` (e.g. `MaskPayload` →
+/// `Other("masked")`) need the normal channel to observe the masked
+/// envelope; the standard `register_session` drops it.
+async fn register_session_dual(
+    router: &Router,
+    cn: &str,
+    group: &str,
+) -> (
+    mpsc::Receiver<rustgate_transport::RoutedMessage>,
+    mpsc::Receiver<rustgate_transport::RoutedMessage>,
+) {
+    let (ptx, prx) = mpsc::channel(16);
+    let (ntx, nrx) = mpsc::channel(64);
+    let mut groups = BTreeSet::new();
+    let _ = groups.insert(group.to_string());
+    let identity = Arc::new(Identity::plaintext(cn.to_string(), groups).expect("valid identity"));
+    let handle = rustgate_transport::SessionHandle::new(identity, ptx, ntx);
+    let _ = router.register(handle).await;
+    (prx, nrx)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────
 
 /// Connect to NATS and verify the adapter initializes without error.
@@ -1299,6 +1322,393 @@ async fn dead_letter_publishes_unparseable_payload() {
             .and_then(|v| v.as_str().parse::<u128>().ok())
             .is_some(),
         "timestamp header is a parseable unix-millis integer",
+    );
+
+    sub_task.abort();
+}
+
+// ── Subscriber egress fan-out (refs #737 — NATS subscriber sub-item) ─────
+//
+// The subscriber's consumer loop drives every inbound NATS message
+// through `Router::route_for_egress` so any Send-PEP obligations land
+// on the envelope before the optional federation / HTTP / NATS-publish
+// forwarder callbacks observe it. The five tests below pin the
+// load-bearing security properties of that path:
+//
+// 1. **Federation fan-out fires once per inbound message.** A federation
+//    forwarder wired on the subscriber must be invoked exactly once per
+//    NATS message that survives the router's admission, with the
+//    post-Send-PEP payload + groups + metadata.
+// 2. **HTTP fan-out fires once per inbound message.** Symmetric to
+//    federation — wires an HTTP forwarder and asserts it fires.
+// 3. **Obligations apply before fan-out.** A `MaskPayload` obligation
+//    on the Send PEP MUST strip the payload before the local recipient
+//    sees it AND before the federation forwarder observes the
+//    envelope. A regression that fired the egress callbacks against
+//    the pre-PEP form would leak raw payload bytes to a federation
+//    peer while the in-process delivery looked compliant.
+//    `MaskPayload` is used here rather than `MaskPoint` because the
+//    NATS wire form is JSON, not CoT XML — `MaskPoint`'s non-XML
+//    branch would silently forward the payload unmasked.
+// 4. **Echo prevention.** A NATS-sourced `RoutableMessage` re-published
+//    onto the bus through the publisher must short-circuit on the
+//    case-insensitive `source_protocol == "nats"` guard (#1192) — the
+//    new `nats_publish` callback on the subscriber is therefore a
+//    no-op in practice. Pinned so a future change to the echo
+//    discipline breaks here rather than at runtime.
+// 5. **`source_protocol` stamping.** Every envelope the subscriber
+//    constructs from a NATS message must stamp
+//    `metadata.source_protocol = "nats"`. This is the workspace
+//    convention the publisher's echo guard depends on; pinning it
+//    here protects the loop-prevention contract end-to-end.
+
+/// Wire a federation forwarder on the subscriber and assert it fires
+/// exactly once per inbound NATS message with the post-Send-PEP
+/// envelope shape (payload + source-groups + metadata).
+#[tokio::test]
+async fn nats_subscriber_publish_fans_out_to_federation() {
+    use std::sync::Mutex as StdMutex;
+
+    let server = require_nats!();
+
+    let config_a = test_config(server.url(), "fed-fanout-A");
+    let config_b = test_config(server.url(), "fed-fanout-B");
+
+    let adapter_a = NatsAdapter::connect(config_a).await.expect("connect A");
+    let adapter_b = NatsAdapter::connect(config_b).await.expect("connect B");
+
+    let router_b = Arc::new(Router::new());
+    let _rx = register_session(&router_b, "local-fed-recv", "Cyan").await;
+
+    type FedCall = (bytes::Bytes, Vec<String>, Metadata);
+    let fed_calls: Arc<StdMutex<Vec<FedCall>>> = Arc::new(StdMutex::new(Vec::new()));
+    let fed_calls_clone = Arc::clone(&fed_calls);
+    let fed_cb: rustgate_core::egress::OnFederationForward =
+        Arc::new(move |payload, groups, meta| {
+            fed_calls_clone
+                .lock()
+                .expect("fed_calls mutex poisoned")
+                .push((payload, groups, meta));
+        });
+
+    let subscriber = adapter_b.subscriber().with_federation_forward(fed_cb);
+    let sub_router = Arc::clone(&router_b);
+    let sub_task = tokio::spawn(async move {
+        let _ = subscriber.run(sub_router).await;
+    });
+
+    // Give the subscriber time to bind its consumer.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let msg = position_message("track-fed-fanout", "Cyan", 37.7749, -122.4194);
+    adapter_a.publisher().publish(&msg).await;
+
+    // Poll up to 5s for the federation callback to fire — the consumer
+    // loop runs on a separate task so wall-clock latency includes
+    // JetStream pull, decode, route, and fan-out.
+    let mut snapshot = Vec::new();
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        snapshot = fed_calls.lock().expect("fed_calls mutex poisoned").clone();
+        if !snapshot.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(
+        snapshot.len(),
+        1,
+        "federation_forward must fire exactly once per inbound NATS message",
+    );
+    let (payload, groups, meta) = &snapshot[0];
+    assert!(
+        !payload.is_empty(),
+        "federation forward must carry the post-Send-PEP payload",
+    );
+    assert!(
+        groups.iter().any(|g| g == "Cyan"),
+        "federation forward must carry the source identity's groups: {groups:?}",
+    );
+    assert_eq!(
+        meta.source_protocol, "nats",
+        "federation forward metadata must preserve the inbound source_protocol",
+    );
+
+    sub_task.abort();
+}
+
+/// Wire an HTTP egress forwarder on the subscriber and assert it
+/// fires exactly once per inbound NATS message with the post-Send-PEP
+/// `RoutableMessage` envelope.
+#[tokio::test]
+async fn nats_subscriber_publish_fans_out_to_http() {
+    use std::sync::Mutex as StdMutex;
+
+    let server = require_nats!();
+
+    let config_a = test_config(server.url(), "http-fanout-A");
+    let config_b = test_config(server.url(), "http-fanout-B");
+
+    let adapter_a = NatsAdapter::connect(config_a).await.expect("connect A");
+    let adapter_b = NatsAdapter::connect(config_b).await.expect("connect B");
+
+    let router_b = Arc::new(Router::new());
+    let _rx = register_session(&router_b, "local-http-recv", "Cyan").await;
+
+    let http_calls: Arc<StdMutex<Vec<RoutableMessage>>> = Arc::new(StdMutex::new(Vec::new()));
+    let http_calls_clone = Arc::clone(&http_calls);
+    let http_cb: rustgate_core::egress::OnHttpForward = Arc::new(move |msg| {
+        http_calls_clone
+            .lock()
+            .expect("http_calls mutex poisoned")
+            .push(msg);
+    });
+
+    let subscriber = adapter_b.subscriber().with_http_forward(http_cb);
+    let sub_router = Arc::clone(&router_b);
+    let sub_task = tokio::spawn(async move {
+        let _ = subscriber.run(sub_router).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let msg = position_message("track-http-fanout", "Cyan", 38.0, -121.0);
+    adapter_a.publisher().publish(&msg).await;
+
+    let mut snapshot = Vec::new();
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        snapshot = http_calls
+            .lock()
+            .expect("http_calls mutex poisoned")
+            .clone();
+        if !snapshot.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(
+        snapshot.len(),
+        1,
+        "http_forward must fire exactly once per inbound NATS message",
+    );
+    let routed = &snapshot[0];
+    assert_eq!(routed.metadata.source_protocol, "nats");
+    assert!(routed.source.groups.contains("Cyan"));
+    assert!(
+        !routed.payload.is_empty(),
+        "http forward payload must be non-empty",
+    );
+
+    sub_task.abort();
+}
+
+/// A Send-PEP obligation MUST scrub the payload BEFORE the local
+/// recipient sees it AND BEFORE the federation forwarder observes it.
+/// A regression that fired the egress callback against the pre-PEP
+/// form would leak raw payload bytes to a federation peer while the
+/// in-process delivery looked compliant — exactly the gap closed by
+/// switching the subscriber's call site from `Router::route` to
+/// `Router::route_for_egress` (refs #737).
+///
+/// Uses [`Obligation::MaskPayload`] (which works on any payload) rather
+/// than [`Obligation::MaskPoint`] (CoT-XML-specific) because the
+/// payload arriving over NATS is the JSON wire form produced by
+/// `WireEvent`, not raw CoT XML; `MaskPoint`'s non-XML branch would
+/// silently forward unmasked bytes and miss the property under test.
+#[tokio::test]
+async fn nats_subscriber_with_send_pep_obligation_applies_obligation_before_fanout() {
+    use std::sync::Mutex as StdMutex;
+
+    use rustgate_transport::rustgate_authz::{
+        Action, Decision, DecisionOutcome, Obligation, PolicyEngine, Resource, Subject,
+    };
+
+    /// Engine that allows everything but attaches `MaskPayload` on the
+    /// Send PEP. The obligation strips the payload bytes and rewrites
+    /// `metadata.message_type` to `Other("masked")`, both of which are
+    /// observable from the local recipient and the egress fan-out copy.
+    struct AllowWithSendMaskPayloadEngine;
+    impl PolicyEngine for AllowWithSendMaskPayloadEngine {
+        fn evaluate(&self, _s: &Subject<'_>, _r: &Resource<'_>, a: Action) -> DecisionOutcome {
+            let obligations = if a == Action::Send {
+                vec![Obligation::MaskPayload]
+            } else {
+                Vec::new()
+            };
+            DecisionOutcome {
+                decision: Decision::Allow,
+                rule_id: None,
+                obligations,
+            }
+        }
+        fn policy_id(&self) -> &str {
+            "test-nats-subscriber-send-mask-payload"
+        }
+    }
+
+    let server = require_nats!();
+
+    let config_a = test_config(server.url(), "mask-fanout-A");
+    let config_b = test_config(server.url(), "mask-fanout-B");
+
+    let adapter_a = NatsAdapter::connect(config_a).await.expect("connect A");
+    let adapter_b = NatsAdapter::connect(config_b).await.expect("connect B");
+
+    // Bob is the local recipient; the router has Send-MaskPayload wired.
+    // After the obligation rewrites `message_type` to `Other("masked")`
+    // the message routes to Bob's NORMAL channel (not the priority
+    // channel that Position would have taken), so we register the dual
+    // helper and read from `nrx`.
+    let router_b = Arc::new(Router::new().with_authz(Arc::new(AllowWithSendMaskPayloadEngine)));
+    let (_prx, mut nrx) = register_session_dual(&router_b, "bob-mask", "Cyan").await;
+
+    type FedCall = (bytes::Bytes, Vec<String>, Metadata);
+    let fed_calls: Arc<StdMutex<Vec<FedCall>>> = Arc::new(StdMutex::new(Vec::new()));
+    let fed_calls_clone = Arc::clone(&fed_calls);
+    let fed_cb: rustgate_core::egress::OnFederationForward =
+        Arc::new(move |payload, groups, meta| {
+            fed_calls_clone
+                .lock()
+                .expect("fed_calls mutex poisoned")
+                .push((payload, groups, meta));
+        });
+
+    let subscriber = adapter_b.subscriber().with_federation_forward(fed_cb);
+    let sub_router = Arc::clone(&router_b);
+    let sub_task = tokio::spawn(async move {
+        let _ = subscriber.run(sub_router).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Alice publishes a position. The Send PEP scrubs the payload bytes
+    // BEFORE Bob's session channel receives the message and BEFORE the
+    // federation callback fires.
+    let msg = position_message("track-mask", "Cyan", 38.8977, -77.0365);
+    adapter_a.publisher().publish(&msg).await;
+
+    // Bob receives the masked envelope on his normal channel (the
+    // obligation rewrote `message_type` away from `Position`):
+    // payload bytes stripped, message type rewritten to
+    // `Other("masked")`.
+    let received = timeout(Duration::from_secs(5), nrx.recv())
+        .await
+        .expect("local recipient must receive the masked message")
+        .expect("session channel closed");
+    assert!(
+        received.payload.is_empty(),
+        "local subscriber must see Send-PEP MaskPayload applied (payload bytes stripped); got {} bytes",
+        received.payload.len(),
+    );
+    assert!(
+        matches!(received.metadata.message_type, MessageType::Other(ref s) if s == "masked"),
+        "local subscriber must see message_type rewritten to Other(\"masked\"); got {:?}",
+        received.metadata.message_type,
+    );
+
+    // Federation callback observes the same masked form.
+    let mut snapshot = Vec::new();
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        snapshot = fed_calls.lock().expect("fed_calls mutex poisoned").clone();
+        if !snapshot.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(
+        snapshot.len(),
+        1,
+        "federation_forward must fire exactly once for the obligation-allowed inbound NATS message",
+    );
+    let (egress_payload, _groups, egress_meta) = &snapshot[0];
+    assert!(
+        egress_payload.is_empty(),
+        "federation egress must see Send-PEP MaskPayload applied (payload bytes stripped); got {} bytes",
+        egress_payload.len(),
+    );
+    assert!(
+        matches!(egress_meta.message_type, MessageType::Other(ref s) if s == "masked"),
+        "federation egress must see message_type rewritten to Other(\"masked\"); got {:?}",
+        egress_meta.message_type,
+    );
+
+    sub_task.abort();
+}
+
+/// A NATS-sourced `RoutableMessage` re-published onto the bus through
+/// the publisher must short-circuit on the case-insensitive
+/// `source_protocol == "nats"` guard (#1192). The new `nats_publish`
+/// callback on the subscriber composes with that guard so wiring it
+/// cannot form a publish loop — pinned so a future change to the echo
+/// discipline breaks here rather than at runtime in production.
+#[tokio::test]
+async fn nats_subscriber_does_not_re_publish_to_nats() {
+    let server = require_nats!();
+
+    let config = test_config(server.url(), "echo-subscriber-test");
+    let adapter = NatsAdapter::connect(config).await.expect("connect");
+
+    let raw_client = async_nats::connect(server.url())
+        .await
+        .expect("raw connect");
+    let mut raw_sub = raw_client.subscribe("points.>").await.expect("subscribe");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // A message stamped as if it had just come off the subscriber's
+    // consumer loop (the workspace convention is
+    // `metadata.source_protocol = "nats"`). Publishing this through the
+    // publisher MUST short-circuit on the echo guard — otherwise a NATS
+    // → subscriber → nats_publish callback → publisher → NATS loop
+    // would form.
+    let mut msg = position_message("track-echo-sub", "Cyan", 37.0, -122.0);
+    msg.metadata.source_protocol = "nats".to_string();
+
+    adapter.publisher().publish(&msg).await;
+
+    let result = timeout(Duration::from_secs(2), raw_sub.next()).await;
+    assert!(
+        result.is_err(),
+        "publisher must short-circuit on source_protocol=nats so the subscriber's nats_publish callback cannot form a loop",
+    );
+}
+
+/// The subscriber's `WireEvent::into_routable` MUST stamp
+/// `metadata.source_protocol = "nats"` on every envelope it
+/// constructs from an inbound NATS message. The publisher's echo
+/// guard depends on this convention; pinning the invariant here
+/// protects the loop-prevention contract end-to-end (refs #737).
+#[tokio::test]
+async fn nats_subscriber_source_protocol_stamped_correctly() {
+    let server = require_nats!();
+
+    let config_a = test_config(server.url(), "stamp-A");
+    let config_b = test_config(server.url(), "stamp-B");
+
+    let adapter_a = NatsAdapter::connect(config_a).await.expect("connect A");
+    let adapter_b = NatsAdapter::connect(config_b).await.expect("connect B");
+
+    let router_b = Arc::new(Router::new());
+    let mut rx = register_session(&router_b, "local-stamp", "Cyan").await;
+
+    let subscriber = adapter_b.subscriber();
+    let sub_router = Arc::clone(&router_b);
+    let sub_task = tokio::spawn(async move {
+        let _ = subscriber.run(sub_router).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let msg = position_message("track-stamp", "Cyan", 37.0, -122.0);
+    adapter_a.publisher().publish(&msg).await;
+
+    let received = timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("local recipient must receive the message")
+        .expect("session channel closed");
+
+    assert_eq!(
+        received.metadata.source_protocol, "nats",
+        "subscriber must stamp source_protocol=nats so the publisher's echo guard catches future loops",
     );
 
     sub_task.abort();

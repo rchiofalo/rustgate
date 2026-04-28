@@ -1226,8 +1226,19 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     let connection_limit = Arc::new(Semaphore::new(max_connections as usize));
 
     // ── NATS ────────────────────────────────────────────────────────
+    //
+    // The subscriber is constructed here but its background task is
+    // deferred until federation + HTTP egress callbacks have been
+    // wired further down — that way an inbound NATS-bridged message
+    // hits `Router::route_for_egress` and reaches the same external
+    // sinks (federation peers, webhook targets) the directly-connected
+    // transports already feed (refs #737).
     #[cfg(feature = "nats")]
-    let nats_publisher = setup::connect_nats(&cli, &router).await;
+    let (nats_publisher, deferred_nats_subscriber) = match setup::connect_nats(&cli, &router).await
+    {
+        Some(outcome) => (Some(outcome.publisher), Some(outcome.subscriber)),
+        None => (None, None),
+    };
 
     // Register NATS client with readiness state for health checks.
     #[cfg(all(feature = "nats", feature = "metrics"))]
@@ -1344,6 +1355,28 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
 
     #[cfg(not(feature = "http"))]
     setup::warn_http_disabled(&cli);
+
+    // ── NATS subscriber (deferred spawn) ────────────────────────────
+    //
+    // Wire the federation + HTTP egress forwarders that just landed
+    // and spawn the consumer loop. Putting the spawn here means an
+    // inbound NATS message routes through `route_for_egress` and
+    // fans out to the same sinks every other transport feeds (refs
+    // #737). Echo prevention is the publisher's case-insensitive
+    // `source_protocol == "nats"` guard plus the
+    // `metadata.source_protocol = "nats"` stamp the subscriber
+    // applies via `WireEvent::into_routable`.
+    #[cfg(feature = "nats")]
+    if let Some(subscriber) = deferred_nats_subscriber {
+        setup::start_nats_subscriber(
+            subscriber,
+            &router,
+            nats_publisher.as_ref(),
+            &fed_forward,
+            #[cfg(feature = "http")]
+            &http_forward,
+        );
+    }
 
     // ── Per-client rate limiting ────────────────────────────────────
     let throttle_config = setup::build_throttle_config(&cli);

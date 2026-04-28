@@ -498,14 +498,40 @@ pub(crate) fn build_throttle_config(cli: &Cli) -> Option<ThrottleConfig> {
 // NATS
 // ---------------------------------------------------------------------------
 
-/// Connect to NATS, run JetStream replay, and spawn the subscriber task.
+/// Outcome of connecting to NATS: the publisher handle plus an
+/// already-configured subscriber that has been deferred from spawn so
+/// the caller can wire egress forwarder callbacks (federation / HTTP /
+/// NATS-publish) before launching it (refs #737).
 ///
-/// Returns the publisher handle if connection succeeds, `None` otherwise.
+/// The two halves are returned together so a NATS connect failure
+/// surfaces as `None` for both — there is never a publisher without a
+/// subscriber in this transport.
 #[cfg(feature = "nats")]
-pub(crate) async fn connect_nats(
-    cli: &Cli,
-    router: &Arc<Router>,
-) -> Option<rustgate_nats::NatsPublisher> {
+pub(crate) struct NatsConnectOutcome {
+    /// Publisher used by every other transport to push routed messages
+    /// onto the NATS bus.
+    pub publisher: rustgate_nats::NatsPublisher,
+    /// Pre-configured subscriber. Wire forwarder callbacks via
+    /// [`start_nats_subscriber`] before spawning so the consumer
+    /// loop's `route_for_egress` fan-out reaches federation peers and
+    /// HTTP egress targets.
+    pub subscriber: rustgate_nats::NatsSubscriber,
+}
+
+/// Connect to NATS, run JetStream replay, and return the publisher
+/// plus a pre-configured (but un-spawned) subscriber.
+///
+/// The subscriber is deferred from spawn so the caller can wire the
+/// federation / HTTP / NATS-publish forwarders that live further down
+/// the bootstrap sequence (refs #737). Use
+/// [`start_nats_subscriber`] to attach the forwarders and spawn the
+/// background task once those callbacks are in scope.
+///
+/// Returns `None` when NATS isn't configured or the initial connect
+/// fails — both signals surface as a missing bridge in every other
+/// transport.
+#[cfg(feature = "nats")]
+pub(crate) async fn connect_nats(cli: &Cli, router: &Arc<Router>) -> Option<NatsConnectOutcome> {
     let nats_url = cli.nats_url.as_ref()?;
 
     let config = rustgate_nats::NatsConfig {
@@ -539,7 +565,9 @@ pub(crate) async fn connect_nats(
                 }
             }
 
-            // Spawn NATS subscriber as a background task
+            // Build the subscriber but defer the spawn so the caller
+            // can attach forwarder callbacks once federation / HTTP
+            // egress have been wired.
             #[cfg_attr(not(feature = "metrics"), allow(unused_mut))]
             let mut subscriber = adapter.subscriber();
             #[cfg(feature = "metrics")]
@@ -565,20 +593,75 @@ pub(crate) async fn connect_nats(
                     .with_lag_callback(cb, None)
                     .with_latency_callback(lat_cb);
             }
-            let sub_router = Arc::clone(router);
-            spawn_background("nats-subscriber", async move {
-                if let Err(e) = subscriber.run(sub_router).await {
-                    tracing::warn!(error = %e, "NATS subscriber ended with error");
-                }
-            });
 
-            Some(adapter.publisher())
+            Some(NatsConnectOutcome {
+                publisher: adapter.publisher(),
+                subscriber,
+            })
         }
         Err(e) => {
             tracing::warn!(error = %e, "failed to connect to NATS (continuing without bridge)");
             None
         }
     }
+}
+
+/// Wire the optional federation / HTTP / NATS-publish forwarders onto
+/// the subscriber and spawn its consumer loop as a background task
+/// (refs #737).
+///
+/// The subscriber drives every inbound NATS message through
+/// [`Router::route_for_egress`] so Send-PEP obligations apply to the
+/// envelope before the optional forwarder callbacks observe it. The
+/// `nats_publish` callback short-circuits in practice — the
+/// publisher's case-insensitive `source_protocol == "nats"` echo
+/// guard catches every invocation — but we wire it here so the
+/// shape matches the MQTT and WebSocket transports.
+#[cfg(feature = "nats")]
+pub(crate) fn start_nats_subscriber(
+    subscriber: rustgate_nats::NatsSubscriber,
+    router: &Arc<Router>,
+    nats_publisher: Option<&rustgate_nats::NatsPublisher>,
+    fed_forward: &Option<FedForwardFn>,
+    #[cfg(feature = "http")] http_forward: &Option<HttpForwardFn>,
+) {
+    let mut subscriber = subscriber;
+    if let Some(publisher) = nats_publisher {
+        let publisher = publisher.clone();
+        let cb: rustgate_core::egress::OnNatsPublish = std::sync::Arc::new(move |msg| {
+            let publisher = publisher.clone();
+            spawn_background("nats-subscriber-nats-publish", async move {
+                publisher.publish(&msg).await;
+            });
+        });
+        subscriber = subscriber.with_nats_publish(cb);
+    }
+    if let Some(fwd) = fed_forward {
+        // The `FedForwardFn` from `crate::session` is the same
+        // `Arc<dyn Fn(Bytes, Vec<String>, Metadata) + Send + Sync>`
+        // shape as `OnFederationForward`. Adapt by wrapping so the
+        // subscriber sees the workspace-shared alias type.
+        let fwd = fwd.clone();
+        let cb: rustgate_core::egress::OnFederationForward =
+            std::sync::Arc::new(move |payload, groups, meta| {
+                fwd(payload, groups, meta);
+            });
+        subscriber = subscriber.with_federation_forward(cb);
+    }
+    #[cfg(feature = "http")]
+    if let Some(fwd) = http_forward {
+        let fwd = fwd.clone();
+        let cb: rustgate_core::egress::OnHttpForward = std::sync::Arc::new(move |msg| {
+            fwd(msg);
+        });
+        subscriber = subscriber.with_http_forward(cb);
+    }
+    let sub_router = Arc::clone(router);
+    spawn_background("nats-subscriber", async move {
+        if let Err(e) = subscriber.run(sub_router).await {
+            tracing::warn!(error = %e, "NATS subscriber ended with error");
+        }
+    });
 }
 
 /// Stub for when the `nats` feature is disabled.
