@@ -35,12 +35,12 @@
 //!    parameters (m_cost=19 MiB, t_cost=2, p_cost=1) unless overridden.
 //!
 //! For both KDF variants the input keying material may be supplied in one of
-//! three ways via [`IkmSource`]:
+//! three ways via the IKM-source fields on [`Derivation`]:
 //!
-//! - inline lowercase-hex string (development / tests; not recommended for
-//!   production secrets that should not live in a config-management blob),
-//! - reading the named environment variable (`from_env`), or
-//! - reading from a file (`from_file`) — the file is loaded via
+//! - inline lowercase-hex string `ikm` (development / tests; not recommended
+//!   for production secrets that should not live in a config-management blob),
+//! - reading the named environment variable (`ikm_from_env`), or
+//! - reading from a file (`ikm_from_file`) — the file is loaded via
 //!   [`crate::secrets::read_secret_file`], so it inherits the workspace's
 //!   strict permission gate (`mode 0o077` rejected on Unix), size cap
 //!   (16 KiB), and ownership-UID check.
@@ -262,11 +262,12 @@ pub struct KeyFile {
 /// a clear error rather than silently falling back to a default.
 ///
 /// The IKM (input keying material — passphrase or shared secret) for both
-/// variants is supplied via [`IkmSource`], which supports inline-hex
-/// strings, environment variables, and on-disk secret files. Inline hex
-/// is convenient for development but should not be used for production
-/// secrets that ought not live in config-management blobs; `from_env` and
-/// `from_file` keep the secret out of the JSON entirely.
+/// variants is supplied via the `ikm` / `ikm_from_env` / `ikm_from_file`
+/// fields on each variant: inline-hex strings, environment variables, and
+/// on-disk secret files respectively. Inline hex is convenient for
+/// development but should not be used for production secrets that ought
+/// not live in config-management blobs; `ikm_from_env` and `ikm_from_file`
+/// keep the secret out of the JSON entirely.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kdf", rename_all = "kebab-case")]
 #[serde(deny_unknown_fields)]
