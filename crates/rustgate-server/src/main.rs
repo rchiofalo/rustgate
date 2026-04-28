@@ -1303,6 +1303,12 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     // forwarder never observes them in the first place.
     #[cfg(feature = "federation")]
     let fed_inbound_hooks: setup::FedInboundForwardingHooks = {
+        // justification: `hooks` is mutated below only when `nats` and/or `http` features are
+        // enabled; with `federation` alone no branch fires, so the `mut` is spurious in that
+        // feature combination. `unused_mut` is `-D warning`-promoted, and adding the feature
+        // gate to the `mut` keyword itself isn't expressible — so suppress just for the
+        // disjoint case.
+        #[cfg_attr(not(any(feature = "nats", feature = "http")), allow(unused_mut))]
         let mut hooks = setup::FedInboundForwardingHooks::default();
         #[cfg(feature = "nats")]
         if let Some(ref publisher) = nats_publisher {
