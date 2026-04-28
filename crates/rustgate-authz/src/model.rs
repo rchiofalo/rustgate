@@ -67,6 +67,44 @@ pub enum Decision {
 /// `#[non_exhaustive]` — new obligations are added over time (e.g. more
 /// masking flavours or audit tiers). Downstream matches must include a
 /// wildcard arm so the obligation set can grow without breaking the API.
+///
+/// # Canonical chaining order (refs #882)
+///
+/// When multiple obligations apply to a single message (e.g. Send-PEP
+/// attaches `MaskPoint` and Receive-PEP attaches `TagClassified`) they
+/// MUST compose in a defined order so the same input produces the same
+/// post-PEP byte output regardless of which code path encountered the
+/// obligations or in which sequence the policy engine emitted them. The
+/// canonical order is:
+///
+/// 1. **Group 1 — Redactors** (`priority = 0`). Variants that REMOVE
+///    information from the payload. Run first so subsequent groups
+///    operate on the redacted form rather than seeing pre-redaction
+///    bytes. Members today: [`Obligation::MaskPoint`],
+///    [`Obligation::MaskPayload`].
+/// 2. **Group 2 — Classifiers / Taggers** (`priority = 1`). Variants
+///    that ATTACH new fields, headers, or labels to the (already
+///    redacted) message. Members today: [`Obligation::TagClassified`].
+/// 3. **Group 3 — Auditors** (`priority = 2`). Variants that EMIT
+///    audit events without changing the message bytes. Run last so the
+///    audit record reflects the final post-redact-post-tag state.
+///    Members today: [`Obligation::AuditExtended`]. Future
+///    `#[non_exhaustive]` variants without an explicit group fall here
+///    by default — auditing the final state is the safest fallback for
+///    a transport build older than the policy engine.
+///
+/// Within each group ordering is alphabetical by `Debug` repr — a
+/// deterministic, byte-stable rule that does not require per-variant
+/// configuration. The application path applies a **stable sort** by
+/// [`Obligation::chain_sort_key`] before actuation, so two permutations
+/// of the same obligation set produce byte-identical post-PEP output.
+///
+/// **Adding a new variant**: assign it to a group via
+/// [`Obligation::priority`] in the same edit that introduces the
+/// variant, and document the assignment in the variant's docstring.
+/// New variants without an explicit assignment default to Group 3
+/// (Auditors) — see [`Obligation::priority`] for the default-group
+/// rationale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -77,13 +115,103 @@ pub enum Obligation {
     /// envelope metadata, and not free-form geographic references inside
     /// the payload. Non-CoT payloads pass through unmodified — masking
     /// is a best-effort leak-prevention obligation, not a hard gate.
+    ///
+    /// **Chaining group**: 1 (Redactor). Removes coordinate bytes from
+    /// the payload; runs before classifiers and auditors so they see
+    /// the redacted form.
     MaskPoint,
     /// Strip the payload body, leaving only envelope metadata.
+    ///
+    /// **Chaining group**: 1 (Redactor). Empties the payload and
+    /// coerces the message type to `Other("masked")`; supersedes any
+    /// prior [`Obligation::MaskPoint`] by replacing the body entirely.
     MaskPayload,
     /// Tag the outbound message as classified.
+    ///
+    /// **Chaining group**: 2 (Classifier/Tagger). Attaches the
+    /// classified marker to the (already redacted) outbound message;
+    /// data-plane is a no-op today, the audit record is emitted at the
+    /// PEP call site.
     TagClassified,
     /// Emit an extended audit record for this decision.
+    ///
+    /// **Chaining group**: 3 (Auditor). Pure audit emission, no
+    /// payload mutation; runs last so the audit record reflects the
+    /// final post-redact-post-tag state.
     AuditExtended,
+}
+
+impl Obligation {
+    /// Return the canonical chaining group this obligation belongs to
+    /// (refs #882). `0` = Redactors, `1` = Classifiers/Taggers, `2` =
+    /// Auditors.
+    ///
+    /// The application path sorts by `(priority, debug_repr)` with a
+    /// **stable sort** so two permutations of the same obligation set
+    /// produce byte-identical post-PEP output. Within a group the
+    /// ordering is alphabetical by `Debug` repr — deterministic, no
+    /// per-variant configuration.
+    ///
+    /// # Default for unknown variants
+    ///
+    /// `Obligation` is `#[non_exhaustive]`. A future variant landing
+    /// in a transport build that pre-dates the authz upgrade will
+    /// match the wildcard arm and receive `priority = 2` (Auditors).
+    /// This is the safest fallback: an unknown variant the data plane
+    /// cannot actuate is most likely a new audit/classification flavour
+    /// the policy author added, and forcing it last lets every known
+    /// redactor and tagger run first. The
+    /// [`crate::Obligation`]-actuation site
+    /// (`rustgate_transport::obligations::apply_obligations`) still
+    /// fail-closes on unknown variants under the default
+    /// `UnknownObligationPolicy::FailClosed` after the sort runs, so
+    /// the priority assignment matters only when the operator opted
+    /// into `SkipAndContinue` for a rolling-upgrade window.
+    pub fn priority(&self) -> u8 {
+        // justification: the wildcard arm is reachable only when a
+        // future `#[non_exhaustive]` variant is added to this enum
+        // without a corresponding match arm. Inside the defining
+        // crate the compiler proves the wildcard is currently
+        // unreachable, but removing it would silently regress the
+        // forward-compat fallback the docstring promises — a future
+        // variant landing without an explicit arm would then be a
+        // compile failure here rather than a documented group-3
+        // default. The `#[allow(unreachable_patterns)]` is the
+        // narrowest annotation that preserves the safety net.
+        #[allow(unreachable_patterns)]
+        match self {
+            // Group 1 — Redactors.
+            Obligation::MaskPoint | Obligation::MaskPayload => 0,
+            // Group 2 — Classifiers / Taggers.
+            Obligation::TagClassified => 1,
+            // Group 3 — Auditors. Unknown variants land here by
+            // default (see docstring above).
+            Obligation::AuditExtended => 2,
+            // `#[non_exhaustive]` fallback: future variants assigned
+            // to Group 3 by default. Add an explicit arm above when
+            // landing the variant.
+            _ => 2,
+        }
+    }
+
+    /// Composite sort key used by the stable-sort step before
+    /// obligation actuation (refs #882).
+    ///
+    /// Returns `(priority, debug_repr)` — the primary key is the
+    /// chaining group from [`Obligation::priority`] and the secondary
+    /// key is the `Debug` rendering, giving alphabetical disambiguation
+    /// within each group. Stable-sort + this key guarantees the same
+    /// obligation set produces byte-identical post-PEP output across
+    /// any input permutation.
+    ///
+    /// The `String` allocation is intentional: variants may grow
+    /// payload-bearing forms (e.g. a future `Obligation::TagWith(label)`)
+    /// and bucketing by the full `Debug` repr keeps the sort
+    /// deterministic across those without introducing a parallel
+    /// per-variant tie-breaker constant.
+    pub fn chain_sort_key(&self) -> (u8, String) {
+        (self.priority(), format!("{self:?}"))
+    }
 }
 
 /// The result of evaluating a policy against a subject/resource/action tuple.
@@ -762,5 +890,120 @@ mod model_tests {
         // on the hash without clone cost.
         fn assert_bounds<T: Copy + Eq + std::hash::Hash>() {}
         assert_bounds::<SubjectHash>();
+    }
+
+    // ── Refs #882: canonical obligation chaining order ──────────────
+    //
+    // `Obligation::priority` and `Obligation::chain_sort_key` are the
+    // load-bearing primitives the dispatcher uses to enforce the
+    // documented 3-group ordering (Redactors → Classifiers/Taggers →
+    // Auditors, alphabetical within each group). The tests below pin
+    // the per-variant priority assignment, the alphabetical
+    // tie-breaking, and the `(priority, debug_repr)` composition —
+    // so a regression that demoted MaskPoint into group 2, or that
+    // swapped the sort-key tuple ordering, fails here at the model
+    // layer rather than only at the dispatcher integration site.
+
+    /// Pin every known variant's group assignment. Group 1
+    /// (Redactors) gets priority 0, Group 2 (Classifiers/Taggers)
+    /// gets 1, Group 3 (Auditors) gets 2. A regression that
+    /// reshuffled these would invert the canonical chaining order
+    /// and silently reroute Receive-side classification before
+    /// Send-side redaction.
+    #[test]
+    fn obligation_priority_pins_canonical_group_assignment() {
+        assert_eq!(
+            Obligation::MaskPoint.priority(),
+            0,
+            "MaskPoint must be Redactor (group 0)"
+        );
+        assert_eq!(
+            Obligation::MaskPayload.priority(),
+            0,
+            "MaskPayload must be Redactor (group 0)"
+        );
+        assert_eq!(
+            Obligation::TagClassified.priority(),
+            1,
+            "TagClassified must be Classifier/Tagger (group 1)"
+        );
+        assert_eq!(
+            Obligation::AuditExtended.priority(),
+            2,
+            "AuditExtended must be Auditor (group 2)"
+        );
+    }
+
+    /// `chain_sort_key` is `(priority, Debug-repr)` — primary key is
+    /// the group, secondary is alphabetical. Pin the tuple shape so
+    /// a regression that swapped the order (alphabetical first,
+    /// group second) lands here. That regression would let
+    /// `AuditExtended` outrank `MaskPoint` on the alphabetical
+    /// component (`A` < `M`) and break the canonical chaining
+    /// contract.
+    #[test]
+    fn obligation_chain_sort_key_is_priority_then_debug_repr() {
+        let (mp_pri, mp_name) = Obligation::MaskPoint.chain_sort_key();
+        assert_eq!(mp_pri, 0);
+        assert_eq!(mp_name, "MaskPoint");
+
+        let (mpl_pri, mpl_name) = Obligation::MaskPayload.chain_sort_key();
+        assert_eq!(mpl_pri, 0);
+        assert_eq!(mpl_name, "MaskPayload");
+
+        let (tc_pri, tc_name) = Obligation::TagClassified.chain_sort_key();
+        assert_eq!(tc_pri, 1);
+        assert_eq!(tc_name, "TagClassified");
+
+        let (ae_pri, ae_name) = Obligation::AuditExtended.chain_sort_key();
+        assert_eq!(ae_pri, 2);
+        assert_eq!(ae_name, "AuditExtended");
+    }
+
+    /// Within group 0 (Redactors) the sort key resolves
+    /// alphabetically: `MaskPayload` < `MaskPoint` because
+    /// `MaskP[a]…` precedes `MaskP[o]…`. A regression that ranked
+    /// variants by enum-declaration order would swap these.
+    #[test]
+    fn obligation_chain_sort_key_orders_alphabetically_within_group() {
+        // Group 0 alphabetical: MaskPayload < MaskPoint.
+        assert!(
+            Obligation::MaskPayload.chain_sort_key() < Obligation::MaskPoint.chain_sort_key(),
+            "within group 0, MaskPayload must sort before MaskPoint (alphabetical)"
+        );
+        // Cross-group: every group-0 variant outranks every
+        // group-1 / group-2 variant because priority dominates.
+        assert!(
+            Obligation::MaskPoint.chain_sort_key() < Obligation::TagClassified.chain_sort_key(),
+            "group 0 (MaskPoint) must sort before group 1 (TagClassified)"
+        );
+        assert!(
+            Obligation::TagClassified.chain_sort_key() < Obligation::AuditExtended.chain_sort_key(),
+            "group 1 (TagClassified) must sort before group 2 (AuditExtended)"
+        );
+    }
+
+    /// Stable sort on `chain_sort_key` reorders any input
+    /// permutation into the canonical order. Pin the full
+    /// permutation round-trip so a regression that returned an
+    /// unstable / non-deterministic sort key surfaces here.
+    #[test]
+    fn obligation_chain_sort_key_canonicalizes_permutations() {
+        let canonical = vec![
+            Obligation::MaskPayload,   // group 0, alphabetically first
+            Obligation::MaskPoint,     // group 0, alphabetically second
+            Obligation::TagClassified, // group 1
+            Obligation::AuditExtended, // group 2
+        ];
+        // Take a deliberately-scrambled permutation and run the
+        // same stable sort the dispatcher uses.
+        let mut scrambled = vec![
+            Obligation::AuditExtended,
+            Obligation::TagClassified,
+            Obligation::MaskPoint,
+            Obligation::MaskPayload,
+        ];
+        scrambled.sort_by_cached_key(Obligation::chain_sort_key);
+        assert_eq!(scrambled, canonical);
     }
 }
