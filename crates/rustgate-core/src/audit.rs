@@ -1756,6 +1756,110 @@ pub fn admin_drain_triggered(source: &str) {
     );
 }
 
+// ── JWKS refresh lifecycle (refs #952) ──────────────────────────────
+
+/// Record a successful JWKS refresh from a remote endpoint.
+///
+/// Emitted by the federation JWKS client after every successful HTTP
+/// fetch of `<url>/.well-known/jwks.json` (or the operator-configured
+/// path) where the response parses cleanly into a key set. `key_count`
+/// is the number of asymmetric public keys advertised in the response
+/// after filtering — HS256 entries that the client refused to load
+/// because `allow_hs256: false` are NOT counted, by design.
+///
+/// Pairs with [`jwks_refresh_failed`] for full lifecycle coverage of
+/// the refresh loop. SIEM rules can alert on a sustained absence of
+/// `jwks.refresh_success` events for a given URL even when the failure
+/// stream is silent (network partition).
+///
+/// Sanitization: `url` is sanitized at the audit boundary.
+pub fn jwks_refresh_success(url: &str, key_count: usize) {
+    let url = s(url);
+    audit!(
+        "jwks.refresh_success",
+        url = %url,
+        key_count = key_count,
+        action = "refresh",
+        result = "success"
+    );
+}
+
+/// Record a failed JWKS refresh from a remote endpoint.
+///
+/// Emitted by the federation JWKS client when an HTTP fetch fails
+/// (network error, DNS failure, TLS handshake error), the server returns
+/// a non-2xx status, or the response body cannot be parsed as a JWKS
+/// document. The cached keyset is preserved on failure (fail-closed
+/// posture per #952), so `jwks.refresh_failed` is a degradation signal
+/// rather than an availability one — verifiers continue to validate
+/// tokens against the last good snapshot.
+///
+/// Sanitization: `url` and `reason` are sanitized at the audit
+/// boundary.
+pub fn jwks_refresh_failed(url: &str, reason: &str) {
+    let url = s(url);
+    let reason = s(reason);
+    audit!(
+        "jwks.refresh_failed",
+        url = %url,
+        reason = %reason,
+        action = "refresh",
+        result = "failure"
+    );
+}
+
+/// Record a key being added to the active JWKS verifier registry.
+///
+/// Emitted once per `kid` newly observed in a JWKS response and
+/// successfully registered with the [`jwt::JwtAuthority`] verifier set.
+/// The companion [`jwks_key_removed`] event fires when a previously
+/// registered `kid` disappears from the JWKS response and is dropped
+/// from the verifier set.
+///
+/// `alg` is the JOSE algorithm string (`"ES256"`, `"EdDSA"`, or
+/// `"HS256"` when `allow_hs256: true`).
+///
+/// Sanitization: `url`, `kid`, and `alg` are sanitized at the audit
+/// boundary.
+pub fn jwks_key_added(url: &str, kid: &str, alg: &str) {
+    let url = s(url);
+    let kid = s(kid);
+    let alg = s(alg);
+    audit!(
+        "jwks.key_added",
+        url = %url,
+        kid = %kid,
+        alg = %alg,
+        action = "add_key",
+        result = "success"
+    );
+}
+
+/// Record a key being removed from the active JWKS verifier registry.
+///
+/// Emitted when a previously registered `kid` is no longer advertised
+/// in the JWKS response and the federation JWKS client removes it from
+/// the verifier set. After removal, JWTs carrying this `kid` will
+/// fail verification with [`jwt::JwtError::UnknownKid`].
+///
+/// Removal is gated on the JWKS response itself being valid — a 5xx
+/// or network failure does NOT trigger key removal (fail-closed
+/// posture per #952), so this event always corresponds to an
+/// authoritative absence in the upstream key server.
+///
+/// Sanitization: `url` and `kid` are sanitized at the audit boundary.
+pub fn jwks_key_removed(url: &str, kid: &str) {
+    let url = s(url);
+    let kid = s(kid);
+    audit!(
+        "jwks.key_removed",
+        url = %url,
+        kid = %kid,
+        action = "remove_key",
+        result = "success"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};

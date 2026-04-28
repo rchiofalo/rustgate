@@ -26,6 +26,13 @@ peer-discovery = ["peer-discovery-dns-sd", "peer-discovery-consul", "peer-discov
 peer-discovery-dns-sd = ["dep:async-trait", "dep:mdns-sd"]
 peer-discovery-consul = ["dep:async-trait", "dep:reqwest"]
 peer-discovery-etcd = ["dep:async-trait", "dep:etcd-client"]
+# JWKS URL fetching with periodic refresh (refs #952). Pulls in reqwest
+# behind a federation-scoped feature so deployments that do not need
+# remote key discovery do not pay the HTTP-client compile cost. The
+# JWKS client re-uses the federation mTLS trust bundle (rustgate-core
+# pem helpers + rustls ClientConfig) and does not introduce a separate
+# trust path.
+jwks = ["dep:reqwest"]
 
 [dependencies]
 rustgate-core = { workspace = true, features = ["pem"] }

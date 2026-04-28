@@ -33,9 +33,10 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use arc_swap::ArcSwap;
 use lru::LruCache;
 use ring::signature::{self as ring_sig, KeyPair};
 use rustgate_core::b64;
@@ -304,6 +305,66 @@ impl VerificationKey {
     }
 }
 
+/// Externally-sourced verifier key, materialised from a JWKS document.
+///
+/// This is the public mirror of the crate-private [`VerificationKey`]:
+/// the JWKS client constructs values of this type from each
+/// `kty`/`alg`-validated JWK entry and hands them to
+/// [`JwtAuthority::install_external_verifiers`] in a `HashMap` keyed by
+/// `kid`. The receiver translates these into the internal
+/// representation atomically.
+///
+/// `ExternalVerifier::Hs256` is intentionally available so operators
+/// who explicitly opt in (`allow_hs256: true`) can ship symmetric
+/// secrets through JWKS — but it is fail-closed by default at the
+/// JWKS-client layer.
+#[derive(Debug, Clone)]
+pub enum ExternalVerifier {
+    /// Symmetric HMAC-SHA256 secret. Wrapped in
+    /// [`Zeroizing`] so the bytes are wiped on drop. Length must be
+    /// at least [`MIN_SECRET_LENGTH`] — checked at install time.
+    Hs256(Zeroizing<Vec<u8>>),
+    /// ECDSA P-256 public key in SEC1 uncompressed form
+    /// (`0x04 || x(32) || y(32)` = 65 bytes).
+    Es256(Vec<u8>),
+    /// Raw Ed25519 public key (32 bytes per RFC 8032 §5.1.5).
+    EdDsa(Vec<u8>),
+}
+
+impl ExternalVerifier {
+    /// Materialise the public-facing variant into the crate-private
+    /// [`VerificationKey`]. The shape is one-to-one but each branch
+    /// either takes ownership (Hs256) or copies a small Vec (Es256,
+    /// EdDsa) so the resulting registry can live behind an `ArcSwap`
+    /// without a lifetime hanging off the caller's input map.
+    fn into_verification_key(self) -> VerificationKey {
+        match self {
+            ExternalVerifier::Hs256(secret) => VerificationKey::Hs256(secret),
+            ExternalVerifier::Es256(b) => VerificationKey::Es256(b),
+            ExternalVerifier::EdDsa(b) => VerificationKey::EdDsa(b),
+        }
+    }
+
+    /// Algorithm advertised by this verifier — used by the JWKS client
+    /// for diff logging without breaking the encapsulation of the
+    /// crate-private `VerificationKey`.
+    pub fn algorithm(&self) -> Algorithm {
+        match self {
+            ExternalVerifier::Hs256(_) => Algorithm::Hs256,
+            ExternalVerifier::Es256(_) => Algorithm::Es256,
+            ExternalVerifier::EdDsa(_) => Algorithm::EdDsa,
+        }
+    }
+}
+
+/// Initial value for the [`JwtAuthority::external_verifiers`] field.
+/// An empty `HashMap` behind an `ArcSwap` so the validation hot path
+/// always sees a non-`None` snapshot — no `Option` unwrap on each
+/// token validation.
+fn empty_external_verifiers() -> ArcSwap<HashMap<String, VerificationKey>> {
+    ArcSwap::from_pointee(HashMap::new())
+}
+
 /// Manages JWT issuance, validation, and revocation for federation.
 pub struct JwtAuthority {
     /// Active signing key — used by `issue()` / `issue_with_expiry()`.
@@ -313,6 +374,16 @@ pub struct JwtAuthority {
     /// pre-populates this with its own local public key (so it can
     /// verify tokens it issued itself).
     verifiers: HashMap<String, VerificationKey>,
+    /// Hot-reloadable verifier registry sourced from a remote JWKS
+    /// endpoint (refs #952). Populated and atomically swapped by
+    /// [`crate::jwks_client::JwksClient`]; consulted by [`decode`]
+    /// after the static `verifiers` map has been searched. The
+    /// `ArcSwap<Arc<HashMap<...>>>` shape mirrors the ACL/authz
+    /// hot-reload pattern in `transport::router` — readers get a
+    /// lock-free snapshot via [`ArcSwap::load`] and the JWKS refresh
+    /// task swaps a fresh map in via [`ArcSwap::store`] without
+    /// blocking validation.
+    external_verifiers: ArcSwap<HashMap<String, VerificationKey>>,
     /// Fallback verifier for tokens whose header has no `kid`.
     /// Present only when [`JwtAuthority::new`] (HS256) was used, so
     /// legacy tokens without a `kid` header still validate. ES256
@@ -375,6 +446,7 @@ impl JwtAuthority {
         Ok(Self {
             signing: SigningKey::Hs256 { secret, kid: None },
             verifiers: HashMap::new(),
+            external_verifiers: empty_external_verifiers(),
             legacy_verifier: Some(VerificationKey::Hs256(legacy)),
             issuer: issuer.into(),
             default_expiry: Duration::from_secs(3600),
@@ -420,6 +492,7 @@ impl JwtAuthority {
                 kid,
             },
             verifiers,
+            external_verifiers: empty_external_verifiers(),
             legacy_verifier: None,
             issuer: issuer.into(),
             default_expiry: Duration::from_secs(3600),
@@ -465,6 +538,7 @@ impl JwtAuthority {
                 kid,
             },
             verifiers,
+            external_verifiers: empty_external_verifiers(),
             legacy_verifier: None,
             issuer: issuer.into(),
             default_expiry: Duration::from_secs(3600),
@@ -774,7 +848,37 @@ impl JwtAuthority {
     /// state-machine integration tests to assert that a kid maps to the
     /// expected algorithm before any signature work.
     pub fn verifier_algorithm(&self, kid: &str) -> Option<Algorithm> {
-        self.verifiers.get(kid).map(|k| k.algorithm())
+        self.verifiers.get(kid).map(|k| k.algorithm()).or_else(|| {
+            let guard = self.external_verifiers.load();
+            guard.get(kid).map(|k| k.algorithm())
+        })
+    }
+
+    /// Atomically replace the external verifier registry with a fresh
+    /// snapshot. Used by [`crate::jwks_client::JwksClient`] (refs #952)
+    /// after a successful JWKS refresh — readers see the new map on
+    /// their next call to [`Self::validate`] without any locking on the
+    /// hot path.
+    ///
+    /// External verifiers are consulted only after the static
+    /// `verifiers` map (the one populated by `with_*_verifier` builders
+    /// and the local self-verifier) has been searched, so an operator
+    /// can override a JWKS-supplied entry by registering the same kid
+    /// inline at startup.
+    pub fn install_external_verifiers(&self, verifiers: HashMap<String, ExternalVerifier>) {
+        let materialised: HashMap<String, VerificationKey> = verifiers
+            .into_iter()
+            .map(|(kid, v)| (kid, v.into_verification_key()))
+            .collect();
+        self.external_verifiers.store(Arc::new(materialised));
+    }
+
+    /// Return the set of `kid`s currently published by the external
+    /// (JWKS-sourced) verifier registry. Stable ordering is not
+    /// guaranteed — callers that need a deterministic ordering must
+    /// sort.
+    pub fn external_verifier_kids(&self) -> Vec<String> {
+        self.external_verifiers.load().keys().cloned().collect()
     }
 
     /// Test-only helper: forge an HS256-signed token with a custom
@@ -977,11 +1081,25 @@ fn decode(auth: &JwtAuthority, token: &str) -> Result<FederationClaims, JwtError
     let alg = Algorithm::parse(&header.alg)
         .ok_or_else(|| JwtError::UnsupportedAlgorithm(header.alg.clone()))?;
 
+    // Hold the external-verifier guard for the lifetime of this call.
+    // `ArcSwap::load` is `Guard<Arc<HashMap<...>>>` — dropping it
+    // releases the read snapshot, so we must keep it on the stack for
+    // as long as `verifier` borrows out of it.
+    let external_guard = auth.external_verifiers.load();
+
+    // Verifier resolution order (kid present):
+    //   1. Static `verifiers` map (with_*_verifier + self-verifier)
+    //   2. External JWKS-sourced map (refs #952)
+    // An operator-provided static entry therefore overrides a JWKS
+    // entry under the same kid, which is the conservative posture for
+    // a misconfigured remote.
     let verifier: &VerificationKey = match header.kid.as_deref() {
-        Some(kid) => auth
-            .verifiers
-            .get(kid)
-            .ok_or_else(|| JwtError::UnknownKid(kid.to_string()))?,
+        Some(kid) => match auth.verifiers.get(kid) {
+            Some(v) => v,
+            None => external_guard
+                .get(kid)
+                .ok_or_else(|| JwtError::UnknownKid(kid.to_string()))?,
+        },
         None => auth
             .legacy_verifier
             .as_ref()
@@ -1003,6 +1121,7 @@ fn decode(auth: &JwtAuthority, token: &str) -> Result<FederationClaims, JwtError
     let claims: FederationClaims = serde_json::from_slice(&payload_bytes)
         .map_err(|e| JwtError::SerializationError(e.to_string()))?;
 
+    drop(external_guard);
     Ok(claims)
 }
 
