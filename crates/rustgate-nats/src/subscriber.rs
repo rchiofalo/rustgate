@@ -14,6 +14,8 @@ use async_nats::jetstream;
 use async_nats::jetstream::consumer::AckPolicy;
 use async_nats::jetstream::stream::RetentionPolicy;
 use futures::StreamExt;
+use rustgate_core::egress::{OnFederationForward, OnHttpForward, OnNatsPublish};
+use rustgate_core::message::RoutableMessage;
 use rustgate_transport::Router;
 use tracing::Instrument;
 
@@ -63,21 +65,65 @@ rustgate_core::on_callback!(
 /// Runs as a background task. Creates (or fetches) a JetStream stream
 /// capturing `{prefix}.>` subjects, then creates a durable pull consumer
 /// for explicit-ACK message delivery with real backpressure.
+///
+/// The subscriber drives every inbound message through
+/// [`Router::route_for_egress`] (not `Router::route`) so any Send-PEP
+/// obligations (e.g.
+/// [`MaskPoint`](rustgate_transport::rustgate_authz::Obligation::MaskPoint))
+/// are applied to the dispatched envelope before the optional
+/// federation / HTTP / NATS-publish fan-out callbacks observe it. This
+/// closes the second sub-item of #737: a NATS-bridged message arriving
+/// locally must reach external sinks (federation peers, webhook /
+/// SIEM targets) in the same post-Send-PEP form a directly-connected
+/// client would produce. Each forward callback is independent — a
+/// `None` field is a no-op and never allocates.
+///
+/// **Echo prevention.** The subscriber stamps
+/// `metadata.source_protocol = "nats"` on the envelope it constructs
+/// from each NATS message (see
+/// [`WireEvent::into_routable`](crate::WireEvent::into_routable)). The
+/// NATS publisher checks that field with a case-insensitive
+/// `eq_ignore_ascii_case("nats")` guard and short-circuits, so wiring
+/// the optional `nats_publish` callback here cannot form a publish
+/// loop — it is included for completeness so every transport that
+/// fans out shares the exact same `MqttForwardingHooks`-shaped
+/// surface.
 pub struct NatsSubscriber {
     client: async_nats::Client,
     config: NatsConfig,
     lag_callback: Option<LagCallback>,
     latency_callback: Option<LatencyCallback>,
     lag_poll_interval: Duration,
+    /// Optional NATS-publish forward — fired once per message after
+    /// `Router::route_for_egress` returns the post-Send-PEP envelope.
+    /// In this transport the publisher's case-insensitive
+    /// `source_protocol == "nats"` echo guard short-circuits every
+    /// invocation; the field exists so the wiring shape is identical
+    /// across MQTT / NATS-subscriber / WebSocket transports.
+    nats_publish: Option<OnNatsPublish>,
+    /// Optional federation forward — fan-out to peer rustgate
+    /// instances over the federation mesh. `None` skips the fan-out at
+    /// no runtime cost.
+    federation_forward: Option<OnFederationForward>,
+    /// Optional HTTP egress forward — fan-out to webhook / SIEM
+    /// targets. `None` skips the fan-out at no runtime cost.
+    http_forward: Option<OnHttpForward>,
 }
 
 impl std::fmt::Debug for NatsSubscriber {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let fmt_cb = |present: bool| if present { "Some(<cb>)" } else { "None" };
         f.debug_struct("NatsSubscriber")
             .field("config", &self.config)
-            .field("lag_callback", &self.lag_callback.is_some())
-            .field("latency_callback", &self.latency_callback.is_some())
+            .field("lag_callback", &fmt_cb(self.lag_callback.is_some()))
+            .field("latency_callback", &fmt_cb(self.latency_callback.is_some()))
             .field("lag_poll_interval", &self.lag_poll_interval)
+            .field("nats_publish", &fmt_cb(self.nats_publish.is_some()))
+            .field(
+                "federation_forward",
+                &fmt_cb(self.federation_forward.is_some()),
+            )
+            .field("http_forward", &fmt_cb(self.http_forward.is_some()))
             .finish()
     }
 }
@@ -90,6 +136,9 @@ impl NatsSubscriber {
             lag_callback: None,
             latency_callback: None,
             lag_poll_interval: DEFAULT_LAG_POLL_INTERVAL,
+            nats_publish: None,
+            federation_forward: None,
+            http_forward: None,
         }
     }
 
@@ -109,6 +158,39 @@ impl NatsSubscriber {
         if let Some(i) = interval {
             self.lag_poll_interval = i;
         }
+        self
+    }
+
+    /// Wire an optional NATS-publish forward callback fired after the
+    /// router applies any Send-PEP obligations.
+    ///
+    /// Included for shape parity with the MQTT / WebSocket forwarder
+    /// bundles. The publisher's case-insensitive `source_protocol ==
+    /// "nats"` echo guard short-circuits every invocation in practice
+    /// (see #1192), but the field exists so the binary crate can plug
+    /// the same `OnNatsPublish` closure into every transport that
+    /// fans out.
+    #[must_use]
+    pub fn with_nats_publish(mut self, callback: OnNatsPublish) -> Self {
+        self.nats_publish = Some(callback);
+        self
+    }
+
+    /// Wire an optional federation forwarder. Fired once per
+    /// successfully-routed inbound NATS message after Send-PEP
+    /// obligations have been applied to the dispatched envelope.
+    #[must_use]
+    pub fn with_federation_forward(mut self, callback: OnFederationForward) -> Self {
+        self.federation_forward = Some(callback);
+        self
+    }
+
+    /// Wire an optional HTTP egress forwarder. Fired once per
+    /// successfully-routed inbound NATS message after Send-PEP
+    /// obligations have been applied to the dispatched envelope.
+    #[must_use]
+    pub fn with_http_forward(mut self, callback: OnHttpForward) -> Self {
+        self.http_forward = Some(callback);
         self
     }
 
@@ -225,6 +307,12 @@ impl NatsSubscriber {
     ///
     /// Tracks processed and dropped message counts and emits periodic stats
     /// logs (every 60 seconds) for backpressure observability.
+    ///
+    /// Each successfully decoded inbound message is dispatched through
+    /// [`Router::route_for_egress`] so any Send-PEP obligations apply
+    /// to the envelope before the optional `nats_publish` /
+    /// `federation_forward` / `http_forward` callbacks observe it
+    /// (refs #737).
     pub async fn run(self, router: Arc<Router>) -> Result<(), async_nats::Error> {
         let js = jetstream::new(self.client.clone());
         let stream = self.ensure_stream(&js).await?;
@@ -370,7 +458,21 @@ impl NatsSubscriber {
                 // _guard dropped here — before the .await below
             };
 
-            router.route(routable).instrument(span).await;
+            // Egress fan-out: drive the message through `route_for_egress`
+            // so Send-PEP obligations land on the envelope every external
+            // sink observes. A `None` return means the router dropped
+            // the message (dedup, TTL expiry, Send-PEP deny, oversize
+            // multicast) and every fan-out MUST be skipped to keep the
+            // external sinks consistent with the local fanout.
+            let routed = router.route_for_egress(routable).instrument(span).await;
+            if let Some(routed) = routed.as_ref() {
+                fire_forwarding(
+                    self.nats_publish.as_ref(),
+                    self.federation_forward.as_ref(),
+                    self.http_forward.as_ref(),
+                    routed,
+                );
+            }
             processed += 1;
 
             // ACK after successful processing
@@ -387,6 +489,44 @@ impl NatsSubscriber {
 
         tracing::info!(processed, dropped, "NATS JetStream subscriber ended");
         Ok(())
+    }
+}
+
+/// Fan out the post-Send-PEP routed message to NATS / federation /
+/// HTTP egress sinks (refs #737).
+///
+/// Mirrors the MQTT fan-out helper in `rustgate_mqtt::session` so an
+/// inbound NATS message that survives the router's obligations is
+/// visible to every external sink in exactly the same way an MQTT
+/// PUBLISH would be. Each sink is independent — a `None` field is a
+/// no-op and never allocates.
+///
+/// The publisher's case-insensitive `source_protocol == "nats"` echo
+/// guard catches the `nats_publish` callback because every envelope
+/// constructed from a NATS-bridged message stamps
+/// `metadata.source_protocol = "nats"` in
+/// [`WireEvent::into_routable`](crate::WireEvent::into_routable). The
+/// `nats_publish` field is therefore safe to wire even though it
+/// short-circuits in this transport.
+fn fire_forwarding(
+    nats_publish: Option<&OnNatsPublish>,
+    federation_forward: Option<&OnFederationForward>,
+    http_forward: Option<&OnHttpForward>,
+    routed: &Arc<RoutableMessage>,
+) {
+    if let Some(cb) = nats_publish {
+        // Echo guard inside the NATS publisher itself short-circuits
+        // these calls; we still fire so the wiring shape matches MQTT
+        // and a future change to the echo discipline only needs one
+        // edit at the publisher.
+        cb(routed.as_ref().clone());
+    }
+    if let Some(fwd) = federation_forward {
+        let groups: Vec<String> = routed.source.groups.iter().cloned().collect();
+        fwd(routed.payload.clone(), groups, routed.metadata.clone());
+    }
+    if let Some(fwd) = http_forward {
+        fwd(routed.as_ref().clone());
     }
 }
 
