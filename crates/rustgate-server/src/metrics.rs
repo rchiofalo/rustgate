@@ -227,6 +227,15 @@ static AUTHZ_CACHE_HITS: OnceLock<IntCounter> = OnceLock::new();
 static AUTHZ_CACHE_MISSES: OnceLock<IntCounter> = OnceLock::new();
 static RELOAD_ROLLBACK: OnceLock<IntCounterVec> = OnceLock::new();
 static AUTHZ_OBLIGATION_UNKNOWN: OnceLock<IntCounterVec> = OnceLock::new();
+/// Live count of in-flight authz evaluations holding the engine `Arc`
+/// cloned out of the router's `ArcSwap`. Issue #721: the
+/// `ArcSwap`-based hot-reload is lock-free and a `swap_authz` install
+/// is atomic for *future* `.load()` calls, but already-running
+/// evaluations continue against the pre-swap engine until they
+/// finish. This gauge is the operator-visible drain signal — when it
+/// returns to its pre-swap baseline, every evaluation that observed
+/// the previous engine has retired.
+static AUTHZ_EVALUATIONS_IN_FLIGHT: OnceLock<IntGauge> = OnceLock::new();
 
 // ── Router fanout, PEP, and obligation metrics (issue #768) ─────────
 //
@@ -1122,6 +1131,22 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(authz_cache_misses.clone()))?;
     let _ = AUTHZ_CACHE_MISSES.set(authz_cache_misses);
 
+    // Issue #721: in-flight authz evaluations gauge. Observation-only
+    // — the value rises by `+1` on entry to every PEP evaluation and
+    // falls by `-1` on the corresponding RAII guard drop. Operators
+    // monitoring an `Router::swap_authz` reload watch this gauge for
+    // the post-swap drain time: when it returns to the pre-swap
+    // baseline, every evaluation that observed the previous policy
+    // engine has retired.
+    let authz_evaluations_in_flight = IntGauge::with_opts(Opts::new(
+        "rustgate_authz_evaluations_in_flight",
+        "In-flight authz evaluations currently holding the engine Arc cloned \
+         out of the router's ArcSwap; observe this gauge after a SIGHUP / \
+         policy reload to determine when the previous engine has fully drained",
+    ))?;
+    registry.register(Box::new(authz_evaluations_in_flight.clone()))?;
+    let _ = AUTHZ_EVALUATIONS_IN_FLIGHT.set(authz_evaluations_in_flight);
+
     // Subsystem-labelled rollback counter for #818. Operators page on
     // a non-zero `rate(rustgate_reload_rollback_total{subsystem="authz"}[5m])`
     // because a sustained rollback rate means the on-disk policy is
@@ -1590,6 +1615,25 @@ pub fn router_pep_decision_callback() -> rustgate_transport::OnPepDecision {
 pub fn router_obligation_applied_callback() -> rustgate_transport::OnObligationApplied {
     Arc::new(|kind: &'static str| {
         obligation_applied_total().with_label_values(&[kind]).inc();
+    })
+}
+
+/// Accessor for the in-flight authz-evaluations gauge. Issue #721.
+pub fn authz_evaluations_in_flight() -> &'static IntGauge {
+    AUTHZ_EVALUATIONS_IN_FLIGHT
+        .get_or_init(|| fallback_gauge("rustgate_authz_evaluations_in_flight", "fallback"))
+}
+
+/// Build the [`rustgate_transport::OnAuthzInFlightChanged`] callback
+/// that feeds the `rustgate_authz_evaluations_in_flight` gauge with
+/// the signed `+1` / `-1` deltas emitted by the router's RAII
+/// `AuthzEvalGuard`. Wired by the server binary once at startup so
+/// every authz evaluation observed by the router contributes to the
+/// gauge — and so the gauge is a faithful drain signal across an
+/// `Router::swap_authz` policy reload. Closes #721.
+pub fn router_authz_in_flight_callback() -> rustgate_transport::OnAuthzInFlightChanged {
+    Arc::new(|delta: i64| {
+        authz_evaluations_in_flight().add(delta);
     })
 }
 

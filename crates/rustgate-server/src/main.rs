@@ -877,6 +877,13 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
         router.set_on_dropped(Some(metrics::router_dropped_callback()));
         router.set_on_pep_decision(Some(metrics::router_pep_decision_callback()));
         router.set_on_obligation_applied(Some(metrics::router_obligation_applied_callback()));
+        // Closes #721. Operator-visible drain signal for ArcSwap
+        // policy hot-reloads — every authz evaluation increments the
+        // gauge on entry and decrements on exit via the router's
+        // RAII guard. After a `swap_authz`, the gauge returning to
+        // its pre-swap baseline is the all-clear that every
+        // evaluation that observed the previous engine has retired.
+        router.set_on_authz_in_flight_changed(Some(metrics::router_authz_in_flight_callback()));
     }
 
     #[cfg(feature = "metrics")]

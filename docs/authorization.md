@@ -508,6 +508,93 @@ re-evaluate against the current policy on every drain — so a policy
 that is tight enough on the persistence boundary will catch any
 stragglers from an in-flight split.
 
+## Policy reload effective time
+
+This section is for SREs planning a tightening rollout who need a
+defensible answer to "as of what wall-clock time does the new policy
+apply to every routed message?". Issue
+[#721](https://github.com/rchiofalo/rustgate/issues/721).
+
+The mental model is simple but the timing is fuzzy at sub-microsecond
+resolution. `arc_swap::ArcSwap` makes the swap itself instantaneous
+(a single atomic pointer store) but in-flight evaluations that
+already cloned the previous engine `Arc` continue to run against the
+pre-swap policy until they finish. The window is short — typically
+sub-microsecond, bounded by the tail latency of one evaluation on
+the loaded policy — but it is not zero. There is no barrier; readers
+never block writers and writers never block readers (see "The
+`ArcSwap` architecture" above for the lock-free contract).
+
+Three properties to anchor on:
+
+1. **The swap is atomic for future `.load()` calls.** Every PEP site
+   that calls `self.authz.load()` after the `store` observes the new
+   engine. There is no "torn read" hazard; the inner pointer is
+   either the old `Arc` or the new one, never both.
+2. **In-flight evaluations finish on the old policy.** A PEP that
+   has already called `.load()` and cloned the old engine `Arc`
+   continues to run against that engine. The drop of the cloned
+   `Arc` at the end of evaluation is what releases the previous
+   engine's last refcount once the swap has retired the slot.
+3. **Effective time is "T plus drain time", not just "T".** The new
+   policy is in force for *all* messages from `T + drain_time`
+   onward, where `drain_time` is the longest in-flight evaluation
+   active at `T`. For compliance audits requiring "policy X effective
+   at T", record both: the audit timestamp from
+   `audit::authz_reload_success` (T) and the gauge drain observation
+   (T + drain_time).
+
+### `rustgate_authz_evaluations_in_flight` — the drain gauge
+
+`rustgate_authz_evaluations_in_flight` (Prometheus `IntGauge`) is the
+operator-visible signal for "how many evaluations are still holding
+the pre-swap engine `Arc`". It increments by `+1` on entry to every
+Send and Receive PEP evaluation and decrements by `-1` on the
+corresponding RAII guard drop, regardless of whether the evaluation
+returned Allow, Deny, or panicked on the way out. Every PEP path is
+covered because the guard is constructed inside
+`authz_evaluate_inner`, which is the single shared codepath for the
+two `authz_evaluate_send` / `authz_evaluate_receive` entry points.
+
+Operational use:
+
+- **Steady-state baseline.** On a healthy router the gauge oscillates
+  around a small value proportional to the live message rate × per-
+  evaluation latency (Little's law). Plot it as a per-second average,
+  not a max — instantaneous peaks are dominated by sampling
+  granularity.
+- **Reload drain observation.** Annotate your dashboard with
+  `audit::authz_reload_success` events. After every annotation,
+  watch the gauge return to its pre-swap baseline. The wall-clock
+  delta from the annotation to the gauge returning to baseline is
+  the drain time — i.e., the moment the new policy is in force on
+  every in-flight request.
+- **Stuck-evaluation alerting.** A gauge value that does not return
+  to baseline within seconds of a reload is a stuck PEP — an engine
+  whose `evaluate()` is wedged. The native engine's measured P99 is
+  ~80 ns; anything past tens of milliseconds warrants investigation.
+  Alert on `max_over_time(rustgate_authz_evaluations_in_flight[1m])`
+  staying above the steady-state baseline for longer than your
+  per-evaluation tail SLO.
+- **Capacity planning.** A monotonically rising gauge is the symptom
+  of a misconfigured policy whose `evaluate()` cost has grown faster
+  than the message rate. Combine with `rustgate_authz_eval_nanos` to
+  separate "more evaluations" from "slower evaluations".
+
+### Why the metric path was taken over a barrier-stall
+
+The alternative to the metric+docs approach is a router-wide barrier
+that stalls `swap_authz` until every in-flight evaluation that
+observed the previous engine has finished. That option was
+deliberately rejected: it converts the lock-free hot path into a
+blocking one, and on a tactical router whose value proposition is
+liveness, the latency of the swap is more important than its
+serializability. The metric makes the existing window observable
+without changing its shape — operators get the drain time as data,
+not as a serialization point. The persisted paths
+(store-and-forward, SA replay) already provide strict serializability
+where it matters; see "Hot-reload and store-and-forward" above.
+
 ## Optional Cedar backend
 
 For operators with an existing Cedar policy corpus, rustgate can be

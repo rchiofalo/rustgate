@@ -112,6 +112,70 @@ pub type OnPepDecision = Arc<dyn Fn(&'static str, &'static str, f64) + Send + Sy
 /// actuation rate. Closes #768.
 pub type OnObligationApplied = Arc<dyn Fn(&'static str) + Send + Sync>;
 
+/// Callback invoked twice per authz evaluation: once with `+1` on
+/// entry to `authz_evaluate_send` / `authz_evaluate_receive` and once
+/// with `-1` when the `AuthzEvalGuard` RAII handle drops at the end
+/// of evaluation. The signed delta lets the consumer feed a
+/// Prometheus `IntGauge` via `add` without a separate "sub" entry
+/// point. Wired by the server binary to feed the
+/// `rustgate_authz_evaluations_in_flight` gauge so operators
+/// monitoring an `ArcSwap` policy hot-reload can see the drain time
+/// of in-flight evaluations holding the previous engine `Arc`.
+/// Closes #721.
+pub type OnAuthzInFlightChanged = Arc<dyn Fn(i64) + Send + Sync>;
+
+/// RAII handle that bumps the in-flight authz-evaluation gauge on
+/// construction and decrements it on `Drop`. Constructed at the entry
+/// of [`Router::authz_evaluate_inner`] so every `_send` / `_receive`
+/// PEP site is covered without each call site duplicating the
+/// increment/decrement pair — and so an early return via `?` (today
+/// or in any future variant of the inner evaluator) cannot leak the
+/// counter.
+///
+/// The `_phantom: PhantomData` field exists so `AuthzEvalGuard` cannot
+/// be constructed via the struct-literal short-form from outside the
+/// module — every constructor must go through [`AuthzEvalGuard::new`],
+/// which is the only path that issues the `+1` to the consumer
+/// callback. Closes #721.
+struct AuthzEvalGuard {
+    /// Pre-resolved `+1` / `-1` emitter. `None` when no callback is
+    /// installed; the guard's `new` and `Drop` paths short-circuit on
+    /// the empty arm so the un-wired hot path stays a single
+    /// `ArcSwap::load`.
+    cb: Option<OnAuthzInFlightChanged>,
+    /// Marker to keep the struct-literal constructor private. See the
+    /// type-level doc-comment.
+    _phantom: std::marker::PhantomData<()>,
+}
+
+impl AuthzEvalGuard {
+    /// Acquire the gauge slot. Loads the callback once, emits `+1` if
+    /// installed, and returns a guard whose `Drop` emits the matching
+    /// `-1`. The callback handle is cloned into the guard so a swap of
+    /// the slot mid-evaluation cannot strand the decrement on a fresh
+    /// callback that never saw the `+1` (the `Arc<dyn Fn …>` carries
+    /// the original consumer through to drop).
+    fn new(slot: &ArcSwap<Option<OnAuthzInFlightChanged>>) -> Self {
+        let guard = slot.load();
+        let cb = (**guard).as_ref().cloned();
+        if let Some(ref f) = cb {
+            f(1);
+        }
+        Self {
+            cb,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for AuthzEvalGuard {
+    fn drop(&mut self) {
+        if let Some(ref f) = self.cb {
+            f(-1);
+        }
+    }
+}
+
 /// Map an [`Obligation`] variant to the small fixed-vocabulary label
 /// used by the `rustgate_obligation_applied_total{kind}` counter. The
 /// `_` arm covers the `#[non_exhaustive]` contract on the authz crate's
@@ -934,6 +998,14 @@ pub struct Router {
     /// feed the `rustgate_obligation_applied_total{kind}` counter.
     /// Hot-reloadable via `ArcSwap`. Closes #768.
     on_obligation_applied: ArcSwap<Option<OnObligationApplied>>,
+    /// Optional callback fired with `+1` on entry to
+    /// `authz_evaluate_inner` and `-1` when the `AuthzEvalGuard` drops
+    /// at the end of evaluation. Wired by the server binary to feed
+    /// the `rustgate_authz_evaluations_in_flight` gauge so operators
+    /// can observe how long in-flight evaluations continue to hold the
+    /// pre-swap engine `Arc` after a hot-reload. Hot-reloadable via
+    /// `ArcSwap`. Closes #721.
+    on_authz_in_flight_changed: ArcSwap<Option<OnAuthzInFlightChanged>>,
 }
 
 impl std::fmt::Debug for Router {
@@ -974,6 +1046,10 @@ impl std::fmt::Debug for Router {
                 "on_obligation_applied_installed",
                 &(**self.on_obligation_applied.load()).is_some(),
             )
+            .field(
+                "on_authz_in_flight_changed_installed",
+                &(**self.on_authz_in_flight_changed.load()).is_some(),
+            )
             .finish()
     }
 }
@@ -1000,6 +1076,7 @@ impl Default for Router {
             on_dropped: ArcSwap::from_pointee(None),
             on_pep_decision: ArcSwap::from_pointee(None),
             on_obligation_applied: ArcSwap::from_pointee(None),
+            on_authz_in_flight_changed: ArcSwap::from_pointee(None),
         }
     }
 }
@@ -1039,6 +1116,7 @@ impl Router {
             on_dropped: ArcSwap::from_pointee(None),
             on_pep_decision: ArcSwap::from_pointee(None),
             on_obligation_applied: ArcSwap::from_pointee(None),
+            on_authz_in_flight_changed: ArcSwap::from_pointee(None),
         }
     }
 
@@ -1084,6 +1162,7 @@ impl Router {
             on_dropped: ArcSwap::from_pointee(None),
             on_pep_decision: ArcSwap::from_pointee(None),
             on_obligation_applied: ArcSwap::from_pointee(None),
+            on_authz_in_flight_changed: ArcSwap::from_pointee(None),
         }
     }
 
@@ -1132,6 +1211,7 @@ impl Router {
             on_dropped: ArcSwap::from_pointee(None),
             on_pep_decision: ArcSwap::from_pointee(None),
             on_obligation_applied: ArcSwap::from_pointee(None),
+            on_authz_in_flight_changed: ArcSwap::from_pointee(None),
         }
     }
 
@@ -1262,6 +1342,13 @@ impl Router {
         resource: &AuthzResource<'_>,
         action: AuthzAction,
     ) -> rustgate_authz::DecisionOutcome {
+        // RAII guard for the in-flight gauge (issue #721). Constructed
+        // BEFORE `engine.evaluate` so the gauge reflects exactly the
+        // window during which this invocation holds the engine `Arc`
+        // cloned out of `self.authz` — which is the window operators
+        // need to observe across an `ArcSwap` swap. Drop on every exit
+        // path is automatic.
+        let _in_flight = AuthzEvalGuard::new(&self.on_authz_in_flight_changed);
         let start = std::time::Instant::now();
         let outcome = engine.evaluate(subject, resource, action);
         let elapsed = start.elapsed();
@@ -1451,6 +1538,28 @@ impl Router {
     /// `rustgate_obligation_applied_total{kind}` counter. Closes #768.
     pub fn set_on_obligation_applied(&self, cb: Option<OnObligationApplied>) {
         self.on_obligation_applied.store(Arc::new(cb));
+    }
+
+    /// Install (or replace) the in-flight authz-evaluation observer.
+    ///
+    /// The callback fires twice per evaluation: `+1` on entry and `-1`
+    /// on exit (RAII via `AuthzEvalGuard`). The signed delta is meant
+    /// to be added directly into a Prometheus `IntGauge` so the gauge
+    /// value is the real-time count of in-flight evaluations holding
+    /// the engine `Arc` cloned out of the router's `authz` slot.
+    ///
+    /// The metric is observation-only — it does NOT change reload
+    /// semantics (the issue's barrier-stall option was deliberately
+    /// not taken; see `docs/authorization.md` "Reload semantics" for
+    /// the rationale). Operators monitoring the gauge can determine
+    /// when a [`Self::swap_authz`] has fully drained the previous
+    /// engine: when the gauge returns to its pre-swap baseline, every
+    /// in-flight evaluation observed at the swap moment has finished.
+    ///
+    /// Wired by the server binary under `#[cfg(feature = "metrics")]`
+    /// to feed `rustgate_authz_evaluations_in_flight`. Closes #721.
+    pub fn set_on_authz_in_flight_changed(&self, cb: Option<OnAuthzInFlightChanged>) {
+        self.on_authz_in_flight_changed.store(Arc::new(cb));
     }
 
     /// Internal helper — invoke the fanout callback if installed.
@@ -3652,6 +3761,7 @@ impl Router {
 #[cfg(test)]
 mod tests {
     #![allow(unused_results)]
+    #![allow(clippy::panic, clippy::unwrap_used)]
 
     use std::collections::BTreeSet;
     use std::time::SystemTime;
@@ -6471,6 +6581,148 @@ mod tests {
             "fan-out must not allocate per recipient: cn Arc strong_count \
              went from {baseline} → {after} for {SUBSCRIBERS} subscribers \
              (a per-recipient String clone would push it to baseline + N)"
+        );
+    }
+
+    #[test]
+    fn authz_eval_gauge_reflects_concurrent_evaluations() {
+        // Closes #721. The in-flight gauge is the operator-visible
+        // signal for "how many evaluations are still holding the
+        // pre-swap engine `Arc`". Drive N concurrent evaluations
+        // through threads that each hold an `AuthzEvalGuard` while
+        // they wait at a shared barrier, verify the gauge reads N
+        // exactly while every guard is alive, then release the
+        // barrier and confirm the gauge drains back to zero.
+        //
+        // Driving the guard directly (rather than going through the
+        // full `Router::route` pipeline) keeps the test focused on
+        // the gauge contract: every entry into `authz_evaluate_inner`
+        // increments and every exit decrements, regardless of which
+        // PEP entry point or destination shape called it.
+        use std::sync::Barrier;
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        const N: usize = 4;
+        let gauge = Arc::new(AtomicI64::new(0));
+        let gauge_cb = Arc::clone(&gauge);
+        let slot: Arc<ArcSwap<Option<OnAuthzInFlightChanged>>> =
+            Arc::new(ArcSwap::from_pointee(Some(Arc::new(move |delta: i64| {
+                let _ = gauge_cb.fetch_add(delta, Ordering::SeqCst);
+            }))));
+
+        // Two-phase barrier. Phase 1: every thread has constructed
+        // its guard (and therefore emitted `+1`). Phase 2: every
+        // thread is allowed to drop its guard.
+        let entered = Arc::new(Barrier::new(N + 1));
+        let release = Arc::new(Barrier::new(N + 1));
+
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let slot = Arc::clone(&slot);
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            handles.push(std::thread::spawn(move || {
+                let _g = AuthzEvalGuard::new(&slot);
+                entered.wait();
+                release.wait();
+                // Guard drops on scope exit here.
+            }));
+        }
+
+        // Wait until every thread has constructed its guard. With
+        // the barrier model this is deterministic — no timeouts, no
+        // sleeps.
+        entered.wait();
+        assert_eq!(
+            gauge.load(Ordering::SeqCst),
+            N as i64,
+            "in-flight gauge must equal the number of held guards"
+        );
+
+        // Release every thread; each guard drops and emits `-1`.
+        release.wait();
+        for h in handles {
+            h.join().expect("worker thread must join");
+        }
+        assert_eq!(
+            gauge.load(Ordering::SeqCst),
+            0,
+            "in-flight gauge must drain to 0 after every guard drops"
+        );
+    }
+
+    #[test]
+    fn authz_eval_gauge_decrements_on_panic_safe_path() {
+        // Closes #721. The `AuthzEvalGuard` is RAII; a panic inside
+        // `engine.evaluate` (or any future early-return / `?` path
+        // through `authz_evaluate_inner`) MUST still release the
+        // gauge slot. Verify by directly dropping a guard inside an
+        // unwound scope — `catch_unwind` here is overkill because
+        // `AuthzEvalGuard` is its own type, not bound to the larger
+        // Router lifecycle. The guarantee we need is: if the local
+        // goes out of scope for ANY reason, the `-1` fires.
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        let gauge = Arc::new(AtomicI64::new(0));
+        let gauge_cb = Arc::clone(&gauge);
+        let slot: ArcSwap<Option<OnAuthzInFlightChanged>> =
+            ArcSwap::from_pointee(Some(Arc::new(move |delta: i64| {
+                let _ = gauge_cb.fetch_add(delta, Ordering::SeqCst);
+            })));
+
+        // Normal scope exit.
+        {
+            let _g = AuthzEvalGuard::new(&slot);
+            assert_eq!(gauge.load(Ordering::SeqCst), 1, "guard increments on new()");
+        }
+        assert_eq!(
+            gauge.load(Ordering::SeqCst),
+            0,
+            "guard must decrement on Drop at scope end"
+        );
+
+        // Early-return / `?` path simulation — guard dropped before
+        // a hypothetical post-evaluation step. If a future refactor
+        // routes the inner evaluator through a fallible step that
+        // returns `Result`, the guard's drop still runs because the
+        // local is bound before the fallible call.
+        fn fallible_path(
+            slot: &ArcSwap<Option<OnAuthzInFlightChanged>>,
+        ) -> Result<(), &'static str> {
+            let _g = AuthzEvalGuard::new(slot);
+            Err("simulated early return")
+        }
+        let res = fallible_path(&slot);
+        assert!(res.is_err());
+        assert_eq!(
+            gauge.load(Ordering::SeqCst),
+            0,
+            "guard must decrement even on `?`-style early return"
+        );
+
+        // Panic path — guard.drop() runs during stack unwind.
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = AuthzEvalGuard::new(&slot);
+            assert_eq!(gauge.load(Ordering::SeqCst), 1);
+            panic!("simulated engine.evaluate panic");
+        }));
+        assert!(r.is_err());
+        assert_eq!(
+            gauge.load(Ordering::SeqCst),
+            0,
+            "guard must decrement during panic unwind"
+        );
+
+        // Empty-callback path — no callback installed, no observable
+        // effect on the gauge, and Drop is still safe.
+        let empty: ArcSwap<Option<OnAuthzInFlightChanged>> = ArcSwap::from_pointee(None);
+        {
+            let _g = AuthzEvalGuard::new(&empty);
+        }
+        assert_eq!(
+            gauge.load(Ordering::SeqCst),
+            0,
+            "no-callback path must not perturb a foreign gauge"
         );
     }
 }
