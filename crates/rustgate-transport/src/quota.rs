@@ -20,7 +20,13 @@ use serde::Deserialize;
 pub const DEFAULT_TENANT_KEY: &str = "__default__";
 
 /// Resource limits for a single tenant.
+///
+/// Uses `deny_unknown_fields` to reject quota entries containing
+/// unexpected properties — a typo like `"max_connectons"` produces a
+/// clear deserialization error instead of being silently ignored,
+/// which is critical for a security-relevant cap (#815, F-136).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TenantQuota {
     /// Maximum concurrent connections. 0 = unlimited.
     #[serde(default)]
@@ -38,7 +44,13 @@ pub struct TenantQuota {
 }
 
 /// Quota configuration loaded from file.
+///
+/// Uses `deny_unknown_fields` to reject quota files containing
+/// unexpected top-level keys — a typo like `"tenats"` would otherwise
+/// silently parse as an empty map and leave every tenant unlimited
+/// (#815, F-136).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QuotaConfig {
     /// Per-tenant quotas keyed by tenant name (cert Organization).
     #[serde(default)]
@@ -608,5 +620,44 @@ mod tests {
         assert!(debug.contains("TenantBytePermit"));
         assert!(debug.contains("acme"));
         assert!(debug.contains("256"));
+    }
+
+    /// Pin that `QuotaConfig::deserialize` rejects unknown top-level keys.
+    /// A typo like `"tenats"` (missing `n`) would otherwise parse as an
+    /// empty `tenants` map, silently leaving every tenant unlimited; the
+    /// `deny_unknown_fields` discipline (#815, F-136) is what catches it
+    /// at config load.
+    #[test]
+    fn quota_config_rejects_unknown_top_level_field() {
+        let json = r#"{"tenants":{},"bogus":42}"#;
+        let result: Result<QuotaConfig, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "unknown top-level field must be rejected by deny_unknown_fields"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown field") && err.contains("bogus"),
+            "error should name the offending field: {err}"
+        );
+    }
+
+    /// Pin that `TenantQuota::deserialize` rejects unknown nested keys
+    /// — a typo like `"max_connectons"` is silently ignored without
+    /// `deny_unknown_fields`, leaving the tenant unlimited (the
+    /// security-relevant default for an unset `max_connections`).
+    #[test]
+    fn tenant_quota_rejects_unknown_nested_field() {
+        let json = r#"{"tenants":{"acme":{"max_connections":3,"max_connectons":99}},"default_quota":null}"#;
+        let result: Result<QuotaConfig, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "typo'd `max_connectons` must be rejected by deny_unknown_fields"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown field") && err.contains("max_connectons"),
+            "error should name the offending field: {err}"
+        );
     }
 }

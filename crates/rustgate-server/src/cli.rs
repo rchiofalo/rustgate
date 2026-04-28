@@ -8,6 +8,9 @@
 
 use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
+use rustgate_core::config::validate::{
+    validate_non_empty as core_validate_non_empty, validate_path_exists as core_validate_path,
+};
 use rustgate_core::protocol::{FramingStrategy, HeaderSize};
 use serde::{Deserialize, Serialize};
 
@@ -1952,25 +1955,39 @@ impl Cli {
         // SPIFFE mode obtains cert/key/ca from the Workload API, so
         // file-based TLS checks do not apply.
         if !self.spiffe {
-            if self.cert.is_empty() {
+            // Non-empty checks delegate to the shared validator; messages
+            // are wrapped to preserve the longstanding operator-facing
+            // "(or [<key>] in the config file)" hint that makes the error
+            // actionable from either CLI or config-file misconfiguration.
+            if core_validate_non_empty(&self.cert, "--cert").is_err() {
                 anyhow::bail!("--cert (or [cert] in the config file) is required");
             }
-            if self.key.is_empty() {
+            if core_validate_non_empty(&self.key, "--key").is_err() {
                 anyhow::bail!("--key (or [key] in the config file) is required");
             }
-            if self.ca.is_empty() {
+            if core_validate_non_empty(&self.ca, "--ca").is_err() {
                 anyhow::bail!("--ca (or [ca] in the config file) is required");
             }
 
             // TLS file existence — catch typos / missing mounts before the
-            // TLS stack produces a cryptic I/O error.
-            if !self.cert.is_empty() && !std::path::Path::new(&self.cert).exists() {
+            // TLS stack produces a cryptic I/O error. The operator-facing
+            // text below matches the longstanding format ("TLS cert file
+            // not found: <path>") that operator runbooks and our own
+            // regression tests grep on; the shared validator's structured
+            // error is consumed only as a yes/no probe here.
+            if !self.cert.is_empty()
+                && core_validate_path(std::path::Path::new(&self.cert), "--cert").is_err()
+            {
                 anyhow::bail!("TLS cert file not found: {}", self.cert);
             }
-            if !self.key.is_empty() && !std::path::Path::new(&self.key).exists() {
+            if !self.key.is_empty()
+                && core_validate_path(std::path::Path::new(&self.key), "--key").is_err()
+            {
                 anyhow::bail!("TLS key file not found: {}", self.key);
             }
-            if !self.ca.is_empty() && !std::path::Path::new(&self.ca).exists() {
+            if !self.ca.is_empty()
+                && core_validate_path(std::path::Path::new(&self.ca), "--ca").is_err()
+            {
                 anyhow::bail!("TLS CA file not found: {}", self.ca);
             }
         }
@@ -3190,5 +3207,30 @@ mod tests {
         cli.archive_max_age = 0;
         cli.archive_rotate_interval = 1; // aggressive, but rotation is off
         cli.validate().expect("disabled rotation should skip check");
+    }
+
+    /// Pin that loading a TOML config with a misspelled top-level key
+    /// fails with a `unknown field` error rather than silently producing
+    /// a default-valued field. The `ConfigFile` macro wires
+    /// `#[serde(deny_unknown_fields)]` (#815, F-136); a regression that
+    /// drops the attribute would let `--bnd = "..."` be silently
+    /// ignored and the operator would never see the mistake.
+    #[test]
+    fn config_file_rejects_unknown_toml_key() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let cfg_path = dir.path().join("rustgate.toml");
+        // `bnd` is the typo (should be `bind`). With deny_unknown_fields,
+        // figment surfaces the offending key in the error message.
+        std::fs::write(&cfg_path, "bnd = \"0.0.0.0:4433\"\n").expect("write toml");
+
+        let result = load_config_file(cfg_path.to_str().expect("path utf8"));
+        let err = match result {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("typo'd `bnd` must be rejected by deny_unknown_fields"),
+        };
+        assert!(
+            err.contains("unknown field") && err.contains("bnd"),
+            "error should name the offending field: {err}"
+        );
     }
 }
