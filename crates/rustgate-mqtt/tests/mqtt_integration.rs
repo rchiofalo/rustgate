@@ -3640,3 +3640,377 @@ async fn connect_default_config_omits_server_keep_alive_in_connack() {
 
     server.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// Send-PEP obligation + echo-prevention coverage (refs #737 — MQTT egress)
+// ---------------------------------------------------------------------------
+//
+// The wiring closed by #1129 routes inbound MQTT PUBLISHes through
+// `Router::route_for_egress`, which applies Send-PEP obligations BEFORE
+// returning the post-mutation envelope to the fan-out helper. The two
+// tests below pin the load-bearing security properties of that path:
+//
+// 1. **Obligations apply before fan-out.** A `MaskPoint` obligation on
+//    the Send PEP MUST scrub `<point lat lon hae />` before the NATS /
+//    federation / HTTP egress callbacks observe the message AND before
+//    the message reaches a co-located MQTT subscriber. A regression that
+//    fired the egress callbacks against the pre-PEP form would leak raw
+//    coordinates to a SIEM, federation peer, or webhook target while the
+//    in-process delivery looked compliant — exactly the gap closed by
+//    switching the publish path from `Router::route` to
+//    `Router::route_for_egress`.
+//
+// 2. **No echo back into MQTT egress on inbound delivery.** A
+//    `RoutableMessage` injected through the router (simulating a
+//    NATS-subscriber consumer loop or any other inbound source) MUST NOT
+//    re-trigger the MQTT publish-side fan-out callbacks. The forwarder
+//    bundle is wired only on the MQTT PUBLISH hot path; messages that
+//    reach an MQTT subscriber via the local fan-out do not loop back to
+//    NATS / federation / HTTP. Combined with `source_protocol = "mqtt"`
+//    on every MQTT-originated envelope and the NATS publisher's own
+//    case-insensitive `nats` echo guard (#1192), this closes the
+//    bidirectional loop that #737 flagged.
+
+#[tokio::test]
+async fn mqtt_publish_with_send_pep_obligation_applies_obligation_before_fanout() {
+    use std::sync::Mutex as StdMutex;
+    use std::time::SystemTime;
+
+    use bytes::Bytes;
+    use rustgate_core::message::RoutableMessage;
+    use rustgate_transport::rustgate_authz::{
+        Action, Decision, DecisionOutcome, Obligation, PolicyEngine, Resource, Subject,
+    };
+
+    /// Engine that allows everything but attaches `MaskPoint` on the
+    /// Send PEP. Mirrors the `AllowWithObligationEngine` pattern from
+    /// `rustgate-transport/tests/multicast_egress_pep.rs`.
+    struct AllowWithSendMaskPointEngine;
+    impl PolicyEngine for AllowWithSendMaskPointEngine {
+        fn evaluate(&self, _s: &Subject<'_>, _r: &Resource<'_>, a: Action) -> DecisionOutcome {
+            let obligations = if a == Action::Send {
+                vec![Obligation::MaskPoint]
+            } else {
+                Vec::new()
+            };
+            DecisionOutcome {
+                decision: Decision::Allow,
+                rule_id: None,
+                obligations,
+            }
+        }
+        fn policy_id(&self) -> &str {
+            "test-mqtt-send-mask-point"
+        }
+    }
+
+    // The CoT payload carries a `<point>` with non-zero coordinates.
+    // After the Send-PEP `MaskPoint` obligation runs, both `lat` and
+    // `lon` must be `0.0` and the original `38.8977` / `-77.0365`
+    // values must be absent from every observable form (the local MQTT
+    // subscriber's PUBLISH payload AND the egress fan-out copy).
+    const SAMPLE_COT: &[u8] = br#"<event uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><point lat="38.8977" lon="-77.0365" hae="125.4"/></event>"#;
+
+    let _ = SystemTime::now(); // pin the import — the helper builds a
+    // Metadata stamp inside the synthetic injection branch below.
+
+    let ca = TestCa::new("MQTT Test CA");
+    let alice_cert = ca.issue_client_cert("alice", &["alpha"]);
+    let bob_cert = ca.issue_client_cert("bob", &["alpha"]);
+    let router = Arc::new(Router::new().with_authz(Arc::new(AllowWithSendMaskPointEngine)));
+
+    let nats_events: Arc<StdMutex<Vec<RoutableMessage>>> = Arc::new(StdMutex::new(Vec::new()));
+    let nats_clone = Arc::clone(&nats_events);
+    let forwarding_hooks = MqttForwardingHooks {
+        nats_publish: Some(Arc::new(move |msg| {
+            nats_clone.lock().unwrap().push(msg);
+        })),
+        federation_forward: None,
+        http_forward: None,
+    };
+
+    let server = TestServer::new_with_forwarding(&ca, Arc::clone(&router), forwarding_hooks);
+
+    // Bob subscribes first so the inline CoT publish lands on a live
+    // session and we can compare the wire form against the egress copy.
+    let bob_tls = build_client_tls_config(&bob_cert.cert_pem, &bob_cert.key_pem, &ca.cert_pem);
+    let mut bob = mqtt_connect(server.addr, &bob_tls).await;
+    let mut bob_buf = BytesMut::new();
+    write_v5_packet(
+        &mut bob,
+        &mqttbytes::v5::Packet::Connect(mqttbytes::v5::Connect::new("bob-mask-recv")),
+    )
+    .await;
+    let _ = read_v5_packet(&mut bob, &mut bob_buf).await; // CONNACK
+    let sub = mqttbytes::v5::Subscribe::new("alpha", mqttbytes::QoS::AtMostOnce);
+    write_v5_packet(&mut bob, &mqttbytes::v5::Packet::Subscribe(sub)).await;
+    let _ = read_v5_packet(&mut bob, &mut bob_buf).await; // SUBACK
+
+    // Alice publishes a CoT event with non-zero coordinates. The Send
+    // PEP scrubs the payload BEFORE the message hits Bob's session
+    // channel and BEFORE the NATS callback fires.
+    let alice_tls =
+        build_client_tls_config(&alice_cert.cert_pem, &alice_cert.key_pem, &ca.cert_pem);
+    let mut alice = mqtt_connect(server.addr, &alice_tls).await;
+    let mut alice_buf = BytesMut::new();
+    write_v5_packet(
+        &mut alice,
+        &mqttbytes::v5::Packet::Connect(mqttbytes::v5::Connect::new("alice-mask-pub")),
+    )
+    .await;
+    let _ = read_v5_packet(&mut alice, &mut alice_buf).await; // CONNACK
+    let publish =
+        mqttbytes::v5::Publish::new("alpha", mqttbytes::QoS::AtMostOnce, Bytes::from(SAMPLE_COT));
+    write_v5_packet(&mut alice, &mqttbytes::v5::Packet::Publish(publish)).await;
+
+    // Bob receives the masked PUBLISH.
+    let received = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_v5_packet(&mut bob, &mut bob_buf),
+    )
+    .await
+    .expect("bob must receive the obligation-mutated publish");
+    let local_payload = match received {
+        mqttbytes::v5::Packet::Publish(p) => p.payload,
+        other => panic!("expected Publish on bob, got {other:?}"),
+    };
+    let local = std::str::from_utf8(&local_payload).expect("masked payload is UTF-8");
+    assert!(
+        local.contains(r#"lat="0.0""#),
+        "local subscriber must see Send-PEP MaskPoint applied (lat zeroed): {local}"
+    );
+    assert!(
+        local.contains(r#"lon="0.0""#),
+        "local subscriber must see Send-PEP MaskPoint applied (lon zeroed): {local}"
+    );
+    assert!(
+        !local.contains("38.8977"),
+        "raw lat leaked to local MQTT subscriber despite Send MaskPoint: {local}"
+    );
+    assert!(
+        !local.contains("-77.0365"),
+        "raw lon leaked to local MQTT subscriber despite Send MaskPoint: {local}"
+    );
+
+    // Yield so the egress callback (synchronous in this test) has run
+    // by the time we snapshot the recorded events.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let snapshot = nats_events.lock().unwrap();
+    assert_eq!(
+        snapshot.len(),
+        1,
+        "nats_publish must fire exactly once for the obligation-allowed PUBLISH",
+    );
+    let egress = std::str::from_utf8(&snapshot[0].payload).expect("egress payload is UTF-8");
+    assert!(
+        egress.contains(r#"lat="0.0""#),
+        "egress sink must see Send-PEP MaskPoint applied (lat zeroed): {egress}"
+    );
+    assert!(
+        egress.contains(r#"lon="0.0""#),
+        "egress sink must see Send-PEP MaskPoint applied (lon zeroed): {egress}"
+    );
+    assert!(
+        !egress.contains("38.8977"),
+        "raw lat leaked to NATS egress despite Send MaskPoint: {egress}"
+    );
+    assert!(
+        !egress.contains("-77.0365"),
+        "raw lon leaked to NATS egress despite Send MaskPoint: {egress}"
+    );
+
+    // The local copy and the egress copy must be byte-identical: a
+    // regression that fanned out the pre-mutation form (or that
+    // mutated the local copy after egress sampled it) would surface
+    // as a mismatch here, complementing the per-side mask assertions
+    // above.
+    assert_eq!(
+        local_payload.as_ref(),
+        snapshot[0].payload.as_ref(),
+        "local-subscriber payload must be byte-identical to the egress fan-out copy \
+         (both must have observed the same post-Send-PEP form)",
+    );
+    drop(snapshot);
+
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn mqtt_publish_does_not_loop_back_to_mqtt_subscriber_via_nats() {
+    use std::collections::BTreeSet;
+    use std::sync::Mutex as StdMutex;
+    use std::time::SystemTime;
+
+    use bytes::Bytes;
+    use rustgate_core::identity::Identity;
+    use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
+
+    // Echo-loop scenario: a NATS subscriber consumer (out of scope for
+    // this PR) injects a `RoutableMessage` into the router with
+    // `source_protocol = "nats"` so the in-process MQTT subscriber
+    // receives it. The forwarder bundle is wired ONLY on the MQTT
+    // publish path, so the inbound delivery to the MQTT subscriber
+    // MUST NOT re-trigger any of the three fan-out callbacks. If this
+    // invariant ever breaks, an MQTT-sourced message that came back
+    // through NATS would be re-published over MQTT (and re-published
+    // back to NATS, etc.) — the canonical broker-level echo loop.
+    //
+    // This test pins:
+    //   1. The MQTT subscriber receives the injected message (so the
+    //      inbound path itself is wired and not silently dropped).
+    //   2. None of the three forwarder callbacks fire — the publish-
+    //      side fan-out helper is only attached to the inbound MQTT
+    //      PUBLISH hot path.
+    //   3. When the same MQTT subscriber later publishes a fresh
+    //      message, the forwarder fires once with `source_protocol =
+    //      "mqtt"` so the NATS publisher's own `eq_ignore_ascii_case
+    //      ("nats")` echo guard (#1192) trips on any return trip.
+
+    let ca = TestCa::new("MQTT Test CA");
+    let bob_cert = ca.issue_client_cert("bob", &["alpha"]);
+    let router = Arc::new(Router::new());
+
+    type FedEvent = (Bytes, Vec<String>, Metadata);
+    let nats_events: Arc<StdMutex<Vec<RoutableMessage>>> = Arc::new(StdMutex::new(Vec::new()));
+    let fed_events: Arc<StdMutex<Vec<FedEvent>>> = Arc::new(StdMutex::new(Vec::new()));
+    let http_events: Arc<StdMutex<Vec<RoutableMessage>>> = Arc::new(StdMutex::new(Vec::new()));
+    let nats_clone = Arc::clone(&nats_events);
+    let fed_clone = Arc::clone(&fed_events);
+    let http_clone = Arc::clone(&http_events);
+
+    let forwarding_hooks = MqttForwardingHooks {
+        nats_publish: Some(Arc::new(move |msg| {
+            nats_clone.lock().unwrap().push(msg);
+        })),
+        federation_forward: Some(Arc::new(move |payload, groups, metadata| {
+            fed_clone.lock().unwrap().push((payload, groups, metadata));
+        })),
+        http_forward: Some(Arc::new(move |msg| {
+            http_clone.lock().unwrap().push(msg);
+        })),
+    };
+
+    let server = TestServer::new_with_forwarding(&ca, Arc::clone(&router), forwarding_hooks);
+
+    let bob_tls = build_client_tls_config(&bob_cert.cert_pem, &bob_cert.key_pem, &ca.cert_pem);
+    let mut bob = mqtt_connect(server.addr, &bob_tls).await;
+    let mut bob_buf = BytesMut::new();
+    write_v5_packet(
+        &mut bob,
+        &mqttbytes::v5::Packet::Connect(mqttbytes::v5::Connect::new("bob-echo-recv")),
+    )
+    .await;
+    let _ = read_v5_packet(&mut bob, &mut bob_buf).await; // CONNACK
+    let sub = mqttbytes::v5::Subscribe::new("alpha", mqttbytes::QoS::AtMostOnce);
+    write_v5_packet(&mut bob, &mqttbytes::v5::Packet::Subscribe(sub)).await;
+    let _ = read_v5_packet(&mut bob, &mut bob_buf).await; // SUBACK
+
+    // Inject a NATS-sourced envelope through the router as if a NATS
+    // subscriber consumer fed it in. Use a non-MQTT source identity so
+    // the test stays representative of the real ingest pattern (a NATS
+    // subscriber consumer constructs an `Identity` for the federated
+    // peer, not for the local Bob session).
+    let nats_source = Identity::new(
+        "nats-subscriber".to_string(),
+        "nats-sub-fp".to_string(),
+        BTreeSet::from(["alpha".to_string()]),
+    )
+    .expect("identity for nats-subscriber");
+    let injected = RoutableMessage {
+        source: nats_source,
+        destination: Destination::Group("alpha".into()),
+        payload: Bytes::from_static(b"injected-from-nats"),
+        metadata: Metadata {
+            received_at: SystemTime::now(),
+            source_protocol: "nats".to_string(),
+            message_type: MessageType::Other("nats".into()),
+            ttl: None,
+        },
+    };
+    // `route_for_egress` is the same surface the future NATS-subscriber
+    // sub-item of #737 will use. The test exercises the MQTT-side
+    // contract independent of that future code: the MQTT subscriber
+    // path receives the message, but the MQTT publisher fan-out helper
+    // does NOT observe it because that helper is only wired on the
+    // inbound PUBLISH dispatch (`handle_publish_v5` / `handle_publish_v4`).
+    let _ = router.route_for_egress(injected).await;
+
+    // Bob must receive the injected message — the inbound delivery
+    // path itself is wired correctly.
+    let received = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_v5_packet(&mut bob, &mut bob_buf),
+    )
+    .await
+    .expect("bob must receive the injected NATS-sourced message");
+    match received {
+        mqttbytes::v5::Packet::Publish(p) => {
+            assert_eq!(p.topic, "alpha");
+            assert_eq!(p.payload.as_ref(), b"injected-from-nats");
+        }
+        other => panic!("expected Publish on bob from NATS-injected envelope, got {other:?}"),
+    }
+
+    // Yield so any spurious callback (regression) would have fired by
+    // the time we snapshot.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    {
+        let snapshot = nats_events.lock().unwrap();
+        assert!(
+            snapshot.is_empty(),
+            "nats_publish MUST NOT fire for inbound deliveries to an MQTT subscriber — \
+             only inbound MQTT PUBLISHes drive egress fan-out, otherwise an MQTT-sourced \
+             message returning via NATS would loop indefinitely. Got {} events",
+            snapshot.len(),
+        );
+    }
+    {
+        let snapshot = fed_events.lock().unwrap();
+        assert!(
+            snapshot.is_empty(),
+            "federation_forward MUST NOT fire for inbound deliveries to an MQTT subscriber: \
+             saw {} events",
+            snapshot.len(),
+        );
+    }
+    {
+        let snapshot = http_events.lock().unwrap();
+        assert!(
+            snapshot.is_empty(),
+            "http_forward MUST NOT fire for inbound deliveries to an MQTT subscriber: \
+             saw {} events",
+            snapshot.len(),
+        );
+    }
+
+    // Now Bob publishes a fresh message — the MQTT publish path MUST
+    // fire the fan-out exactly once, and the recorded envelope MUST
+    // carry `source_protocol = "mqtt"` so the NATS publisher's
+    // case-insensitive echo guard would prevent any return trip from
+    // re-publishing back over MQTT. This pins the second half of the
+    // bidirectional echo-loop break: the publish-side contract that
+    // makes the inbound-side guard above sufficient.
+    let publish =
+        mqttbytes::v5::Publish::new("alpha", mqttbytes::QoS::AtMostOnce, b"bob-fresh-publish");
+    write_v5_packet(&mut bob, &mqttbytes::v5::Packet::Publish(publish)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    {
+        let snapshot = nats_events.lock().unwrap();
+        assert_eq!(
+            snapshot.len(),
+            1,
+            "MQTT publish path MUST fan out to NATS exactly once",
+        );
+        assert_eq!(
+            snapshot[0].metadata.source_protocol, "mqtt",
+            "MQTT-published envelope MUST carry source_protocol=\"mqtt\" so the NATS \
+             publisher's echo guard (#1192) trips on any return trip — got {:?}",
+            snapshot[0].metadata.source_protocol,
+        );
+        assert_eq!(snapshot[0].payload.as_ref(), b"bob-fresh-publish");
+    }
+
+    server.shutdown();
+}
