@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use rustgate_authz::{NativeEngine, PolicyEngine, parser};
 use rustgate_core::audit;
+use rustgate_core::tasks::spawn_background;
 use rustgate_transport::Router;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
@@ -320,7 +321,7 @@ impl AuthzReloader {
     /// thread so the async runtime is never stalled.
     pub(crate) fn spawn_watcher(self: &Arc<Self>, interval: Duration) {
         let reloader = Arc::clone(self);
-        drop(tokio::spawn(async move {
+        spawn_background("authz-reloader", async move {
             let mut tick = tokio::time::interval(interval);
             let _ = tick.tick().await; // skip immediate first tick
             loop {
@@ -363,7 +364,7 @@ impl AuthzReloader {
                     }
                 }
             }
-        }));
+        });
     }
 }
 

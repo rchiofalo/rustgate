@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rustgate_core::tasks::spawn_background;
 use rustgate_federation::manager::FederationManager;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
@@ -154,7 +155,7 @@ impl FederationPeerReloader {
     /// and reloads when changes are detected.
     pub(crate) fn spawn_watcher(self: &Arc<Self>, interval: Duration) {
         let reloader = Arc::clone(self);
-        drop(tokio::spawn(async move {
+        spawn_background("federation-peer-reloader", async move {
             let mut tick = tokio::time::interval(interval);
             // Skip the first immediate tick — peers were just loaded.
             let _ = tick.tick().await;
@@ -173,7 +174,7 @@ impl FederationPeerReloader {
                     );
                 }
             }
-        }));
+        });
     }
 }
 

@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
+use rustgate_core::tasks::spawn_background;
 use tracing::{debug, info, warn};
 
 use crate::config::RoutingMode;
@@ -163,11 +164,11 @@ impl KvStore {
         let kv = self.kv.clone();
         let key = info.id.clone();
         // Fire-and-forget async write
-        drop(tokio::spawn(async move {
+        spawn_background("fed-kv-put", async move {
             if let Err(e) = kv.put(&key, data.into()).await {
                 warn!(key = %key, error = %e, "failed to write federate to KV");
             }
-        }));
+        });
         Ok(())
     }
 
@@ -175,11 +176,11 @@ impl KvStore {
     fn delete_kv(&self, id: &str) {
         let kv = self.kv.clone();
         let key = id.to_string();
-        drop(tokio::spawn(async move {
+        spawn_background("fed-kv-delete", async move {
             if let Err(e) = kv.delete(&key).await {
                 warn!(key = %key, error = %e, "failed to delete federate from KV");
             }
-        }));
+        });
     }
 
     /// Stop background tasks.
@@ -499,11 +500,11 @@ fn flush_stats(
         {
             let kv = kv.clone();
             let key = id.clone();
-            drop(tokio::spawn(async move {
+            spawn_background("fed-kv-stats-flush", async move {
                 if let Err(e) = kv.put(&key, data.into()).await {
                     warn!(key = %key, error = %e, "failed to flush stats to KV");
                 }
-            }));
+            });
         }
     }
 }

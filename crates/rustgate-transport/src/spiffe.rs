@@ -19,6 +19,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use rustgate_core::error::{ConfigError, Result, RustgateError};
+use rustgate_core::tasks::spawn_background;
 use spiffe::cert::Certificate;
 use spiffe::svid::x509::X509Svid;
 use spiffe::workload_api::client::WorkloadApiClient;
@@ -187,7 +188,7 @@ pub fn spawn_refresh_task(
     if cfg.refresh_interval.is_zero() {
         return;
     }
-    drop(tokio::spawn(async move {
+    spawn_background("spiffe-svid-refresh", async move {
         let mut tick = tokio::time::interval(cfg.refresh_interval);
         let _ = tick.tick().await; // skip the immediate tick
         loop {
@@ -227,7 +228,7 @@ pub fn spawn_refresh_task(
                 }
             }
         }
-    }));
+    });
 }
 
 /// Fetch once and update the reloader. Returns the new SPIFFE ID, trust

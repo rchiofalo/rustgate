@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rustgate_core::sanitize::sanitize_for_log;
+use rustgate_core::tasks::spawn_background;
 use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
@@ -1099,7 +1100,7 @@ impl FederatedChannel for FederationService {
 
         const MAX_CONSECUTIVE_VIOLATIONS: u32 = 10;
 
-        drop(tokio::spawn(async move {
+        spawn_background("fed-v2-server-event-stream", async move {
             let mut consecutive_violations: u32 = 0;
 
             while let Ok(Some(event)) = stream.message().await {
@@ -1156,7 +1157,7 @@ impl FederatedChannel for FederationService {
                 on_event(event, rustgate_core::PeerId::new(pid.as_str()));
             }
             info!(peer = %pid, "server_event_stream closed");
-        }));
+        });
 
         Ok(Response::new(self.our_subscription()))
     }
@@ -1169,11 +1170,11 @@ impl FederatedChannel for FederationService {
         let mut stream = request.into_inner();
 
         // Drain the stream without processing (binary blobs not supported)
-        drop(tokio::spawn(async move {
+        spawn_background("fed-v2-binary-message-stream", async move {
             while let Ok(Some(_blob)) = stream.message().await {
                 debug!(peer = %peer_id, "received binary blob (ignored)");
             }
-        }));
+        });
 
         Ok(Response::new(figpb::Empty {}))
     }
@@ -1218,7 +1219,7 @@ impl FederatedChannel for FederationService {
         let on_rol_event = Arc::clone(&self.on_rol_event);
         let pid = peer_id.clone();
         let max_hops = self.max_hops;
-        drop(tokio::spawn(async move {
+        spawn_background("fed-v2-server-rol-stream", async move {
             while let Ok(Some(rol)) = stream.message().await {
                 let _ = FederationService::observe_inbound_rol_event(
                     &on_rol_event,
@@ -1228,7 +1229,7 @@ impl FederatedChannel for FederationService {
                 );
             }
             info!(peer = %pid, "server_rol_stream closed");
-        }));
+        });
 
         Ok(Response::new(self.our_subscription()))
     }
@@ -1271,7 +1272,7 @@ impl FederatedChannel for FederationService {
         let max_name_len = self.max_group_name_length;
         let max_hops = self.max_hops;
 
-        drop(tokio::spawn(async move {
+        spawn_background("fed-v2-client-federate-groups-stream", async move {
             while let Ok(Some(groups_msg)) = stream.message().await {
                 // Per-update observation hook: hop validation + audit +
                 // metric + callback. The existing per-peer bookkeeping
@@ -1326,7 +1327,7 @@ impl FederatedChannel for FederationService {
             }
             info!(peer = %pid, "client_federate_groups_stream closed");
             let _ = peer_groups.write().await.remove(&pid);
-        }));
+        });
 
         Ok(Response::new(self.our_subscription()))
     }
@@ -1367,7 +1368,7 @@ impl FederatedChannel for FederationService {
         // Forward events from the mpsc channel to the gRPC stream
         let outbound_streams = Arc::clone(&self.outbound_streams);
         let pid = peer_id.clone();
-        drop(tokio::spawn(async move {
+        spawn_background("fed-v2-client-event-forwarder", async move {
             while let Some(event) = event_rx.recv().await {
                 if stream_tx.send(Ok(event)).await.is_err() {
                     warn!(peer = %pid, "event dropped: gRPC stream closed or full, stopping forwarding");
@@ -1376,7 +1377,7 @@ impl FederatedChannel for FederationService {
             }
             info!(peer = %pid, "client_event_stream closed");
             let _ = outbound_streams.write().await.remove(&pid);
-        }));
+        });
 
         Ok(Response::new(ReceiverStream::new(stream_rx)))
     }
@@ -1437,10 +1438,10 @@ impl FederatedChannel for FederationService {
         // until the peer disconnects and tonic drops `rx` — same
         // pattern as `server_federate_groups_stream`.
         let (tx, rx) = mpsc::channel(1);
-        drop(tokio::spawn(async move {
+        spawn_background("fed-v2-client-rol-stream-holder", async move {
             futures::future::pending::<()>().await;
             drop(tx);
-        }));
+        });
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
@@ -1519,11 +1520,11 @@ impl FederatedChannel for FederationService {
 
         // Hold the sender alive in a background task so the stream stays open.
         // The stream closes when the remote disconnects (rx is dropped by tonic).
-        drop(tokio::spawn(async move {
+        spawn_background("fed-v2-server-federate-groups-holder", async move {
             // Keep tx alive until the connection drops — pending never resolves
             futures::future::pending::<()>().await;
             drop(tx);
-        }));
+        });
 
         Ok(Response::new(ReceiverStream::new(rx)))
     }

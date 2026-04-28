@@ -21,6 +21,7 @@ use rustgate_core::constants::{READ_TIMEOUT, WRITE_TIMEOUT};
 pub use rustgate_core::egress::{OnFederationForward, OnHttpForward, OnNatsPublish};
 use rustgate_core::identity::Identity;
 use rustgate_core::masking::hash_cn;
+use rustgate_core::tasks::spawn_background;
 use rustgate_cot::MessageBuilder;
 use rustgate_transport::{ClientThrottle, ReplayFilter, Router, SessionHandle, ThrottleConfig};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
@@ -213,10 +214,13 @@ impl WebSocketServer {
                             let hc = health_check;
                             let hooks = session_hooks.clone();
                             let sa_obs = sa_upgrade_observer.clone();
-                            drop(tokio::spawn(handle_ws_session(
-                                session, router, session_codec, nats, fed, http, tc, rf,
-                                cb, fps, bps, vio, mwb, hc, hooks, sa_obs, permit,
-                            )));
+                            spawn_background(
+                                "ws-session",
+                                handle_ws_session(
+                                    session, router, session_codec, nats, fed, http, tc, rf,
+                                    cb, fps, bps, vio, mwb, hc, hooks, sa_obs, permit,
+                                ),
+                            );
                         }
                         Err(e) => {
                             warn!(transport = TRANSPORT_LABEL, error = %e, "WebSocket accept error");

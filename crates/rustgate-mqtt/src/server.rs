@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use rustgate_core::tasks::spawn_background;
 use tracing::{info, warn};
 
 use crate::TRANSPORT_LABEL;
@@ -72,7 +73,7 @@ impl MqttServer {
         if session_store.is_enabled() {
             let store_for_reaper = Arc::clone(&session_store);
             let shutdown_for_reaper = Arc::clone(&shutdown);
-            drop(tokio::spawn(async move {
+            spawn_background("mqtt-session-reaper", async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
@@ -93,7 +94,7 @@ impl MqttServer {
                         }
                     }
                 }
-            }));
+            });
         }
 
         info!(
@@ -139,25 +140,28 @@ impl MqttServer {
                             let sessions = Arc::clone(&session_store);
                             let hooks = session_hooks.clone();
                             let forwarding = forwarding_hooks.clone();
-                            drop(tokio::spawn(handle_mqtt_session(
-                                pre_session,
-                                router,
-                                prefix,
-                                max_packet_size,
-                                receive_max,
-                                topic_alias_max,
-                                max_session_expiry_secs,
-                                min_keep_alive_secs,
-                                server_keep_alive_secs,
-                                response_channel_capacity,
-                                wildcard_policy,
-                                registry,
-                                retain,
-                                sessions,
-                                permit,
-                                hooks,
-                                forwarding,
-                            )));
+                            spawn_background(
+                                "mqtt-session",
+                                handle_mqtt_session(
+                                    pre_session,
+                                    router,
+                                    prefix,
+                                    max_packet_size,
+                                    receive_max,
+                                    topic_alias_max,
+                                    max_session_expiry_secs,
+                                    min_keep_alive_secs,
+                                    server_keep_alive_secs,
+                                    response_channel_capacity,
+                                    wildcard_policy,
+                                    registry,
+                                    retain,
+                                    sessions,
+                                    permit,
+                                    hooks,
+                                    forwarding,
+                                ),
+                            );
                         }
                         Ok(None) => {
                             // TLS handshake failed or cert invalid — already logged by listener.

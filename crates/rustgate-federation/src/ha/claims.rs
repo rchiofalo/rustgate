@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use rustgate_core::PeerId;
 use rustgate_core::masking::hash_cn;
+use rustgate_core::tasks::spawn_background;
 use tokio::sync::{Mutex, watch};
 use tracing::{debug, info, warn};
 
@@ -460,10 +461,10 @@ async fn watch_expired_claims(
                     let callback = callback.clone();
                     let peer_id_owned: PeerId = PeerId::new(peer_id);
                     let jitter = ClaimManager::adoption_jitter();
-                    drop(tokio::spawn(async move {
+                    spawn_background("fed-claim-adoption", async move {
                         tokio::time::sleep(jitter).await;
                         callback(peer_id_owned);
-                    }));
+                    });
                 }
             }
             _ = shutdown_rx.changed() => {

@@ -25,6 +25,7 @@ const MAX_ENROLLMENT_CONNECTIONS: usize = 64;
 
 use rustgate_core::constants::HANDSHAKE_TIMEOUT;
 use rustgate_core::net::configure_tactical_socket;
+use rustgate_core::tasks::spawn_background;
 
 /// Maximum time for an HTTP connection on the enrollment server.
 ///
@@ -254,7 +255,7 @@ impl EnrollmentServer {
             #[cfg(feature = "est")]
             let est_enabled = self.est_enabled;
 
-            drop(tokio::spawn(async move {
+            spawn_background("enrollment-conn", async move {
                 let _permit = permit;
                 let tls_stream = match tokio::time::timeout(
                     HANDSHAKE_TIMEOUT,
@@ -318,7 +319,7 @@ impl EnrollmentServer {
                 {
                     tracing::debug!(peer = %peer, error = %e, "HTTP connection timed out");
                 }
-            }));
+            });
         }
     }
 }
