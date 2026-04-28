@@ -29,6 +29,7 @@ mod codec;
 mod codecs;
 mod config;
 mod dedup;
+pub mod egress;
 mod extract;
 mod filter;
 mod listener;
@@ -70,6 +71,7 @@ pub use config::{install_pq_provider, install_provider_with_kx_groups};
 pub use dedup::{
     DEFAULT_MAX_ENTRIES as DEFAULT_DEDUP_MAX_ENTRIES, DedupCache, OnDuplicate, OnInsert,
 };
+pub use egress::{EgressEnvelope, EgressError, RecipientClass};
 pub use extract::{ExpectedKeyUsage, extract_identity, validate_key_usage};
 pub use filter::{GeoBounds, MessageFilter};
 pub use listener::{DEFAULT_MAX_HANDSHAKES, OnHandshakeDuration, OnHandshakeError, TlsListener};

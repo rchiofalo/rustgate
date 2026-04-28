@@ -1269,6 +1269,45 @@ pub fn server_started(bind: &str, version: &str) {
     );
 }
 
+// ── Egress envelope obligation events ──────────────────────────────
+
+/// Record one data-plane obligation actuation that was applied while
+/// rendering the post-Send-PEP envelope used for an egress fan-out
+/// (NATS, federation, HTTP, MQTT, multicast egress copy).
+///
+/// Fires once per `(envelope, obligation)` pair — i.e. an envelope
+/// rendered from a multicast whose union carries `MaskPoint` and
+/// `TagClassified` produces two events for that single envelope, not
+/// one per recipient. Closes the per-recipient obligation duplication
+/// gap that #746 calls out: today's local-fanout path runs the masking
+/// path N times for an N-recipient multicast; the egress path renders
+/// it exactly once and the audit cadence reflects that.
+///
+/// `sink` is the sink class label (`"multicast"`, `"nats"`,
+/// `"federation"`, `"http"`, `"mqtt"`, `"local"`); `obligation_type`
+/// is the small fixed-vocabulary obligation label
+/// (`"mask_point"`, `"mask_payload"`, `"tag_classified"`,
+/// `"audit_extended"`, `"unknown"`); `recipient_class` is a
+/// human-readable rendering of the `RecipientClass` variant
+/// (e.g. `"multicast:[alpha,bravo]"`, `"nats:my.subject"`).
+///
+/// Sanitization: every `&str` parameter is sanitized at the audit
+/// boundary so a maliciously-crafted group name or NATS subject cannot
+/// forge surrounding fields.
+pub fn egress_obligation_applied(sink: &str, obligation_type: &str, recipient_class: &str) {
+    let sink = s(sink);
+    let obligation_type = s(obligation_type);
+    let recipient_class = s(recipient_class);
+    audit!(
+        "egress.obligation.applied",
+        sink = %sink,
+        obligation_type = %obligation_type,
+        recipient_class = %recipient_class,
+        action = "apply_obligation",
+        result = "success"
+    );
+}
+
 // ── HTTP egress audit events ───────────────────────────────────────
 
 /// Record an HTTP publish failure for a target.
@@ -2428,6 +2467,34 @@ mod tests {
         fn test_verifier_rebuild_failed() {
             verifier_rebuild_failed("root store build error: invalid cert");
             verifier_rebuild_failed("");
+        }
+    }
+
+    mod egress_envelope {
+        use super::*;
+
+        #[test]
+        fn test_egress_obligation_applied() {
+            // Smoke-test the documented call shapes: every sink class
+            // label that today's `RecipientClass` enum surfaces and the
+            // documented obligation labels exposed by the transport
+            // crate's `obligation_kind_label`. The audit emitter
+            // sanitizes `&str` arguments at the boundary, so a
+            // newline-injected sink label must NOT split the captured
+            // line.
+            egress_obligation_applied("multicast", "mask_point", "multicast:[alpha,bravo]");
+            egress_obligation_applied("nats", "tag_classified", "nats:siem.events");
+            egress_obligation_applied("federation", "mask_payload", "federation:peer-1");
+            egress_obligation_applied("http", "audit_extended", "http:dashboard");
+            egress_obligation_applied("mqtt", "unknown", "mqtt:tactical/events");
+            // Boundary-attack shape: every parameter is sanitized
+            // independently, so the smoke test exercises the
+            // log-forging input on each.
+            egress_obligation_applied(
+                "multicast\nFAKE_LINE",
+                "mask_point\r\nfoo",
+                "multicast:[a]\nb=1",
+            );
         }
     }
 

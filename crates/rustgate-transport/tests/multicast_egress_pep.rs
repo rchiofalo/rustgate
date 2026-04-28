@@ -180,8 +180,8 @@ async fn multicast_egress_applies_send_pep_obligations() {
 /// - Each local recipient applies `MaskPoint` via the Receive PEP in
 ///   `send_to_group_excluding`, so the in-process delivery is masked.
 /// - The egress side has no Send obligations to apply, so
-///   `compute_multicast_egress` returns `Unchanged` and the egress
-///   arc is the original unmodified source bytes.
+///   `prepare_egress_envelope` returns the unmodified arc and the
+///   egress arc is the original unmodified source bytes.
 ///
 /// This pins the perf carve-out: the egress-side code path adds zero
 /// allocation when no Send obligations exist, and the local fanout
