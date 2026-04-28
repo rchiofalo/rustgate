@@ -19,9 +19,14 @@
 //! these via `?` and surface them through `anyhow::Error` at the
 //! orchestration layer.
 
+pub mod compression;
 pub mod health;
 mod rate_limit;
 mod server;
+
+pub use compression::{
+    CompressionConfig, Deflater, Inflater, NegotiatedExtension, PermessageDeflateConfig,
+};
 
 /// Canonical value of the `transport` structured-log field emitted by every
 /// session-lifecycle event in this crate.
@@ -79,6 +84,18 @@ pub struct WsSession {
     /// session is still valid and MUST be treated as the default (unnamed)
     /// application protocol.
     negotiated_subprotocol: Option<String>,
+    /// Outcome of the RFC 7692 `permessage-deflate` extension negotiation.
+    ///
+    /// Set when both (a) the server's [`WsListenerConfig::compression`] is
+    /// [`CompressionConfig::Enabled`] and (b) the client's offer fit the
+    /// configured envelope. `None` means compression was not negotiated
+    /// (operator opted out, client did not offer, or no offer fit the
+    /// envelope). Downstream metrics code can branch on this for
+    /// per-session compression telemetry. The negotiation surface ships
+    /// today; per-frame wire compression is gated on a future
+    /// tokio-tungstenite release exposing the upstream `deflate` feature
+    /// — see the `compression` module docs for details.
+    negotiated_compression: Option<NegotiatedExtension>,
 }
 
 impl WsSession {
@@ -103,6 +120,15 @@ impl WsSession {
         self.negotiated_subprotocol.as_deref()
     }
 
+    /// The outcome of the RFC 7692 `permessage-deflate` negotiation, or
+    /// `None` if compression was not negotiated for this session.
+    ///
+    /// See [`WsSession::negotiated_compression`](Self) field docs for the
+    /// exact semantics, including the current wire-level limitation.
+    pub fn negotiated_compression(&self) -> Option<&NegotiatedExtension> {
+        self.negotiated_compression.as_ref()
+    }
+
     pub fn into_stream(self) -> WsStream {
         self.stream
     }
@@ -119,6 +145,7 @@ impl std::fmt::Debug for WsSession {
             .field("peer_addr", &self.peer_addr)
             .field("stream", &"<WebSocketStream>")
             .field("negotiated_subprotocol", &self.negotiated_subprotocol)
+            .field("negotiated_compression", &self.negotiated_compression)
             .finish()
     }
 }
@@ -163,6 +190,21 @@ pub struct WsListener {
     /// selected, per RFC 6455 §4.2.2. Stored as `Arc<[String]>` so each
     /// handshake callback closure only clones an `Arc`, not the vec contents.
     supported_subprotocols: Arc<[String]>,
+    /// When `true`, a client that offered a `Sec-WebSocket-Protocol` set
+    /// disjoint from [`Self::supported_subprotocols`] is rejected with a
+    /// 400 Bad Request. When `false` (the default), the upgrade still
+    /// completes — the response simply omits the
+    /// `Sec-WebSocket-Protocol` header. The lenient default favours
+    /// interop with TAK/tactical clients that probe many subprotocols and
+    /// fall back to native framing on no-match. Strict mode is the right
+    /// choice for deployments with a single well-known client family.
+    subprotocol_strict: bool,
+    /// `permessage-deflate` (RFC 7692) negotiation envelope. See
+    /// [`CompressionConfig`] for semantics. Stored as a plain owned
+    /// value, not `Arc<…>`, because the type is small (one bool tuple +
+    /// `u8`) and cloning per handshake is cheaper than the `Arc`
+    /// indirection on the hot path.
+    compression: CompressionConfig,
     on_connection_rejected: Option<OnWsRejectFn>,
 }
 
@@ -175,6 +217,8 @@ impl std::fmt::Debug for WsListener {
             .field("max_frame_size", &self.max_frame_size)
             .field("max_message_size", &self.max_message_size)
             .field("supported_subprotocols", &self.supported_subprotocols)
+            .field("subprotocol_strict", &self.subprotocol_strict)
+            .field("compression", &self.compression)
             .field(
                 "on_connection_rejected",
                 &self.on_connection_rejected.is_some(),
@@ -201,13 +245,26 @@ pub struct WsListenerConfig {
     /// When non-empty, the handshake callback walks the client's offered
     /// tokens in client order and picks the first one that matches any
     /// server entry (case-sensitive, whitespace-trimmed per RFC 6455 §4.1
-    /// /ABNF rules). If no client token matches any server entry, the
-    /// handshake still completes, but no `Sec-WebSocket-Protocol` header is
-    /// sent — RFC 6455 §4.2.2 permits this and leaves the decision to close
-    /// or continue to the client. Compare to a hard-reject policy: we
-    /// deliberately stay permissive because TAK/tactical clients routinely
-    /// speak their native framing even when no subprotocol is advertised.
+    /// /ABNF rules). If no client token matches any server entry, behaviour
+    /// depends on [`Self::subprotocol_strict`]: lenient (the default) lets
+    /// the upgrade complete with no `Sec-WebSocket-Protocol` header, strict
+    /// rejects with 400.
     pub supported_subprotocols: Vec<String>,
+    /// Whether to reject (`true`) or silently accept (`false`) a client
+    /// whose `Sec-WebSocket-Protocol` offer is disjoint from
+    /// [`Self::supported_subprotocols`]. Defaults to `false` (lenient) — most
+    /// tactical clients probe several subprotocols and fall back to a
+    /// native non-subprotocol framing on no-match, so a strict 400 there
+    /// regresses interop. Operators running a homogeneous client fleet can
+    /// flip this on for stricter handshake hygiene.
+    pub subprotocol_strict: bool,
+    /// `permessage-deflate` (RFC 7692) compression negotiation envelope.
+    /// Defaults to [`CompressionConfig::default`] which enables negotiation
+    /// at the RFC 7692 maxima — see [`CompressionConfig`] field docs and
+    /// the `compression` module-level docs for the rationale (mTLS already
+    /// kills CRIME-style attacks; the operator gets a kill-switch via
+    /// [`CompressionConfig::Disabled`] regardless).
+    pub compression: CompressionConfig,
     /// Fired on every connection rejected inside the accept loop (per-IP
     /// rate limit, TLS handshake failure, identity extraction failure,
     /// upgrade handshake failure). Typically cloned from
@@ -225,6 +282,8 @@ impl std::fmt::Debug for WsListenerConfig {
             .field("max_frame_size", &self.max_frame_size)
             .field("max_message_size", &self.max_message_size)
             .field("supported_subprotocols", &self.supported_subprotocols)
+            .field("subprotocol_strict", &self.subprotocol_strict)
+            .field("compression", &self.compression)
             .field(
                 "on_connection_rejected",
                 &self.on_connection_rejected.is_some(),
@@ -241,6 +300,8 @@ impl Default for WsListenerConfig {
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             supported_subprotocols: Vec::new(),
+            subprotocol_strict: false,
+            compression: CompressionConfig::default(),
             on_connection_rejected: None,
         }
     }
@@ -304,6 +365,8 @@ impl WsListener {
             max_frame_size: config.max_frame_size,
             max_message_size: config.max_message_size,
             supported_subprotocols: config.supported_subprotocols.into(),
+            subprotocol_strict: config.subprotocol_strict,
+            compression: config.compression,
             on_connection_rejected: config.on_connection_rejected,
         })
     }
@@ -399,55 +462,81 @@ impl WsListener {
             ws_config.max_frame_size = Some(self.max_frame_size);
             ws_config.max_message_size = Some(self.max_message_size);
 
-            // Capture the subprotocol chosen inside the handshake callback.
-            // The tungstenite `Callback` trait is `FnOnce(Request, Response)
-            // -> Result<Response, ErrorResponse>`, so the callback's return
-            // value stays header-shaped; we thread the selected token back
-            // out-of-band through a shared
-            // `Arc<parking_lot::Mutex<Option<String>>>`. Both the closure
+            // Capture the subprotocol and compression-extension outcomes
+            // inside the handshake callback. The tungstenite `Callback`
+            // trait is `FnOnce(Request, Response) -> Result<Response,
+            // ErrorResponse>`, so the callback's return value stays
+            // header-shaped; we thread the selected values back
+            // out-of-band through shared
+            // `Arc<parking_lot::Mutex<Option<…>>>` slots. Both the closure
             // and the post-handshake reader live on the same task — the
-            // mutex is never contended, just syntactically required.
-            let selected = Arc::new(parking_lot::Mutex::new(None::<String>));
-            let selected_cb = Arc::clone(&selected);
+            // mutexes are never contended, just syntactically required.
+            let selected_subprotocol = Arc::new(parking_lot::Mutex::new(None::<String>));
+            let selected_subprotocol_cb = Arc::clone(&selected_subprotocol);
+            let selected_compression =
+                Arc::new(parking_lot::Mutex::new(None::<NegotiatedExtension>));
+            let selected_compression_cb = Arc::clone(&selected_compression);
             let server_protocols = Arc::clone(&self.supported_subprotocols);
+            let subprotocol_strict = self.subprotocol_strict;
+            let compression_cfg = self.compression.clone();
 
             let ws_stream = match tokio::time::timeout(
                 HANDSHAKE_TIMEOUT,
                 tokio_tungstenite::accept_hdr_async_with_config(
                     tls_stream,
                     move |req: &Request, mut resp: Response| {
+                        // 1) Subprotocol — RFC 6455 §4.2.2.
                         match negotiate_subprotocol(&server_protocols, req.headers()) {
                             NegotiationOutcome::Selected(picked) => {
                                 if let Ok(hv) = HeaderValue::from_str(&picked) {
-                                    let _ = resp.headers_mut()
+                                    let _ = resp
+                                        .headers_mut()
                                         .insert(header::SEC_WEBSOCKET_PROTOCOL, hv);
                                 }
-                                *selected_cb.lock() = Some(picked);
-                                Ok(resp)
+                                *selected_subprotocol_cb.lock() = Some(picked);
                             }
-                            NegotiationOutcome::NoProtocolRequired => Ok(resp),
+                            NegotiationOutcome::NoProtocolRequired => {
+                                // No header echoed; session has no
+                                // negotiated subprotocol. Lenient and
+                                // strict modes converge here.
+                            }
                             NegotiationOutcome::Unsupported => {
-                                // Client asked for at least one protocol,
-                                // server advertises its own list, zero
-                                // overlap. Reject with 400 — real clients
-                                // (browsers, Python `websockets`, Go
-                                // `nhooyr/websocket`, `tungstenite` itself)
-                                // treat "I asked, you didn't pick" as a
-                                // fatal error anyway, so returning a plain
-                                // 400 with a machine-parseable body matches
-                                // what deployments see in practice and
-                                // surfaces the mismatch cleanly in logs.
-                                let body = "no advertised subprotocol matches server support";
-                                let err_resp = tokio_tungstenite::tungstenite::http::Response::builder()
-                                    .status(tokio_tungstenite::tungstenite::http::StatusCode::BAD_REQUEST)
-                                    .body(Some(body.to_string()))
-                                    .map_err(|e| tokio_tungstenite::tungstenite::http::Response::builder()
-                                        .status(tokio_tungstenite::tungstenite::http::StatusCode::INTERNAL_SERVER_ERROR)
-                                        .body(Some(format!("error building 400 response: {e}")))
-                                        .expect("500 fallback always builds"))?;
-                                Err(err_resp)
+                                if subprotocol_strict {
+                                    // Operator opted into strict mode:
+                                    // a disjoint client offer is a fatal
+                                    // 400. Real homogeneous-fleet
+                                    // deployments use this so a config
+                                    // drift surfaces in server logs
+                                    // instead of as opaque client-side
+                                    // protocol errors.
+                                    let body = "no advertised subprotocol matches server support";
+                                    let err_resp = build_400(body)?;
+                                    return Err(err_resp);
+                                }
+                                // Lenient (the default): the upgrade
+                                // proceeds with no
+                                // `Sec-WebSocket-Protocol` header — TAK
+                                // and similar tactical clients probe
+                                // several subprotocols and fall back to
+                                // a native non-subprotocol framing on
+                                // no-match, so a hard 400 here would
+                                // regress interop.
                             }
                         }
+
+                        // 2) `permessage-deflate` — RFC 7692 §5.
+                        if let Some(ext) =
+                            compression::negotiate_extension(&compression_cfg, req.headers())
+                        {
+                            if let Ok(hv) = HeaderValue::from_str(&ext.response_header_value) {
+                                let _ = resp
+                                    .headers_mut()
+                                    .insert(header::SEC_WEBSOCKET_EXTENSIONS, hv);
+                            }
+                            *selected_compression_cb.lock() = Some(ext);
+                        }
+
+                        Ok(resp)
                     },
                     Some(ws_config),
                 ),
@@ -467,12 +556,14 @@ impl WsListener {
                 }
             };
 
-            let negotiated_subprotocol = selected.lock().take();
+            let negotiated_subprotocol = selected_subprotocol.lock().take();
+            let negotiated_compression = selected_compression.lock().take();
 
             debug!(
                 peer_addr = %peer_addr,
                 cn = %hash_cn(&identity.cn),
                 subprotocol = ?negotiated_subprotocol,
+                compression_negotiated = negotiated_compression.is_some(),
                 "WebSocket session established"
             );
 
@@ -481,9 +572,47 @@ impl WsListener {
                 stream: ws_stream,
                 peer_addr,
                 negotiated_subprotocol,
+                negotiated_compression,
             });
         }
     }
+}
+
+/// Build a 400 Bad Request response for the tungstenite handshake callback.
+/// Factored out so the strict-subprotocol path stays readable; future
+/// strict checks (e.g. forbidden extensions) reuse the same helper.
+///
+/// The fallback path constructs a 500 if response building somehow fails;
+/// `tungstenite::http::Response::builder()` only returns errors on
+/// invalid header construction, which `Response::builder().status(400)
+/// .body(Some(_))` cannot trigger — but we keep the fallback so a future
+/// regression of the builder's invariants does not crash the accept loop.
+// justification: the tungstenite `Callback` trait dictates the
+// `Result<Response, Response<Option<String>>>` shape — we cannot box or
+// shrink it without breaking the trait-required signature.
+#[allow(clippy::result_large_err)]
+fn build_400(
+    body: &str,
+) -> std::result::Result<
+    tokio_tungstenite::tungstenite::http::Response<Option<String>>,
+    tokio_tungstenite::tungstenite::http::Response<Option<String>>,
+> {
+    use tokio_tungstenite::tungstenite::http::{Response, StatusCode};
+
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .body(Some(body.to_string()))
+        .map_err(|e| {
+            // The inner builder is given a known-valid status code and a
+            // string body, so the builder cannot fail here. If
+            // tungstenite's HTTP type ever evolves a way for this to break,
+            // we want the error surfaced — but today this `expect` is
+            // unreachable on every supported tungstenite minor version.
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Some(format!("error building 400 response: {e}")))
+                .expect("500 fallback always builds")
+        })
 }
 
 /// Outcome of the `Sec-WebSocket-Protocol` negotiation step. Three cases,

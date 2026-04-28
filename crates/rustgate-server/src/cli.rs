@@ -634,6 +634,33 @@ pub(crate) struct Cli {
     )]
     pub(crate) ws_subprotocols: Vec<String>,
 
+    /// When set, a WebSocket client whose `Sec-WebSocket-Protocol` offer
+    /// does not intersect `--websocket-subprotocols` is rejected with a
+    /// 400 Bad Request. Default off (lenient): the upgrade still completes
+    /// and the response simply omits the `Sec-WebSocket-Protocol` header
+    /// — TAK and similar tactical clients probe several subprotocols and
+    /// fall back to native non-subprotocol framing on no-match. Operators
+    /// running a homogeneous client fleet flip this on so a config drift
+    /// surfaces in server logs instead of as opaque client-side protocol
+    /// errors.
+    #[arg(long, default_value_t = false, env = "RUSTGATE_WS_SUBPROTOCOL_STRICT")]
+    pub(crate) ws_subprotocol_strict: bool,
+
+    /// Disable `permessage-deflate` (RFC 7692) negotiation entirely. By
+    /// default the server accepts the extension at the RFC 7692 maxima
+    /// because mTLS already neutralises CRIME-style chosen-plaintext
+    /// attacks. Operators on links where compression-oracle attacks are
+    /// in scope, or where an upstream deep-inspection device rejects
+    /// compressed frames, flip this on — the server emits no
+    /// `Sec-WebSocket-Extensions` response header regardless of what the
+    /// client offered.
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "RUSTGATE_WS_COMPRESSION_DISABLED"
+    )]
+    pub(crate) ws_compression_disabled: bool,
+
     /// Interval in seconds between active WebSocket Ping health-check frames.
     /// Set to 0 (default) to disable the active heartbeat — `tokio-tungstenite`
     /// already auto-responds to inbound Pings but never probes the peer, so
@@ -1837,6 +1864,8 @@ define_config_file! {
     ws_rate_limit_max: usize,
     ws_rate_limit_window_secs: u64,
     ws_subprotocols: Vec<String>,
+    ws_subprotocol_strict: bool,
+    ws_compression_disabled: bool,
     ws_ping_interval_secs: u64,
     ws_pong_timeout_secs: u64,
     mqtt_bind: Option<String>,

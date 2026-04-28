@@ -16,6 +16,7 @@ rustgate-cot = { workspace = true }
 rustgate-resilience = { workspace = true }
 rustgate-transport = { workspace = true }
 bytes = { workspace = true }
+flate2 = { workspace = true }
 futures = { workspace = true }
 parking_lot = { workspace = true }
 tokio = { workspace = true, features = ["net", "time", "sync", "rt", "macros"] }

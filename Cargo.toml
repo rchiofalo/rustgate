@@ -70,6 +70,14 @@ http-body = "1"
 http-body-util = "0.1"
 base64 = "0.22"
 tokio-tungstenite = "0.29"
+# `permessage-deflate` (RFC 7692) is implemented at the application layer
+# inside `rustgate-websocket::compression` because tokio-tungstenite 0.29
+# does not yet ship a `deflate` feature on its `tungstenite` dep — the only
+# consumer today is the deflate-codec round-trip and the negotiation-handshake
+# header echo, but it is workspace-level so future per-frame wire-up (slated
+# for whichever release first exposes the upstream feature) can adopt the same
+# version pin without churn.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 socket2 = "0.6"
 rustix = { version = "1", default-features = false, features = ["process"] }
 async-nats = { version = "0.47", default-features = false, features = ["jetstream", "nkeys", "server_2_10"] }

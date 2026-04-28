@@ -3633,6 +3633,7 @@ name = "rustgate-websocket"
 version = "0.8.0"
 dependencies = [
  "bytes",
+ "flate2",
  "futures",
  "parking_lot",
  "rustgate-core",

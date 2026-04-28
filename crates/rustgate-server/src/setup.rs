@@ -1484,6 +1484,12 @@ pub(crate) fn start_websocket<P: NatsPublish + Send + Sync + 'static>(
         max_frame_size: cli.ws_max_frame_size,
         max_message_size: cli.ws_max_message_size,
         supported_subprotocols: cli.ws_subprotocols.clone(),
+        subprotocol_strict: cli.ws_subprotocol_strict,
+        compression: if cli.ws_compression_disabled {
+            rustgate_websocket::CompressionConfig::Disabled
+        } else {
+            rustgate_websocket::CompressionConfig::default()
+        },
         on_connection_rejected: ws_session_hooks
             .as_ref()
             .and_then(|h| h.on_connection_rejected.clone()),
