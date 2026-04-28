@@ -146,7 +146,15 @@ pub(crate) async fn handle_list_revoked(revocation: &RevocationStore) -> Respons
     }
 }
 
+/// JSON body for `POST /api/revoke`.
+///
+/// Uses `deny_unknown_fields` to reject API requests containing
+/// unexpected keys — a typo like `"sereal"` produces an explicit
+/// `400 Bad Request` instead of silently parsing as a missing-field
+/// error or, worse, a body where the typo is ignored and the missing
+/// field defaults somewhere downstream (#815, F-136).
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RevokeRequest {
     serial: String,
     #[serde(default = "default_reason")]
@@ -324,5 +332,24 @@ mod tests {
     #[test]
     fn default_reason_is_unspecified() {
         assert_eq!(default_reason(), "unspecified");
+    }
+
+    /// Pin that `RevokeRequest::deserialize` rejects unknown JSON keys
+    /// — without `deny_unknown_fields`, a typo like `"sereal"` would be
+    /// silently ignored and the request would fail downstream with the
+    /// less actionable "missing serial" error instead of pointing at
+    /// the actual mistake (#815, F-136).
+    #[test]
+    fn revoke_request_rejects_unknown_field() {
+        let json = r#"{"serial":"aa","sereal":"bb"}"#;
+        let result: Result<RevokeRequest, _> = serde_json::from_str(json);
+        let err = match result {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("typo'd `sereal` must be rejected by deny_unknown_fields"),
+        };
+        assert!(
+            err.contains("unknown field") && err.contains("sereal"),
+            "error should name the offending field: {err}"
+        );
     }
 }
