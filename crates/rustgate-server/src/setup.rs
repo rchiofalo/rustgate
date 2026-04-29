@@ -547,6 +547,7 @@ pub(crate) async fn connect_nats(cli: &Cli, router: &Arc<Router>) -> Option<Nats
         live_stream: cli.nats_live_stream.clone(),
         max_ack_pending: cli.nats_max_ack_pending,
         max_deliver: cli.nats_max_deliver,
+        dead_letter_subject: cli.nats_dead_letter_subject.clone(),
         checkpoint_path: cli
             .nats_checkpoint_path
             .as_ref()

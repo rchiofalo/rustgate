@@ -34,3 +34,4 @@ unicode-normalization = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
 rustgate-test-utils = { workspace = true, features = ["nats"] }
+tracing-subscriber = { workspace = true }

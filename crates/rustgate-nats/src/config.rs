@@ -122,7 +122,7 @@ pub struct NatsConfig {
 
     /// Maximum number of JetStream delivery attempts for any single
     /// message before the consumer gives up and advances past it
-    /// (default: 0 = unlimited, matching the JetStream server default).
+    /// (default: `5` — the workspace poison-message handling standard).
     ///
     /// Defense-in-depth against poison messages: if processing panics
     /// mid-handler or the task is cancelled between receive and ACK, the
@@ -133,9 +133,21 @@ pub struct NatsConfig {
     /// (emitted by the NATS server on each give-up) if they want an
     /// alerting signal — this crate does not subscribe to it here.
     ///
-    /// Recommended starting value: `5`. Large enough to survive a
-    /// transient pod restart, small enough that a persistently-failing
-    /// message drops within a few seconds of re-delivery intervals.
+    /// **Behaviour change.** Pre-#883-sub3 the default was `0`, which
+    /// JetStream interprets as "use the server default of unlimited
+    /// redelivery". Operators upgrading from a pre-#883 build now see
+    /// the consumer give up after five attempts on a persistently-
+    /// failing message; the audit event `nats.poison_dlq` fires on the
+    /// give-up so SIEM tooling can alert. Set explicitly to `0` (or
+    /// any non-positive value) to opt back into the legacy unlimited-
+    /// redelivery semantics — useful for legacy migrations where a
+    /// JetStream stream contains records the operator wants to keep
+    /// retrying indefinitely while they fix the upstream producer.
+    ///
+    /// Five attempts is the workspace poison-message standard: large
+    /// enough to survive a transient pod restart, small enough that a
+    /// persistently-failing message drops within a few seconds of re-
+    /// delivery intervals.
     pub max_deliver: i64,
 
     /// Optional path for JetStream replay checkpoint file.
@@ -391,7 +403,11 @@ impl Default for NatsConfig {
             subscription_capacity: 1024,
             live_stream: "RUSTGATE_LIVE".to_string(),
             max_ack_pending: 1000,
-            max_deliver: 0,
+            // Default: five attempts is the workspace poison-message
+            // standard. Operators who want the pre-#883-sub3 unlimited-
+            // redelivery semantics back must set this to `0` (or any
+            // non-positive value) explicitly. Refs #883 sub-item 3.
+            max_deliver: 5,
             checkpoint_path: None,
             request_subject: None,
             dead_letter_subject: None,
@@ -756,13 +772,32 @@ mod tests {
     }
 
     #[test]
-    fn default_max_deliver_is_unlimited_sentinel() {
-        // Default `0` is the JetStream wire sentinel that tells the server
-        // to use its own unlimited default. This is the only back-compat
-        // posture — any positive default would change redelivery behaviour
-        // for existing deployments on upgrade, which is not a silent change
-        // we are willing to ship.
+    fn default_max_deliver_is_five_for_poison_handling() {
+        // Default `5` is the workspace poison-message handling standard
+        // (refs #883 sub-item 3). Pre-#883-sub3 the default was `0`
+        // (JetStream's "unlimited" sentinel), which let a poisonous
+        // message redeliver indefinitely and silently. The new default
+        // bounds the redelivery loop and triggers the
+        // `nats.poison_dlq` audit event on the final give-up.
+        // Operators who need the legacy semantics back must set this
+        // explicitly to `0` (or any non-positive value).
         let config = NatsConfig::default();
+        assert_eq!(config.max_deliver, 5);
+    }
+
+    #[test]
+    fn explicit_zero_max_deliver_opts_into_legacy_unlimited() {
+        // The escape hatch documented in the field's rustdoc: setting
+        // `max_deliver = 0` explicitly tells the JetStream server to
+        // use its own default (unlimited redelivery), preserving the
+        // pre-#883 behaviour for operators who need it. Validation
+        // must accept the value — we never want to refuse a legitimate
+        // legacy-compat opt-in.
+        let config = NatsConfig {
+            max_deliver: 0,
+            ..Default::default()
+        };
+        config.validate().unwrap();
         assert_eq!(config.max_deliver, 0);
     }
 
