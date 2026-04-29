@@ -1475,6 +1475,19 @@ impl Router {
         guard.as_ref().as_ref().map(|d| (d.hits(), d.len()))
     }
 
+    /// Full snapshot of dedup-cache statistics for the
+    /// `/api/v1/dedup/stats` management endpoint.
+    ///
+    /// Returns `None` when no dedup cache is installed (server started
+    /// without `--dedup-window-secs`). The richer shape — entries,
+    /// capacity, hits, misses, evictions, ttl — is the operator-facing
+    /// view; `dedup_stats` above remains for callers that only need
+    /// `(hits, len)` and predates this addition. Refs #902.
+    pub fn dedup_full_stats(&self) -> Option<crate::dedup::DedupStats> {
+        let guard = self.dedup.load();
+        guard.as_ref().as_ref().map(|d| d.stats())
+    }
+
     /// Configured deduplication window, in whole seconds, when a dedup
     /// cache is installed.
     ///

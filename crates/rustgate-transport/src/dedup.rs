@@ -101,6 +101,18 @@ pub struct DedupCache {
     inner: Mutex<LruCache<Key, Instant>>,
     window: Duration,
     hits: AtomicU64,
+    /// Lookups that did NOT match an existing live entry — either no
+    /// entry was present, or the entry was present but expired. Counted
+    /// here so the management API can surface a hit/miss ratio without
+    /// approximating it from `hits` alone (the LRU `len` does not
+    /// distinguish "never seen" from "evicted by capacity"). Refs #902.
+    misses: AtomicU64,
+    /// Capacity-driven evictions: entries removed by `LruCache::put`
+    /// returning `Some` because the cache was already at capacity. Does
+    /// not count TTL expiries (those are observed implicitly when an
+    /// expired entry is overwritten by the same key) — see
+    /// [`DedupStats`] field docs for the exact accounting boundary.
+    evictions: AtomicU64,
     on_duplicate: Option<OnDuplicate>,
     on_insert: Option<OnInsert>,
     /// When `true`, the tenant slot in the key preimage is forced to
@@ -110,11 +122,47 @@ pub struct DedupCache {
     cross_tenant: bool,
 }
 
+/// Snapshot of dedup-cache statistics for the management REST API.
+///
+/// Returned by [`DedupCache::stats`]; surfaced through
+/// [`crate::Router::dedup_full_stats`] to the
+/// `GET /api/v1/dedup/stats` endpoint (refs #902). Counter fields are
+/// `u64` snapshots taken with `Ordering::Relaxed` and are not consistent
+/// with each other under concurrent writers — operators reading the
+/// endpoint get a non-atomic instant-in-time view, matching the
+/// `prometheus`-scrape semantics the rest of the workspace uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DedupStats {
+    /// Currently tracked entries — equivalent to [`DedupCache::len`].
+    pub entries: usize,
+    /// Maximum tracked entries before LRU eviction kicks in. Constant
+    /// for the lifetime of the cache (set at construction).
+    pub capacity: usize,
+    /// Cumulative duplicates suppressed since startup — equivalent to
+    /// [`DedupCache::hits`].
+    pub hit_count: u64,
+    /// Cumulative non-duplicate lookups (fresh insert OR refresh of an
+    /// expired entry). The pre-fix duplicate-only counter could not
+    /// distinguish a healthy stream of unique messages from a stalled
+    /// pipeline — exposing misses lets operators graph a hit ratio.
+    pub miss_count: u64,
+    /// Cumulative capacity-driven LRU evictions since startup. A
+    /// sustained non-zero rate indicates the configured `max_entries`
+    /// is too low for the dedup window and traffic rate combination,
+    /// and dedup correctness is degraded (evicted entries are no longer
+    /// available to suppress duplicates).
+    pub evictions: u64,
+    /// Configured deduplication window in whole seconds.
+    pub ttl_seconds: u64,
+}
+
 impl std::fmt::Debug for DedupCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DedupCache")
             .field("window", &self.window)
             .field("hits", &self.hits.load(Ordering::Relaxed))
+            .field("misses", &self.misses.load(Ordering::Relaxed))
+            .field("evictions", &self.evictions.load(Ordering::Relaxed))
             .field("cross_tenant", &self.cross_tenant)
             .finish()
     }
@@ -133,6 +181,8 @@ impl DedupCache {
             inner: Mutex::new(LruCache::new(cap)),
             window,
             hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
             on_duplicate: None,
             on_insert: None,
             cross_tenant: false,
@@ -189,9 +239,30 @@ impl DedupCache {
         self.hits.load(Ordering::Relaxed)
     }
 
+    /// Total number of non-duplicate lookups since startup — fresh
+    /// inserts plus expired-entry refreshes. Pairs with [`hits`][Self::hits]
+    /// for hit-ratio computation; refs #902.
+    pub fn misses(&self) -> u64 {
+        self.misses.load(Ordering::Relaxed)
+    }
+
+    /// Total number of capacity-driven LRU evictions since startup.
+    /// A sustained non-zero rate signals that the configured
+    /// `max_entries` is too low for the dedup window and traffic rate.
+    pub fn evictions(&self) -> u64 {
+        self.evictions.load(Ordering::Relaxed)
+    }
+
     /// Number of currently tracked entries.
     pub fn len(&self) -> usize {
         self.inner.lock().len()
+    }
+
+    /// Maximum tracked entries before LRU eviction kicks in. Constant
+    /// for the lifetime of the cache; surfaces the construction-time
+    /// `max_entries` value for the management REST API. Refs #902.
+    pub fn capacity(&self) -> usize {
+        self.inner.lock().cap().get()
     }
 
     /// Whether the cache currently has no tracked entries.
@@ -202,6 +273,31 @@ impl DedupCache {
     /// Configured deduplication window.
     pub fn window(&self) -> Duration {
         self.window
+    }
+
+    /// Snapshot of all stats fields surfaced by the management REST
+    /// API. Counter fields are read with `Ordering::Relaxed` and are
+    /// not consistent with each other under concurrent writers — see
+    /// [`DedupStats`] for the exact accounting boundary. Refs #902.
+    pub fn stats(&self) -> DedupStats {
+        // Take the lock once for `len` + `cap` so the entry count and
+        // capacity are read under the same critical section. The
+        // counter loads happen outside the lock — they are atomic
+        // singletons and the snapshot is documented non-atomic, so
+        // holding the cache mutex across them would only widen the
+        // hot-path lock without an observable correctness gain.
+        let (entries, capacity) = {
+            let cache = self.inner.lock();
+            (cache.len(), cache.cap().get())
+        };
+        DedupStats {
+            entries,
+            capacity,
+            hit_count: self.hits.load(Ordering::Relaxed),
+            miss_count: self.misses.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
+            ttl_seconds: self.window.as_secs(),
+        }
     }
 
     /// Check whether the CoT preimage
@@ -315,18 +411,35 @@ impl DedupCache {
                 }
                 return true;
             }
-            // Entry expired — refresh and treat as new.
+            // Entry expired — refresh and treat as a miss. The same
+            // key is overwritten in place, which is NOT a
+            // capacity-driven eviction so we deliberately do not bump
+            // `evictions`.
             let _ = cache.put(key, now);
             let len = cache.len();
             drop(cache);
+            let _ = self.misses.fetch_add(1, Ordering::Relaxed);
             if let Some(cb) = &self.on_insert {
                 cb(len);
             }
             return false;
         }
-        let _ = cache.put(key, now);
+        // Fresh insert: use `push` (not `put`) so the LRU returns the
+        // `(K, V)` pair pushed out by capacity, if any. `put` filters
+        // capacity-eviction tuples internally and returns `None`,
+        // which would silently undercount evictions for a brand-new
+        // key in a full cache. By construction we already know the
+        // key was absent (the `cache.get` branch above did not match),
+        // so any `Some` returned here is unambiguously a capacity
+        // eviction — track it so operators can detect a too-small
+        // `max_entries` configuration.
+        let evicted = cache.push(key, now);
         let len = cache.len();
         drop(cache);
+        let _ = self.misses.fetch_add(1, Ordering::Relaxed);
+        if evicted.is_some() {
+            let _ = self.evictions.fetch_add(1, Ordering::Relaxed);
+        }
         if let Some(cb) = &self.on_insert {
             cb(len);
         }
@@ -492,6 +605,59 @@ mod tests {
     fn from_secs_zero_returns_none() {
         assert!(DedupCache::from_secs(0, 100).is_none());
         assert!(DedupCache::from_secs(60, 100).is_some());
+    }
+
+    // ----- Stats accounting (refs #902) -------------------------------
+
+    #[test]
+    fn stats_track_hits_misses_and_capacity() {
+        // Two unique inserts → 2 misses, 0 hits. Two re-inserts of a
+        // known key within the window → 2 hits. Capacity stays constant
+        // for the lifetime of the cache.
+        let c = cache(60, 8);
+        assert!(!c.check_and_insert("", "U1", b"a"));
+        assert!(!c.check_and_insert("", "U2", b"b"));
+        assert!(c.check_and_insert("", "U1", b"a"));
+        assert!(c.check_and_insert("", "U2", b"b"));
+        let s = c.stats();
+        assert_eq!(s.entries, 2);
+        assert_eq!(s.capacity, 8);
+        assert_eq!(s.hit_count, 2);
+        assert_eq!(s.miss_count, 2);
+        assert_eq!(s.evictions, 0);
+        assert_eq!(s.ttl_seconds, 60);
+    }
+
+    #[test]
+    fn stats_track_capacity_driven_evictions() {
+        // Capacity = 2; the third insert pushes the LRU tail out and
+        // bumps the eviction counter. A re-insert of the evicted key
+        // is a fresh miss, not a hit.
+        let c = cache(3600, 2);
+        assert!(!c.check_and_insert("", "U1", b"a"));
+        assert!(!c.check_and_insert("", "U2", b"b"));
+        assert!(!c.check_and_insert("", "U3", b"c")); // evicts U1
+        assert_eq!(c.evictions(), 1);
+        assert!(!c.check_and_insert("", "U1", b"a")); // evicts U2
+        assert_eq!(c.evictions(), 2);
+        assert_eq!(c.misses(), 4);
+        assert_eq!(c.hits(), 0);
+    }
+
+    #[test]
+    fn stats_ttl_refresh_does_not_count_as_eviction() {
+        // An entry whose timestamp falls outside the window is treated
+        // as a miss and overwritten in place — that is NOT a
+        // capacity-driven eviction. The eviction counter is reserved
+        // for "the LRU tail had to be pushed out to make room", which
+        // operators need to monitor independently of TTL churn.
+        let c = DedupCache::new(Duration::from_millis(10), 16);
+        assert!(!c.check_and_insert("", "U1", b"a"));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(!c.check_and_insert("", "U1", b"a"));
+        assert_eq!(c.evictions(), 0);
+        assert_eq!(c.misses(), 2);
+        assert_eq!(c.hits(), 0);
     }
 
     #[test]
