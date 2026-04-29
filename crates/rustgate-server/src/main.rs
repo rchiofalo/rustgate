@@ -1264,7 +1264,73 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     #[cfg(not(feature = "enrollment"))]
     setup::warn_enrollment_disabled(&cli);
 
+    // ── HTTP egress ─────────────────────────────────────────────────
+    //
+    // Wired BEFORE federation so the federation `on_inbound` callback
+    // can fan inbound peer messages out to webhook / SIEM targets via
+    // `Router::route_for_egress` (refs #737, the federation sub-item
+    // that completes the umbrella alongside MQTT #1263 and the NATS
+    // subscriber #1266). The HTTP publisher itself is independent of
+    // both federation and the local router, so this reordering is
+    // purely a wiring change — no behaviour relies on the previous
+    // post-federation ordering.
+    #[cfg(feature = "http")]
+    let (http_forward, _http_publisher): (Option<session::HttpForwardFn>, _) = {
+        match setup::connect_http(&cli).await {
+            Some((fwd, publisher)) => {
+                #[cfg(feature = "metrics")]
+                readiness.set_http_publisher(publisher.clone());
+                (Some(fwd), Some(publisher))
+            }
+            None => (None, None),
+        }
+    };
+
+    #[cfg(not(feature = "http"))]
+    setup::warn_http_disabled(&cli);
+
     // ── Federation ──────────────────────────────────────────────────
+    //
+    // The `FedInboundForwardingHooks` carry the optional NATS-publish
+    // and HTTP-forward callbacks that the federation `on_inbound`
+    // path fires AFTER `Router::route_for_egress` has applied any
+    // Send-PEP obligations to the envelope. This closes the federation
+    // sub-item of #737 so a peer-sourced message reaches the same
+    // external sinks (NATS bus, HTTP webhooks) that a directly-
+    // connected client would feed. We do NOT wire a federation
+    // self-forward — the V2 protocol's hop guard catches re-emitted
+    // federation messages, and the right invariant is that the
+    // forwarder never observes them in the first place.
+    #[cfg(feature = "federation")]
+    let fed_inbound_hooks: setup::FedInboundForwardingHooks = {
+        // justification: `hooks` is mutated below only when `nats` and/or `http` features are
+        // enabled; with `federation` alone no branch fires, so the `mut` is spurious in that
+        // feature combination. `unused_mut` is `-D warning`-promoted, and adding the feature
+        // gate to the `mut` keyword itself isn't expressible — so suppress just for the
+        // disjoint case.
+        #[cfg_attr(not(any(feature = "nats", feature = "http")), allow(unused_mut))]
+        let mut hooks = setup::FedInboundForwardingHooks::default();
+        #[cfg(feature = "nats")]
+        if let Some(ref publisher) = nats_publisher {
+            let publisher = publisher.clone();
+            let cb: rustgate_core::egress::OnNatsPublish = std::sync::Arc::new(move |msg| {
+                let publisher = publisher.clone();
+                rustgate_core::tasks::spawn_background(
+                    "federation-inbound-nats-publish",
+                    async move {
+                        publisher.publish(&msg).await;
+                    },
+                );
+            });
+            hooks.nats_publish = Some(cb);
+        }
+        #[cfg(feature = "http")]
+        if let Some(ref fwd) = http_forward {
+            hooks.http_forward = Some(fwd.clone());
+        }
+        hooks
+    };
+
     #[cfg(feature = "federation")]
     let (fed_forward, fed_shutdown_handle): (
         Option<FedForwardFn>,
@@ -1272,6 +1338,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     ) = setup::start_federation(
         &cli,
         &router,
+        fed_inbound_hooks,
         #[cfg(feature = "metrics")]
         &fed_api_slot,
     )
@@ -1344,22 +1411,6 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
         };
     #[cfg(not(feature = "federation"))]
     setup::warn_federation_peer_discovery_disabled(&cli);
-
-    // ── HTTP egress ─────────────────────────────────────────────────
-    #[cfg(feature = "http")]
-    let (http_forward, _http_publisher): (Option<session::HttpForwardFn>, _) = {
-        match setup::connect_http(&cli).await {
-            Some((fwd, publisher)) => {
-                #[cfg(feature = "metrics")]
-                readiness.set_http_publisher(publisher.clone());
-                (Some(fwd), Some(publisher))
-            }
-            None => (None, None),
-        }
-    };
-
-    #[cfg(not(feature = "http"))]
-    setup::warn_http_disabled(&cli);
 
     // ── NATS subscriber (deferred spawn) ────────────────────────────
     //

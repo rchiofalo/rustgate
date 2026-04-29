@@ -1249,51 +1249,79 @@ async fn setup_ha_handlers(
     }
 }
 
-/// Start the federation subsystem and return the forwarding callback + shutdown handle.
+/// Hooks fired after a federation-inbound message has been driven
+/// through [`Router::route_for_egress`] (refs #737).
+///
+/// The federation `on_inbound` callback used to call `router.route()`
+/// and stop there, which delivered the message to local subscribers
+/// but skipped the external sinks (NATS bridge, HTTP webhooks). This
+/// asymmetry left a federation-sourced message visible only to
+/// directly-connected clients while every other transport (MQTT in
+/// #1263, NATS subscriber in #1266) already fanned out to the same
+/// external sinks. Closing #737 means routing federation-inbound
+/// through `route_for_egress` so Send-PEP obligations land on the
+/// envelope and the post-mutation form is what the optional
+/// `nats_publish` / `http_forward` callbacks observe.
+///
+/// **No federation-forward field.** A federation-sourced message must
+/// not re-enter the federation forwarder — the V2 protocol's per-hop
+/// loop guard would catch the echo, but the right invariant is that
+/// the federation egress path never even sees the message. The hook
+/// struct therefore intentionally omits any federation-forward
+/// callback. The publisher's case-insensitive `source_protocol ==
+/// "nats"` echo guard (#1192) does NOT match `"federation"`, so
+/// federation→NATS fan-out is intended and the `nats_publish` field
+/// is fired without short-circuit.
+///
+/// Each field is `Option`: a `None` value is a no-op and never
+/// allocates. Existing federation tests that pass `None` for both
+/// keep passing — the new fan-out is additive.
 #[cfg(feature = "federation")]
-pub(crate) async fn start_federation(
-    cli: &Cli,
+#[derive(Default, Clone)]
+pub(crate) struct FedInboundForwardingHooks {
+    /// NATS publisher fired once per inbound federation message
+    /// after the router applies any Send-PEP obligations. The NATS
+    /// publisher's case-insensitive `source_protocol == "nats"` echo
+    /// guard does NOT short-circuit `"federation"`, so the callback
+    /// fires through to the bus (see #1192).
+    pub(crate) nats_publish: Option<rustgate_core::egress::OnNatsPublish>,
+    /// HTTP egress callback fired once per inbound federation message
+    /// after the router applies any Send-PEP obligations.
+    #[cfg(feature = "http")]
+    pub(crate) http_forward: Option<HttpForwardFn>,
+}
+
+/// Build the federation `OnInbound` callback used by
+/// [`start_federation`].
+///
+/// Extracted from the inlined closure so the unit-test mod can
+/// exercise the post-`route_for_egress` fan-out without spinning up
+/// a real federation manager (refs #737). The returned closure
+/// constructs a `RoutableMessage` from the peer CN + payload and
+/// drives it through [`Router::route_for_egress`] so any Send-PEP
+/// obligations are baked into the envelope before the optional
+/// `nats_publish` / `http_forward` hooks observe it.
+///
+/// **Echo prevention.** The `source_protocol = "federation"` stamp
+/// applied here is what the publisher's NATS echo guard inspects on
+/// the way back out — but the publisher only matches `"nats"`
+/// (case-insensitive, see #1192), so federation→NATS fan-out is the
+/// intended behaviour and is NOT short-circuited. The federation
+/// V2 protocol carries its own hop-count / origin-tracking which
+/// drops a re-emitted federation message before it enters another
+/// peer; we do not wire a federation-forward callback here so the
+/// invariant "federation→federation never re-enters the forwarder"
+/// is preserved at the call-site, not just at the wire-protocol
+/// hop guard.
+#[cfg(feature = "federation")]
+pub(crate) fn build_federation_inbound_handler(
     router: &Arc<Router>,
-    #[cfg(feature = "metrics")] fed_api_slot: &Arc<std::sync::OnceLock<metrics::FedApiHandler>>,
-) -> anyhow::Result<(
-    Option<FedForwardFn>,
-    Option<Arc<tokio::sync::RwLock<rustgate_federation::manager::FederationManager>>>,
-)> {
-    let v1_bind = match cli.federation_v1_bind.as_ref() {
-        Some(b) => b,
-        None => return Ok((None, None)),
-    };
-
-    let bind_addr: std::net::SocketAddr = v1_bind
-        .parse()
-        .context("parsing --federation-v1-bind address")?;
-
-    let config = build_federation_config(cli, bind_addr).await?;
-    let mut manager = rustgate_federation::manager::FederationManager::new(config);
-
-    // on_inbound: route messages from federation peers to local clients.
-    //
-    // Security note (issue #719): federated messages are handed to
-    // `router.route()`, which re-runs the full PEP chain — Send-PEP with
-    // the peer CN as subject, then per-recipient Receive-PEP with each
-    // recipient's CN as subject. Obligations returned by the local
-    // Receive-PEP are always applied on a per-recipient copy of the
-    // envelope, regardless of what the upstream peer did.
-    //
-    // The V2 wire protocol does NOT carry the upstream peer's obligation
-    // list: data-plane obligations (MaskPoint, MaskPayload) are baked
-    // into the payload before forwarding, and audit-shaped obligations
-    // are not serialized at all. Upstream obligations are therefore
-    // advisory only — the local policy is authoritative. This defends
-    // against a permissive upstream silently delivering coordinates
-    // that the local policy would have masked.
-    //
-    // See `docs/federation.md` → "Cross-origin authz obligations" and
-    // `crates/rustgate-transport/tests/authz_routing.rs`
-    // (`federated_broadcast_*`) for the pinned guarantees.
+    hooks: FedInboundForwardingHooks,
+) -> rustgate_federation::manager::OnInbound {
     let router_for_fed = Arc::clone(router);
-    let on_inbound: rustgate_federation::manager::OnInbound = Arc::new(move |peer_cn, payload| {
+    Arc::new(move |peer_cn, payload| {
         let router = Arc::clone(&router_for_fed);
+        let hooks = hooks.clone();
         spawn_background("federation-inbound", async move {
             // F-113: federation now hands us a typed `PeerId`. Materialize
             // it as a `String` once for the `Identity::plaintext` call —
@@ -1329,9 +1357,108 @@ pub(crate) async fn start_federation(
                     ttl: None,
                 },
             };
-            router.route(msg).await;
+            // Drive through `route_for_egress` so Send-PEP obligations
+            // (e.g. `MaskPoint` / `MaskPayload`) apply to the envelope
+            // before the egress fan-out fires. A `None` return means
+            // the router dropped the message (dedup, TTL expiry,
+            // Send-PEP deny, oversize multicast); every fan-out MUST
+            // be skipped so external sinks stay consistent with the
+            // local fanout.
+            let routed = router.route_for_egress(msg).await;
+            if let Some(routed) = routed.as_ref() {
+                fire_federation_inbound_forwarding(&hooks, routed);
+            }
         });
-    });
+    })
+}
+
+/// Fan out the post-Send-PEP routed message from the federation
+/// `on_inbound` path to NATS and HTTP egress sinks (refs #737).
+///
+/// Mirrors the helper in `rustgate_nats::subscriber` so a
+/// federation-inbound message that survives the router's
+/// obligations is visible to every external sink in exactly the
+/// same way an MQTT publish or NATS subscribe would be. Each sink
+/// is independent — a `None` field is a no-op and never allocates.
+///
+/// `nats_publish` is fired without a short-circuit because the
+/// NATS publisher's echo guard matches `source_protocol == "nats"`
+/// only (case-insensitive, see #1192) — federation→NATS fan-out is
+/// the intended behaviour.
+#[cfg(feature = "federation")]
+fn fire_federation_inbound_forwarding(
+    hooks: &FedInboundForwardingHooks,
+    routed: &Arc<RoutableMessage>,
+) {
+    if let Some(cb) = hooks.nats_publish.as_ref() {
+        cb(routed.as_ref().clone());
+    }
+    #[cfg(feature = "http")]
+    if let Some(fwd) = hooks.http_forward.as_ref() {
+        fwd(routed.as_ref().clone());
+    }
+}
+
+/// Start the federation subsystem and return the forwarding callback + shutdown handle.
+///
+/// `hooks` is the post-`route_for_egress` fan-out wiring (refs
+/// #737). When the caller has not yet built the NATS publisher /
+/// HTTP egress (e.g. the no-bridges configuration), pass
+/// `FedInboundForwardingHooks::default()`; the federation inbound
+/// path then degrades to a local-only delivery, matching the
+/// pre-#737 behaviour.
+#[cfg(feature = "federation")]
+pub(crate) async fn start_federation(
+    cli: &Cli,
+    router: &Arc<Router>,
+    hooks: FedInboundForwardingHooks,
+    #[cfg(feature = "metrics")] fed_api_slot: &Arc<std::sync::OnceLock<metrics::FedApiHandler>>,
+) -> anyhow::Result<(
+    Option<FedForwardFn>,
+    Option<Arc<tokio::sync::RwLock<rustgate_federation::manager::FederationManager>>>,
+)> {
+    let v1_bind = match cli.federation_v1_bind.as_ref() {
+        Some(b) => b,
+        None => return Ok((None, None)),
+    };
+
+    let bind_addr: std::net::SocketAddr = v1_bind
+        .parse()
+        .context("parsing --federation-v1-bind address")?;
+
+    let config = build_federation_config(cli, bind_addr).await?;
+    let mut manager = rustgate_federation::manager::FederationManager::new(config);
+
+    // on_inbound: route messages from federation peers to local
+    // clients AND fan out to optional NATS / HTTP egress sinks.
+    //
+    // Security note (issue #719): federated messages are handed to
+    // `router.route_for_egress()`, which re-runs the full PEP chain —
+    // Send-PEP with the peer CN as subject, then per-recipient
+    // Receive-PEP with each recipient's CN as subject. Obligations
+    // returned by the local Receive-PEP are always applied on a
+    // per-recipient copy of the envelope, regardless of what the
+    // upstream peer did.
+    //
+    // Egress fan-out (#737): the post-Send-PEP envelope returned by
+    // `route_for_egress` is what the optional NATS / HTTP callbacks
+    // observe — never the raw inbound payload. A regression that
+    // fired the egress callbacks against the pre-PEP form would leak
+    // unmasked coordinates to external sinks while the in-process
+    // delivery looked compliant.
+    //
+    // The V2 wire protocol does NOT carry the upstream peer's obligation
+    // list: data-plane obligations (MaskPoint, MaskPayload) are baked
+    // into the payload before forwarding, and audit-shaped obligations
+    // are not serialized at all. Upstream obligations are therefore
+    // advisory only — the local policy is authoritative. This defends
+    // against a permissive upstream silently delivering coordinates
+    // that the local policy would have masked.
+    //
+    // See `docs/federation.md` → "Cross-origin authz obligations" and
+    // `crates/rustgate-transport/tests/authz_routing.rs`
+    // (`federated_broadcast_*`) for the pinned guarantees.
+    let on_inbound = build_federation_inbound_handler(router, hooks);
 
     manager
         .start(on_inbound)
@@ -2184,5 +2311,377 @@ mod tests {
         let cfg = build_throttle_config(&cli).expect("throttle enabled");
         assert_eq!(cfg.rate, 100);
         assert_eq!(cfg.burst, 200, "default burst must flow through");
+    }
+
+    // -----------------------------------------------------------------
+    // Federation `on_inbound` egress fan-out (refs #737, the
+    // federation sub-item that completes the umbrella alongside MQTT
+    // #1263 and the NATS subscriber #1266)
+    //
+    // Pins the load-bearing security properties of the post-
+    // `route_for_egress` fan-out:
+    //
+    // 1. **Federation→NATS fans out.** A NATS publisher wired on
+    //    `FedInboundForwardingHooks` MUST fire exactly once per
+    //    inbound federation message that survives the router's
+    //    obligations.
+    // 2. **Federation→HTTP fans out.** Symmetric to (1) — wires an
+    //    HTTP forwarder and asserts it fires.
+    // 3. **No federation→federation echo.** The hook struct does not
+    //    expose a federation-forward field, so a federation-sourced
+    //    message cannot re-enter the federation forwarder via this
+    //    path; the V2 protocol's hop guard backs the invariant up at
+    //    the wire layer. Pinning the type-level absence stops a
+    //    future refactor from silently re-introducing the loop.
+    // 4. **Send-PEP obligations apply before fan-out.** A
+    //    `MaskPayload` obligation on the Send PEP MUST scrub the
+    //    payload BEFORE the local recipient sees it AND BEFORE the
+    //    NATS / HTTP egress callbacks observe it. A regression that
+    //    fired the egress callbacks against the pre-PEP form would
+    //    leak raw payload bytes to a webhook target while the
+    //    in-process delivery looked compliant — exactly the gap
+    //    closed by switching the federation `on_inbound` call site
+    //    from `Router::route` to `Router::route_for_egress`.
+    // 5. **`source_protocol` stamp.** Every envelope the handler
+    //    constructs from a federation peer must stamp
+    //    `metadata.source_protocol = "federation"`. This is the
+    //    workspace convention the publisher echo guards inspect on
+    //    the way back out (NATS publisher matches `"nats"` only,
+    //    HTTP publisher matches `"http"` only — neither
+    //    short-circuits `"federation"`).
+
+    #[cfg(feature = "federation")]
+    #[allow(clippy::panic, clippy::unwrap_used)]
+    mod federation_inbound {
+        use std::sync::Mutex as StdMutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        use bytes::Bytes;
+        use rustgate_core::PeerId;
+        use rustgate_core::message::{MessageType, RoutableMessage};
+        use rustgate_transport::Router;
+
+        use super::super::{FedInboundForwardingHooks, build_federation_inbound_handler};
+
+        /// Drive the test runtime forward in small slices until `pred`
+        /// returns true or `tries` slices have elapsed. The closure
+        /// dispatches its async work via `spawn_background`, so the
+        /// caller cannot await a `JoinHandle`; this poll is the
+        /// supported way to observe the fan-out from a test.
+        async fn wait_for(pred: impl Fn() -> bool, tries: usize) {
+            for _ in 0..tries {
+                if pred() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        /// Build a synthetic federation-inbound message: peer CN
+        /// `"peer-cn"` and a non-empty payload. The handler stamps
+        /// `source_protocol = "federation"` regardless of what the
+        /// caller does, so we exercise that invariant from the
+        /// outside.
+        fn invoke_handler(handler: &rustgate_federation::manager::OnInbound, payload: &[u8]) {
+            let peer = PeerId::new("peer-cn".to_string());
+            handler(peer, Bytes::copy_from_slice(payload));
+        }
+
+        /// Wire a NATS-publish hook on the federation inbound
+        /// handler and assert it fires exactly once per inbound
+        /// federation message with the post-Send-PEP envelope.
+        #[tokio::test]
+        async fn federation_inbound_fans_out_to_nats() {
+            let router = std::sync::Arc::new(Router::new());
+
+            let nats_calls: std::sync::Arc<StdMutex<Vec<RoutableMessage>>> =
+                std::sync::Arc::new(StdMutex::new(Vec::new()));
+            let nats_calls_clone = std::sync::Arc::clone(&nats_calls);
+            let nats_cb: rustgate_core::egress::OnNatsPublish = std::sync::Arc::new(move |msg| {
+                nats_calls_clone.lock().expect("mutex poisoned").push(msg);
+            });
+
+            let hooks = FedInboundForwardingHooks {
+                nats_publish: Some(nats_cb),
+                #[cfg(feature = "http")]
+                http_forward: None,
+            };
+
+            let handler = build_federation_inbound_handler(&router, hooks);
+            invoke_handler(&handler, b"<event/>");
+
+            wait_for(
+                || nats_calls.lock().expect("mutex poisoned").len() == 1,
+                100,
+            )
+            .await;
+
+            let snapshot = nats_calls.lock().expect("mutex poisoned").clone();
+            assert_eq!(
+                snapshot.len(),
+                1,
+                "federation→NATS hook must fire exactly once per inbound message",
+            );
+            let routed = &snapshot[0];
+            assert_eq!(
+                routed.metadata.source_protocol, "federation",
+                "fan-out envelope must preserve the federation source_protocol stamp",
+            );
+            assert_eq!(routed.payload.as_ref(), b"<event/>");
+            assert_eq!(&*routed.source.cn, "peer-cn");
+        }
+
+        /// Wire an HTTP-egress hook and assert it fires exactly once
+        /// per inbound federation message with the post-Send-PEP
+        /// envelope.
+        #[cfg(feature = "http")]
+        #[tokio::test]
+        async fn federation_inbound_fans_out_to_http() {
+            let router = std::sync::Arc::new(Router::new());
+
+            let http_calls: std::sync::Arc<StdMutex<Vec<RoutableMessage>>> =
+                std::sync::Arc::new(StdMutex::new(Vec::new()));
+            let http_calls_clone = std::sync::Arc::clone(&http_calls);
+            let http_cb: crate::session::HttpForwardFn = std::sync::Arc::new(move |msg| {
+                http_calls_clone.lock().expect("mutex poisoned").push(msg);
+            });
+
+            let hooks = FedInboundForwardingHooks {
+                nats_publish: None,
+                http_forward: Some(http_cb),
+            };
+
+            let handler = build_federation_inbound_handler(&router, hooks);
+            invoke_handler(&handler, b"<event/>");
+
+            wait_for(
+                || http_calls.lock().expect("mutex poisoned").len() == 1,
+                100,
+            )
+            .await;
+
+            let snapshot = http_calls.lock().expect("mutex poisoned").clone();
+            assert_eq!(
+                snapshot.len(),
+                1,
+                "federation→HTTP hook must fire exactly once per inbound message",
+            );
+            let routed = &snapshot[0];
+            assert_eq!(routed.metadata.source_protocol, "federation");
+            assert_eq!(routed.payload.as_ref(), b"<event/>");
+        }
+
+        /// The hook struct intentionally has no
+        /// federation-forward field, so a federation-sourced
+        /// message cannot re-enter the federation forwarder via
+        /// this path. We pin the absence at the type level: any
+        /// future refactor that adds a federation-forward field
+        /// must update this test, forcing a deliberate review of
+        /// the loop-prevention invariant.
+        #[test]
+        fn federation_inbound_does_not_loop_back_to_federation() {
+            let hooks = FedInboundForwardingHooks::default();
+            // Confirm the only egress fields are nats_publish and
+            // (optionally) http_forward — *not* federation. If a
+            // future field is added that exposes a federation
+            // forward callback this assertion will need to be
+            // re-evaluated against the V2 hop guard.
+            assert!(
+                hooks.nats_publish.is_none(),
+                "default hooks must not pre-wire NATS",
+            );
+            #[cfg(feature = "http")]
+            assert!(
+                hooks.http_forward.is_none(),
+                "default hooks must not pre-wire HTTP",
+            );
+            // The compile-time absence of a `federation_forward`
+            // field on `FedInboundForwardingHooks` is the load-
+            // bearing invariant: this test fails to build (rather
+            // than at runtime) if the field is added back.
+        }
+
+        /// A Send-PEP obligation MUST scrub the payload BEFORE the
+        /// NATS / HTTP egress callbacks observe it. This pins the
+        /// switch from `Router::route` to `Router::route_for_egress`
+        /// inside `build_federation_inbound_handler` — a regression
+        /// that fired the egress callbacks against the pre-PEP form
+        /// would leak raw federation-peer payload bytes to webhook
+        /// targets while the in-process delivery looked compliant.
+        #[tokio::test]
+        async fn federation_inbound_with_send_pep_obligation_applies_obligation_before_fanout() {
+            use rustgate_transport::rustgate_authz::{
+                Action, Decision, DecisionOutcome, Obligation, PolicyEngine, Resource, Subject,
+            };
+
+            /// Engine that allows everything but attaches
+            /// `MaskPayload` on the Send PEP. The obligation strips
+            /// the payload bytes and rewrites
+            /// `metadata.message_type` to `Other("masked")`.
+            struct AllowWithSendMaskPayloadEngine;
+            impl PolicyEngine for AllowWithSendMaskPayloadEngine {
+                fn evaluate(
+                    &self,
+                    _s: &Subject<'_>,
+                    _r: &Resource<'_>,
+                    a: Action,
+                ) -> DecisionOutcome {
+                    let obligations = if a == Action::Send {
+                        vec![Obligation::MaskPayload]
+                    } else {
+                        Vec::new()
+                    };
+                    DecisionOutcome {
+                        decision: Decision::Allow,
+                        rule_id: None,
+                        obligations,
+                    }
+                }
+                fn policy_id(&self) -> &str {
+                    "test-fed-inbound-send-mask-payload"
+                }
+            }
+
+            let router = std::sync::Arc::new(
+                Router::new().with_authz(std::sync::Arc::new(AllowWithSendMaskPayloadEngine)),
+            );
+
+            let nats_calls: std::sync::Arc<StdMutex<Vec<RoutableMessage>>> =
+                std::sync::Arc::new(StdMutex::new(Vec::new()));
+            let nats_calls_clone = std::sync::Arc::clone(&nats_calls);
+            let nats_cb: rustgate_core::egress::OnNatsPublish = std::sync::Arc::new(move |msg| {
+                nats_calls_clone.lock().expect("mutex poisoned").push(msg);
+            });
+
+            let hooks = FedInboundForwardingHooks {
+                nats_publish: Some(nats_cb),
+                #[cfg(feature = "http")]
+                http_forward: None,
+            };
+
+            let handler = build_federation_inbound_handler(&router, hooks);
+            invoke_handler(&handler, b"<event payload=\"sensitive\"/>");
+
+            wait_for(
+                || nats_calls.lock().expect("mutex poisoned").len() == 1,
+                100,
+            )
+            .await;
+
+            let snapshot = nats_calls.lock().expect("mutex poisoned").clone();
+            assert_eq!(
+                snapshot.len(),
+                1,
+                "federation→NATS hook must fire even when Send-PEP attaches an obligation",
+            );
+            let egress = &snapshot[0];
+            assert!(
+                egress.payload.is_empty(),
+                "MaskPayload obligation must scrub egress payload BEFORE the NATS hook observes it; got {} bytes",
+                egress.payload.len(),
+            );
+            assert!(
+                matches!(egress.metadata.message_type, MessageType::Other(ref s) if s == "masked"),
+                "MaskPayload obligation must rewrite message_type before fan-out; got {:?}",
+                egress.metadata.message_type,
+            );
+        }
+
+        /// Pin the metadata invariant: every envelope the federation
+        /// `on_inbound` handler constructs MUST stamp
+        /// `source_protocol = "federation"`. Both publisher echo
+        /// guards (NATS in #1192, HTTP at line 419 of
+        /// `rustgate-http/src/publisher.rs`) match their own
+        /// transport name only — `"federation"` does NOT trip
+        /// either, so the fan-out reaches the bus and webhooks as
+        /// intended.
+        #[tokio::test]
+        async fn federation_inbound_source_protocol_is_federation() {
+            let router = std::sync::Arc::new(Router::new());
+
+            let observed: std::sync::Arc<StdMutex<Option<RoutableMessage>>> =
+                std::sync::Arc::new(StdMutex::new(None));
+            let observed_clone = std::sync::Arc::clone(&observed);
+            let nats_cb: rustgate_core::egress::OnNatsPublish = std::sync::Arc::new(move |msg| {
+                *observed_clone.lock().expect("mutex poisoned") = Some(msg);
+            });
+
+            let hooks = FedInboundForwardingHooks {
+                nats_publish: Some(nats_cb),
+                #[cfg(feature = "http")]
+                http_forward: None,
+            };
+
+            let handler = build_federation_inbound_handler(&router, hooks);
+            invoke_handler(&handler, b"<event/>");
+
+            wait_for(|| observed.lock().expect("mutex poisoned").is_some(), 100).await;
+
+            let snap = observed.lock().expect("mutex poisoned").clone();
+            let routed = snap.expect("hook must observe one message");
+            assert_eq!(routed.metadata.source_protocol, "federation");
+            assert!(
+                matches!(routed.metadata.message_type, MessageType::Other(ref s) if s == "federation"),
+                "source-protocol invariant: message_type for an inbound federation message must be Other(\"federation\"); got {:?}",
+                routed.metadata.message_type,
+            );
+        }
+
+        /// `None` hooks must keep the pre-#737 behaviour: the
+        /// router still receives the message (local fan-out runs)
+        /// but no egress callback fires. The accidental introduction
+        /// of an unconditional callback would corrupt the no-bridge
+        /// configuration for operators who haven't enabled NATS or
+        /// HTTP egress.
+        #[tokio::test]
+        async fn federation_inbound_with_default_hooks_does_not_call_egress() {
+            let router = std::sync::Arc::new(Router::new());
+
+            // No callbacks wired; the only observable signal is
+            // that the handler completes without panicking and the
+            // `route_for_egress` path returns successfully.
+            let counter = std::sync::Arc::new(AtomicUsize::new(0));
+            let counter_clone = std::sync::Arc::clone(&counter);
+            let nats_cb: rustgate_core::egress::OnNatsPublish = std::sync::Arc::new(move |_| {
+                let _ = counter_clone.fetch_add(1, Ordering::SeqCst);
+            });
+
+            // Build hooks with no callbacks — assert the closure
+            // does not invoke them, even though the message still
+            // flows through `route_for_egress`.
+            let hooks_default = FedInboundForwardingHooks::default();
+            let handler = build_federation_inbound_handler(&router, hooks_default);
+            invoke_handler(&handler, b"<event/>");
+
+            // Give the spawned task time to run; even after the
+            // handler completes, the counter must remain zero
+            // because the default hooks have no callbacks wired.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                0,
+                "default-hook handler must not fire any egress callback",
+            );
+
+            // Sanity-check that the closure we hold is actually
+            // wireable: replace `hooks_default` with a populated
+            // hook bag and confirm the same handler shape fires
+            // the callback exactly once.
+            let nats_cb2 = std::sync::Arc::clone(&nats_cb);
+            let hooks_wired = FedInboundForwardingHooks {
+                nats_publish: Some(nats_cb2),
+                #[cfg(feature = "http")]
+                http_forward: None,
+            };
+            let handler2 = build_federation_inbound_handler(&router, hooks_wired);
+            invoke_handler(&handler2, b"<event2/>");
+            wait_for(|| counter.load(Ordering::SeqCst) == 1, 100).await;
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                1,
+                "wired hook must fire exactly once",
+            );
+        }
     }
 }
