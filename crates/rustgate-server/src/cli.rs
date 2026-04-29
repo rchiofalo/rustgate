@@ -1367,6 +1367,18 @@ pub(crate) struct Cli {
     #[arg(long, env = "RUSTGATE_ACCESS_LOG")]
     pub(crate) access_log: Option<String>,
 
+    /// Emit per-recipient `message.delivered` and `message.dropped`
+    /// audit events for chain-of-custody trails on classified traffic.
+    /// Default off — high-volume in busy deployments because a single
+    /// broadcast to N subscribers produces N audit records. When set,
+    /// the router invokes per-recipient hooks on every successful
+    /// `try_send` (delivered) and every post-admission drop
+    /// (backpressure / no_subscribers / etc.) so a SIEM can correlate
+    /// individual recipients against the higher-cardinality
+    /// `client.connected` / `client.disconnected` timeline. Closes #854.
+    #[arg(long, default_value_t = false, env = "RUSTGATE_AUDIT_DELIVERY")]
+    pub(crate) audit_delivery: bool,
+
     /// Directory in which to keep the per-client store-and-forward
     /// queue database. When unset, offline messages are dropped (the
     /// default pre-v0.7 behavior). When set, messages destined for a
@@ -1959,6 +1971,7 @@ define_config_file! {
     audit_log: Option<String>,
     audit_allow_chain_break: bool,
     access_log: Option<String>,
+    audit_delivery: bool,
     client_queue_dir: Option<std::path::PathBuf>,
     client_queue_max_bytes: u64,
     client_queue_key_file: Option<std::path::PathBuf>,
@@ -2622,6 +2635,40 @@ mod tests {
         ])
         .expect("should parse");
         assert!(cli.audit_allow_chain_break);
+    }
+
+    #[test]
+    fn cli_audit_delivery_defaults_false() {
+        // Closes #854. Per-recipient delivery audit is opt-in because
+        // it produces one record per recipient — high-volume in busy
+        // deployments. The default must keep the routing hot path
+        // silent.
+        let cli = Cli::try_parse_from([
+            "rustgate", "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
+        ])
+        .expect("should parse");
+        assert!(!cli.audit_delivery);
+    }
+
+    #[test]
+    fn cli_audit_delivery_opt_in() {
+        // Closes #854. The flag is the only way to install the
+        // per-recipient delivery audit callbacks; pin the parsing
+        // contract so a typo or rename of the long form fails this
+        // test instead of silently breaking the operator-facing
+        // surface.
+        let cli = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--audit-delivery",
+        ])
+        .expect("should parse");
+        assert!(cli.audit_delivery);
     }
 
     // ── build_codec tests ──────────────────────────────────────────

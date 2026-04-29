@@ -196,6 +196,79 @@ ties a specific user to a specific artefact. See the doc comment on
 `rustgate_core::audit::authz_classified_delivery` for the full PII
 policy rationale.
 
+#### Per-recipient delivery audit (`--audit-delivery`)
+
+For deployments that need a **per-recipient chain-of-custody trail**
+(every classified message has a record naming exactly which CN
+received it and exactly when), set `--audit-delivery` /
+`RUSTGATE_AUDIT_DELIVERY=true` (default off). When enabled, the router
+emits one of two events for every recipient on every routed message:
+
+| Event | When | Fields |
+|---|---|---|
+| `message.delivered` | A per-recipient `try_send` succeeded — the message has been enqueued on the recipient's session channel and will be flushed to the wire by the writer task. Fires AFTER the `authz.classified_delivery` audit when both apply, so a SIEM can correlate the obligation with its delivery. | `source` (sender CN), `dest` (recipient CN), `uid` (CoT `uid="…"` attribute or empty), `msg_type` (the `MessageType::Display` form: `position`, `chat`, `alert`, etc.), `group` (the destination group name on group / multicast fan-out, or the small fixed-vocabulary tag `direct` / `broadcast` for non-group destinations), `action = "deliver"`, `result = "success"` |
+| `message.dropped` | A per-recipient `try_send` failed (channel full or closed → `reason = "backpressure"`) OR no live session existed for the recipient and store-and-forward was unavailable (`reason = "no_subscribers"`). Other reason tokens — `acl_denied`, `authz_denied`, `obligation_failed` — are emitted by the existing `authz.*` audit family at a higher level and are NOT duplicated by this event. | `source`, `dest`, `uid`, `reason`, `action = "deliver"`, `result = "dropped"` |
+
+**Volume implications.** Per-recipient audit is high-volume by design.
+A single broadcast to 100 subscribers produces 100 audit records, and a
+multicast across 5 groups of 50 subscribers each produces 250 records.
+On a busy tactical link this can dominate the audit-log byte budget —
+which is why the flag defaults to off. Operators who turn it on should
+also size `--audit-log` storage and rotation cadence to absorb the
+expected fan-out (a rough estimate: average broadcast subscribers ×
+broadcasts per second × ~250 bytes per JSON line). The hash-chain tip
+sequence (`tip_seq`, see #883) advances correspondingly, so a seq-gap
+verifier sees one increment per recipient.
+
+**PII discipline.** Per #1207 / #1221, the audit-log uses **raw CNs**
+for `source` and `dest` because the audit is a forensic chain of
+custody — the operator who later queries the log to answer "which
+classified events did `bob.smith` receive on date X" must be able to
+filter by raw CN. The lower-cardinality access-log (target=`access`)
+continues to use `hash_cn` for operator dashboards. Every `&str` field
+is sanitized at the audit boundary by
+`rustgate_core::sanitize::sanitize_for_log` so an attacker-controlled
+CN with embedded CR/LF cannot log-forge a fake delivery record.
+
+**Performance.** When `--audit-delivery` is unset (the default), the
+per-recipient cost on the routing hot path is exactly one
+`ArcSwap::load` plus one `is_none()` check — a few nanoseconds per
+recipient with no allocation. When the flag is set, each recipient
+pays the cost of one bounded scan over the payload prefix to extract
+the CoT `uid` and one heap allocation for the `MessageType::Display`
+string before the audit emission.
+
+**Where it fires.** All four destination paths emit:
+
+- `Destination::Direct` — fires on `try_send` success or backpressure;
+  also fires `message.dropped { reason = "no_subscribers" }` when the
+  destination CN has no live session (the router may still persist via
+  store-and-forward; the drop is recorded against the live attempt
+  regardless).
+- `Destination::Group` — fires once per group member per pass through
+  `send_to_group`, after per-recipient ACL and Receive-PEP filtering.
+- `Destination::Broadcast` — fires once per connected session (excluding
+  the sender) after Receive-PEP and obligation actuation.
+- `Destination::Multicast` — fires once per group member per group in
+  the multicast list, deduplicated against recipients already reached
+  by an earlier group in the same fan-out (per the `delivered` set in
+  `send_to_multicast`).
+
+**SIEM correlation patterns.**
+
+- *"Did recipient X actually receive this classified message?"* — join
+  on `uid` between the `authz.classified_delivery` event and the
+  `message.delivered` event. The two events are emitted in that order
+  on the success path; a `classified_delivery` without a matching
+  `delivered` indicates an unobserved drop (rare — the dispatcher
+  emits `classified_delivery` only after a successful `try_send`).
+- *"Which recipients lost messages this hour?"* — query
+  `event_type = "message.dropped"` filtered to `reason in
+  ["backpressure", "no_subscribers"]`. The other reasons
+  (`acl_denied`, `authz_denied`, `obligation_failed`) appear only via
+  the `authz.*` family and the `rustgate_router_dropped_total{reason}`
+  metric.
+
 ### Metadata residue: what the maskers do NOT scrub
 
 `MaskPoint` and `MaskPayload` are payload-body mutations. The surrounding

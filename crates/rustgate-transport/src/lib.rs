@@ -80,9 +80,9 @@ pub use repeater::EmergencyRepeater;
 pub use replay::ReplayFilter;
 pub use router::{
     ACCESS_LOG_TARGET, AuthzEvent, AuthzObserver, NORMAL_CHANNEL_CAPACITY, OnAuthzInFlightChanged,
-    OnDropped, OnFanout, OnMulticastOversizeDropped, OnObligationApplied, OnPepDecision,
-    PRIORITY_CHANNEL_CAPACITY, PendingAudit, PendingDelivery, PositionReplayLimitConfig,
-    RoutedMessage, Router, SessionHandle,
+    OnDropped, OnFanout, OnMessageDelivered, OnMessageDropped, OnMulticastOversizeDropped,
+    OnObligationApplied, OnPepDecision, PRIORITY_CHANNEL_CAPACITY, PendingAudit, PendingDelivery,
+    PositionReplayLimitConfig, RoutedMessage, Router, SessionHandle,
 };
 pub use rustgate_authz;
 #[cfg(feature = "proto")]

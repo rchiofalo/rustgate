@@ -151,6 +151,53 @@ rustgate_core::on_callback!(
     i64
 );
 
+rustgate_core::on_callback!(
+    /// Callback invoked once per recipient that the router successfully
+    /// enqueued a message for via `try_send`. Wired by the server binary
+    /// behind `--audit-delivery` (default off, high-volume in busy
+    /// deployments) to feed
+    /// [`rustgate_core::audit::message_delivered`] for chain-of-custody
+    /// audit trails. The five `&str` arguments are, in order:
+    /// `source_cn`, `dest_cn`, `msg_uid` (CoT `uid="…"` attribute or
+    /// empty when not CoT-shaped), `msg_type` (the `Display` form of
+    /// [`rustgate_core::message::MessageType`]), and `group` (the
+    /// destination group name on group / multicast fan-out, or the small
+    /// fixed-vocabulary tag `"direct"` / `"broadcast"` for non-group
+    /// destinations).
+    ///
+    /// Hot-reloadable via `ArcSwap` so the audit layer can be installed
+    /// after construction without a lock on the routing hot path. The
+    /// callback fires exactly once per recipient on the success path —
+    /// per-recipient cardinality, not per-message — and is the only way
+    /// to observe individual delivery for forensic correlation. Closes
+    /// #854.
+    pub OnMessageDelivered,
+    &str,
+    &str,
+    &str,
+    &str,
+    &str
+);
+
+rustgate_core::on_callback!(
+    /// Callback invoked once per recipient whose delivery the router
+    /// dropped after admission. The four `&str` arguments are, in order:
+    /// `source_cn`, `dest_cn`, `msg_uid`, and `reason` — the latter is
+    /// one of the small fixed-vocabulary labels the existing
+    /// [`OnDropped`] callback uses (`"backpressure"`, `"no_subscribers"`,
+    /// `"acl_denied"`, `"authz_denied"`, `"obligation_failed"`) so SIEM
+    /// dashboards and audit queries share a vocabulary.
+    ///
+    /// Wired by the server binary behind `--audit-delivery` to feed
+    /// [`rustgate_core::audit::message_dropped`]. Hot-reloadable via
+    /// `ArcSwap`. Closes #854.
+    pub OnMessageDropped,
+    &str,
+    &str,
+    &str,
+    &str
+);
+
 /// RAII handle that bumps the in-flight authz-evaluation gauge on
 /// construction and decrements it on `Drop`. Constructed at the entry
 /// of [`Router::authz_evaluate_inner`] so every `_send` / `_receive`
@@ -1024,6 +1071,19 @@ pub struct Router {
     /// pre-swap engine `Arc` after a hot-reload. Hot-reloadable via
     /// `ArcSwap`. Closes #721.
     on_authz_in_flight_changed: ArcSwap<Option<OnAuthzInFlightChanged>>,
+    /// Optional callback fired once per recipient on a successful
+    /// per-recipient `try_send`. Wired by the server binary under
+    /// `--audit-delivery` to feed
+    /// [`rustgate_core::audit::message_delivered`] for chain-of-custody
+    /// audit trails. Hot-reloadable via `ArcSwap`; default `None` keeps
+    /// the high-volume per-recipient audit path off. Closes #854.
+    on_message_delivered: ArcSwap<Option<OnMessageDelivered>>,
+    /// Optional callback fired once per recipient whose delivery the
+    /// router dropped post-admission. Wired by the server binary under
+    /// `--audit-delivery` to feed
+    /// [`rustgate_core::audit::message_dropped`]. Hot-reloadable via
+    /// `ArcSwap`. Closes #854.
+    on_message_dropped: ArcSwap<Option<OnMessageDropped>>,
 }
 
 impl std::fmt::Debug for Router {
@@ -1068,6 +1128,14 @@ impl std::fmt::Debug for Router {
                 "on_authz_in_flight_changed_installed",
                 &(**self.on_authz_in_flight_changed.load()).is_some(),
             )
+            .field(
+                "on_message_delivered_installed",
+                &(**self.on_message_delivered.load()).is_some(),
+            )
+            .field(
+                "on_message_dropped_installed",
+                &(**self.on_message_dropped.load()).is_some(),
+            )
             .finish()
     }
 }
@@ -1095,6 +1163,8 @@ impl Default for Router {
             on_pep_decision: ArcSwap::from_pointee(None),
             on_obligation_applied: ArcSwap::from_pointee(None),
             on_authz_in_flight_changed: ArcSwap::from_pointee(None),
+            on_message_delivered: ArcSwap::from_pointee(None),
+            on_message_dropped: ArcSwap::from_pointee(None),
         }
     }
 }
@@ -1135,6 +1205,8 @@ impl Router {
             on_pep_decision: ArcSwap::from_pointee(None),
             on_obligation_applied: ArcSwap::from_pointee(None),
             on_authz_in_flight_changed: ArcSwap::from_pointee(None),
+            on_message_delivered: ArcSwap::from_pointee(None),
+            on_message_dropped: ArcSwap::from_pointee(None),
         }
     }
 
@@ -1181,6 +1253,8 @@ impl Router {
             on_pep_decision: ArcSwap::from_pointee(None),
             on_obligation_applied: ArcSwap::from_pointee(None),
             on_authz_in_flight_changed: ArcSwap::from_pointee(None),
+            on_message_delivered: ArcSwap::from_pointee(None),
+            on_message_dropped: ArcSwap::from_pointee(None),
         }
     }
 
@@ -1230,6 +1304,8 @@ impl Router {
             on_pep_decision: ArcSwap::from_pointee(None),
             on_obligation_applied: ArcSwap::from_pointee(None),
             on_authz_in_flight_changed: ArcSwap::from_pointee(None),
+            on_message_delivered: ArcSwap::from_pointee(None),
+            on_message_dropped: ArcSwap::from_pointee(None),
         }
     }
 
@@ -1603,6 +1679,37 @@ impl Router {
         self.on_authz_in_flight_changed.store(Arc::new(cb));
     }
 
+    /// Install (or replace) the per-recipient delivery audit observer.
+    ///
+    /// The callback fires once per recipient on a successful
+    /// per-recipient `try_send` with the source CN, recipient CN,
+    /// CoT `uid` (or empty), `MessageType` Display form, and a
+    /// destination tag (group name on group/multicast, `"direct"` or
+    /// `"broadcast"` otherwise). Wired by the server binary behind
+    /// `--audit-delivery` to feed
+    /// [`rustgate_core::audit::message_delivered`] for chain-of-custody
+    /// trails. The callback is per-recipient and high-volume — pass
+    /// `None` (the default) on builds or deployments where the
+    /// operational cost of per-recipient audit records is unwelcome.
+    /// Closes #854.
+    pub fn set_on_message_delivered(&self, cb: Option<OnMessageDelivered>) {
+        self.on_message_delivered.store(Arc::new(cb));
+    }
+
+    /// Install (or replace) the per-recipient delivery-drop audit
+    /// observer.
+    ///
+    /// The callback fires once per recipient whose delivery the router
+    /// dropped post-admission with the source CN, recipient CN,
+    /// CoT `uid`, and one of the documented `reason` labels
+    /// (`"backpressure"`, `"no_subscribers"`, `"acl_denied"`,
+    /// `"authz_denied"`, `"obligation_failed"`). Wired by the server
+    /// binary behind `--audit-delivery` to feed
+    /// [`rustgate_core::audit::message_dropped`]. Closes #854.
+    pub fn set_on_message_dropped(&self, cb: Option<OnMessageDropped>) {
+        self.on_message_dropped.store(Arc::new(cb));
+    }
+
     /// Internal helper — invoke the fanout callback if installed.
     /// Centralised so call sites stay short and the load+`is_some`
     /// pattern is identical across direct/group/broadcast/multicast
@@ -1646,6 +1753,36 @@ impl Router {
         for obligation in obligations {
             cb(obligation_kind_label(obligation));
         }
+    }
+
+    /// Internal helper — invoke the per-recipient delivery callback if
+    /// installed. The hot path on the un-installed (default) build is a
+    /// single `ArcSwap::load` + `is_none()` check, so per-recipient cost
+    /// stays bounded when the operator has not opted into
+    /// `--audit-delivery`. The `msg_uid_for` helper does a single
+    /// bounded `extract_cot_uid` scan over the payload prefix; that
+    /// cost is paid only when the callback is installed. Closes #854.
+    fn emit_message_delivered(&self, msg: &RoutableMessage, dest_cn: &str, group_label: &str) {
+        let guard = self.on_message_delivered.load();
+        let Some(cb) = (**guard).as_ref() else {
+            return;
+        };
+        let uid = extract_cot_uid(&msg.payload);
+        let msg_type = msg.metadata.message_type.to_string();
+        cb(&msg.source.cn, dest_cn, uid, &msg_type, group_label);
+    }
+
+    /// Internal helper — invoke the per-recipient delivery-drop
+    /// callback if installed. Mirrors [`Self::emit_message_delivered`]
+    /// on the failure side; the un-installed cost is the same single
+    /// `ArcSwap::load` + `is_none()` check. Closes #854.
+    fn emit_message_dropped(&self, msg: &RoutableMessage, dest_cn: &str, reason: &'static str) {
+        let guard = self.on_message_dropped.load();
+        let Some(cb) = (**guard).as_ref() else {
+            return;
+        };
+        let uid = extract_cot_uid(&msg.payload);
+        cb(&msg.source.cn, dest_cn, uid, reason);
     }
 
     /// Attach a per-tenant quota tracker to the router.
@@ -3113,6 +3250,13 @@ impl Router {
                             rule_id.as_deref(),
                         );
                     }
+                    // Closes #854. Per-recipient delivery audit. The
+                    // `pre_receive` form is the canonical envelope for
+                    // recovering the source CN, message type, and CoT
+                    // uid — the post-`with_obligations` form may have
+                    // had its payload masked, which would lose the uid
+                    // attribute for a forensic record.
+                    self.emit_message_delivered(&pre_receive, cn, "direct");
                     1
                 } else {
                     // Non-blocking: channel is full or closed. Persist
@@ -3145,6 +3289,13 @@ impl Router {
                     // drop even though the message survives via the
                     // store-forward queue.
                     self.emit_dropped("backpressure");
+                    // Closes #854. Per-recipient drop audit. Forensic
+                    // chain-of-custody must record the drop even if the
+                    // payload survives via store-and-forward — the
+                    // drain path will emit a fresh delivered/dropped
+                    // record on the eventual outcome, so a SIEM that
+                    // pairs the two events sees the full hop sequence.
+                    self.emit_message_dropped(&pre_receive, cn, "backpressure");
                     self.persist_for_offline(cn, &pre_receive);
                     0
                 }
@@ -3156,6 +3307,12 @@ impl Router {
                 // acceptable because policy may change before the
                 // session returns.
                 self.emit_dropped("no_subscribers");
+                // Closes #854. The message was admitted but no live
+                // session exists — record the no-subscribers drop so a
+                // SIEM can correlate against client-disconnected events
+                // and identify recipients who never came back to drain
+                // their queue.
+                self.emit_message_dropped(&msg, cn, "no_subscribers");
                 self.persist_for_offline(cn, &msg);
                 0
             }
@@ -3352,10 +3509,18 @@ impl Router {
                         rule_id.as_deref(),
                     );
                 }
+                // Closes #854. Per-recipient delivery audit. Use the
+                // pre-`with_obligations` envelope so the CoT uid scrape
+                // sees the original payload — a `MaskPayload`
+                // obligation may have stripped the uid attribute on
+                // the rewrapped form.
+                self.emit_message_delivered(&msg, &handle.identity.cn, group);
                 delivered += 1;
             } else {
                 dropped += 1;
                 self.emit_dropped("backpressure");
+                // Closes #854.
+                self.emit_message_dropped(&msg, &handle.identity.cn, "backpressure");
             }
         }
         if dropped > 0 {
@@ -3475,10 +3640,17 @@ impl Router {
                         rule_id.as_deref(),
                     );
                 }
+                // Closes #854. The destination tag for broadcast is
+                // the small fixed-vocabulary `"broadcast"` so SIEM
+                // correlation can filter without knowing the broadcast
+                // had no group name.
+                self.emit_message_delivered(&msg, &handle.identity.cn, "broadcast");
                 delivered += 1;
             } else {
                 dropped += 1;
                 self.emit_dropped("backpressure");
+                // Closes #854.
+                self.emit_message_dropped(&msg, &handle.identity.cn, "backpressure");
             }
         }
         if dropped > 0 {
@@ -3732,10 +3904,14 @@ impl Router {
                         rule_id.as_deref(),
                     );
                 }
+                // Closes #854. Per-recipient multicast delivery audit.
+                self.emit_message_delivered(&msg, &handle.identity.cn, group);
                 delivered_count += 1;
             } else {
                 dropped += 1;
                 self.emit_dropped("backpressure");
+                // Closes #854.
+                self.emit_message_dropped(&msg, &handle.identity.cn, "backpressure");
             }
         }
         if dropped > 0 {
