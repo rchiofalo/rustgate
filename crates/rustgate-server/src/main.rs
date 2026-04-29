@@ -896,6 +896,29 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
         router.set_on_authz_in_flight_changed(Some(metrics::router_authz_in_flight_callback()));
     }
 
+    // Closes #854. Per-recipient delivery audit is opt-in because a
+    // single broadcast to N subscribers produces N records. When
+    // `--audit-delivery` is set, install callbacks that bridge the
+    // router's per-recipient `try_send` outcome to the
+    // `rustgate_core::audit::message_delivered` /
+    // `message_dropped` helpers. When unset (the default), the slots
+    // stay `None` and the routing hot path pays only an
+    // `ArcSwap::load` + `is_none` check per recipient.
+    if cli.audit_delivery {
+        router.set_on_message_delivered(Some(std::sync::Arc::new(
+            |source_cn, dest_cn, msg_uid, msg_type, group| {
+                rustgate_core::audit::message_delivered(
+                    source_cn, dest_cn, msg_uid, msg_type, group,
+                );
+            },
+        )));
+        router.set_on_message_dropped(Some(std::sync::Arc::new(
+            |source_cn, dest_cn, msg_uid, reason| {
+                rustgate_core::audit::message_dropped(source_cn, dest_cn, msg_uid, reason);
+            },
+        )));
+    }
+
     #[cfg(feature = "metrics")]
     if let Some(ref q) = client_queue {
         metrics::spawn_client_queue_metrics_task(Arc::clone(q), Arc::clone(&metrics_identity));

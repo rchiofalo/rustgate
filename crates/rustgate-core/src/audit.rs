@@ -1930,6 +1930,91 @@ pub fn jwks_key_removed(url: &str, kid: &str) {
     );
 }
 
+/// Record a per-recipient delivery confirmation for chain-of-custody
+/// audit trails (closes #854).
+///
+/// Emitted by the router after every successful per-recipient
+/// `try_send` when the operator has explicitly opted in via the
+/// `--audit-delivery` CLI flag. The event is high-volume in busy
+/// deployments — a single broadcast to N subscribers produces N
+/// records — so the wiring is gated and disabled by default.
+///
+/// `source_cn` is the sending client's CN; `dest_cn` is the recipient's
+/// CN (raw, not hashed: per #1207 / #1221, audit fields use raw CNs for
+/// forensic chain-of-custody, while access logs use `hash_cn` for
+/// cardinality-bounded operational logs). `msg_uid` is the CoT
+/// `uid="..."` attribute scraped from the payload; pass an empty string
+/// when the payload is not CoT-shaped or no uid is present. `msg_type`
+/// is the `Display` form of [`crate::message::MessageType`] (e.g.
+/// `"position"`, `"chat"`, `"alert"`). `group` is the destination group
+/// name on group / multicast fan-out, or a small fixed-vocabulary tag
+/// (`"direct"`, `"broadcast"`) for non-group destinations so SIEM
+/// correlation queries do not have to special-case the absent-group
+/// shape.
+///
+/// Sanitization: every `&str` field is sanitized at the audit boundary
+/// per the workspace audit-boundary discipline (#1197 / #1220). Callers
+/// MAY still wrap on their side — `sanitize_for_log` is idempotent —
+/// but they no longer NEED to.
+pub fn message_delivered(
+    source_cn: &str,
+    dest_cn: &str,
+    msg_uid: &str,
+    msg_type: &str,
+    group: &str,
+) {
+    let source_cn = s(source_cn);
+    let dest_cn = s(dest_cn);
+    let msg_uid = s(msg_uid);
+    let msg_type = s(msg_type);
+    let group = s(group);
+    audit!(
+        "message.delivered",
+        source = %source_cn,
+        dest = %dest_cn,
+        uid = %msg_uid,
+        msg_type = %msg_type,
+        group = %group,
+        action = "deliver",
+        result = "success"
+    );
+}
+
+/// Record a per-recipient delivery drop for chain-of-custody audit
+/// trails (closes #854).
+///
+/// Emitted by the router after a per-recipient `try_send` fails (channel
+/// full, channel closed, or no live session and no store-and-forward
+/// queue) when the operator has explicitly opted in via the
+/// `--audit-delivery` CLI flag. The companion to [`message_delivered`]:
+/// SIEM correlation across the two events answers "did every classified
+/// message intended for recipient X land on the wire, and if not, why?"
+///
+/// `reason` is one of the small fixed-vocabulary labels the router's
+/// `OnDropped` callback already uses — `"backpressure"` (channel full
+/// or closed), `"no_subscribers"` (recipient is offline and no
+/// store-forward queue is configured), `"acl_denied"`, `"authz_denied"`,
+/// `"obligation_failed"` — so dashboards and audit queries share a
+/// vocabulary.
+///
+/// Sanitization: every `&str` field is sanitized at the audit boundary
+/// per the workspace audit-boundary discipline (#1197 / #1220).
+pub fn message_dropped(source_cn: &str, dest_cn: &str, msg_uid: &str, reason: &str) {
+    let source_cn = s(source_cn);
+    let dest_cn = s(dest_cn);
+    let msg_uid = s(msg_uid);
+    let reason = s(reason);
+    audit!(
+        "message.dropped",
+        source = %source_cn,
+        dest = %dest_cn,
+        uid = %msg_uid,
+        reason = %reason,
+        action = "deliver",
+        result = "dropped"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -2628,6 +2713,34 @@ mod tests {
         }
     }
 
+    mod delivery {
+        use super::*;
+
+        #[test]
+        fn test_message_delivered_smoke() {
+            // Pin every documented call shape so a future refactor
+            // that drops a field or reorders arguments fails the
+            // build instead of silently reshaping the audit record.
+            message_delivered("alice", "bob", "UID-1", "position", "team");
+            message_delivered("alice", "bob", "", "chat", "direct");
+            message_delivered("alice", "bob", "UID-2", "alert", "broadcast");
+            message_delivered("", "", "", "", "");
+        }
+
+        #[test]
+        fn test_message_dropped_smoke() {
+            // Cover every documented `reason` token in the small
+            // fixed vocabulary. A typo here would silently break SIEM
+            // rules that filter on the reason field.
+            message_dropped("alice", "bob", "UID-1", "backpressure");
+            message_dropped("alice", "bob", "UID-1", "no_subscribers");
+            message_dropped("alice", "bob", "UID-1", "acl_denied");
+            message_dropped("alice", "bob", "UID-1", "authz_denied");
+            message_dropped("alice", "bob", "UID-1", "obligation_failed");
+            message_dropped("", "", "", "");
+        }
+    }
+
     /// Tests pinning the boundary-sanitization contract: every audit
     /// helper that takes a user-controlled `&str` MUST sanitize it
     /// internally so that a forgotten call-site wrap cannot produce a
@@ -3130,6 +3243,152 @@ mod tests {
                     .as_str()
                     .expect("reason must be a JSON string"),
                 OBLIGATION_REASON_UNKNOWN_VARIANT,
+            );
+        }
+
+        #[test]
+        fn message_delivered_emits_documented_shape() {
+            // Closes #854. SIEM correlation queries key on the field
+            // names below; pin the wire shape end-to-end so a future
+            // refactor that renames a field fails this test instead of
+            // silently breaking downstream rules.
+            let snapshot = capture_audit(|| {
+                message_delivered("alice", "bob", "ANDROID-1", "position", "team-blue")
+            });
+            let event = parse_event(&snapshot, "message.delivered");
+            assert_eq!(
+                event["fields"]["source"]
+                    .as_str()
+                    .expect("source must be a JSON string"),
+                "alice"
+            );
+            assert_eq!(
+                event["fields"]["dest"]
+                    .as_str()
+                    .expect("dest must be a JSON string"),
+                "bob"
+            );
+            assert_eq!(
+                event["fields"]["uid"]
+                    .as_str()
+                    .expect("uid must be a JSON string"),
+                "ANDROID-1"
+            );
+            assert_eq!(
+                event["fields"]["msg_type"]
+                    .as_str()
+                    .expect("msg_type must be a JSON string"),
+                "position"
+            );
+            assert_eq!(
+                event["fields"]["group"]
+                    .as_str()
+                    .expect("group must be a JSON string"),
+                "team-blue"
+            );
+            assert_eq!(
+                event["fields"]["action"]
+                    .as_str()
+                    .expect("action must be a JSON string"),
+                "deliver"
+            );
+            assert_eq!(
+                event["fields"]["result"]
+                    .as_str()
+                    .expect("result must be a JSON string"),
+                "success"
+            );
+        }
+
+        #[test]
+        fn message_delivered_sanitizes_cn_with_log_forging() {
+            // Closes #854. Recipient CN crosses the audit-boundary at
+            // the audit emission site, so sanitization is the helper's
+            // responsibility regardless of whether the caller wrapped.
+            let malicious_cn = "bob\r\n\x1b[31m[FAKE]\x1b[0m";
+            let snapshot = capture_audit(|| {
+                message_delivered("alice", malicious_cn, "UID-1", "chat", "direct")
+            });
+            let event = parse_event(&snapshot, "message.delivered");
+            let dest = event["fields"]["dest"]
+                .as_str()
+                .expect("dest must be a JSON string");
+            for forbidden in &['\n', '\r', '\x1b'] {
+                assert!(
+                    !dest.contains(*forbidden),
+                    "forge byte {forbidden:?} must be replaced: {dest:?}"
+                );
+            }
+            assert!(
+                dest.contains('\u{FFFD}'),
+                "sanitized output must contain U+FFFD: {dest:?}"
+            );
+        }
+
+        #[test]
+        fn message_dropped_emits_documented_shape() {
+            // Closes #854. The companion to message_delivered — pin
+            // the field set and the static action/result tokens.
+            let snapshot =
+                capture_audit(|| message_dropped("alice", "bob", "ANDROID-2", "backpressure"));
+            let event = parse_event(&snapshot, "message.dropped");
+            assert_eq!(
+                event["fields"]["source"]
+                    .as_str()
+                    .expect("source must be a JSON string"),
+                "alice"
+            );
+            assert_eq!(
+                event["fields"]["dest"]
+                    .as_str()
+                    .expect("dest must be a JSON string"),
+                "bob"
+            );
+            assert_eq!(
+                event["fields"]["uid"]
+                    .as_str()
+                    .expect("uid must be a JSON string"),
+                "ANDROID-2"
+            );
+            assert_eq!(
+                event["fields"]["reason"]
+                    .as_str()
+                    .expect("reason must be a JSON string"),
+                "backpressure"
+            );
+            assert_eq!(
+                event["fields"]["action"]
+                    .as_str()
+                    .expect("action must be a JSON string"),
+                "deliver"
+            );
+            assert_eq!(
+                event["fields"]["result"]
+                    .as_str()
+                    .expect("result must be a JSON string"),
+                "dropped"
+            );
+        }
+
+        #[test]
+        fn message_dropped_sanitizes_reason_field() {
+            // Closes #854. While the in-tree call sites pass static
+            // tokens, an attacker-controlled `reason` would be a
+            // log-forge vector if the audit boundary missed it.
+            let malicious_reason = "backpressure\nattacker_line";
+            let snapshot =
+                capture_audit(|| message_dropped("alice", "bob", "UID-1", malicious_reason));
+            let event = parse_event(&snapshot, "message.dropped");
+            let reason = event["fields"]["reason"]
+                .as_str()
+                .expect("reason must be a JSON string");
+            assert!(
+                !reason.contains('\n'),
+                "raw newline must not survive sanitization: {reason:?}"
+            );
+            assert!(
+                reason.contains('\u{FFFD}'),
+                "sanitized output must contain U+FFFD: {reason:?}"
             );
         }
     }
