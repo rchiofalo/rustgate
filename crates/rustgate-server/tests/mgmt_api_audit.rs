@@ -110,6 +110,64 @@ fn mgmt_api_accessed_emits_pinned_audit_shape() {
 }
 
 #[test]
+fn client_force_disconnected_emits_pinned_audit_shape() {
+    // Closes #902 — pin the wire shape of the
+    // `client.force_disconnected` audit event. SIEM correlation rules
+    // key on the `event_type` / `action` / `result` / `cn` /
+    // `by_operator` / numeric `sessions_closed` tuple to attribute
+    // operator-driven disconnects, so a future refactor that drops
+    // the emission, renames a field, or swaps the numeric/string
+    // positions must fail loudly.
+    let buf = SharedBuf::default();
+    let layer = tracing_subscriber::fmt::layer()
+        .json()
+        .with_writer(buf.clone())
+        .with_filter(Targets::new().with_target("audit", tracing::Level::INFO));
+    let subscriber = tracing_subscriber::registry().with(layer);
+
+    tracing::subscriber::with_default(subscriber, || {
+        rustgate_core::audit::client_force_disconnected("alice", "bearer", 1);
+    });
+
+    let snapshot = buf.snapshot();
+    let line = snapshot
+        .lines()
+        .find(|l| l.contains("client.force_disconnected"))
+        .expect("audit event client.force_disconnected must be emitted");
+    let event: serde_json::Value = serde_json::from_str(line).unwrap();
+    assert_eq!(
+        event["fields"]["event_type"].as_str(),
+        Some("client.force_disconnected"),
+        "event_type must match the documented SIEM-correlation token",
+    );
+    assert_eq!(
+        event["fields"]["cn"].as_str(),
+        Some("alice"),
+        "cn must echo the URL path segment verbatim",
+    );
+    assert_eq!(
+        event["fields"]["by_operator"].as_str(),
+        Some("bearer"),
+        "by_operator must reflect the authenticated principal",
+    );
+    assert_eq!(
+        event["fields"]["sessions_closed"].as_u64(),
+        Some(1),
+        "sessions_closed must be a JSON number, not a string",
+    );
+    assert_eq!(
+        event["fields"]["action"].as_str(),
+        Some("force_disconnect"),
+        "action must be the documented audit verb",
+    );
+    assert_eq!(
+        event["fields"]["result"].as_str(),
+        Some("success"),
+        "result must indicate success — auth failures are 401-and-no-emission",
+    );
+}
+
+#[test]
 fn mgmt_api_accessed_sanitizes_endpoint_at_audit_boundary() {
     // A pathological caller injecting CR/LF into the `endpoint` field
     // (per #1197 / #1220 hardening) MUST be sanitized at the audit
