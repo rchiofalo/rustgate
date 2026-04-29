@@ -1,0 +1,489 @@
+{
+  "annotations": {"list": []},
+  "description": "Operator overview for a rustgate process. Covers system state, throughput by protocol, authorization decisions and latency, federation health, queue and resilience signals, and TLS/cert health. All panels query metrics emitted by the workspace's Prometheus exporter at /metrics.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "type": "row",
+      "title": "System overview",
+      "id": 1,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "Build info",
+      "id": 2,
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "value_and_name", "colorMode": "background"},
+      "targets": [{"expr": "rustgate_build_info", "refId": "A", "legendFormat": "{{version}}"}]
+    },
+    {
+      "type": "stat",
+      "title": "Active connections",
+      "id": 3,
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "colorMode": "value"},
+      "targets": [{"expr": "sum(rustgate_connections_active) + sum(rustgate_mqtt_active_sessions) + sum(rustgate_ws_active_connections)", "refId": "A", "legendFormat": "all transports"}]
+    },
+    {
+      "type": "stat",
+      "title": "Federation peers connected",
+      "id": 4,
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "colorMode": "value"},
+      "targets": [{"expr": "rustgate_federation_connections", "refId": "A", "legendFormat": "peers"}]
+    },
+    {
+      "type": "stat",
+      "title": "Server cert expiry (days)",
+      "id": 5,
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "colorMode": "background"},
+      "fieldConfig": {"defaults": {"unit": "d", "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "orange", "value": 7}, {"color": "green", "value": 30}]}}, "overrides": []},
+      "targets": [{"expr": "rustgate_cert_expiry_seconds / 86400", "refId": "A", "legendFormat": "days"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Active sessions by transport",
+      "id": 6,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 5},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "stacking": {"mode": "normal"}, "fillOpacity": 30}}, "overrides": []},
+      "targets": [
+        {"expr": "sum(rustgate_sessions_active)", "refId": "A", "legendFormat": "TLS / plaintext"},
+        {"expr": "sum(rustgate_mqtt_active_sessions)", "refId": "B", "legendFormat": "MQTT"},
+        {"expr": "sum(rustgate_ws_active_connections)", "refId": "C", "legendFormat": "WebSocket"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Connections accepted vs rejected",
+      "id": 7,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 5},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum(rate(rustgate_connections_accepted_total[1m]))", "refId": "A", "legendFormat": "accepted/s"},
+        {"expr": "sum(rate(rustgate_connections_rejected_total[1m]))", "refId": "B", "legendFormat": "rejected/s"},
+        {"expr": "sum(rate(rustgate_accept_errors_total[1m]))", "refId": "C", "legendFormat": "accept errors/s"}
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Throughput",
+      "id": 8,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 13},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Messages per second by protocol",
+      "id": 9,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 14},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "stacking": {"mode": "normal"}, "fillOpacity": 25}}, "overrides": []},
+      "targets": [
+        {"expr": "sum(rate(rustgate_mqtt_publishes_total[1m]))", "refId": "A", "legendFormat": "MQTT publish"},
+        {"expr": "sum(rate(rustgate_nats_publishes_total[1m]))", "refId": "B", "legendFormat": "NATS publish"},
+        {"expr": "sum(rate(rustgate_ws_messages_total[1m]))", "refId": "C", "legendFormat": "WebSocket"},
+        {"expr": "sum(rate(rustgate_federation_messages_in_total[1m])) + sum(rate(rustgate_federation_messages_out_total[1m]))", "refId": "D", "legendFormat": "Federation"},
+        {"expr": "sum(rate(rustgate_http_publishes_total[1m]))", "refId": "E", "legendFormat": "HTTP egress"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Bytes per second (per-identity, summed)",
+      "id": 10,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 14},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "Bps", "custom": {"drawStyle": "line", "fillOpacity": 15}}, "overrides": []},
+      "targets": [
+        {"expr": "sum(rate(rustgate_per_identity_bytes_received_total[1m]))", "refId": "A", "legendFormat": "inbound"},
+        {"expr": "sum(rate(rustgate_per_identity_bytes_sent_total[1m]))", "refId": "B", "legendFormat": "outbound"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Messages routed by destination",
+      "id": 11,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 22},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum by (destination) (rate(rustgate_messages_routed_total[1m]))", "refId": "A", "legendFormat": "{{destination}}"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "CoT parse rate by result",
+      "id": 12,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 22},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum by (result) (rate(rustgate_cot_parse_total[1m]))", "refId": "A", "legendFormat": "{{result}}"}]
+    },
+    {
+      "type": "row",
+      "title": "Authorization & latency",
+      "id": 13,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 30},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Authz decisions per second (allow vs deny)",
+      "id": 14,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 31},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "stacking": {"mode": "normal"}, "fillOpacity": 25}}, "overrides": []},
+      "targets": [{"expr": "sum by (decision) (rate(rustgate_authz_decisions_total[1m]))", "refId": "A", "legendFormat": "{{decision}}"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Authz evaluations per second (engine, by decision)",
+      "id": 15,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 31},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum by (decision) (rate(rustgate_authz_evaluations_total[1m]))", "refId": "A", "legendFormat": "{{decision}}"}]
+    },
+    {
+      "type": "stat",
+      "title": "Authz cache hit ratio (5m)",
+      "id": 16,
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 39},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "orange", "value": 0.5}, {"color": "green", "value": 0.8}]}}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "colorMode": "background"},
+      "targets": [{"expr": "rate(rustgate_authz_cache_hits_total[5m]) / clamp_min(rate(rustgate_authz_cache_hits_total[5m]) + rate(rustgate_authz_cache_misses_total[5m]), 1)", "refId": "A", "legendFormat": "hit ratio"}]
+    },
+    {
+      "type": "stat",
+      "title": "Authz evaluations in flight",
+      "id": 17,
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 39},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "colorMode": "value"},
+      "targets": [{"expr": "rustgate_authz_evaluations_in_flight", "refId": "A", "legendFormat": "in-flight"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Authz evaluation latency (p50 / p95 / p99)",
+      "id": 18,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 39},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, sum by (le) (rate(rustgate_authz_evaluation_seconds_bucket[5m])))", "refId": "A", "legendFormat": "p50"},
+        {"expr": "histogram_quantile(0.95, sum by (le) (rate(rustgate_authz_evaluation_seconds_bucket[5m])))", "refId": "B", "legendFormat": "p95"},
+        {"expr": "histogram_quantile(0.99, sum by (le) (rate(rustgate_authz_evaluation_seconds_bucket[5m])))", "refId": "C", "legendFormat": "p99"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Obligations emitted by type",
+      "id": 19,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 43},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum by (obligation_type) (rate(rustgate_authz_obligations_emitted_total[1m]))", "refId": "A", "legendFormat": "{{obligation_type}}"}]
+    },
+    {
+      "type": "row",
+      "title": "Federation",
+      "id": 20,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 51},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Federation traffic in/out",
+      "id": 21,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 52},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum(rate(rustgate_federation_messages_in_total[1m]))", "refId": "A", "legendFormat": "in/s"},
+        {"expr": "sum(rate(rustgate_federation_messages_out_total[1m]))", "refId": "B", "legendFormat": "out/s"},
+        {"expr": "sum(rate(rustgate_federation_messages_dropped_total[1m]))", "refId": "C", "legendFormat": "dropped/s"},
+        {"expr": "sum(rate(rustgate_federation_forward_ttl_expired_total[1m]))", "refId": "D", "legendFormat": "ttl expired/s"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Federation circuit-breaker trips and recoveries",
+      "id": 22,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 52},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum(rate(rustgate_federation_circuit_breaker_trips_total[5m])) * 60", "refId": "A", "legendFormat": "trips/min"},
+        {"expr": "sum(rate(rustgate_federation_circuit_breaker_recoveries_total[5m])) * 60", "refId": "B", "legendFormat": "recoveries/min"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Federation reconnects per minute",
+      "id": 23,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 60},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum(rate(rustgate_federation_reconnects_total[5m])) * 60", "refId": "A", "legendFormat": "reconnects/min"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Per-peer outbound queue bytes",
+      "id": 24,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 60},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []},
+      "targets": [{"expr": "rustgate_federation_peer_queue_bytes{peer=~\"$peer\"}", "refId": "A", "legendFormat": "{{peer}}"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Per-peer EWMA latency",
+      "id": 25,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 68},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "ns"}, "overrides": []},
+      "targets": [{"expr": "rustgate_federation_peer_latency_nanos{peer=~\"$peer\"}", "refId": "A", "legendFormat": "{{peer}}"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Federation replay buffer (bytes on disk)",
+      "id": 26,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 68},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []},
+      "targets": [{"expr": "rustgate_federation_replay_buffer_bytes", "refId": "A", "legendFormat": "replay bytes"}]
+    },
+    {
+      "type": "row",
+      "title": "Resilience and queues",
+      "id": 27,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 76},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "gauge",
+      "title": "Backpressure: global queued bytes",
+      "id": 28,
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 77},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []},
+      "targets": [{"expr": "rustgate_queued_bytes", "refId": "A", "legendFormat": "queued"}]
+    },
+    {
+      "type": "table",
+      "title": "Top-10 store-and-forward queue depth (per CN)",
+      "id": 29,
+      "gridPos": {"h": 8, "w": 16, "x": 8, "y": 77},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "options": {"showHeader": true},
+      "targets": [{"expr": "topk(10, rustgate_client_queue_depth)", "refId": "A", "format": "table", "instant": true}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Store-and-forward enqueue / drain / drop rate",
+      "id": 30,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 85},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum(rate(rustgate_client_queue_enqueues_total[1m]))", "refId": "A", "legendFormat": "enqueue/s"},
+        {"expr": "sum(rate(rustgate_client_queue_drains_total[1m]))", "refId": "B", "legendFormat": "drain/s"},
+        {"expr": "sum(rate(rustgate_client_queue_drops_total[1m]))", "refId": "C", "legendFormat": "drop/s"},
+        {"expr": "sum(rate(rustgate_client_queue_expired_total[1m]))", "refId": "D", "legendFormat": "expired/s"}
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Dedup hit ratio (5m)",
+      "id": 31,
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 85},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 0.5}, {"color": "red", "value": 0.9}]}}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "colorMode": "background"},
+      "targets": [{"expr": "rate(rustgate_dedup_hits_total[5m]) / clamp_min(rate(rustgate_messages_received_total[5m]), 1)", "refId": "A", "legendFormat": "dedup ratio"}]
+    },
+    {
+      "type": "stat",
+      "title": "Position cache size",
+      "id": 32,
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 85},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "colorMode": "value"},
+      "targets": [{"expr": "rustgate_position_cache_size", "refId": "A", "legendFormat": "entries"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Router drops by reason",
+      "id": 33,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 89},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum by (reason) (rate(rustgate_router_dropped_total[1m]))", "refId": "A", "legendFormat": "{{reason}}"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Tenant quota rejections per minute",
+      "id": 34,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 93},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum by (tenant) (rate(rustgate_tenant_quota_rejections_total[5m])) * 60", "refId": "A", "legendFormat": "{{tenant}}"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Enrollment rate-limit triggers per minute",
+      "id": 35,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 97},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum(rate(rustgate_enrollment_rate_limited_total[5m])) * 60", "refId": "A", "legendFormat": "rate-limited/min"}]
+    },
+    {
+      "type": "row",
+      "title": "TLS and cert health",
+      "id": 36,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 105},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "TLS handshake failures per minute by reason",
+      "id": 37,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 106},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum by (reason) (rate(rustgate_handshake_failures_total[5m])) * 60", "refId": "A", "legendFormat": "{{reason}}"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "TLS handshake duration (p50 / p95 / p99)",
+      "id": 38,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 106},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, sum by (le) (rate(rustgate_tls_handshake_duration_seconds_bucket[5m])))", "refId": "A", "legendFormat": "p50"},
+        {"expr": "histogram_quantile(0.95, sum by (le) (rate(rustgate_tls_handshake_duration_seconds_bucket[5m])))", "refId": "B", "legendFormat": "p95"},
+        {"expr": "histogram_quantile(0.99, sum by (le) (rate(rustgate_tls_handshake_duration_seconds_bucket[5m])))", "refId": "C", "legendFormat": "p99"}
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "OCSP cache hit ratio (5m)",
+      "id": 39,
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 114},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "orange", "value": 0.5}, {"color": "green", "value": 0.8}]}}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "colorMode": "background"},
+      "targets": [{"expr": "rate(rustgate_client_ocsp_cache_hits_total[5m]) / clamp_min(rate(rustgate_client_ocsp_cache_hits_total[5m]) + rate(rustgate_client_ocsp_cache_misses_total[5m]), 1)", "refId": "A", "legendFormat": "ocsp ratio"}]
+    },
+    {
+      "type": "stat",
+      "title": "CRL age (seconds)",
+      "id": 40,
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 114},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "s", "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 86400}, {"color": "red", "value": 604800}]}}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "colorMode": "background"},
+      "targets": [{"expr": "rustgate_crl_age_seconds", "refId": "A", "legendFormat": "stalest CRL"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Reload rollbacks per subsystem",
+      "id": 41,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 114},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum by (subsystem) (rate(rustgate_reload_rollback_total[15m])) * 60", "refId": "A", "legendFormat": "{{subsystem}}"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "SPIFFE SVID refresh by outcome",
+      "id": 42,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 122},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum by (outcome) (rate(rustgate_spiffe_svid_refresh_total[15m])) * 60", "refId": "A", "legendFormat": "{{outcome}}"}]
+    },
+    {
+      "type": "stat",
+      "title": "SPIFFE SVID notAfter (unix seconds)",
+      "id": 43,
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 122},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "colorMode": "value"},
+      "targets": [{"expr": "rustgate_spiffe_svid_expiry_seconds", "refId": "A", "legendFormat": "notAfter"}]
+    },
+    {
+      "type": "stat",
+      "title": "Negotiation outcomes (5m)",
+      "id": 44,
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 122},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "result", "values": false}, "colorMode": "value"},
+      "targets": [{"expr": "sum by (result) (increase(rustgate_negotiations_total[5m]))", "refId": "A", "legendFormat": "{{result}}"}]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "tags": ["rustgate", "tactical-mtls", "observability"],
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "label": "Prometheus datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {"selected": false, "text": "Prometheus", "value": "Prometheus"},
+        "hide": 0,
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false
+      },
+      {
+        "name": "peer",
+        "label": "Federation peer",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "definition": "label_values(rustgate_federation_peer_queue_bytes, peer)",
+        "query": {"query": "label_values(rustgate_federation_peer_queue_bytes, peer)", "refId": "PrometheusVariableQueryEditor-VariableQuery"},
+        "current": {"selected": true, "text": "All", "value": "$__all"},
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "hide": 0,
+        "refresh": 2,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1
+      },
+      {
+        "name": "tenant",
+        "label": "Tenant",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "definition": "label_values(rustgate_tenant_quota_rejections_total, tenant)",
+        "query": {"query": "label_values(rustgate_tenant_quota_rejections_total, tenant)", "refId": "PrometheusVariableQueryEditor-VariableQuery"},
+        "current": {"selected": true, "text": "All", "value": "$__all"},
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "hide": 0,
+        "refresh": 2,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1
+      }
+    ]
+  },
+  "time": {"from": "now-1h", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "rustgate / Golden Overview",
+  "uid": "rustgate-overview-golden",
+  "version": 1,
+  "weekStart": ""
+}
