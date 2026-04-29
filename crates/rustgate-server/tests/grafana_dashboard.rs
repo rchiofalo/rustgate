@@ -44,8 +44,7 @@ fn load_dashboard() -> serde_json::Value {
     let path = dashboard_path();
     let raw = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("read {} failed: {e}", path.display()));
-    serde_json::from_str(&raw)
-        .unwrap_or_else(|e| panic!("parse {} failed: {e}", path.display()))
+    serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {} failed: {e}", path.display()))
 }
 
 /// Walk every panel (including panels nested in row-collapsed groups)
@@ -131,10 +130,7 @@ fn defined_metric_names() -> BTreeSet<String> {
             if let Some(end) = hit.find('"') {
                 let name = format!("rustgate_{}", &hit[..end]);
                 // Defensive: identifier characters only.
-                if name
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
-                {
+                if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                     let _ = out.insert(name);
                 }
             }
