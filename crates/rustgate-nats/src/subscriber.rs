@@ -244,35 +244,47 @@ impl NatsSubscriber {
         Ok(consumer)
     }
 
-    /// Publish a poison message to the configured dead-letter subject,
-    /// if any. Returns without side effects when `dead_letter_subject`
-    /// is `None` — the DLQ is strictly opt-in.
+    /// Handle a poison message: emit the structured audit event and,
+    /// if `dead_letter_subject` is configured, republish the original
+    /// payload there with diagnostic headers.
     ///
-    /// The original payload is forwarded unchanged so operators can
-    /// inspect whatever garbage arrived at the subscriber. Diagnostic
-    /// context travels in headers:
+    /// The audit emission and the DLQ publish are independent surfaces:
     ///
-    /// - `X-Rustgate-DLQ-Reason` — short slug identifying which drop
-    ///   path fired (`oversized`, `unparseable`, `unknown-position`,
-    ///   `invalid-identity`).
-    /// - `X-Rustgate-DLQ-Original-Subject` — the live-stream subject
-    ///   the poison message arrived on, so a forensic viewer can tell
-    ///   one group or tenant's garbage from another's.
-    /// - `X-Rustgate-DLQ-Timestamp` — Unix millis at DLQ publish time,
-    ///   useful for correlating with other logs when the original
-    ///   message has no timestamp of its own.
+    /// - The audit event (`nats.poison_dlq`) ALWAYS fires when a drop
+    ///   path is taken, regardless of whether the optional DLQ subject
+    ///   is wired. Operators get a structured SIEM signal even on
+    ///   deployments that never opt in to DLQ. This closes the
+    ///   "silent ACK on poison" gap called out in sub-item 3 of #883.
+    /// - The DLQ publish is strictly opt-in. The original payload is
+    ///   forwarded unchanged so operators can inspect whatever garbage
+    ///   arrived. Diagnostic context travels in headers:
     ///
-    /// **Best-effort semantics.** A failed DLQ publish is logged at
-    /// `warn` but does NOT propagate an error to the caller — the whole
-    /// point of DLQ is to unblock the consumer past stuck sequences, so
-    /// we never let a transient NATS publish error keep the original
-    /// message in the pending set.
-    async fn publish_dead_letter(
+    ///   - `X-Rustgate-DLQ-Reason` — short slug identifying which drop
+    ///     path fired (`oversized`, `unparseable`, `unknown-position`,
+    ///     `invalid-identity`).
+    ///   - `X-Rustgate-DLQ-Original-Subject` — the live-stream subject
+    ///     the poison message arrived on, so a forensic viewer can
+    ///     tell one group or tenant's garbage from another's.
+    ///   - `X-Rustgate-DLQ-Timestamp` — Unix millis at DLQ publish
+    ///     time, useful for correlating with other logs when the
+    ///     original message has no timestamp of its own.
+    ///
+    /// **Best-effort DLQ.** A failed DLQ publish is logged at `warn`
+    /// but does NOT propagate an error to the caller — the whole point
+    /// of DLQ is to unblock the consumer past stuck sequences, so we
+    /// never let a transient NATS publish error keep the original
+    /// message in the pending set. The audit event has already fired
+    /// by the time the publish runs, so SIEM still sees the drop.
+    async fn handle_poison_message(
         &self,
         reason: &str,
         original_subject: &str,
+        msg_id: &str,
+        attempts: u32,
         original_payload: bytes::Bytes,
     ) {
+        rustgate_core::audit::nats_poison_message_dlq(original_subject, msg_id, reason, attempts);
+
         let Some(ref dlq_subject) = self.config.dead_letter_subject else {
             return;
         };
@@ -376,11 +388,19 @@ impl NatsSubscriber {
                     "dropping oversized NATS message"
                 );
                 dropped += 1;
+                let (msg_id, attempts) = poison_metadata(&msg);
                 // Preserve the original payload on the DLQ (if configured)
                 // so operators can inspect the oversized garbage — we're
-                // about to ACK and lose it from the stream forever.
-                self.publish_dead_letter("oversized", msg.subject.as_str(), msg.payload.clone())
-                    .await;
+                // about to ACK and lose it from the stream forever. The
+                // audit event fires regardless of whether DLQ is wired.
+                self.handle_poison_message(
+                    "oversized",
+                    msg.subject.as_str(),
+                    &msg_id,
+                    attempts,
+                    msg.payload.clone(),
+                )
+                .await;
                 // ACK to prevent redelivery of garbage
                 if let Err(e) = msg.ack().await {
                     tracing::debug!(error = %e, "failed to ACK oversized message");
@@ -407,12 +427,17 @@ impl NatsSubscriber {
                     Err(e) => {
                         tracing::debug!(error = %e, subject = %msg.subject, "failed to parse NATS message");
                         dropped += 1;
+                        let (msg_id, attempts) = poison_metadata(&msg);
                         // Preserve original bytes on DLQ before ACK — the
                         // point of DLQ is that operators can see exactly
-                        // what malformed payload arrived.
-                        self.publish_dead_letter(
+                        // what malformed payload arrived. The audit
+                        // event fires regardless of whether DLQ is
+                        // wired.
+                        self.handle_poison_message(
                             "unparseable",
                             msg.subject.as_str(),
+                            &msg_id,
+                            attempts,
                             msg.payload.clone(),
                         )
                         .await;
@@ -426,9 +451,12 @@ impl NatsSubscriber {
 
                 if wire_event.is_position_unknown() {
                     dropped += 1;
-                    self.publish_dead_letter(
+                    let (msg_id, attempts) = poison_metadata(&msg);
+                    self.handle_poison_message(
                         "unknown-position",
                         msg.subject.as_str(),
+                        &msg_id,
+                        attempts,
                         msg.payload.clone(),
                     )
                     .await;
@@ -443,9 +471,12 @@ impl NatsSubscriber {
                     Err(e) => {
                         tracing::warn!(error = %e, "invalid NATS message identity");
                         dropped += 1;
-                        self.publish_dead_letter(
+                        let (msg_id, attempts) = poison_metadata(&msg);
+                        self.handle_poison_message(
                             "invalid-identity",
                             msg.subject.as_str(),
+                            &msg_id,
+                            attempts,
                             msg.payload.clone(),
                         )
                         .await;
@@ -489,6 +520,38 @@ impl NatsSubscriber {
 
         tracing::info!(processed, dropped, "NATS JetStream subscriber ended");
         Ok(())
+    }
+}
+
+/// Extract a `(msg_id, attempts)` pair from a JetStream message for
+/// the [`rustgate_core::audit::nats_poison_message_dlq`] audit event.
+///
+/// `msg_id` is the JetStream stream sequence rendered as a decimal
+/// string when [`async_nats::jetstream::Message::info`] succeeds —
+/// this is the canonical correlation token a forensic operator uses
+/// to point JetStream's `nats consumer` admin tooling at the exact
+/// stuck record. When `info()` fails (a malformed reply subject is
+/// the documented failure mode), the audit must still fire so SIEM
+/// alerting on `nats.poison_dlq` is not gated by JetStream
+/// availability — the helper returns `("unknown", 0)` and the
+/// downstream sanitizer guards against the literal `"unknown"` string
+/// in case a future caller threads operator-controlled context here.
+///
+/// `attempts` is the JetStream delivery-attempt count for this stream
+/// sequence — the value of `info.delivered` at the moment the
+/// subscriber gave up. Saturates at `u32::MAX` for the (effectively
+/// impossible) case of a delivered count that overflows `u32`; the
+/// signed-to-unsigned cast also clamps the rare case of a JetStream
+/// server returning a negative `delivered` value (we have not seen
+/// this in practice, but defensive clamping costs one branch per
+/// poison drop).
+fn poison_metadata(msg: &async_nats::jetstream::Message) -> (String, u32) {
+    match msg.info() {
+        Ok(info) => {
+            let attempts = u32::try_from(info.delivered).unwrap_or(u32::MAX);
+            (info.stream_sequence.to_string(), attempts)
+        }
+        Err(_) => ("unknown".to_string(), 0),
     }
 }
 
@@ -802,16 +865,33 @@ mod tests {
     }
 
     #[test]
-    fn build_consumer_config_default_max_deliver_is_server_default_sentinel() {
-        // Default `max_deliver = 0` is the wire sentinel that tells the
-        // JetStream server to use its own default (unlimited). This is the
-        // only back-compat posture — any positive default would change
-        // redelivery behaviour for existing deployments on upgrade.
+    fn build_consumer_config_default_max_deliver_is_workspace_poison_cap() {
+        // Default `max_deliver = 5` is the workspace poison-message
+        // handling standard (refs #883 sub-item 3). The pull-consumer
+        // wiring must round-trip the new default verbatim — anything
+        // else silently re-opens the poison-redelivery gap on every
+        // fresh deployment.
         let nats_config = NatsConfig {
             instance_id: "test-instance".to_string(),
             ..Default::default()
         };
-        assert_eq!(nats_config.max_deliver, 0);
+        assert_eq!(nats_config.max_deliver, 5);
+        let (_, pull_config) = build_consumer_config(&nats_config);
+        assert_eq!(pull_config.max_deliver, 5);
+    }
+
+    #[test]
+    fn build_consumer_config_explicit_zero_max_deliver_passes_through() {
+        // The legacy-compat opt-in: `max_deliver = 0` is the JetStream
+        // wire sentinel for "unlimited redelivery". The pull-consumer
+        // wiring must pass it through verbatim so an operator who
+        // explicitly opted out of the new default sees the pre-#883
+        // semantics.
+        let nats_config = NatsConfig {
+            instance_id: "test-instance".to_string(),
+            max_deliver: 0,
+            ..Default::default()
+        };
         let (_, pull_config) = build_consumer_config(&nats_config);
         assert_eq!(pull_config.max_deliver, 0);
     }

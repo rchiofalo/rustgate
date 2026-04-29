@@ -843,6 +843,13 @@
       ],
       "default": null
     },
+    "nats-dead-letter-subject": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
     "nats-live-stream": {
       "type": [
         "string",

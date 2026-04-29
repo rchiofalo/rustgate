@@ -1727,6 +1727,58 @@ pub fn mqtt_will_published(cn: &str, topic: &str, group: &str, retain: bool) {
     );
 }
 
+/// Record that a NATS-bridged message was dispatched to the poison-message
+/// dead-letter queue (DLQ).
+///
+/// Emitted by `rustgate_nats::NatsSubscriber` whenever a JetStream message
+/// fires one of the four local-drop paths (`oversized`, `unparseable`,
+/// `unknown-position`, `invalid-identity`) that would otherwise let the
+/// pull consumer redeliver the same poison payload indefinitely. The
+/// audit fires regardless of whether the optional DLQ subject is wired
+/// — the security record is the audit trail; the DLQ subject is the
+/// forensic-payload sink.
+///
+/// `subject` is the original live-stream subject the poison message
+/// arrived on (e.g. `"points.ALPHA"`). `msg_id` is the JetStream stream
+/// sequence rendered as a decimal string when available, or the literal
+/// `"unknown"` when `msg.info()` failed (the audit must still fire so
+/// SIEM alerting on `nats.poison_dlq` is not gated by JetStream
+/// availability). `reason` is the short slug from the four drop paths.
+/// `attempts` is the JetStream delivery attempt count for this stream
+/// sequence — the value of `info.delivered` at the moment the
+/// subscriber gave up. A persistently-failing message reaches this
+/// emission once per attempt, so SIEM rules can rate-limit on the
+/// `(subject, msg_id)` pair if the alerting source is the audit log
+/// rather than the DLQ subject itself.
+///
+/// **Sub-item 3 of #883.** Closes the poison-message redelivery gap
+/// called out in the issue: pre-this-event the subscriber silently
+/// ACKed the four drop paths with no audit record, so a SIEM operator
+/// had no way to distinguish "consumer is healthy" from "consumer is
+/// burning a poison message every redelivery interval". The new event
+/// gives operators a structured signal that survives even when the
+/// optional DLQ subject is unset.
+///
+/// Sanitization: every `&str` field crosses the audit boundary via
+/// [`sanitize_for_log`] so an attacker who can publish to the live
+/// stream cannot forge a log line through the original subject or a
+/// downstream-controlled reason slug. `attempts` is a numeric field
+/// and bypasses sanitization.
+pub fn nats_poison_message_dlq(subject: &str, msg_id: &str, reason: &str, attempts: u32) {
+    let subject = s(subject);
+    let msg_id = s(msg_id);
+    let reason = s(reason);
+    audit!(
+        "nats.poison_dlq",
+        subject = %subject,
+        msg_id = %msg_id,
+        reason = %reason,
+        attempts = attempts,
+        action = "dead_letter",
+        result = "moved"
+    );
+}
+
 /// Record that an encrypted-archive [`crate::encrypted::KeyRing`] was loaded
 /// with an active key whose configured `not_after` is within the rotation
 /// window — the operator must rotate before the key expires or new-write
@@ -2697,6 +2749,20 @@ mod tests {
             mavlink_heartbeat_received(0, 0, 0, 0);
             mavlink_heartbeat_received(u8::MAX, u8::MAX, u8::MAX, u8::MAX);
         }
+
+        #[test]
+        fn test_nats_poison_message_dlq() {
+            // Smoke-test the four documented `reason` slugs the
+            // subscriber emits on a poison drop, plus the boundary
+            // shapes the macro must not panic on (zero attempts, max
+            // attempts, empty fields, "unknown" msg_id when JetStream
+            // info() failed).
+            nats_poison_message_dlq("points.ALPHA", "12345", "oversized", 1);
+            nats_poison_message_dlq("points.BRAVO", "67890", "unparseable", 5);
+            nats_poison_message_dlq("points.CHARLIE", "1", "unknown-position", 0);
+            nats_poison_message_dlq("points.DELTA", "unknown", "invalid-identity", u32::MAX);
+            nats_poison_message_dlq("", "", "", 0);
+        }
     }
 
     mod admin {
@@ -2896,6 +2962,128 @@ mod tests {
             assert!(
                 group.contains('\u{FFFD}'),
                 "sanitized output must contain U+FFFD: {group:?}"
+            );
+        }
+
+        #[test]
+        fn audit_nats_poison_message_dlq_emits_documented_shape() {
+            // Pin the wire-format contract for sub-item 3 of #883:
+            // SIEM rules will alert on `event_type ==
+            // "nats.poison_dlq"` and `action == "dead_letter"`. A
+            // future refactor that renames either field would
+            // silently break those rules, so capture the JSON output
+            // and pin the shape end-to-end.
+            let snapshot = capture_audit(|| {
+                nats_poison_message_dlq("points.ALPHA", "12345", "unparseable", 5)
+            });
+            let event = parse_event(&snapshot, "nats.poison_dlq");
+            assert_eq!(
+                event["fields"]["event_type"]
+                    .as_str()
+                    .expect("event_type must be a JSON string"),
+                "nats.poison_dlq",
+            );
+            assert_eq!(
+                event["fields"]["action"]
+                    .as_str()
+                    .expect("action must be a JSON string"),
+                "dead_letter",
+            );
+            assert_eq!(
+                event["fields"]["result"]
+                    .as_str()
+                    .expect("result must be a JSON string"),
+                "moved",
+            );
+            assert_eq!(
+                event["fields"]["subject"]
+                    .as_str()
+                    .expect("subject must be a JSON string"),
+                "points.ALPHA",
+            );
+            assert_eq!(
+                event["fields"]["msg_id"]
+                    .as_str()
+                    .expect("msg_id must be a JSON string"),
+                "12345",
+            );
+            assert_eq!(
+                event["fields"]["reason"]
+                    .as_str()
+                    .expect("reason must be a JSON string"),
+                "unparseable",
+            );
+            // `attempts` is numeric (u32) — must serialise as a number,
+            // not a string, so PromQL/PromQ-style alert rules can do
+            // numeric comparisons without parsing. tracing-subscriber's
+            // JSON format renders u32 as an unsigned integer.
+            assert_eq!(
+                event["fields"]["attempts"]
+                    .as_u64()
+                    .expect("attempts must be a numeric JSON value"),
+                5,
+            );
+        }
+
+        #[test]
+        fn audit_nats_poison_message_dlq_sanitizes_subject_msg_id_and_reason() {
+            // The subscriber receives `subject` from the live JetStream
+            // stream, where any client that can publish to
+            // `{subject_prefix}.>` can inject control bytes into the
+            // subject string. `msg_id` is server-derived (stream
+            // sequence rendered as a decimal string), so in practice
+            // it cannot contain control bytes — but the audit boundary
+            // sanitizes anyway for defense-in-depth, since the
+            // server's wire format is not under our control. `reason`
+            // is a literal in our code today, but a future caller
+            // that threads operator-controlled context through would
+            // get the same protection.
+            let malicious_subject = "points.ALPHA\r\n\x1b[31m[FAKE ALERT]\x1b[0m";
+            let malicious_msg_id = "12345\nfake_event=injected";
+            let malicious_reason = "unparseable\r\nspoofed";
+            let snapshot = capture_audit(|| {
+                nats_poison_message_dlq(malicious_subject, malicious_msg_id, malicious_reason, 7)
+            });
+            let event = parse_event(&snapshot, "nats.poison_dlq");
+            let subject = event["fields"]["subject"]
+                .as_str()
+                .expect("subject must be a JSON string");
+            let msg_id = event["fields"]["msg_id"]
+                .as_str()
+                .expect("msg_id must be a JSON string");
+            let reason = event["fields"]["reason"]
+                .as_str()
+                .expect("reason must be a JSON string");
+            for forbidden in &['\n', '\r', '\x1b'] {
+                assert!(
+                    !subject.contains(*forbidden),
+                    "subject: forge byte {forbidden:?} must be replaced: {subject:?}"
+                );
+                assert!(
+                    !msg_id.contains(*forbidden),
+                    "msg_id: forge byte {forbidden:?} must be replaced: {msg_id:?}"
+                );
+                assert!(
+                    !reason.contains(*forbidden),
+                    "reason: forge byte {forbidden:?} must be replaced: {reason:?}"
+                );
+            }
+            assert!(
+                subject.contains('\u{FFFD}')
+                    && msg_id.contains('\u{FFFD}')
+                    && reason.contains('\u{FFFD}'),
+                "sanitized fields must contain U+FFFD",
+            );
+            // The captured snapshot itself must not contain the
+            // injected fake entry as a separate logical line.
+            let lines_with_event: Vec<_> = snapshot
+                .lines()
+                .filter(|l| l.contains("nats.poison_dlq"))
+                .collect();
+            assert_eq!(
+                lines_with_event.len(),
+                1,
+                "log forging must not split the record into multiple lines",
             );
         }
 

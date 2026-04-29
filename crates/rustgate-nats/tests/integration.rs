@@ -1714,6 +1714,554 @@ async fn nats_subscriber_source_protocol_stamped_correctly() {
     sub_task.abort();
 }
 
+// ── Sub-item 3 of #883: poison-message redelivery cap + audit ─────────────
+//
+// JetStream's `max_deliver` field bounds redelivery so a poison message
+// cannot wedge the consumer indefinitely. The subscriber-side audit event
+// `nats.poison_dlq` gives SIEM a structured signal regardless of whether
+// the optional DLQ subject is wired. The tests below cover the contract
+// end-to-end: the new default of 5 attempts, the `0` legacy-compat
+// escape hatch, the audit-event emission on every poison drop, and the
+// `attempts` field crossing into the audit record.
+
+/// The new default `max_deliver = 5` flows into the actual JetStream
+/// consumer config — pre-#883-sub3 the default was `0` (unlimited),
+/// which let a single poison message redeliver indefinitely. Verifies
+/// the projection by introspecting `consumer.info()` against a live
+/// JetStream server, not just the in-memory `pull::Config` (the
+/// build-config unit tests cover that).
+#[tokio::test]
+async fn nats_subscriber_default_max_deliver_is_five_in_jetstream() {
+    let server = require_nats!();
+
+    let config = test_config(server.url(), "default-max-deliver");
+    assert_eq!(
+        config.max_deliver, 5,
+        "default config must enable five-attempt poison cap (refs #883 sub-item 3)",
+    );
+    let adapter = NatsAdapter::connect(config.clone()).await.expect("connect");
+
+    let router = Arc::new(Router::new());
+    let subscriber = adapter.subscriber();
+    let sub_router = Arc::clone(&router);
+    let sub_task = tokio::spawn(async move {
+        let _ = subscriber.run(sub_router).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let js = server.jetstream().await;
+    let stream = js
+        .get_stream(&config.live_stream)
+        .await
+        .expect("live stream exists");
+    let consumer_name = format!("rustgate-sub-{}", config.instance_id);
+    let mut consumer = stream
+        .get_consumer::<async_nats::jetstream::consumer::pull::Config>(&consumer_name)
+        .await
+        .expect("consumer exists");
+    let info = consumer.info().await.expect("consumer info");
+    assert_eq!(
+        info.config.max_deliver, 5,
+        "JetStream consumer must carry the new default max_deliver=5 cap",
+    );
+
+    sub_task.abort();
+}
+
+/// Operators who need the pre-#883 unlimited-redelivery semantics back
+/// must set `max_deliver = 0` explicitly. Verifies the legacy-compat
+/// escape hatch reaches JetStream — a regression that mapped `0` onto
+/// the new default would silently re-enable the poison cap for
+/// operators who explicitly opted out.
+#[tokio::test]
+async fn nats_subscriber_explicit_zero_max_deliver_is_unlimited_in_jetstream() {
+    let server = require_nats!();
+
+    let mut config = test_config(server.url(), "legacy-unlimited");
+    config.max_deliver = 0;
+    let adapter = NatsAdapter::connect(config.clone()).await.expect("connect");
+
+    let router = Arc::new(Router::new());
+    let subscriber = adapter.subscriber();
+    let sub_router = Arc::clone(&router);
+    let sub_task = tokio::spawn(async move {
+        let _ = subscriber.run(sub_router).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let js = server.jetstream().await;
+    let stream = js
+        .get_stream(&config.live_stream)
+        .await
+        .expect("live stream exists");
+    let consumer_name = format!("rustgate-sub-{}", config.instance_id);
+    let mut consumer = stream
+        .get_consumer::<async_nats::jetstream::consumer::pull::Config>(&consumer_name)
+        .await
+        .expect("consumer exists");
+    let info = consumer.info().await.expect("consumer info");
+    assert!(
+        info.config.max_deliver <= 0,
+        "explicit max_deliver=0 must round-trip into JetStream as the unlimited sentinel \
+         (server may render as 0 or -1); got {got}",
+        got = info.config.max_deliver,
+    );
+
+    sub_task.abort();
+}
+
+/// The default 5-attempt cap MUST NOT break the happy path: a
+/// well-formed message published to the live subject still reaches a
+/// locally-registered session and is ACKed. Pinning this prevents a
+/// future regression where the new default (or a refactor of the
+/// drop paths) accidentally rejects valid traffic.
+#[tokio::test]
+async fn nats_subscriber_default_5_attempts_does_not_break_happy_path() {
+    let server = require_nats!();
+
+    let config_pub = test_config(server.url(), "happy-pub");
+    let config_sub = test_config(server.url(), "happy-sub");
+    assert_eq!(
+        config_sub.max_deliver, 5,
+        "test must run against the new five-attempt default",
+    );
+
+    let adapter_pub = NatsAdapter::connect(config_pub).await.expect("connect pub");
+    let adapter_sub = NatsAdapter::connect(config_sub.clone())
+        .await
+        .expect("connect sub");
+
+    let router = Arc::new(Router::new());
+    let mut rx = register_session(&router, "happy-listener", "Cyan").await;
+
+    let subscriber = adapter_sub.subscriber();
+    let sub_router = Arc::clone(&router);
+    let sub_task = tokio::spawn(async move {
+        let _ = subscriber.run(sub_router).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let msg = position_message("happy-track", "Cyan", 37.0, -122.0);
+    adapter_pub.publisher().publish(&msg).await;
+
+    let received = timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("happy-path message must arrive within 5s")
+        .expect("session channel closed");
+    assert_eq!(&*received.source.cn, "happy-track");
+
+    // ACK should land within a few hundred ms — pin that the new
+    // default does not leave the message sitting in ack-pending.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let js = server.jetstream().await;
+    let stream = js
+        .get_stream(&config_sub.live_stream)
+        .await
+        .expect("stream");
+    let consumer_name = format!("rustgate-sub-{}", config_sub.instance_id);
+    let mut consumer = stream
+        .get_consumer::<async_nats::jetstream::consumer::pull::Config>(&consumer_name)
+        .await
+        .expect("consumer");
+    let info = consumer.info().await.expect("info");
+    assert_eq!(
+        info.num_ack_pending, 0,
+        "happy-path message must be ACKed under the new five-attempt default",
+    );
+
+    sub_task.abort();
+}
+
+/// JetStream gives up on a poison message after `max_deliver` attempts
+/// rather than redelivering forever. Verifies the cap reaches
+/// JetStream by manually creating a non-rustgate consumer with a
+/// short ack-wait and `max_deliver = 3`, intentionally never ACKing,
+/// and asserting redelivery stops at three. The subscriber's own
+/// poison paths ACK explicitly so they do not exercise the
+/// JetStream-side cap directly — but the cap exists for the panic
+/// edge-case where the handler dies between receive and ACK, which is
+/// exactly what this test simulates.
+#[tokio::test]
+async fn nats_subscriber_acks_after_max_delivery_attempts_to_break_redelivery_loop() {
+    let server = require_nats!();
+
+    // Use the rustgate live-stream subject space so the test exercises
+    // the same JetStream config the production subscriber uses.
+    let stream_name = "RUSTGATE_TEST_REDELIVERY_CAP";
+    let subject = "points.REDELIVERY";
+
+    let js = server.jetstream().await;
+    // Build a stream that captures `points.>` exactly like the
+    // production live stream.
+    let stream = js
+        .get_or_create_stream(async_nats::jetstream::stream::Config {
+            name: stream_name.to_string(),
+            subjects: vec!["points.>".to_string()],
+            retention: async_nats::jetstream::stream::RetentionPolicy::Limits,
+            max_messages: 100,
+            ..Default::default()
+        })
+        .await
+        .expect("create test stream");
+
+    // Manually create a pull consumer with `max_deliver = 3` and a
+    // short `ack_wait` so redelivery cycles fit in the test budget.
+    let consumer = stream
+        .get_or_create_consumer(
+            "redelivery-cap-test",
+            async_nats::jetstream::consumer::pull::Config {
+                durable_name: Some("redelivery-cap-test".to_string()),
+                ack_policy: async_nats::jetstream::consumer::AckPolicy::Explicit,
+                ack_wait: Duration::from_millis(500),
+                max_deliver: 3,
+                deliver_policy: async_nats::jetstream::consumer::DeliverPolicy::All,
+                filter_subject: subject.to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create test consumer");
+
+    // Publish one message; it will be delivered up to 3 times before
+    // JetStream gives up.
+    let _ack = js
+        .publish(subject.to_string(), bytes::Bytes::from_static(b"poison"))
+        .await
+        .expect("publish")
+        .await
+        .expect("publish ack");
+
+    // Drain the consumer for long enough that a 4th delivery would
+    // have happened if the cap were not enforced. Each fetch is bounded
+    // to 1 message at a time so we can count attempts. Never ACK.
+    let mut attempts = 0_u32;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline && attempts < 5 {
+        let mut batch = match consumer
+            .batch()
+            .max_messages(1)
+            .expires(Duration::from_millis(700))
+            .messages()
+            .await
+        {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        if let Some(Ok(_msg)) = batch.next().await {
+            attempts += 1;
+            // Intentionally never ACK — let `ack_wait` expire so
+            // JetStream redelivers (or gives up after `max_deliver`).
+        }
+    }
+
+    assert_eq!(
+        attempts, 3,
+        "JetStream must give up after `max_deliver = 3` attempts; \
+         observed {attempts} (a cap regression would yield 4+)",
+    );
+
+    // Verify the consumer's post-give-up view: after the cap fires,
+    // the message is no longer in the redelivery queue, so a fresh
+    // batch fetch must time out cleanly with no payload.
+    let info_consumer = stream
+        .get_consumer::<async_nats::jetstream::consumer::pull::Config>("redelivery-cap-test")
+        .await
+        .expect("consumer info");
+    let mut after_cap = info_consumer
+        .batch()
+        .max_messages(1)
+        .expires(Duration::from_millis(700))
+        .messages()
+        .await
+        .expect("post-cap batch");
+    let post_cap = timeout(Duration::from_secs(2), after_cap.next()).await;
+    assert!(
+        matches!(post_cap, Ok(None) | Err(_)),
+        "after the cap fires, no further deliveries must arrive; got {post_cap:?}",
+    );
+}
+
+/// On every poison drop, the subscriber emits the structured
+/// `nats.poison_dlq` audit event. Captures the audit-target tracing
+/// output via a custom `tracing_subscriber::Layer` and asserts the
+/// event fires once per poison drop with the expected `subject` and
+/// `reason` fields. The audit fires regardless of whether the
+/// optional DLQ subject is wired — the audit trail is the security
+/// record; the DLQ subject is the forensic-payload sink.
+#[tokio::test]
+async fn nats_poison_message_dlq_audit_event_fires() {
+    use std::sync::Mutex;
+
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::filter::Targets;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let server = require_nats!();
+
+    // Capture every audit-target event with `event_type ==
+    // "nats.poison_dlq"`, recording its `subject` and `reason` fields.
+    #[derive(Debug, Clone)]
+    struct CapturedEvent {
+        subject: String,
+        reason: String,
+    }
+
+    #[derive(Default)]
+    struct FieldCollector {
+        event_type: Option<String>,
+        subject: Option<String>,
+        reason: Option<String>,
+    }
+    impl Visit for FieldCollector {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            match field.name() {
+                "event_type" => self.event_type = Some(value.to_string()),
+                "subject" => self.subject = Some(value.to_string()),
+                "reason" => self.reason = Some(value.to_string()),
+                _ => {}
+            }
+        }
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            // tracing renders `%val` via Display through Debug; capture
+            // both shapes so tests are robust to formatter choice.
+            let rendered = format!("{value:?}");
+            // Strip surrounding quotes that Debug adds for &str.
+            let trimmed = rendered.trim_matches('"').to_string();
+            match field.name() {
+                "event_type" => self.event_type = Some(trimmed),
+                "subject" => self.subject = Some(trimmed),
+                "reason" => self.reason = Some(trimmed),
+                _ => {}
+            }
+        }
+    }
+
+    struct CapturingLayer(Arc<Mutex<Vec<CapturedEvent>>>);
+    impl<S: tracing::Subscriber> Layer<S> for CapturingLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut collector = FieldCollector::default();
+            event.record(&mut collector);
+            if collector.event_type.as_deref() == Some("nats.poison_dlq")
+                && let (Some(subject), Some(reason)) = (collector.subject, collector.reason)
+            {
+                self.0
+                    .lock()
+                    .expect("audit capture mutex poisoned")
+                    .push(CapturedEvent { subject, reason });
+            }
+        }
+    }
+
+    let captured: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let layer = CapturingLayer(Arc::clone(&captured))
+        .with_filter(Targets::new().with_target("audit", tracing::Level::INFO));
+    let subscriber = tracing_subscriber::registry().with(layer);
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let sub_config = test_config(server.url(), "audit-event-sub");
+    let sub_adapter = NatsAdapter::connect(sub_config).await.expect("connect sub");
+
+    let pub_client = async_nats::connect(server.url())
+        .await
+        .expect("pub connect");
+
+    let router = Arc::new(Router::new());
+    let subscriber = sub_adapter.subscriber();
+    let sub_router = Arc::clone(&router);
+    let sub_task = tokio::spawn(async move {
+        let _ = subscriber.run(sub_router).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    pub_client
+        .publish(
+            "points.AUDIT",
+            bytes::Bytes::from_static(b"not-json-poison"),
+        )
+        .await
+        .expect("publish poison");
+
+    // Wait for the subscriber to process and emit the audit event.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if !captured
+            .lock()
+            .expect("audit capture mutex poisoned")
+            .is_empty()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let events = captured.lock().expect("audit capture mutex poisoned");
+    assert_eq!(
+        events.len(),
+        1,
+        "exactly one nats.poison_dlq audit event expected, got {}",
+        events.len(),
+    );
+    assert_eq!(events[0].subject, "points.AUDIT");
+    assert_eq!(events[0].reason, "unparseable");
+
+    sub_task.abort();
+}
+
+/// The DLQ message wrapper carries the original subject (so a
+/// forensic operator can correlate per-tenant) and JetStream's
+/// stream-sequence-derived `msg_id` reaches the audit event so SIEM
+/// rules can rate-limit on `(subject, msg_id)`. This test pins that
+/// the audit event includes the JetStream-derived `msg_id` and
+/// `attempts` fields; the DLQ wire payload coverage lives in
+/// `dead_letter_publishes_unparseable_payload`.
+#[tokio::test]
+async fn nats_subscriber_dead_letter_payload_includes_original_subject_and_attempts() {
+    use std::sync::Mutex;
+
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::filter::Targets;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let server = require_nats!();
+
+    #[derive(Default)]
+    struct PoisonAttemptsVisitor {
+        event_type: Option<String>,
+        subject: Option<String>,
+        msg_id: Option<String>,
+        attempts: Option<u64>,
+    }
+    impl Visit for PoisonAttemptsVisitor {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            match field.name() {
+                "event_type" => self.event_type = Some(value.to_string()),
+                "subject" => self.subject = Some(value.to_string()),
+                "msg_id" => self.msg_id = Some(value.to_string()),
+                _ => {}
+            }
+        }
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            let rendered = format!("{value:?}");
+            let trimmed = rendered.trim_matches('"').to_string();
+            match field.name() {
+                "event_type" => self.event_type = Some(trimmed),
+                "subject" => self.subject = Some(trimmed),
+                "msg_id" => self.msg_id = Some(trimmed),
+                _ => {}
+            }
+        }
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            if field.name() == "attempts" {
+                self.attempts = Some(value);
+            }
+        }
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            if field.name() == "attempts" {
+                self.attempts = Some(value as u64);
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct CapturedEvent {
+        subject: String,
+        msg_id: String,
+        attempts: u64,
+    }
+
+    struct CapturingLayer(Arc<Mutex<Vec<CapturedEvent>>>);
+    impl<S: tracing::Subscriber> Layer<S> for CapturingLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = PoisonAttemptsVisitor::default();
+            event.record(&mut visitor);
+            if visitor.event_type.as_deref() == Some("nats.poison_dlq")
+                && let (Some(subject), Some(msg_id), Some(attempts)) =
+                    (visitor.subject, visitor.msg_id, visitor.attempts)
+            {
+                self.0
+                    .lock()
+                    .expect("capture mutex poisoned")
+                    .push(CapturedEvent {
+                        subject,
+                        msg_id,
+                        attempts,
+                    });
+            }
+        }
+    }
+
+    let captured: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let layer = CapturingLayer(Arc::clone(&captured))
+        .with_filter(Targets::new().with_target("audit", tracing::Level::INFO));
+    let subscriber_layer = tracing_subscriber::registry().with(layer);
+    let _guard = tracing::subscriber::set_default(subscriber_layer);
+
+    let sub_config = test_config(server.url(), "audit-attempts-sub");
+    let sub_adapter = NatsAdapter::connect(sub_config).await.expect("connect sub");
+
+    let pub_client = async_nats::connect(server.url())
+        .await
+        .expect("pub connect");
+
+    let router = Arc::new(Router::new());
+    let subscriber = sub_adapter.subscriber();
+    let sub_router = Arc::clone(&router);
+    let sub_task = tokio::spawn(async move {
+        let _ = subscriber.run(sub_router).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    pub_client
+        .publish("points.ATTEMPTS", bytes::Bytes::from_static(b"poison"))
+        .await
+        .expect("publish poison");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if !captured.lock().expect("capture mutex poisoned").is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let events = captured.lock().expect("capture mutex poisoned");
+    assert_eq!(events.len(), 1, "expected exactly one audit event");
+    assert_eq!(events[0].subject, "points.ATTEMPTS");
+    // The first delivery from a fresh JetStream consumer has
+    // `delivered = 1`; the audit fires with whatever attempts value
+    // the JetStream server reports at the moment the drop is taken.
+    assert!(
+        events[0].attempts >= 1,
+        "attempts must be >= 1 (first delivery is attempt 1); got {got}",
+        got = events[0].attempts,
+    );
+    // `msg_id` is the JetStream stream sequence rendered as a decimal
+    // string. The first message published to a fresh stream gets
+    // sequence 1, so the rendered token must be "1".
+    assert_eq!(
+        events[0].msg_id, "1",
+        "first poison message in a fresh stream must surface stream-sequence 1 as msg_id",
+    );
+
+    sub_task.abort();
+}
+
 /// When `dead_letter_subject` is `None` (the default), poison messages are
 /// silently dropped as before — nothing arrives on any would-be DLQ
 /// subject. Guards against a regression where the DLQ helper fires

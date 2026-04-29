@@ -345,11 +345,30 @@ pub(crate) struct Cli {
     pub(crate) nats_max_ack_pending: i64,
 
     /// Maximum JetStream delivery attempts per message before the consumer
-    /// gives up (poison-message defence). `0` keeps the JetStream server
-    /// default (unlimited) for backwards compatibility; recommended
-    /// production value is `5`.
-    #[arg(long, default_value_t = 0, env = "RUSTGATE_NATS_MAX_DELIVER")]
+    /// gives up (poison-message defence, refs #883 sub-item 3). Default
+    /// `5` is the workspace poison-message handling standard. Set to `0`
+    /// (or any non-positive value) to opt into the pre-#883 unlimited-
+    /// redelivery semantics — useful for legacy migrations where a
+    /// JetStream stream contains records the operator wants to keep
+    /// retrying indefinitely while they fix the upstream producer. On
+    /// the final give-up, the subscriber emits the structured
+    /// `nats.poison_dlq` audit event and (if `--nats-dead-letter-subject`
+    /// is set) republishes the original payload to that subject before
+    /// ACKing.
+    #[arg(long, default_value_t = 5, env = "RUSTGATE_NATS_MAX_DELIVER")]
     pub(crate) nats_max_deliver: i64,
+
+    /// Optional NATS subject to republish poison messages to before the
+    /// subscriber ACKs them. When unset (default), poison messages are
+    /// silently ACKed after the structured `nats.poison_dlq` audit
+    /// event fires. When set, the original payload is republished to
+    /// this subject with diagnostic headers (`X-Rustgate-DLQ-Reason`,
+    /// `X-Rustgate-DLQ-Original-Subject`, `X-Rustgate-DLQ-Timestamp`)
+    /// so operators can inspect the malformed bytes. The subject MUST
+    /// live outside the live stream's `{subject_prefix}.>` namespace
+    /// to avoid an infinite redelivery loop. Refs #883 sub-item 3.
+    #[arg(long, env = "RUSTGATE_NATS_DEAD_LETTER_SUBJECT")]
+    pub(crate) nats_dead_letter_subject: Option<String>,
 
     /// Path to JetStream replay checkpoint file. When set, the server
     /// persists the last replayed sequence number and resumes from it
@@ -1858,6 +1877,7 @@ define_config_file! {
     nats_live_stream: String,
     nats_max_ack_pending: i64,
     nats_max_deliver: i64,
+    nats_dead_letter_subject: Option<String>,
     nats_checkpoint_path: Option<String>,
     http_config_file: Option<String>,
     enrollment_bind: Option<String>,
@@ -2340,6 +2360,7 @@ mod tests {
             "RUSTGATE_NATS_LIVE_STREAM",
             "RUSTGATE_NATS_MAX_ACK_PENDING",
             "RUSTGATE_NATS_MAX_DELIVER",
+            "RUSTGATE_NATS_DEAD_LETTER_SUBJECT",
             "RUSTGATE_NATS_CHECKPOINT_PATH",
             "RUSTGATE_ENROLLMENT_BIND",
             "RUSTGATE_CA_KEY",
