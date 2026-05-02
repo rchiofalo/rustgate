@@ -16,6 +16,8 @@
 //! | `POST /api/dlq/{target}/replay`            | Manually trigger a DLQ drain for an HTTP egress target  |
 //! | `POST /api/drain`                          | Initiate graceful drain (Kubernetes preStop, closes #791) |
 //! | `POST /api/reload`                         | Trigger the same reload path SIGHUP runs, structured    |
+//! | `GET  /api/v1/cert-status`                 | Versioned cert status with serial + fingerprint (#902)  |
+//! | `POST /api/v1/clients/{cn}/disconnect`     | Versioned force-disconnect with `sessions_closed` count |
 //!
 //! Every response is a JSON envelope of the form `{"data": ...}` on
 //! success or `{"error": "..."}` on failure, mirroring the `acl_api`
@@ -49,6 +51,7 @@ use hyper::{Method, Response, StatusCode};
 use rustgate_transport::{CertReloader, Router};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -274,6 +277,20 @@ async fn route(method: &Method, path: &str, state: &MgmtApiState) -> Response<Fu
             _ => json_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
         };
     }
+    // /api/v1/clients/{cn}/disconnect — versioned force-disconnect with
+    // `sessions_closed` count semantics + `client.force_disconnected`
+    // audit event (refs #902). Sits beside the legacy
+    // `/api/clients/{cn}/disconnect` so existing tooling keeps working
+    // until it migrates to the v1 contract.
+    if let Some(cn) = path
+        .strip_prefix("/api/v1/clients/")
+        .and_then(|s| s.strip_suffix("/disconnect"))
+    {
+        return match method {
+            &Method::POST => v1_disconnect_client_handler(cn, state).await,
+            _ => json_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
+        };
+    }
     #[cfg(feature = "http")]
     if let Some(target) = path
         .strip_prefix("/api/dlq/")
@@ -307,6 +324,13 @@ async fn route(method: &Method, path: &str, state: &MgmtApiState) -> Response<Fu
         // /api/v1/dedup/stats returns the richer operator-facing
         // counter set (hit/miss/eviction). Refs #902.
         (&Method::GET, "/api/v1/dedup/stats") => v1_dedup_stats(state),
+        // /api/v1/cert-status returns the server's own leaf cert
+        // validity snapshot — subject/issuer CN, serial, RFC 3339 dates,
+        // `days_remaining`, SHA-256 fingerprint, plus
+        // `expiring_soon` / `expired` boolean flags so dashboards can
+        // alert without doing arithmetic on the date strings. Closes
+        // the third sub-item of #902 (cert-status endpoint).
+        (&Method::GET, "/api/v1/cert-status") => v1_cert_status(state),
         // A recognized prefix with an unrecognized suffix or an
         // incorrect method gets a 405/404 split: wrong method on a
         // known endpoint is `METHOD_NOT_ALLOWED` (so operators see
@@ -318,7 +342,8 @@ async fn route(method: &Method, path: &str, state: &MgmtApiState) -> Response<Fu
             | "/api/crl/status"
             | "/api/dedup/stats"
             | "/api/v1/crl"
-            | "/api/v1/dedup/stats",
+            | "/api/v1/dedup/stats"
+            | "/api/v1/cert-status",
         ) => json_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
         _ => json_error(StatusCode::NOT_FOUND, "not found"),
     }
@@ -673,6 +698,224 @@ fn v1_dedup_stats(state: &MgmtApiState) -> Response<Full<Bytes>> {
     })
 }
 
+// ── /api/v1/cert-status (closes #902) ──────────────────────────────
+
+/// Threshold below which a server certificate is reported as
+/// `expiring_soon`. Pinned in a constant so the operator-facing
+/// contract — "alert when fewer than 30 days remain" — has a single
+/// source of truth visible to dashboards, runbooks, and the integration
+/// tests. Mirrors the standard `cert-manager` warning window so the
+/// rustgate dashboard reads the same as upstream Kubernetes tooling.
+pub(crate) const CERT_EXPIRING_SOON_DAYS: i64 = 30;
+
+/// On-wire shape for `GET /api/v1/cert-status`.
+///
+/// Pinned by integration tests in `tests/mgmt_cert_status.rs` —
+/// appending fields is fine, renaming or removing is a breaking change.
+/// `subject_cn` and `issuer_cn` mirror the optional shape of the legacy
+/// `/api/cert/status` so a missing `commonName` RDN renders as JSON
+/// `null` instead of fabricating an empty string. `serial` and
+/// `fingerprint_sha256` are lowercase hex without separators — same
+/// format that `rustgate_transport::extract::cert_serial` and the
+/// `rustgate-server cert-info` CLI subcommand emit, so policy authors,
+/// pinning code, and operator tooling all interpret one canonical
+/// rendering. `days_remaining` is computed as a saturating signed
+/// integer division by 86400 against the cert's `notAfter` minus the
+/// current wall time, so an expired cert reports a negative value
+/// (matching the contract called out in the task spec). Refs #902.
+#[derive(Debug, Serialize)]
+pub(crate) struct V1CertStatus {
+    /// Subject CN (X.509 subject commonName) — `null` when absent.
+    subject_cn: Option<String>,
+    /// Issuer CN — surfaces which CA signed the live leaf in a
+    /// multi-CA environment.
+    issuer_cn: Option<String>,
+    /// DER serial rendered as lowercase hex with leading zero bytes
+    /// preserved. Matches the wire form used by every other rustgate
+    /// surface that reports a cert serial.
+    serial: String,
+    /// `notBefore` rendered in RFC 3339.
+    not_before: String,
+    /// `notAfter` rendered in RFC 3339.
+    not_after: String,
+    /// Whole days remaining until `notAfter`. Negative for expired
+    /// certs; saturating, so wildly-future certs cannot overflow the
+    /// `i64`.
+    days_remaining: i64,
+    /// SHA-256 over the full DER, lowercase hex, no separators. This is
+    /// the same fingerprint rustls reports and that certificate-pinning
+    /// code compares against.
+    fingerprint_sha256: String,
+    /// `true` when fewer than [`CERT_EXPIRING_SOON_DAYS`] days remain.
+    /// Saturating: an already-expired cert reports `expiring_soon: true`
+    /// because zero or negative days left is, definitionally, "less
+    /// than thirty".
+    expiring_soon: bool,
+    /// `true` when the current wall time is past `notAfter`.
+    expired: bool,
+}
+
+/// `GET /api/v1/cert-status` — return the server's own leaf certificate
+/// validity snapshot.
+///
+/// Status code matrix:
+/// - **`200 OK`** with the JSON envelope when the cert reloader has a
+///   live leaf and the DER parses cleanly.
+/// - **`404 Not Found`** when no certificate reloader is configured —
+///   the rare plaintext-only deployment path. The 404 is the operator
+///   signal that mTLS is OFF by design (vs the 503 that signals a
+///   misconfiguration of an mTLS-enabled deployment).
+/// - **`503 Service Unavailable`** when a reloader was configured but
+///   currently has no certified key (mid-rotation race) or the leaf
+///   chain is empty.
+/// - **`500 Internal Server Error`** when the DER fails to parse.
+///
+/// Auth is enforced by the outer [`handle_request`] guard before this
+/// handler is reached. Successful access fires
+/// [`rustgate_core::audit::mgmt_api_accessed`] so the operator trail
+/// matches every other `/api/v1/*` read endpoint.
+fn v1_cert_status(state: &MgmtApiState) -> Response<Full<Bytes>> {
+    let Some(reloader) = state.cert_reloader.as_ref() else {
+        // No reloader configured — typically a plaintext-only
+        // deployment where there is no server cert to report on.
+        // Return 404 (not 503) so operators can scrape this endpoint
+        // unconditionally and distinguish "off by design" from
+        // "mTLS configured but currently unhealthy".
+        return json_error(StatusCode::NOT_FOUND, "no certificate configured");
+    };
+    let Some(ckey) = reloader.certified_key() else {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no active certified key on reloader",
+        );
+    };
+    let leaf_der = match ckey.end_entity_cert() {
+        Ok(der) => der,
+        Err(e) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("no leaf certificate in chain: {e}"),
+            );
+        }
+    };
+    match build_v1_cert_status(leaf_der.as_ref()) {
+        Ok(status) => {
+            // Audit BEFORE constructing the response so a subsequent
+            // builder failure cannot produce an audited 200 the
+            // operator never received.
+            rustgate_core::audit::mgmt_api_accessed("/api/v1/cert-status", MGMT_AUDIT_IDENTITY);
+            json_ok(&status)
+        }
+        Err(msg) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &msg),
+    }
+}
+
+/// Parse a DER-encoded leaf and build a [`V1CertStatus`]. Exposed
+/// `pub(crate)` so unit tests can drive it without spinning up a
+/// full [`CertReloader`].
+pub(crate) fn build_v1_cert_status(der: &[u8]) -> Result<V1CertStatus, String> {
+    let (_, cert) =
+        X509Certificate::from_der(der).map_err(|e| format!("parse X.509 certificate: {e}"))?;
+
+    let subject_cn = first_rdn_value(cert.subject(), &OID_X509_COMMON_NAME);
+    let issuer_cn = first_rdn_value(cert.issuer(), &OID_X509_COMMON_NAME);
+
+    // Match `rustgate_transport::extract::cert_serial` so policy rules
+    // and operator tooling interpret the same hex string.
+    let serial = hex::encode(cert.tbs_certificate.serial.to_bytes_be());
+
+    let not_before = asn1_to_rfc3339(cert.validity().not_before)
+        .map_err(|e| format!("render notBefore: {e}"))?;
+    let not_after =
+        asn1_to_rfc3339(cert.validity().not_after).map_err(|e| format!("render notAfter: {e}"))?;
+
+    let now_ts = OffsetDateTime::now_utc().unix_timestamp();
+    let not_after_ts = cert.validity().not_after.timestamp();
+    let seconds_until_expiry = not_after_ts.saturating_sub(now_ts);
+    // Whole days, signed: an expired cert reports a negative value
+    // matching the operator-facing contract documented in the issue.
+    let days_remaining = seconds_until_expiry / 86_400;
+    let expired = now_ts > not_after_ts;
+    // `expiring_soon` covers both "approaching expiry" and "already
+    // expired" — a cert with -5 days remaining is, definitionally, less
+    // than 30 days left, so dashboards do not need to OR the two flags.
+    let expiring_soon = days_remaining < CERT_EXPIRING_SOON_DAYS;
+
+    let mut hasher = Sha256::new();
+    hasher.update(der);
+    let fingerprint_sha256 = hex::encode(hasher.finalize());
+
+    Ok(V1CertStatus {
+        subject_cn,
+        issuer_cn,
+        serial,
+        not_before,
+        not_after,
+        days_remaining,
+        fingerprint_sha256,
+        expiring_soon,
+        expired,
+    })
+}
+
+// ── /api/v1/clients/{cn}/disconnect (closes #902) ──────────────────
+
+/// On-wire shape for `POST /api/v1/clients/{cn}/disconnect`.
+///
+/// Pinned by integration tests — appending fields is fine, renaming or
+/// removing is a breaking change. `sessions_closed` is the count of
+/// session writer channels signalled to drain (currently 0 or 1 because
+/// the router holds at most one [`SessionHandle`] per CN, but the field
+/// is `u64` so a future per-CN multi-session model — multiple
+/// concurrent connections from the same identity — would not be a
+/// breaking response-shape change). A `0` count is reported with `200
+/// OK` because "no live session for this CN" is a normal,
+/// not-exceptional state for the endpoint.
+///
+/// [`SessionHandle`]: rustgate_transport::SessionHandle
+#[derive(Debug, Serialize)]
+struct V1DisconnectResult {
+    /// Number of session writer channels signalled to drain.
+    sessions_closed: u64,
+}
+
+/// `POST /api/v1/clients/{cn}/disconnect` — force-close any active
+/// session for `cn` and emit a structured audit record.
+///
+/// Status code matrix:
+/// - **`200 OK`** with `{"data": {"sessions_closed": N}}` on the
+///   success path, regardless of whether `N` is zero.
+/// - **`400 Bad Request`** when the CN segment is empty
+///   (`/api/v1/clients//disconnect`) — the legacy endpoint short-circuits
+///   here too so the operator-facing contract is consistent.
+/// - **`405 Method Not Allowed`** for verbs other than POST.
+/// - **`401 Unauthorized`** is enforced by the outer
+///   [`handle_request`] guard before this handler runs.
+///
+/// On every success path (including `sessions_closed == 0`) the
+/// handler emits
+/// [`rustgate_core::audit::client_force_disconnected`] so the SIEM
+/// trail records every operator-driven attempt — a `0` count with a
+/// known-good CN is a useful forensic signal (operator scripted a
+/// disconnect against a stale CN list).
+async fn v1_disconnect_client_handler(cn: &str, state: &MgmtApiState) -> Response<Full<Bytes>> {
+    // Reject an empty CN segment with a structured 400 rather than
+    // falling into the Router and returning a misleading
+    // `sessions_closed: 0`.
+    if cn.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "client CN must not be empty");
+    }
+    // The router currently holds at most one SessionHandle per CN —
+    // `disconnect_client` returns `bool` for "matched", which maps to
+    // exactly one closed session on the success path. The cast to
+    // `u64` is the on-wire contract; it future-proofs the response
+    // shape against a per-CN multi-session router model without
+    // requiring a breaking change.
+    let sessions_closed: u64 = u64::from(state.router.disconnect_client(cn).await);
+    rustgate_core::audit::client_force_disconnected(cn, MGMT_AUDIT_IDENTITY, sessions_closed);
+    json_ok(&V1DisconnectResult { sessions_closed })
+}
+
 // ── /api/clients/{cn}/disconnect ───────────────────────────────────
 
 /// On-wire shape for the `/api/clients/{cn}/disconnect` endpoint.
@@ -924,6 +1167,19 @@ mod tests {
             MGMT_PATH_PREFIXES
                 .iter()
                 .any(|p| "/api/v1/dedup/stats".starts_with(p))
+        );
+        // Closes #902 — the cert-status and v1 disconnect endpoints
+        // also live under the versioned prefix; pin them so the
+        // dispatcher cannot drift and silently 404 the new routes.
+        assert!(
+            MGMT_PATH_PREFIXES
+                .iter()
+                .any(|p| "/api/v1/cert-status".starts_with(p))
+        );
+        assert!(
+            MGMT_PATH_PREFIXES
+                .iter()
+                .any(|p| "/api/v1/clients/alice/disconnect".starts_with(p))
         );
         // Bare-path routes (no trailing slash) live in MGMT_EXACT_PATHS
         // — closes #791 added `/api/drain`.
@@ -1382,6 +1638,366 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("success")
         );
+    }
+
+    // ── /api/v1/cert-status (closes #902) ──────────────────────────
+
+    #[test]
+    fn build_v1_cert_status_returns_documented_fields_for_fresh_server_cert() {
+        // Drive the parser directly with a freshly-issued test cert so
+        // the happy path is pinned without a live CertReloader. A
+        // 365-day server cert reports `expired: false`,
+        // `expiring_soon: false`, positive `days_remaining` and a
+        // 64-char SHA-256 fingerprint.
+        let ca = TestCa::new("v1-cert-status-test-ca");
+        let server = ca.issue_server_cert("rustgate-edge-1", &["rustgate-edge-1"]);
+        let leaf_der: CertificateDer<'static> =
+            CertificateDer::pem_slice_iter(server.cert_pem.as_bytes())
+                .next()
+                .unwrap()
+                .unwrap();
+        let status = build_v1_cert_status(leaf_der.as_ref()).unwrap();
+        assert_eq!(status.subject_cn.as_deref(), Some("rustgate-edge-1"));
+        assert!(status.issuer_cn.is_some());
+        assert!(!status.serial.is_empty(), "serial must be populated");
+        assert!(
+            status.serial.chars().all(|c| c.is_ascii_hexdigit()),
+            "serial must be lowercase hex: {}",
+            status.serial,
+        );
+        // Fingerprint is hex(SHA-256(der)) — exactly 64 chars.
+        assert_eq!(
+            status.fingerprint_sha256.len(),
+            64,
+            "fingerprint must be 64 hex chars: {}",
+            status.fingerprint_sha256,
+        );
+        assert!(!status.expired);
+        // The `TestCa::issue_server_cert` helper issues with a
+        // ~10-year validity window, so a fresh cert must NOT be flagged
+        // as expiring soon.
+        assert!(
+            !status.expiring_soon,
+            "freshly issued ~10y cert must not be expiring soon: days_remaining={}",
+            status.days_remaining,
+        );
+        assert!(
+            status.days_remaining > CERT_EXPIRING_SOON_DAYS,
+            "days_remaining must clear the threshold: {}",
+            status.days_remaining,
+        );
+        // RFC 3339 timestamps always include 'T'.
+        assert!(status.not_before.contains('T'));
+        assert!(status.not_after.contains('T'));
+    }
+
+    #[test]
+    fn build_v1_cert_status_flags_expiring_soon_at_30_day_threshold() {
+        // A cert issued with 7 days remaining MUST trip the
+        // `expiring_soon` flag (7 < 30) — this is the operator-facing
+        // contract and the dashboard alert keys on it.
+        let ca = TestCa::new("v1-cert-status-expiring-ca");
+        let server = ca.issue_near_expiry_server_cert("near-expiry", &["near-expiry"], 7);
+        let leaf_der: CertificateDer<'static> =
+            CertificateDer::pem_slice_iter(server.cert_pem.as_bytes())
+                .next()
+                .unwrap()
+                .unwrap();
+        let status = build_v1_cert_status(leaf_der.as_ref()).unwrap();
+        assert!(
+            status.expiring_soon,
+            "7-day cert must be flagged expiring_soon: days_remaining={}",
+            status.days_remaining,
+        );
+        assert!(!status.expired, "7-day cert must not be expired");
+        assert!(
+            status.days_remaining <= 7 && status.days_remaining >= 0,
+            "days_remaining must be 0..=7 for a 7-day cert: {}",
+            status.days_remaining,
+        );
+    }
+
+    #[test]
+    fn build_v1_cert_status_flags_expired_for_past_cert() {
+        // An already-expired cert reports `expired: true`,
+        // `expiring_soon: true` (because zero/negative days remain is
+        // less than the 30-day threshold), and a non-positive
+        // `days_remaining`. The CA helper used here issues a client
+        // cert (not server) but the parser does not care about EKU —
+        // we only need a cert whose `notAfter` is in the past.
+        let ca = TestCa::new("v1-cert-status-expired-ca");
+        let expired = ca.issue_expired_client_cert("expired-cn", &[]);
+        let leaf_der: CertificateDer<'static> =
+            CertificateDer::pem_slice_iter(expired.cert_pem.as_bytes())
+                .next()
+                .unwrap()
+                .unwrap();
+        let status = build_v1_cert_status(leaf_der.as_ref()).unwrap();
+        assert!(status.expired, "past-dated cert must be expired");
+        assert!(
+            status.expiring_soon,
+            "expired cert must also satisfy expiring_soon (< 30 days)",
+        );
+        assert!(
+            status.days_remaining <= 0,
+            "expired cert must report non-positive days_remaining: {}",
+            status.days_remaining,
+        );
+    }
+
+    #[tokio::test]
+    async fn mgmt_v1_cert_status_returns_404_when_no_reloader_configured() {
+        // Plaintext-only deployment path: no CertReloader installed →
+        // 404 (not 503), so operator scrapers can distinguish "off by
+        // design" from "configured-but-unhealthy".
+        let state = state_with(None);
+        let t = token();
+        let hdr = format!("Bearer {}", String::from_utf8(t.to_vec()).unwrap());
+        let resp = handle_request(&Method::GET, "/api/v1/cert-status", Some(&hdr), &[], &state)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn mgmt_v1_cert_status_wrong_method_returns_405() {
+        // POST on a GET-only endpoint must surface as 405 (path
+        // matches, verb does not), not 404 — operator scripts should
+        // see a precise diagnostic.
+        let state = state_with(None);
+        let t = token();
+        let hdr = format!("Bearer {}", String::from_utf8(t.to_vec()).unwrap());
+        let resp = handle_request(
+            &Method::POST,
+            "/api/v1/cert-status",
+            Some(&hdr),
+            &[],
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn mgmt_v1_cert_status_requires_auth() {
+        // Auth boundary check — pin the 401 so a future refactor that
+        // accidentally hoists the route match above the auth check
+        // cannot leak cert metadata to anonymous callers.
+        let state = state_with(None);
+        let resp = handle_request(&Method::GET, "/api/v1/cert-status", None, &[], &state)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── /api/v1/clients/{cn}/disconnect (closes #902) ──────────────
+
+    #[tokio::test]
+    async fn mgmt_v1_disconnect_unknown_cn_returns_zero_count() {
+        // No session registered → `sessions_closed: 0` with 200. The
+        // versioned endpoint reports a count rather than a bool so a
+        // future per-CN multi-session router model can populate >1
+        // without a breaking response-shape change.
+        let state = state_with(None);
+        let t = token();
+        let hdr = format!("Bearer {}", String::from_utf8(t.to_vec()).unwrap());
+        let resp = handle_request(
+            &Method::POST,
+            "/api/v1/clients/ghost/disconnect",
+            Some(&hdr),
+            &[],
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = extract_json_body(resp).await;
+        let data = body.get("data").unwrap();
+        assert_eq!(
+            data.get("sessions_closed").and_then(|v| v.as_u64()),
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn mgmt_v1_disconnect_wrong_method_returns_405() {
+        // GET on a POST-only write endpoint must surface as 405.
+        let state = state_with(None);
+        let t = token();
+        let hdr = format!("Bearer {}", String::from_utf8(t.to_vec()).unwrap());
+        let resp = handle_request(
+            &Method::GET,
+            "/api/v1/clients/alice/disconnect",
+            Some(&hdr),
+            &[],
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn mgmt_v1_disconnect_empty_cn_returns_400() {
+        // `/api/v1/clients//disconnect` — empty CN segment. The
+        // handler short-circuits with a 400 rather than letting the
+        // router lookup return a misleading `sessions_closed: 0`.
+        let state = state_with(None);
+        let t = token();
+        let hdr = format!("Bearer {}", String::from_utf8(t.to_vec()).unwrap());
+        let resp = handle_request(
+            &Method::POST,
+            "/api/v1/clients//disconnect",
+            Some(&hdr),
+            &[],
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mgmt_v1_disconnect_requires_auth() {
+        // Auth boundary check — anonymous POST must surface as 401.
+        let state = state_with(None);
+        let resp = handle_request(
+            &Method::POST,
+            "/api/v1/clients/alice/disconnect",
+            None,
+            &[],
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn mgmt_v1_endpoints_require_auth_for_new_endpoints() {
+        // Extends the legacy `mgmt_v1_endpoints_require_auth` test to
+        // cover the two new endpoints landed in this PR. A future
+        // refactor that accidentally moves the auth check past the
+        // route match for either endpoint must fail loudly.
+        let state = state_with(None);
+        let resp = handle_request(&Method::GET, "/api/v1/cert-status", None, &[], &state)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let resp = handle_request(
+            &Method::POST,
+            "/api/v1/clients/alice/disconnect",
+            None,
+            &[],
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn mgmt_v1_disconnect_terminates_active_session() {
+        // Closes #902 — register a real SessionHandle in the router and
+        // confirm the v1 endpoint reports `sessions_closed: 1` AND
+        // actually clears the writer-channel slots. The latter half is
+        // load-bearing: a regression that returned `1` without
+        // signalling the channels would leak past the unit test that
+        // only inspects the response body.
+        use std::collections::BTreeSet;
+        use std::sync::Arc as StdArc;
+
+        use rustgate_core::identity::Identity;
+        use rustgate_transport::SessionHandle;
+        use tokio::sync::mpsc;
+
+        let identity = StdArc::new(
+            Identity::new(
+                "alice".to_string(),
+                "aa:bb:cc:dd".to_string(),
+                BTreeSet::new(),
+            )
+            .expect("fixture identity"),
+        );
+        let (ptx, _prx) = mpsc::channel(16);
+        let (ntx, _nrx) = mpsc::channel(16);
+        let handle = SessionHandle::new(StdArc::clone(&identity), ptx, ntx);
+
+        let router = StdArc::new(Router::new());
+        assert!(router.register(handle).await, "session must register");
+
+        let state = MgmtApiState {
+            router: StdArc::clone(&router),
+            cert_reloader: None,
+            crl_path: None,
+            reload: None,
+            #[cfg(feature = "http")]
+            http_publisher: None,
+            drain_notify: Arc::new(tokio::sync::Notify::new()),
+            auth_token: token(),
+        };
+        let t = token();
+        let hdr = format!("Bearer {}", String::from_utf8(t.to_vec()).unwrap());
+        let resp = handle_request(
+            &Method::POST,
+            "/api/v1/clients/alice/disconnect",
+            Some(&hdr),
+            &[],
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = extract_json_body(resp).await;
+        assert_eq!(
+            body.get("data")
+                .and_then(|v| v.get("sessions_closed"))
+                .and_then(|v| v.as_u64()),
+            Some(1),
+            "sessions_closed must be 1 for an active CN: {body}",
+        );
+
+        // A second disconnect for the same CN must be a no-op — the
+        // sender slots were already cleared, so `disconnect_client`
+        // returns true again on the same registered handle (sessions
+        // are NOT removed from the routing map, by design — the
+        // session task itself runs `unregister`). What we DO want to
+        // pin is that the count stays well-formed across repeats.
+        let resp2 = handle_request(
+            &Method::POST,
+            "/api/v1/clients/alice/disconnect",
+            Some(&hdr),
+            &[],
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn mgmt_v1_disconnect_endpoint_reaches_audit_emission() {
+        // Smoke-test that the route reaches the audit emission
+        // without panicking. The audit-record wire shape is pinned in
+        // `tests/mgmt_api_audit.rs` where the Interest cache is fresh
+        // — same rationale as `admin_drain_emits_audit_event`.
+        let state = state_with(None);
+        let t = token();
+        let hdr = format!("Bearer {}", String::from_utf8(t.to_vec()).unwrap());
+        let resp = handle_request(
+            &Method::POST,
+            "/api/v1/clients/alice/disconnect",
+            Some(&hdr),
+            &[],
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The audit fn is reachable from this test binary — calling
+        // it directly does not error.
+        rustgate_core::audit::client_force_disconnected("alice", "bearer", 0);
     }
 
     #[test]

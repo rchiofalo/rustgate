@@ -1878,6 +1878,41 @@ pub fn mgmt_api_accessed(endpoint: &str, identity: &str) {
     );
 }
 
+/// Record an operator-driven force-disconnect of an active client.
+///
+/// Emitted when `POST /api/v1/clients/{cn}/disconnect` (refs #902) closes
+/// one or more session writer channels for the targeted CN. `cn` is the
+/// disconnect target (echoed from the URL path), `by_operator` identifies
+/// the principal who issued the API call (currently the literal
+/// `"bearer"` because the metrics HTTP server fronting the management
+/// API uses bearer-token auth, not mTLS, so there is no caller CN to
+/// record), and `sessions_closed` is the number of session handles whose
+/// outbound channels were signalled to drain. The event fires regardless
+/// of `sessions_closed` value — a `0` count is a normal, not-exceptional
+/// state for this endpoint and is part of the forensic trail (operator
+/// scripted a batch disconnect with stale CN list).
+///
+/// Pairs with [`client_disconnected`] for full lifecycle coverage: the
+/// session task itself emits `client.disconnected` on its exit path
+/// (driven by the writer-channel drop forced here), so a SIEM can join
+/// the operator action with the eventual session teardown via the `cn`
+/// field.
+///
+/// Sanitization: `cn` and `by_operator` are sanitized at the audit
+/// boundary via [`sanitize_for_log`]. Refs #902.
+pub fn client_force_disconnected(cn: &str, by_operator: &str, sessions_closed: u64) {
+    let cn = s(cn);
+    let by_operator = s(by_operator);
+    audit!(
+        "client.force_disconnected",
+        cn = %cn,
+        by_operator = %by_operator,
+        sessions_closed = sessions_closed,
+        action = "force_disconnect",
+        result = "success"
+    );
+}
+
 // ── JWKS refresh lifecycle (refs #952) ──────────────────────────────
 
 /// Record a successful JWKS refresh from a remote endpoint.
@@ -2777,6 +2812,19 @@ mod tests {
             admin_drain_triggered("");
             admin_drain_triggered(&"x".repeat(1024));
         }
+
+        #[test]
+        fn test_client_force_disconnected() {
+            // Pin every documented call shape so a future refactor that
+            // drops a field or swaps numeric/string positions fails the
+            // build. Includes the `0` count edge-case (operator
+            // disconnects a CN with no live session) and the boundary
+            // shapes (empty, oversize) the macro must not panic on.
+            client_force_disconnected("alice", "bearer", 1);
+            client_force_disconnected("ghost", "bearer", 0);
+            client_force_disconnected("", "", 0);
+            client_force_disconnected(&"x".repeat(1024), "bearer", u64::MAX);
+        }
     }
 
     mod delivery {
@@ -3123,6 +3171,99 @@ mod tests {
                     .as_str()
                     .expect("result must be a JSON string"),
                 "initiated"
+            );
+        }
+
+        #[test]
+        fn client_force_disconnected_emits_documented_shape() {
+            // Pins the wire-format contract for issue #902: SIEM rules
+            // alert on `event_type == "client.force_disconnected"` and
+            // `action == "force_disconnect"`. A future refactor that
+            // renames either field, swaps numeric/string positions, or
+            // drops `sessions_closed` would silently break those rules,
+            // so capture the JSON output and pin the shape end-to-end.
+            let snapshot = capture_audit(|| client_force_disconnected("alice", "bearer", 2));
+            let event = parse_event(&snapshot, "client.force_disconnected");
+            assert_eq!(
+                event["fields"]["event_type"]
+                    .as_str()
+                    .expect("event_type must be a JSON string"),
+                "client.force_disconnected",
+            );
+            assert_eq!(
+                event["fields"]["cn"]
+                    .as_str()
+                    .expect("cn must be a JSON string"),
+                "alice",
+            );
+            assert_eq!(
+                event["fields"]["by_operator"]
+                    .as_str()
+                    .expect("by_operator must be a JSON string"),
+                "bearer",
+            );
+            assert_eq!(
+                event["fields"]["sessions_closed"]
+                    .as_u64()
+                    .expect("sessions_closed must be a JSON number"),
+                2,
+            );
+            assert_eq!(
+                event["fields"]["action"]
+                    .as_str()
+                    .expect("action must be a JSON string"),
+                "force_disconnect",
+            );
+            assert_eq!(
+                event["fields"]["result"]
+                    .as_str()
+                    .expect("result must be a JSON string"),
+                "success",
+            );
+        }
+
+        #[test]
+        fn client_force_disconnected_sanitizes_cn_and_by_operator() {
+            // An attacker-controlled CN (or a future mTLS-fronted variant
+            // where `by_operator` carries a peer CN) cannot log-forge a
+            // fake force-disconnect record by injecting CR/LF or ANSI
+            // CSI into the audit boundary. Pin the contract.
+            let malicious_cn = "alice\r\nFAKE EVENT";
+            let malicious_op = "operator\x1b[31mFAKE\x1b[0m";
+            let snapshot = capture_audit(|| {
+                client_force_disconnected(malicious_cn, malicious_op, 1);
+            });
+            let event = parse_event(&snapshot, "client.force_disconnected");
+            let cn = event["fields"]["cn"]
+                .as_str()
+                .expect("cn must be a JSON string");
+            let by_operator = event["fields"]["by_operator"]
+                .as_str()
+                .expect("by_operator must be a JSON string");
+            for forbidden in &['\n', '\r', '\x1b'] {
+                assert!(
+                    !cn.contains(*forbidden),
+                    "forge byte {forbidden:?} must be replaced in cn: {cn:?}"
+                );
+                assert!(
+                    !by_operator.contains(*forbidden),
+                    "forge byte {forbidden:?} must be replaced in by_operator: {by_operator:?}"
+                );
+            }
+            assert!(
+                cn.contains('\u{FFFD}') && by_operator.contains('\u{FFFD}'),
+                "sanitized output must contain U+FFFD",
+            );
+            // The captured snapshot itself must not contain the
+            // injected fake entry as a separate logical line.
+            let lines: Vec<_> = snapshot
+                .lines()
+                .filter(|l| l.contains("client.force_disconnected"))
+                .collect();
+            assert_eq!(
+                lines.len(),
+                1,
+                "log forging must not split the record into multiple lines",
             );
         }
 
