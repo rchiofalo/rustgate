@@ -204,12 +204,18 @@ fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
-        Some(Command::GenerateConfig) => {
-            diagnostics::generate_config::run()?;
+        Some(Command::GenerateConfig { minimal }) => {
+            diagnostics::generate_config::run(diagnostics::generate_config::BuildOpts { minimal })?;
             return Ok(());
         }
         Some(Command::TestConnection {
             ref tcp,
+            ref tls,
+            ref target_cert,
+            ref target_key,
+            ref target_ca,
+            ref server_name,
+            peer_cert_warn_days,
             #[cfg(feature = "nats")]
             ref nats,
             #[cfg(feature = "http")]
@@ -222,57 +228,82 @@ fn main() -> anyhow::Result<()> {
             // enforces mutual exclusion, but we still need to catch
             // the all-none case (no flag supplied at all) with a
             // friendly error rather than a panic.
+            let tls_target = if let Some(addr) = tls.as_ref() {
+                Some(build_tls_target(
+                    addr,
+                    target_cert.as_deref(),
+                    target_key.as_deref(),
+                    target_ca.as_deref(),
+                    server_name.as_deref(),
+                    peer_cert_warn_days,
+                )?)
+            } else {
+                None
+            };
+
             let target = {
                 #[cfg(all(feature = "nats", feature = "http"))]
                 {
-                    match (tcp, nats, http) {
-                        (Some(t), None, None) => {
+                    match (tcp, tls_target, nats, http) {
+                        (Some(t), None, None, None) => {
                             diagnostics::test_connection::Target::Tcp(t.clone())
                         }
-                        (None, Some(u), None) => {
+                        (None, Some(t), None, None) => diagnostics::test_connection::Target::Tls(t),
+                        (None, None, Some(u), None) => {
                             diagnostics::test_connection::Target::Nats(u.clone())
                         }
-                        (None, None, Some(u)) => {
+                        (None, None, None, Some(u)) => {
                             diagnostics::test_connection::Target::Http(u.clone())
                         }
                         _ => {
                             return Err(anyhow::anyhow!(
-                                "test-connection requires exactly one of --tcp, --nats, --http"
+                                "test-connection requires exactly one of --tcp, --tls, --nats, --http"
                             ));
                         }
                     }
                 }
                 #[cfg(all(feature = "nats", not(feature = "http")))]
                 {
-                    match (tcp, nats) {
-                        (Some(t), None) => diagnostics::test_connection::Target::Tcp(t.clone()),
-                        (None, Some(u)) => diagnostics::test_connection::Target::Nats(u.clone()),
+                    match (tcp, tls_target, nats) {
+                        (Some(t), None, None) => {
+                            diagnostics::test_connection::Target::Tcp(t.clone())
+                        }
+                        (None, Some(t), None) => diagnostics::test_connection::Target::Tls(t),
+                        (None, None, Some(u)) => {
+                            diagnostics::test_connection::Target::Nats(u.clone())
+                        }
                         _ => {
                             return Err(anyhow::anyhow!(
-                                "test-connection requires exactly one of --tcp, --nats"
+                                "test-connection requires exactly one of --tcp, --tls, --nats"
                             ));
                         }
                     }
                 }
                 #[cfg(all(not(feature = "nats"), feature = "http"))]
                 {
-                    match (tcp, http) {
-                        (Some(t), None) => diagnostics::test_connection::Target::Tcp(t.clone()),
-                        (None, Some(u)) => diagnostics::test_connection::Target::Http(u.clone()),
+                    match (tcp, tls_target, http) {
+                        (Some(t), None, None) => {
+                            diagnostics::test_connection::Target::Tcp(t.clone())
+                        }
+                        (None, Some(t), None) => diagnostics::test_connection::Target::Tls(t),
+                        (None, None, Some(u)) => {
+                            diagnostics::test_connection::Target::Http(u.clone())
+                        }
                         _ => {
                             return Err(anyhow::anyhow!(
-                                "test-connection requires exactly one of --tcp, --http"
+                                "test-connection requires exactly one of --tcp, --tls, --http"
                             ));
                         }
                     }
                 }
                 #[cfg(all(not(feature = "nats"), not(feature = "http")))]
                 {
-                    match tcp {
-                        Some(t) => diagnostics::test_connection::Target::Tcp(t.clone()),
-                        None => {
+                    match (tcp, tls_target) {
+                        (Some(t), None) => diagnostics::test_connection::Target::Tcp(t.clone()),
+                        (None, Some(t)) => diagnostics::test_connection::Target::Tls(t),
+                        _ => {
                             return Err(anyhow::anyhow!(
-                                "test-connection requires --tcp HOST:PORT"
+                                "test-connection requires exactly one of --tcp, --tls"
                             ));
                         }
                     }
@@ -2369,6 +2400,69 @@ fn read_queue_key_file(path: &std::path::Path) -> anyhow::Result<zeroize::Zeroiz
     hex::decode_to_slice(trimmed.as_bytes(), &mut *key)
         .map_err(|e| anyhow::anyhow!("client-queue key file `{display}` is not valid hex: {e}"))?;
     Ok(key)
+}
+
+/// Read the on-disk PEM material for a `test-connection --tls` probe
+/// and bundle it into the [`diagnostics::test_connection::TlsTarget`]
+/// the probe consumes.
+///
+/// Required when `--tls` is set. Surfaces a precise filesystem error
+/// (missing path, permission, empty file) instead of a generic
+/// "handshake failed" — the diagnostic's whole purpose is to catch
+/// configuration mistakes before they produce a stack of opaque TLS
+/// errors at server startup.
+fn build_tls_target(
+    addr: &str,
+    cert: Option<&std::path::Path>,
+    key: Option<&std::path::Path>,
+    ca: Option<&std::path::Path>,
+    server_name: Option<&str>,
+    warn_days: u32,
+) -> anyhow::Result<diagnostics::test_connection::TlsTarget> {
+    let cert_path =
+        cert.ok_or_else(|| anyhow::anyhow!("test-connection --tls requires --target-cert <path>"))?;
+    let key_path =
+        key.ok_or_else(|| anyhow::anyhow!("test-connection --tls requires --target-key <path>"))?;
+    let ca_path =
+        ca.ok_or_else(|| anyhow::anyhow!("test-connection --tls requires --target-ca <path>"))?;
+
+    let cert_pem = std::fs::read(cert_path)
+        .with_context(|| format!("read --target-cert {}", cert_path.display()))?;
+    // The private key funnels through the shared `read_secret_file`
+    // helper so it gets the unified perm / size / empty / UTF-8
+    // discipline; we then re-encode the (already-validated) string back
+    // into bytes for the rustls PEM parser. The 16 KiB cap matches the
+    // value `rustgate-client::connect` uses for the same operation.
+    let key_str = rustgate_core::read_secret_file(
+        key_path,
+        &rustgate_core::SecretFileOpts::with_max_bytes(16 * 1024),
+    )
+    .with_context(|| format!("read --target-key {}", key_path.display()))?;
+    let mut key_str = key_str;
+    let key_pem = zeroize::Zeroizing::new(std::mem::take(&mut *key_str).into_bytes());
+    let ca_pem = std::fs::read(ca_path)
+        .with_context(|| format!("read --target-ca {}", ca_path.display()))?;
+
+    // Default the TLS server name to the host part of `addr` so an
+    // operator who only types `--tls 10.0.0.5:4433` still gets an
+    // SNI-bearing handshake. The host part is parsed lossily — a
+    // malformed `addr` will be caught by the TCP connect step anyway.
+    let resolved_server_name = match server_name {
+        Some(n) => n.to_string(),
+        None => addr
+            .rsplit_once(':')
+            .map(|(host, _)| host.to_string())
+            .unwrap_or_else(|| addr.to_string()),
+    };
+
+    Ok(diagnostics::test_connection::TlsTarget {
+        addr: addr.to_string(),
+        server_name: resolved_server_name,
+        cert_pem,
+        key_pem,
+        ca_pem,
+        warn_days,
+    })
 }
 
 #[cfg(test)]
