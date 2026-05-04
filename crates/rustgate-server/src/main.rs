@@ -190,7 +190,14 @@ fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Some(Command::CrlInfo { ref file, json }) => {
-            diagnostics::crl_info::run(file, json)?;
+            // Translate the in-band exit-code contract (0 = ok, 2 =
+            // stale; 1 = parse failure surfaced via the `?` above) to
+            // a process exit so cron jobs and Ansible playbooks can
+            // branch on `$?` without parsing stderr.
+            let code = diagnostics::crl_info::run(file, json)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
             return Ok(());
         }
         Some(Command::CheckCertExpiry {
@@ -318,6 +325,18 @@ fn main() -> anyhow::Result<()> {
         #[cfg(feature = "schema")]
         Some(Command::EmitSchema) => {
             diagnostics::emit_schema::run()?;
+            return Ok(());
+        }
+        Some(Command::DumpState {
+            ref config,
+            format,
+            ref output,
+        }) => {
+            // dump-state runs offline against the same `--config` the
+            // server consumes — it never opens a listener, so doing
+            // the work here (before tracing init / runtime spin-up)
+            // mirrors the other diagnostic subcommands.
+            diagnostics::dump_state::run(config, format, output.as_deref())?;
             return Ok(());
         }
         None => {}

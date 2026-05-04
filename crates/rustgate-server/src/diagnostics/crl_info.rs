@@ -54,8 +54,19 @@ pub(crate) struct CrlReport {
     pub(crate) signature_algorithm: String,
 }
 
-/// CLI entry point.
-pub(crate) fn run(path: &Path, json: bool) -> Result<()> {
+/// CLI entry point. Returns the operator-facing exit code:
+///
+/// | Code | Meaning |
+/// |------|---------|
+/// | `0`  | CRL parsed cleanly and `nextUpdate` is in the future (or absent) |
+/// | `1`  | The PEM is missing/malformed, or it does not contain an X.509 CRL block — surfaced via `Err` |
+/// | `2`  | `nextUpdate` is in the past (CRL stale; operator must refresh) |
+///
+/// Exit code `1` is mapped through `?` so the caller in `main.rs` can
+/// translate the `anyhow::Error` to a non-zero status. The stale path
+/// is signalled in-band (Ok(2)) because the CRL itself parses cleanly
+/// and the operator still wants to see the report fields.
+pub(crate) fn run(path: &Path, json: bool) -> Result<i32> {
     let report = build_report(path)?;
     if json {
         let out = serde_json::to_string_pretty(&report)
@@ -64,7 +75,7 @@ pub(crate) fn run(path: &Path, json: bool) -> Result<()> {
     } else {
         print!("{}", render_human(&report));
     }
-    Ok(())
+    Ok(if report.stale { 2 } else { 0 })
 }
 
 pub(crate) fn build_report(path: &Path) -> Result<CrlReport> {
