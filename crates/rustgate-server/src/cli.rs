@@ -1617,11 +1617,7 @@ pub(crate) enum Command {
         /// Works against every listener type (TLS, WebSocket, MQTT,
         /// plaintext, enrollment, metrics) without risking a malformed
         /// application-layer probe.
-        #[arg(
-            long,
-            value_name = "HOST:PORT",
-            conflicts_with = "tls",
-        )]
+        #[arg(long, value_name = "HOST:PORT", conflicts_with = "tls")]
         tcp: Option<String>,
         /// TLS handshake probe — TCP connect plus a full mTLS handshake
         /// using the supplied client cert / key / CA. Reports the

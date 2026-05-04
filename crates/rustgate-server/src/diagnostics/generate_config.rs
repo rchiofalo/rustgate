@@ -124,8 +124,8 @@ const MINIMAL_FIELDS: &[&str] = &[
     "max_connections",
 ];
 
-/// Build options for [`build_template_with_opts`]. Splitting from the
-/// zero-arg [`build_template`] keeps the existing test surface (key
+/// Build options for `build_template_with_opts`. Splitting from the
+/// zero-arg `build_template` keeps the existing test surface (key
 /// presence, section ordering, etc.) untouched.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct BuildOpts {
