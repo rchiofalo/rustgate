@@ -111,6 +111,13 @@ pub(crate) struct V2Queued {
 ///
 /// Maintains a persistent gRPC connection to a remote federation peer,
 /// performs the 5-stream handshake, and automatically reconnects on failure.
+///
+/// In addition to [`Self::send`] for [`figpb::FederatedEvent`], the client
+/// exposes [`Self::send_blob`] (unary `SendOneBlob`),
+/// [`Self::send_rol`] (client-streaming `ServerROLStream`), and
+/// [`Self::send_groups`] (client-streaming
+/// `ClientFederateGroupsStream`) so the local server can push the full
+/// V2 RPC suite to remote peers (refs #864).
 #[derive(Debug)]
 pub struct V2Client {
     /// Background task handle.
@@ -119,6 +126,22 @@ pub struct V2Client {
     shutdown_tx: Option<watch::Sender<bool>>,
     /// Channel for sending outbound events to the remote peer.
     outbound_tx: mpsc::Sender<V2Queued>,
+    /// Channel for sending outbound binary blobs to the remote peer
+    /// (refs #864). Drained by the connection loop and forwarded over
+    /// the unary `SendOneBlob` RPC. Held as a separate channel from
+    /// `outbound_tx` so a backed-up event stream cannot delay the
+    /// blob path (and vice versa).
+    blob_tx: mpsc::Sender<figpb::BinaryBlob>,
+    /// Channel for sending outbound ROL events to the remote peer
+    /// (refs #864). Drained by the connection loop and forwarded over
+    /// the long-lived `ServerROLStream` client-streaming RPC.
+    rol_tx: mpsc::Sender<figpb::Rol>,
+    /// Channel for sending outbound `FederateGroups` updates to the
+    /// remote peer (refs #864). Drained by the connection loop and
+    /// forwarded over the long-lived `ClientFederateGroupsStream`
+    /// client-streaming RPC. Distinct from `outbound_tx` so a
+    /// backed-up event channel cannot delay group-sync delivery.
+    groups_tx: mpsc::Sender<figpb::FederateGroups>,
     /// Peer state tracking.
     peer: Arc<PeerHandle>,
     /// Optional global backpressure gate shared with ingress admission.
@@ -135,12 +158,23 @@ impl V2Client {
     pub fn start(peer: Arc<PeerHandle>, config: V2ClientConfig) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (outbound_tx, outbound_rx) = mpsc::channel::<V2Queued>(256);
+        // Side channels for the additional V2 RPCs (refs #864). The
+        // capacities mirror `outbound_tx`'s 256 — high enough to absorb
+        // a synchronous burst without immediately back-pressuring the
+        // local broadcast site, low enough that a stalled remote will
+        // surface a `try_send`/`send` failure to the caller.
+        let (blob_tx, blob_rx) = mpsc::channel::<figpb::BinaryBlob>(256);
+        let (rol_tx, rol_rx) = mpsc::channel::<figpb::Rol>(256);
+        let (groups_tx, groups_rx) = mpsc::channel::<figpb::FederateGroups>(64);
 
         let peer_clone = Arc::clone(&peer);
         let task_handle = tokio::spawn(connection_loop(
             peer_clone,
             config,
             outbound_rx,
+            blob_rx,
+            rol_rx,
+            groups_rx,
             shutdown_rx,
         ));
 
@@ -148,6 +182,9 @@ impl V2Client {
             task_handle: Some(task_handle),
             shutdown_tx: Some(shutdown_tx),
             outbound_tx,
+            blob_tx,
+            rol_tx,
+            groups_tx,
             peer,
             gate: None,
         }
@@ -177,6 +214,72 @@ impl V2Client {
         if self.outbound_tx.send(queued).await.is_err() {
             self.peer.record_dequeue();
             return Err(FederationError::other("outbound channel closed"));
+        }
+        Ok(())
+    }
+
+    /// Send a `BinaryBlob` to the remote peer via the unary `SendOneBlob`
+    /// RPC (refs #864).
+    ///
+    /// Wire format mirrors what the V2 server's `send_one_blob` handler
+    /// observes: peer-auth, hop-count validation, allowlist gate, and
+    /// the `OnBlob` callback. The blob travels independently of the
+    /// `FederatedEvent` event channel — a backed-up event stream cannot
+    /// delay blob delivery and vice versa.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FederationError`] when the connection loop has shut
+    /// down (channel closed). Transient gRPC failures while forwarding
+    /// the blob are logged inside the loop; the caller does not block
+    /// on the unary RPC's completion.
+    #[tracing::instrument(level = "debug", skip_all, fields(peer = %self.peer.id), err)]
+    pub async fn send_blob(&self, blob: figpb::BinaryBlob) -> Result<()> {
+        if self.blob_tx.send(blob).await.is_err() {
+            return Err(FederationError::other("blob channel closed"));
+        }
+        Ok(())
+    }
+
+    /// Send a `Rol` event to the remote peer via the long-lived
+    /// `ServerROLStream` client-streaming RPC (refs #864).
+    ///
+    /// The connection loop maintains a single open `ServerROLStream`
+    /// for the lifetime of the gRPC channel; this method enqueues the
+    /// ROL event onto an internal mpsc that the loop drains into the
+    /// stream. On reconnect the stream is reopened transparently.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FederationError`] when the connection loop has shut
+    /// down (channel closed). Stream-level forwarding failures are
+    /// logged in the loop and trigger reconnection.
+    #[tracing::instrument(level = "debug", skip_all, fields(peer = %self.peer.id), err)]
+    pub async fn send_rol(&self, rol: figpb::Rol) -> Result<()> {
+        if self.rol_tx.send(rol).await.is_err() {
+            return Err(FederationError::other("rol channel closed"));
+        }
+        Ok(())
+    }
+
+    /// Send a `FederateGroups` update to the remote peer via the
+    /// long-lived `ClientFederateGroupsStream` client-streaming RPC
+    /// (refs #864).
+    ///
+    /// The connection loop opens the stream during handshake, sends
+    /// the local roster as the first message, then keeps the stream
+    /// open and forwards every update enqueued through this method.
+    /// On reconnect the stream is reopened and the local roster is
+    /// re-sent automatically — callers do not need to replay it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FederationError`] when the connection loop has shut
+    /// down (channel closed).
+    #[tracing::instrument(level = "debug", skip_all, fields(peer = %self.peer.id), err)]
+    pub async fn send_groups(&self, groups: figpb::FederateGroups) -> Result<()> {
+        if self.groups_tx.send(groups).await.is_err() {
+            return Err(FederationError::other("groups channel closed"));
         }
         Ok(())
     }
@@ -275,6 +378,9 @@ async fn connection_loop(
     peer: Arc<PeerHandle>,
     config: V2ClientConfig,
     mut outbound_rx: mpsc::Receiver<V2Queued>,
+    mut blob_rx: mpsc::Receiver<figpb::BinaryBlob>,
+    mut rol_rx: mpsc::Receiver<figpb::Rol>,
+    mut groups_rx: mpsc::Receiver<figpb::FederateGroups>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let mut reconnect_count: u32 = 0;
@@ -357,12 +463,18 @@ async fn connection_loop(
             );
         }
 
-        // Run the 5-stream handshake and event loop
+        // Run the handshake and event loop. Threads the additional V2
+        // RPC channels through (refs #864) — the loop drains each into
+        // its own gRPC stream / unary call independently of the main
+        // event flow.
         let result = run_streams(
             &peer,
             client,
             &config,
             &mut outbound_rx,
+            &mut blob_rx,
+            &mut rol_rx,
+            &mut groups_rx,
             &mut shutdown_rx,
             replay_messages,
         )
@@ -422,6 +534,15 @@ async fn connection_loop(
             "discarded buffered events on V2 client exit"
         );
     }
+    // Drain the V2 RPC side channels too (refs #864). Each carries
+    // owned wire payloads — discarding them here is the only way to
+    // avoid keeping the channel allocations alive past the loop exit.
+    blob_rx.close();
+    while blob_rx.try_recv().is_ok() {}
+    rol_rx.close();
+    while rol_rx.try_recv().is_ok() {}
+    groups_rx.close();
+    while groups_rx.try_recv().is_ok() {}
     peer.reset_queue();
 }
 
@@ -451,19 +572,38 @@ async fn build_channel(address: &str, tls_config: ClientTlsConfig) -> Result<Cha
     Ok(channel)
 }
 
-/// Run the 5-stream handshake and maintain all concurrent streams.
+/// Run the handshake and maintain all concurrent streams.
 ///
 /// Stream sequence (TAK Server SDK compatible):
 /// 1. ServerFederateGroupsStream — receive remote groups (server-streaming)
 /// 2. ClientFederateGroupsStream — send our groups (client-streaming)
 /// 3. ServerEventStream — open for sending events (client-streaming)
 /// 4. ClientEventStream — open for receiving events (server-streaming)
-/// 5. Health check loop — periodic HealthCheck RPCs
+/// 5. ServerROLStream — open for sending ROL events (client-streaming, refs #864)
+/// 6. Health check loop — periodic HealthCheck RPCs
+///
+/// `BinaryBlob` outbound traffic uses the unary `SendOneBlob` RPC and
+/// is dispatched directly from the `select!` arm rather than over a
+/// dedicated long-lived stream — this matches the server-side path
+/// that fires `OnBlob`. ROL and group-sync use long-lived
+/// client-streaming RPCs so the per-event peer auth + audit on the
+/// server side amortizes across the connection lifetime.
+// justification: `run_streams` is the dispatch entry-point for the V2
+// connection loop and is called exactly once per reconnection attempt.
+// Bundling the receiver halves into a struct would just push the same
+// fan-in upstream into `connection_loop` without reducing live
+// references at the call site, and the receivers each drive a
+// distinct gRPC stream that the function selects across — they are
+// not interchangeable. Refs #864.
+#[allow(clippy::too_many_arguments)]
 async fn run_streams(
     peer: &Arc<PeerHandle>,
     mut client: FederatedChannelClient<Channel>,
     config: &V2ClientConfig,
     outbound_rx: &mut mpsc::Receiver<V2Queued>,
+    blob_rx: &mut mpsc::Receiver<figpb::BinaryBlob>,
+    rol_rx: &mut mpsc::Receiver<figpb::Rol>,
+    groups_rx: &mut mpsc::Receiver<figpb::FederateGroups>,
     shutdown_rx: &mut watch::Receiver<bool>,
     replay_messages: Vec<BufferedMessage>,
 ) -> Result<()> {
@@ -490,8 +630,12 @@ async fn run_streams(
     }
 
     // --- Step 2: ClientFederateGroupsStream (send our groups) ---
-    let (groups_tx, groups_rx) = mpsc::channel::<figpb::FederateGroups>(16);
-    let groups_stream = tokio_stream::wrappers::ReceiverStream::new(groups_rx);
+    // Local channel feeding the gRPC stream. The outer `groups_rx`
+    // owned by the connection loop forwards updates into this channel
+    // through the `select!` arm below; the V2Client::send_groups path
+    // therefore stays independent of the local roster bootstrap.
+    let (groups_send_tx, groups_send_rx) = mpsc::channel::<figpb::FederateGroups>(16);
+    let groups_stream = tokio_stream::wrappers::ReceiverStream::new(groups_send_rx);
 
     let _groups_resp = client
         .client_federate_groups_stream(Request::new(groups_stream))
@@ -511,7 +655,7 @@ async fn run_streams(
         federate_group_hop_limits: None,
         nested_groups: Vec::new(),
     };
-    groups_tx
+    groups_send_tx
         .send(our_groups)
         .await
         .map_err(|_| FederationError::other("groups channel closed"))?;
@@ -531,6 +675,19 @@ async fn run_streams(
         .await
         .map_err(|e| FederationError::other(format!("client_event_stream failed: {e}")))?
         .into_inner();
+
+    // --- Step 5: ServerROLStream (open for sending ROL events, refs #864) ---
+    // Same shape as the event send stream: a local mpsc feeds the
+    // gRPC client-streaming RPC, and the outer `rol_rx` is forwarded
+    // into it through the `select!` arm below. Separate from the event
+    // path so a backed-up event channel cannot delay ROL delivery.
+    let (rol_send_tx, rol_send_rx) = mpsc::channel::<figpb::Rol>(256);
+    let rol_stream = tokio_stream::wrappers::ReceiverStream::new(rol_send_rx);
+
+    let _rol_resp = client
+        .server_rol_stream(Request::new(rol_stream))
+        .await
+        .map_err(|e| FederationError::other(format!("server_rol_stream failed: {e}")))?;
 
     // --- Connection established ---
     peer.set_state(PeerState::Connected);
@@ -687,6 +844,48 @@ async fn run_streams(
                 // `_permit` drops here — reservation released.
             }
 
+            // Forward outbound binary blobs to remote via unary
+            // `SendOneBlob` (refs #864). The unary RPC is awaited here
+            // rather than spawned so a slow remote naturally back-
+            // pressures the in-flight blob queue (capacity 256). A
+            // failure breaks the loop so the connection_loop's
+            // reconnect logic kicks in — same recovery shape as the
+            // event send stream.
+            Some(blob) = blob_rx.recv() => {
+                let blob_bytes = blob.data.len();
+                let resp = client.send_one_blob(Request::new(blob)).await;
+                if let Err(e) = resp {
+                    warn!(
+                        peer = %peer.id,
+                        error = %e,
+                        blob_bytes = blob_bytes,
+                        "send_one_blob failed"
+                    );
+                    return Err(FederationError::other(format!(
+                        "send_one_blob failed: {e}"
+                    )));
+                }
+                debug!(peer = %peer.id, blob_bytes, "blob forwarded to remote");
+            }
+
+            // Forward outbound ROL events to remote via the long-lived
+            // `ServerROLStream` client-streaming RPC (refs #864).
+            Some(rol) = rol_rx.recv() => {
+                if rol_send_tx.send(rol).await.is_err() {
+                    warn!(peer = %peer.id, "rol send stream closed");
+                    break;
+                }
+            }
+
+            // Forward outbound `FederateGroups` updates to remote via
+            // the long-lived `ClientFederateGroupsStream` RPC (refs #864).
+            Some(groups_update) = groups_rx.recv() => {
+                if groups_send_tx.send(groups_update).await.is_err() {
+                    warn!(peer = %peer.id, "groups send stream closed");
+                    break;
+                }
+            }
+
             // Periodic health checks (also measures RTT for latency-aware routing)
             _ = health_ticker.tick() => {
                 let hc_start = tokio::time::Instant::now();
@@ -826,6 +1025,57 @@ mod tests {
         let event = figpb::FederatedEvent::default();
         let result = client.send(event).await;
         assert!(result.is_err());
+    }
+
+    /// `send_blob`, `send_rol`, and `send_groups` must surface a closed
+    /// channel error once the connection loop has exited (refs #864).
+    /// Mirrors `client_send_fails_after_shutdown` for the V2 RPC side
+    /// channels — without this, a caller could enqueue blobs onto a
+    /// dead channel forever and never see the back-pressure signal.
+    #[tokio::test]
+    async fn rpc_side_channels_fail_after_shutdown() {
+        let peer = test_peer("rpc-shutdown-peer");
+        let tls_config = ClientTlsConfig::new();
+
+        let mut client = V2Client::start(
+            peer,
+            V2ClientConfig {
+                address: "127.0.0.1:19899".into(),
+                tls_config,
+                federate_id: "test-server".into(),
+                groups: vec![],
+                health_interval: Duration::from_secs(5),
+                reconnect_delay: Duration::from_secs(1),
+                max_reconnects: 0,
+                on_event: noop_on_event(),
+                replay_drain: None,
+                max_hops: 10,
+                compression: None,
+            },
+        );
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        client.shutdown().await;
+
+        // Each RPC channel should be closed and surface an error.
+        assert!(
+            client
+                .send_blob(figpb::BinaryBlob::default())
+                .await
+                .is_err(),
+            "send_blob must fail after shutdown"
+        );
+        assert!(
+            client.send_rol(figpb::Rol::default()).await.is_err(),
+            "send_rol must fail after shutdown"
+        );
+        assert!(
+            client
+                .send_groups(figpb::FederateGroups::default())
+                .await
+                .is_err(),
+            "send_groups must fail after shutdown"
+        );
     }
 
     #[tokio::test]
