@@ -35,6 +35,8 @@ pub mod heartbeat;
 pub mod jwks;
 #[cfg(feature = "jwks")]
 pub mod jwks_client;
+#[cfg(feature = "jwks")]
+pub mod jwks_rotation;
 pub mod jwt;
 pub mod manager;
 pub mod peer;

@@ -2119,6 +2119,42 @@ pub fn jwks_key_removed(url: &str, kid: &str) {
     );
 }
 
+/// Record a JWT that successfully verified against a `kid` whose
+/// rotation-state has been demoted to **Retiring** by the JWKS rotation-
+/// window state machine (closes #952).
+///
+/// A retiring `kid` is one the upstream JWKS no longer advertises but
+/// which our local verifier registry still honours for the configured
+/// grace window so that JWTs minted just before the upstream removal do
+/// not transiently fail verification. SIEM operators key on this event
+/// to spot peers that are still using a soon-to-be-removed key — every
+/// emission is a hint that the issuing peer has not yet rotated, so a
+/// dashboard summing `retiring_for_seconds` over a moving window
+/// reveals which peers will start failing once `retiring_window`
+/// elapses. Pairs with `jwks.key_added` / `jwks.key_removed` for the
+/// full lifecycle picture.
+///
+/// `retiring_for_seconds` is the wall-time elapsed since the kid was
+/// demoted from Active to Retiring. The field is numeric so SIEM rules
+/// can do `retiring_for_seconds > <half-grace-window>` comparisons
+/// without parsing.
+///
+/// Sanitization: `kid` is sanitized at the audit boundary per the
+/// workspace audit-boundary discipline (#1197 / #1220) — an attacker-
+/// controlled `kid` (e.g. a rogue peer minting a token with embedded
+/// CR/LF in its `kid` header) cannot log-forge a fake retiring-key
+/// record.
+pub fn jwt_using_retiring_kid(kid: &str, retiring_for_seconds: u64) {
+    let kid = s(kid);
+    audit!(
+        "jwt.using_retiring_kid",
+        kid = %kid,
+        retiring_for_seconds = retiring_for_seconds,
+        action = "verify",
+        result = "warning"
+    );
+}
+
 /// Record a per-recipient delivery confirmation for chain-of-custody
 /// audit trails (closes #854).
 ///
@@ -3052,6 +3088,18 @@ mod tests {
             message_dropped("alice", "bob", "UID-1", "authz_denied");
             message_dropped("alice", "bob", "UID-1", "obligation_failed");
             message_dropped("", "", "", "");
+        }
+
+        #[test]
+        fn test_jwt_using_retiring_kid_smoke() {
+            // Closes #952. Pin every documented call shape (zero-second
+            // edge case, oversize boundary, empty kid) so a future
+            // refactor that swaps positions or drops a field fails the
+            // build instead of silently breaking the audit record.
+            jwt_using_retiring_kid("k-old", 0);
+            jwt_using_retiring_kid("k-old", 300);
+            jwt_using_retiring_kid("", u64::MAX);
+            jwt_using_retiring_kid(&"x".repeat(64), 60);
         }
     }
 
@@ -4195,6 +4243,46 @@ mod tests {
             assert!(
                 uid.contains('\u{FFFD}'),
                 "sanitized output must contain U+FFFD: {uid:?}"
+            );
+        }
+
+        #[test]
+        fn jwt_using_retiring_kid_emits_documented_shape() {
+            // Closes #952. Pin the wire format SIEM operators key on:
+            // event_type, kid, numeric retiring_for_seconds, action,
+            // result. A future refactor that drops one of these or
+            // changes a static token fails this test rather than
+            // silently breaking downstream correlation rules.
+            let snapshot = capture_audit(|| jwt_using_retiring_kid("k-old", 42));
+            let event = parse_event(&snapshot, "jwt.using_retiring_kid");
+            assert_eq!(event["fields"]["kid"], "k-old");
+            assert_eq!(event["fields"]["retiring_for_seconds"], 42);
+            assert_eq!(event["fields"]["action"], "verify");
+            assert_eq!(event["fields"]["result"], "warning");
+        }
+
+        #[test]
+        fn jwt_using_retiring_kid_sanitizes_kid_field() {
+            // Closes #952. A rogue federation peer that mints a JWT
+            // with embedded CR/LF or ANSI CSI in its `kid` header could
+            // otherwise log-forge a fake retiring-key record visible to
+            // the SIEM operator. The audit-boundary sanitization gates
+            // this off regardless of whether the caller wrapped.
+            let malicious_kid = "k-evil\r\n\x1b[31m[FORGED]\x1b[0m";
+            let snapshot = capture_audit(|| jwt_using_retiring_kid(malicious_kid, 7));
+            let event = parse_event(&snapshot, "jwt.using_retiring_kid");
+            let kid = event["fields"]["kid"]
+                .as_str()
+                .expect("kid must be a JSON string");
+            for forbidden in &['\n', '\r', '\x1b'] {
+                assert!(
+                    !kid.contains(*forbidden),
+                    "forge byte {forbidden:?} must be replaced: {kid:?}"
+                );
+            }
+            assert!(
+                kid.contains('\u{FFFD}'),
+                "sanitized output must contain U+FFFD: {kid:?}"
             );
         }
     }

@@ -259,6 +259,8 @@ async fn cache_control_max_age_clamped_into_window() {
         refresh_min: Duration::from_secs(120),
         refresh_max: Duration::from_secs(3600),
         allow_hs256: false,
+        pending_window: Duration::from_secs(60),
+        retiring_window: Duration::from_secs(300),
     };
     let next_delay = test_refresh_returning_delay(&cfg).await;
     assert_eq!(
@@ -283,6 +285,8 @@ async fn cache_control_max_age_clamped_into_window() {
         refresh_min: Duration::from_secs(120),
         refresh_max: Duration::from_secs(3600),
         allow_hs256: false,
+        pending_window: Duration::from_secs(60),
+        retiring_window: Duration::from_secs(300),
     };
     let delay_low = test_refresh_returning_delay(&cfg_low).await;
     assert_eq!(
@@ -591,12 +595,21 @@ async fn mtls_to_jwks_server_uses_federation_trust_bundle() {
 
     // Drive the JWKS client through `start` + the HTTPS path. Use
     // localhost as the SNI name; addr is 127.0.0.1.
+    //
+    // `pending_window: 0` opts the test out of the rotation-window
+    // smoothing (closes #952) so the FIRST refresh promotes the kid
+    // straight to Active. The smoothing semantics are exercised by the
+    // dedicated `tests/jwks_kid_rotation.rs` suite; this test is the
+    // mTLS-trust-bundle integration check and only needs the verifier
+    // to be installed within the 10s wait window.
     let url = format!("https://localhost:{}/jwks.json", addr.port());
     let cfg = JwksConfig {
         url: url.clone(),
         refresh_min: Duration::from_secs(60),
         refresh_max: Duration::from_secs(3600),
         allow_hs256: false,
+        pending_window: Duration::from_secs(0),
+        retiring_window: Duration::from_secs(300),
     };
 
     let authority = fresh_authority();
@@ -651,6 +664,8 @@ async fn try_refresh_via_test_client(
         refresh_min: Duration::from_secs(60),
         refresh_max: Duration::from_secs(3600),
         allow_hs256,
+        pending_window: Duration::from_secs(60),
+        retiring_window: Duration::from_secs(300),
     };
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))

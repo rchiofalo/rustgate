@@ -41,15 +41,30 @@
 //! - [`rustgate_core::audit::jwks_key_added`]
 //! - [`rustgate_core::audit::jwks_key_removed`]
 //!
-//! ## Out of scope
+//! ## Rotation-window state machine (closes #952)
 //!
-//! The kid rotation-window state machine (the `Active → VerifyOnly →
-//! Removed` lifecycle in [`crate::jwks::KeyState`]) is a separate
-//! sub-item of #952 and is NOT consumed here. This module installs the
-//! current set of advertised keys verbatim; once the rotation-window
-//! work lands, callers will be able to compose the two.
+//! [`JwksClient::start`] wires a `jwks_rotation::RotationStateMachine`
+//! into the live [`JwtAuthority`] so verifier installs flow through
+//! the four-state `Pending → Active → Retiring → Retired` lifecycle.
+//! The smoothing absorbs two edge cases the raw refresh path leaves
+//! exposed:
+//!
+//! - **Pending → Active is gated** on a wall-time `pending_window`
+//!   plus a second consecutive observation, so a typo'd JWKS push
+//!   that gets rolled back within the window never registers as
+//!   Active.
+//! - **Active → Retiring → Retired** keeps the verifier installed
+//!   for a `retiring_window` grace period after the upstream JWKS
+//!   stops advertising the key, so a JWT minted just before the
+//!   removal still verifies. While the kid is Retiring, every
+//!   successful validation fires
+//!   [`rustgate_core::audit::jwt_using_retiring_kid`] so SIEM
+//!   dashboards can spot peers that have not yet rotated.
+//!
+//! See the module docs on `jwks_rotation` for the transition
+//! table.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -57,9 +72,10 @@ use rustgate_core::tasks::SubsystemHandle;
 use rustgate_core::{audit, b64};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep};
 use tracing::{debug, warn};
 
+use crate::jwks_rotation::{RetainedVerifiers, RotationStateMachine, install_on_authority};
 use crate::jwt::{Algorithm, ExternalVerifier, JwtAuthority};
 
 /// Lower bound for the refresh interval. Operators MUST configure at
@@ -80,6 +96,19 @@ pub const MAX_REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// editing this constant — but a JWKS endpoint that takes >30s is
 /// itself a misconfiguration.
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default Pending → Active promotion window (closes #952). Sized to
+/// match the default refresh interval so a typo'd JWKS push that is
+/// rolled back within a single refresh cycle never registers as Active.
+pub const DEFAULT_PENDING_WINDOW: Duration = Duration::from_secs(60);
+
+/// Default Retiring → Retired grace window (closes #952). Five minutes
+/// covers the worst case where a peer mints a JWT moments before our
+/// refresh dropped its `kid` from the upstream JWKS — common token TTLs
+/// are 1–5 minutes, so a 5-minute grace bridges the gap. Operators with
+/// longer-TTL tokens raise this; deployments allergic to drift can
+/// shorten it.
+pub const DEFAULT_RETIRING_WINDOW: Duration = Duration::from_secs(300);
 
 /// Configuration for [`JwksClient`].
 ///
@@ -108,6 +137,22 @@ pub struct JwksConfig {
     /// federation trust.
     #[serde(default)]
     pub allow_hs256: bool,
+    /// Wall-time floor for the Pending → Active promotion window in
+    /// the rotation-window state machine (closes #952). A newly
+    /// observed `kid` must persist across at least one refresh AND
+    /// remain visible for `pending_window` of wall time before the
+    /// state machine flips it to Active. Defends against typo'd
+    /// JWKS pushes that get rolled back within seconds. Defaults to
+    /// [`DEFAULT_PENDING_WINDOW`] (60s).
+    #[serde(default = "default_pending_window", with = "humantime_serde_compat")]
+    pub pending_window: Duration,
+    /// Grace window for the Retiring → Retired demotion (closes
+    /// #952). When a `kid` drops from the upstream JWKS, the local
+    /// verifier registry continues to honour it for this duration
+    /// so JWTs minted just before the upstream removal still verify.
+    /// Defaults to [`DEFAULT_RETIRING_WINDOW`] (300s = 5 min).
+    #[serde(default = "default_retiring_window", with = "humantime_serde_compat")]
+    pub retiring_window: Duration,
 }
 
 fn default_refresh_min() -> Duration {
@@ -116,6 +161,14 @@ fn default_refresh_min() -> Duration {
 
 fn default_refresh_max() -> Duration {
     MAX_REFRESH_INTERVAL
+}
+
+fn default_pending_window() -> Duration {
+    DEFAULT_PENDING_WINDOW
+}
+
+fn default_retiring_window() -> Duration {
+    DEFAULT_RETIRING_WINDOW
 }
 
 // Inline serde adapter for Duration → secs encoded as an integer in
@@ -222,9 +275,29 @@ impl JwksClient {
         let url = config.url.clone();
         let cli = JwksClient { url: url.clone() };
 
+        // Wire the rotation-window state machine into the authority
+        // so the post-validate hook fires `audit::jwt_using_retiring_kid`
+        // for any kid in Retiring state. The state machine is shared
+        // between the refresh task (transitions) and the verifier
+        // (notify_kid_used) — both paths are lock-free in steady state.
+        let rotation = Arc::new(RotationStateMachine::new(
+            config.pending_window,
+            config.retiring_window,
+            url.clone(),
+        ));
+        install_on_authority(Arc::clone(&rotation), &authority);
+        let retained = Arc::new(RetainedVerifiers::new());
+
         let shutdown = Arc::new(Notify::new());
         let shutdown_inner = Arc::clone(&shutdown);
-        let task = tokio::spawn(cli.run(client, config, authority, shutdown_inner));
+        let task = tokio::spawn(cli.run(
+            client,
+            config,
+            authority,
+            rotation,
+            retained,
+            shutdown_inner,
+        ));
 
         debug!(url = %url, "jwks client started");
         Ok(SubsystemHandle::new(shutdown, task))
@@ -238,6 +311,8 @@ impl JwksClient {
         client: reqwest::Client,
         config: JwksConfig,
         authority: Arc<JwtAuthority>,
+        rotation: Arc<RotationStateMachine>,
+        retained: Arc<RetainedVerifiers>,
         shutdown: Arc<Notify>,
     ) {
         // Track last-installed kids so we can emit add/remove audit
@@ -247,7 +322,16 @@ impl JwksClient {
         // diff.
         let mut current: HashMap<String, Algorithm> = HashMap::new();
         loop {
-            let next_delay = match refresh_once(&client, &config, &authority, &mut current).await {
+            let next_delay = match refresh_once_with_rotation(
+                &client,
+                &config,
+                &authority,
+                &rotation,
+                &retained,
+                &mut current,
+            )
+            .await
+            {
                 Ok(delay) => delay,
                 Err(e) => {
                     audit::jwks_refresh_failed(&self.url, &e.to_string());
@@ -378,6 +462,93 @@ pub async fn refresh_once(
     );
 
     *current = next
+        .into_iter()
+        .map(|(kid, v)| (kid, v.algorithm()))
+        .collect();
+    Ok(clamp_refresh_delay(max_age_hint, config))
+}
+
+/// Run one refresh cycle and drive the [`RotationStateMachine`] (refs
+/// #952). Identical to [`refresh_once`] except verifier installation
+/// goes through [`RotationStateMachine::filter_for_install`], which
+/// excludes Pending kids (not yet trusted) and Retired kids (grace
+/// elapsed) and includes Retiring kids from the supplied
+/// [`RetainedVerifiers`] cache.
+///
+/// Visibility: `pub` so `JwksClient::run` can call it without the
+/// state machine leaking through the public surface, while integration
+/// tests can drive a single iteration directly. The arity is wide
+/// because the rotation-state-machine + retained-cache pair has to
+/// flow through the call site; bundling them into a struct would push
+/// the same fan-in upstream without reducing live references.
+pub async fn refresh_once_with_rotation(
+    client: &reqwest::Client,
+    config: &JwksConfig,
+    authority: &Arc<JwtAuthority>,
+    rotation: &Arc<RotationStateMachine>,
+    retained: &Arc<RetainedVerifiers>,
+    current: &mut HashMap<String, Algorithm>,
+) -> Result<Duration> {
+    let response = client
+        .get(&config.url)
+        .send()
+        .await
+        .map_err(|e| JwksError::Fetch(e.to_string()))?;
+    if !response.status().is_success() {
+        return Err(JwksError::Fetch(format!(
+            "non-success status {}",
+            response.status()
+        )));
+    }
+    let max_age_hint = parse_cache_control_max_age(&response);
+    let body = response
+        .bytes()
+        .await
+        .map_err(|e| JwksError::Fetch(e.to_string()))?;
+    let parsed: JsonWebKeySet =
+        serde_json::from_slice(&body).map_err(|e| JwksError::Parse(e.to_string()))?;
+
+    let next = build_external_verifiers(&parsed, config.allow_hs256);
+
+    // Drive the state machine: every observed kid becomes a Pending /
+    // Active observation; missing kids transition Active → Retiring or
+    // Retiring → Retired as appropriate.
+    let observed: HashSet<String> = next.keys().cloned().collect();
+    let transitions = rotation.observe_refresh(&observed, Instant::now());
+
+    // Cache freshly-fetched verifiers so that Retiring kids that
+    // dropped out of `next` keep verifying during the grace window.
+    retained.upsert(&next);
+    for kid in &transitions.retired {
+        retained.forget(kid);
+    }
+
+    // Compute the install set: Active kids from `next` plus Retiring
+    // kids from the retained cache. Pending and Retired kids are
+    // filtered out by `filter_for_install`.
+    let install = rotation.filter_for_install(next.clone(), &retained.snapshot());
+
+    // Diff: emit add/remove audit events against the installed set so
+    // SIEM rules see the same set the verifier path serves. The diff
+    // is computed against `current` rather than `next` so a Pending
+    // kid does not flap an `added` event on every refresh prior to
+    // promotion.
+    diff_and_audit(current, &install, &config.url);
+
+    let key_count = install.len();
+    authority.install_external_verifiers(install.clone());
+    audit::jwks_refresh_success(&config.url, key_count);
+    debug!(
+        url = %config.url,
+        key_count = key_count,
+        promoted = transitions.promoted.len(),
+        demoted = transitions.demoted.len(),
+        retired = transitions.retired.len(),
+        pending_pruned = transitions.pending_pruned.len(),
+        "jwks refresh installed verifier set with rotation state machine"
+    );
+
+    *current = install
         .into_iter()
         .map(|(kid, v)| (kid, v.algorithm()))
         .collect();
@@ -581,6 +752,8 @@ mod tests {
             refresh_min: MIN_REFRESH_INTERVAL,
             refresh_max: MAX_REFRESH_INTERVAL,
             allow_hs256: false,
+            pending_window: DEFAULT_PENDING_WINDOW,
+            retiring_window: DEFAULT_RETIRING_WINDOW,
         };
         let err = validate_config(&cfg).expect_err("must reject http://");
         assert!(matches!(err, JwksError::Config(_)));
@@ -593,6 +766,8 @@ mod tests {
             refresh_min: Duration::from_secs(30),
             refresh_max: MAX_REFRESH_INTERVAL,
             allow_hs256: false,
+            pending_window: DEFAULT_PENDING_WINDOW,
+            retiring_window: DEFAULT_RETIRING_WINDOW,
         };
         let err = validate_config(&cfg).expect_err("must reject sub-floor refresh_min");
         assert!(matches!(err, JwksError::Config(_)));
@@ -605,6 +780,8 @@ mod tests {
             refresh_min: MIN_REFRESH_INTERVAL,
             refresh_max: Duration::from_secs(48 * 60 * 60),
             allow_hs256: false,
+            pending_window: DEFAULT_PENDING_WINDOW,
+            retiring_window: DEFAULT_RETIRING_WINDOW,
         };
         let err = validate_config(&cfg).expect_err("must reject above-ceiling refresh_max");
         assert!(matches!(err, JwksError::Config(_)));
@@ -617,6 +794,8 @@ mod tests {
             refresh_min: Duration::from_secs(7200),
             refresh_max: Duration::from_secs(120),
             allow_hs256: false,
+            pending_window: DEFAULT_PENDING_WINDOW,
+            retiring_window: DEFAULT_RETIRING_WINDOW,
         };
         let err = validate_config(&cfg).expect_err("must reject inverted refresh_min/max");
         assert!(matches!(err, JwksError::Config(_)));
@@ -629,6 +808,8 @@ mod tests {
             refresh_min: Duration::from_secs(120),
             refresh_max: Duration::from_secs(3600),
             allow_hs256: false,
+            pending_window: DEFAULT_PENDING_WINDOW,
+            retiring_window: DEFAULT_RETIRING_WINDOW,
         };
         assert_eq!(clamp_refresh_delay(None, &cfg), Duration::from_secs(120));
     }
@@ -640,6 +821,8 @@ mod tests {
             refresh_min: Duration::from_secs(120),
             refresh_max: Duration::from_secs(3600),
             allow_hs256: false,
+            pending_window: DEFAULT_PENDING_WINDOW,
+            retiring_window: DEFAULT_RETIRING_WINDOW,
         };
         assert_eq!(
             clamp_refresh_delay(Some(Duration::from_secs(30)), &cfg),

@@ -365,6 +365,21 @@ fn empty_external_verifiers() -> ArcSwap<HashMap<String, VerificationKey>> {
     ArcSwap::from_pointee(HashMap::new())
 }
 
+/// Cross-thread "kid was used to verify a token" callback (refs #952).
+///
+/// Fired by [`JwtAuthority::validate`] after a successful signature
+/// check, with the `kid` header value (or `""` when the token had no
+/// `kid` and the authority's `legacy_verifier` was used). The JWKS
+/// rotation-window state machine in `jwks_rotation` installs
+/// one of these to detect tokens minted against a Retiring kid and emit
+/// `audit::jwt_using_retiring_kid`.
+///
+/// Following the workspace `On*` callback convention: an
+/// `Arc<dyn Fn(...) + Send + Sync>` rather than a `dyn AsyncFn` (the
+/// latter is not object-safe). Closures that need to do async work
+/// dispatch via `spawn_background` from the body.
+pub type OnKidUsed = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Manages JWT issuance, validation, and revocation for federation.
 pub struct JwtAuthority {
     /// Active signing key — used by `issue()` / `issue_with_expiry()`.
@@ -402,6 +417,16 @@ pub struct JwtAuthority {
     revoked: Mutex<RevocationState>,
     /// Maximum number of entries in the revocation cache.
     revocation_capacity: NonZeroUsize,
+    /// Optional post-verification callback fired with the resolved
+    /// `kid` after every successful [`Self::validate`] call (refs #952).
+    /// Hot-reloadable via `ArcSwap` so the JWKS rotation-window state
+    /// machine can install / replace it after construction without
+    /// taking a lock on the validation hot path. The slot is loaded
+    /// once per `validate` call and the inner `Option` is checked with
+    /// `is_some` before the closure is fired — un-installed cost is one
+    /// atomic load + one nullable check, matching the `OnFanout` /
+    /// `OnPepDecision` pattern in `transport::router`.
+    on_kid_used: ArcSwap<Option<OnKidUsed>>,
 }
 
 /// Lock-protected revocation cache state. Keeping the sweep counter
@@ -455,6 +480,7 @@ impl JwtAuthority {
                 sweep_counter: 0,
             }),
             revocation_capacity: capacity,
+            on_kid_used: ArcSwap::from_pointee(None),
         })
     }
 
@@ -501,6 +527,7 @@ impl JwtAuthority {
                 sweep_counter: 0,
             }),
             revocation_capacity: capacity,
+            on_kid_used: ArcSwap::from_pointee(None),
         })
     }
 
@@ -547,6 +574,7 @@ impl JwtAuthority {
                 sweep_counter: 0,
             }),
             revocation_capacity: capacity,
+            on_kid_used: ArcSwap::from_pointee(None),
         })
     }
 
@@ -727,7 +755,7 @@ impl JwtAuthority {
     /// - The header's `alg` must match the selected verifier's
     ///   algorithm, or [`JwtError::AlgorithmMismatch`] is returned.
     pub fn validate(&self, token: &str) -> Result<FederationClaims, JwtError> {
-        let claims = decode(self, token)?;
+        let (kid, claims) = decode(self, token)?;
 
         // Check expiration
         let now = SystemTime::now()
@@ -761,7 +789,26 @@ impl JwtAuthority {
             }
         }
 
+        // Fire the post-verification kid-used hook (refs #952). The slot
+        // is hot-reloadable; un-installed cost is one atomic load and a
+        // nullable check. When installed, the JWKS rotation-window
+        // state machine inspects the kid against its tracked entries
+        // and emits `audit::jwt_using_retiring_kid` for any kid in the
+        // Retiring state.
+        let guard = self.on_kid_used.load();
+        if let Some(cb) = guard.as_ref() {
+            cb(kid.as_deref().unwrap_or(""));
+        }
+
         Ok(claims)
+    }
+
+    /// Install or replace the post-verification kid-used callback
+    /// (refs #952). Hot-reloadable: callers can swap the closure at
+    /// runtime without taking a lock on the validation hot path.
+    /// Pass `None` to disable.
+    pub fn set_on_kid_used(&self, cb: Option<OnKidUsed>) {
+        self.on_kid_used.store(Arc::new(cb));
     }
 
     /// Revoke a token by its JTI (unique identifier).
@@ -1068,7 +1115,16 @@ fn encode(signing: &SigningKey, claims: &FederationClaims) -> Result<String, Jwt
 /// header's `alg` must match the verifier's algorithm — this is the
 /// defence against the classic "`alg: HS256` + RSA public key as HMAC
 /// secret" algorithm-confusion attack.
-fn decode(auth: &JwtAuthority, token: &str) -> Result<FederationClaims, JwtError> {
+///
+/// Returns the resolved `kid` (if any was present in the header)
+/// alongside the parsed claims so the caller can fire post-verification
+/// hooks (e.g. the JWKS rotation-window state machine's
+/// `notify_kid_used`, refs #952) that need to know which verifier the
+/// token routed to.
+fn decode(
+    auth: &JwtAuthority,
+    token: &str,
+) -> Result<(Option<String>, FederationClaims), JwtError> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         return Err(JwtError::Malformed);
@@ -1122,7 +1178,7 @@ fn decode(auth: &JwtAuthority, token: &str) -> Result<FederationClaims, JwtError
         .map_err(|e| JwtError::SerializationError(e.to_string()))?;
 
     drop(external_guard);
-    Ok(claims)
+    Ok((header.kid, claims))
 }
 
 /// Validate a `kid` string. Rejects empty values, anything longer than
