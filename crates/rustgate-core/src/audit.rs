@@ -1563,7 +1563,7 @@ pub fn http_rate_limited(target: &str, source_cn: &str) {
 /// `available` is the number of tokens the bucket had at evaluation
 /// time. Together they let an operator see how far over the cap the
 /// burst was without re-deriving the rate from
-/// [`security_rate_limited`] event timing.
+/// `security_rate_limited` event timing.
 ///
 /// Sanitization: `tenant` and `msg_uid` are sanitized at the audit
 /// boundary so a noisy CoT `uid="…"` carrying control characters
