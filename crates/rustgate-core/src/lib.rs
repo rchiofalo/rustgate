@@ -27,6 +27,7 @@ pub mod audit;
 pub mod audit_chain;
 pub mod b64;
 pub mod callbacks;
+pub mod classification;
 pub mod codec;
 pub mod config;
 pub mod constants;
