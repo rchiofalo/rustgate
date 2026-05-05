@@ -2159,6 +2159,100 @@ pub(crate) async fn start_udp<P: NatsPublish + Send + Sync + 'static>(
     Ok(Some(SubsystemHandle::new(shutdown, task)))
 }
 
+// ---------------------------------------------------------------------------
+// UDP MULTICAST INPUT (closes #861)
+// ---------------------------------------------------------------------------
+
+/// Start the UDP multicast input listener (and optional rebroadcast egress)
+/// and return its subsystem handle.
+///
+/// When `--udp-multicast-groups` is empty (default), this returns
+/// `Ok(None)` and no listener is spawned. When at least one group is
+/// configured, the kernel `join_multicast_v4` is called per group, the
+/// receive loop tags incoming datagrams with `source_protocol =
+/// "udp-multicast"`, and (if `--udp-multicast-rebroadcast` is set) a
+/// router-installed `OnMulticastForward` callback re-emits every routed
+/// CoT message out the egress socket. Closes #861.
+pub(crate) async fn start_udp_multicast(
+    cli: &Cli,
+    router: &Arc<Router>,
+) -> anyhow::Result<Option<SubsystemHandle>> {
+    let groups_str = match cli.udp_multicast_groups.as_ref() {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => return Ok(None),
+    };
+
+    let mut groups = Vec::new();
+    for entry in groups_str.split(',') {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let g = rustgate_transport::MulticastGroup::parse(trimmed).map_err(|e| {
+            anyhow::anyhow!("invalid --udp-multicast-groups entry '{trimmed}': {e}")
+        })?;
+        groups.push(g);
+    }
+    if groups.is_empty() {
+        return Ok(None);
+    }
+
+    let interface: std::net::Ipv4Addr = cli.udp_multicast_interface.parse().with_context(|| {
+        format!(
+            "parsing --udp-multicast-interface '{}'",
+            cli.udp_multicast_interface
+        )
+    })?;
+
+    let cfg = rustgate_transport::MulticastConfig {
+        groups,
+        interface,
+        multicast_loop: cli.udp_multicast_loop,
+        ttl: cli.udp_multicast_ttl,
+        cn: cli.plaintext_cn.clone(),
+        default_group: cli.plaintext_group.clone(),
+        rebroadcast: cli.udp_multicast_rebroadcast,
+        max_bps: cli.udp_multicast_max_bps,
+    };
+
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+
+    // Inbound listener tasks (one per group).
+    let inbound_handles = rustgate_transport::udp_multicast::spawn_inbound(
+        cfg.clone(),
+        Arc::clone(router),
+        Arc::clone(&shutdown),
+    )
+    .context("spawning UDP multicast listeners")?;
+
+    // Optional egress task. When rebroadcast is off, no callback is
+    // installed and the router fast-paths the on-multicast-forward
+    // ArcSwap as `is_none()`.
+    let egress_handle = if cfg.rebroadcast {
+        let (cb, h) =
+            rustgate_transport::udp_multicast::spawn_egress(cfg.clone(), Arc::clone(&shutdown))
+                .await
+                .context("spawning UDP multicast egress")?;
+        router.set_on_multicast_forward(Some(cb));
+        Some(h)
+    } else {
+        None
+    };
+
+    // Wrap all spawned tasks in a single supervisor that completes
+    // when every per-group + egress task exits.
+    let task = tokio::spawn(async move {
+        for h in inbound_handles {
+            let _ = h.await;
+        }
+        if let Some(eh) = egress_handle {
+            let _ = eh.await;
+        }
+    });
+
+    Ok(Some(SubsystemHandle::new(shutdown, task)))
+}
+
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {

@@ -47,6 +47,11 @@ spiffe = { workspace = true, optional = true }
 redb = { workspace = true }
 smol_str = { workspace = true }
 thiserror = { workspace = true }
+# socket2 is used by `udp_multicast` to set SO_REUSEADDR on the inbound
+# multicast bind so the tactical-radio test rig (and CI on Linux) can
+# co-bind the same port from multiple sibling sockets — tokio's
+# `UdpSocket` does not expose the option directly. Closes #861.
+socket2 = { workspace = true }
 
 [dev-dependencies]
 rustgate-test-utils = { workspace = true }
@@ -56,6 +61,9 @@ bytes = { workspace = true }
 criterion = { workspace = true, features = ["async_tokio"] }
 tempfile = { workspace = true }
 proptest = { workspace = true }
+# Used by `tests/udp_multicast.rs` for SO_REUSEADDR on sniffer sockets
+# that need to co-bind the same multicast port the inbound listener
+# also binds. Same workspace pin as the production dep above.
 socket2 = { workspace = true }
 tracing-subscriber = { workspace = true }
 # Used by the byte-for-byte compute_hmac regression test in
