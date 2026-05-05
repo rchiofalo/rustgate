@@ -32,6 +32,7 @@ mod dedup;
 pub mod egress;
 mod extract;
 mod filter;
+pub mod hw_identity;
 mod listener;
 pub mod obligations;
 mod repeater;
@@ -74,6 +75,10 @@ pub use dedup::{
 pub use egress::{EgressEnvelope, EgressError, RecipientClass};
 pub use extract::{ExpectedKeyUsage, extract_identity, validate_key_usage};
 pub use filter::{GeoBounds, MessageFilter};
+pub use hw_identity::{
+    HardwareIdentity, HardwareIdentityError, HardwareIdentityResolver, Pkcs11StubBackend,
+    SignatureAlgorithm as HardwareSignatureAlgorithm,
+};
 pub use listener::{DEFAULT_MAX_HANDSHAKES, OnHandshakeDuration, OnHandshakeError, TlsListener};
 pub use quota::{DEFAULT_TENANT_KEY, QuotaConfig, TenantQuota, TenantQuotaTracker};
 pub use repeater::EmergencyRepeater;

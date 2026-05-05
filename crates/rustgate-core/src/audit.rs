@@ -1932,6 +1932,89 @@ pub fn client_force_disconnected(cn: &str, by_operator: &str, sessions_closed: u
     );
 }
 
+// ── Hardware-rooted identity lifecycle (refs #856) ──────────────────
+
+/// Record a successful initialization of a hardware-rooted identity
+/// backend. Fires once per
+/// `rustgate_transport::hw_identity::HardwareIdentity` provider that
+/// the server wires into the TLS listener — typically at startup, but
+/// also after a hot-reload that swaps the active backend. `backend` is
+/// a small fixed-vocabulary slug identifying the implementation
+/// (`"pkcs11-stub"` for the reference software-backed stub; future
+/// drivers will add `"pkcs11"`, `"tpm2"`, `"yubikey"`).
+///
+/// The event documents that the server's identity key now lives behind
+/// a hardware module; SIEM rules can alert on the absence of this
+/// event in deployments that mandate hardware-rooted identity.
+///
+/// Sanitization: `backend` is sanitized at the audit boundary even
+/// though every in-tree caller passes a static slug — a future
+/// configuration-driven driver name could be operator-supplied, and
+/// the boundary discipline is uniform across the audit module.
+/// Refs #856.
+pub fn hw_identity_loaded(backend: &str) {
+    let backend = s(backend);
+    audit!(
+        "hw_identity.loaded",
+        backend = %backend,
+        action = "load",
+        result = "success"
+    );
+}
+
+/// Record a hardware-identity backend reporting unavailable at the
+/// moment a TLS handshake (or other identity-consuming operation)
+/// requested a signature. Fires when
+/// [`HardwareIdentity::is_available`](rustgate_transport::hw_identity::HardwareIdentity::is_available)
+/// returns `false` — for example, a token has been unplugged, a PIN
+/// has not been entered, or the workload-API socket has dropped.
+///
+/// This is the fail-closed audit boundary: when the backend is
+/// unavailable, the listener refuses to complete the handshake and
+/// emits this record so a SIEM can alert on the gap rather than
+/// silently fall back to a software key. `backend` is the slug from
+/// [`hw_identity_loaded`]; `reason` is a free-form operator-readable
+/// string explaining why the backend is unavailable.
+///
+/// Sanitization: `backend` and `reason` are sanitized at the audit
+/// boundary. Refs #856.
+pub fn hw_identity_unavailable(backend: &str, reason: &str) {
+    let backend = s(backend);
+    let reason = s(reason);
+    audit!(
+        "hw_identity.unavailable",
+        backend = %backend,
+        reason = %reason,
+        action = "sign",
+        result = "rejected"
+    );
+}
+
+/// Record a hardware-identity signing failure. Fires when the backend
+/// was nominally available (`is_available` returned `true`) but the
+/// underlying sign operation returned an error — e.g. the token
+/// rejected the request, the PIN was wrong, or the driver returned an
+/// I/O error. Distinct from [`hw_identity_unavailable`] so SIEM rules
+/// can distinguish "token not present" from "token present but
+/// rejected the operation".
+///
+/// `backend` is the slug from [`hw_identity_loaded`]; `reason` is a
+/// free-form operator-readable string describing the failure.
+///
+/// Sanitization: `backend` and `reason` are sanitized at the audit
+/// boundary. Refs #856.
+pub fn hw_identity_sign_failed(backend: &str, reason: &str) {
+    let backend = s(backend);
+    let reason = s(reason);
+    audit!(
+        "hw_identity.sign_failed",
+        backend = %backend,
+        reason = %reason,
+        action = "sign",
+        result = "failure"
+    );
+}
+
 // ── JWKS refresh lifecycle (refs #952) ──────────────────────────────
 
 /// Record a successful JWKS refresh from a remote endpoint.
@@ -2903,6 +2986,47 @@ mod tests {
         }
     }
 
+    mod hw_identity {
+        use super::*;
+
+        #[test]
+        fn test_hw_identity_loaded_smoke() {
+            // Pin every documented call shape so a future refactor
+            // that drops the field or renames the macro arm fails
+            // the build instead of silently breaking the audit
+            // contract. Boundary shapes (empty, oversize) the macro
+            // must not panic on.
+            hw_identity_loaded("pkcs11-stub");
+            hw_identity_loaded("pkcs11");
+            hw_identity_loaded("tpm2");
+            hw_identity_loaded("yubikey");
+            hw_identity_loaded("");
+            hw_identity_loaded(&"x".repeat(1024));
+        }
+
+        #[test]
+        fn test_hw_identity_unavailable_smoke() {
+            // The fail-closed event needs the same boundary
+            // robustness — a bug in the resolver path that produces
+            // an oversized or empty `reason` must still emit a
+            // well-formed audit record, not panic.
+            hw_identity_unavailable("pkcs11-stub", "is_available() returned false");
+            hw_identity_unavailable("tpm2", "tpm device not present");
+            hw_identity_unavailable("", "");
+            hw_identity_unavailable(&"x".repeat(1024), &"y".repeat(4096));
+        }
+
+        #[test]
+        fn test_hw_identity_sign_failed_smoke() {
+            // Same robustness contract for the third hw_identity
+            // event.
+            hw_identity_sign_failed("pkcs11-stub", "ECDSA P-256 not enabled");
+            hw_identity_sign_failed("yubikey", "PIN locked");
+            hw_identity_sign_failed("", "");
+            hw_identity_sign_failed(&"x".repeat(1024), &"y".repeat(4096));
+        }
+    }
+
     mod delivery {
         use super::*;
 
@@ -3341,6 +3465,214 @@ mod tests {
                 1,
                 "log forging must not split the record into multiple lines",
             );
+        }
+
+        #[test]
+        fn hw_identity_loaded_emits_documented_shape() {
+            // Pin the wire-format contract for issue #856: the
+            // `hw_identity.loaded` event is the operator's "the
+            // listener is now hardware-rooted" signal, and SIEM rules
+            // alert on the event_type plus the backend slug. A future
+            // refactor that drops or renames either would silently
+            // break those rules.
+            let snapshot = capture_audit(|| hw_identity_loaded("pkcs11-stub"));
+            let event = parse_event(&snapshot, "hw_identity.loaded");
+            assert_eq!(
+                event["fields"]["event_type"]
+                    .as_str()
+                    .expect("event_type must be a JSON string"),
+                "hw_identity.loaded",
+            );
+            assert_eq!(
+                event["fields"]["backend"]
+                    .as_str()
+                    .expect("backend must be a JSON string"),
+                "pkcs11-stub",
+            );
+            assert_eq!(
+                event["fields"]["action"]
+                    .as_str()
+                    .expect("action must be a JSON string"),
+                "load",
+            );
+            assert_eq!(
+                event["fields"]["result"]
+                    .as_str()
+                    .expect("result must be a JSON string"),
+                "success",
+            );
+        }
+
+        #[test]
+        fn hw_identity_unavailable_emits_documented_shape() {
+            // Pin the fail-closed audit-event contract. Operators
+            // alert on this event firing repeatedly between
+            // `hw_identity.loaded` and the next handshake — the gap
+            // signals a token unplugged or a workload-API socket
+            // dropped.
+            let snapshot = capture_audit(|| {
+                hw_identity_unavailable("pkcs11-stub", "is_available() returned false")
+            });
+            let event = parse_event(&snapshot, "hw_identity.unavailable");
+            assert_eq!(
+                event["fields"]["event_type"]
+                    .as_str()
+                    .expect("event_type must be a JSON string"),
+                "hw_identity.unavailable",
+            );
+            assert_eq!(
+                event["fields"]["backend"]
+                    .as_str()
+                    .expect("backend must be a JSON string"),
+                "pkcs11-stub",
+            );
+            assert_eq!(
+                event["fields"]["reason"]
+                    .as_str()
+                    .expect("reason must be a JSON string"),
+                "is_available() returned false",
+            );
+            assert_eq!(
+                event["fields"]["action"]
+                    .as_str()
+                    .expect("action must be a JSON string"),
+                "sign",
+            );
+            assert_eq!(
+                event["fields"]["result"]
+                    .as_str()
+                    .expect("result must be a JSON string"),
+                "rejected",
+            );
+        }
+
+        #[test]
+        fn hw_identity_sign_failed_emits_documented_shape() {
+            // The third hardware-identity event distinguishes "token
+            // present but rejected the operation" from "token not
+            // present" so SIEMs can route the two failure modes to
+            // different operator workflows.
+            let snapshot = capture_audit(|| {
+                hw_identity_sign_failed("pkcs11-stub", "ECDSA P-256 not enabled on token")
+            });
+            let event = parse_event(&snapshot, "hw_identity.sign_failed");
+            assert_eq!(
+                event["fields"]["event_type"]
+                    .as_str()
+                    .expect("event_type must be a JSON string"),
+                "hw_identity.sign_failed",
+            );
+            assert_eq!(
+                event["fields"]["backend"]
+                    .as_str()
+                    .expect("backend must be a JSON string"),
+                "pkcs11-stub",
+            );
+            assert_eq!(
+                event["fields"]["action"]
+                    .as_str()
+                    .expect("action must be a JSON string"),
+                "sign",
+            );
+            assert_eq!(
+                event["fields"]["result"]
+                    .as_str()
+                    .expect("result must be a JSON string"),
+                "failure",
+            );
+        }
+
+        #[test]
+        fn hw_identity_events_sanitize_user_controlled_fields() {
+            // The `backend` field is in principle a static slug today
+            // but a future configuration-driven driver name could be
+            // operator-supplied; `reason` is always free-form. Pin
+            // that the audit boundary scrubs CR/LF and ANSI CSI on
+            // every `&str` field crossing the boundary.
+            let malicious_backend = "pkcs11-stub\r\nFAKE LOAD";
+            let malicious_reason = "token rejected\x1b[31m[FORGED]\x1b[0m";
+
+            let snapshot_loaded = capture_audit(|| hw_identity_loaded(malicious_backend));
+            let event_loaded = parse_event(&snapshot_loaded, "hw_identity.loaded");
+            let backend_loaded = event_loaded["fields"]["backend"]
+                .as_str()
+                .expect("backend must be a JSON string");
+            for forbidden in &['\n', '\r', '\x1b'] {
+                assert!(
+                    !backend_loaded.contains(*forbidden),
+                    "forge byte {forbidden:?} must be replaced in loaded.backend: {backend_loaded:?}"
+                );
+            }
+            assert!(
+                backend_loaded.contains('\u{FFFD}'),
+                "sanitized loaded.backend must contain U+FFFD: {backend_loaded:?}"
+            );
+
+            let snapshot_unavail =
+                capture_audit(|| hw_identity_unavailable(malicious_backend, malicious_reason));
+            let event_unavail = parse_event(&snapshot_unavail, "hw_identity.unavailable");
+            let backend_unavail = event_unavail["fields"]["backend"]
+                .as_str()
+                .expect("backend must be a JSON string");
+            let reason_unavail = event_unavail["fields"]["reason"]
+                .as_str()
+                .expect("reason must be a JSON string");
+            for forbidden in &['\n', '\r', '\x1b'] {
+                assert!(
+                    !backend_unavail.contains(*forbidden),
+                    "forge byte {forbidden:?} must be replaced in unavailable.backend"
+                );
+                assert!(
+                    !reason_unavail.contains(*forbidden),
+                    "forge byte {forbidden:?} must be replaced in unavailable.reason"
+                );
+            }
+            assert!(
+                backend_unavail.contains('\u{FFFD}') && reason_unavail.contains('\u{FFFD}'),
+                "sanitized unavailable fields must contain U+FFFD"
+            );
+
+            let snapshot_failed =
+                capture_audit(|| hw_identity_sign_failed(malicious_backend, malicious_reason));
+            let event_failed = parse_event(&snapshot_failed, "hw_identity.sign_failed");
+            let backend_failed = event_failed["fields"]["backend"]
+                .as_str()
+                .expect("backend must be a JSON string");
+            let reason_failed = event_failed["fields"]["reason"]
+                .as_str()
+                .expect("reason must be a JSON string");
+            for forbidden in &['\n', '\r', '\x1b'] {
+                assert!(
+                    !backend_failed.contains(*forbidden),
+                    "forge byte {forbidden:?} must be replaced in sign_failed.backend"
+                );
+                assert!(
+                    !reason_failed.contains(*forbidden),
+                    "forge byte {forbidden:?} must be replaced in sign_failed.reason"
+                );
+            }
+            assert!(
+                backend_failed.contains('\u{FFFD}') && reason_failed.contains('\u{FFFD}'),
+                "sanitized sign_failed fields must contain U+FFFD"
+            );
+            // Each of the three captured snapshots must keep the
+            // event on a single logical line — log-forging must not
+            // be able to split a record into two.
+            for (snapshot, event_type) in [
+                (&snapshot_loaded, "hw_identity.loaded"),
+                (&snapshot_unavail, "hw_identity.unavailable"),
+                (&snapshot_failed, "hw_identity.sign_failed"),
+            ] {
+                let lines: Vec<_> = snapshot
+                    .lines()
+                    .filter(|l| l.contains(event_type))
+                    .collect();
+                assert_eq!(
+                    lines.len(),
+                    1,
+                    "log forging must not split the {event_type} record into multiple lines",
+                );
+            }
         }
 
         #[test]
