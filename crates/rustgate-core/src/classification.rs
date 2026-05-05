@@ -197,11 +197,10 @@ pub enum DisseminationControl {
 
 impl DisseminationControl {
     fn parse(token: &str) -> Result<Self, ParseError> {
-        if token == "NOFORN" {
-            return Ok(Self::Noforn);
-        }
-        if token == "FVEY" {
-            return Ok(Self::Fvey);
+        match token {
+            "NOFORN" => return Ok(Self::Noforn),
+            "FVEY" => return Ok(Self::Fvey),
+            _ => {}
         }
         if let Some(rest) = token.strip_prefix("REL TO ") {
             let trimmed = rest.trim();
@@ -695,7 +694,7 @@ fn classify_block(tokens: &[String]) -> Result<BlockKind, ParseError> {
 /// `parse` method afterwards; this routine just routes a token to
 /// the right block kind.
 fn token_kind(token: &str) -> BlockKind {
-    if token == "NOFORN" || token == "FVEY" || token.starts_with("REL TO") {
+    if matches!(token, "NOFORN" | "FVEY") || token.starts_with("REL TO") {
         BlockKind::Dissemination
     } else if matches!(token, "FOUO" | "LES" | "SBU") {
         BlockKind::NonIntel
