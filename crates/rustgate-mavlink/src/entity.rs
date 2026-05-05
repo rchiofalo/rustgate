@@ -867,12 +867,12 @@ pub fn mav_msg_supported(msg_id: u32) -> bool {
     msg_id == HEARTBEAT_MSG_ID || msg_id == GLOBAL_POSITION_INT_MSG_ID
 }
 
-// Defense-in-depth: pin the v1 magic to keep the lint surface honest.
-// Without this the constant looks unused in this module since the
-// decoder path keys on `MavlinkVersion::from_magic` rather than the
-// raw byte. The codec's contract documents that v1 frames are
-// supported on the inbound path, so the constant carry is intentional
-// even though it does not appear in a `match` arm here.
+// justification: pin the v1 magic to keep the lint surface honest. The
+// decoder path keys on `MavlinkVersion::from_magic` rather than the raw
+// byte, so the constant looks unused in this module. The codec's
+// contract documents that v1 frames are supported on the inbound path,
+// so the constant carry is intentional even though it does not appear
+// in a `match` arm here.
 #[allow(dead_code)]
 const _MAVLINK_V1_MAGIC_USED: u8 = MAVLINK_V1_MAGIC;
 
