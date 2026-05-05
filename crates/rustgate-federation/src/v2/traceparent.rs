@@ -19,7 +19,7 @@
 //!
 //! # Local span linkage
 //!
-//! With the `otel` feature on, [`extract_into_current_span`] consults
+//! With the `otel` feature on, `extract_into_current_span` consults
 //! the inbound `traceparent` and attaches the parsed parent context to
 //! `tracing::Span::current()` via `tracing-opentelemetry`'s
 //! `OpenTelemetrySpanExt::set_parent`. Downstream telemetry (Jaeger /
