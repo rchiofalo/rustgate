@@ -49,6 +49,7 @@ pub mod protocol;
 pub mod sanitize;
 pub mod secrets;
 pub mod tasks;
+pub mod traceparent;
 
 pub use crypto::{HmacError, hmac_sha256_tag, hmac_sha256_verify};
 pub use identity::AttrValue;
@@ -56,3 +57,4 @@ pub use masking::hash_cn;
 pub use peer_id::{PeerId, ServerName};
 pub use sanitize::sanitize_for_log;
 pub use secrets::{SecretFileError, SecretFileOpts, read_secret_file};
+pub use traceparent::{MAX_TRACESTATE_BYTES, ParseTraceparentError, TraceContext};

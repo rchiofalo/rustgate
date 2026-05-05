@@ -913,6 +913,11 @@ impl FederatedChannel for FederationService {
         // and returns Unauthenticated — no extra audit here.
         let peer_id = Self::peer_id_from_request(&request)?;
         let _ = tracing::Span::current().record("peer", tracing::field::display(&peer_id));
+        // W3C trace context propagation (PR-B of #852): pull the parent
+        // trace from the inbound metadata and link it onto the current
+        // span. Best-effort — a missing or malformed header does not
+        // fail the RPC.
+        let _ = super::traceparent::extract_into_current_span(&request, &peer_id);
         let event = request.into_inner();
 
         if !Self::validate_hop_count(&event, &peer_id, self.max_hops) {
@@ -987,6 +992,7 @@ impl FederatedChannel for FederationService {
     ) -> Result<Response<figpb::ServerHealth>, Status> {
         let peer_id = Self::peer_id_from_request(&request)?;
         let _ = tracing::Span::current().record("peer", tracing::field::display(&peer_id));
+        let _ = super::traceparent::extract_into_current_span(&request, &peer_id);
         debug!(peer = %peer_id, "health check received");
         Ok(Response::new(figpb::ServerHealth {
             status: figpb::server_health::ServingStatus::Serving as i32,
@@ -1002,6 +1008,7 @@ impl FederatedChannel for FederationService {
         // and returns Unauthenticated — no extra audit here.
         let peer_id = Self::peer_id_from_request(&request)?;
         let _ = tracing::Span::current().record("peer", tracing::field::display(&peer_id));
+        let _ = super::traceparent::extract_into_current_span(&request, &peer_id);
         let blob = request.into_inner();
 
         // Hop-count validation (refs #864): mirrors `send_one_event` —
@@ -1084,6 +1091,7 @@ impl FederatedChannel for FederationService {
         request: Request<Streaming<figpb::FederatedEvent>>,
     ) -> Result<Response<figpb::Subscription>, Status> {
         let peer_id = Self::peer_id_from_request(&request)?;
+        let _ = super::traceparent::extract_into_current_span(&request, &peer_id);
         let mut stream = request.into_inner();
 
         info!(peer = %peer_id, "server_event_stream opened (receiving events)");
@@ -1187,6 +1195,7 @@ impl FederatedChannel for FederationService {
         // and returns Unauthenticated before any payload processing —
         // matches the SendOneEvent / SendOneBlob discipline.
         let peer_id = Self::peer_id_from_request(&request)?;
+        let _ = super::traceparent::extract_into_current_span(&request, &peer_id);
 
         // Pre-flight allowlist check on stream open. ROL has no
         // `federate_groups` semantics shared with BinaryBlob's
@@ -1243,6 +1252,7 @@ impl FederatedChannel for FederationService {
         // matches the SendOneEvent / SendOneBlob / ServerROLStream
         // discipline.
         let peer_id = Self::peer_id_from_request(&request)?;
+        let _ = super::traceparent::extract_into_current_span(&request, &peer_id);
 
         // Pre-flight allowlist check on stream open. Mirrors the
         // ServerROLStream gate so the audit reason vocabulary stays
@@ -1397,6 +1407,7 @@ impl FederatedChannel for FederationService {
         // pushing ROL state out lands in a separate follow-up — the
         // stub explicitly does NOT push payloads.
         let peer_id = Self::peer_id_from_request(&request)?;
+        let _ = super::traceparent::extract_into_current_span(&request, &peer_id);
 
         // Allowlist check on subscription open — a peer not in the
         // inbound allowlist must not be able to keep an outbound ROL
@@ -1461,6 +1472,7 @@ impl FederatedChannel for FederationService {
         // machinery for incremental group-sync state lands in a
         // separate follow-up.
         let peer_id = Self::peer_id_from_request(&request)?;
+        let _ = super::traceparent::extract_into_current_span(&request, &peer_id);
 
         // Allowlist check on subscription open. Mirrors the
         // `ClientROLStream` / `ClientFederateGroupsStream` gates so the

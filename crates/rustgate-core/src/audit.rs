@@ -2297,6 +2297,34 @@ pub fn udp_multicast_publish(group: &str, msg_uid: &str) {
     );
 }
 
+/// Record that a federation peer sent a malformed W3C `traceparent`
+/// header on an inbound gRPC RPC.
+///
+/// Emitted by the V2 federation server when a remote peer attaches a
+/// `traceparent` metadata entry that fails strict parsing (non-version
+/// `00`, wrong length, non-hex, all-zero trace or span IDs, or a
+/// `tracestate` companion exceeding 512 bytes per RFC). The RPC itself
+/// still completes — propagation is best-effort and a malformed header
+/// is treated as "no parent" rather than a transport error — but the
+/// audit event captures the rejection so SIEM operators can flag peers
+/// that are emitting non-conforming trace metadata. PR-B of issue #852.
+///
+/// `peer_cn` is the connecting peer's CN extracted from the mTLS
+/// client certificate; `reason` is the `Display` form of the
+/// `ParseTraceparentError` variant. Both fields cross the audit
+/// boundary via [`sanitize_for_log`].
+pub fn federation_traceparent_invalid(peer_cn: &str, reason: &str) {
+    let peer_cn = s(peer_cn);
+    let reason = s(reason);
+    audit!(
+        "federation.traceparent_invalid",
+        peer = %peer_cn,
+        reason = %reason,
+        action = "trace_propagation",
+        result = "rejected"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -2385,6 +2413,20 @@ mod tests {
             federation_config_changed("api", "create", &PeerId::new("peer-1"));
             federation_config_changed("admin", "delete", &PeerId::new("peer-2"));
             federation_config_changed("api", "update", &PeerId::new("peer-3"));
+        }
+
+        #[test]
+        fn test_traceparent_invalid() {
+            // Smoke-test every documented call shape including the
+            // boundary cases (empty CN; CR/LF in either field). The
+            // audit boundary's `sanitize_for_log` pass guarantees no
+            // raw newline survives into the JSON wire form even when
+            // an attacker controls the upstream `traceparent` header
+            // and the resulting parser error message.
+            federation_traceparent_invalid("peer-1", "wrong field count");
+            federation_traceparent_invalid("", "non-hex character");
+            federation_traceparent_invalid("peer\r\nINJECT", "field has wrong length");
+            federation_traceparent_invalid("peer-2", "tracestate exceeds 512-byte cap");
         }
     }
 

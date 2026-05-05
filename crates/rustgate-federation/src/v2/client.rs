@@ -572,6 +572,28 @@ async fn build_channel(address: &str, tls_config: ClientTlsConfig) -> Result<Cha
     Ok(channel)
 }
 
+/// Build a `tonic::Request` with the active OpenTelemetry trace
+/// context (W3C `traceparent` + optional `tracestate`) injected as gRPC
+/// metadata. Wraps `Request::new` with the
+/// [`super::traceparent::inject_into_request`] helper at the single
+/// federation-outbound call site so every RPC ([`figpb::FederatedEvent`],
+/// [`figpb::BinaryBlob`], [`figpb::Rol`], [`figpb::FederateGroups`],
+/// `Subscription`, `ClientHealth`) propagates the parent trace
+/// uniformly. Refs #852 PR-B.
+///
+/// When the `otel` feature is off (or no active span has a valid OTel
+/// context), the helper is a no-op — the wire format is unchanged from
+/// the pre-#852 baseline. PR-C of the split plan will surface the
+/// extracted [`rustgate_core::TraceContext`] on
+/// `RoutableMessage::metadata`; this PR carries the context only at
+/// the gRPC header level so trace linkage is established at the SDK
+/// span hierarchy.
+fn outbound_request<T>(payload: T) -> Request<T> {
+    let mut req = Request::new(payload);
+    super::traceparent::inject_into_request(&mut req);
+    req
+}
+
 /// Run the handshake and maintain all concurrent streams.
 ///
 /// Stream sequence (TAK Server SDK compatible):
@@ -611,7 +633,7 @@ async fn run_streams(
 
     // --- Step 1: ServerFederateGroupsStream (receive remote groups) ---
     let mut server_groups_stream = client
-        .server_federate_groups_stream(Request::new(sub.clone()))
+        .server_federate_groups_stream(outbound_request(sub.clone()))
         .await
         .map_err(|e| FederationError::other(format!("server_federate_groups_stream failed: {e}")))?
         .into_inner();
@@ -638,7 +660,7 @@ async fn run_streams(
     let groups_stream = tokio_stream::wrappers::ReceiverStream::new(groups_send_rx);
 
     let _groups_resp = client
-        .client_federate_groups_stream(Request::new(groups_stream))
+        .client_federate_groups_stream(outbound_request(groups_stream))
         .await
         .map_err(|e| {
             FederationError::other(format!("client_federate_groups_stream failed: {e}"))
@@ -665,13 +687,13 @@ async fn run_streams(
     let send_stream = tokio_stream::wrappers::ReceiverStream::new(send_rx);
 
     let _send_resp = client
-        .server_event_stream(Request::new(send_stream))
+        .server_event_stream(outbound_request(send_stream))
         .await
         .map_err(|e| FederationError::other(format!("server_event_stream failed: {e}")))?;
 
     // --- Step 4: ClientEventStream (open for receiving) ---
     let mut recv_stream = client
-        .client_event_stream(Request::new(sub.clone()))
+        .client_event_stream(outbound_request(sub.clone()))
         .await
         .map_err(|e| FederationError::other(format!("client_event_stream failed: {e}")))?
         .into_inner();
@@ -685,7 +707,7 @@ async fn run_streams(
     let rol_stream = tokio_stream::wrappers::ReceiverStream::new(rol_send_rx);
 
     let _rol_resp = client
-        .server_rol_stream(Request::new(rol_stream))
+        .server_rol_stream(outbound_request(rol_stream))
         .await
         .map_err(|e| FederationError::other(format!("server_rol_stream failed: {e}")))?;
 
@@ -703,7 +725,7 @@ async fn run_streams(
     // Initial health check (immediate, prevents inactivity disconnect)
     let hc_start = tokio::time::Instant::now();
     let health_result = client
-        .health_check(Request::new(figpb::ClientHealth {
+        .health_check(outbound_request(figpb::ClientHealth {
             status: figpb::client_health::ServingStatus::Serving as i32,
         }))
         .await;
@@ -853,7 +875,7 @@ async fn run_streams(
             // event send stream.
             Some(blob) = blob_rx.recv() => {
                 let blob_bytes = blob.data.len();
-                let resp = client.send_one_blob(Request::new(blob)).await;
+                let resp = client.send_one_blob(outbound_request(blob)).await;
                 if let Err(e) = resp {
                     warn!(
                         peer = %peer.id,
@@ -890,7 +912,7 @@ async fn run_streams(
             _ = health_ticker.tick() => {
                 let hc_start = tokio::time::Instant::now();
                 let resp = client
-                    .health_check(Request::new(figpb::ClientHealth {
+                    .health_check(outbound_request(figpb::ClientHealth {
                         status: figpb::client_health::ServingStatus::Serving as i32,
                     }))
                     .await;
