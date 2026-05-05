@@ -43,7 +43,7 @@
 //!
 //! ## Rotation-window state machine (closes #952)
 //!
-//! [`JwksClient::start`] wires a [`crate::jwks_rotation::RotationStateMachine`]
+//! [`JwksClient::start`] wires a `jwks_rotation::RotationStateMachine`
 //! into the live [`JwtAuthority`] so verifier installs flow through
 //! the four-state `Pending → Active → Retiring → Retired` lifecycle.
 //! The smoothing absorbs two edge cases the raw refresh path leaves
@@ -61,7 +61,7 @@
 //!   [`rustgate_core::audit::jwt_using_retiring_kid`] so SIEM
 //!   dashboards can spot peers that have not yet rotated.
 //!
-//! See the module docs on [`crate::jwks_rotation`] for the transition
+//! See the module docs on `jwks_rotation` for the transition
 //! table.
 
 use std::collections::{HashMap, HashSet};

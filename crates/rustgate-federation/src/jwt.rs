@@ -370,7 +370,7 @@ fn empty_external_verifiers() -> ArcSwap<HashMap<String, VerificationKey>> {
 /// Fired by [`JwtAuthority::validate`] after a successful signature
 /// check, with the `kid` header value (or `""` when the token had no
 /// `kid` and the authority's `legacy_verifier` was used). The JWKS
-/// rotation-window state machine in [`crate::jwks_rotation`] installs
+/// rotation-window state machine in `jwks_rotation` installs
 /// one of these to detect tokens minted against a Retiring kid and emit
 /// `audit::jwt_using_retiring_kid`.
 ///
