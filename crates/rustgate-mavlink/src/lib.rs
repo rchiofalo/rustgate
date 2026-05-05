@@ -10,7 +10,7 @@
 //!
 //! # Scope
 //!
-//! Two concerns, deliberately no more:
+//! Three concerns, deliberately no more:
 //!
 //! - [`frame::MavlinkFrameCodec`] — a `tokio_util::codec::Decoder` /
 //!   `Encoder` pair that slices complete MAVLink frames out of a byte
@@ -23,6 +23,13 @@
 //!   handles CoT XML and TAK protobuf. Payloads are carried opaquely
 //!   (the full frame including magic/header/CRC/signature), matching the
 //!   behaviour of `raw-length-prefixed`.
+//! - [`entity::MavlinkEntityCodec`] — implements
+//!   [`rustgate_core::entity::EntityCodec`] so the workspace's
+//!   protocol-agnostic `Entity` shape can carry MAVLink wire frames.
+//!   Decodes HEARTBEAT (`MSG_ID = 0`) and GLOBAL_POSITION_INT
+//!   (`MSG_ID = 33`) on the inbound path; encodes Position-bearing
+//!   `Entity` values back to GLOBAL_POSITION_INT on the outbound path.
+//!   Refs #847.
 //!
 //! # What is deliberately absent
 //!
@@ -50,11 +57,13 @@
 
 pub mod codec;
 pub mod crc_extra;
+pub mod entity;
 pub mod error;
 pub mod frame;
 
 pub use codec::MavlinkCodec;
 pub use crc_extra::crc_extra;
+pub use entity::{GLOBAL_POSITION_INT_MSG_ID, MavlinkEntityCodec, MavlinkEntityError};
 pub use error::MavlinkError;
 pub use frame::{
     HEARTBEAT_MSG_ID, MAVLINK_V1_MAGIC, MAVLINK_V2_MAGIC, MavlinkFrameCodec, MavlinkVersion,
