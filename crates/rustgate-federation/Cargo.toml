@@ -37,6 +37,17 @@ peer-discovery-etcd = ["dep:async-trait", "dep:etcd-client"]
 # pem helpers + rustls ClientConfig) and does not introduce a separate
 # trust path.
 jwks = ["dep:reqwest"]
+# OpenTelemetry distributed-trace context propagation across federation
+# gRPC RPCs (PR-B of #852). When enabled, outbound `V2Client` RPCs
+# inject the active `tracing::Span`'s OpenTelemetry context as a W3C
+# `traceparent` (and optional `tracestate`) gRPC metadata entry; the
+# inbound `FederationService` extracts the same headers and either
+# attaches the parent context to the per-RPC span (via
+# `tracing-opentelemetry`) or emits a `debug!` for log correlation when
+# OTel is off. The `traceparent` parser ships in `rustgate-core` and is
+# always available — this feature gates only the OTel-aware inject /
+# extract glue. Refs #852.
+otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
 
 [dependencies]
 rustgate-core = { workspace = true, features = ["pem"] }
@@ -76,6 +87,8 @@ async-trait = { workspace = true, optional = true }
 mdns-sd = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 etcd-client = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
 
 [build-dependencies]
 prost-build = { workspace = true, optional = true }
