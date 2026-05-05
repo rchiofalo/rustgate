@@ -78,13 +78,15 @@ pub enum Decision {
 /// canonical order is:
 ///
 /// 1. **Group 1 — Redactors** (`priority = 0`). Variants that REMOVE
-///    information from the payload. Run first so subsequent groups
-///    operate on the redacted form rather than seeing pre-redaction
-///    bytes. Members today: [`Obligation::MaskPoint`],
-///    [`Obligation::MaskPayload`].
+///    or coarsen information from the payload. Run first so subsequent
+///    groups operate on the redacted form rather than seeing
+///    pre-redaction bytes. Members today: [`Obligation::MaskPoint`],
+///    [`Obligation::MaskPayload`], [`Obligation::StripPii`],
+///    [`Obligation::DegradePosition`].
 /// 2. **Group 2 — Classifiers / Taggers** (`priority = 1`). Variants
 ///    that ATTACH new fields, headers, or labels to the (already
-///    redacted) message. Members today: [`Obligation::TagClassified`].
+///    redacted) message. Members today: [`Obligation::TagClassified`],
+///    [`Obligation::InjectMarking`].
 /// 3. **Group 3 — Auditors** (`priority = 2`). Variants that EMIT
 ///    audit events without changing the message bytes. Run last so the
 ///    audit record reflects the final post-redact-post-tag state.
@@ -105,7 +107,18 @@ pub enum Decision {
 /// New variants without an explicit assignment default to Group 3
 /// (Auditors) — see [`Obligation::priority`] for the default-group
 /// rationale.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// # `Clone` not `Copy` (refs #857)
+///
+/// Pre-#857 every variant was a unit-form so `Obligation` derived
+/// `Copy`. The cross-domain inspection guard scaffold introduces
+/// payload-bearing variants ([`Obligation::DegradePosition`] carrying
+/// a `u32`, [`Obligation::InjectMarking`] carrying a `String`) and the
+/// `String` payload makes `Copy` impossible. Hot-path call sites that
+/// previously used `.copied()` to clone unit variants now use
+/// `.cloned()`; the Hash/Eq/PartialEq derives still hold because every
+/// payload type implements them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Obligation {
@@ -139,6 +152,54 @@ pub enum Obligation {
     /// payload mutation; runs last so the audit record reflects the
     /// final post-redact-post-tag state.
     AuditExtended,
+    /// Cross-domain inspection: strip operator-identity PII fields
+    /// (callsign, phone, email, endpoint URLs) from CoT `<contact>` and
+    /// related `<detail>` children before crossing a security boundary.
+    /// Non-CoT payloads pass through unmodified.
+    ///
+    /// **Chaining group**: 1 (Redactor). Removes identity bytes from
+    /// the payload; runs before classifiers and auditors. Refs #857 —
+    /// scaffold for the cross-domain inspection guard. The full
+    /// `rustgate-guard` crate (rate limiting, mandatory CAPCO marking,
+    /// dedicated audit envelope) is deferred to a follow-up PR.
+    StripPii,
+    /// Cross-domain inspection: round CoT `<point>` lat/lon coordinates
+    /// to a coarser grid sized in metres, suitable for delivery to a
+    /// lower-classification network. The `precision_meters` value
+    /// configures the grid spacing (e.g. `1000` rounds to roughly three
+    /// decimal places of latitude at mid-latitudes). Non-CoT payloads
+    /// pass through unmodified.
+    ///
+    /// **Chaining group**: 1 (Redactor). Coarsens coordinate bytes in
+    /// the payload; runs before classifiers and auditors. Refs #857 —
+    /// scaffold for the cross-domain inspection guard.
+    DegradePosition {
+        /// Grid spacing in metres. Coordinates are rounded to the
+        /// nearest multiple of this many metres along each axis.
+        /// `0` is treated as a no-op — see the actuator implementation
+        /// in `rustgate-cot::cdi::degrade_position` for the safe
+        /// fallback.
+        precision_meters: u32,
+    },
+    /// Cross-domain inspection: inject a CAPCO classification marking
+    /// (e.g. `"//SECRET//NOFORN"`) into the CoT `<detail>` element as a
+    /// `<marking value="…">` child so receivers on the lower-side see
+    /// the classification banner travelling with the event. Non-XML
+    /// payloads pass through unmodified.
+    ///
+    /// **Chaining group**: 2 (Classifier/Tagger). Attaches a label to
+    /// the already-redacted message; runs after Group 1 redactors so
+    /// the marking is the last thing added to the body. Refs #857 —
+    /// scaffold for the cross-domain inspection guard. The full CAPCO
+    /// parser lives in #849; this scaffold treats the marking string
+    /// as opaque and only enforces the wrapping shape.
+    InjectMarking {
+        /// The classification banner string to insert. Stored verbatim;
+        /// callers MUST sanitize before constructing the obligation.
+        /// XML-special characters are escaped at injection time so a
+        /// crafted marking cannot break out of the attribute value.
+        marking: String,
+    },
 }
 
 impl Obligation {
@@ -180,10 +241,18 @@ impl Obligation {
         // narrowest annotation that preserves the safety net.
         #[allow(unreachable_patterns)]
         match self {
-            // Group 1 — Redactors.
-            Obligation::MaskPoint | Obligation::MaskPayload => 0,
-            // Group 2 — Classifiers / Taggers.
-            Obligation::TagClassified => 1,
+            // Group 1 — Redactors. The CDI obligations from #857
+            // (StripPii, DegradePosition) sit here too: they remove or
+            // coarsen information from the payload so they MUST run
+            // before any classifier or auditor sees the bytes.
+            Obligation::MaskPoint
+            | Obligation::MaskPayload
+            | Obligation::StripPii
+            | Obligation::DegradePosition { .. } => 0,
+            // Group 2 — Classifiers / Taggers. `InjectMarking` joins
+            // `TagClassified` here: it ATTACHES a classification banner
+            // to the already-redacted body rather than removing data.
+            Obligation::TagClassified | Obligation::InjectMarking { .. } => 1,
             // Group 3 — Auditors. Unknown variants land here by
             // default (see docstring above).
             Obligation::AuditExtended => 2,
@@ -755,18 +824,48 @@ mod model_tests {
         // Same invariant as actions: obligation serialization is part
         // of the policy wire format. `MaskPoint` maps to `mask_point`,
         // etc. Pin the full mapping so a rename of the Rust variant
-        // doesn't silently desynchronise from the policy files.
+        // doesn't silently desynchronise from the policy files. Unit
+        // variants serialize as bare strings under serde's external-
+        // tagged default; struct variants from #857 (DegradePosition,
+        // InjectMarking) serialize as single-key objects whose key is
+        // the snake_case variant name.
         for (obl, wire) in [
             (Obligation::MaskPoint, "\"mask_point\""),
             (Obligation::MaskPayload, "\"mask_payload\""),
             (Obligation::TagClassified, "\"tag_classified\""),
             (Obligation::AuditExtended, "\"audit_extended\""),
+            (Obligation::StripPii, "\"strip_pii\""),
         ] {
             let ser = serde_json::to_string(&obl).expect("serialize obligation");
             assert_eq!(ser, wire, "{obl:?}");
             let de: Obligation = serde_json::from_str(wire).expect("deserialize obligation");
             assert_eq!(de, obl);
         }
+        // Struct variants — externally-tagged form `{ "name": { … } }`.
+        let degrade = Obligation::DegradePosition {
+            precision_meters: 1000,
+        };
+        let degrade_wire = r#"{"degrade_position":{"precision_meters":1000}}"#;
+        assert_eq!(
+            serde_json::to_string(&degrade).expect("serialize degrade"),
+            degrade_wire
+        );
+        assert_eq!(
+            serde_json::from_str::<Obligation>(degrade_wire).expect("deserialize degrade"),
+            degrade
+        );
+        let inject = Obligation::InjectMarking {
+            marking: "//SECRET//NOFORN".to_string(),
+        };
+        let inject_wire = r#"{"inject_marking":{"marking":"//SECRET//NOFORN"}}"#;
+        assert_eq!(
+            serde_json::to_string(&inject).expect("serialize inject"),
+            inject_wire
+        );
+        assert_eq!(
+            serde_json::from_str::<Obligation>(inject_wire).expect("deserialize inject"),
+            inject
+        );
     }
 
     #[test]
@@ -788,16 +887,30 @@ mod model_tests {
     }
 
     #[test]
-    fn action_and_obligation_are_copy_and_hash() {
-        // Compile-time pin: both types are `Copy + Hash + Eq` so they
-        // can key HashMaps/HashSets and be moved freely on the
-        // evaluation hot path without clone cost. A regression that
-        // removed either bound (e.g. added a non-Copy field) would
-        // fail this generic-function assertion.
+    fn action_and_decision_are_copy_and_hash() {
+        // Compile-time pin: `Action` and `Decision` are `Copy + Hash +
+        // Eq` so they can key HashMaps/HashSets and be moved freely on
+        // the evaluation hot path without clone cost. A regression
+        // that removed either bound would fail this generic-function
+        // assertion. `Obligation` is intentionally NOT `Copy` since
+        // the #857 cross-domain variants carry payloads (`String` for
+        // `InjectMarking`); see `obligation_is_clone_hash_eq` for the
+        // weakened bound.
         fn assert_copy_hash_eq<T: Copy + std::hash::Hash + Eq>() {}
         assert_copy_hash_eq::<Action>();
-        assert_copy_hash_eq::<Obligation>();
         assert_copy_hash_eq::<Decision>();
+    }
+
+    #[test]
+    fn obligation_is_clone_hash_eq() {
+        // Refs #857: the obligation enum dropped `Copy` when payload-
+        // bearing variants (`DegradePosition { precision_meters }` and
+        // `InjectMarking { marking }`) landed. Pin the surviving
+        // contract — `Clone + Hash + Eq` — so cache keying, HashSet
+        // insertion in egress fold, and `.cloned()` propagation across
+        // call sites all keep compiling.
+        fn assert_clone_hash_eq<T: Clone + std::hash::Hash + Eq>() {}
+        assert_clone_hash_eq::<Obligation>();
     }
 
     // ── CacheStats ─────────────────────────────────────────────────
@@ -937,6 +1050,28 @@ mod model_tests {
             Obligation::AuditExtended.priority(),
             2,
             "AuditExtended must be Auditor (group 2)"
+        );
+        // Refs #857 — cross-domain inspection variants.
+        assert_eq!(
+            Obligation::StripPii.priority(),
+            0,
+            "StripPii must be Redactor (group 0): it removes PII from the body"
+        );
+        assert_eq!(
+            Obligation::DegradePosition {
+                precision_meters: 1000
+            }
+            .priority(),
+            0,
+            "DegradePosition must be Redactor (group 0): it coarsens coordinates"
+        );
+        assert_eq!(
+            Obligation::InjectMarking {
+                marking: "//S".to_string()
+            }
+            .priority(),
+            1,
+            "InjectMarking must be Classifier/Tagger (group 1): it attaches a marking"
         );
     }
 

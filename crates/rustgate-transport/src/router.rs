@@ -262,6 +262,13 @@ pub(crate) fn obligation_kind_label(obligation: &Obligation) -> &'static str {
         Obligation::MaskPayload => "mask_payload",
         Obligation::TagClassified => "tag_classified",
         Obligation::AuditExtended => "audit_extended",
+        // Refs #857 — cross-domain inspection scaffold. Labels are
+        // bounded snake_case so Prometheus cardinality stays under the
+        // documented 8-element vocabulary plus the `unknown` fallback
+        // for `#[non_exhaustive]` future variants.
+        Obligation::StripPii => "strip_pii",
+        Obligation::DegradePosition { .. } => "degrade_position",
+        Obligation::InjectMarking { .. } => "inject_marking",
         // `#[non_exhaustive]` — bucket future variants under a single
         // label so a new authz release cannot grow Prometheus
         // cardinality without an explicit transport change.
@@ -6844,6 +6851,20 @@ mod tests {
         assert_eq!(
             obligation_kind_label(&Obligation::AuditExtended),
             "audit_extended"
+        );
+        // Refs #857 — cross-domain inspection scaffold labels.
+        assert_eq!(obligation_kind_label(&Obligation::StripPii), "strip_pii");
+        assert_eq!(
+            obligation_kind_label(&Obligation::DegradePosition {
+                precision_meters: 1000
+            }),
+            "degrade_position"
+        );
+        assert_eq!(
+            obligation_kind_label(&Obligation::InjectMarking {
+                marking: "//S".to_string()
+            }),
+            "inject_marking"
         );
     }
 

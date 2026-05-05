@@ -341,6 +341,11 @@ fn obligation_label(o: &crate::model::Obligation) -> &'static str {
         Obligation::MaskPayload => "mask_payload",
         Obligation::TagClassified => "tag_classified",
         Obligation::AuditExtended => "audit_extended",
+        // Refs #857 — cross-domain inspection scaffold. Labels match
+        // the `obligation_kind_label` mapping in the transport crate.
+        Obligation::StripPii => "strip_pii",
+        Obligation::DegradePosition { .. } => "degrade_position",
+        Obligation::InjectMarking { .. } => "inject_marking",
     }
 }
 

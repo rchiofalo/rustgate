@@ -19,6 +19,7 @@
 //! slice and is not automatically constructed from this crate's
 //! per-submodule errors.
 
+pub mod cdi;
 pub mod delta;
 pub mod mask;
 #[cfg(feature = "metrics")]

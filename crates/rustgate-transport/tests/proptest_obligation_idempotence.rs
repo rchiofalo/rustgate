@@ -91,19 +91,29 @@ fn payload_strategy() -> impl Strategy<Value = &'static [u8]> {
     ]
 }
 
-/// Strategy producing one of the four known obligation variants. The
+/// Strategy producing one of the known obligation variants. The
 /// authz crate's [`Obligation`] enum is `#[non_exhaustive]`, but only
 /// known variants can be constructed from outside the defining crate —
 /// which is exactly what the proptest needs (the dispatcher's
 /// composition invariants are stated over known variants only; the
 /// unknown-variant path is its own audit-rate-limit contract pinned
-/// elsewhere).
+/// elsewhere). Refs #857 added three CDI variants (`StripPii`,
+/// `DegradePosition`, `InjectMarking`) that participate in the
+/// composition invariants alongside the original four.
 fn obligation_strategy() -> impl Strategy<Value = Obligation> {
     prop_oneof![
         Just(Obligation::MaskPoint),
         Just(Obligation::MaskPayload),
         Just(Obligation::TagClassified),
         Just(Obligation::AuditExtended),
+        // Refs #857 — cross-domain inspection scaffold variants.
+        Just(Obligation::StripPii),
+        Just(Obligation::DegradePosition {
+            precision_meters: 1000,
+        }),
+        Just(Obligation::InjectMarking {
+            marking: "//SECRET//NOFORN".to_string(),
+        }),
     ]
 }
 
@@ -160,7 +170,7 @@ proptest! {
         a in obligation_set_strategy(),
         b in obligation_set_strategy(),
     ) {
-        let combined: Vec<Obligation> = a.iter().chain(b.iter()).copied().collect();
+        let combined: Vec<Obligation> = a.iter().chain(b.iter()).cloned().collect();
 
         let mut staged = msg.clone();
         apply(&mut staged, &a);
@@ -225,7 +235,7 @@ proptest! {
         b in obligation_strategy(),
     ) {
         let mut ab = msg.clone();
-        apply(&mut ab, &[a, b]);
+        apply(&mut ab, &[a.clone(), b.clone()]);
 
         let mut ba = msg;
         apply(&mut ba, &[b, a]);

@@ -23,6 +23,21 @@
 //!   empty [`Bytes`] and the classified message type is coerced to
 //!   [`MessageType::Other`] with a `"masked"` tag so downstream caches
 //!   and dedup do not mistake it for the real event.
+//! - [`Obligation::StripPii`] — refs #857 cross-domain inspection
+//!   scaffold. Strips operator-identity attributes (`callsign`, `phone`,
+//!   `email`, IM/chat tokens) from CoT `<contact>` and `<detail>`
+//!   children via [`rustgate_cot::cdi::strip_pii`]. Non-XML payloads
+//!   pass through unmodified; XML-intent parse failures fail-closed to
+//!   `MaskPayload`-equivalent erasure.
+//! - [`Obligation::DegradePosition`] — refs #857. Rounds CoT
+//!   `<point lat lon>` coordinates to a coarser grid sized in metres
+//!   via [`rustgate_cot::cdi::degrade_position`]. Same recovery
+//!   contract as `StripPii`.
+//! - [`Obligation::InjectMarking`] — refs #857. Inserts a CAPCO-style
+//!   `<marking value="…"/>` child under `<detail>` via
+//!   [`rustgate_cot::cdi::inject_marking`]. Same recovery contract as
+//!   `StripPii`; documents without `<detail>` pass through unmodified
+//!   per the helper's docstring.
 //!
 //! [`Obligation::TagClassified`] and [`Obligation::AuditExtended`] are
 //! audit-shaped obligations that do not mutate the wire payload:
@@ -391,6 +406,12 @@ pub(crate) fn obligations_mutate_payload(obligations: &[Obligation]) -> bool {
     obligations.iter().any(|o| match o {
         Obligation::MaskPoint | Obligation::MaskPayload => true,
         Obligation::TagClassified | Obligation::AuditExtended => false,
+        // Refs #857 — every cross-domain inspection variant rewrites
+        // the payload (PII strip, position rounding, marking
+        // insertion) so the clone-out-of-Arc path is required.
+        Obligation::StripPii
+        | Obligation::DegradePosition { .. }
+        | Obligation::InjectMarking { .. } => true,
         // `#[non_exhaustive]` — unknown variants default to "mutates"
         // so the clone-out path runs and `apply_obligations` gets a
         // chance to emit the unknown-variant audit event.
@@ -495,6 +516,14 @@ pub fn apply_obligations_with_limiter(
             Obligation::MaskPayload => apply_mask_payload(msg),
             // Audit-only obligations handled at the call site.
             Obligation::TagClassified | Obligation::AuditExtended => {}
+            // Refs #857 — cross-domain inspection scaffold.
+            Obligation::StripPii => apply_strip_pii(msg, policy_id, rate_limiter),
+            Obligation::DegradePosition { precision_meters } => {
+                apply_degrade_position(msg, *precision_meters, policy_id, rate_limiter);
+            }
+            Obligation::InjectMarking { marking } => {
+                apply_inject_marking(msg, marking, policy_id, rate_limiter);
+            }
             // `#[non_exhaustive]` Obligation — future variants land
             // here. The audit event fires regardless of policy so the
             // stale-transport / new-policy skew is always visible in
@@ -714,6 +743,163 @@ fn apply_mask_point(
 fn apply_mask_payload(msg: &mut RoutableMessage) {
     msg.payload = Bytes::new();
     msg.metadata.message_type = MessageType::Other("masked".into());
+}
+
+/// Refs #857 — common recovery path for the cross-domain inspection
+/// helpers. All three helpers (`StripPii`, `DegradePosition`,
+/// `InjectMarking`) share the same fail-modes:
+///
+/// - **Non-XML payload** (the helper returned `Ok` echoing the input
+///   bytes verbatim) — the obligation is a CoT control, so a non-XML
+///   payload is forwarded unmodified and the audit trail records the
+///   pass-through.
+/// - **XML-intent parse failure** ([`MaskError::Xml`]) — fail-closed:
+///   erase the body via [`apply_mask_payload`] so a crafted partial
+///   document cannot leak pre-redaction bytes via pass-through.
+/// - **Attribute budget trip** ([`MaskError::AttrBudgetExceeded`]) —
+///   same fail-closed posture as `MaskPoint`.
+///
+/// `obligation_label` is the `Debug`-derived obligation name for the
+/// audit `obligation` field; `policy_id` and `rate_limiter` are the
+/// usual hot-path threading.
+fn handle_cdi_helper_result(
+    msg: &mut RoutableMessage,
+    obligation_label: &'static str,
+    policy_id: &str,
+    rate_limiter: Option<&ObligationRateLimiter>,
+    result: Result<bytes::Bytes, rustgate_cot::mask::MaskError>,
+) {
+    match result {
+        Ok(new_payload) => {
+            // The CDI helpers echo the input bytes when the payload is
+            // not XML-intent. We can't distinguish "the helper rewrote
+            // identical bytes" from "no XML" here without re-comparing,
+            // but both cases produce the same observable outcome: the
+            // forwarded payload is the helper's return value. Updating
+            // the payload Bytes is cheap when the underlying allocation
+            // is shared (Bytes ref-counted) so even the no-op path
+            // costs at most an Arc bump.
+            msg.payload = new_payload;
+        }
+        Err(e) => {
+            // XML-intent parse failure or attribute-budget trip. Same
+            // posture as MaskPoint — drop the body and coerce the
+            // message type so a hostile sender cannot leak pre-
+            // redaction bytes via pass-through recovery.
+            let kind = e.kind();
+            let reason = match kind {
+                "attr_budget_exceeded" => audit::OBLIGATION_REASON_MASK_POINT_ATTR_BUDGET_EXCEEDED,
+                _ => audit::OBLIGATION_REASON_CDI_XML_ERROR,
+            };
+            tracing::debug!(
+                error_kind = %kind,
+                reason = reason,
+                obligation = obligation_label,
+                source_protocol = %msg.metadata.source_protocol,
+                "CDI obligation: XML-intent parse failed, erasing payload",
+            );
+            audit::authz_obligation_failed(
+                &msg.source.cn,
+                obligation_label,
+                reason,
+                audit::MASK_RECOVERY_DROPPED,
+                &msg.metadata.source_protocol,
+                msg.destination.kind_str(),
+                policy_id,
+            );
+            if let Some(limiter) = rate_limiter {
+                limiter.observe_failure(reason);
+            }
+            apply_mask_payload(msg);
+        }
+    }
+}
+
+/// Audit a non-XML pass-through for a CDI obligation. The CDI helpers
+/// echo non-XML bytes verbatim; the dispatcher emits a forensic event
+/// with [`audit::OBLIGATION_REASON_CDI_NON_XML`] so SIEM dashboards see
+/// when a CDI obligation lands on traffic it cannot transform.
+fn audit_cdi_non_xml(
+    msg: &RoutableMessage,
+    obligation_label: &'static str,
+    policy_id: &str,
+    rate_limiter: Option<&ObligationRateLimiter>,
+) {
+    let recovery = audit::classify_mask_recovery_for(&msg.metadata.source_protocol);
+    audit::authz_obligation_failed(
+        &msg.source.cn,
+        obligation_label,
+        audit::OBLIGATION_REASON_CDI_NON_XML,
+        recovery,
+        &msg.metadata.source_protocol,
+        msg.destination.kind_str(),
+        policy_id,
+    );
+    if let Some(limiter) = rate_limiter {
+        limiter.observe_failure(audit::OBLIGATION_REASON_CDI_NON_XML);
+    }
+}
+
+/// Refs #857 — apply [`Obligation::StripPii`] via
+/// [`rustgate_cot::cdi::strip_pii`].
+fn apply_strip_pii(
+    msg: &mut RoutableMessage,
+    policy_id: &str,
+    rate_limiter: Option<&ObligationRateLimiter>,
+) {
+    let is_xml = msg
+        .payload
+        .iter()
+        .find(|b| !b.is_ascii_whitespace())
+        .is_some_and(|b| *b == b'<');
+    if !is_xml {
+        audit_cdi_non_xml(msg, "StripPii", policy_id, rate_limiter);
+        return;
+    }
+    let result = rustgate_cot::cdi::strip_pii(&msg.payload);
+    handle_cdi_helper_result(msg, "StripPii", policy_id, rate_limiter, result);
+}
+
+/// Refs #857 — apply [`Obligation::DegradePosition`] via
+/// [`rustgate_cot::cdi::degrade_position`].
+fn apply_degrade_position(
+    msg: &mut RoutableMessage,
+    precision_meters: u32,
+    policy_id: &str,
+    rate_limiter: Option<&ObligationRateLimiter>,
+) {
+    let is_xml = msg
+        .payload
+        .iter()
+        .find(|b| !b.is_ascii_whitespace())
+        .is_some_and(|b| *b == b'<');
+    if !is_xml {
+        audit_cdi_non_xml(msg, "DegradePosition", policy_id, rate_limiter);
+        return;
+    }
+    let result = rustgate_cot::cdi::degrade_position(&msg.payload, precision_meters);
+    handle_cdi_helper_result(msg, "DegradePosition", policy_id, rate_limiter, result);
+}
+
+/// Refs #857 — apply [`Obligation::InjectMarking`] via
+/// [`rustgate_cot::cdi::inject_marking`].
+fn apply_inject_marking(
+    msg: &mut RoutableMessage,
+    marking: &str,
+    policy_id: &str,
+    rate_limiter: Option<&ObligationRateLimiter>,
+) {
+    let is_xml = msg
+        .payload
+        .iter()
+        .find(|b| !b.is_ascii_whitespace())
+        .is_some_and(|b| *b == b'<');
+    if !is_xml {
+        audit_cdi_non_xml(msg, "InjectMarking", policy_id, rate_limiter);
+        return;
+    }
+    let result = rustgate_cot::cdi::inject_marking(&msg.payload, marking);
+    handle_cdi_helper_result(msg, "InjectMarking", policy_id, rate_limiter, result);
 }
 
 #[cfg(test)]
@@ -1051,6 +1237,14 @@ mod tests {
             Obligation::MaskPoint,
             Obligation::TagClassified
         ]));
+        // Refs #857 — every CDI variant mutates the payload.
+        assert!(obligations_mutate_payload(&[Obligation::StripPii]));
+        assert!(obligations_mutate_payload(&[Obligation::DegradePosition {
+            precision_meters: 1000
+        }]));
+        assert!(obligations_mutate_payload(&[Obligation::InjectMarking {
+            marking: "//S//".to_string()
+        }]));
     }
 
     #[test]
@@ -1083,14 +1277,22 @@ mod tests {
         // mutation assertions are covered by the dedicated per-
         // variant tests; this test asserts only the Result shape.
         let mut msg = sample_msg(SAMPLE_COT, MessageType::Position);
-        let all_known = &[
+        let all_known = vec![
             Obligation::MaskPoint,
             Obligation::MaskPayload,
             Obligation::TagClassified,
             Obligation::AuditExtended,
+            // Refs #857 — cross-domain inspection scaffold.
+            Obligation::StripPii,
+            Obligation::DegradePosition {
+                precision_meters: 1000,
+            },
+            Obligation::InjectMarking {
+                marking: "//SECRET//NOFORN".to_string(),
+            },
         ];
         assert!(
-            apply_obligations(&mut msg, all_known, UnknownObligationPolicy::FailClosed).is_ok()
+            apply_obligations(&mut msg, &all_known, UnknownObligationPolicy::FailClosed).is_ok()
         );
     }
 
@@ -1102,16 +1304,23 @@ mod tests {
         // actuation error", which is not what SkipAndContinue
         // advertises.
         let mut msg = sample_msg(SAMPLE_COT, MessageType::Position);
-        let all_known = &[
+        let all_known = vec![
             Obligation::MaskPoint,
             Obligation::MaskPayload,
             Obligation::TagClassified,
             Obligation::AuditExtended,
+            Obligation::StripPii,
+            Obligation::DegradePosition {
+                precision_meters: 1000,
+            },
+            Obligation::InjectMarking {
+                marking: "//SECRET//NOFORN".to_string(),
+            },
         ];
         assert!(
             apply_obligations(
                 &mut msg,
-                all_known,
+                &all_known,
                 UnknownObligationPolicy::SkipAndContinue
             )
             .is_ok()

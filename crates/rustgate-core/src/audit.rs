@@ -772,6 +772,23 @@ pub const OBLIGATION_REASON_MASK_POINT_ATTR_BUDGET_EXCEEDED: &str =
 /// alerting key independent of which specific variant fired.
 pub const OBLIGATION_REASON_UNKNOWN_VARIANT: &str = "unknown_variant";
 
+/// Stable `reason` token emitted by [`authz_obligation_failed`] when a
+/// cross-domain inspection obligation (`StripPii`, `DegradePosition`,
+/// `InjectMarking` — refs #857) lands on a payload whose first
+/// non-whitespace byte is not `<`. The CDI helpers are best-effort CoT
+/// controls; non-XML payloads pass through unmodified and SIEM
+/// dashboards group the resulting forensic event under a single token
+/// rather than on a per-obligation suffix.
+pub const OBLIGATION_REASON_CDI_NON_XML: &str = "cdi_non_xml";
+
+/// Stable `reason` token emitted by [`authz_obligation_failed`] when a
+/// CDI obligation (refs #857) lands on an XML-intent payload that the
+/// masker cannot parse. The dispatcher fail-closes the payload — same
+/// security posture as `OBLIGATION_REASON_MASK_POINT_XML_ERROR` — so a
+/// crafted sender that aborts a document mid-parse cannot leak
+/// pre-redaction bytes via pass-through recovery.
+pub const OBLIGATION_REASON_CDI_XML_ERROR: &str = "cdi_xml_error";
+
 /// Map a [`rustgate_cot::mask::MaskError::kind`] discriminant to the
 /// corresponding `reason` token used by [`authz_obligation_failed`].
 ///
@@ -1287,7 +1304,9 @@ pub fn server_started(bind: &str, version: &str) {
 /// `"federation"`, `"http"`, `"mqtt"`, `"local"`); `obligation_type`
 /// is the small fixed-vocabulary obligation label
 /// (`"mask_point"`, `"mask_payload"`, `"tag_classified"`,
-/// `"audit_extended"`, `"unknown"`); `recipient_class` is a
+/// `"audit_extended"`, plus the cross-domain inspection labels from
+/// refs #857 — `"strip_pii"`, `"degrade_position"`, `"inject_marking"`
+/// — and the catch-all `"unknown"`); `recipient_class` is a
 /// human-readable rendering of the `RecipientClass` variant
 /// (e.g. `"multicast:[alpha,bravo]"`, `"nats:my.subject"`).
 ///
