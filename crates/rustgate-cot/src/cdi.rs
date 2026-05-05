@@ -16,8 +16,8 @@
 //! # Scope and shape
 //!
 //! Each helper takes a `&[u8]` payload and returns either a transformed
-//! [`Bytes`] copy or [`mask::MaskError`] under the same fail-closed
-//! contract as the existing [`mask::strip_coordinates`] family:
+//! [`Bytes`] copy or `MaskError` under the same fail-closed
+//! contract as the existing `strip_coordinates` family:
 //!
 //! - **Non-XML payloads** (first non-whitespace byte is not `<`) are
 //!   returned verbatim — these helpers are best-effort CoT controls and
@@ -25,12 +25,12 @@
 //!   a misconfiguration, not a leak. The transport-side actuator emits
 //!   the standard `authz.obligation_failed` audit record with the
 //!   appropriate recovery token.
-//! - **XML-intent parse failures** propagate as [`mask::MaskError::Xml`]
+//! - **XML-intent parse failures** propagate as `mask::MaskError::Xml`
 //!   so the caller can fail-closed on the boundary message rather than
 //!   forward partially-redacted bytes.
 //!
 //! Element matching is namespace-prefix-tolerant and case-insensitive,
-//! delegating to the existing helpers in [`mask`] so a sender cannot
+//! delegating to the existing helpers in `mask` so a sender cannot
 //! dodge the transform by emitting `<cot:contact>` or `<DETAIL>`.
 //!
 //! # Out of scope
@@ -118,7 +118,7 @@ fn is_marking_element(name: &[u8]) -> bool {
 }
 
 /// Return `true` when `attr_name` matches any token in
-/// [`PII_CONTACT_ATTR_TOKENS`] as a case-insensitive substring. The
+/// `PII_CONTACT_ATTR_TOKENS` as a case-insensitive substring. The
 /// substring scan is intentional — vendor extensions like
 /// `xmppUsername` should also trip the matcher.
 fn attr_name_is_pii(attr_name: &[u8]) -> bool {
@@ -169,7 +169,7 @@ fn reader(xml: &[u8]) -> Reader<&[u8]> {
 /// The transform walks every `<contact>`, `<endpoint>`, and any element
 /// whose attributes contain a PII-bearing key (`callsign`, `phone`,
 /// `email`, `endpoint`, plus the broader IM/chat tokens listed in
-/// [`PII_CONTACT_ATTR_TOKENS`]). Matching attributes have their values
+/// `PII_CONTACT_ATTR_TOKENS`). Matching attributes have their values
 /// replaced with the empty byte sequence; the element shape, attribute
 /// order, and non-PII attributes are preserved byte-for-byte. Elements
 /// without PII attributes pass through unchanged.
@@ -184,7 +184,7 @@ fn reader(xml: &[u8]) -> Reader<&[u8]> {
 ///   redacted bytes.
 /// - **Attribute budget trip** — surfaces
 ///   [`MaskError::AttrBudgetExceeded`] when a single element packs
-///   more than [`ATTR_BUDGET`] attributes.
+///   more than `ATTR_BUDGET` attributes.
 ///
 /// # Errors
 ///

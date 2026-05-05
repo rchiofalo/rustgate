@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc db2080efd3f0e2a72cd46b6ac9c6dff6dfe6ee194d391c87320a28e3b6b6ba19 # shrinks to msg = RoutableMessage { source: Identity { cn: "alice", fingerprint: "abc123", groups: {}, tenant: None, spiffe_id: None, attributes: {} }, destination: Broadcast, payload: b"<event uid=\"u1\" type=\"a-f-G-U-C\" start=\"2024-01-01T00:00:00Z\" stale=\"2024-01-01T00:05:00Z\"><point lat=\"38.8977\" lon=\"-77.0365\" hae=\"125.4\"/></event>", metadata: Metadata { received_at: SystemTime { tv_sec: 0, tv_nsec: 0 }, source_protocol: "cot", message_type: Position, ttl: None } }, a = [MaskPoint], b = [DegradePosition { precision_meters: 1000 }]
+cc 76def3dbe42af9bb915e4d8c141bfa4379dc642395068c69e31c00bfe79903da # shrinks to msg = RoutableMessage { source: Identity { cn: "alice", fingerprint: "abc123", groups: {}, tenant: None, spiffe_id: None, attributes: {} }, destination: Broadcast, payload: b"<event uid=\"u1\" type=\"a-f-G-U-C\" start=\"2024-01-01T00:00:00Z\" stale=\"2024-01-01T00:05:00Z\"><point lat=\"38.8977\" lon=\"-77.0365\" hae=\"125.4\"/></event>", metadata: Metadata { received_at: SystemTime { tv_sec: 0, tv_nsec: 0 }, source_protocol: "cot", message_type: Position, ttl: None } }, obligations = [DegradePosition { precision_meters: 1000 }]
