@@ -88,7 +88,9 @@ opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 schemars = { workspace = true, optional = true }
+rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
+tokio-rustls = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "signal", "fs", "macros", "time", "net"] }
 tokio-util = { workspace = true }
 bytes = { workspace = true }

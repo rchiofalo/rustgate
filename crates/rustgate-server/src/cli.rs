@@ -1586,27 +1586,77 @@ pub(crate) enum Command {
     /// and before the server loads any TLS material: it inspects the
     /// CLI schema itself, so the output is a complete template
     /// suitable as a starting point for a new deployment.
-    GenerateConfig,
+    GenerateConfig {
+        /// Emit only the bare-essentials configuration: TLS material,
+        /// bind address, framing / encoding, and connection limits.
+        /// Skip every other option, leaving the server to apply its
+        /// defaults. Use this for first-time deployments and re-run
+        /// without `--minimal` to see every available knob.
+        #[arg(long)]
+        minimal: bool,
+    },
     /// Probe a single remote endpoint for reachability, without
     /// starting the server. Intended as a pre-flight for cron /
     /// Ansible / systemd `ExecStartPre=` so firewall, DNS, or
     /// service-outage problems are caught before `rustgate` itself
     /// tries to start.
     ///
-    /// Exit codes: `0` = connected, `1` = refused, `2` = timeout,
-    /// `3` = other error (DNS, bad URL, unexpected I/O). Exactly one
-    /// of the `--tcp`, `--nats`, or `--http` flags must be supplied.
+    /// Exactly one of the `--tcp`, `--tls`, `--nats`, or `--http`
+    /// flags must be supplied.
+    ///
+    /// TCP / NATS / HTTP exit codes: `0` = connected, `1` = refused,
+    /// `2` = timeout, `3` = other error (DNS, bad URL, unexpected I/O).
+    ///
+    /// TLS exit codes (separate ladder, three values only):
+    /// `0` = handshake succeeded and peer cert healthy, `1` = handshake
+    /// failed for any reason (network, cert validation, timeout),
+    /// `2` = handshake succeeded but peer cert expires within
+    /// `--peer-cert-warn-days`.
     TestConnection {
         /// Plain TCP probe — three-way handshake only, no bytes sent.
         /// Works against every listener type (TLS, WebSocket, MQTT,
         /// plaintext, enrollment, metrics) without risking a malformed
         /// application-layer probe.
+        #[arg(long, value_name = "HOST:PORT", conflicts_with = "tls")]
+        tcp: Option<String>,
+        /// TLS handshake probe — TCP connect plus a full mTLS handshake
+        /// using the supplied client cert / key / CA. Reports the
+        /// negotiated cipher and the peer certificate's `notAfter`.
+        /// Triggers exit code `2` (separate from the TCP/NATS/HTTP
+        /// ladder) when the peer cert is valid but expires within
+        /// `--peer-cert-warn-days`.
         #[arg(
             long,
             value_name = "HOST:PORT",
-            conflicts_with_all = ["nats", "http"],
+            conflicts_with = "tcp",
+            requires_all = ["target_cert", "target_key", "target_ca"],
         )]
-        tcp: Option<String>,
+        tls: Option<String>,
+        /// PEM-encoded client certificate chain for the TLS probe.
+        /// Required when `--tls` is supplied.
+        #[arg(long, value_name = "PATH", required = false)]
+        target_cert: Option<std::path::PathBuf>,
+        /// PEM-encoded client private key for the TLS probe.
+        /// Required when `--tls` is supplied.
+        #[arg(long, value_name = "PATH", required = false)]
+        target_key: Option<std::path::PathBuf>,
+        /// PEM-encoded CA bundle the TLS probe trusts. Required when
+        /// `--tls` is supplied.
+        #[arg(long, value_name = "PATH", required = false)]
+        target_ca: Option<std::path::PathBuf>,
+        /// Server name to send in the TLS SNI extension and to
+        /// validate the peer certificate against. Defaults to the host
+        /// part of `--tls`.
+        #[arg(long, value_name = "NAME")]
+        server_name: Option<String>,
+        /// Days before the peer certificate's `notAfter` at which the
+        /// TLS probe reports `near_expiry` (exit code `2`). Only
+        /// applied when `--tls` is supplied.
+        #[arg(
+            long,
+            default_value_t = crate::diagnostics::test_connection::DEFAULT_PEER_CERT_WARN_DAYS,
+        )]
+        peer_cert_warn_days: u32,
         /// NATS probe — TCP connect plus a read of the server's
         /// `INFO` greeting. Catches listeners that accept TCP but
         /// reject NATS (misconfigured auth, wrong service on the
@@ -1615,7 +1665,7 @@ pub(crate) enum Command {
         #[arg(
             long,
             value_name = "URL",
-            conflicts_with_all = ["tcp", "http"],
+            conflicts_with_all = ["tcp", "tls"],
         )]
         nats: Option<String>,
         /// HTTP probe — send `GET /` and classify by status line.
@@ -1624,7 +1674,7 @@ pub(crate) enum Command {
         #[arg(
             long,
             value_name = "URL",
-            conflicts_with_all = ["tcp", "nats"],
+            conflicts_with_all = ["tcp", "tls"],
         )]
         http: Option<String>,
         /// Overall timeout for the probe (seconds). Applies to the

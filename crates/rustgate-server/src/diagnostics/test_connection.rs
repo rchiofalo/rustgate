@@ -18,6 +18,7 @@
 //! | Flag | Behaviour | Feature gate |
 //! |------|-----------|--------------|
 //! | `--tcp HOST:PORT` | TCP three-way handshake only | always |
+//! | `--tls HOST:PORT` | TCP + mTLS handshake, reports cipher and peer cert | always |
 //! | `--nats nats://HOST:PORT` | TCP + read NATS `INFO` line | `nats` |
 //! | `--http URL` | HTTP `GET` and read the status line | `http` |
 //!
@@ -27,10 +28,22 @@
 //! useful when a TCP accept happens but the application layer rejects
 //! (common with NATS when authentication is misconfigured).
 //!
+//! The `--tls` probe drives a full mTLS handshake using the same
+//! `--cert` / `--key` / `--ca` material the server itself takes, so
+//! operators can verify "would `rustgate` itself be able to talk to
+//! this peer?" without bringing the listener up. Unlike the other
+//! probes, a successful TLS handshake also reports the negotiated
+//! cipher, the peer certificate subject, and the peer certificate's
+//! `notAfter` — and uses a separate three-code exit ladder (see below)
+//! that surfaces near-expiry as a distinct outcome.
+//!
 //! # Exit codes
 //!
-//! The exit codes form a monotonic severity ladder that downstream
-//! scripts can branch on without parsing the report body:
+//! Two ladders exist, one for the TCP/NATS/HTTP probes and one for the
+//! TLS probe. Downstream scripts must branch on `target_type` first and
+//! then on the exit code.
+//!
+//! TCP / NATS / HTTP ladder:
 //!
 //! | Code | Meaning |
 //! |------|---------|
@@ -42,18 +55,31 @@
 //! Exit code `3` is the "something is off on this host" bucket and
 //! should be investigated before rerunning.
 //!
+//! TLS ladder (intentionally smaller — operator-facing pre-flight):
+//!
+//! | Code | Meaning |
+//! |------|---------|
+//! | `0`  | Handshake succeeded and peer certificate is healthy |
+//! | `1`  | Handshake failed for any reason (network, cert validation, timeout, etc.) |
+//! | `2`  | Handshake succeeded but peer certificate expires within `--peer-cert-warn-days` (default 30 days) |
+//!
 //! # JSON contract
 //!
 //! The top-level keys (`target_type`, `target`, `timeout_seconds`,
 //! `status`, `elapsed_ms`, `error`) and the `status` values
-//! (`connected`, `refused`, `timeout`, `error`) are pinned by the unit
-//! tests in this module. Additions land at the end; renames or removals
-//! are breaking.
+//! (`connected`, `refused`, `timeout`, `error`, `near_expiry`) are
+//! pinned by the unit tests in this module. The TLS probe adds five
+//! optional fields (`negotiated_cipher`, `tls_version`,
+//! `peer_subject_cn`, `peer_not_after`, `peer_days_until_expiry`) that
+//! only serialize when present, so existing tcp/nats/http consumers
+//! continue to see exactly the original key set. Additions land at the
+//! end; renames or removals are breaking.
 //!
 //! Addresses Finding F-181 (issue #900).
 
 use std::fmt::Write as _;
 use std::io::ErrorKind;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -67,11 +93,19 @@ use tokio::time::timeout;
 /// wait on a stuck session.
 pub(crate) const DEFAULT_TIMEOUT_SECS: u64 = 5;
 
+/// Default `notAfter` warning window for the TLS probe (days). A peer
+/// cert expiring sooner than this triggers exit code `2` even when
+/// the handshake itself succeeded — gives an operator running the
+/// pre-flight from cron a head-up before rotation actually breaks
+/// the connection.
+pub(crate) const DEFAULT_PEER_CERT_WARN_DAYS: u32 = 30;
+
 /// Result of a single connection attempt.
 ///
-/// `connected`, `refused`, `timeout`, and `error` are the only four
-/// values this enum serializes to — kept deliberately small so
-/// downstream jq/grep scripts can pattern-match on a single string.
+/// `connected`, `refused`, `timeout`, `error`, and `near_expiry` are
+/// the only five values this enum serializes to — kept deliberately
+/// small so downstream jq/grep scripts can pattern-match on a single
+/// string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ProbeStatus {
@@ -84,19 +118,30 @@ pub(crate) enum ProbeStatus {
     Timeout,
     /// Any other failure (DNS, bad target format, unexpected I/O).
     Error,
+    /// TLS handshake succeeded but the peer certificate's `notAfter`
+    /// lands within the warning window. The connection is usable today
+    /// but a rotation is due. Only emitted by the TLS probe.
+    NearExpiry,
 }
 
 impl ProbeStatus {
     /// Map each status to the exit code documented at the top of the
-    /// module. Kept here (rather than on the `Report`) so tests can
-    /// pin the ladder independently of whichever status happened to
-    /// be produced by the test clock.
+    /// module *for the TCP / NATS / HTTP ladder*. The TLS probe uses a
+    /// separate ladder via [`tls_exit_code`] because its set of
+    /// possible outcomes is intentionally smaller. Kept here (rather
+    /// than on the `Report`) so tests can pin the ladder independently
+    /// of whichever status happened to be produced by the test clock.
     fn exit_code(self) -> i32 {
         match self {
             ProbeStatus::Connected => 0,
             ProbeStatus::Refused => 1,
             ProbeStatus::Timeout => 2,
             ProbeStatus::Error => 3,
+            // `NearExpiry` is a TLS-only outcome that does not appear
+            // in the TCP/NATS/HTTP ladder. If it ever leaks here (a
+            // future probe emitting it), surface it as the same
+            // generic-error bucket so the script-side contract holds.
+            ProbeStatus::NearExpiry => 3,
         }
     }
 
@@ -106,19 +151,37 @@ impl ProbeStatus {
             ProbeStatus::Refused => "refused",
             ProbeStatus::Timeout => "timeout",
             ProbeStatus::Error => "error",
+            ProbeStatus::NearExpiry => "near_expiry",
         }
+    }
+}
+
+/// Exit-code ladder for the TLS probe. Kept separate from the
+/// per-`ProbeStatus` mapping so the TCP/NATS/HTTP ladder stays
+/// monotonically Connected→Refused→Timeout→Error and the TLS
+/// near-expiry signal does not collide with the existing meaning of
+/// exit code `2` (timeout) for those probes.
+fn tls_exit_code(status: ProbeStatus) -> i32 {
+    match status {
+        ProbeStatus::Connected => 0,
+        ProbeStatus::NearExpiry => 2,
+        // Every other failure mode rolls up into a single "handshake
+        // did not produce a usable connection" code. Operators get the
+        // detail from the report's `error` field.
+        ProbeStatus::Refused | ProbeStatus::Timeout | ProbeStatus::Error => 1,
     }
 }
 
 /// Which kind of target is being probed. The JSON value is used both
 /// by the operator (to see at a glance what kind of check ran) and by
-/// downstream tooling to know which fields to expect — currently they
-/// are identical across target types, but leaving a discriminant in
-/// the payload makes it forward-compatible.
+/// downstream tooling to know which fields to expect — the TLS variant
+/// adds `negotiated_cipher` / `peer_subject_cn` / etc. that the other
+/// variants do not produce, so jq scripts must branch on this discriminant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TargetType {
     Tcp,
+    Tls,
     #[cfg(feature = "nats")]
     Nats,
     #[cfg(feature = "http")]
@@ -129,6 +192,7 @@ impl TargetType {
     fn as_str(self) -> &'static str {
         match self {
             TargetType::Tcp => "tcp",
+            TargetType::Tls => "tls",
             #[cfg(feature = "nats")]
             TargetType::Nats => "nats",
             #[cfg(feature = "http")]
@@ -139,7 +203,13 @@ impl TargetType {
 
 /// The report emitted by a single run. Structure is the public JSON
 /// contract — see the module docs. `error` is `Some` whenever `status`
-/// is not `connected`; `None` on success.
+/// is not `connected` (or `near_expiry`); `None` on success.
+///
+/// The five TLS-specific fields at the bottom of the struct only
+/// serialize when populated (the TLS probe is the only producer). For
+/// every other target type they are absent from the JSON output, so the
+/// existing TCP/NATS/HTTP key set stays exactly as it was before #900
+/// gained the TLS variant.
 #[derive(Debug, Serialize)]
 pub(crate) struct ConnReport {
     pub(crate) target_type: TargetType,
@@ -151,6 +221,23 @@ pub(crate) struct ConnReport {
     /// but feels slow.
     pub(crate) elapsed_ms: u128,
     pub(crate) error: Option<String>,
+    /// IANA name of the cipher rustls negotiated. `Some` after a
+    /// successful TLS handshake, `None` everywhere else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) negotiated_cipher: Option<String>,
+    /// TLS protocol version (e.g. `TLSv1.3`). Same population rules as
+    /// `negotiated_cipher`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) tls_version: Option<String>,
+    /// Common Name pulled from the peer (server) certificate Subject.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) peer_subject_cn: Option<String>,
+    /// RFC 3339 string of the peer cert's `notAfter`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) peer_not_after: Option<String>,
+    /// Days until the peer cert's `notAfter`. Negative if expired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) peer_days_until_expiry: Option<i64>,
 }
 
 /// Enum driving [`run`] — the CLI layer translates its mutually
@@ -160,10 +247,34 @@ pub(crate) struct ConnReport {
 #[derive(Debug)]
 pub(crate) enum Target {
     Tcp(String),
+    Tls(TlsTarget),
     #[cfg(feature = "nats")]
     Nats(String),
     #[cfg(feature = "http")]
     Http(String),
+}
+
+/// All inputs the TLS handshake probe needs. Bundled into a struct so
+/// the [`Target`] variant stays a single name and the CLI plumbing
+/// stays linear when more knobs are added (e.g. SNI override, cipher
+/// preference) without touching every probe site.
+#[derive(Debug)]
+pub(crate) struct TlsTarget {
+    /// `host:port` to dial.
+    pub(crate) addr: String,
+    /// Server name to send in the TLS SNI extension and to validate
+    /// the peer certificate against.
+    pub(crate) server_name: String,
+    /// PEM-encoded client certificate chain.
+    pub(crate) cert_pem: Vec<u8>,
+    /// PEM-encoded client private key. Wrapped at the call site (in
+    /// [`run`]) so the bytes here are already wiped on drop.
+    pub(crate) key_pem: zeroize::Zeroizing<Vec<u8>>,
+    /// PEM-encoded CA bundle used to verify the peer.
+    pub(crate) ca_pem: Vec<u8>,
+    /// Number of days before the peer cert's `notAfter` at which the
+    /// probe should report `near_expiry` (exit code `2`).
+    pub(crate) warn_days: u32,
 }
 
 /// CLI entry point. Runs the probe, prints the report, and returns the
@@ -195,6 +306,7 @@ pub(crate) fn run(target: Target, timeout_secs: u64, json: bool) -> Result<i32> 
 pub(crate) async fn probe(target: Target, timeout_secs: u64) -> ConnReport {
     match target {
         Target::Tcp(addr) => probe_tcp(addr, timeout_secs).await,
+        Target::Tls(tls) => probe_tls(tls, timeout_secs).await,
         #[cfg(feature = "nats")]
         Target::Nats(url) => probe_nats(url, timeout_secs).await,
         #[cfg(feature = "http")]
@@ -230,6 +342,269 @@ async fn probe_tcp(addr: String, timeout_secs: u64) -> ConnReport {
         status,
         elapsed_ms: started.elapsed().as_millis(),
         error,
+        negotiated_cipher: None,
+        tls_version: None,
+        peer_subject_cn: None,
+        peer_not_after: None,
+        peer_days_until_expiry: None,
+    }
+}
+
+/// TLS handshake probe: TCP connect, drive the rustls client handshake
+/// to completion using operator-supplied client certificate / key / CA,
+/// and report the negotiated cipher and the peer certificate's
+/// `notAfter`.
+///
+/// Mirrors what the rustgate-server itself would do as an outbound
+/// federation peer or enrollment client, so a green run here means the
+/// listening side accepts our identity, our trust anchors validate
+/// theirs, and the link supports a mutually-acceptable cipher suite.
+/// A peer cert that is still valid today but lands within
+/// `warn_days` triggers `near_expiry` (exit code `2`) — the operator
+/// knows the connection works *now* but rotation is due.
+async fn probe_tls(target: TlsTarget, timeout_secs: u64) -> ConnReport {
+    let started = Instant::now();
+    let deadline = Duration::from_secs(timeout_secs);
+
+    // Build the rustls ClientConfig once, up front. Any error here is a
+    // "bad input" failure (malformed PEM, untrusted CA, etc.) and gets
+    // exit-code `1` via `tls_exit_code(Error)`.
+    let tls_config = match build_client_config(&target) {
+        Ok(cfg) => Arc::new(cfg),
+        Err(msg) => {
+            return tls_error_report(target, timeout_secs, msg, started);
+        }
+    };
+
+    let server_name_owned = target.server_name.clone();
+    let server_name: rustls::pki_types::ServerName<'static> =
+        match rustls::pki_types::ServerName::try_from(server_name_owned.as_str())
+            .map(|s| s.to_owned())
+        {
+            Ok(name) => name,
+            Err(e) => {
+                return tls_error_report(
+                    target,
+                    timeout_secs,
+                    format!("invalid --server-name {server_name_owned:?}: {e}"),
+                    started,
+                );
+            }
+        };
+
+    let warn_days = target.warn_days;
+    let addr = target.addr.clone();
+    let connector = tokio_rustls::TlsConnector::from(tls_config);
+
+    let fut = async {
+        let tcp = TcpStream::connect(&addr).await?;
+        rustgate_core::net::configure_tactical_socket(&tcp);
+        let stream = connector
+            .connect(server_name, tcp)
+            .await
+            .map_err(|e| std::io::Error::other(format!("tls handshake: {e}")))?;
+        Ok::<_, std::io::Error>(stream)
+    };
+
+    match timeout(deadline, fut).await {
+        Ok(Ok(stream)) => {
+            let (_tcp, conn) = stream.get_ref();
+            let cipher = conn
+                .negotiated_cipher_suite()
+                .map(|cs| format!("{:?}", cs.suite()));
+            let version = conn.protocol_version().map(|v| format!("{v:?}"));
+            let peer = conn
+                .peer_certificates()
+                .and_then(|certs| certs.first())
+                .map(|c| extract_peer_info(c.as_ref()));
+            let (peer_cn, peer_not_after, days_until) = match peer {
+                Some(Ok(info)) => (info.subject_cn, Some(info.not_after), Some(info.days_until)),
+                Some(Err(msg)) => {
+                    return tls_error_report(
+                        TlsTarget {
+                            addr: addr.clone(),
+                            ..target
+                        },
+                        timeout_secs,
+                        format!("peer cert parse: {msg}"),
+                        started,
+                    );
+                }
+                // No peer cert at all is highly unusual for a server
+                // that asked for client auth, but treat it as a hard
+                // failure rather than crashing the probe — the operator
+                // wants a precise error, not a panic.
+                None => {
+                    return tls_error_report(
+                        TlsTarget {
+                            addr: addr.clone(),
+                            ..target
+                        },
+                        timeout_secs,
+                        "peer presented no certificate".to_string(),
+                        started,
+                    );
+                }
+            };
+
+            let status = match days_until {
+                Some(d) if d < 0 => ProbeStatus::Error,
+                Some(d) if d < i64::from(warn_days) => ProbeStatus::NearExpiry,
+                _ => ProbeStatus::Connected,
+            };
+            let error = if matches!(status, ProbeStatus::NearExpiry) {
+                Some(format!(
+                    "peer certificate expires in {} days (warn threshold {warn_days})",
+                    days_until.unwrap_or(0)
+                ))
+            } else if matches!(status, ProbeStatus::Error) {
+                Some(format!(
+                    "peer certificate already expired ({} days ago)",
+                    -days_until.unwrap_or(0)
+                ))
+            } else {
+                None
+            };
+
+            ConnReport {
+                target_type: TargetType::Tls,
+                target: addr,
+                timeout_seconds: timeout_secs,
+                status,
+                elapsed_ms: started.elapsed().as_millis(),
+                error,
+                negotiated_cipher: cipher,
+                tls_version: version,
+                peer_subject_cn: peer_cn,
+                peer_not_after,
+                peer_days_until_expiry: days_until,
+            }
+        }
+        Ok(Err(e)) => {
+            let (status, err) = classify_io_error(&e);
+            ConnReport {
+                target_type: TargetType::Tls,
+                target: addr,
+                timeout_seconds: timeout_secs,
+                status,
+                elapsed_ms: started.elapsed().as_millis(),
+                error: err,
+                negotiated_cipher: None,
+                tls_version: None,
+                peer_subject_cn: None,
+                peer_not_after: None,
+                peer_days_until_expiry: None,
+            }
+        }
+        Err(_) => ConnReport {
+            target_type: TargetType::Tls,
+            target: addr,
+            timeout_seconds: timeout_secs,
+            status: ProbeStatus::Timeout,
+            elapsed_ms: started.elapsed().as_millis(),
+            error: Some(format!("TLS handshake timeout after {timeout_secs}s")),
+            negotiated_cipher: None,
+            tls_version: None,
+            peer_subject_cn: None,
+            peer_not_after: None,
+            peer_days_until_expiry: None,
+        },
+    }
+}
+
+/// Build a `rustls::ClientConfig` from PEM material in [`TlsTarget`].
+/// Errors are returned as plain strings so they can flow into the
+/// report's `error` field without dragging more types through the
+/// public surface.
+fn build_client_config(target: &TlsTarget) -> Result<rustls::ClientConfig, String> {
+    let certs = rustgate_core::pem::parse_certs(&target.cert_pem)
+        .map_err(|e| format!("client cert PEM: {e}"))?;
+    let key = rustgate_core::pem::parse_key(&target.key_pem)
+        .map_err(|e| format!("client key PEM: {e}"))?;
+    let roots =
+        rustgate_core::pem::parse_ca_store(&target.ca_pem).map_err(|e| format!("CA PEM: {e}"))?;
+
+    rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(certs, key)
+        .map_err(|e| format!("rustls client config: {e}"))
+}
+
+/// Subset of peer certificate information that the TLS probe needs.
+struct PeerInfo {
+    subject_cn: Option<String>,
+    not_after: String,
+    days_until: i64,
+}
+
+/// Parse the peer certificate just enough to surface the Subject CN
+/// and `notAfter`. Reuses `x509-parser` so we get the same handling
+/// quirks (UTC vs Generalized time, unicode CN) as `cert-info`.
+fn extract_peer_info(der: &[u8]) -> Result<PeerInfo, String> {
+    use time::OffsetDateTime;
+    use time::format_description::well_known::Rfc3339;
+    use x509_parser::certificate::X509Certificate;
+    use x509_parser::oid_registry::OID_X509_COMMON_NAME;
+    use x509_parser::prelude::FromDer;
+
+    let (_, cert) = X509Certificate::from_der(der).map_err(|e| format!("parse: {e}"))?;
+    let subject_cn = cert
+        .subject()
+        .iter_common_name()
+        .next()
+        .and_then(|cn| cn.attr_value().as_str().ok().map(str::to_owned))
+        // Fallback: walk the RDN sequence by OID. A CN with non-printable
+        // bytes will land here even when iter_common_name() succeeds —
+        // both paths produce the same `Option<String>` so the JSON shape
+        // is stable.
+        .or_else(|| {
+            cert.subject()
+                .iter_by_oid(&OID_X509_COMMON_NAME)
+                .next()
+                .and_then(|attr| attr.attr_value().as_str().ok().map(str::to_owned))
+        });
+
+    let not_after_ts = cert.validity().not_after.timestamp();
+    let not_after_dt = OffsetDateTime::from_unix_timestamp(not_after_ts)
+        .map_err(|e| format!("notAfter timestamp: {e}"))?;
+    let not_after = not_after_dt
+        .format(&Rfc3339)
+        .map_err(|e| format!("format notAfter: {e}"))?;
+    let now = OffsetDateTime::now_utc();
+    let delta = not_after_dt - now;
+    // Whole days, rounded toward zero. A cert that expires in 23 hours
+    // reports `0` days until expiry, which still trips the warn ladder
+    // (any positive `warn_days` is greater than `0`).
+    let days_until = delta.whole_days();
+
+    Ok(PeerInfo {
+        subject_cn,
+        not_after,
+        days_until,
+    })
+}
+
+/// Build a `ProbeStatus::Error` report for a TLS probe that failed
+/// before reaching the network. Mirrors `error_report` but for the TLS
+/// path (which has its own struct of inputs).
+fn tls_error_report(
+    target: TlsTarget,
+    timeout_seconds: u64,
+    msg: String,
+    started: Instant,
+) -> ConnReport {
+    ConnReport {
+        target_type: TargetType::Tls,
+        target: target.addr,
+        timeout_seconds,
+        status: ProbeStatus::Error,
+        elapsed_ms: started.elapsed().as_millis(),
+        error: Some(msg),
+        negotiated_cipher: None,
+        tls_version: None,
+        peer_subject_cn: None,
+        peer_not_after: None,
+        peer_days_until_expiry: None,
     }
 }
 
@@ -287,6 +662,11 @@ async fn probe_nats(url: String, timeout_secs: u64) -> ConnReport {
         status,
         elapsed_ms: started.elapsed().as_millis(),
         error,
+        negotiated_cipher: None,
+        tls_version: None,
+        peer_subject_cn: None,
+        peer_not_after: None,
+        peer_days_until_expiry: None,
     }
 }
 
@@ -341,6 +721,11 @@ async fn probe_http(url: String, timeout_secs: u64) -> ConnReport {
         status,
         elapsed_ms: started.elapsed().as_millis(),
         error,
+        negotiated_cipher: None,
+        tls_version: None,
+        peer_subject_cn: None,
+        peer_not_after: None,
+        peer_days_until_expiry: None,
     }
 }
 
@@ -405,6 +790,11 @@ fn error_report(
         status: ProbeStatus::Error,
         elapsed_ms: started.elapsed().as_millis(),
         error: Some(msg),
+        negotiated_cipher: None,
+        tls_version: None,
+        peer_subject_cn: None,
+        peer_not_after: None,
+        peer_days_until_expiry: None,
     }
 }
 
@@ -468,8 +858,16 @@ fn parse_http_url(url: &str) -> Result<ParsedHttp, String> {
 
 /// Map a report to the exit code contract documented in the module
 /// docs. Public (crate-scoped) for tests.
+///
+/// Branches on `target_type` because the TLS probe uses a smaller
+/// three-code ladder (`0` healthy, `1` failed, `2` near-expiry) where
+/// the others use the original four-code ladder (`0` connected, `1`
+/// refused, `2` timeout, `3` error).
 pub(crate) fn exit_code(report: &ConnReport) -> i32 {
-    report.status.exit_code()
+    match report.target_type {
+        TargetType::Tls => tls_exit_code(report.status),
+        _ => report.status.exit_code(),
+    }
 }
 
 /// Human-readable rendering of the report. Emphasises the status line
@@ -485,6 +883,20 @@ pub(crate) fn render_human(report: &ConnReport) -> String {
     let _ = writeln!(out, "Timeout: {}s", report.timeout_seconds);
     let _ = writeln!(out, "Elapsed: {}ms", report.elapsed_ms);
     let _ = writeln!(out, "Status:  {}", report.status.as_str());
+    if let Some(version) = &report.tls_version {
+        let _ = writeln!(out, "Version: {version}");
+    }
+    if let Some(cipher) = &report.negotiated_cipher {
+        let _ = writeln!(out, "Cipher:  {cipher}");
+    }
+    if let Some(cn) = &report.peer_subject_cn {
+        let _ = writeln!(out, "Peer CN: {cn}");
+    }
+    if let Some(not_after) = &report.peer_not_after
+        && let Some(days) = report.peer_days_until_expiry
+    {
+        let _ = writeln!(out, "Expires: {not_after} (in {days} days)");
+    }
     if let Some(err) = &report.error {
         let _ = writeln!(out, "Error:   {err}");
     }
@@ -561,16 +973,35 @@ mod tests {
 
     // --- human + JSON rendering ---
 
+    /// Build a minimal `ConnReport` for the TCP/NATS/HTTP tests with the
+    /// five TLS-only fields all set to `None`. Centralised here so the
+    /// existing tests don't have to spell every field out — additions
+    /// to `ConnReport` for future probes only require updating this
+    /// helper, not every test body.
+    fn empty_tcp_report(
+        target: &str,
+        status: ProbeStatus,
+        error: Option<String>,
+        elapsed_ms: u128,
+    ) -> ConnReport {
+        ConnReport {
+            target_type: TargetType::Tcp,
+            target: target.to_string(),
+            timeout_seconds: 5,
+            status,
+            elapsed_ms,
+            error,
+            negotiated_cipher: None,
+            tls_version: None,
+            peer_subject_cn: None,
+            peer_not_after: None,
+            peer_days_until_expiry: None,
+        }
+    }
+
     #[tokio::test]
     async fn render_human_includes_all_headline_fields() {
-        let report = ConnReport {
-            target_type: TargetType::Tcp,
-            target: "example.com:443".to_string(),
-            timeout_seconds: 5,
-            status: ProbeStatus::Connected,
-            elapsed_ms: 42,
-            error: None,
-        };
+        let report = empty_tcp_report("example.com:443", ProbeStatus::Connected, None, 42);
         let rendered = render_human(&report);
         assert!(rendered.contains("example.com:443"));
         assert!(rendered.contains("(tcp)"));
@@ -582,14 +1013,12 @@ mod tests {
 
     #[tokio::test]
     async fn render_human_includes_error_line_when_present() {
-        let report = ConnReport {
-            target_type: TargetType::Tcp,
-            target: "nope:1".to_string(),
-            timeout_seconds: 5,
-            status: ProbeStatus::Refused,
-            elapsed_ms: 1,
-            error: Some("connection refused".to_string()),
-        };
+        let report = empty_tcp_report(
+            "nope:1",
+            ProbeStatus::Refused,
+            Some("connection refused".to_string()),
+            1,
+        );
         let rendered = render_human(&report);
         assert!(rendered.contains("Status:  refused"));
         assert!(rendered.contains("Error:   connection refused"));
@@ -597,14 +1026,7 @@ mod tests {
 
     #[test]
     fn json_contract_is_stable() {
-        let report = ConnReport {
-            target_type: TargetType::Tcp,
-            target: "example.com:443".to_string(),
-            timeout_seconds: 5,
-            status: ProbeStatus::Connected,
-            elapsed_ms: 42,
-            error: None,
-        };
+        let report = empty_tcp_report("example.com:443", ProbeStatus::Connected, None, 42);
         let json = serde_json::to_value(&report).unwrap();
         // Pin the key set so accidental renames break the test, not
         // downstream tooling.
