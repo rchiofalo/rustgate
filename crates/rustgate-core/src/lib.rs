@@ -34,6 +34,7 @@ pub mod constants;
 pub mod crypto;
 pub mod egress;
 pub mod encrypted;
+pub mod entity;
 pub mod error;
 pub mod identity;
 pub mod masking;
