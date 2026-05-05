@@ -21,6 +21,7 @@
 
 pub mod cdi;
 pub mod delta;
+pub mod entity;
 pub mod mask;
 #[cfg(feature = "metrics")]
 pub mod metrics;
