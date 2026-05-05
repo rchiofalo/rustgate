@@ -105,6 +105,11 @@ pub mod quota;
 
 mod plaintext;
 pub mod udp;
+pub mod udp_multicast;
 
 pub use plaintext::{PlaintextIdentityConfig, PlaintextListener, PlaintextSession};
 pub use udp::{CidrPrefix, UdpInput, UdpInputConfig};
+pub use udp_multicast::{
+    DEFAULT_MAX_BPS as DEFAULT_MULTICAST_MAX_BPS, DEFAULT_MULTICAST_TTL, MulticastConfig,
+    MulticastGroup, OnMulticastForward, SOURCE_UDP_MULTICAST,
+};

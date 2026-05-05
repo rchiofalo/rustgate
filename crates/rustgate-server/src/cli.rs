@@ -856,6 +856,68 @@ pub(crate) struct Cli {
     #[arg(long, default_value = "1024", env = "RUSTGATE_UDP_MAX_IDENTITIES", value_parser = parse_nonzero_usize)]
     pub(crate) udp_max_identities: usize,
 
+    /// Comma-separated IPv4 multicast `host:port` groups to join for CoT
+    /// ingress (e.g. `"239.2.3.1:6969,239.2.3.1:17012"`). Empty (the
+    /// default) disables multicast. Closes #861.
+    ///
+    /// ATAK devices on tactical mesh radio networks (MPU5, Silvus) use
+    /// multicast for peer-to-peer SA. Setting this lets the server
+    /// participate in that fabric — datagrams are routed through the
+    /// standard router and tagged with `source_protocol = "udp-multicast"`.
+    #[arg(long, env = "RUSTGATE_UDP_MULTICAST_GROUPS")]
+    pub(crate) udp_multicast_groups: Option<String>,
+
+    /// IPv4 address of the interface to bind for multicast join.
+    /// Defaults to `0.0.0.0` (all interfaces). Operators on hosts with
+    /// multiple physical NICs can pin the multicast listener to one
+    /// interface.
+    #[arg(
+        long,
+        default_value = "0.0.0.0",
+        env = "RUSTGATE_UDP_MULTICAST_INTERFACE"
+    )]
+    pub(crate) udp_multicast_interface: String,
+
+    /// Enable `IP_MULTICAST_LOOP` on inbound + egress sockets. Default
+    /// `false` — tactical deployments don't want loopback. Set to
+    /// `true` only for development on a single host.
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "RUSTGATE_UDP_MULTICAST_LOOP",
+        action = clap::ArgAction::Set
+    )]
+    pub(crate) udp_multicast_loop: bool,
+
+    /// `IP_MULTICAST_TTL`. Default `1` — same subnet only, the safe
+    /// default for mesh radio. Operators with a routed multicast
+    /// fabric can raise this.
+    #[arg(long, default_value_t = 1, env = "RUSTGATE_UDP_MULTICAST_TTL")]
+    pub(crate) udp_multicast_ttl: u32,
+
+    /// Re-broadcast every routed CoT message back out to the configured
+    /// multicast groups. Default off — when enabled, the router fans
+    /// every CoT-shaped `RoutableMessage` to the multicast egress
+    /// socket subject to `--udp-multicast-max-bps`.
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "RUSTGATE_UDP_MULTICAST_REBROADCAST",
+        action = clap::ArgAction::Set
+    )]
+    pub(crate) udp_multicast_rebroadcast: bool,
+
+    /// Maximum outbound multicast egress bytes per second. Default
+    /// 1_048_576 (1 MiB/s). Tokens are 1 byte each; a full datagram of
+    /// `N` bytes consumes `N` tokens. The bucket starts full so the
+    /// first 1-second burst is unrestricted.
+    #[arg(
+        long,
+        default_value_t = 1_048_576,
+        env = "RUSTGATE_UDP_MULTICAST_MAX_BPS"
+    )]
+    pub(crate) udp_multicast_max_bps: u64,
+
     /// Default CN for plaintext (TCP/UDP) clients.
     #[arg(long, default_value = "anonymous", env = "RUSTGATE_PLAINTEXT_CN")]
     pub(crate) plaintext_cn: String,
@@ -2022,6 +2084,12 @@ define_config_file! {
     udp_rate_limit: u32,
     udp_allowed_cidrs: Option<String>,
     udp_max_identities: usize,
+    udp_multicast_groups: Option<String>,
+    udp_multicast_interface: String,
+    udp_multicast_loop: bool,
+    udp_multicast_ttl: u32,
+    udp_multicast_rebroadcast: bool,
+    udp_multicast_max_bps: u64,
     plaintext_cn: String,
     plaintext_group: String,
     federation_v1_bind: Option<String>,

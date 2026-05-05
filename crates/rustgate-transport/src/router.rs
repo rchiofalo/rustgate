@@ -1091,6 +1091,14 @@ pub struct Router {
     /// [`rustgate_core::audit::message_dropped`]. Hot-reloadable via
     /// `ArcSwap`. Closes #854.
     on_message_dropped: ArcSwap<Option<OnMessageDropped>>,
+    /// Optional callback fired once per [`Router::route_for_egress`]
+    /// call after the message is admitted and the egress envelope is
+    /// final. Wired by the server binary behind
+    /// `--udp-multicast-rebroadcast` to feed the
+    /// `rustgate_transport::udp_multicast` egress task. Hot-reloadable
+    /// via `ArcSwap` so the operator can flip rebroadcast at runtime
+    /// without restarting the listener. Default `None`. Closes #861.
+    on_multicast_forward: ArcSwap<Option<crate::udp_multicast::OnMulticastForward>>,
 }
 
 impl std::fmt::Debug for Router {
@@ -1143,6 +1151,10 @@ impl std::fmt::Debug for Router {
                 "on_message_dropped_installed",
                 &(**self.on_message_dropped.load()).is_some(),
             )
+            .field(
+                "on_multicast_forward_installed",
+                &(**self.on_multicast_forward.load()).is_some(),
+            )
             .finish()
     }
 }
@@ -1172,6 +1184,7 @@ impl Default for Router {
             on_authz_in_flight_changed: ArcSwap::from_pointee(None),
             on_message_delivered: ArcSwap::from_pointee(None),
             on_message_dropped: ArcSwap::from_pointee(None),
+            on_multicast_forward: ArcSwap::from_pointee(None),
         }
     }
 }
@@ -1214,6 +1227,7 @@ impl Router {
             on_authz_in_flight_changed: ArcSwap::from_pointee(None),
             on_message_delivered: ArcSwap::from_pointee(None),
             on_message_dropped: ArcSwap::from_pointee(None),
+            on_multicast_forward: ArcSwap::from_pointee(None),
         }
     }
 
@@ -1262,6 +1276,7 @@ impl Router {
             on_authz_in_flight_changed: ArcSwap::from_pointee(None),
             on_message_delivered: ArcSwap::from_pointee(None),
             on_message_dropped: ArcSwap::from_pointee(None),
+            on_multicast_forward: ArcSwap::from_pointee(None),
         }
     }
 
@@ -1313,6 +1328,7 @@ impl Router {
             on_authz_in_flight_changed: ArcSwap::from_pointee(None),
             on_message_delivered: ArcSwap::from_pointee(None),
             on_message_dropped: ArcSwap::from_pointee(None),
+            on_multicast_forward: ArcSwap::from_pointee(None),
         }
     }
 
@@ -1715,6 +1731,23 @@ impl Router {
     /// [`rustgate_core::audit::message_dropped`]. Closes #854.
     pub fn set_on_message_dropped(&self, cb: Option<OnMessageDropped>) {
         self.on_message_dropped.store(Arc::new(cb));
+    }
+
+    /// Install (or replace) the multicast-egress forwarding callback.
+    ///
+    /// When installed, the callback fires once per
+    /// [`Self::route_for_egress`] call that successfully admits and
+    /// fans out a [`RoutableMessage`]. Wired by the server binary
+    /// behind `--udp-multicast-rebroadcast` to push CoT-shaped
+    /// messages back out the UDP multicast egress socket. The
+    /// callback is responsible for its own per-target rate limiting
+    /// and CoT-shape detection — the router only knows it routed a
+    /// message and that the operator wants it observed.
+    ///
+    /// Pass `None` (the default) to disable rebroadcast without
+    /// restarting the routing pipeline. Closes #861.
+    pub fn set_on_multicast_forward(&self, cb: Option<crate::udp_multicast::OnMulticastForward>) {
+        self.on_multicast_forward.store(Arc::new(cb));
     }
 
     /// Internal helper — invoke the fanout callback if installed.
@@ -2226,7 +2259,22 @@ impl Router {
             .as_ref()
             .map(|gate| Arc::new(gate.acquire(msg.payload.len())));
 
-        self.route_inner(msg, permit).await
+        let routed = self.route_inner(msg, permit).await;
+
+        // Closes #861: fire the multicast rebroadcast callback for
+        // every successfully routed message. The callback decides
+        // whether to actually emit (CoT-shape filter, source-protocol
+        // echo guard, rate-bucket gate) — the router stays
+        // policy-agnostic. The hot path on the un-installed (default)
+        // build is a single `ArcSwap::load` + `is_none()` check.
+        if let Some(ref arc_msg) = routed {
+            let guard = self.on_multicast_forward.load();
+            if let Some(cb) = (**guard).as_ref() {
+                cb(Arc::clone(arc_msg));
+            }
+        }
+
+        routed
     }
 
     /// Inner routing logic, separated so [`Self::route_for_egress`] can

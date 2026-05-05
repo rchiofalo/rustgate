@@ -2121,6 +2121,63 @@ pub fn message_dropped(source_cn: &str, dest_cn: &str, msg_uid: &str, reason: &s
     );
 }
 
+/// Record that the UDP-multicast input listener joined a group.
+///
+/// Emitted by `rustgate_transport::udp_multicast` once per configured
+/// `(group, port)` after `tokio::net::UdpSocket::join_multicast_v4`
+/// succeeds. Operators can grep for this event to confirm the server is
+/// participating in tactical-mesh SA traffic, and a SIEM rule can flag
+/// an absence of the event at startup as a misconfiguration (the join
+/// can fail silently if the kernel refuses the request — e.g. when the
+/// configured interface lacks an IPv4 address). Closes #861.
+///
+/// `group` is the dotted-quad multicast address with port (e.g.
+/// `"239.2.3.1:6969"`); `interface` is the bind interface as configured
+/// by `--udp-multicast-interface` or the literal `"0.0.0.0"` for
+/// "all interfaces". Both `&str` arguments are sanitized at the audit
+/// boundary so an operator-supplied interface name cannot forge a log
+/// line via embedded control characters.
+pub fn udp_multicast_joined(group: &str, interface: &str) {
+    let group = s(group);
+    let interface = s(interface);
+    audit!(
+        "udp_multicast.joined",
+        group = %group,
+        interface = %interface,
+        action = "join",
+        result = "success"
+    );
+}
+
+/// Record that a routed CoT message was re-published to the configured
+/// UDP multicast group.
+///
+/// Emitted by `rustgate_transport::udp_multicast` once per outbound
+/// datagram on the optional rebroadcast path
+/// (`--udp-multicast-rebroadcast`). The audit gives operators a
+/// per-message trail of egress decisions distinct from the inbound-
+/// listener's `udp_multicast.joined` and from the per-message access
+/// log: SIEM rules monitoring exfil over multicast can correlate the
+/// `msg_uid` against the upstream `client.connected` event. Closes
+/// #861.
+///
+/// `group` is the dotted-quad multicast address with port; `msg_uid`
+/// is the CoT `uid="…"` attribute extracted from the payload (or empty
+/// for non-CoT shaped payloads, which the rebroadcast path does not
+/// emit but the field is sanitized anyway for defense in depth). Both
+/// fields cross the audit boundary via [`sanitize_for_log`].
+pub fn udp_multicast_publish(group: &str, msg_uid: &str) {
+    let group = s(group);
+    let msg_uid = s(msg_uid);
+    audit!(
+        "udp_multicast.publish",
+        group = %group,
+        uid = %msg_uid,
+        action = "publish",
+        result = "success"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -3737,6 +3794,75 @@ mod tests {
             assert!(
                 reason.contains('\u{FFFD}'),
                 "sanitized output must contain U+FFFD: {reason:?}"
+            );
+        }
+
+        #[test]
+        fn udp_multicast_joined_emits_documented_shape() {
+            // Closes #861. Pin the field set and the static
+            // action/result tokens so SIEM rules looking for
+            // `udp_multicast.joined` keep firing across refactors.
+            let snapshot = capture_audit(|| udp_multicast_joined("239.2.3.1:6969", "0.0.0.0"));
+            let event = parse_event(&snapshot, "udp_multicast.joined");
+            assert_eq!(event["fields"]["group"], "239.2.3.1:6969");
+            assert_eq!(event["fields"]["interface"], "0.0.0.0");
+            assert_eq!(event["fields"]["action"], "join");
+            assert_eq!(event["fields"]["result"], "success");
+        }
+
+        #[test]
+        fn udp_multicast_joined_sanitizes_interface_field() {
+            // Closes #861. An operator-supplied interface name is
+            // attacker-influenced via configuration; the audit boundary
+            // must replace control bytes with U+FFFD so a forged log
+            // line cannot be smuggled through `--udp-multicast-interface`.
+            let malicious_interface = "eth0\r\n[FORGED]";
+            let snapshot =
+                capture_audit(|| udp_multicast_joined("239.2.3.1:6969", malicious_interface));
+            let event = parse_event(&snapshot, "udp_multicast.joined");
+            let interface = event["fields"]["interface"]
+                .as_str()
+                .expect("interface must be a JSON string");
+            assert!(
+                !interface.contains('\n') && !interface.contains('\r'),
+                "control bytes must not survive sanitization: {interface:?}"
+            );
+            assert!(
+                interface.contains('\u{FFFD}'),
+                "sanitized output must contain U+FFFD: {interface:?}"
+            );
+        }
+
+        #[test]
+        fn udp_multicast_publish_emits_documented_shape() {
+            // Closes #861. Pin field shape for the rebroadcast egress
+            // audit trail.
+            let snapshot = capture_audit(|| udp_multicast_publish("239.2.3.1:6969", "ANDROID-1"));
+            let event = parse_event(&snapshot, "udp_multicast.publish");
+            assert_eq!(event["fields"]["group"], "239.2.3.1:6969");
+            assert_eq!(event["fields"]["uid"], "ANDROID-1");
+            assert_eq!(event["fields"]["action"], "publish");
+            assert_eq!(event["fields"]["result"], "success");
+        }
+
+        #[test]
+        fn udp_multicast_publish_sanitizes_uid_field() {
+            // Closes #861. CoT `uid="…"` is attacker-controlled — a
+            // hostile peer can craft a uid containing newlines or ANSI
+            // CSI sequences. The audit boundary must replace those.
+            let malicious_uid = "uid\x1b[31m[FORGED]";
+            let snapshot = capture_audit(|| udp_multicast_publish("239.2.3.1:6969", malicious_uid));
+            let event = parse_event(&snapshot, "udp_multicast.publish");
+            let uid = event["fields"]["uid"]
+                .as_str()
+                .expect("uid must be a JSON string");
+            assert!(
+                !uid.contains('\x1b'),
+                "ANSI CSI must not survive sanitization: {uid:?}"
+            );
+            assert!(
+                uid.contains('\u{FFFD}'),
+                "sanitized output must contain U+FFFD: {uid:?}"
             );
         }
     }

@@ -1635,6 +1635,15 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     let udp_shutdown =
         setup::start_udp(&cli, &router, &nats_publisher, &fed_forward, &replay_filter).await?;
 
+    // ── UDP multicast listener (closes #861) ───────────────────────
+    //
+    // ATAK on tactical mesh radio uses IPv4 multicast for SA. When
+    // `--udp-multicast-groups` is set, the listener joins each group,
+    // tags incoming datagrams with `source_protocol = "udp-multicast"`,
+    // and (if `--udp-multicast-rebroadcast` is on) re-emits routed CoT
+    // back out the egress socket subject to the configured BPS cap.
+    let udp_multicast_shutdown = setup::start_udp_multicast(&cli, &router).await?;
+
     // ── Management REST API ────────────────────────────────────────
     //
     // Registered only when `--mgmt-api-token-file` is supplied. Exposes
@@ -1945,6 +1954,9 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     }
     if let Some(handle) = udp_shutdown {
         stop_subsystem("udp", handle).await;
+    }
+    if let Some(handle) = udp_multicast_shutdown {
+        stop_subsystem("udp-multicast", handle).await;
     }
     if let Some(handle) = archive_rotation_handle {
         handle.abort();
