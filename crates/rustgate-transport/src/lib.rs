@@ -80,7 +80,10 @@ pub use hw_identity::{
     SignatureAlgorithm as HardwareSignatureAlgorithm,
 };
 pub use listener::{DEFAULT_MAX_HANDSHAKES, OnHandshakeDuration, OnHandshakeError, TlsListener};
-pub use quota::{DEFAULT_TENANT_KEY, QuotaConfig, TenantQuota, TenantQuotaTracker};
+pub use quota::{
+    DEFAULT_TENANT_KEY, OnTenantThroughputConsumed, OnTenantThroughputRejection, QuotaConfig,
+    TenantQuota, TenantQuotaTracker, TenantThroughputRejection,
+};
 pub use repeater::EmergencyRepeater;
 pub use replay::ReplayFilter;
 pub use router::{

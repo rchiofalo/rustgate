@@ -100,10 +100,14 @@ rustgate_core::on_callback!(
     /// the message was admitted into the routing pipeline. The single
     /// argument is one of the documented `reason` labels:
     /// `"no_subscribers"`, `"backpressure"`, `"acl_denied"`,
-    /// `"authz_denied"`, `"obligation_failed"`. Wired by the server binary
-    /// to feed the `rustgate_router_dropped_total{reason}` counter — the
+    /// `"authz_denied"`, `"obligation_failed"`,
+    /// `"tenant_throughput_exceeded"`. Wired by the server binary to
+    /// feed the `rustgate_router_dropped_total{reason}` counter — the
     /// same `reason` vocabulary the audit-log emits, so SIEM correlation
-    /// and Prometheus dashboards stay in lock-step. Closes #768.
+    /// and Prometheus dashboards stay in lock-step. The
+    /// `tenant_throughput_exceeded` label is emitted by the per-tenant
+    /// token bucket layer added in issue #883 sub-item 4.
+    /// Closes #768.
     pub OnDropped,
     &'static str
 );
@@ -2470,6 +2474,55 @@ impl Router {
                         send_obligations = outcome.obligations;
                         send_policy_id = engine.policy_id().to_owned();
                     }
+                }
+            }
+        }
+
+        // Per-tenant aggregate throughput cap (issue #883 sub-item 4).
+        // Runs *after* the Send-PEP allow above and *before* both
+        // `cache.store` and `apply_obligations`: a tenant-throttled
+        // drop must not enter the SA replay cache, must not pay the
+        // obligation actuation cost, and must not fan out to local
+        // recipients. Tenant key falls back to
+        // [`crate::quota::DEFAULT_TENANT_KEY`] when the source
+        // identity has no tenant — matching the existing
+        // connection-quota behaviour.
+        //
+        // Composition with the per-session throttle: the per-session
+        // bucket lives in `rustgate-server::session` and runs on the
+        // read side (decode → throttle.allow → push to router). Once
+        // a message reaches `route_inner` it has already passed the
+        // per-session bucket. The per-tenant bucket here is a
+        // strictly tighter cap on the aggregate of all sessions for
+        // the tenant; a message that passes both buckets is delivered
+        // exactly once.
+        {
+            let tracker_guard = self.quota_tracker.load();
+            if let Some(ref tracker) = **tracker_guard {
+                let tenant_key = msg
+                    .source
+                    .tenant
+                    .as_deref()
+                    .unwrap_or(crate::quota::DEFAULT_TENANT_KEY);
+                let bytes = msg.payload.len() as u64;
+                if let Err(rej) = tracker.try_acquire_tenant_tokens(tenant_key, bytes) {
+                    let uid = extract_cot_uid(&msg.payload);
+                    rustgate_core::audit::tenant_throughput_exceeded(
+                        tenant_key,
+                        uid,
+                        rej.requested,
+                        rej.available,
+                    );
+                    warn!(
+                        tenant = %tenant_key,
+                        source = %hash_cn(&msg.source.cn),
+                        requested = rej.requested,
+                        available = rej.available,
+                        "tenant aggregate throughput exceeded — dropping message"
+                    );
+                    emit_access(&msg, "tenant_throughput_exceeded");
+                    self.emit_dropped("tenant_throughput_exceeded");
+                    return None;
                 }
             }
         }
