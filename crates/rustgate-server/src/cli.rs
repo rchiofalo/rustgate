@@ -1701,6 +1701,42 @@ pub(crate) enum Command {
     /// runtime image. Issue #815, F-137.
     #[cfg(feature = "schema")]
     EmitSchema,
+    /// Capture an on-disk diagnostic snapshot of the server's locally
+    /// observable state: build metadata, the merged configuration with
+    /// all secret-bearing fields redacted, the configured CRL summary
+    /// (if any), and the last 100 lines of the audit log (if
+    /// configured). Intended for forensics and bug reports — the
+    /// command runs offline against the same `--config` the server
+    /// would consume, never connects to a remote endpoint, and never
+    /// writes secrets to its output. Closes #900.
+    DumpState {
+        /// Path to the TOML config file the running server uses. The
+        /// command merges flags + env + file the same way the server
+        /// would, so the snapshot reflects the actual effective config.
+        #[arg(long, value_name = "PATH")]
+        config: std::path::PathBuf,
+        /// Output format. `json` (the default) emits a stable
+        /// machine-readable document for tooling; `toml` emits a more
+        /// human-readable layout for ticket attachments.
+        #[arg(long, value_enum, default_value_t = DumpFormat::Json)]
+        format: DumpFormat,
+        /// Optional path to write the snapshot to. When omitted the
+        /// snapshot is written to stdout. The file is created with
+        /// owner-only permissions (`0o600` on Unix) because even
+        /// redacted snapshots leak topology information.
+        #[arg(long, value_name = "PATH")]
+        output: Option<std::path::PathBuf>,
+    },
+}
+
+/// Output format for `dump-state`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum DumpFormat {
+    /// Stable JSON document — preferred for tooling.
+    Json,
+    /// TOML — preferred for ticket attachments and human review.
+    Toml,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Serialize, Deserialize)]
