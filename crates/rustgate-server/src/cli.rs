@@ -1096,6 +1096,28 @@ pub(crate) struct Cli {
     #[arg(long, env = "RUSTGATE_FEDERATION_REGION")]
     pub(crate) federation_region: Option<String>,
 
+    // -- JWKS rotation-window state machine (closes #952) --
+    /// Pending → Active promotion window (seconds) for the JWKS rotation
+    /// state machine. A newly observed `kid` must persist across at
+    /// least one refresh AND remain visible for this many seconds before
+    /// the verifier registry trusts it. Defends against typo'd JWKS
+    /// pushes that get rolled back within seconds. Default: 60.
+    #[arg(long, default_value_t = 60, env = "RUSTGATE_JWKS_PENDING_WINDOW_SECS")]
+    pub(crate) jwks_pending_window_secs: u64,
+
+    /// Retiring → Retired grace window (seconds) for the JWKS rotation
+    /// state machine. When a `kid` drops from the upstream JWKS, the
+    /// local verifier registry continues to honour it for this duration
+    /// so JWTs minted just before the upstream removal still verify;
+    /// each such verification emits the
+    /// `audit::jwt_using_retiring_kid` event. Default: 300 (5 min).
+    #[arg(
+        long,
+        default_value_t = 300,
+        env = "RUSTGATE_JWKS_RETIRING_WINDOW_SECS"
+    )]
+    pub(crate) jwks_retiring_window_secs: u64,
+
     // -- Federation peer discovery (issue #571) --
     /// Dynamic federation peer discovery backend.
     ///
@@ -2119,6 +2141,8 @@ define_config_file! {
     federation_peer_discovery_consul_service: String,
     federation_peer_discovery_etcd_endpoints: String,
     federation_peer_discovery_etcd_prefix: String,
+    jwks_pending_window_secs: u64,
+    jwks_retiring_window_secs: u64,
     replay_window: u64,
     client_message_rate: u32,
     client_burst: u32,
@@ -2844,6 +2868,44 @@ mod tests {
         ])
         .expect("should parse");
         assert!(cli.audit_delivery);
+    }
+
+    #[test]
+    fn cli_jwks_rotation_window_defaults_match_documented_values() {
+        // Closes #952. Backward-compat for existing JWKS deployments:
+        // operators that do not set --jwks-pending-window-secs or
+        // --jwks-retiring-window-secs pick up the documented defaults
+        // (60s pending, 300s retiring) — same behaviour they have
+        // today plus the rotation-window smoothing.
+        let cli = Cli::try_parse_from([
+            "rustgate", "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
+        ])
+        .expect("should parse");
+        assert_eq!(cli.jwks_pending_window_secs, 60);
+        assert_eq!(cli.jwks_retiring_window_secs, 300);
+    }
+
+    #[test]
+    fn cli_jwks_rotation_window_overrides_parse() {
+        // Closes #952. Pin the parser contract for both new flags so a
+        // typo or rename of the long form fails this test instead of
+        // silently breaking the operator-facing surface.
+        let cli = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--jwks-pending-window-secs",
+            "120",
+            "--jwks-retiring-window-secs",
+            "600",
+        ])
+        .expect("should parse");
+        assert_eq!(cli.jwks_pending_window_secs, 120);
+        assert_eq!(cli.jwks_retiring_window_secs, 600);
     }
 
     // ── build_codec tests ──────────────────────────────────────────
