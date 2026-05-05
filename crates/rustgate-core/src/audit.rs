@@ -1965,7 +1965,7 @@ pub fn hw_identity_loaded(backend: &str) {
 /// Record a hardware-identity backend reporting unavailable at the
 /// moment a TLS handshake (or other identity-consuming operation)
 /// requested a signature. Fires when
-/// [`HardwareIdentity::is_available`](rustgate_transport::hw_identity::HardwareIdentity::is_available)
+/// `HardwareIdentity::is_available`
 /// returns `false` — for example, a token has been unplugged, a PIN
 /// has not been entered, or the workload-API socket has dropped.
 ///
