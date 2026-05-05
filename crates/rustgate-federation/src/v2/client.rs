@@ -588,7 +588,6 @@ async fn build_channel(address: &str, tls_config: ClientTlsConfig) -> Result<Cha
 /// that fires `OnBlob`. ROL and group-sync use long-lived
 /// client-streaming RPCs so the per-event peer auth + audit on the
 /// server side amortizes across the connection lifetime.
-#[allow(clippy::too_many_arguments)]
 // justification: `run_streams` is the dispatch entry-point for the V2
 // connection loop and is called exactly once per reconnection attempt.
 // Bundling the receiver halves into a struct would just push the same
@@ -596,6 +595,7 @@ async fn build_channel(address: &str, tls_config: ClientTlsConfig) -> Result<Cha
 // references at the call site, and the receivers each drive a
 // distinct gRPC stream that the function selects across — they are
 // not interchangeable. Refs #864.
+#[allow(clippy::too_many_arguments)]
 async fn run_streams(
     peer: &Arc<PeerHandle>,
     mut client: FederatedChannelClient<Channel>,
