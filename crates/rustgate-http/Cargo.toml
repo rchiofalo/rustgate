@@ -62,3 +62,4 @@ tempfile = { workspace = true }
 # construction. Not needed for production builds — the migrated code
 # path goes through `rustgate_core::crypto::hmac_sha256_*`.
 hmac = { workspace = true }
+proptest = { workspace = true }
