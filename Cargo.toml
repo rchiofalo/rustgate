@@ -123,6 +123,12 @@ ocsp-stapler = "0.4"
 fastrand = "2"
 figment = { version = "0.10", features = ["toml"] }
 toml = "1.1"
+# Comment-preserving TOML editor used by the `migrate-config` subcommand
+# (issue #815, F-138). Unlike the `toml` crate, `toml_edit` round-trips
+# through a syntax tree that preserves blank lines, comments, and key
+# ordering, which keeps an operator's hand-written annotations intact when
+# their config is rewritten across a version boundary.
+toml_edit = "0.22"
 serial_test = "3"
 redb = "4"
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc", "getrandom"] }

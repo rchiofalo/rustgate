@@ -327,6 +327,20 @@ fn main() -> anyhow::Result<()> {
             diagnostics::emit_schema::run()?;
             return Ok(());
         }
+        Some(Command::MigrateConfig {
+            ref config,
+            ref output,
+            ref from,
+        }) => {
+            // Pure file rewrite. Runs offline, never opens listeners,
+            // never validates the migrated output — pipe through
+            // `validate-config` for that. The diagnostic propagates
+            // its typed error variants so a CI wrapper can branch on
+            // `unrecognized version` vs. `read failed` without
+            // parsing stderr.
+            diagnostics::migrate_config::run(config, output.as_deref(), from.as_deref())?;
+            return Ok(());
+        }
         Some(Command::DumpState {
             ref config,
             format,
