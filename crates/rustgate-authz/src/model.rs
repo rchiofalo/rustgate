@@ -563,6 +563,138 @@ impl<'a> Resource<'a> {
     }
 }
 
+/// Optional auxiliary inputs the policy engine evaluates alongside the
+/// `(subject, resource, action)` tuple. Refs #849 — policy-side
+/// `ClassificationMarking` enforcement.
+///
+/// `AuthzContext` is intentionally additive: every existing call site
+/// that did not need a context continues to work unchanged via
+/// `PolicyEngine::evaluate`, which delegates to
+/// `PolicyEngine::evaluate_with_context` using
+/// [`AuthzContext::default`]. A policy that does not reference any
+/// context field sees no behaviour change.
+///
+/// # Forward compatibility
+///
+/// `#[non_exhaustive]` so future additions (e.g. a release-marking
+/// hint, an originator-domain hint, or a transport-tier flag) do not
+/// break downstream construction. Use the [`AuthzContext::default`]
+/// constructor or the [`AuthzContext::with_classification`] builder
+/// rather than struct-literal syntax outside this crate.
+///
+/// # Wire-format compatibility
+///
+/// The struct itself is not serialised — it is constructed at every
+/// PEP call site from the message envelope. The classification field
+/// round-trips through its own `Display` / `FromStr` (and
+/// `serde(into="String", try_from="String")`) wire form when a backend
+/// chooses to forward it (e.g. the Cedar backend serialises it as a
+/// canonical banner string under `context.classification.label`).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AuthzContext {
+    /// Classification marking attached to the message under
+    /// evaluation, if any. `None` when the call site does not yet
+    /// carry a marking — e.g. plaintext sessions, group-ACL paths
+    /// that pre-date #849, or test fixtures that elide the field.
+    /// Backends that do not consult classification simply ignore it;
+    /// the Cedar backend forwards the canonical banner string to
+    /// policies under `context.classification.label`.
+    ///
+    /// The struct lives in `rustgate_core` so this crate can stay
+    /// focussed on policy evaluation; see
+    /// [`rustgate_core::classification`] for the parser, the
+    /// canonical banner form, the serde representation, and the
+    /// dominates / lub lattice operations.
+    pub classification: Option<rustgate_core::classification::ClassificationMarking>,
+}
+
+impl AuthzContext {
+    /// Builder: attach a [`rustgate_core::classification::ClassificationMarking`]
+    /// to the context. Consumes and returns `self` for fluent chaining.
+    ///
+    /// ```
+    /// use rustgate_authz::AuthzContext;
+    /// use rustgate_core::classification::{Classification, ClassificationMarking};
+    ///
+    /// let marking = ClassificationMarking::new(Classification::Secret);
+    /// let ctx = AuthzContext::default().with_classification(marking);
+    /// assert!(ctx.classification.is_some());
+    /// ```
+    pub fn with_classification(
+        mut self,
+        marking: rustgate_core::classification::ClassificationMarking,
+    ) -> Self {
+        self.classification = Some(marking);
+        self
+    }
+}
+
+#[cfg(test)]
+mod authz_context_tests {
+    #![allow(clippy::panic, clippy::unwrap_used)]
+
+    //! Behavioural pins for [`AuthzContext`] — the small struct that
+    //! threads `Option<ClassificationMarking>` and any future
+    //! request-scoped policy hints through to the engine.
+    //!
+    //! Refs #849 — policy-side `ClassificationMarking` enforcement.
+
+    use rustgate_core::classification::{Classification, ClassificationMarking};
+
+    use super::*;
+
+    #[test]
+    fn authz_context_default_has_no_classification() {
+        // Backward-compat test: the existing call sites that have not
+        // yet been taught about classification construct `AuthzContext`
+        // via `default()`. The default must carry `classification:
+        // None` so a policy that doesn't reference the field keeps
+        // making the same decision as before #849.
+        let ctx = AuthzContext::default();
+        assert!(
+            ctx.classification.is_none(),
+            "default context must carry no classification"
+        );
+    }
+
+    #[test]
+    fn authz_context_with_classification_sets_field() {
+        // The fluent builder must populate the field with the supplied
+        // marking. Pin both directions: `None` after default, `Some(m)`
+        // after `with_classification(m)`. A regression that returned a
+        // freshly-defaulted `AuthzContext` from `with_classification`
+        // would silently drop the marking on every call site that uses
+        // the builder.
+        let marking = ClassificationMarking::new(Classification::Secret);
+        let ctx = AuthzContext::default().with_classification(marking.clone());
+        assert_eq!(
+            ctx.classification.as_ref(),
+            Some(&marking),
+            "builder must install supplied marking"
+        );
+    }
+
+    #[test]
+    fn authz_context_with_classification_is_idempotent_overrides_last_writer() {
+        // The builder takes `self` by value and overwrites the field.
+        // Calling it twice must leave the *second* marking installed.
+        // A regression that appended (e.g. Vec semantics) or that
+        // ignored subsequent calls would break egress fold call sites
+        // that intentionally re-stamp a recomputed LUB.
+        let first = ClassificationMarking::new(Classification::Confidential);
+        let second = ClassificationMarking::new(Classification::TopSecret);
+        let ctx = AuthzContext::default()
+            .with_classification(first)
+            .with_classification(second.clone());
+        assert_eq!(
+            ctx.classification.as_ref(),
+            Some(&second),
+            "second with_classification call must overwrite the first"
+        );
+    }
+}
+
 #[cfg(test)]
 mod subject_hash_tests {
     #![allow(clippy::panic, clippy::unwrap_used)]

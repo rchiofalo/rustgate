@@ -45,13 +45,14 @@ use std::str::FromStr;
 
 use cedar_policy::{
     Authorizer, Context, Decision as CedarDecision, Entities, EntityUid, PolicySet, Request,
+    RestrictedExpression,
 };
 use smol_str::SmolStr;
 use tracing::warn;
 
 use crate::engine::PolicyEngine;
 use crate::error::AuthzError;
-use crate::model::{Action, Decision, DecisionOutcome, Resource, Subject};
+use crate::model::{Action, AuthzContext, Decision, DecisionOutcome, Resource, Subject};
 
 /// Cedar-backed [`PolicyEngine`].
 pub struct CedarBackend {
@@ -184,12 +185,71 @@ fn escape(s: &str) -> Option<String> {
     }
 }
 
-impl PolicyEngine for CedarBackend {
-    fn evaluate(
+/// Build the Cedar request `Context` from a rustgate [`AuthzContext`].
+///
+/// The classification (refs #849) is forwarded as a record under the
+/// `classification` key with a single string-typed `label` field
+/// holding the canonical CAPCO banner form. Cedar policy authors compare
+/// the label string in `when { … }` clauses — see the integration test
+/// in `tests/classification_policy.rs` for representative patterns.
+///
+/// # Fail-closed contract
+///
+/// If `Context::from_pairs` errors (it cannot today for these inputs,
+/// but the API is fallible), the caller logs and falls back to
+/// `Context::empty()` so an upstream `forbid(...)` policy still runs.
+/// This keeps the deny-by-default invariant intact even when the
+/// context wiring itself misbehaves.
+fn build_cedar_context(authz_ctx: &AuthzContext) -> Context {
+    // Fast path: no context fields set → reuse Context::empty() so we
+    // don't spend allocations on every cold path.
+    let Some(marking) = authz_ctx.classification.as_ref() else {
+        return Context::empty();
+    };
+
+    // Wrap the canonical banner string in a `{ label: "<banner>" }`
+    // record so policies can write `context.classification.label
+    // contains "SECRET"`. The intermediate record shape leaves room for
+    // future fields (e.g. parsed level, SCI/dissemination sets) without
+    // a wire-breaking change.
+    let label = RestrictedExpression::new_string(marking.to_string());
+    let classification_record =
+        match RestrictedExpression::new_record([("label".to_string(), label)]) {
+            Ok(rec) => rec,
+            Err(e) => {
+                warn!(
+                    target: "authz",
+                    error = %e,
+                    "cedar: failed to build classification record; evaluating with empty context"
+                );
+                return Context::empty();
+            }
+        };
+    match Context::from_pairs([("classification".to_string(), classification_record)]) {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            warn!(
+                target: "authz",
+                error = %e,
+                "cedar: failed to build context; evaluating with empty context"
+            );
+            Context::empty()
+        }
+    }
+}
+
+impl CedarBackend {
+    /// Shared evaluator: builds the principal/action/resource UIDs and
+    /// dispatches to Cedar with the supplied [`Context`]. Both the
+    /// classification-aware and the legacy contextless paths funnel
+    /// through this helper so Cedar diagnostics handling and fail-closed
+    /// override stay in one place.
+    fn evaluate_inner(
         &self,
         subject: &Subject<'_>,
         resource: &Resource<'_>,
         action: Action,
+        context: Context,
     ) -> DecisionOutcome {
         // Fail closed if any input escapes to the empty string.
         // Returning a placeholder here would fold distinct hostile
@@ -234,14 +294,13 @@ impl PolicyEngine for CedarBackend {
             }
         };
 
-        let request =
-            match Request::new(principal, action_uid, resource_uid, Context::empty(), None) {
-                Ok(req) => req,
-                Err(e) => {
-                    warn!(target: "authz", error = %e, "cedar: request construction failed");
-                    return DecisionOutcome::deny();
-                }
-            };
+        let request = match Request::new(principal, action_uid, resource_uid, context, None) {
+            Ok(req) => req,
+            Err(e) => {
+                warn!(target: "authz", error = %e, "cedar: request construction failed");
+                return DecisionOutcome::deny();
+            }
+        };
 
         let response = self
             .authorizer
@@ -278,6 +337,36 @@ impl PolicyEngine for CedarBackend {
             },
             CedarDecision::Deny => DecisionOutcome::deny(),
         }
+    }
+}
+
+impl PolicyEngine for CedarBackend {
+    fn evaluate(
+        &self,
+        subject: &Subject<'_>,
+        resource: &Resource<'_>,
+        action: Action,
+    ) -> DecisionOutcome {
+        // Backward-compat path: no classification context. Funnel
+        // through `evaluate_inner` with an empty Cedar context so
+        // diagnostics handling and fail-closed override stay in one
+        // place.
+        self.evaluate_inner(subject, resource, action, Context::empty())
+    }
+
+    /// Forward `context.classification` (refs #849) into Cedar as a
+    /// record under `context.classification.label` carrying the
+    /// canonical CAPCO banner string. Policies that don't reference
+    /// the field continue to make the same decision as before.
+    fn evaluate_with_context(
+        &self,
+        subject: &Subject<'_>,
+        resource: &Resource<'_>,
+        action: Action,
+        authz_ctx: &AuthzContext,
+    ) -> DecisionOutcome {
+        let cedar_ctx = build_cedar_context(authz_ctx);
+        self.evaluate_inner(subject, resource, action, cedar_ctx)
     }
 
     fn policy_id(&self) -> &str {
