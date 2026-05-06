@@ -64,12 +64,7 @@ fn position_message(uid: &str, group: &str, lat: f64, lon: f64) -> RoutableMessa
         source: Identity::plaintext(uid.to_string(), groups).expect("valid identity"),
         destination: Destination::Broadcast,
         payload: cot_position_xml(uid, lat, lon),
-        metadata: Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: "tak".to_string(),
-            message_type: MessageType::Position,
-            ttl: None,
-        },
+        metadata: Metadata::new(SystemTime::now(), "tak".to_string(), MessageType::Position),
     }
 }
 
@@ -558,12 +553,7 @@ async fn non_position_messages_filtered() {
         source: Identity::plaintext("chatter".to_string(), groups).expect("valid identity"),
         destination: Destination::Broadcast,
         payload: chat_xml,
-        metadata: Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: "tak".to_string(),
-            message_type: MessageType::Chat,
-            ttl: None,
-        },
+        metadata: Metadata::new(SystemTime::now(), "tak".to_string(), MessageType::Chat),
     };
 
     adapter.publisher().publish(&chat_msg).await;
@@ -609,12 +599,7 @@ async fn non_position_messages_published() {
         source: Identity::plaintext("chatter".to_string(), groups).expect("valid identity"),
         destination: Destination::Broadcast,
         payload: chat_xml,
-        metadata: Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: "tak".to_string(),
-            message_type: MessageType::Chat,
-            ttl: None,
-        },
+        metadata: Metadata::new(SystemTime::now(), "tak".to_string(), MessageType::Chat),
     };
 
     adapter.publisher().publish(&chat_msg).await;
@@ -675,12 +660,7 @@ async fn unknown_position_filtered() {
             9_999_999.0,
             9_999_999.0,
         ),
-        metadata: Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: "tak".to_string(),
-            message_type: MessageType::Position,
-            ttl: None,
-        },
+        metadata: Metadata::new(SystemTime::now(), "tak".to_string(), MessageType::Position),
     };
     adapter.publisher().publish(&msg).await;
 

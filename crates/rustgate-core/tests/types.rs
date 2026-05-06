@@ -185,12 +185,7 @@ fn make_source() -> Identity {
 }
 
 fn make_metadata() -> Metadata {
-    Metadata {
-        received_at: SystemTime::now(),
-        source_protocol: "tcp".to_string(),
-        message_type: MessageType::Position,
-        ttl: None,
-    }
+    Metadata::new(SystemTime::now(), "tcp".to_string(), MessageType::Position)
 }
 
 #[test]
@@ -243,12 +238,8 @@ fn routable_message_payload_preservation() {
 #[test]
 fn routable_message_metadata_fields() {
     let now = SystemTime::now();
-    let meta = Metadata {
-        received_at: now,
-        source_protocol: "websocket".to_string(),
-        message_type: MessageType::Chat,
-        ttl: Some(Duration::from_secs(60)),
-    };
+    let meta = Metadata::new(now, "websocket".to_string(), MessageType::Chat)
+        .with_ttl(Duration::from_secs(60));
     let msg = RoutableMessage {
         source: make_source(),
         destination: Destination::Broadcast,
@@ -262,12 +253,7 @@ fn routable_message_metadata_fields() {
 
 #[test]
 fn routable_message_no_ttl() {
-    let meta = Metadata {
-        received_at: SystemTime::now(),
-        source_protocol: "tcp".to_string(),
-        message_type: MessageType::Status,
-        ttl: None,
-    };
+    let meta = Metadata::new(SystemTime::now(), "tcp".to_string(), MessageType::Status);
     assert!(meta.ttl.is_none());
 }
 
@@ -633,33 +619,24 @@ fn peer_id_and_server_name_are_distinct_types() {
 
 #[test]
 fn metadata_is_expired_no_ttl() {
-    let m = Metadata {
-        received_at: SystemTime::now(),
-        source_protocol: "tcp".into(),
-        message_type: MessageType::Position,
-        ttl: None,
-    };
+    let m = Metadata::new(SystemTime::now(), "tcp".into(), MessageType::Position);
     assert!(!m.is_expired());
 }
 
 #[test]
 fn metadata_is_expired_future_ttl() {
-    let m = Metadata {
-        received_at: SystemTime::now(),
-        source_protocol: "tcp".into(),
-        message_type: MessageType::Position,
-        ttl: Some(Duration::from_secs(3600)),
-    };
+    let m = Metadata::new(SystemTime::now(), "tcp".into(), MessageType::Position)
+        .with_ttl(Duration::from_secs(3600));
     assert!(!m.is_expired());
 }
 
 #[test]
 fn metadata_is_expired_past_ttl() {
-    let m = Metadata {
-        received_at: SystemTime::now() - Duration::from_secs(10),
-        source_protocol: "tcp".into(),
-        message_type: MessageType::Position,
-        ttl: Some(Duration::from_secs(1)),
-    };
+    let m = Metadata::new(
+        SystemTime::now() - Duration::from_secs(10),
+        "tcp".into(),
+        MessageType::Position,
+    )
+    .with_ttl(Duration::from_secs(1));
     assert!(m.is_expired());
 }

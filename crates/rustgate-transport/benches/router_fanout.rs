@@ -213,12 +213,7 @@ fn make_chat(source: &Arc<Identity>, dest: Destination) -> RoutableMessage {
         source: (**source).clone(),
         destination: dest,
         payload: Bytes::from(vec![0u8; PAYLOAD_BYTES]),
-        metadata: Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: "bench".to_string(),
-            message_type: MessageType::Chat,
-            ttl: None,
-        },
+        metadata: Metadata::new(SystemTime::now(), "bench".to_string(), MessageType::Chat),
     }
 }
 

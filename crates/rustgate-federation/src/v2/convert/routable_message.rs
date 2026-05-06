@@ -149,16 +149,19 @@ pub fn federated_event_to_routable(
         }
     });
 
+    let mut metadata = Metadata::new(
+        SystemTime::now(),
+        SOURCE_FEDERATION.to_string(),
+        message_type,
+    );
+    if let Some(t) = ttl {
+        metadata = metadata.with_ttl(t);
+    }
     Ok(RoutableMessage {
         source,
         destination,
         payload: Bytes::from(xml),
-        metadata: Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: SOURCE_FEDERATION.to_string(),
-            message_type,
-            ttl,
-        },
+        metadata,
     })
 }
 
@@ -261,12 +264,11 @@ mod tests {
                 .expect("valid identity"),
             destination: Destination::Broadcast,
             payload: Bytes::from_static(sample_xml()),
-            metadata: Metadata {
-                received_at: SystemTime::now(),
-                source_protocol: SOURCE_FEDERATION.to_string(),
-                message_type: MessageType::Position,
-                ttl: None,
-            },
+            metadata: Metadata::new(
+                SystemTime::now(),
+                SOURCE_FEDERATION.to_string(),
+                MessageType::Position,
+            ),
         };
 
         let event = routable_to_federated_event(&msg, &empty_metadata()).expect("conversion");
@@ -290,12 +292,11 @@ mod tests {
             },
             destination: Destination::Group("Delta".into()),
             payload: Bytes::from_static(sample_xml()),
-            metadata: Metadata {
-                received_at: SystemTime::now(),
-                source_protocol: SOURCE_FEDERATION.to_string(),
-                message_type: MessageType::Position,
-                ttl: None,
-            },
+            metadata: Metadata::new(
+                SystemTime::now(),
+                SOURCE_FEDERATION.to_string(),
+                MessageType::Position,
+            ),
         };
 
         let event = routable_to_federated_event(&msg, &empty_metadata()).expect("conversion");
@@ -510,12 +511,11 @@ mod tests {
                 .expect("valid identity"),
             destination: Destination::Group("Alpha".into()),
             payload: Bytes::from_static(sample_xml()),
-            metadata: Metadata {
-                received_at: SystemTime::now(),
-                source_protocol: SOURCE_FEDERATION.to_string(),
-                message_type: MessageType::Position,
-                ttl: None,
-            },
+            metadata: Metadata::new(
+                SystemTime::now(),
+                SOURCE_FEDERATION.to_string(),
+                MessageType::Position,
+            ),
         };
 
         let event = routable_to_federated_event(&msg, &sample_metadata()).expect("to event");

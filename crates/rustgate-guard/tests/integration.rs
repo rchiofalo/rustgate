@@ -40,12 +40,7 @@ fn make_message(payload: Bytes) -> RoutableMessage {
         },
         destination: Destination::Broadcast,
         payload,
-        metadata: Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: "tcp".into(),
-            message_type: MessageType::Position,
-            ttl: None,
-        },
+        metadata: Metadata::new(SystemTime::now(), "tcp".into(), MessageType::Position),
     }
 }
 

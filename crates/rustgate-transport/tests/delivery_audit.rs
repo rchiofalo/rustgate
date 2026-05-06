@@ -153,12 +153,7 @@ fn make_msg(
         source: (**source).clone(),
         destination: dest,
         payload: Bytes::from_static(payload),
-        metadata: Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: "tcp".to_string(),
-            message_type: msg_type,
-            ttl: None,
-        },
+        metadata: Metadata::new(SystemTime::now(), "tcp".to_string(), msg_type),
     }
 }
 

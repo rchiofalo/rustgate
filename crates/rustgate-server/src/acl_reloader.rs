@@ -325,12 +325,11 @@ mod tests {
             source: (*bob_id).clone(),
             destination: rustgate_core::message::Destination::Group("alpha".into()),
             payload: bytes::Bytes::from_static(b"<msg/>"),
-            metadata: rustgate_core::message::Metadata {
-                received_at: std::time::SystemTime::now(),
-                source_protocol: "test".to_string(),
-                message_type: rustgate_core::message::MessageType::Chat,
-                ttl: None,
-            },
+            metadata: rustgate_core::message::Metadata::new(
+                std::time::SystemTime::now(),
+                "test".to_string(),
+                rustgate_core::message::MessageType::Chat,
+            ),
         };
         router.route(msg).await;
         assert!(nrx_a.try_recv().is_ok(), "alice must receive in open mode");
@@ -344,12 +343,11 @@ mod tests {
             source: (*bob_id).clone(),
             destination: rustgate_core::message::Destination::Group("alpha".into()),
             payload: bytes::Bytes::from_static(b"<msg2/>"),
-            metadata: rustgate_core::message::Metadata {
-                received_at: std::time::SystemTime::now(),
-                source_protocol: "test".to_string(),
-                message_type: rustgate_core::message::MessageType::Chat,
-                ttl: None,
-            },
+            metadata: rustgate_core::message::Metadata::new(
+                std::time::SystemTime::now(),
+                "test".to_string(),
+                rustgate_core::message::MessageType::Chat,
+            ),
         };
         router.route(msg).await;
         assert!(

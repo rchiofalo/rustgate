@@ -32,12 +32,7 @@ fn make_chat(source: &Arc<Identity>, dest: Destination, seq: usize) -> RoutableM
         source: (**source).clone(),
         destination: dest,
         payload: Bytes::from(format!("<chat seq=\"{seq}\"/>")),
-        metadata: Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: "cot".to_string(),
-            message_type: MessageType::Chat,
-            ttl: None,
-        },
+        metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Chat),
     }
 }
 

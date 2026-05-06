@@ -73,12 +73,7 @@ fn direct_msg(source_cn: &str, dest_cn: &str, payload_bytes: usize) -> RoutableM
     RoutableMessage {
         source: ident(source_cn),
         destination: Destination::Direct(ident(dest_cn)),
-        metadata: Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: "test".to_string(),
-            message_type: MessageType::Chat,
-            ttl: None,
-        },
+        metadata: Metadata::new(SystemTime::now(), "test".to_string(), MessageType::Chat),
         payload: Bytes::from(vec![0xAA; payload_bytes]),
     }
 }

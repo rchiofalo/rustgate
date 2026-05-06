@@ -139,12 +139,11 @@ mod tests {
             source: identity,
             destination: Destination::Broadcast,
             payload: Bytes::from_static(b"<not xml at all"),
-            metadata: Metadata {
-                received_at: SystemTime::UNIX_EPOCH,
-                source_protocol: "test".to_string(),
-                message_type: MessageType::Other("test".to_string()),
-                ttl: None,
-            },
+            metadata: Metadata::new(
+                SystemTime::UNIX_EPOCH,
+                "test".to_string(),
+                MessageType::Other("test".to_string()),
+            ),
         };
         let err = codec.encode_payload(&msg).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);

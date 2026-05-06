@@ -102,12 +102,11 @@ mod tests {
             .unwrap(),
             destination: Destination::Broadcast,
             payload: Bytes::copy_from_slice(payload),
-            metadata: Metadata {
-                received_at: SystemTime::now(),
-                source_protocol: SOURCE_MAVLINK.into(),
-                message_type: MessageType::Mavlink,
-                ttl: None,
-            },
+            metadata: Metadata::new(
+                SystemTime::now(),
+                SOURCE_MAVLINK.into(),
+                MessageType::Mavlink,
+            ),
         }
     }
 

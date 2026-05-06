@@ -212,12 +212,7 @@ mod tests {
                 .expect("valid identity"),
             destination: Destination::Broadcast,
             payload: Bytes::from(payload.to_string()),
-            metadata: Metadata {
-                received_at: SystemTime::now(),
-                source_protocol: "cot".to_string(),
-                message_type: MessageType::Alert,
-                ttl: None,
-            },
+            metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Alert),
         }
     }
 
@@ -227,12 +222,7 @@ mod tests {
                 .expect("valid identity"),
             destination: Destination::Broadcast,
             payload: Bytes::from_static(b"<event type=\"a-f-G\" uid=\"pos1\" />"),
-            metadata: Metadata {
-                received_at: SystemTime::now(),
-                source_protocol: "cot".to_string(),
-                message_type: MessageType::Position,
-                ttl: None,
-            },
+            metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Position),
         }
     }
 

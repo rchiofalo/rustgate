@@ -1174,12 +1174,11 @@ mod tests {
             .expect("identity"),
             destination: rustgate_core::message::Destination::Broadcast,
             payload: Bytes::from_static(b"hello"),
-            metadata: rustgate_core::message::Metadata {
-                received_at: std::time::SystemTime::now(),
-                source_protocol: "test".into(),
-                message_type: rustgate_core::message::MessageType::Other("test".into()),
-                ttl: None,
-            },
+            metadata: rustgate_core::message::Metadata::new(
+                std::time::SystemTime::now(),
+                "test".into(),
+                rustgate_core::message::MessageType::Other("test".into()),
+            ),
         };
 
         let cloned = Arc::clone(&cb);
@@ -1225,12 +1224,11 @@ mod tests {
         cb(
             Bytes::from_static(b"payload"),
             vec!["alpha".into(), "beta".into()],
-            rustgate_core::message::Metadata {
-                received_at: std::time::SystemTime::now(),
-                source_protocol: "websocket".into(),
-                message_type: rustgate_core::message::MessageType::Other("test".into()),
-                ttl: None,
-            },
+            rustgate_core::message::Metadata::new(
+                std::time::SystemTime::now(),
+                "websocket".into(),
+                rustgate_core::message::MessageType::Other("test".into()),
+            ),
         );
 
         let guard = captured.lock().expect("mutex");
@@ -1268,12 +1266,11 @@ mod tests {
             .expect("identity"),
             destination: rustgate_core::message::Destination::Broadcast,
             payload: Bytes::from_static(b"http-payload"),
-            metadata: rustgate_core::message::Metadata {
-                received_at: std::time::SystemTime::now(),
-                source_protocol: "test".into(),
-                message_type: rustgate_core::message::MessageType::Other("test".into()),
-                ttl: None,
-            },
+            metadata: rustgate_core::message::Metadata::new(
+                std::time::SystemTime::now(),
+                "test".into(),
+                rustgate_core::message::MessageType::Other("test".into()),
+            ),
         };
         cb(msg);
 

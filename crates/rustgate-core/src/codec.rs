@@ -149,12 +149,11 @@ mod tests {
             source: identity,
             destination: Destination::Broadcast,
             payload: Bytes::from_static(payload),
-            metadata: Metadata {
-                received_at: SystemTime::now(),
-                source_protocol: "test".to_string(),
-                message_type: MessageType::Other("test".to_string()),
-                ttl: None,
-            },
+            metadata: Metadata::new(
+                SystemTime::now(),
+                "test".to_string(),
+                MessageType::Other("test".to_string()),
+            ),
         }
     }
 

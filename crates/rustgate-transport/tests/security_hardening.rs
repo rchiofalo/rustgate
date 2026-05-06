@@ -37,12 +37,7 @@ fn chat(source: &Arc<Identity>, dest: Destination) -> RoutableMessage {
         source: (**source).clone(),
         destination: dest,
         payload: Bytes::from_static(b"<chat/>"),
-        metadata: Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: "cot".to_string(),
-            message_type: MessageType::Chat,
-            ttl: None,
-        },
+        metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Chat),
     }
 }
 

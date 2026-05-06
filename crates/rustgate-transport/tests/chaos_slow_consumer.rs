@@ -54,12 +54,11 @@ fn broadcast(payload_bytes: usize) -> RoutableMessage {
     RoutableMessage {
         source: ident("sender"),
         destination: Destination::Broadcast,
-        metadata: Metadata {
-            received_at: std::time::SystemTime::now(),
-            source_protocol: "test".to_string(),
-            message_type: MessageType::Chat,
-            ttl: None,
-        },
+        metadata: Metadata::new(
+            std::time::SystemTime::now(),
+            "test".to_string(),
+            MessageType::Chat,
+        ),
         payload: Bytes::from(vec![0u8; payload_bytes]),
     }
 }

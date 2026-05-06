@@ -1598,12 +1598,11 @@ async fn replay_entry(
         },
         destination: rustgate_core::message::Destination::Broadcast,
         payload,
-        metadata: rustgate_core::message::Metadata {
-            received_at: std::time::SystemTime::now(),
-            source_protocol: entry.source_protocol.clone(),
-            message_type: parse_message_type(&entry.message_type),
-            ttl: None,
-        },
+        metadata: rustgate_core::message::Metadata::new(
+            std::time::SystemTime::now(),
+            entry.source_protocol.clone(),
+            parse_message_type(&entry.message_type),
+        ),
     };
 
     // Rate-limit and oversize checks mirror the dispatch path so a
@@ -1713,12 +1712,11 @@ fn requeue_failed_entry(
         },
         destination: rustgate_core::message::Destination::Broadcast,
         payload: bytes::Bytes::from(payload_bytes),
-        metadata: rustgate_core::message::Metadata {
-            received_at: std::time::SystemTime::now(),
-            source_protocol: entry.source_protocol.clone(),
-            message_type: parse_message_type(&entry.message_type),
-            ttl: None,
-        },
+        metadata: rustgate_core::message::Metadata::new(
+            std::time::SystemTime::now(),
+            entry.source_protocol.clone(),
+            parse_message_type(&entry.message_type),
+        ),
     };
     if entry.delivery_id.is_empty() {
         // Pre-migration entry without an id: re-persist with a fresh
@@ -2147,12 +2145,11 @@ mod tests {
                 },
                 destination: rustgate_core::message::Destination::Broadcast,
                 payload: bytes::Bytes::from_static(b"test"),
-                metadata: rustgate_core::message::Metadata {
-                    received_at: std::time::SystemTime::now(),
-                    source_protocol: protocol.to_string(),
-                    message_type: rustgate_core::message::MessageType::Position,
-                    ttl: None,
-                },
+                metadata: rustgate_core::message::Metadata::new(
+                    std::time::SystemTime::now(),
+                    protocol.to_string(),
+                    rustgate_core::message::MessageType::Position,
+                ),
             };
             publisher.publish(&msg);
         }
@@ -2174,12 +2171,11 @@ mod tests {
             },
             destination: rustgate_core::message::Destination::Broadcast,
             payload: bytes::Bytes::from_static(b"admission-shed payload"),
-            metadata: rustgate_core::message::Metadata {
-                received_at: std::time::SystemTime::now(),
-                source_protocol: "tcp".to_string(),
-                message_type: rustgate_core::message::MessageType::Position,
-                ttl: None,
-            },
+            metadata: rustgate_core::message::Metadata::new(
+                std::time::SystemTime::now(),
+                "tcp".to_string(),
+                rustgate_core::message::MessageType::Position,
+            ),
         }
     }
 

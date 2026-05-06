@@ -1351,12 +1351,11 @@ pub(crate) fn build_federation_inbound_handler(
                 source: identity,
                 destination: Destination::Broadcast,
                 payload,
-                metadata: Metadata {
-                    received_at: SystemTime::now(),
-                    source_protocol: "federation".into(),
-                    message_type: rustgate_core::message::MessageType::Other("federation".into()),
-                    ttl: None,
-                },
+                metadata: Metadata::new(
+                    SystemTime::now(),
+                    "federation".into(),
+                    rustgate_core::message::MessageType::Other("federation".into()),
+                ),
             };
             // Drive through `route_for_egress` so Send-PEP obligations
             // (e.g. `MaskPoint` / `MaskPayload`) apply to the envelope

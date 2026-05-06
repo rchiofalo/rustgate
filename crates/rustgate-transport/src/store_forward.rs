@@ -1205,17 +1205,16 @@ pub fn decode(raw: &[u8]) -> Result<DecodedEnvelope, StoreForwardError> {
     }
     let payload = Bytes::copy_from_slice(&buf[..payload_len]);
 
+    let mut metadata = Metadata::new(received_at, source_protocol, message_type);
+    if let Some(t) = ttl {
+        metadata = metadata.with_ttl(t);
+    }
     Ok(DecodedEnvelope {
         message: RoutableMessage {
             source,
             destination,
             payload,
-            metadata: Metadata {
-                received_at,
-                source_protocol,
-                message_type,
-                ttl,
-            },
+            metadata,
         },
         queued_at_ms,
     })
@@ -1468,12 +1467,7 @@ mod tests {
             source: ident(from),
             destination: Destination::Direct(ident(to)),
             payload: Bytes::copy_from_slice(payload),
-            metadata: Metadata {
-                received_at: SystemTime::now(),
-                source_protocol: "tcp".to_string(),
-                message_type: MessageType::Chat,
-                ttl: None,
-            },
+            metadata: Metadata::new(SystemTime::now(), "tcp".to_string(), MessageType::Chat),
         }
     }
 

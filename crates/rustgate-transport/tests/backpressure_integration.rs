@@ -25,12 +25,11 @@ fn make_msg(bytes: usize) -> RoutableMessage {
     RoutableMessage {
         source: make_identity("sender"),
         destination: Destination::Direct(make_identity("slow")),
-        metadata: rustgate_core::message::Metadata {
-            received_at: std::time::SystemTime::now(),
-            source_protocol: "test".to_string(),
-            message_type: MessageType::Chat,
-            ttl: None,
-        },
+        metadata: rustgate_core::message::Metadata::new(
+            std::time::SystemTime::now(),
+            "test".to_string(),
+            MessageType::Chat,
+        ),
         payload: Bytes::from(vec![0u8; bytes]),
     }
 }

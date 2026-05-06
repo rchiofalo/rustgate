@@ -284,12 +284,7 @@ async fn group_send_backpressure_drops_without_panic() {
             source: (*bob).clone(),
             destination: Destination::Group("team".into()),
             payload: Bytes::from(format!("msg-{i}")),
-            metadata: Metadata {
-                received_at: SystemTime::now(),
-                source_protocol: "cot".to_string(),
-                message_type: MessageType::Chat,
-                ttl: None,
-            },
+            metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Chat),
         };
         router.route(msg).await;
     }
@@ -345,12 +340,7 @@ async fn disconnected_receiver_drops_gracefully() {
             source: (*alice).clone(),
             destination: Destination::Direct((*bob).clone()),
             payload: Bytes::from(format!("direct-{i}")),
-            metadata: Metadata {
-                received_at: SystemTime::now(),
-                source_protocol: "cot".to_string(),
-                message_type: MessageType::Chat,
-                ttl: None,
-            },
+            metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Chat),
         };
         router.route(msg).await;
     }
@@ -361,12 +351,7 @@ async fn disconnected_receiver_drops_gracefully() {
             source: (*alice).clone(),
             destination: Destination::Broadcast,
             payload: Bytes::from(format!("broadcast-{i}")),
-            metadata: Metadata {
-                received_at: SystemTime::now(),
-                source_protocol: "cot".to_string(),
-                message_type: MessageType::Chat,
-                ttl: None,
-            },
+            metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Chat),
         };
         router.route(msg).await;
     }
