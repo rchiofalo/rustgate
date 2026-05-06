@@ -33,4 +33,5 @@ pub(crate) mod dump_state;
 #[cfg(feature = "schema")]
 pub(crate) mod emit_schema;
 pub(crate) mod generate_config;
+pub(crate) mod migrate_config;
 pub(crate) mod test_connection;
