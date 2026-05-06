@@ -7,7 +7,9 @@ use smol_str::SmolStr;
 use crate::cache::{DecisionCache, DecisionKey};
 use crate::compile::{BucketKey, CompiledPolicy, CompiledRule};
 use crate::error::AuthzError;
-use crate::model::{Action, CacheStats, Decision, DecisionOutcome, Resource, Subject};
+use crate::model::{
+    Action, AuthzContext, CacheStats, Decision, DecisionOutcome, Resource, Subject,
+};
 use crate::policy::{Effect, RuleSet};
 
 /// A policy engine evaluates a `(subject, resource, action)` tuple.
@@ -22,6 +24,35 @@ pub trait PolicyEngine: Send + Sync + 'static {
         resource: &Resource<'_>,
         action: Action,
     ) -> DecisionOutcome;
+
+    /// Evaluate the policy with an auxiliary [`AuthzContext`].
+    ///
+    /// This is the policy-side hook for issue #849: callers that have
+    /// a [`crate::model::AuthzContext`] in hand (e.g. an envelope-borne
+    /// classification marking from #849 item 3) pass it through here.
+    /// The default implementation ignores the context and delegates to
+    /// [`PolicyEngine::evaluate`], so existing implementations and call
+    /// sites continue to work unchanged. Backends that consume the
+    /// context (e.g. the optional Cedar backend) override this method
+    /// to forward `context.classification` into their evaluator's
+    /// request `Context`.
+    ///
+    /// # Wire-format compatibility
+    ///
+    /// `AuthzContext::default()` carries `classification: None`, which
+    /// is identical to "the existing contract" — any backend that does
+    /// not override this method will return the same outcome regardless
+    /// of the context. Refs #849 items 3 (Metadata field), 4 (router
+    /// enforcement), and 6 (MIL-STD-2525 SIDC) remain.
+    fn evaluate_with_context(
+        &self,
+        subject: &Subject<'_>,
+        resource: &Resource<'_>,
+        action: Action,
+        _context: &AuthzContext,
+    ) -> DecisionOutcome {
+        self.evaluate(subject, resource, action)
+    }
 
     /// Stable policy identifier (sha256 hex of the canonical rule set).
     fn policy_id(&self) -> &str;

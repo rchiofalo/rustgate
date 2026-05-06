@@ -36,6 +36,7 @@ pub use cedar_backend::CedarBackend;
 pub use engine::{NativeEngine, PolicyEngine};
 pub use error::AuthzError;
 pub use model::{
-    Action, CacheStats, Decision, DecisionOutcome, Obligation, Resource, Subject, SubjectHash,
+    Action, AuthzContext, CacheStats, Decision, DecisionOutcome, Obligation, Resource, Subject,
+    SubjectHash,
 };
 pub use policy::{Effect, ResourceMatcher, Rule, RuleSet, SubjectMatcher};
