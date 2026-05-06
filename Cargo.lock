@@ -3597,6 +3597,7 @@ version = "0.8.0"
 dependencies = [
  "bytes",
  "proptest",
+ "rustgate-core",
  "thiserror 2.0.18",
 ]
 

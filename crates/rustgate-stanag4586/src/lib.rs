@@ -42,6 +42,10 @@
 //!   [`vehicle_position::decode`] — symmetric round-trip: every
 //!   typed field is preserved across `decode(encode(v)) == v`,
 //!   pinned by a property test.
+//! - [`entity::Stanag4586EntityCodec`] — implementation of the
+//!   canonical [`rustgate_core::entity::EntityCodec`] trait that
+//!   maps `VehiclePosition` frames to and from the protocol-agnostic
+//!   `Entity` shape (refs #847).
 //!
 //! # What is deliberately absent
 //!
@@ -96,6 +100,7 @@
 
 pub mod bit_report;
 pub mod emergency_status_request;
+pub mod entity;
 pub mod error;
 pub mod gcs_handover_command;
 pub mod mission_abort_command;
@@ -111,6 +116,10 @@ pub mod waypoint_command;
 
 pub use bit_report::{BitReport, FaultSeverity, SubsystemId};
 pub use emergency_status_request::{EmergencyStatusRequest, RequestKind, UrgencyLevel};
+pub use entity::{
+    Stanag4586EntityCodec, Stanag4586EntityError, VEHICLE_POSITION_MSG_ID,
+    stanag4586_message_supported,
+};
 pub use error::Stanag4586Error;
 pub use gcs_handover_command::{GcsHandoverCommand, HandoverKind};
 pub use mission_abort_command::{AbortBehaviour, MissionAbortCommand, Priority};
