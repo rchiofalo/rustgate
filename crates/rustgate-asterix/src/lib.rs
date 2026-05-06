@@ -84,9 +84,11 @@
 pub mod cat021;
 pub mod cat048;
 pub mod cat062;
+pub mod entity;
 
 pub use cat021::{
     Cat021EncodeError, Cat021Error, Cat021Report, decode_cat021, encode_cat021, encode_cat021_into,
 };
 pub use cat048::{Cat048Error, Cat048Report, PolarPosition, decode_cat048};
 pub use cat062::{Cat062Error, Cat062Track, Mode3aCode, ModeCCode, TrackStatus, decode_cat062};
+pub use entity::{AsterixEntityCodec, AsterixEntityError, asterix_category_supported};
