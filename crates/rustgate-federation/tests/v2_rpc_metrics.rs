@@ -75,7 +75,8 @@ async fn start_mtls_server(
 
     // The OnEvent / OnRolEvent / OnGroupSync callbacks are irrelevant
     // for the metric coverage in this file; pass no-ops.
-    let no_op_event: rustgate_federation::v2::server::OnEvent = Arc::new(|_event, _peer| {});
+    let no_op_event: rustgate_federation::v2::server::OnEvent =
+        Arc::new(|_event, _peer, _trace| {});
     let mut svc =
         FederationService::new(federate_id.to_string(), vec!["Alpha".into()], no_op_event);
     svc = svc.with_on_blob(on_blob);

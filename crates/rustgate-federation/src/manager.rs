@@ -34,7 +34,7 @@ use crate::v1::{V1Client, V1Server};
 rustgate_core::on_callback!(
     /// Callback invoked for each non-heartbeat message received from a federation peer.
     ///
-    /// Arguments: (peer_id_or_cn, raw_payload_bytes).
+    /// Arguments: `(peer_id_or_cn, raw_payload_bytes, trace_context)`.
     ///
     /// F-113: `peer_id_or_cn` is a typed [`PeerId`] (the V2 callback site
     /// already owns the typed value via `peer.id.clone()` on the client
@@ -44,6 +44,15 @@ rustgate_core::on_callback!(
     /// `peer_id.as_str()` when they need to interface with the router's
     /// existing `&str` API surface.
     ///
+    /// Closes #852 (PR-C): the third argument is the parsed inbound
+    /// W3C [`rustgate_core::TraceContext`] from the gRPC `traceparent`
+    /// metadata header. The receiving end persists it on
+    /// `RoutableMessage::metadata.trace_context` so the upstream trace
+    /// continues across local routing and onto any further federation
+    /// egress. V1 federation peers do not carry W3C trace context (the
+    /// V1 wire format predates this PR); V1's `OnMessage` site passes
+    /// `None`.
+    ///
     /// The caller is responsible for provenance checking, format conversion,
     /// and routing the message to local clients (e.g., via the Router).
     ///
@@ -52,7 +61,8 @@ rustgate_core::on_callback!(
     /// the closure body. Revisit when `dyn AsyncFn` stabilizes for trait objects.
     pub OnInbound,
     PeerId,
-    Bytes
+    Bytes,
+    Option<rustgate_core::TraceContext>
 );
 
 /// Capacity for HA peer adoption/loss event channels.
@@ -900,7 +910,7 @@ impl FederationManager {
                     let event = match &v2_event {
                         Some(e) => e.clone(),
                         None => {
-                            let mut metadata =
+                            let mut prov_metadata =
                                 crate::provenance::FederationMetadata::new(self.config.max_hops);
                             // F-113: convert the configured `federate_id` (still a
                             // bare `String` on disk for wire compatibility) into the
@@ -909,8 +919,11 @@ impl FederationManager {
                                 rustgate_core::PeerId::new(self.config.federate_id.as_str());
                             let self_name =
                                 rustgate_core::ServerName::new(self.config.federate_id.as_str());
-                            metadata.add_hop(&self_peer, &self_name);
-                            match crate::v2::convert::xml_to_federated_event(&payload, &metadata) {
+                            prov_metadata.add_hop(&self_peer, &self_name);
+                            match crate::v2::convert::xml_to_federated_event(
+                                &payload,
+                                &prov_metadata,
+                            ) {
                                 Ok(e) => {
                                     v2_event = Some(e.clone());
                                     e
@@ -926,7 +939,16 @@ impl FederationManager {
                             }
                         }
                     };
-                    v2.send(event).await
+                    // PR-C of #852: extract the explicit trace context
+                    // from the source `Metadata` (when carried by an
+                    // inbound federation hop) and hand it to the V2
+                    // client so the outbound `traceparent` continues
+                    // the upstream trace rather than spawning a new
+                    // one. `metadata` here is the upstream
+                    // `Metadata` from the routing layer, NOT the
+                    // V2 federation provenance metadata above.
+                    let trace_ctx = metadata.and_then(|m| m.trace_context.clone());
+                    v2.send_with_trace(event, trace_ctx).await
                 }
             };
 
@@ -1418,7 +1440,11 @@ impl FederationManager {
                 );
                 return;
             }
-            on_inbound(peer_id, data);
+            // PR-C of #852: V1 federation predates W3C trace context;
+            // there is no `traceparent` carry on the V1 wire format, so
+            // V1 inbound surfaces `None` and the consumer falls back to
+            // the active OTel span (or no trace).
+            on_inbound(peer_id, data, None);
         })
     }
 
@@ -1442,6 +1468,12 @@ impl FederationManager {
     /// purely observational — the claim is already silently discarded
     /// by the conversion layer. When `trust_peer_groups == true`
     /// (explicit opt-in) the handler skips the audit emission.
+    ///
+    /// PR-C of #852: forwards the parsed inbound `TraceContext` (when
+    /// present) to the [`OnInbound`] callback so the consumer can
+    /// persist it on `RoutableMessage::metadata.trace_context` and
+    /// continue the upstream trace across local routing and onto
+    /// federation-egress fan-out.
     #[cfg(feature = "v2")]
     fn create_v2_event_handler(
         on_inbound: &OnInbound,
@@ -1450,7 +1482,7 @@ impl FederationManager {
     ) -> crate::v2::client::OnEvent {
         let on_event_inbound = Arc::clone(on_inbound);
         let federate_id = federate_id.to_owned();
-        Arc::new(move |event, peer_id| {
+        Arc::new(move |event, peer_id, trace_ctx| {
             // Check provenance for loops and hop limits
             let metadata = crate::v2::convert::extract_metadata(&event);
             if metadata.should_drop(&federate_id) {
@@ -1483,7 +1515,7 @@ impl FederationManager {
             if event.event.is_some() {
                 match crate::v2::convert::federated_event_to_xml(&event) {
                     Ok(xml) => {
-                        on_event_inbound(peer_id, Bytes::from(xml));
+                        on_event_inbound(peer_id, Bytes::from(xml), trace_ctx);
                     }
                     Err(e) => {
                         warn!(
@@ -1496,7 +1528,7 @@ impl FederationManager {
             } else if let Some(ref contact) = event.contact
                 && let Some(xml) = crate::v2::convert::contact_list_entry_to_xml(contact)
             {
-                on_event_inbound(peer_id, Bytes::from(xml));
+                on_event_inbound(peer_id, Bytes::from(xml), trace_ctx);
             }
         })
     }
@@ -2029,7 +2061,7 @@ mod tests {
     #[tokio::test]
     async fn start_fails_with_missing_certs() {
         let mut manager = FederationManager::new(test_config());
-        let on_inbound: OnInbound = Arc::new(|_cn, _data| {});
+        let on_inbound: OnInbound = Arc::new(|_cn, _data, _trace| {});
         let result = manager.start(on_inbound).await;
         assert!(result.is_err());
         assert!(!manager.is_running());
@@ -2062,7 +2094,7 @@ mod tests {
         };
 
         let mut manager = FederationManager::new(config);
-        let on_inbound: OnInbound = Arc::new(|_cn, _data| {});
+        let on_inbound: OnInbound = Arc::new(|_cn, _data, _trace| {});
 
         manager.start(on_inbound).await.expect("start");
         assert!(manager.is_running());
@@ -2098,7 +2130,7 @@ mod tests {
         };
 
         let mut manager = FederationManager::new(config);
-        let on_inbound: OnInbound = Arc::new(|_cn, _data| {});
+        let on_inbound: OnInbound = Arc::new(|_cn, _data, _trace| {});
 
         manager.start(Arc::clone(&on_inbound)).await.expect("start");
         let result = manager.start(on_inbound).await;
@@ -2145,7 +2177,7 @@ mod tests {
         };
 
         let mut manager = FederationManager::new(config);
-        let on_inbound: OnInbound = Arc::new(|_cn, _data| {});
+        let on_inbound: OnInbound = Arc::new(|_cn, _data, _trace| {});
 
         manager.start(on_inbound).await.expect("start");
         assert_eq!(manager.peer_count(), 2);
@@ -2207,7 +2239,7 @@ mod tests {
         };
 
         let mut manager = FederationManager::new(config);
-        let on_inbound: OnInbound = Arc::new(|_cn, _data| {});
+        let on_inbound: OnInbound = Arc::new(|_cn, _data, _trace| {});
 
         manager.start(on_inbound).await.expect("start");
         // Only active-peer should be started (disabled, inbound-only, and bad version skipped)
@@ -2247,7 +2279,7 @@ mod tests {
         };
 
         let mut manager = FederationManager::new(config);
-        let on_inbound: OnInbound = Arc::new(|_cn, _data| {});
+        let on_inbound: OnInbound = Arc::new(|_cn, _data, _trace| {});
 
         // Start should succeed even with bad address (skipped with warning)
         manager.start(on_inbound).await.expect("start");
@@ -2290,7 +2322,7 @@ mod tests {
         };
 
         let mut manager = FederationManager::new(config);
-        let on_inbound: OnInbound = Arc::new(|_cn, _data| {});
+        let on_inbound: OnInbound = Arc::new(|_cn, _data, _trace| {});
 
         // Start should succeed — trust store dir loaded and merged
         manager
@@ -2333,7 +2365,7 @@ mod tests {
         };
 
         let mut manager = FederationManager::new(config);
-        let on_inbound: OnInbound = Arc::new(|_cn, _data| {});
+        let on_inbound: OnInbound = Arc::new(|_cn, _data, _trace| {});
 
         // Start should succeed — empty trust store just uses base CA
         manager
@@ -2654,7 +2686,7 @@ mod tests {
         };
 
         let mut manager = FederationManager::new(config);
-        let on_inbound: OnInbound = Arc::new(|_cn, _data| {});
+        let on_inbound: OnInbound = Arc::new(|_cn, _data, _trace| {});
         manager.start(on_inbound).await.expect("start");
         assert_eq!(manager.peer_count(), 5);
 
@@ -3166,7 +3198,7 @@ mod tests {
         let forwarded: Arc<std::sync::Mutex<Vec<(PeerId, Bytes)>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let forwarded_clone = Arc::clone(&forwarded);
-        let on_inbound: OnInbound = Arc::new(move |cn, data| {
+        let on_inbound: OnInbound = Arc::new(move |cn, data, _trace| {
             let _ = forwarded_clone.lock().map(|mut v| v.push((cn, data)));
         });
 
@@ -3186,7 +3218,7 @@ mod tests {
             ..Default::default()
         };
 
-        handler(event, "malicious-peer".into());
+        handler(event, "malicious-peer".into(), None);
 
         // Event was forwarded. The XML produced by `federated_event_to_xml`
         // does not embed `federate_groups`, so the forged claim is
@@ -3280,7 +3312,7 @@ mod tests {
             .expect("static connector"),
         );
         mgr.connector = Some(connector);
-        mgr.on_inbound = Some(Arc::new(|_cn, _data| {}) as OnInbound);
+        mgr.on_inbound = Some(Arc::new(|_cn, _data, _trace| {}) as OnInbound);
         mgr.v1_dedup = Some(Arc::new(Mutex::new(MessageDedup::new())));
 
         let cfg = PeerConfig {
@@ -3328,7 +3360,7 @@ mod tests {
         let forwarded: Arc<std::sync::Mutex<Vec<(PeerId, Bytes)>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let forwarded_clone = Arc::clone(&forwarded);
-        let on_inbound: OnInbound = Arc::new(move |cn, data| {
+        let on_inbound: OnInbound = Arc::new(move |cn, data, _trace| {
             let _ = forwarded_clone.lock().map(|mut v| v.push((cn, data)));
         });
 
@@ -3348,7 +3380,7 @@ mod tests {
             ..Default::default()
         };
 
-        handler(event, "trusted-peer".into());
+        handler(event, "trusted-peer".into(), None);
         let entries = forwarded.lock().expect("lock").clone();
         assert_eq!(entries.len(), 1);
     }

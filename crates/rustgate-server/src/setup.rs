@@ -1320,7 +1320,7 @@ pub(crate) fn build_federation_inbound_handler(
     hooks: FedInboundForwardingHooks,
 ) -> rustgate_federation::manager::OnInbound {
     let router_for_fed = Arc::clone(router);
-    Arc::new(move |peer_cn, payload| {
+    Arc::new(move |peer_cn, payload, trace_ctx| {
         let router = Arc::clone(&router_for_fed);
         let hooks = hooks.clone();
         spawn_background("federation-inbound", async move {
@@ -1347,15 +1347,27 @@ pub(crate) fn build_federation_inbound_handler(
                     return;
                 }
             };
+            // PR-C of #852: persist the inbound trace context onto the
+            // routable envelope so (1) per-recipient delivery audit can
+            // surface the trace_id for cross-service correlation, and
+            // (2) any downstream federation egress reads the explicit
+            // context from `Metadata` instead of opening a fresh OTel
+            // span at the relay edge. The context is `None` when the
+            // upstream peer did not send a `traceparent` header or when
+            // the header was malformed (audit fired separately).
+            let mut metadata = Metadata::new(
+                SystemTime::now(),
+                "federation".into(),
+                rustgate_core::message::MessageType::Other("federation".into()),
+            );
+            if let Some(ctx) = trace_ctx {
+                metadata = metadata.with_trace_context(ctx);
+            }
             let msg = RoutableMessage {
                 source: identity,
                 destination: Destination::Broadcast,
                 payload,
-                metadata: Metadata::new(
-                    SystemTime::now(),
-                    "federation".into(),
-                    rustgate_core::message::MessageType::Other("federation".into()),
-                ),
+                metadata,
             };
             // Drive through `route_for_egress` so Send-PEP obligations
             // (e.g. `MaskPoint` / `MaskPayload`) apply to the envelope
@@ -2479,7 +2491,10 @@ mod tests {
         /// outside.
         fn invoke_handler(handler: &rustgate_federation::manager::OnInbound, payload: &[u8]) {
             let peer = PeerId::new("peer-cn".to_string());
-            handler(peer, Bytes::copy_from_slice(payload));
+            // PR-C of #852: trace_context is `None` for these
+            // tests because the fan-out invariant is independent of
+            // the trace propagation contract.
+            handler(peer, Bytes::copy_from_slice(payload), None);
         }
 
         /// Wire a NATS-publish hook on the federation inbound

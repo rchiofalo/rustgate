@@ -103,6 +103,27 @@ impl TraceContext {
     pub fn is_sampled(&self) -> bool {
         self.trace_flags & 0x01 != 0
     }
+
+    /// Render the 16-byte `trace_id` as a 32-character lowercase hex
+    /// string. Closes #852, PR-C.
+    ///
+    /// The audit trail surfaces this string (rather than the full
+    /// `traceparent` banner) so cross-service log correlation queries
+    /// stay grep-friendly and the SIEM index does not have to special-
+    /// case the four `-`-separated fields.
+    pub fn trace_id_hex(&self) -> String {
+        let mut out = String::with_capacity(32);
+        for byte in &self.trace_id {
+            // 02x is the canonical W3C lowercase rendering — same shape
+            // as the `Display` impl uses for the banner string.
+            use std::fmt::Write;
+            // justification: the `write!` to a `String` is infallible;
+            // a `Result::ok()` on the side keeps the builder pattern
+            // panic-free under the workspace `clippy::unwrap_used` deny.
+            let _ = write!(&mut out, "{byte:02x}");
+        }
+        out
+    }
 }
 
 /// Typed error for [`TraceContext::from_str`] / [`TraceContext::new`]
@@ -437,5 +458,38 @@ mod tests {
         // Bit 0 only — bit 1 must not flip the sampled determination.
         let ctx = TraceContext::new(sample_trace_id(), sample_span_id(), 0x02).expect("new");
         assert!(!ctx.is_sampled());
+    }
+
+    #[test]
+    fn trace_id_hex_renders_32_lowercase_chars() {
+        // Pins the audit-correlation contract (closes #852, PR-C):
+        // `trace_id_hex` returns exactly 32 lowercase hex chars (no
+        // version prefix, no separators, no padding) so log-shipping
+        // grep rules can join across services on a fixed-width token.
+        let ctx = TraceContext::new(sample_trace_id(), sample_span_id(), 0x01).expect("new");
+        let hex = ctx.trace_id_hex();
+        assert_eq!(hex.len(), 32, "trace_id_hex must be 32 chars, got {hex:?}");
+        assert_eq!(hex, "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert!(
+            hex.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+            "trace_id_hex must be lowercase hex, got {hex:?}"
+        );
+    }
+
+    #[test]
+    fn trace_id_hex_zero_pads_each_byte() {
+        // A trace_id whose first byte is `0x01` must render as `01…`,
+        // not `1…`. Pin the per-byte zero-padding contract so a future
+        // refactor that switched to `format!("{x:x}")` (without the
+        // `:02x` width specifier) is caught here rather than at a
+        // downstream log-correlation join site that silently drops
+        // matches.
+        let trace_id = [
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01,
+        ];
+        let ctx = TraceContext::new(trace_id, sample_span_id(), 0x00).expect("new");
+        assert_eq!(ctx.trace_id_hex(), "01000000000000000000000000000001");
     }
 }

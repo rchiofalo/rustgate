@@ -64,7 +64,8 @@ async fn start_mtls_server_full(
 
     // The OnEvent callback is irrelevant for these tests but the
     // `FederationService::new` builder requires one — pass a no-op.
-    let no_op_event: rustgate_federation::v2::server::OnEvent = Arc::new(|_event, _peer| {});
+    let no_op_event: rustgate_federation::v2::server::OnEvent =
+        Arc::new(|_event, _peer, _trace| {});
     let mut svc = FederationService::new(federate_id.to_string(), groups, no_op_event);
     if let Some(cb) = on_blob {
         svc = svc.with_on_blob(cb);

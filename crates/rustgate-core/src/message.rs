@@ -97,6 +97,17 @@ pub struct Metadata {
     /// Optional time-to-live; expired messages are evicted from the position cache.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl: Option<Duration>,
+    /// Optional W3C Trace Context attached at ingress and propagated end-to-end
+    /// across local routing and federation hops (closes #852, PR-C).
+    ///
+    /// Populated on inbound federation traffic from the gRPC `traceparent`
+    /// metadata header (when valid). Local-protocol transports (TLS, MQTT,
+    /// WebSocket, NATS) leave this `None` because their wire format has no
+    /// native traceparent carry; federation outbound consults this field
+    /// (when `Some`) instead of the active OTel span so a relay node
+    /// continues an upstream trace rather than spawning a new one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_context: Option<crate::traceparent::TraceContext>,
     // Future optional fields land here. Each must:
     //   1. Be `Option<T>` (or another type with a sensible default).
     //   2. Carry `#[serde(default, skip_serializing_if = "…")]` so absent
@@ -126,6 +137,7 @@ impl Metadata {
             source_protocol,
             message_type,
             ttl: None,
+            trace_context: None,
         }
     }
 
@@ -133,6 +145,20 @@ impl Metadata {
     #[must_use]
     pub fn with_ttl(mut self, ttl: Duration) -> Self {
         self.ttl = Some(ttl);
+        self
+    }
+
+    /// Builder-style setter for [`Metadata::trace_context`]. Returns `self`
+    /// for chaining. Closes #852.
+    ///
+    /// The trace context is picked up by federation outbound dispatch so an
+    /// explicit context (e.g. one extracted from an inbound peer header)
+    /// wins over the active OTel span when injecting the W3C `traceparent`
+    /// onto the outgoing gRPC metadata. This makes a relay node continue
+    /// the upstream trace rather than spawning a new one.
+    #[must_use]
+    pub fn with_trace_context(mut self, ctx: crate::traceparent::TraceContext) -> Self {
+        self.trace_context = Some(ctx);
         self
     }
 
@@ -984,5 +1010,158 @@ mod tests {
             Metadata::new(SystemTime::UNIX_EPOCH, "tcp".into(), MessageType::Position)
                 .with_ttl(Duration::from_secs(10));
         assert_eq!(via_builder.ttl, Some(Duration::from_secs(10)));
+    }
+
+    // ── trace context coverage (closes #852, PR-C) ──────────────────
+
+    /// Build a fixed-content [`crate::traceparent::TraceContext`] for
+    /// trace-context unit-test fixtures. The trace_id / span_id values
+    /// are the canonical W3C examples used by every other unit test in
+    /// the workspace; pinning them here gives the audit-correlation
+    /// assertions a stable hex tail to grep for.
+    fn sample_trace_context() -> crate::traceparent::TraceContext {
+        crate::traceparent::TraceContext::new(
+            [
+                0x4b, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6, 0xa3, 0xce, 0x92, 0x9d, 0x0e, 0x0e,
+                0x47, 0x36,
+            ],
+            [0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7],
+            0x01,
+        )
+        .expect("valid trace context")
+    }
+
+    #[test]
+    fn metadata_new_initializes_trace_context_to_none() {
+        // Per PR-C of #852: `trace_context` is the latest optional field
+        // and MUST default to `None` so existing call sites that did not
+        // request a trace context behave identically to the pre-PR
+        // baseline. A regression that forgot to zero this field inside
+        // `Metadata::new` would be caught here at construction time
+        // rather than at the federation forwarder where the misset
+        // value would silently override the active OTel span.
+        let meta = Metadata::new(SystemTime::now(), "tcp".into(), MessageType::Position);
+        assert!(
+            meta.trace_context.is_none(),
+            "trace_context must default to None, got {:?}",
+            meta.trace_context
+        );
+    }
+
+    #[test]
+    fn metadata_with_trace_context_sets_field() {
+        // Builder-style chain on `trace_context`: same contract as
+        // `with_ttl` — the field is set, no other field is mutated, and
+        // the call returns `Self` so it can chain after `with_ttl` /
+        // `Metadata::new`.
+        let ctx = sample_trace_context();
+        let now = SystemTime::now();
+        let meta = Metadata::new(now, "federation".into(), MessageType::Alert)
+            .with_trace_context(ctx.clone());
+        assert_eq!(meta.trace_context.as_ref(), Some(&ctx));
+        assert_eq!(meta.received_at, now);
+        assert_eq!(meta.source_protocol, "federation");
+        assert_eq!(meta.message_type, MessageType::Alert);
+        assert!(
+            meta.ttl.is_none(),
+            "ttl must remain untouched by with_trace_context"
+        );
+    }
+
+    #[test]
+    fn metadata_serde_round_trip_preserves_trace_context_some() {
+        // Round-trip a `Some(trace_context)` through serde_json and
+        // assert (1) the wire format includes the `trace_context` key
+        // and (2) the deserialized value compares equal to the original.
+        // The `#[serde(into = "String", try_from = "String")]` delegation
+        // on `TraceContext` means the JSON representation is the W3C
+        // banner string, not a struct dump — pin that shape here so a
+        // future serde-derive change cannot silently flip the wire form.
+        let original = Metadata::new(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            "federation".into(),
+            MessageType::Position,
+        )
+        .with_trace_context(sample_trace_context());
+        let json = serde_json::to_string(&original).expect("serialize");
+        assert!(
+            json.contains("\"trace_context\""),
+            "wire format must include trace_context when Some, got {json}"
+        );
+        // Banner string is the canonical traceparent for the sample
+        // context; confirms the `into = String` delegation fires.
+        assert!(
+            json.contains("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+            "wire format must include the W3C banner string, got {json}"
+        );
+        let parsed: Metadata = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, original);
+        assert_eq!(parsed.trace_context.as_ref(), Some(&sample_trace_context()));
+    }
+
+    #[test]
+    fn metadata_serde_round_trip_preserves_trace_context_none() {
+        // Default `None` MUST round-trip cleanly without emitting a
+        // `trace_context` field in the wire output — pin via the
+        // `skip_serializing_if = "Option::is_none"` attribute. A
+        // regression that emitted `"trace_context":null` would still
+        // deserialize correctly but would inflate every routed message
+        // on the wire by a non-trivial constant.
+        let original = Metadata::new(SystemTime::UNIX_EPOCH, "tcp".into(), MessageType::Chat);
+        let json = serde_json::to_string(&original).expect("serialize");
+        assert!(
+            !json.contains("\"trace_context\""),
+            "wire format must omit trace_context when None, got {json}"
+        );
+        let parsed: Metadata = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, original);
+        assert!(parsed.trace_context.is_none());
+    }
+
+    #[test]
+    fn metadata_serde_old_wire_format_without_trace_context_field_still_deserializes() {
+        // Wire-format compatibility: pre-PR-C peers (or on-disk store-
+        // and-forward queues) emit metadata records without the
+        // `trace_context` field. The `#[serde(default)]` attribute MUST
+        // accept the absent field as `None` so a binary built with this
+        // PR can replay queues written before #852 / #1293 / this PR.
+        // The same shape with explicit `null` is also pinned for
+        // belt-and-braces coverage.
+        let with_omitted_field = "{\"received_at\":{\"secs_since_epoch\":1700000000,\"nanos_since_epoch\":0},\"source_protocol\":\"tcp\",\"message_type\":\"Position\"}";
+        let parsed: Metadata =
+            serde_json::from_str(with_omitted_field).expect("omitted trace_context");
+        assert!(parsed.trace_context.is_none());
+        assert!(parsed.ttl.is_none());
+
+        let with_explicit_null = "{\"received_at\":{\"secs_since_epoch\":1700000000,\"nanos_since_epoch\":0},\"source_protocol\":\"tcp\",\"message_type\":\"Position\",\"trace_context\":null}";
+        let parsed: Metadata =
+            serde_json::from_str(with_explicit_null).expect("null trace_context");
+        assert!(parsed.trace_context.is_none());
+    }
+
+    #[test]
+    fn metadata_with_trace_context_overwrites_previous_value() {
+        // Builder methods are idempotent under chained re-application —
+        // calling `with_trace_context` twice replaces (not stacks) the
+        // value. Mirrors the `with_ttl` invariant pinned above so the
+        // contract is consistent across builder methods.
+        let first = sample_trace_context();
+        let second = crate::traceparent::TraceContext::new(
+            [
+                0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22,
+                0x11, 0x00,
+            ],
+            [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
+            0x00,
+        )
+        .expect("valid replacement context");
+        let meta = Metadata::new(
+            SystemTime::now(),
+            "federation".into(),
+            MessageType::Position,
+        )
+        .with_trace_context(first)
+        .with_trace_context(second.clone());
+        assert_eq!(meta.trace_context.as_ref(), Some(&second));
     }
 }

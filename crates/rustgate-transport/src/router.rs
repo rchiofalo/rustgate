@@ -161,18 +161,20 @@ rustgate_core::on_callback!(
     /// behind `--audit-delivery` (default off, high-volume in busy
     /// deployments) to feed
     /// [`rustgate_core::audit::message_delivered`] for chain-of-custody
-    /// audit trails. The arguments are, in order:
+    /// audit trails. The seven arguments are, in order:
     /// `source_cn`, `dest_cn`, `msg_uid` (CoT `uid="…"` attribute or
     /// empty when not CoT-shaped), `msg_type` (the `Display` form of
     /// [`rustgate_core::message::MessageType`]), `group` (the
     /// destination group name on group / multicast fan-out, or the small
     /// fixed-vocabulary tag `"direct"` / `"broadcast"` for non-group
-    /// destinations), and `entity_kind` — the closed-vocabulary
+    /// destinations), `entity_kind` — the closed-vocabulary
     /// [`rustgate_core::entity::EntityKind::as_str`] tag when the router
     /// successfully decoded the payload via the registered codec for
-    /// `metadata.source_protocol`, or `None` either when no codec is
-    /// registered for the protocol or when the codec rejected the
-    /// payload. Closes #847 (umbrella).
+    /// `metadata.source_protocol` (`None` when no codec is registered or
+    /// when the codec rejected the payload — closes #847 umbrella), and
+    /// `trace_id` — the 32-char lowercase hex render of the inbound W3C
+    /// `traceparent.trace_id` when the routed message carried a trace
+    /// context, `None` otherwise (closes #852 PR-C).
     ///
     /// Hot-reloadable via `ArcSwap` so the audit layer can be installed
     /// after construction without a lock on the routing hot path. The
@@ -186,6 +188,7 @@ rustgate_core::on_callback!(
     &str,
     &str,
     &str,
+    Option<&str>,
     Option<&str>
 );
 
@@ -1968,10 +1971,13 @@ impl Router {
     /// Closes #847 — when an [`EntityCodecRegistry`] is installed, the
     /// canonical [`rustgate_core::entity::EntityKind`] tag is computed
     /// once via [`Self::classify_entity_kind`] and surfaced as the
-    /// callback's sixth argument. The decode cost is paid only when
-    /// the audit callback is installed (the early `is_none` return on
-    /// the un-installed slot short-circuits before the registry
-    /// lookup), so opt-out builds pay nothing.
+    /// callback's sixth argument.
+    ///
+    /// Closes #852 PR-C — when the routed message carries a W3C trace
+    /// context on `metadata.trace_context`, the helper renders the
+    /// 32-char lowercase hex `trace_id` and forwards it to the callback
+    /// as the seventh argument so cross-service SIEM joins can
+    /// correlate this delivery with the upstream producer's trail.
     fn emit_message_delivered(&self, msg: &RoutableMessage, dest_cn: &str, group_label: &str) {
         let guard = self.on_message_delivered.load();
         let Some(cb) = (**guard).as_ref() else {
@@ -1980,6 +1986,11 @@ impl Router {
         let uid = extract_cot_uid(&msg.payload);
         let msg_type = msg.metadata.message_type.to_string();
         let entity_kind = self.classify_entity_kind(msg);
+        let trace_id_owned = msg
+            .metadata
+            .trace_context
+            .as_ref()
+            .map(|c| c.trace_id_hex());
         cb(
             &msg.source.cn,
             dest_cn,
@@ -1987,6 +1998,7 @@ impl Router {
             &msg_type,
             group_label,
             entity_kind,
+            trace_id_owned.as_deref(),
         );
     }
 
@@ -7555,7 +7567,7 @@ mod tests {
             Arc::new(parking_lot::Mutex::new(Vec::new()));
         let recorder_cb = Arc::clone(&recorder);
         router.set_on_message_delivered(Some(Arc::new(
-            move |_src, _dst, _uid, _mtype, _grp, kind| {
+            move |_src, _dst, _uid, _mtype, _grp, kind, _trace| {
                 recorder_cb.lock().push(kind.map(str::to_owned));
             },
         )));
@@ -7596,7 +7608,7 @@ mod tests {
             Arc::new(parking_lot::Mutex::new(Vec::new()));
         let recorder_cb = Arc::clone(&recorder);
         router.set_on_message_delivered(Some(Arc::new(
-            move |_src, _dst, _uid, _mtype, _grp, kind| {
+            move |_src, _dst, _uid, _mtype, _grp, kind, _trace| {
                 recorder_cb.lock().push(kind.map(str::to_owned));
             },
         )));
@@ -7644,7 +7656,7 @@ mod tests {
             Arc::new(parking_lot::Mutex::new(Vec::new()));
         let recorder_cb = Arc::clone(&recorder);
         router.set_on_message_delivered(Some(Arc::new(
-            move |_src, _dst, _uid, _mtype, _grp, kind| {
+            move |_src, _dst, _uid, _mtype, _grp, kind, _trace| {
                 recorder_cb.lock().push(kind.map(str::to_owned));
             },
         )));
