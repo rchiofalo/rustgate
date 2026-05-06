@@ -326,8 +326,8 @@ The Helm chart uses different defaults than the CLI for framing and encoding, op
 ## Editor Autocomplete (JSON Schema)
 
 A JSON Schema describing the `rustgate.toml` surface ships at
-[`schemas/rustgate-v0.8.json`](../schemas/rustgate-v0.8.json) in the
-repository root. Wire it into any JSON-Schema-aware editor for
+[`schemas/rustgate-v0.8.json`](https://github.com/rchiofalo/rustgate/blob/main/schemas/rustgate-v0.8.json)
+in the repository root. Wire it into any JSON-Schema-aware editor for
 autocomplete and inline validation while editing your config — every
 key, type, allowed enum value, and default is generated from the same
 `Cli` struct that powers the binary itself, so the schema cannot drift
