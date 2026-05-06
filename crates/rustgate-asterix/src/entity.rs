@@ -848,10 +848,15 @@ const _CAT_062_ERROR_USED: fn(Cat062Error) -> String = |e| format!("{e}");
 // importable so the doc cross-references in this module's intro
 // resolve under `cargo doc`. They are accessed via
 // `track.mode_3a_code` etc. rather than as standalone types.
+//
+// justification: name-binding for rustdoc intra-doc-link resolution; the
+// type is reached via field access on `Cat062Track`, never as a standalone.
 #[allow(dead_code)]
 const _MODE_C_CODE_USED: Option<ModeCCode> = None;
+// justification: same as above — name-binding for rustdoc.
 #[allow(dead_code)]
 const _MODE_3A_CODE_USED: Option<Mode3aCode> = None;
+// justification: same as above — name-binding for rustdoc.
 #[allow(dead_code)]
 const _TRACK_STATUS_USED: Option<TrackStatus> = None;
 
