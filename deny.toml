@@ -179,6 +179,9 @@ crate = "rustgate-stanag4586"
 [[licenses.exceptions]]
 allow = ["LicenseRef-Proprietary"]
 crate = "rustgate-asterix"
+[[licenses.exceptions]]
+allow = ["LicenseRef-Proprietary"]
+crate = "rustgate-guard"
 
 [bans]
 multiple-versions = "warn"
