@@ -539,6 +539,75 @@ impl FederationService {
         true
     }
 
+    /// Inner body of `send_one_blob` (closes #1299). Split out so the
+    /// per-RPC duration / in-flight / total metrics in the trait
+    /// implementation can wrap a single call site that returns a
+    /// `Result<Response, Status>` — the `result` label classification
+    /// then has one place to look at instead of being threaded through
+    /// every early-return branch. Mirrors the policy of the original
+    /// inlined handler one-for-one: hop-count gate, allowlist gate,
+    /// success-path counters/audit, callback dispatch.
+    fn send_one_blob_handle(
+        &self,
+        blob: figpb::BinaryBlob,
+        peer_id: &str,
+    ) -> Result<Response<figpb::Empty>, Status> {
+        // Hop-count validation (refs #864): mirrors `send_one_event` —
+        // a blob arriving at or beyond the hop limit is silently
+        // dropped at the protocol layer (BinaryBlob has no per-RPC
+        // signal channel for "too many hops" beyond the standard
+        // success/error split, so the audit is the only forensic
+        // vantage point).
+        if !Self::validate_blob_hop_count(&blob, peer_id, self.max_hops) {
+            rustgate_core::audit::federation_event_rejected(
+                RPC_SEND_ONE_BLOB,
+                peer_id,
+                "hop_limit",
+            );
+            return Ok(Response::new(figpb::Empty {}));
+        }
+
+        // Authz: peer must be in the allowlist when one is configured.
+        // BinaryBlob carries no `federate_groups` field of its own
+        // (unlike FederatedEvent), so the only check is "is this peer
+        // allowed to talk to us at all" — split out so the rejection
+        // audit token matches what the SendOneEvent path emits for
+        // the same condition (`peer_not_in_allowlist`).
+        if let Some(ref allowed) = self.allowed_peer_groups
+            && !allowed.contains_key(peer_id)
+        {
+            rustgate_core::audit::federation_event_rejected(
+                RPC_SEND_ONE_BLOB,
+                peer_id,
+                "peer_not_in_allowlist",
+            );
+            return Err(Status::permission_denied("peer not in inbound allowlist"));
+        }
+
+        // Success path: increment counters and emit the audit record
+        // BEFORE invoking the callback so the forensic trail captures
+        // ingress even if the downstream consumer panics. Same
+        // ordering as the SendOneEvent path for consistency.
+        #[cfg(feature = "api")]
+        {
+            crate::metrics::messages_in().inc();
+            crate::metrics::messages_in_by_rpc()
+                .with_label_values(&[RPC_SEND_ONE_BLOB])
+                .inc();
+        }
+        rustgate_core::audit::federation_event_received(RPC_SEND_ONE_BLOB, peer_id);
+
+        debug!(
+            peer = %peer_id,
+            blob_type = ?blob.r#type,
+            blob_bytes = blob.data.len(),
+            "received single blob"
+        );
+        // F-113: wrap the CN in a typed `PeerId` at the gRPC boundary.
+        (self.on_blob)(blob, rustgate_core::PeerId::new(peer_id));
+        Ok(Response::new(figpb::Empty {}))
+    }
+
     /// Hop-count validation for `BinaryBlob` (refs #864). The
     /// `FederateHops` proto field shape is the same as on
     /// `FederatedEvent` (it's a sibling message), but the field
@@ -1011,60 +1080,44 @@ impl FederatedChannel for FederationService {
         let _ = super::traceparent::extract_into_current_span(&request, &peer_id);
         let blob = request.into_inner();
 
-        // Hop-count validation (refs #864): mirrors `send_one_event` —
-        // a blob arriving at or beyond the hop limit is silently
-        // dropped at the protocol layer (BinaryBlob has no per-RPC
-        // signal channel for "too many hops" beyond the standard
-        // success/error split, so the audit is the only forensic
-        // vantage point).
-        if !Self::validate_blob_hop_count(&blob, &peer_id, self.max_hops) {
-            rustgate_core::audit::federation_event_rejected(
-                RPC_SEND_ONE_BLOB,
-                &peer_id,
-                "hop_limit",
-            );
-            return Ok(Response::new(figpb::Empty {}));
-        }
+        // Per-RPC observability (closes #1299). The in-flight gauge
+        // covers from the moment we have a verified peer-id (so
+        // unauthenticated probe traffic does not pollute the per-peer
+        // series with the "anonymous" label) through to the unary
+        // response. Duration is measured manually so we can attach the
+        // `result` label after classification — `start_timer()` would
+        // RAII-record before we know the outcome.
+        #[cfg(feature = "api")]
+        let _in_flight =
+            crate::metrics::InFlightGuard::enter(crate::metrics::RPC_SEND_ONE_BLOB, &peer_id);
+        #[cfg(feature = "api")]
+        let rpc_started = std::time::Instant::now();
 
-        // Authz: peer must be in the allowlist when one is configured.
-        // BinaryBlob carries no `federate_groups` field of its own
-        // (unlike FederatedEvent), so the only check is "is this peer
-        // allowed to talk to us at all" — split out so the rejection
-        // audit token matches what the SendOneEvent path emits for
-        // the same condition (`peer_not_in_allowlist`).
-        if let Some(ref allowed) = self.allowed_peer_groups
-            && !allowed.contains_key(&peer_id)
-        {
-            rustgate_core::audit::federation_event_rejected(
-                RPC_SEND_ONE_BLOB,
-                &peer_id,
-                "peer_not_in_allowlist",
-            );
-            return Err(Status::permission_denied("peer not in inbound allowlist"));
-        }
-
-        // Success path: increment counters and emit the audit record
-        // BEFORE invoking the callback so the forensic trail captures
-        // ingress even if the downstream consumer panics. Same
-        // ordering as the SendOneEvent path for consistency.
+        let result = self.send_one_blob_handle(blob, &peer_id);
         #[cfg(feature = "api")]
         {
-            crate::metrics::messages_in().inc();
-            crate::metrics::messages_in_by_rpc()
-                .with_label_values(&[RPC_SEND_ONE_BLOB])
+            let elapsed = rpc_started.elapsed().as_secs_f64();
+            let label = crate::metrics::sanitize_peer_label(&peer_id);
+            let result_label = match &result {
+                Ok(_) => crate::metrics::RESULT_SUCCESS,
+                Err(status) => crate::metrics::classify_status(status.code()),
+            };
+            crate::metrics::rpc_duration()
+                .with_label_values(&[
+                    crate::metrics::RPC_SEND_ONE_BLOB,
+                    label.as_str(),
+                    result_label,
+                ])
+                .observe(elapsed);
+            crate::metrics::rpc_total()
+                .with_label_values(&[
+                    crate::metrics::RPC_SEND_ONE_BLOB,
+                    label.as_str(),
+                    result_label,
+                ])
                 .inc();
         }
-        rustgate_core::audit::federation_event_received(RPC_SEND_ONE_BLOB, &peer_id);
-
-        debug!(
-            peer = %peer_id,
-            blob_type = ?blob.r#type,
-            blob_bytes = blob.data.len(),
-            "received single blob"
-        );
-        // F-113: wrap the CN in a typed `PeerId` at the gRPC boundary.
-        (self.on_blob)(blob, rustgate_core::PeerId::new(peer_id));
-        Ok(Response::new(figpb::Empty {}))
+        result
     }
 
     async fn get_auth_token_by_x509(
@@ -1092,6 +1145,19 @@ impl FederatedChannel for FederationService {
     ) -> Result<Response<figpb::Subscription>, Status> {
         let peer_id = Self::peer_id_from_request(&request)?;
         let _ = super::traceparent::extract_into_current_span(&request, &peer_id);
+
+        // Per-RPC observability (closes #1299). For a streaming RPC,
+        // "duration" is the lifetime of the open stream (handler entry
+        // through drain-task exit); the in-flight gauge tracks the
+        // count of currently-open streams from this peer. The
+        // `_in_flight` guard moves into the spawned drain task so the
+        // gauge decrements when the task ends — not when this handler
+        // returns the `Subscription` ack.
+        let rpc_started = std::time::Instant::now();
+        #[cfg(feature = "api")]
+        let in_flight =
+            crate::metrics::InFlightGuard::enter(crate::metrics::RPC_SERVER_EVENT_STREAM, &peer_id);
+
         let mut stream = request.into_inner();
 
         info!(peer = %peer_id, "server_event_stream opened (receiving events)");
@@ -1109,6 +1175,12 @@ impl FederatedChannel for FederationService {
         const MAX_CONSECUTIVE_VIOLATIONS: u32 = 10;
 
         spawn_background("fed-v2-server-event-stream", async move {
+            // Move the in-flight guard into the drain task so it
+            // decrements when the stream actually closes, not when
+            // tonic returns the Subscription.
+            #[cfg(feature = "api")]
+            let _in_flight = in_flight;
+
             let mut consecutive_violations: u32 = 0;
 
             while let Ok(Some(event)) = stream.message().await {
@@ -1165,6 +1237,42 @@ impl FederatedChannel for FederationService {
                 on_event(event, rustgate_core::PeerId::new(pid.as_str()));
             }
             info!(peer = %pid, "server_event_stream closed");
+
+            // Per-RPC observability (closes #1299): record duration
+            // and bump the result counter on stream close. A stream
+            // that closed via `Ok(None)` from the peer's `message()`
+            // poll is success — the streaming RPC's contract is
+            // "until either side closes." Errors during the drain
+            // are caught by the `while let Ok(Some(...))` pattern
+            // and break the loop without surfacing the error here;
+            // a future enhancement can split that into an explicit
+            // error-result label.
+            #[cfg(feature = "api")]
+            {
+                let elapsed = rpc_started.elapsed().as_secs_f64();
+                let label = crate::metrics::sanitize_peer_label(&pid);
+                let result_label = crate::metrics::RESULT_SUCCESS;
+                crate::metrics::rpc_duration()
+                    .with_label_values(&[
+                        crate::metrics::RPC_SERVER_EVENT_STREAM,
+                        label.as_str(),
+                        result_label,
+                    ])
+                    .observe(elapsed);
+                crate::metrics::rpc_total()
+                    .with_label_values(&[
+                        crate::metrics::RPC_SERVER_EVENT_STREAM,
+                        label.as_str(),
+                        result_label,
+                    ])
+                    .inc();
+                // _in_flight drops here, decrementing the gauge.
+            }
+            // Suppress unused-variable lint for the timer when the
+            // `api` feature is off — the no-feature build never reads
+            // `rpc_started` because both observation sites are gated.
+            #[cfg(not(feature = "api"))]
+            let _ = rpc_started;
         });
 
         Ok(Response::new(self.our_subscription()))
@@ -1215,10 +1323,31 @@ impl FederatedChannel for FederationService {
                 &peer_id,
                 "peer_not_in_allowlist",
             );
+            #[cfg(feature = "api")]
+            {
+                let label = crate::metrics::sanitize_peer_label(&peer_id);
+                crate::metrics::rpc_total()
+                    .with_label_values(&[
+                        crate::metrics::RPC_SERVER_ROL_STREAM,
+                        label.as_str(),
+                        crate::metrics::RESULT_ERROR,
+                    ])
+                    .inc();
+            }
             return Err(Status::permission_denied("peer not in inbound allowlist"));
         }
 
         info!(peer = %peer_id, "server_rol_stream opened (receiving ROL events)");
+
+        // Per-RPC observability (closes #1299): for a streaming RPC
+        // the duration spans handler entry through drain-task exit.
+        // The in-flight guard moves into the spawned task so the
+        // gauge decrements when the stream actually closes.
+        let rpc_started = std::time::Instant::now();
+        #[cfg(feature = "api")]
+        let in_flight =
+            crate::metrics::InFlightGuard::enter(crate::metrics::RPC_SERVER_ROL_STREAM, &peer_id);
+
         let mut stream = request.into_inner();
 
         // Per-event policy lives in `observe_inbound_rol_event` so
@@ -1229,6 +1358,9 @@ impl FederatedChannel for FederationService {
         let pid = peer_id.clone();
         let max_hops = self.max_hops;
         spawn_background("fed-v2-server-rol-stream", async move {
+            #[cfg(feature = "api")]
+            let _in_flight = in_flight;
+
             while let Ok(Some(rol)) = stream.message().await {
                 let _ = FederationService::observe_inbound_rol_event(
                     &on_rol_event,
@@ -1238,6 +1370,29 @@ impl FederatedChannel for FederationService {
                 );
             }
             info!(peer = %pid, "server_rol_stream closed");
+
+            #[cfg(feature = "api")]
+            {
+                let elapsed = rpc_started.elapsed().as_secs_f64();
+                let label = crate::metrics::sanitize_peer_label(&pid);
+                let result_label = crate::metrics::RESULT_SUCCESS;
+                crate::metrics::rpc_duration()
+                    .with_label_values(&[
+                        crate::metrics::RPC_SERVER_ROL_STREAM,
+                        label.as_str(),
+                        result_label,
+                    ])
+                    .observe(elapsed);
+                crate::metrics::rpc_total()
+                    .with_label_values(&[
+                        crate::metrics::RPC_SERVER_ROL_STREAM,
+                        label.as_str(),
+                        result_label,
+                    ])
+                    .inc();
+            }
+            #[cfg(not(feature = "api"))]
+            let _ = rpc_started;
         });
 
         Ok(Response::new(self.our_subscription()))
@@ -1269,10 +1424,30 @@ impl FederatedChannel for FederationService {
                 &peer_id,
                 "peer_not_in_allowlist",
             );
+            #[cfg(feature = "api")]
+            {
+                let label = crate::metrics::sanitize_peer_label(&peer_id);
+                crate::metrics::rpc_total()
+                    .with_label_values(&[
+                        crate::metrics::RPC_CLIENT_FEDERATE_GROUPS_STREAM,
+                        label.as_str(),
+                        crate::metrics::RESULT_ERROR,
+                    ])
+                    .inc();
+            }
             return Err(Status::permission_denied("peer not in inbound allowlist"));
         }
 
         info!(peer = %peer_id, "client_federate_groups_stream opened (receiving groups)");
+
+        // Per-RPC observability (closes #1299).
+        let rpc_started = std::time::Instant::now();
+        #[cfg(feature = "api")]
+        let in_flight = crate::metrics::InFlightGuard::enter(
+            crate::metrics::RPC_CLIENT_FEDERATE_GROUPS_STREAM,
+            &peer_id,
+        );
+
         let mut stream = request.into_inner();
 
         let peer_groups = Arc::clone(&self.peer_groups);
@@ -1283,6 +1458,9 @@ impl FederatedChannel for FederationService {
         let max_hops = self.max_hops;
 
         spawn_background("fed-v2-client-federate-groups-stream", async move {
+            #[cfg(feature = "api")]
+            let _in_flight = in_flight;
+
             while let Ok(Some(groups_msg)) = stream.message().await {
                 // Per-update observation hook: hop validation + audit +
                 // metric + callback. The existing per-peer bookkeeping
@@ -1337,6 +1515,29 @@ impl FederatedChannel for FederationService {
             }
             info!(peer = %pid, "client_federate_groups_stream closed");
             let _ = peer_groups.write().await.remove(&pid);
+
+            #[cfg(feature = "api")]
+            {
+                let elapsed = rpc_started.elapsed().as_secs_f64();
+                let label = crate::metrics::sanitize_peer_label(&pid);
+                let result_label = crate::metrics::RESULT_SUCCESS;
+                crate::metrics::rpc_duration()
+                    .with_label_values(&[
+                        crate::metrics::RPC_CLIENT_FEDERATE_GROUPS_STREAM,
+                        label.as_str(),
+                        result_label,
+                    ])
+                    .observe(elapsed);
+                crate::metrics::rpc_total()
+                    .with_label_values(&[
+                        crate::metrics::RPC_CLIENT_FEDERATE_GROUPS_STREAM,
+                        label.as_str(),
+                        result_label,
+                    ])
+                    .inc();
+            }
+            #[cfg(not(feature = "api"))]
+            let _ = rpc_started;
         });
 
         Ok(Response::new(self.our_subscription()))

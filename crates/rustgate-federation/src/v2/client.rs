@@ -659,12 +659,50 @@ async fn run_streams(
     let (groups_send_tx, groups_send_rx) = mpsc::channel::<figpb::FederateGroups>(16);
     let groups_stream = tokio_stream::wrappers::ReceiverStream::new(groups_send_rx);
 
-    let _groups_resp = client
+    // Per-RPC observability (closes #1299): measure open-call duration
+    // for the long-lived `ClientFederateGroupsStream` client-streaming
+    // RPC. The duration recorded here is "time spent opening the
+    // stream", not "time the stream stayed open" — that's what the
+    // server-side handler's own duration histogram covers. On the
+    // client side, the open-call duration is the actionable signal:
+    // a slow open means the remote is overloaded or the trust path is
+    // mis-cached.
+    #[cfg(feature = "api")]
+    let _client_groups_in_flight = crate::metrics::InFlightGuard::enter(
+        crate::metrics::RPC_CLIENT_FEDERATE_GROUPS_STREAM,
+        peer.id.as_str(),
+    );
+    #[cfg(feature = "api")]
+    let client_groups_started = std::time::Instant::now();
+    let groups_resp = client
         .client_federate_groups_stream(outbound_request(groups_stream))
-        .await
-        .map_err(|e| {
-            FederationError::other(format!("client_federate_groups_stream failed: {e}"))
-        })?;
+        .await;
+    #[cfg(feature = "api")]
+    {
+        let elapsed = client_groups_started.elapsed().as_secs_f64();
+        let label = crate::metrics::sanitize_peer_label(peer.id.as_str());
+        let result_label = match &groups_resp {
+            Ok(_) => crate::metrics::RESULT_SUCCESS,
+            Err(status) => crate::metrics::classify_status(status.code()),
+        };
+        crate::metrics::rpc_duration()
+            .with_label_values(&[
+                crate::metrics::RPC_CLIENT_FEDERATE_GROUPS_STREAM,
+                label.as_str(),
+                result_label,
+            ])
+            .observe(elapsed);
+        crate::metrics::rpc_total()
+            .with_label_values(&[
+                crate::metrics::RPC_CLIENT_FEDERATE_GROUPS_STREAM,
+                label.as_str(),
+                result_label,
+            ])
+            .inc();
+    }
+    let _groups_resp = groups_resp.map_err(|e| {
+        FederationError::other(format!("client_federate_groups_stream failed: {e}"))
+    })?;
 
     // Send our initial groups
     let our_groups = figpb::FederateGroups {
@@ -686,9 +724,44 @@ async fn run_streams(
     let (send_tx, send_rx) = mpsc::channel::<figpb::FederatedEvent>(256);
     let send_stream = tokio_stream::wrappers::ReceiverStream::new(send_rx);
 
-    let _send_resp = client
+    // Per-RPC observability (closes #1299): measure open-call duration
+    // for the long-lived `ServerEventStream` client-streaming RPC. See
+    // the comment on the `ClientFederateGroupsStream` open above for
+    // the rationale on "open-call vs stream-lifetime" duration.
+    #[cfg(feature = "api")]
+    let _server_event_in_flight = crate::metrics::InFlightGuard::enter(
+        crate::metrics::RPC_SERVER_EVENT_STREAM,
+        peer.id.as_str(),
+    );
+    #[cfg(feature = "api")]
+    let server_event_started = std::time::Instant::now();
+    let send_resp = client
         .server_event_stream(outbound_request(send_stream))
-        .await
+        .await;
+    #[cfg(feature = "api")]
+    {
+        let elapsed = server_event_started.elapsed().as_secs_f64();
+        let label = crate::metrics::sanitize_peer_label(peer.id.as_str());
+        let result_label = match &send_resp {
+            Ok(_) => crate::metrics::RESULT_SUCCESS,
+            Err(status) => crate::metrics::classify_status(status.code()),
+        };
+        crate::metrics::rpc_duration()
+            .with_label_values(&[
+                crate::metrics::RPC_SERVER_EVENT_STREAM,
+                label.as_str(),
+                result_label,
+            ])
+            .observe(elapsed);
+        crate::metrics::rpc_total()
+            .with_label_values(&[
+                crate::metrics::RPC_SERVER_EVENT_STREAM,
+                label.as_str(),
+                result_label,
+            ])
+            .inc();
+    }
+    let _send_resp = send_resp
         .map_err(|e| FederationError::other(format!("server_event_stream failed: {e}")))?;
 
     // --- Step 4: ClientEventStream (open for receiving) ---
@@ -706,10 +779,42 @@ async fn run_streams(
     let (rol_send_tx, rol_send_rx) = mpsc::channel::<figpb::Rol>(256);
     let rol_stream = tokio_stream::wrappers::ReceiverStream::new(rol_send_rx);
 
-    let _rol_resp = client
-        .server_rol_stream(outbound_request(rol_stream))
-        .await
-        .map_err(|e| FederationError::other(format!("server_rol_stream failed: {e}")))?;
+    // Per-RPC observability (closes #1299): measure open-call duration
+    // for `ServerROLStream`. See the `ServerEventStream` open block
+    // above for the per-RPC observation rationale.
+    #[cfg(feature = "api")]
+    let _server_rol_in_flight = crate::metrics::InFlightGuard::enter(
+        crate::metrics::RPC_SERVER_ROL_STREAM,
+        peer.id.as_str(),
+    );
+    #[cfg(feature = "api")]
+    let server_rol_started = std::time::Instant::now();
+    let rol_resp = client.server_rol_stream(outbound_request(rol_stream)).await;
+    #[cfg(feature = "api")]
+    {
+        let elapsed = server_rol_started.elapsed().as_secs_f64();
+        let label = crate::metrics::sanitize_peer_label(peer.id.as_str());
+        let result_label = match &rol_resp {
+            Ok(_) => crate::metrics::RESULT_SUCCESS,
+            Err(status) => crate::metrics::classify_status(status.code()),
+        };
+        crate::metrics::rpc_duration()
+            .with_label_values(&[
+                crate::metrics::RPC_SERVER_ROL_STREAM,
+                label.as_str(),
+                result_label,
+            ])
+            .observe(elapsed);
+        crate::metrics::rpc_total()
+            .with_label_values(&[
+                crate::metrics::RPC_SERVER_ROL_STREAM,
+                label.as_str(),
+                result_label,
+            ])
+            .inc();
+    }
+    let _rol_resp =
+        rol_resp.map_err(|e| FederationError::other(format!("server_rol_stream failed: {e}")))?;
 
     // --- Connection established ---
     peer.set_state(PeerState::Connected);
@@ -873,9 +978,44 @@ async fn run_streams(
             // failure breaks the loop so the connection_loop's
             // reconnect logic kicks in — same recovery shape as the
             // event send stream.
+            //
+            // Per-RPC observability (closes #1299): unary RPC, so the
+            // observation pattern is the textbook one — start timer
+            // and in-flight guard on entry, observe on exit, classify
+            // result from `tonic::Status::code()`.
             Some(blob) = blob_rx.recv() => {
                 let blob_bytes = blob.data.len();
+                #[cfg(feature = "api")]
+                let _blob_in_flight = crate::metrics::InFlightGuard::enter(
+                    crate::metrics::RPC_SEND_ONE_BLOB,
+                    peer.id.as_str(),
+                );
+                #[cfg(feature = "api")]
+                let blob_started = std::time::Instant::now();
                 let resp = client.send_one_blob(outbound_request(blob)).await;
+                #[cfg(feature = "api")]
+                {
+                    let elapsed = blob_started.elapsed().as_secs_f64();
+                    let label = crate::metrics::sanitize_peer_label(peer.id.as_str());
+                    let result_label = match &resp {
+                        Ok(_) => crate::metrics::RESULT_SUCCESS,
+                        Err(status) => crate::metrics::classify_status(status.code()),
+                    };
+                    crate::metrics::rpc_duration()
+                        .with_label_values(&[
+                            crate::metrics::RPC_SEND_ONE_BLOB,
+                            label.as_str(),
+                            result_label,
+                        ])
+                        .observe(elapsed);
+                    crate::metrics::rpc_total()
+                        .with_label_values(&[
+                            crate::metrics::RPC_SEND_ONE_BLOB,
+                            label.as_str(),
+                            result_label,
+                        ])
+                        .inc();
+                }
                 if let Err(e) = resp {
                     warn!(
                         peer = %peer.id,
