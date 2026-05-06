@@ -948,6 +948,13 @@ impl FederationService {
     ///
     /// Returns a `JoinHandle` that resolves when the server shuts down.
     /// Abort the handle to stop the server.
+    ///
+    /// # Runtime requirement
+    ///
+    /// **Must be called from within a tokio runtime context.** This
+    /// constructor invokes [`tokio::spawn`] to drive the gRPC server
+    /// loop in the background. Calling it from outside a tokio
+    /// runtime panics with `there is no reactor running`.
     pub fn start(
         bind: SocketAddr,
         tls_config: tonic::transport::ServerTlsConfig,

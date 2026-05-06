@@ -121,6 +121,13 @@ impl V1Client {
     ///
     /// The client immediately begins connecting to the remote peer
     /// and will reconnect automatically on disconnection.
+    ///
+    /// # Runtime requirement
+    ///
+    /// **Must be called from within a tokio runtime context.** This
+    /// constructor invokes [`tokio::spawn`] to drive the connection
+    /// loop in the background. Calling it from outside a tokio
+    /// runtime panics with `there is no reactor running`.
     pub fn start(peer: Arc<PeerHandle>, config: V1ClientConfig) -> Self {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let (outbound_tx, outbound_rx) = mpsc::channel::<V1Queued>(64);

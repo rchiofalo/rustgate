@@ -75,6 +75,29 @@ impl std::fmt::Debug for TrustStore {
 
 impl TrustStore {
     /// Create a new empty trust store with optional disk persistence.
+    ///
+    /// # Runtime requirement
+    ///
+    /// This constructor is **synchronous and pure** — it allocates the in-memory
+    /// data structures and returns. No file I/O, no DNS, no task spawning. It is
+    /// safe to call outside any async runtime (e.g. from `main` before
+    /// `tokio::runtime::Runtime::new`).
+    ///
+    /// Note that the `data_dir` argument is *recorded* but **not** read here.
+    /// Persistence happens lazily on subsequent `add_certificate_from_pem` /
+    /// `remove_certificate` calls, both of which use blocking [`std::fs`]
+    /// helpers. To pre-load existing on-disk state at startup, prefer
+    /// [`TrustStore::load_from_directory`] instead.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rustgate_federation::trust_store::TrustStore;
+    ///
+    /// // Construct outside any tokio runtime — no .await, no spawn.
+    /// let store = TrustStore::new(None);
+    /// assert_eq!(store.count().expect("read empty store"), 0);
+    /// ```
     pub fn new(data_dir: Option<PathBuf>) -> Self {
         Self {
             certs: RwLock::new(HashMap::new()),
@@ -87,6 +110,33 @@ impl TrustStore {
     ///
     /// Reads all `.pem` and `.crt` files from the specified directory.
     /// Creates the directory if it does not exist.
+    ///
+    /// # Blocking I/O
+    ///
+    /// This constructor performs **synchronous, blocking** filesystem I/O via
+    /// [`std::fs`] (`create_dir_all`, `read_dir`, `read`). It does *not*
+    /// schedule async work, but it does block the calling thread for the
+    /// duration of the directory scan. From a tokio worker thread, prefer
+    /// `tokio::task::spawn_blocking(move || TrustStore::load_from_directory(&dir))`
+    /// when the directory is large or on slow storage so the runtime's worker
+    /// is not starved during startup.
+    ///
+    /// All currently-known call sites invoke this synchronously during
+    /// `rustgate-server` startup before any tokio listeners are accepting
+    /// traffic, so the blocking cost is paid before the runtime is hot.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::path::Path;
+    /// use rustgate_federation::trust_store::TrustStore;
+    ///
+    /// // Synchronous filesystem load — no tokio runtime required, but
+    /// // blocks the calling thread while the directory is scanned.
+    /// let store = TrustStore::load_from_directory(Path::new("/var/lib/rustgate/trust"))
+    ///     .expect("load trust store");
+    /// let _count = store.count().expect("count");
+    /// ```
     pub fn load_from_directory(dir: &Path) -> Result<Self> {
         let store = Self::new(Some(dir.to_path_buf()));
 

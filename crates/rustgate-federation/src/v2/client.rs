@@ -181,6 +181,13 @@ impl V2Client {
     /// 1. Establishes a gRPC channel over TLS
     /// 2. Performs the 5-stream handshake (groups, events, health)
     /// 3. Reconnects automatically on failure with exponential backoff
+    ///
+    /// # Runtime requirement
+    ///
+    /// **Must be called from within a tokio runtime context.** This
+    /// constructor invokes [`tokio::spawn`] to drive the connection
+    /// loop in the background. Calling it from outside a tokio
+    /// runtime panics with `there is no reactor running`.
     pub fn start(peer: Arc<PeerHandle>, config: V2ClientConfig) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (outbound_tx, outbound_rx) = mpsc::channel::<V2Queued>(256);

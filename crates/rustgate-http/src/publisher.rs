@@ -225,6 +225,27 @@ impl HttpPublisher {
     /// matching targets, and (when a DLQ is configured) a drain worker
     /// that replays sealed DLQ segments whenever a target's circuit
     /// breaker recovers (`HalfOpen → Closed`). `#881`.
+    ///
+    /// # Runtime requirement
+    ///
+    /// **Must be called from within a tokio runtime context.** Despite
+    /// the synchronous `pub fn new` signature, this constructor calls
+    /// [`tokio::spawn`] for the dispatch worker (and a second time for
+    /// the DLQ drain worker when `dlq_dir` + `dlq_key_file` are
+    /// configured). Calling it from outside a tokio runtime panics
+    /// with `there is no reactor running`.
+    ///
+    /// # Blocking I/O
+    ///
+    /// In addition to the spawned tasks, this constructor performs
+    /// **synchronous, blocking** filesystem I/O when a DLQ is
+    /// configured: it reads the encryption key ring via
+    /// [`std::fs`](std::fs) and creates the DLQ directory tree with
+    /// `std::fs::create_dir_all`. From a tokio worker thread the cost
+    /// is paid once at startup; if the key file lives on slow storage,
+    /// wrap the call in
+    /// [`tokio::task::spawn_blocking`](tokio::task::spawn_blocking) so
+    /// the runtime worker is not starved.
     pub fn new(config: HttpConfig) -> Result<Self, HttpError> {
         config.validate()?;
 
