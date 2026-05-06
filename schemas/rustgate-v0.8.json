@@ -84,6 +84,13 @@
       ],
       "default": null
     },
+    "audit-delivery": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
     "audit-log": {
       "type": [
         "string",
@@ -327,6 +334,13 @@
       "format": "uint64",
       "default": null,
       "minimum": 0
+    },
+    "default-classification": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
     },
     "encoding": {
       "anyOf": [
@@ -619,6 +633,24 @@
         "null"
       ],
       "default": null
+    },
+    "jwks-pending-window-secs": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "default": null,
+      "minimum": 0
+    },
+    "jwks-retiring-window-secs": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "default": null,
+      "minimum": 0
     },
     "key": {
       "type": [
@@ -1034,6 +1066,13 @@
       "default": null,
       "minimum": 0
     },
+    "require-classification-marking": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
     "revocation-db": {
       "type": [
         "string",
@@ -1121,6 +1160,52 @@
         "null"
       ],
       "format": "uint",
+      "default": null,
+      "minimum": 0
+    },
+    "udp-multicast-groups": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "udp-multicast-interface": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "udp-multicast-loop": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
+    "udp-multicast-max-bps": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "default": null,
+      "minimum": 0
+    },
+    "udp-multicast-rebroadcast": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
+    "udp-multicast-ttl": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
       "default": null,
       "minimum": 0
     },
@@ -1258,7 +1343,7 @@
   "additionalProperties": false,
   "$defs": {
     "AuthzPolicyFormat": {
-      "description": "Selects which dynamic federation peer discovery backend is used.\n\n `None` (the default) disables discovery entirely; static peer\n configuration via `--federation-peers-file` remains the only source of\n truth. The other variants each map to a backend gated behind its own\n cargo feature (`peer-discovery-dns-sd`, `peer-discovery-consul`,\n `peer-discovery-etcd`); selecting a backend whose feature was not\n compiled in surfaces a startup error.\n Authz policy-file format selector.",
+      "description": "Selects which dynamic federation peer discovery backend is used.\n\n`None` (the default) disables discovery entirely; static peer\nconfiguration via `--federation-peers-file` remains the only source of\ntruth. The other variants each map to a backend gated behind its own\ncargo feature (`peer-discovery-dns-sd`, `peer-discovery-consul`,\n`peer-discovery-etcd`); selecting a backend whose feature was not\ncompiled in surfaces a startup error.\nAuthz policy-file format selector.",
       "oneOf": [
         {
           "description": "Native rustgate-authz JSON ruleset.",
@@ -1304,14 +1389,14 @@
           "const": "tak-protobuf"
         },
         {
-          "description": "TAK protocol negotiation: starts XML, upgrades to protobuf if the client requests it.\n This is the mode real TAK clients expect. Requires --features proto.",
+          "description": "TAK protocol negotiation: starts XML, upgrades to protobuf if the client requests it.\nThis is the mode real TAK clients expect. Requires --features proto.",
           "type": "string",
           "const": "tak-negotiate"
         }
       ]
     },
     "MqttWildcardPolicy": {
-      "description": "MQTT SUBSCRIBE wildcard policy selector for the CLI / config file.\n\n Mirrors `rustgate_mqtt::WildcardPolicy` but is owned by the server\n crate so `rustgate-mqtt` does not need a clap dependency. A plain\n code reference is used instead of an intra-doc link because the\n `rustgate-mqtt` crate is an optional dependency that is absent from\n the default feature set used by `cargo doc --workspace --no-deps`\n on the docs-site build. The defaulting behaviour\n (`single-level-only`) matches the MQTT adapter's own default so\n operators who omit the flag get spec-conformant single-level (`+`)\n wildcards without the `#` firehose.",
+      "description": "MQTT SUBSCRIBE wildcard policy selector for the CLI / config file.\n\nMirrors `rustgate_mqtt::WildcardPolicy` but is owned by the server\ncrate so `rustgate-mqtt` does not need a clap dependency. A plain\ncode reference is used instead of an intra-doc link because the\n`rustgate-mqtt` crate is an optional dependency that is absent from\nthe default feature set used by `cargo doc --workspace --no-deps`\non the docs-site build. The defaulting behaviour\n(`single-level-only`) matches the MQTT adapter's own default so\noperators who omit the flag get spec-conformant single-level (`+`)\nwildcards without the `#` firehose.",
       "oneOf": [
         {
           "description": "Reject both `+` and `#`. Exact-topic subscriptions only.",
