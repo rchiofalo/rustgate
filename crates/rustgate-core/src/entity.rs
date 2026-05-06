@@ -37,7 +37,8 @@
 //! work will optionally attach an `Entity` alongside `payload` so the
 //! workspace can migrate codec by codec without a breaking flag day.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use bytes::Bytes;
@@ -152,6 +153,28 @@ pub enum EntityKind {
     Unknown(String),
 }
 
+impl EntityKind {
+    /// Stable lowercase ASCII tag for use as a Prometheus label value.
+    ///
+    /// The vocabulary is closed: every variant maps to one of
+    /// `"aircraft"`, `"ground"`, `"marine"`, `"sensor"`, `"track"`,
+    /// `"munition"`, `"unknown"`. The free-form label inside
+    /// [`EntityKind::Unknown`] is **not** surfaced here so cardinality
+    /// stays bounded — operators wanting the codec-specific label use
+    /// the `Entity.attributes` map directly. Closes #847.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Aircraft => "aircraft",
+            Self::Ground => "ground",
+            Self::Marine => "marine",
+            Self::Sensor => "sensor",
+            Self::Track => "track",
+            Self::Munition => "munition",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+}
+
 /// Geographic position in WGS-84 decimal degrees.
 ///
 /// `lat` is in `[-90, 90]`; `lon` is in `[-180, 180]`. The codec is
@@ -261,6 +284,137 @@ pub trait EntityCodec: Send + Sync {
     fn from_entity(&self, entity: &Entity) -> Result<Bytes, Self::Error>;
 }
 
+/// Boxed-error type returned by the object-safe [`DynEntityCodec`]
+/// trait. Per-impl `EntityCodec::Error` variants are erased here so a
+/// heterogeneous registry (CoT + MAVLink + ASTERIX + STANAG-4586 + …)
+/// can be held under a single `dyn` type. The router crate that consumes
+/// the registry maps this back into its own typed error at the boundary
+/// when needed, but for the dispatch path the loss of typing is an
+/// acceptable trade — the router only logs decode failures and falls
+/// back to wire-format delivery, so a `Display`-able message is
+/// sufficient.
+pub type DynEntityCodecError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Object-safe variant of [`EntityCodec`] for heterogeneous registries.
+///
+/// `EntityCodec::Error` is an associated type to keep per-codec typing
+/// (`rustgate_cot::ParseError`, `rustgate_mavlink::MavlinkEntityError`,
+/// …) at the codec boundary, but a registry that holds many codecs
+/// behind one `dyn` slot needs a single error type. This trait erases
+/// the per-impl error into [`DynEntityCodecError`] via a blanket impl
+/// (`impl<T: EntityCodec> DynEntityCodec for T`), so callers do not
+/// need to write any boxing boilerplate at the codec implementation
+/// site.
+///
+/// Closes #847 — the router consumes
+/// `Arc<dyn DynEntityCodec>` per registered `source_protocol` and looks
+/// the codec up by string at message-dispatch time.
+pub trait DynEntityCodec: Send + Sync {
+    /// Object-safe equivalent of [`EntityCodec::to_entity`]. The
+    /// per-impl error is boxed into [`DynEntityCodecError`].
+    fn to_entity_dyn(&self, payload: &[u8]) -> Result<Entity, DynEntityCodecError>;
+
+    /// Object-safe equivalent of [`EntityCodec::from_entity`]. The
+    /// per-impl error is boxed into [`DynEntityCodecError`].
+    // justification: directional pair of `to_entity_dyn`. The
+    // `wrong_self_convention` lint targets `from_*` constructors that
+    // confusingly take `&self`; this is the encode arrow on the codec
+    // trait and `&self` is required for object-safety.
+    #[allow(clippy::wrong_self_convention)]
+    fn from_entity_dyn(&self, entity: &Entity) -> Result<Bytes, DynEntityCodecError>;
+}
+
+impl<T> DynEntityCodec for T
+where
+    T: EntityCodec + Send + Sync,
+    T::Error: std::error::Error + Send + Sync + 'static,
+{
+    fn to_entity_dyn(&self, payload: &[u8]) -> Result<Entity, DynEntityCodecError> {
+        self.to_entity(payload).map_err(|e| Box::new(e) as _)
+    }
+
+    fn from_entity_dyn(&self, entity: &Entity) -> Result<Bytes, DynEntityCodecError> {
+        self.from_entity(entity).map_err(|e| Box::new(e) as _)
+    }
+}
+
+/// Registry mapping a [`crate::message::Metadata::source_protocol`]
+/// string to the [`DynEntityCodec`] that knows how to decode the
+/// matching wire format into an [`Entity`].
+///
+/// The router consumes this at message-dispatch time: when a routed
+/// message's `source_protocol` matches a registered key, the codec is
+/// invoked best-effort to produce an [`Entity`] surface for audit /
+/// metrics / track-correlation hooks. A miss (unknown protocol) or a
+/// decode failure is logged at `tracing::debug!` but never blocks
+/// delivery of the underlying wire payload — the entity surface is a
+/// cross-cutting concern, not a gating one.
+///
+/// Lookup is `HashMap<String, Arc<dyn …>>` so the hot path is a single
+/// hash + clone-Arc and the registry is `Send + Sync` for the
+/// `Arc<Router>` shape used across worker threads. There is no
+/// per-message lock — the registry is built once at server startup,
+/// stored behind `Arc`, and never mutated; a future hot-reload story
+/// would wrap it in `ArcSwap` matching the existing `acl` / `authz`
+/// patterns. Closes #847.
+#[derive(Default)]
+pub struct EntityCodecRegistry {
+    codecs: HashMap<String, Arc<dyn DynEntityCodec>>,
+}
+
+impl std::fmt::Debug for EntityCodecRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Render only the registered keys — the `dyn` codec itself is
+        // not Debug, and the keys are the operationally interesting
+        // signal anyway (an operator dump shows which protocols have
+        // an Entity codec wired and which fall through to wire-format-
+        // only routing).
+        f.debug_struct("EntityCodecRegistry")
+            .field("protocols", &self.codecs.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl EntityCodecRegistry {
+    /// Create an empty registry. Use [`Self::register`] to populate.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a codec under the given `source_protocol` string.
+    ///
+    /// The string is matched verbatim against
+    /// [`crate::message::Metadata::source_protocol`] at dispatch time.
+    /// Subsequent registrations of the same key replace the previous
+    /// codec — the registry is expected to be built once at startup,
+    /// so the silent replacement avoids a panicking `expect_unique`
+    /// API in cases where the server binary registers duplicate
+    /// codecs across feature-flag overlap.
+    pub fn register(&mut self, source_protocol: &str, codec: Arc<dyn DynEntityCodec>) {
+        let _ = self.codecs.insert(source_protocol.to_string(), codec);
+    }
+
+    /// Look up the codec for the given `source_protocol`. Returns
+    /// `None` if no codec is registered. The hot path on a registered
+    /// hit is a hash lookup plus an `Arc::clone` — no allocation.
+    pub fn get(&self, source_protocol: &str) -> Option<Arc<dyn DynEntityCodec>> {
+        self.codecs.get(source_protocol).map(Arc::clone)
+    }
+
+    /// Return `true` when the registry has no codecs registered. The
+    /// router uses this to short-circuit the dispatch-path lookup on
+    /// builds where the operator has not opted into entity decoding.
+    pub fn is_empty(&self) -> bool {
+        self.codecs.is_empty()
+    }
+
+    /// Number of codecs currently registered. Surfaced for diagnostics
+    /// and tests.
+    pub fn len(&self) -> usize {
+        self.codecs.len()
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
@@ -317,5 +471,192 @@ mod tests {
         };
         let json = serde_json::to_string(&pos).expect("serialise");
         assert!(json.contains("\"hae_meters\":null"));
+    }
+
+    #[test]
+    fn entity_kind_as_str_pins_closed_label_vocabulary() {
+        // Closes #847. The label vocabulary is closed and lowercase
+        // ASCII so a Prometheus counter labelled by `kind` cannot
+        // explode in cardinality. Pin all variants — adding a new
+        // variant must update this test (forces an explicit decision
+        // at the metrics level).
+        assert_eq!(EntityKind::Aircraft.as_str(), "aircraft");
+        assert_eq!(EntityKind::Ground.as_str(), "ground");
+        assert_eq!(EntityKind::Marine.as_str(), "marine");
+        assert_eq!(EntityKind::Sensor.as_str(), "sensor");
+        assert_eq!(EntityKind::Track.as_str(), "track");
+        assert_eq!(EntityKind::Munition.as_str(), "munition");
+        assert_eq!(
+            EntityKind::Unknown("custom-protocol-thing".into()).as_str(),
+            "unknown",
+            "Unknown variant must collapse the inner label to keep \
+             Prometheus cardinality bounded",
+        );
+    }
+
+    /// Trivial codec used to exercise the [`DynEntityCodec`] blanket
+    /// impl and the [`EntityCodecRegistry`] dispatch path without
+    /// pulling in any real wire-format crate.
+    #[derive(Debug, Clone)]
+    struct TestCodec(EntityKind);
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("test codec failure: {0}")]
+    struct TestCodecError(String);
+
+    impl EntityCodec for TestCodec {
+        type Error = TestCodecError;
+
+        fn to_entity(&self, payload: &[u8]) -> Result<Entity, Self::Error> {
+            // Empty payload is a "decode failure" — used by the
+            // registry-wraps-error tests.
+            if payload.is_empty() {
+                return Err(TestCodecError("empty".into()));
+            }
+            Ok(Entity {
+                uid: "test-uid".into(),
+                kind: self.0.clone(),
+                position: None,
+                velocity: None,
+                timestamp: SystemTime::UNIX_EPOCH,
+                callsign: None,
+                mil_std_2525_sidc: None,
+                attributes: BTreeMap::new(),
+            })
+        }
+
+        fn from_entity(&self, _entity: &Entity) -> Result<Bytes, Self::Error> {
+            Ok(Bytes::from_static(b"encoded"))
+        }
+    }
+
+    #[test]
+    fn dyn_entity_codec_blanket_impl_boxes_typed_error() {
+        // Pins the blanket `impl<T: EntityCodec> DynEntityCodec for T`:
+        // a typed `TestCodecError` must round-trip through the boxed
+        // `Box<dyn std::error::Error + Send + Sync>` shape.
+        let codec: Arc<dyn DynEntityCodec> = Arc::new(TestCodec(EntityKind::Aircraft));
+        let err = codec
+            .to_entity_dyn(b"")
+            .expect_err("empty payload must decode-fail");
+        assert!(
+            err.to_string().contains("test codec failure"),
+            "boxed error must preserve Display output, got {err}",
+        );
+    }
+
+    #[test]
+    fn dyn_entity_codec_round_trip_works_through_arc_dyn() {
+        // Pins that a real (non-erroring) call site stays usable
+        // through the `Arc<dyn DynEntityCodec>` shape — encoder and
+        // decoder both succeed and the encode-then-decode round trip
+        // recovers the source `kind`.
+        let codec: Arc<dyn DynEntityCodec> = Arc::new(TestCodec(EntityKind::Marine));
+        let entity = codec
+            .to_entity_dyn(b"non-empty")
+            .expect("non-empty payload decodes");
+        assert_eq!(entity.kind, EntityKind::Marine);
+        let bytes = codec.from_entity_dyn(&entity).expect("encode round trip");
+        assert_eq!(bytes.as_ref(), b"encoded");
+    }
+
+    #[test]
+    fn entity_codec_registry_get_returns_some_when_registered() {
+        let mut registry = EntityCodecRegistry::new();
+        registry.register("test", Arc::new(TestCodec(EntityKind::Sensor)));
+        assert!(!registry.is_empty());
+        assert_eq!(registry.len(), 1);
+
+        let codec = registry.get("test").expect("registered codec");
+        let entity = codec
+            .to_entity_dyn(b"non-empty")
+            .expect("registered codec decodes");
+        assert_eq!(entity.kind, EntityKind::Sensor);
+    }
+
+    #[test]
+    fn entity_codec_registry_get_returns_none_for_unknown_protocol() {
+        let registry = EntityCodecRegistry::new();
+        assert!(registry.is_empty());
+        assert!(registry.get("nonexistent").is_none());
+    }
+
+    #[test]
+    fn entity_codec_registry_register_replaces_existing_key() {
+        let mut registry = EntityCodecRegistry::new();
+        registry.register("test", Arc::new(TestCodec(EntityKind::Sensor)));
+        // Re-register under the same key — silent replacement so the
+        // server binary's feature-flag overlap (e.g. the MAVLink crate
+        // registering a frame codec and a downstream extension
+        // registering a richer one) does not panic at startup.
+        registry.register("test", Arc::new(TestCodec(EntityKind::Aircraft)));
+        assert_eq!(registry.len(), 1);
+
+        let codec = registry.get("test").expect("registered codec");
+        let entity = codec
+            .to_entity_dyn(b"non-empty")
+            .expect("registered codec decodes");
+        assert_eq!(
+            entity.kind,
+            EntityKind::Aircraft,
+            "second register call must replace the first",
+        );
+    }
+
+    #[test]
+    fn entity_codec_registry_supports_multiple_protocols() {
+        let mut registry = EntityCodecRegistry::new();
+        registry.register("cot", Arc::new(TestCodec(EntityKind::Ground)));
+        registry.register("mavlink", Arc::new(TestCodec(EntityKind::Aircraft)));
+        registry.register("asterix", Arc::new(TestCodec(EntityKind::Track)));
+        registry.register("stanag4586", Arc::new(TestCodec(EntityKind::Aircraft)));
+
+        assert_eq!(registry.len(), 4);
+
+        // Each protocol resolves to its own codec — pins that the
+        // registry does not collapse keys or share Arc storage
+        // unintentionally.
+        assert_eq!(
+            registry
+                .get("cot")
+                .expect("cot")
+                .to_entity_dyn(b"x")
+                .expect("decode")
+                .kind,
+            EntityKind::Ground,
+        );
+        assert_eq!(
+            registry
+                .get("mavlink")
+                .expect("mavlink")
+                .to_entity_dyn(b"x")
+                .expect("decode")
+                .kind,
+            EntityKind::Aircraft,
+        );
+        assert_eq!(
+            registry
+                .get("asterix")
+                .expect("asterix")
+                .to_entity_dyn(b"x")
+                .expect("decode")
+                .kind,
+            EntityKind::Track,
+        );
+    }
+
+    #[test]
+    fn entity_codec_registry_debug_renders_protocols_only() {
+        // The custom Debug impl exists so an operator dump of the
+        // registry shape is readable. Pin that the rendering
+        // includes the protocol keys (and not, e.g., a placeholder
+        // string with no diagnostic value).
+        let mut registry = EntityCodecRegistry::new();
+        registry.register("cot", Arc::new(TestCodec(EntityKind::Ground)));
+        let dbg = format!("{registry:?}");
+        assert!(
+            dbg.contains("cot"),
+            "Debug must include registered protocol keys, got {dbg}",
+        );
     }
 }

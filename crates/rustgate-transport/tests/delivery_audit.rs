@@ -79,6 +79,7 @@ struct DeliveredRecord {
     msg_uid: String,
     msg_type: String,
     group: String,
+    entity_kind: Option<String>,
 }
 
 impl DeliveredRecorder {
@@ -88,15 +89,18 @@ impl DeliveredRecorder {
 
     fn callback(&self) -> rustgate_transport::OnMessageDelivered {
         let inner = Arc::clone(&self.0);
-        Arc::new(move |source_cn, dest_cn, msg_uid, msg_type, group| {
-            inner.lock().unwrap().push(DeliveredRecord {
-                source_cn: source_cn.to_string(),
-                dest_cn: dest_cn.to_string(),
-                msg_uid: msg_uid.to_string(),
-                msg_type: msg_type.to_string(),
-                group: group.to_string(),
-            });
-        })
+        Arc::new(
+            move |source_cn, dest_cn, msg_uid, msg_type, group, entity_kind| {
+                inner.lock().unwrap().push(DeliveredRecord {
+                    source_cn: source_cn.to_string(),
+                    dest_cn: dest_cn.to_string(),
+                    msg_uid: msg_uid.to_string(),
+                    msg_type: msg_type.to_string(),
+                    group: group.to_string(),
+                    entity_kind: entity_kind.map(str::to_owned),
+                });
+            },
+        )
     }
 }
 
@@ -399,7 +403,14 @@ async fn audit_event_fields_are_sanitized() {
     // Emit directly through the audit helper — exercising the
     // sanitization boundary without standing up a full router.
     let malicious_cn = "evil\nattacker_line";
-    rustgate_core::audit::message_delivered("alice", malicious_cn, "ATTACK-1", "chat", "direct");
+    rustgate_core::audit::message_delivered(
+        "alice",
+        malicious_cn,
+        "ATTACK-1",
+        "chat",
+        "direct",
+        None,
+    );
 
     let captured = buf.snapshot();
     let line = captured

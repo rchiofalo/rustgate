@@ -2206,6 +2206,18 @@ pub fn jwt_using_retiring_kid(kid: &str, retiring_for_seconds: u64) {
 /// correlation queries do not have to special-case the absent-group
 /// shape.
 ///
+/// `entity_kind` is the closed-vocabulary
+/// [`crate::entity::EntityKind::as_str`] tag (e.g. `"aircraft"`,
+/// `"ground"`, `"unknown"`) when the router was able to decode the
+/// payload into an [`crate::entity::Entity`] via the registered
+/// codec for `metadata.source_protocol`. Pass `None` for two cases:
+/// the operator has not registered a codec for the protocol, OR the
+/// codec rejected the payload as malformed. The field is rendered as
+/// `entity_kind=Some("aircraft")` / `entity_kind=None` in the audit
+/// record so SIEM rules can correlate kind to delivery without having
+/// to re-parse the payload. Closes #847 — the umbrella Entity Model
+/// Abstraction Layer extension to the chain-of-custody audit shape.
+///
 /// Sanitization: every `&str` field is sanitized at the audit boundary
 /// per the workspace audit-boundary discipline (#1197 / #1220). Callers
 /// MAY still wrap on their side — `sanitize_for_log` is idempotent —
@@ -2216,12 +2228,18 @@ pub fn message_delivered(
     msg_uid: &str,
     msg_type: &str,
     group: &str,
+    entity_kind: Option<&str>,
 ) {
     let source_cn = s(source_cn);
     let dest_cn = s(dest_cn);
     let msg_uid = s(msg_uid);
     let msg_type = s(msg_type);
     let group = s(group);
+    // `entity_kind` is `Option<&str>` so an absent codec / failed
+    // decode renders explicitly as `None` rather than the empty
+    // string — the latter would be ambiguous with a registered codec
+    // that returned an empty `EntityKind::as_str()`, which the closed
+    // vocabulary precludes today but a future refactor could change.
     audit!(
         "message.delivered",
         source = %source_cn,
@@ -2229,6 +2247,7 @@ pub fn message_delivered(
         uid = %msg_uid,
         msg_type = %msg_type,
         group = %group,
+        entity_kind = ?entity_kind,
         action = "deliver",
         result = "success"
     );
@@ -3156,10 +3175,37 @@ mod tests {
             // Pin every documented call shape so a future refactor
             // that drops a field or reorders arguments fails the
             // build instead of silently reshaping the audit record.
-            message_delivered("alice", "bob", "UID-1", "position", "team");
-            message_delivered("alice", "bob", "", "chat", "direct");
-            message_delivered("alice", "bob", "UID-2", "alert", "broadcast");
-            message_delivered("", "", "", "", "");
+            message_delivered("alice", "bob", "UID-1", "position", "team", None);
+            message_delivered("alice", "bob", "", "chat", "direct", None);
+            message_delivered("alice", "bob", "UID-2", "alert", "broadcast", None);
+            message_delivered("", "", "", "", "", None);
+            // Closes #847 — pin the entity_kind=Some(...) shape so
+            // the closed-vocabulary tags continue to render through
+            // the audit boundary without per-call sanitization.
+            message_delivered(
+                "alice",
+                "bob",
+                "UID-3",
+                "position",
+                "team",
+                Some("aircraft"),
+            );
+            message_delivered(
+                "alice",
+                "bob",
+                "UID-4",
+                "position",
+                "direct",
+                Some("ground"),
+            );
+            message_delivered(
+                "alice",
+                "bob",
+                "UID-5",
+                "position",
+                "broadcast",
+                Some("unknown"),
+            );
         }
 
         #[test]
@@ -4123,7 +4169,7 @@ mod tests {
             // refactor that renames a field fails this test instead of
             // silently breaking downstream rules.
             let snapshot = capture_audit(|| {
-                message_delivered("alice", "bob", "ANDROID-1", "position", "team-blue")
+                message_delivered("alice", "bob", "ANDROID-1", "position", "team-blue", None)
             });
             let event = parse_event(&snapshot, "message.delivered");
             assert_eq!(
@@ -4171,13 +4217,62 @@ mod tests {
         }
 
         #[test]
+        fn message_delivered_includes_entity_kind_when_some() {
+            // Closes #847. Pin the wire shape for the new `entity_kind`
+            // field on the success path so SIEM rules that key on
+            // `entity_kind` see a stable rendering. The `?` formatter
+            // on `Option<&str>` produces `Some("aircraft")`.
+            let snapshot = capture_audit(|| {
+                message_delivered(
+                    "alice",
+                    "bob",
+                    "ANDROID-1",
+                    "position",
+                    "team-blue",
+                    Some("aircraft"),
+                )
+            });
+            let event = parse_event(&snapshot, "message.delivered");
+            let entity_kind = event["fields"]["entity_kind"]
+                .as_str()
+                .expect("entity_kind must be a JSON string");
+            assert!(
+                entity_kind.contains("aircraft"),
+                "entity_kind must contain the kind tag, got {entity_kind}",
+            );
+            assert!(
+                entity_kind.contains("Some"),
+                "entity_kind must render as Some(...) when codec succeeded, got {entity_kind}",
+            );
+        }
+
+        #[test]
+        fn message_delivered_renders_none_when_codec_unset() {
+            // Closes #847. The router sets `None` either when no codec
+            // is registered for the source_protocol or when the codec
+            // rejected the payload. Both cases must render explicitly
+            // as `None` in the audit record.
+            let snapshot = capture_audit(|| {
+                message_delivered("alice", "bob", "UID-1", "chat", "direct", None)
+            });
+            let event = parse_event(&snapshot, "message.delivered");
+            let entity_kind = event["fields"]["entity_kind"]
+                .as_str()
+                .expect("entity_kind must be a JSON string");
+            assert_eq!(
+                entity_kind, "None",
+                "entity_kind must render exactly as `None` when codec absent, got {entity_kind}",
+            );
+        }
+
+        #[test]
         fn message_delivered_sanitizes_cn_with_log_forging() {
             // Closes #854. Recipient CN crosses the audit-boundary at
             // the audit emission site, so sanitization is the helper's
             // responsibility regardless of whether the caller wrapped.
             let malicious_cn = "bob\r\n\x1b[31m[FAKE]\x1b[0m";
             let snapshot = capture_audit(|| {
-                message_delivered("alice", malicious_cn, "UID-1", "chat", "direct")
+                message_delivered("alice", malicious_cn, "UID-1", "chat", "direct", None)
             });
             let event = parse_event(&snapshot, "message.delivered");
             let dest = event["fields"]["dest"]
