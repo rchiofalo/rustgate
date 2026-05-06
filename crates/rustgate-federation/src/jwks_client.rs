@@ -264,6 +264,52 @@ impl JwksClient {
     /// management. The `authority` is the live [`JwtAuthority`]; the
     /// task atomically swaps verifier maps into it as JWKS responses
     /// arrive.
+    ///
+    /// # Runtime requirement
+    ///
+    /// **Must be called from within a tokio runtime context.** Despite
+    /// the synchronous `pub fn start` signature, this function calls
+    /// [`tokio::spawn`] directly. Calling it from outside a tokio
+    /// runtime panics with `there is no reactor running`.
+    ///
+    /// The pattern is intentional: `start` is fast (it only validates
+    /// the config, builds a `reqwest::Client`, and hands off to the
+    /// background task), so requiring `async fn` would force every
+    /// caller into an `.await` for no behavioural benefit. The cost is
+    /// a runtime contract the signature does not advertise — hence
+    /// this section.
+    ///
+    /// Returns a [`SubsystemHandle`] for graceful shutdown via
+    /// [`stop_subsystem`](rustgate_core::tasks::stop_subsystem).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    /// use rustgate_federation::jwks_client::{
+    ///     JwksClient, JwksConfig, MIN_REFRESH_INTERVAL, MAX_REFRESH_INTERVAL,
+    ///     DEFAULT_PENDING_WINDOW, DEFAULT_RETIRING_WINDOW,
+    /// };
+    /// use rustgate_federation::jwt::JwtAuthority;
+    ///
+    /// # async fn example(
+    /// #     tls_config: Arc<rustls::ClientConfig>,
+    /// #     authority: Arc<JwtAuthority>,
+    /// # ) {
+    /// // Inside an async fn — i.e. inside a tokio runtime context.
+    /// let cfg = JwksConfig {
+    ///     url: "https://idp.example.com/.well-known/jwks.json".into(),
+    ///     refresh_min: MIN_REFRESH_INTERVAL,
+    ///     refresh_max: MAX_REFRESH_INTERVAL,
+    ///     allow_hs256: false,
+    ///     pending_window: DEFAULT_PENDING_WINDOW,
+    ///     retiring_window: DEFAULT_RETIRING_WINDOW,
+    /// };
+    /// let _handle = JwksClient::start(cfg, tls_config, authority)
+    ///     .expect("start jwks client");
+    /// # }
+    /// ```
     pub fn start(
         config: JwksConfig,
         tls_config: Arc<rustls::ClientConfig>,

@@ -79,6 +79,39 @@ impl DynamicCertVerifier {
     /// also called once at construction to build the initial verifier.
     ///
     /// `crls` are included in every rebuilt `WebPkiClientVerifier`.
+    ///
+    /// # Runtime requirement
+    ///
+    /// This constructor is **synchronous** — no tokio runtime context is
+    /// required. It does **not** spawn tasks, perform network I/O, or
+    /// touch the filesystem directly: all I/O is the responsibility of
+    /// the caller-supplied `provider` closure (which may, for example,
+    /// snapshot a `TrustStore` populated earlier from disk).
+    ///
+    /// The `provider` closure is invoked **once** during construction
+    /// to build the initial verifier, and **once per**
+    /// [`verify_client_cert`](Self::verify_client_cert) **call** thereafter.
+    /// If the closure performs blocking I/O it will block the rustls
+    /// handshake worker thread, so the closure body should be fast and
+    /// non-blocking — typically a `RwLock::read` over an in-memory store.
+    ///
+    /// Each generation advance leaks a small `Vec<DistinguishedName>`
+    /// via [`Vec::leak`] — see the type-level docs on root-hint freshness.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use rustls::RootCertStore;
+    /// use rustgate_transport::DynamicCertVerifier;
+    ///
+    /// // The provider closure is invoked lock-free on every TLS handshake;
+    /// // keep it cheap. A typical implementation snapshots an in-memory
+    /// // trust store and returns a (generation, RootCertStore) pair.
+    /// let provider = Box::new(|| (0u64, RootCertStore::empty()));
+    /// let _verifier = DynamicCertVerifier::new(provider, Vec::new())
+    ///     .expect("build verifier");
+    /// ```
     pub fn new(
         provider: RootStoreProvider,
         crls: Vec<CertificateRevocationListDer<'static>>,

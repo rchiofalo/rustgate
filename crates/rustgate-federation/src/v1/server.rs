@@ -77,6 +77,13 @@ impl V1Server {
     ///
     /// Use this when you need custom TLS configuration, such as a
     /// `DynamicCertVerifier` for runtime trust store changes.
+    ///
+    /// # Runtime requirement
+    ///
+    /// **Must be called from within a tokio runtime context.** This
+    /// constructor invokes [`tokio::spawn`] to drive the accept loop
+    /// in the background. Calling it from outside a tokio runtime
+    /// panics with `there is no reactor running`.
     pub fn start_with_listener(
         listener: TlsListener,
         server_uid: String,
