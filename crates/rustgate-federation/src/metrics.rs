@@ -8,7 +8,9 @@
 
 use std::sync::OnceLock;
 
-use prometheus::{IntCounter, IntCounterVec, IntGauge, Opts};
+use prometheus::{
+    HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+};
 
 // ── Metric statics ──────────────────────────────────────────────────
 
@@ -41,6 +43,18 @@ static REPLAY_BUFFER_BYTES: OnceLock<IntGauge> = OnceLock::new();
 static PEER_LATENCY_NANOS: OnceLock<prometheus::IntGaugeVec> = OnceLock::new();
 static PEER_QUEUE_BYTES: OnceLock<prometheus::IntGaugeVec> = OnceLock::new();
 static CROSS_REGION_FORWARDS: OnceLock<IntCounter> = OnceLock::new();
+
+// ── Per-RPC observability (closes #1299) ────────────────────────────
+//
+// Three vector metrics give operators per-RPC granularity over the V2
+// federation gRPC suite — the aggregate counters above can't tell
+// "slow `SendOneBlob` (large payloads)" from "slow `ServerEventStream`
+// (steady state)" from "bursty `ServerROLStream`". The label
+// vocabulary is shared across all three so PromQL can `sum by (rpc)`
+// to get a uniform view.
+static RPC_DURATION: OnceLock<HistogramVec> = OnceLock::new();
+static RPC_IN_FLIGHT: OnceLock<IntGaugeVec> = OnceLock::new();
+static RPC_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 
 // ── Registration ────────────────────────────────────────────────────
 
@@ -204,6 +218,47 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(cross_region_forwards.clone()))?;
     let _ = CROSS_REGION_FORWARDS.set(cross_region_forwards);
 
+    // Per-RPC observability (closes #1299).
+    let rpc_duration = HistogramVec::new(
+        HistogramOpts::new(
+            "rustgate_federation_rpc_duration_seconds",
+            "Per-RPC wall-clock duration of V2 federation gRPC calls. The \
+             `rpc` label is one of `server_event_stream`, `send_one_blob`, \
+             `server_rol_stream`, `client_federate_groups_stream`. The \
+             `result` label is `success`, `error`, or `timeout`.",
+        ),
+        &["rpc", "peer", "result"],
+    )?;
+    registry.register(Box::new(rpc_duration.clone()))?;
+    let _ = RPC_DURATION.set(rpc_duration);
+
+    let rpc_in_flight = IntGaugeVec::new(
+        Opts::new(
+            "rustgate_federation_rpc_in_flight",
+            "Per-RPC in-flight count for V2 federation gRPC calls. \
+             Incremented on entry into the handler / send path and \
+             decremented when it returns (RAII via the duration timer's \
+             `Drop` and a paired gauge guard).",
+        ),
+        &["rpc", "peer"],
+    )?;
+    registry.register(Box::new(rpc_in_flight.clone()))?;
+    let _ = RPC_IN_FLIGHT.set(rpc_in_flight);
+
+    let rpc_total = IntCounterVec::new(
+        Opts::new(
+            "rustgate_federation_rpc_total",
+            "Per-RPC total invocation count for V2 federation gRPC calls, \
+             classified by outcome. The `result` label distinguishes \
+             `success` (gRPC `Ok`), `error` (any non-OK gRPC `Status` \
+             other than `DeadlineExceeded`), and `timeout` \
+             (`DeadlineExceeded` or local deadline hit).",
+        ),
+        &["rpc", "peer", "result"],
+    )?;
+    registry.register(Box::new(rpc_total.clone()))?;
+    let _ = RPC_TOTAL.set(rpc_total);
+
     Ok(())
 }
 
@@ -216,7 +271,9 @@ pub fn init() -> prometheus::Result<()> {
 
 use rustgate_core::metrics_util::{
     fallback_counter, fallback_counter_vec, fallback_gauge, fallback_gauge_vec,
+    fallback_histogram_vec,
 };
+use rustgate_core::sanitize::sanitize_for_log;
 
 // ── Accessor functions ──────────────────────────────────────────────
 //
@@ -400,6 +457,135 @@ pub fn cross_region_forwards() -> &'static IntCounter {
             "fallback",
         )
     })
+}
+
+// ── Per-RPC observability accessors (closes #1299) ──────────────────
+
+/// Canonical `rpc` label for `ServerEventStream` send path / handler.
+pub const RPC_SERVER_EVENT_STREAM: &str = "server_event_stream";
+/// Canonical `rpc` label for `SendOneBlob` (unary).
+pub const RPC_SEND_ONE_BLOB: &str = "send_one_blob";
+/// Canonical `rpc` label for `ServerROLStream`.
+pub const RPC_SERVER_ROL_STREAM: &str = "server_rol_stream";
+/// Canonical `rpc` label for `ClientFederateGroupsStream`.
+pub const RPC_CLIENT_FEDERATE_GROUPS_STREAM: &str = "client_federate_groups_stream";
+
+/// Result label `success` — RPC completed with gRPC `Ok` status.
+pub const RESULT_SUCCESS: &str = "success";
+/// Result label `error` — explicit non-OK / non-`DeadlineExceeded` gRPC `Err`.
+pub const RESULT_ERROR: &str = "error";
+/// Result label `timeout` — `DeadlineExceeded` or local deadline.
+pub const RESULT_TIMEOUT: &str = "timeout";
+
+/// Per-RPC duration histogram (vec, labels: `rpc`, `peer`, `result`).
+///
+/// Each bucket observation is the wall-clock duration of one V2
+/// federation gRPC invocation. Use [`HistogramVec::with_label_values`]
+/// at the call site; pair with [`rpc_in_flight`] for an in-flight gauge.
+pub fn rpc_duration() -> &'static HistogramVec {
+    RPC_DURATION.get_or_init(|| {
+        fallback_histogram_vec(
+            "rustgate_federation_rpc_duration_seconds",
+            "fallback",
+            &["rpc", "peer", "result"],
+        )
+    })
+}
+
+/// Per-RPC in-flight gauge (vec, labels: `rpc`, `peer`).
+///
+/// Incremented on entry into the RPC handler / send path; decremented on
+/// exit. The `result` label is intentionally absent here — operators
+/// already get success-vs-error rates from [`rpc_total`], and a third
+/// dimension would inflate the cardinality of an in-flight series with
+/// values that are mechanically zero except in transient bursts.
+pub fn rpc_in_flight() -> &'static IntGaugeVec {
+    RPC_IN_FLIGHT.get_or_init(|| {
+        fallback_gauge_vec(
+            "rustgate_federation_rpc_in_flight",
+            "fallback",
+            &["rpc", "peer"],
+        )
+    })
+}
+
+/// Per-RPC invocation counter classified by outcome (vec, labels:
+/// `rpc`, `peer`, `result`).
+///
+/// `result` ∈ `{success, error, timeout}`. See [`classify_status`] for
+/// the canonical gRPC `Status` → label mapping.
+pub fn rpc_total() -> &'static IntCounterVec {
+    RPC_TOTAL.get_or_init(|| {
+        fallback_counter_vec(
+            "rustgate_federation_rpc_total",
+            "fallback",
+            &["rpc", "peer", "result"],
+        )
+    })
+}
+
+/// Sanitize a peer-id label value for the per-RPC metric vectors.
+///
+/// Peer-id is the federate-id string from a peer-controlled `Identity`
+/// or the mTLS CN. Both are user-influenced surfaces — we route them
+/// through [`sanitize_for_log`] so a peer that smuggled `\r\n` into its
+/// federate-id can't forge log lines downstream of a Prometheus scrape
+/// that prints labels verbatim.
+pub fn sanitize_peer_label(peer: &str) -> String {
+    sanitize_for_log(peer)
+}
+
+/// Classify a `tonic::Status` into the canonical `result` label value
+/// for [`rpc_total`] / [`rpc_duration`].
+///
+/// - `Code::Ok` → [`RESULT_SUCCESS`]
+/// - `Code::DeadlineExceeded` → [`RESULT_TIMEOUT`]
+/// - any other code → [`RESULT_ERROR`]
+///
+/// Local deadline hits surface as `DeadlineExceeded` from tonic's timer
+/// machinery, so callers that wrap an RPC in `tokio::time::timeout`
+/// should map the elapsed branch to [`RESULT_TIMEOUT`] explicitly —
+/// this helper only sees the gRPC layer's view.
+#[cfg(feature = "v2")]
+pub fn classify_status(code: tonic::Code) -> &'static str {
+    match code {
+        tonic::Code::Ok => RESULT_SUCCESS,
+        tonic::Code::DeadlineExceeded => RESULT_TIMEOUT,
+        _ => RESULT_ERROR,
+    }
+}
+
+/// RAII guard that increments [`rpc_in_flight`] on construction and
+/// decrements on `Drop`. Pair with `rpc_duration().start_timer()` for
+/// the matching duration histogram (the histogram timer's RAII is its
+/// own type; we keep a separate guard so the two metrics can diverge
+/// in the unlikely future where one wants different label cardinality).
+#[derive(Debug)]
+pub struct InFlightGuard {
+    rpc: &'static str,
+    peer: String,
+}
+
+impl InFlightGuard {
+    /// Increment the in-flight gauge for `(rpc, peer)` and return a
+    /// guard that decrements on `Drop`. The `rpc` value is one of the
+    /// `RPC_*` constants in this module; the `peer` value goes through
+    /// [`sanitize_peer_label`] before being used as a label.
+    pub fn enter(rpc: &'static str, peer: &str) -> Self {
+        let peer = sanitize_peer_label(peer);
+        rpc_in_flight()
+            .with_label_values(&[rpc, peer.as_str()])
+            .inc();
+        Self { rpc, peer }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        rpc_in_flight()
+            .with_label_values(&[self.rpc, self.peer.as_str()])
+            .dec();
+    }
 }
 
 // ── Snapshot ────────────────────────────────────────────────────────
@@ -641,5 +827,95 @@ mod tests {
         let snap = snapshot();
         let debug = format!("{snap:?}");
         assert!(debug.contains("MetricsSnapshot"));
+    }
+
+    // ── Per-RPC observability (closes #1299) ────────────────────────
+
+    /// `init()` is idempotent — a second call returns
+    /// `Err(AlreadyReg)` from prometheus's registry but must not panic.
+    /// All call sites guard with `let _ = init();` precisely so the
+    /// second-call error is silently absorbed.
+    #[test]
+    fn rpc_metrics_init_is_idempotent() {
+        // First call may succeed (or be a re-entry from another test);
+        // second call must not panic regardless.
+        let _ = init();
+        let _ = init();
+        // Sentinel: the accessor still returns a usable metric.
+        let _ = rpc_duration();
+    }
+
+    /// Accessors must work even when `init()` was never called — the
+    /// `OnceLock::get_or_init` fallback path constructs an unregistered
+    /// metric on demand. We can't isolate the global `OnceLock` from a
+    /// preceding test that already triggered `init()`, but the
+    /// fallback constructor's correctness is independently exercised
+    /// by `rustgate_core::metrics_util` unit tests; here we just
+    /// confirm the accessor returns a callable handle.
+    #[test]
+    fn rpc_metrics_accessor_works_without_init() {
+        let dur = rpc_duration();
+        let inf = rpc_in_flight();
+        let tot = rpc_total();
+        // Calling `with_label_values` on each must not panic — that
+        // proves the accessor returned a vec with the expected label
+        // arity (3 / 2 / 3 respectively) regardless of whether the
+        // metric is registered or fallback.
+        let _ = dur.with_label_values(&[RPC_SEND_ONE_BLOB, "peer-fallback", RESULT_SUCCESS]);
+        let _ = inf.with_label_values(&[RPC_SEND_ONE_BLOB, "peer-fallback"]);
+        let _ = tot.with_label_values(&[RPC_SEND_ONE_BLOB, "peer-fallback", RESULT_SUCCESS]);
+    }
+
+    /// The peer-id label must be sanitized before reaching the metric
+    /// vector — a peer that injected `\r\n` into its federate-id
+    /// would otherwise forge log lines downstream of any scrape that
+    /// prints labels verbatim. The output of [`sanitize_peer_label`]
+    /// must contain neither CR nor LF.
+    #[test]
+    fn rpc_metrics_label_peer_is_sanitized() {
+        let evil = "peer-\r\nfake-line";
+        let safe = sanitize_peer_label(evil);
+        assert!(!safe.contains('\r'), "CR must be stripped: {safe:?}");
+        assert!(!safe.contains('\n'), "LF must be stripped: {safe:?}");
+    }
+
+    /// `classify_status` is the canonical gRPC `Code` → `result`
+    /// label mapping. Pin the three branches so a future tonic
+    /// upgrade that renames a variant fails this test instead of
+    /// silently mis-classifying outcomes.
+    #[cfg(feature = "v2")]
+    #[test]
+    fn rpc_metrics_classify_status_three_buckets() {
+        assert_eq!(classify_status(tonic::Code::Ok), RESULT_SUCCESS);
+        assert_eq!(
+            classify_status(tonic::Code::DeadlineExceeded),
+            RESULT_TIMEOUT,
+        );
+        assert_eq!(classify_status(tonic::Code::Internal), RESULT_ERROR);
+        assert_eq!(classify_status(tonic::Code::Unavailable), RESULT_ERROR);
+        assert_eq!(classify_status(tonic::Code::Unauthenticated), RESULT_ERROR,);
+    }
+
+    /// The in-flight gauge must increment when an `InFlightGuard` is
+    /// created and decrement on `Drop`. Drives the success path
+    /// (no early return between `enter` and the implicit drop) and
+    /// pins both transitions.
+    #[test]
+    fn rpc_in_flight_gauge_enters_and_exits_via_guard() {
+        ensure_init();
+        let before = rpc_in_flight()
+            .with_label_values(&[RPC_SEND_ONE_BLOB, "peer-guard-test"])
+            .get();
+        {
+            let _g = InFlightGuard::enter(RPC_SEND_ONE_BLOB, "peer-guard-test");
+            let during = rpc_in_flight()
+                .with_label_values(&[RPC_SEND_ONE_BLOB, "peer-guard-test"])
+                .get();
+            assert_eq!(during, before + 1, "guard must increment on enter");
+        }
+        let after = rpc_in_flight()
+            .with_label_values(&[RPC_SEND_ONE_BLOB, "peer-guard-test"])
+            .get();
+        assert_eq!(after, before, "guard must decrement on drop");
     }
 }

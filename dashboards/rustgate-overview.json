@@ -425,6 +425,39 @@
       "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
       "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "result", "values": false}, "colorMode": "value"},
       "targets": [{"expr": "sum by (result) (increase(rustgate_negotiations_total[5m]))", "refId": "A", "legendFormat": "{{result}}"}]
+    },
+    {
+      "type": "row",
+      "title": "Federation per-RPC",
+      "id": 45,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 130},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Per-RPC p99 latency",
+      "id": 46,
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 131},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "targets": [{"expr": "histogram_quantile(0.99, sum by (rpc, le) (rate(rustgate_federation_rpc_duration_seconds_bucket[5m])))", "refId": "A", "legendFormat": "{{rpc}}"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Per-RPC in-flight",
+      "id": 47,
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 131},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "rustgate_federation_rpc_in_flight", "refId": "A", "legendFormat": "{{rpc}} / {{peer}}"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Per-RPC error rate",
+      "id": 48,
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 131},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum by (rpc) (rate(rustgate_federation_rpc_total{result=\"error\"}[5m]))", "refId": "A", "legendFormat": "{{rpc}}"}]
     }
   ],
   "refresh": "30s",
