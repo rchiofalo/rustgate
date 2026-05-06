@@ -114,6 +114,12 @@ pub(crate) struct SessionDeps<P: NatsPublish> {
     /// bucketing plus the Tier 2 enable flag.
     #[cfg(feature = "metrics")]
     pub(crate) metrics_identity: Arc<metrics::MetricsIdentity>,
+    /// Refs #849 item 4: per-listener default CAPCO classification
+    /// banner. When `Some`, every inbound message that does not
+    /// already carry a `Metadata.classification` is stamped with this
+    /// marking before reaching the router. `None` (default) keeps
+    /// pre-#849 behaviour for legacy traffic.
+    pub(crate) default_classification: Option<rustgate_core::classification::ClassificationMarking>,
 }
 
 /// Runtime context for a connected session's read/write loops.
@@ -131,6 +137,10 @@ struct SessionContext<'a, P: NatsPublish> {
     delta_config: DeltaConfig,
     #[cfg(feature = "metrics")]
     metrics_identity: &'a metrics::MetricsIdentity,
+    /// Refs #849: per-listener default CAPCO classification, threaded
+    /// through to the [`MessageBuilder`] in `read_loop` so unmarked
+    /// inbound traffic is stamped before it reaches the router.
+    default_classification: &'a Option<rustgate_core::classification::ClassificationMarking>,
 }
 
 /// Trait for optional NATS publishing. Allows the server to compile with or
@@ -292,6 +302,7 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
         delta_config: deps.delta_config,
         #[cfg(feature = "metrics")]
         metrics_identity: deps.metrics_identity.as_ref(),
+        default_classification: &deps.default_classification,
     };
 
     let result = run_session_loops(
@@ -481,6 +492,14 @@ async fn read_loop(
         MessageBuilder::new().with_on_sa_upgraded(crate::metrics::sa_auto_upgraded_callback());
     #[cfg(not(feature = "metrics"))]
     let mut msg_builder = MessageBuilder::new();
+    // Refs #849: stamp inbound messages with the listener default
+    // marking (if configured) before they reach the router. The
+    // builder applies the default only when the message does not
+    // already carry a marking, so payloads that already encode one
+    // (future Entity Model parsers, federation peers) override.
+    if let Some(default) = ctx.default_classification {
+        msg_builder = msg_builder.with_default_classification(default.clone());
+    }
 
     loop {
         let frame = match tokio::time::timeout(READ_TIMEOUT, framed.next()).await {
@@ -728,6 +747,9 @@ pub(crate) struct PlaintextTcpConfig<P: NatsPublish> {
     pub(crate) shutdown: Arc<tokio::sync::Notify>,
     #[cfg(feature = "metrics")]
     pub(crate) metrics_identity: Arc<metrics::MetricsIdentity>,
+    /// Refs #849 item 4: per-listener default CAPCO classification.
+    /// `None` keeps pre-#849 behaviour for legacy traffic.
+    pub(crate) default_classification: Option<rustgate_core::classification::ClassificationMarking>,
 }
 
 /// Accept loop for plaintext TCP connections.
@@ -755,6 +777,7 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
         shutdown,
         #[cfg(feature = "metrics")]
         metrics_identity,
+        default_classification,
     } = config;
 
     loop {
@@ -846,6 +869,7 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
                         let session_rf = replay_filter.clone();
                         #[cfg(feature = "metrics")]
                         let session_metrics_id = Arc::clone(&metrics_identity);
+                        let session_default_classification = default_classification.clone();
 
                         rustgate_core::tasks::spawn_background("plaintext-tcp-session", async move {
                             let _permit = permit;
@@ -868,6 +892,7 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
                                 delta_config,
                                 #[cfg(feature = "metrics")]
                                 metrics_identity: session_metrics_id.as_ref(),
+                                default_classification: &session_default_classification,
                             }).await;
 
                             if let Err(e) = result {
@@ -910,6 +935,9 @@ struct PlaintextSessionContext<'a, P: NatsPublish> {
     delta_config: DeltaConfig,
     #[cfg(feature = "metrics")]
     metrics_identity: &'a metrics::MetricsIdentity,
+    /// Refs #849: per-listener default CAPCO classification, applied
+    /// to inbound messages that do not already carry one.
+    default_classification: &'a Option<rustgate_core::classification::ClassificationMarking>,
 }
 
 /// Read/write loops for a plaintext TCP session.
@@ -937,6 +965,7 @@ async fn run_plaintext_session_loops<P: NatsPublish>(
         delta_config,
         #[cfg(feature = "metrics")]
         metrics_identity,
+        default_classification,
     } = ctx;
     let mut plaintext_delta_encoder = if codec_is_xml(codec) {
         delta_config.build_encoder()
@@ -953,6 +982,9 @@ async fn run_plaintext_session_loops<P: NatsPublish>(
         MessageBuilder::new().with_on_sa_upgraded(crate::metrics::sa_auto_upgraded_callback());
     #[cfg(not(feature = "metrics"))]
     let mut msg_builder = MessageBuilder::new();
+    if let Some(default) = default_classification {
+        msg_builder = msg_builder.with_default_classification(default.clone());
+    }
 
     let write_framed_codec = FramedCodec::try_from_strategy(&codec.framing())?;
     let mut framed_write = FramedWrite::new(writer, write_framed_codec);

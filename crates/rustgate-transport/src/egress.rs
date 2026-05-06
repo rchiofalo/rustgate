@@ -414,6 +414,7 @@ fn fold_multicast(
     evaluator: &dyn EnvelopeEvaluator,
 ) -> FoldOutcome {
     let mut union: HashSet<Obligation> = HashSet::new();
+    let classification = arc_msg.metadata.classification.as_ref();
     for group in groups {
         // Mirror the local-fanout membership gate: a sender that is
         // not a member of the group cannot Send to it on the local
@@ -424,7 +425,7 @@ fn fold_multicast(
         }
         let subject = AuthzSubject::from_identity(&arc_msg.source);
         let resource = AuthzResource::Group { group };
-        let outcome = evaluator.evaluate_send(engine, &subject, &resource);
+        let outcome = evaluator.evaluate_send(engine, &subject, &resource, classification);
         if !outcome.is_allow() {
             // Deny-first: any per-group deny vetoes the entire
             // envelope. The per-group `authz_denied` audit record is
@@ -446,7 +447,8 @@ fn fold_single(
     evaluator: &dyn EnvelopeEvaluator,
 ) -> FoldOutcome {
     let subject = AuthzSubject::from_identity(&arc_msg.source);
-    let outcome = evaluator.evaluate_send(engine, &subject, &resource);
+    let classification = arc_msg.metadata.classification.as_ref();
+    let outcome = evaluator.evaluate_send(engine, &subject, &resource, classification);
     if !outcome.is_allow() {
         return FoldOutcome::Denied;
     }
@@ -463,11 +465,17 @@ fn fold_single(
 /// that delegates to its existing `authz_evaluate_send` so every
 /// envelope-rendering evaluation is observed identically to a local
 /// fan-out evaluation.
+///
+/// Refs #849: the trait now takes the source message's
+/// `Option<&ClassificationMarking>` as the fourth argument so the
+/// per-group fold can drive a marking-driven Send-PEP deny on multicast
+/// egress, not just on the local-fanout path.
 pub(crate) trait EnvelopeEvaluator {
     fn evaluate_send(
         &self,
         engine: &Arc<dyn PolicyEngine>,
         subject: &AuthzSubject<'_>,
         resource: &AuthzResource<'_>,
+        classification: Option<&rustgate_core::classification::ClassificationMarking>,
     ) -> rustgate_authz::DecisionOutcome;
 }

@@ -1316,6 +1316,30 @@ pub(crate) struct Cli {
     )]
     pub(crate) authz_allow_unknown_obligations: bool,
 
+    /// Refs #849 item 4: when `true`, every inbound message that lacks
+    /// a CAPCO classification marking on its envelope is rejected at
+    /// admission with a `classification.missing` audit record. Default
+    /// `false` keeps pre-#849 behaviour: unmarked legacy traffic flows
+    /// unchanged. Set this for deployments where every message MUST
+    /// carry a marking (cross-domain solutions, classified networks).
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "RUSTGATE_REQUIRE_CLASSIFICATION_MARKING"
+    )]
+    pub(crate) require_classification_marking: bool,
+
+    /// Refs #849 item 4: per-listener default CAPCO classification
+    /// banner. When set, every inbound message that does NOT already
+    /// carry a `Metadata.classification` is stamped with this banner
+    /// before policy evaluation. The value MUST parse as a CAPCO
+    /// banner string (e.g. `"//UNCLASSIFIED"`, `"//SECRET//NOFORN"`).
+    /// Combine with `--require-classification-marking` for a
+    /// "stamp-or-reject" pipeline; combine without it to default-tag
+    /// only the unmarked traffic.
+    #[arg(long, env = "RUSTGATE_DEFAULT_CLASSIFICATION")]
+    pub(crate) default_classification: Option<String>,
+
     /// Sustained per-CN replay rate (events per second) for
     /// `Router::replay_positions` (issue #724). Each reconnect consumes
     /// one token from a per-CN `TokenBucket`; when the bucket is
@@ -2154,6 +2178,8 @@ define_config_file! {
     authz_reload_interval: u64,
     authz_fail_open: bool,
     authz_allow_unknown_obligations: bool,
+    require_classification_marking: bool,
+    default_classification: Option<String>,
     position_replay_rate_per_sec: u32,
     position_replay_burst: u32,
     tenant_quota_file: Option<std::path::PathBuf>,
@@ -2271,6 +2297,15 @@ impl Cli {
         // than bail so the server still starts (harmless misconfiguration).
         if self.authz_fail_open && self.authz_policy_file.is_none() {
             tracing::warn!("--authz-fail-open has no effect without --authz-policy-file");
+        }
+
+        // Refs #849: a `--default-classification` value MUST parse as a
+        // CAPCO banner string. Catch typos at startup rather than on
+        // every inbound message.
+        if let Some(ref banner) = self.default_classification
+            && let Err(e) = banner.parse::<rustgate_core::classification::ClassificationMarking>()
+        {
+            anyhow::bail!("--default-classification ({banner:?}) is not a valid CAPCO banner: {e}");
         }
 
         if self.authz_policy_file.is_some() && self.authz_reload_interval == 0 {
@@ -3452,6 +3487,95 @@ mod tests {
         // Should succeed (warn, not bail).
         cli.validate()
             .expect("authz-fail-open without policy should warn, not error");
+    }
+
+    // ── classification CLI flag pins (refs #849) ─────────────────────
+
+    #[test]
+    fn cli_require_classification_marking_flag_parses() {
+        // Pin the flag name and bool semantics. Operator runbooks key
+        // off the exact flag string; a refactor that renamed it would
+        // break every helm chart and `--help` example without showing
+        // up at compile time.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let cert = dir.path().join("c.pem");
+        let key = dir.path().join("k.pem");
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&cert, "").expect("write cert");
+        std::fs::write(&key, "").expect("write key");
+        std::fs::write(&ca, "").expect("write ca");
+
+        let cli = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            cert.to_str().unwrap(),
+            "--key",
+            key.to_str().unwrap(),
+            "--ca",
+            ca.to_str().unwrap(),
+            "--require-classification-marking",
+        ])
+        .expect("flag should parse");
+        assert!(
+            cli.require_classification_marking,
+            "--require-classification-marking must set the field to true"
+        );
+
+        let cli_default = cli_with_temp_tls(&dir);
+        assert!(
+            !cli_default.require_classification_marking,
+            "default value must be false (legacy traffic flows unchanged)"
+        );
+    }
+
+    #[test]
+    fn cli_default_classification_flag_parses_capco_banner() {
+        // Pin both that the flag name parses and that the value
+        // round-trips through CAPCO `FromStr` validation. A typo that
+        // breaks the validator surfaces at startup, not at runtime.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let cert = dir.path().join("c.pem");
+        let key = dir.path().join("k.pem");
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&cert, "").expect("write cert");
+        std::fs::write(&key, "").expect("write key");
+        std::fs::write(&ca, "").expect("write ca");
+
+        let cli = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            cert.to_str().unwrap(),
+            "--key",
+            key.to_str().unwrap(),
+            "--ca",
+            ca.to_str().unwrap(),
+            "--default-classification",
+            "//UNCLASSIFIED",
+        ])
+        .expect("flag should parse");
+        assert_eq!(
+            cli.default_classification.as_deref(),
+            Some("//UNCLASSIFIED"),
+            "value must round-trip verbatim into the field"
+        );
+        cli.validate()
+            .expect("//UNCLASSIFIED is a valid CAPCO banner");
+    }
+
+    #[test]
+    fn validate_rejects_invalid_default_classification_banner() {
+        // Defence-in-depth: a malformed banner caught at startup beats
+        // a per-message reject loop. The validator wraps the
+        // ParseError with the offending banner verbatim so operators
+        // can fix the typo from the error message alone.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut cli = cli_with_temp_tls(&dir);
+        cli.default_classification = Some("not-a-banner".to_string());
+        let err = cli.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("--default-classification"),
+            "validator must surface the offending flag, got: {err}"
+        );
     }
 
     #[test]

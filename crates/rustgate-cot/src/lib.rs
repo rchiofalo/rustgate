@@ -748,6 +748,12 @@ pub struct MessageBuilder {
     /// counter without making `rustgate-cot` depend on the metrics
     /// layer. Closes #741.
     on_sa_upgraded: Option<OnSaAutoUpgraded>,
+    /// Refs #849: per-listener default CAPCO classification banner.
+    /// When set, every built message that does not already carry a
+    /// `Metadata.classification` is stamped with this marking before
+    /// being returned. `None` (default) keeps pre-#849 behaviour:
+    /// unmarked traffic flows unchanged.
+    default_classification: Option<rustgate_core::classification::ClassificationMarking>,
 }
 
 impl std::fmt::Debug for MessageBuilder {
@@ -755,6 +761,10 @@ impl std::fmt::Debug for MessageBuilder {
         f.debug_struct("MessageBuilder")
             .field("session_group", &self.session_group)
             .field("on_sa_upgraded_installed", &self.on_sa_upgraded.is_some())
+            .field(
+                "default_classification",
+                &self.default_classification.as_ref().map(|m| m.to_string()),
+            )
             .finish()
     }
 }
@@ -771,6 +781,20 @@ impl MessageBuilder {
     /// observer.
     pub fn with_on_sa_upgraded(mut self, cb: OnSaAutoUpgraded) -> Self {
         self.on_sa_upgraded = Some(cb);
+        self
+    }
+
+    /// Refs #849: install a per-listener default CAPCO classification
+    /// marking. Every message produced by [`Self::build`] that does
+    /// not already carry a `Metadata.classification` will be stamped
+    /// with this marking before being returned. Subsequent calls
+    /// replace the previous default.
+    #[must_use]
+    pub fn with_default_classification(
+        mut self,
+        marking: rustgate_core::classification::ClassificationMarking,
+    ) -> Self {
+        self.default_classification = Some(marking);
         self
     }
 
@@ -804,7 +828,7 @@ impl MessageBuilder {
             }
             None => payload,
         };
-        match parse(&payload) {
+        let mut msg = match parse(&payload) {
             Ok(cot) => {
                 if cot.source_group.is_some() {
                     self.session_group = cot.source_group.clone();
@@ -812,7 +836,19 @@ impl MessageBuilder {
                 self.build_from_cot(identity, payload, source_protocol, cot)
             }
             Err(_) => self.build_raw(identity, payload, source_protocol),
+        };
+        // Refs #849 item 4: stamp the per-listener default
+        // classification when configured and the message does not
+        // already carry one. The CoT path could in principle parse a
+        // `<marking>` element from the payload in a future iteration;
+        // until then the field is `None` after `build_from_cot` /
+        // `build_raw` and the default applies unconditionally.
+        if let Some(ref default) = self.default_classification
+            && msg.metadata.classification.is_none()
+        {
+            msg.metadata = msg.metadata.with_classification(default.clone());
         }
+        msg
     }
 
     fn build_from_cot(

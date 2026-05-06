@@ -99,15 +99,15 @@ pub struct Metadata {
     pub ttl: Option<Duration>,
     /// Optional W3C Trace Context attached at ingress and propagated end-to-end
     /// across local routing and federation hops (closes #852, PR-C).
-    ///
-    /// Populated on inbound federation traffic from the gRPC `traceparent`
-    /// metadata header (when valid). Local-protocol transports (TLS, MQTT,
-    /// WebSocket, NATS) leave this `None` because their wire format has no
-    /// native traceparent carry; federation outbound consults this field
-    /// (when `Some`) instead of the active OTel span so a relay node
-    /// continues an upstream trace rather than spawning a new one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_context: Option<crate::traceparent::TraceContext>,
+    /// Optional CAPCO classification marking attached to the message
+    /// envelope. `None` for legacy traffic; the per-recipient authz
+    /// path forwards `Some(_)` into the `classification` context so
+    /// policies can deny release to recipients whose clearance does
+    /// not dominate the marking (closes #849 items 3 + 4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification: Option<crate::classification::ClassificationMarking>,
     // Future optional fields land here. Each must:
     //   1. Be `Option<T>` (or another type with a sensible default).
     //   2. Carry `#[serde(default, skip_serializing_if = "…")]` so absent
@@ -138,6 +138,7 @@ impl Metadata {
             message_type,
             ttl: None,
             trace_context: None,
+            classification: None,
         }
     }
 
@@ -150,15 +151,20 @@ impl Metadata {
 
     /// Builder-style setter for [`Metadata::trace_context`]. Returns `self`
     /// for chaining. Closes #852.
-    ///
-    /// The trace context is picked up by federation outbound dispatch so an
-    /// explicit context (e.g. one extracted from an inbound peer header)
-    /// wins over the active OTel span when injecting the W3C `traceparent`
-    /// onto the outgoing gRPC metadata. This makes a relay node continue
-    /// the upstream trace rather than spawning a new one.
     #[must_use]
     pub fn with_trace_context(mut self, ctx: crate::traceparent::TraceContext) -> Self {
         self.trace_context = Some(ctx);
+        self
+    }
+
+    /// Builder-style setter for [`Metadata::classification`]. Returns
+    /// `self` for chaining. Refs #849.
+    #[must_use]
+    pub fn with_classification(
+        mut self,
+        marking: crate::classification::ClassificationMarking,
+    ) -> Self {
+        self.classification = Some(marking);
         self
     }
 
@@ -1048,6 +1054,22 @@ mod tests {
         );
     }
 
+    // ── classification field coverage (refs #849) ───────────────────
+
+    #[test]
+    fn metadata_new_initializes_classification_to_none() {
+        // Constructor invariant: every optional field defaults to
+        // `None` so existing call sites observe identical behaviour
+        // before and after the additive #849 field landed. A regression
+        // that defaulted to `Some(...)` would silently mark every
+        // legacy message and tip the egress enforcement open.
+        let meta = Metadata::new(SystemTime::now(), "tcp".into(), MessageType::Position);
+        assert!(
+            meta.classification.is_none(),
+            "Metadata::new must default classification to None"
+        );
+    }
+
     #[test]
     fn metadata_with_trace_context_sets_field() {
         // Builder-style chain on `trace_context`: same contract as
@@ -1065,6 +1087,29 @@ mod tests {
         assert!(
             meta.ttl.is_none(),
             "ttl must remain untouched by with_trace_context"
+        );
+    }
+
+    #[test]
+    fn metadata_with_classification_sets_field() {
+        // Builder pin: `with_classification` takes ownership of a
+        // marking and returns the metadata with the field populated.
+        // Pin both the field set and that the other fields are
+        // untouched so a future refactor to the builder shape is
+        // caught here rather than at every call site.
+        use crate::classification::{Classification, ClassificationMarking};
+
+        let now = SystemTime::now();
+        let marking = ClassificationMarking::new(Classification::Secret);
+        let meta = Metadata::new(now, "tcp".into(), MessageType::Position)
+            .with_classification(marking.clone());
+        assert_eq!(meta.classification, Some(marking));
+        assert_eq!(meta.received_at, now);
+        assert_eq!(meta.source_protocol, "tcp");
+        assert_eq!(meta.message_type, MessageType::Position);
+        assert!(
+            meta.ttl.is_none(),
+            "ttl must remain None after classification"
         );
     }
 
@@ -1163,5 +1208,70 @@ mod tests {
         .with_trace_context(first)
         .with_trace_context(second.clone());
         assert_eq!(meta.trace_context.as_ref(), Some(&second));
+    }
+
+    #[test]
+    fn metadata_serde_round_trip_preserves_classification() {
+        // Pin that a marking on the wire deserializes to an equivalent
+        // marking — including the canonical CAPCO banner-string form
+        // produced by `Display`. Pre-#849 federation peers do not emit
+        // this field; post-#849 peers must round-trip cleanly.
+        use crate::classification::ClassificationMarking;
+
+        let marking: ClassificationMarking =
+            "//SECRET//NOFORN".parse().expect("test fixture must parse");
+        let original = Metadata::new(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            "tcp".into(),
+            MessageType::Position,
+        )
+        .with_classification(marking.clone());
+        let json = serde_json::to_string(&original).expect("serialize");
+        assert!(
+            json.contains("\"classification\""),
+            "wire format must include `classification` field when Some, got {json}"
+        );
+        assert!(
+            json.contains("//SECRET//NOFORN"),
+            "wire format must carry canonical banner string, got {json}"
+        );
+        let parsed: Metadata = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, original);
+        assert_eq!(parsed.classification, Some(marking));
+    }
+
+    #[test]
+    fn metadata_serde_old_wire_format_without_classification_still_deserializes() {
+        // Backward-compatibility pin (#849): pre-#849 peers serialise
+        // `Metadata` without the `classification` key. Their wire form
+        // — both `"classification": null` and the omitted-field shape
+        // — must continue to deserialise cleanly so on-disk
+        // store-and-forward queues written before this PR can replay
+        // post-PR. A regression that removed the
+        // `#[serde(default, skip_serializing_if = "Option::is_none")]`
+        // attribute would surface here.
+        let with_explicit_null = "{\
+            \"received_at\":{\"secs_since_epoch\":1700000000,\"nanos_since_epoch\":0},\
+            \"source_protocol\":\"tcp\",\
+            \"message_type\":\"Position\",\
+            \"classification\":null}";
+        let parsed: Metadata = serde_json::from_str(with_explicit_null).expect("explicit null");
+        assert!(parsed.classification.is_none());
+
+        let with_omitted_field = "{\
+            \"received_at\":{\"secs_since_epoch\":1700000000,\"nanos_since_epoch\":0},\
+            \"source_protocol\":\"tcp\",\
+            \"message_type\":\"Position\"}";
+        let parsed: Metadata = serde_json::from_str(with_omitted_field).expect("omitted field");
+        assert!(parsed.classification.is_none());
+
+        // And a present marking deserializes to Some.
+        let with_marking = "{\
+            \"received_at\":{\"secs_since_epoch\":1700000000,\"nanos_since_epoch\":0},\
+            \"source_protocol\":\"tcp\",\
+            \"message_type\":\"Position\",\
+            \"classification\":\"//UNCLASSIFIED//\"}";
+        let parsed: Metadata = serde_json::from_str(with_marking).expect("with marking");
+        assert!(parsed.classification.is_some());
     }
 }

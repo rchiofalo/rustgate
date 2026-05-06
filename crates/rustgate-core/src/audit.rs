@@ -2375,6 +2375,62 @@ pub fn federation_traceparent_invalid(peer_cn: &str, reason: &str) {
     );
 }
 
+/// Record an egress denial caused by a recipient's clearance failing
+/// to dominate the message's classification marking.
+///
+/// Fires from the per-recipient receive-PEP path inside the router
+/// when the source message carries a `Metadata.classification` and
+/// the recipient's per-group policy denies release. Refs #849 item 4.
+///
+/// Sanitization: `source_cn`, `dest_cn`, `msg_uid`, `marking`, and
+/// `group` are all sanitized at the audit boundary. Callers may pass
+/// raw CN/UID strings without pre-sanitization.
+pub fn classification_denied(
+    source_cn: &str,
+    dest_cn: &str,
+    msg_uid: &str,
+    marking: &str,
+    group: &str,
+) {
+    let source = s(source_cn);
+    let dest = s(dest_cn);
+    let uid = s(msg_uid);
+    let marking = s(marking);
+    let group = s(group);
+    audit!(
+        "classification.denied",
+        source = %source,
+        dest = %dest,
+        uid = %uid,
+        marking = %marking,
+        group = %group,
+        action = "egress",
+        result = "denied"
+    );
+}
+
+/// Record an inbound rejection because the message lacked a CAPCO
+/// classification marking under `--require-classification-marking`.
+///
+/// Fires from the listener-level enforcement path when an operator has
+/// opted into mandatory marking but the inbound envelope's
+/// `Metadata.classification` is `None`. Refs #849 item 4.
+///
+/// Sanitization: every string field is sanitized at the audit boundary.
+pub fn missing_classification_marking(source_cn: &str, msg_uid: &str, source_protocol: &str) {
+    let source = s(source_cn);
+    let uid = s(msg_uid);
+    let protocol = s(source_protocol);
+    audit!(
+        "classification.missing",
+        source = %source,
+        uid = %uid,
+        protocol = %protocol,
+        action = "ingress",
+        result = "rejected"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -4478,6 +4534,108 @@ mod tests {
                 kid.contains('\u{FFFD}'),
                 "sanitized output must contain U+FFFD: {kid:?}"
             );
+        }
+
+        // ── classification audit hooks (refs #849) ──────────────────
+
+        #[test]
+        fn classification_denied_emits_expected_fields() {
+            // Pin the field set on `classification.denied`. The
+            // egress filter in `rustgate-transport` calls this whenever
+            // a recipient's per-group policy rejects the marking; SIEM
+            // rules grep on `event_type=classification.denied` so the
+            // shape must stay stable.
+            let snapshot = capture_audit(|| {
+                classification_denied(
+                    "alice",
+                    "bob",
+                    "msg-uid-123",
+                    "//SECRET//NOFORN",
+                    "team-alpha",
+                );
+            });
+            let event = parse_event(&snapshot, "classification.denied");
+            assert_eq!(event["fields"]["source"], "alice");
+            assert_eq!(event["fields"]["dest"], "bob");
+            assert_eq!(event["fields"]["uid"], "msg-uid-123");
+            assert_eq!(event["fields"]["marking"], "//SECRET//NOFORN");
+            assert_eq!(event["fields"]["group"], "team-alpha");
+            assert_eq!(event["fields"]["action"], "egress");
+            assert_eq!(event["fields"]["result"], "denied");
+        }
+
+        #[test]
+        fn classification_denied_sanitizes_all_string_fields() {
+            // Defence-in-depth: every user-controlled field crosses the
+            // audit boundary through `s(...)` so an attacker-controlled
+            // CN or marking cannot log-forge by injecting CR/LF/CSI.
+            let snapshot = capture_audit(|| {
+                classification_denied(
+                    "src\ninjected",
+                    "dst\rinjected",
+                    "uid\x1b[31m",
+                    "marking\nmalicious",
+                    "group\rmalicious",
+                );
+            });
+            let event = parse_event(&snapshot, "classification.denied");
+            for field in ["source", "dest", "uid", "marking", "group"] {
+                let value = event["fields"][field]
+                    .as_str()
+                    .expect("field must be a JSON string");
+                for forbidden in &['\n', '\r', '\x1b'] {
+                    assert!(
+                        !value.contains(*forbidden),
+                        "{field} forge byte {forbidden:?} must be replaced: {value:?}"
+                    );
+                }
+                assert!(
+                    value.contains('\u{FFFD}'),
+                    "{field} sanitized output must contain U+FFFD: {value:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn missing_classification_marking_emits_expected_fields() {
+            // Pin the field set on `classification.missing`. The
+            // listener-level enforcement path under
+            // `--require-classification-marking=true` calls this when
+            // an inbound message has no marking; SIEM dashboards key
+            // on this event_type to alert on policy bypass attempts.
+            let snapshot = capture_audit(|| {
+                missing_classification_marking("alice", "msg-uid-456", "tcp");
+            });
+            let event = parse_event(&snapshot, "classification.missing");
+            assert_eq!(event["fields"]["source"], "alice");
+            assert_eq!(event["fields"]["uid"], "msg-uid-456");
+            assert_eq!(event["fields"]["protocol"], "tcp");
+            assert_eq!(event["fields"]["action"], "ingress");
+            assert_eq!(event["fields"]["result"], "rejected");
+        }
+
+        #[test]
+        fn missing_classification_marking_sanitizes_user_fields() {
+            // Audit-boundary sanitization parity with `classification_denied`.
+            let snapshot = capture_audit(|| {
+                missing_classification_marking("src\ninjected", "uid\rinjected", "proto\x1b[31m");
+            });
+            let event = parse_event(&snapshot, "classification.missing");
+            for field in ["source", "uid", "protocol"] {
+                let value = event["fields"][field]
+                    .as_str()
+                    .expect("field must be a JSON string");
+                for forbidden in &['\n', '\r', '\x1b'] {
+                    assert!(
+                        !value.contains(*forbidden),
+                        "{field} forge byte {forbidden:?} must be replaced: {value:?}"
+                    );
+                }
+                assert!(
+                    value.contains('\u{FFFD}'),
+                    "{field} sanitized output must contain U+FFFD: {value:?}"
+                );
+            }
         }
     }
 }

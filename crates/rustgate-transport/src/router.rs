@@ -46,7 +46,7 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use rustgate_authz::{
-    Action as AuthzAction, Decision as AuthzDecision, Obligation, PolicyEngine,
+    Action as AuthzAction, AuthzContext, Decision as AuthzDecision, Obligation, PolicyEngine,
     Resource as AuthzResource, Subject as AuthzSubject,
 };
 use smol_str::SmolStr;
@@ -1169,6 +1169,15 @@ pub struct Router {
     /// hot path at a single `ArcSwap::load` + `is_none()` check.
     /// Closes #847.
     on_routed_by_kind: ArcSwap<Option<OnRoutedByKind>>,
+    /// When `true`, every inbound message that lacks a
+    /// [`rustgate_core::message::Metadata::classification`] is rejected
+    /// at admission with a `classification.missing` audit record.
+    ///
+    /// Default `false` keeps pre-#849 behaviour: legacy traffic without
+    /// markings flows unchanged. Set via the server CLI flag
+    /// `--require-classification-marking` for deployments where every
+    /// message must carry a CAPCO marking. Refs #849 item 4.
+    require_classification_marking: bool,
 }
 
 impl std::fmt::Debug for Router {
@@ -1233,6 +1242,10 @@ impl std::fmt::Debug for Router {
                 "on_routed_by_kind_installed",
                 &(**self.on_routed_by_kind.load()).is_some(),
             )
+            .field(
+                "require_classification_marking",
+                &self.require_classification_marking,
+            )
             .finish()
     }
 }
@@ -1265,6 +1278,7 @@ impl Default for Router {
             on_multicast_forward: ArcSwap::from_pointee(None),
             entity_codec_registry: None,
             on_routed_by_kind: ArcSwap::from_pointee(None),
+            require_classification_marking: false,
         }
     }
 }
@@ -1273,6 +1287,23 @@ impl Router {
     /// Create a new router with default group limits.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Builder: enable mandatory CAPCO classification marking on
+    /// inbound messages. When set, every [`Router::route_for_egress`]
+    /// call whose message lacks a `Metadata.classification` is dropped
+    /// with a `classification.missing` audit record.
+    ///
+    /// Default `false` keeps pre-#849 behaviour. Refs #849 item 4.
+    #[must_use]
+    pub fn with_require_classification_marking(mut self, require: bool) -> Self {
+        self.require_classification_marking = require;
+        self
+    }
+
+    /// Returns whether this router enforces the mandatory-marking rule.
+    pub fn require_classification_marking(&self) -> bool {
+        self.require_classification_marking
     }
 
     /// Create a new router with custom group limits.
@@ -1310,6 +1341,7 @@ impl Router {
             on_multicast_forward: ArcSwap::from_pointee(None),
             entity_codec_registry: None,
             on_routed_by_kind: ArcSwap::from_pointee(None),
+            require_classification_marking: false,
         }
     }
 
@@ -1361,6 +1393,7 @@ impl Router {
             on_multicast_forward: ArcSwap::from_pointee(None),
             entity_codec_registry: None,
             on_routed_by_kind: ArcSwap::from_pointee(None),
+            require_classification_marking: false,
         }
     }
 
@@ -1415,6 +1448,7 @@ impl Router {
             on_multicast_forward: ArcSwap::from_pointee(None),
             entity_codec_registry: None,
             on_routed_by_kind: ArcSwap::from_pointee(None),
+            require_classification_marking: false,
         }
     }
 
@@ -1510,28 +1544,47 @@ impl Router {
     /// PEP. The two entry points share `authz_evaluate_inner` so the
     /// observer / metric / latency instrumentation is identical between
     /// directions.
-    fn authz_evaluate_send(
+    /// Send-PEP entry. Forwards the optional [`AuthzContext`]-borne
+    /// classification marking through the engine's
+    /// `evaluate_with_context` method so policies (e.g. the optional
+    /// Cedar backend) can deny release based on the marking. Refs
+    /// #849 item 4 — router-side egress enforcement.
+    ///
+    /// When `classification` is `None` the engine's default
+    /// `evaluate_with_context` delegates to `evaluate`, so existing
+    /// engines stay unchanged.
+    fn authz_evaluate_send_with_classification(
         &self,
         engine: &Arc<dyn PolicyEngine>,
         subject: &AuthzSubject<'_>,
         resource: &AuthzResource<'_>,
+        classification: Option<&rustgate_core::classification::ClassificationMarking>,
     ) -> rustgate_authz::DecisionOutcome {
-        self.authz_evaluate_inner(engine, subject, resource, AuthzAction::Send)
+        let ctx = match classification {
+            Some(m) => AuthzContext::default().with_classification(m.clone()),
+            None => AuthzContext::default(),
+        };
+        self.authz_evaluate_inner(engine, subject, resource, AuthzAction::Send, &ctx)
     }
 
-    /// Receive-PEP entry point. Evaluates the installed engine for a
-    /// per-recipient (delivery-side) decision and returns the
-    /// [`DecisionOutcome`].
-    ///
-    /// Closes #730: paired with `authz_evaluate_send`. See that
-    /// function's doc-comment for the rationale.
-    fn authz_evaluate_receive(
+    /// Receive-PEP entry. Forwards the optional
+    /// [`AuthzContext`]-borne classification marking for the
+    /// per-recipient delivery decision path. Mirrors
+    /// [`Self::authz_evaluate_send_with_classification`] for the
+    /// Receive direction. Closes #730 (split-direction PEPs);
+    /// refs #849 item 4 (classification context).
+    fn authz_evaluate_receive_with_classification(
         &self,
         engine: &Arc<dyn PolicyEngine>,
         subject: &AuthzSubject<'_>,
         resource: &AuthzResource<'_>,
+        classification: Option<&rustgate_core::classification::ClassificationMarking>,
     ) -> rustgate_authz::DecisionOutcome {
-        self.authz_evaluate_inner(engine, subject, resource, AuthzAction::Receive)
+        let ctx = match classification {
+            Some(m) => AuthzContext::default().with_classification(m.clone()),
+            None => AuthzContext::default(),
+        };
+        self.authz_evaluate_inner(engine, subject, resource, AuthzAction::Receive, &ctx)
     }
 
     /// Shared instrumentation for the Send and Receive PEP entry
@@ -1554,6 +1607,7 @@ impl Router {
         subject: &AuthzSubject<'_>,
         resource: &AuthzResource<'_>,
         action: AuthzAction,
+        context: &AuthzContext,
     ) -> rustgate_authz::DecisionOutcome {
         // RAII guard for the in-flight gauge (issue #721). Constructed
         // BEFORE `engine.evaluate` so the gauge reflects exactly the
@@ -1563,7 +1617,13 @@ impl Router {
         // path is automatic.
         let _in_flight = AuthzEvalGuard::new(&self.on_authz_in_flight_changed);
         let start = std::time::Instant::now();
-        let outcome = engine.evaluate(subject, resource, action);
+        // Refs #849: route through `evaluate_with_context` so an
+        // engine that consumes `context.classification` (e.g. the
+        // optional Cedar backend) can condition on the marking. The
+        // default `evaluate_with_context` impl delegates to
+        // `evaluate`, so engines that have not been taught about the
+        // context are unchanged.
+        let outcome = engine.evaluate_with_context(subject, resource, action, context);
         let elapsed = start.elapsed();
         let eval_nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
         let observer_guard = self.authz_observer.load();
@@ -2548,6 +2608,34 @@ impl Router {
             return None;
         }
 
+        // Refs #849 item 4: mandatory-marking enforcement. When the
+        // operator has set `--require-classification-marking=true`, an
+        // inbound message that lacks a `Metadata.classification` is
+        // rejected at admission with a `classification.missing` audit
+        // record. Default behaviour (`require_classification_marking
+        // == false`) leaves legacy traffic flowing — the marking is
+        // optional. Enforcing here (after dedup/TTL but before any
+        // PEP, cache store, or fanout) keeps a rejected message off
+        // the position cache, the audit log of obligations, and the
+        // metrics counters for delivery — the only side effect of a
+        // rejection is the dedicated audit record.
+        if self.require_classification_marking && msg.metadata.classification.is_none() {
+            let uid = extract_cot_uid(&msg.payload);
+            rustgate_core::audit::missing_classification_marking(
+                &msg.source.cn,
+                uid,
+                &msg.metadata.source_protocol,
+            );
+            debug!(
+                source = %hash_cn(&msg.source.cn),
+                protocol = %msg.metadata.source_protocol,
+                "rejecting inbound message: --require-classification-marking is set and the marking is absent"
+            );
+            emit_access(&msg, "classification_missing");
+            self.emit_dropped("classification_missing");
+            return None;
+        }
+
         // SA auto-multicast: when enabled, upgrade Group-destination SA
         // position events to Multicast targeting all groups the sender
         // belongs to. This runs before authz so per-group policy still
@@ -2633,7 +2721,16 @@ impl Router {
                             // Multicast is handled above.
                             _ => AuthzResource::Broadcast,
                         };
-                        let outcome = self.authz_evaluate_send(engine, &subject, &resource);
+                        // Refs #849: forward `Metadata.classification`
+                        // into the top-level Send PEP so the marking
+                        // can drive a deny here, before the message
+                        // ever hits the per-recipient fanout.
+                        let outcome = self.authz_evaluate_send_with_classification(
+                            engine,
+                            &subject,
+                            &resource,
+                            msg.metadata.classification.as_ref(),
+                        );
                         if !outcome.is_allow() {
                             let (kind, id): (&'static str, &str) = match dest {
                                 Destination::Direct(target) => ("direct", &target.cn),
@@ -3035,7 +3132,17 @@ impl Router {
                             AuthzResource::Broadcast
                         }
                     };
-                    let send_outcome = self.authz_evaluate_send(engine, &subject, &resource);
+                    // Refs #849: forward the persisted message's
+                    // classification (if any) into the offline-drain
+                    // PEP so policies can re-evaluate against the
+                    // marking the message carried when it was queued.
+                    let classification = msg.metadata.classification.as_ref();
+                    let send_outcome = self.authz_evaluate_send_with_classification(
+                        engine,
+                        &subject,
+                        &resource,
+                        classification,
+                    );
                     if !send_outcome.is_allow() {
                         debug!(
                             sender = %hash_cn(&msg.source.cn),
@@ -3046,14 +3153,32 @@ impl Router {
 
                     // Recipient Receive check
                     let recipient_subject = AuthzSubject::from_identity(recipient_identity);
-                    let recv_outcome =
-                        self.authz_evaluate_receive(engine, &recipient_subject, &resource);
+                    let recv_outcome = self.authz_evaluate_receive_with_classification(
+                        engine,
+                        &recipient_subject,
+                        &resource,
+                        classification,
+                    );
                     if !recv_outcome.is_allow() {
                         debug!(
                             sender = %hash_cn(&msg.source.cn),
                             recipient = %hash_cn(&recipient_identity.cn),
                             "offline message filtered: recipient denied by authz",
                         );
+                        if let Some(marking) = classification {
+                            let uid = extract_cot_uid(&msg.payload);
+                            let group_label = match &msg.destination {
+                                Destination::Group(g) => g.as_ref(),
+                                _ => "",
+                            };
+                            rustgate_core::audit::classification_denied(
+                                &msg.source.cn,
+                                &recipient_identity.cn,
+                                uid,
+                                &marking.to_string(),
+                                group_label,
+                            );
+                        }
                         return None;
                     }
 
@@ -3269,7 +3394,18 @@ impl Router {
             let (recv_obligations, recv_rule_id, engine_for_audit) = if let Some(engine) = authz {
                 let sender_subject = AuthzSubject::from_identity(&msg.source);
                 let resource = AuthzResource::Broadcast;
-                let send_outcome = self.authz_evaluate_send(engine, &sender_subject, &resource);
+                // Refs #849: forward the replayed message's marking
+                // through both PEP evaluations on the replay path, so
+                // a tightened policy that denies a recipient based on
+                // marking after the position was cached takes effect
+                // here rather than leaking stale coordinates.
+                let classification = msg.metadata.classification.clone();
+                let send_outcome = self.authz_evaluate_send_with_classification(
+                    engine,
+                    &sender_subject,
+                    &resource,
+                    classification.as_ref(),
+                );
                 if !send_outcome.is_allow() {
                     // Sender is no longer allowed to send to this
                     // resource class under the current policy; drop
@@ -3299,8 +3435,12 @@ impl Router {
 
                 let recipient_subject =
                     AuthzSubject::with_hash(&handle.identity, handle.subject_hash);
-                let recv_outcome =
-                    self.authz_evaluate_receive(engine, &recipient_subject, &resource);
+                let recv_outcome = self.authz_evaluate_receive_with_classification(
+                    engine,
+                    &recipient_subject,
+                    &resource,
+                    classification.as_ref(),
+                );
                 if !recv_outcome.is_allow() {
                     continue;
                 }
@@ -3484,7 +3624,14 @@ impl Router {
                 let (msg, audit_ctx) = if let Some(engine) = (**authz_guard).as_ref() {
                     let subject = AuthzSubject::from_identity(&handle.identity);
                     let resource = AuthzResource::Direct { target_cn: cn };
-                    let outcome = self.authz_evaluate_receive(engine, &subject, &resource);
+                    // Refs #849: classification-aware Receive PEP for
+                    // the direct-recipient path.
+                    let outcome = self.authz_evaluate_receive_with_classification(
+                        engine,
+                        &subject,
+                        &resource,
+                        msg.metadata.classification.as_ref(),
+                    );
                     if !outcome.is_allow() {
                         rustgate_core::audit::authz_denied(
                             &handle.identity.cn,
@@ -3495,6 +3642,18 @@ impl Router {
                             outcome.rule_id.as_deref(),
                             engine.policy_id(),
                         );
+                        // Refs #849: marking-driven denial side-channel
+                        // for SIEM correlation.
+                        if let Some(marking) = msg.metadata.classification.as_ref() {
+                            let uid = extract_cot_uid(&msg.payload);
+                            rustgate_core::audit::classification_denied(
+                                &msg.source.cn,
+                                &handle.identity.cn,
+                                uid,
+                                &marking.to_string(),
+                                "",
+                            );
+                        }
                         // Closes #768: Receive-PEP deny — recipient
                         // skipped, contributes to the authz_denied
                         // bucket of `dropped_total`.
@@ -3740,7 +3899,15 @@ impl Router {
                     };
                     let subject = AuthzSubject::with_hash(&handle.identity, handle.subject_hash);
                     let resource = AuthzResource::Group { group };
-                    let outcome = self.authz_evaluate_receive(engine, &subject, &resource);
+                    // Refs #849: forward `Metadata.classification` into
+                    // the Receive PEP so policies that condition on the
+                    // marking can deny release per recipient.
+                    let outcome = self.authz_evaluate_receive_with_classification(
+                        engine,
+                        &subject,
+                        &resource,
+                        msg.metadata.classification.as_ref(),
+                    );
                     if !outcome.is_allow() {
                         rustgate_core::audit::authz_denied(
                             &handle.identity.cn,
@@ -3751,6 +3918,22 @@ impl Router {
                             outcome.rule_id.as_deref(),
                             engine.policy_id(),
                         );
+                        // Refs #849: when the source carried a
+                        // classification marking and the recipient was
+                        // filtered, emit the dedicated
+                        // `classification.denied` audit event so SIEM
+                        // dashboards can isolate marking-driven denials
+                        // from the broader `authz_denied` bucket.
+                        if let Some(marking) = msg.metadata.classification.as_ref() {
+                            let uid = extract_cot_uid(&msg.payload);
+                            rustgate_core::audit::classification_denied(
+                                &msg.source.cn,
+                                &handle.identity.cn,
+                                uid,
+                                &marking.to_string(),
+                                group,
+                            );
+                        }
                         self.emit_dropped("authz_denied");
                         return None;
                     }
@@ -3891,7 +4074,14 @@ impl Router {
             let (delivery, audit_ctx) = if let Some(engine) = authz {
                 let subject = AuthzSubject::from_identity(&handle.identity);
                 let resource = AuthzResource::Broadcast;
-                let outcome = self.authz_evaluate_receive(engine, &subject, &resource);
+                // Refs #849: classification-aware Receive PEP for the
+                // broadcast fan-out path.
+                let outcome = self.authz_evaluate_receive_with_classification(
+                    engine,
+                    &subject,
+                    &resource,
+                    msg.metadata.classification.as_ref(),
+                );
                 if !outcome.is_allow() {
                     rustgate_core::audit::authz_denied(
                         &handle.identity.cn,
@@ -3902,6 +4092,16 @@ impl Router {
                         outcome.rule_id.as_deref(),
                         engine.policy_id(),
                     );
+                    if let Some(marking) = msg.metadata.classification.as_ref() {
+                        let uid = extract_cot_uid(&msg.payload);
+                        rustgate_core::audit::classification_denied(
+                            &msg.source.cn,
+                            &handle.identity.cn,
+                            uid,
+                            &marking.to_string(),
+                            "",
+                        );
+                    }
                     filtered += 1;
                     self.emit_dropped("authz_denied");
                     continue;
@@ -4057,7 +4257,14 @@ impl Router {
         let msg = if let Some(engine) = authz {
             let subject = AuthzSubject::from_identity(&msg.source);
             let resource = AuthzResource::Group { group };
-            let outcome = self.authz_evaluate_send(engine, &subject, &resource);
+            // Refs #849: classification-aware Send PEP for per-group
+            // multicast fan-out.
+            let outcome = self.authz_evaluate_send_with_classification(
+                engine,
+                &subject,
+                &resource,
+                msg.metadata.classification.as_ref(),
+            );
             if !outcome.is_allow() {
                 rustgate_core::audit::authz_denied(
                     &msg.source.cn,
@@ -4135,7 +4342,13 @@ impl Router {
                     };
                     let subject = AuthzSubject::with_hash(&handle.identity, handle.subject_hash);
                     let resource = AuthzResource::Group { group };
-                    let outcome = self.authz_evaluate_receive(engine, &subject, &resource);
+                    // Refs #849: classification-aware Receive PEP.
+                    let outcome = self.authz_evaluate_receive_with_classification(
+                        engine,
+                        &subject,
+                        &resource,
+                        msg.metadata.classification.as_ref(),
+                    );
                     if !outcome.is_allow() {
                         rustgate_core::audit::authz_denied(
                             &handle.identity.cn,
@@ -4146,6 +4359,19 @@ impl Router {
                             outcome.rule_id.as_deref(),
                             engine.policy_id(),
                         );
+                        // Refs #849: per-recipient
+                        // `classification.denied` when the marking is
+                        // present. Mirrors the path in `send_to_group`.
+                        if let Some(marking) = msg.metadata.classification.as_ref() {
+                            let uid = extract_cot_uid(&msg.payload);
+                            rustgate_core::audit::classification_denied(
+                                &msg.source.cn,
+                                &handle.identity.cn,
+                                uid,
+                                &marking.to_string(),
+                                group,
+                            );
+                        }
                         self.emit_dropped("authz_denied");
                         return None;
                     }
@@ -4252,8 +4478,9 @@ impl EnvelopeEvaluator for Router {
         engine: &Arc<dyn PolicyEngine>,
         subject: &AuthzSubject<'_>,
         resource: &AuthzResource<'_>,
+        classification: Option<&rustgate_core::classification::ClassificationMarking>,
     ) -> rustgate_authz::DecisionOutcome {
-        self.authz_evaluate_send(engine, subject, resource)
+        self.authz_evaluate_send_with_classification(engine, subject, resource, classification)
     }
 }
 

@@ -2026,6 +2026,18 @@ pub(crate) async fn start_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
     // only spelling that compiles in both.
     #[allow(clippy::clone_on_copy)]
     let pt_nats = nats_publisher.clone();
+    // Refs #849: parse the per-listener default marking. Validation
+    // ran at startup in `Cli::validate`, so a parse failure here is a
+    // bug — surface as a hard error rather than silently skipping.
+    let default_classification: Option<rustgate_core::classification::ClassificationMarking> =
+        match cli.default_classification.as_ref() {
+            Some(banner) => Some(banner.parse().map_err(|e| {
+                anyhow::anyhow!(
+                    "--default-classification ({banner:?}) parse failed for plaintext listener: {e}"
+                )
+            })?),
+            None => None,
+        };
     let config = PlaintextTcpConfig {
         listener: pt_listener,
         router: Arc::clone(router),
@@ -2047,6 +2059,7 @@ pub(crate) async fn start_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
         shutdown: shutdown_clone,
         #[cfg(feature = "metrics")]
         metrics_identity: Arc::clone(metrics_identity),
+        default_classification,
     };
 
     let task = tokio::spawn(async move {

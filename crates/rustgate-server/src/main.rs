@@ -916,6 +916,11 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
         // `--authz-allow-unknown-obligations` /
         // `RUSTGATE_AUTHZ_ALLOW_UNKNOWN_OBLIGATIONS`.
         .with_allow_unknown_obligations(cli.authz_allow_unknown_obligations)
+        // Refs #849: when `--require-classification-marking` is set,
+        // every inbound message that lacks a marking is rejected at
+        // admission. Default `false` keeps pre-#849 behaviour for
+        // legacy traffic that does not yet attach a marking.
+        .with_require_classification_marking(cli.require_classification_marking)
         // Issue #724: cap per-CN position replay events with a
         // TokenBucket so a flap-looping client cannot drive the
         // authz engine at an uncapped rate. Defaults
@@ -1580,6 +1585,22 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     // ── Per-client rate limiting ────────────────────────────────────
     let throttle_config = setup::build_throttle_config(&cli);
 
+    // ── Default classification marking (refs #849 item 4) ──────────
+    // Parsed once at startup; the parsed marking is cloned into every
+    // session's `MessageBuilder` so unmarked inbound traffic gets
+    // stamped before reaching the router. Validation already ran in
+    // `Cli::validate`, so a parse failure here means the validator
+    // missed a case — bail rather than silently skip.
+    let default_classification: Option<rustgate_core::classification::ClassificationMarking> =
+        match cli.default_classification.as_ref() {
+            Some(banner) => Some(banner.parse().map_err(|e| {
+                anyhow::anyhow!(
+                    "--default-classification ({banner:?}) parse failed at startup: {e}"
+                )
+            })?),
+            None => None,
+        };
+
     // ── Anti-replay filter ─────────────────────────────────────────
     let replay_filter =
         rustgate_transport::ReplayFilter::from_secs(cli.replay_window).map(Arc::new);
@@ -1951,6 +1972,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
                             ),
                             #[cfg(feature = "metrics")]
                             metrics_identity: Arc::clone(&metrics_identity),
+                            default_classification: default_classification.clone(),
                         };
                         spawn_background("tls-session", session::handle_session(session, deps, permit));
                     }
