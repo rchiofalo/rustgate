@@ -1553,6 +1553,35 @@ pub fn http_rate_limited(target: &str, source_cn: &str) {
     );
 }
 
+/// Record a message being dropped because the per-tenant aggregate
+/// throughput token bucket was exhausted (issue #883, sub-item 4).
+///
+/// The per-session token bucket caps each individual session; this
+/// audit event fires when the *tenant-level* bucket — which sums
+/// across every active session for that tenant — rejected the request.
+/// `requested` is the number of tokens (bytes) the message asked for;
+/// `available` is the number of tokens the bucket had at evaluation
+/// time. Together they let an operator see how far over the cap the
+/// burst was without re-deriving the rate from
+/// `security_rate_limited` event timing.
+///
+/// Sanitization: `tenant` and `msg_uid` are sanitized at the audit
+/// boundary so a noisy CoT `uid="…"` carrying control characters
+/// cannot forge log lines.
+pub fn tenant_throughput_exceeded(tenant: &str, msg_uid: &str, requested: u64, available: u64) {
+    let tenant = s(tenant);
+    let msg_uid = s(msg_uid);
+    audit!(
+        "quota.tenant_throughput_exceeded",
+        tenant = %tenant,
+        uid = %msg_uid,
+        requested = requested,
+        available = available,
+        action = "send",
+        result = "rejected"
+    );
+}
+
 /// Record a dead-letter queue write failure.
 ///
 /// Sanitization: `target` and `error` are sanitized at the audit
@@ -2517,6 +2546,20 @@ mod tests {
             // through the audit macro without panicking. Issue #724.
             position_replay_rate_limited("deadbeefcafe1234", 256, 0);
             position_replay_rate_limited("aabbccddeeff0011", 1024, 17);
+        }
+
+        #[test]
+        fn test_tenant_throughput_exceeded() {
+            // Smoke: the tenant-level aggregate-throughput audit event
+            // (issue #883 sub-item 4) renders cleanly across a span of
+            // request sizes — a small CoT position update, a 16 MiB
+            // file-share blob, and the boundary case where the bucket
+            // had exactly zero tokens available.
+            tenant_throughput_exceeded("Acme Corp", "TAK-1-1234", 1024, 0);
+            tenant_throughput_exceeded("Globex", "FILE-XL-9999", 16 * 1024 * 1024, 512);
+            // Adversarial input: a CoT uid carrying CR/LF must round-trip
+            // through `s(...)` without forging the audit line.
+            tenant_throughput_exceeded("Acme\nCorp", "TAK-\r\n-PWN", 100, 50);
         }
     }
 

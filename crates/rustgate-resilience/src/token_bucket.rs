@@ -58,9 +58,34 @@ impl TokenBucket {
     /// On mutex poisoning, allows the request (fail-open — matching the
     /// workspace pattern in [`super::conn_rate_limiter`]).
     pub fn try_acquire(&self) -> bool {
+        self.try_acquire_n(1.0).is_ok()
+    }
+
+    /// Try to consume `n` tokens at once. Returns `Ok(())` on success.
+    ///
+    /// Used by the per-tenant aggregate-throughput limiter (issue #883
+    /// sub-item 4) where each byte of payload corresponds to one token —
+    /// a single `try_acquire` call per message would force the caller
+    /// into an `n`-iteration loop and would not actually represent the
+    /// "drop or admit" decision the byte-budget bucket needs to make.
+    ///
+    /// Returns `Err(TokenBucketRejection { available })` when the bucket
+    /// holds fewer than `n` tokens after the lazy refill. The returned
+    /// `available` count is captured *after* the refill but *before* any
+    /// decrement, so audit-emitting callers can attribute the rejection
+    /// to the actual headroom rather than a raw stale snapshot.
+    ///
+    /// Refills tokens based on elapsed time before checking availability.
+    /// On mutex poisoning, allows the request (fail-open — matching the
+    /// workspace pattern in [`super::conn_rate_limiter`]). The fail-open
+    /// path returns `available = 0` so a caller that audits the
+    /// rejection still emits a deterministic value rather than leaking
+    /// stale state from before the poison.
+    pub fn try_acquire_n(&self, n: f64) -> Result<(), TokenBucketRejection> {
+        let n = if n.is_finite() { n.max(0.0) } else { 0.0 };
         let Ok(mut guard) = self.state.lock() else {
             // Fail-open on mutex poison — don't block traffic on internal error
-            return true;
+            return Ok(());
         };
 
         let now = Instant::now();
@@ -68,14 +93,68 @@ impl TokenBucket {
         guard.tokens = (guard.tokens + elapsed * self.refill_rate).min(self.max_tokens);
         guard.last_refill = now;
 
-        if guard.tokens >= 1.0 {
-            guard.tokens -= 1.0;
-            true
+        if guard.tokens >= n {
+            guard.tokens -= n;
+            Ok(())
         } else {
-            false
+            Err(TokenBucketRejection {
+                available: guard.tokens.max(0.0),
+            })
         }
     }
+
+    /// Snapshot of the current token level. Lazily refills the bucket
+    /// before reading so the value reflects the same accounting the
+    /// next [`try_acquire_n`](Self::try_acquire_n) would observe.
+    ///
+    /// Used by the per-tenant `OnTenantThroughputConsumed` callback
+    /// (issue #883 sub-item 4) so a Prometheus gauge can publish
+    /// "current bucket level" without taking a token.
+    pub fn current_tokens(&self) -> f64 {
+        let Ok(mut guard) = self.state.lock() else {
+            // Fail-open on mutex poison — same convention as `try_acquire`.
+            return self.max_tokens;
+        };
+        let now = Instant::now();
+        let elapsed = now.duration_since(guard.last_refill).as_secs_f64();
+        guard.tokens = (guard.tokens + elapsed * self.refill_rate).min(self.max_tokens);
+        guard.last_refill = now;
+        guard.tokens.max(0.0)
+    }
+
+    /// Configured maximum bucket capacity (tokens). Exposed so audit
+    /// sinks can record the configured cap alongside an
+    /// over-the-cap rejection without re-reading the constructor
+    /// arguments.
+    pub fn capacity(&self) -> f64 {
+        self.max_tokens
+    }
 }
+
+/// Rejection returned by [`TokenBucket::try_acquire_n`].
+///
+/// `available` is the number of tokens the bucket held at the moment
+/// of rejection (after the lazy refill). Audit callers use this to
+/// attribute the drop event to the actual bucket level rather than
+/// re-reading via [`TokenBucket::current_tokens`] (which would race
+/// against concurrent acquires and a refill clock advance).
+#[derive(Debug, Clone, Copy)]
+pub struct TokenBucketRejection {
+    /// Tokens remaining when the rejection was decided.
+    pub available: f64,
+}
+
+impl std::fmt::Display for TokenBucketRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "token bucket rejected: {:.2} tokens available",
+            self.available
+        )
+    }
+}
+
+impl std::error::Error for TokenBucketRejection {}
 
 #[cfg(test)]
 mod tests {
@@ -332,6 +411,108 @@ mod tests {
             !bucket.try_acquire(),
             "fresh token consumed, back to fractional state"
         );
+    }
+
+    // -- try_acquire_n / current_tokens / capacity coverage -----------
+
+    #[test]
+    fn try_acquire_n_admits_partial_burst() {
+        // Issue #883 sub-item 4: byte-token semantics. A 1_000-token
+        // bucket should accept a single 800-token request and reject a
+        // follow-up 300-token request because only 200 tokens remain.
+        let bucket = TokenBucket::new(0.0, Some(1_000.0));
+        assert!(bucket.try_acquire_n(800.0).is_ok());
+        let err = bucket
+            .try_acquire_n(300.0)
+            .expect_err("over-cap request must be rejected");
+        // The reported `available` must reflect the true post-decrement
+        // headroom — 200 tokens, not the original 1 000.
+        assert!(
+            (err.available - 200.0).abs() < 1.0,
+            "available should be ~200, got {}",
+            err.available
+        );
+    }
+
+    #[test]
+    fn try_acquire_n_rejects_when_under_request_size() {
+        let bucket = TokenBucket::new(0.0, Some(100.0));
+        let err = bucket
+            .try_acquire_n(101.0)
+            .expect_err("request larger than capacity must reject");
+        // Available is the bucket's current level (~100), NOT 0.
+        assert!(err.available >= 99.0 && err.available <= 100.0);
+    }
+
+    #[test]
+    fn try_acquire_n_zero_is_a_no_op_admit() {
+        // A zero-byte payload should not be charged against the bucket
+        // — there is nothing to queue and rejecting would degrade
+        // protocol heartbeats. Pin the no-op-admit semantics.
+        let bucket = TokenBucket::new(0.0, Some(1.0));
+        assert!(bucket.try_acquire_n(0.0).is_ok());
+        // The 1-token cap is still intact afterwards.
+        assert!(bucket.try_acquire_n(1.0).is_ok());
+        assert!(bucket.try_acquire_n(1.0).is_err());
+    }
+
+    #[test]
+    fn try_acquire_n_negative_request_is_clamped_to_zero() {
+        // Defensive: a negative `n` (from a buggy size computation
+        // upstream) must NOT drive the bucket level upwards on
+        // subtraction. Clamp to zero so the call is a no-op admit.
+        let bucket = TokenBucket::new(0.0, Some(5.0));
+        assert!(bucket.try_acquire_n(-100.0).is_ok());
+        // Bucket still has its full 5-token capacity.
+        assert!(bucket.try_acquire_n(5.0).is_ok());
+        assert!(bucket.try_acquire_n(0.5).is_err());
+    }
+
+    #[test]
+    fn try_acquire_n_nan_request_is_treated_as_zero() {
+        let bucket = TokenBucket::new(0.0, Some(5.0));
+        assert!(
+            bucket.try_acquire_n(f64::NAN).is_ok(),
+            "NaN request size must be sanitized to zero, not corrupt the bucket"
+        );
+        // Cap is still intact after the NaN call.
+        assert!(bucket.try_acquire_n(5.0).is_ok());
+        assert!(bucket.try_acquire_n(1.0).is_err());
+    }
+
+    #[test]
+    fn current_tokens_reflects_post_refill_level() {
+        let bucket = TokenBucket::new(0.0, Some(100.0));
+        assert!((bucket.current_tokens() - 100.0).abs() < 0.01);
+        assert!(bucket.try_acquire_n(40.0).is_ok());
+        assert!((bucket.current_tokens() - 60.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn capacity_returns_configured_max() {
+        let bucket = TokenBucket::new(50.0, Some(123.0));
+        assert!((bucket.capacity() - 123.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn try_acquire_n_refills_over_time() {
+        let bucket = TokenBucket::new(100.0, Some(100.0));
+        // Drain.
+        assert!(bucket.try_acquire_n(100.0).is_ok());
+        assert!(bucket.try_acquire_n(50.0).is_err());
+        // Wait 0.5s — refills 50 tokens at 100/s.
+        tokio::time::advance(std::time::Duration::from_millis(500)).await;
+        assert!(bucket.try_acquire_n(50.0).is_ok());
+        assert!(bucket.try_acquire_n(0.5).is_err());
+    }
+
+    #[test]
+    fn rejection_display_contains_available() {
+        let bucket = TokenBucket::new(0.0, Some(10.0));
+        let err = bucket.try_acquire_n(20.0).unwrap_err();
+        let s = format!("{err}");
+        assert!(s.contains("token bucket rejected"));
+        assert!(s.contains("10"));
     }
 
     /// Pin the workspace `Debug` implementability on `TokenBucket`. The

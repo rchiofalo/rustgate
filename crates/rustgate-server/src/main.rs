@@ -833,6 +833,27 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
             match rustgate_transport::TenantQuotaTracker::load_config(path) {
                 Ok(config) => {
                     let tracker = Arc::new(rustgate_transport::TenantQuotaTracker::new(config));
+                    // Issue #883 sub-item 4: wire the per-tenant
+                    // throughput rejection / consumption callbacks to
+                    // Prometheus so an operator can see drops and
+                    // current bucket headroom per tenant.
+                    #[cfg(feature = "metrics")]
+                    {
+                        tracker.set_on_throughput_rejection(Some(std::sync::Arc::new(
+                            |tenant: &str| {
+                                metrics::tenant_throughput_rejections()
+                                    .with_label_values(&[tenant])
+                                    .inc();
+                            },
+                        )));
+                        tracker.set_on_throughput_consumed(Some(std::sync::Arc::new(
+                            |tenant: &str, level: f64| {
+                                if let Some(g) = metrics::tenant_throughput_bps() {
+                                    g.with_label_values(&[tenant]).set(level);
+                                }
+                            },
+                        )));
+                    }
                     tracing::info!(
                         path = %path.display(),
                         "per-tenant quota tracker loaded"

@@ -260,6 +260,9 @@ static CERT_EXPIRY_SECONDS: OnceLock<IntGauge> = OnceLock::new();
 static ENROLLMENT_RATE_LIMITED: OnceLock<IntCounter> = OnceLock::new();
 static ENROLLMENT_RATE_LIMIT_POISON: OnceLock<IntCounter> = OnceLock::new();
 static TENANT_QUOTA_REJECTIONS: OnceLock<IntCounterVec> = OnceLock::new();
+// Issue #883 sub-item 4: per-tenant aggregate-throughput metrics.
+static TENANT_THROUGHPUT_REJECTIONS: OnceLock<IntCounterVec> = OnceLock::new();
+static TENANT_THROUGHPUT_BPS: OnceLock<prometheus::GaugeVec> = OnceLock::new();
 
 #[cfg(feature = "spiffe")]
 static SPIFFE_SVID_REFRESH_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
@@ -1076,6 +1079,32 @@ pub fn init() -> prometheus::Result<()> {
     )?;
     registry.register(Box::new(tenant_quota_rejections.clone()))?;
     let _ = TENANT_QUOTA_REJECTIONS.set(tenant_quota_rejections);
+
+    // Issue #883 sub-item 4: per-tenant aggregate-throughput metrics.
+    // The token-bucket layer in `TenantQuotaTracker` fires
+    // `OnTenantThroughputRejection` once per dropped message and
+    // `OnTenantThroughputConsumed` once per acquire (admit OR reject)
+    // with the post-decision bucket level — let operators see both
+    // total rejections and current headroom in a single dashboard.
+    let tenant_throughput_rejections = IntCounterVec::new(
+        Opts::new(
+            "rustgate_tenant_throughput_rejections_total",
+            "Messages dropped because the per-tenant aggregate-throughput token bucket was exhausted",
+        ),
+        &["tenant"],
+    )?;
+    registry.register(Box::new(tenant_throughput_rejections.clone()))?;
+    let _ = TENANT_THROUGHPUT_REJECTIONS.set(tenant_throughput_rejections);
+
+    let tenant_throughput_bps = prometheus::GaugeVec::new(
+        Opts::new(
+            "rustgate_tenant_throughput_bps",
+            "Current aggregate-throughput token-bucket level (bytes) per tenant; updated on every send admit or reject",
+        ),
+        &["tenant"],
+    )?;
+    registry.register(Box::new(tenant_throughput_bps.clone()))?;
+    let _ = TENANT_THROUGHPUT_BPS.set(tenant_throughput_bps);
 
     let authz_decisions = IntCounterVec::new(
         Opts::new(
@@ -2259,6 +2288,48 @@ pub fn tenant_quota_rejections() -> &'static IntCounterVec {
             &["tenant"],
         )
     })
+}
+
+/// Per-tenant aggregate-throughput rejection counter (issue #883
+/// sub-item 4). Labelled by `tenant`. Increments once per message
+/// dropped by the per-tenant token bucket; pair with
+/// `rustgate_tenant_throughput_bps` to see both current headroom and
+/// drop rate in the same panel.
+pub fn tenant_throughput_rejections() -> &'static IntCounterVec {
+    TENANT_THROUGHPUT_REJECTIONS.get_or_init(|| {
+        fallback_counter_vec(
+            "rustgate_tenant_throughput_rejections_total",
+            "fallback",
+            &["tenant"],
+        )
+    })
+}
+
+/// Per-tenant aggregate-throughput level gauge (issue #883
+/// sub-item 4), in bytes. Updated on every send admit or reject
+/// with the post-decision bucket level so a Prometheus scrape sees
+/// the same value the next acquire would observe.
+///
+/// Returns `None` if `init()` was not called and the fallback
+/// constructor failed — callers gate their `.set()` on the
+/// presence of the metric, matching the workspace pattern for
+/// tier-1 instruments that test paths construct without `init()`.
+pub fn tenant_throughput_bps() -> Option<&'static prometheus::GaugeVec> {
+    if let Some(g) = TENANT_THROUGHPUT_BPS.get() {
+        return Some(g);
+    }
+    // Fallback for callers that bypass `init()` (rare). On the
+    // expected `init()` path the gauge is registered with the
+    // default registry and `TENANT_THROUGHPUT_BPS.get()` above
+    // returns it. The fallback keeps the accessor non-panicking
+    // even if a future refactor calls it before init.
+    let fallback = prometheus::GaugeVec::new(
+        Opts::new("rustgate_tenant_throughput_bps", "fallback"),
+        &["tenant"],
+    )
+    .ok()?;
+    let _ = TENANT_THROUGHPUT_BPS.set(fallback);
+    TENANT_THROUGHPUT_BPS.get()
 }
 
 /// Returns the client-queue depth gauge vector (Tier 1, registered
